@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *" # nightly at 02:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Format ──────────────────────────────────────────────────────────
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+
+  # ── Lint ────────────────────────────────────────────────────────────
+  clippy:
+    name: clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # ── Test ────────────────────────────────────────────────────────────
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+
+  # ── Docs ────────────────────────────────────────────────────────────
+  doc:
+    name: doc
+    runs-on: ubuntu-22.04
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+
+  # ── Miri (nightly only) ────────────────────────────────────────────
+  miri:
+    name: miri
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'schedule'
+    env:
+      MIRIFLAGS: >-
+        -Zmiri-strict-provenance
+        -Zmiri-symbolic-alignment-check
+        -Zmiri-preemption-rate=0.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: ubuntu-22.04-miri
+      - run: cargo miri test --all-features
