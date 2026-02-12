@@ -1,0 +1,11 @@
+[package]
+name = "gossip-scan-pipeline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Scheduler-like pipeline: I/O threads, chunking, CPU executor"
+
+[dependencies]
+gossip-contracts.workspace = true
+gossip-engine.workspace = true

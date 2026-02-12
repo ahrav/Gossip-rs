@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gossip-contracts",
+    "crates/gossip-engine",
+    "crates/gossip-scan-pipeline",
+    "crates/gossip-connectors",
+    "crates/gossip-coordination",
+    "crates/gossip-worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
+repository = "https://github.com/ahrav/gossip-rs"
+
+[workspace.dependencies]
+# Internal crate dependencies
+gossip-contracts = { path = "crates/gossip-contracts" }
+gossip-engine = { path = "crates/gossip-engine" }
+gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }
+gossip-connectors = { path = "crates/gossip-connectors" }
+gossip-coordination = { path = "crates/gossip-coordination" }

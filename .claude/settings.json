@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]]; then cargo fmt --all && cargo clippy --all-targets 2>&1 | head -100; fi"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/doc-rigor-gate.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *.rs ]] && grep -q 'unsafe' \"$CLAUDE_FILE_PATH\" 2>/dev/null; then echo '⚠️  WARNING: This file contains unsafe code blocks. Proceeding with caution.'; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *default_rules.yaml ]]; then echo '⚠️  WARNING: default_rules.yaml contains detection rule definitions. Confirm intentional edit.' >&2; fi"
+          },
+          {
+            "type": "command",
+            "command": "if [[ \"$CLAUDE_FILE_PATH\" == *src/engine/* ]] || [[ \"$CLAUDE_FILE_PATH\" == *src/scheduler/* ]] || [[ \"$CLAUDE_FILE_PATH\" == *src/stdx/* ]]; then echo '⚠️  HOT PATH: Run /perf-regression before merging changes to this file.' >&2; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "gossip-connectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Source connectors: filesystem, git, SaaS integrations"
+
+[dependencies]
+gossip-contracts.workspace = true
