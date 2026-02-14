@@ -25,3 +25,41 @@
 //!    `identity → coordination → shard → connector → persistence`.
 
 #![forbid(unsafe_code)]
+
+// Re-export blake3 for internal use across modules.
+pub use blake3;
+
+#[cfg(test)]
+mod tests {
+    /// Smoke test: blake3 is importable and functional.
+    #[test]
+    fn blake3_available() {
+        let hasher = blake3::Hasher::new();
+        let hash = hasher.finalize();
+        assert_eq!(hash.as_bytes().len(), 32);
+    }
+
+    /// Smoke test: proptest macros are usable in test context.
+    #[test]
+    fn proptest_available() {
+        use proptest::prelude::*;
+
+        proptest!(|(x: u64)| {
+            // Verify blake3 produces deterministic output.
+            let h1 = blake3::hash(&x.to_le_bytes());
+            let h2 = blake3::hash(&x.to_le_bytes());
+            prop_assert_eq!(h1, h2);
+        });
+    }
+
+    /// Smoke test: test-support feature gate compiles in both configurations.
+    #[test]
+    fn test_support_feature_gate() {
+        // This test verifies the feature flag plumbing exists.
+        // Code gated behind `test-support` will be added in later phases.
+        #[cfg(feature = "test-support")]
+        {
+            // Placeholder: test-support-gated code will live here.
+        }
+    }
+}

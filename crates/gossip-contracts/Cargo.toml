@@ -9,4 +9,12 @@ description = "Shared types, encodings, and invariants for gossip-rs"
 
 [lib]
 
+[features]
+default = []
+test-support = []
+
 [dependencies]
+blake3 = "1.8"
+
+[dev-dependencies]
+proptest = "1.10"
