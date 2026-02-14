@@ -23,11 +23,34 @@
 //! 3. **Boundary isolation.** Modules mirror the five-boundary decomposition
 //!    and follow an acyclic dependency direction:
 //!    `identity → coordination → shard → connector → persistence`.
+//!
+//! # Feature flags
+//!
+//! | Flag | Default | Purpose |
+//! |------|---------|---------|
+//! | `test-support` | off | Enables test doubles and helpers for downstream crate tests. |
 
 #![forbid(unsafe_code)]
 
 // Re-export blake3 for internal use across modules.
 pub use blake3;
+
+// ---------------------------------------------------------------------------
+// Boundary modules — declared in dependency order (see module docs).
+//
+// Each layer may depend on any layer to its left but never to its right.
+// For example, `persistence` may use types from `identity`, `coordination`,
+// and `connector`, but `identity` must not reference any other boundary.
+// ---------------------------------------------------------------------------
+
+pub mod connector;
+pub mod coordination;
+pub mod identity;
+pub mod persistence;
+pub mod shard;
+
+// Root-level re-exports will be added here as boundary implementations land.
+// Keeping this section empty during Phase 0 avoids premature API commitment.
 
 #[cfg(test)]
 mod tests {
