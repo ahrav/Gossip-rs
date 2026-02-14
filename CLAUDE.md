@@ -167,3 +167,11 @@ bd sync                 # Commit beads changes
 - Always `bd sync` before ending session
 
 <!-- end-bv-agent-instructions -->
+
+## Rust Code Modification Workflow
+
+After modifying Rust code, ALWAYS run these steps:
+
+1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
+2. Run `/doc-rigor` skill on the new code to keep documentation updated
+3. If adding new components, update relevant docs: `architecture-overview.md`, `detection-engine.md`, `memory-management.md`, `transform-chain.md`

@@ -11,6 +11,14 @@ For graph-aware triage: `bv --robot-triage` (never bare `bv`).
 When working in plan mode, always include bd status updates
 in the plan (update to in_progress at start, close at end).
 
+## Rust Code Modification Workflow
+
+After modifying Rust code, ALWAYS run these steps:
+
+1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
+2. Run `/doc-rigor` skill on the new code to keep documentation updated
+3. If adding new components, update relevant docs: `architecture-overview.md`, `detection-engine.md`, `memory-management.md`, `transform-chain.md`
+
 <!-- bv-agent-instructions-v1 -->
 
 ### Using bv as an AI sidecar
@@ -189,6 +197,7 @@ bd sync                 # Commit beads changes
 7. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
+
 - Work is NOT complete until `git push` succeeds
 - NEVER stop before pushing - that leaves work stranded locally
 - NEVER say "ready to push when you are" - YOU must push
