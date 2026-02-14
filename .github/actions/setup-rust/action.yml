@@ -1,0 +1,59 @@
+name: "Setup Rust"
+description: "Install Rust toolchain and configure caching for CI jobs"
+
+inputs:
+  toolchain:
+    description: "Rust toolchain (stable or nightly)"
+    required: false
+    default: "stable"
+  components:
+    description: "Comma-separated Rust components (e.g. clippy, rustfmt, miri)"
+    required: false
+    default: ""
+  shared-key:
+    description: "Shared cache key for Swatinem/rust-cache"
+    required: true
+  save-cache:
+    description: "Whether to save the cache (false for read-only consumers)"
+    required: false
+    default: "true"
+  extra-apt:
+    description: "Additional apt packages to install (space-separated)"
+    required: false
+    default: ""
+  cache-workspaces:
+    description: "Workspaces for rust-cache (e.g. 'fuzz -> target')"
+    required: false
+    default: ""
+  targets:
+    description: "Additional rustup targets to install (e.g. x86_64-unknown-linux-musl)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install system deps
+      if: inputs.extra-apt != ''
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.extra-apt }}
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-cache }}
+        cache-all-crates: "true"
+        workspaces: ${{ inputs.cache-workspaces }}
