@@ -9,6 +9,24 @@
 //! | [`ItemKey`] | variable | `new(connector, path)` | Human-meaningful item identity |
 //! | [`StableItemId`] | 32 B | derived via `ItemKey::stable_id` | Fixed-width item identity for derivation |
 //! | [`ObjectVersionId`] | 32 B | `from_version_bytes` | Version-specific content identity |
+//!
+//! # Derivation flow
+//!
+//! ```text
+//! ConnectorTag + path ──► ItemKey ──(blake3 derive-key)──► StableItemId
+//!                                                              │
+//!                                                    enters FindingId derivation
+//!
+//! version token bytes ──(blake3 derive-key)──► ObjectVersionId
+//!                                                    │
+//!                                          enters OccurrenceId derivation
+//! ```
+//!
+//! `StableItemId` and `ObjectVersionId` are independent derivations with
+//! distinct BLAKE3 domain separators (see [`super::domain`]). Both are
+//! consumed downstream by the finding module — `StableItemId` in
+//! `FindingId` and `ObjectVersionId` in `OccurrenceId` — but neither
+//! depends on the other.
 
 use blake3::Hasher;
 use core::fmt;
@@ -421,8 +439,8 @@ impl ObjectVersionId {
     /// S3 ETag). It normalizes to 32 bytes via BLAKE3.
     ///
     /// Connectors with richer version semantics (e.g., needing to combine
-    /// commit SHA + tree SHA) should build a [`domain_hasher`] manually and
-    /// feed structured fields via [`CanonicalBytes`].
+    /// commit SHA + tree SHA) should build a [`domain_hasher`](super::domain_hasher)
+    /// manually and feed structured fields via [`CanonicalBytes`].
     ///
     /// # Examples
     ///
