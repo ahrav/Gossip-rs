@@ -2,18 +2,25 @@
 //! secret scanner.
 //!
 //! This crate defines the boundary-oriented API surface that all runtime crates
-//! depend on. It contains:
+//! depend on.
 //!
-//! - **Identity types** — content-addressed IDs (`TenantId`, `FindingId`, …),
-//!   encoding infrastructure (`CanonicalBytes`), and domain-separated hashing.
-//! - **Coordination contracts** — shard lifecycle, lease management, and the
-//!   `CoordinationBackend` trait.
-//! - **Shard algebra** — key encoding schemas, range arithmetic, and split
-//!   computation.
-//! - **Connector contracts** — enumeration/read traits and connector
+//! **Phase 0 status:** Identity hashing infrastructure is implemented. The
+//! remaining boundary modules are currently documentation-first scaffolds whose
+//! concrete trait/type implementations land in later phase tasks.
+//!
+//! It contains:
+//!
+//! - **Identity primitives (implemented)** — canonical encoding
+//!   (`CanonicalBytes`), domain-separated hashing helpers, ID newtype macros,
+//!   and the domain-tag registry.
+//! - **Coordination boundary (planned)** — shard lifecycle, lease management,
+//!   and the eventual `CoordinationBackend` trait.
+//! - **Shard boundary (planned)** — key encoding schemas, range arithmetic, and
+//!   split computation.
+//! - **Connector boundary (planned)** — enumeration/read traits and connector
 //!   registration.
-//! - **Persistence contracts** — done-ledger, findings-sink traits, and the
-//!   commit protocol typestate machine.
+//! - **Persistence boundary (planned)** — done-ledger/findings-sink traits and
+//!   commit protocol typestate.
 //!
 //! # Design principles
 //!
@@ -32,15 +39,19 @@
 
 #![forbid(unsafe_code)]
 
-// Re-export blake3 for internal use across modules.
+/// Re-export used by macro expansions (`$crate::blake3::Hasher`).
+///
+/// This is part of macro hygiene rather than the intended end-user API.
+#[doc(hidden)]
 pub use blake3;
 
 // ---------------------------------------------------------------------------
-// Boundary modules — declared in dependency order (see module docs).
+// Boundary modules.
 //
-// Each layer may depend on any layer to its left but never to its right.
-// For example, `persistence` may use types from `identity`, `coordination`,
-// and `connector`, but `identity` must not reference any other boundary.
+// Dependency direction is:
+// `identity -> coordination -> shard -> connector -> persistence`.
+// Declarations below do not imply or enforce dependency order; each module's
+// docs define what it may reference.
 // ---------------------------------------------------------------------------
 
 pub mod connector;

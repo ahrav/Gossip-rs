@@ -15,8 +15,9 @@
 //!
 //! [`domain_hasher`] uses BLAKE3's derive-key mode ([`blake3::Hasher::new_derive_key`]),
 //! which produces a context-dependent key schedule. Two hashers with different
-//! domain tags can **never** produce colliding output, regardless of payload —
-//! this is a cryptographic guarantee, not merely a statistical one.
+//! domain tags are treated as independent hash functions. Cross-domain
+//! collisions remain cryptographically negligible, but not mathematically
+//! impossible.
 //!
 //! # Context string requirements
 //!
@@ -29,8 +30,8 @@ use blake3::Hasher;
 
 /// Create a BLAKE3 hasher initialized with a domain separation context.
 ///
-/// Uses BLAKE3's derive-key mode to guarantee that distinct domain tags
-/// produce cryptographically independent hash functions.
+/// Uses BLAKE3's derive-key mode so distinct domain tags map to
+/// cryptographically independent hash domains.
 ///
 /// Accepts `&[u8]` rather than `&str` so callers can pass byte-string
 /// literals (`b"gossip/…/vN"`) directly — the UTF-8 check is deferred to

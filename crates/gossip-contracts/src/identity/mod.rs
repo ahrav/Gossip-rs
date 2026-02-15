@@ -1,11 +1,10 @@
 //! Content-addressed identity types, canonical encoding, and domain-separated hashing.
 //!
-//! This module owns all content-addressed identities used across the scanner
-//! (`TenantId`, `SecretHash`, `FindingId`, `OccurrenceId`, …) and the shared
-//! encoding infrastructure they depend on: the `CanonicalBytes` trait for
-//! deterministic serialisation, `domain_hasher` / `finalize_32` helpers for
-//! BLAKE3 domain-separated hashing, the `define_id_32!` / `define_id_32_restricted!`
-//! newtype macros, and the authoritative domain-constant registry.
+//! **Phase 0 status:** This module currently provides shared identity
+//! infrastructure (`CanonicalBytes`, hashing helpers, ID newtype macros, and the
+//! domain-constant registry). Concrete scanner identity types (`TenantId`,
+//! `SecretHash`, `FindingId`, `OccurrenceId`, etc.) are planned for later Phase
+//! 1 tasks and may evolve before stabilization.
 //!
 //! **Dependency direction:** This is the leaf of the boundary graph — no other
 //! boundary module may be referenced here. All four sibling modules depend on
