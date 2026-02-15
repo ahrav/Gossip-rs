@@ -20,6 +20,7 @@
 //!   unique, enforced by a meta-test.
 
 mod canonical;
+pub mod domain;
 mod hashing;
 mod macros;
 
