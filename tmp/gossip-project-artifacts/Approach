@@ -1,0 +1,31 @@
+**The core insight: not all boundaries need the same on-ramp to implementation.**
+
+Boundary 1 (identity spine) is pure computation — deterministic functions, type definitions, hashing. There's no distributed protocol to model-check. Boundary 2 (coordination) is the opposite — it's a stateful protocol with fencing, zombie rejection, and concurrent ownership transitions. These demand fundamentally different pre-implementation work.
+
+Here's the phased approach I'd recommend:
+
+**Phase 0: Crate scaffolding.** Before touching any boundary's implementation, stand up the actual `gossip-contracts` crate (or whatever the module structure will be) with `Cargo.toml`, feature flags, module hierarchy, and dependency declarations (blake3, proptest as dev-dependency). This takes an hour and removes friction from everything that follows. You want `cargo test` running from day one, even if it's just compiling an empty lib.
+
+**Phase 1: Implement B1 directly, test-alongside.** Boundary 1 is the right place to start implementing, and for this boundary, the contracts *are* close enough to the spec that you can go straight from contract to code + tests together. The approach per chunk would be:
+
+Write the type (e.g., `CanonicalBytes` trait, `define_id_32!` macro), then immediately write the property-based test that validates its invariant (determinism, collision domain separation, encoding round-trip stability). Ship them as a unit. The B1 contracts already have the invariants cataloged — INV-B5-001 through INV-B5-003 for example — so the tests practically write themselves from the invariant list.
+
+Golden tests for encoding stability are critical from chunk 1 onward. Once you serialize a `DoneLedgerKey` or hash a `FindingId`, that encoding is a compatibility commitment. Capture known-good vectors immediately.
+
+The reason this works for B1 is that the verification strategy for identity types is Tier 3-4 (property tests + unit tests). There's no Tier 1 TLA+ needed because there's no protocol — just pure functions with algebraic properties.
+
+**Phase 2: Normative spec for B2 before implementing it.** This is where the coordination spec you shared becomes relevant — and where I'd push back against jumping straight to code. The B2 contracts define the *types and invariants*, but a normative spec like the one you shared defines the *operational semantics*: what each operation does as a state transition, what the preconditions and postconditions are, and how the backend enforces atomicity.
+
+The spec you shared is a solid jumping-off point. It aligns well with the B2 contracts in several ways — the shard record schema maps to `ShardRecord` from B2C2, the fenced mutation pattern matches the `FenceEpoch` + `Lease` design, and the OpId/OpLog idempotency maps directly to B2C3. Where it needs refinement is aligning the terminology exactly with the contract types (e.g., making sure `AcquireAndRestore` maps to the contract's `acquire_and_restore` with the same return types), and incorporating the run-level coordination from B2C4 (the spec currently only covers shard-level operations).
+
+The ideal sequence for B2 would be: refined normative spec → TLA+ for the shard state machine (the acquire/fence/checkpoint/complete/split lifecycle) → implementation with a conformance test suite derived from the spec. The TLA+ doesn't need to be exhaustive — focus on the safety properties that matter most: "zombie commits must be rejected" (your non-negotiable #2) and "at most one worker may successfully execute fenced mutations" (#1). The B5 verification roadmap already identifies these as Tier 1 targets.
+
+**Phase 3: B3 (shard algebra) can parallel B2.** B3 depends on B1 types but not on B2. It's algebraic in nature (key encoding, range operations, ordering proofs), so like B1, it can go contract → implementation + property tests directly. The key encoding ordering invariant (big-endian numeric fields sort lexicographically = numerically, as documented in D3.3) is a perfect property-test target.
+
+**Phase 4: B4 (connector contracts) after B1+B2 types exist.** B4 depends on B1 types and B2 coordination types. The contracts are trait definitions — the implementation here is defining the trait and a stub/mock connector for testing. The real connector implementations (S3, GitHub, etc.) come later in the actual application layer.
+
+**Phase 5: B5 (persistence) last.** It consumes types from all other boundaries. The in-memory implementations from B5C4 are essentially the test doubles that drive the deterministic simulation harness. This is also where the commit ordering protocol (findings → ledger → checkpoint) gets its TLA+ spec and simulation tests.
+
+**On the coordination spec specifically:** The document you shared draws from exactly the right sources — Kafka consumer-group epochs, Gazette fences, KCL lease rows. The mental model it captures ("zombies can run, but zombies must not be able to commit") is the correct one and matches the fencing protocol in B2. I'd use it as the seed for the B2 normative spec, with these refinements needed: adding run-level lifecycle (B2C4/C5), aligning error types with the contract's error enums, specifying the backend conformance test contract that any implementation (etcd, in-memory, etc.) must pass, and adding the cursor semantics distinction (`Completed` vs `Dispatched`) that the contracts define.
+
+So to directly answer your question: yes, start with B1C1 and implement it, but do it test-alongside rather than code-then-test. And before you get to B2, invest in refining that coordination spec into a normative document that bridges the contract types to operational semantics, ideally backed by a focused TLA+ spec for the shard state machine. That investment pays for itself many times over when you hit the coordination implementation.
