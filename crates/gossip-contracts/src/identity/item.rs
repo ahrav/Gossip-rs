@@ -126,7 +126,13 @@ impl ConnectorTag {
         Self(buf)
     }
 
-    /// Create a tag from a raw 8-byte array.
+    /// Create a tag from a raw 8-byte array **without validation**.
+    ///
+    /// Unlike [`from_ascii`](Self::from_ascii), this constructor does not
+    /// enforce ASCII-graphic content, null-padding, or non-emptiness.
+    /// Prefer `from_ascii` for standard connectors; `from_bytes` exists as
+    /// an escape hatch for deserialization and foreign-format tags that may
+    /// not satisfy the ASCII-graphic invariant.
     #[inline]
     pub const fn from_bytes(bytes: [u8; 8]) -> Self {
         Self(bytes)

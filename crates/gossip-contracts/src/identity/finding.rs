@@ -65,6 +65,12 @@ crate::define_id_32_restricted! {
     debug_display = "NormHash([redacted])"
 }
 
+/// `from_digest` is intentionally `pub` despite `define_id_32_restricted!`
+/// hiding the default constructor. The restricted macro's primary value is
+/// the redacted `Debug` impl — it prevents accidental logging of
+/// security-sensitive material. Public construction via `from_digest` is
+/// required because the engine crate is the sole legitimate producer of
+/// `NormHash` values and must be able to build them from raw digests.
 impl NormHash {
     /// Construct a `NormHash` from a pre-computed 32-byte digest.
     ///
