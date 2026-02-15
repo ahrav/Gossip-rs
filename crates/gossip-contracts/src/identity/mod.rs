@@ -1,14 +1,10 @@
 //! Content-addressed identity types, canonical encoding, and domain-separated hashing.
 //!
-//! **Phase 0 status:** This module currently provides shared identity
-//! infrastructure (`CanonicalBytes`, hashing helpers, ID newtype macros, and the
-//! domain-constant registry). Concrete scanner identity types (`TenantId`,
-//! `SecretHash`, `FindingId`, `OccurrenceId`, etc.) are planned for later Phase
-//! 1 tasks and may evolve before stabilization.
-//!
 //! **Dependency direction:** This is the leaf of the boundary graph — no other
 //! boundary module may be referenced here. All four sibling modules depend on
 //! `identity`.
+//!
+//! For the full architecture design, see `docs/boundary-1-identity-spine.md`.
 //!
 //! **Key invariants:**
 //! - Collision-freedom — distinct values produce distinct canonical byte
@@ -20,10 +16,24 @@
 
 mod canonical;
 pub mod domain;
+mod finding;
 mod hashing;
+mod item;
 mod macros;
+mod policy;
 mod types;
 
+#[cfg(test)]
+mod golden;
+
 pub use canonical::CanonicalBytes;
+pub use finding::{
+    FindingId, FindingIdInputs, NormHash, OccurrenceId, OccurrenceIdInputs, RuleFingerprint,
+    SecretHash, derive_finding_id, derive_occurrence_id, key_secret_hash,
+};
 pub use hashing::{domain_hasher, finalize_32};
+pub use item::{ConnectorTag, IdentityInputError, ItemKey, ObjectVersionId, StableItemId};
+pub use policy::{
+    CURRENT_EVIDENCE_VERSION, CURRENT_VERSION, IdHashMode, PolicyHashInputs, compute_policy_hash,
+};
 pub use types::{PolicyHash, TenantId, TenantSecretKey};

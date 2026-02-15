@@ -4,7 +4,7 @@ This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
 
 At session start: run `bd ready` to find work.
 Track status with `bd update <id> --status in_progress`.
-At session end: close finished work, file new issues, run `bd sync`.
+At session end: close finished work, file new issues, run `bd sync`. Do NOT commit.
 
 For graph-aware triage: `bv --robot-triage` (never bare `bv`).
 
@@ -158,13 +158,9 @@ bd sync               # Commit and push changes
 
 ### Session Protocol
 
-**Before ending any session, run this checklist:**
+**Before ending any session, run `bd sync` to persist beads state.**
 
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-bd sync                 # Commit beads changes
-```
+Do NOT stage, commit, or push code changes. Leave that to the user.
 
 ### Best Practices
 
@@ -172,33 +168,59 @@ bd sync                 # Commit beads changes
 - Update status as you work (in_progress → closed)
 - Create new issues with `bd create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always `bd sync` before ending session
 
 <!-- end-bv-agent-instructions -->
 
+<!-- duplication-prevention-v1 -->
+
+## Duplication Prevention — MANDATORY Pre-Coding Check
+
+**Before writing ANY new function, struct, trait, method, or module, you MUST
+verify the functionality does not already exist in the codebase.**
+
+This is non-negotiable. Duplicated logic is a bug — it creates drift, increases
+maintenance burden, and undermines the single-source-of-truth principle.
+
+### Required Steps
+
+1. **Search before you write.** Use Grep/Glob to search for existing
+   implementations that match the intent of what you are about to create.
+   Search by concept (e.g., "retry", "timeout", "base64 decode"), not just
+   by the exact name you plan to use.
+2. **Check neighboring modules.** Read the module and its siblings. If you are
+   adding a helper to `engine/core.rs`, read the other files in `engine/` and
+   `stdx/` first.
+3. **Check utility crates.** `src/stdx/` contains shared data structures and
+   helpers. Confirm your functionality is not already there before creating
+   a new one.
+4. **If similar logic exists, extend or reuse it.** Do not create a parallel
+   implementation. Refactor the existing code to be more general if needed.
+5. **If you are unsure, ask.** It is always better to ask "does X already
+   exist?" than to introduce a duplicate.
+
+### What Counts as Duplication
+
+- A second function that does the same thing with a different name.
+- A method that reimplements logic already available in a trait or utility.
+- A new struct that is structurally identical to an existing one.
+- Copy-pasted blocks with minor variations (extract a shared helper instead).
+- A new constant/sentinel that duplicates an existing one.
+
+### Enforcement
+
+If during review a duplicate is found that could have been caught by searching
+the codebase first, the change will be rejected. No exceptions.
+
+<!-- end-duplication-prevention -->
+
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
-
-**MANDATORY WORKFLOW:**
+**When ending a work session:**
 
 1. **File issues for remaining work** - Create issues for anything that needs follow-up
 2. **Run quality gates** (if code changed) - Tests, linters, builds
 3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+4. **Run `bd sync`** - Persist beads state
+5. **Hand off** - Provide context for next session
 
-**CRITICAL RULES:**
-
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+Do NOT stage, commit, or push code changes. Leave that to the user.

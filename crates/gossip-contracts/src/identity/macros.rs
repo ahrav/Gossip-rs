@@ -19,7 +19,7 @@
 //!
 //! | Macro | Inner field | Constructor | Use case |
 //! |-------|-----------|-------------|----------|
-//! | [`define_id_32!`] | `pub` | `from_bytes` (pub) | Freely constructible IDs (`TenantId`, `FindingId`) |
+//! | [`define_id_32!`] | private | `from_bytes` (pub) | Freely constructible IDs (`TenantId`, `FindingId`) |
 //! | [`define_id_32_restricted!`] | private | `from_bytes_internal` (`pub(crate)`) | Derivation-only IDs (`NormHash`, `SecretHash`) |
 //!
 //! The restricted variant exists for values that *must* be produced by a
@@ -31,9 +31,23 @@
 //! `$crate::blake3::Hasher`, `::core::fmt`) so they work from any invocation site —
 //! inside this crate, in sibling modules, or from downstream crates.
 //!
+//! # Test-support macros
+//!
+//! Two additional macros exist for **consumer-crate integration tests** (the
+//! `tests/identity_smoke.rs` files in engine, connectors, coordination, and
+//! pipeline).  Their purpose is to act as *import canaries*: if a type is
+//! removed from the public API or its layout changes, the downstream crate's
+//! build breaks immediately — even though `gossip-contracts` itself already
+//! has comprehensive property-test and golden-vector coverage.
+//!
+//! | Macro | Checks | Multiple invocations? |
+//! |-------|--------|-----------------------|
+//! | [`smoke_test_id_32!`] | size == 32 (const) + `ZERO` sentinel (runtime) | **No** — generates named `#[test]` fns |
+//! | [`smoke_test_id_size!`] | size == N (const only) | Yes — only emits `const _` blocks |
+//!
 //! [`CanonicalBytes`]: crate::identity::CanonicalBytes
 
-/// Generate a `[u8; 32]` newtype with public inner field.
+/// Generate a `[u8; 32]` newtype with private inner field.
 ///
 /// Produces:
 /// - `#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]`
@@ -64,7 +78,7 @@ macro_rules! define_id_32 {
     ) => {
         $(#[$meta])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub [u8; 32]);
+        pub struct $name([u8; 32]);
 
         // Show only the first 4 bytes in hex to keep log output compact
         // while still giving enough entropy to distinguish instances.
@@ -180,6 +194,101 @@ macro_rules! define_id_32_restricted {
     };
 }
 
+/// Import-canary macro for consumer crates: asserts that every listed
+/// [`define_id_32!`] type is still 32 bytes and that its `ZERO` sentinel is
+/// all-zero.
+///
+/// Consumer crates (engine, connectors, coordination, pipeline) each invoke
+/// this once in their `tests/identity_smoke.rs` so that removing a type from
+/// the public API or changing its layout breaks the downstream build
+/// immediately.  The invariants themselves are already covered by property
+/// tests and golden vectors inside `gossip-contracts`; this macro exists
+/// purely for the **cross-crate compile-gate** effect.
+///
+/// # What it generates
+///
+/// - A `const _: ()` block with a compile-time `size_of` assertion per type
+///   (fires during `cargo check`, not just `cargo test`).
+/// - `#[test] fn id_types_are_32_bytes()` — runtime confirmation with
+///   per-type error messages.
+/// - `#[test] fn zero_sentinels_are_zeroed()` — runtime check that
+///   `T::ZERO.as_bytes()` is `[0u8; 32]` for every listed type.
+///
+/// # Constraints
+///
+/// - Every type must expose `ZERO` and `as_bytes()` — i.e. it must be
+///   produced by [`define_id_32!`], **not** [`define_id_32_restricted!`].
+///   For restricted types use `smoke_test_id_size!` instead.
+/// - **Invoke at most once per scope.** The generated test function names
+///   (`id_types_are_32_bytes`, `zero_sentinels_are_zeroed`) are fixed, so a
+///   second invocation in the same module causes a compile error.
+///
+/// # Usage
+///
+/// ```ignore
+/// gossip_contracts::smoke_test_id_32!(FindingId, OccurrenceId, RuleFingerprint);
+/// ```
+#[macro_export]
+macro_rules! smoke_test_id_32 {
+    ($($ty:ty),+ $(,)?) => {
+        // Compile-time size guard — fires during `cargo check`, not just `cargo test`.
+        const _: () = {
+            $(::core::assert!(::core::mem::size_of::<$ty>() == 32);)+
+        };
+
+        #[test]
+        fn id_types_are_32_bytes() {
+            $(
+                assert_eq!(
+                    ::core::mem::size_of::<$ty>(), 32,
+                    "{} is not 32 bytes", stringify!($ty),
+                );
+            )+
+        }
+
+        #[test]
+        fn zero_sentinels_are_zeroed() {
+            $({
+                let z = <$ty>::ZERO;
+                assert_eq!(
+                    *z.as_bytes(), [0u8; 32],
+                    "{}::ZERO is not all-zero", stringify!($ty),
+                );
+            })+
+        }
+    };
+}
+
+/// Compile-time size assertion for any identity type — the layout counterpart
+/// of [`smoke_test_id_32!`] for types that lack a `ZERO` sentinel.
+///
+/// Use this for:
+/// - **Restricted types** ([`define_id_32_restricted!`]) such as `NormHash`,
+///   `SecretHash`, and `TenantSecretKey`, which have no `ZERO` constant.
+/// - **Non-32-byte types** such as `ConnectorTag` (8 bytes).
+///
+/// Only a `const` assertion is emitted — no `#[test]` function — because the
+/// size is a layout invariant that should fail the build, not just a test run.
+/// Multiple invocations in the same scope are safe (each produces an
+/// independent `const _: ()` block).
+///
+/// See the module-level docs on `macros` for the import-canary rationale.
+///
+/// # Usage
+///
+/// ```ignore
+/// gossip_contracts::smoke_test_id_size!(ConnectorTag, 8);
+/// gossip_contracts::smoke_test_id_size!(NormHash, 32);
+/// ```
+#[macro_export]
+macro_rules! smoke_test_id_size {
+    ($ty:ty, $size:expr) => {
+        const _: () = {
+            ::core::assert!(::core::mem::size_of::<$ty>() == $size);
+        };
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use crate::identity::CanonicalBytes;
@@ -215,10 +324,13 @@ mod tests {
     }
 
     #[test]
-    fn pub_inner_field_accessible() {
+    fn pub_inner_field_is_private() {
+        // The inner `[u8; 32]` field is private — callers must use
+        // `from_bytes` / `as_bytes`.  This test exists as a compile-gate
+        // reminder; the actual privacy check is structural (removing `pub`
+        // from the tuple field).
         let id = PubTestId::from_bytes([0x01; 32]);
-        // Public inner field is directly accessible.
-        assert_eq!(id.0, [0x01; 32]);
+        assert_eq!(*id.as_bytes(), [0x01; 32]);
     }
 
     // ---------------------------------------------------------------

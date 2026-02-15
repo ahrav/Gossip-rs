@@ -1,7 +1,8 @@
 //! Core identity primitives: `TenantId`, `PolicyHash`, and `TenantSecretKey`.
 //!
-//! These are the first concrete identity types for the Boundary 1 (Identity &
-//! Hashing Spine) epic. All downstream B1 tasks depend on these three types.
+//! These three types form the root of the identity type hierarchy.  All other
+//! identity types (items, findings, occurrences, policy hashes) depend on at
+//! least one of them.
 //!
 //! # Type overview
 //!
@@ -32,8 +33,9 @@ crate::define_id_32! {
     /// enforces this by requiring `TenantId` at every API boundary.
     ///
     /// **Safety**: `TenantId` is an input to `SecretHash` keying (via
-    /// `TenantSecretKey`), `FindingId` derivation, and `OccurrenceId`
-    /// derivation. Changing a tenant's ID invalidates all derived hashes.
+    /// `TenantSecretKey`) and `FindingId` derivation.  It enters
+    /// `OccurrenceId` derivation transitively through `FindingId`.
+    /// Changing a tenant's ID invalidates all derived hashes.
     TenantId
 }
 
@@ -80,6 +82,18 @@ crate::define_id_32! {
 /// Secret keys are not ordered and should not be used as map keys. Omitting
 /// these traits prevents accidental misuse in sorted collections or hash maps.
 ///
+/// # Why `Copy` instead of `Zeroize`?
+///
+/// `Copy` is chosen for ergonomics: the key is passed by value through
+/// derivation functions without borrow-lifetime entanglement.  Rust forbids
+/// implementing `Drop` on `Copy` types, so `Zeroize`-on-drop (from the
+/// `zeroize` crate) is structurally impossible.  Stack copies of the key may
+/// persist after the owning variable goes out of scope.  This is acceptable
+/// under the current threat model — the key is not considered a high-value
+/// long-term secret (it is re-provisionable and tenant-scoped), and
+/// memory-scrubbing defenses add complexity with limited practical benefit
+/// against an attacker who can already read process memory.
+///
 /// `#[derive(PartialEq)]` generates a short-circuiting comparison that leaks
 /// key material via timing side-channels. The manual impl uses constant-time
 /// comparison from the `subtle` crate.
@@ -112,6 +126,20 @@ impl TenantSecretKey {
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Check that the key has non-trivial entropy.
+    ///
+    /// Returns `true` if the key is not all-zeros.  An all-zero key
+    /// provides no tenant isolation and should be rejected during
+    /// provisioning.
+    ///
+    /// Note: `from_bytes` is `const fn` and cannot perform this check
+    /// automatically, so callers at the provisioning boundary should
+    /// call `is_valid()` after construction.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        !self.0.iter().all(|&b| b == 0)
     }
 }
 

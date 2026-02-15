@@ -6,7 +6,7 @@
 //! ```
 //! use gossip_contracts::identity::{domain_hasher, finalize_32, CanonicalBytes};
 //!
-//! let mut h = domain_hasher(b"gossip/example/v1").expect("domain tag must be valid UTF-8");
+//! let mut h = domain_hasher("gossip/example/v1");
 //! 42u64.write_canonical(&mut h);
 //! let id: [u8; 32] = finalize_32(&h);
 //! ```
@@ -19,30 +19,79 @@
 //! collisions remain cryptographically negligible, but not mathematically
 //! impossible.
 //!
+//! # Crate-internal fast path
+//!
+//! For the five domain tags used in identity derivation, pre-initialized
+//! hashers are cached in `LazyLock<Hasher>` statics (`FINDING_HASHER`, etc.).
+//! [`derive_from_cached`] clones one of these statics instead of re-running
+//! the key-schedule setup, making repeated same-domain derivations cheaper.
+//! All `derive_*` functions in sibling modules use this path.
+//!
 //! # Context string requirements
 //!
-//! Domain context bytes must be valid UTF-8 (required by BLAKE3's derive-key
-//! API). All domain constants in this crate are ASCII `b"gossip/…/vN"` literals,
-//! so this is always satisfied. Invalid UTF-8 returns an error instead of
-//! panicking, so call sites can decide whether to propagate or assert.
+//! Domain constants are `&str`, so UTF-8 validity is enforced at compile time.
+//! There is no runtime validation or error path — callers cannot pass invalid
+//! context strings through the type system.
+
+use std::sync::LazyLock;
 
 use blake3::Hasher;
+
+use super::domain;
+
+// ---------------------------------------------------------------------------
+// Cached derive-key hashers
+//
+// BLAKE3 derive-key mode performs a key-schedule setup from the context
+// string.  Caching the post-setup state in a `LazyLock<Hasher>` lets
+// every derivation start from a `clone()` of the fully-initialized
+// hasher, avoiding redundant key-schedule computation on each call.
+// ---------------------------------------------------------------------------
+
+pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::FINDING_ID_V1));
+
+pub(crate) static OCCURRENCE_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::OCCURRENCE_ID_V1));
+
+pub(crate) static ITEM_ID_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::ITEM_ID_V1));
+
+pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::OBJECT_VERSION_V1));
+
+pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
+
+/// Clone a cached hasher, feed canonical input, and finalize to 32 bytes.
+///
+/// This is the hot-path helper used by every `derive_*` function in the
+/// identity module. Cloning a pre-initialized [`Hasher`] is cheaper than
+/// calling [`Hasher::new_derive_key`] because the BLAKE3 key-schedule setup
+/// (derived from the domain string) has already been computed and stored in
+/// the source `LazyLock<Hasher>` static. The clone copies only the
+/// post-setup internal state.
+///
+/// `base` is expected to be one of this module's `LazyLock<Hasher>` statics
+/// (e.g., [`FINDING_HASHER`]); deref coercion provides `&Hasher` transparently.
+#[inline]
+pub(crate) fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
+    let mut h = base.clone();
+    inputs.write_canonical(&mut h);
+    finalize_32(&h)
+}
 
 /// Create a BLAKE3 hasher initialized with a domain separation context.
 ///
 /// Uses BLAKE3's derive-key mode so distinct domain tags map to
 /// cryptographically independent hash domains.
 ///
-/// Accepts `&[u8]` rather than `&str` so callers can pass byte-string
-/// literals (`b"gossip/…/vN"`) directly — the UTF-8 check is deferred to
-/// runtime since all domain constants in practice are ASCII.
-///
-/// # Errors
-///
-/// Returns [`core::str::Utf8Error`] if `context` is not valid UTF-8.
+/// All domain constants in [`super::domain`] are `&str`, so this function
+/// takes `&str` directly — UTF-8 validity is enforced by the type system
+/// with no runtime check.
 #[inline]
-pub fn domain_hasher(context: &[u8]) -> Result<Hasher, core::str::Utf8Error> {
-    core::str::from_utf8(context).map(Hasher::new_derive_key)
+pub fn domain_hasher(context: &str) -> Hasher {
+    Hasher::new_derive_key(context)
 }
 
 /// Finalize a hasher into a 32-byte (256-bit) digest.
@@ -61,20 +110,30 @@ mod tests {
     use crate::identity::CanonicalBytes;
     use proptest::prelude::*;
 
-    fn hash_payload(domain: &[u8], payload: &[u8]) -> [u8; 32] {
-        let mut hasher = domain_hasher(domain).expect("test domain tags must be valid UTF-8");
+    fn hash_payload(domain: &str, payload: &[u8]) -> [u8; 32] {
+        let mut hasher = domain_hasher(domain);
         payload.write_canonical(&mut hasher);
         finalize_32(&hasher)
     }
 
     // ---------------------------------------------------------------
-    // Invalid UTF-8 handling
+    // Correctness anchor: domain_hasher + finalize_32 == blake3::derive_key
     // ---------------------------------------------------------------
 
     #[test]
-    fn rejects_invalid_utf8_context() {
-        let err = domain_hasher(&[0xFF, 0xFE]).expect_err("invalid UTF-8 should error");
-        assert_eq!(err.valid_up_to(), 0);
+    fn domain_hasher_matches_blake3_derive_key() {
+        let context = "gossip/test-anchor/v1";
+        let payload = b"deterministic payload for correctness check";
+
+        // Our two-step API.
+        let mut h = domain_hasher(context);
+        h.update(payload);
+        let ours = finalize_32(&h);
+
+        // Direct blake3 derive_key (single-shot, fixed 32-byte output).
+        let reference = blake3::derive_key(context, payload);
+
+        assert_eq!(ours, reference);
     }
 
     // ---------------------------------------------------------------
@@ -85,7 +144,7 @@ mod tests {
         #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn deterministic_for_random_payload(data in proptest::collection::vec(any::<u8>(), 0..512)) {
-            let domain = b"gossip/prop/v1";
+            let domain = "gossip/prop/v1";
 
             let d1 = hash_payload(domain, data.as_slice());
             let d2 = hash_payload(domain, data.as_slice());
@@ -95,8 +154,8 @@ mod tests {
 
         #[test]
         fn domain_separation_for_random_payload(data in proptest::collection::vec(any::<u8>(), 1..256)) {
-            let d1 = hash_payload(b"gossip/left/v1", data.as_slice());
-            let d2 = hash_payload(b"gossip/right/v1", data.as_slice());
+            let d1 = hash_payload("gossip/left/v1", data.as_slice());
+            let d2 = hash_payload("gossip/right/v1", data.as_slice());
 
             prop_assert_ne!(d1, d2);
         }

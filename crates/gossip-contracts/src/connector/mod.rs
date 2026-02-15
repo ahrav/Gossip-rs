@@ -1,9 +1,6 @@
 //! Enumeration/read traits, connector registration, and runtime bridge types.
 //!
-//! **Phase 0 status:** This module is currently a documentation scaffold. The
-//! APIs described below are planned design targets for Phase 1 implementation.
-//!
-//! This module will own the traits that data-source connectors implement
+//! Owns the traits that data-source connectors implement
 //! (`EnumerationConnector`, `ReadConnector`), the value types they exchange
 //! (`ScanItem`, `ItemRef`, `EnumerationPage`, `VersionId`), page validation
 //! and cursor extraction helpers, the circuit-breaker state machine

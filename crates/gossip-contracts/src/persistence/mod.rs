@@ -1,9 +1,6 @@
 //! Done-ledger, findings-sink traits, and the commit protocol typestate machine.
 //!
-//! **Phase 0 status:** This module is currently a documentation scaffold. The
-//! APIs described below are planned design targets for Phase 1 implementation.
-//!
-//! This module will own the persistence boundary: the `DoneLedger` trait for
+//! Owns the persistence boundary: the `DoneLedger` trait for
 //! recording completed work (`DoneLedgerKey`, `OvidHash`), the `FindingsSink`
 //! trait for emitting detection results (`FindingRecord`, `OccurrenceRecord`,
 //! `FindingsUpsertBatch`), and the `PageCommit<S>` typestate machine that
