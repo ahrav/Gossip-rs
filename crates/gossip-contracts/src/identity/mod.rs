@@ -28,4 +28,7 @@ pub use finding::{
 };
 pub use hashing::{domain_hasher, finalize_32};
 pub use item::{ConnectorTag, ItemKey, ObjectVersionId, StableItemId};
+pub use policy::{
+    CURRENT_EVIDENCE_VERSION, CURRENT_VERSION, IdHashMode, PolicyHashInputs, compute_policy_hash,
+};
 pub use types::{PolicyHash, TenantId, TenantSecretKey};
