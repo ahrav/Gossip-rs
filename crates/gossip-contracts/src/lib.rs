@@ -60,6 +60,9 @@ pub mod identity;
 pub mod persistence;
 pub mod shard;
 
+#[cfg(test)]
+mod test_util;
+
 // Root-level re-exports will be added here as boundary implementations land.
 // Keeping this section empty during Phase 0 avoids premature API commitment.
 
@@ -78,7 +81,7 @@ mod tests {
     fn proptest_available() {
         use proptest::prelude::*;
 
-        proptest!(|(x: u64)| {
+        proptest!(crate::test_util::miri_proptest_config(), |(x: u64)| {
             // Verify blake3 produces deterministic output.
             let h1 = blake3::hash(&x.to_le_bytes());
             let h2 = blake3::hash(&x.to_le_bytes());
