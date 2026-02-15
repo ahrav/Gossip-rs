@@ -4,7 +4,7 @@ This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
 
 At session start: run `bd ready` to find work.
 Track status with `bd update <id> --status in_progress`.
-At session end: close finished work, file new issues, run `bd sync`.
+At session end: close finished work, file new issues, run `bd sync`. Do NOT commit.
 
 For graph-aware triage: `bv --robot-triage` (never bare `bv`).
 
@@ -150,13 +150,9 @@ bd sync               # Commit and push changes
 
 ### Session Protocol
 
-**Before ending any session, run this checklist:**
+**Before ending any session, run `bd sync` to persist beads state.**
 
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-bd sync                 # Commit beads changes
-```
+Do NOT stage, commit, or push code changes. Leave that to the user.
 
 ### Best Practices
 
@@ -164,7 +160,6 @@ bd sync                 # Commit beads changes
 - Update status as you work (in_progress → closed)
 - Create new issues with `bd create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always `bd sync` before ending session
 
 <!-- end-bv-agent-instructions -->
 
