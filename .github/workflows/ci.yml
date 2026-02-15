@@ -13,6 +13,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   SCCACHE_GHA_ENABLED: "true"
@@ -67,7 +70,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
-    needs: [fmt]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    needs: [changes, fmt]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
@@ -82,7 +86,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
-    needs: [clippy]
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    needs: [changes, fmt]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust

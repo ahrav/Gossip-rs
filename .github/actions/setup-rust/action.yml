@@ -37,8 +37,27 @@ runs:
       if: inputs.extra-apt != ''
       shell: bash
       run: |
+        set -euo pipefail
+        raw_input='${{ inputs.extra-apt }}'
+        normalized_input="${raw_input//$'\n'/ }"
+        normalized_input="${normalized_input//$'\t'/ }"
+        read -r -a packages <<< "${normalized_input}"
+
+        if [[ ${#packages[@]} -eq 0 ]]; then
+          echo "No valid extra apt packages were provided."
+          exit 0
+        fi
+
+        # Treat input as package tokens only (no shell metacharacters/flags).
+        for package in "${packages[@]}"; do
+          if [[ ! "${package}" =~ ^[A-Za-z0-9][A-Za-z0-9+.:-]*$ ]]; then
+            echo "Invalid apt package token: '${package}'" >&2
+            exit 1
+          fi
+        done
+
         sudo apt-get update
-        sudo apt-get install -y ${{ inputs.extra-apt }}
+        sudo apt-get install -y -- "${packages[@]}"
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master

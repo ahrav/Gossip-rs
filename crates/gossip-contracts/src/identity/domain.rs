@@ -23,11 +23,11 @@
 //! # Safety requirements
 //!
 //! - Every constant **must** be valid UTF-8 (ASCII expected) because
-//!   [`domain_hasher`] converts `&[u8]` to `&str` via `expect`.
+//!   [`domain_hasher`] validates `&[u8]` as UTF-8 before constructing the hasher.
 //! - No two constants may share the same byte value. The `no_duplicate_values`
 //!   test enforces this at `cargo test` time.
 //! - Constants are `&[u8]` (not `&str`) to avoid a redundant conversion
-//!   at every call site; the UTF-8 check happens inside `domain_hasher`.
+//!   at every call site; UTF-8 validation happens inside `domain_hasher`.
 //!
 //! [`domain_hasher`]: super::domain_hasher
 
