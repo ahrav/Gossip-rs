@@ -24,8 +24,7 @@
 use blake3::Hasher;
 
 use super::canonical::CanonicalBytes;
-use super::domain;
-use super::hashing::{domain_hasher, finalize_32};
+use super::hashing::{POLICY_HASH_HASHER, derive_from_cached};
 use super::types::PolicyHash;
 
 /// Selects the identity-hashing mode for secret derivation.
@@ -147,9 +146,7 @@ impl CanonicalBytes for PolicyHashInputs {
 /// let hash = compute_policy_hash(&inputs);
 /// ```
 pub fn compute_policy_hash(inputs: &PolicyHashInputs) -> PolicyHash {
-    let mut h = domain_hasher(domain::POLICY_HASH_V2);
-    inputs.write_canonical(&mut h);
-    PolicyHash::from_bytes(finalize_32(&h))
+    PolicyHash::from_bytes(derive_from_cached(&POLICY_HASH_HASHER, inputs))
 }
 
 #[cfg(test)]
@@ -324,5 +321,27 @@ mod tests {
             });
             proptest::prop_assert_ne!(a, b);
         }
+    }
+
+    // -- Field-order swap test --
+
+    #[test]
+    fn policy_hash_inputs_field_order_matters() {
+        let inputs_a = PolicyHashInputs {
+            policy_hash_version: 1,
+            id_hash_mode: IdHashMode::KeyedV1,
+            evidence_hash_version: 2,
+            rules_digest: [0xAA; 32],
+        };
+        let inputs_b = PolicyHashInputs {
+            policy_hash_version: 2, // swapped
+            id_hash_mode: IdHashMode::KeyedV1,
+            evidence_hash_version: 1, // swapped
+            rules_digest: [0xAA; 32],
+        };
+        assert_ne!(
+            compute_policy_hash(&inputs_a),
+            compute_policy_hash(&inputs_b)
+        );
     }
 }

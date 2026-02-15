@@ -80,11 +80,9 @@ impl CanonicalBytes for u64 {
 impl CanonicalBytes for [u8] {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
-        assert!(
-            self.len() <= u32::MAX as usize,
-            "slice too large for canonical encoding"
-        );
-        (self.len() as u32).write_canonical(h);
+        let len =
+            u32::try_from(self.len()).expect("slice too large for canonical encoding (max 4 GiB)");
+        len.write_canonical(h);
         h.update(self);
     }
 }

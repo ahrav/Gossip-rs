@@ -39,7 +39,7 @@ use blake3::Hasher;
 
 use super::canonical::CanonicalBytes;
 use super::domain;
-use super::hashing::{domain_hasher, finalize_32};
+use super::hashing::{FINDING_HASHER, OCCURRENCE_HASHER, derive_from_cached, finalize_32};
 use super::item::{ObjectVersionId, StableItemId};
 use super::types::{TenantId, TenantSecretKey};
 
@@ -302,9 +302,7 @@ pub fn key_secret_hash(key: &TenantSecretKey, norm: &NormHash) -> SecretHash {
 /// let finding_id = derive_finding_id(&inputs);
 /// ```
 pub fn derive_finding_id(inputs: &FindingIdInputs) -> FindingId {
-    let mut h = domain_hasher(domain::FINDING_ID_V1);
-    inputs.write_canonical(&mut h);
-    FindingId::from_bytes(finalize_32(&h))
+    FindingId::from_bytes(derive_from_cached(&FINDING_HASHER, inputs))
 }
 
 /// Derive a version-specific [`OccurrenceId`] from its inputs.
@@ -327,9 +325,7 @@ pub fn derive_finding_id(inputs: &FindingIdInputs) -> FindingId {
 /// let occurrence_id = derive_occurrence_id(&inputs);
 /// ```
 pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
-    let mut h = domain_hasher(domain::OCCURRENCE_ID_V1);
-    inputs.write_canonical(&mut h);
-    OccurrenceId::from_bytes(finalize_32(&h))
+    OccurrenceId::from_bytes(derive_from_cached(&OCCURRENCE_HASHER, inputs))
 }
 
 // ============================================================================
@@ -769,5 +765,49 @@ mod tests {
                 derive_occurrence_id(&varied),
             );
         }
+    }
+
+    // -- Field-order swap tests --
+    //
+    // These catch bugs where two same-width fields are swapped in
+    // `write_canonical` without changing the struct declaration order.
+    // With uniform fill bytes, a swap silently produces the same hash;
+    // with distinct fill bytes per field, a swap changes the hash.
+
+    #[test]
+    fn finding_id_inputs_field_order_matters() {
+        let inputs_a = FindingIdInputs {
+            tenant: TenantId::from_bytes([0x11; 32]),
+            item: StableItemId::from_bytes([0x22; 32]),
+            rule: RuleFingerprint::from_bytes([0x33; 32]),
+            secret: SecretHash::from_bytes_internal([0x44; 32]),
+        };
+        let inputs_b = FindingIdInputs {
+            tenant: TenantId::from_bytes([0x22; 32]),   // was item
+            item: StableItemId::from_bytes([0x11; 32]), // was tenant
+            rule: RuleFingerprint::from_bytes([0x33; 32]),
+            secret: SecretHash::from_bytes_internal([0x44; 32]),
+        };
+        assert_ne!(derive_finding_id(&inputs_a), derive_finding_id(&inputs_b));
+    }
+
+    #[test]
+    fn occurrence_id_inputs_field_order_matters() {
+        let inputs_a = OccurrenceIdInputs {
+            finding: FindingId::from_bytes([0x55; 32]),
+            version: ObjectVersionId::from_bytes([0x66; 32]),
+            byte_offset: 100,
+            byte_length: 200,
+        };
+        let inputs_b = OccurrenceIdInputs {
+            finding: FindingId::from_bytes([0x55; 32]),
+            version: ObjectVersionId::from_bytes([0x66; 32]),
+            byte_offset: 200, // swapped
+            byte_length: 100, // swapped
+        };
+        assert_ne!(
+            derive_occurrence_id(&inputs_a),
+            derive_occurrence_id(&inputs_b)
+        );
     }
 }

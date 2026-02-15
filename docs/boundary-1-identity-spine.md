@@ -294,3 +294,125 @@ If a golden vector test fails, follow this 5-step protocol:
 | `FINDING_ID_EXPECTED`          | `FINDING_ID_V1`      | `FindingIdInputs` encoding changes          |
 | `OCCURRENCE_ID_EXPECTED`       | `OCCURRENCE_ID_V1`   | `OccurrenceIdInputs` encoding changes       |
 | `POLICY_HASH_EXPECTED`         | `POLICY_HASH_V2`     | `PolicyHashInputs` encoding changes         |
+
+---
+
+## 8. Version Migration Protocol
+
+When a domain constant's version suffix is bumped (e.g., `FINDING_ID_V1` →
+`FINDING_ID_V2`), all IDs derived under the old version become stale. This
+section documents the migration procedure and its blast radius.
+
+### What triggers a version bump
+
+A version bump is required whenever any of these change:
+
+- The domain-separation constant string itself (changes the BLAKE3 key schedule)
+- The `CanonicalBytes` encoding for an input type (changes the hash input)
+- The field set or field order of an `*Inputs` struct
+- The hashing mode (derive-key vs. keyed) for a derivation
+
+### Blast radius
+
+Version bumps cascade through the derivation chain. The table below shows
+which downstream IDs are invalidated when a given constant changes:
+
+| Changed Constant     | Directly Invalidated | Transitively Invalidated                |
+|----------------------|----------------------|-----------------------------------------|
+| `ITEM_ID_V1`         | `StableItemId`       | `FindingId` → `OccurrenceId`            |
+| `OBJECT_VERSION_V1`  | `ObjectVersionId`    | `OccurrenceId`                          |
+| `SECRET_HASH_V1`     | `SecretHash`         | `FindingId` → `OccurrenceId`            |
+| `FINDING_ID_V1`      | `FindingId`          | `OccurrenceId`                          |
+| `OCCURRENCE_ID_V1`   | `OccurrenceId`       | (leaf)                                  |
+| `POLICY_HASH_V2`     | `PolicyHash`         | (independent — triggers rescan via RunId)|
+
+### Dual-version coexistence
+
+Dual-version coexistence is **not supported**. The system performs a clean-cut
+migration: old IDs become orphans and a full rescan is required for affected
+items. This design avoids the complexity of maintaining two derivation paths
+simultaneously.
+
+### Persistence impact
+
+Old IDs stored in persistence become orphans after a version bump:
+
+- `FindingId` values in the done-ledger no longer match new derivations →
+  findings are re-reported as new.
+- `OccurrenceId` values in occurrence stores no longer match → duplicate
+  occurrences may be created until the old data is purged.
+- `PolicyHash` changes trigger new `RunId` generation → the coordination layer
+  treats all items as requiring rescan.
+
+### PolicyHash interaction
+
+When a derivation constant changes:
+
+1. Bump the constant version suffix in `domain.rs`.
+2. Bump `CURRENT_VERSION` in `policy.rs` (forces `PolicyHash` to change).
+3. Changed `PolicyHash` → new `RunId` → coordination layer marks all items as
+   needing rescan.
+4. Rescan produces new IDs under the updated derivation scheme.
+
+### Step-by-step migration procedure
+
+1. **Bump the domain constant** version suffix in `domain.rs` and update
+   `ALL` array length.
+2. **Update `CURRENT_VERSION`** in `policy.rs` if the change affects detection
+   output identity.
+3. **Regenerate golden vectors** following the protocol in section 7.
+4. **Update downstream references** — grep for the old constant name across
+   all crates.
+5. **Deploy** — the new `PolicyHash` automatically triggers rescan on next run.
+6. **Purge stale data** (optional) — remove orphaned IDs from persistence
+   stores after rescan completes.
+
+---
+
+## 9. Key Rotation Strategy
+
+`TenantSecretKey` is the per-tenant BLAKE3 key used in `key_secret_hash`.
+Rotating (replacing) a tenant's key has a well-defined blast radius.
+
+### Blast radius
+
+```text
+TenantSecretKey change
+  └─► SecretHash (all secrets for the tenant are re-keyed)
+        └─► FindingId (all findings for the tenant change)
+              └─► OccurrenceId (all occurrences for the tenant change)
+```
+
+`PolicyHash` is **not** affected — it depends on the derivation *scheme*
+(version numbers, hash mode, rules digest), not on any tenant key.
+
+### Persistence impact
+
+After key rotation:
+
+- All `SecretHash` values for the affected tenant become stale — the same
+  `NormHash` produces a different `SecretHash` under the new key.
+- All `FindingId` values for the tenant change — findings that were previously
+  triaged as "resolved" will reappear as new findings.
+- All `OccurrenceId` values for the tenant change — duplicate occurrences may
+  be created until old data is purged.
+
+### Required action: full rescan
+
+Key rotation requires a full rescan of all items for the affected tenant.
+There is no dual-key coexistence mechanism — the rotation is a clean cut.
+
+1. **Provision new key** — replace the tenant's `TenantSecretKey` in the
+   key store.
+2. **Trigger rescan** — the coordination layer must re-derive all secrets,
+   findings, and occurrences for the tenant.
+3. **Purge stale data** (optional) — remove orphaned IDs from persistence
+   stores after rescan completes.
+
+### Copy-vs-Zeroize design rationale
+
+`TenantSecretKey` implements `Copy` instead of `Zeroize`-on-drop. See the
+type-level documentation in `types.rs` for the full rationale. In short:
+Rust forbids `Drop` on `Copy` types, and the current threat model does not
+justify the complexity of a `!Copy` key wrapper with borrow-lifetime
+entanglement throughout the derivation API.

@@ -127,6 +127,20 @@ impl TenantSecretKey {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Check that the key has non-trivial entropy.
+    ///
+    /// Returns `true` if the key is not all-zeros.  An all-zero key
+    /// provides no tenant isolation and should be rejected during
+    /// provisioning.
+    ///
+    /// Note: `from_bytes` is `const fn` and cannot perform this check
+    /// automatically, so callers at the provisioning boundary should
+    /// call `is_valid()` after construction.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        !self.0.iter().all(|&b| b == 0)
+    }
 }
 
 // No CanonicalBytes for TenantSecretKey — it must never be hashed into

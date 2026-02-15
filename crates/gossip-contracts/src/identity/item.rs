@@ -14,8 +14,57 @@ use blake3::Hasher;
 use core::fmt;
 
 use super::canonical::CanonicalBytes;
-use super::domain;
-use super::hashing::{domain_hasher, finalize_32};
+use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
+
+// ---------------------------------------------------------------------------
+// IdentityInputError — validation errors for identity constructors
+// ---------------------------------------------------------------------------
+
+/// Errors from identity type construction.
+///
+/// These are returned by the `try_*` constructors on [`ConnectorTag`],
+/// [`ItemKey`], and [`ObjectVersionId`]. The panicking constructors
+/// (`from_ascii`, `new`, `from_version_bytes`) remain available for
+/// const contexts and trusted internal code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityInputError {
+    /// Connector tag is empty.
+    EmptyTag,
+    /// Connector tag exceeds 8 bytes.
+    TagTooLong(usize),
+    /// Connector tag contains a non-ASCII-graphic byte at the given index.
+    NonGraphicByte {
+        /// Byte index within the tag.
+        index: usize,
+        /// The invalid byte value.
+        byte: u8,
+    },
+    /// Item path is empty.
+    EmptyPath,
+    /// Version bytes are empty.
+    EmptyVersionBytes,
+}
+
+impl fmt::Display for IdentityInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyTag => write!(f, "ConnectorTag must not be empty"),
+            Self::TagTooLong(len) => {
+                write!(f, "ConnectorTag must be at most 8 bytes, got {len}")
+            }
+            Self::NonGraphicByte { index, byte } => {
+                write!(
+                    f,
+                    "ConnectorTag byte at index {index} is not ASCII graphic: 0x{byte:02X}"
+                )
+            }
+            Self::EmptyPath => write!(f, "ItemKey path must not be empty"),
+            Self::EmptyVersionBytes => write!(f, "version bytes must not be empty"),
+        }
+    }
+}
+
+impl std::error::Error for IdentityInputError {}
 
 // ---------------------------------------------------------------------------
 // ConnectorTag — source discriminator
@@ -124,6 +173,27 @@ impl ConnectorTag {
             i += 1;
         }
         Self(buf)
+    }
+
+    /// Fallible version of [`from_ascii`](Self::from_ascii).
+    ///
+    /// Returns an error instead of panicking when the input is invalid.
+    /// Use this at system boundaries where the tag comes from external input.
+    pub fn try_from_ascii(tag: &[u8]) -> Result<Self, IdentityInputError> {
+        if tag.is_empty() {
+            return Err(IdentityInputError::EmptyTag);
+        }
+        if tag.len() > 8 {
+            return Err(IdentityInputError::TagTooLong(tag.len()));
+        }
+        let mut buf = [0u8; 8];
+        for (i, &b) in tag.iter().enumerate() {
+            if !(0x21..=0x7E).contains(&b) {
+                return Err(IdentityInputError::NonGraphicByte { index: i, byte: b });
+            }
+            buf[i] = b;
+        }
+        Ok(Self(buf))
     }
 
     /// Create a tag from a raw 8-byte array **without validation**.
@@ -235,6 +305,20 @@ impl ItemKey {
         }
     }
 
+    /// Fallible version of [`new`](Self::new).
+    ///
+    /// Returns an error instead of panicking when the path is empty.
+    /// Use this at system boundaries where the path comes from external input.
+    pub fn try_new(connector: ConnectorTag, path: Vec<u8>) -> Result<Self, IdentityInputError> {
+        if path.is_empty() {
+            return Err(IdentityInputError::EmptyPath);
+        }
+        Ok(Self {
+            connector,
+            path: path.into_boxed_slice(),
+        })
+    }
+
     /// The connector tag for this item.
     #[inline]
     pub fn connector(&self) -> ConnectorTag {
@@ -252,7 +336,7 @@ impl ItemKey {
     /// This is a pure, infallible function: same `ItemKey` always produces
     /// the same `StableItemId`.
     pub fn stable_id(&self) -> StableItemId {
-        let mut h = domain_hasher(domain::ITEM_ID_V1);
+        let mut h = ITEM_ID_HASHER.clone();
         self.write_canonical(&mut h);
         StableItemId::from_bytes(finalize_32(&h))
     }
@@ -362,9 +446,23 @@ impl ObjectVersionId {
     /// so a panic (rather than `Result`) is appropriate.
     pub fn from_version_bytes(version_bytes: &[u8]) -> Self {
         assert!(!version_bytes.is_empty(), "version bytes must not be empty");
-        let mut h = domain_hasher(domain::OBJECT_VERSION_V1);
+        let mut h = OBJECT_VERSION_HASHER.clone();
         version_bytes.write_canonical(&mut h);
         Self::from_bytes(finalize_32(&h))
+    }
+
+    /// Fallible version of [`from_version_bytes`](Self::from_version_bytes).
+    ///
+    /// Returns an error instead of panicking when `version_bytes` is empty.
+    /// Use this at system boundaries where the version token comes from
+    /// external input.
+    pub fn try_from_version_bytes(version_bytes: &[u8]) -> Result<Self, IdentityInputError> {
+        if version_bytes.is_empty() {
+            return Err(IdentityInputError::EmptyVersionBytes);
+        }
+        let mut h = OBJECT_VERSION_HASHER.clone();
+        version_bytes.write_canonical(&mut h);
+        Ok(Self::from_bytes(finalize_32(&h)))
     }
 }
 

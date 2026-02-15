@@ -4,6 +4,8 @@
 //! boundary module may be referenced here. All four sibling modules depend on
 //! `identity`.
 //!
+//! For the full architecture design, see `docs/boundary-1-identity-spine.md`.
+//!
 //! **Key invariants:**
 //! - Collision-freedom — distinct values produce distinct canonical byte
 //!   sequences (variable-length fields are length-prefixed).
@@ -30,7 +32,7 @@ pub use finding::{
     SecretHash, derive_finding_id, derive_occurrence_id, key_secret_hash,
 };
 pub use hashing::{domain_hasher, finalize_32};
-pub use item::{ConnectorTag, ItemKey, ObjectVersionId, StableItemId};
+pub use item::{ConnectorTag, IdentityInputError, ItemKey, ObjectVersionId, StableItemId};
 pub use policy::{
     CURRENT_EVIDENCE_VERSION, CURRENT_VERSION, IdHashMode, PolicyHashInputs, compute_policy_hash,
 };

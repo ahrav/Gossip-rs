@@ -25,7 +25,47 @@
 //! There is no runtime validation or error path — callers cannot pass invalid
 //! context strings through the type system.
 
+use std::sync::LazyLock;
+
 use blake3::Hasher;
+
+use super::domain;
+
+// ---------------------------------------------------------------------------
+// Cached derive-key hashers
+//
+// BLAKE3 derive-key mode performs a key-schedule setup from the context
+// string.  Caching the post-setup state in a `LazyLock<Hasher>` lets
+// every derivation start from a `clone()` of the fully-initialized
+// hasher, avoiding redundant key-schedule computation on each call.
+// ---------------------------------------------------------------------------
+
+pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::FINDING_ID_V1));
+
+pub(crate) static OCCURRENCE_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::OCCURRENCE_ID_V1));
+
+pub(crate) static ITEM_ID_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::ITEM_ID_V1));
+
+pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::OBJECT_VERSION_V1));
+
+pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
+
+/// Clone a pre-initialized hasher, feed canonical input, finalize.
+///
+/// This is the hot-path helper used by all derive-key derivation functions.
+/// The caller passes a reference to one of the cached `LazyLock<Hasher>`
+/// statics; deref coercion provides `&Hasher` transparently.
+#[inline]
+pub(crate) fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
+    let mut h = base.clone();
+    inputs.write_canonical(&mut h);
+    finalize_32(&h)
+}
 
 /// Create a BLAKE3 hasher initialized with a domain separation context.
 ///
