@@ -87,6 +87,13 @@ pub const CURRENT_EVIDENCE_VERSION: u32 = 1;
 /// The canonical encoding is 41 bytes: `u32` (4) + `u8` (1) + `u32` (4) +
 /// `[u8; 32]` (32). All fields are fixed-width, so no length prefixes are
 /// needed.
+///
+/// # Field-ordering invariant
+///
+/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
+/// declaration order**.  Reordering fields without updating
+/// `write_canonical` silently changes every derived `PolicyHash` and
+/// breaks the golden vectors in `golden.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyHashInputs {
     /// Schema version of the policy-hash derivation itself.

@@ -223,7 +223,10 @@ impl ItemKey {
     ///
     /// # Panics
     ///
-    /// Panics if `path` is empty (an item must have a non-empty path).
+    /// Panics if `path` is empty.  An empty path is a programming error in
+    /// the connector — every scannable item has a non-empty location.  This
+    /// is not a user-input validation boundary; connectors are trusted
+    /// internal code, so a panic (rather than `Result`) is appropriate.
     pub fn new(connector: ConnectorTag, path: Vec<u8>) -> Self {
         assert!(!path.is_empty(), "ItemKey path must not be empty");
         Self {
@@ -353,7 +356,10 @@ impl ObjectVersionId {
     ///
     /// # Panics
     ///
-    /// Panics if `version_bytes` is empty.
+    /// Panics if `version_bytes` is empty.  An empty version token is a
+    /// programming error in the connector — every versioned object has a
+    /// non-empty version identifier.  Connectors are trusted internal code,
+    /// so a panic (rather than `Result`) is appropriate.
     pub fn from_version_bytes(version_bytes: &[u8]) -> Self {
         assert!(!version_bytes.is_empty(), "version bytes must not be empty");
         let mut h = domain_hasher(domain::OBJECT_VERSION_V1);

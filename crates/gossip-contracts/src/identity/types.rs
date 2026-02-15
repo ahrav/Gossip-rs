@@ -1,7 +1,8 @@
 //! Core identity primitives: `TenantId`, `PolicyHash`, and `TenantSecretKey`.
 //!
-//! These are the first concrete identity types for the Boundary 1 (Identity &
-//! Hashing Spine) epic. All downstream B1 tasks depend on these three types.
+//! These three types form the root of the identity type hierarchy.  All other
+//! identity types (items, findings, occurrences, policy hashes) depend on at
+//! least one of them.
 //!
 //! # Type overview
 //!
@@ -32,8 +33,9 @@ crate::define_id_32! {
     /// enforces this by requiring `TenantId` at every API boundary.
     ///
     /// **Safety**: `TenantId` is an input to `SecretHash` keying (via
-    /// `TenantSecretKey`), `FindingId` derivation, and `OccurrenceId`
-    /// derivation. Changing a tenant's ID invalidates all derived hashes.
+    /// `TenantSecretKey`) and `FindingId` derivation.  It enters
+    /// `OccurrenceId` derivation transitively through `FindingId`.
+    /// Changing a tenant's ID invalidates all derived hashes.
     TenantId
 }
 

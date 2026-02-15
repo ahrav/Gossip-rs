@@ -14,17 +14,17 @@
 //! # Derivation chain
 //!
 //! ```text
-//! NormHash ──┐
-//!            ├─ key_secret_hash ──► SecretHash ──┐
-//! TenantKey ─┘                                   │
-//!                                                ├─ derive_finding_id ──► FindingId ──┐
-//! TenantId ──────────────────────────────────────┤                                    │
-//! StableItemId ──────────────────────────────────┤                                    │
-//! RuleFingerprint ───────────────────────────────┘                                    │
-//!                                                                                     │
-//!                                                ├─ derive_occurrence_id ──► OccurrenceId
-//! ObjectVersionId ───────────────────────────────┤
-//! byte_offset + byte_length ─────────────────────┘
+//! NormHash ─────────┐
+//!                   ├─ key_secret_hash ──► SecretHash ──┐
+//! TenantSecretKey ──┘                                   │
+//!                                                       ├─ derive_finding_id ──► FindingId ──┐
+//! TenantId ─────────────────────────────────────────────┤                                    │
+//! StableItemId ─────────────────────────────────────────┤                                    │
+//! RuleFingerprint ──────────────────────────────────────┘                                    │
+//!                                                                                            │
+//!                                                       ├─ derive_occurrence_id ──► OccurrenceId
+//! ObjectVersionId ──────────────────────────────────────┤
+//! byte_offset + byte_length ────────────────────────────┘
 //! ```
 //!
 //! # Construction boundary
@@ -176,6 +176,13 @@ crate::define_id_32! {
 ///
 /// All fields are fixed-width (4 × 32 = 128 bytes), so the canonical
 /// encoding writes them sequentially with no length prefixes.
+///
+/// # Field-ordering invariant
+///
+/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
+/// declaration order**.  Reordering fields without updating
+/// `write_canonical` silently changes every derived `FindingId` and
+/// breaks the golden vectors in `golden.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingIdInputs {
     /// Tenant that owns the scanned item.
@@ -209,6 +216,13 @@ impl CanonicalBytes for FindingIdInputs {
 /// Mixed-width fields (2 × 32 + 2 × 8 = 80 bytes). All fixed-width,
 /// so the canonical encoding writes them sequentially with no length
 /// prefixes.
+///
+/// # Field-ordering invariant
+///
+/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
+/// declaration order**.  Reordering fields without updating
+/// `write_canonical` silently changes every derived `OccurrenceId` and
+/// breaks the golden vectors in `golden.rs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OccurrenceIdInputs {
     /// The version-stable finding this occurrence belongs to.

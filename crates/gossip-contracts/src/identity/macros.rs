@@ -19,7 +19,7 @@
 //!
 //! | Macro | Inner field | Constructor | Use case |
 //! |-------|-----------|-------------|----------|
-//! | [`define_id_32!`] | `pub` | `from_bytes` (pub) | Freely constructible IDs (`TenantId`, `FindingId`) |
+//! | [`define_id_32!`] | private | `from_bytes` (pub) | Freely constructible IDs (`TenantId`, `FindingId`) |
 //! | [`define_id_32_restricted!`] | private | `from_bytes_internal` (`pub(crate)`) | Derivation-only IDs (`NormHash`, `SecretHash`) |
 //!
 //! The restricted variant exists for values that *must* be produced by a
@@ -47,7 +47,7 @@
 //!
 //! [`CanonicalBytes`]: crate::identity::CanonicalBytes
 
-/// Generate a `[u8; 32]` newtype with public inner field.
+/// Generate a `[u8; 32]` newtype with private inner field.
 ///
 /// Produces:
 /// - `#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]`
@@ -78,7 +78,7 @@ macro_rules! define_id_32 {
     ) => {
         $(#[$meta])*
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(pub [u8; 32]);
+        pub struct $name([u8; 32]);
 
         // Show only the first 4 bytes in hex to keep log output compact
         // while still giving enough entropy to distinguish instances.
@@ -324,10 +324,13 @@ mod tests {
     }
 
     #[test]
-    fn pub_inner_field_accessible() {
+    fn pub_inner_field_is_private() {
+        // The inner `[u8; 32]` field is private — callers must use
+        // `from_bytes` / `as_bytes`.  This test exists as a compile-gate
+        // reminder; the actual privacy check is structural (removing `pub`
+        // from the tuple field).
         let id = PubTestId::from_bytes([0x01; 32]);
-        // Public inner field is directly accessible.
-        assert_eq!(id.0, [0x01; 32]);
+        assert_eq!(*id.as_bytes(), [0x01; 32]);
     }
 
     // ---------------------------------------------------------------
