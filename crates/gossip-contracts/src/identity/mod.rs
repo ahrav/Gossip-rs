@@ -20,5 +20,7 @@
 //!   unique, enforced by a meta-test.
 
 mod canonical;
+mod hashing;
 
 pub use canonical::CanonicalBytes;
+pub use hashing::{domain_hasher, finalize_32};
