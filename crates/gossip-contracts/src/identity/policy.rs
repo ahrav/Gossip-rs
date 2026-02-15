@@ -119,7 +119,7 @@ impl CanonicalBytes for PolicyHashInputs {
 
 /// Derive a [`PolicyHash`] from its structured inputs.
 ///
-/// Uses BLAKE3 derive-key mode with [`domain::POLICY_HASH_V2`].
+/// Uses BLAKE3 derive-key mode with [`super::domain::POLICY_HASH_V2`].
 ///
 /// # Invariants
 ///
