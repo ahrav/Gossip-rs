@@ -80,6 +80,18 @@ crate::define_id_32! {
 /// Secret keys are not ordered and should not be used as map keys. Omitting
 /// these traits prevents accidental misuse in sorted collections or hash maps.
 ///
+/// # Why `Copy` instead of `Zeroize`?
+///
+/// `Copy` is chosen for ergonomics: the key is passed by value through
+/// derivation functions without borrow-lifetime entanglement.  Rust forbids
+/// implementing `Drop` on `Copy` types, so `Zeroize`-on-drop (from the
+/// `zeroize` crate) is structurally impossible.  Stack copies of the key may
+/// persist after the owning variable goes out of scope.  This is acceptable
+/// under the current threat model — the key is not considered a high-value
+/// long-term secret (it is re-provisionable and tenant-scoped), and
+/// memory-scrubbing defenses add complexity with limited practical benefit
+/// against an attacker who can already read process memory.
+///
 /// `#[derive(PartialEq)]` generates a short-circuiting comparison that leaks
 /// key material via timing side-channels. The manual impl uses constant-time
 /// comparison from the `subtle` crate.

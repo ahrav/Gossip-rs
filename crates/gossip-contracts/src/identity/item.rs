@@ -107,7 +107,7 @@ impl ConnectorTag {
     /// # Panics
     ///
     /// Panics if `tag` is longer than 8 bytes, empty, or contains
-    /// non-ASCII-graphic bytes (anything outside `!`..`~`, i.e. 0x21..0x7E).
+    /// non-ASCII-graphic bytes (anything outside `!`..`~`, i.e. 0x21..=0x7E).
     pub const fn from_ascii(tag: &[u8]) -> Self {
         assert!(!tag.is_empty(), "ConnectorTag must not be empty");
         assert!(tag.len() <= 8, "ConnectorTag must be at most 8 bytes");
@@ -117,8 +117,8 @@ impl ConnectorTag {
         while i < tag.len() {
             // const-compatible equivalent of `tag[i].is_ascii_graphic()`.
             assert!(
-                tag[i] > 0x20 && tag[i] < 0x7F,
-                "ConnectorTag bytes must be ASCII graphic (0x21..0x7E)"
+                tag[i] >= 0x21 && tag[i] <= 0x7E,
+                "ConnectorTag bytes must be ASCII graphic (0x21..=0x7E)"
             );
             buf[i] = tag[i];
             i += 1;
@@ -475,6 +475,8 @@ mod tests {
     // -- Property-based --
 
     proptest::proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
         #[test]
         fn item_key_stable_id_is_pure(
             tag_bytes in proptest::array::uniform8(proptest::num::u8::ANY),

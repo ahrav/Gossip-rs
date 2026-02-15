@@ -381,6 +381,8 @@ mod tests {
     // -- Property-based --
 
     proptest::proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
         // Cluster 5: Purity
 
         #[test]
@@ -612,6 +614,44 @@ mod tests {
                 derive_finding_id(&base),
                 derive_finding_id(&varied),
             );
+        }
+
+        // SecretHash (key_secret_hash): each input independently affects the output.
+
+        #[test]
+        fn key_secret_hash_key_sensitivity(
+            key_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            key_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            norm in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(key_a != key_b);
+            let a = key_secret_hash(
+                &TenantSecretKey::from_bytes(key_a),
+                &NormHash::from_digest(norm),
+            );
+            let b = key_secret_hash(
+                &TenantSecretKey::from_bytes(key_b),
+                &NormHash::from_digest(norm),
+            );
+            proptest::prop_assert_ne!(a, b);
+        }
+
+        #[test]
+        fn key_secret_hash_norm_sensitivity(
+            key in proptest::array::uniform32(proptest::num::u8::ANY),
+            norm_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            norm_b in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(norm_a != norm_b);
+            let a = key_secret_hash(
+                &TenantSecretKey::from_bytes(key),
+                &NormHash::from_digest(norm_a),
+            );
+            let b = key_secret_hash(
+                &TenantSecretKey::from_bytes(key),
+                &NormHash::from_digest(norm_b),
+            );
+            proptest::prop_assert_ne!(a, b);
         }
 
         // OccurrenceId: each field independently affects the output.
