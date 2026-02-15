@@ -79,8 +79,21 @@ crate::define_id_32! {
 ///
 /// Secret keys are not ordered and should not be used as map keys. Omitting
 /// these traits prevents accidental misuse in sorted collections or hash maps.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// `#[derive(PartialEq)]` generates a short-circuiting comparison that leaks
+/// key material via timing side-channels. The manual impl uses constant-time
+/// comparison from the `subtle` crate.
+#[derive(Clone, Copy)]
 pub struct TenantSecretKey([u8; 32]);
+
+impl PartialEq for TenantSecretKey {
+    fn eq(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq;
+        self.0.ct_eq(&other.0).into()
+    }
+}
+
+impl Eq for TenantSecretKey {}
 
 impl ::core::fmt::Debug for TenantSecretKey {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
