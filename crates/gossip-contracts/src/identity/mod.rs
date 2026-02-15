@@ -18,6 +18,7 @@ mod finding;
 mod hashing;
 mod item;
 mod macros;
+mod policy;
 mod types;
 
 pub use canonical::CanonicalBytes;

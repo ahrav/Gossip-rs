@@ -44,7 +44,7 @@ use super::item::{ObjectVersionId, StableItemId};
 use super::types::{TenantId, TenantSecretKey};
 
 // ---------------------------------------------------------------------------
-// § NormHash — normalized secret digest
+// NormHash — normalized secret digest
 // ---------------------------------------------------------------------------
 
 crate::define_id_32_restricted! {
@@ -78,7 +78,7 @@ impl NormHash {
 }
 
 // ---------------------------------------------------------------------------
-// § SecretHash — tenant-scoped secret identity
+// SecretHash — tenant-scoped secret identity
 // ---------------------------------------------------------------------------
 
 crate::define_id_32_restricted! {
@@ -102,7 +102,7 @@ crate::define_id_32_restricted! {
 }
 
 // ---------------------------------------------------------------------------
-// § RuleFingerprint — detection rule identity
+// RuleFingerprint — detection rule identity
 // ---------------------------------------------------------------------------
 
 crate::define_id_32! {
@@ -121,7 +121,7 @@ crate::define_id_32! {
 }
 
 // ---------------------------------------------------------------------------
-// § FindingId — version-stable finding identity
+// FindingId — version-stable finding identity
 // ---------------------------------------------------------------------------
 
 crate::define_id_32! {
@@ -142,7 +142,7 @@ crate::define_id_32! {
 }
 
 // ---------------------------------------------------------------------------
-// § OccurrenceId — version-specific occurrence location
+// OccurrenceId — version-specific occurrence location
 // ---------------------------------------------------------------------------
 
 crate::define_id_32! {
@@ -163,7 +163,7 @@ crate::define_id_32! {
 }
 
 // ---------------------------------------------------------------------------
-// § FindingIdInputs
+// FindingIdInputs
 // ---------------------------------------------------------------------------
 
 /// Inputs to [`derive_finding_id`].
@@ -195,7 +195,7 @@ impl CanonicalBytes for FindingIdInputs {
 }
 
 // ---------------------------------------------------------------------------
-// § OccurrenceIdInputs
+// OccurrenceIdInputs
 // ---------------------------------------------------------------------------
 
 /// Inputs to [`derive_occurrence_id`].
@@ -228,7 +228,7 @@ impl CanonicalBytes for OccurrenceIdInputs {
 }
 
 // ---------------------------------------------------------------------------
-// § Derivation functions
+// Derivation functions
 // ---------------------------------------------------------------------------
 
 /// Derive a tenant-scoped [`SecretHash`] from a [`NormHash`] using
@@ -266,7 +266,7 @@ pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
 }
 
 // ============================================================================
-// § Tests
+// Tests
 // ============================================================================
 
 #[cfg(test)]

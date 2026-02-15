@@ -18,7 +18,7 @@ use super::domain;
 use super::hashing::{domain_hasher, finalize_32};
 
 // ---------------------------------------------------------------------------
-// § ConnectorTag — source discriminator
+// ConnectorTag — source discriminator
 // ---------------------------------------------------------------------------
 
 /// Fixed-width tag identifying the connector (source system) that produced
@@ -148,7 +148,7 @@ impl CanonicalBytes for ConnectorTag {
 }
 
 // ---------------------------------------------------------------------------
-// § ItemKey — variable-length scannable-item identity
+// ItemKey — variable-length scannable-item identity
 // ---------------------------------------------------------------------------
 
 /// Logical identity of a scannable item: a file, page, object, etc.
@@ -259,7 +259,7 @@ impl CanonicalBytes for ItemKey {
 }
 
 // ---------------------------------------------------------------------------
-// § StableItemId — fixed-width item identity for derivation
+// StableItemId — fixed-width item identity for derivation
 // ---------------------------------------------------------------------------
 
 crate::define_id_32! {
@@ -283,7 +283,7 @@ crate::define_id_32! {
 }
 
 // ---------------------------------------------------------------------------
-// § ObjectVersionId — version-specific content identity
+// ObjectVersionId — version-specific content identity
 // ---------------------------------------------------------------------------
 
 crate::define_id_32! {
@@ -357,7 +357,7 @@ impl ObjectVersionId {
 }
 
 // ============================================================================
-// § Tests
+// Tests
 // ============================================================================
 
 #[cfg(test)]
