@@ -466,48 +466,6 @@ mod tests {
         assert!(dbg.len() < 80);
     }
 
-    // -- Golden value pinning --
-
-    #[test]
-    fn stable_id_golden_value() {
-        let key = ItemKey::new(
-            ConnectorTag::from_ascii(b"github"),
-            b"org/repo\0src/main.rs".to_vec(),
-        );
-        let id = key.stable_id();
-        #[rustfmt::skip]
-        let expected: [u8; 32] = [
-            109, 41, 43, 47, 77, 156, 86, 138,
-             65,  4, 87, 205, 58, 190, 232, 127,
-            119, 37, 70,  74, 170, 54, 251, 24,
-             19, 168, 147, 3, 16, 223, 137, 164,
-        ];
-        assert_eq!(
-            id.as_bytes(),
-            &expected,
-            "StableItemId golden vector mismatch.\nActual: {:?}",
-            id.as_bytes(),
-        );
-    }
-
-    #[test]
-    fn object_version_id_golden_value() {
-        let id = ObjectVersionId::from_version_bytes(b"abc123def456");
-        #[rustfmt::skip]
-        let expected: [u8; 32] = [
-            207, 174, 101, 19, 118, 93, 148, 58,
-             86,  67, 244, 84, 41,  92, 129, 255,
-            131, 255, 202, 73, 56, 127, 27,  21,
-             61, 105, 214, 98, 80, 246, 222, 46,
-        ];
-        assert_eq!(
-            id.as_bytes(),
-            &expected,
-            "ObjectVersionId golden vector mismatch.\nActual: {:?}",
-            id.as_bytes(),
-        );
-    }
-
     // -- Property-based --
 
     proptest::proptest! {

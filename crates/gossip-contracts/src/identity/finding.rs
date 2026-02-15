@@ -325,76 +325,6 @@ mod tests {
         }
     }
 
-    // -- Golden value pinning --
-
-    #[test]
-    fn key_secret_hash_golden_value() {
-        let key = TenantSecretKey::from_bytes([0xBB; 32]);
-        let norm = NormHash::from_digest([0xCC; 32]);
-        let hash = key_secret_hash(&key, &norm);
-        #[rustfmt::skip]
-        let expected: [u8; 32] = [
-            107, 164, 199, 152, 51, 176, 95, 14,
-             13,  32,  93, 184, 155, 171, 197, 251,
-            107, 125, 226, 39, 249, 98, 104, 84,
-             45, 103, 226, 242, 100, 150, 60, 190,
-        ];
-        assert_eq!(
-            hash.as_bytes(),
-            &expected,
-            "key_secret_hash golden vector mismatch.\nActual: {:?}",
-            hash.as_bytes(),
-        );
-    }
-
-    #[test]
-    fn derive_finding_id_golden_value() {
-        let inputs = FindingIdInputs {
-            tenant: TenantId::from_bytes([0x11; 32]),
-            item: StableItemId::from_bytes([0x22; 32]),
-            rule: RuleFingerprint::from_bytes([0x33; 32]),
-            secret: SecretHash::from_bytes_internal([0x44; 32]),
-        };
-        let id = derive_finding_id(&inputs);
-        #[rustfmt::skip]
-        let expected: [u8; 32] = [
-            129, 206, 40, 133, 223, 133, 233, 99,
-             13,  70, 160, 41, 89, 233, 58, 207,
-            138, 206, 142, 121, 1, 110, 233, 216,
-            115, 193,   9, 187, 32, 118, 31, 216,
-        ];
-        assert_eq!(
-            id.as_bytes(),
-            &expected,
-            "derive_finding_id golden vector mismatch.\nActual: {:?}",
-            id.as_bytes(),
-        );
-    }
-
-    #[test]
-    fn derive_occurrence_id_golden_value() {
-        let inputs = OccurrenceIdInputs {
-            finding: FindingId::from_bytes([0x55; 32]),
-            version: ObjectVersionId::from_bytes([0x66; 32]),
-            byte_offset: 1024,
-            byte_length: 42,
-        };
-        let id = derive_occurrence_id(&inputs);
-        #[rustfmt::skip]
-        let expected: [u8; 32] = [
-            204, 235, 205, 237, 233, 101, 171, 205,
-             56, 142, 104, 226, 214, 125, 41, 140,
-            120,  45,  83,   2, 247, 26, 223, 82,
-             36,  70, 205, 233, 150, 35, 220, 133,
-        ];
-        assert_eq!(
-            id.as_bytes(),
-            &expected,
-            "derive_occurrence_id golden vector mismatch.\nActual: {:?}",
-            id.as_bytes(),
-        );
-    }
-
     // -- Property-based --
 
     proptest::proptest! {
@@ -521,6 +451,216 @@ mod tests {
                 byte_length: len2,
             });
             proptest::prop_assert_ne!(a, b);
+        }
+    }
+
+    // -- Field sensitivity --
+
+    proptest::proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        // FindingId: each field independently affects the output.
+
+        #[test]
+        fn finding_id_tenant_field_sensitivity(
+            tenant_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            tenant_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            item in proptest::array::uniform32(proptest::num::u8::ANY),
+            rule in proptest::array::uniform32(proptest::num::u8::ANY),
+            secret in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(tenant_a != tenant_b);
+            let base = FindingIdInputs {
+                tenant: TenantId::from_bytes(tenant_a),
+                item: StableItemId::from_bytes(item),
+                rule: RuleFingerprint::from_bytes(rule),
+                secret: SecretHash::from_bytes_internal(secret),
+            };
+            let varied = FindingIdInputs {
+                tenant: TenantId::from_bytes(tenant_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_finding_id(&base),
+                derive_finding_id(&varied),
+            );
+        }
+
+        #[test]
+        fn finding_id_item_field_sensitivity(
+            tenant in proptest::array::uniform32(proptest::num::u8::ANY),
+            item_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            item_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            rule in proptest::array::uniform32(proptest::num::u8::ANY),
+            secret in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(item_a != item_b);
+            let base = FindingIdInputs {
+                tenant: TenantId::from_bytes(tenant),
+                item: StableItemId::from_bytes(item_a),
+                rule: RuleFingerprint::from_bytes(rule),
+                secret: SecretHash::from_bytes_internal(secret),
+            };
+            let varied = FindingIdInputs {
+                item: StableItemId::from_bytes(item_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_finding_id(&base),
+                derive_finding_id(&varied),
+            );
+        }
+
+        #[test]
+        fn finding_id_rule_field_sensitivity(
+            tenant in proptest::array::uniform32(proptest::num::u8::ANY),
+            item in proptest::array::uniform32(proptest::num::u8::ANY),
+            rule_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            rule_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            secret in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(rule_a != rule_b);
+            let base = FindingIdInputs {
+                tenant: TenantId::from_bytes(tenant),
+                item: StableItemId::from_bytes(item),
+                rule: RuleFingerprint::from_bytes(rule_a),
+                secret: SecretHash::from_bytes_internal(secret),
+            };
+            let varied = FindingIdInputs {
+                rule: RuleFingerprint::from_bytes(rule_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_finding_id(&base),
+                derive_finding_id(&varied),
+            );
+        }
+
+        #[test]
+        fn finding_id_secret_field_sensitivity(
+            tenant in proptest::array::uniform32(proptest::num::u8::ANY),
+            item in proptest::array::uniform32(proptest::num::u8::ANY),
+            rule in proptest::array::uniform32(proptest::num::u8::ANY),
+            secret_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            secret_b in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(secret_a != secret_b);
+            let base = FindingIdInputs {
+                tenant: TenantId::from_bytes(tenant),
+                item: StableItemId::from_bytes(item),
+                rule: RuleFingerprint::from_bytes(rule),
+                secret: SecretHash::from_bytes_internal(secret_a),
+            };
+            let varied = FindingIdInputs {
+                secret: SecretHash::from_bytes_internal(secret_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_finding_id(&base),
+                derive_finding_id(&varied),
+            );
+        }
+
+        // OccurrenceId: each field independently affects the output.
+
+        #[test]
+        fn occurrence_id_finding_field_sensitivity(
+            finding_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            finding_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            version in proptest::array::uniform32(proptest::num::u8::ANY),
+            offset in proptest::num::u64::ANY,
+            length in proptest::num::u64::ANY,
+        ) {
+            proptest::prop_assume!(finding_a != finding_b);
+            let base = OccurrenceIdInputs {
+                finding: FindingId::from_bytes(finding_a),
+                version: ObjectVersionId::from_bytes(version),
+                byte_offset: offset,
+                byte_length: length,
+            };
+            let varied = OccurrenceIdInputs {
+                finding: FindingId::from_bytes(finding_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_occurrence_id(&base),
+                derive_occurrence_id(&varied),
+            );
+        }
+
+        #[test]
+        fn occurrence_id_version_field_sensitivity(
+            finding in proptest::array::uniform32(proptest::num::u8::ANY),
+            version_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            version_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            offset in proptest::num::u64::ANY,
+            length in proptest::num::u64::ANY,
+        ) {
+            proptest::prop_assume!(version_a != version_b);
+            let base = OccurrenceIdInputs {
+                finding: FindingId::from_bytes(finding),
+                version: ObjectVersionId::from_bytes(version_a),
+                byte_offset: offset,
+                byte_length: length,
+            };
+            let varied = OccurrenceIdInputs {
+                version: ObjectVersionId::from_bytes(version_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_occurrence_id(&base),
+                derive_occurrence_id(&varied),
+            );
+        }
+
+        #[test]
+        fn occurrence_id_offset_field_sensitivity(
+            finding in proptest::array::uniform32(proptest::num::u8::ANY),
+            version in proptest::array::uniform32(proptest::num::u8::ANY),
+            offset_a in proptest::num::u64::ANY,
+            offset_b in proptest::num::u64::ANY,
+            length in proptest::num::u64::ANY,
+        ) {
+            proptest::prop_assume!(offset_a != offset_b);
+            let base = OccurrenceIdInputs {
+                finding: FindingId::from_bytes(finding),
+                version: ObjectVersionId::from_bytes(version),
+                byte_offset: offset_a,
+                byte_length: length,
+            };
+            let varied = OccurrenceIdInputs {
+                byte_offset: offset_b,
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_occurrence_id(&base),
+                derive_occurrence_id(&varied),
+            );
+        }
+
+        #[test]
+        fn occurrence_id_length_field_sensitivity(
+            finding in proptest::array::uniform32(proptest::num::u8::ANY),
+            version in proptest::array::uniform32(proptest::num::u8::ANY),
+            offset in proptest::num::u64::ANY,
+            length_a in proptest::num::u64::ANY,
+            length_b in proptest::num::u64::ANY,
+        ) {
+            proptest::prop_assume!(length_a != length_b);
+            let base = OccurrenceIdInputs {
+                finding: FindingId::from_bytes(finding),
+                version: ObjectVersionId::from_bytes(version),
+                byte_offset: offset,
+                byte_length: length_a,
+            };
+            let varied = OccurrenceIdInputs {
+                byte_length: length_b,
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_occurrence_id(&base),
+                derive_occurrence_id(&varied),
+            );
         }
     }
 }

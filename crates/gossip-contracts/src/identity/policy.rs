@@ -158,34 +158,6 @@ mod tests {
         }
     }
 
-    // -- Golden value pinning --
-
-    #[test]
-    fn compute_policy_hash_golden_value() {
-        let inputs = PolicyHashInputs {
-            policy_hash_version: 1,
-            id_hash_mode: IdHashMode::KeyedV1,
-            evidence_hash_version: 1,
-            rules_digest: [0xAA; 32],
-        };
-        let hash = compute_policy_hash(&inputs);
-
-        // Golden value computed once and pinned. If this breaks, the
-        // derivation scheme changed — that requires a version bump.
-        let expected: [u8; 32] = [
-            0x29, 0xf1, 0xe1, 0xf8, 0xf5, 0x92, 0xa9, 0xec, 0xca, 0xeb, 0x83, 0xf7, 0x98, 0x7f,
-            0x63, 0x6a, 0x39, 0xd5, 0x92, 0xeb, 0x71, 0x16, 0x4e, 0x73, 0x38, 0x1e, 0x83, 0x77,
-            0x4c, 0xf1, 0xf8, 0x5c,
-        ];
-        assert_eq!(
-            *hash.as_bytes(),
-            expected,
-            "Golden value mismatch — derivation scheme changed. \
-             Actual: {:02x?}",
-            hash.as_bytes()
-        );
-    }
-
     // -- Property-based --
 
     proptest::proptest! {

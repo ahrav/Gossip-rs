@@ -21,6 +21,9 @@ mod macros;
 mod policy;
 mod types;
 
+#[cfg(test)]
+mod golden;
+
 pub use canonical::CanonicalBytes;
 pub use finding::{
     FindingId, FindingIdInputs, NormHash, OccurrenceId, OccurrenceIdInputs, RuleFingerprint,
