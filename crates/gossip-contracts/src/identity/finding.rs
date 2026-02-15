@@ -325,6 +325,76 @@ mod tests {
         }
     }
 
+    // -- Golden value pinning --
+
+    #[test]
+    fn key_secret_hash_golden_value() {
+        let key = TenantSecretKey::from_bytes([0xBB; 32]);
+        let norm = NormHash::from_digest([0xCC; 32]);
+        let hash = key_secret_hash(&key, &norm);
+        #[rustfmt::skip]
+        let expected: [u8; 32] = [
+            107, 164, 199, 152, 51, 176, 95, 14,
+             13,  32,  93, 184, 155, 171, 197, 251,
+            107, 125, 226, 39, 249, 98, 104, 84,
+             45, 103, 226, 242, 100, 150, 60, 190,
+        ];
+        assert_eq!(
+            hash.as_bytes(),
+            &expected,
+            "key_secret_hash golden vector mismatch.\nActual: {:?}",
+            hash.as_bytes(),
+        );
+    }
+
+    #[test]
+    fn derive_finding_id_golden_value() {
+        let inputs = FindingIdInputs {
+            tenant: TenantId::from_bytes([0x11; 32]),
+            item: StableItemId::from_bytes([0x22; 32]),
+            rule: RuleFingerprint::from_bytes([0x33; 32]),
+            secret: SecretHash::from_bytes_internal([0x44; 32]),
+        };
+        let id = derive_finding_id(&inputs);
+        #[rustfmt::skip]
+        let expected: [u8; 32] = [
+            129, 206, 40, 133, 223, 133, 233, 99,
+             13,  70, 160, 41, 89, 233, 58, 207,
+            138, 206, 142, 121, 1, 110, 233, 216,
+            115, 193,   9, 187, 32, 118, 31, 216,
+        ];
+        assert_eq!(
+            id.as_bytes(),
+            &expected,
+            "derive_finding_id golden vector mismatch.\nActual: {:?}",
+            id.as_bytes(),
+        );
+    }
+
+    #[test]
+    fn derive_occurrence_id_golden_value() {
+        let inputs = OccurrenceIdInputs {
+            finding: FindingId::from_bytes([0x55; 32]),
+            version: ObjectVersionId::from_bytes([0x66; 32]),
+            byte_offset: 1024,
+            byte_length: 42,
+        };
+        let id = derive_occurrence_id(&inputs);
+        #[rustfmt::skip]
+        let expected: [u8; 32] = [
+            204, 235, 205, 237, 233, 101, 171, 205,
+             56, 142, 104, 226, 214, 125, 41, 140,
+            120,  45,  83,   2, 247, 26, 223, 82,
+             36,  70, 205, 233, 150, 35, 220, 133,
+        ];
+        assert_eq!(
+            id.as_bytes(),
+            &expected,
+            "derive_occurrence_id golden vector mismatch.\nActual: {:?}",
+            id.as_bytes(),
+        );
+    }
+
     // -- Property-based --
 
     proptest::proptest! {
