@@ -1,0 +1,456 @@
+//! Secret, finding, and occurrence identity: the types that answer
+//! "what secret was found", "where was it found", and "in which version."
+//!
+//! # Type overview
+//!
+//! | Type | Width | Construction | Purpose |
+//! |------|-------|-------------|---------|
+//! | [`NormHash`] | 32 B | `from_digest` (pub) | Normalized secret digest from engine |
+//! | [`SecretHash`] | 32 B | `key_secret_hash` | Tenant-scoped secret identity |
+//! | [`RuleFingerprint`] | 32 B | `from_bytes` (pub) | Detection rule identity |
+//! | [`FindingId`] | 32 B | `derive_finding_id` | Version-stable finding identity |
+//! | [`OccurrenceId`] | 32 B | `derive_occurrence_id` | Version-specific occurrence location |
+//!
+//! # Derivation chain
+//!
+//! ```text
+//! NormHash ──┐
+//!            ├─ key_secret_hash ──► SecretHash ──┐
+//! TenantKey ─┘                                   │
+//!                                                ├─ derive_finding_id ──► FindingId ──┐
+//! TenantId ──────────────────────────────────────┤                                    │
+//! StableItemId ──────────────────────────────────┤                                    │
+//! RuleFingerprint ───────────────────────────────┘                                    │
+//!                                                                                     │
+//!                                                ├─ derive_occurrence_id ──► OccurrenceId
+//! ObjectVersionId ───────────────────────────────┤
+//! byte_offset + byte_length ─────────────────────┘
+//! ```
+//!
+//! # Construction boundary
+//!
+//! Types that hold security-sensitive material (`NormHash`, `SecretHash`) use
+//! [`define_id_32_restricted!`](crate::define_id_32_restricted) — their constructor is
+//! `pub(crate)`, so only derivation functions inside this crate can produce them.
+//! All other types use [`define_id_32!`](crate::define_id_32) with a public `from_bytes`
+//! constructor.
+
+use blake3::Hasher;
+
+use super::canonical::CanonicalBytes;
+use super::domain;
+use super::hashing::{domain_hasher, finalize_32};
+use super::item::{ObjectVersionId, StableItemId};
+use super::types::{TenantId, TenantSecretKey};
+
+// ---------------------------------------------------------------------------
+// § NormHash — normalized secret digest
+// ---------------------------------------------------------------------------
+
+crate::define_id_32_restricted! {
+    /// Digest of the normalized (whitespace-stripped, case-folded) secret
+    /// value, computed by the detection engine.
+    ///
+    /// `NormHash` is the engine's output — it captures *what* was found
+    /// before tenant-scoped keying is applied. The engine crate constructs
+    /// these via [`NormHash::from_digest`].
+    ///
+    /// # Invariants
+    ///
+    /// **Safety**: Two secrets that are semantically identical after
+    /// normalization MUST produce the same `NormHash`. Two semantically
+    /// different secrets MUST produce different `NormHash` values (with
+    /// cryptographic collision resistance).
+    NormHash,
+    debug_display = "NormHash([redacted])"
+}
+
+impl NormHash {
+    /// Construct a `NormHash` from a pre-computed 32-byte digest.
+    ///
+    /// The caller (detection engine) is responsible for computing the
+    /// digest from the normalized secret value. This function performs
+    /// no additional hashing.
+    #[inline]
+    pub fn from_digest(bytes: [u8; 32]) -> Self {
+        Self::from_bytes_internal(bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// § SecretHash — tenant-scoped secret identity
+// ---------------------------------------------------------------------------
+
+crate::define_id_32_restricted! {
+    /// Tenant-scoped secret identity, derived by keying a [`NormHash`] with
+    /// a [`TenantSecretKey`].
+    ///
+    /// `SecretHash` is what enters [`FindingId`] derivation. Because it is
+    /// keyed, the same normalized secret produces different `SecretHash`
+    /// values for different tenants — preventing cross-tenant correlation
+    /// of secret values.
+    ///
+    /// # Invariants
+    ///
+    /// **Safety**: `SecretHash` MUST be a pure function of
+    /// `(TenantSecretKey, NormHash)`. Same inputs → same output.
+    ///
+    /// **Safety**: Different `(key, norm)` pairs MUST produce different
+    /// `SecretHash` values (with cryptographic collision resistance).
+    SecretHash,
+    debug_display = "SecretHash([redacted])"
+}
+
+// ---------------------------------------------------------------------------
+// § RuleFingerprint — detection rule identity
+// ---------------------------------------------------------------------------
+
+crate::define_id_32! {
+    /// Identity of a detection rule.
+    ///
+    /// The engine/policy layer computes rule fingerprints externally and
+    /// passes them into finding derivation. The contracts crate treats
+    /// the value as opaque.
+    ///
+    /// # Invariants
+    ///
+    /// **Safety**: The same rule definition MUST always produce the same
+    /// `RuleFingerprint`. If a rule's detection semantics change, its
+    /// fingerprint MUST change.
+    RuleFingerprint
+}
+
+// ---------------------------------------------------------------------------
+// § FindingId — version-stable finding identity
+// ---------------------------------------------------------------------------
+
+crate::define_id_32! {
+    /// Version-stable finding identity.
+    ///
+    /// Derived from `(tenant, item, rule, secret_hash)`. Because
+    /// `ObjectVersionId` is NOT an input, the same finding persists across
+    /// versions of the scanned item — enabling stable triage state.
+    ///
+    /// # Invariants
+    ///
+    /// **Safety**: `FindingId` MUST be a pure function of
+    /// [`FindingIdInputs`]. Same inputs → same output.
+    ///
+    /// **Safety**: Distinct inputs MUST produce distinct `FindingId` values
+    /// (with cryptographic collision resistance).
+    FindingId
+}
+
+// ---------------------------------------------------------------------------
+// § OccurrenceId — version-specific occurrence location
+// ---------------------------------------------------------------------------
+
+crate::define_id_32! {
+    /// Version-specific occurrence of a finding at a particular location.
+    ///
+    /// Derived from `(finding, version, byte_offset, byte_length)`. This
+    /// ties a [`FindingId`] to a specific version and byte range within
+    /// the scanned content.
+    ///
+    /// # Invariants
+    ///
+    /// **Safety**: `OccurrenceId` MUST be a pure function of
+    /// [`OccurrenceIdInputs`]. Same inputs → same output.
+    ///
+    /// **Safety**: Distinct inputs MUST produce distinct `OccurrenceId`
+    /// values (with cryptographic collision resistance).
+    OccurrenceId
+}
+
+// ---------------------------------------------------------------------------
+// § FindingIdInputs
+// ---------------------------------------------------------------------------
+
+/// Inputs to [`derive_finding_id`].
+///
+/// All fields are fixed-width (4 × 32 = 128 bytes), so the canonical
+/// encoding writes them sequentially with no length prefixes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindingIdInputs {
+    /// Tenant that owns the scanned item.
+    pub tenant: TenantId,
+    /// Version-stable identity of the scanned item (repo, bucket, etc.).
+    pub item: StableItemId,
+    /// Detection rule that matched.
+    pub rule: RuleFingerprint,
+    /// Tenant-keyed secret identity (post-[`key_secret_hash`], not raw `NormHash`).
+    pub secret: SecretHash,
+}
+
+impl CanonicalBytes for FindingIdInputs {
+    /// Field order must match struct declaration order — reordering fields
+    /// without updating this impl silently changes all derived IDs.
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.tenant.write_canonical(h);
+        self.item.write_canonical(h);
+        self.rule.write_canonical(h);
+        self.secret.write_canonical(h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// § OccurrenceIdInputs
+// ---------------------------------------------------------------------------
+
+/// Inputs to [`derive_occurrence_id`].
+///
+/// Mixed-width fields (2 × 32 + 2 × 8 = 80 bytes). All fixed-width,
+/// so the canonical encoding writes them sequentially with no length
+/// prefixes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OccurrenceIdInputs {
+    /// The version-stable finding this occurrence belongs to.
+    pub finding: FindingId,
+    /// Specific version of the scanned object (commit SHA, object etag, etc.).
+    pub version: ObjectVersionId,
+    /// Byte offset of the secret within the scanned content.
+    pub byte_offset: u64,
+    /// Byte length of the secret within the scanned content.
+    pub byte_length: u64,
+}
+
+impl CanonicalBytes for OccurrenceIdInputs {
+    /// Field order must match struct declaration order — reordering fields
+    /// without updating this impl silently changes all derived IDs.
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.finding.write_canonical(h);
+        self.version.write_canonical(h);
+        self.byte_offset.write_canonical(h);
+        self.byte_length.write_canonical(h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// § Derivation functions
+// ---------------------------------------------------------------------------
+
+/// Derive a tenant-scoped [`SecretHash`] from a [`NormHash`] using
+/// BLAKE3 keyed mode.
+///
+/// This is the only derivation that uses keyed mode rather than
+/// derive-key mode. The tenant's secret key prevents cross-tenant
+/// correlation of normalized secret values.
+pub fn key_secret_hash(key: &TenantSecretKey, norm: &NormHash) -> SecretHash {
+    let mut h = Hasher::new_keyed(key.as_bytes());
+    // Domain tag is fed as *data* (not a derive-key context) because the
+    // hasher is already in keyed mode. This acts as a context prefix that
+    // separates this derivation from any other use of the same tenant key.
+    h.update(domain::SECRET_HASH_V1.as_bytes());
+    h.update(norm.as_bytes());
+    SecretHash::from_bytes_internal(finalize_32(&h))
+}
+
+/// Derive a version-stable [`FindingId`] from its inputs.
+///
+/// Uses BLAKE3 derive-key mode with [`domain::FINDING_ID_V1`].
+pub fn derive_finding_id(inputs: &FindingIdInputs) -> FindingId {
+    let mut h = domain_hasher(domain::FINDING_ID_V1);
+    inputs.write_canonical(&mut h);
+    FindingId::from_bytes(finalize_32(&h))
+}
+
+/// Derive a version-specific [`OccurrenceId`] from its inputs.
+///
+/// Uses BLAKE3 derive-key mode with [`domain::OCCURRENCE_ID_V1`].
+pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
+    let mut h = domain_hasher(domain::OCCURRENCE_ID_V1);
+    inputs.write_canonical(&mut h);
+    OccurrenceId::from_bytes(finalize_32(&h))
+}
+
+// ============================================================================
+// § Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Debug format safety --
+
+    #[test]
+    fn restricted_types_debug_is_redacted() {
+        let cases: &[(&str, &str)] = &[
+            (
+                &format!("{:?}", NormHash::from_digest([0xFF; 32])),
+                "NormHash([redacted])",
+            ),
+            (
+                &format!("{:?}", SecretHash::from_bytes_internal([0xFF; 32])),
+                "SecretHash([redacted])",
+            ),
+        ];
+
+        for (actual, expected) in cases {
+            assert_eq!(actual, expected, "Debug mismatch for {expected}");
+            assert!(
+                !actual.contains("ff"),
+                "restricted Debug must not leak hex bytes: {actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_types_debug_is_safe() {
+        let cases: &[String] = &[
+            format!("{:?}", RuleFingerprint::from_bytes([0xAB; 32])),
+            format!("{:?}", FindingId::from_bytes([0xCD; 32])),
+            format!("{:?}", OccurrenceId::from_bytes([0xEF; 32])),
+        ];
+
+        let type_names = ["RuleFingerprint", "FindingId", "OccurrenceId"];
+
+        for (dbg, name) in cases.iter().zip(type_names.iter()) {
+            assert!(
+                dbg.starts_with(name),
+                "{name} Debug should start with type name, got: {dbg}"
+            );
+            assert!(
+                dbg.len() < 80,
+                "{name} Debug too long ({} chars): {dbg}",
+                dbg.len()
+            );
+            // Public types show hex prefix.
+            assert!(
+                dbg.contains(|c: char| c.is_ascii_hexdigit()),
+                "{name} Debug should contain hex: {dbg}"
+            );
+        }
+    }
+
+    // -- Property-based --
+
+    proptest::proptest! {
+        // Cluster 5: Purity
+
+        #[test]
+        fn key_secret_hash_is_pure(
+            key_bytes in proptest::array::uniform32(proptest::num::u8::ANY),
+            norm_bytes in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            let key = TenantSecretKey::from_bytes(key_bytes);
+            let norm = NormHash::from_digest(norm_bytes);
+            let a = key_secret_hash(&key, &norm);
+            let b = key_secret_hash(&key, &norm);
+            proptest::prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn finding_id_is_pure(
+            t in proptest::array::uniform32(proptest::num::u8::ANY),
+            i in proptest::array::uniform32(proptest::num::u8::ANY),
+            r in proptest::array::uniform32(proptest::num::u8::ANY),
+            s in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            let inputs = FindingIdInputs {
+                tenant: TenantId::from_bytes(t),
+                item: StableItemId::from_bytes(i),
+                rule: RuleFingerprint::from_bytes(r),
+                secret: SecretHash::from_bytes_internal(s),
+            };
+            let a = derive_finding_id(&inputs);
+            let b = derive_finding_id(&inputs);
+            proptest::prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn occurrence_id_is_pure(
+            f in proptest::array::uniform32(proptest::num::u8::ANY),
+            v in proptest::array::uniform32(proptest::num::u8::ANY),
+            offset in proptest::num::u64::ANY,
+            length in proptest::num::u64::ANY,
+        ) {
+            let inputs = OccurrenceIdInputs {
+                finding: FindingId::from_bytes(f),
+                version: ObjectVersionId::from_bytes(v),
+                byte_offset: offset,
+                byte_length: length,
+            };
+            let a = derive_occurrence_id(&inputs);
+            let b = derive_occurrence_id(&inputs);
+            proptest::prop_assert_eq!(a, b);
+        }
+
+        // Cluster 3: Collision-freedom
+
+        #[test]
+        fn secret_hash_collision_free(
+            key1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            norm1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            key2 in proptest::array::uniform32(proptest::num::u8::ANY),
+            norm2 in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(key1 != key2 || norm1 != norm2);
+            let a = key_secret_hash(
+                &TenantSecretKey::from_bytes(key1),
+                &NormHash::from_digest(norm1),
+            );
+            let b = key_secret_hash(
+                &TenantSecretKey::from_bytes(key2),
+                &NormHash::from_digest(norm2),
+            );
+            proptest::prop_assert_ne!(a, b);
+        }
+
+        #[test]
+        fn finding_id_collision_free(
+            t1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            i1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            r1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            s1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            t2 in proptest::array::uniform32(proptest::num::u8::ANY),
+            i2 in proptest::array::uniform32(proptest::num::u8::ANY),
+            r2 in proptest::array::uniform32(proptest::num::u8::ANY),
+            s2 in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(t1 != t2 || i1 != i2 || r1 != r2 || s1 != s2);
+            let a = derive_finding_id(&FindingIdInputs {
+                tenant: TenantId::from_bytes(t1),
+                item: StableItemId::from_bytes(i1),
+                rule: RuleFingerprint::from_bytes(r1),
+                secret: SecretHash::from_bytes_internal(s1),
+            });
+            let b = derive_finding_id(&FindingIdInputs {
+                tenant: TenantId::from_bytes(t2),
+                item: StableItemId::from_bytes(i2),
+                rule: RuleFingerprint::from_bytes(r2),
+                secret: SecretHash::from_bytes_internal(s2),
+            });
+            proptest::prop_assert_ne!(a, b);
+        }
+
+        #[test]
+        fn occurrence_id_collision_free(
+            f1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            v1 in proptest::array::uniform32(proptest::num::u8::ANY),
+            off1 in proptest::num::u64::ANY,
+            len1 in proptest::num::u64::ANY,
+            f2 in proptest::array::uniform32(proptest::num::u8::ANY),
+            v2 in proptest::array::uniform32(proptest::num::u8::ANY),
+            off2 in proptest::num::u64::ANY,
+            len2 in proptest::num::u64::ANY,
+        ) {
+            proptest::prop_assume!(f1 != f2 || v1 != v2 || off1 != off2 || len1 != len2);
+            let a = derive_occurrence_id(&OccurrenceIdInputs {
+                finding: FindingId::from_bytes(f1),
+                version: ObjectVersionId::from_bytes(v1),
+                byte_offset: off1,
+                byte_length: len1,
+            });
+            let b = derive_occurrence_id(&OccurrenceIdInputs {
+                finding: FindingId::from_bytes(f2),
+                version: ObjectVersionId::from_bytes(v2),
+                byte_offset: off2,
+                byte_length: len2,
+            });
+            proptest::prop_assert_ne!(a, b);
+        }
+    }
+}

@@ -14,12 +14,17 @@
 
 mod canonical;
 pub mod domain;
+mod finding;
 mod hashing;
 mod item;
 mod macros;
 mod types;
 
 pub use canonical::CanonicalBytes;
+pub use finding::{
+    FindingId, FindingIdInputs, NormHash, OccurrenceId, OccurrenceIdInputs, RuleFingerprint,
+    SecretHash, derive_finding_id, derive_occurrence_id, key_secret_hash,
+};
 pub use hashing::{domain_hasher, finalize_32};
 pub use item::{ConnectorTag, ItemKey, ObjectVersionId, StableItemId};
 pub use types::{PolicyHash, TenantId, TenantSecretKey};
