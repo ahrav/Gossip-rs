@@ -21,6 +21,7 @@
 
 mod canonical;
 mod hashing;
+mod macros;
 
 pub use canonical::CanonicalBytes;
 pub use hashing::{domain_hasher, finalize_32};
