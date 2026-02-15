@@ -22,6 +22,8 @@ mod canonical;
 pub mod domain;
 mod hashing;
 mod macros;
+mod types;
 
 pub use canonical::CanonicalBytes;
 pub use hashing::{domain_hasher, finalize_32};
+pub use types::{PolicyHash, TenantId, TenantSecretKey};
