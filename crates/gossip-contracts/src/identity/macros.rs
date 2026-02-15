@@ -28,7 +28,7 @@
 //! supplying arbitrary bytes.
 //!
 //! Both macros use fully-qualified paths (`$crate::identity::CanonicalBytes`,
-//! `::blake3::Hasher`, `::core::fmt`) so they work from any invocation site —
+//! `$crate::blake3::Hasher`, `::core::fmt`) so they work from any invocation site —
 //! inside this crate, in sibling modules, or from downstream crates.
 //!
 //! [`CanonicalBytes`]: crate::identity::CanonicalBytes
@@ -99,7 +99,7 @@ macro_rules! define_id_32 {
             // Fixed-width: 32 bytes are written directly with no length
             // prefix because the size is statically known from the type.
             #[inline]
-            fn write_canonical(&self, h: &mut ::blake3::Hasher) {
+            fn write_canonical(&self, h: &mut $crate::blake3::Hasher) {
                 h.update(&self.0);
             }
         }
@@ -173,7 +173,7 @@ macro_rules! define_id_32_restricted {
         impl $crate::identity::CanonicalBytes for $name {
             // Fixed-width: 32 bytes written directly, no length prefix.
             #[inline]
-            fn write_canonical(&self, h: &mut ::blake3::Hasher) {
+            fn write_canonical(&self, h: &mut $crate::blake3::Hasher) {
                 h.update(&self.0);
             }
         }
