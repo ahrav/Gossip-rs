@@ -87,6 +87,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn deterministic_for_random_payload(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let domain = "gossip/prop/v1";

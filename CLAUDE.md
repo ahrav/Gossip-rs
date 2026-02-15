@@ -1,3 +1,5 @@
+**NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
+
 ## Task Management
 
 This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
@@ -130,7 +132,7 @@ bd create --title="..." --type=task --priority=2
 bd update <id> --status=in_progress
 bd close <id> --reason="Completed"
 bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+bd sync --flush-only  # Export beads to JSONL (no git ops)
 ```
 
 ### Workflow Pattern
@@ -139,7 +141,6 @@ bd sync               # Commit and push changes
 2. **Claim**: Use `bd update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
 
 ### Key Concepts
 
@@ -153,6 +154,7 @@ bd sync               # Commit and push changes
 **Before ending any session, run `bd sync` to persist beads state.**
 
 Do NOT stage, commit, or push code changes. Leave that to the user.
+
 
 ### Best Practices
 

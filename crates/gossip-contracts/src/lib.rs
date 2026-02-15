@@ -57,6 +57,9 @@ pub mod persistence;
 pub mod shard;
 
 #[cfg(test)]
+mod test_util;
+
+#[cfg(test)]
 mod tests {
     /// Smoke test: blake3 is importable and functional.
     #[test]
@@ -71,7 +74,7 @@ mod tests {
     fn proptest_available() {
         use proptest::prelude::*;
 
-        proptest!(|(x: u64)| {
+        proptest!(crate::test_util::miri_proptest_config(), |(x: u64)| {
             // Verify blake3 produces deterministic output.
             let h1 = blake3::hash(&x.to_le_bytes());
             let h2 = blake3::hash(&x.to_le_bytes());
