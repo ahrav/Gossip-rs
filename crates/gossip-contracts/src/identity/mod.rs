@@ -1,11 +1,5 @@
 //! Content-addressed identity types, canonical encoding, and domain-separated hashing.
 //!
-//! **Phase 0 status:** This module currently provides shared identity
-//! infrastructure (`CanonicalBytes`, hashing helpers, ID newtype macros, and the
-//! domain-constant registry). Concrete scanner identity types (`TenantId`,
-//! `SecretHash`, `FindingId`, `OccurrenceId`, etc.) are planned for later Phase
-//! 1 tasks and may evolve before stabilization.
-//!
 //! **Dependency direction:** This is the leaf of the boundary graph — no other
 //! boundary module may be referenced here. All four sibling modules depend on
 //! `identity`.
@@ -21,9 +15,11 @@
 mod canonical;
 pub mod domain;
 mod hashing;
+mod item;
 mod macros;
 mod types;
 
 pub use canonical::CanonicalBytes;
 pub use hashing::{domain_hasher, finalize_32};
+pub use item::{ConnectorTag, ItemKey, ObjectVersionId, StableItemId};
 pub use types::{PolicyHash, TenantId, TenantSecretKey};

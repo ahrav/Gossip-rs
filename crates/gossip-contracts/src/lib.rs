@@ -4,23 +4,19 @@
 //! This crate defines the boundary-oriented API surface that all runtime crates
 //! depend on.
 //!
-//! **Phase 0 status:** Identity hashing infrastructure is implemented. The
-//! remaining boundary modules are currently documentation-first scaffolds whose
-//! concrete trait/type implementations land in later phase tasks.
-//!
 //! It contains:
 //!
-//! - **Identity primitives (implemented)** — canonical encoding
-//!   (`CanonicalBytes`), domain-separated hashing helpers, ID newtype macros,
-//!   and the domain-tag registry.
-//! - **Coordination boundary (planned)** — shard lifecycle, lease management,
-//!   and the eventual `CoordinationBackend` trait.
-//! - **Shard boundary (planned)** — key encoding schemas, range arithmetic, and
-//!   split computation.
-//! - **Connector boundary (planned)** — enumeration/read traits and connector
+//! - **Identity primitives** — canonical encoding (`CanonicalBytes`),
+//!   domain-separated hashing helpers, ID newtype macros, and the domain-tag
+//!   registry.
+//! - **Coordination boundary** — shard lifecycle, lease management, and the
+//!   `CoordinationBackend` trait.
+//! - **Shard boundary** — key encoding schemas, range arithmetic, and split
+//!   computation.
+//! - **Connector boundary** — enumeration/read traits and connector
 //!   registration.
-//! - **Persistence boundary (planned)** — done-ledger/findings-sink traits and
-//!   commit protocol typestate.
+//! - **Persistence boundary** — done-ledger/findings-sink traits and commit
+//!   protocol typestate.
 //!
 //! # Design principles
 //!
@@ -60,9 +56,6 @@ pub mod identity;
 pub mod persistence;
 pub mod shard;
 
-// Root-level re-exports will be added here as boundary implementations land.
-// Keeping this section empty during Phase 0 avoids premature API commitment.
-
 #[cfg(test)]
 mod tests {
     /// Smoke test: blake3 is importable and functional.
@@ -90,10 +83,7 @@ mod tests {
     #[test]
     fn test_support_feature_gate() {
         // This test verifies the feature flag plumbing exists.
-        // Code gated behind `test-support` will be added in later phases.
         #[cfg(feature = "test-support")]
-        {
-            // Placeholder: test-support-gated code will live here.
-        }
+        {}
     }
 }

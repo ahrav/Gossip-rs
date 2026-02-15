@@ -1,10 +1,7 @@
 //! Key encoding schemas, range arithmetic, and split computation.
 //!
-//! **Phase 0 status:** This module is currently a documentation scaffold. The
-//! APIs described below are planned design targets for Phase 1 implementation.
-//!
-//! This module will own the shard algebra that governs how the scanner's keyspace
-//! is partitioned: key encoding schemas (`PathKey`, `NumericPrefixKey`, …),
+//! Owns the shard algebra that governs how the scanner's keyspace is
+//! partitioned: key encoding schemas (`PathKey`, `NumericPrefixKey`, …),
 //! key-range types with intersection/union/containment operations, the split-key
 //! computation that divides oversize shards, ordering proofs, and the coverage
 //! verification logic that answers "did we scan everything?" after a run settles.

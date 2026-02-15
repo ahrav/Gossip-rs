@@ -1,7 +1,6 @@
 //! Core identity primitives: `TenantId`, `PolicyHash`, and `TenantSecretKey`.
 //!
-//! These are the first concrete identity types for the Boundary 1 (Identity &
-//! Hashing Spine) epic. All downstream B1 tasks depend on these three types.
+//! These types enter downstream identity derivations.
 //!
 //! # Type overview
 //!

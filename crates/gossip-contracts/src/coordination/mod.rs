@@ -1,11 +1,8 @@
 //! Shard lifecycle, lease management, and the coordination backend trait.
 //!
-//! **Phase 0 status:** This module is currently a documentation scaffold. The
-//! APIs described below are planned design targets for Phase 1 implementation.
-//!
-//! This module will own the shard state machine (`Active → Done | Parked | Split`),
-//! lease management (`Lease`, `FenceEpoch`), the `CoordinationBackend` trait
-//! that all storage backends implement, run lifecycle (`RunRecord`, `RunConfig`,
+//! Owns the shard state machine (`Active → Done | Parked | Split`), lease
+//! management (`Lease`, `FenceEpoch`), the `CoordinationBackend` trait that all
+//! storage backends implement, run lifecycle (`RunRecord`, `RunConfig`,
 //! `RunManagement`), and the ergonomic `WorkerSession` wrapper. Together these
 //! define how shards are assigned to workers, how progress is checkpointed, and
 //! how ownership is transferred via fencing tokens.

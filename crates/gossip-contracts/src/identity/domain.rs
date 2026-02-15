@@ -18,7 +18,7 @@
 //! Most constants are used with [`domain_hasher`] which invokes BLAKE3
 //! derive-key mode (`Hasher::new_derive_key`). The one exception is
 //! [`SECRET_HASH_V1`], which is fed as data into a BLAKE3 keyed-mode hasher
-//! (`Hasher::new_keyed`) in the planned Phase 1 secret-hash derivation path.
+//! (`Hasher::new_keyed`).
 //!
 //! # Safety requirements
 //!
@@ -37,14 +37,11 @@
 
 /// Shard-ID derivation during split operations.
 ///
-/// Planned call site (Phase 1 coordination): shard split-ID derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const SPLIT_ID_V1: &[u8] = b"gossip/coord/v1/split-id";
 
 /// Op-log payload hashing for idempotency conflict detection.
 ///
-/// Planned call site (Phase 1 coordination): operation payload hash for
-/// idempotency conflict detection.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const OP_PAYLOAD_V1: &[u8] = b"gossip/coord/v1/op-payload";
 
@@ -54,38 +51,32 @@ pub const OP_PAYLOAD_V1: &[u8] = b"gossip/coord/v1/op-payload";
 
 /// `FindingId` derivation from `(tenant, item, rule, secret_hash)`.
 ///
-/// Planned call site (Phase 1 identity): finding-ID derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const FINDING_ID_V1: &[u8] = b"gossip/finding/v1";
 
 /// `OccurrenceId` derivation from `(finding, version, offset, length)`.
 ///
-/// Planned call site (Phase 1 identity): occurrence-ID derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const OCCURRENCE_ID_V1: &[u8] = b"gossip/occurrence/v1";
 
 /// `SecretHash` keying — tenant-scoped secret identity.
 ///
-/// Planned call site (Phase 1 identity): secret-hash keyed derivation.
 /// Hash mode: **BLAKE3 keyed mode** (`Hasher::new_keyed`). The domain tag is
 /// fed as data *inside* the keyed hasher, not as a derive-key context.
 pub const SECRET_HASH_V1: &[u8] = b"gossip/secret-hash/v1";
 
 /// `StableItemId` derivation from `ItemKey`.
 ///
-/// Planned call site (Phase 1 identity): stable item-ID derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const ITEM_ID_V1: &[u8] = b"gossip/item-id/v1";
 
 /// `ObjectVersionId` derivation from version bytes.
 ///
-/// Planned call site (Phase 1 identity): object-version-ID derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const OBJECT_VERSION_V1: &[u8] = b"gossip/object-version/v1";
 
 /// `RuleFingerprint` derivation from rule definition.
 ///
-/// Planned call site: engine-side rule fingerprinting (outside this crate).
 /// Domain tag provided here for registry completeness and uniqueness enforcement.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const RULE_FINGERPRINT_V1: &[u8] = b"gossip/rule/v1";
@@ -96,7 +87,6 @@ pub const RULE_FINGERPRINT_V1: &[u8] = b"gossip/rule/v1";
 
 /// `PolicyHash` derivation from `PolicyHashInputs`.
 ///
-/// Planned call site (Phase 1 policy hashing): `PolicyHash` computation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 ///
 /// Note: version is `v2` because the derivation scheme was redesigned after
@@ -105,7 +95,6 @@ pub const POLICY_HASH_V2: &[u8] = b"gossip/policy-hash/v2";
 
 /// Rules-digest derivation — content-addressed hash of the full rule set.
 ///
-/// Planned call site: engine-side rules digest computation (outside this crate).
 /// Domain tag provided here for registry completeness and uniqueness enforcement.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const RULES_DIGEST_V1: &[u8] = b"gossip/rules-digest/v1";
@@ -116,7 +105,6 @@ pub const RULES_DIGEST_V1: &[u8] = b"gossip/rules-digest/v1";
 
 /// OVID (Object-Version Identity) hash derivation.
 ///
-/// Planned call site (Phase 1 persistence): OVID derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const OVID_V1: &[u8] = b"gossip/persistence/v1/ovid";
 
@@ -129,7 +117,6 @@ pub const DONE_LEDGER_KEY_V1: &[u8] = b"gossip/persistence/v1/done-key";
 
 /// `TriageGroupKey` derivation from `(tenant, item)`.
 ///
-/// Planned call site (Phase 1 persistence): triage-group key derivation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const TRIAGE_GROUP_KEY_V1: &[u8] = b"gossip/persistence/v1/triage-group";
 

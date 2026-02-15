@@ -9,20 +9,6 @@
 //! | [`ItemKey`] | variable | `new(connector, path)` | Human-meaningful item identity |
 //! | [`StableItemId`] | 32 B | derived via `ItemKey::stable_id` | Fixed-width item identity for derivation |
 //! | [`ObjectVersionId`] | 32 B | `from_version_bytes` | Version-specific content identity |
-//!
-//! # Design decisions (locked)
-//!
-//! **D3a**: `ItemKey` is source-prefixed with an opaque `ConnectorTag` to prevent
-//! cross-source collisions. Connectors self-identify; the contracts crate does
-//! not enumerate connector types.
-//!
-//! **D3b**: `ObjectVersionId` is fixed `[u8; 32]`. Connectors normalize their
-//! version tokens via BLAKE3 before constructing.
-//!
-//! **D3c**: `ConnectorTag` is `[u8; 8]` — readable ASCII tags, null-padded.
-//!
-//! **D3d**: `StableItemId` is tenant-independent. Tenant scoping enters at
-//! `FindingId` derivation (chunk 4).
 
 use blake3::Hasher;
 use core::fmt;
@@ -273,7 +259,7 @@ crate::define_id_32! {
     /// This is the identifier that enters `FindingId` derivation. It is
     /// **tenant-independent**: the same file has the same `StableItemId`
     /// regardless of which tenant is scanning it. Tenant scoping is
-    /// applied at `FindingId` derivation (chunk 4).
+    /// applied at `FindingId` derivation.
     ///
     /// # Invariants
     ///
