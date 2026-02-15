@@ -386,6 +386,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn pub_canonical_bytes_stable(bytes in proptest::array::uniform32(any::<u8>())) {
             let id = PubTestId::from_bytes(bytes);

@@ -206,6 +206,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn tenant_id_canonical_bytes_stable(bytes in proptest::array::uniform32(any::<u8>())) {
             let id = TenantId::from_bytes(bytes);
@@ -232,6 +233,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn tenant_id_canonical_bytes_collision_free(
             a in proptest::array::uniform32(any::<u8>()),

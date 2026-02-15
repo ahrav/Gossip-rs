@@ -109,6 +109,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn u8_stable(v in any::<u8>()) {
             let mut h1 = Hasher::new();
@@ -161,6 +162,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
         #[test]
         fn u8_collision_free(a in any::<u8>(), b in any::<u8>()) {
             prop_assume!(a != b);
