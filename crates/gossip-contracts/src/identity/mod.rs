@@ -18,3 +18,7 @@
 //!   (fixed-endian, little-endian by convention).
 //! - Domain-tag uniqueness — every domain constant in the registry is globally
 //!   unique, enforced by a meta-test.
+
+mod canonical;
+
+pub use canonical::CanonicalBytes;
