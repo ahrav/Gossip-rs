@@ -237,6 +237,16 @@ impl CanonicalBytes for OccurrenceIdInputs {
 /// This is the only derivation that uses keyed mode rather than
 /// derive-key mode. The tenant's secret key prevents cross-tenant
 /// correlation of normalized secret values.
+///
+/// # Examples
+///
+/// ```
+/// use gossip_contracts::identity::{TenantSecretKey, NormHash, key_secret_hash};
+///
+/// let tenant_key = TenantSecretKey::from_bytes([0x42; 32]);
+/// let norm = NormHash::from_digest([0xAB; 32]);
+/// let secret_hash = key_secret_hash(&tenant_key, &norm);
+/// ```
 pub fn key_secret_hash(key: &TenantSecretKey, norm: &NormHash) -> SecretHash {
     let mut h = Hasher::new_keyed(key.as_bytes());
     // Domain tag is fed as *data* (not a derive-key context) because the
@@ -250,6 +260,27 @@ pub fn key_secret_hash(key: &TenantSecretKey, norm: &NormHash) -> SecretHash {
 /// Derive a version-stable [`FindingId`] from its inputs.
 ///
 /// Uses BLAKE3 derive-key mode with [`domain::FINDING_ID_V1`].
+///
+/// # Examples
+///
+/// ```
+/// use gossip_contracts::identity::{
+///     TenantId, StableItemId, RuleFingerprint, TenantSecretKey,
+///     NormHash, FindingIdInputs, derive_finding_id, key_secret_hash,
+/// };
+///
+/// let secret = key_secret_hash(
+///     &TenantSecretKey::from_bytes([0x42; 32]),
+///     &NormHash::from_digest([0xAB; 32]),
+/// );
+/// let inputs = FindingIdInputs {
+///     tenant: TenantId::from_bytes([0x01; 32]),
+///     item: StableItemId::from_bytes([0x02; 32]),
+///     rule: RuleFingerprint::from_bytes([0x03; 32]),
+///     secret,
+/// };
+/// let finding_id = derive_finding_id(&inputs);
+/// ```
 pub fn derive_finding_id(inputs: &FindingIdInputs) -> FindingId {
     let mut h = domain_hasher(domain::FINDING_ID_V1);
     inputs.write_canonical(&mut h);
@@ -259,6 +290,22 @@ pub fn derive_finding_id(inputs: &FindingIdInputs) -> FindingId {
 /// Derive a version-specific [`OccurrenceId`] from its inputs.
 ///
 /// Uses BLAKE3 derive-key mode with [`domain::OCCURRENCE_ID_V1`].
+///
+/// # Examples
+///
+/// ```
+/// use gossip_contracts::identity::{
+///     FindingId, ObjectVersionId, OccurrenceIdInputs, derive_occurrence_id,
+/// };
+///
+/// let inputs = OccurrenceIdInputs {
+///     finding: FindingId::from_bytes([0x01; 32]),
+///     version: ObjectVersionId::from_bytes([0x02; 32]),
+///     byte_offset: 1024,
+///     byte_length: 256,
+/// };
+/// let occurrence_id = derive_occurrence_id(&inputs);
+/// ```
 pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
     let mut h = domain_hasher(domain::OCCURRENCE_ID_V1);
     inputs.write_canonical(&mut h);

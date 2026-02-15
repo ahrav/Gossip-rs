@@ -122,6 +122,23 @@ impl CanonicalBytes for PolicyHashInputs {
 ///
 /// **Collision resistance**: Distinct `PolicyHashInputs` produce distinct
 /// `PolicyHash` values (with cryptographic collision resistance from BLAKE3).
+///
+/// # Examples
+///
+/// ```
+/// use gossip_contracts::identity::{
+///     compute_policy_hash, PolicyHashInputs, IdHashMode,
+///     CURRENT_VERSION, CURRENT_EVIDENCE_VERSION,
+/// };
+///
+/// let inputs = PolicyHashInputs {
+///     policy_hash_version: CURRENT_VERSION,
+///     id_hash_mode: IdHashMode::KeyedV1,
+///     evidence_hash_version: CURRENT_EVIDENCE_VERSION,
+///     rules_digest: [0xAA; 32],
+/// };
+/// let hash = compute_policy_hash(&inputs);
+/// ```
 pub fn compute_policy_hash(inputs: &PolicyHashInputs) -> PolicyHash {
     let mut h = domain_hasher(domain::POLICY_HASH_V2);
     inputs.write_canonical(&mut h);
