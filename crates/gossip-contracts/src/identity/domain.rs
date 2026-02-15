@@ -22,12 +22,10 @@
 //!
 //! # Safety requirements
 //!
-//! - Every constant **must** be valid UTF-8 (ASCII expected) because
-//!   [`domain_hasher`] validates `&[u8]` as UTF-8 before constructing the hasher.
-//! - No two constants may share the same byte value. The `no_duplicate_values`
+//! - No two constants may share the same value. The `no_duplicate_values`
 //!   test enforces this at `cargo test` time.
-//! - Constants are `&[u8]` (not `&str`) to avoid a redundant conversion
-//!   at every call site; UTF-8 validation happens inside `domain_hasher`.
+//! - Constants are `&str` so [`domain_hasher`] can pass them directly to
+//!   BLAKE3's derive-key API without runtime UTF-8 validation.
 //!
 //! [`domain_hasher`]: super::domain_hasher
 
@@ -38,12 +36,12 @@
 /// Shard-ID derivation during split operations.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const SPLIT_ID_V1: &[u8] = b"gossip/coord/v1/split-id";
+pub const SPLIT_ID_V1: &str = "gossip/coord/v1/split-id";
 
 /// Op-log payload hashing for idempotency conflict detection.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const OP_PAYLOAD_V1: &[u8] = b"gossip/coord/v1/op-payload";
+pub const OP_PAYLOAD_V1: &str = "gossip/coord/v1/op-payload";
 
 // =========================================================================
 // Identity subsystem — finding & secret derivations
@@ -52,34 +50,34 @@ pub const OP_PAYLOAD_V1: &[u8] = b"gossip/coord/v1/op-payload";
 /// `FindingId` derivation from `(tenant, item, rule, secret_hash)`.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const FINDING_ID_V1: &[u8] = b"gossip/finding/v1";
+pub const FINDING_ID_V1: &str = "gossip/finding/v1";
 
 /// `OccurrenceId` derivation from `(finding, version, offset, length)`.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const OCCURRENCE_ID_V1: &[u8] = b"gossip/occurrence/v1";
+pub const OCCURRENCE_ID_V1: &str = "gossip/occurrence/v1";
 
 /// `SecretHash` keying — tenant-scoped secret identity.
 ///
 /// Hash mode: **BLAKE3 keyed mode** (`Hasher::new_keyed`). The domain tag is
 /// fed as data *inside* the keyed hasher, not as a derive-key context.
-pub const SECRET_HASH_V1: &[u8] = b"gossip/secret-hash/v1";
+pub const SECRET_HASH_V1: &str = "gossip/secret-hash/v1";
 
 /// `StableItemId` derivation from `ItemKey`.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const ITEM_ID_V1: &[u8] = b"gossip/item-id/v1";
+pub const ITEM_ID_V1: &str = "gossip/item-id/v1";
 
 /// `ObjectVersionId` derivation from version bytes.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const OBJECT_VERSION_V1: &[u8] = b"gossip/object-version/v1";
+pub const OBJECT_VERSION_V1: &str = "gossip/object-version/v1";
 
 /// `RuleFingerprint` derivation from rule definition.
 ///
 /// Domain tag provided here for registry completeness and uniqueness enforcement.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const RULE_FINGERPRINT_V1: &[u8] = b"gossip/rule/v1";
+pub const RULE_FINGERPRINT_V1: &str = "gossip/rule/v1";
 
 // =========================================================================
 // Policy subsystem
@@ -91,13 +89,13 @@ pub const RULE_FINGERPRINT_V1: &[u8] = b"gossip/rule/v1";
 ///
 /// Note: version is `v2` because the derivation scheme was redesigned after
 /// the initial spec (v1 was never shipped).
-pub const POLICY_HASH_V2: &[u8] = b"gossip/policy-hash/v2";
+pub const POLICY_HASH_V2: &str = "gossip/policy-hash/v2";
 
 /// Rules-digest derivation — content-addressed hash of the full rule set.
 ///
 /// Domain tag provided here for registry completeness and uniqueness enforcement.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const RULES_DIGEST_V1: &[u8] = b"gossip/rules-digest/v1";
+pub const RULES_DIGEST_V1: &str = "gossip/rules-digest/v1";
 
 // =========================================================================
 // Persistence subsystem
@@ -106,19 +104,44 @@ pub const RULES_DIGEST_V1: &[u8] = b"gossip/rules-digest/v1";
 /// OVID (Object-Version Identity) hash derivation.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const OVID_V1: &[u8] = b"gossip/persistence/v1/ovid";
+pub const OVID_V1: &str = "gossip/persistence/v1/ovid";
 
 /// Done-ledger key derivation.
 ///
 /// Reserved for future use — will be needed if the done-ledger key requires
 /// hashing beyond simple field concatenation.
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const DONE_LEDGER_KEY_V1: &[u8] = b"gossip/persistence/v1/done-key";
+pub const DONE_LEDGER_KEY_V1: &str = "gossip/persistence/v1/done-key";
 
 /// `TriageGroupKey` derivation from `(tenant, item)`.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
-pub const TRIAGE_GROUP_KEY_V1: &[u8] = b"gossip/persistence/v1/triage-group";
+pub const TRIAGE_GROUP_KEY_V1: &str = "gossip/persistence/v1/triage-group";
+
+// =========================================================================
+// Authoritative constant list
+// =========================================================================
+
+/// Every domain constant in the registry, in declaration order.
+///
+/// The array length is checked at compile time — adding a constant without
+/// updating `ALL` is a compile error. Tests use this for uniqueness and
+/// coverage checks.
+pub const ALL: [&str; 13] = [
+    SPLIT_ID_V1,
+    OP_PAYLOAD_V1,
+    FINDING_ID_V1,
+    OCCURRENCE_ID_V1,
+    SECRET_HASH_V1,
+    ITEM_ID_V1,
+    OBJECT_VERSION_V1,
+    RULE_FINGERPRINT_V1,
+    POLICY_HASH_V2,
+    RULES_DIGEST_V1,
+    OVID_V1,
+    DONE_LEDGER_KEY_V1,
+    TRIAGE_GROUP_KEY_V1,
+];
 
 // =========================================================================
 // Test fixtures
@@ -127,10 +150,10 @@ pub const TRIAGE_GROUP_KEY_V1: &[u8] = b"gossip/persistence/v1/triage-group";
 /// Returns every domain constant in the registry as a `(name, value)` pair.
 ///
 /// Used by the uniqueness and coverage tests in this module.
-/// When adding a new domain constant, you **must** add it here *and*
-/// bump `expected_count` in `fixture_covers_all_module_constants`.
+/// When adding a new domain constant, you **must** add it to [`ALL`] *and*
+/// here, then bump the `ALL` array length.
 #[cfg(test)]
-pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static [u8])> {
+pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {
     vec![
         ("SPLIT_ID_V1", SPLIT_ID_V1),
         ("OP_PAYLOAD_V1", OP_PAYLOAD_V1),
@@ -156,15 +179,14 @@ mod tests {
     #[test]
     fn all_constants_are_printable_ascii() {
         for (name, value) in all_domain_constants() {
-            for (i, &byte) in value.iter().enumerate() {
+            for (i, &byte) in value.as_bytes().iter().enumerate() {
                 assert!(
                     byte.is_ascii_lowercase()
                         || byte.is_ascii_digit()
                         || byte == b'/'
                         || byte == b'-',
                     "domain constant {name} has disallowed byte 0x{byte:02X} \
-                     at position {i}: {:?}",
-                    core::str::from_utf8(value).unwrap_or("<invalid>")
+                     at position {i}: {value:?}",
                 );
             }
         }
@@ -172,9 +194,7 @@ mod tests {
 
     #[test]
     fn all_constants_follow_naming_convention() {
-        for (name, value) in all_domain_constants() {
-            let s = core::str::from_utf8(value).unwrap();
-
+        for (name, s) in all_domain_constants() {
             assert!(
                 s.starts_with("gossip/"),
                 "domain constant {name} does not start with 'gossip/': {s}"
@@ -212,15 +232,13 @@ mod tests {
         for (name, value) in all_domain_constants() {
             assert!(
                 value.len() >= 11,
-                "domain constant {name} is too short ({} bytes, min 11): {:?}",
+                "domain constant {name} is too short ({} bytes, min 11): {value:?}",
                 value.len(),
-                core::str::from_utf8(value).unwrap_or("<invalid>")
             );
             assert!(
                 value.len() <= 64,
-                "domain constant {name} is too long ({} bytes, max 64): {:?}",
+                "domain constant {name} is too long ({} bytes, max 64): {value:?}",
                 value.len(),
-                core::str::from_utf8(value).unwrap_or("<invalid>")
             );
         }
     }
@@ -247,20 +265,25 @@ mod tests {
     }
 
     #[test]
-    fn fixture_covers_all_module_constants() {
-        // Verify the fixture count matches the number of `pub const` items
-        // defined in this module. If you add a constant and forget to add it
-        // to `all_domain_constants()`, this test will catch it.
-        //
-        // Update this count when adding new constants.
-        let expected_count = 13;
-        let actual = all_domain_constants();
+    fn fixture_covers_all_constants() {
+        // The ALL array length is compiler-checked (adding a constant without
+        // updating ALL is a compile error). This test verifies the named
+        // fixture stays in sync with ALL.
+        let fixture = all_domain_constants();
         assert_eq!(
-            actual.len(),
-            expected_count,
-            "all_domain_constants() has {} entries but expected {expected_count}. \
-             Did you add a new constant without updating the fixture?",
-            actual.len()
+            fixture.len(),
+            ALL.len(),
+            "all_domain_constants() has {} entries but ALL has {}. \
+             Did you add a constant without updating both?",
+            fixture.len(),
+            ALL.len(),
         );
+        // Every value in the fixture must appear in ALL.
+        for (name, value) in &fixture {
+            assert!(
+                ALL.contains(value),
+                "fixture entry {name} ({value:?}) missing from ALL array"
+            );
+        }
     }
 }

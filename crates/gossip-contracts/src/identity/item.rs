@@ -56,12 +56,18 @@ pub struct ConnectorTag([u8; 8]);
 
 impl fmt::Debug for ConnectorTag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Print as ASCII if all bytes are printable or null, else hex.
-        let end = self.0.iter().position(|&b| b == 0).unwrap_or(8);
-        let ascii = &self.0[..end];
-        if ascii.iter().all(|b| b.is_ascii_graphic()) {
-            // Safety: we just checked all bytes are ASCII graphic.
-            let s = core::str::from_utf8(ascii).unwrap_or("???");
+        // Three branches:
+        // 1. Properly null-padded + all-ASCII-graphic prefix → quoted ASCII
+        // 2. No NUL (all 8 bytes filled) + all-ASCII-graphic → quoted ASCII
+        // 3. Everything else → hex
+        let first_nul = self.0.iter().position(|&b| b == 0);
+        let (prefix, tail_clean) = match first_nul {
+            Some(pos) => (&self.0[..pos], self.0[pos..].iter().all(|&b| b == 0)),
+            None => (&self.0[..], true),
+        };
+
+        if tail_clean && !prefix.is_empty() && prefix.iter().all(|b| b.is_ascii_graphic()) {
+            let s = core::str::from_utf8(prefix).unwrap_or("???");
             write!(f, "ConnectorTag({s:?})")
         } else {
             write!(
@@ -100,7 +106,8 @@ impl ConnectorTag {
     ///
     /// # Panics
     ///
-    /// Panics if `tag` is longer than 8 bytes or empty.
+    /// Panics if `tag` is longer than 8 bytes, empty, or contains
+    /// non-ASCII-graphic bytes (anything outside `!`..`~`, i.e. 0x21..0x7E).
     pub const fn from_ascii(tag: &[u8]) -> Self {
         assert!(!tag.is_empty(), "ConnectorTag must not be empty");
         assert!(tag.len() <= 8, "ConnectorTag must be at most 8 bytes");
@@ -108,6 +115,11 @@ impl ConnectorTag {
         let mut buf = [0u8; 8];
         let mut i = 0;
         while i < tag.len() {
+            // const-compatible equivalent of `tag[i].is_ascii_graphic()`.
+            assert!(
+                tag[i] > 0x20 && tag[i] < 0x7F,
+                "ConnectorTag bytes must be ASCII graphic (0x21..0x7E)"
+            );
             buf[i] = tag[i];
             i += 1;
         }
@@ -229,10 +241,9 @@ impl ItemKey {
     /// Derive the fixed-width [`StableItemId`] for this key.
     ///
     /// This is a pure, infallible function: same `ItemKey` always produces
-    /// the same `StableItemId`. The internal `expect` cannot panic because
-    /// [`domain::ITEM_ID_V1`] is an ASCII byte-string literal.
+    /// the same `StableItemId`.
     pub fn stable_id(&self) -> StableItemId {
-        let mut h = domain_hasher(domain::ITEM_ID_V1).expect("ITEM_ID_V1 is valid UTF-8");
+        let mut h = domain_hasher(domain::ITEM_ID_V1);
         self.write_canonical(&mut h);
         StableItemId::from_bytes(finalize_32(&h))
     }
@@ -339,8 +350,7 @@ impl ObjectVersionId {
     /// Panics if `version_bytes` is empty.
     pub fn from_version_bytes(version_bytes: &[u8]) -> Self {
         assert!(!version_bytes.is_empty(), "version bytes must not be empty");
-        let mut h =
-            domain_hasher(domain::OBJECT_VERSION_V1).expect("OBJECT_VERSION_V1 is valid UTF-8");
+        let mut h = domain_hasher(domain::OBJECT_VERSION_V1);
         version_bytes.write_canonical(&mut h);
         Self::from_bytes(finalize_32(&h))
     }
@@ -381,6 +391,28 @@ mod tests {
         let dbg = format!("{tag:?}");
         // Non-ASCII → hex output.
         assert!(dbg.contains("ffffffff"), "got: {dbg}");
+    }
+
+    #[test]
+    fn connector_tag_debug_nonzero_after_nul() {
+        // Tag with non-zero byte after first NUL must print as hex, not ASCII.
+        let tag = ConnectorTag::from_bytes(*b"github\0\x42");
+        let dbg = format!("{tag:?}");
+        assert!(
+            !dbg.contains("\"github\""),
+            "non-zero trailing byte must not be hidden: {dbg}"
+        );
+        assert!(dbg.starts_with("ConnectorTag("), "got: {dbg}");
+        // Should be hex output.
+        assert!(dbg.contains("676974687562"), "got: {dbg}");
+    }
+
+    #[test]
+    fn connector_tag_debug_full_ascii_no_nul() {
+        // All 8 bytes are ASCII graphic, no NUL → prints as ASCII.
+        let tag = ConnectorTag::from_bytes(*b"githubXY");
+        let dbg = format!("{tag:?}");
+        assert!(dbg.contains("githubXY"), "got: {dbg}");
     }
 
     // -- ItemKey --
@@ -472,12 +504,32 @@ mod tests {
 
         #[test]
         fn connector_tag_from_ascii_pads_correctly(
-            raw in proptest::collection::vec(proptest::num::u8::ANY, 1..=8),
+            raw in proptest::collection::vec(0x21u8..0x7Fu8, 1..=8),
         ) {
             let tag = ConnectorTag::from_ascii(&raw);
             let mut expected = [0u8; 8];
             expected[..raw.len()].copy_from_slice(&raw);
             proptest::prop_assert_eq!(*tag.as_bytes(), expected);
+        }
+
+        #[test]
+        fn from_ascii_rejects_non_graphic(
+            // Generate 1-8 bytes with at least one non-graphic byte.
+            len in 1usize..=8,
+            bad_pos in 0usize..8,
+            bad_byte in proptest::prop_oneof![
+                0u8..=0x20u8,   // NUL, control chars, space
+                0x7Fu8..=0xFFu8 // DEL and high bytes
+            ],
+            fill_byte in 0x21u8..0x7Fu8,
+        ) {
+            let len = len.min(8);
+            let bad_pos = bad_pos % len;
+            let mut buf = vec![fill_byte; len];
+            buf[bad_pos] = bad_byte;
+
+            let result = std::panic::catch_unwind(|| ConnectorTag::from_ascii(&buf));
+            proptest::prop_assert!(result.is_err(), "expected panic for input {buf:?}");
         }
 
         #[test]
