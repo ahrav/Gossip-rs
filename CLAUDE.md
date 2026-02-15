@@ -1,10 +1,12 @@
+**NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
+
 ## Task Management
 
 This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
 
 At session start: run `bd ready` to find work.
 Track status with `bd update <id> --status in_progress`.
-At session end: close finished work, file new issues, run `bd sync`.
+At session end: close finished work and file new issues.
 
 For graph-aware triage: `bv --robot-triage` (never bare `bv`).
 
@@ -130,7 +132,7 @@ bd create --title="..." --type=task --priority=2
 bd update <id> --status=in_progress
 bd close <id> --reason="Completed"
 bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+bd sync --flush-only  # Export beads to JSONL (no git ops)
 ```
 
 ### Workflow Pattern
@@ -139,7 +141,6 @@ bd sync               # Commit and push changes
 2. **Claim**: Use `bd update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
 
 ### Key Concepts
 
@@ -148,23 +149,12 @@ bd sync               # Commit and push changes
 - **Types**: task, bug, feature, epic, question, docs
 - **Blocking**: `bd dep add <issue> <depends-on>` to add dependencies
 
-### Session Protocol
-
-**Before ending any session, run this checklist:**
-
-```bash
-git status              # Check what changed
-git add <files>         # Stage code changes
-bd sync                 # Commit beads changes
-```
-
 ### Best Practices
 
 - Check `bd ready` at session start to find available work
 - Update status as you work (in_progress → closed)
 - Create new issues with `bd create` when you discover tasks
 - Use descriptive titles and set appropriate priority/type
-- Always `bd sync` before ending session
 
 <!-- end-bv-agent-instructions -->
 
