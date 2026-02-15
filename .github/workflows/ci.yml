@@ -25,10 +25,18 @@ jobs:
     runs-on: ubuntu-24.04
     if: github.event_name == 'pull_request'
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
+      rust: ${{ steps.non_pr.outputs.rust || steps.filter.outputs.rust }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - name: Default to rust changes for non-PR events
+        if: github.event_name != 'pull_request'
+        id: non_pr
+        run: echo "rust=true" >> "$GITHUB_OUTPUT"
+
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+
+      - if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
@@ -45,7 +53,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-24.04
-    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes]
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +97,7 @@ jobs:
   doc:
     name: Doc
     runs-on: ubuntu-24.04
-    if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes]
     env:
       RUSTDOCFLAGS: -D warnings
