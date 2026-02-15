@@ -1,0 +1,78 @@
+name: "Setup Rust"
+description: "Install Rust toolchain and configure caching for CI jobs"
+
+inputs:
+  toolchain:
+    description: "Rust toolchain (stable or nightly)"
+    required: false
+    default: "stable"
+  components:
+    description: "Comma-separated Rust components (e.g. clippy, rustfmt, miri)"
+    required: false
+    default: ""
+  shared-key:
+    description: "Shared cache key for Swatinem/rust-cache"
+    required: true
+  save-cache:
+    description: "Whether to save the cache (false for read-only consumers)"
+    required: false
+    default: "true"
+  extra-apt:
+    description: "Additional apt packages to install (space-separated)"
+    required: false
+    default: ""
+  cache-workspaces:
+    description: "Workspaces for rust-cache (e.g. 'fuzz -> target')"
+    required: false
+    default: ""
+  targets:
+    description: "Additional rustup targets to install (e.g. x86_64-unknown-linux-musl)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install system deps
+      if: inputs.extra-apt != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        raw_input='${{ inputs.extra-apt }}'
+        normalized_input="${raw_input//$'\n'/ }"
+        normalized_input="${normalized_input//$'\t'/ }"
+        read -r -a packages <<< "${normalized_input}"
+
+        if [[ ${#packages[@]} -eq 0 ]]; then
+          echo "No valid extra apt packages were provided."
+          exit 0
+        fi
+
+        # Treat input as package tokens only (no shell metacharacters/flags).
+        for package in "${packages[@]}"; do
+          if [[ ! "${package}" =~ ^[A-Za-z0-9][A-Za-z0-9+.:-]*$ ]]; then
+            echo "Invalid apt package token: '${package}'" >&2
+            exit 1
+          fi
+        done
+
+        sudo apt-get update
+        sudo apt-get install -y -- "${packages[@]}"
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Setup sccache
+      uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
+
+    - name: Configure Rust cache
+      uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        save-if: ${{ inputs.save-cache }}
+        cache-all-crates: "true"
+        workspaces: ${{ inputs.cache-workspaces }}

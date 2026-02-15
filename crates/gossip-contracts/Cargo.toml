@@ -4,6 +4,17 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
 description = "Shared types, encodings, and invariants for gossip-rs"
 
+[lib]
+
+[features]
+default = []
+test-support = []
+
 [dependencies]
+blake3 = "1.8"
+
+[dev-dependencies]
+proptest = "1.10"
