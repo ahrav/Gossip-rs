@@ -171,6 +171,48 @@ Do NOT stage, commit, or push code changes. Leave that to the user.
 
 <!-- end-bv-agent-instructions -->
 
+<!-- duplication-prevention-v1 -->
+
+## Duplication Prevention — MANDATORY Pre-Coding Check
+
+**Before writing ANY new function, struct, trait, method, or module, you MUST
+verify the functionality does not already exist in the codebase.**
+
+This is non-negotiable. Duplicated logic is a bug — it creates drift, increases
+maintenance burden, and undermines the single-source-of-truth principle.
+
+### Required Steps
+
+1. **Search before you write.** Use Grep/Glob to search for existing
+   implementations that match the intent of what you are about to create.
+   Search by concept (e.g., "retry", "timeout", "base64 decode"), not just
+   by the exact name you plan to use.
+2. **Check neighboring modules.** Read the module and its siblings. If you are
+   adding a helper to `engine/core.rs`, read the other files in `engine/` and
+   `stdx/` first.
+3. **Check utility crates.** `src/stdx/` contains shared data structures and
+   helpers. Confirm your functionality is not already there before creating
+   a new one.
+4. **If similar logic exists, extend or reuse it.** Do not create a parallel
+   implementation. Refactor the existing code to be more general if needed.
+5. **If you are unsure, ask.** It is always better to ask "does X already
+   exist?" than to introduce a duplicate.
+
+### What Counts as Duplication
+
+- A second function that does the same thing with a different name.
+- A method that reimplements logic already available in a trait or utility.
+- A new struct that is structurally identical to an existing one.
+- Copy-pasted blocks with minor variations (extract a shared helper instead).
+- A new constant/sentinel that duplicates an existing one.
+
+### Enforcement
+
+If during review a duplicate is found that could have been caught by searching
+the codebase first, the change will be rejected. No exceptions.
+
+<!-- end-duplication-prevention -->
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session:**
