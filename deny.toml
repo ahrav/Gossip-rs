@@ -1,11 +1,8 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-unsound = "deny"
-yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -18,6 +15,7 @@ allow = [
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
