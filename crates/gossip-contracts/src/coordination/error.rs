@@ -257,6 +257,7 @@ impl std::error::Error for CoordError {
 /// it cannot produce `StaleFence` or `LeaseExpired`. It can fail if
 /// the shard is terminal, or if another worker holds a live lease.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AcquireError {
     /// The shard does not exist.
     ShardNotFound { shard: ShardKey },
@@ -338,6 +339,7 @@ impl std::error::Error for AcquireError {}
 /// cursor, and split variants because renew is not an idempotent
 /// progress-advancing operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RenewError {
     ShardNotFound {
         shard: ShardKey,
@@ -393,6 +395,7 @@ impl std::error::Error for RenewError {}
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CheckpointError {
     ShardNotFound {
         shard: ShardKey,
@@ -422,6 +425,8 @@ pub enum CheckpointError {
         new_key: Option<Box<[u8]>>,
     },
     CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
+    /// The checkpoint cursor did not contain a `last_key`, which is required
+    /// to track scan progress.
     CheckpointMissingKey,
 }
 
@@ -518,6 +523,7 @@ impl std::error::Error for CheckpointError {}
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CompleteError {
     ShardNotFound {
         shard: ShardKey,
@@ -643,6 +649,7 @@ impl std::error::Error for CompleteError {}
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParkError {
     ShardNotFound {
         shard: ShardKey,
@@ -740,6 +747,7 @@ impl std::error::Error for ParkError {}
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SplitError {
     ShardNotFound {
         shard: ShardKey,
@@ -1057,6 +1065,7 @@ pub enum IdempotentOutcome<T> {
 
 impl<T> IdempotentOutcome<T> {
     /// Extract the inner result regardless of execution path.
+    #[inline]
     pub fn into_inner(self) -> T {
         match self {
             Self::Executed(v) | Self::Replayed(v) => v,
@@ -1064,6 +1073,7 @@ impl<T> IdempotentOutcome<T> {
     }
 
     /// Returns `true` if this was a replay (retry).
+    #[inline]
     pub fn is_replay(&self) -> bool {
         matches!(self, Self::Replayed(_))
     }
@@ -1075,6 +1085,7 @@ impl<T> IdempotentOutcome<T> {
     }
 
     /// Map the inner value, preserving the execution/replay distinction.
+    #[inline]
     #[must_use = "map produces a new outcome that should be used"]
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> IdempotentOutcome<U> {
         match self {
@@ -1199,6 +1210,24 @@ mod tests {
         }
     }
 
+    /// Assert every variant in `variants` panics via `unreachable!()` when
+    /// converting to `E`.
+    fn assert_from_coord_error_rejected<E: From<CoordError> + fmt::Debug + 'static>(
+        variants: Vec<CoordError>,
+    ) {
+        for v in variants {
+            let label = format!("{v}");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: E = v.into();
+            }));
+            assert!(
+                result.is_err(),
+                "expected unreachable!() panic converting {label} -> {}",
+                std::any::type_name::<E>(),
+            );
+        }
+    }
+
     // -- IdempotentOutcome -----------------------------------------------
 
     #[test]
@@ -1252,7 +1281,9 @@ mod tests {
         v.extend(cursor_variants());
         v.push(checkpoint_missing_key_variant());
         assert_from_coord_error_accepted::<CheckpointError>(v);
+
         // Rejected: SplitInvalid
+        assert_from_coord_error_rejected::<CheckpointError>(vec![split_invalid_variant()]);
     }
 
     #[test]
@@ -1262,7 +1293,9 @@ mod tests {
         v.extend(cursor_variants());
         v.push(checkpoint_missing_key_variant());
         assert_from_coord_error_accepted::<CompleteError>(v);
+
         // Rejected: SplitInvalid
+        assert_from_coord_error_rejected::<CompleteError>(vec![split_invalid_variant()]);
     }
 
     #[test]
@@ -1270,8 +1303,13 @@ mod tests {
         let mut v = common_precondition_variants();
         v.push(op_id_conflict_variant());
         assert_from_coord_error_accepted::<ParkError>(v);
+
         // Rejected: CursorRegression, CursorOutOfBounds,
         //           SplitInvalid, CheckpointMissingKey
+        let mut rejected = cursor_variants();
+        rejected.push(split_invalid_variant());
+        rejected.push(checkpoint_missing_key_variant());
+        assert_from_coord_error_rejected::<ParkError>(rejected);
     }
 
     #[test]
@@ -1280,16 +1318,26 @@ mod tests {
         v.push(op_id_conflict_variant());
         v.push(split_invalid_variant());
         assert_from_coord_error_accepted::<SplitError>(v);
+
         // Rejected: CursorRegression, CursorOutOfBounds,
         //           CheckpointMissingKey
+        let mut rejected = cursor_variants();
+        rejected.push(checkpoint_missing_key_variant());
+        assert_from_coord_error_rejected::<SplitError>(rejected);
     }
 
     #[test]
     fn renew_error_from_coord_error_exhaustive() {
         let v = common_precondition_variants();
         assert_from_coord_error_accepted::<RenewError>(v);
+
         // Rejected: OpIdConflict, CursorRegression,
         //           CursorOutOfBounds, SplitInvalid, CheckpointMissingKey
+        let mut rejected = vec![op_id_conflict_variant()];
+        rejected.extend(cursor_variants());
+        rejected.push(split_invalid_variant());
+        rejected.push(checkpoint_missing_key_variant());
+        assert_from_coord_error_rejected::<RenewError>(rejected);
     }
 
     // -- Display + Security tests ----------------------------------------
@@ -1333,22 +1381,76 @@ mod tests {
         }
     }
 
-    #[test]
-    fn op_id_conflict_display_no_hash_leak() {
-        let err = CoordError::OpIdConflict {
-            op_id: OpId::from_raw(1),
-            expected_hash: 0xDEAD_BEEF,
-            actual_hash: 0xCAFE_BABE,
-        };
-        let display = err.to_string();
+    fn assert_op_id_conflict_no_hash_leak(display: &str, debug: &str, type_name: &str) {
+        // Display checks.
         assert!(
             !display.contains("DEAD") && !display.contains("CAFE"),
-            "display must not leak hash values: {display}"
+            "{type_name} Display leaks hex hash: {display}"
         );
         assert!(
             !display.contains("3735928559") && !display.contains("3405691582"),
-            "display must not leak hash values as decimal: {display}"
+            "{type_name} Display leaks decimal hash: {display}"
         );
+        // Debug checks.
+        assert!(
+            debug.contains("<redacted>"),
+            "{type_name} Debug must contain <redacted>: {debug}"
+        );
+        assert!(
+            !debug.contains("DEAD") && !debug.contains("CAFE"),
+            "{type_name} Debug leaks hex hash: {debug}"
+        );
+        assert!(
+            !debug.contains("3735928559") && !debug.contains("3405691582"),
+            "{type_name} Debug leaks decimal hash: {debug}"
+        );
+    }
+
+    #[test]
+    fn op_id_conflict_no_hash_leak_all_types() {
+        let op = OpId::from_raw(1);
+        let ha = 0xDEAD_BEEF_u64;
+        let hb = 0xCAFE_BABE_u64;
+
+        // CoordError
+        let e = CoordError::OpIdConflict {
+            op_id: op,
+            expected_hash: ha,
+            actual_hash: hb,
+        };
+        assert_op_id_conflict_no_hash_leak(&e.to_string(), &format!("{e:?}"), "CoordError");
+
+        // CheckpointError
+        let e = CheckpointError::OpIdConflict {
+            op_id: op,
+            expected_hash: ha,
+            actual_hash: hb,
+        };
+        assert_op_id_conflict_no_hash_leak(&e.to_string(), &format!("{e:?}"), "CheckpointError");
+
+        // CompleteError
+        let e = CompleteError::OpIdConflict {
+            op_id: op,
+            expected_hash: ha,
+            actual_hash: hb,
+        };
+        assert_op_id_conflict_no_hash_leak(&e.to_string(), &format!("{e:?}"), "CompleteError");
+
+        // ParkError
+        let e = ParkError::OpIdConflict {
+            op_id: op,
+            expected_hash: ha,
+            actual_hash: hb,
+        };
+        assert_op_id_conflict_no_hash_leak(&e.to_string(), &format!("{e:?}"), "ParkError");
+
+        // SplitError
+        let e = SplitError::OpIdConflict {
+            op_id: op,
+            expected_hash: ha,
+            actual_hash: hb,
+        };
+        assert_op_id_conflict_no_hash_leak(&e.to_string(), &format!("{e:?}"), "SplitError");
     }
 
     // -- source() chain tests --------------------------------------------
@@ -1418,28 +1520,6 @@ mod tests {
     }
 
     // -- Debug redaction tests -------------------------------------------
-
-    #[test]
-    fn op_id_conflict_debug_no_hash_leak() {
-        let err = CoordError::OpIdConflict {
-            op_id: OpId::from_raw(1),
-            expected_hash: 0xDEAD_BEEF,
-            actual_hash: 0xCAFE_BABE,
-        };
-        let debug = format!("{err:?}");
-        assert!(
-            debug.contains("<redacted>"),
-            "debug must redact hash values: {debug}"
-        );
-        assert!(
-            !debug.contains("DEAD") && !debug.contains("CAFE"),
-            "debug must not leak hash values: {debug}"
-        );
-        assert!(
-            !debug.contains("3735928559") && !debug.contains("3405691582"),
-            "debug must not leak hash values as decimal: {debug}"
-        );
-    }
 
     #[test]
     fn already_leased_debug_no_owner_leak() {

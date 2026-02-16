@@ -24,9 +24,17 @@
 //! 2. **Terminal status** — fast rejection of dead shards
 //! 3. **Fence epoch** — zombie fencing
 //! 4. **Lease expiry** — time-based rejection
+//! 5. **Owner divergence** — catches identity mismatches when fence epochs agree
 //!
 //! This order ensures that a tenant-mismatch error never reveals whether
 //! the shard is terminal, has a stale fence, or has an expired lease.
+//!
+//! ## Invariants
+//!
+//! - **Lease deadline existence:** When a caller's fence epoch matches the
+//!   record's current fence epoch, the record's lease deadline MUST be `Some`.
+//!   If it is `None`, the record is in an inconsistent state and `validate_lease`
+//!   returns `StaleFence` to force re-acquisition (see check 4).
 
 use crate::coordination::cursor::{Cursor, check_cursor_advance, check_cursor_bounds};
 use crate::coordination::cursor::{CursorAdvance, CursorBoundsCheck};
@@ -42,6 +50,7 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId};
 /// 2. Terminal status — terminal shards reject all mutations.
 /// 3. Fence epoch — the lease's epoch must match the record's current epoch.
 /// 4. Lease expiry — `now` must be before the record's lease deadline.
+/// 5. Owner divergence — the lease's owner must match the record's current lease holder.
 ///
 /// # Preconditions
 ///
@@ -223,7 +232,10 @@ pub fn check_op_idempotency(
 ) -> Result<Option<&OpLogEntry>, CoordError> {
     // Precondition: payload hash must be non-zero. A zero hash indicates
     // broken hashing — this is a caller bug, not a protocol error.
-    assert!(payload_hash != 0, "payload_hash must be non-zero");
+    assert!(
+        payload_hash != 0,
+        "check_op_idempotency: payload_hash must be non-zero"
+    );
 
     let Some(entry) = record.op_log_lookup(op_id) else {
         return Ok(None);
@@ -442,6 +454,16 @@ mod tests {
             matches!(result, Err(CoordError::StaleFence { .. })),
             "owner divergence should return StaleFence, got {result:?}"
         );
+    }
+
+    // -- validate_lease: precondition tests --------------------------------
+
+    #[test]
+    #[should_panic(expected = "now must be > ZERO")]
+    fn validate_lease_panics_on_zero_time() {
+        let record = active_leased_record();
+        let lease = valid_lease_for(&record);
+        let _ = validate_lease(LogicalTime::ZERO, test_tenant(), &lease, &record);
     }
 
     // -- validate_lease: error priority ordering --------------------------
@@ -684,6 +706,37 @@ mod tests {
         assert!(
             matches!(result, Ok(Some(_))),
             "oldest entry in full op-log should be found"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "check_op_idempotency: payload_hash must be non-zero")]
+    fn check_op_idempotency_panics_on_zero_hash() {
+        let record = active_unleased_record();
+        let _ = check_op_idempotency(&record, OpId::from_raw(1), 0);
+    }
+
+    #[test]
+    fn check_op_idempotency_evicted_entry_returns_none() {
+        let mut record = active_unleased_record();
+        for i in 0..ShardRecord::OP_LOG_CAP as u64 {
+            record.op_log.push(make_entry(i + 1, 0x1000 + i));
+        }
+        // Evict oldest (op_id=1) by pushing beyond capacity.
+        record.op_log_push(make_entry(ShardRecord::OP_LOG_CAP as u64 + 1, 0x2000));
+
+        // Evicted entry should be treated as a new operation.
+        let result = check_op_idempotency(&record, OpId::from_raw(1), 0x1000);
+        assert!(
+            matches!(result, Ok(None)),
+            "evicted op should return Ok(None)"
+        );
+
+        // A surviving entry should still be found.
+        let result = check_op_idempotency(&record, OpId::from_raw(2), 0x1001);
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "surviving op should be found"
         );
     }
 
