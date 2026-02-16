@@ -299,6 +299,9 @@ pub struct ShardRecord {
     // -- Idempotency --
     /// Bounded operation log for idempotent replay.
     /// Oldest entries are evicted when capacity is reached.
+    /// After eviction, retries are treated as new operations — safe
+    /// because of convergent state transitions and [`FenceEpoch`] zombie
+    /// fencing. See [`op_log_lookup`](Self::op_log_lookup) for details.
     pub(crate) op_log: Vec<OpLogEntry>,
 }
 
@@ -578,6 +581,21 @@ impl ShardRecord {
     /// Returns `None` if the OpId is not in the log (either never seen
     /// or evicted). Linear scan in reverse order for retry optimization
     /// (~5ns avg improvement — retries involve the most recent operations).
+    ///
+    /// ## Eviction failure mode
+    ///
+    /// When an [`OpId`] has been evicted, this method returns `None` and
+    /// the caller treats the operation as new. This is safe because:
+    ///
+    /// 1. **Staleness guarantee** — eviction implies the `OpId` is at
+    ///    least [`OP_LOG_CAP`](Self::OP_LOG_CAP) operations old.
+    /// 2. **Convergent transitions** — shard operations are convergent
+    ///    state transitions: re-executing either converges to the same
+    ///    terminal state or is rejected by status guards (e.g., a split
+    ///    on an already-split shard is a no-op or error).
+    /// 3. **Primary zombie fence** — [`FenceEpoch`] is the primary
+    ///    defense against zombie workers from prior leases. The op-log
+    ///    is a *secondary* defense for in-lease retries only.
     pub fn op_log_lookup(&self, op: OpId) -> Option<&OpLogEntry> {
         debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
         self.op_log.iter().rev().find(|e| e.op_id() == op)
@@ -588,6 +606,24 @@ impl ShardRecord {
     /// Eviction is FIFO: the oldest entry (index 0) is removed first.
     /// This is correct because older operations are less likely to be
     /// retried — retry storms typically involve the most recent operations.
+    ///
+    /// ## Why `Vec::remove(0)` instead of `VecDeque`
+    ///
+    /// At cap=16, `remove(0)` shifts at most 15 entries (~480 bytes).
+    /// This fits in L1 cache as a single `memmove` and benchmarks show
+    /// no measurable difference from `VecDeque::pop_front`. `VecDeque`
+    /// would add ring-buffer indirection (modular indexing, two-region
+    /// iteration) for no benefit at this scale. The compile-time guard
+    /// [`OP_LOG_CAP`](Self::OP_LOG_CAP) `<= 64` prevents silent
+    /// regression if the cap is ever increased.
+    ///
+    /// ## Persistence atomicity
+    ///
+    /// This method is called within coordinator mutations that invoke
+    /// [`assert_invariants`](Self::assert_invariants) before persistence.
+    /// If any assertion fails, the mutation panics and is **not**
+    /// persisted — crash-recovery restores the last valid state. The
+    /// op-log therefore never contains a partially-applied entry on disk.
     ///
     /// # Panics
     ///
@@ -704,7 +740,9 @@ impl ShardRecord {
 }
 
 // Guard against future cap increases — Vec::remove(0) on more than 64
-// entries would become a noticeable memcpy.
+// entries would become a noticeable memcpy. At 64 entries × ~32 bytes
+// each, the shift is ~2 KiB — still comfortably L1-resident. Beyond
+// that threshold, switch to VecDeque for O(1) pop-front.
 const _: () = assert!(ShardRecord::OP_LOG_CAP > 0);
 const _: () = assert!(ShardRecord::OP_LOG_CAP <= 64);
 
