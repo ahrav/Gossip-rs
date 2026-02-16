@@ -317,7 +317,7 @@ macro_rules! define_id_64 {
             // Delegates to the u64 CanonicalBytes impl (8-byte LE, no prefix).
             #[inline]
             fn write_canonical(&self, h: &mut $crate::blake3::Hasher) {
-                h.update(&self.0.to_le_bytes());
+                self.0.write_canonical(h);
             }
         }
     };

@@ -177,4 +177,48 @@ mod tests {
             prop_assert_ne!(d1, d2);
         }
     }
+
+    // ---------------------------------------------------------------
+    // finalize_64: property-based
+    // ---------------------------------------------------------------
+
+    fn hash_payload_64(domain: &str, payload: &[u8]) -> u64 {
+        let mut hasher = domain_hasher(domain);
+        payload.write_canonical(&mut hasher);
+        finalize_64(&hasher)
+    }
+
+    proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        #[test]
+        fn finalize_64_is_le_prefix_of_finalize_32(
+            data in proptest::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let domain = "gossip/cross-width-anchor/v1";
+            let mut h = domain_hasher(domain);
+            data.as_slice().write_canonical(&mut h);
+
+            let full = finalize_32(&h);
+            let short = finalize_64(&h);
+
+            let expected = u64::from_le_bytes(full[..8].try_into().unwrap());
+            prop_assert_eq!(short, expected);
+        }
+
+        #[test]
+        fn finalize_64_deterministic(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let domain = "gossip/prop64/v1";
+            let d1 = hash_payload_64(domain, data.as_slice());
+            let d2 = hash_payload_64(domain, data.as_slice());
+            prop_assert_eq!(d1, d2);
+        }
+
+        #[test]
+        fn finalize_64_domain_separation(data in proptest::collection::vec(any::<u8>(), 1..256)) {
+            let d1 = hash_payload_64("gossip/left64/v1", data.as_slice());
+            let d2 = hash_payload_64("gossip/right64/v1", data.as_slice());
+            prop_assert_ne!(d1, d2);
+        }
+    }
 }
