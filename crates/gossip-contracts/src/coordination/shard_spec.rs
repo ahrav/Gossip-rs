@@ -21,9 +21,24 @@
 //! (Zhou et al., SIGMOD 2021) — key ranges as `[begin, end)` byte
 //! strings.
 
+use std::fmt;
+
 use blake3::Hasher;
 
 use crate::identity::CanonicalBytes;
+
+/// Maximum size of a shard-spec key (start or end) in bytes (4 KiB).
+///
+/// Same ceiling as [`super::cursor::MAX_KEY_SIZE`] — both operate in the
+/// same lexicographic keyspace. Defined per-module to avoid cross-dependency
+/// on an unrelated constant.
+pub const MAX_KEY_SIZE: usize = 4_096;
+
+/// Maximum size of shard-spec opaque metadata in bytes (64 KiB).
+///
+/// Metadata is stored verbatim by the coordinator. Unbounded metadata
+/// would bloat coordination state.
+pub const MAX_METADATA_SIZE: usize = 65_536;
 
 // ============================================================================
 // CursorSemantics
@@ -148,17 +163,23 @@ const _: () = assert!(CursorSemantics::Dispatched as u8 == 1);
 ///
 /// **Safety (cursor bounds)**: On checkpoint, `cursor.last_key` MUST
 /// fall within `[start, end)`. Enforced by the coordinator.
+///
+/// ## Encapsulation
+///
+/// Fields are private — constructors enforce the well-formed range
+/// invariant (`start < end`), and public accessors return borrowed
+/// views.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardSpec {
     /// Inclusive lower bound of the key range.
     ///
     /// Empty (`[]`) means "start of keyspace."
-    pub key_range_start: Box<[u8]>,
+    key_range_start: Box<[u8]>,
 
     /// Exclusive upper bound of the key range.
     ///
     /// Empty (`[]`) means "end of keyspace" (unbounded).
-    pub key_range_end: Box<[u8]>,
+    key_range_end: Box<[u8]>,
 
     /// Connector-opaque metadata.
     ///
@@ -168,7 +189,7 @@ pub struct ShardSpec {
     ///
     /// Participates in payload hashing for idempotency but is not used
     /// for any coordination decision.
-    pub metadata: Box<[u8]>,
+    metadata: Box<[u8]>,
 }
 
 impl ShardSpec {
@@ -212,15 +233,80 @@ impl ShardSpec {
         }
     }
 
-    /// Returns `true` if the range bounds are well-formed.
+    /// Fallible constructor: returns `Err` if range is inverted or keys
+    /// exceed [`MAX_KEY_SIZE`].
     ///
-    /// Valid iff either bound is unbounded (empty), or `start < end` (lex).
-    #[inline]
-    pub fn is_valid(&self) -> bool {
-        if !self.key_range_start.is_empty() && !self.key_range_end.is_empty() {
-            self.key_range_start.as_ref() < self.key_range_end.as_ref()
-        } else {
-            true
+    /// # Errors
+    ///
+    /// - [`ShardSpecInputError::KeyTooLarge`] — `start` or `end` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`ShardSpecInputError::InvertedRange`] — both `start` and `end`
+    ///   are non-empty and `start >= end`.
+    pub fn try_with_range(start: Vec<u8>, end: Vec<u8>) -> Result<Self, ShardSpecInputError> {
+        Self::try_with_range_and_metadata(start, end, vec![])
+    }
+
+    /// Fallible constructor: returns `Err` if range is inverted, keys
+    /// exceed [`MAX_KEY_SIZE`], or metadata exceeds [`MAX_METADATA_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ShardSpecInputError::KeyTooLarge`] — `start` or `end` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`ShardSpecInputError::InvertedRange`] — both `start` and `end`
+    ///   are non-empty and `start >= end`.
+    /// - [`ShardSpecInputError::MetadataTooLarge`] — `metadata` exceeds
+    ///   [`MAX_METADATA_SIZE`] bytes.
+    pub fn try_with_range_and_metadata(
+        start: Vec<u8>,
+        end: Vec<u8>,
+        metadata: Vec<u8>,
+    ) -> Result<Self, ShardSpecInputError> {
+        if start.len() > MAX_KEY_SIZE {
+            return Err(ShardSpecInputError::KeyTooLarge {
+                size: start.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if end.len() > MAX_KEY_SIZE {
+            return Err(ShardSpecInputError::KeyTooLarge {
+                size: end.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if metadata.len() > MAX_METADATA_SIZE {
+            return Err(ShardSpecInputError::MetadataTooLarge {
+                size: metadata.len(),
+                max: MAX_METADATA_SIZE,
+            });
+        }
+        if !start.is_empty() && !end.is_empty() && start.as_slice() >= end.as_slice() {
+            return Err(ShardSpecInputError::InvertedRange {
+                start_len: start.len(),
+                end_len: end.len(),
+            });
+        }
+        Ok(Self {
+            key_range_start: start.into_boxed_slice(),
+            key_range_end: end.into_boxed_slice(),
+            metadata: metadata.into_boxed_slice(),
+        })
+    }
+
+    /// Construct a `ShardSpec` from pre-built parts, bypassing validation.
+    ///
+    /// Only available in test builds — allows constructing intentionally
+    /// invalid specs for testing validation logic.
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(
+        key_range_start: Box<[u8]>,
+        key_range_end: Box<[u8]>,
+        metadata: Box<[u8]>,
+    ) -> Self {
+        Self {
+            key_range_start,
+            key_range_end,
+            metadata,
         }
     }
 
@@ -242,12 +328,31 @@ impl ShardSpec {
         self.is_start_unbounded() && self.is_end_unbounded()
     }
 
+    /// Inclusive lower bound of the key range (borrowed).
+    #[inline]
+    pub fn key_range_start(&self) -> &[u8] {
+        &self.key_range_start
+    }
+
+    /// Exclusive upper bound of the key range (borrowed).
+    #[inline]
+    pub fn key_range_end(&self) -> &[u8] {
+        &self.key_range_end
+    }
+
+    /// Connector-opaque metadata (borrowed).
+    #[inline]
+    pub fn metadata(&self) -> &[u8] {
+        &self.metadata
+    }
+
     /// Check whether a key falls within this shard's key range.
     ///
     /// Returns `true` if `key ∈ [start, end)` (lexicographic byte order).
     ///
     /// An empty key `[]` is at the very start of the keyspace — less
     /// than any non-empty key.
+    #[inline]
     pub fn contains_key(&self, key: &[u8]) -> bool {
         let above_start = self.is_start_unbounded() || key >= self.key_range_start.as_ref();
 
@@ -277,6 +382,61 @@ impl CanonicalBytes for ShardSpec {
 }
 
 // ============================================================================
+// ShardSpecInputError
+// ============================================================================
+
+/// Error returned by fallible [`ShardSpec`] constructors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardSpecInputError {
+    /// The key range is inverted: `start >= end` when both are non-empty.
+    InvertedRange {
+        /// Length of the start key in bytes.
+        start_len: usize,
+        /// Length of the end key in bytes.
+        end_len: usize,
+    },
+
+    /// A key (start or end) exceeds [`MAX_KEY_SIZE`].
+    KeyTooLarge {
+        /// Actual size of the key in bytes.
+        size: usize,
+        /// Maximum allowed size ([`MAX_KEY_SIZE`]).
+        max: usize,
+    },
+
+    /// The metadata exceeds [`MAX_METADATA_SIZE`].
+    MetadataTooLarge {
+        /// Actual size of the metadata in bytes.
+        size: usize,
+        /// Maximum allowed size ([`MAX_METADATA_SIZE`]).
+        max: usize,
+    },
+}
+
+impl fmt::Display for ShardSpecInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvertedRange { start_len, end_len } => write!(
+                f,
+                "ShardSpec: start must be strictly less than end \
+                 (start: {start_len} bytes, end: {end_len} bytes)"
+            ),
+            Self::KeyTooLarge { size, max } => {
+                write!(f, "ShardSpec: key too large ({size} bytes, max {max})")
+            }
+            Self::MetadataTooLarge { size, max } => {
+                write!(
+                    f,
+                    "ShardSpec: metadata too large ({size} bytes, max {max})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ShardSpecInputError {}
+
+// ============================================================================
 // Split Validation
 // ============================================================================
 
@@ -299,27 +459,82 @@ pub enum SplitValidationError {
         parent_end: Box<[u8]>,
         last_child_end: Box<[u8]>,
     },
-    /// Gap between adjacent children.
-    Gap {
+    /// Boundary mismatch (gap or overlap) between adjacent children.
+    BoundaryMismatch {
+        /// Index in the caller's input order, not the internal sorted order.
         child_index: usize,
+        /// Index in the caller's input order, not the internal sorted order.
+        next_child_index: usize,
         child_end: Box<[u8]>,
         next_child_start: Box<[u8]>,
     },
     /// Child has inverted key range (start >= end).
-    InvertedChild { child_index: usize },
+    InvertedChild {
+        /// Index in the caller's input order, not the internal sorted order.
+        child_index: usize,
+    },
 
-    /// Residual split must not strand the parent by shrinking its spec past
-    /// the current cursor.
-    ///
-    /// Not produced by the pure-validation functions in this module. The
-    /// coordination backend raises this when a residual split would move the
-    /// parent's range boundary behind the cursor's `last_key`.
-    ParentCursorOutOfBounds {
-        cursor: Box<[u8]>,
-        new_parent_start: Box<[u8]>,
-        new_parent_end: Box<[u8]>,
+    /// A non-last child has an unbounded end, causing it to overlap with
+    /// subsequent children.
+    OverlappingChild {
+        child_index: usize,
+        next_child_index: usize,
     },
 }
+
+impl fmt::Display for SplitValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoChildren => write!(f, "split requires at least 2 children"),
+            Self::SingleChild => write!(f, "a single child is not a split"),
+            Self::StartMismatch {
+                parent_start,
+                first_child_start,
+            } => write!(
+                f,
+                "first child start ({} bytes) does not match parent start ({} bytes)",
+                first_child_start.len(),
+                parent_start.len(),
+            ),
+            Self::EndMismatch {
+                parent_end,
+                last_child_end,
+            } => write!(
+                f,
+                "last child end ({} bytes) does not match parent end ({} bytes)",
+                last_child_end.len(),
+                parent_end.len(),
+            ),
+            Self::BoundaryMismatch {
+                child_index,
+                next_child_index,
+                child_end,
+                next_child_start,
+            } => write!(
+                f,
+                "boundary mismatch between child {child_index} end ({} bytes) \
+                 and child {next_child_index} start ({} bytes)",
+                child_end.len(),
+                next_child_start.len(),
+            ),
+            Self::InvertedChild { child_index } => {
+                write!(
+                    f,
+                    "child {child_index} has inverted key range (start >= end)"
+                )
+            }
+            Self::OverlappingChild {
+                child_index,
+                next_child_index,
+            } => write!(
+                f,
+                "child {child_index} has unbounded end, overlapping with child {next_child_index}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SplitValidationError {}
 
 /// Validate that a proposed split produces children whose key ranges
 /// exactly cover the parent's range without gaps or overlaps.
@@ -337,11 +552,14 @@ pub enum SplitValidationError {
 /// need not provide them in order. This is a robustness choice: the
 /// function validates the *set* of children, not an ordered sequence.
 ///
+/// Error indices (`child_index`) refer to the caller's input order, not
+/// the internal sorted order.
+///
 /// Reference: CockroachDB range split/merge validation; Spanner tablet
 /// split with key-range continuity check.
 pub fn validate_split_coverage(
     parent: &ShardSpec,
-    children: &[ShardSpec],
+    children: &[&ShardSpec],
 ) -> Result<(), SplitValidationError> {
     if children.is_empty() {
         return Err(SplitValidationError::NoChildren);
@@ -351,48 +569,65 @@ pub fn validate_split_coverage(
         return Err(SplitValidationError::SingleChild);
     }
 
-    // Sort children by start key for order-independent validation.
-    // Empty start key sorts first (it's the keyspace minimum).
-    let mut sorted: Vec<&ShardSpec> = children.iter().collect();
-    sorted.sort_by(|a, b| a.key_range_start.cmp(&b.key_range_start));
+    // Pair each child with its original index, then sort by start key.
+    // This lets us report the caller's input indices in errors.
+    let mut indexed: Vec<(usize, &ShardSpec)> = children.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.key_range_start.cmp(&b.1.key_range_start));
 
     // First child start == parent start.
-    if sorted[0].key_range_start != parent.key_range_start {
+    if indexed[0].1.key_range_start != parent.key_range_start {
         return Err(SplitValidationError::StartMismatch {
             parent_start: parent.key_range_start.clone(),
-            first_child_start: sorted[0].key_range_start.clone(),
+            first_child_start: indexed[0].1.key_range_start.clone(),
         });
     }
 
     // Last child end == parent end.
-    let last = sorted[sorted.len() - 1];
-    if last.key_range_end != parent.key_range_end {
+    let last = indexed[indexed.len() - 1];
+    if last.1.key_range_end != parent.key_range_end {
         return Err(SplitValidationError::EndMismatch {
             parent_end: parent.key_range_end.clone(),
-            last_child_end: last.key_range_end.clone(),
+            last_child_end: last.1.key_range_end.clone(),
         });
     }
 
     // Contiguity: each child's end == next child's start.
-    for i in 0..sorted.len() - 1 {
-        if sorted[i].key_range_end != sorted[i + 1].key_range_start {
-            return Err(SplitValidationError::Gap {
-                child_index: i,
-                child_end: sorted[i].key_range_end.clone(),
-                next_child_start: sorted[i + 1].key_range_start.clone(),
+    // Also reject empty internal boundaries: an empty `key_range_end` means
+    // "extends to end of keyspace" which is only valid for the last child.
+    // Empty internal boundaries indicate overlapping children (e.g. two
+    // fully-unbounded children `[[], [])` pass the equality check but
+    // cover the same keyspace).
+    for i in 0..indexed.len() - 1 {
+        if indexed[i].1.key_range_end != indexed[i + 1].1.key_range_start {
+            return Err(SplitValidationError::BoundaryMismatch {
+                child_index: indexed[i].0,
+                next_child_index: indexed[i + 1].0,
+                child_end: indexed[i].1.key_range_end.clone(),
+                next_child_start: indexed[i + 1].1.key_range_start.clone(),
+            });
+        }
+        if indexed[i].1.key_range_end.is_empty() {
+            return Err(SplitValidationError::OverlappingChild {
+                child_index: indexed[i].0,
+                next_child_index: indexed[i + 1].0,
             });
         }
     }
 
     // Each child individually well-formed.
-    for (i, child) in sorted.iter().enumerate() {
+    for &(orig_idx, child) in &indexed {
         if !child.key_range_start.is_empty()
             && !child.key_range_end.is_empty()
             && child.key_range_start >= child.key_range_end
         {
-            return Err(SplitValidationError::InvertedChild { child_index: i });
+            return Err(SplitValidationError::InvertedChild {
+                child_index: orig_idx,
+            });
         }
     }
+
+    debug_assert!(indexed.first().unwrap().1.key_range_start == parent.key_range_start);
+    debug_assert!(indexed.last().unwrap().1.key_range_end == parent.key_range_end);
 
     Ok(())
 }
@@ -413,14 +648,30 @@ pub fn validate_split_coverage(
 /// unprocessed). This aligns with cursor monotonicity: the parent's
 /// cursor has been advancing through the lower keys.
 ///
-/// Delegates to `validate_split_coverage` — a residual split is a
-/// two-child split.
+/// Enforces role assignment before delegating to `validate_split_coverage`:
+/// `new_parent` must retain the left portion (start matches old parent)
+/// and `residual` must cover the right portion (end matches old parent).
+/// This prevents callers from accidentally swapping the two arguments.
 pub fn validate_residual_split(
     old_parent: &ShardSpec,
     new_parent: &ShardSpec,
     residual: &ShardSpec,
 ) -> Result<(), SplitValidationError> {
-    validate_split_coverage(old_parent, &[new_parent.clone(), residual.clone()])
+    // The parent must keep the left (lower) portion of the range.
+    if new_parent.key_range_start != old_parent.key_range_start {
+        return Err(SplitValidationError::StartMismatch {
+            parent_start: old_parent.key_range_start.clone(),
+            first_child_start: new_parent.key_range_start.clone(),
+        });
+    }
+    // The residual must cover the right (upper) portion.
+    if residual.key_range_end != old_parent.key_range_end {
+        return Err(SplitValidationError::EndMismatch {
+            parent_end: old_parent.key_range_end.clone(),
+            last_child_end: residual.key_range_end.clone(),
+        });
+    }
+    validate_split_coverage(old_parent, &[new_parent, residual])
 }
 
 // ============================================================================
@@ -430,15 +681,8 @@ pub fn validate_residual_split(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blake3::Hasher;
+    use crate::test_util::{arb_bounded_shard_spec, arb_shard_spec, canonical_digest};
     use proptest::prelude::*;
-
-    /// Helper: hash a value via CanonicalBytes and return the digest.
-    fn canonical_digest<T: CanonicalBytes>(val: &T) -> blake3::Hash {
-        let mut h = Hasher::new();
-        val.write_canonical(&mut h);
-        h.finalize()
-    }
 
     // -------------------------------------------------------------------
     // CursorSemantics
@@ -480,20 +724,19 @@ mod tests {
         assert!(spec.is_unbounded());
         assert!(spec.is_start_unbounded());
         assert!(spec.is_end_unbounded());
-        assert!(spec.key_range_start.is_empty());
-        assert!(spec.key_range_end.is_empty());
-        assert!(spec.metadata.is_empty());
+        assert!(spec.key_range_start().is_empty());
+        assert!(spec.key_range_end().is_empty());
+        assert!(spec.metadata().is_empty());
     }
 
     #[test]
     fn shard_spec_with_range() {
         let spec = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-        assert_eq!(&*spec.key_range_start, b"a");
-        assert_eq!(&*spec.key_range_end, b"m");
+        assert_eq!(spec.key_range_start(), b"a");
+        assert_eq!(spec.key_range_end(), b"m");
         assert!(!spec.is_unbounded());
         assert!(!spec.is_start_unbounded());
         assert!(!spec.is_end_unbounded());
-        assert!(spec.is_valid());
     }
 
     #[test]
@@ -525,65 +768,198 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Fallible constructors
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn try_with_range_valid() {
+        let spec = ShardSpec::try_with_range(b"a".to_vec(), b"z".to_vec()).unwrap();
+        assert_eq!(spec.key_range_start(), b"a");
+        assert_eq!(spec.key_range_end(), b"z");
+    }
+
+    #[test]
+    fn try_with_range_inverted() {
+        let err = ShardSpec::try_with_range(b"z".to_vec(), b"a".to_vec()).unwrap_err();
+        assert_eq!(
+            err,
+            ShardSpecInputError::InvertedRange {
+                start_len: 1,
+                end_len: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn try_with_range_equal_bounds() {
+        let err = ShardSpec::try_with_range(b"a".to_vec(), b"a".to_vec()).unwrap_err();
+        assert!(matches!(err, ShardSpecInputError::InvertedRange { .. }));
+    }
+
+    #[test]
+    fn try_with_range_and_metadata_valid() {
+        let spec =
+            ShardSpec::try_with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), b"meta".to_vec())
+                .unwrap();
+        assert_eq!(spec.key_range_start(), b"a");
+        assert_eq!(spec.key_range_end(), b"z");
+        assert_eq!(spec.metadata(), b"meta");
+    }
+
+    #[test]
+    fn try_with_range_unbounded_start() {
+        let spec = ShardSpec::try_with_range(vec![], b"z".to_vec()).unwrap();
+        assert!(spec.is_start_unbounded());
+    }
+
+    #[test]
+    fn try_with_range_unbounded_end() {
+        let spec = ShardSpec::try_with_range(b"a".to_vec(), vec![]).unwrap();
+        assert!(spec.is_end_unbounded());
+    }
+
+    #[test]
+    fn shard_spec_input_error_display() {
+        let err = ShardSpecInputError::InvertedRange {
+            start_len: 3,
+            end_len: 1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("start must be strictly less than end"));
+        assert!(msg.contains("3 bytes"));
+        assert!(msg.contains("1 bytes"));
+    }
+
+    // -------------------------------------------------------------------
+    // Size-limit validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn try_with_range_start_key_at_max() {
+        let start = vec![0x01; MAX_KEY_SIZE];
+        let mut end = start.clone();
+        end.push(0xFF);
+        let spec = ShardSpec::try_with_range(start, end).unwrap();
+        assert_eq!(spec.key_range_start().len(), MAX_KEY_SIZE);
+    }
+
+    #[test]
+    fn try_with_range_start_key_over_max() {
+        let start = vec![0x01; MAX_KEY_SIZE + 1];
+        let mut end = start.clone();
+        end.push(0xFF);
+        let err = ShardSpec::try_with_range(start, end).unwrap_err();
+        assert_eq!(
+            err,
+            ShardSpecInputError::KeyTooLarge {
+                size: MAX_KEY_SIZE + 1,
+                max: MAX_KEY_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn try_with_range_end_key_over_max() {
+        let end = vec![0xFF; MAX_KEY_SIZE + 1];
+        let err = ShardSpec::try_with_range(b"a".to_vec(), end).unwrap_err();
+        assert!(matches!(err, ShardSpecInputError::KeyTooLarge { .. }));
+    }
+
+    #[test]
+    fn try_with_range_and_metadata_at_max() {
+        let meta = vec![0xAA; MAX_METADATA_SIZE];
+        let spec =
+            ShardSpec::try_with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), meta).unwrap();
+        assert_eq!(spec.metadata().len(), MAX_METADATA_SIZE);
+    }
+
+    #[test]
+    fn try_with_range_and_metadata_over_max() {
+        let meta = vec![0xAA; MAX_METADATA_SIZE + 1];
+        let err =
+            ShardSpec::try_with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), meta).unwrap_err();
+        assert_eq!(
+            err,
+            ShardSpecInputError::MetadataTooLarge {
+                size: MAX_METADATA_SIZE + 1,
+                max: MAX_METADATA_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn shard_spec_input_error_display_key_too_large() {
+        let err = ShardSpecInputError::KeyTooLarge {
+            size: 5000,
+            max: 4096,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("5000"));
+        assert!(msg.contains("4096"));
+    }
+
+    #[test]
+    fn shard_spec_input_error_display_metadata_too_large() {
+        let err = ShardSpecInputError::MetadataTooLarge {
+            size: 70000,
+            max: 65536,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("70000"));
+        assert!(msg.contains("65536"));
+    }
+
+    // -------------------------------------------------------------------
     // Split validation
     // -------------------------------------------------------------------
 
     #[test]
     fn split_valid_two_way() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let children = [
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-        ];
-        assert!(validate_split_coverage(&parent, &children).is_ok());
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let c2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
     }
 
     #[test]
     fn split_valid_three_way() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let children = [
-            ShardSpec::with_range(b"a".to_vec(), b"g".to_vec()),
-            ShardSpec::with_range(b"g".to_vec(), b"p".to_vec()),
-            ShardSpec::with_range(b"p".to_vec(), b"z".to_vec()),
-        ];
-        assert!(validate_split_coverage(&parent, &children).is_ok());
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+        let c2 = ShardSpec::with_range(b"g".to_vec(), b"p".to_vec());
+        let c3 = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+        assert!(validate_split_coverage(&parent, &[&c1, &c2, &c3]).is_ok());
     }
 
     #[test]
     fn split_valid_unbounded_parent() {
         let parent = ShardSpec::unbounded();
-        let children = [
-            ShardSpec::with_range(vec![], b"m".to_vec()),
-            ShardSpec::with_range(b"m".to_vec(), vec![]),
-        ];
-        assert!(validate_split_coverage(&parent, &children).is_ok());
+        let c1 = ShardSpec::with_range(vec![], b"m".to_vec());
+        let c2 = ShardSpec::with_range(b"m".to_vec(), vec![]);
+        assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
     }
 
     #[test]
     fn split_no_children() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let result = validate_split_coverage(&parent, &[]);
+        let empty: &[&ShardSpec] = &[];
+        let result = validate_split_coverage(&parent, empty);
         assert!(matches!(result, Err(SplitValidationError::NoChildren)));
     }
 
     #[test]
     fn split_single_child() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let result = validate_split_coverage(
-            &parent,
-            &[ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())],
-        );
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        let result = validate_split_coverage(&parent, &[&c1]);
         assert!(matches!(result, Err(SplitValidationError::SingleChild)));
     }
 
     #[test]
     fn split_start_mismatch() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let children = [
-            ShardSpec::with_range(b"b".to_vec(), b"m".to_vec()),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-        ];
-        let result = validate_split_coverage(&parent, &children);
+        let c1 = ShardSpec::with_range(b"b".to_vec(), b"m".to_vec());
+        let c2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let result = validate_split_coverage(&parent, &[&c1, &c2]);
         assert!(matches!(
             result,
             Err(SplitValidationError::StartMismatch { .. })
@@ -593,11 +969,9 @@ mod tests {
     #[test]
     fn split_end_mismatch() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let children = [
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            ShardSpec::with_range(b"m".to_vec(), b"y".to_vec()),
-        ];
-        let result = validate_split_coverage(&parent, &children);
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let c2 = ShardSpec::with_range(b"m".to_vec(), b"y".to_vec());
+        let result = validate_split_coverage(&parent, &[&c1, &c2]);
         assert!(matches!(
             result,
             Err(SplitValidationError::EndMismatch { .. })
@@ -605,25 +979,24 @@ mod tests {
     }
 
     #[test]
-    fn split_gap_between_children() {
+    fn split_boundary_mismatch_between_children() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-        let children = [
-            ShardSpec::with_range(b"a".to_vec(), b"g".to_vec()),
-            ShardSpec::with_range(b"h".to_vec(), b"z".to_vec()),
-        ];
-        let result = validate_split_coverage(&parent, &children);
-        assert!(matches!(result, Err(SplitValidationError::Gap { .. })));
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+        let c2 = ShardSpec::with_range(b"h".to_vec(), b"z".to_vec());
+        let result = validate_split_coverage(&parent, &[&c1, &c2]);
+        assert!(matches!(
+            result,
+            Err(SplitValidationError::BoundaryMismatch { .. })
+        ));
     }
 
     #[test]
     fn split_children_out_of_order_still_valid() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
         // Provide children in reverse order; sorting makes it pass.
-        let children = [
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-        ];
-        assert!(validate_split_coverage(&parent, &children).is_ok());
+        let c1 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let c2 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
     }
 
     #[test]
@@ -631,20 +1004,60 @@ mod tests {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
         // A zero-width child [m, m) passes contiguity but fails
         // the well-formedness check (start >= end).
-        let children = [
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            ShardSpec {
-                key_range_start: b"m".as_slice().into(),
-                key_range_end: b"m".as_slice().into(),
-                metadata: Box::new([]),
-            },
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-        ];
-        let result = validate_split_coverage(&parent, &children);
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let c2 =
+            ShardSpec::from_raw_parts(b"m".as_slice().into(), b"m".as_slice().into(), Box::new([]));
+        let c3 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let result = validate_split_coverage(&parent, &[&c1, &c2, &c3]);
         assert!(matches!(
             result,
             Err(SplitValidationError::InvertedChild { .. })
         ));
+    }
+
+    #[test]
+    fn split_boundary_mismatch_reports_original_indices() {
+        let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        // Pass children in reverse order: index 0 is [m,z), index 1 is [a,g).
+        // After sorting: [a,g) then [m,z) — gap between them.
+        // The gap is between sorted[0]=original[1] and sorted[1]=original[0].
+        let c0 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+        let result = validate_split_coverage(&parent, &[&c0, &c1]);
+        match result {
+            Err(SplitValidationError::BoundaryMismatch {
+                child_index,
+                next_child_index,
+                ..
+            }) => {
+                // Original index of [a,g) is 1, original index of [m,z) is 0.
+                assert_eq!(child_index, 1, "gap child should be original index 1");
+                assert_eq!(next_child_index, 0, "next child should be original index 0");
+            }
+            other => panic!("expected BoundaryMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_inverted_child_reports_original_index() {
+        let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        // Degenerate [g,g) at original index 0, normal children at 1 and 2.
+        // Stable sort on start key produces:
+        //   sorted[0] = (orig 2, [a,g))
+        //   sorted[1] = (orig 0, [g,g))   ← degenerate, at sorted position 1
+        //   sorted[2] = (orig 1, [g,z))
+        // The inverted child is at sorted position 1 but original index 0.
+        let c0 =
+            ShardSpec::from_raw_parts(b"g".as_slice().into(), b"g".as_slice().into(), Box::new([]));
+        let c1 = ShardSpec::with_range(b"g".to_vec(), b"z".to_vec());
+        let c2 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+        let result = validate_split_coverage(&parent, &[&c0, &c1, &c2]);
+        match result {
+            Err(SplitValidationError::InvertedChild { child_index }) => {
+                assert_eq!(child_index, 0, "inverted child should be original index 0");
+            }
+            other => panic!("expected InvertedChild, got {other:?}"),
+        }
     }
 
     // -------------------------------------------------------------------
@@ -668,35 +1081,85 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn residual_split_swapped_roles_rejected() {
+        let old_parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        // Swap: new_parent gets upper range, residual gets lower.
+        let new_parent = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let residual = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let result = validate_residual_split(&old_parent, &new_parent, &residual);
+        assert!(
+            matches!(result, Err(SplitValidationError::StartMismatch { .. })),
+            "swapped residual split should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn split_two_unbounded_children_rejected() {
+        let parent = ShardSpec::unbounded();
+        let c1 = ShardSpec::unbounded();
+        let c2 = ShardSpec::unbounded();
+        let result = validate_split_coverage(&parent, &[&c1, &c2]);
+        assert!(
+            matches!(result, Err(SplitValidationError::OverlappingChild { .. })),
+            "two fully-unbounded children should be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn split_non_last_child_unbounded_end_rejected() {
+        let parent = ShardSpec::unbounded();
+        // First child covers everything, second is also unbounded.
+        let c1 = ShardSpec::with_range(vec![], vec![]);
+        let c2 = ShardSpec::with_range(vec![], vec![]);
+        let result = validate_split_coverage(&parent, &[&c1, &c2]);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // SplitValidationError Display
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn split_validation_error_display() {
+        let err = SplitValidationError::BoundaryMismatch {
+            child_index: 0,
+            next_child_index: 1,
+            child_end: b"g".as_slice().into(),
+            next_child_start: b"h".as_slice().into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("boundary mismatch"));
+        assert!(msg.contains("child 0"));
+        assert!(msg.contains("child 1"));
+    }
+
+    // -------------------------------------------------------------------
+    // Metadata participates in canonical hashing
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn with_range_and_metadata_stores_and_hashes_metadata() {
+        let spec_no_meta = ShardSpec::with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), vec![]);
+        let spec_with_meta = ShardSpec::with_range_and_metadata(
+            b"a".to_vec(),
+            b"z".to_vec(),
+            b"repo:org/foo".to_vec(),
+        );
+
+        // Metadata is stored.
+        assert_eq!(spec_with_meta.metadata(), b"repo:org/foo");
+
+        // Same range, different metadata → different canonical digest.
+        assert_ne!(
+            canonical_digest(&spec_no_meta),
+            canonical_digest(&spec_with_meta),
+        );
+    }
+
     // -------------------------------------------------------------------
     // Property-based tests
     // -------------------------------------------------------------------
-
-    /// Generate a valid bounded ShardSpec: end = start ++ non-empty suffix,
-    /// guaranteeing `start < end` lexicographically.
-    fn arb_bounded_shard_spec() -> impl Strategy<Value = ShardSpec> {
-        (
-            proptest::collection::vec(any::<u8>(), 1..64),
-            proptest::collection::vec(any::<u8>(), 1..8),
-        )
-            .prop_map(|(start, suffix)| {
-                let mut end = start.clone();
-                end.extend_from_slice(&suffix);
-                ShardSpec::with_range(start, end)
-            })
-    }
-
-    /// Generate a ShardSpec covering all four boundedness variants.
-    fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
-        proptest::prop_oneof![
-            4 => arb_bounded_shard_spec(),
-            1 => proptest::collection::vec(any::<u8>(), 1..64)
-                .prop_map(|end| ShardSpec::with_range(vec![], end)),
-            1 => proptest::collection::vec(any::<u8>(), 1..64)
-                .prop_map(|start| ShardSpec::with_range(start, vec![])),
-            1 => Just(ShardSpec::unbounded()),
-        ]
-    }
 
     /// Generate a valid parent + 2–4 contiguous children via suffix
     /// accumulation (same proven pattern as `arb_bounded_shard_spec`).
@@ -759,9 +1222,9 @@ mod tests {
             key in proptest::collection::vec(any::<u8>(), 0..64),
         ) {
             let above_start = spec.is_start_unbounded()
-                || key.as_slice() >= spec.key_range_start.as_ref();
+                || key.as_slice() >= spec.key_range_start();
             let below_end = spec.is_end_unbounded()
-                || key.as_slice() < spec.key_range_end.as_ref();
+                || key.as_slice() < spec.key_range_end();
             let expected = above_start && below_end;
             prop_assert_eq!(spec.contains_key(&key), expected);
         }
@@ -773,7 +1236,8 @@ mod tests {
             (parent, children) in arb_valid_n_way_split(),
             key in proptest::collection::vec(any::<u8>(), 0..64),
         ) {
-            prop_assert!(validate_split_coverage(&parent, &children).is_ok());
+            let refs: Vec<&ShardSpec> = children.iter().collect();
+            prop_assert!(validate_split_coverage(&parent, &refs).is_ok());
             let parent_has = parent.contains_key(&key);
             let child_count = children.iter().filter(|c| c.contains_key(&key)).count();
             if parent_has {

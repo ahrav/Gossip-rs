@@ -275,7 +275,7 @@ impl CanonicalBytes for ShardKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blake3::Hasher;
+    use crate::test_util::canonical_digest;
     use proptest::prelude::*;
 
     // -------------------------------------------------------------------
@@ -429,13 +429,6 @@ mod tests {
     // -------------------------------------------------------------------
     // CanonicalBytes — property-based (all 8 types)
     // -------------------------------------------------------------------
-
-    /// Helper: hash a value via CanonicalBytes and return the digest.
-    fn canonical_digest<T: CanonicalBytes>(val: &T) -> blake3::Hash {
-        let mut h = Hasher::new();
-        val.write_canonical(&mut h);
-        h.finalize()
-    }
 
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]

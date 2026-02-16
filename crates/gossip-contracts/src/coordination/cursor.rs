@@ -28,10 +28,25 @@
 //!       Connector-internal bookkeeping without committed items is not
 //!       coordination state.
 
+use std::fmt;
+
 use blake3::Hasher;
 
 use super::shard_spec::ShardSpec;
 use crate::identity::CanonicalBytes;
+
+/// Maximum size of a cursor `last_key` in bytes (4 KiB).
+///
+/// Sized to the row-key ceiling of DynamoDB / Bigtable. Keys larger than
+/// this are almost certainly a serialisation bug, not legitimate progress.
+pub const MAX_KEY_SIZE: usize = 4_096;
+
+/// Maximum size of a cursor `token` in bytes (64 KiB).
+///
+/// Generous ceiling for opaque connector resume state. Tokens are never
+/// interpreted by the coordinator, but unbounded tokens would bloat
+/// checkpoint storage.
+pub const MAX_TOKEN_SIZE: usize = 65_536;
 
 // ============================================================================
 // Cursor
@@ -61,7 +76,7 @@ use crate::identity::CanonicalBytes;
 /// | `None`       | `Some(k)`    | OK — first progress |
 /// | `Some(a)`    | `Some(b)`    | OK iff `b >= a` (lex) |
 /// | `Some(a)`    | `Some(a)`    | OK — idempotent retry |
-/// | `Some(_)`    | `None`       | **REJECT** — regression |
+/// | `Some(_)`    | `None`       | **REJECT** — reset to none |
 /// | `Some(a)`    | `Some(b)`    | **REJECT** if `b < a` |
 ///
 /// ## Invariants
@@ -75,13 +90,19 @@ use crate::identity::CanonicalBytes;
 /// **Liveness**: The cursor MUST eventually advance if work remains,
 /// or the shard MUST reach a terminal state (Done or Parked).
 ///
+/// ## Encapsulation
+///
+/// Fields are private — constructors enforce invariants (e.g.,
+/// `last_key` must not be empty when present), and public accessors
+/// return borrowed views.
+///
 /// Reference: Bacon et al., "Spanner: Becoming a SQL System" (2017).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor {
     /// The key of the last fully-processed item (lex-ordered).
     ///
     /// `None` = no items processed yet (initial state or empty shard).
-    pub last_key: Option<Box<[u8]>>,
+    last_key: Option<Box<[u8]>>,
 
     /// Connector-opaque resume token.
     ///
@@ -90,7 +111,7 @@ pub struct Cursor {
     /// The coordinator stores this verbatim and returns it on acquisition.
     /// It MUST NOT be interpreted, compared, or logged at the coordination
     /// layer.
-    pub token: Option<Box<[u8]>>,
+    token: Option<Box<[u8]>>,
 }
 
 impl Cursor {
@@ -144,10 +165,103 @@ impl Cursor {
         }
     }
 
-    /// Returns `true` if no progress has been made.
+    /// Fallible constructor: returns `Err` if `last_key` is empty or
+    /// exceeds [`MAX_KEY_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
+    /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    pub fn try_with_last_key(last_key: Vec<u8>) -> Result<Self, CursorInputError> {
+        if last_key.is_empty() {
+            return Err(CursorInputError::EmptyLastKey);
+        }
+        if last_key.len() > MAX_KEY_SIZE {
+            return Err(CursorInputError::KeyTooLarge {
+                size: last_key.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        Ok(Self {
+            last_key: Some(last_key.into_boxed_slice()),
+            token: None,
+        })
+    }
+
+    /// Fallible constructor: returns `Err` if `last_key` is empty,
+    /// `last_key` exceeds [`MAX_KEY_SIZE`], or `token` exceeds
+    /// [`MAX_TOKEN_SIZE`].
+    ///
+    /// Empty `token` is normalized to `None`.
+    ///
+    /// # Errors
+    ///
+    /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
+    /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`CursorInputError::TokenTooLarge`] — `token` exceeds
+    ///   [`MAX_TOKEN_SIZE`] bytes.
+    pub fn try_from_parts(last_key: Vec<u8>, token: Vec<u8>) -> Result<Self, CursorInputError> {
+        if last_key.is_empty() {
+            return Err(CursorInputError::EmptyLastKey);
+        }
+        if last_key.len() > MAX_KEY_SIZE {
+            return Err(CursorInputError::KeyTooLarge {
+                size: last_key.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if token.len() > MAX_TOKEN_SIZE {
+            return Err(CursorInputError::TokenTooLarge {
+                size: token.len(),
+                max: MAX_TOKEN_SIZE,
+            });
+        }
+        Ok(Self {
+            last_key: Some(last_key.into_boxed_slice()),
+            token: if token.is_empty() {
+                None
+            } else {
+                Some(token.into_boxed_slice())
+            },
+        })
+    }
+
+    /// Construct a `Cursor` from pre-built parts, bypassing validation.
+    ///
+    /// Only available in test builds — allows constructing intentionally
+    /// invalid cursors (e.g., with an empty `last_key`) for testing.
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(last_key: Option<Box<[u8]>>, token: Option<Box<[u8]>>) -> Self {
+        Self { last_key, token }
+    }
+
+    /// Returns `true` if no progress has been made (`last_key` is `None`).
+    /// The `token` field is not considered — progress is measured solely
+    /// by `last_key`.
     #[inline]
     pub fn is_initial(&self) -> bool {
         self.last_key.is_none()
+    }
+
+    /// The key of the last fully-processed item, if any.
+    #[inline]
+    pub fn last_key(&self) -> Option<&[u8]> {
+        self.last_key.as_deref()
+    }
+
+    /// The connector-opaque resume token, if any.
+    #[inline]
+    pub fn token(&self) -> Option<&[u8]> {
+        self.token.as_deref()
+    }
+
+    /// Consume the cursor and return its parts.
+    #[inline]
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(self) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
+        (self.last_key, self.token)
     }
 }
 
@@ -185,6 +299,50 @@ impl CanonicalBytes for Cursor {
 }
 
 // ============================================================================
+// CursorInputError
+// ============================================================================
+
+/// Error returned by fallible [`Cursor`] constructors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CursorInputError {
+    /// The `last_key` was empty. A present key must contain at least
+    /// one byte to be meaningful in the lex-ordered keyspace.
+    EmptyLastKey,
+
+    /// The `last_key` exceeds [`MAX_KEY_SIZE`].
+    KeyTooLarge {
+        /// Actual size of the key in bytes.
+        size: usize,
+        /// Maximum allowed size ([`MAX_KEY_SIZE`]).
+        max: usize,
+    },
+
+    /// The `token` exceeds [`MAX_TOKEN_SIZE`].
+    TokenTooLarge {
+        /// Actual size of the token in bytes.
+        size: usize,
+        /// Maximum allowed size ([`MAX_TOKEN_SIZE`]).
+        max: usize,
+    },
+}
+
+impl fmt::Display for CursorInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyLastKey => write!(f, "last_key must not be empty when present"),
+            Self::KeyTooLarge { size, max } => {
+                write!(f, "last_key too large ({size} bytes, max {max})")
+            }
+            Self::TokenTooLarge { size, max } => {
+                write!(f, "token too large ({size} bytes, max {max})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CursorInputError {}
+
+// ============================================================================
 // Cursor Monotonicity
 // ============================================================================
 
@@ -196,6 +354,7 @@ impl CanonicalBytes for Cursor {
 ///
 /// [`Forward`]: CursorAdvance::Forward
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "advance check result must be inspected to enforce monotonicity"]
 pub enum CursorAdvance {
     /// New cursor represents forward progress (or idempotent same-position).
     Forward,
@@ -226,7 +385,12 @@ pub enum CursorAdvance {
 ///
 /// Reference: Bigtable, Spanner, CockroachDB, FoundationDB all use
 /// lex-ordered byte keys for range comparisons.
+#[inline]
+#[must_use = "ignoring the advance check defeats the monotonicity safety invariant"]
 pub fn check_cursor_advance(old: &Cursor, new: &Cursor) -> CursorAdvance {
+    debug_assert!(old.last_key.as_ref().is_none_or(|k| !k.is_empty()));
+    debug_assert!(new.last_key.as_ref().is_none_or(|k| !k.is_empty()));
+
     match (&old.last_key, &new.last_key) {
         // No progress → first progress: always valid.
         (None, Some(_)) => CursorAdvance::Forward,
@@ -262,6 +426,7 @@ pub fn check_cursor_advance(old: &Cursor, new: &Cursor) -> CursorAdvance {
 /// [`InBounds`]: CursorBoundsCheck::InBounds
 /// [`NoKey`]: CursorBoundsCheck::NoKey
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "bounds check result must be inspected to enforce range safety"]
 pub enum CursorBoundsCheck {
     /// Cursor has no `last_key` — nothing to check (initial state).
     NoKey,
@@ -286,22 +451,22 @@ pub enum CursorBoundsCheck {
 ///
 /// See [`ShardSpec::contains_key`] for the underlying range membership
 /// logic.
+#[inline]
+#[must_use = "ignoring the bounds check defeats the range safety invariant"]
 pub fn check_cursor_bounds(cursor: &Cursor, spec: &ShardSpec) -> CursorBoundsCheck {
-    let Some(ref last_key) = cursor.last_key else {
+    let Some(last_key) = cursor.last_key() else {
         return CursorBoundsCheck::NoKey;
     };
 
-    let key = last_key.as_ref();
-
-    if !spec.is_start_unbounded() && key < spec.key_range_start.as_ref() {
-        return CursorBoundsCheck::BelowRange;
+    if spec.contains_key(last_key) {
+        return CursorBoundsCheck::InBounds;
     }
 
-    if !spec.is_end_unbounded() && key >= spec.key_range_end.as_ref() {
-        return CursorBoundsCheck::AboveRange;
+    if !spec.is_start_unbounded() && last_key < spec.key_range_start() {
+        CursorBoundsCheck::BelowRange
+    } else {
+        CursorBoundsCheck::AboveRange
     }
-
-    CursorBoundsCheck::InBounds
 }
 
 // ============================================================================
@@ -311,7 +476,7 @@ pub fn check_cursor_bounds(cursor: &Cursor, spec: &ShardSpec) -> CursorBoundsChe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blake3::Hasher;
+    use crate::test_util::{arb_bounded_shard_spec, arb_shard_spec, canonical_digest};
     use proptest::prelude::*;
 
     /// Table row: (label, old_key, new_key, expected).
@@ -331,13 +496,6 @@ mod tests {
         CursorBoundsCheck,
     );
 
-    /// Helper: hash a value via CanonicalBytes and return the digest.
-    fn canonical_digest<T: CanonicalBytes>(val: &T) -> blake3::Hash {
-        let mut h = Hasher::new();
-        val.write_canonical(&mut h);
-        h.finalize()
-    }
-
     // -------------------------------------------------------------------
     // Cursor construction
     // -------------------------------------------------------------------
@@ -346,40 +504,159 @@ mod tests {
     fn cursor_initial_is_empty() {
         let c = Cursor::initial();
         assert!(c.is_initial());
-        assert!(c.last_key.is_none());
-        assert!(c.token.is_none());
+        assert!(c.last_key().is_none());
+        assert!(c.token().is_none());
     }
 
     #[test]
     fn cursor_with_last_key() {
         let c = Cursor::with_last_key(b"org/repo\0src/main.rs".to_vec());
         assert!(!c.is_initial());
-        assert_eq!(
-            c.last_key.as_deref(),
-            Some(b"org/repo\0src/main.rs".as_slice())
-        );
-        assert!(c.token.is_none());
+        assert_eq!(c.last_key(), Some(b"org/repo\0src/main.rs".as_slice()));
+        assert!(c.token().is_none());
     }
 
     #[test]
     fn cursor_from_parts() {
         let c = Cursor::from_parts(b"key".to_vec(), b"token-data".to_vec());
         assert!(!c.is_initial());
-        assert_eq!(c.last_key.as_deref(), Some(b"key".as_slice()));
-        assert_eq!(c.token.as_deref(), Some(b"token-data".as_slice()));
+        assert_eq!(c.last_key(), Some(b"key".as_slice()));
+        assert_eq!(c.token(), Some(b"token-data".as_slice()));
     }
 
     #[test]
     fn cursor_from_parts_empty_token_becomes_none() {
         let c = Cursor::from_parts(b"key".to_vec(), vec![]);
-        assert_eq!(c.last_key.as_deref(), Some(b"key".as_slice()));
-        assert!(c.token.is_none());
+        assert_eq!(c.last_key(), Some(b"key".as_slice()));
+        assert!(c.token().is_none());
     }
 
     #[test]
     #[should_panic(expected = "must not be empty")]
     fn cursor_with_empty_last_key_panics() {
         let _ = Cursor::with_last_key(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn cursor_from_parts_empty_last_key_panics() {
+        let _ = Cursor::from_parts(vec![], b"token".to_vec());
+    }
+
+    // -------------------------------------------------------------------
+    // Fallible constructors
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn try_with_last_key_valid() {
+        let c = Cursor::try_with_last_key(b"key".to_vec()).unwrap();
+        assert_eq!(c.last_key(), Some(b"key".as_slice()));
+        assert!(c.token().is_none());
+    }
+
+    #[test]
+    fn try_with_last_key_empty() {
+        let err = Cursor::try_with_last_key(vec![]).unwrap_err();
+        assert_eq!(err, CursorInputError::EmptyLastKey);
+    }
+
+    #[test]
+    fn try_from_parts_valid() {
+        let c = Cursor::try_from_parts(b"key".to_vec(), b"tok".to_vec()).unwrap();
+        assert_eq!(c.last_key(), Some(b"key".as_slice()));
+        assert_eq!(c.token(), Some(b"tok".as_slice()));
+    }
+
+    #[test]
+    fn try_from_parts_empty_key() {
+        let err = Cursor::try_from_parts(vec![], b"tok".to_vec()).unwrap_err();
+        assert_eq!(err, CursorInputError::EmptyLastKey);
+    }
+
+    #[test]
+    fn try_from_parts_empty_token_normalized() {
+        let c = Cursor::try_from_parts(b"key".to_vec(), vec![]).unwrap();
+        assert!(c.token().is_none());
+    }
+
+    #[test]
+    fn cursor_input_error_display() {
+        let err = CursorInputError::EmptyLastKey;
+        let msg = err.to_string();
+        assert!(msg.contains("must not be empty"));
+    }
+
+    // -------------------------------------------------------------------
+    // Size-limit validation
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn try_with_last_key_at_max_size() {
+        let key = vec![0xAB; MAX_KEY_SIZE];
+        let c = Cursor::try_with_last_key(key).unwrap();
+        assert_eq!(c.last_key().unwrap().len(), MAX_KEY_SIZE);
+    }
+
+    #[test]
+    fn try_with_last_key_over_max_size() {
+        let key = vec![0xAB; MAX_KEY_SIZE + 1];
+        let err = Cursor::try_with_last_key(key).unwrap_err();
+        assert_eq!(
+            err,
+            CursorInputError::KeyTooLarge {
+                size: MAX_KEY_SIZE + 1,
+                max: MAX_KEY_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn try_from_parts_key_over_max() {
+        let key = vec![0xAB; MAX_KEY_SIZE + 1];
+        let err = Cursor::try_from_parts(key, b"tok".to_vec()).unwrap_err();
+        assert!(matches!(err, CursorInputError::KeyTooLarge { .. }));
+    }
+
+    #[test]
+    fn try_from_parts_token_at_max_size() {
+        let token = vec![0xCD; MAX_TOKEN_SIZE];
+        let c = Cursor::try_from_parts(b"key".to_vec(), token).unwrap();
+        assert_eq!(c.token().unwrap().len(), MAX_TOKEN_SIZE);
+    }
+
+    #[test]
+    fn try_from_parts_token_over_max() {
+        let token = vec![0xCD; MAX_TOKEN_SIZE + 1];
+        let err = Cursor::try_from_parts(b"key".to_vec(), token).unwrap_err();
+        assert_eq!(
+            err,
+            CursorInputError::TokenTooLarge {
+                size: MAX_TOKEN_SIZE + 1,
+                max: MAX_TOKEN_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_input_error_display_key_too_large() {
+        let err = CursorInputError::KeyTooLarge {
+            size: 5000,
+            max: 4096,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("5000"));
+        assert!(msg.contains("4096"));
+    }
+
+    #[test]
+    fn cursor_input_error_display_token_too_large() {
+        let err = CursorInputError::TokenTooLarge {
+            size: 70000,
+            max: 65536,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("70000"));
+        assert!(msg.contains("65536"));
     }
 
     // -------------------------------------------------------------------
@@ -507,6 +784,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cursor_bounds_half_unbounded_start_in_range() {
+        let spec = ShardSpec::with_range(vec![], b"z".to_vec());
+        let cursor = Cursor::with_last_key(b"m".to_vec());
+        assert_eq!(
+            check_cursor_bounds(&cursor, &spec),
+            CursorBoundsCheck::InBounds
+        );
+    }
+
+    #[test]
+    fn cursor_bounds_half_unbounded_start_above() {
+        let spec = ShardSpec::with_range(vec![], b"m".to_vec());
+        let cursor = Cursor::with_last_key(b"z".to_vec());
+        assert_eq!(
+            check_cursor_bounds(&cursor, &spec),
+            CursorBoundsCheck::AboveRange
+        );
+    }
+
+    #[test]
+    fn cursor_bounds_half_unbounded_end_in_range() {
+        let spec = ShardSpec::with_range(b"a".to_vec(), vec![]);
+        let cursor = Cursor::with_last_key(b"m".to_vec());
+        assert_eq!(
+            check_cursor_bounds(&cursor, &spec),
+            CursorBoundsCheck::InBounds
+        );
+    }
+
+    #[test]
+    fn cursor_bounds_half_unbounded_end_below() {
+        let spec = ShardSpec::with_range(b"m".to_vec(), vec![]);
+        let cursor = Cursor::with_last_key(b"a".to_vec());
+        assert_eq!(
+            check_cursor_bounds(&cursor, &spec),
+            CursorBoundsCheck::BelowRange
+        );
+    }
+
     // -------------------------------------------------------------------
     // CanonicalBytes
     // -------------------------------------------------------------------
@@ -522,11 +839,8 @@ mod tests {
     #[test]
     fn cursor_canonical_bytes_none_vs_some_empty_distinct() {
         let c_none = Cursor::initial();
-        // Bypass the panic in with_last_key by constructing directly.
-        let c_some_empty = Cursor {
-            last_key: Some(Box::new([])),
-            token: None,
-        };
+        // Bypass the panic in with_last_key by constructing via from_raw_parts.
+        let c_some_empty = Cursor::from_raw_parts(Some(Box::new([])), None);
         assert_ne!(canonical_digest(&c_none), canonical_digest(&c_some_empty));
     }
 
@@ -554,10 +868,10 @@ mod tests {
             key in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)),
             token in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)),
         ) {
-            let c = Cursor {
-                last_key: key.map(|v| v.into_boxed_slice()),
-                token: token.map(|v| v.into_boxed_slice()),
-            };
+            let c = Cursor::from_raw_parts(
+                key.map(|v| v.into_boxed_slice()),
+                token.map(|v| v.into_boxed_slice()),
+            );
             prop_assert_eq!(canonical_digest(&c), canonical_digest(&c));
         }
 
@@ -592,16 +906,47 @@ mod tests {
             k2 in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)),
             t2 in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)),
         ) {
-            let c1 = Cursor {
-                last_key: k1.map(|v| v.into_boxed_slice()),
-                token: t1.map(|v| v.into_boxed_slice()),
-            };
-            let c2 = Cursor {
-                last_key: k2.map(|v| v.into_boxed_slice()),
-                token: t2.map(|v| v.into_boxed_slice()),
-            };
+            let c1 = Cursor::from_raw_parts(
+                k1.map(|v| v.into_boxed_slice()),
+                t1.map(|v| v.into_boxed_slice()),
+            );
+            let c2 = Cursor::from_raw_parts(
+                k2.map(|v| v.into_boxed_slice()),
+                t2.map(|v| v.into_boxed_slice()),
+            );
             prop_assume!(c1 != c2);
             prop_assert_ne!(canonical_digest(&c1), canonical_digest(&c2));
+        }
+
+        // -- Anti-symmetry: regression(a,b) ⟹ forward(b,a) ----------------
+
+        #[test]
+        fn cursor_advance_anti_symmetric(
+            a_key in proptest::collection::vec(any::<u8>(), 1..64),
+            b_key in proptest::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let a = Cursor::with_last_key(a_key);
+            let b = Cursor::with_last_key(b_key);
+            let ab = check_cursor_advance(&a, &b);
+            let ba = check_cursor_advance(&b, &a);
+            match ab {
+                CursorAdvance::Regression => {
+                    prop_assert_eq!(ba, CursorAdvance::Forward,
+                        "advance(a,b)==Regression but advance(b,a)!=Forward");
+                }
+                CursorAdvance::Forward => {
+                    // b >= a, so a <= b, meaning advance(b,a) is Forward (a==b)
+                    // or Regression (a < b).
+                    prop_assert!(
+                        ba == CursorAdvance::Forward || ba == CursorAdvance::Regression,
+                        "advance(a,b)==Forward but advance(b,a) is {:?}", ba
+                    );
+                }
+                CursorAdvance::ResetToNone => {
+                    // Not reachable when both have Some keys.
+                    prop_assert!(false, "ResetToNone with two Some keys");
+                }
+            }
         }
 
         // -- Cross-type: bounds_check ↔ contains_key -----------------------
@@ -609,12 +954,25 @@ mod tests {
         #[test]
         fn bounds_check_iff_contains_key(
             key in proptest::collection::vec(any::<u8>(), 1..64),
-            start in proptest::collection::vec(any::<u8>(), 1..32),
-            suffix in proptest::collection::vec(any::<u8>(), 1..8),
+            spec in arb_shard_spec(),
         ) {
-            let mut end = start.clone();
-            end.extend_from_slice(&suffix);
-            let spec = ShardSpec::with_range(start, end);
+            let cursor = Cursor::with_last_key(key.clone());
+            let bounds = check_cursor_bounds(&cursor, &spec);
+            let contains = spec.contains_key(&key);
+            prop_assert_eq!(
+                bounds == CursorBoundsCheck::InBounds,
+                contains,
+                "bounds_check and contains_key disagree for key={:?}", key
+            );
+        }
+
+        // -- Cross-type: bounded spec bounds_check ↔ contains_key ----------
+
+        #[test]
+        fn bounds_check_iff_contains_key_bounded(
+            key in proptest::collection::vec(any::<u8>(), 1..64),
+            spec in arb_bounded_shard_spec(),
+        ) {
             let cursor = Cursor::with_last_key(key.clone());
             let bounds = check_cursor_bounds(&cursor, &spec);
             let contains = spec.contains_key(&key);

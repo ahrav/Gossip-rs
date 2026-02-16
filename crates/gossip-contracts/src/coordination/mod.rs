@@ -25,9 +25,11 @@ pub mod cursor;
 pub mod shard_spec;
 
 pub use cursor::{
-    Cursor, CursorAdvance, CursorBoundsCheck, check_cursor_advance, check_cursor_bounds,
+    Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, MAX_KEY_SIZE as CursorMaxKeySize,
+    MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
 pub use shard_spec::{
-    CursorSemantics, ShardSpec, SplitValidationError, validate_residual_split,
-    validate_split_coverage,
+    CursorSemantics, MAX_KEY_SIZE as ShardSpecMaxKeySize,
+    MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardSpec, ShardSpecInputError,
+    SplitValidationError, validate_residual_split, validate_split_coverage,
 };
