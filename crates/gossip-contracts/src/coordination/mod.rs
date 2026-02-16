@@ -20,3 +20,14 @@
 //!   payloads for the same `OpId` are rejected.
 //! - Terminal irreversibility — `Done`, `Parked`, and `Split` shards (and
 //!   `Done` / `Failed` runs) reject all further mutations.
+
+pub mod cursor;
+pub mod shard_spec;
+
+pub use cursor::{
+    Cursor, CursorAdvance, CursorBoundsCheck, check_cursor_advance, check_cursor_bounds,
+};
+pub use shard_spec::{
+    CursorSemantics, ShardSpec, SplitValidationError, validate_residual_split,
+    validate_split_coverage,
+};

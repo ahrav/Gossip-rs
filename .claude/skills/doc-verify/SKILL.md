@@ -64,7 +64,9 @@ The invoking agent performs these steps before dispatching the verification agen
 - If files are specified: use those
 - If no argument: run `git diff --name-only HEAD` and `git diff --cached --name-only`
   to find recently changed `.rs` files
-- Filter to files that contain doc comments (`///`, `//!`, or `/** */`)
+- Filter to files that contain doc comments. Use the Grep tool (NOT bash grep) with
+    pattern: ^(///|//!) to find files with doc comments. Do NOT pass these patterns
+    through Bash — use the Grep tool directly.
 
 ### 2. Read File Contents
 
