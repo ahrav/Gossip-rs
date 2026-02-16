@@ -25,11 +25,12 @@
 //!
 //! # Crate-internal fast path
 //!
-//! For the five domain tags used in identity derivation, pre-initialized
-//! hashers are cached in `LazyLock<Hasher>` statics (`FINDING_HASHER`, etc.).
+//! For the seven domain tags used across identity and coordination derivation,
+//! pre-initialized hashers are cached in `LazyLock<Hasher>` statics
+//! (`FINDING_HASHER`, `SPLIT_ID_HASHER`, etc.).
 //! [`derive_from_cached`] clones one of these statics instead of re-running
 //! the key-schedule setup, making repeated same-domain derivations cheaper.
-//! All `derive_*` functions in sibling modules use this path.
+//! All `derive_*` functions in the crate use this path.
 //!
 //! # Context string requirements
 //!
@@ -75,8 +76,8 @@ pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
 
 /// Clone a cached hasher, feed canonical input, and finalize to 32 bytes.
 ///
-/// This is the hot-path helper used by every `derive_*` function in the
-/// identity module. Cloning a pre-initialized [`Hasher`] is cheaper than
+/// This is the hot-path helper used by `derive_*` functions across the
+/// identity and coordination modules. Cloning a pre-initialized [`Hasher`] is cheaper than
 /// calling [`Hasher::new_derive_key`] because the BLAKE3 key-schedule setup
 /// (derived from the domain string) has already been computed and stored in
 /// the source `LazyLock<Hasher>` static. The clone copies only the

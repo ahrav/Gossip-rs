@@ -565,13 +565,14 @@ impl ShardRecord {
     /// This is correct because older operations are less likely to be
     /// retried — retry storms typically involve the most recent operations.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     ///
-    /// Debug-asserts that `entry.op_id()` is not already in the log.
-    /// Callers must check [`op_log_lookup`](Self::op_log_lookup) first
-    /// for idempotent replay.
-    pub fn op_log_push(&mut self, entry: OpLogEntry) {
-        debug_assert!(
+    /// Panics if `entry.op_id()` is already in the log. Callers must
+    /// check [`op_log_lookup`](Self::op_log_lookup) first for idempotent
+    /// replay.
+    #[allow(dead_code)] // Used by coordinator backend (Task 4).
+    pub(crate) fn op_log_push(&mut self, entry: OpLogEntry) {
+        assert!(
             !self.op_log.iter().any(|e| e.op_id() == entry.op_id()),
             "Shard {:?}: attempt to push duplicate OpId {:?}",
             self.shard,
@@ -581,7 +582,7 @@ impl ShardRecord {
             self.op_log.remove(0);
         }
         self.op_log.push(entry);
-        debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
+        assert!(self.op_log.len() <= Self::OP_LOG_CAP);
     }
 
     /// Returns `true` if this shard's status is terminal.
@@ -962,6 +963,50 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "must not have a lease")]
+    fn assert_invariants_parked_with_lease_panics() {
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10),
+            ShardStatus::Parked,
+            Some(ParkReason::TooManyErrors),
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            Some(WorkerId::from_raw(1)),
+            Some(LogicalTime::from_raw(100)),
+            FenceEpoch::INITIAL,
+            None,
+            vec![],
+            vec![],
+        );
+        r.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "must not have a lease")]
+    fn assert_invariants_split_with_lease_panics() {
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10),
+            ShardStatus::Split,
+            None,
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            Some(WorkerId::from_raw(1)),
+            Some(LogicalTime::from_raw(100)),
+            FenceEpoch::INITIAL,
+            None,
+            vec![derived_shard_id(1), derived_shard_id(2)],
+            vec![],
+        );
+        r.assert_invariants();
+    }
+
+    #[test]
     #[should_panic(expected = "exceeds cap")]
     fn assert_invariants_op_log_overflow_panics() {
         let entries: Vec<OpLogEntry> = (0..=ShardRecord::OP_LOG_CAP as u64)
@@ -1015,6 +1060,98 @@ mod tests {
         let mut r = active_record();
         r.status = ShardStatus::Split;
         r.spawned = vec![ShardId::from_raw(42)]; // NOT derived (bit 63 clear)
+        r.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "fence_epoch must be >= INITIAL")]
+    fn assert_invariants_fence_epoch_zero_panics() {
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10),
+            ShardStatus::Active,
+            None,
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            None,
+            FenceEpoch::ZERO,
+            None,
+            vec![],
+            vec![],
+        );
+        r.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "must have spawned children")]
+    fn assert_invariants_split_without_spawned_panics() {
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10),
+            ShardStatus::Split,
+            None,
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            None,
+            FenceEpoch::INITIAL,
+            None,
+            vec![], // empty spawned
+            vec![],
+        );
+        r.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate OpId")]
+    fn assert_invariants_duplicate_op_id_panics() {
+        let entries = vec![make_entry(42), make_entry(42)]; // same OpId
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10),
+            ShardStatus::Active,
+            None,
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            None,
+            FenceEpoch::INITIAL,
+            None,
+            vec![],
+            entries,
+        );
+        r.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic(expected = "spawned count")]
+    fn assert_invariants_spawned_exceeds_cap_panics() {
+        let spawned: Vec<ShardId> = (0..=MAX_SPAWNED_PER_SHARD as u64)
+            .map(|i| derived_shard_id(i + 1))
+            .collect();
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10),
+            ShardStatus::Split,
+            None,
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            None,
+            FenceEpoch::INITIAL,
+            None,
+            spawned,
+            vec![],
+        );
         r.assert_invariants();
     }
 

@@ -17,13 +17,13 @@
 //!
 //! ## Design Decisions (locked)
 //!
-//! D2.8: Derived shard IDs have bit 63 set — distinguishing root shards
-//!       (externally assigned) from split-derived shards (deterministically
-//!       computed). Birthday collision bound ~2^32 values before 50%
-//!       collision probability; acceptable for bounded coordination use
-//!       cases.
+//! D2.10: Derived shard IDs have bit 63 set — distinguishing root shards
+//!        (externally assigned) from split-derived shards (deterministically
+//!        computed). Birthday collision bound ~2^31.5 values before 50%
+//!        collision probability (63 effective bits); acceptable for bounded
+//!        coordination use cases.
 //!
-//! D2.9: Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`
+//! D2.8: Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`
 //!       encoding. This ties the op-log idempotency check to the actual
 //!       operation parameters, detecting "same OpId, different payload"
 //!       conflicts.
