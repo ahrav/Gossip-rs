@@ -67,6 +67,12 @@ pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
 pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
 
+pub(crate) static SPLIT_ID_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::SPLIT_ID_V1));
+
+pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::OP_PAYLOAD_V1));
+
 /// Clone a cached hasher, feed canonical input, and finalize to 32 bytes.
 ///
 /// This is the hot-path helper used by every `derive_*` function in the

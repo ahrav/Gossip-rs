@@ -22,14 +22,25 @@
 //!   `Done` / `Failed` runs) reject all further mutations.
 
 pub mod cursor;
+pub mod lease;
+pub mod record;
 pub mod shard_spec;
+pub mod split;
 
 pub use cursor::{
     Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, MAX_KEY_SIZE as CursorMaxKeySize,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
+pub use lease::{Lease, OpKind, OpLogEntry, OpResult};
+pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};
 pub use shard_spec::{
     CursorSemantics, MAX_KEY_SIZE as ShardSpecMaxKeySize,
     MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardSpec, ShardSpecInputError,
     SplitValidationError, validate_residual_split, validate_split_coverage,
+};
+pub use split::{
+    DerivedShardKind, MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN, SplitReplaceChild,
+    SplitReplacePlan, SplitReplacePlanError, SplitResidualPlan, derive_split_shard_id,
+    hash_checkpoint_payload, hash_complete_payload, hash_park_payload, hash_split_replace_payload,
+    hash_split_residual_payload,
 };
