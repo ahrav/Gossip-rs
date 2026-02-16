@@ -194,6 +194,7 @@ pub struct ShardSpec {
 
 impl ShardSpec {
     /// Unbounded shard covering the entire keyspace, no metadata.
+    #[must_use = "creates a shard spec that should be stored or used"]
     pub fn unbounded() -> Self {
         Self {
             key_range_start: Box::new([]),
@@ -207,6 +208,7 @@ impl ShardSpec {
     /// # Panics
     ///
     /// Panics if `start` and `end` are both non-empty and `start >= end`.
+    #[must_use = "creates a shard spec that should be stored or used"]
     pub fn with_range(start: Vec<u8>, end: Vec<u8>) -> Self {
         Self::with_range_and_metadata(start, end, vec![])
     }
@@ -216,6 +218,7 @@ impl ShardSpec {
     /// # Panics
     ///
     /// Panics if `start` and `end` are both non-empty and `start >= end`.
+    #[must_use = "creates a shard spec that should be stored or used"]
     pub fn with_range_and_metadata(start: Vec<u8>, end: Vec<u8>, metadata: Vec<u8>) -> Self {
         if !start.is_empty() && !end.is_empty() {
             assert!(
@@ -242,6 +245,7 @@ impl ShardSpec {
     ///   [`MAX_KEY_SIZE`] bytes.
     /// - [`ShardSpecInputError::InvertedRange`] — both `start` and `end`
     ///   are non-empty and `start >= end`.
+    #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_with_range(start: Vec<u8>, end: Vec<u8>) -> Result<Self, ShardSpecInputError> {
         Self::try_with_range_and_metadata(start, end, vec![])
     }
@@ -257,6 +261,7 @@ impl ShardSpec {
     ///   are non-empty and `start >= end`.
     /// - [`ShardSpecInputError::MetadataTooLarge`] — `metadata` exceeds
     ///   [`MAX_METADATA_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_with_range_and_metadata(
         start: Vec<u8>,
         end: Vec<u8>,
@@ -324,24 +329,28 @@ impl ShardSpec {
 
     /// Returns `true` if the shard covers the entire keyspace.
     #[inline]
+    #[must_use = "returns a bool that should be checked"]
     pub fn is_unbounded(&self) -> bool {
         self.is_start_unbounded() && self.is_end_unbounded()
     }
 
     /// Inclusive lower bound of the key range (borrowed).
     #[inline]
+    #[must_use = "returns a reference that should be used"]
     pub fn key_range_start(&self) -> &[u8] {
         &self.key_range_start
     }
 
     /// Exclusive upper bound of the key range (borrowed).
     #[inline]
+    #[must_use = "returns a reference that should be used"]
     pub fn key_range_end(&self) -> &[u8] {
         &self.key_range_end
     }
 
     /// Connector-opaque metadata (borrowed).
     #[inline]
+    #[must_use = "returns a reference that should be used"]
     pub fn metadata(&self) -> &[u8] {
         &self.metadata
     }
@@ -425,10 +434,7 @@ impl fmt::Display for ShardSpecInputError {
                 write!(f, "ShardSpec: key too large ({size} bytes, max {max})")
             }
             Self::MetadataTooLarge { size, max } => {
-                write!(
-                    f,
-                    "ShardSpec: metadata too large ({size} bytes, max {max})"
-                )
+                write!(f, "ShardSpec: metadata too large ({size} bytes, max {max})")
             }
         }
     }
@@ -444,6 +450,7 @@ impl std::error::Error for ShardSpecInputError {}
 /// [`validate_residual_split`] when proposed child shards do not form
 /// a valid partition of the parent's key range.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SplitValidationError {
     /// No children were provided (need at least 2).
     NoChildren,

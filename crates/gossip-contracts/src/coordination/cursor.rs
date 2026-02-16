@@ -116,6 +116,7 @@ pub struct Cursor {
 
 impl Cursor {
     /// Initial cursor: no progress, no resume token.
+    #[must_use = "creates a cursor that should be stored or passed to a connector"]
     pub fn initial() -> Self {
         Self {
             last_key: None,
@@ -150,6 +151,7 @@ impl Cursor {
     /// # Panics
     ///
     /// Panics if `last_key` is empty.
+    #[must_use = "creates a cursor that should be stored or passed to a connector"]
     pub fn from_parts(last_key: Vec<u8>, token: Vec<u8>) -> Self {
         assert!(
             !last_key.is_empty(),
@@ -173,6 +175,7 @@ impl Cursor {
     /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
     /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
     ///   [`MAX_KEY_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_with_last_key(last_key: Vec<u8>) -> Result<Self, CursorInputError> {
         if last_key.is_empty() {
             return Err(CursorInputError::EmptyLastKey);
@@ -202,6 +205,7 @@ impl Cursor {
     ///   [`MAX_KEY_SIZE`] bytes.
     /// - [`CursorInputError::TokenTooLarge`] — `token` exceeds
     ///   [`MAX_TOKEN_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_from_parts(last_key: Vec<u8>, token: Vec<u8>) -> Result<Self, CursorInputError> {
         if last_key.is_empty() {
             return Err(CursorInputError::EmptyLastKey);
@@ -241,24 +245,28 @@ impl Cursor {
     /// The `token` field is not considered — progress is measured solely
     /// by `last_key`.
     #[inline]
+    #[must_use = "returns a bool that should be checked"]
     pub fn is_initial(&self) -> bool {
         self.last_key.is_none()
     }
 
     /// The key of the last fully-processed item, if any.
     #[inline]
+    #[must_use = "returns a reference that should be used"]
     pub fn last_key(&self) -> Option<&[u8]> {
         self.last_key.as_deref()
     }
 
     /// The connector-opaque resume token, if any.
     #[inline]
+    #[must_use = "returns a reference that should be used"]
     pub fn token(&self) -> Option<&[u8]> {
         self.token.as_deref()
     }
 
     /// Consume the cursor and return its parts.
     #[inline]
+    #[must_use = "returns owned data that should be used"]
     #[allow(clippy::type_complexity)]
     pub fn into_parts(self) -> (Option<Box<[u8]>>, Option<Box<[u8]>>) {
         (self.last_key, self.token)
@@ -355,6 +363,7 @@ impl std::error::Error for CursorInputError {}
 /// [`Forward`]: CursorAdvance::Forward
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "advance check result must be inspected to enforce monotonicity"]
+#[non_exhaustive]
 pub enum CursorAdvance {
     /// New cursor represents forward progress (or idempotent same-position).
     Forward,
@@ -427,6 +436,7 @@ pub fn check_cursor_advance(old: &Cursor, new: &Cursor) -> CursorAdvance {
 /// [`NoKey`]: CursorBoundsCheck::NoKey
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "bounds check result must be inspected to enforce range safety"]
+#[non_exhaustive]
 pub enum CursorBoundsCheck {
     /// Cursor has no `last_key` — nothing to check (initial state).
     NoKey,
@@ -764,6 +774,34 @@ mod tests {
                 b"",
                 CursorBoundsCheck::InBounds,
             ),
+            (
+                "half-unbounded start, in range",
+                Some(b"m"),
+                b"",
+                b"z",
+                CursorBoundsCheck::InBounds,
+            ),
+            (
+                "half-unbounded start, above",
+                Some(b"z"),
+                b"",
+                b"m",
+                CursorBoundsCheck::AboveRange,
+            ),
+            (
+                "half-unbounded end, in range",
+                Some(b"m"),
+                b"a",
+                b"",
+                CursorBoundsCheck::InBounds,
+            ),
+            (
+                "half-unbounded end, below",
+                Some(b"a"),
+                b"m",
+                b"",
+                CursorBoundsCheck::BelowRange,
+            ),
         ];
 
         for (label, key, start, end, expected) in cases {
@@ -782,46 +820,6 @@ mod tests {
                 "case: {label}"
             );
         }
-    }
-
-    #[test]
-    fn cursor_bounds_half_unbounded_start_in_range() {
-        let spec = ShardSpec::with_range(vec![], b"z".to_vec());
-        let cursor = Cursor::with_last_key(b"m".to_vec());
-        assert_eq!(
-            check_cursor_bounds(&cursor, &spec),
-            CursorBoundsCheck::InBounds
-        );
-    }
-
-    #[test]
-    fn cursor_bounds_half_unbounded_start_above() {
-        let spec = ShardSpec::with_range(vec![], b"m".to_vec());
-        let cursor = Cursor::with_last_key(b"z".to_vec());
-        assert_eq!(
-            check_cursor_bounds(&cursor, &spec),
-            CursorBoundsCheck::AboveRange
-        );
-    }
-
-    #[test]
-    fn cursor_bounds_half_unbounded_end_in_range() {
-        let spec = ShardSpec::with_range(b"a".to_vec(), vec![]);
-        let cursor = Cursor::with_last_key(b"m".to_vec());
-        assert_eq!(
-            check_cursor_bounds(&cursor, &spec),
-            CursorBoundsCheck::InBounds
-        );
-    }
-
-    #[test]
-    fn cursor_bounds_half_unbounded_end_below() {
-        let spec = ShardSpec::with_range(b"m".to_vec(), vec![]);
-        let cursor = Cursor::with_last_key(b"a".to_vec());
-        assert_eq!(
-            check_cursor_bounds(&cursor, &spec),
-            CursorBoundsCheck::BelowRange
-        );
     }
 
     // -------------------------------------------------------------------
