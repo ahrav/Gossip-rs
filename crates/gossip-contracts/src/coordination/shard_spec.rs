@@ -754,10 +754,12 @@ mod tests {
     // ShardSpec construction
     // -------------------------------------------------------------------
 
+    // (label, spec, expected_start, expected_end, start_ub, end_ub, full_ub)
+    type ConstructionCase<'a> = (&'a str, ShardSpec, &'a [u8], &'a [u8], bool, bool, bool);
+
     #[test]
     fn shard_spec_construction_truth_table() {
-        // (label, spec, expected_start, expected_end, start_ub, end_ub, full_ub)
-        let cases: &[(&str, ShardSpec, &[u8], &[u8], bool, bool, bool)] = &[
+        let cases: &[ConstructionCase<'_>] = &[
             (
                 "unbounded",
                 ShardSpec::unbounded(),
@@ -840,13 +842,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn try_with_range_valid() {
-        let spec = ShardSpec::try_with_range(b"a".to_vec(), b"z".to_vec()).unwrap();
-        assert_eq!(spec.key_range_start(), b"a");
-        assert_eq!(spec.key_range_end(), b"z");
-    }
-
-    #[test]
     fn try_with_range_inverted() {
         let err = ShardSpec::try_with_range(b"z".to_vec(), b"a".to_vec()).unwrap_err();
         assert_eq!(
@@ -872,18 +867,6 @@ mod tests {
         assert_eq!(spec.key_range_start(), b"a");
         assert_eq!(spec.key_range_end(), b"z");
         assert_eq!(spec.metadata(), b"meta");
-    }
-
-    #[test]
-    fn try_with_range_unbounded_start() {
-        let spec = ShardSpec::try_with_range(vec![], b"z".to_vec()).unwrap();
-        assert!(spec.is_start_unbounded());
-    }
-
-    #[test]
-    fn try_with_range_unbounded_end() {
-        let spec = ShardSpec::try_with_range(b"a".to_vec(), vec![]).unwrap();
-        assert!(spec.is_end_unbounded());
     }
 
     #[test]
@@ -1341,6 +1324,35 @@ mod tests {
             let in_res = residual.contains_key(&key);
             prop_assert_eq!(in_old, in_new || in_res);
             prop_assert!(!(in_new && in_res), "key in both new_parent and residual");
+        }
+
+        // -- Constructor equivalence: try_with_range ≡ with_range ------------
+
+        #[test]
+        fn try_with_range_equivalent_to_with_range(
+            spec in arb_shard_spec(),
+        ) {
+            let start = spec.key_range_start().to_vec();
+            let end = spec.key_range_end().to_vec();
+            let result = ShardSpec::try_with_range(start, end);
+            prop_assert_eq!(result, Ok(spec));
+        }
+
+        // -- Constructor equivalence: try_with_range_and_metadata -------------
+
+        #[test]
+        fn try_with_range_and_metadata_equivalent(
+            start in proptest::collection::vec(any::<u8>(), 1..64),
+            suffix in proptest::collection::vec(any::<u8>(), 1..8),
+            metadata in proptest::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let mut end = start.clone();
+            end.extend_from_slice(&suffix);
+            let try_result = ShardSpec::try_with_range_and_metadata(
+                start.clone(), end.clone(), metadata.clone(),
+            );
+            let direct = ShardSpec::with_range_and_metadata(start, end, metadata);
+            prop_assert_eq!(try_result, Ok(direct));
         }
 
         // -- Metadata distinction: different metadata → different digest -----
