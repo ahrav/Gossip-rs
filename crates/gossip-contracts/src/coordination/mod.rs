@@ -34,8 +34,9 @@ pub use cursor::{
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
 pub use error::{
-    AcquireError, AcquireResult, CheckpointError, CompleteError, CoordError, IdempotentOutcome,
-    ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireResult, CheckpointError, CompleteError, CoordError,
+    CursorOutOfBoundsDetail, IdempotentOutcome, ParkError, RenewError, RenewResult, SplitError,
+    SplitReplaceError, SplitResidualError,
 };
 pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};

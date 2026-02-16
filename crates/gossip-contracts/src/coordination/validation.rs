@@ -58,8 +58,9 @@ pub fn validate_lease(
     lease: &Lease,
     record: &ShardRecord,
 ) -> Result<(), CoordError> {
-    // Precondition: time must be positive.
-    debug_assert!(
+    // Precondition: time must be positive. A zero timestamp indicates a
+    // broken clock — this is a caller bug, not a protocol error.
+    assert!(
         now > LogicalTime::ZERO,
         "validate_lease: now must be > ZERO"
     );
@@ -86,12 +87,28 @@ pub fn validate_lease(
     }
 
     // 4. Lease expiry. If the fence epoch check passed, the record
-    // MUST have a lease holder — unwrap_or(ZERO) would mask a logic bug.
-    let deadline = record
-        .lease_deadline()
-        .expect("lease deadline must exist when fence epochs match");
+    // should have a lease holder. If it doesn't, the record is in
+    // an inconsistent state — treat as stale so the caller re-acquires.
+    let Some(deadline) = record.lease_deadline() else {
+        return Err(CoordError::StaleFence {
+            presented: lease.fence(),
+            current: record.fence_epoch,
+        });
+    };
     if now >= deadline {
         return Err(CoordError::LeaseExpired { deadline, now });
+    }
+
+    // 5. Owner divergence. The fence epoch alone is the authoritative
+    // guard, but a bug in lease-handoff or state reconstruction could
+    // leave fence == current while the recorded owner differs. This
+    // runtime check catches that class of logic error before the
+    // mutation proceeds with the wrong identity.
+    if record.lease_owner() != Some(lease.owner()) {
+        return Err(CoordError::StaleFence {
+            presented: lease.fence(),
+            current: record.fence_epoch,
+        });
     }
 
     // Postconditions: all checks passed.
@@ -99,18 +116,6 @@ pub fn validate_lease(
     debug_assert!(!record.status.is_terminal());
     debug_assert!(lease.fence() == record.fence_epoch);
     debug_assert!(record.is_leased_at(now));
-
-    // Belt-and-suspenders owner check. The fence epoch alone is the
-    // authoritative guard, but a bug in lease-handoff or state
-    // reconstruction could leave fence == current while the recorded
-    // owner differs. This assert catches that class of logic error
-    // early, before the mutation proceeds with the wrong identity.
-    debug_assert!(
-        record.lease_owner() == Some(lease.owner()),
-        "fence epoch matched but owner diverged: lease={:?}, record={:?}",
-        lease.owner(),
-        record.lease_owner(),
-    );
 
     Ok(())
 }
@@ -166,11 +171,13 @@ pub fn validate_cursor_update(new_cursor: &Cursor, record: &ShardRecord) -> Resu
                 .expect("last_key validated as Some in check 1")
                 .to_vec()
                 .into_boxed_slice();
-            return Err(CoordError::CursorOutOfBounds {
-                last_key,
-                spec_start: record.spec.key_range_start().to_vec().into_boxed_slice(),
-                spec_end: record.spec.key_range_end().to_vec().into_boxed_slice(),
-            });
+            return Err(CoordError::CursorOutOfBounds(Box::new(
+                crate::coordination::error::CursorOutOfBoundsDetail {
+                    last_key,
+                    spec_start: record.spec.key_range_start().to_vec().into_boxed_slice(),
+                    spec_end: record.spec.key_range_end().to_vec().into_boxed_slice(),
+                },
+            )));
         }
     }
 
@@ -214,9 +221,9 @@ pub fn check_op_idempotency(
     op_id: OpId,
     payload_hash: u64,
 ) -> Result<Option<&OpLogEntry>, CoordError> {
-    // Precondition: payload hash must be non-zero (indicates hashing
-    // failure if zero — see OpLogEntry::new assertion).
-    debug_assert!(payload_hash != 0, "payload_hash must be non-zero");
+    // Precondition: payload hash must be non-zero. A zero hash indicates
+    // broken hashing — this is a caller bug, not a protocol error.
+    assert!(payload_hash != 0, "payload_hash must be non-zero");
 
     let Some(entry) = record.op_log_lookup(op_id) else {
         return Ok(None);
@@ -390,6 +397,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_lease_no_lease_returns_stale_fence() {
+        // Active record with INITIAL fence and no lease holder.
+        let record = active_unleased_record();
+        // Caller presents a lease with INITIAL fence (matches record).
+        let lease = Lease::new(
+            test_tenant(),
+            test_run(),
+            test_shard(),
+            WorkerId::from_raw(1),
+            FenceEpoch::INITIAL,
+            LogicalTime::from_raw(100),
+        );
+        let now = LogicalTime::from_raw(50);
+        let result = validate_lease(now, test_tenant(), &lease, &record);
+        assert!(
+            matches!(
+                result,
+                Err(CoordError::StaleFence {
+                    presented,
+                    current,
+                }) if presented == FenceEpoch::INITIAL && current == FenceEpoch::INITIAL
+            ),
+            "unleased record with matching fence should return StaleFence, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_lease_owner_divergence_returns_stale_fence() {
+        let record = active_leased_record(); // owner=99, fence=2
+        // Create a lease with matching fence but different owner.
+        let lease = Lease::new(
+            test_tenant(),
+            test_run(),
+            test_shard(),
+            WorkerId::from_raw(999), // different owner
+            record.fence_epoch,
+            record.lease_deadline().unwrap(),
+        );
+        let now = LogicalTime::from_raw(50);
+        let result = validate_lease(now, test_tenant(), &lease, &record);
+        assert!(
+            matches!(result, Err(CoordError::StaleFence { .. })),
+            "owner divergence should return StaleFence, got {result:?}"
+        );
+    }
+
     // -- validate_lease: error priority ordering --------------------------
     // Table-driven test covering all C(4,2)+C(4,3)+C(4,4) = 11 multi-
     // condition combinations. Verifies the documented check priority:
@@ -528,7 +582,7 @@ mod tests {
         let new_cursor = Cursor::with_last_key(vec![0x00]);
         let result = validate_cursor_update(&new_cursor, &record);
         assert!(
-            matches!(result, Err(CoordError::CursorOutOfBounds { .. })),
+            matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "expected CursorOutOfBounds, got {result:?}"
         );
     }
@@ -540,7 +594,7 @@ mod tests {
         let new_cursor = Cursor::with_last_key(b"z".to_vec());
         let result = validate_cursor_update(&new_cursor, &record);
         assert!(
-            matches!(result, Err(CoordError::CursorOutOfBounds { .. })),
+            matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "expected CursorOutOfBounds, got {result:?}"
         );
     }
@@ -574,7 +628,7 @@ mod tests {
         let new_cursor = Cursor::with_last_key(b"z".to_vec()); // at end (exclusive)
         let result = validate_cursor_update(&new_cursor, &record);
         assert!(
-            matches!(result, Err(CoordError::CursorOutOfBounds { .. })),
+            matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "key at spec end should be AboveRange (exclusive)"
         );
     }
@@ -699,7 +753,7 @@ mod tests {
                         adv == CursorAdvance::Regression || adv == CursorAdvance::ResetToNone,
                     );
                 }
-                Err(CoordError::CursorOutOfBounds { .. }) => {
+                Err(CoordError::CursorOutOfBounds(_)) => {
                     let bounds = check_cursor_bounds(&new_cursor, &record.spec);
                     prop_assert!(
                         bounds == CursorBoundsCheck::BelowRange

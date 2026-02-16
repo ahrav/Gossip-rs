@@ -50,7 +50,7 @@ use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardKey, TenantId, WorkerI
 /// In both cases, the worker MUST stop processing and re-acquire.
 ///
 /// Reference: Kleppmann, "How to do distributed locking" (2016).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CoordError {
     /// The shard does not exist in the coordination store.
@@ -89,16 +89,6 @@ pub enum CoordError {
         status: ShardStatus,
     },
 
-    /// The shard is not in the expected status for this operation.
-    ///
-    /// Reserved for status precondition checks not covered by
-    /// `ShardTerminal`. Retained for coordinator backends that need
-    /// finer-grained status checks.
-    WrongStatus {
-        expected: ShardStatus,
-        actual: ShardStatus,
-    },
-
     /// Idempotency conflict: the OpId was previously used with a
     /// different payload hash. This is always a client bug -- accidental
     /// reuse of an OpId for a semantically different operation.
@@ -125,19 +115,95 @@ pub enum CoordError {
     /// Cursor bounds violation: the cursor's `last_key` falls outside
     /// the shard's key range.
     ///
+    /// Boxed to keep `CoordError` at ~40 bytes instead of ~64.
+    ///
     /// Reference: D2.4 -- cursor bounds checking is a hard safety invariant.
-    CursorOutOfBounds {
-        last_key: Box<[u8]>,
-        spec_start: Box<[u8]>,
-        spec_end: Box<[u8]>,
-    },
+    CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
 
     /// Split validation failed. Wraps the detailed error from
     /// `validate_split_coverage` / `validate_residual_split`.
-    SplitInvalid(SplitValidationError),
+    ///
+    /// Boxed to keep `CoordError` at ~40 bytes instead of ~64.
+    SplitInvalid(Box<SplitValidationError>),
 
     /// Checkpoint requires a `last_key` but the provided cursor has none.
     CheckpointMissingKey,
+}
+
+/// Detail payload for [`CoordError::CursorOutOfBounds`].
+///
+/// Boxed to keep the `CoordError` enum at ~40 bytes instead of ~64.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CursorOutOfBoundsDetail {
+    pub last_key: Box<[u8]>,
+    pub spec_start: Box<[u8]>,
+    pub spec_end: Box<[u8]>,
+}
+
+impl fmt::Debug for CursorOutOfBoundsDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CursorOutOfBoundsDetail")
+            .field("last_key", &format_args!("[{} bytes]", self.last_key.len()))
+            .field(
+                "spec_start",
+                &format_args!("[{} bytes]", self.spec_start.len()),
+            )
+            .field("spec_end", &format_args!("[{} bytes]", self.spec_end.len()))
+            .finish()
+    }
+}
+
+// Custom Debug: redacts sensitive fields -- hash values in OpIdConflict
+// (SEC-6), raw key bytes in CursorRegression and CursorOutOfBounds.
+impl fmt::Debug for CoordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardNotFound { shard } => f
+                .debug_struct("ShardNotFound")
+                .field("shard", shard)
+                .finish(),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::StaleFence { presented, current } => f
+                .debug_struct("StaleFence")
+                .field("presented", presented)
+                .field("current", current)
+                .finish(),
+            Self::LeaseExpired { deadline, now } => f
+                .debug_struct("LeaseExpired")
+                .field("deadline", deadline)
+                .field("now", now)
+                .finish(),
+            Self::ShardTerminal { shard, status } => f
+                .debug_struct("ShardTerminal")
+                .field("shard", shard)
+                .field("status", status)
+                .finish(),
+            Self::OpIdConflict { op_id, .. } => f
+                .debug_struct("OpIdConflict")
+                .field("op_id", op_id)
+                .field("expected_hash", &"<redacted>")
+                .field("actual_hash", &"<redacted>")
+                .finish(),
+            Self::CursorRegression { old_key, new_key } => {
+                let redact = |k: &Option<Box<[u8]>>| match k {
+                    Some(b) => format!("Some([{} bytes])", b.len()),
+                    None => "None".to_string(),
+                };
+                f.debug_struct("CursorRegression")
+                    .field("old_key", &redact(old_key))
+                    .field("new_key", &redact(new_key))
+                    .finish()
+            }
+            Self::CursorOutOfBounds(detail) => {
+                f.debug_tuple("CursorOutOfBounds").field(detail).finish()
+            }
+            Self::SplitInvalid(inner) => f.debug_tuple("SplitInvalid").field(inner).finish(),
+            Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
+        }
+    }
 }
 
 impl fmt::Display for CoordError {
@@ -157,17 +223,14 @@ impl fmt::Display for CoordError {
             Self::ShardTerminal { shard, status } => {
                 write!(f, "shard {shard:?} is terminal ({status})")
             }
-            Self::WrongStatus { expected, actual } => {
-                write!(f, "wrong status: expected {expected}, actual {actual}")
-            }
             Self::OpIdConflict { op_id, .. } => {
                 write!(f, "op-id conflict: {op_id:?} reused with different payload")
             }
             Self::CursorRegression { .. } => write!(f, "cursor regression: new key < old key"),
-            Self::CursorOutOfBounds { last_key, .. } => write!(
+            Self::CursorOutOfBounds(detail) => write!(
                 f,
                 "cursor out of bounds: key ({} bytes) outside shard range",
-                last_key.len()
+                detail.last_key.len()
             ),
             Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
@@ -178,7 +241,7 @@ impl fmt::Display for CoordError {
 impl std::error::Error for CoordError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SplitInvalid(inner) => Some(inner),
+            Self::SplitInvalid(inner) => Some(inner.as_ref()),
             _ => None,
         }
     }
@@ -193,7 +256,7 @@ impl std::error::Error for CoordError {
 /// Acquire is special: it does NOT require a pre-existing lease, so
 /// it cannot produce `StaleFence` or `LeaseExpired`. It can fail if
 /// the shard is terminal, or if another worker holds a live lease.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AcquireError {
     /// The shard does not exist.
     ShardNotFound { shard: ShardKey },
@@ -218,6 +281,33 @@ pub enum AcquireError {
         current_owner: WorkerId,
         lease_deadline: LogicalTime,
     },
+}
+
+// Custom Debug: redacts `current_owner` to prevent worker identity
+// leakage (SEC-5). Display already redacts via `..`.
+impl fmt::Debug for AcquireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardNotFound { shard } => f
+                .debug_struct("ShardNotFound")
+                .field("shard", shard)
+                .finish(),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::ShardTerminal { shard, status } => f
+                .debug_struct("ShardTerminal")
+                .field("shard", shard)
+                .field("status", status)
+                .finish(),
+            Self::AlreadyLeased { lease_deadline, .. } => f
+                .debug_struct("AlreadyLeased")
+                .field("current_owner", &"<redacted>")
+                .field("lease_deadline", lease_deadline)
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Display for AcquireError {
@@ -299,10 +389,10 @@ impl std::error::Error for RenewError {}
 /// types (tied with [`CompleteError`]), carrying all common precondition
 /// variants plus `OpIdConflict`,
 /// `CursorRegression`, `CursorOutOfBounds`, and `CheckpointMissingKey`.
-/// It excludes only `WrongStatus` and `SplitInvalid`.
+/// It excludes only `SplitInvalid`.
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CheckpointError {
     ShardNotFound {
         shard: ShardKey,
@@ -331,12 +421,58 @@ pub enum CheckpointError {
         old_key: Option<Box<[u8]>>,
         new_key: Option<Box<[u8]>>,
     },
-    CursorOutOfBounds {
-        last_key: Box<[u8]>,
-        spec_start: Box<[u8]>,
-        spec_end: Box<[u8]>,
-    },
+    CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
     CheckpointMissingKey,
+}
+
+impl fmt::Debug for CheckpointError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardNotFound { shard } => f
+                .debug_struct("ShardNotFound")
+                .field("shard", shard)
+                .finish(),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::StaleFence { presented, current } => f
+                .debug_struct("StaleFence")
+                .field("presented", presented)
+                .field("current", current)
+                .finish(),
+            Self::LeaseExpired { deadline, now } => f
+                .debug_struct("LeaseExpired")
+                .field("deadline", deadline)
+                .field("now", now)
+                .finish(),
+            Self::ShardTerminal { shard, status } => f
+                .debug_struct("ShardTerminal")
+                .field("shard", shard)
+                .field("status", status)
+                .finish(),
+            Self::OpIdConflict { op_id, .. } => f
+                .debug_struct("OpIdConflict")
+                .field("op_id", op_id)
+                .field("expected_hash", &"<redacted>")
+                .field("actual_hash", &"<redacted>")
+                .finish(),
+            Self::CursorRegression { old_key, new_key } => {
+                let redact = |k: &Option<Box<[u8]>>| match k {
+                    Some(b) => format!("Some([{} bytes])", b.len()),
+                    None => "None".to_string(),
+                };
+                f.debug_struct("CursorRegression")
+                    .field("old_key", &redact(old_key))
+                    .field("new_key", &redact(new_key))
+                    .finish()
+            }
+            Self::CursorOutOfBounds(detail) => {
+                f.debug_tuple("CursorOutOfBounds").field(detail).finish()
+            }
+            Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
+        }
+    }
 }
 
 impl fmt::Display for CheckpointError {
@@ -360,10 +496,10 @@ impl fmt::Display for CheckpointError {
                 write!(f, "op-id conflict: {op_id:?} reused with different payload")
             }
             Self::CursorRegression { .. } => write!(f, "cursor regression: new key < old key"),
-            Self::CursorOutOfBounds { last_key, .. } => write!(
+            Self::CursorOutOfBounds(detail) => write!(
                 f,
                 "cursor out of bounds: key ({} bytes) outside shard range",
-                last_key.len()
+                detail.last_key.len()
             ),
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
         }
@@ -376,12 +512,12 @@ impl std::error::Error for CheckpointError {}
 ///
 /// Complete shares most variants with [`CheckpointError`] (idempotency,
 /// cursor checks) because it records a final cursor position. It excludes
-/// `WrongStatus` and `SplitInvalid`. The `CheckpointMissingKey` variant
+/// `SplitInvalid`. The `CheckpointMissingKey` variant
 /// here means the worker did not supply a `last_key` proving it reached
 /// the end of its assigned range.
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CompleteError {
     ShardNotFound {
         shard: ShardKey,
@@ -406,18 +542,64 @@ pub enum CompleteError {
         expected_hash: u64,
         actual_hash: u64,
     },
-    /// Complete requires a final cursor with a `last_key` to confirm
-    /// the worker reached the end of its assigned range.
-    CheckpointMissingKey,
     CursorRegression {
         old_key: Option<Box<[u8]>>,
         new_key: Option<Box<[u8]>>,
     },
-    CursorOutOfBounds {
-        last_key: Box<[u8]>,
-        spec_start: Box<[u8]>,
-        spec_end: Box<[u8]>,
-    },
+    CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
+    /// Complete requires a final cursor with a `last_key` to confirm
+    /// the worker reached the end of its assigned range.
+    CheckpointMissingKey,
+}
+
+impl fmt::Debug for CompleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardNotFound { shard } => f
+                .debug_struct("ShardNotFound")
+                .field("shard", shard)
+                .finish(),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::StaleFence { presented, current } => f
+                .debug_struct("StaleFence")
+                .field("presented", presented)
+                .field("current", current)
+                .finish(),
+            Self::LeaseExpired { deadline, now } => f
+                .debug_struct("LeaseExpired")
+                .field("deadline", deadline)
+                .field("now", now)
+                .finish(),
+            Self::ShardTerminal { shard, status } => f
+                .debug_struct("ShardTerminal")
+                .field("shard", shard)
+                .field("status", status)
+                .finish(),
+            Self::OpIdConflict { op_id, .. } => f
+                .debug_struct("OpIdConflict")
+                .field("op_id", op_id)
+                .field("expected_hash", &"<redacted>")
+                .field("actual_hash", &"<redacted>")
+                .finish(),
+            Self::CursorRegression { old_key, new_key } => {
+                let redact = |k: &Option<Box<[u8]>>| match k {
+                    Some(b) => format!("Some([{} bytes])", b.len()),
+                    None => "None".to_string(),
+                };
+                f.debug_struct("CursorRegression")
+                    .field("old_key", &redact(old_key))
+                    .field("new_key", &redact(new_key))
+                    .finish()
+            }
+            Self::CursorOutOfBounds(detail) => {
+                f.debug_tuple("CursorOutOfBounds").field(detail).finish()
+            }
+            Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
+        }
+    }
 }
 
 impl fmt::Display for CompleteError {
@@ -440,13 +622,13 @@ impl fmt::Display for CompleteError {
             Self::OpIdConflict { op_id, .. } => {
                 write!(f, "op-id conflict: {op_id:?} reused with different payload")
             }
-            Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
             Self::CursorRegression { .. } => write!(f, "cursor regression: new key < old key"),
-            Self::CursorOutOfBounds { last_key, .. } => write!(
+            Self::CursorOutOfBounds(detail) => write!(
                 f,
                 "cursor out of bounds: key ({} bytes) outside shard range",
-                last_key.len()
+                detail.last_key.len()
             ),
+            Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
         }
     }
 }
@@ -460,7 +642,7 @@ impl std::error::Error for CompleteError {}
 /// so it excludes all cursor variants and `CheckpointMissingKey`.
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ParkError {
     ShardNotFound {
         shard: ShardKey,
@@ -485,6 +667,42 @@ pub enum ParkError {
         expected_hash: u64,
         actual_hash: u64,
     },
+}
+
+impl fmt::Debug for ParkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardNotFound { shard } => f
+                .debug_struct("ShardNotFound")
+                .field("shard", shard)
+                .finish(),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::StaleFence { presented, current } => f
+                .debug_struct("StaleFence")
+                .field("presented", presented)
+                .field("current", current)
+                .finish(),
+            Self::LeaseExpired { deadline, now } => f
+                .debug_struct("LeaseExpired")
+                .field("deadline", deadline)
+                .field("now", now)
+                .finish(),
+            Self::ShardTerminal { shard, status } => f
+                .debug_struct("ShardTerminal")
+                .field("shard", shard)
+                .field("status", status)
+                .finish(),
+            Self::OpIdConflict { op_id, .. } => f
+                .debug_struct("OpIdConflict")
+                .field("op_id", op_id)
+                .field("expected_hash", &"<redacted>")
+                .field("actual_hash", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Display for ParkError {
@@ -513,16 +731,16 @@ impl fmt::Display for ParkError {
 
 impl std::error::Error for ParkError {}
 
-/// Error from `split_replace`.
+/// Error from split operations (`split_replace` and `split_residual`).
 ///
-/// Split-replace atomically replaces a parent shard with child shards.
-/// It is idempotent and carries `SplitInvalid` for coverage validation
-/// failures, but excludes cursor variants and `CheckpointMissingKey`
-/// because splits do not advance a scan cursor.
+/// Both split operations share identical error surfaces: common
+/// preconditions, `OpIdConflict`, and `SplitInvalid`, with no cursor
+/// variants or `CheckpointMissingKey` (splits do not advance a scan
+/// cursor).
 ///
 /// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SplitReplaceError {
+#[derive(Clone, PartialEq, Eq)]
+pub enum SplitError {
     ShardNotFound {
         shard: ShardKey,
     },
@@ -546,10 +764,53 @@ pub enum SplitReplaceError {
         expected_hash: u64,
         actual_hash: u64,
     },
-    SplitInvalid(SplitValidationError),
+    SplitInvalid(Box<SplitValidationError>),
 }
 
-impl fmt::Display for SplitReplaceError {
+impl fmt::Debug for SplitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ShardNotFound { shard } => f
+                .debug_struct("ShardNotFound")
+                .field("shard", shard)
+                .finish(),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::StaleFence { presented, current } => f
+                .debug_struct("StaleFence")
+                .field("presented", presented)
+                .field("current", current)
+                .finish(),
+            Self::LeaseExpired { deadline, now } => f
+                .debug_struct("LeaseExpired")
+                .field("deadline", deadline)
+                .field("now", now)
+                .finish(),
+            Self::ShardTerminal { shard, status } => f
+                .debug_struct("ShardTerminal")
+                .field("shard", shard)
+                .field("status", status)
+                .finish(),
+            Self::OpIdConflict { op_id, .. } => f
+                .debug_struct("OpIdConflict")
+                .field("op_id", op_id)
+                .field("expected_hash", &"<redacted>")
+                .field("actual_hash", &"<redacted>")
+                .finish(),
+            Self::SplitInvalid(inner) => f.debug_tuple("SplitInvalid").field(inner).finish(),
+        }
+    }
+}
+
+/// Backward-compatible alias for `split_replace` callers.
+pub type SplitReplaceError = SplitError;
+
+/// Backward-compatible alias for `split_residual` callers.
+pub type SplitResidualError = SplitError;
+
+impl fmt::Display for SplitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
@@ -574,80 +835,10 @@ impl fmt::Display for SplitReplaceError {
     }
 }
 
-impl std::error::Error for SplitReplaceError {
+impl std::error::Error for SplitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SplitInvalid(inner) => Some(inner),
-            _ => None,
-        }
-    }
-}
-
-/// Error from `split_residual`.
-///
-/// Split-residual creates the leftover shard covering the unscanned
-/// portion of the parent's key range. Its error surface mirrors
-/// [`SplitReplaceError`] exactly: common preconditions, `OpIdConflict`,
-/// and `SplitInvalid`, with no cursor variants.
-///
-/// See [`CoordError`] variant docs for detailed semantics of each field.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SplitResidualError {
-    ShardNotFound {
-        shard: ShardKey,
-    },
-    TenantMismatch {
-        expected: TenantId,
-    },
-    StaleFence {
-        presented: FenceEpoch,
-        current: FenceEpoch,
-    },
-    LeaseExpired {
-        deadline: LogicalTime,
-        now: LogicalTime,
-    },
-    ShardTerminal {
-        shard: ShardKey,
-        status: ShardStatus,
-    },
-    OpIdConflict {
-        op_id: OpId,
-        expected_hash: u64,
-        actual_hash: u64,
-    },
-    SplitInvalid(SplitValidationError),
-}
-
-impl fmt::Display for SplitResidualError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ShardNotFound { shard } => write!(f, "shard not found: {shard:?}"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::StaleFence { presented, current } => write!(
-                f,
-                "stale fence epoch: presented {presented:?}, current {current:?}"
-            ),
-            Self::LeaseExpired { deadline, now } => {
-                write!(f, "lease expired: deadline {deadline:?}, now {now:?}")
-            }
-            Self::ShardTerminal { shard, status } => {
-                write!(f, "shard {shard:?} is terminal ({status})")
-            }
-            Self::OpIdConflict { op_id, .. } => {
-                write!(f, "op-id conflict: {op_id:?} reused with different payload")
-            }
-            Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
-        }
-    }
-}
-
-impl std::error::Error for SplitResidualError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::SplitInvalid(inner) => Some(inner),
+            Self::SplitInvalid(inner) => Some(inner.as_ref()),
             _ => None,
         }
     }
@@ -687,20 +878,12 @@ impl From<CoordError> for CheckpointError {
             CoordError::CursorRegression { old_key, new_key } => {
                 Self::CursorRegression { old_key, new_key }
             }
-            CoordError::CursorOutOfBounds {
-                last_key,
-                spec_start,
-                spec_end,
-            } => Self::CursorOutOfBounds {
-                last_key,
-                spec_start,
-                spec_end,
-            },
+            CoordError::CursorOutOfBounds(detail) => Self::CursorOutOfBounds(detail),
             CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
             // Explicitly reject all variants CheckpointError does not cover.
             // Adding a new CoordError variant triggers a compile error here.
-            CoordError::WrongStatus { .. } | CoordError::SplitInvalid(_) => {
-                unreachable!("CoordError::{e:?} is not valid for CheckpointError")
+            CoordError::SplitInvalid(_) => {
+                unreachable!("CoordError::{e} is not valid for CheckpointError")
             }
         }
     }
@@ -725,22 +908,14 @@ impl From<CoordError> for CompleteError {
                 expected_hash,
                 actual_hash,
             },
-            CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
             CoordError::CursorRegression { old_key, new_key } => {
                 Self::CursorRegression { old_key, new_key }
             }
-            CoordError::CursorOutOfBounds {
-                last_key,
-                spec_start,
-                spec_end,
-            } => Self::CursorOutOfBounds {
-                last_key,
-                spec_start,
-                spec_end,
-            },
+            CoordError::CursorOutOfBounds(detail) => Self::CursorOutOfBounds(detail),
+            CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
             // Explicitly reject all variants CompleteError does not cover.
-            CoordError::WrongStatus { .. } | CoordError::SplitInvalid(_) => {
-                unreachable!("CoordError::{e:?} is not valid for CompleteError")
+            CoordError::SplitInvalid(_) => {
+                unreachable!("CoordError::{e} is not valid for CompleteError")
             }
         }
     }
@@ -766,18 +941,17 @@ impl From<CoordError> for ParkError {
                 actual_hash,
             },
             // Explicitly reject all variants ParkError does not cover.
-            CoordError::WrongStatus { .. }
-            | CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds { .. }
+            CoordError::CursorRegression { .. }
+            | CoordError::CursorOutOfBounds(_)
             | CoordError::SplitInvalid(_)
             | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e:?} is not valid for ParkError")
+                unreachable!("CoordError::{e} is not valid for ParkError")
             }
         }
     }
 }
 
-impl From<CoordError> for SplitReplaceError {
+impl From<CoordError> for SplitError {
     fn from(e: CoordError) -> Self {
         match e {
             CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
@@ -797,43 +971,11 @@ impl From<CoordError> for SplitReplaceError {
                 actual_hash,
             },
             CoordError::SplitInvalid(e) => Self::SplitInvalid(e),
-            // Explicitly reject all variants SplitReplaceError does not cover.
-            CoordError::WrongStatus { .. }
-            | CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds { .. }
+            // Explicitly reject all variants SplitError does not cover.
+            CoordError::CursorRegression { .. }
+            | CoordError::CursorOutOfBounds(_)
             | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e:?} is not valid for SplitReplaceError")
-            }
-        }
-    }
-}
-
-impl From<CoordError> for SplitResidualError {
-    fn from(e: CoordError) -> Self {
-        match e {
-            CoordError::ShardNotFound { shard } => Self::ShardNotFound { shard },
-            CoordError::TenantMismatch { expected } => Self::TenantMismatch { expected },
-            CoordError::StaleFence { presented, current } => {
-                Self::StaleFence { presented, current }
-            }
-            CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
-            CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
-            CoordError::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            } => Self::OpIdConflict {
-                op_id,
-                expected_hash,
-                actual_hash,
-            },
-            CoordError::SplitInvalid(e) => Self::SplitInvalid(e),
-            // Explicitly reject all variants SplitResidualError does not cover.
-            CoordError::WrongStatus { .. }
-            | CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds { .. }
-            | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e:?} is not valid for SplitResidualError")
+                unreachable!("CoordError::{e} is not valid for SplitError")
             }
         }
     }
@@ -850,13 +992,12 @@ impl From<CoordError> for RenewError {
             CoordError::LeaseExpired { deadline, now } => Self::LeaseExpired { deadline, now },
             CoordError::ShardTerminal { shard, status } => Self::ShardTerminal { shard, status },
             // Explicitly reject all variants RenewError does not cover.
-            CoordError::WrongStatus { .. }
-            | CoordError::OpIdConflict { .. }
+            CoordError::OpIdConflict { .. }
             | CoordError::CursorRegression { .. }
-            | CoordError::CursorOutOfBounds { .. }
+            | CoordError::CursorOutOfBounds(_)
             | CoordError::SplitInvalid(_)
             | CoordError::CheckpointMissingKey => {
-                unreachable!("CoordError::{e:?} is not valid for RenewError")
+                unreachable!("CoordError::{e} is not valid for RenewError")
             }
         }
     }
@@ -952,6 +1093,13 @@ impl<T> AsRef<T> for IdempotentOutcome<T> {
     }
 }
 
+// Compile-time size assertion to prevent future regressions.
+// 48 bytes allows room for alignment; actual size is ~40 bytes.
+#[cfg(test)]
+const _: () = {
+    assert!(std::mem::size_of::<CoordError>() <= 48);
+};
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1016,29 +1164,25 @@ mod tests {
                 old_key: None,
                 new_key: None,
             },
-            CoordError::CursorOutOfBounds {
+            CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
                 last_key: b"k".as_slice().into(),
                 spec_start: b"a".as_slice().into(),
                 spec_end: b"z".as_slice().into(),
-            },
+            })),
         ]
     }
 
     fn split_invalid_variant() -> CoordError {
-        CoordError::SplitInvalid(SplitValidationError::NoChildren)
+        CoordError::SplitInvalid(Box::new(SplitValidationError::NoChildren))
     }
 
     fn checkpoint_missing_key_variant() -> CoordError {
         CoordError::CheckpointMissingKey
     }
 
-    /// All 11 `CoordError` variants. Used by the display-determinism test.
+    /// All 10 `CoordError` variants. Used by the display-determinism test.
     fn all_coord_error_variants() -> Vec<CoordError> {
         let mut v = common_precondition_variants();
-        v.push(CoordError::WrongStatus {
-            expected: ShardStatus::Active,
-            actual: ShardStatus::Done,
-        });
         v.push(op_id_conflict_variant());
         v.extend(cursor_variants());
         v.push(split_invalid_variant());
@@ -1108,7 +1252,7 @@ mod tests {
         v.extend(cursor_variants());
         v.push(checkpoint_missing_key_variant());
         assert_from_coord_error_accepted::<CheckpointError>(v);
-        // Rejected: WrongStatus, SplitInvalid
+        // Rejected: SplitInvalid
     }
 
     #[test]
@@ -1118,7 +1262,7 @@ mod tests {
         v.extend(cursor_variants());
         v.push(checkpoint_missing_key_variant());
         assert_from_coord_error_accepted::<CompleteError>(v);
-        // Rejected: WrongStatus, SplitInvalid
+        // Rejected: SplitInvalid
     }
 
     #[test]
@@ -1126,27 +1270,17 @@ mod tests {
         let mut v = common_precondition_variants();
         v.push(op_id_conflict_variant());
         assert_from_coord_error_accepted::<ParkError>(v);
-        // Rejected: WrongStatus, CursorRegression, CursorOutOfBounds,
+        // Rejected: CursorRegression, CursorOutOfBounds,
         //           SplitInvalid, CheckpointMissingKey
     }
 
     #[test]
-    fn split_replace_error_from_coord_error_exhaustive() {
+    fn split_error_from_coord_error_exhaustive() {
         let mut v = common_precondition_variants();
         v.push(op_id_conflict_variant());
         v.push(split_invalid_variant());
-        assert_from_coord_error_accepted::<SplitReplaceError>(v);
-        // Rejected: WrongStatus, CursorRegression, CursorOutOfBounds,
-        //           CheckpointMissingKey
-    }
-
-    #[test]
-    fn split_residual_error_from_coord_error_exhaustive() {
-        let mut v = common_precondition_variants();
-        v.push(op_id_conflict_variant());
-        v.push(split_invalid_variant());
-        assert_from_coord_error_accepted::<SplitResidualError>(v);
-        // Rejected: WrongStatus, CursorRegression, CursorOutOfBounds,
+        assert_from_coord_error_accepted::<SplitError>(v);
+        // Rejected: CursorRegression, CursorOutOfBounds,
         //           CheckpointMissingKey
     }
 
@@ -1154,7 +1288,7 @@ mod tests {
     fn renew_error_from_coord_error_exhaustive() {
         let v = common_precondition_variants();
         assert_from_coord_error_accepted::<RenewError>(v);
-        // Rejected: WrongStatus, OpIdConflict, CursorRegression,
+        // Rejected: OpIdConflict, CursorRegression,
         //           CursorOutOfBounds, SplitInvalid, CheckpointMissingKey
     }
 
@@ -1222,7 +1356,7 @@ mod tests {
     #[test]
     fn coord_error_split_invalid_source_returns_inner() {
         let inner = SplitValidationError::NoChildren;
-        let err = CoordError::SplitInvalid(inner.clone());
+        let err = CoordError::SplitInvalid(Box::new(inner.clone()));
         let src = err.source().expect("SplitInvalid should return source");
         assert_eq!(src.to_string(), inner.to_string());
     }
@@ -1234,26 +1368,14 @@ mod tests {
     }
 
     #[test]
-    fn split_replace_error_source_propagates() {
+    fn split_error_source_propagates() {
         let inner = SplitValidationError::NoChildren;
-        let err = SplitReplaceError::SplitInvalid(inner.clone());
+        let err = SplitError::SplitInvalid(Box::new(inner.clone()));
         let src = err.source().expect("SplitInvalid should return source");
         assert_eq!(src.to_string(), inner.to_string());
 
         // Non-SplitInvalid variant returns None.
-        let err = SplitReplaceError::ShardNotFound { shard: test_key() };
-        assert!(err.source().is_none());
-    }
-
-    #[test]
-    fn split_residual_error_source_propagates() {
-        let inner = SplitValidationError::NoChildren;
-        let err = SplitResidualError::SplitInvalid(inner.clone());
-        let src = err.source().expect("SplitInvalid should return source");
-        assert_eq!(src.to_string(), inner.to_string());
-
-        // Non-SplitInvalid variant returns None.
-        let err = SplitResidualError::ShardNotFound { shard: test_key() };
+        let err = SplitError::ShardNotFound { shard: test_key() };
         assert!(err.source().is_none());
     }
 
@@ -1261,16 +1383,16 @@ mod tests {
 
     #[test]
     fn coord_error_eq_compares_box_bytes_by_value() {
-        let a = CoordError::CursorOutOfBounds {
+        let a = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
             last_key: b"key".to_vec().into_boxed_slice(),
             spec_start: b"a".to_vec().into_boxed_slice(),
             spec_end: b"z".to_vec().into_boxed_slice(),
-        };
-        let b = CoordError::CursorOutOfBounds {
+        }));
+        let b = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
             last_key: b"key".to_vec().into_boxed_slice(),
             spec_start: b"a".to_vec().into_boxed_slice(),
             spec_end: b"z".to_vec().into_boxed_slice(),
-        };
+        }));
         // Different allocations, same content -- should be equal.
         assert_eq!(a, b);
     }
@@ -1293,5 +1415,126 @@ mod tests {
             new_key: Some(b"new".to_vec().into_boxed_slice()),
         };
         assert_ne!(a, c);
+    }
+
+    // -- Debug redaction tests -------------------------------------------
+
+    #[test]
+    fn op_id_conflict_debug_no_hash_leak() {
+        let err = CoordError::OpIdConflict {
+            op_id: OpId::from_raw(1),
+            expected_hash: 0xDEAD_BEEF,
+            actual_hash: 0xCAFE_BABE,
+        };
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("<redacted>"),
+            "debug must redact hash values: {debug}"
+        );
+        assert!(
+            !debug.contains("DEAD") && !debug.contains("CAFE"),
+            "debug must not leak hash values: {debug}"
+        );
+        assert!(
+            !debug.contains("3735928559") && !debug.contains("3405691582"),
+            "debug must not leak hash values as decimal: {debug}"
+        );
+    }
+
+    #[test]
+    fn already_leased_debug_no_owner_leak() {
+        let err = AcquireError::AlreadyLeased {
+            current_owner: WorkerId::from_raw(42),
+            lease_deadline: LogicalTime::from_raw(999),
+        };
+        let debug = format!("{err:?}");
+        assert!(
+            debug.contains("<redacted>"),
+            "debug must redact current_owner: {debug}"
+        );
+        assert!(
+            !debug.contains("42"),
+            "debug must not leak worker id: {debug}"
+        );
+        assert!(debug.contains("999"), "debug should contain deadline");
+    }
+
+    #[test]
+    fn cursor_out_of_bounds_display_no_key_leak() {
+        let err = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
+            last_key: b"SECRET_KEY_DATA".to_vec().into_boxed_slice(),
+            spec_start: b"SPEC_START_BYTES".to_vec().into_boxed_slice(),
+            spec_end: b"SPEC_END_BYTES".to_vec().into_boxed_slice(),
+        }));
+        let display = err.to_string();
+        assert!(
+            !display.contains("SECRET") && !display.contains("SPEC_"),
+            "display must not leak raw key bytes: {display}"
+        );
+        assert!(
+            display.contains("15"),
+            "display should contain key byte length: {display}"
+        );
+    }
+
+    #[test]
+    fn cursor_regression_display_no_key_leak() {
+        let err = CoordError::CursorRegression {
+            old_key: Some(b"OLD_SECRET_KEY".to_vec().into_boxed_slice()),
+            new_key: Some(b"NEW_SECRET_KEY".to_vec().into_boxed_slice()),
+        };
+        let display = err.to_string();
+        assert!(
+            !display.contains("OLD_SECRET") && !display.contains("NEW_SECRET"),
+            "display must not leak raw key bytes: {display}"
+        );
+    }
+
+    #[test]
+    fn cursor_out_of_bounds_debug_no_key_leak() {
+        let err = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
+            last_key: b"SECRET_KEY_DATA".to_vec().into_boxed_slice(),
+            spec_start: b"SPEC_START_BYTES".to_vec().into_boxed_slice(),
+            spec_end: b"SPEC_END_BYTES".to_vec().into_boxed_slice(),
+        }));
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("SECRET") && !debug.contains("SPEC_"),
+            "debug must not leak raw key bytes: {debug}"
+        );
+        // Verify byte lengths are shown.
+        assert!(
+            debug.contains("15 bytes") && debug.contains("16 bytes") && debug.contains("14 bytes"),
+            "debug should contain byte lengths: {debug}"
+        );
+    }
+
+    #[test]
+    fn cursor_regression_debug_no_key_leak() {
+        let err = CoordError::CursorRegression {
+            old_key: Some(b"OLD_SECRET_KEY".to_vec().into_boxed_slice()),
+            new_key: Some(b"NEW_SECRET_KEY".to_vec().into_boxed_slice()),
+        };
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("OLD_SECRET") && !debug.contains("NEW_SECRET"),
+            "debug must not leak raw key bytes: {debug}"
+        );
+        // Verify byte lengths are shown.
+        assert!(
+            debug.contains("14 bytes"),
+            "debug should contain byte lengths: {debug}"
+        );
+    }
+
+    // -- Size regression test --------------------------------------------
+
+    #[test]
+    fn coord_error_size_regression() {
+        assert!(
+            std::mem::size_of::<CoordError>() <= 48,
+            "CoordError is {} bytes, expected <= 48",
+            std::mem::size_of::<CoordError>()
+        );
     }
 }
