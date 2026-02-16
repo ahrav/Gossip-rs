@@ -1334,8 +1334,9 @@ mod tests {
         ) {
             let start = spec.key_range_start().to_vec();
             let end = spec.key_range_end().to_vec();
+            let expected = ShardSpec::with_range(start.clone(), end.clone());
             let result = ShardSpec::try_with_range(start, end);
-            prop_assert_eq!(result, Ok(spec));
+            prop_assert_eq!(result, Ok(expected));
         }
 
         // -- Constructor equivalence: try_with_range_and_metadata -------------
