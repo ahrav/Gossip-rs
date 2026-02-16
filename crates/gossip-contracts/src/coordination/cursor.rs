@@ -132,6 +132,7 @@ impl Cursor {
     ///
     /// Panics if `last_key` is empty. A present key must contain at
     /// least one byte to be meaningful in the lex-ordered keyspace.
+    #[must_use = "creates a cursor that should be stored or passed to a connector"]
     pub fn with_last_key(last_key: Vec<u8>) -> Self {
         assert!(
             !last_key.is_empty(),

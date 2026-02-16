@@ -47,11 +47,27 @@ pub(crate) fn arb_bounded_shard_spec() -> impl Strategy<Value = ShardSpec> {
         })
 }
 
-/// Generate a [`ShardSpec`] covering all four boundedness variants:
-/// fully bounded (weighted 4×), start-unbounded, end-unbounded, fully unbounded.
+/// Generate a valid bounded [`ShardSpec`] with non-empty metadata.
+pub(crate) fn arb_bounded_shard_spec_with_metadata() -> impl Strategy<Value = ShardSpec> {
+    (
+        proptest::collection::vec(any::<u8>(), 1..64),
+        proptest::collection::vec(any::<u8>(), 1..8),
+        proptest::collection::vec(any::<u8>(), 1..128),
+    )
+        .prop_map(|(start, suffix, meta)| {
+            let mut end = start.clone();
+            end.extend_from_slice(&suffix);
+            ShardSpec::with_range_and_metadata(start, end, meta)
+        })
+}
+
+/// Generate a [`ShardSpec`] covering all four boundedness variants plus
+/// a metadata variant: fully bounded (weight 4), bounded-with-metadata
+/// (weight 2), start-unbounded, end-unbounded, fully unbounded.
 pub(crate) fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
     proptest::prop_oneof![
         4 => arb_bounded_shard_spec(),
+        2 => arb_bounded_shard_spec_with_metadata(),
         1 => proptest::collection::vec(any::<u8>(), 1..64)
             .prop_map(|end| ShardSpec::with_range(vec![], end)),
         1 => proptest::collection::vec(any::<u8>(), 1..64)

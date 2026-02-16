@@ -362,6 +362,7 @@ impl ShardSpec {
     /// An empty key `[]` is at the very start of the keyspace — less
     /// than any non-empty key.
     #[inline]
+    #[must_use = "returns a bool that should be checked"]
     pub fn contains_key(&self, key: &[u8]) -> bool {
         let above_start = self.is_start_unbounded() || key >= self.key_range_start.as_ref();
 
@@ -562,8 +563,23 @@ impl std::error::Error for SplitValidationError {}
 /// Error indices (`child_index`) refer to the caller's input order, not
 /// the internal sorted order.
 ///
+/// # Errors
+///
+/// - [`SplitValidationError::NoChildren`] — empty children slice.
+/// - [`SplitValidationError::SingleChild`] — only one child provided.
+/// - [`SplitValidationError::StartMismatch`] — first child's start ≠
+///   parent's start.
+/// - [`SplitValidationError::EndMismatch`] — last child's end ≠ parent's
+///   end.
+/// - [`SplitValidationError::BoundaryMismatch`] — gap or overlap between
+///   adjacent children.
+/// - [`SplitValidationError::OverlappingChild`] — a non-last child has
+///   an unbounded end.
+/// - [`SplitValidationError::InvertedChild`] — a child has `start >= end`.
+///
 /// Reference: CockroachDB range split/merge validation; Spanner tablet
 /// split with key-range continuity check.
+#[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_split_coverage(
     parent: &ShardSpec,
     children: &[&ShardSpec],
@@ -659,6 +675,16 @@ pub fn validate_split_coverage(
 /// `new_parent` must retain the left portion (start matches old parent)
 /// and `residual` must cover the right portion (end matches old parent).
 /// This prevents callers from accidentally swapping the two arguments.
+///
+/// # Errors
+///
+/// - [`SplitValidationError::StartMismatch`] — `new_parent`'s start ≠
+///   `old_parent`'s start (roles may be swapped).
+/// - [`SplitValidationError::EndMismatch`] — `residual`'s end ≠
+///   `old_parent`'s end.
+/// - Any error from [`validate_split_coverage`] when the two children
+///   don't form a valid partition.
+#[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_residual_split(
     old_parent: &ShardSpec,
     new_parent: &ShardSpec,
@@ -688,7 +714,10 @@ pub fn validate_residual_split(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{arb_bounded_shard_spec, arb_shard_spec, canonical_digest};
+    use crate::test_util::{
+        arb_bounded_shard_spec, arb_bounded_shard_spec_with_metadata, arb_shard_spec,
+        canonical_digest,
+    };
     use proptest::prelude::*;
 
     // -------------------------------------------------------------------
@@ -726,40 +755,72 @@ mod tests {
     // -------------------------------------------------------------------
 
     #[test]
-    fn shard_spec_unbounded() {
-        let spec = ShardSpec::unbounded();
-        assert!(spec.is_unbounded());
-        assert!(spec.is_start_unbounded());
-        assert!(spec.is_end_unbounded());
-        assert!(spec.key_range_start().is_empty());
-        assert!(spec.key_range_end().is_empty());
-        assert!(spec.metadata().is_empty());
-    }
+    fn shard_spec_construction_truth_table() {
+        // (label, spec, expected_start, expected_end, start_ub, end_ub, full_ub)
+        let cases: &[(&str, ShardSpec, &[u8], &[u8], bool, bool, bool)] = &[
+            (
+                "unbounded",
+                ShardSpec::unbounded(),
+                b"",
+                b"",
+                true,
+                true,
+                true,
+            ),
+            (
+                "bounded [a,m)",
+                ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+                b"a",
+                b"m",
+                false,
+                false,
+                false,
+            ),
+            (
+                "start-unbounded [,m)",
+                ShardSpec::with_range(vec![], b"m".to_vec()),
+                b"",
+                b"m",
+                true,
+                false,
+                false,
+            ),
+            (
+                "end-unbounded [m,)",
+                ShardSpec::with_range(b"m".to_vec(), vec![]),
+                b"m",
+                b"",
+                false,
+                true,
+                false,
+            ),
+        ];
 
-    #[test]
-    fn shard_spec_with_range() {
-        let spec = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-        assert_eq!(spec.key_range_start(), b"a");
-        assert_eq!(spec.key_range_end(), b"m");
-        assert!(!spec.is_unbounded());
-        assert!(!spec.is_start_unbounded());
-        assert!(!spec.is_end_unbounded());
-    }
+        for (label, spec, exp_start, exp_end, start_ub, end_ub, full_ub) in cases {
+            assert_eq!(
+                spec.key_range_start(),
+                *exp_start,
+                "{label}: key_range_start"
+            );
+            assert_eq!(spec.key_range_end(), *exp_end, "{label}: key_range_end");
+            assert_eq!(
+                spec.is_start_unbounded(),
+                *start_ub,
+                "{label}: is_start_unbounded"
+            );
+            assert_eq!(
+                spec.is_end_unbounded(),
+                *end_ub,
+                "{label}: is_end_unbounded"
+            );
+            assert_eq!(spec.is_unbounded(), *full_ub, "{label}: is_unbounded");
+        }
 
-    #[test]
-    fn shard_spec_half_unbounded_start() {
-        let spec = ShardSpec::with_range(vec![], b"m".to_vec());
-        assert!(spec.is_start_unbounded());
-        assert!(!spec.is_end_unbounded());
-        assert!(!spec.is_unbounded());
-    }
-
-    #[test]
-    fn shard_spec_half_unbounded_end() {
-        let spec = ShardSpec::with_range(b"m".to_vec(), vec![]);
-        assert!(!spec.is_start_unbounded());
-        assert!(spec.is_end_unbounded());
-        assert!(!spec.is_unbounded());
+        // Unbounded spec also has empty metadata.
+        assert!(
+            ShardSpec::unbounded().metadata().is_empty(),
+            "unbounded: metadata"
+        );
     }
 
     #[test]
@@ -844,9 +905,8 @@ mod tests {
     #[test]
     fn try_with_range_start_key_at_max() {
         let start = vec![0x01; MAX_KEY_SIZE];
-        let mut end = start.clone();
-        end.push(0xFF);
-        let spec = ShardSpec::try_with_range(start, end).unwrap();
+        // Use an unbounded end so it doesn't also exceed MAX_KEY_SIZE.
+        let spec = ShardSpec::try_with_range(start, vec![]).unwrap();
         assert_eq!(spec.key_range_start().len(), MAX_KEY_SIZE);
     }
 
@@ -1281,6 +1341,26 @@ mod tests {
             let in_res = residual.contains_key(&key);
             prop_assert_eq!(in_old, in_new || in_res);
             prop_assert!(!(in_new && in_res), "key in both new_parent and residual");
+        }
+
+        // -- Metadata distinction: different metadata → different digest -----
+
+        #[test]
+        fn metadata_changes_canonical_digest(
+            spec in arb_bounded_shard_spec_with_metadata(),
+        ) {
+            let no_meta = ShardSpec::with_range(
+                spec.key_range_start().to_vec(),
+                spec.key_range_end().to_vec(),
+            );
+            // If the spec has non-empty metadata, digests must differ.
+            if !spec.metadata().is_empty() {
+                prop_assert_ne!(
+                    canonical_digest(&spec),
+                    canonical_digest(&no_meta),
+                    "non-empty metadata must change the canonical digest"
+                );
+            }
         }
     }
 }
