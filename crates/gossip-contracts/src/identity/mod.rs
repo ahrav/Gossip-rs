@@ -15,6 +15,7 @@
 //!   unique, enforced by a meta-test.
 
 mod canonical;
+mod coordination;
 pub mod domain;
 mod finding;
 mod hashing;
@@ -27,11 +28,12 @@ mod types;
 mod golden;
 
 pub use canonical::CanonicalBytes;
+pub use coordination::{FenceEpoch, JobId, LogicalTime, OpId, RunId, ShardId, ShardKey, WorkerId};
 pub use finding::{
     FindingId, FindingIdInputs, NormHash, OccurrenceId, OccurrenceIdInputs, RuleFingerprint,
     SecretHash, derive_finding_id, derive_occurrence_id, key_secret_hash,
 };
-pub use hashing::{domain_hasher, finalize_32};
+pub use hashing::{domain_hasher, finalize_32, finalize_64};
 pub use item::{ConnectorTag, IdentityInputError, ItemKey, ObjectVersionId, StableItemId};
 pub use policy::{
     CURRENT_EVIDENCE_VERSION, CURRENT_VERSION, IdHashMode, PolicyHashInputs, compute_policy_hash,

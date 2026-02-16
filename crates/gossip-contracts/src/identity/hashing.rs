@@ -1,7 +1,11 @@
 //! Domain-separated hashing helpers for content-addressed ID derivation.
 //!
 //! Every ID derivation in the system flows through [`domain_hasher`] and
-//! [`finalize_32`]. Together they provide a two-step pattern:
+//! one of the finalization functions:
+//!
+//! - [`finalize_32`] — full 256-bit digest for content-addressed IDs.
+//! - [`finalize_64`] — truncated 64-bit digest for coordination IDs
+//!   (op-log payload hashes, split shard ID derivation).
 //!
 //! ```
 //! use gossip_contracts::identity::{domain_hasher, finalize_32, CanonicalBytes};
@@ -102,6 +106,19 @@ pub fn domain_hasher(context: &str) -> Hasher {
 #[inline]
 pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
     *hasher.finalize().as_bytes()
+}
+
+/// Finalize a hasher into a 64-bit (8-byte) digest.
+///
+/// Takes the first 8 bytes of the BLAKE3 output as a little-endian `u64`.
+/// Used for op-log payload hashes and split shard ID derivation.
+#[inline]
+pub fn finalize_64(hasher: &Hasher) -> u64 {
+    let bytes = hasher.finalize();
+    let first8: [u8; 8] = bytes.as_bytes()[..8]
+        .try_into()
+        .expect("BLAKE3 output is always ≥ 8 bytes");
+    u64::from_le_bytes(first8)
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
-//! `define_id_32!` and `define_id_32_restricted!` newtype macros.
+//! Identity newtype macros for `[u8; 32]` and `u64` widths.
 //!
-//! These macros are the factory for every `[u8; 32]` identity type in the
-//! system.  Each invocation generates a complete newtype with standard derives,
-//! a [`Debug`] implementation, byte accessors, and a [`CanonicalBytes`] impl.
+//! These macros are the factory for every identity type in the system.  Each
+//! invocation generates a complete newtype with standard derives, a [`Debug`]
+//! implementation, accessors, and a [`CanonicalBytes`] impl.
 //!
 //! # Why macros instead of a generic struct?
 //!
@@ -15,25 +15,24 @@
 //!
 //! # Variants
 //!
-//! Two variants exist to enforce a construction-safety boundary:
-//!
-//! | Macro | Inner field | Constructor | Use case |
-//! |-------|-----------|-------------|----------|
-//! | [`define_id_32!`] | private | `from_bytes` (pub) | Freely constructible IDs (`TenantId`, `FindingId`) |
-//! | [`define_id_32_restricted!`] | private | `from_bytes_internal` (`pub(crate)`) | Derivation-only IDs (`NormHash`, `SecretHash`) |
+//! | Macro | Width | Inner | Constructor | Use case |
+//! |-------|-------|-------|-------------|----------|
+//! | [`define_id_32!`] | `[u8; 32]` | private | `from_bytes` (pub) | Content-addressed IDs (`TenantId`, `FindingId`) |
+//! | [`define_id_32_restricted!`] | `[u8; 32]` | private | `from_bytes_internal` (`pub(crate)`) | Derivation-only IDs (`NormHash`, `SecretHash`) |
+//! | [`define_id_64!`] | `u64` | private | `from_raw` (pub) | Coordination IDs (`RunId`, `ShardId`, `WorkerId`) |
 //!
 //! The restricted variant exists for values that *must* be produced by a
 //! specific derivation function (e.g. hashing with a domain separator).
 //! Hiding the constructor prevents callers from forging a hash output by
 //! supplying arbitrary bytes.
 //!
-//! Both macros use fully-qualified paths (`$crate::identity::CanonicalBytes`,
+//! All macros use fully-qualified paths (`$crate::identity::CanonicalBytes`,
 //! `$crate::blake3::Hasher`, `::core::fmt`) so they work from any invocation site —
 //! inside this crate, in sibling modules, or from downstream crates.
 //!
 //! # Test-support macros
 //!
-//! Two additional macros exist for **consumer-crate integration tests** (the
+//! Additional macros exist for **consumer-crate integration tests** (the
 //! `tests/identity_smoke.rs` files in engine, connectors, coordination, and
 //! pipeline).  Their purpose is to act as *import canaries*: if a type is
 //! removed from the public API or its layout changes, the downstream crate's
@@ -43,6 +42,7 @@
 //! | Macro | Checks | Multiple invocations? |
 //! |-------|--------|-----------------------|
 //! | [`smoke_test_id_32!`] | size == 32 (const) + `ZERO` sentinel (runtime) | **No** — generates named `#[test]` fns |
+//! | [`smoke_test_id_64!`] | size == 8 (const) + `ZERO` sentinel (runtime) | **No** — generates named `#[test]` fns |
 //! | [`smoke_test_id_size!`] | size == N (const only) | Yes — only emits `const _` blocks |
 //!
 //! [`CanonicalBytes`]: crate::identity::CanonicalBytes
@@ -253,6 +253,130 @@ macro_rules! smoke_test_id_32 {
                 assert_eq!(
                     *z.as_bytes(), [0u8; 32],
                     "{}::ZERO is not all-zero", stringify!($ty),
+                );
+            })+
+        }
+    };
+}
+
+/// Generate a `u64` newtype with private inner field.
+///
+/// Produces:
+/// - `#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]`
+/// - `Debug` printing `TypeName(decimal)` — decimal is more useful for u64 IDs than hex
+/// - `ZERO` constant, `from_raw` (pub const), `as_raw` (pub const)
+/// - `CanonicalBytes` impl (little-endian 8-byte encoding, no length prefix)
+///
+/// # Example
+///
+/// ```
+/// use gossip_contracts::define_id_64;
+/// use gossip_contracts::identity::CanonicalBytes;
+///
+/// define_id_64! {
+///     /// A test 64-bit identity type.
+///     TestId64
+/// }
+///
+/// let id = TestId64::from_raw(42);
+/// assert_eq!(id.as_raw(), 42);
+/// assert_eq!(format!("{:?}", id), "TestId64(42)");
+/// ```
+#[macro_export]
+macro_rules! define_id_64 {
+    (
+        $(#[$meta:meta])*
+        $name:ident
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(u64);
+
+        // Decimal format is more useful than hex for 64-bit counter/ID values
+        // that are assigned sequentially or generated from small ranges.
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), self.0)
+            }
+        }
+
+        impl $name {
+            /// The zero sentinel value.
+            pub const ZERO: Self = Self(0);
+
+            /// Construct from a raw `u64`.
+            #[inline]
+            pub const fn from_raw(raw: u64) -> Self { Self(raw) }
+
+            /// Return the inner `u64`.
+            #[inline]
+            pub const fn as_raw(&self) -> u64 { self.0 }
+        }
+
+        impl $crate::identity::CanonicalBytes for $name {
+            // Delegates to the u64 CanonicalBytes impl (8-byte LE, no prefix).
+            #[inline]
+            fn write_canonical(&self, h: &mut $crate::blake3::Hasher) {
+                h.update(&self.0.to_le_bytes());
+            }
+        }
+    };
+}
+
+/// Import-canary macro for consumer crates: asserts that every listed
+/// [`define_id_64!`] type is still 8 bytes and that its `ZERO` sentinel is
+/// zero.
+///
+/// This is the 64-bit counterpart of [`smoke_test_id_32!`]. Consumer crates
+/// invoke this in their `tests/identity_smoke.rs` to catch layout or API
+/// changes in downstream builds.
+///
+/// # What it generates
+///
+/// - A `const _: ()` block with a compile-time `size_of` assertion per type
+///   (fires during `cargo check`, not just `cargo test`).
+/// - `#[test] fn id_64_types_are_8_bytes()` — runtime confirmation with
+///   per-type error messages.
+/// - `#[test] fn id_64_zero_sentinels_are_zeroed()` — runtime check that
+///   `T::ZERO.as_raw() == 0` for every listed type.
+///
+/// # Constraints
+///
+/// - Every type must expose `ZERO` and `as_raw()` — i.e. it must be
+///   produced by [`define_id_64!`].
+/// - **Invoke at most once per scope.** The generated test function names
+///   are fixed, so a second invocation in the same module causes a compile error.
+///
+/// # Usage
+///
+/// ```ignore
+/// gossip_contracts::smoke_test_id_64!(RunId, ShardId, WorkerId, OpId, JobId);
+/// ```
+#[macro_export]
+macro_rules! smoke_test_id_64 {
+    ($($ty:ty),+ $(,)?) => {
+        // Compile-time size guard — fires during `cargo check`, not just `cargo test`.
+        const _: () = {
+            $(::core::assert!(::core::mem::size_of::<$ty>() == 8);)+
+        };
+
+        #[test]
+        fn id_64_types_are_8_bytes() {
+            $(
+                assert_eq!(
+                    ::core::mem::size_of::<$ty>(), 8,
+                    "{} is not 8 bytes", stringify!($ty),
+                );
+            )+
+        }
+
+        #[test]
+        fn id_64_zero_sentinels_are_zeroed() {
+            $({
+                let z = <$ty>::ZERO;
+                assert_eq!(
+                    z.as_raw(), 0u64,
+                    "{}::ZERO is not zero", stringify!($ty),
                 );
             })+
         }
