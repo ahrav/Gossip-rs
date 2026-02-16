@@ -542,10 +542,11 @@ fn hash_split_residual_golden_value() {
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{SplitResidualPlan, hash_split_residual_payload};
 
-    let plan = SplitResidualPlan::new(
+    let plan = SplitResidualPlan::try_new(
         ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
         ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-    );
+    )
+    .unwrap();
     let hash = hash_split_residual_payload(&plan);
     assert_eq!(
         hash, HASH_SPLIT_RESIDUAL_EXPECTED,

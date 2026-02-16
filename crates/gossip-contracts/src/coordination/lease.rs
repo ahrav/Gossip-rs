@@ -9,10 +9,65 @@
 //! do not appear in the op-log) carry an [`OpId`]. The shard record caches the
 //! last N (cap=16) operation fingerprints so the coordinator can detect retries
 //! and return cached results instead of re-executing.
+//!
+//! ## Idempotency window semantics
+//!
+//! The op-log is a **bounded sliding window**, not a permanent record. Once an
+//! entry is evicted (after 16 newer operations), the coordinator can no longer
+//! distinguish a retry from a new operation with the same [`OpId`]. In this
+//! case the coordinator re-executes the operation.
+//!
+//! This is safe because:
+//! 1. The cap (16) covers several retry rounds of a single RPC.
+//! 2. Callers must generate unique, non-recycled `OpId` values.
+//! 3. An evicted operation was already durably persisted, so re-execution of
+//!    an idempotent operation (e.g., checkpoint with the same cursor) produces
+//!    the same result.
+//!
+//! If non-idempotent re-execution is a concern, callers must ensure retries
+//! complete within the 16-operation window.
 
 use crate::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
+
+// ============================================================================
+// LeaseHolder
+// ============================================================================
+
+/// Identity and deadline of the worker currently holding a shard lease.
+///
+/// Bundles `owner` and `deadline` into a single value so that the
+/// `ShardRecord` can store `Option<LeaseHolder>` instead of two separate
+/// `Option` fields — making the "both-present-or-both-absent" invariant
+/// structurally impossible to violate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseHolder {
+    owner: WorkerId,
+    deadline: LogicalTime,
+}
+
+impl LeaseHolder {
+    /// Construct a new lease holder.
+    #[must_use]
+    pub fn new(owner: WorkerId, deadline: LogicalTime) -> Self {
+        Self { owner, deadline }
+    }
+
+    /// The worker holding the lease.
+    #[inline]
+    #[must_use]
+    pub fn owner(&self) -> WorkerId {
+        self.owner
+    }
+
+    /// The logical time at which the lease expires.
+    #[inline]
+    #[must_use]
+    pub fn deadline(&self) -> LogicalTime {
+        self.deadline
+    }
+}
 
 // ============================================================================
 // Lease
@@ -50,6 +105,14 @@ impl Lease {
         fence: FenceEpoch,
         deadline: LogicalTime,
     ) -> Self {
+        assert!(
+            fence >= FenceEpoch::INITIAL,
+            "Lease fence epoch must be >= INITIAL (1), got {fence:?}",
+        );
+        assert!(
+            deadline > LogicalTime::ZERO,
+            "Lease deadline must be > ZERO, got {deadline:?}",
+        );
         Self {
             tenant,
             run,
@@ -147,6 +210,7 @@ impl OpKind {
     /// Parse a `u8` discriminant to the corresponding variant.
     ///
     /// Returns `None` for unrecognized values — forward compatibility.
+    #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Checkpoint),
@@ -161,6 +225,7 @@ impl OpKind {
 
     /// Return the stable `u8` discriminant.
     #[inline]
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -204,6 +269,7 @@ impl OpResult {
     /// Parse a `u8` discriminant to the corresponding variant.
     ///
     /// Returns `None` for unrecognized values — forward compatibility.
+    #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Completed),
@@ -215,6 +281,7 @@ impl OpResult {
 
     /// Return the stable `u8` discriminant.
     #[inline]
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -262,6 +329,14 @@ impl OpLogEntry {
         payload_hash: u64,
         executed_at: LogicalTime,
     ) -> Self {
+        assert!(
+            executed_at > LogicalTime::ZERO,
+            "OpLogEntry executed_at must be > ZERO, got {executed_at:?}",
+        );
+        assert!(
+            payload_hash != 0,
+            "OpLogEntry payload_hash must be non-zero (indicates hashing failure)",
+        );
         Self {
             op_id,
             kind,
@@ -318,6 +393,7 @@ impl OpLogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // -- OpKind roundtrip ------------------------------------------------
 
@@ -404,5 +480,68 @@ mod tests {
         assert_eq!(entry.result(), result);
         assert_eq!(entry.payload_hash(), payload_hash);
         assert_eq!(entry.executed_at(), executed_at);
+    }
+
+    // -- Property tests --------------------------------------------------
+
+    proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        #[test]
+        fn prop_op_kind_roundtrip(v in any::<u8>()) {
+            if let Some(kind) = OpKind::from_u8(v) {
+                prop_assert_eq!(kind.as_u8(), v);
+            }
+            // Unrecognized values must return None — no crash, no panic.
+        }
+
+        #[test]
+        fn prop_lease_accessor_identity(
+            tenant_bytes in proptest::array::uniform32(any::<u8>()),
+            run_raw in any::<u64>(),
+            shard_raw in any::<u64>(),
+            owner_raw in any::<u64>(),
+            fence_raw in 1u64..=u64::MAX,
+            deadline_raw in 1u64..=u64::MAX,
+        ) {
+            let tenant = TenantId::from_bytes(tenant_bytes);
+            let run = RunId::from_raw(run_raw);
+            let shard = ShardId::from_raw(shard_raw);
+            let owner = WorkerId::from_raw(owner_raw);
+            let fence = FenceEpoch::from_raw(fence_raw);
+            let deadline = LogicalTime::from_raw(deadline_raw);
+
+            let lease = Lease::new(tenant, run, shard, owner, fence, deadline);
+
+            prop_assert_eq!(lease.tenant(), tenant);
+            prop_assert_eq!(lease.run(), run);
+            prop_assert_eq!(lease.shard(), shard);
+            prop_assert_eq!(lease.owner(), owner);
+            prop_assert_eq!(lease.fence(), fence);
+            prop_assert_eq!(lease.deadline(), deadline);
+            prop_assert_eq!(lease.shard_key(), ShardKey::new(run, shard));
+        }
+
+        #[test]
+        fn prop_op_log_entry_accessor_identity(
+            op_raw in any::<u64>(),
+            kind_disc in 0u8..=5u8,
+            result_disc in 0u8..=2u8,
+            payload_hash in 1u64..=u64::MAX,
+            executed_raw in 1u64..=u64::MAX,
+        ) {
+            let op_id = OpId::from_raw(op_raw);
+            let kind = OpKind::from_u8(kind_disc).unwrap();
+            let result = OpResult::from_u8(result_disc).unwrap();
+            let executed_at = LogicalTime::from_raw(executed_raw);
+
+            let entry = OpLogEntry::new(op_id, kind, result, payload_hash, executed_at);
+
+            prop_assert_eq!(entry.op_id(), op_id);
+            prop_assert_eq!(entry.kind(), kind);
+            prop_assert_eq!(entry.result(), result);
+            prop_assert_eq!(entry.payload_hash(), payload_hash);
+            prop_assert_eq!(entry.executed_at(), executed_at);
+        }
     }
 }

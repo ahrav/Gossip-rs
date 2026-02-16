@@ -27,7 +27,7 @@ use std::fmt;
 use blake3::Hasher;
 
 use crate::coordination::cursor::Cursor;
-use crate::coordination::lease::OpLogEntry;
+use crate::coordination::lease::{LeaseHolder, OpLogEntry};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
@@ -102,6 +102,7 @@ impl ShardStatus {
     /// Parse a `u8` discriminant to the corresponding variant.
     ///
     /// Returns `None` for unrecognized values — forward compatibility.
+    #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::Active),
@@ -114,6 +115,7 @@ impl ShardStatus {
 
     /// Return the stable `u8` discriminant.
     #[inline]
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -180,6 +182,7 @@ impl ParkReason {
     /// Parse a `u8` discriminant to the corresponding variant.
     ///
     /// Returns `None` for unrecognized values — forward compatibility.
+    #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::PermissionDenied),
@@ -193,6 +196,7 @@ impl ParkReason {
 
     /// Return the stable `u8` discriminant.
     #[inline]
+    #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
@@ -246,11 +250,11 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 /// ## Invariants (checked by `assert_invariants`)
 ///
 /// 1. `park_reason.is_some()` iff `status == Parked`
-/// 2. `lease_owner.is_some() == lease_deadline.is_some()` (paired or both None)
-/// 3. `status.is_terminal()` implies `lease_owner.is_none()`
+/// 2. _(structural — enforced by `Option<LeaseHolder>`)_
+/// 3. `status.is_terminal()` implies `lease.is_none()`
 /// 4. `fence_epoch >= FenceEpoch::INITIAL`
 /// 5. `op_log.len() <= OP_LOG_CAP`
-/// 6. `status == Split` implies `!spawned.is_empty()` (INV-S16)
+/// 6. `status == Split` implies `!spawned.is_empty()`
 /// 7. `parent.is_some()` implies `shard.is_derived()`
 /// 8. All entries in `spawned` satisfy `is_derived() == true`
 /// 9. `op_log` entries have unique `OpId` values
@@ -277,10 +281,8 @@ pub struct ShardRecord {
     pub(crate) cursor_semantics: CursorSemantics,
 
     // -- Lease / ownership --
-    /// The worker currently holding the lease, or `None` if unleased.
-    pub(crate) lease_owner: Option<WorkerId>,
-    /// Logical time at which the lease expires, or `None` if unleased.
-    pub(crate) lease_deadline: Option<LogicalTime>,
+    /// The current lease holder, or `None` if unleased.
+    pub(crate) lease: Option<LeaseHolder>,
     /// Monotonically increasing fence epoch. Incremented on every
     /// ownership transfer to fence zombie workers.
     pub(crate) fence_epoch: FenceEpoch,
@@ -325,8 +327,7 @@ impl ShardRecord {
             spec,
             cursor: Cursor::initial(),
             cursor_semantics,
-            lease_owner: None,
-            lease_deadline: None,
+            lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
             spawned: Vec::new(),
@@ -356,8 +357,7 @@ impl ShardRecord {
             spec,
             cursor,
             cursor_semantics,
-            lease_owner: None,
-            lease_deadline: None,
+            lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: Some(parent),
             spawned: Vec::new(),
@@ -382,8 +382,7 @@ impl ShardRecord {
         spec: ShardSpec,
         cursor: Cursor,
         cursor_semantics: CursorSemantics,
-        lease_owner: Option<WorkerId>,
-        lease_deadline: Option<LogicalTime>,
+        lease: Option<LeaseHolder>,
         fence_epoch: FenceEpoch,
         parent: Option<ShardId>,
         spawned: Vec<ShardId>,
@@ -398,8 +397,7 @@ impl ShardRecord {
             spec,
             cursor,
             cursor_semantics,
-            lease_owner,
-            lease_deadline,
+            lease,
             fence_epoch,
             parent,
             spawned,
@@ -426,7 +424,26 @@ impl ShardRecord {
     /// persistence cost.
     ///
     /// Reference: TigerBeetle's Tiger Style — assert at every boundary.
+    ///
+    /// ## Crash-to-prevent-corruption philosophy
+    ///
+    /// Panicking is the intentional recovery strategy. An invariant violation
+    /// means the coordinator's in-memory state is inconsistent with its design
+    /// contract — continuing would risk persisting corrupt data. By crashing
+    /// *before* persistence, the coordinator ensures crash-recovery returns to
+    /// the last valid state.
+    ///
+    /// **Operational guidance:** Invariant panics should be treated as critical
+    /// bugs. Monitor for coordinator process crashes and alert immediately.
+    /// The shard's durable state is safe (the failing operation was not
+    /// persisted), but the root cause must be investigated.
     pub fn assert_invariants(&self) {
+        self.assert_lifecycle_invariants();
+        self.assert_lineage_invariants();
+    }
+
+    /// INV-1 through INV-5: status, park_reason, lease, fence, op-log cap.
+    fn assert_lifecycle_invariants(&self) {
         // INV-1: park_reason consistency.
         match self.status {
             ShardStatus::Parked => {
@@ -446,18 +463,12 @@ impl ShardRecord {
             }
         }
 
-        // INV-2: Lease consistency: both present or both absent.
-        assert_eq!(
-            self.lease_owner.is_some(),
-            self.lease_deadline.is_some(),
-            "Shard {:?}: lease_owner and lease_deadline must both be Some or both be None",
-            self.shard,
-        );
+        // INV-2: (structural — `Option<LeaseHolder>` makes paired-ness implicit)
 
         // INV-3: Terminal shards must not hold a lease.
         if self.status.is_terminal() {
             assert!(
-                self.lease_owner.is_none(),
+                self.lease.is_none(),
                 "Terminal shard {:?} (status: {:?}) must not have a lease",
                 self.shard,
                 self.status,
@@ -479,7 +490,11 @@ impl ShardRecord {
             self.op_log.len(),
             Self::OP_LOG_CAP,
         );
+    }
 
+    /// INV-6 through INV-10 + INV-7b: split/spawned, parent/derived, op-log
+    /// uniqueness, spawned cap.
+    fn assert_lineage_invariants(&self) {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split {
             assert!(
@@ -494,6 +509,15 @@ impl ShardRecord {
             assert!(
                 self.shard.is_derived(),
                 "Shard {:?} claims parentage but is not derived (bit 63 not set)",
+                self.shard,
+            );
+        }
+
+        // INV-7b: Derived shard must have a parent (converse of INV-7).
+        if self.shard.is_derived() {
+            assert!(
+                self.parent.is_some(),
+                "Shard {:?}: derived (bit 63 set) but has no parent",
                 self.shard,
             );
         }
@@ -585,11 +609,53 @@ impl ShardRecord {
         assert!(self.op_log.len() <= Self::OP_LOG_CAP);
     }
 
+    /// Assert that transitioning to `new_status` is legal from the current state.
+    ///
+    /// The only legal transitions originate from `Active`:
+    /// - Active → Done
+    /// - Active → Split
+    /// - Active → Parked
+    ///
+    /// Terminal states (Done, Split, Parked) cannot transition to any other state
+    /// within the protocol. (Administrative `unpark` is handled separately and
+    /// bumps the fence epoch.)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current status is terminal and `new_status` differs.
+    #[allow(dead_code)] // Used by coordinator backend (Task 4).
+    pub(crate) fn assert_transition_legal(&self, new_status: ShardStatus) {
+        assert!(
+            !self.status.is_terminal() || self.status == new_status,
+            "Shard {:?}: illegal transition from terminal {:?} to {:?}",
+            self.shard,
+            self.status,
+            new_status,
+        );
+    }
+
     /// Returns `true` if this shard's status is terminal.
     #[inline]
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         self.status.is_terminal()
+    }
+
+    /// Atomically advance the fence epoch by one.
+    ///
+    /// This is the intended path for fence epoch mutation. Direct writes to
+    /// `self.fence_epoch` should only occur in constructors (`new_active`,
+    /// `new_split_child`).
+    ///
+    /// Returns the new (incremented) fence epoch.
+    ///
+    /// # Panics
+    ///
+    /// Panics at `u64::MAX` (via `FenceEpoch::increment`).
+    #[allow(dead_code)] // Used by coordinator backend (Task 4).
+    pub(crate) fn advance_fence(&mut self) -> FenceEpoch {
+        self.fence_epoch = self.fence_epoch.increment();
+        self.fence_epoch
     }
 
     /// Returns `true` if this shard has an active (non-expired) lease
@@ -601,10 +667,39 @@ impl ShardRecord {
     /// Reference: Gray & Cheriton, "Leases" (SOSP 1989).
     #[must_use]
     pub fn is_leased_at(&self, now: LogicalTime) -> bool {
-        match self.lease_deadline {
-            Some(deadline) => now < deadline,
+        match &self.lease {
+            Some(holder) => now < holder.deadline(),
             None => false,
         }
+    }
+
+    /// The current lease holder, if any.
+    #[inline]
+    #[must_use]
+    pub fn lease(&self) -> Option<&LeaseHolder> {
+        self.lease.as_ref()
+    }
+
+    /// The worker currently holding the lease, if any.
+    #[inline]
+    #[must_use]
+    pub fn lease_owner(&self) -> Option<WorkerId> {
+        self.lease.as_ref().map(|h| h.owner())
+    }
+
+    /// The lease deadline, if any.
+    #[inline]
+    #[must_use]
+    pub fn lease_deadline(&self) -> Option<LogicalTime> {
+        self.lease.as_ref().map(|h| h.deadline())
+    }
+
+    /// Returns `true` if the shard can accept `additional` spawned children
+    /// without exceeding [`MAX_SPAWNED_PER_SHARD`].
+    #[inline]
+    #[must_use]
+    pub fn can_spawn(&self, additional: usize) -> bool {
+        self.spawned.len().saturating_add(additional) <= MAX_SPAWNED_PER_SHARD
     }
 }
 
@@ -647,6 +742,7 @@ impl ShardSnapshot {
     ///
     /// Prefer [`ShardRecord::snapshot()`] which validates invariants
     /// before constructing.
+    #[must_use]
     pub(crate) fn new(
         status: ShardStatus,
         spec: ShardSpec,
@@ -745,8 +841,10 @@ mod tests {
 
     fn leased_record() -> ShardRecord {
         let mut r = active_record();
-        r.lease_owner = Some(WorkerId::from_raw(99));
-        r.lease_deadline = Some(LogicalTime::from_raw(1000));
+        r.lease = Some(LeaseHolder::new(
+            WorkerId::from_raw(99),
+            LogicalTime::from_raw(1000),
+        ));
         r
     }
 
@@ -777,15 +875,15 @@ mod tests {
 
     #[test]
     fn shard_status_roundtrip_table() {
-        let cases: &[(u8, Option<ShardStatus>)] = &[
-            (0, Some(ShardStatus::Active)),
-            (1, Some(ShardStatus::Done)),
-            (2, Some(ShardStatus::Split)),
-            (3, Some(ShardStatus::Parked)),
-            (4, None),
-            (u8::MAX, None),
+        let cases: &[(u8, Option<ShardStatus>, Option<&str>)] = &[
+            (0, Some(ShardStatus::Active), Some("Active")),
+            (1, Some(ShardStatus::Done), Some("Done")),
+            (2, Some(ShardStatus::Split), Some("Split")),
+            (3, Some(ShardStatus::Parked), Some("Parked")),
+            (4, None, None),
+            (u8::MAX, None, None),
         ];
-        for &(disc, expected) in cases {
+        for &(disc, expected, display) in cases {
             assert_eq!(
                 ShardStatus::from_u8(disc),
                 expected,
@@ -793,32 +891,33 @@ mod tests {
             );
             if let Some(status) = expected {
                 assert_eq!(status.as_u8(), disc, "ShardStatus::as_u8({status:?})");
+                assert_eq!(
+                    status.to_string(),
+                    display.unwrap(),
+                    "ShardStatus::Display({status:?})"
+                );
             }
         }
-    }
-
-    #[test]
-    fn shard_status_display() {
-        assert_eq!(ShardStatus::Active.to_string(), "Active");
-        assert_eq!(ShardStatus::Done.to_string(), "Done");
-        assert_eq!(ShardStatus::Split.to_string(), "Split");
-        assert_eq!(ShardStatus::Parked.to_string(), "Parked");
     }
 
     // -- ParkReason ------------------------------------------------------
 
     #[test]
     fn park_reason_roundtrip_table() {
-        let cases: &[(u8, Option<ParkReason>)] = &[
-            (0, Some(ParkReason::PermissionDenied)),
-            (1, Some(ParkReason::NotFound)),
-            (2, Some(ParkReason::Poisoned)),
-            (3, Some(ParkReason::TooManyErrors)),
-            (4, Some(ParkReason::Other)),
-            (5, None),
-            (u8::MAX, None),
+        let cases: &[(u8, Option<ParkReason>, Option<&str>)] = &[
+            (
+                0,
+                Some(ParkReason::PermissionDenied),
+                Some("permission denied"),
+            ),
+            (1, Some(ParkReason::NotFound), Some("not found")),
+            (2, Some(ParkReason::Poisoned), Some("poisoned")),
+            (3, Some(ParkReason::TooManyErrors), Some("too many errors")),
+            (4, Some(ParkReason::Other), Some("other")),
+            (5, None, None),
+            (u8::MAX, None, None),
         ];
-        for &(disc, expected) in cases {
+        for &(disc, expected, display) in cases {
             assert_eq!(
                 ParkReason::from_u8(disc),
                 expected,
@@ -826,20 +925,13 @@ mod tests {
             );
             if let Some(reason) = expected {
                 assert_eq!(reason.as_u8(), disc, "ParkReason::as_u8({reason:?})");
+                assert_eq!(
+                    reason.to_string(),
+                    display.unwrap(),
+                    "ParkReason::Display({reason:?})"
+                );
             }
         }
-    }
-
-    #[test]
-    fn park_reason_display() {
-        assert_eq!(
-            ParkReason::PermissionDenied.to_string(),
-            "permission denied"
-        );
-        assert_eq!(ParkReason::NotFound.to_string(), "not found");
-        assert_eq!(ParkReason::Poisoned.to_string(), "poisoned");
-        assert_eq!(ParkReason::TooManyErrors.to_string(), "too many errors");
-        assert_eq!(ParkReason::Other.to_string(), "other");
     }
 
     // -- assert_invariants (success) -------------------------------------
@@ -897,113 +989,84 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "must both be Some or both be None")]
-    fn assert_invariants_lease_owner_without_deadline_panics() {
-        let r = ShardRecord::from_raw_parts(
-            test_tenant(),
-            test_run(),
-            ShardId::from_raw(10),
-            ShardStatus::Active,
-            None,
-            test_spec(),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            Some(WorkerId::from_raw(1)),
-            None, // deadline missing
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            vec![],
-        );
-        r.assert_invariants();
-    }
-
-    #[test]
-    #[should_panic(expected = "must both be Some or both be None")]
-    fn assert_invariants_lease_deadline_without_owner_panics() {
-        let r = ShardRecord::from_raw_parts(
-            test_tenant(),
-            test_run(),
-            ShardId::from_raw(10),
-            ShardStatus::Active,
-            None,
-            test_spec(),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None, // owner missing
-            Some(LogicalTime::from_raw(100)),
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            vec![],
-        );
-        r.assert_invariants();
-    }
-
-    #[test]
-    #[should_panic(expected = "must not have a lease")]
-    fn assert_invariants_done_with_lease_panics() {
-        let r = ShardRecord::from_raw_parts(
-            test_tenant(),
-            test_run(),
-            ShardId::from_raw(10),
-            ShardStatus::Done,
-            None,
-            test_spec(),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            Some(WorkerId::from_raw(1)),
-            Some(LogicalTime::from_raw(100)),
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            vec![],
-        );
-        r.assert_invariants();
-    }
-
-    #[test]
-    #[should_panic(expected = "must not have a lease")]
-    fn assert_invariants_parked_with_lease_panics() {
-        let r = ShardRecord::from_raw_parts(
-            test_tenant(),
-            test_run(),
-            ShardId::from_raw(10),
-            ShardStatus::Parked,
-            Some(ParkReason::TooManyErrors),
-            test_spec(),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            Some(WorkerId::from_raw(1)),
-            Some(LogicalTime::from_raw(100)),
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            vec![],
-        );
-        r.assert_invariants();
-    }
-
-    #[test]
-    #[should_panic(expected = "must not have a lease")]
-    fn assert_invariants_split_with_lease_panics() {
-        let r = ShardRecord::from_raw_parts(
-            test_tenant(),
-            test_run(),
-            ShardId::from_raw(10),
-            ShardStatus::Split,
-            None,
-            test_spec(),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            Some(WorkerId::from_raw(1)),
-            Some(LogicalTime::from_raw(100)),
-            FenceEpoch::INITIAL,
-            None,
-            vec![derived_shard_id(1), derived_shard_id(2)],
-            vec![],
-        );
-        r.assert_invariants();
+    fn assert_invariants_terminal_with_lease_panics() {
+        let lease = Some(LeaseHolder::new(
+            WorkerId::from_raw(1),
+            LogicalTime::from_raw(100),
+        ));
+        let cases: Vec<(&str, ShardRecord)> = vec![
+            (
+                "Done",
+                ShardRecord::from_raw_parts(
+                    test_tenant(),
+                    test_run(),
+                    ShardId::from_raw(10),
+                    ShardStatus::Done,
+                    None,
+                    test_spec(),
+                    Cursor::initial(),
+                    CursorSemantics::Completed,
+                    lease,
+                    FenceEpoch::INITIAL,
+                    None,
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                "Parked",
+                ShardRecord::from_raw_parts(
+                    test_tenant(),
+                    test_run(),
+                    ShardId::from_raw(10),
+                    ShardStatus::Parked,
+                    Some(ParkReason::TooManyErrors),
+                    test_spec(),
+                    Cursor::initial(),
+                    CursorSemantics::Completed,
+                    lease,
+                    FenceEpoch::INITIAL,
+                    None,
+                    vec![],
+                    vec![],
+                ),
+            ),
+            (
+                "Split",
+                ShardRecord::from_raw_parts(
+                    test_tenant(),
+                    test_run(),
+                    ShardId::from_raw(10),
+                    ShardStatus::Split,
+                    None,
+                    test_spec(),
+                    Cursor::initial(),
+                    CursorSemantics::Completed,
+                    lease,
+                    FenceEpoch::INITIAL,
+                    None,
+                    vec![derived_shard_id(1), derived_shard_id(2)],
+                    vec![],
+                ),
+            ),
+        ];
+        for (label, record) in cases {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                record.assert_invariants();
+            }));
+            let err = result.expect_err(&format!(
+                "{label}: assert_invariants should panic for terminal shard with lease"
+            ));
+            let msg = err
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| err.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic>");
+            assert!(
+                msg.contains("must not have a lease"),
+                "{label}: expected 'must not have a lease' in panic, got: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -1021,7 +1084,6 @@ mod tests {
             test_spec(),
             Cursor::initial(),
             CursorSemantics::Completed,
-            None,
             None,
             FenceEpoch::INITIAL,
             None,
@@ -1044,7 +1106,6 @@ mod tests {
             test_spec(),
             Cursor::initial(),
             CursorSemantics::Completed,
-            None,
             None,
             FenceEpoch::INITIAL,
             Some(ShardId::from_raw(5)), // has parent
@@ -1076,7 +1137,6 @@ mod tests {
             Cursor::initial(),
             CursorSemantics::Completed,
             None,
-            None,
             FenceEpoch::ZERO,
             None,
             vec![],
@@ -1097,7 +1157,6 @@ mod tests {
             test_spec(),
             Cursor::initial(),
             CursorSemantics::Completed,
-            None,
             None,
             FenceEpoch::INITIAL,
             None,
@@ -1120,7 +1179,6 @@ mod tests {
             test_spec(),
             Cursor::initial(),
             CursorSemantics::Completed,
-            None,
             None,
             FenceEpoch::INITIAL,
             None,
@@ -1145,7 +1203,6 @@ mod tests {
             test_spec(),
             Cursor::initial(),
             CursorSemantics::Completed,
-            None,
             None,
             FenceEpoch::INITIAL,
             None,
@@ -1188,6 +1245,8 @@ mod tests {
         assert_eq!(r.op_log.len(), ShardRecord::OP_LOG_CAP);
         assert!(r.op_log_lookup(OpId::from_raw(0)).is_none());
         assert!(r.op_log_lookup(OpId::from_raw(999)).is_some());
+        // Second-oldest (op_id=1) must survive eviction.
+        assert!(r.op_log_lookup(OpId::from_raw(1)).is_some());
     }
 
     #[test]
@@ -1236,12 +1295,185 @@ mod tests {
         );
     }
 
+    // -- INV-7b: derived without parent -----------------------------------
+
+    #[test]
+    #[should_panic(expected = "derived (bit 63 set) but has no parent")]
+    fn assert_invariants_derived_without_parent_panics() {
+        let r = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            derived_shard_id(42), // derived, but parent is None
+            ShardStatus::Active,
+            None,
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::INITIAL,
+            None, // parent = None -- violates INV-7b
+            vec![],
+            vec![],
+        );
+        r.assert_invariants();
+    }
+
+    // -- assert_transition_legal -----------------------------------------
+
+    #[test]
+    fn assert_transition_legal_active_to_done_ok() {
+        let r = active_record();
+        r.assert_transition_legal(ShardStatus::Done);
+    }
+
+    #[test]
+    fn assert_transition_legal_active_to_parked_ok() {
+        let r = active_record();
+        r.assert_transition_legal(ShardStatus::Parked);
+    }
+
+    #[test]
+    fn assert_transition_legal_active_to_split_ok() {
+        let r = active_record();
+        r.assert_transition_legal(ShardStatus::Split);
+    }
+
+    #[test]
+    fn assert_transition_legal_done_to_done_ok() {
+        let mut r = active_record();
+        r.status = ShardStatus::Done;
+        r.assert_transition_legal(ShardStatus::Done);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal transition from terminal")]
+    fn assert_transition_legal_done_to_active_panics() {
+        let mut r = active_record();
+        r.status = ShardStatus::Done;
+        r.assert_transition_legal(ShardStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal transition from terminal")]
+    fn assert_transition_legal_parked_to_active_panics() {
+        let mut r = active_record();
+        r.status = ShardStatus::Parked;
+        r.park_reason = Some(ParkReason::TooManyErrors);
+        r.assert_transition_legal(ShardStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "illegal transition from terminal")]
+    fn assert_transition_legal_split_to_done_panics() {
+        let mut r = active_record();
+        r.status = ShardStatus::Split;
+        r.spawned = vec![derived_shard_id(1), derived_shard_id(2)];
+        r.assert_transition_legal(ShardStatus::Done);
+    }
+
+    // -- advance_fence ---------------------------------------------------
+
+    #[test]
+    fn advance_fence_increments() {
+        let mut r = active_record();
+        assert_eq!(r.fence_epoch, FenceEpoch::INITIAL);
+        let new = r.advance_fence();
+        assert_eq!(new, FenceEpoch::INITIAL.increment());
+    }
+
+    #[test]
+    fn advance_fence_monotonic() {
+        let mut r = active_record();
+        let f1 = r.advance_fence();
+        let f2 = r.advance_fence();
+        let f3 = r.advance_fence();
+        assert!(f1 < f2);
+        assert!(f2 < f3);
+    }
+
     // -- is_leased_at ----------------------------------------------------
 
     #[test]
     fn is_leased_at_no_lease() {
         let r = active_record();
         assert!(!r.is_leased_at(LogicalTime::from_raw(0)));
+    }
+
+    // -- can_spawn -------------------------------------------------------
+
+    #[test]
+    fn can_spawn_within_cap() {
+        let r = active_record();
+        assert!(r.can_spawn(1));
+        assert!(r.can_spawn(MAX_SPAWNED_PER_SHARD));
+    }
+
+    #[test]
+    fn can_spawn_at_cap() {
+        let mut r = active_record();
+        r.spawned = (0..MAX_SPAWNED_PER_SHARD as u64)
+            .map(|i| derived_shard_id(i + 1))
+            .collect();
+        assert!(!r.can_spawn(1));
+        assert!(r.can_spawn(0));
+    }
+
+    #[test]
+    fn can_spawn_overflow() {
+        let r = active_record();
+        assert!(!r.can_spawn(usize::MAX));
+    }
+
+    // -- op_log_push duplicate rejection ----------------------------------
+
+    #[test]
+    #[should_panic(expected = "duplicate OpId")]
+    fn op_log_push_rejects_duplicate() {
+        let mut r = active_record();
+        r.op_log_push(make_entry(42));
+        r.op_log_push(make_entry(42)); // same OpId — should panic
+    }
+
+    // -- new_split_child construction ------------------------------------
+
+    #[test]
+    fn new_split_child_construction_and_fields() {
+        let parent_id = ShardId::from_raw(10);
+        let child_id = derived_shard_id(1);
+        let cursor = Cursor::with_last_key(b"middle-key".to_vec());
+
+        let record = ShardRecord::new_split_child(
+            test_tenant(),
+            test_run(),
+            child_id,
+            test_spec(),
+            cursor.clone(),
+            CursorSemantics::Dispatched,
+            parent_id,
+        );
+
+        assert_eq!(record.status, ShardStatus::Active);
+        assert_eq!(record.parent, Some(parent_id));
+        assert_eq!(record.cursor, cursor);
+        assert_eq!(record.cursor_semantics, CursorSemantics::Dispatched);
+        assert_eq!(record.shard, child_id);
+        assert!(record.spawned.is_empty());
+        assert!(record.op_log.is_empty());
+        assert_eq!(record.fence_epoch, FenceEpoch::INITIAL);
+    }
+
+    #[test]
+    #[should_panic(expected = "not derived")]
+    fn new_split_child_non_derived_shard_panics() {
+        let _ = ShardRecord::new_split_child(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(10), // NOT derived
+            test_spec(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            ShardId::from_raw(5),
+        );
     }
 
     // -- Property tests --------------------------------------------------
@@ -1279,8 +1511,10 @@ mod tests {
             now_raw in 0u64..u64::MAX,
         ) {
             let mut r = active_record();
-            r.lease_owner = Some(WorkerId::from_raw(99));
-            r.lease_deadline = Some(LogicalTime::from_raw(deadline_raw));
+            r.lease = Some(LeaseHolder::new(
+                WorkerId::from_raw(99),
+                LogicalTime::from_raw(deadline_raw),
+            ));
             prop_assert_eq!(
                 r.is_leased_at(LogicalTime::from_raw(now_raw)),
                 now_raw < deadline_raw,
