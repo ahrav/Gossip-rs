@@ -1,0 +1,703 @@
+//! Split operation types and shard-ID/payload-hash derivation functions.
+//!
+//! When a shard's key range becomes too large or unevenly distributed,
+//! the coordinator splits it into smaller shards. Two strategies exist:
+//!
+//! - **Split-replace** ([`SplitReplacePlan`]): the parent is retired and
+//!   replaced by ≥ 2 children that collectively cover its entire key range.
+//!   Use when the parent's range should be evenly subdivided.
+//!
+//! - **Split-residual** ([`SplitResidualPlan`]): the parent shrinks its
+//!   key range and a new *residual* shard covers the remainder. Use when
+//!   the parent should keep scanning a prefix while offloading the tail.
+//!
+//! Both strategies produce deterministic child shard IDs via
+//! [`derive_split_shard_id`], and all operations are fingerprinted for
+//! op-log idempotency via the `hash_*_payload` functions.
+//!
+//! ## Design Decisions (locked)
+//!
+//! D2.10: Derived shard IDs have bit 63 set — distinguishing root shards
+//!        (externally assigned) from split-derived shards (deterministically
+//!        computed). Birthday collision bound ~2^31.5 values before 50%
+//!        collision probability (63 effective bits); acceptable for bounded
+//!        coordination use cases.
+//!
+//! D2.8: Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`
+//!       encoding. This ties the op-log idempotency check to the actual
+//!       operation parameters, detecting "same OpId, different payload"
+//!       conflicts.
+
+use std::fmt;
+
+use blake3::Hasher;
+
+use crate::coordination::cursor::Cursor;
+use crate::coordination::record::ParkReason;
+use crate::coordination::shard_spec::ShardSpec;
+use crate::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
+use crate::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Maximum number of children in a single SplitReplace operation.
+///
+/// Bounds the fan-out of any single split to prevent a single coordinator
+/// operation from creating an unbounded number of shards. 256 children
+/// allows fine-grained subdivision while keeping the per-operation metadata
+/// size tractable (SEC-4: resource exhaustion guard).
+pub const MAX_SPLIT_CHILDREN: usize = 256;
+
+/// Maximum total spawned shards per parent shard.
+///
+/// Caps the cumulative number of children + residuals a parent may produce
+/// across its lifetime (multiple split-residual operations accumulate).
+/// 1024 bounds the total spawn count per parent shard (SEC-4).
+pub const MAX_SPAWNED_PER_SHARD: usize = 1024;
+
+// Relationship assertion: a single split can't exceed total spawned cap.
+const _: () = assert!(MAX_SPLIT_CHILDREN <= MAX_SPAWNED_PER_SHARD);
+const _: () = assert!(MAX_SPLIT_CHILDREN >= 2);
+const _: () = assert!(MAX_SPAWNED_PER_SHARD > 0);
+
+// ============================================================================
+// DerivedShardKind
+// ============================================================================
+
+/// Distinguishes child shards from residual shards in ID derivation.
+///
+/// Both come from a split, but play different roles: children replace the
+/// parent's range, while a residual covers the unprocessed remainder.
+///
+/// ## Invariants
+///
+/// **Safety (discriminant stability)**: The `u8` discriminant values
+/// participate in shard-ID derivation. Changing them would produce
+/// different IDs for the same logical operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DerivedShardKind {
+    Child = 0,
+    Residual = 1,
+}
+
+impl DerivedShardKind {
+    /// Parse a `u8` discriminant to the corresponding variant.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Child),
+            1 => Some(Self::Residual),
+            _ => None,
+        }
+    }
+
+    /// Return the stable `u8` discriminant.
+    #[inline]
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl CanonicalBytes for DerivedShardKind {
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.as_u8().write_canonical(h);
+    }
+}
+
+// Compile-time assertions for DerivedShardKind.
+const _: () = assert!(DerivedShardKind::Child as u8 == 0);
+const _: () = assert!(DerivedShardKind::Residual as u8 == 1);
+const _: () = assert!(core::mem::size_of::<DerivedShardKind>() == 1);
+
+// ============================================================================
+// SplitReplaceChild
+// ============================================================================
+
+/// A single child in a [`SplitReplacePlan`].
+///
+/// Each child carries its own [`ShardSpec`] (the key sub-range it covers)
+/// and an initial [`Cursor`] (where scanning should begin). The cursor
+/// allows the coordinator to pre-position a child at the parent's last
+/// checkpoint within that sub-range, avoiding re-scanning already-processed
+/// keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitReplaceChild {
+    spec: ShardSpec,
+    cursor: Cursor,
+}
+
+impl SplitReplaceChild {
+    /// Construct a new child entry.
+    #[must_use]
+    pub fn new(spec: ShardSpec, cursor: Cursor) -> Self {
+        Self { spec, cursor }
+    }
+
+    /// The child's shard specification (key sub-range).
+    #[inline]
+    #[must_use]
+    pub fn spec(&self) -> &ShardSpec {
+        &self.spec
+    }
+
+    /// The child's initial cursor position.
+    #[inline]
+    #[must_use]
+    pub fn cursor(&self) -> &Cursor {
+        &self.cursor
+    }
+}
+
+impl CanonicalBytes for SplitReplaceChild {
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.spec.write_canonical(h);
+        self.cursor.write_canonical(h);
+    }
+}
+
+// ============================================================================
+// SplitReplacePlan
+// ============================================================================
+
+/// Plan for a split-replace operation: parent is replaced by ≥ 2 children
+/// that collectively cover the parent's key range.
+///
+/// The `children` field is private — the constructor validates the
+/// minimum-count invariant (≥ 2, ≤ [`MAX_SPLIT_CHILDREN`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitReplacePlan {
+    children: Vec<SplitReplaceChild>,
+}
+
+/// Error returned when a [`SplitReplacePlan`] is constructed with an
+/// invalid number of children.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitReplacePlanError {
+    /// Fewer than 2 children — not a split.
+    TooFewChildren { count: usize },
+    /// More than [`MAX_SPLIT_CHILDREN`] children.
+    TooManyChildren { count: usize },
+}
+
+impl fmt::Display for SplitReplacePlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooFewChildren { count } => {
+                write!(f, "split-replace requires >= 2 children, got {count}")
+            }
+            Self::TooManyChildren { count } => {
+                write!(
+                    f,
+                    "split-replace exceeds max children ({count} > {MAX_SPLIT_CHILDREN})"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplitReplacePlanError {}
+
+impl SplitReplacePlan {
+    /// Construct a validated split-replace plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SplitReplacePlanError`] if `children.len() < 2` or
+    /// `children.len() > MAX_SPLIT_CHILDREN`.
+    pub fn try_new(children: Vec<SplitReplaceChild>) -> Result<Self, SplitReplacePlanError> {
+        if children.len() < 2 {
+            return Err(SplitReplacePlanError::TooFewChildren {
+                count: children.len(),
+            });
+        }
+        if children.len() > MAX_SPLIT_CHILDREN {
+            return Err(SplitReplacePlanError::TooManyChildren {
+                count: children.len(),
+            });
+        }
+        Ok(Self { children })
+    }
+
+    /// The children in this plan.
+    #[inline]
+    #[must_use]
+    pub fn children(&self) -> &[SplitReplaceChild] {
+        &self.children
+    }
+}
+
+impl CanonicalBytes for SplitReplacePlan {
+    /// Length-prefixed encoding: `len || child[0] || child[1] || ...`.
+    ///
+    /// The length prefix ensures plans with different child counts produce
+    /// distinct byte sequences even if the concatenated child bytes happen
+    /// to collide.
+    fn write_canonical(&self, h: &mut Hasher) {
+        u32::try_from(self.children.len())
+            .expect("child count exceeds u32")
+            .write_canonical(h);
+        for child in &self.children {
+            child.write_canonical(h);
+        }
+    }
+}
+
+// ============================================================================
+// SplitResidualPlan
+// ============================================================================
+
+/// Plan for a split-residual operation: parent shrinks its key range and
+/// a new residual shard covers the remainder.
+///
+/// The parent keeps `parent_new_spec` (typically the prefix it has already
+/// partially scanned) and continues processing. The residual shard gets
+/// `residual_spec` (the unprocessed suffix) and starts from
+/// [`Cursor::initial()`] (enforced by the coordinator, not by this type).
+///
+/// ## Coverage contract
+///
+/// `parent_new_spec ∪ residual_spec` must equal the parent's original
+/// `ShardSpec` range, with no overlap. This is enforced by the coordinator
+/// at execution time, not by this plan type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitResidualPlan {
+    parent_new_spec: ShardSpec,
+    residual_spec: ShardSpec,
+}
+
+/// Error returned when a [`SplitResidualPlan`] is constructed with
+/// identical specs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitResidualPlanError {
+    /// `parent_new_spec` and `residual_spec` are identical — a residual
+    /// split must actually shrink the parent and produce a distinct range.
+    IdenticalSpecs,
+}
+
+impl fmt::Display for SplitResidualPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdenticalSpecs => {
+                write!(
+                    f,
+                    "split-residual requires parent_new_spec and residual_spec to differ"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplitResidualPlanError {}
+
+impl SplitResidualPlan {
+    /// Construct a validated residual plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SplitResidualPlanError::IdenticalSpecs`] if
+    /// `parent_new_spec == residual_spec`. Full coverage validation
+    /// (parent_new ∪ residual == old_parent, no overlap) is performed
+    /// by the coordinator at execution time via `validate_residual_split`.
+    pub fn try_new(
+        parent_new_spec: ShardSpec,
+        residual_spec: ShardSpec,
+    ) -> Result<Self, SplitResidualPlanError> {
+        if parent_new_spec == residual_spec {
+            return Err(SplitResidualPlanError::IdenticalSpecs);
+        }
+        Ok(Self {
+            parent_new_spec,
+            residual_spec,
+        })
+    }
+
+    /// The parent's new (shrunk) specification — the range it keeps.
+    #[inline]
+    #[must_use]
+    pub fn parent_new_spec(&self) -> &ShardSpec {
+        &self.parent_new_spec
+    }
+
+    /// The residual shard's specification — the range split off.
+    #[inline]
+    #[must_use]
+    pub fn residual_spec(&self) -> &ShardSpec {
+        &self.residual_spec
+    }
+}
+
+impl CanonicalBytes for SplitResidualPlan {
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.parent_new_spec.write_canonical(h);
+        self.residual_spec.write_canonical(h);
+    }
+}
+
+// ============================================================================
+// derive_split_shard_id
+// ============================================================================
+
+/// Deterministically derive a child/residual shard ID from the split context.
+///
+/// Uses domain-separated BLAKE3 (`SPLIT_ID_V1`) with five inputs:
+/// `(run, parent, op, kind, index)`. The output has bit 63 set to mark
+/// it as a derived ID — distinguishing it from externally-assigned root
+/// shard IDs.
+///
+/// ## Collision Bound
+///
+/// BLAKE3 truncated to 64 bits with bit 63 forced gives 63 effective
+/// bits of entropy. Birthday collision probability reaches ~50% at
+/// ~2^31.5 derived IDs. This is acceptable for coordination use cases
+/// where the total number of derived shards per run is bounded by
+/// [`MAX_SPAWNED_PER_SHARD`] × shard count.
+///
+/// ## Caller Responsibility
+///
+/// The `index` parameter must be `parent.spawned.len() as u32` at call
+/// time — callers must not hardcode 0. Different indices produce different
+/// IDs (tested by `derive_split_shard_id_collision_free`).
+#[must_use]
+pub fn derive_split_shard_id(
+    run: RunId,
+    parent: ShardId,
+    op: OpId,
+    kind: DerivedShardKind,
+    index: u32,
+) -> ShardId {
+    let mut h = SPLIT_ID_HASHER.clone();
+    run.write_canonical(&mut h);
+    parent.write_canonical(&mut h);
+    op.write_canonical(&mut h);
+    kind.write_canonical(&mut h);
+    index.write_canonical(&mut h);
+
+    let id = finalize_64(&h) | (1u64 << 63);
+    let result = ShardId::from_raw(id);
+    assert!(result.is_derived(), "derived shard ID must have bit 63 set");
+    assert!(result.as_raw() != 0, "derived shard ID must be non-zero");
+    result
+}
+
+// ============================================================================
+// Payload hash functions
+// ============================================================================
+
+/// Internal helper: compute a domain-tagged payload hash.
+///
+/// Uses the cached `OP_PAYLOAD_HASHER` (`OP_PAYLOAD_V1` domain) and
+/// prepends the operation-specific `op_tag` before calling `write_fields`.
+/// The tag acts as a second domain-separation layer — even if two different
+/// operation types happen to produce identical field bytes, the different
+/// tags guarantee distinct hashes (tested by `hash_checkpoint_vs_complete_different`).
+#[must_use]
+pub(crate) fn op_payload_hash(op_tag: &[u8], write_fields: impl FnOnce(&mut Hasher)) -> u64 {
+    let mut h = OP_PAYLOAD_HASHER.clone();
+    h.update(op_tag);
+    write_fields(&mut h);
+    finalize_64(&h)
+}
+
+/// Payload hash for a checkpoint operation.
+///
+/// Stored in the op-log alongside the [`OpId`] to detect "same OpId,
+/// different cursor" conflicts during idempotent replay.
+#[must_use]
+pub fn hash_checkpoint_payload(new_cursor: &Cursor) -> u64 {
+    op_payload_hash(b"checkpoint", |h| {
+        new_cursor.write_canonical(h);
+    })
+}
+
+/// Payload hash for a complete operation.
+///
+/// Same role as [`hash_checkpoint_payload`] but for the terminal
+/// completion event. The `b"complete"` tag ensures a completion and
+/// a checkpoint with the same cursor produce different hashes.
+#[must_use]
+pub fn hash_complete_payload(final_cursor: &Cursor) -> u64 {
+    op_payload_hash(b"complete", |h| {
+        final_cursor.write_canonical(h);
+    })
+}
+
+/// Payload hash for a park operation.
+///
+/// Fingerprints the [`ParkReason`] so the op-log can distinguish
+/// "park with reason A" from "park with reason B" under the same [`OpId`].
+#[must_use]
+pub fn hash_park_payload(reason: ParkReason) -> u64 {
+    op_payload_hash(b"park", |h| {
+        reason.write_canonical(h);
+    })
+}
+
+/// Payload hash for a split-replace operation.
+///
+/// Fingerprints the full [`SplitReplacePlan`] (child count + all child
+/// specs and cursors) for op-log idempotency.
+#[must_use]
+pub fn hash_split_replace_payload(plan: &SplitReplacePlan) -> u64 {
+    op_payload_hash(b"split_replace", |h| {
+        plan.write_canonical(h);
+    })
+}
+
+/// Payload hash for a split-residual operation.
+///
+/// Fingerprints both the parent's new spec and the residual spec for
+/// op-log idempotency.
+#[must_use]
+pub fn hash_split_residual_payload(plan: &SplitResidualPlan) -> u64 {
+    op_payload_hash(b"split_residual", |h| {
+        plan.write_canonical(h);
+    })
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::canonical_digest;
+    use proptest::prelude::*;
+
+    // -- DerivedShardKind ------------------------------------------------
+
+    #[test]
+    fn derived_shard_kind_roundtrip() {
+        assert_eq!(DerivedShardKind::from_u8(0), Some(DerivedShardKind::Child));
+        assert_eq!(
+            DerivedShardKind::from_u8(1),
+            Some(DerivedShardKind::Residual)
+        );
+        assert_eq!(DerivedShardKind::from_u8(2), None);
+        assert_eq!(DerivedShardKind::from_u8(u8::MAX), None);
+    }
+
+    #[test]
+    fn derived_shard_kind_canonical_all_distinct() {
+        assert_ne!(
+            canonical_digest(&DerivedShardKind::Child),
+            canonical_digest(&DerivedShardKind::Residual),
+        );
+    }
+
+    // -- SplitReplacePlan validation -------------------------------------
+
+    /// Table-driven boundary validation for `SplitReplacePlan::try_new`.
+    ///
+    /// Consolidates the five boundary tests (empty, 1, 2, MAX, MAX+1)
+    /// into a single test that exercises every critical threshold.
+    #[test]
+    fn split_replace_plan_boundary_validation() {
+        let cases: &[(usize, Result<(), SplitReplacePlanError>)] = &[
+            (0, Err(SplitReplacePlanError::TooFewChildren { count: 0 })),
+            (1, Err(SplitReplacePlanError::TooFewChildren { count: 1 })),
+            (2, Ok(())),
+            (MAX_SPLIT_CHILDREN, Ok(())),
+            (
+                MAX_SPLIT_CHILDREN + 1,
+                Err(SplitReplacePlanError::TooManyChildren {
+                    count: MAX_SPLIT_CHILDREN + 1,
+                }),
+            ),
+        ];
+
+        for &(count, ref expected) in cases {
+            let children: Vec<SplitReplaceChild> = (0..count)
+                .map(|i| {
+                    let start = (i as u16).to_be_bytes().to_vec();
+                    let end = ((i + 1) as u16).to_be_bytes().to_vec();
+                    SplitReplaceChild::new(ShardSpec::with_range(start, end), Cursor::initial())
+                })
+                .collect();
+            let result = SplitReplacePlan::try_new(children);
+            match expected {
+                Ok(()) => assert!(result.is_ok(), "count={count} should be accepted"),
+                Err(e) => assert_eq!(&result.unwrap_err(), e, "count={count}"),
+            }
+        }
+    }
+
+    // -- SplitResidualPlan validation ------------------------------------
+
+    #[test]
+    fn split_residual_plan_valid() {
+        let parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let plan = SplitResidualPlan::try_new(parent.clone(), residual.clone()).unwrap();
+        assert_eq!(plan.parent_new_spec(), &parent);
+        assert_eq!(plan.residual_spec(), &residual);
+    }
+
+    #[test]
+    fn split_residual_plan_identical_specs_returns_error() {
+        let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        assert_eq!(
+            SplitResidualPlan::try_new(spec.clone(), spec),
+            Err(SplitResidualPlanError::IdenticalSpecs),
+        );
+    }
+
+    // -- CanonicalBytes --------------------------------------------------
+
+    #[test]
+    fn split_replace_plan_canonical_deterministic() {
+        let c1 = SplitReplaceChild::new(
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        );
+        let c2 = SplitReplaceChild::new(
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        );
+        let plan = SplitReplacePlan::try_new(vec![c1.clone(), c2.clone()]).unwrap();
+        assert_eq!(canonical_digest(&plan), canonical_digest(&plan));
+    }
+
+    // -- Property tests --------------------------------------------------
+
+    proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        // Collision-freedom: distinct inputs → different derived shard IDs.
+        #[test]
+        fn derive_split_shard_id_collision_free(
+            run_a in any::<u64>(), parent_a in any::<u64>(), op_a in any::<u64>(),
+            kind_a in 0u8..2, index_a in any::<u32>(),
+            run_b in any::<u64>(), parent_b in any::<u64>(), op_b in any::<u64>(),
+            kind_b in 0u8..2, index_b in any::<u32>(),
+        ) {
+            let tuple_a = (run_a, parent_a, op_a, kind_a, index_a);
+            let tuple_b = (run_b, parent_b, op_b, kind_b, index_b);
+            prop_assume!(tuple_a != tuple_b);
+
+            let id_a = derive_split_shard_id(
+                RunId::from_raw(run_a), ShardId::from_raw(parent_a), OpId::from_raw(op_a),
+                DerivedShardKind::from_u8(kind_a).unwrap(), index_a,
+            );
+            let id_b = derive_split_shard_id(
+                RunId::from_raw(run_b), ShardId::from_raw(parent_b), OpId::from_raw(op_b),
+                DerivedShardKind::from_u8(kind_b).unwrap(), index_b,
+            );
+            prop_assert_ne!(id_a, id_b);
+        }
+
+        // Derived IDs always have bit 63 set + same inputs → same output.
+        #[test]
+        fn derive_split_shard_id_derived_and_pure(
+            run in any::<u64>(), parent in any::<u64>(), op in any::<u64>(),
+            kind in 0u8..2, index in any::<u32>(),
+        ) {
+            let k = DerivedShardKind::from_u8(kind).unwrap();
+            let a = derive_split_shard_id(RunId::from_raw(run), ShardId::from_raw(parent), OpId::from_raw(op), k, index);
+            let b = derive_split_shard_id(RunId::from_raw(run), ShardId::from_raw(parent), OpId::from_raw(op), k, index);
+            prop_assert!(a.is_derived());
+            prop_assert_eq!(a, b);
+        }
+
+        // Cursor-based hash collision-freedom (checkpoint and complete).
+        #[test]
+        fn cursor_hash_collision_free(
+            k1 in proptest::collection::vec(any::<u8>(), 1..64),
+            k2 in proptest::collection::vec(any::<u8>(), 1..64),
+        ) {
+            prop_assume!(k1 != k2);
+            let c1 = Cursor::with_last_key(k1);
+            let c2 = Cursor::with_last_key(k2);
+            prop_assert_ne!(hash_checkpoint_payload(&c1), hash_checkpoint_payload(&c2));
+            prop_assert_ne!(hash_complete_payload(&c1), hash_complete_payload(&c2));
+        }
+
+        // Cursor-based hash purity (checkpoint and complete).
+        #[test]
+        fn cursor_hash_functions_are_pure(
+            k in proptest::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let c = Cursor::with_last_key(k);
+            prop_assert_eq!(hash_checkpoint_payload(&c), hash_checkpoint_payload(&c));
+            prop_assert_eq!(hash_complete_payload(&c), hash_complete_payload(&c));
+        }
+
+        // Domain separation: checkpoint and complete produce different hashes
+        // for any cursor. Subsumes the former point-check unit test.
+        #[test]
+        fn checkpoint_and_complete_hashes_differ(
+            k in proptest::collection::vec(any::<u8>(), 1..64),
+        ) {
+            let c = Cursor::with_last_key(k);
+            prop_assert_ne!(hash_checkpoint_payload(&c), hash_complete_payload(&c));
+        }
+
+        // Park hash: collision-free.
+        #[test]
+        fn hash_park_collision_free(a in 0u8..5, b in 0u8..5) {
+            prop_assume!(a != b);
+            let ra = ParkReason::from_u8(a).unwrap();
+            let rb = ParkReason::from_u8(b).unwrap();
+            prop_assert_ne!(hash_park_payload(ra), hash_park_payload(rb));
+        }
+
+        // Split-replace collision-free.
+        #[test]
+        fn hash_split_replace_collision_free(
+            s1 in proptest::collection::vec(any::<u8>(), 1..16),
+            s1_suffix in proptest::collection::vec(any::<u8>(), 1..8),
+            s2 in proptest::collection::vec(any::<u8>(), 1..16),
+            s2_suffix in proptest::collection::vec(any::<u8>(), 1..8),
+        ) {
+            let mut e1 = s1.clone();
+            e1.extend_from_slice(&s1_suffix);
+            let mut e2 = s2.clone();
+            e2.extend_from_slice(&s2_suffix);
+
+            prop_assume!((s1.clone(), e1.clone()) != (s2.clone(), e2.clone()));
+
+            let plan1 = SplitReplacePlan::try_new(vec![
+                SplitReplaceChild::new(ShardSpec::with_range(s1.clone(), e1.clone()), Cursor::initial()),
+                SplitReplaceChild::new(ShardSpec::with_range(e1, vec![0xFF; 32]), Cursor::initial()),
+            ]).unwrap();
+            let plan2 = SplitReplacePlan::try_new(vec![
+                SplitReplaceChild::new(ShardSpec::with_range(s2.clone(), e2.clone()), Cursor::initial()),
+                SplitReplaceChild::new(ShardSpec::with_range(e2, vec![0xFF; 32]), Cursor::initial()),
+            ]).unwrap();
+            prop_assume!(plan1 != plan2);
+            prop_assert_ne!(hash_split_replace_payload(&plan1), hash_split_replace_payload(&plan2));
+        }
+
+        // Split-residual collision-free.
+        #[test]
+        fn hash_split_residual_collision_free(
+            s1 in proptest::collection::vec(any::<u8>(), 1..16),
+            s1_suffix in proptest::collection::vec(any::<u8>(), 1..8),
+            s2 in proptest::collection::vec(any::<u8>(), 1..16),
+            s2_suffix in proptest::collection::vec(any::<u8>(), 1..8),
+        ) {
+            let mut e1 = s1.clone();
+            e1.extend_from_slice(&s1_suffix);
+            let mut e2 = s2.clone();
+            e2.extend_from_slice(&s2_suffix);
+
+            let plan1 = SplitResidualPlan::try_new(
+                ShardSpec::with_range(s1.clone(), e1.clone()),
+                ShardSpec::with_range(e1, vec![0xFF; 32]),
+            ).unwrap();
+            let plan2 = SplitResidualPlan::try_new(
+                ShardSpec::with_range(s2.clone(), e2.clone()),
+                ShardSpec::with_range(e2, vec![0xFF; 32]),
+            ).unwrap();
+            prop_assume!(plan1 != plan2);
+            prop_assert_ne!(hash_split_residual_payload(&plan1), hash_split_residual_payload(&plan2));
+        }
+
+    }
+}
