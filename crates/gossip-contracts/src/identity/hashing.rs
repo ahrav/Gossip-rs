@@ -1,7 +1,11 @@
 //! Domain-separated hashing helpers for content-addressed ID derivation.
 //!
 //! Every ID derivation in the system flows through [`domain_hasher`] and
-//! [`finalize_32`]. Together they provide a two-step pattern:
+//! one of the finalization functions:
+//!
+//! - [`finalize_32`] — full 256-bit digest for content-addressed IDs.
+//! - [`finalize_64`] — truncated 64-bit digest for coordination IDs
+//!   (op-log payload hashes, split shard ID derivation).
 //!
 //! ```
 //! use gossip_contracts::identity::{domain_hasher, finalize_32, CanonicalBytes};
@@ -104,6 +108,28 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+/// Finalize a hasher into a 64-bit (8-byte) digest.
+///
+/// Takes the first 8 bytes of the BLAKE3 output as a little-endian `u64`.
+/// Used for op-log payload hashes and split shard ID derivation.
+///
+/// # Cardinality bounds
+///
+/// A 64-bit truncated hash has a birthday collision bound of approximately
+/// 2^32 (~4.3 billion) values before a 50% collision probability.  This is
+/// acceptable for coordination use cases (shard counts per run, op-log
+/// entries per epoch) where cardinality is bounded by system design.  For
+/// globally-unique content-addressed identifiers with unbounded cardinality,
+/// use [`finalize_32`] instead.
+#[inline]
+pub fn finalize_64(hasher: &Hasher) -> u64 {
+    let bytes = hasher.finalize();
+    let first8: [u8; 8] = bytes.as_bytes()[..8]
+        .try_into()
+        .expect("BLAKE3 output is always ≥ 8 bytes");
+    u64::from_le_bytes(first8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +183,50 @@ mod tests {
             let d1 = hash_payload("gossip/left/v1", data.as_slice());
             let d2 = hash_payload("gossip/right/v1", data.as_slice());
 
+            prop_assert_ne!(d1, d2);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // finalize_64: property-based
+    // ---------------------------------------------------------------
+
+    fn hash_payload_64(domain: &str, payload: &[u8]) -> u64 {
+        let mut hasher = domain_hasher(domain);
+        payload.write_canonical(&mut hasher);
+        finalize_64(&hasher)
+    }
+
+    proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        #[test]
+        fn finalize_64_is_le_prefix_of_finalize_32(
+            data in proptest::collection::vec(any::<u8>(), 0..512)
+        ) {
+            let domain = "gossip/cross-width-anchor/v1";
+            let mut h = domain_hasher(domain);
+            data.as_slice().write_canonical(&mut h);
+
+            let full = finalize_32(&h);
+            let short = finalize_64(&h);
+
+            let expected = u64::from_le_bytes(full[..8].try_into().unwrap());
+            prop_assert_eq!(short, expected);
+        }
+
+        #[test]
+        fn finalize_64_deterministic(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let domain = "gossip/prop64/v1";
+            let d1 = hash_payload_64(domain, data.as_slice());
+            let d2 = hash_payload_64(domain, data.as_slice());
+            prop_assert_eq!(d1, d2);
+        }
+
+        #[test]
+        fn finalize_64_domain_separation(data in proptest::collection::vec(any::<u8>(), 1..256)) {
+            let d1 = hash_payload_64("gossip/left64/v1", data.as_slice());
+            let d2 = hash_payload_64("gossip/right64/v1", data.as_slice());
             prop_assert_ne!(d1, d2);
         }
     }
