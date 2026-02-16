@@ -179,8 +179,12 @@ impl Lease {
 
 /// Operation kinds that participate in per-shard idempotency.
 ///
-/// Every lease-gated mutation records its kind in the op-log so retries with
-/// the same [`OpId`] can be detected and safely replayed.
+/// Every mutation in the shard's op-log carries an `OpKind` so the coordinator
+/// can detect retries via [`OpId`] + payload hash and safely replay them.
+///
+/// Most variants are **lease-gated** — they require a valid lease held by the
+/// calling worker. The exception is [`Unpark`](Self::Unpark), which is an
+/// admin operation the coordinator may perform without a lease.
 ///
 /// ## Invariants
 ///
