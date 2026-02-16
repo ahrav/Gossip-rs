@@ -32,12 +32,14 @@
 //! | `FINDING_ID_EXPECTED` | `domain::FINDING_ID_V1` | `FindingIdInputs` encoding changes |
 //! | `OCCURRENCE_ID_EXPECTED` | `domain::OCCURRENCE_ID_V1` | `OccurrenceIdInputs` encoding changes |
 //! | `POLICY_HASH_EXPECTED` | `domain::POLICY_HASH_V2` | `PolicyHashInputs` encoding changes |
+//! | `FINALIZE_64_EXPECTED` | (test-only domain) | `finalize_64` truncation or endianness changes |
 //!
 //! # Adding a new vector
 //!
-//! 1. Add a `const ..._EXPECTED: [u8; 32]` array with `#[rustfmt::skip]`.
+//! 1. Add a `const ..._EXPECTED: [u8; 32]` array with `#[rustfmt::skip]`
+//!    (or `u64` for 64-bit vectors).
 //! 2. Add a `#[test]` function that constructs canonical inputs, calls the
-//!    derivation, and asserts against the const array.
+//!    derivation, and asserts against the const.
 //! 3. Add the derivation name to the [`ALL`] registry.
 //! 4. Update the `ALL` array length (compile-time checked).
 //! 5. Update the [`registry_is_complete`] test assertion.
@@ -46,7 +48,7 @@ use super::{
     ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemKey, NormHash, ObjectVersionId,
     OccurrenceId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint, SecretHash, StableItemId,
     TenantId, TenantSecretKey, compute_policy_hash, derive_finding_id, derive_occurrence_id,
-    key_secret_hash,
+    domain_hasher, finalize_64, key_secret_hash,
 };
 
 // ============================================================================
@@ -57,13 +59,14 @@ use super::{
 ///
 /// The compile-time array length enforces exhaustiveness: adding a new
 /// derivation without updating this array is a compile error.
-const ALL: [&str; 6] = [
+const ALL: [&str; 7] = [
     "StableItemId",
     "ObjectVersionId",
     "key_secret_hash",
     "FindingId",
     "OccurrenceId",
     "PolicyHash",
+    "finalize_64",
 ];
 
 // ============================================================================
@@ -125,6 +128,11 @@ const POLICY_HASH_EXPECTED: [u8; 32] = [
     0x39, 0xD5, 0x92, 0xEB, 0x71, 0x16, 0x4E, 0x73,
     0x38, 0x1E, 0x83, 0x77, 0x4C, 0xF1, 0xF8, 0x5C,
 ];
+
+/// `finalize_64` with domain `"gossip/golden-64/v1"`, payload `b"deterministic golden vector"`.
+///
+/// Unlike 32-byte vectors, this is a `u64` since `finalize_64` returns a truncated 64-bit digest.
+const FINALIZE_64_EXPECTED: u64 = 0x_8665_9F94_9814_3183;
 
 // ============================================================================
 // Golden vector tests
@@ -232,6 +240,19 @@ fn compute_policy_hash_golden_value() {
     );
 }
 
+#[test]
+fn finalize_64_golden_value() {
+    let mut h = domain_hasher("gossip/golden-64/v1");
+    h.update(b"deterministic golden vector");
+    let result = finalize_64(&h);
+    assert_eq!(
+        result, FINALIZE_64_EXPECTED,
+        "finalize_64 golden vector changed. Coordination ID derivations \
+         will produce different values. This is a breaking change.\n\
+         Actual: {result:#018x}",
+    );
+}
+
 // ============================================================================
 // Registry completeness
 // ============================================================================
@@ -244,8 +265,8 @@ fn compute_policy_hash_golden_value() {
 fn registry_is_complete() {
     assert_eq!(
         ALL.len(),
-        6,
-        "ALL registry has {} entries, expected 6. Did you add a derivation \
+        7,
+        "ALL registry has {} entries, expected 7. Did you add a derivation \
          without updating the registry?",
         ALL.len(),
     );

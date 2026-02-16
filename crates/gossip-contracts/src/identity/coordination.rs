@@ -11,6 +11,35 @@
 //! remaining three ([`FenceEpoch`], [`LogicalTime`], [`ShardKey`]) are
 //! hand-written because they carry domain-specific invariants that the
 //! macro cannot express.
+//!
+//! # Type overview
+//!
+//! | Type | Width | Construction | Purpose |
+//! |------|-------|-------------|---------|
+//! | [`RunId`] | 8 B | `from_raw` (pub) | Unique run identifier |
+//! | [`ShardId`] | 8 B | `from_raw` (pub) | Shard identity within a run |
+//! | [`WorkerId`] | 8 B | `from_raw` (pub) | Worker process identity |
+//! | [`OpId`] | 8 B | `from_raw` (pub) | Caller-generated idempotency key (CSPRNG) |
+//! | [`JobId`] | 8 B | `from_raw` (pub) | Higher-level job grouping |
+//! | [`FenceEpoch`] | 8 B | `from_raw` (pub) | Monotonic epoch for leader fencing |
+//! | [`LogicalTime`] | 8 B | `from_raw` (pub) | Abstract monotonic clock for leases |
+//! | [`ShardKey`] | 16 B | `new(RunId, ShardId)` | Compound HashMap lookup key |
+//!
+//! # Design rationale: 64-bit width
+//!
+//! Coordination types use `u64` rather than the `[u8; 32]` width used by
+//! content-addressed identity types.  The tradeoff:
+//!
+//! - **Content-addressed IDs** (`FindingId`, `OccurrenceId`, etc.) derive
+//!   from unbounded external inputs and need 256-bit collision resistance.
+//! - **Coordination IDs** are counters, assigned identifiers, or lookup keys
+//!   with bounded cardinality per run.  A 64-bit width fits in a single
+//!   register, halves HashMap key size, and packs 8 values per cache line
+//!   — meaningful for high-frequency coordination operations.
+//!
+//! Types that *derive* coordination values from hashed inputs (e.g., split
+//! shard IDs) use [`finalize_64`](super::finalize_64), which truncates a
+//! BLAKE3 digest to 64 bits.  See its documentation for cardinality bounds.
 
 use crate::define_id_64;
 use crate::identity::CanonicalBytes;

@@ -112,6 +112,15 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
 ///
 /// Takes the first 8 bytes of the BLAKE3 output as a little-endian `u64`.
 /// Used for op-log payload hashes and split shard ID derivation.
+///
+/// # Cardinality bounds
+///
+/// A 64-bit truncated hash has a birthday collision bound of approximately
+/// 2^32 (~4.3 billion) values before a 50% collision probability.  This is
+/// acceptable for coordination use cases (shard counts per run, op-log
+/// entries per epoch) where cardinality is bounded by system design.  For
+/// globally-unique content-addressed identifiers with unbounded cardinality,
+/// use [`finalize_32`] instead.
 #[inline]
 pub fn finalize_64(hasher: &Hasher) -> u64 {
     let bytes = hasher.finalize();
