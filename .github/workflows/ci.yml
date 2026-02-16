@@ -98,6 +98,36 @@ jobs:
 
       - run: cargo test --all-features
 
+  # ── Test (release profile) ──────────────────────────────────────────
+  test-release:
+    name: Test (release)
+    runs-on: ubuntu-24.04
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    needs: [changes, fmt]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+          save-cache: "false"
+      - run: cargo test --all-features --release
+
+  # ── MSRV ──────────────────────────────────────────────────────────
+  msrv:
+    name: MSRV (1.93)
+    runs-on: ubuntu-24.04
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    needs: [changes]
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: "1.93"
+      - run: cargo check --all-features
+
   # ── Docs ───────────────────────────────────────────────────────────
   doc:
     name: Doc
