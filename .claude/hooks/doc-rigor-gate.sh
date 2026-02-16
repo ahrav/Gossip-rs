@@ -162,6 +162,7 @@ if [[ $SHOULD_RUN -eq 1 ]]; then
     echo ""
     echo "📝 DOC-RIGOR RECOMMENDED: $REASON"
     echo "   Consider running /doc-rigor on modified code to ensure documentation quality."
+    echo "   Then run /doc-verify in a separate agent to verify accuracy."
     echo ""
 fi
 
