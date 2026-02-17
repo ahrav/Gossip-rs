@@ -29,6 +29,10 @@ inputs:
     description: "Additional rustup targets to install (e.g. x86_64-unknown-linux-musl)"
     required: false
     default: ""
+  github-token:
+    description: "GitHub token for downloading sccache binary from releases"
+    required: false
+    default: ${{ github.token }}
 
 runs:
   using: "composite"
@@ -68,6 +72,8 @@ runs:
 
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
+      with:
+        token: ${{ inputs.github-token }}
 
     - name: Configure Rust cache
       uses: Swatinem/rust-cache@bc2d2e71bd35c5549942babaa51a89c586b981d1 # v2.8.1
