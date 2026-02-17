@@ -24,8 +24,9 @@
 //! - **Leases** (Gray & Cheriton 1989): time-bounded ownership via
 //!   `LeaseHolder(worker, deadline)`. Expiry makes shards re-acquirable.
 //! - **Bounded idempotency** (Stripe pattern): a 16-entry FIFO op-log caches
-//!   `(OpId, payload_hash)` pairs. Replays return cached results; hash
-//!   mismatches yield `OpIdConflict`.
+//!   operation fingerprints including `(OpId, payload_hash)` for replay
+//!   detection. Replays return cached results; hash mismatches yield
+//!   `OpIdConflict`.
 //!
 //! # Shard state machine
 //!
@@ -981,24 +982,6 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_idempotent_replay() {
-        let mut coord = seeded_coordinator();
-        let lease = acquire_shard(&mut coord, 1, 1);
-
-        let cursor = test_cursor(b"b");
-        let op = OpId::from_raw(1);
-        let _ = coord
-            .checkpoint(now(2), test_tenant(), &lease, cursor.clone(), op)
-            .unwrap();
-
-        // Same op_id, same payload -> Replayed.
-        let result = coord
-            .checkpoint(now(3), test_tenant(), &lease, cursor, op)
-            .unwrap();
-        assert!(result.is_replay());
-    }
-
-    #[test]
     fn checkpoint_op_id_conflict() {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 1, 1);
@@ -1212,54 +1195,6 @@ mod tests {
         assert!(matches!(err, SplitResidualError::SplitInvalid(_)));
     }
 
-    // -- Fence monotonicity tests ------------------------------------------
-
-    #[test]
-    fn fence_monotonicity_across_acquisitions() {
-        let mut coord = seeded_coordinator();
-        let mut prev_fence = FenceEpoch::INITIAL;
-
-        for i in 0..5u64 {
-            let t = (i + 1) * (LEASE_DURATION + 1);
-            let result = coord
-                .acquire_and_restore(now(t), test_tenant(), test_key(), test_worker(i + 1))
-                .unwrap();
-            let fence = result.lease.fence();
-            assert!(fence > prev_fence, "fence must strictly increase");
-            prev_fence = fence;
-        }
-    }
-
-    // -- Zombie worker rejection ------------------------------------------
-
-    #[test]
-    fn zombie_worker_rejected_after_reacquire() {
-        let mut coord = seeded_coordinator();
-        let w1_lease = acquire_shard(&mut coord, 1, 1);
-
-        // W2 acquires after W1's lease expires.
-        let _w2_lease = coord
-            .acquire_and_restore(
-                now(LEASE_DURATION + 2),
-                test_tenant(),
-                test_key(),
-                test_worker(2),
-            )
-            .unwrap();
-
-        // W1's checkpoint with stale fence should fail.
-        let err = coord
-            .checkpoint(
-                now(LEASE_DURATION + 3),
-                test_tenant(),
-                &w1_lease,
-                test_cursor(b"b"),
-                OpId::from_raw(1),
-            )
-            .unwrap_err();
-        assert!(matches!(err, CheckpointError::StaleFence { .. }));
-    }
-
     // -- Op-log eviction edge case ----------------------------------------
 
     #[test]
@@ -1292,27 +1227,6 @@ mod tests {
             .unwrap_err();
         // After eviction, it's treated as new — cursor regression check fails.
         assert!(matches!(err, CheckpointError::CursorRegression { .. }));
-    }
-
-    // -- Idempotent replay returns correct result -------------------------
-
-    #[test]
-    fn idempotent_replay_returns_same_result() {
-        let mut coord = seeded_coordinator();
-        let lease = acquire_shard(&mut coord, 1, 1);
-
-        let cursor = test_cursor(b"d");
-        let op = OpId::from_raw(42);
-
-        let first = coord
-            .checkpoint(now(2), test_tenant(), &lease, cursor.clone(), op)
-            .unwrap();
-        assert!(first.is_executed());
-
-        let second = coord
-            .checkpoint(now(3), test_tenant(), &lease, cursor, op)
-            .unwrap();
-        assert!(second.is_replay());
     }
 
     // -- Fencing mutual exclusion -----------------------------------------
@@ -1610,10 +1524,79 @@ mod prop_tests {
                 ) {
                     let fence = result.lease.fence();
                     prop_assert!(
-                        fence >= max_fence,
-                        "fence must be monotonically non-decreasing: {fence:?} < {max_fence:?}",
+                        fence > max_fence,
+                        "fence must strictly increase: {fence:?} <= {max_fence:?}",
                     );
                     max_fence = fence;
+                }
+            }
+        }
+
+        /// Any idempotent operation (checkpoint, complete, park), when
+        /// replayed with the same op_id and identical payload, returns
+        /// `Replayed`.
+        #[test]
+        fn idempotent_replay_across_operations(
+            cursor_key in b'b'..b'y',
+            op_raw in 1u64..1000,
+            op_kind in 0u8..3,
+        ) {
+            let mut coord = seeded_coordinator();
+            let ten = test_tenant();
+            let lease = coord
+                .acquire_and_restore(
+                    LogicalTime::from_raw(1),
+                    ten,
+                    test_key(),
+                    WorkerId::from_raw(1),
+                )
+                .unwrap()
+                .lease;
+            let op = OpId::from_raw(op_raw);
+            let cursor = Cursor::with_last_key(vec![cursor_key]);
+
+            match op_kind {
+                0 => {
+                    let first = coord
+                        .checkpoint(LogicalTime::from_raw(2), ten, &lease, cursor.clone(), op)
+                        .unwrap();
+                    prop_assert!(first.is_executed());
+                    let second = coord
+                        .checkpoint(LogicalTime::from_raw(3), ten, &lease, cursor, op)
+                        .unwrap();
+                    prop_assert!(second.is_replay());
+                }
+                1 => {
+                    let first = coord
+                        .complete(LogicalTime::from_raw(2), ten, &lease, cursor.clone(), op)
+                        .unwrap();
+                    prop_assert!(first.is_executed());
+                    let second = coord
+                        .complete(LogicalTime::from_raw(3), ten, &lease, cursor, op)
+                        .unwrap();
+                    prop_assert!(second.is_replay());
+                }
+                _ => {
+                    let first = coord
+                        .park_shard(
+                            LogicalTime::from_raw(2),
+                            ten,
+                            &lease,
+                            ParkReason::TooManyErrors,
+                            op,
+                        )
+                        .unwrap();
+                    prop_assert!(first.is_executed());
+                    let second = coord
+                        .park_shard(
+                            LogicalTime::from_raw(3),
+                            ten,
+                            &lease,
+                            ParkReason::TooManyErrors,
+                            op,
+                        )
+                        .unwrap();
+                    prop_assert!(second.is_replay());
                 }
             }
         }
