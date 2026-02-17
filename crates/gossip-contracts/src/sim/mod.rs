@@ -203,7 +203,7 @@ const PPM_MAX: u32 = 1_000_000;
 /// [`should_pause`](Self::should_pause), [`should_time_jump`](Self::should_time_jump),
 /// [`pause_ticks`](Self::pause_ticks), [`time_jump_ticks`](Self::time_jump_ticks)) are
 /// building blocks for custom simulation drivers. The built-in
-/// [`CoordinationSim::run`](super::harness::CoordinationSim::run) does **not** call
+/// [`CoordinationSim::run`](CoordinationSim::run) does **not** call
 /// `should_expire_lease` or `should_pause` directly — it generates operations via
 /// weighted random op selection and injects faults through `should_time_jump` only.
 /// If you are writing your own simulation loop, you can call any of these methods
@@ -259,7 +259,7 @@ impl FaultConfig {
     /// Whether to inject a lease-expiry fault this step.
     ///
     /// Available for custom simulation drivers; the built-in
-    /// [`CoordinationSim::run`](super::harness::CoordinationSim::run)
+    /// [`CoordinationSim::run`](CoordinationSim::run)
     /// does not call this method directly.
     pub fn should_expire_lease(&self, rng: &mut ChaCha8Rng) -> bool {
         should_inject(rng, self.lease_expiry_ppm)
@@ -268,7 +268,7 @@ impl FaultConfig {
     /// Whether to inject a worker-pause fault this step.
     ///
     /// Available for custom simulation drivers; the built-in
-    /// [`CoordinationSim::run`](super::harness::CoordinationSim::run)
+    /// [`CoordinationSim::run`](CoordinationSim::run)
     /// does not call this method directly.
     pub fn should_pause(&self, rng: &mut ChaCha8Rng) -> bool {
         should_inject(rng, self.pause_ppm)
