@@ -106,7 +106,7 @@ impl SimWorker {
     ///
     /// # Panics
     ///
-    /// Panics if held shard count would exceed [`MAX_HELD_SHARDS`].
+    /// Panics if held shard count would exceed `MAX_HELD_SHARDS`.
     pub fn record_acquire(&mut self, key: ShardKey, lease: Lease) {
         if !self.held_shards.contains_key(&key) {
             assert!(

@@ -112,7 +112,7 @@ pub enum SimEvent {
 /// Categorized rejection reason (no heap allocation).
 ///
 /// Used instead of `String` to avoid hot-path allocation in fault-heavy
-/// simulation modes where 30-50% of operations are rejected.
+/// simulation modes where a large fraction of operations are rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum RejectionKind {
@@ -311,7 +311,7 @@ impl CoordinationSim {
     /// Execute a single step: run the operation, then check **all** invariants.
     ///
     /// Every operation—successful or rejected—is followed by a full invariant
-    /// sweep (S1–S6). This is the core simulation guarantee: no operation can
+    /// sweep (S1–S7). This is the core simulation guarantee: no operation can
     /// leave the coordinator in a state that violates any checked invariant
     /// without immediate detection.
     pub fn step(&mut self, op: SimOp) -> (SimEvent, Vec<InvariantViolation>) {
@@ -328,7 +328,7 @@ impl CoordinationSim {
 
     /// Run a two-phase simulation.
     ///
-    /// 1. Safety phase: `safety_ops` random operations (first [`WARMUP_OPS`]
+    /// 1. Safety phase: `safety_ops` random operations (first `WARMUP_OPS`
     ///    without faults, remainder with full fault injection).
     /// 2. Liveness phase: `liveness_ops` convergence-biased operations.
     ///
@@ -1006,8 +1006,7 @@ impl CoordinationSim {
     /// - replay/conflict (4%) exercise idempotency
     /// - zombie (3%) exercises stale-fence rejection
     /// - time advances (13%) create expiry windows
-    /// - pause/resume (10%) model worker failures
-    /// - remaining goes to environmental ops
+    /// - pause (10%) and resume (10%) model worker failures
     fn generate_random_op(&mut self, suppress_faults: bool) -> SimOp {
         for _ in 0..MAX_OP_RETRIES {
             // Weighted selection.
