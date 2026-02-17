@@ -271,10 +271,10 @@ impl CoordinationBackend for InMemoryCoordinator {
         // 6) Return the fencing lease + a read-only snapshot of shard state
         //    so the worker can resume from the last checkpointed cursor.
         let lease = Lease::new(tenant, key.run(), key.shard(), worker, new_fence, deadline);
+        // snapshot() calls assert_invariants() internally.
         let snapshot = record.snapshot();
 
         // TODO(events): emit ShardAcquired
-        record.assert_invariants();
         Ok(AcquireResult { lease, snapshot })
     }
 
@@ -365,6 +365,7 @@ impl CoordinationBackend for InMemoryCoordinator {
         validate_cursor_update(&final_cursor, record)?;
 
         record.cursor = final_cursor;
+        record.assert_transition_legal(ShardStatus::Done);
         record.status = ShardStatus::Done;
         record.lease = None;
         record.op_log_push(OpLogEntry::new(
@@ -401,6 +402,7 @@ impl CoordinationBackend for InMemoryCoordinator {
 
         validate_lease(now, tenant, lease, record)?;
 
+        record.assert_transition_legal(ShardStatus::Parked);
         record.status = ShardStatus::Parked;
         record.park_reason = Some(reason);
         record.lease = None;
@@ -716,6 +718,7 @@ fn split_replace_apply_parent(
 ) {
     debug_assert!(!child_ids.is_empty(), "split_replace requires children");
 
+    parent.assert_transition_legal(ShardStatus::Split);
     parent.status = ShardStatus::Split;
     parent.spawned.extend_from_slice(child_ids);
     parent.lease = None;
@@ -747,6 +750,12 @@ fn split_replace_apply_parent(
 ///
 /// Returns `None` if no match, meaning this is genuinely a new operation.
 fn find_replayed_residual(parent: &ShardRecord, op_id: OpId) -> Option<ShardId> {
+    assert!(
+        parent.spawned.len() <= MAX_SPAWNED_PER_SHARD,
+        "spawned count {} exceeds bound {}",
+        parent.spawned.len(),
+        MAX_SPAWNED_PER_SHARD,
+    );
     let spawned_set: HashSet<&ShardId> = parent.spawned.iter().collect();
     for idx in 0..parent.spawned.len() as u32 {
         let candidate = derive_split_shard_id(
@@ -805,6 +814,16 @@ fn split_residual_check_replay(
     // already created, detect via parent.spawned (permanent, never
     // evicted). This check comes AFTER op-log miss to avoid masking
     // OpIdConflict. MAX_SPAWNED_PER_SHARD bounds the search.
+    //
+    // NOTE(limitation): The spawned-probe tier cannot verify payload hash
+    // after op-log eviction. If a client replays op_id=X with a *different*
+    // plan after the op-log entry is evicted, this path returns Replayed
+    // (matching the original residual) instead of OpIdConflict. This is
+    // acceptable because: (1) eviction requires 16+ intervening ops,
+    // meaning the original execution is far in the past, (2) op_ids are
+    // CSPRNG-generated so accidental reuse is astronomically unlikely,
+    // (3) this is a reference implementation — production backends with
+    // durable op-logs don't have this window.
     if let Some(existing) = find_replayed_residual(parent, op_id) {
         return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
             residual: existing,

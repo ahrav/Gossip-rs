@@ -653,7 +653,6 @@ impl ShardRecord {
     /// # Panics
     ///
     /// Panics if the current status is terminal and `new_status` differs.
-    #[allow(dead_code)] // Used by test helpers (state-transition tests).
     pub(crate) fn assert_transition_legal(&self, new_status: ShardStatus) {
         assert!(
             !self.status.is_terminal() || self.status == new_status,
