@@ -23,10 +23,12 @@
 
 pub mod cursor;
 pub mod error;
+pub mod in_memory;
 pub mod lease;
 pub mod record;
 pub mod shard_spec;
 pub mod split;
+pub mod traits;
 pub mod validation;
 
 pub use cursor::{
@@ -38,6 +40,7 @@ pub use error::{
     CursorOutOfBoundsDetail, IdempotentOutcome, ParkError, RenewError, RenewResult, SplitError,
     SplitReplaceError, SplitResidualError,
 };
+pub use in_memory::InMemoryCoordinator;
 pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};
 pub use shard_spec::{
@@ -47,8 +50,10 @@ pub use shard_spec::{
 };
 pub use split::{
     DerivedShardKind, MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN, SplitReplaceChild,
-    SplitReplacePlan, SplitReplacePlanError, SplitResidualPlan, SplitResidualPlanError,
-    derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
-    hash_split_replace_payload, hash_split_residual_payload,
+    SplitReplacePlan, SplitReplacePlanError, SplitReplaceResult, SplitResidualPlan,
+    SplitResidualPlanError, SplitResidualResult, derive_split_shard_id, hash_checkpoint_payload,
+    hash_complete_payload, hash_park_payload, hash_split_replace_payload,
+    hash_split_residual_payload,
 };
+pub use traits::CoordinationBackend;
 pub use validation::{check_op_idempotency, validate_cursor_update, validate_lease};

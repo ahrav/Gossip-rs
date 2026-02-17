@@ -447,9 +447,10 @@ impl std::error::Error for ShardSpecInputError {}
 // Split Validation
 // ============================================================================
 
-/// Errors returned by [`validate_split_coverage`] and
-/// [`validate_residual_split`] when proposed child shards do not form
-/// a valid partition of the parent's key range.
+/// Errors produced during split validation — by
+/// [`validate_split_coverage`], [`validate_residual_split`], and the
+/// coordinator's cursor-bounds check — when proposed child shards do
+/// not form a valid partition of the parent's key range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SplitValidationError {
@@ -487,6 +488,16 @@ pub enum SplitValidationError {
     OverlappingChild {
         child_index: usize,
         next_child_index: usize,
+    },
+
+    /// The parent's current cursor falls outside the proposed new (shrunk)
+    /// parent spec after a residual split. Accepting this split would
+    /// strand the cursor outside the parent's key range, violating
+    /// cursor bounds (D2.4).
+    ParentCursorOutOfBounds {
+        cursor: Box<[u8]>,
+        new_parent_start: Vec<u8>,
+        new_parent_end: Vec<u8>,
     },
 }
 
@@ -537,6 +548,18 @@ impl fmt::Display for SplitValidationError {
             } => write!(
                 f,
                 "child {child_index} has unbounded end, overlapping with child {next_child_index}"
+            ),
+            Self::ParentCursorOutOfBounds {
+                cursor,
+                new_parent_start,
+                new_parent_end,
+            } => write!(
+                f,
+                "parent cursor ({} bytes) falls outside new parent range \
+                 (start: {} bytes, end: {} bytes)",
+                cursor.len(),
+                new_parent_start.len(),
+                new_parent_end.len(),
             ),
         }
     }

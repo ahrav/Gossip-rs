@@ -340,6 +340,27 @@ impl CanonicalBytes for SplitResidualPlan {
 }
 
 // ============================================================================
+// Split operation result types
+// ============================================================================
+
+/// Result of a successful `split_replace` operation.
+///
+/// Contains the deterministically-derived child shard IDs, ordered by
+/// `key_range_start` for reproducibility (same inputs → same order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitReplaceResult {
+    pub children: Vec<ShardId>,
+}
+
+/// Result of a successful `split_residual` operation.
+///
+/// Contains the deterministically-derived residual shard ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitResidualResult {
+    pub residual: ShardId,
+}
+
+// ============================================================================
 // derive_split_shard_id
 // ============================================================================
 
