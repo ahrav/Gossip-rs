@@ -1,7 +1,7 @@
 //! ShardRecord: the coordinator's authoritative state for a single shard.
 //!
 //! Contains the lifecycle state machine ([`ShardStatus`]), park reasons
-//! ([`ParkReason`]), the full [`ShardRecord`] with Tiger Style invariant
+//! ([`ParkReason`]), the full [`ShardRecord`] with runtime invariant
 //! assertions, and the worker-visible [`ShardSnapshot`].
 //!
 //! ## Design Decisions (locked)
@@ -12,7 +12,6 @@
 //!
 //! D2.7: `park_reason.is_some()` iff `status == Parked`.
 //!       Asserted at every state transition via `assert_invariants`.
-//!       Reference: TigerBeetle's Tiger Style — assert at every boundary.
 //!
 //! D2.11: ShardRecord is self-contained — no back-references to RunConfig.
 //!        `cursor_semantics` is embedded directly.
@@ -243,7 +242,7 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 /// ## Visibility
 ///
 /// Fields are `pub(crate)` — the coordinator backend directly mutates
-/// fields during state transitions. Safety is enforced by Tiger Style
+/// fields during state transitions. Safety is enforced by
 /// `assert_invariants()` after every transition, not by accessor-gated
 /// field access.
 ///
@@ -260,8 +259,7 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 /// 9. `op_log` entries have unique `OpId` values
 /// 10. `spawned.len() <= MAX_SPAWNED_PER_SHARD`
 ///
-/// Reference: TigerBeetle's Tiger Style — assert at every boundary;
-///            Gray & Cheriton, "Leases" (SOSP 1989);
+/// Reference: Gray & Cheriton, "Leases" (SOSP 1989);
 ///            Stripe idempotency keys — op-log pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardRecord {
@@ -313,7 +311,7 @@ impl ShardRecord {
     pub const OP_LOG_CAP: usize = 16;
 
     /// Construct a new active shard record (root shard).
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
+    #[allow(dead_code)] // Used by test helpers (seeded_coordinator).
     pub(crate) fn new_active(
         tenant: TenantId,
         run: RunId,
@@ -341,7 +339,6 @@ impl ShardRecord {
     }
 
     /// Construct a new active shard record created by a split.
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
     pub(crate) fn new_split_child(
         tenant: TenantId,
         run: RunId,
@@ -425,8 +422,6 @@ impl ShardRecord {
     /// O(n²) for INV-9 (op-log uniqueness), where n ≤ [`OP_LOG_CAP`](Self::OP_LOG_CAP)
     /// (16). At most 120 comparisons — dominated by the per-transition
     /// persistence cost.
-    ///
-    /// Reference: TigerBeetle's Tiger Style — assert at every boundary.
     ///
     /// ## Crash-to-prevent-corruption philosophy
     ///
@@ -630,7 +625,6 @@ impl ShardRecord {
     /// Panics if `entry.op_id()` is already in the log. Callers must
     /// check [`op_log_lookup`](Self::op_log_lookup) first for idempotent
     /// replay.
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
     pub(crate) fn op_log_push(&mut self, entry: OpLogEntry) {
         assert!(
             !self.op_log.iter().any(|e| e.op_id() == entry.op_id()),
@@ -659,7 +653,6 @@ impl ShardRecord {
     /// # Panics
     ///
     /// Panics if the current status is terminal and `new_status` differs.
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
     pub(crate) fn assert_transition_legal(&self, new_status: ShardStatus) {
         assert!(
             !self.status.is_terminal() || self.status == new_status,
@@ -688,7 +681,6 @@ impl ShardRecord {
     /// # Panics
     ///
     /// Panics at `u64::MAX` (via `FenceEpoch::increment`).
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
     pub(crate) fn advance_fence(&mut self) -> FenceEpoch {
         self.fence_epoch = self.fence_epoch.increment();
         self.fence_epoch

@@ -61,6 +61,7 @@ pub const MAX_SPAWNED_PER_SHARD: usize = 1024;
 const _: () = assert!(MAX_SPLIT_CHILDREN <= MAX_SPAWNED_PER_SHARD);
 const _: () = assert!(MAX_SPLIT_CHILDREN >= 2);
 const _: () = assert!(MAX_SPAWNED_PER_SHARD > 0);
+const _: () = assert!(MAX_SPAWNED_PER_SHARD <= u32::MAX as usize);
 
 // ============================================================================
 // DerivedShardKind
@@ -337,6 +338,27 @@ impl CanonicalBytes for SplitResidualPlan {
         self.parent_new_spec.write_canonical(h);
         self.residual_spec.write_canonical(h);
     }
+}
+
+// ============================================================================
+// Split operation result types
+// ============================================================================
+
+/// Result of a successful `split_replace` operation.
+///
+/// Contains the deterministically-derived child shard IDs, ordered by
+/// `key_range_start` for reproducibility (same inputs → same order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitReplaceResult {
+    pub children: Vec<ShardId>,
+}
+
+/// Result of a successful `split_residual` operation.
+///
+/// Contains the deterministically-derived residual shard ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitResidualResult {
+    pub residual: ShardId,
 }
 
 // ============================================================================

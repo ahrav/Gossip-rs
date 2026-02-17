@@ -447,9 +447,28 @@ impl std::error::Error for ShardSpecInputError {}
 // Split Validation
 // ============================================================================
 
-/// Errors returned by [`validate_split_coverage`] and
-/// [`validate_residual_split`] when proposed child shards do not form
-/// a valid partition of the parent's key range.
+/// Whether a shard limit breach is per-tenant or global.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardLimitScope {
+    /// Per-tenant shard count limit.
+    PerTenant,
+    /// Global (all tenants) shard count limit.
+    Global,
+}
+
+impl fmt::Display for ShardLimitScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PerTenant => write!(f, "per-tenant"),
+            Self::Global => write!(f, "global"),
+        }
+    }
+}
+
+/// Errors produced during split validation — by
+/// [`validate_split_coverage`], [`validate_residual_split`], and the
+/// coordinator's cursor-bounds check — when proposed child shards do
+/// not form a valid partition of the parent's key range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SplitValidationError {
@@ -487,6 +506,46 @@ pub enum SplitValidationError {
     OverlappingChild {
         child_index: usize,
         next_child_index: usize,
+    },
+
+    /// The parent's current cursor falls outside the proposed new (shrunk)
+    /// parent spec after a residual split. Accepting this split would
+    /// strand the cursor outside the parent's key range, violating
+    /// cursor bounds (D2.4).
+    ParentCursorOutOfBounds {
+        cursor: Box<[u8]>,
+        new_parent_start: Box<[u8]>,
+        new_parent_end: Box<[u8]>,
+    },
+
+    /// The split would exceed the parent's spawn capacity
+    /// ([`MAX_SPAWNED_PER_SHARD`](super::split::MAX_SPAWNED_PER_SHARD)).
+    ///
+    /// Production backends would surface this as a constraint violation;
+    /// the in-memory reference spec matches by returning this error
+    /// instead of panicking at `assert_invariants`.
+    SpawnLimitExceeded {
+        current: usize,
+        additional: usize,
+        max: usize,
+    },
+
+    /// The split would exceed a shard count limit (per-tenant or global).
+    ///
+    /// Prevents unbounded resource growth from split-flooding (CWE-400).
+    ShardLimitExceeded {
+        current: usize,
+        additional: usize,
+        max: usize,
+        scope: ShardLimitScope,
+    },
+
+    /// A derived shard ID collided with an existing shard in the map.
+    ///
+    /// With BLAKE3 + domain separation this is astronomically unlikely,
+    /// but returning an error is safer than panicking on external input.
+    DerivedIdCollision {
+        derived_id: crate::identity::ShardId,
     },
 }
 
@@ -538,6 +597,38 @@ impl fmt::Display for SplitValidationError {
                 f,
                 "child {child_index} has unbounded end, overlapping with child {next_child_index}"
             ),
+            Self::ParentCursorOutOfBounds {
+                cursor,
+                new_parent_start,
+                new_parent_end,
+            } => write!(
+                f,
+                "parent cursor ({} bytes) falls outside new parent range \
+                 (start: {} bytes, end: {} bytes)",
+                cursor.len(),
+                new_parent_start.len(),
+                new_parent_end.len(),
+            ),
+            Self::SpawnLimitExceeded {
+                current,
+                additional,
+                max,
+            } => write!(
+                f,
+                "spawn limit exceeded: {current} existing + {additional} new > {max} max",
+            ),
+            Self::ShardLimitExceeded {
+                current,
+                additional,
+                max,
+                scope,
+            } => write!(
+                f,
+                "shard limit exceeded ({scope}): {current} existing + {additional} new > {max} max",
+            ),
+            Self::DerivedIdCollision { derived_id } => {
+                write!(f, "derived shard id collision: {derived_id:?}")
+            }
         }
     }
 }
@@ -647,6 +738,20 @@ pub fn validate_split_coverage(
                 child_index: orig_idx,
             });
         }
+    }
+
+    // Defense-in-depth: child keys derive from parent range boundaries.
+    // If parent was validated, children cannot exceed MAX_KEY_SIZE.
+    // This assert catches logic bugs where specs are constructed without validation.
+    for &(_, child) in &indexed {
+        debug_assert!(
+            child.key_range_start().len() <= MAX_KEY_SIZE,
+            "child start key exceeds MAX_KEY_SIZE"
+        );
+        debug_assert!(
+            child.key_range_end().len() <= MAX_KEY_SIZE || child.key_range_end().is_empty(),
+            "child end key exceeds MAX_KEY_SIZE"
+        );
     }
 
     debug_assert!(indexed.first().unwrap().1.key_range_start == parent.key_range_start);
