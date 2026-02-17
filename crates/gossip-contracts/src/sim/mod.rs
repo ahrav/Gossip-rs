@@ -17,7 +17,7 @@
 //!   lease claims, op-ID generation (partitioned for cross-worker uniqueness),
 //!   pause state, and cursor progress.
 //! - **`invariants`** — [`InvariantChecker`], an external observer that verifies
-//!   six safety properties (S1–S6) against coordinator ground truth at every
+//!   seven safety properties (S1–S7) against coordinator ground truth at every
 //!   simulation step. It never trusts worker-side bookkeeping.
 //! - **`harness`** — [`CoordinationSim`], the top-level driver. Runs a
 //!   two-phase simulation (safety then liveness) with weighted random op

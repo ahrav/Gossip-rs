@@ -14,6 +14,7 @@
 //! | S4 | **RecordInvariant** | `ShardRecord::assert_invariants()` does not panic. |
 //! | S5 | **CursorMonotonicity** | `cursor.last_key()` never decreases per shard (B2 extension). |
 //! | S6 | **CursorBounds** | Non-initial cursors remain within shard spec range (B3 extension). |
+//! | S7 | **SplitCoverage** | Split-parent's spawned children exist and reference the parent. |
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic;
@@ -312,14 +313,17 @@ impl InvariantChecker {
         }
     }
 
-    /// S7: Split-parent's spawned children exist and their ranges cover
-    /// the parent's range exactly (no gaps, no overlaps).
+    /// S7: Split-parent's spawned children all exist in the coordinator.
     ///
-    /// Only checks shards in `Split` status. Children must:
-    /// 1. All exist in the coordinator.
-    /// 2. Be contiguous: child[i].end == child[i+1].start.
-    /// 3. First child start == parent start.
-    /// 4. Last child end == parent end.
+    /// Only checks shards in `Split` status. Verifies:
+    /// 1. The shard has at least one spawned child.
+    /// 2. All spawned children exist as records in the coordinator.
+    /// 3. Each child's `parent` field references the split parent.
+    ///
+    /// Does **not** re-validate collective range coverage here because the
+    /// `spawned` list may contain children from multiple operations
+    /// (split_residual + split_replace). The coordinator validates coverage
+    /// at execution time; this check verifies referential integrity.
     fn check_split_coverage(
         coordinator: &InMemoryCoordinator,
         tenant: TenantId,
@@ -338,15 +342,17 @@ impl InvariantChecker {
                 continue;
             }
 
-            // Collect child specs in spawned order.
-            let mut child_specs = Vec::with_capacity(record.spawned.len());
             let mut missing = Vec::new();
+            let mut wrong_parent = Vec::new();
             for &child_id in &record.spawned {
                 let child_key = ShardKey::new(record.run, child_id);
-                if let Some(child_record) = coordinator.shards().get(&(tenant, child_key)) {
-                    child_specs.push(&child_record.spec);
-                } else {
-                    missing.push(child_id);
+                match coordinator.shards().get(&(tenant, child_key)) {
+                    Some(child_record) => {
+                        if child_record.parent != Some(record.shard) {
+                            wrong_parent.push(child_id);
+                        }
+                    }
+                    None => missing.push(child_id),
                 }
             }
 
@@ -356,17 +362,12 @@ impl InvariantChecker {
                     shard: record.shard,
                     detail: format!("Missing child shards: {missing:?}"),
                 });
-                continue;
             }
-
-            // Validate coverage using the same function the coordinator uses.
-            if let Err(e) =
-                crate::coordination::validate_split_coverage(&record.spec, &child_specs)
-            {
+            if !wrong_parent.is_empty() {
                 violations.push(InvariantViolation::SplitCoverage {
                     run: record.run,
                     shard: record.shard,
-                    detail: format!("Split coverage validation failed: {e}"),
+                    detail: format!("Children with incorrect parent reference: {wrong_parent:?}"),
                 });
             }
         }

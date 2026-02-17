@@ -15,17 +15,17 @@ use std::collections::BTreeMap;
 
 use rand::Rng;
 
+use crate::coordination::Lease;
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
-use crate::coordination::split::{
-    SplitReplaceChild, SplitReplacePlan, SplitResidualPlan, hash_checkpoint_payload,
-};
+use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::coordination::traits::CoordinationBackend;
-use crate::coordination::Lease;
-use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
+use crate::identity::{
+    FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
+};
 
 use super::invariants::{InvariantChecker, InvariantViolation};
 use super::worker::SimWorker;
@@ -235,6 +235,9 @@ const WARMUP_OPS: usize = 5;
 /// `AdvanceTime`.
 const MAX_OP_RETRIES: usize = 10;
 
+/// Saved checkpoint data: `(OpId, Cursor, WorkerId, ShardKey)` keyed by raw IDs.
+type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Cursor, WorkerId, ShardKey)>;
+
 /// Full deterministic simulation harness.
 ///
 /// Drives [`InMemoryCoordinator`] through random operations, injecting faults
@@ -252,9 +255,9 @@ pub struct CoordinationSim {
     /// Stale leases saved when B1 cleanup supersedes them, used for
     /// zombie checkpoint injection to exercise the `StaleFence` path.
     stale_leases: Vec<(WorkerId, ShardKey, Lease)>,
-    /// Last successful (OpId, Cursor) per (WorkerId, ShardKey) for
-    /// OpId replay/conflict testing.
-    last_checkpoint_ops: BTreeMap<(WorkerId, ShardKey), (crate::identity::OpId, Cursor)>,
+    /// Last successful checkpoint info per `(worker_raw, run_raw, shard_raw)`.
+    /// Uses raw u64 keys because `ShardKey` intentionally omits `Ord`.
+    last_checkpoint_ops: CheckpointOpMap,
 }
 
 impl CoordinationSim {
@@ -339,7 +342,6 @@ impl CoordinationSim {
         let initial_ticks = self.context.rng().random_range(1u64..=10);
         self.context.advance(initial_ticks);
 
-        // --- Zombie-worker scenario (H6) ---
         // Inject one deterministic zombie sequence before random ops.
         self.inject_zombie_scenario(&mut all_violations, &mut event_counts);
 
@@ -431,16 +433,18 @@ impl CoordinationSim {
                 let fence = result.lease.fence();
                 let lease = result.lease;
 
-                // B1 fix: when worker W acquires shard K, clear K from every
-                // other worker's local bookkeeping. Without this, a worker
-                // whose lease expired silently still "thinks" it holds the
-                // shard and would attempt checkpoint/complete with a stale
-                // lease, producing confusing Rejected events instead of the
-                // expected NotLeased rejection path.
+                // When worker W acquires shard K, clear K from every other
+                // worker's local bookkeeping. Without this, a worker whose
+                // lease expired silently still "thinks" it holds the shard
+                // and would produce confusing Rejected events.
+                //
+                // Save superseded leases for zombie checkpoint injection so
+                // the coordinator's StaleFence rejection path gets exercised.
                 for (wid, w) in &mut self.workers {
                     if *wid == worker {
                         w.record_acquire(key, lease);
-                    } else {
+                    } else if let Some(stale) = w.lease_for(&key) {
+                        self.stale_leases.push((*wid, key, *stale));
                         w.record_release(&key);
                     }
                 }
@@ -521,6 +525,10 @@ impl CoordinationSim {
                 {
                     w.record_cursor(key.run(), key.shard(), last_key.to_vec());
                 }
+                // Save for OpId replay/conflict testing.
+                let ck = (worker.as_raw(), key.run().as_raw(), key.shard().as_raw());
+                self.last_checkpoint_ops
+                    .insert(ck, (op_id, cursor, worker, key));
                 SimEvent::CheckpointOk
             }
             Err(_) => SimEvent::Rejected {
@@ -621,6 +629,367 @@ impl CoordinationSim {
     }
 
     // -----------------------------------------------------------------------
+    // Split operations
+    // -----------------------------------------------------------------------
+
+    /// Execute a split-replace: parent → 2 children covering the parent's range.
+    fn exec_split_replace(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
+            return SimEvent::Rejected {
+                kind: RejectionKind::WorkerPaused,
+            };
+        }
+
+        let (lease, op_id) = match self.workers.get_mut(&worker) {
+            Some(w) => match w.lease_for(&key) {
+                Some(l) => {
+                    let l = *l;
+                    let op = w.next_op_id();
+                    (l, op)
+                }
+                None => {
+                    return SimEvent::Rejected {
+                        kind: RejectionKind::NotLeased,
+                    };
+                }
+            },
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::NotLeased,
+                };
+            }
+        };
+
+        // Look up parent's spec to compute a valid split point.
+        let parent_spec = match self.coordinator.shards().get(&(self.tenant, key)) {
+            Some(record) => record.spec.clone(),
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::Other,
+                };
+            }
+        };
+
+        let start = parent_spec.key_range_start();
+        let end = parent_spec.key_range_end();
+
+        // Need at least 2 bytes of range to split meaningfully.
+        if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
+            return SimEvent::Rejected {
+                kind: RejectionKind::SplitValidation,
+            };
+        }
+
+        // Random split point strictly between start[0] and end[0].
+        let lo = start[0] + 1;
+        let hi = end[0];
+        if lo >= hi {
+            return SimEvent::Rejected {
+                kind: RejectionKind::SplitValidation,
+            };
+        }
+        let mid = self.context.rng().random_range(lo..hi);
+
+        let child_a_spec = ShardSpec::with_range(start.to_vec(), vec![mid]);
+        let child_b_spec = ShardSpec::with_range(vec![mid], end.to_vec());
+
+        let plan = match SplitReplacePlan::try_new(vec![
+            SplitReplaceChild::new(child_a_spec, Cursor::initial()),
+            SplitReplaceChild::new(child_b_spec, Cursor::initial()),
+        ]) {
+            Ok(p) => p,
+            Err(_) => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::SplitValidation,
+                };
+            }
+        };
+
+        let now = self.context.now();
+        match self
+            .coordinator
+            .split_replace(now, self.tenant, &lease, plan, op_id)
+        {
+            Ok(outcome) => {
+                let result = outcome.into_inner();
+                let children = result.children;
+                // Release parent from worker (it's now terminal).
+                if let Some(w) = self.workers.get_mut(&worker) {
+                    w.record_release(&key);
+                }
+                // Register child shards so future ops can exercise them.
+                let run = key.run();
+                for &child_id in &children {
+                    self.shard_keys.push(ShardKey::new(run, child_id));
+                }
+                SimEvent::SplitReplaceOk { children }
+            }
+            Err(_) => SimEvent::Rejected {
+                kind: RejectionKind::TerminalState,
+            },
+        }
+    }
+
+    /// Execute a split-residual: parent shrinks, residual covers remainder.
+    fn exec_split_residual(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
+            return SimEvent::Rejected {
+                kind: RejectionKind::WorkerPaused,
+            };
+        }
+
+        let (lease, op_id) = match self.workers.get_mut(&worker) {
+            Some(w) => match w.lease_for(&key) {
+                Some(l) => {
+                    let l = *l;
+                    let op = w.next_op_id();
+                    (l, op)
+                }
+                None => {
+                    return SimEvent::Rejected {
+                        kind: RejectionKind::NotLeased,
+                    };
+                }
+            },
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::NotLeased,
+                };
+            }
+        };
+
+        // Look up parent's current spec and cursor to compute a valid split.
+        let (parent_spec, parent_cursor_key) =
+            match self.coordinator.shards().get(&(self.tenant, key)) {
+                Some(record) => {
+                    let ck = record.cursor.last_key().map(|k| k.to_vec());
+                    (record.spec.clone(), ck)
+                }
+                None => {
+                    return SimEvent::Rejected {
+                        kind: RejectionKind::Other,
+                    };
+                }
+            };
+
+        let start = parent_spec.key_range_start();
+        let end = parent_spec.key_range_end();
+
+        if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
+            return SimEvent::Rejected {
+                kind: RejectionKind::SplitValidation,
+            };
+        }
+
+        // Split point must be after the current cursor (parent keeps the
+        // prefix it already scanned). If no cursor yet, split anywhere.
+        let cursor_byte = parent_cursor_key
+            .as_ref()
+            .and_then(|k| k.first().copied())
+            .unwrap_or(start[0]);
+
+        let lo = cursor_byte.saturating_add(1).max(start[0] + 1);
+        let hi = end[0];
+        if lo >= hi {
+            return SimEvent::Rejected {
+                kind: RejectionKind::SplitValidation,
+            };
+        }
+        let mid = self.context.rng().random_range(lo..hi);
+
+        let new_parent_spec = ShardSpec::with_range(start.to_vec(), vec![mid]);
+        let residual_spec = ShardSpec::with_range(vec![mid], end.to_vec());
+
+        let plan = match SplitResidualPlan::try_new(new_parent_spec, residual_spec) {
+            Ok(p) => p,
+            Err(_) => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::SplitValidation,
+                };
+            }
+        };
+
+        let now = self.context.now();
+        match self
+            .coordinator
+            .split_residual(now, self.tenant, &lease, plan, op_id)
+        {
+            Ok(outcome) => {
+                let result = outcome.into_inner();
+                let residual = result.residual;
+                // Parent stays active (non-terminal) -- worker keeps lease.
+                // Register residual shard for future ops.
+                self.shard_keys.push(ShardKey::new(key.run(), residual));
+                SimEvent::SplitResidualOk { residual }
+            }
+            Err(_) => SimEvent::Rejected {
+                kind: RejectionKind::TerminalState,
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // OpId replay/conflict
+    // -----------------------------------------------------------------------
+
+    /// Replay a previous checkpoint with the same OpId and payload.
+    /// Exercises the `IdempotentOutcome::Replayed` path.
+    fn exec_replay_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
+            return SimEvent::Rejected {
+                kind: RejectionKind::WorkerPaused,
+            };
+        }
+
+        let ck = (worker.as_raw(), key.run().as_raw(), key.shard().as_raw());
+        let (prev_op_id, prev_cursor) = match self.last_checkpoint_ops.get(&ck) {
+            Some((op_id, cursor, ..)) => (*op_id, cursor.clone()),
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::NoPriorCheckpoint,
+                };
+            }
+        };
+
+        let lease = match self.workers.get(&worker).and_then(|w| w.lease_for(&key)) {
+            Some(l) => *l,
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::NotLeased,
+                };
+            }
+        };
+
+        let now = self.context.now();
+        match self
+            .coordinator
+            .checkpoint(now, self.tenant, &lease, prev_cursor, prev_op_id)
+        {
+            Ok(outcome) => match outcome {
+                IdempotentOutcome::Replayed(()) => SimEvent::ReplayedOk,
+                IdempotentOutcome::Executed(()) => {
+                    // Op-log entry was evicted -- treated as new execution.
+                    SimEvent::CheckpointOk
+                }
+            },
+            Err(_) => SimEvent::Rejected {
+                kind: RejectionKind::StaleFence,
+            },
+        }
+    }
+
+    /// Replay a previous OpId with a different cursor payload.
+    /// Exercises the `OpIdConflict` error path.
+    fn exec_conflict_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
+            return SimEvent::Rejected {
+                kind: RejectionKind::WorkerPaused,
+            };
+        }
+
+        let ck = (worker.as_raw(), key.run().as_raw(), key.shard().as_raw());
+        let prev_op_id = match self.last_checkpoint_ops.get(&ck) {
+            Some((op_id, ..)) => *op_id,
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::NoPriorCheckpoint,
+                };
+            }
+        };
+
+        let lease = match self.workers.get(&worker).and_then(|w| w.lease_for(&key)) {
+            Some(l) => *l,
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::NotLeased,
+                };
+            }
+        };
+
+        // Generate a *different* cursor to trigger a payload hash mismatch.
+        let different_cursor = self.generate_forward_cursor(worker, key);
+
+        let now = self.context.now();
+        match self
+            .coordinator
+            .checkpoint(now, self.tenant, &lease, different_cursor, prev_op_id)
+        {
+            Ok(_) => {
+                // Op-log entry was evicted -- old OpId not found, so this
+                // was treated as a fresh execution. Still valid.
+                SimEvent::CheckpointOk
+            }
+            Err(e) => {
+                // Check for OpIdConflict specifically.
+                if matches!(
+                    e,
+                    crate::coordination::error::CheckpointError::OpIdConflict { .. }
+                ) {
+                    SimEvent::Rejected {
+                        kind: RejectionKind::OpIdConflict,
+                    }
+                } else {
+                    SimEvent::Rejected {
+                        kind: RejectionKind::StaleFence,
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zombie checkpoint
+    // -----------------------------------------------------------------------
+
+    /// Execute a checkpoint using a stale lease saved when another worker
+    /// acquired the same shard. Exercises the coordinator's fence-based
+    /// `StaleFence` rejection path that bookkeeping cleanup otherwise shadows.
+    fn exec_zombie_checkpoint(&mut self) -> SimEvent {
+        if self.stale_leases.is_empty() {
+            return SimEvent::Rejected {
+                kind: RejectionKind::NoStaleLease,
+            };
+        }
+
+        // Pick a random stale lease.
+        let idx = self.context.rng().random_range(0..self.stale_leases.len());
+        let (stale_worker, _key, stale_lease) = self.stale_leases[idx];
+
+        // Generate a fresh op-ID from the stale worker.
+        let op_id = match self.workers.get_mut(&stale_worker) {
+            Some(w) => w.next_op_id(),
+            None => {
+                return SimEvent::Rejected {
+                    kind: RejectionKind::Other,
+                };
+            }
+        };
+
+        // Use the stale lease directly -- bypasses B1 bookkeeping.
+        let cursor = Cursor::with_last_key(vec![b'm']);
+        let now = self.context.now();
+        match self
+            .coordinator
+            .checkpoint(now, self.tenant, &stale_lease, cursor, op_id)
+        {
+            Ok(_) => {
+                // Unexpected: stale lease was somehow still valid.
+                SimEvent::CheckpointOk
+            }
+            Err(e) => {
+                use crate::coordination::error::CheckpointError;
+                let kind = match e {
+                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
+                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    _ => RejectionKind::Other,
+                };
+                SimEvent::Rejected { kind }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Op generation
     // -----------------------------------------------------------------------
 
@@ -629,20 +998,22 @@ impl CoordinationSim {
     /// During warmup (`suppress_faults = true`), only generates coordinator
     /// operations (no time jumps, pauses, or resumes).
     ///
-    /// Weight rationale (normal mode): acquire (20%) and checkpoint (20%) are
-    /// the most frequent to exercise the happy path; renew (15%) keeps leases
-    /// alive to enable downstream ops; complete (10%) and park (5%) are
-    /// terminal and would starve coverage if over-weighted; time advances
-    /// (15%) create expiry windows; pause/resume (15%) model worker failures.
-    ///
-    /// Warmup weights differ: acquire (30%), renew (20%), checkpoint (25%),
-    /// complete (15%), park (10%) — no environmental ops.
+    /// Weight rationale (normal mode):
+    /// - acquire (15%) and checkpoint (15%) exercise the happy path
+    /// - renew (10%) keeps leases alive
+    /// - complete (8%) and park (4%) are terminal (over-weighting starves coverage)
+    /// - split_replace (4%) and split_residual (4%) exercise split paths
+    /// - replay/conflict (4%) exercise idempotency
+    /// - zombie (3%) exercises stale-fence rejection
+    /// - time advances (13%) create expiry windows
+    /// - pause/resume (10%) model worker failures
+    /// - remaining goes to environmental ops
     fn generate_random_op(&mut self, suppress_faults: bool) -> SimOp {
         for _ in 0..MAX_OP_RETRIES {
             // Weighted selection.
             let roll: u32 = self.context.rng().random_range(0..100);
             let op = if suppress_faults {
-                // Warmup: only coordinator ops.
+                // Warmup: only coordinator ops (no faults, no splits, no idempotency).
                 match roll {
                     0..30 => self.try_gen_acquire(),
                     30..50 => self.try_gen_renew(),
@@ -652,13 +1023,18 @@ impl CoordinationSim {
                 }
             } else {
                 match roll {
-                    0..20 => self.try_gen_acquire(),
-                    20..35 => self.try_gen_renew(),
-                    35..55 => self.try_gen_checkpoint(),
-                    55..65 => self.try_gen_complete(),
-                    65..70 => self.try_gen_park(),
-                    70..85 => Some(self.gen_advance_time()),
-                    85..95 => self.try_gen_pause(),
+                    0..15 => self.try_gen_acquire(),
+                    15..25 => self.try_gen_renew(),
+                    25..40 => self.try_gen_checkpoint(),
+                    40..48 => self.try_gen_complete(),
+                    48..52 => self.try_gen_park(),
+                    52..56 => self.try_gen_split_replace(),
+                    56..60 => self.try_gen_split_residual(),
+                    60..62 => self.try_gen_replay_checkpoint(),
+                    62..64 => self.try_gen_conflict_checkpoint(),
+                    64..67 => self.try_gen_zombie_checkpoint(),
+                    67..80 => Some(self.gen_advance_time()),
+                    80..90 => self.try_gen_pause(),
                     _ => self.try_gen_resume(),
                 }
             };
@@ -829,43 +1205,138 @@ impl CoordinationSim {
         })
     }
 
+    fn try_gen_split_replace(&mut self) -> Option<SimOp> {
+        let worker = self.pick_random_active_worker()?;
+        let held = self.sorted_held_keys(worker);
+        if held.is_empty() {
+            return None;
+        }
+        let idx = self.context.rng().random_range(0..held.len());
+        Some(SimOp::SplitReplace {
+            worker,
+            key: held[idx],
+        })
+    }
+
+    fn try_gen_split_residual(&mut self) -> Option<SimOp> {
+        let worker = self.pick_random_active_worker()?;
+        let held = self.sorted_held_keys(worker);
+        if held.is_empty() {
+            return None;
+        }
+        let idx = self.context.rng().random_range(0..held.len());
+        Some(SimOp::SplitResidual {
+            worker,
+            key: held[idx],
+        })
+    }
+
+    fn try_gen_replay_checkpoint(&mut self) -> Option<SimOp> {
+        if self.last_checkpoint_ops.is_empty() {
+            return None;
+        }
+        // Pick a random entry from last_checkpoint_ops.
+        let idx = self
+            .context
+            .rng()
+            .random_range(0..self.last_checkpoint_ops.len());
+        let (.., worker, key) = self.last_checkpoint_ops.values().nth(idx)?;
+        Some(SimOp::ReplayCheckpoint {
+            worker: *worker,
+            key: *key,
+        })
+    }
+
+    fn try_gen_conflict_checkpoint(&mut self) -> Option<SimOp> {
+        if self.last_checkpoint_ops.is_empty() {
+            return None;
+        }
+        let idx = self
+            .context
+            .rng()
+            .random_range(0..self.last_checkpoint_ops.len());
+        let (.., worker, key) = self.last_checkpoint_ops.values().nth(idx)?;
+        Some(SimOp::ConflictCheckpoint {
+            worker: *worker,
+            key: *key,
+        })
+    }
+
+    fn try_gen_zombie_checkpoint(&mut self) -> Option<SimOp> {
+        if self.stale_leases.is_empty() {
+            return None;
+        }
+        Some(SimOp::ZombieCheckpoint)
+    }
+
     // -----------------------------------------------------------------------
-    // Cursor generation (H5 fix)
+    // Cursor generation
     // -----------------------------------------------------------------------
 
     /// Generate a cursor that is lexicographically >= the worker's last cursor
-    /// for this shard, and within the shard spec bounds `[a, z)`.
+    /// for this shard and within the shard spec bounds.
     ///
-    /// H5 fix: naively random cursors would frequently regress behind the
-    /// worker's last checkpoint, causing the coordinator to correctly reject
-    /// the operation. That masks real bugs behind a flood of expected
+    /// Naively random cursors would frequently regress behind the worker's
+    /// last checkpoint, causing the coordinator to correctly reject the
+    /// operation. That masks real bugs behind a flood of expected
     /// `CursorRegression` rejections. By tracking per-worker cursor progress
     /// and only generating forward cursors, rejections in the simulation
     /// signal actual protocol violations rather than test-harness noise.
+    ///
+    /// Generates variable-length keys (1–3 bytes) to exercise multi-byte
+    /// lexicographic comparison paths in the coordinator.
     fn generate_forward_cursor(&mut self, worker: WorkerId, key: ShardKey) -> Cursor {
         let last = self
             .workers
             .get(&worker)
-            .and_then(|w| w.last_cursor_for(key.run(), key.shard()))
-            .map(|k| k[0]);
+            .and_then(|w| w.last_cursor_for(key.run(), key.shard()));
 
-        let start = match last {
-            Some(k) => k.saturating_add(1),
-            None => b'a',
+        // Look up this shard's actual spec bounds from the coordinator.
+        let (spec_start, spec_end) = self
+            .coordinator
+            .shards()
+            .get(&(self.tenant, key))
+            .map(|r| {
+                (
+                    r.spec.key_range_start().to_vec(),
+                    r.spec.key_range_end().to_vec(),
+                )
+            })
+            .unwrap_or_else(|| (vec![b'a'], vec![b'z']));
+
+        // The first byte determines the "slot". We advance forward from the
+        // last cursor's first byte (or the spec start).
+        let last_first = last.and_then(|k| k.first().copied());
+
+        let range_lo = spec_start.first().copied().unwrap_or(b'a');
+        let range_hi = spec_end.first().copied().unwrap_or(b'z');
+
+        let start = match last_first {
+            Some(k) => k.saturating_add(1).max(range_lo),
+            None => range_lo,
         };
-        let end = b'z';
 
-        if start >= end {
+        if start >= range_hi {
             // Already at end of range -- produce max valid cursor.
-            return Cursor::with_last_key(vec![end - 1]);
+            return Cursor::with_last_key(vec![range_hi.saturating_sub(1)]);
         }
 
-        let key_byte = self.context.rng().random_range(start..end);
-        Cursor::with_last_key(vec![key_byte])
+        let first_byte = self.context.rng().random_range(start..range_hi);
+
+        // Variable-length key: 1–3 bytes. Extra bytes are random suffix
+        // that exercises multi-byte lex comparison in the coordinator.
+        let key_len: usize = self.context.rng().random_range(1..=3);
+        let mut cursor_key = Vec::with_capacity(key_len);
+        cursor_key.push(first_byte);
+        for _ in 1..key_len {
+            cursor_key.push(self.context.rng().random_range(0u8..=255));
+        }
+
+        Cursor::with_last_key(cursor_key)
     }
 
     // -----------------------------------------------------------------------
-    // Zombie scenario (H6 fix)
+    // Zombie scenario
     // -----------------------------------------------------------------------
 
     /// Inject one deterministic zombie-worker scenario.
@@ -913,10 +1384,9 @@ impl CoordinationSim {
         all_violations.extend(violations);
 
         // Step 4: Worker A attempts checkpoint with stale lease.
-        // The worker A should still have the old lease in its bookkeeping
-        // (if not cleaned up by B1 fix -- but B1 fix does clean it up on
-        // acquire by worker B). So we need to check: if worker A no longer
-        // has the lease, the checkpoint will be rejected with NotLeased.
+        // Worker A's bookkeeping was cleared when worker B acquired, so the
+        // checkpoint will be rejected with NotLeased (worker A no longer
+        // thinks it holds the shard).
         let (event, violations) = self.step(SimOp::Checkpoint {
             worker: worker_a,
             key,
@@ -1064,5 +1534,49 @@ mod tests {
             rejected > 0,
             "expected at least one rejection from zombie scenario"
         );
+    }
+
+    /// Verify the new operation types (split, replay, conflict) are exercised
+    /// across multiple seeds. This catches regressions where op generation
+    /// weights produce zero coverage.
+    #[test]
+    fn new_op_types_exercised() {
+        let mut split_replace_seen = false;
+        let mut split_residual_seen = false;
+        let mut replayed_seen = false;
+        // Run with a large enough op count and enough seeds to trigger
+        // the probabilistic generation paths.
+        for seed in 0..20u64 {
+            let report = default_sim(seed, FaultLevel::Stormy).run(1000, 200);
+            assert!(
+                report.violations.is_empty(),
+                "seed {seed}: violations: {:?}",
+                report.violations,
+            );
+            if report
+                .event_counts
+                .contains_key(&SimEventKind::SplitReplaceOk)
+            {
+                split_replace_seen = true;
+            }
+            if report
+                .event_counts
+                .contains_key(&SimEventKind::SplitResidualOk)
+            {
+                split_residual_seen = true;
+            }
+            if report.event_counts.contains_key(&SimEventKind::ReplayedOk) {
+                replayed_seen = true;
+            }
+        }
+        assert!(
+            split_replace_seen,
+            "SplitReplaceOk never observed across 20 seeds"
+        );
+        assert!(
+            split_residual_seen,
+            "SplitResidualOk never observed across 20 seeds"
+        );
+        assert!(replayed_seen, "ReplayedOk never observed across 20 seeds");
     }
 }
