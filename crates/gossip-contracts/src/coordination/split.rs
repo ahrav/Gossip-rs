@@ -61,6 +61,7 @@ pub const MAX_SPAWNED_PER_SHARD: usize = 1024;
 const _: () = assert!(MAX_SPLIT_CHILDREN <= MAX_SPAWNED_PER_SHARD);
 const _: () = assert!(MAX_SPLIT_CHILDREN >= 2);
 const _: () = assert!(MAX_SPAWNED_PER_SHARD > 0);
+const _: () = assert!(MAX_SPAWNED_PER_SHARD <= u32::MAX as usize);
 
 // ============================================================================
 // DerivedShardKind

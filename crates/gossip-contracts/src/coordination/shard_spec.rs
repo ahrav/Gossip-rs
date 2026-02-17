@@ -447,6 +447,24 @@ impl std::error::Error for ShardSpecInputError {}
 // Split Validation
 // ============================================================================
 
+/// Whether a shard limit breach is per-tenant or global.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardLimitScope {
+    /// Per-tenant shard count limit.
+    PerTenant,
+    /// Global (all tenants) shard count limit.
+    Global,
+}
+
+impl fmt::Display for ShardLimitScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PerTenant => write!(f, "per-tenant"),
+            Self::Global => write!(f, "global"),
+        }
+    }
+}
+
 /// Errors produced during split validation — by
 /// [`validate_split_coverage`], [`validate_residual_split`], and the
 /// coordinator's cursor-bounds check — when proposed child shards do
@@ -496,8 +514,8 @@ pub enum SplitValidationError {
     /// cursor bounds (D2.4).
     ParentCursorOutOfBounds {
         cursor: Box<[u8]>,
-        new_parent_start: Vec<u8>,
-        new_parent_end: Vec<u8>,
+        new_parent_start: Box<[u8]>,
+        new_parent_end: Box<[u8]>,
     },
 
     /// The split would exceed the parent's spawn capacity
@@ -510,6 +528,24 @@ pub enum SplitValidationError {
         current: usize,
         additional: usize,
         max: usize,
+    },
+
+    /// The split would exceed a shard count limit (per-tenant or global).
+    ///
+    /// Prevents unbounded resource growth from split-flooding (CWE-400).
+    ShardLimitExceeded {
+        current: usize,
+        additional: usize,
+        max: usize,
+        scope: ShardLimitScope,
+    },
+
+    /// A derived shard ID collided with an existing shard in the map.
+    ///
+    /// With BLAKE3 + domain separation this is astronomically unlikely,
+    /// but returning an error is safer than panicking on external input.
+    DerivedIdCollision {
+        derived_id: crate::identity::ShardId,
     },
 }
 
@@ -581,6 +617,18 @@ impl fmt::Display for SplitValidationError {
                 f,
                 "spawn limit exceeded: {current} existing + {additional} new > {max} max",
             ),
+            Self::ShardLimitExceeded {
+                current,
+                additional,
+                max,
+                scope,
+            } => write!(
+                f,
+                "shard limit exceeded ({scope}): {current} existing + {additional} new > {max} max",
+            ),
+            Self::DerivedIdCollision { derived_id } => {
+                write!(f, "derived shard id collision: {derived_id:?}")
+            }
         }
     }
 }

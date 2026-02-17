@@ -96,7 +96,6 @@ impl Lease {
     ///
     /// Only callable within the crate — the coordinator is the sole producer.
     #[must_use]
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
     pub(crate) fn new(
         tenant: TenantId,
         run: RunId,
@@ -325,7 +324,6 @@ impl OpLogEntry {
     ///
     /// Only callable within the crate — the coordinator is the sole producer.
     #[must_use]
-    #[allow(dead_code)] // Used by coordinator backend (Task 4).
     pub(crate) fn new(
         op_id: OpId,
         kind: OpKind,

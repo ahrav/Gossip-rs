@@ -9,13 +9,15 @@
 //!
 //! A lease-gated mutation (e.g. checkpoint, complete) typically chains:
 //!
-//! 1. **[`validate_lease`]** — tenant, terminal, fence, expiry checks.
-//! 2. **[`check_op_idempotency`]** — replay detection before side effects.
+//! 1. **[`check_op_idempotency`]** — replay detection first, so replays
+//!    succeed even after lease expiry or terminal status.
+//! 2. **[`validate_lease`]** — tenant, terminal, fence, expiry checks.
 //! 3. **Operation-specific validation** (e.g. [`validate_cursor_update`]
 //!    for checkpoint).
 //!
-//! Step 1 is mandatory for every lease-gated path. Steps 2–3 depend on
-//! the operation.
+//! Step 1 is checked first on every idempotent path so that a successful
+//! replay is never blocked by an expired lease or terminal status.
+//! Step 2 is mandatory for every lease-gated path.
 //!
 //! ## Check ordering
 //!
