@@ -452,22 +452,7 @@ impl CoordinationBackend for InMemoryCoordinator {
             }
 
             validate_lease(now, tenant, lease, &parent)?;
-
-            let sorted = split_replace_sort_children(&plan);
-            let child_specs: Vec<&_> = sorted.iter().map(|c| c.spec()).collect();
-            validate_split_coverage(&parent.spec, &child_specs)
-                .map_err(|e| SplitReplaceError::SplitInvalid(Box::new(e)))?;
-
-            // Spawn-cap guard: check BEFORE mutating parent.spawned.
-            if !parent.can_spawn(sorted.len()) {
-                return Err(SplitReplaceError::SplitInvalid(Box::new(
-                    SplitValidationError::SpawnLimitExceeded {
-                        current: parent.spawned.len(),
-                        additional: sorted.len(),
-                        max: MAX_SPAWNED_PER_SHARD,
-                    },
-                )));
-            }
+            let sorted = split_replace_validate_preconditions(&parent, &plan)?;
 
             // Shard count limit guard: prevents split-flooding (CWE-400).
             // Parent was temporarily removed from the map (remove-mutate-restore
@@ -544,17 +529,6 @@ impl CoordinationBackend for InMemoryCoordinator {
             }
             split_residual_validate_preconditions(now, tenant, lease, &parent, &plan)?;
 
-            // Spawn-cap guard: check BEFORE mutating parent.spawned.
-            if !parent.can_spawn(1) {
-                return Err(SplitResidualError::SplitInvalid(Box::new(
-                    SplitValidationError::SpawnLimitExceeded {
-                        current: parent.spawned.len(),
-                        additional: 1,
-                        max: MAX_SPAWNED_PER_SHARD,
-                    },
-                )));
-            }
-
             // Shard count limit guard: prevents split-flooding (CWE-400).
             // Parent was temporarily removed from the map (remove-mutate-restore
             // pattern), so pass temporarily_removed=1 for correct counting.
@@ -599,6 +573,32 @@ impl CoordinationBackend for InMemoryCoordinator {
 // ============================================================================
 // split_replace helpers
 // ============================================================================
+
+/// Validate split_replace preconditions: coverage and spawn-cap.
+///
+/// Sorts children, validates that they partition the parent's range, and
+/// checks the spawn-cap limit. Returns the sorted children on success.
+fn split_replace_validate_preconditions<'a>(
+    parent: &ShardRecord,
+    plan: &'a SplitReplacePlan,
+) -> Result<Vec<&'a SplitReplaceChild>, SplitReplaceError> {
+    let sorted = split_replace_sort_children(plan);
+    let child_specs: Vec<&_> = sorted.iter().map(|c| c.spec()).collect();
+    validate_split_coverage(&parent.spec, &child_specs)
+        .map_err(|e| SplitReplaceError::SplitInvalid(Box::new(e)))?;
+
+    // Spawn-cap guard: check BEFORE mutating parent.spawned.
+    if !parent.can_spawn(sorted.len()) {
+        return Err(SplitReplaceError::SplitInvalid(Box::new(
+            SplitValidationError::SpawnLimitExceeded {
+                current: parent.spawned.len(),
+                additional: sorted.len(),
+                max: MAX_SPAWNED_PER_SHARD,
+            },
+        )));
+    }
+    Ok(sorted)
+}
 
 /// Sort plan children by `key_range_start` for deterministic ordering.
 ///
@@ -849,7 +849,18 @@ fn split_residual_validate_preconditions(
     validate_residual_split(&parent.spec, plan.parent_new_spec(), plan.residual_spec())
         .map_err(|e| SplitResidualError::SplitInvalid(Box::new(e)))?;
     // Safety: shrinking the parent must not strand its existing cursor.
-    split_residual_validate_cursor_bounds(parent, plan)
+    split_residual_validate_cursor_bounds(parent, plan)?;
+    // Spawn-cap guard: check BEFORE mutating parent.spawned.
+    if !parent.can_spawn(1) {
+        return Err(SplitResidualError::SplitInvalid(Box::new(
+            SplitValidationError::SpawnLimitExceeded {
+                current: parent.spawned.len(),
+                additional: 1,
+                max: MAX_SPAWNED_PER_SHARD,
+            },
+        )));
+    }
+    Ok(())
 }
 
 /// Verify the parent's cursor remains within the shrunk key range.
@@ -1970,6 +1981,129 @@ mod tests {
             matches!(err, SplitResidualError::ShardNotFound { .. }),
             "wrong tenant should see ShardNotFound, got: {err:?}",
         );
+    }
+
+    // -- split_residual replay via op-log (before eviction) --------------------
+
+    #[test]
+    fn split_residual_replay_via_oplog_returns_replayed() {
+        let mut coord = seeded_coordinator();
+        let lease = acquire_shard(&mut coord, 1, 1);
+
+        // Checkpoint to set cursor within the new parent range.
+        let _ = coord
+            .checkpoint(
+                now(2),
+                test_tenant(),
+                &lease,
+                test_cursor(b"d"),
+                OpId::from_raw(100),
+            )
+            .unwrap();
+
+        let new_parent_spec = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let residual_spec = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let plan = SplitResidualPlan::try_new(new_parent_spec, residual_spec).unwrap();
+        let op = OpId::from_raw(1);
+
+        // First execution.
+        let first = coord
+            .split_residual(now(3), test_tenant(), &lease, plan.clone(), op)
+            .unwrap();
+        assert!(first.is_executed());
+
+        // Immediate replay (op-log still has the entry) — same op_id + plan.
+        let second = coord
+            .split_residual(now(4), test_tenant(), &lease, plan.clone(), op)
+            .unwrap();
+        assert!(
+            second.is_replay(),
+            "immediate replay should return Replayed, got: {second:?}",
+        );
+        assert_eq!(first.as_ref().residual, second.as_ref().residual);
+
+        // Same op_id, different plan (different split point) — OpIdConflict.
+        let plan_b = SplitResidualPlan::try_new(
+            ShardSpec::with_range(b"a".to_vec(), b"p".to_vec()),
+            ShardSpec::with_range(b"p".to_vec(), b"z".to_vec()),
+        )
+        .unwrap();
+        let err = coord
+            .split_residual(now(5), test_tenant(), &lease, plan_b, op)
+            .unwrap_err();
+        assert!(
+            matches!(err, SplitResidualError::OpIdConflict { .. }),
+            "same op_id + different plan should return OpIdConflict, got: {err:?}",
+        );
+    }
+
+    // -- split_residual then continued parent ops ---------------------------
+
+    #[test]
+    fn split_residual_parent_continues_with_shrunk_range() {
+        let mut coord = seeded_coordinator(); // [a, z)
+        let lease = acquire_shard(&mut coord, 1, 1);
+
+        // Step 1: Checkpoint to "d" (within [a, z)).
+        let _ = coord
+            .checkpoint(
+                now(2),
+                test_tenant(),
+                &lease,
+                test_cursor(b"d"),
+                OpId::from_raw(100),
+            )
+            .unwrap();
+
+        // Step 2: Split residual — shrink parent to [a, m), residual [m, z).
+        let plan = SplitResidualPlan::try_new(
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        )
+        .unwrap();
+        let split_result = coord
+            .split_residual(now(3), test_tenant(), &lease, plan, OpId::from_raw(200))
+            .unwrap();
+        assert!(split_result.is_executed());
+
+        // Step 3: Checkpoint at "f" (within [a, m)) — should succeed.
+        let cp = coord
+            .checkpoint(
+                now(4),
+                test_tenant(),
+                &lease,
+                test_cursor(b"f"),
+                OpId::from_raw(300),
+            )
+            .unwrap();
+        assert!(cp.is_executed());
+
+        // Step 4: Checkpoint at "n" (within [m, z), outside new parent) — should fail.
+        let err = coord
+            .checkpoint(
+                now(5),
+                test_tenant(),
+                &lease,
+                test_cursor(b"n"),
+                OpId::from_raw(400),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::CursorOutOfBounds { .. }),
+            "cursor outside shrunk parent range should fail, got: {err:?}",
+        );
+
+        // Step 5: Complete at "g" (within [a, m)) — should succeed.
+        let complete = coord
+            .complete(
+                now(6),
+                test_tenant(),
+                &lease,
+                test_cursor(b"g"),
+                OpId::from_raw(500),
+            )
+            .unwrap();
+        assert!(complete.is_executed());
     }
 
     // -- Lifecycle integration tests -----------------------------------------------

@@ -740,6 +740,20 @@ pub fn validate_split_coverage(
         }
     }
 
+    // Defense-in-depth: child keys derive from parent range boundaries.
+    // If parent was validated, children cannot exceed MAX_KEY_SIZE.
+    // This assert catches logic bugs where specs are constructed without validation.
+    for &(_, child) in &indexed {
+        debug_assert!(
+            child.key_range_start().len() <= MAX_KEY_SIZE,
+            "child start key exceeds MAX_KEY_SIZE"
+        );
+        debug_assert!(
+            child.key_range_end().len() <= MAX_KEY_SIZE || child.key_range_end().is_empty(),
+            "child end key exceeds MAX_KEY_SIZE"
+        );
+    }
+
     debug_assert!(indexed.first().unwrap().1.key_range_start == parent.key_range_start);
     debug_assert!(indexed.last().unwrap().1.key_range_end == parent.key_range_end);
 
