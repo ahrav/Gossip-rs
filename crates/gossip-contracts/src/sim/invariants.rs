@@ -64,6 +64,13 @@ pub enum InvariantViolation {
     CursorMonotonicity { run: RunId, shard: ShardId },
     /// Cursor `last_key` is outside the shard spec range.
     CursorOutOfBounds { run: RunId, shard: ShardId },
+    /// A split-parent's spawned children do not exist or their ranges
+    /// do not collectively cover the parent's range.
+    SplitCoverage {
+        run: RunId,
+        shard: ShardId,
+        detail: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -90,7 +97,7 @@ impl InvariantChecker {
         }
     }
 
-    /// Run all invariant checks (S1–S6) against the current coordinator state.
+    /// Run all invariant checks (S1–S7) against the current coordinator state.
     ///
     /// Returns an empty `Vec` when all invariants hold.
     ///
@@ -112,6 +119,7 @@ impl InvariantChecker {
         self.check_record_invariants(coordinator, tenant, &mut violations);
         self.check_cursor_monotonicity(coordinator, tenant, &mut violations);
         self.check_cursor_bounds(coordinator, tenant, &mut violations);
+        Self::check_split_coverage(coordinator, tenant, &mut violations);
         violations
     }
 
@@ -299,6 +307,66 @@ impl InvariantChecker {
                 violations.push(InvariantViolation::CursorOutOfBounds {
                     run: record.run,
                     shard: record.shard,
+                });
+            }
+        }
+    }
+
+    /// S7: Split-parent's spawned children exist and their ranges cover
+    /// the parent's range exactly (no gaps, no overlaps).
+    ///
+    /// Only checks shards in `Split` status. Children must:
+    /// 1. All exist in the coordinator.
+    /// 2. Be contiguous: child[i].end == child[i+1].start.
+    /// 3. First child start == parent start.
+    /// 4. Last child end == parent end.
+    fn check_split_coverage(
+        coordinator: &InMemoryCoordinator,
+        tenant: TenantId,
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        for (&(tid, _key), record) in coordinator.shards() {
+            if tid != tenant || record.status != ShardStatus::Split {
+                continue;
+            }
+            if record.spawned.is_empty() {
+                violations.push(InvariantViolation::SplitCoverage {
+                    run: record.run,
+                    shard: record.shard,
+                    detail: "Split shard has no spawned children".to_owned(),
+                });
+                continue;
+            }
+
+            // Collect child specs in spawned order.
+            let mut child_specs = Vec::with_capacity(record.spawned.len());
+            let mut missing = Vec::new();
+            for &child_id in &record.spawned {
+                let child_key = ShardKey::new(record.run, child_id);
+                if let Some(child_record) = coordinator.shards().get(&(tenant, child_key)) {
+                    child_specs.push(&child_record.spec);
+                } else {
+                    missing.push(child_id);
+                }
+            }
+
+            if !missing.is_empty() {
+                violations.push(InvariantViolation::SplitCoverage {
+                    run: record.run,
+                    shard: record.shard,
+                    detail: format!("Missing child shards: {missing:?}"),
+                });
+                continue;
+            }
+
+            // Validate coverage using the same function the coordinator uses.
+            if let Err(e) =
+                crate::coordination::validate_split_coverage(&record.spec, &child_specs)
+            {
+                violations.push(InvariantViolation::SplitCoverage {
+                    run: record.run,
+                    shard: record.shard,
+                    detail: format!("Split coverage validation failed: {e}"),
                 });
             }
         }

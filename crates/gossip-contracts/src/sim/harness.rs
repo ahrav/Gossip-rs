@@ -16,10 +16,15 @@ use std::collections::BTreeMap;
 use rand::Rng;
 
 use crate::coordination::cursor::Cursor;
+use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::split::{
+    SplitReplaceChild, SplitReplacePlan, SplitResidualPlan, hash_checkpoint_payload,
+};
 use crate::coordination::traits::CoordinationBackend;
+use crate::coordination::Lease;
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
 use super::invariants::{InvariantChecker, InvariantViolation};
@@ -48,6 +53,18 @@ pub enum SimOp {
     Complete { worker: WorkerId, key: ShardKey },
     /// Park a shard for later retry (terminal).
     Park { worker: WorkerId, key: ShardKey },
+    /// Split-replace: parent shard → N children covering parent's range (terminal).
+    SplitReplace { worker: WorkerId, key: ShardKey },
+    /// Split-residual: parent shrinks, residual shard covers remainder (non-terminal).
+    SplitResidual { worker: WorkerId, key: ShardKey },
+    /// Replay a previous checkpoint with the same OpId + payload (idempotency test).
+    ReplayCheckpoint { worker: WorkerId, key: ShardKey },
+    /// Replay a previous OpId with a different payload (conflict test).
+    ConflictCheckpoint { worker: WorkerId, key: ShardKey },
+    /// Attempt a checkpoint using a previously superseded (stale) lease,
+    /// bypassing B1 bookkeeping cleanup to exercise the coordinator's
+    /// fence-based zombie rejection (`StaleFence`).
+    ZombieCheckpoint,
     /// Advance the logical clock by `ticks`.
     AdvanceTime { ticks: u64 },
     /// Simulate a worker stall (GC pause, network partition).
@@ -74,6 +91,12 @@ pub enum SimEvent {
     CompleteOk,
     /// Shard parked (terminal).
     ParkOk,
+    /// Parent shard replaced by children (terminal).
+    SplitReplaceOk { children: Vec<ShardId> },
+    /// Parent shrunk; residual shard created (non-terminal).
+    SplitResidualOk { residual: ShardId },
+    /// Idempotent replay returned cached result.
+    ReplayedOk,
     /// Operation was rejected by the coordinator or skipped due to precondition.
     Rejected { kind: RejectionKind },
     /// Logical clock advanced.
@@ -115,6 +138,14 @@ pub enum RejectionKind {
     /// Not produced by the built-in harness (op generation retries instead),
     /// but available for custom `step()` callers.
     NoShardsHeld,
+    /// OpId conflict: same OpId with different payload hash.
+    OpIdConflict,
+    /// Split validation failed (bad coverage, bad plan, etc.).
+    SplitValidation,
+    /// No stale lease available for zombie injection.
+    NoStaleLease,
+    /// No previous checkpoint to replay.
+    NoPriorCheckpoint,
     /// Coordinator returned an error not matching a specific category.
     Other,
 }
@@ -127,6 +158,9 @@ pub enum SimEventKind {
     CheckpointOk,
     CompleteOk,
     ParkOk,
+    SplitReplaceOk,
+    SplitResidualOk,
+    ReplayedOk,
     Rejected,
     TimeAdvanced,
     WorkerPaused,
@@ -142,6 +176,9 @@ impl SimEvent {
             SimEvent::CheckpointOk => SimEventKind::CheckpointOk,
             SimEvent::CompleteOk => SimEventKind::CompleteOk,
             SimEvent::ParkOk => SimEventKind::ParkOk,
+            SimEvent::SplitReplaceOk { .. } => SimEventKind::SplitReplaceOk,
+            SimEvent::SplitResidualOk { .. } => SimEventKind::SplitResidualOk,
+            SimEvent::ReplayedOk => SimEventKind::ReplayedOk,
             SimEvent::Rejected { .. } => SimEventKind::Rejected,
             SimEvent::TimeAdvanced { .. } => SimEventKind::TimeAdvanced,
             SimEvent::WorkerPaused { .. } => SimEventKind::WorkerPaused,
