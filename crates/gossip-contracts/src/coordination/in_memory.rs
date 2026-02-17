@@ -172,13 +172,20 @@ impl InMemoryCoordinator {
     }
 
     /// Check that adding `additional` shards for `tenant` stays within limits.
+    ///
+    /// `temporarily_removed` accounts for records that have been removed
+    /// from the map for the remove-mutate-restore pattern (split ops) but
+    /// will be restored. These must be counted toward both per-tenant and
+    /// global totals.
     fn check_shard_limits(
         &self,
         tenant: TenantId,
         additional: usize,
+        temporarily_removed: usize,
     ) -> Result<(), SplitValidationError> {
-        // Per-tenant limit.
-        let tenant_count = self.shards.keys().filter(|(t, _)| *t == tenant).count();
+        // Per-tenant limit (restored parent(s) are for this tenant).
+        let tenant_count =
+            self.shards.keys().filter(|(t, _)| *t == tenant).count() + temporarily_removed;
         if tenant_count + additional > self.max_shards_per_tenant {
             return Err(SplitValidationError::ShardLimitExceeded {
                 current: tenant_count,
@@ -189,9 +196,10 @@ impl InMemoryCoordinator {
         }
 
         // Global limit.
-        if self.shards.len() + additional > self.max_total_shards {
+        let total_count = self.shards.len() + temporarily_removed;
+        if total_count + additional > self.max_total_shards {
             return Err(SplitValidationError::ShardLimitExceeded {
-                current: self.shards.len(),
+                current: total_count,
                 additional,
                 max: self.max_total_shards,
                 scope: ShardLimitScope::Global,
@@ -460,7 +468,9 @@ impl CoordinationBackend for InMemoryCoordinator {
             }
 
             // Shard count limit guard: prevents split-flooding (CWE-400).
-            self.check_shard_limits(tenant, sorted.len())
+            // Parent was temporarily removed from the map (remove-mutate-restore
+            // pattern), so pass temporarily_removed=1 for correct counting.
+            self.check_shard_limits(tenant, sorted.len(), 1)
                 .map_err(|e| SplitReplaceError::SplitInvalid(Box::new(e)))?;
 
             // Phase 2: Compute new state (pure — no side effects).
@@ -544,7 +554,9 @@ impl CoordinationBackend for InMemoryCoordinator {
             }
 
             // Shard count limit guard: prevents split-flooding (CWE-400).
-            self.check_shard_limits(tenant, 1)
+            // Parent was temporarily removed from the map (remove-mutate-restore
+            // pattern), so pass temporarily_removed=1 for correct counting.
+            self.check_shard_limits(tenant, 1, 1)
                 .map_err(|e| SplitResidualError::SplitInvalid(Box::new(e)))?;
 
             // Phase 2: Build residual record (pure).
@@ -1824,21 +1836,28 @@ mod tests {
     }
 
     // -- Tenant isolation tests -----------------------------------------------
+    //
+    // The coordinator uses a composite key `(TenantId, ShardKey)` for the
+    // shard map. A wrong tenant simply doesn't find the record, returning
+    // `ShardNotFound`. This is the correct security behavior: the wrong
+    // tenant never learns the shard exists. The `TenantMismatch` variant
+    // in `validate_lease` is a defense-in-depth check for internal
+    // corruption, not the primary isolation mechanism.
 
     #[test]
-    fn acquire_tenant_mismatch() {
+    fn acquire_wrong_tenant_returns_not_found() {
         let mut coord = seeded_coordinator();
         let err = coord
             .acquire_and_restore(now(1), other_tenant(), test_key(), test_worker(1))
             .unwrap_err();
         assert!(
-            matches!(err, AcquireError::TenantMismatch { .. }),
-            "expected TenantMismatch, got: {err:?}",
+            matches!(err, AcquireError::ShardNotFound { .. }),
+            "wrong tenant should see ShardNotFound, got: {err:?}",
         );
     }
 
     #[test]
-    fn checkpoint_tenant_mismatch() {
+    fn checkpoint_wrong_tenant_returns_not_found() {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 1, 1);
 
@@ -1852,13 +1871,13 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            matches!(err, CheckpointError::TenantMismatch { .. }),
-            "expected TenantMismatch, got: {err:?}",
+            matches!(err, CheckpointError::ShardNotFound { .. }),
+            "wrong tenant should see ShardNotFound, got: {err:?}",
         );
     }
 
     #[test]
-    fn complete_tenant_mismatch() {
+    fn complete_wrong_tenant_returns_not_found() {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 1, 1);
 
@@ -1872,13 +1891,13 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            matches!(err, CompleteError::TenantMismatch { .. }),
-            "expected TenantMismatch, got: {err:?}",
+            matches!(err, CompleteError::ShardNotFound { .. }),
+            "wrong tenant should see ShardNotFound, got: {err:?}",
         );
     }
 
     #[test]
-    fn split_replace_tenant_mismatch() {
+    fn split_replace_wrong_tenant_returns_not_found() {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 1, 1);
 
@@ -1898,13 +1917,13 @@ mod tests {
             .split_replace(now(2), other_tenant(), &lease, plan, OpId::from_raw(1))
             .unwrap_err();
         assert!(
-            matches!(err, SplitReplaceError::TenantMismatch { .. }),
-            "expected TenantMismatch, got: {err:?}",
+            matches!(err, SplitReplaceError::ShardNotFound { .. }),
+            "wrong tenant should see ShardNotFound, got: {err:?}",
         );
     }
 
     #[test]
-    fn split_residual_tenant_mismatch() {
+    fn split_residual_wrong_tenant_returns_not_found() {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 1, 1);
 
@@ -1929,8 +1948,8 @@ mod tests {
             .split_residual(now(3), other_tenant(), &lease, plan, OpId::from_raw(1))
             .unwrap_err();
         assert!(
-            matches!(err, SplitResidualError::TenantMismatch { .. }),
-            "expected TenantMismatch, got: {err:?}",
+            matches!(err, SplitResidualError::ShardNotFound { .. }),
+            "wrong tenant should see ShardNotFound, got: {err:?}",
         );
     }
 
