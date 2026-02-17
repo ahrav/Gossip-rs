@@ -4,7 +4,7 @@
 //! pause state, and cursor progress. Op-ID spaces are partitioned per worker
 //! to guarantee cross-worker uniqueness without coordination.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use crate::coordination::Lease;
 use crate::identity::{OpId, RunId, ShardId, ShardKey, WorkerId};
@@ -29,7 +29,12 @@ const OP_ID_PARTITION: u64 = 1_000_000;
 /// bookkeeping, to avoid masking real invariant violations.
 pub struct SimWorker {
     id: WorkerId,
-    held_shards: HashMap<ShardKey, Lease>,
+    /// Shards this worker believes it holds.
+    ///
+    /// Keyed by `(run_raw, shard_raw)` to provide deterministic iteration
+    /// order (matching the natural `(RunId, ShardId)` tuple ordering)
+    /// without requiring `Ord` on `ShardKey`.
+    held_shards: BTreeMap<(u64, u64), (ShardKey, Lease)>,
     next_op: u64,
     op_ceiling: u64,
     paused: bool,
@@ -54,7 +59,7 @@ impl SimWorker {
             .expect("op-ID partition ceiling overflow");
         Self {
             id,
-            held_shards: HashMap::new(),
+            held_shards: BTreeMap::new(),
             next_op: base,
             op_ceiling: ceiling,
             paused: false,
@@ -108,34 +113,36 @@ impl SimWorker {
     ///
     /// Panics if held shard count would exceed `MAX_HELD_SHARDS`.
     pub fn record_acquire(&mut self, key: ShardKey, lease: Lease) {
-        if !self.held_shards.contains_key(&key) {
+        let raw = (key.run().as_raw(), key.shard().as_raw());
+        if !self.held_shards.contains_key(&raw) {
             assert!(
                 self.held_shards.len() < MAX_HELD_SHARDS,
                 "SimWorker {}: exceeded MAX_HELD_SHARDS ({MAX_HELD_SHARDS})",
                 self.id.as_raw(),
             );
         }
-        self.held_shards.insert(key, lease);
+        self.held_shards.insert(raw, (key, lease));
     }
 
     /// Remove tracking for a released/expired shard.
     pub fn record_release(&mut self, key: &ShardKey) {
-        self.held_shards.remove(key);
+        let raw = (key.run().as_raw(), key.shard().as_raw());
+        self.held_shards.remove(&raw);
     }
 
     /// Look up the tracked lease for a shard key.
     #[must_use]
     pub fn lease_for(&self, key: &ShardKey) -> Option<&Lease> {
-        self.held_shards.get(key)
+        let raw = (key.run().as_raw(), key.shard().as_raw());
+        self.held_shards.get(&raw).map(|(_, lease)| lease)
     }
 
-    /// Iterator over currently held shard keys.
+    /// Iterator over currently held shard keys in deterministic order.
     ///
-    /// **Iteration order is non-deterministic** (`HashMap`). Callers that need
-    /// reproducible ordering must collect and sort (see
-    /// `CoordinationSim::sorted_held_keys`).
+    /// `BTreeMap<(u64, u64), _>` iterates in ascending `(run, shard)` order,
+    /// so callers get reproducible iteration without collecting and sorting.
     pub fn held_keys(&self) -> impl Iterator<Item = &ShardKey> {
-        self.held_shards.keys()
+        self.held_shards.values().map(|(key, _)| key)
     }
 
     /// Number of shards currently held.

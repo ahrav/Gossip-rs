@@ -17,7 +17,10 @@ use rand::Rng;
 
 use crate::coordination::Lease;
 use crate::coordination::cursor::Cursor;
-use crate::coordination::error::IdempotentOutcome;
+use crate::coordination::error::{
+    AcquireError, CheckpointError, CompleteError, IdempotentOutcome, ParkError, RenewError,
+    SplitError,
+};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
@@ -53,7 +56,7 @@ pub enum SimOp {
     Complete { worker: WorkerId, key: ShardKey },
     /// Park a shard for later retry (terminal).
     Park { worker: WorkerId, key: ShardKey },
-    /// Split-replace: parent shard → N children covering parent's range (terminal).
+    /// Split-replace: parent shard → 2 children covering parent's range (terminal).
     SplitReplace { worker: WorkerId, key: ShardKey },
     /// Split-residual: parent shrinks, residual shard covers remainder (non-terminal).
     SplitResidual { worker: WorkerId, key: ShardKey },
@@ -140,6 +143,14 @@ pub enum RejectionKind {
     NoShardsHeld,
     /// OpId conflict: same OpId with different payload hash.
     OpIdConflict,
+    /// Target shard was not found in the coordinator.
+    ShardNotFound,
+    /// Tenant ID does not match the shard's tenant.
+    TenantMismatch,
+    /// Shard is already held by another worker with a valid lease.
+    AlreadyLeased,
+    /// Checkpoint is missing a required key field.
+    CheckpointMissingKey,
     /// Split validation failed (bad coverage, bad plan, etc.).
     SplitValidation,
     /// No stale lease available for zombie injection.
@@ -220,9 +231,6 @@ pub struct SimReport {
 /// Default lease duration for the simulated coordinator.
 const DEFAULT_LEASE_DURATION: u64 = 100;
 
-/// Initial trace capacity (avoids early reallocs in typical runs).
-const INITIAL_TRACE_CAPACITY: usize = 2048;
-
 /// Number of initial operations where faults are suppressed to let the
 /// system reach a healthy baseline.
 ///
@@ -235,8 +243,38 @@ const WARMUP_OPS: usize = 5;
 /// `AdvanceTime`.
 const MAX_OP_RETRIES: usize = 10;
 
+/// Maximum number of stale leases retained for zombie checkpoint injection.
+///
+/// Capped to prevent unbounded growth in long-running simulations. When
+/// the limit is exceeded, random entries are evicted via `swap_remove`.
+const MAX_STALE_LEASES: usize = 64;
+
 /// Saved checkpoint data: `(OpId, Cursor, WorkerId, ShardKey)` keyed by raw IDs.
 type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Cursor, WorkerId, ShardKey)>;
+
+/// Check that `worker` exists, is not paused, holds a lease on `key`,
+/// and advance its op-id counter.
+///
+/// Free function (not `&mut self`) so callers retain mutable access to
+/// the remaining `CoordinationSim` fields (`coordinator`, `context`, etc.)
+/// while borrowing only `workers`.
+fn require_lease_and_op(
+    workers: &mut BTreeMap<WorkerId, SimWorker>,
+    worker: WorkerId,
+    key: &ShardKey,
+) -> Result<(Lease, OpId), SimEvent> {
+    let w = workers
+        .get_mut(&worker)
+        .filter(|w| !w.is_paused())
+        .ok_or(SimEvent::Rejected {
+            kind: RejectionKind::WorkerPaused,
+        })?;
+    let lease = *w.lease_for(key).ok_or(SimEvent::Rejected {
+        kind: RejectionKind::NotLeased,
+    })?;
+    let op_id = w.next_op_id();
+    Ok((lease, op_id))
+}
 
 /// Full deterministic simulation harness.
 ///
@@ -248,8 +286,11 @@ pub struct CoordinationSim {
     workers: BTreeMap<WorkerId, SimWorker>,
     fault_config: FaultConfig,
     checker: InvariantChecker,
-    trace: Vec<(LogicalTime, SimOp, SimEvent)>,
     shard_keys: Vec<ShardKey>,
+    /// Subset of `shard_keys` containing only non-terminal shards.
+    /// Used by `pick_random_shard_key` to avoid selecting terminal shards
+    /// that would always be rejected.
+    active_shard_keys: Vec<ShardKey>,
     tenant: TenantId,
     ops_executed: usize,
     /// Stale leases saved when B1 cleanup supersedes them, used for
@@ -269,8 +310,8 @@ impl CoordinationSim {
             workers: BTreeMap::new(),
             fault_config: FaultConfig::for_level(level),
             checker: InvariantChecker::new(),
-            trace: Vec::with_capacity(INITIAL_TRACE_CAPACITY),
             shard_keys: Vec::new(),
+            active_shard_keys: Vec::new(),
             tenant: TenantId::from_bytes([0x01; 32]),
             ops_executed: 0,
             stale_leases: Vec::new(),
@@ -305,6 +346,8 @@ impl CoordinationSim {
         for i in 1..=n_shards {
             self.register_shard(run, ShardId::from_raw(i));
         }
+        // At creation all shards are active (non-terminal).
+        self.active_shard_keys = self.shard_keys.clone();
         self
     }
 
@@ -315,9 +358,7 @@ impl CoordinationSim {
     /// leave the coordinator in a state that violates any checked invariant
     /// without immediate detection.
     pub fn step(&mut self, op: SimOp) -> (SimEvent, Vec<InvariantViolation>) {
-        let now = self.context.now();
         let event = self.execute_op(&op);
-        self.trace.push((now, op, event.clone()));
         self.ops_executed += 1;
 
         let violations =
@@ -380,18 +421,22 @@ impl CoordinationSim {
 
     fn execute_op(&mut self, op: &SimOp) -> SimEvent {
         match op {
-            SimOp::Acquire { worker, key } => self.exec_acquire(*worker, *key),
-            SimOp::Renew { worker, key } => self.exec_renew(*worker, *key),
-            SimOp::Checkpoint { worker, key } => self.exec_checkpoint(*worker, *key),
-            SimOp::Complete { worker, key } => self.exec_complete(*worker, *key),
-            SimOp::Park { worker, key } => self.exec_park(*worker, *key),
-            SimOp::SplitReplace { worker, key } => self.exec_split_replace(*worker, *key),
-            SimOp::SplitResidual { worker, key } => self.exec_split_residual(*worker, *key),
-            SimOp::ReplayCheckpoint { worker, key } => self.exec_replay_checkpoint(*worker, *key),
-            SimOp::ConflictCheckpoint { worker, key } => {
-                self.exec_conflict_checkpoint(*worker, *key)
+            SimOp::Acquire { worker, key }
+            | SimOp::Renew { worker, key }
+            | SimOp::Checkpoint { worker, key }
+            | SimOp::Complete { worker, key }
+            | SimOp::Park { worker, key } => self.execute_lease_op(op, *worker, *key),
+
+            SimOp::SplitReplace { worker, key } | SimOp::SplitResidual { worker, key } => {
+                self.execute_split_op(op, *worker, *key)
             }
+
+            SimOp::ReplayCheckpoint { worker, key } | SimOp::ConflictCheckpoint { worker, key } => {
+                self.execute_replay_op(op, *worker, *key)
+            }
+
             SimOp::ZombieCheckpoint => self.exec_zombie_checkpoint(),
+
             SimOp::AdvanceTime { ticks } => {
                 self.context.advance(*ticks);
                 SimEvent::TimeAdvanced {
@@ -414,6 +459,33 @@ impl CoordinationSim {
                     SimEvent::Skipped
                 }
             }
+        }
+    }
+
+    fn execute_lease_op(&mut self, op: &SimOp, worker: WorkerId, key: ShardKey) -> SimEvent {
+        match op {
+            SimOp::Acquire { .. } => self.exec_acquire(worker, key),
+            SimOp::Renew { .. } => self.exec_renew(worker, key),
+            SimOp::Checkpoint { .. } => self.exec_checkpoint(worker, key),
+            SimOp::Complete { .. } => self.exec_complete(worker, key),
+            SimOp::Park { .. } => self.exec_park(worker, key),
+            _ => unreachable!("execute_lease_op called with non-lease op"),
+        }
+    }
+
+    fn execute_split_op(&mut self, op: &SimOp, worker: WorkerId, key: ShardKey) -> SimEvent {
+        match op {
+            SimOp::SplitReplace { .. } => self.exec_split_replace(worker, key),
+            SimOp::SplitResidual { .. } => self.exec_split_residual(worker, key),
+            _ => unreachable!("execute_split_op called with non-split op"),
+        }
+    }
+
+    fn execute_replay_op(&mut self, op: &SimOp, worker: WorkerId, key: ShardKey) -> SimEvent {
+        match op {
+            SimOp::ReplayCheckpoint { .. } => self.exec_replay_checkpoint(worker, key),
+            SimOp::ConflictCheckpoint { .. } => self.exec_conflict_checkpoint(worker, key),
+            _ => unreachable!("execute_replay_op called with non-replay op"),
         }
     }
 
@@ -449,10 +521,21 @@ impl CoordinationSim {
                     }
                 }
 
+                // Trim stale_leases to prevent unbounded growth.
+                while self.stale_leases.len() > MAX_STALE_LEASES {
+                    let idx = self.context.rng().random_range(0..self.stale_leases.len());
+                    self.stale_leases.swap_remove(idx);
+                }
+
                 SimEvent::AcquireOk { fence }
             }
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::Other,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    AcquireError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    AcquireError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    AcquireError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                    AcquireError::AlreadyLeased { .. } => RejectionKind::AlreadyLeased,
+                },
             },
         }
     }
@@ -475,40 +558,40 @@ impl CoordinationSim {
 
         let now = self.context.now();
         match self.coordinator.renew(now, self.tenant, &lease) {
-            Ok(result) => SimEvent::RenewOk {
-                new_deadline: result.new_deadline,
-            },
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::LeaseExpired,
+            Ok(result) => {
+                // Update the worker's local lease to reflect the new deadline,
+                // keeping bookkeeping consistent with coordinator truth.
+                if let Some(w) = self.workers.get_mut(&worker) {
+                    let updated = Lease::new(
+                        lease.tenant(),
+                        lease.run(),
+                        lease.shard(),
+                        lease.owner(),
+                        lease.fence(),
+                        result.new_deadline,
+                    );
+                    w.record_acquire(key, updated);
+                }
+                SimEvent::RenewOk {
+                    new_deadline: result.new_deadline,
+                }
+            }
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    RenewError::StaleFence { .. } => RejectionKind::StaleFence,
+                    RenewError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    RenewError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    RenewError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    RenewError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                },
             },
         }
     }
 
     fn exec_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
-        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
-                kind: RejectionKind::WorkerPaused,
-            };
-        }
-
-        let (lease, op_id) = match self.workers.get_mut(&worker) {
-            Some(w) => match w.lease_for(&key) {
-                Some(l) => {
-                    let l = *l;
-                    let op = w.next_op_id();
-                    (l, op)
-                }
-                None => {
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::NotLeased,
-                    };
-                }
-            },
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
+            Ok(pair) => pair,
+            Err(event) => return event,
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
@@ -531,37 +614,26 @@ impl CoordinationSim {
                     .insert(ck, (op_id, cursor, worker, key));
                 SimEvent::CheckpointOk
             }
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::StaleFence,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
+                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
+                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
+                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
+                },
             },
         }
     }
 
     fn exec_complete(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
-        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
-                kind: RejectionKind::WorkerPaused,
-            };
-        }
-
-        let (lease, op_id) = match self.workers.get_mut(&worker) {
-            Some(w) => match w.lease_for(&key) {
-                Some(l) => {
-                    let l = *l;
-                    let op = w.next_op_id();
-                    (l, op)
-                }
-                None => {
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::NotLeased,
-                    };
-                }
-            },
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
+            Ok(pair) => pair,
+            Err(event) => return event,
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
@@ -576,39 +648,30 @@ impl CoordinationSim {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.record_release(&key);
                 }
+                // Shard is now terminal — remove from active set.
+                self.active_shard_keys.retain(|k| *k != key);
                 SimEvent::CompleteOk
             }
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::TerminalState,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    CompleteError::StaleFence { .. } => RejectionKind::StaleFence,
+                    CompleteError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    CompleteError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    CompleteError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    CompleteError::CursorRegression { .. } => RejectionKind::CursorRegression,
+                    CompleteError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
+                    CompleteError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    CompleteError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                    CompleteError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
+                },
             },
         }
     }
 
     fn exec_park(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
-        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
-                kind: RejectionKind::WorkerPaused,
-            };
-        }
-
-        let (lease, op_id) = match self.workers.get_mut(&worker) {
-            Some(w) => match w.lease_for(&key) {
-                Some(l) => {
-                    let l = *l;
-                    let op = w.next_op_id();
-                    (l, op)
-                }
-                None => {
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::NotLeased,
-                    };
-                }
-            },
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
+            Ok(pair) => pair,
+            Err(event) => return event,
         };
 
         let now = self.context.now();
@@ -620,12 +683,53 @@ impl CoordinationSim {
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.record_release(&key);
                 }
+                // Shard is now terminal — remove from active set.
+                self.active_shard_keys.retain(|k| *k != key);
                 SimEvent::ParkOk
             }
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::TerminalState,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    ParkError::StaleFence { .. } => RejectionKind::StaleFence,
+                    ParkError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    ParkError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    ParkError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    ParkError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    ParkError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                },
             },
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Split helpers
+    // -----------------------------------------------------------------------
+
+    /// Look up a shard's spec from the coordinator.
+    fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
+        match self.coordinator.shards().get(&(self.tenant, key)) {
+            Some(record) => Ok(record.spec.clone()),
+            None => Err(SimEvent::Rejected {
+                kind: RejectionKind::ShardNotFound,
+            }),
+        }
+    }
+
+    /// Compute a random split point between `start[0]+1` and `end[0]`.
+    /// Returns `Err` if the range is too small to split.
+    fn compute_split_byte(&mut self, start: &[u8], end: &[u8]) -> Result<u8, SimEvent> {
+        if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
+            return Err(SimEvent::Rejected {
+                kind: RejectionKind::SplitValidation,
+            });
+        }
+        let lo = start[0] + 1;
+        let hi = end[0];
+        if lo >= hi {
+            return Err(SimEvent::Rejected {
+                kind: RejectionKind::SplitValidation,
+            });
+        }
+        Ok(self.context.rng().random_range(lo..hi))
     }
 
     // -----------------------------------------------------------------------
@@ -634,61 +738,24 @@ impl CoordinationSim {
 
     /// Execute a split-replace: parent → 2 children covering the parent's range.
     fn exec_split_replace(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
-        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
-                kind: RejectionKind::WorkerPaused,
-            };
-        }
-
-        let (lease, op_id) = match self.workers.get_mut(&worker) {
-            Some(w) => match w.lease_for(&key) {
-                Some(l) => {
-                    let l = *l;
-                    let op = w.next_op_id();
-                    (l, op)
-                }
-                None => {
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::NotLeased,
-                    };
-                }
-            },
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
+            Ok(pair) => pair,
+            Err(event) => return event,
         };
 
         // Look up parent's spec to compute a valid split point.
-        let parent_spec = match self.coordinator.shards().get(&(self.tenant, key)) {
-            Some(record) => record.spec.clone(),
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::Other,
-                };
-            }
+        let parent_spec = match self.lookup_shard_spec(key) {
+            Ok(spec) => spec,
+            Err(event) => return event,
         };
 
         let start = parent_spec.key_range_start();
         let end = parent_spec.key_range_end();
 
-        // Need at least 2 bytes of range to split meaningfully.
-        if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
-            return SimEvent::Rejected {
-                kind: RejectionKind::SplitValidation,
-            };
-        }
-
-        // Random split point strictly between start[0] and end[0].
-        let lo = start[0] + 1;
-        let hi = end[0];
-        if lo >= hi {
-            return SimEvent::Rejected {
-                kind: RejectionKind::SplitValidation,
-            };
-        }
-        let mid = self.context.rng().random_range(lo..hi);
+        let mid = match self.compute_split_byte(start, end) {
+            Ok(m) => m,
+            Err(event) => return event,
+        };
 
         let child_a_spec = ShardSpec::with_range(start.to_vec(), vec![mid]);
         let child_b_spec = ShardSpec::with_range(vec![mid], end.to_vec());
@@ -720,61 +787,50 @@ impl CoordinationSim {
                 // Register child shards so future ops can exercise them.
                 let run = key.run();
                 for &child_id in &children {
-                    self.shard_keys.push(ShardKey::new(run, child_id));
+                    let child_key = ShardKey::new(run, child_id);
+                    self.shard_keys.push(child_key);
+                    self.active_shard_keys.push(child_key);
                 }
+                // Parent is now terminal — remove from active set.
+                self.active_shard_keys.retain(|k| *k != key);
                 SimEvent::SplitReplaceOk { children }
             }
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::TerminalState,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    SplitError::StaleFence { .. } => RejectionKind::StaleFence,
+                    SplitError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    SplitError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    SplitError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    SplitError::SplitInvalid(_) => RejectionKind::SplitValidation,
+                    SplitError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    SplitError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                },
             },
         }
     }
 
     /// Execute a split-residual: parent shrinks, residual covers remainder.
     fn exec_split_residual(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
-        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
-                kind: RejectionKind::WorkerPaused,
-            };
-        }
-
-        let (lease, op_id) = match self.workers.get_mut(&worker) {
-            Some(w) => match w.lease_for(&key) {
-                Some(l) => {
-                    let l = *l;
-                    let op = w.next_op_id();
-                    (l, op)
-                }
-                None => {
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::NotLeased,
-                    };
-                }
-            },
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
+            Ok(pair) => pair,
+            Err(event) => return event,
         };
 
         // Look up parent's current spec and cursor to compute a valid split.
-        let (parent_spec, parent_cursor_key) =
-            match self.coordinator.shards().get(&(self.tenant, key)) {
-                Some(record) => {
-                    let ck = record.cursor.last_key().map(|k| k.to_vec());
-                    (record.spec.clone(), ck)
-                }
-                None => {
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::Other,
-                    };
-                }
-            };
+        let parent_spec = match self.lookup_shard_spec(key) {
+            Ok(spec) => spec,
+            Err(event) => return event,
+        };
+        let parent_cursor_key = self
+            .coordinator
+            .shards()
+            .get(&(self.tenant, key))
+            .and_then(|r| r.cursor.last_key().map(|k| k.to_vec()));
 
         let start = parent_spec.key_range_start();
         let end = parent_spec.key_range_end();
 
+        // Basic range validation (reuse helper logic).
         if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
             return SimEvent::Rejected {
                 kind: RejectionKind::SplitValidation,
@@ -819,11 +875,21 @@ impl CoordinationSim {
                 let residual = result.residual;
                 // Parent stays active (non-terminal) -- worker keeps lease.
                 // Register residual shard for future ops.
-                self.shard_keys.push(ShardKey::new(key.run(), residual));
+                let residual_key = ShardKey::new(key.run(), residual);
+                self.shard_keys.push(residual_key);
+                self.active_shard_keys.push(residual_key);
                 SimEvent::SplitResidualOk { residual }
             }
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::TerminalState,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    SplitError::StaleFence { .. } => RejectionKind::StaleFence,
+                    SplitError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    SplitError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    SplitError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    SplitError::SplitInvalid(_) => RejectionKind::SplitValidation,
+                    SplitError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    SplitError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                },
             },
         }
     }
@@ -872,8 +938,18 @@ impl CoordinationSim {
                     SimEvent::CheckpointOk
                 }
             },
-            Err(_) => SimEvent::Rejected {
-                kind: RejectionKind::StaleFence,
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
+                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
+                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
+                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
+                },
             },
         }
     }
@@ -919,21 +995,19 @@ impl CoordinationSim {
                 // was treated as a fresh execution. Still valid.
                 SimEvent::CheckpointOk
             }
-            Err(e) => {
-                // Check for OpIdConflict specifically.
-                if matches!(
-                    e,
-                    crate::coordination::error::CheckpointError::OpIdConflict { .. }
-                ) {
-                    SimEvent::Rejected {
-                        kind: RejectionKind::OpIdConflict,
-                    }
-                } else {
-                    SimEvent::Rejected {
-                        kind: RejectionKind::StaleFence,
-                    }
-                }
-            }
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
+                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
+                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
+                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
+                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
+                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
+                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
+                },
+            },
         }
     }
 
@@ -951,9 +1025,9 @@ impl CoordinationSim {
             };
         }
 
-        // Pick a random stale lease.
+        // Pick a random stale lease and remove it to bound growth.
         let idx = self.context.rng().random_range(0..self.stale_leases.len());
-        let (stale_worker, _key, stale_lease) = self.stale_leases[idx];
+        let (stale_worker, _key, stale_lease) = self.stale_leases.swap_remove(idx);
 
         // Generate a fresh op-ID from the stale worker.
         let op_id = match self.workers.get_mut(&stale_worker) {
@@ -973,19 +1047,24 @@ impl CoordinationSim {
             .checkpoint(now, self.tenant, &stale_lease, cursor, op_id)
         {
             Ok(_) => {
-                // Unexpected: stale lease was somehow still valid.
-                SimEvent::CheckpointOk
+                panic!(
+                    "zombie checkpoint succeeded with stale lease — \
+                     fencing protocol is broken"
+                );
             }
-            Err(e) => {
-                use crate::coordination::error::CheckpointError;
-                let kind = match e {
+            Err(e) => SimEvent::Rejected {
+                kind: match e {
                     CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
                     CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
                     CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    _ => RejectionKind::Other,
-                };
-                SimEvent::Rejected { kind }
-            }
+                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
+                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
+                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
+                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
+                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
+                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
+                },
+            },
         }
     }
 
@@ -995,8 +1074,8 @@ impl CoordinationSim {
 
     /// Generate a random operation with weighted distribution.
     ///
-    /// During warmup (`suppress_faults = true`), only generates coordinator
-    /// operations (no time jumps, pauses, or resumes).
+    /// During warmup (`suppress_faults = true`), only generates basic
+    /// lease-lifecycle operations (acquire, renew, checkpoint, complete, park).
     ///
     /// Weight rationale (normal mode):
     /// - acquire (15%) and checkpoint (15%) exercise the happy path
@@ -1074,39 +1153,38 @@ impl CoordinationSim {
     }
 
     fn pick_random_active_worker(&mut self) -> Option<WorkerId> {
-        let active: Vec<WorkerId> = self
-            .workers
+        let count = self.workers.values().filter(|w| !w.is_paused()).count();
+        if count == 0 {
+            return None;
+        }
+        let idx = self.context.rng().random_range(0..count);
+        self.workers
             .iter()
             .filter(|(_, w)| !w.is_paused())
             .map(|(id, _)| *id)
-            .collect();
-        if active.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..active.len());
-        Some(active[idx])
+            .nth(idx)
     }
 
     fn pick_random_shard_key(&mut self) -> Option<ShardKey> {
-        if self.shard_keys.is_empty() {
+        if self.active_shard_keys.is_empty() {
             return None;
         }
-        let idx = self.context.rng().random_range(0..self.shard_keys.len());
-        Some(self.shard_keys[idx])
+        let idx = self
+            .context
+            .rng()
+            .random_range(0..self.active_shard_keys.len());
+        Some(self.active_shard_keys[idx])
     }
 
     /// Collect a worker's held shard keys in deterministic order.
     ///
-    /// `HashMap` iteration order is non-deterministic. Sorting by raw
-    /// `(RunId, ShardId)` ensures reproducible op generation.
+    /// `SimWorker::held_keys()` iterates in deterministic `(run, shard)`
+    /// order (backed by `BTreeMap`), so no post-hoc sort is needed.
     fn sorted_held_keys(&self, worker: WorkerId) -> Vec<ShardKey> {
-        let mut keys: Vec<ShardKey> = self
-            .workers
+        self.workers
             .get(&worker)
             .map(|w| w.held_keys().copied().collect())
-            .unwrap_or_default();
-        keys.sort_by_key(|k| (k.run().as_raw(), k.shard().as_raw()));
-        keys
+            .unwrap_or_default()
     }
 
     fn try_gen_acquire(&mut self) -> Option<SimOp> {
@@ -1115,56 +1193,36 @@ impl CoordinationSim {
         Some(SimOp::Acquire { worker, key })
     }
 
-    fn try_gen_renew(&mut self) -> Option<SimOp> {
+    /// Pick an active worker, select a random held shard, and wrap both
+    /// in a `SimOp` via the supplied constructor.
+    ///
+    /// Six `try_gen_*` methods share this exact pattern; factoring it here
+    /// removes ~60 lines of duplicated logic while preserving the PRNG
+    /// call sequence (pick worker → sorted keys → random index).
+    fn try_gen_held_shard_op(&mut self, f: fn(WorkerId, ShardKey) -> SimOp) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         let held = self.sorted_held_keys(worker);
         if held.is_empty() {
             return None;
         }
         let idx = self.context.rng().random_range(0..held.len());
-        Some(SimOp::Renew {
-            worker,
-            key: held[idx],
-        })
+        Some(f(worker, held[idx]))
+    }
+
+    fn try_gen_renew(&mut self) -> Option<SimOp> {
+        self.try_gen_held_shard_op(|worker, key| SimOp::Renew { worker, key })
     }
 
     fn try_gen_checkpoint(&mut self) -> Option<SimOp> {
-        let worker = self.pick_random_active_worker()?;
-        let held = self.sorted_held_keys(worker);
-        if held.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..held.len());
-        Some(SimOp::Checkpoint {
-            worker,
-            key: held[idx],
-        })
+        self.try_gen_held_shard_op(|worker, key| SimOp::Checkpoint { worker, key })
     }
 
     fn try_gen_complete(&mut self) -> Option<SimOp> {
-        let worker = self.pick_random_active_worker()?;
-        let held = self.sorted_held_keys(worker);
-        if held.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..held.len());
-        Some(SimOp::Complete {
-            worker,
-            key: held[idx],
-        })
+        self.try_gen_held_shard_op(|worker, key| SimOp::Complete { worker, key })
     }
 
     fn try_gen_park(&mut self) -> Option<SimOp> {
-        let worker = self.pick_random_active_worker()?;
-        let held = self.sorted_held_keys(worker);
-        if held.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..held.len());
-        Some(SimOp::Park {
-            worker,
-            key: held[idx],
-        })
+        self.try_gen_held_shard_op(|worker, key| SimOp::Park { worker, key })
     }
 
     fn gen_advance_time(&mut self) -> SimOp {
@@ -1173,61 +1231,31 @@ impl CoordinationSim {
     }
 
     fn try_gen_pause(&mut self) -> Option<SimOp> {
-        let active: Vec<WorkerId> = self
-            .workers
-            .iter()
-            .filter(|(_, w)| !w.is_paused())
-            .map(|(id, _)| *id)
-            .collect();
-        if active.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..active.len());
-        Some(SimOp::PauseWorker {
-            worker: active[idx],
-        })
+        let worker = self.pick_random_active_worker()?;
+        Some(SimOp::PauseWorker { worker })
     }
 
     fn try_gen_resume(&mut self) -> Option<SimOp> {
-        let paused: Vec<WorkerId> = self
+        let count = self.workers.values().filter(|w| w.is_paused()).count();
+        if count == 0 {
+            return None;
+        }
+        let idx = self.context.rng().random_range(0..count);
+        let worker = self
             .workers
             .iter()
             .filter(|(_, w)| w.is_paused())
             .map(|(id, _)| *id)
-            .collect();
-        if paused.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..paused.len());
-        Some(SimOp::ResumeWorker {
-            worker: paused[idx],
-        })
+            .nth(idx)?;
+        Some(SimOp::ResumeWorker { worker })
     }
 
     fn try_gen_split_replace(&mut self) -> Option<SimOp> {
-        let worker = self.pick_random_active_worker()?;
-        let held = self.sorted_held_keys(worker);
-        if held.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..held.len());
-        Some(SimOp::SplitReplace {
-            worker,
-            key: held[idx],
-        })
+        self.try_gen_held_shard_op(|worker, key| SimOp::SplitReplace { worker, key })
     }
 
     fn try_gen_split_residual(&mut self) -> Option<SimOp> {
-        let worker = self.pick_random_active_worker()?;
-        let held = self.sorted_held_keys(worker);
-        if held.is_empty() {
-            return None;
-        }
-        let idx = self.context.rng().random_range(0..held.len());
-        Some(SimOp::SplitResidual {
-            worker,
-            key: held[idx],
-        })
+        self.try_gen_held_shard_op(|worker, key| SimOp::SplitResidual { worker, key })
     }
 
     fn try_gen_replay_checkpoint(&mut self) -> Option<SimOp> {
@@ -1316,7 +1344,12 @@ impl CoordinationSim {
         };
 
         if start >= range_hi {
-            // Already at end of range -- produce max valid cursor.
+            // Range exhausted — return previous cursor (idempotent retry) to
+            // maintain the forward-only guarantee. Without this, a single-byte
+            // fallback could regress behind a multi-byte previous cursor.
+            if let Some(prev) = last {
+                return Cursor::with_last_key(prev.to_vec());
+            }
             return Cursor::with_last_key(vec![range_hi.saturating_sub(1)]);
         }
 
@@ -1343,8 +1376,14 @@ impl CoordinationSim {
     /// 1. Worker A acquires a shard.
     /// 2. Time advances past lease deadline.
     /// 3. Worker B acquires the same shard (bumps fence).
-    /// 4. Worker A attempts checkpoint after losing its lease (B1 bookkeeping
-    ///    cleanup cleared it on Worker B's acquire) -- must be rejected.
+    /// 4. Worker A attempts checkpoint — rejected with `NotLeased` because
+    ///    B1 bookkeeping cleanup cleared Worker A's lease when Worker B
+    ///    acquired. This exercises the **B1 bookkeeping cleanup** path,
+    ///    not the coordinator's fence-based `StaleFence` rejection.
+    ///
+    /// The coordinator's `StaleFence` path (fence-epoch mismatch) is
+    /// separately exercised by [`exec_zombie_checkpoint`], which uses
+    /// saved stale leases to bypass B1 cleanup entirely.
     fn inject_zombie_scenario(
         &mut self,
         all_violations: &mut Vec<InvariantViolation>,
@@ -1364,6 +1403,10 @@ impl CoordinationSim {
             worker: worker_a,
             key,
         });
+        assert!(
+            matches!(event, SimEvent::AcquireOk { .. }),
+            "zombie setup: worker A acquire failed: {event:?}",
+        );
         *event_counts.entry(event.kind()).or_insert(0) += 1;
         all_violations.extend(violations);
 
@@ -1379,13 +1422,16 @@ impl CoordinationSim {
             worker: worker_b,
             key,
         });
+        assert!(
+            matches!(event, SimEvent::AcquireOk { .. }),
+            "zombie setup: worker B acquire failed: {event:?}",
+        );
         *event_counts.entry(event.kind()).or_insert(0) += 1;
         all_violations.extend(violations);
 
-        // Step 4: Worker A attempts checkpoint with stale lease.
-        // Worker A's bookkeeping was cleared when worker B acquired, so the
-        // checkpoint will be rejected with NotLeased (worker A no longer
-        // thinks it holds the shard).
+        // Step 4: Worker A attempts checkpoint — B1 bookkeeping cleanup
+        // cleared its lease on Worker B's acquire, so this is rejected with
+        // NotLeased (exercises B1 path, not StaleFence).
         let (event, violations) = self.step(SimOp::Checkpoint {
             worker: worker_a,
             key,
@@ -1394,7 +1440,7 @@ impl CoordinationSim {
         all_violations.extend(violations);
 
         // The checkpoint must have been rejected (either NotLeased or StaleFence).
-        debug_assert!(
+        assert!(
             matches!(event, SimEvent::Rejected { .. }),
             "zombie worker checkpoint should be rejected, got: {event:?}",
         );
@@ -1407,9 +1453,12 @@ impl CoordinationSim {
     /// Check if all shards reached a terminal state (Done, Split, or Parked).
     fn check_convergence(&self) -> bool {
         for key in &self.shard_keys {
-            if let Some(record) = self.coordinator.shards().get(&(self.tenant, *key))
-                && !record.status.is_terminal()
-            {
+            let record = self
+                .coordinator
+                .shards()
+                .get(&(self.tenant, *key))
+                .expect("shard key missing from coordinator — registration bug");
+            if !record.status.is_terminal() {
                 return false;
             }
         }
@@ -1532,6 +1581,273 @@ mod tests {
         assert!(
             rejected > 0,
             "expected at least one rejection from zombie scenario"
+        );
+    }
+
+    /// When the cursor's first byte is one below range_hi and the cursor is
+    /// multi-byte, `generate_forward_cursor` must NOT produce a shorter cursor
+    /// that is lexicographically less than the previous one.
+    #[test]
+    fn forward_cursor_no_regression_at_range_boundary() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        // Advance time so acquire works.
+        sim.context.advance(1);
+
+        // Worker acquires the shard.
+        let event = sim.execute_op(&SimOp::Acquire { worker, key });
+        assert!(matches!(event, SimEvent::AcquireOk { .. }));
+
+        // Manually set the worker's cursor to a multi-byte value near range end.
+        // Shard spec range is [b'a', b'z']. A cursor of [b'y', 0x42] means
+        // first byte = b'y', so start = b'z' which >= range_hi (b'z').
+        let prev_cursor = vec![b'y', 0x42];
+        sim.workers.get_mut(&worker).unwrap().record_cursor(
+            key.run(),
+            key.shard(),
+            prev_cursor.clone(),
+        );
+
+        // Generate a forward cursor -- must be >= previous.
+        let cursor = sim.generate_forward_cursor(worker, key);
+        let cursor_key = cursor.last_key().expect("cursor should have a key");
+
+        assert!(
+            cursor_key >= prev_cursor.as_slice(),
+            "cursor regression: generated {:?} < previous {:?}",
+            cursor_key,
+            prev_cursor,
+        );
+    }
+
+    /// After a successful renew, the worker's local lease must reflect the
+    /// new deadline from the coordinator.
+    #[test]
+    fn renew_updates_worker_lease_deadline() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        sim.context.advance(1);
+
+        // Acquire.
+        let event = sim.execute_op(&SimOp::Acquire { worker, key });
+        assert!(matches!(event, SimEvent::AcquireOk { .. }));
+
+        let old_deadline = sim
+            .workers
+            .get(&worker)
+            .unwrap()
+            .lease_for(&key)
+            .unwrap()
+            .deadline();
+
+        // Advance time but stay within lease.
+        sim.context.advance(50);
+
+        // Renew.
+        let event = sim.execute_op(&SimOp::Renew { worker, key });
+        match event {
+            SimEvent::RenewOk { new_deadline } => {
+                let worker_deadline = sim
+                    .workers
+                    .get(&worker)
+                    .unwrap()
+                    .lease_for(&key)
+                    .unwrap()
+                    .deadline();
+                assert_eq!(
+                    worker_deadline, new_deadline,
+                    "worker lease deadline ({worker_deadline:?}) should match \
+                     coordinator ({new_deadline:?}) after renew; \
+                     old deadline was {old_deadline:?}",
+                );
+            }
+            other => panic!("expected RenewOk, got {other:?}"),
+        }
+    }
+
+    // -- Task C3: multi-tenant (multi-run) isolation ---------------------------
+
+    /// Interleave operations on shards from two different runs and verify no
+    /// invariant violations occur. Since the coordinator uses a single tenant,
+    /// this exercises cross-run isolation within the same tenant.
+    #[test]
+    fn multi_tenant_isolation() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
+
+        // Add workers.
+        for i in 1..=3 {
+            sim.add_worker(WorkerId::from_raw(i));
+        }
+
+        // Register shards across two runs.
+        let run1 = RunId::from_raw(1);
+        let run2 = RunId::from_raw(2);
+        for i in 1..=3 {
+            sim.register_shard(run1, ShardId::from_raw(i));
+            sim.register_shard(run2, ShardId::from_raw(i));
+        }
+
+        // All registered shards start as active (non-terminal).
+        sim.active_shard_keys = sim.shard_keys.clone();
+
+        // Run simulation — interleaved ops on both runs' shards.
+        let report = sim.run(300, 150);
+        assert!(
+            report.violations.is_empty(),
+            "multi-run isolation: {:?}",
+            report.violations,
+        );
+    }
+
+    // -- Task H9: generate_forward_cursor edge cases --------------------------
+
+    /// Worker with no prior cursor generates a cursor within spec bounds.
+    #[test]
+    fn generate_forward_cursor_no_prior() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        // Advance time so acquire works.
+        sim.context.advance(1);
+
+        // Acquire the shard.
+        let event = sim.execute_op(&SimOp::Acquire { worker, key });
+        assert!(matches!(event, SimEvent::AcquireOk { .. }));
+
+        // No prior cursor recorded — generate a fresh one.
+        let cursor = sim.generate_forward_cursor(worker, key);
+        let cursor_key = cursor.last_key().expect("cursor should have a key");
+
+        // Spec range is [b'a', b'z'). First byte must be in [b'a', b'z').
+        let first_byte = cursor_key[0];
+        assert!(
+            first_byte >= b'a',
+            "cursor first byte {first_byte:#x} below spec start 0x61"
+        );
+        assert!(
+            first_byte < b'z',
+            "cursor first byte {first_byte:#x} >= spec end 0x7a"
+        );
+    }
+
+    /// After setting cursor at b'c', next cursor's first byte must be >= b'd'
+    /// (strict forward progress).
+    #[test]
+    fn generate_forward_cursor_forward_progress() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        sim.context.advance(1);
+
+        let event = sim.execute_op(&SimOp::Acquire { worker, key });
+        assert!(matches!(event, SimEvent::AcquireOk { .. }));
+
+        // Record cursor at b'c'.
+        sim.workers
+            .get_mut(&worker)
+            .unwrap()
+            .record_cursor(key.run(), key.shard(), vec![b'c']);
+
+        let cursor = sim.generate_forward_cursor(worker, key);
+        let cursor_key = cursor.last_key().expect("cursor should have a key");
+
+        assert!(
+            cursor_key[0] >= b'd',
+            "expected first byte >= 0x64 (b'd'), got {:#x}",
+            cursor_key[0],
+        );
+    }
+
+    /// When cursor is at b'y' and range end is b'z', the range is exhausted.
+    /// `generate_forward_cursor` returns the previous cursor (idempotent retry).
+    #[test]
+    fn generate_forward_cursor_range_exhausted() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        sim.context.advance(1);
+
+        let event = sim.execute_op(&SimOp::Acquire { worker, key });
+        assert!(matches!(event, SimEvent::AcquireOk { .. }));
+
+        // Set cursor at b'y' — start becomes b'z' which >= range_hi (b'z').
+        let prev_cursor = vec![b'y'];
+        sim.workers.get_mut(&worker).unwrap().record_cursor(
+            key.run(),
+            key.shard(),
+            prev_cursor.clone(),
+        );
+
+        let cursor = sim.generate_forward_cursor(worker, key);
+        let cursor_key = cursor.last_key().expect("cursor should have a key");
+
+        // Must return the previous cursor since range is exhausted.
+        assert_eq!(
+            cursor_key,
+            prev_cursor.as_slice(),
+            "range-exhausted cursor should repeat previous; got {:?}, expected {:?}",
+            cursor_key,
+            prev_cursor,
+        );
+    }
+
+    /// With a narrow spec [b'a', b'c'), after setting cursor at b'a', the
+    /// next cursor's first byte must be >= b'b' and < b'c'.
+    #[test]
+    fn generate_forward_cursor_single_byte_range() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
+
+        // Add one worker.
+        let worker = WorkerId::from_raw(1);
+        sim.add_worker(worker);
+
+        // Manually seed a shard with narrow spec [b'a', b'c').
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let record = ShardRecord::new_active(
+            sim.tenant,
+            run,
+            shard,
+            ShardSpec::with_range(vec![b'a'], vec![b'c']),
+            CursorSemantics::Completed,
+        );
+        sim.coordinator.seed_shard(record);
+        let key = ShardKey::new(run, shard);
+        sim.shard_keys.push(key);
+        sim.active_shard_keys.push(key);
+
+        sim.context.advance(1);
+
+        let event = sim.execute_op(&SimOp::Acquire { worker, key });
+        assert!(matches!(event, SimEvent::AcquireOk { .. }));
+
+        // Set cursor at b'a'.
+        sim.workers
+            .get_mut(&worker)
+            .unwrap()
+            .record_cursor(run, shard, vec![b'a']);
+
+        let cursor = sim.generate_forward_cursor(worker, key);
+        let cursor_key = cursor.last_key().expect("cursor should have a key");
+
+        // First byte must be >= b'b' (forward from b'a') and < b'c' (range end).
+        // With spec [b'a', b'c'), the only valid first byte is b'b'.
+        let first_byte = cursor_key[0];
+        assert_eq!(
+            first_byte, b'b',
+            "cursor first byte {first_byte:#x} should be 0x62 (b'b') for spec [b'a', b'c')",
         );
     }
 

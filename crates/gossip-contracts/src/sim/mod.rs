@@ -26,9 +26,9 @@
 //! # Determinism model
 //!
 //! All randomness flows through a single [`ChaCha8Rng`] seeded from a `u64`.
-//! `ChaCha8Rng` is algorithm-specified and value-stable across patch releases
-//! (unlike `StdRng` which is explicitly non-portable). Cargo.lock provides
-//! sufficient pinning.
+//! `ChaCha8Rng` is algorithm-specified (RFC 8439) and designed for portable
+//! reproducibility (unlike `StdRng` which is explicitly non-portable).
+//! Cargo.lock provides sufficient pinning.
 //!
 //! **Ordering matters**: the PRNG is a single stream. Any change to the order
 //! or number of `rng` calls changes all subsequent random decisions for a
@@ -41,8 +41,9 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
-//! let report = CoordinationSim::new(seed, FaultLevel::Stormy)
+//! ```rust,no_run
+//! use gossip_contracts::sim::{CoordinationSim, FaultLevel};
+//! let report = CoordinationSim::new(42, FaultLevel::Stormy)
 //!     .with_workers_and_shards(3, 5)
 //!     .run(500, 200);
 //! assert!(report.violations.is_empty());
@@ -51,7 +52,7 @@
 //! # References
 //!
 //! - FoundationDB simulation (Zhou et al., SIGMOD 2021)
-//! - TigerBeetle VOPR (integer-only deterministic testing)
+//! - TigerBeetle VOPR (deterministic simulation testing)
 //! - sled simulation harness
 
 mod harness;
@@ -170,9 +171,9 @@ impl SimContext {
 pub enum FaultLevel {
     /// No faults injected.
     SunnyDay = 1,
-    /// Moderate fault rate -- ~10% lease expiry, ~5% pause, ~10% time jump.
+    /// Moderate fault rate -- ~10% time jump, ~10% lease expiry, ~5% pause.
     Stormy = 2,
-    /// Aggressive fault rate -- ~20% lease expiry, ~10% pause, ~20% time jump.
+    /// Aggressive fault rate -- ~20% time jump, ~20% lease expiry, ~10% pause.
     Radioactive = 3,
 }
 
@@ -195,6 +196,18 @@ const PPM_MAX: u32 = 1_000_000;
 /// Rates are expressed as parts-per-million (0–1 000 000) to eliminate
 /// floating-point non-determinism across platforms. Private fields enforce
 /// validity; use [`FaultConfig::for_level`] to construct.
+///
+/// # Building blocks vs. built-in harness
+///
+/// The public methods on this struct ([`should_expire_lease`](Self::should_expire_lease),
+/// [`should_pause`](Self::should_pause), [`should_time_jump`](Self::should_time_jump),
+/// [`pause_ticks`](Self::pause_ticks), [`time_jump_ticks`](Self::time_jump_ticks)) are
+/// building blocks for custom simulation drivers. The built-in
+/// [`CoordinationSim::run`](super::harness::CoordinationSim::run) does **not** call
+/// `should_expire_lease` or `should_pause` directly — it generates operations via
+/// weighted random op selection and injects faults through `should_time_jump` only.
+/// If you are writing your own simulation loop, you can call any of these methods
+/// to tailor fault injection to your scenario.
 ///
 /// # Fields (sealed)
 ///
@@ -244,11 +257,19 @@ impl FaultConfig {
     }
 
     /// Whether to inject a lease-expiry fault this step.
+    ///
+    /// Available for custom simulation drivers; the built-in
+    /// [`CoordinationSim::run`](super::harness::CoordinationSim::run)
+    /// does not call this method directly.
     pub fn should_expire_lease(&self, rng: &mut ChaCha8Rng) -> bool {
         should_inject(rng, self.lease_expiry_ppm)
     }
 
     /// Whether to inject a worker-pause fault this step.
+    ///
+    /// Available for custom simulation drivers; the built-in
+    /// [`CoordinationSim::run`](super::harness::CoordinationSim::run)
+    /// does not call this method directly.
     pub fn should_pause(&self, rng: &mut ChaCha8Rng) -> bool {
         should_inject(rng, self.pause_ppm)
     }
@@ -279,13 +300,13 @@ impl FaultConfig {
 ///
 /// The draw is uniform over `[0, 1_000_000)` (exclusive upper bound), so
 /// `ppm = 0` never fires and `ppm = 1_000_000` always fires. The
-/// `debug_assert` rejects out-of-range values that would silently skew
+/// `assert` rejects out-of-range values that would silently skew
 /// injection rates.
 fn should_inject(rng: &mut ChaCha8Rng, ppm: u32) -> bool {
     if ppm == 0 {
         return false;
     }
-    debug_assert!(ppm <= PPM_MAX, "PPM rate {ppm} exceeds maximum {PPM_MAX}");
+    assert!(ppm <= PPM_MAX, "PPM rate {ppm} exceeds maximum {PPM_MAX}");
     rng.random_range(0u32..PPM_MAX) < ppm
 }
 

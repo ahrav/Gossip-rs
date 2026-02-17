@@ -28,3 +28,8 @@ rand_chacha = "0.9"
 [[bench]]
 name = "identity"
 harness = false
+
+[[bench]]
+name = "sim"
+harness = false
+required-features = ["test-support"]
