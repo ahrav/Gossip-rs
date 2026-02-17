@@ -80,8 +80,8 @@ use crate::coordination::shard_spec::{
 use crate::coordination::split::{
     DerivedShardKind, MAX_SPAWNED_PER_SHARD, SplitReplaceChild, SplitReplacePlan,
     SplitReplaceResult, SplitResidualPlan, SplitResidualResult, derive_split_shard_id,
-    hash_checkpoint_payload, hash_complete_payload,
-    hash_park_payload, hash_split_replace_payload, hash_split_residual_payload,
+    hash_checkpoint_payload, hash_complete_payload, hash_park_payload, hash_split_replace_payload,
+    hash_split_residual_payload,
 };
 use crate::coordination::traits::CoordinationBackend;
 use crate::coordination::validation::{
@@ -701,7 +701,6 @@ fn split_residual_check_replay(
     parent: &ShardRecord,
     op_id: OpId,
     payload_hash: u64,
-    fresh_residual_id: ShardId,
 ) -> Result<Option<IdempotentOutcome<SplitResidualResult>>, SplitResidualError> {
     if check_op_idempotency(parent, op_id, payload_hash)?.is_some() {
         // Op-log hit. The residual is already in spawned; find it.
