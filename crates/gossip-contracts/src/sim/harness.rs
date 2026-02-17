@@ -249,6 +249,12 @@ pub struct CoordinationSim {
     shard_keys: Vec<ShardKey>,
     tenant: TenantId,
     ops_executed: usize,
+    /// Stale leases saved when B1 cleanup supersedes them, used for
+    /// zombie checkpoint injection to exercise the `StaleFence` path.
+    stale_leases: Vec<(WorkerId, ShardKey, Lease)>,
+    /// Last successful (OpId, Cursor) per (WorkerId, ShardKey) for
+    /// OpId replay/conflict testing.
+    last_checkpoint_ops: BTreeMap<(WorkerId, ShardKey), (crate::identity::OpId, Cursor)>,
 }
 
 impl CoordinationSim {
@@ -264,6 +270,8 @@ impl CoordinationSim {
             shard_keys: Vec::new(),
             tenant: TenantId::from_bytes([0x01; 32]),
             ops_executed: 0,
+            stale_leases: Vec::new(),
+            last_checkpoint_ops: BTreeMap::new(),
         }
     }
 
@@ -375,6 +383,13 @@ impl CoordinationSim {
             SimOp::Checkpoint { worker, key } => self.exec_checkpoint(*worker, *key),
             SimOp::Complete { worker, key } => self.exec_complete(*worker, *key),
             SimOp::Park { worker, key } => self.exec_park(*worker, *key),
+            SimOp::SplitReplace { worker, key } => self.exec_split_replace(*worker, *key),
+            SimOp::SplitResidual { worker, key } => self.exec_split_residual(*worker, *key),
+            SimOp::ReplayCheckpoint { worker, key } => self.exec_replay_checkpoint(*worker, *key),
+            SimOp::ConflictCheckpoint { worker, key } => {
+                self.exec_conflict_checkpoint(*worker, *key)
+            }
+            SimOp::ZombieCheckpoint => self.exec_zombie_checkpoint(),
             SimOp::AdvanceTime { ticks } => {
                 self.context.advance(*ticks);
                 SimEvent::TimeAdvanced {
