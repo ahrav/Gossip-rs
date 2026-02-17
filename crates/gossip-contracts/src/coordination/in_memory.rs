@@ -171,6 +171,25 @@ impl InMemoryCoordinator {
         self.shards.insert((record.tenant, key), record);
     }
 
+    /// Seed a shard record **without** calling `assert_invariants()`.
+    ///
+    /// Only available in test builds — allows inserting intentionally
+    /// invalid records for testing external invariant checkers.
+    #[cfg(test)]
+    pub fn seed_shard_unchecked(&mut self, record: ShardRecord) {
+        let key = ShardKey::new(record.run, record.shard);
+        self.shards.insert((record.tenant, key), record);
+    }
+
+    /// Read-only access to the shard map for external invariant checking.
+    ///
+    /// Gated behind `test-support` or `#[cfg(test)]` -- not part of the
+    /// production API surface.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shards(&self) -> &HashMap<(TenantId, ShardKey), ShardRecord> {
+        &self.shards
+    }
+
     /// Check that adding `additional` shards for `tenant` stays within limits.
     ///
     /// `temporarily_removed` accounts for records that have been removed
