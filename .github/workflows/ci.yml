@@ -15,6 +15,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -112,6 +113,22 @@ jobs:
           shared-key: stable-linux
           save-cache: "false"
       - run: cargo test --all-features --release
+
+  # ── Benchmark (compile check) ────────────────────────────────────
+  bench:
+    name: Bench (compile)
+    runs-on: ubuntu-24.04
+    if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
+    needs: [changes, fmt]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+          save-cache: "false"
+
+      - run: cargo bench --all-features --no-run
 
   # ── MSRV ──────────────────────────────────────────────────────────
   msrv:

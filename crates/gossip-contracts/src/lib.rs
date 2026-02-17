@@ -59,6 +59,9 @@ pub mod shard;
 #[cfg(test)]
 mod test_util;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod sim;
+
 #[cfg(test)]
 mod tests {
     /// Smoke test: blake3 is importable and functional.
