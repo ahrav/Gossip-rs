@@ -61,9 +61,9 @@
 //!
 //! # Performance note
 //!
-//! A `claim_next_available` scan would be O(S log S) over all shards.
-//! Acceptable here; production backends need a secondary available-shards
-//! index.
+//! A future `claim_next_available` would scan all shards — O(S) for a linear
+//! pass, or O(S log S) if sorted by priority. Acceptable here; production
+//! backends need a secondary available-shards index.
 
 use std::collections::HashMap;
 
@@ -631,9 +631,11 @@ fn split_replace_apply_parent(
 /// possible indices `0..spawned.len()`, re-deriving the BLAKE3-based ID
 /// for each and checking membership.
 ///
-/// Complexity: O(S * D) where S = `spawned.len()` and D = BLAKE3 hash
-/// cost. Bounded by `MAX_SPAWNED_PER_SHARD` (1024), so worst case is
-/// ~1024 hashes — acceptable for correctness-critical replay detection.
+/// Complexity: O(S² + S·D) where S = `spawned.len()` and D = BLAKE3 hash
+/// cost (constant). The `contains()` call performs a linear scan of
+/// `spawned` for each candidate. At the bound of `MAX_SPAWNED_PER_SHARD`
+/// (1024), worst case is ~1024 hashes + ~1M `ShardId` comparisons — still
+/// acceptable for correctness-critical replay detection.
 ///
 /// Returns `None` if no match, meaning this is genuinely a new operation.
 fn find_replayed_residual(parent: &ShardRecord, op_id: OpId) -> Option<ShardId> {
