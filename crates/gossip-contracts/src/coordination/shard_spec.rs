@@ -499,6 +499,18 @@ pub enum SplitValidationError {
         new_parent_start: Vec<u8>,
         new_parent_end: Vec<u8>,
     },
+
+    /// The split would exceed the parent's spawn capacity
+    /// ([`MAX_SPAWNED_PER_SHARD`](super::split::MAX_SPAWNED_PER_SHARD)).
+    ///
+    /// Production backends would surface this as a constraint violation;
+    /// the in-memory reference spec matches by returning this error
+    /// instead of panicking at `assert_invariants`.
+    SpawnLimitExceeded {
+        current: usize,
+        additional: usize,
+        max: usize,
+    },
 }
 
 impl fmt::Display for SplitValidationError {
@@ -560,6 +572,14 @@ impl fmt::Display for SplitValidationError {
                 cursor.len(),
                 new_parent_start.len(),
                 new_parent_end.len(),
+            ),
+            Self::SpawnLimitExceeded {
+                current,
+                additional,
+                max,
+            } => write!(
+                f,
+                "spawn limit exceeded: {current} existing + {additional} new > {max} max",
             ),
         }
     }

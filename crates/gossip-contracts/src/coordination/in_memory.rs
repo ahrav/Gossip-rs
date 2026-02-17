@@ -74,10 +74,13 @@ use crate::coordination::error::{
 };
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
-use crate::coordination::shard_spec::{validate_residual_split, validate_split_coverage};
+use crate::coordination::shard_spec::{
+    SplitValidationError, validate_residual_split, validate_split_coverage,
+};
 use crate::coordination::split::{
-    DerivedShardKind, SplitReplaceChild, SplitReplacePlan, SplitReplaceResult, SplitResidualPlan,
-    SplitResidualResult, derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload,
+    DerivedShardKind, MAX_SPAWNED_PER_SHARD, SplitReplaceChild, SplitReplacePlan,
+    SplitReplaceResult, SplitResidualPlan, SplitResidualResult, derive_split_shard_id,
+    hash_checkpoint_payload, hash_complete_payload,
     hash_park_payload, hash_split_replace_payload, hash_split_residual_payload,
 };
 use crate::coordination::traits::CoordinationBackend;
@@ -183,7 +186,7 @@ impl CoordinationBackend for InMemoryCoordinator {
                 .lease
                 .as_ref()
                 .map(|h| (h.owner(), h.deadline()))
-                .unwrap_or((worker, LogicalTime::ZERO));
+                .expect("lease must exist when is_leased_at returns true");
             return Err(AcquireError::AlreadyLeased {
                 current_owner: owner,
                 lease_deadline: deadline,
@@ -389,6 +392,17 @@ impl CoordinationBackend for InMemoryCoordinator {
             validate_split_coverage(&parent.spec, &child_specs)
                 .map_err(|e| SplitReplaceError::SplitInvalid(Box::new(e)))?;
 
+            // Spawn-cap guard: check BEFORE mutating parent.spawned.
+            if !parent.can_spawn(sorted.len()) {
+                return Err(SplitReplaceError::SplitInvalid(Box::new(
+                    SplitValidationError::SpawnLimitExceeded {
+                        current: parent.spawned.len(),
+                        additional: sorted.len(),
+                        max: MAX_SPAWNED_PER_SHARD,
+                    },
+                )));
+            }
+
             // Phase 2: Compute new state (pure — no side effects).
             let (child_ids, children_to_insert) =
                 split_replace_build_children(&parent, &sorted, tenant, op_id);
@@ -456,6 +470,17 @@ impl CoordinationBackend for InMemoryCoordinator {
                 return Ok(replay);
             }
             split_residual_validate_preconditions(now, tenant, lease, &parent, &plan)?;
+
+            // Spawn-cap guard: check BEFORE mutating parent.spawned.
+            if !parent.can_spawn(1) {
+                return Err(SplitResidualError::SplitInvalid(Box::new(
+                    SplitValidationError::SpawnLimitExceeded {
+                        current: parent.spawned.len(),
+                        additional: 1,
+                        max: MAX_SPAWNED_PER_SHARD,
+                    },
+                )));
+            }
 
             // Phase 2: Build residual record (pure).
             let residual_record = split_residual_build_record(&parent, &plan, tenant, residual_id);
@@ -680,7 +705,14 @@ fn split_residual_check_replay(
 ) -> Result<Option<IdempotentOutcome<SplitResidualResult>>, SplitResidualError> {
     if check_op_idempotency(parent, op_id, payload_hash)?.is_some() {
         // Op-log hit. The residual is already in spawned; find it.
-        let replayed = find_replayed_residual(parent, op_id).unwrap_or(fresh_residual_id);
+        // An op-log hit means `split_residual_apply_parent` completed — the
+        // residual was pushed to `parent.spawned` before the op-log entry was
+        // written. If `find_replayed_residual` fails here, it indicates a
+        // logic bug (spawned was mutated without recording the residual).
+        let replayed = find_replayed_residual(parent, op_id).expect(
+            "op-log hit for split_residual implies residual exists in parent.spawned; \
+             missing entry indicates a coordinator bug",
+        );
         return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
             residual: replayed,
         })));
