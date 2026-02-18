@@ -260,6 +260,8 @@ pub fn check_op_idempotency(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::coordination::cursor::Cursor;
     use crate::coordination::lease::{LeaseHolder, OpKind, OpResult};
@@ -473,74 +475,65 @@ mod tests {
     // condition combinations. Verifies the documented check priority:
     //   TenantMismatch > ShardTerminal > StaleFence > LeaseExpired
 
-    #[test]
-    fn validate_lease_error_priority_ordering() {
-        // (wrong_tenant, terminal, stale_fence, expired) → expected winner
-        let cases: &[(bool, bool, bool, bool, &str)] = &[
-            // Pairwise: tenant wins over everything
-            (true, true, false, false, "TenantMismatch"),
-            (true, false, true, false, "TenantMismatch"),
-            (true, false, false, true, "TenantMismatch"),
-            // Pairwise: terminal wins over fence and expired
-            (false, true, true, false, "ShardTerminal"),
-            (false, true, false, true, "ShardTerminal"),
-            // Pairwise: fence wins over expired
-            (false, false, true, true, "StaleFence"),
-            // Triple combinations
-            (true, true, true, false, "TenantMismatch"),
-            (true, true, false, true, "TenantMismatch"),
-            (true, false, true, true, "TenantMismatch"),
-            (false, true, true, true, "ShardTerminal"),
-            // All four active
-            (true, true, true, true, "TenantMismatch"),
-        ];
+    #[rstest]
+    #[case::tenant_over_terminal(true, true, false, false, "TenantMismatch")]
+    #[case::tenant_over_fence(true, false, true, false, "TenantMismatch")]
+    #[case::tenant_over_expired(true, false, false, true, "TenantMismatch")]
+    #[case::terminal_over_fence(false, true, true, false, "ShardTerminal")]
+    #[case::terminal_over_expired(false, true, false, true, "ShardTerminal")]
+    #[case::fence_over_expired(false, false, true, true, "StaleFence")]
+    #[case::triple_tenant_terminal_fence(true, true, true, false, "TenantMismatch")]
+    #[case::triple_tenant_terminal_expired(true, true, false, true, "TenantMismatch")]
+    #[case::triple_tenant_fence_expired(true, false, true, true, "TenantMismatch")]
+    #[case::triple_terminal_fence_expired(false, true, true, true, "ShardTerminal")]
+    #[case::all_four(true, true, true, true, "TenantMismatch")]
+    fn validate_lease_error_priority_ordering(
+        #[case] wrong_tenant: bool,
+        #[case] terminal: bool,
+        #[case] stale_fence: bool,
+        #[case] expired: bool,
+        #[case] expected: &str,
+    ) {
+        let mut record = active_leased_record();
+        let valid_fence = record.fence_epoch;
 
-        for &(wrong_tenant, terminal, stale_fence, expired, expected) in cases {
-            let mut record = active_leased_record();
-            let valid_fence = record.fence_epoch;
-
-            if wrong_tenant {
-                record.tenant = other_tenant();
-            }
-            if terminal {
-                record.status = crate::coordination::record::ShardStatus::Done;
-                record.lease = None;
-            }
-
-            let lease = Lease::new(
-                test_tenant(),
-                test_run(),
-                test_shard(),
-                WorkerId::from_raw(99),
-                if stale_fence {
-                    FenceEpoch::INITIAL
-                } else {
-                    valid_fence
-                },
-                LogicalTime::from_raw(100),
-            );
-
-            let now = if expired {
-                LogicalTime::from_raw(200)
-            } else {
-                LogicalTime::from_raw(50)
-            };
-
-            let result = validate_lease(now, test_tenant(), &lease, &record);
-            let err = result.unwrap_err();
-            let actual = match &err {
-                CoordError::TenantMismatch { .. } => "TenantMismatch",
-                CoordError::ShardTerminal { .. } => "ShardTerminal",
-                CoordError::StaleFence { .. } => "StaleFence",
-                CoordError::LeaseExpired { .. } => "LeaseExpired",
-                other => panic!("unexpected error: {other:?}"),
-            };
-            assert_eq!(
-                actual, expected,
-                "wrong_tenant={wrong_tenant}, terminal={terminal}, \
-                 stale_fence={stale_fence}, expired={expired}"
-            );
+        if wrong_tenant {
+            record.tenant = other_tenant();
         }
+        if terminal {
+            record.status = crate::coordination::record::ShardStatus::Done;
+            record.lease = None;
+        }
+
+        let lease = Lease::new(
+            test_tenant(),
+            test_run(),
+            test_shard(),
+            WorkerId::from_raw(99),
+            if stale_fence {
+                FenceEpoch::INITIAL
+            } else {
+                valid_fence
+            },
+            LogicalTime::from_raw(100),
+        );
+
+        let now = if expired {
+            LogicalTime::from_raw(200)
+        } else {
+            LogicalTime::from_raw(50)
+        };
+
+        let result = validate_lease(now, test_tenant(), &lease, &record);
+        let err = result.unwrap_err();
+        let actual = match &err {
+            CoordError::TenantMismatch { .. } => "TenantMismatch",
+            CoordError::ShardTerminal { .. } => "ShardTerminal",
+            CoordError::StaleFence { .. } => "StaleFence",
+            CoordError::LeaseExpired { .. } => "LeaseExpired",
+            other => panic!("unexpected error: {other:?}"),
+        };
+        assert_eq!(actual, expected);
     }
 
     // -- validate_lease: boundary tests ----------------------------------

@@ -334,58 +334,41 @@ pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     // -- Debug format safety --
 
-    #[test]
-    fn restricted_types_debug_is_redacted() {
-        let cases: &[(&str, &str)] = &[
-            (
-                &format!("{:?}", NormHash::from_digest([0xFF; 32])),
-                "NormHash([redacted])",
-            ),
-            (
-                &format!("{:?}", SecretHash::from_bytes_internal([0xFF; 32])),
-                "SecretHash([redacted])",
-            ),
-        ];
-
-        for (actual, expected) in cases {
-            assert_eq!(actual, expected, "Debug mismatch for {expected}");
-            assert!(
-                !actual.contains("ff"),
-                "restricted Debug must not leak hex bytes: {actual}"
-            );
-        }
+    #[rstest]
+    #[case::norm_hash_redacted(format!("{:?}", NormHash::from_digest([0xFF; 32])), "NormHash([redacted])")]
+    #[case::secret_hash_redacted(format!("{:?}", SecretHash::from_bytes_internal([0xFF; 32])), "SecretHash([redacted])")]
+    fn restricted_types_debug_is_redacted(#[case] actual: String, #[case] expected: &str) {
+        assert_eq!(actual, expected);
+        assert!(
+            !actual.contains("ff"),
+            "restricted Debug must not leak hex bytes: {actual}"
+        );
     }
 
-    #[test]
-    fn public_types_debug_is_safe() {
-        let cases: &[String] = &[
-            format!("{:?}", RuleFingerprint::from_bytes([0xAB; 32])),
-            format!("{:?}", FindingId::from_bytes([0xCD; 32])),
-            format!("{:?}", OccurrenceId::from_bytes([0xEF; 32])),
-        ];
-
-        let type_names = ["RuleFingerprint", "FindingId", "OccurrenceId"];
-
-        for (dbg, name) in cases.iter().zip(type_names.iter()) {
-            assert!(
-                dbg.starts_with(name),
-                "{name} Debug should start with type name, got: {dbg}"
-            );
-            assert!(
-                dbg.len() < 80,
-                "{name} Debug too long ({} chars): {dbg}",
-                dbg.len()
-            );
-            // Public types show hex prefix.
-            assert!(
-                dbg.contains(|c: char| c.is_ascii_hexdigit()),
-                "{name} Debug should contain hex: {dbg}"
-            );
-        }
+    #[rstest]
+    #[case::rule_fingerprint(format!("{:?}", RuleFingerprint::from_bytes([0xAB; 32])), "RuleFingerprint")]
+    #[case::finding_id(format!("{:?}", FindingId::from_bytes([0xCD; 32])), "FindingId")]
+    #[case::occurrence_id(format!("{:?}", OccurrenceId::from_bytes([0xEF; 32])), "OccurrenceId")]
+    fn public_types_debug_is_safe(#[case] dbg: String, #[case] name: &str) {
+        assert!(
+            dbg.starts_with(name),
+            "{name} Debug should start with type name, got: {dbg}"
+        );
+        assert!(
+            dbg.len() < 80,
+            "{name} Debug too long ({} chars): {dbg}",
+            dbg.len()
+        );
+        assert!(
+            dbg.contains(|c: char| c.is_ascii_hexdigit()),
+            "{name} Debug should contain hex: {dbg}"
+        );
     }
 
     // -- Property-based --

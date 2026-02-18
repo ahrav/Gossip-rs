@@ -818,6 +818,8 @@ pub fn validate_residual_split(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::test_util::{
         arb_bounded_shard_spec, arb_bounded_shard_spec_with_metadata, arb_shard_spec,
@@ -859,75 +861,29 @@ mod tests {
     // ShardSpec construction
     // -------------------------------------------------------------------
 
-    // (label, spec, expected_start, expected_end, start_ub, end_ub, full_ub)
-    type ConstructionCase<'a> = (&'a str, ShardSpec, &'a [u8], &'a [u8], bool, bool, bool);
+    #[rstest]
+    #[case::unbounded(ShardSpec::unbounded(), b"" as &[u8], b"" as &[u8], true, true, true)]
+    #[case::bounded_a_m(ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()), b"a", b"m", false, false, false)]
+    #[case::start_unbounded(ShardSpec::with_range(vec![], b"m".to_vec()), b"", b"m", true, false, false)]
+    #[case::end_unbounded(ShardSpec::with_range(b"m".to_vec(), vec![]), b"m", b"", false, true, false)]
+    fn shard_spec_construction_truth_table(
+        #[case] spec: ShardSpec,
+        #[case] exp_start: &[u8],
+        #[case] exp_end: &[u8],
+        #[case] start_ub: bool,
+        #[case] end_ub: bool,
+        #[case] full_ub: bool,
+    ) {
+        assert_eq!(spec.key_range_start(), exp_start);
+        assert_eq!(spec.key_range_end(), exp_end);
+        assert_eq!(spec.is_start_unbounded(), start_ub);
+        assert_eq!(spec.is_end_unbounded(), end_ub);
+        assert_eq!(spec.is_unbounded(), full_ub);
+    }
 
     #[test]
-    fn shard_spec_construction_truth_table() {
-        let cases: &[ConstructionCase<'_>] = &[
-            (
-                "unbounded",
-                ShardSpec::unbounded(),
-                b"",
-                b"",
-                true,
-                true,
-                true,
-            ),
-            (
-                "bounded [a,m)",
-                ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-                b"a",
-                b"m",
-                false,
-                false,
-                false,
-            ),
-            (
-                "start-unbounded [,m)",
-                ShardSpec::with_range(vec![], b"m".to_vec()),
-                b"",
-                b"m",
-                true,
-                false,
-                false,
-            ),
-            (
-                "end-unbounded [m,)",
-                ShardSpec::with_range(b"m".to_vec(), vec![]),
-                b"m",
-                b"",
-                false,
-                true,
-                false,
-            ),
-        ];
-
-        for (label, spec, exp_start, exp_end, start_ub, end_ub, full_ub) in cases {
-            assert_eq!(
-                spec.key_range_start(),
-                *exp_start,
-                "{label}: key_range_start"
-            );
-            assert_eq!(spec.key_range_end(), *exp_end, "{label}: key_range_end");
-            assert_eq!(
-                spec.is_start_unbounded(),
-                *start_ub,
-                "{label}: is_start_unbounded"
-            );
-            assert_eq!(
-                spec.is_end_unbounded(),
-                *end_ub,
-                "{label}: is_end_unbounded"
-            );
-            assert_eq!(spec.is_unbounded(), *full_ub, "{label}: is_unbounded");
-        }
-
-        // Unbounded spec also has empty metadata.
-        assert!(
-            ShardSpec::unbounded().metadata().is_empty(),
-            "unbounded: metadata"
-        );
+    fn shard_spec_unbounded_has_empty_metadata() {
+        assert!(ShardSpec::unbounded().metadata().is_empty());
     }
 
     #[test]
