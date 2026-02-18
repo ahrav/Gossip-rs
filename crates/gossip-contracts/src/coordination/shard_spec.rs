@@ -220,6 +220,21 @@ impl ShardSpec {
     /// Panics if `start` and `end` are both non-empty and `start >= end`.
     #[must_use = "creates a shard spec that should be stored or used"]
     pub fn with_range_and_metadata(start: Vec<u8>, end: Vec<u8>, metadata: Vec<u8>) -> Self {
+        assert!(
+            start.len() <= MAX_KEY_SIZE,
+            "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
+            start.len(),
+        );
+        assert!(
+            end.len() <= MAX_KEY_SIZE,
+            "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
+            end.len(),
+        );
+        assert!(
+            metadata.len() <= MAX_METADATA_SIZE,
+            "ShardSpec: metadata too large ({} bytes, max {MAX_METADATA_SIZE})",
+            metadata.len(),
+        );
         if !start.is_empty() && !end.is_empty() {
             assert!(
                 start.as_slice() < end.as_slice(),
@@ -896,6 +911,28 @@ mod tests {
     #[should_panic(expected = "start must be strictly less than end")]
     fn shard_spec_equal_bounds_panics() {
         let _ = ShardSpec::with_range(b"a".to_vec(), b"a".to_vec());
+    }
+
+    #[test]
+    #[should_panic(expected = "key too large")]
+    fn with_range_panics_on_oversized_start_key() {
+        let _ = ShardSpec::with_range(vec![0x01; MAX_KEY_SIZE + 1], vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "key too large")]
+    fn with_range_panics_on_oversized_end_key() {
+        let _ = ShardSpec::with_range(vec![], vec![0xFF; MAX_KEY_SIZE + 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "metadata too large")]
+    fn with_range_and_metadata_panics_on_oversized_metadata() {
+        let _ = ShardSpec::with_range_and_metadata(
+            b"a".to_vec(),
+            b"z".to_vec(),
+            vec![0xAA; MAX_METADATA_SIZE + 1],
+        );
     }
 
     // -------------------------------------------------------------------
