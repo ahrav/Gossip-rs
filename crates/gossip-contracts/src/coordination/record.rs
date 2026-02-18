@@ -254,7 +254,7 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 /// 4. `fence_epoch >= FenceEpoch::INITIAL`
 /// 5. `op_log.len() <= OP_LOG_CAP`
 /// 6. `status == Split` implies `!spawned.is_empty()`
-/// 7. `parent.is_some()` implies `shard.is_derived()`
+/// 7. `parent.is_some()` iff `shard.is_derived()`
 /// 8. All entries in `spawned` satisfy `is_derived() == true`
 /// 9. `op_log` entries have unique `OpId` values
 /// 10. `spawned.len() <= MAX_SPAWNED_PER_SHARD`
@@ -490,8 +490,8 @@ impl ShardRecord {
         );
     }
 
-    /// INV-6 through INV-10 + INV-7b: split/spawned, parent/derived, op-log
-    /// uniqueness, spawned cap.
+    /// INV-6 through INV-10: split/spawned, parent/derived (biconditional),
+    /// op-log uniqueness, spawned cap.
     fn assert_lineage_invariants(&self) {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split {
@@ -502,7 +502,7 @@ impl ShardRecord {
             );
         }
 
-        // INV-7: parent.is_some() implies shard.is_derived().
+        // INV-7: parent.is_some() iff shard.is_derived().
         if self.parent.is_some() {
             assert!(
                 self.shard.is_derived(),
@@ -510,8 +510,6 @@ impl ShardRecord {
                 self.shard,
             );
         }
-
-        // INV-7b: Derived shard must have a parent (converse of INV-7).
         if self.shard.is_derived() {
             assert!(
                 self.parent.is_some(),
