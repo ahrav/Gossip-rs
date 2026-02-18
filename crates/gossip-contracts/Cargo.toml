@@ -14,6 +14,7 @@ default = []
 test-support = ["dep:rand", "dep:rand_chacha"]
 
 [dependencies]
+ahash = "0.8"
 blake3 = "1.8"
 subtle = "2.6"
 rand = { version = "0.9", optional = true }
@@ -32,5 +33,10 @@ harness = false
 
 [[bench]]
 name = "sim"
+harness = false
+required-features = ["test-support"]
+
+[[bench]]
+name = "coordination"
 harness = false
 required-features = ["test-support"]
