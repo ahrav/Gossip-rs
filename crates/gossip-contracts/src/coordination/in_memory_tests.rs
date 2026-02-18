@@ -1836,7 +1836,7 @@ proptest! {
             (time, op_counter) = apply_op(&mut coord, &op, time, op_counter, &mut last_lease);
 
             // After every op, all records must satisfy invariants.
-            for record in coord.shards.values() {
+            for (_, record) in coord.shards() {
                 record.assert_invariants();
             }
         }

@@ -706,7 +706,7 @@ impl CoordinationSim {
 
     /// Look up a shard's spec from the coordinator.
     fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
-        match self.coordinator.shards().get(&(self.tenant, key)) {
+        match self.coordinator.shard_lookup(&self.tenant, &key) {
             Some(record) => Ok(record.spec.clone()),
             None => Err(SimEvent::Rejected {
                 kind: RejectionKind::ShardNotFound,
@@ -823,8 +823,7 @@ impl CoordinationSim {
         };
         let parent_cursor_key = self
             .coordinator
-            .shards()
-            .get(&(self.tenant, key))
+            .shard_lookup(&self.tenant, &key)
             .and_then(|r| r.cursor.last_key().map(|k| k.to_vec()));
 
         let start = parent_spec.key_range_start();
@@ -1321,8 +1320,7 @@ impl CoordinationSim {
         // Look up this shard's actual spec bounds from the coordinator.
         let (spec_start, spec_end) = self
             .coordinator
-            .shards()
-            .get(&(self.tenant, key))
+            .shard_lookup(&self.tenant, &key)
             .map(|r| {
                 (
                     r.spec.key_range_start().to_vec(),
@@ -1455,8 +1453,7 @@ impl CoordinationSim {
         for key in &self.shard_keys {
             let record = self
                 .coordinator
-                .shards()
-                .get(&(self.tenant, *key))
+                .shard_lookup(&self.tenant, key)
                 .expect("shard key missing from coordinator — registration bug");
             if !record.status.is_terminal() {
                 return false;

@@ -127,12 +127,13 @@ impl InvariantChecker {
         now: LogicalTime,
     ) -> Vec<InvariantViolation> {
         let mut violations = Vec::new();
-        let shards = coordinator.shards();
+        // Collect into a Vec so we can iterate AND do point lookups.
+        let shards: Vec<_> = coordinator.shards().collect();
 
         // Reuse S1 buffer across calls to avoid per-call allocation.
         self.active_holders.clear();
 
-        for (&(tid, key), record) in shards {
+        for &((tid, key), record) in &shards {
             if tid != tenant {
                 continue;
             }
@@ -254,7 +255,7 @@ impl InvariantChecker {
                     self.scratch_wrong_parent.clear();
                     for &child_id in &record.spawned {
                         let child_key = ShardKey::new(record.run, child_id);
-                        match shards.get(&(tenant, child_key)) {
+                        match coordinator.shard_lookup(&tenant, &child_key) {
                             Some(child_record) => {
                                 if child_record.parent != Some(record.shard) {
                                     self.scratch_wrong_parent.push(child_id);

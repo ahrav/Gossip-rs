@@ -1177,6 +1177,31 @@ impl ShardFilter {
         }
         true
     }
+
+    /// Pre-filter on [`ShardRecord`] fields before constructing a
+    /// [`ShardSummary`] (which heap-allocates key ranges).
+    ///
+    /// Equivalent to `self.matches(&ShardSummary::from_record(record, now))`
+    /// but avoids the 2-3 heap allocations per record that `from_record`
+    /// performs. At 10K shards with a selective filter, this turns ~30K
+    /// wasted allocations into ~30.
+    #[must_use]
+    pub fn matches_record(&self, record: &ShardRecord, now: LogicalTime) -> bool {
+        if let Some(status) = self.status
+            && record.status != status
+        {
+            return false;
+        }
+        if let Some(leased) = self.is_leased
+            && record.is_leased_at(now) != leased
+        {
+            return false;
+        }
+        if self.root_only && record.parent.is_some() {
+            return false;
+        }
+        true
+    }
 }
 
 // ============================================================================

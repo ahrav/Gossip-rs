@@ -11,7 +11,7 @@
 //!
 //! - **Single-threaded** — `&mut self` serializes all operations, eliminating
 //!   concurrency concerns so invariants can be verified in-line.
-//! - **Purely in-memory** — `HashMap<(TenantId, ShardKey), ShardRecord>`.
+//! - **Purely in-memory** — two-level `AHashMap<TenantId, AHashMap<ShardKey, ShardRecord>>`.
 //!   No I/O, no transactions, no retries.
 //! - **Tiger-style invariant enforcement** — every mutation path calls
 //!   [`ShardRecord::assert_invariants()`] before returning. A violated
@@ -102,14 +102,22 @@ use crate::coordination::validation::{
 };
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
+/// aHash-backed `HashMap` — ~3x faster hashing than SipHash for point
+/// lookups, with equal DOS resistance (keyed via AES-NI hardware).
+type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
+
 /// In-memory coordinator for shard-level operations.
 ///
 /// # Keying strategy
 ///
-/// Records are stored in a `HashMap<(TenantId, ShardKey), ShardRecord>`.
-/// The composite key `(TenantId, ShardKey)` enforces tenant isolation at
-/// the data-structure level: a lookup with the wrong tenant simply misses,
-/// preventing cross-tenant data leakage even if higher-level checks have bugs.
+/// Shards use a two-level map: `AHashMap<TenantId, AHashMap<ShardKey, ShardRecord>>`.
+/// The outer level provides O(1) tenant isolation — a wrong-tenant lookup misses
+/// at the outer map without scanning any shard records. The inner level reduces
+/// hash input from 48 bytes (composite key) to 16 bytes (`ShardKey` only).
+///
+/// `total_shard_count` is maintained inline (incremented on insert, decremented
+/// on remove) so that global limit checks remain O(1) instead of O(T) where
+/// T = number of tenants.
 ///
 /// # Lease duration
 ///
@@ -119,14 +127,23 @@ use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, Wor
 /// share the same duration.
 #[derive(Debug)]
 pub struct InMemoryCoordinator {
-    shards: HashMap<(TenantId, ShardKey), ShardRecord>,
-    runs: HashMap<(TenantId, RunId), RunRecord>,
+    /// Two-level shard map: tenant → (shard_key → record).
+    ///
+    /// Per-tenant shard count is `inner.len()` — O(1) instead of the
+    /// previous O(N) full-map scan in `check_shard_limits`.
+    shards: AHashMap<TenantId, AHashMap<ShardKey, ShardRecord>>,
+    /// Global shard count, maintained inline on insert/remove.
+    ///
+    /// Invariant: `total_shard_count == self.shards.values().map(|m| m.len()).sum::<usize>()`.
+    /// Verified via `debug_assert!` after mutations.
+    total_shard_count: usize,
+    runs: AHashMap<(TenantId, RunId), RunRecord>,
     /// Secondary index: run → shard IDs (root + split children).
     ///
     /// Avoids a full `shards` map scan when computing run progress or
     /// listing shards for a single run. Updated by `register_shards`
     /// and split operations (`split_replace`, `split_residual`).
-    run_shards: HashMap<(TenantId, RunId), Vec<ShardId>>,
+    run_shards: AHashMap<(TenantId, RunId), Vec<ShardId>>,
     default_lease_duration: u64,
     max_shards_per_tenant: usize,
     max_total_shards: usize,
@@ -160,9 +177,10 @@ impl InMemoryCoordinator {
         );
         assert!(max_total_shards > 0, "max_total_shards must be > 0");
         Self {
-            shards: HashMap::new(),
-            runs: HashMap::new(),
-            run_shards: HashMap::new(),
+            shards: AHashMap::default(),
+            total_shard_count: 0,
+            runs: AHashMap::default(),
+            run_shards: AHashMap::default(),
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
@@ -186,7 +204,7 @@ impl InMemoryCoordinator {
     pub fn seed_shard(&mut self, record: ShardRecord) {
         record.assert_invariants();
         let key = ShardKey::new(record.run, record.shard);
-        self.shards.insert((record.tenant, key), record);
+        self.shard_insert(record.tenant, key, record);
     }
 
     /// Seed a shard record **without** calling `assert_invariants()`.
@@ -196,16 +214,82 @@ impl InMemoryCoordinator {
     #[cfg(test)]
     pub fn seed_shard_unchecked(&mut self, record: ShardRecord) {
         let key = ShardKey::new(record.run, record.shard);
-        self.shards.insert((record.tenant, key), record);
+        self.shard_insert(record.tenant, key, record);
     }
 
     /// Read-only access to the shard map for external invariant checking.
     ///
+    /// Returns a flat iterator over `((TenantId, ShardKey), &ShardRecord)`
+    /// to preserve the API contract for test callers.
+    ///
     /// Gated behind `test-support` or `#[cfg(test)]` -- not part of the
     /// production API surface.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn shards(&self) -> &HashMap<(TenantId, ShardKey), ShardRecord> {
-        &self.shards
+    pub fn shards(&self) -> impl Iterator<Item = ((TenantId, ShardKey), &ShardRecord)> {
+        self.shards.iter().flat_map(|(&tenant, inner)| {
+            inner
+                .iter()
+                .map(move |(&key, record)| ((tenant, key), record))
+        })
+    }
+
+    /// Total number of shard records across all tenants.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shard_count(&self) -> usize {
+        self.total_shard_count
+    }
+
+    /// Point-lookup a shard record by `(TenantId, ShardKey)` for test code.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
+        self.shard_get(tenant, key)
+    }
+
+    // -- Internal two-level map helpers --
+
+    /// Look up a shard record by tenant and key.
+    fn shard_get(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
+        self.shards.get(tenant).and_then(|m| m.get(key))
+    }
+
+    /// Look up a mutable shard record by tenant and key.
+    fn shard_get_mut(&mut self, tenant: &TenantId, key: &ShardKey) -> Option<&mut ShardRecord> {
+        self.shards.get_mut(tenant).and_then(|m| m.get_mut(key))
+    }
+
+    /// Insert a shard record, maintaining `total_shard_count`.
+    fn shard_insert(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
+        let inner = self.shards.entry(tenant).or_default();
+        if inner.insert(key, record).is_none() {
+            self.total_shard_count += 1;
+        }
+        self.debug_assert_shard_count();
+    }
+
+    /// Remove a shard record, maintaining `total_shard_count`.
+    /// Returns the removed record, or `None` if not found.
+    fn shard_remove(&mut self, tenant: &TenantId, key: &ShardKey) -> Option<ShardRecord> {
+        let inner = self.shards.get_mut(tenant)?;
+        let removed = inner.remove(key);
+        if removed.is_some() {
+            self.total_shard_count -= 1;
+        }
+        self.debug_assert_shard_count();
+        removed
+    }
+
+    /// Check whether a shard key exists for the given tenant.
+    fn shard_contains(&self, tenant: &TenantId, key: &ShardKey) -> bool {
+        self.shards.get(tenant).is_some_and(|m| m.contains_key(key))
+    }
+
+    /// Assert `total_shard_count` invariant in debug/test builds.
+    fn debug_assert_shard_count(&self) {
+        debug_assert_eq!(
+            self.total_shard_count,
+            self.shards.values().map(|m| m.len()).sum::<usize>(),
+            "total_shard_count drift detected"
+        );
     }
 
     /// Check that adding `additional` shards for `tenant` stays within limits.
@@ -220,9 +304,8 @@ impl InMemoryCoordinator {
         additional: usize,
         temporarily_removed: usize,
     ) -> Result<(), SplitValidationError> {
-        // Per-tenant limit (restored parent(s) are for this tenant).
-        let tenant_count =
-            self.shards.keys().filter(|(t, _)| *t == tenant).count() + temporarily_removed;
+        // Per-tenant limit: O(1) via inner map len().
+        let tenant_count = self.shards.get(&tenant).map_or(0, |m| m.len()) + temporarily_removed;
         if tenant_count + additional > self.max_shards_per_tenant {
             return Err(SplitValidationError::ShardLimitExceeded {
                 current: tenant_count,
@@ -232,8 +315,8 @@ impl InMemoryCoordinator {
             });
         }
 
-        // Global limit.
-        let total_count = self.shards.len() + temporarily_removed;
+        // Global limit: O(1) via maintained counter.
+        let total_count = self.total_shard_count + temporarily_removed;
         if total_count + additional > self.max_total_shards {
             return Err(SplitValidationError::ShardLimitExceeded {
                 current: total_count,
@@ -261,8 +344,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     ) -> Result<AcquireResult, AcquireError> {
         let lease_duration = self.default_lease_duration;
         let record = self
-            .shards
-            .get_mut(&(tenant, key))
+            .shard_get_mut(&tenant, &key)
             .ok_or(AcquireError::ShardNotFound { shard: key })?;
 
         // 1) Tenant isolation (SEC-1): checked first so that a wrong-tenant
@@ -325,8 +407,7 @@ impl CoordinationBackend for InMemoryCoordinator {
         let key = lease.shard_key();
         let lease_duration = self.default_lease_duration;
         let record = self
-            .shards
-            .get_mut(&(tenant, key))
+            .shard_get_mut(&tenant, &key)
             .ok_or(RenewError::ShardNotFound { shard: key })?;
 
         validate_lease(now, tenant, lease, record)?;
@@ -352,8 +433,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     ) -> Result<IdempotentOutcome<()>, CheckpointError> {
         let key = lease.shard_key();
         let record = self
-            .shards
-            .get_mut(&(tenant, key))
+            .shard_get_mut(&tenant, &key)
             .ok_or(CheckpointError::ShardNotFound { shard: key })?;
 
         // Idempotency checked before lease so replays succeed even after
@@ -390,8 +470,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
         let key = lease.shard_key();
         let record = self
-            .shards
-            .get_mut(&(tenant, key))
+            .shard_get_mut(&tenant, &key)
             .ok_or(CompleteError::ShardNotFound { shard: key })?;
 
         let payload_hash = hash_complete_payload(&final_cursor);
@@ -429,8 +508,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     ) -> Result<IdempotentOutcome<()>, ParkError> {
         let key = lease.shard_key();
         let record = self
-            .shards
-            .get_mut(&(tenant, key))
+            .shard_get_mut(&tenant, &key)
             .ok_or(ParkError::ShardNotFound { shard: key })?;
 
         let payload_hash = hash_park_payload(reason);
@@ -466,15 +544,13 @@ impl CoordinationBackend for InMemoryCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
         let key = lease.shard_key();
-        let map_key = (tenant, key);
 
         // Remove-mutate-restore pattern: we need `&mut parent` for mutation
         // AND `&mut self.shards` for child insertion, which Rust's borrow
         // checker forbids simultaneously via `get_mut`. Removing the parent
         // resolves this. See module-level docs for the panic-safety rationale.
         let mut parent = self
-            .shards
-            .remove(&map_key)
+            .shard_remove(&tenant, &key)
             .ok_or(SplitReplaceError::ShardNotFound { shard: key })?;
 
         let result = (|| {
@@ -505,11 +581,11 @@ impl CoordinationBackend for InMemoryCoordinator {
             // Phase 3: Apply mutations. Collision check is defense-in-depth:
             // derive_split_shard_id uses BLAKE3 with domain separation, so
             // collisions indicate a logic bug, not a hash weakness.
-            for (k, _) in &children_to_insert {
-                if self.shards.contains_key(k) {
+            for (child_key, _) in &children_to_insert {
+                if self.shard_contains(&child_key.0, &child_key.1) {
                     return Err(SplitReplaceError::SplitInvalid(Box::new(
                         SplitValidationError::DerivedIdCollision {
-                            derived_id: k.1.shard(),
+                            derived_id: child_key.1.shard(),
                         },
                     )));
                 }
@@ -517,9 +593,9 @@ impl CoordinationBackend for InMemoryCoordinator {
 
             split_replace_apply_parent(&mut parent, &child_ids, op_id, payload_hash, now);
 
-            for (k, v) in children_to_insert {
+            for (child_key, v) in children_to_insert {
                 let child_shard = v.shard;
-                self.shards.insert(k, v);
+                self.shard_insert(child_key.0, child_key.1, v);
                 self.index_shard(tenant, parent.run, child_shard);
             }
 
@@ -530,7 +606,7 @@ impl CoordinationBackend for InMemoryCoordinator {
         })();
 
         // Always restore the parent record (mutated or not).
-        self.shards.insert(map_key, parent);
+        self.shard_insert(tenant, key, parent);
         result
     }
 
@@ -543,11 +619,9 @@ impl CoordinationBackend for InMemoryCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
         let key = lease.shard_key();
-        let map_key = (tenant, key);
 
         let mut parent = self
-            .shards
-            .remove(&map_key)
+            .shard_remove(&tenant, &key)
             .ok_or(SplitResidualError::ShardNotFound { shard: key })?;
 
         let result = (|| {
@@ -580,7 +654,7 @@ impl CoordinationBackend for InMemoryCoordinator {
 
             // Phase 3: Apply mutations.
             let residual_key = ShardKey::new(parent.run, residual_id);
-            if self.shards.contains_key(&(tenant, residual_key)) {
+            if self.shard_contains(&tenant, &residual_key) {
                 return Err(SplitResidualError::SplitInvalid(Box::new(
                     SplitValidationError::DerivedIdCollision {
                         derived_id: residual_id,
@@ -597,7 +671,7 @@ impl CoordinationBackend for InMemoryCoordinator {
                 now,
             );
 
-            self.shards.insert((tenant, residual_key), residual_record);
+            self.shard_insert(tenant, residual_key, residual_record);
             self.index_shard(tenant, parent.run, residual_id);
 
             // TODO(events): emit ShardResidualCreated
@@ -606,7 +680,7 @@ impl CoordinationBackend for InMemoryCoordinator {
             }))
         })();
 
-        self.shards.insert(map_key, parent);
+        self.shard_insert(tenant, key, parent);
         result
     }
 }
@@ -1131,7 +1205,7 @@ impl RunManagement for InMemoryCoordinator {
                 sr.cursor = s.cursor().clone();
             }
             sr.assert_invariants();
-            self.shards.insert((tenant, key), sr);
+            self.shard_insert(tenant, key, sr);
         }
 
         // Batch-insert into run→shards index (validate_manifest guarantees uniqueness).
@@ -1176,7 +1250,7 @@ impl RunManagement for InMemoryCoordinator {
             // Order-independent: iterate shard_ids, look up each record.
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
-                if let Some(record) = self.shards.get(&(tenant, key)) {
+                if let Some(record) = self.shard_get(&tenant, &key) {
                     let is_leased = record.is_leased_at(now);
                     progress.count_shard(record.status, is_leased);
                 }
@@ -1198,11 +1272,14 @@ impl RunManagement for InMemoryCoordinator {
         if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
-                if let Some(record) = self.shards.get(&(tenant, key)) {
-                    let summary = ShardSummary::from_record(record, now);
-                    if filter.matches(&summary) {
-                        summaries.push(summary);
+                if let Some(record) = self.shard_get(&tenant, &key) {
+                    // Pre-filter on record fields before constructing
+                    // ShardSummary (which heap-allocates key ranges).
+                    if !filter.matches_record(record, now) {
+                        continue;
                     }
+                    let summary = ShardSummary::from_record(record, now);
+                    summaries.push(summary);
                 }
             }
         }
@@ -1385,8 +1462,7 @@ impl RunManagement for InMemoryCoordinator {
         let payload_hash = hash_unpark_payload(&key);
 
         let record = self
-            .shards
-            .get(&(tenant, key))
+            .shard_get(&tenant, &key)
             .ok_or(UnparkError::ShardNotFound)?;
         if record.tenant != tenant {
             return Err(UnparkError::TenantMismatch { expected: tenant });
@@ -1425,7 +1501,7 @@ impl RunManagement for InMemoryCoordinator {
             });
         }
 
-        let record = self.shards.get_mut(&(tenant, key)).unwrap();
+        let record = self.shard_get_mut(&tenant, &key).unwrap();
 
         // Bump fence FIRST (fence any zombie workers from the prior lease).
         record.fence_epoch = record.fence_epoch.increment();
