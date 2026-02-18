@@ -337,7 +337,7 @@ Output the standard doc-verify report format with BLOCK/WARN/INFO findings.
 ### When to Skip
 
 - If `--skip-doc-verify` flag is set, skip this phase entirely.
-- If no modified files contain doc comments (verified via quick Grep for `///` or `//!`),
+- If no modified files contain doc comments (verified via quick Grep for doc-comment prefixes),
   skip with a note in the summary.
 
 ## Phase 6: Summary Report
