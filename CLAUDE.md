@@ -207,6 +207,43 @@ the codebase first, the change will be rejected. No exceptions.
 
 <!-- end-duplication-prevention -->
 
+<!-- no-versioning-v1 -->
+
+## No Versioning, No Legacy Code — MANDATORY
+
+This is pre-release developmental code with zero backwards-compatibility
+obligations. There is exactly one version: the current one.
+
+### Rules
+
+1. **Never version APIs, structs, enums, or serialization formats.** No `V1`/`V2`
+   suffixes, no `_v2` functions, no version discriminants in wire formats.
+2. **Never introduce `#[deprecated]` attributes.** If something is wrong, fix it
+   or remove it. Do not leave the old path around with a deprecation warning.
+3. **Never create legacy or compatibility shims.** No `old_*` / `new_*` parallel
+   implementations, no feature flags gating old behavior, no migration layers.
+4. **All changes are breaking.** Rename, restructure, and delete freely. Callers
+   must be updated in the same commit. There are no downstream consumers to
+   protect.
+5. **One code path per behavior.** If a refactor replaces an approach, delete the
+   old approach entirely. Dead code is a liability, not a safety net.
+6. **No `cfg` gates for old-vs-new.** Feature flags are for optional capabilities,
+   not for preserving defunct logic.
+
+### What This Means in Practice
+
+- Changing a struct field? Rename it everywhere in one pass.
+- Replacing an algorithm? Delete the old one, wire in the new one.
+- Updating serialization? Change the format, update all readers/writers.
+- Removing a public function? Remove it and fix every call site.
+
+### Enforcement
+
+Any PR that introduces versioned types, deprecated annotations, compatibility
+shims, or parallel old/new code paths will be rejected. No exceptions.
+
+<!-- end-no-versioning -->
+
 ## Rust Code Modification Workflow
 
 After modifying Rust code, ALWAYS run these steps:

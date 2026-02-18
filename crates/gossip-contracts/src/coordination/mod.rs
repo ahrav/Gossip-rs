@@ -26,6 +26,8 @@ pub mod error;
 pub mod in_memory;
 pub mod lease;
 pub mod record;
+pub mod run;
+pub mod run_errors;
 pub mod shard_spec;
 pub mod split;
 pub mod traits;
@@ -43,6 +45,18 @@ pub use error::{
 pub use in_memory::InMemoryCoordinator;
 pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};
+pub use run::RunManagement;
+pub use run::{
+    InitialShard, MAX_INITIAL_SHARDS, ManifestValidationError, RunConfig, RunConfigError,
+    RunOpIdConflict, RunOpKind, RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus,
+    RunTerminalEvaluation, ShardFilter, ShardSummary, evaluate_run_terminal,
+    hash_cancel_run_payload, hash_complete_run_payload, hash_fail_run_payload,
+    hash_register_shards_payload, hash_unpark_payload, validate_manifest,
+};
+pub use run_errors::{
+    CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
+    RegisterShardsError, UnparkError,
+};
 pub use shard_spec::{
     CursorSemantics, MAX_KEY_SIZE as ShardSpecMaxKeySize,
     MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardSpec, ShardSpecInputError,

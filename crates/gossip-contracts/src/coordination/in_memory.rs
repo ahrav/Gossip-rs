@@ -74,6 +74,16 @@ use crate::coordination::error::{
 };
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
+use crate::coordination::run::{
+    InitialShard, RunConfig, RunManagement, RunOpKind, RunOpLogEntry, RunOpResult, RunProgress,
+    RunRecord, RunStatus, ShardFilter, ShardSummary, hash_cancel_run_payload,
+    hash_complete_run_payload, hash_fail_run_payload, hash_register_shards_payload,
+    hash_unpark_payload, validate_manifest,
+};
+use crate::coordination::run_errors::{
+    CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
+    RegisterShardsError, UnparkError,
+};
 use crate::coordination::shard_spec::{
     ShardLimitScope, SplitValidationError, validate_residual_split, validate_split_coverage,
 };
@@ -87,7 +97,7 @@ use crate::coordination::traits::CoordinationBackend;
 use crate::coordination::validation::{
     check_op_idempotency, validate_cursor_update, validate_lease,
 };
-use crate::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
+use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
 /// In-memory coordinator for shard-level operations.
 ///
@@ -104,14 +114,16 @@ use crate::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 /// because lease length is an operational parameter of the deployment, not
 /// an intrinsic property of a shard. All shards served by this coordinator
 /// share the same duration.
-///
-/// # Scope
-///
-/// Currently covers shard-level operations only. Run-level operations
-/// (create, register, complete runs) will be added in a future task.
 #[derive(Debug)]
 pub struct InMemoryCoordinator {
     shards: HashMap<(TenantId, ShardKey), ShardRecord>,
+    runs: HashMap<(TenantId, RunId), RunRecord>,
+    /// Secondary index: run → shard IDs (root + split children).
+    ///
+    /// Avoids a full `shards` map scan when computing run progress or
+    /// listing shards for a single run. Updated by `register_shards`;
+    /// production backends would also update on split operations.
+    run_shards: HashMap<(TenantId, RunId), Vec<ShardId>>,
     default_lease_duration: u64,
     max_shards_per_tenant: usize,
     max_total_shards: usize,
@@ -146,6 +158,8 @@ impl InMemoryCoordinator {
         assert!(max_total_shards > 0, "max_total_shards must be > 0");
         Self {
             shards: HashMap::new(),
+            runs: HashMap::new(),
+            run_shards: HashMap::new(),
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
@@ -966,6 +980,419 @@ fn split_residual_apply_parent(
         now,
     ));
     parent.assert_invariants();
+}
+
+// ============================================================================
+// Run-level helpers
+// ============================================================================
+
+impl InMemoryCoordinator {
+    /// Register a shard in the run→shards index.
+    fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
+        let entry = self.run_shards.entry((tenant, run)).or_default();
+        if !entry.contains(&shard) {
+            entry.push(shard);
+        }
+    }
+
+    /// Look up a run record, checking tenant isolation.
+    fn lookup_run(&self, tenant: TenantId, run: RunId) -> Result<&RunRecord, GetRunError> {
+        let record = self
+            .runs
+            .get(&(tenant, run))
+            .ok_or(GetRunError::RunNotFound)?;
+        if record.tenant != tenant {
+            return Err(GetRunError::TenantMismatch { expected: tenant });
+        }
+        Ok(record)
+    }
+}
+
+// ============================================================================
+// RunManagement implementation
+// ============================================================================
+
+impl RunManagement for InMemoryCoordinator {
+    fn create_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        config: RunConfig,
+    ) -> Result<RunRecord, CreateRunError> {
+        config.assert_valid();
+
+        if self.runs.contains_key(&(tenant, run)) {
+            return Err(CreateRunError::RunAlreadyExists { run });
+        }
+
+        let record = RunRecord {
+            tenant,
+            run,
+            config,
+            status: RunStatus::Initializing,
+            created_at: now,
+            completed_at: None,
+            root_shards: Vec::new(),
+            op_log: Vec::with_capacity(RunRecord::OP_LOG_CAP),
+        };
+        record.assert_invariants();
+
+        self.runs.insert((tenant, run), record.clone());
+        Ok(record)
+    }
+
+    fn register_shards(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        shards: &[InitialShard],
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
+        let payload_hash = hash_register_shards_payload(shards);
+
+        // 1. Lookup + tenant check.
+        let record = self
+            .runs
+            .get(&(tenant, run))
+            .ok_or(RegisterShardsError::RunNotFound)?;
+        if record.tenant != tenant {
+            return Err(RegisterShardsError::TenantMismatch { expected: tenant });
+        }
+
+        // 2. Idempotency check FIRST (before status).
+        if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
+            if let RunOpResult::RegisteredShards { shard_ids } = entry.result() {
+                return Ok(IdempotentOutcome::Replayed(shard_ids.to_vec()));
+            }
+            return Ok(IdempotentOutcome::Replayed(Vec::new()));
+        }
+
+        // 3. Status check.
+        if record.status != RunStatus::Initializing {
+            return Err(RegisterShardsError::WrongStatus);
+        }
+
+        // 4. Validate manifest.
+        validate_manifest(shards).map_err(RegisterShardsError::ManifestInvalid)?;
+
+        // 5. Collect-then-insert: build all ShardRecords first, then insert.
+        let cursor_semantics = record.config.cursor_semantics();
+        let shard_ids: Vec<ShardId> = shards.iter().map(|s| s.shard()).collect();
+
+        let shard_records: Vec<((TenantId, ShardKey), ShardRecord)> = shards
+            .iter()
+            .map(|s| {
+                let key = ShardKey::new(run, s.shard());
+                let sr = ShardRecord::new_active(
+                    tenant,
+                    run,
+                    s.shard(),
+                    s.spec().clone(),
+                    cursor_semantics,
+                );
+                // If the initial shard has a non-initial cursor, we need to set it.
+                // new_active creates with Cursor::initial(), so update if needed.
+                ((tenant, key), sr)
+            })
+            .collect();
+
+        // Insert all shard records atomically.
+        for (key, mut sr) in shard_records {
+            // Set the cursor from the initial shard if non-initial.
+            let initial = shards.iter().find(|s| s.shard() == sr.shard).unwrap();
+            if !initial.cursor().is_initial() {
+                sr.cursor = initial.cursor().clone();
+            }
+            sr.assert_invariants();
+            self.shards.insert(key, sr);
+        }
+
+        // Update run→shards index.
+        for id in &shard_ids {
+            self.index_shard(tenant, run, *id);
+        }
+
+        // 6. Update RunRecord: status → Active, root_shards, op-log.
+        let record = self.runs.get_mut(&(tenant, run)).unwrap();
+        record.status = RunStatus::Active;
+        record.root_shards = shard_ids.clone();
+        record.op_log_push(RunOpLogEntry::new(
+            op_id,
+            RunOpKind::RegisterShards,
+            payload_hash,
+            now,
+            RunOpResult::RegisteredShards {
+                shard_ids: shard_ids.clone().into_boxed_slice(),
+            },
+        ));
+        record.assert_invariants();
+
+        Ok(IdempotentOutcome::Executed(shard_ids))
+    }
+
+    fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {
+        self.lookup_run(tenant, run).cloned()
+    }
+
+    fn get_run_progress(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<RunProgress, GetRunError> {
+        // Validate run exists and tenant matches.
+        let _ = self.lookup_run(tenant, run)?;
+
+        let mut progress = RunProgress::default();
+        if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+            // Order-independent: iterate shard_ids, look up each record.
+            for &shard_id in shard_ids {
+                let key = ShardKey::new(run, shard_id);
+                if let Some(record) = self.shards.get(&(tenant, key)) {
+                    let is_leased = record.is_leased_at(now);
+                    progress.count_shard(record.status, is_leased);
+                }
+            }
+        }
+        Ok(progress)
+    }
+
+    fn list_shards(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        filter: ShardFilter,
+    ) -> Result<Vec<ShardSummary>, GetRunError> {
+        let _ = self.lookup_run(tenant, run)?;
+
+        let mut summaries = Vec::new();
+        if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+            for &shard_id in shard_ids {
+                let key = ShardKey::new(run, shard_id);
+                if let Some(record) = self.shards.get(&(tenant, key)) {
+                    let summary = ShardSummary::from_record(record, now);
+                    if filter.matches(&summary) {
+                        summaries.push(summary);
+                    }
+                }
+            }
+        }
+
+        // Sort by key_range_start for deterministic output.
+        summaries.sort_by(|a, b| a.key_range_start().cmp(b.key_range_start()));
+        Ok(summaries)
+    }
+
+    fn complete_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CompleteRunError> {
+        let payload_hash = hash_complete_run_payload();
+
+        let record = self
+            .runs
+            .get(&(tenant, run))
+            .ok_or(CompleteRunError::RunNotFound)?;
+        if record.tenant != tenant {
+            return Err(CompleteRunError::TenantMismatch { expected: tenant });
+        }
+
+        // Idempotency check FIRST.
+        if record.check_op_idempotency(op_id, payload_hash)?.is_some() {
+            return Ok(IdempotentOutcome::Replayed(()));
+        }
+
+        // Terminal check.
+        if record.status.is_terminal() {
+            return Err(CompleteRunError::RunTerminal);
+        }
+
+        // Must be Active.
+        if record.status != RunStatus::Active {
+            return Err(CompleteRunError::WrongStatus);
+        }
+
+        let record = self.runs.get_mut(&(tenant, run)).unwrap();
+        record.status = RunStatus::Done;
+        record.completed_at = Some(now);
+        record.op_log_push(RunOpLogEntry::new(
+            op_id,
+            RunOpKind::CompleteRun,
+            payload_hash,
+            now,
+            RunOpResult::Ack,
+        ));
+        record.assert_invariants();
+
+        Ok(IdempotentOutcome::Executed(()))
+    }
+
+    fn fail_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, FailRunError> {
+        let payload_hash = hash_fail_run_payload();
+
+        let record = self
+            .runs
+            .get(&(tenant, run))
+            .ok_or(FailRunError::RunNotFound)?;
+        if record.tenant != tenant {
+            return Err(FailRunError::TenantMismatch { expected: tenant });
+        }
+
+        // Idempotency check FIRST.
+        if record.check_op_idempotency(op_id, payload_hash)?.is_some() {
+            return Ok(IdempotentOutcome::Replayed(()));
+        }
+
+        // Terminal check.
+        if record.status.is_terminal() {
+            return Err(FailRunError::RunTerminal);
+        }
+
+        // Must be Active (PD-2: not Initializing).
+        if record.status != RunStatus::Active {
+            return Err(FailRunError::WrongStatus);
+        }
+
+        let record = self.runs.get_mut(&(tenant, run)).unwrap();
+        record.status = RunStatus::Failed;
+        record.completed_at = Some(now);
+        record.op_log_push(RunOpLogEntry::new(
+            op_id,
+            RunOpKind::FailRun,
+            payload_hash,
+            now,
+            RunOpResult::Ack,
+        ));
+        record.assert_invariants();
+
+        Ok(IdempotentOutcome::Executed(()))
+    }
+
+    fn cancel_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CancelRunError> {
+        let payload_hash = hash_cancel_run_payload();
+
+        let record = self
+            .runs
+            .get(&(tenant, run))
+            .ok_or(CancelRunError::RunNotFound)?;
+        if record.tenant != tenant {
+            return Err(CancelRunError::TenantMismatch { expected: tenant });
+        }
+
+        // Idempotency check FIRST.
+        if record.check_op_idempotency(op_id, payload_hash)?.is_some() {
+            return Ok(IdempotentOutcome::Replayed(()));
+        }
+
+        // Terminal check.
+        if record.status.is_terminal() {
+            return Err(CancelRunError::RunTerminal);
+        }
+
+        // Accepts both Initializing and Active (unlike fail_run).
+
+        let record = self.runs.get_mut(&(tenant, run)).unwrap();
+        record.status = RunStatus::Cancelled;
+        record.completed_at = Some(now);
+        record.op_log_push(RunOpLogEntry::new(
+            op_id,
+            RunOpKind::CancelRun,
+            payload_hash,
+            now,
+            RunOpResult::Ack,
+        ));
+        record.assert_invariants();
+
+        Ok(IdempotentOutcome::Executed(()))
+    }
+
+    fn unpark_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, UnparkError> {
+        let payload_hash = hash_unpark_payload(&key);
+
+        let record = self
+            .shards
+            .get(&(tenant, key))
+            .ok_or(UnparkError::ShardNotFound)?;
+        if record.tenant != tenant {
+            return Err(UnparkError::TenantMismatch { expected: tenant });
+        }
+
+        // Idempotency via SHARD op-log (not run op-log).
+        match check_op_idempotency(record, op_id, payload_hash) {
+            Ok(Some(_)) => return Ok(IdempotentOutcome::Replayed(())),
+            Ok(None) => {}
+            Err(coord_err) => {
+                // Map CoordError::OpIdConflict to UnparkError::OpIdConflict.
+                if let crate::coordination::error::CoordError::OpIdConflict {
+                    op_id,
+                    expected_hash,
+                    actual_hash,
+                } = coord_err
+                {
+                    return Err(UnparkError::OpIdConflict {
+                        op_id,
+                        expected_hash,
+                        actual_hash,
+                    });
+                }
+                // Other CoordError variants should not occur for unpark idem check.
+                unreachable!("unexpected CoordError from check_op_idempotency: {coord_err:?}");
+            }
+        }
+
+        // Must be Parked.
+        if record.status != ShardStatus::Parked {
+            return Err(UnparkError::NotParked {
+                status: record.status,
+            });
+        }
+
+        let record = self.shards.get_mut(&(tenant, key)).unwrap();
+
+        // Bump fence FIRST (fence any zombie workers from the prior lease).
+        record.fence_epoch = record.fence_epoch.increment();
+
+        // Clear park state, restore Active.
+        record.park_reason = None;
+        record.status = ShardStatus::Active;
+        record.lease = None;
+
+        // Record in shard op-log.
+        record.op_log_push(OpLogEntry::new(
+            op_id,
+            OpKind::Unpark,
+            OpResult::Completed,
+            payload_hash,
+            now,
+        ));
+        record.assert_invariants();
+
+        Ok(IdempotentOutcome::Executed(()))
+    }
 }
 
 // ============================================================================
