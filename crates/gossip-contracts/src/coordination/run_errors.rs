@@ -29,6 +29,8 @@ pub enum CreateRunError {
     RunAlreadyExists { run: RunId },
     /// Registration step failed during `create_run_with_shards`.
     RegistrationFailed { reason: String },
+    /// A run with this `RunId` already exists with a different `RunConfig`.
+    ConfigMismatch { run: RunId },
 }
 
 impl fmt::Display for CreateRunError {
@@ -38,6 +40,9 @@ impl fmt::Display for CreateRunError {
             Self::RunAlreadyExists { run } => write!(f, "run already exists: {run:?}"),
             Self::RegistrationFailed { reason } => {
                 write!(f, "registration failed: {reason}")
+            }
+            Self::ConfigMismatch { run } => {
+                write!(f, "run {run:?} exists with different config")
             }
         }
     }
@@ -247,8 +252,9 @@ impl From<RunOpIdConflict> for CompleteRunError {
 
 /// Error from `fail_run`.
 ///
-/// Separate from `CompleteRunError` (PD-6) because `fail_run` requires
-/// Active only (rejects Initializing), unlike `complete_run`.
+/// Separate from `CompleteRunError` (PD-6) because `fail_run` transitions
+/// to `Failed` (not `Done`), warranting a distinct error type for callers
+/// who need to distinguish completion failures from explicit failure marking.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FailRunError {
@@ -471,7 +477,9 @@ impl From<RunOpIdConflict> for UnparkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::run::{ManifestValidationError, RunConfigError};
     use crate::identity::{OpId, RunId, TenantId};
+    use rstest::rstest;
 
     fn test_tenant() -> TenantId {
         TenantId::from_bytes([0x01; 32])
@@ -479,73 +487,18 @@ mod tests {
 
     // -- SEC-1: No actual tenant in any TenantMismatch --
 
-    #[test]
-    fn register_shards_error_no_actual_tenant() {
-        let err = RegisterShardsError::TenantMismatch {
-            expected: test_tenant(),
-        };
-        let display = err.to_string();
-        assert!(display.contains("expected"));
+    #[rstest]
+    #[case::register_shards(RegisterShardsError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    #[case::get_run(GetRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    #[case::complete_run(CompleteRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    #[case::fail_run(FailRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    #[case::cancel_run(CancelRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    #[case::unpark(UnparkError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    fn tenant_mismatch_no_actual_tenant(#[case] display: String) {
         assert!(
-            !display.contains("actual"),
-            "must not contain 'actual': {display}"
+            display.contains("expected"),
+            "must contain 'expected': {display}"
         );
-    }
-
-    #[test]
-    fn get_run_error_no_actual_tenant() {
-        let err = GetRunError::TenantMismatch {
-            expected: test_tenant(),
-        };
-        let display = err.to_string();
-        assert!(
-            !display.contains("actual"),
-            "must not contain 'actual': {display}"
-        );
-    }
-
-    #[test]
-    fn complete_run_error_no_actual_tenant() {
-        let err = CompleteRunError::TenantMismatch {
-            expected: test_tenant(),
-        };
-        let display = err.to_string();
-        assert!(
-            !display.contains("actual"),
-            "must not contain 'actual': {display}"
-        );
-    }
-
-    #[test]
-    fn fail_run_error_no_actual_tenant() {
-        let err = FailRunError::TenantMismatch {
-            expected: test_tenant(),
-        };
-        let display = err.to_string();
-        assert!(
-            !display.contains("actual"),
-            "must not contain 'actual': {display}"
-        );
-    }
-
-    #[test]
-    fn cancel_run_error_no_actual_tenant() {
-        let err = CancelRunError::TenantMismatch {
-            expected: test_tenant(),
-        };
-        let display = err.to_string();
-        assert!(
-            !display.contains("actual"),
-            "must not contain 'actual': {display}"
-        );
-    }
-
-    #[test]
-    fn unpark_error_no_actual_tenant() {
-        let err = UnparkError::TenantMismatch {
-            expected: test_tenant(),
-        };
-        let display = err.to_string();
         assert!(
             !display.contains("actual"),
             "must not contain 'actual': {display}"
@@ -554,61 +507,25 @@ mod tests {
 
     // -- SEC-6: OpIdConflict Debug redacts hashes --
 
-    fn assert_op_id_conflict_redacted(debug: &str, type_name: &str) {
+    #[rstest]
+    #[case::register_shards(format!("{:?}", RegisterShardsError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 0xDEAD_BEEF, actual_hash: 0xCAFE_BABE }))]
+    #[case::complete_run(format!("{:?}", CompleteRunError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 0xDEAD_BEEF, actual_hash: 0xCAFE_BABE }))]
+    #[case::fail_run(format!("{:?}", FailRunError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 0xDEAD_BEEF, actual_hash: 0xCAFE_BABE }))]
+    #[case::cancel_run(format!("{:?}", CancelRunError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 0xDEAD_BEEF, actual_hash: 0xCAFE_BABE }))]
+    #[case::unpark(format!("{:?}", UnparkError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 0xDEAD_BEEF, actual_hash: 0xCAFE_BABE }))]
+    fn op_id_conflict_debug_redacted(#[case] debug: String) {
         assert!(
             debug.contains("<redacted>"),
-            "{type_name} Debug must contain <redacted>: {debug}"
+            "must contain <redacted>: {debug}"
         );
         assert!(
             !debug.contains("DEAD") && !debug.contains("CAFE"),
-            "{type_name} Debug leaks hex hash: {debug}"
+            "leaks hex hash: {debug}"
         );
         assert!(
             !debug.contains("3735928559") && !debug.contains("3405691582"),
-            "{type_name} Debug leaks decimal hash: {debug}"
+            "leaks decimal hash: {debug}"
         );
-    }
-
-    #[test]
-    fn op_id_conflict_debug_redacted_all_types() {
-        let op = OpId::from_raw(1);
-        let ha = 0xDEAD_BEEF_u64;
-        let hb = 0xCAFE_BABE_u64;
-
-        let e = RegisterShardsError::OpIdConflict {
-            op_id: op,
-            expected_hash: ha,
-            actual_hash: hb,
-        };
-        assert_op_id_conflict_redacted(&format!("{e:?}"), "RegisterShardsError");
-
-        let e = CompleteRunError::OpIdConflict {
-            op_id: op,
-            expected_hash: ha,
-            actual_hash: hb,
-        };
-        assert_op_id_conflict_redacted(&format!("{e:?}"), "CompleteRunError");
-
-        let e = FailRunError::OpIdConflict {
-            op_id: op,
-            expected_hash: ha,
-            actual_hash: hb,
-        };
-        assert_op_id_conflict_redacted(&format!("{e:?}"), "FailRunError");
-
-        let e = CancelRunError::OpIdConflict {
-            op_id: op,
-            expected_hash: ha,
-            actual_hash: hb,
-        };
-        assert_op_id_conflict_redacted(&format!("{e:?}"), "CancelRunError");
-
-        let e = UnparkError::OpIdConflict {
-            op_id: op,
-            expected_hash: ha,
-            actual_hash: hb,
-        };
-        assert_op_id_conflict_redacted(&format!("{e:?}"), "UnparkError");
     }
 
     // -- From<RunOpIdConflict> --
@@ -632,23 +549,105 @@ mod tests {
 
     // -- Display determinism --
 
+    #[rstest]
+    #[case::create_run_already_exists(Box::new(CreateRunError::RunAlreadyExists { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>)]
+    #[case::create_config_mismatch(Box::new(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>)]
+    #[case::register_shards_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>)]
+    #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>)]
+    #[case::complete_run_terminal(Box::new(CompleteRunError::RunTerminal) as Box<dyn std::error::Error>)]
+    #[case::fail_run_wrong_status(Box::new(FailRunError::WrongStatus) as Box<dyn std::error::Error>)]
+    #[case::cancel_run_terminal(Box::new(CancelRunError::RunTerminal) as Box<dyn std::error::Error>)]
+    #[case::unpark_shard_not_found(Box::new(UnparkError::ShardNotFound) as Box<dyn std::error::Error>)]
+    fn error_display_deterministic(#[case] err: Box<dyn std::error::Error>) {
+        let s1 = err.to_string();
+        let s2 = err.to_string();
+        assert_eq!(s1, s2, "Display must be deterministic");
+    }
+
+    // -- Error::source() chaining --
+
+    #[rstest]
+    #[case::create_invalid_config(Box::new(CreateRunError::InvalidConfig(RunConfigError::ZeroLeaseDuration)) as Box<dyn std::error::Error>, true)]
+    #[case::create_already_exists(Box::new(CreateRunError::RunAlreadyExists { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>, false)]
+    #[case::create_registration_failed(Box::new(CreateRunError::RegistrationFailed { reason: "test".into() }) as Box<dyn std::error::Error>, false)]
+    #[case::create_config_mismatch(Box::new(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>, false)]
+    #[case::register_manifest_invalid(Box::new(RegisterShardsError::ManifestInvalid(ManifestValidationError::Empty)) as Box<dyn std::error::Error>, true)]
+    #[case::register_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>, false)]
+    #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>, false)]
+    #[case::complete_run_terminal(Box::new(CompleteRunError::RunTerminal) as Box<dyn std::error::Error>, false)]
+    #[case::fail_run_wrong_status(Box::new(FailRunError::WrongStatus) as Box<dyn std::error::Error>, false)]
+    #[case::cancel_run_terminal(Box::new(CancelRunError::RunTerminal) as Box<dyn std::error::Error>, false)]
+    #[case::unpark_shard_not_found(Box::new(UnparkError::ShardNotFound) as Box<dyn std::error::Error>, false)]
+    fn error_source_chaining(#[case] err: Box<dyn std::error::Error>, #[case] has_source: bool) {
+        assert_eq!(err.source().is_some(), has_source);
+    }
+
+    // -- Display non-empty for all variants --
+
+    #[rstest]
+    // CreateRunError
+    #[case::create_invalid_config(CreateRunError::InvalidConfig(RunConfigError::ZeroLeaseDuration).to_string())]
+    #[case::create_already_exists(CreateRunError::RunAlreadyExists { run: RunId::from_raw(1) }.to_string())]
+    #[case::create_registration_failed(CreateRunError::RegistrationFailed { reason: "test".into() }.to_string())]
+    #[case::create_config_mismatch(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }.to_string())]
+    // RegisterShardsError
+    #[case::register_not_found(RegisterShardsError::RunNotFound.to_string())]
+    #[case::register_tenant_mismatch(RegisterShardsError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::register_wrong_status(RegisterShardsError::WrongStatus.to_string())]
+    #[case::register_manifest_invalid(RegisterShardsError::ManifestInvalid(ManifestValidationError::Empty).to_string())]
+    #[case::register_op_id_conflict(RegisterShardsError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 1, actual_hash: 2 }.to_string())]
+    // GetRunError
+    #[case::get_not_found(GetRunError::RunNotFound.to_string())]
+    #[case::get_tenant_mismatch(GetRunError::TenantMismatch { expected: test_tenant() }.to_string())]
+    // CompleteRunError
+    #[case::complete_not_found(CompleteRunError::RunNotFound.to_string())]
+    #[case::complete_tenant_mismatch(CompleteRunError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::complete_terminal(CompleteRunError::RunTerminal.to_string())]
+    #[case::complete_wrong_status(CompleteRunError::WrongStatus.to_string())]
+    #[case::complete_op_id_conflict(CompleteRunError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 1, actual_hash: 2 }.to_string())]
+    // FailRunError
+    #[case::fail_not_found(FailRunError::RunNotFound.to_string())]
+    #[case::fail_tenant_mismatch(FailRunError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::fail_terminal(FailRunError::RunTerminal.to_string())]
+    #[case::fail_wrong_status(FailRunError::WrongStatus.to_string())]
+    #[case::fail_op_id_conflict(FailRunError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 1, actual_hash: 2 }.to_string())]
+    // CancelRunError
+    #[case::cancel_not_found(CancelRunError::RunNotFound.to_string())]
+    #[case::cancel_tenant_mismatch(CancelRunError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::cancel_terminal(CancelRunError::RunTerminal.to_string())]
+    #[case::cancel_op_id_conflict(CancelRunError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 1, actual_hash: 2 }.to_string())]
+    // UnparkError
+    #[case::unpark_not_found(UnparkError::ShardNotFound.to_string())]
+    #[case::unpark_tenant_mismatch(UnparkError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::unpark_not_parked(UnparkError::NotParked { status: ShardStatus::Active }.to_string())]
+    #[case::unpark_op_id_conflict(UnparkError::OpIdConflict { op_id: OpId::from_raw(1), expected_hash: 1, actual_hash: 2 }.to_string())]
+    fn all_variants_display_non_empty(#[case] display: String) {
+        assert!(!display.is_empty(), "variant has empty Display: {display}");
+    }
+
+    // -- Variant-specific Display content --
+
     #[test]
-    fn error_display_deterministic() {
-        let errors: Vec<Box<dyn std::error::Error>> = vec![
-            Box::new(CreateRunError::RunAlreadyExists {
-                run: RunId::from_raw(1),
-            }),
-            Box::new(RegisterShardsError::RunNotFound),
-            Box::new(GetRunError::RunNotFound),
-            Box::new(CompleteRunError::RunTerminal),
-            Box::new(FailRunError::WrongStatus),
-            Box::new(CancelRunError::RunTerminal),
-            Box::new(UnparkError::ShardNotFound),
-        ];
-        for err in &errors {
-            let s1 = err.to_string();
-            let s2 = err.to_string();
-            assert_eq!(s1, s2, "Display must be deterministic");
-        }
+    fn unpark_not_parked_display_includes_status() {
+        let e = UnparkError::NotParked {
+            status: ShardStatus::Active,
+        };
+        let s = e.to_string();
+        assert!(
+            s.contains("Active"),
+            "NotParked display must include status: {s}"
+        );
+    }
+
+    #[test]
+    fn create_run_registration_failed_display_includes_reason() {
+        let e = CreateRunError::RegistrationFailed {
+            reason: "some failure context".into(),
+        };
+        let s = e.to_string();
+        assert!(
+            s.contains("some failure context"),
+            "RegistrationFailed display must include reason: {s}"
+        );
     }
 }
