@@ -1,6 +1,6 @@
 ---
 name: test-strategy
-description: Assess and recommend the appropriate testing strategy for Rust code - unit tests, property-based tests, fuzz tests, Kani model checking, or simulation testing
+description: Assess and recommend the appropriate testing strategy for Rust code - unit tests, parameterized tests (rstest), property-based tests, fuzz tests, Kani model checking, or simulation testing
 ---
 
 # Test Strategy Assessment
@@ -12,6 +12,7 @@ Analyze code and recommend the optimal testing approach from this project's test
 | Type | Tool | Feature Flag | Best For |
 |------|------|--------------|----------|
 | **Unit Tests** | `#[test]` | None | Specific behavior, edge cases, regression tests |
+| **Parameterized Tests** | rstest | Dev-dep | Finite case sets with specific expected outputs, enum variants, error codes |
 | **Property Tests** | proptest | `stdx-proptest` | Invariants over input domains, mathematical properties |
 | **Fuzz Tests** | cargo-fuzz | External | Security-critical parsing, untrusted input handling |
 | **Model Checking** | Kani | `kani` | Memory safety proofs, absence of panics, formal verification |
@@ -46,6 +47,70 @@ mod tests {
         assert_eq!(function(edge_input), expected_output);
     }
 }
+```
+
+### Use Parameterized Tests (rstest) When:
+- You have a finite, known set of (input, expected output) pairs
+- Each case has a specific expected value — no general invariant exists
+- Multiple test functions share identical structure, differing only in values
+- Testing enum variant mappings, error code tables, or configuration defaults
+- You want each case to appear as a separately named sub-test in `cargo test` output
+- Adding a new case should be one line, not a new function
+
+```rust
+use rstest::rstest;
+
+#[rstest]
+#[case("5s", Duration::from_secs(5))]
+#[case("3m", Duration::from_secs(180))]
+#[case("2h", Duration::from_secs(7200))]
+#[case("0s", Duration::ZERO)]
+fn parse_duration_valid(#[case] input: &str, #[case] expected: Duration) {
+    assert_eq!(parse_duration(input).unwrap(), expected);
+}
+
+#[rstest]
+#[case("5x", ParseError::InvalidUnit)]
+#[case("", ParseError::Empty)]
+#[case("-1s", ParseError::Negative)]
+fn parse_duration_errors(#[case] input: &str, #[case] expected: ParseError) {
+    assert_eq!(parse_duration(input).unwrap_err(), expected);
+}
+```
+
+**Dependency**: Add `rstest = "0.23"` to `[dev-dependencies]` in Cargo.toml.
+
+#### rstest Advanced Features
+
+**Fixtures** — shared setup across tests without boilerplate:
+
+```rust
+use rstest::*;
+
+#[fixture]
+fn config() -> Config {
+    Config::builder().timeout(Duration::from_secs(30)).build()
+}
+
+#[rstest]
+fn test_with_default_config(config: Config) {
+    assert!(config.timeout().as_secs() > 0);
+}
+```
+
+**Matrix testing** — combinatorial cases via multiple `#[values]` parameters:
+
+```rust
+#[rstest]
+fn protocol_version_compat(
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+    #[values(true, false)] compressed: bool,
+    #[values(0, 1, 100)] payload_size: usize,
+) {
+    let msg = Message::new(version, compressed, payload_size);
+    assert!(msg.is_valid());
+}
+// Generates 2 × 2 × 3 = 12 individual test cases
 ```
 
 ### Use Property-Based Tests (proptest) When:
@@ -186,6 +251,8 @@ When analyzing code for test strategy, consider:
 
 1. **Input Domain**
    - [ ] Fixed, known inputs → Unit tests
+   - [ ] Finite set of (input, expected) pairs → Parameterized tests (rstest)
+   - [ ] Combinatorial inputs (multiple parameters × multiple values) → rstest `#[values]` matrix
    - [ ] Large/infinite input space → Property tests
    - [ ] Untrusted/adversarial input → Fuzz tests
    - [ ] Small but critical input space → Kani
@@ -193,6 +260,7 @@ When analyzing code for test strategy, consider:
 
 2. **Properties to Verify**
    - [ ] Specific behavior → Unit tests
+   - [ ] Same assertion, many concrete cases → Parameterized tests (rstest)
    - [ ] Invariants over all inputs → Property tests
    - [ ] "Never crashes" → Fuzz tests + Kani
    - [ ] Memory safety → Kani (especially for unsafe)
@@ -200,6 +268,8 @@ When analyzing code for test strategy, consider:
 
 3. **Code Characteristics**
    - [ ] Pure functions → Property tests
+   - [ ] Enum variant mappings / lookup tables → rstest `#[case]`
+   - [ ] Functions with shared setup across tests → rstest `#[fixture]`
    - [ ] Parsers/decoders → Fuzz tests
    - [ ] Unsafe blocks → Kani proofs
    - [ ] State machines → Property tests + Fuzz
@@ -218,6 +288,7 @@ When analyzing code for test strategy, consider:
 
 5. **Existing Patterns in This Codebase**
    - Unit tests: Same file under `#[cfg(test)] mod tests`
+   - Parameterized tests: rstest `#[rstest]` with `#[case]` in `#[cfg(test)]` modules (requires `rstest = "0.23"` in `[dev-dependencies]`)
    - Property tests: Sibling `*_tests.rs` files with `stdx-proptest` feature
    - Kani proofs: `#[cfg(kani)]` blocks, see `docs/kani-verification.md`
    - Simulation tests: `tests/simulation/` directory, corpus in `tests/corpus/` and `tests/simulation/corpus/`
@@ -257,6 +328,40 @@ When analyzing code for test strategy, consider:
 ```
 
 ```markdown
+## Test Strategy for `RunStatus` Validation
+
+### Recommended Approach: Parameterized Tests (rstest) + Unit Tests
+
+**Rationale:**
+- Finite set of status transitions with known valid/invalid pairs
+- Each transition has a specific expected result (no general invariant)
+- Error cases map to specific error variants
+- Adding new status variants should only require adding `#[case]` lines
+
+**Specific Tests:**
+
+1. **rstest Parameterized**: Valid state transitions
+   ```rust
+   #[rstest]
+   #[case(RunStatus::Pending, RunStatus::Active, true)]
+   #[case(RunStatus::Active, RunStatus::Completed, true)]
+   #[case(RunStatus::Active, RunStatus::Failed, true)]
+   #[case(RunStatus::Pending, RunStatus::Completed, false)]
+   #[case(RunStatus::Completed, RunStatus::Active, false)]
+   fn transition_validity(
+       #[case] from: RunStatus,
+       #[case] to: RunStatus,
+       #[case] allowed: bool,
+   ) {
+       assert_eq!(from.can_transition_to(to), allowed);
+   }
+   ```
+
+2. **rstest Parameterized**: Error messages for invalid transitions
+3. **Unit Test**: Regression test for specific bug (if applicable)
+```
+
+```markdown
 ## Test Strategy for `ZipEntryIterator`
 
 ### Recommended Approach: Fuzz + Archive Sim + Scanner Sim
@@ -280,6 +385,12 @@ When analyzing code for test strategy, consider:
 | Scenario | Primary | Secondary |
 |----------|---------|-----------|
 | New data structure | Property tests | Unit tests for edges |
+| Enum/status mappings | rstest `#[case]` | Unit tests for edge cases |
+| State transition tables | rstest `#[case]` | Property tests if transitions have invariants |
+| Error code/message mapping | rstest `#[case]` | — |
+| Config defaults/lookups | rstest `#[case]` | — |
+| Combinatorial input validation | rstest `#[values]` matrix | Property tests for general invariants |
+| Shared test fixtures | rstest `#[fixture]` | — |
 | Parser/decoder | Fuzz tests | Property tests for roundtrip |
 | Unsafe code | Kani proofs | Property tests for API |
 | Algorithm correctness | Property tests | Unit tests for examples |
