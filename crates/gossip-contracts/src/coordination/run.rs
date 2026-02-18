@@ -12,7 +12,8 @@
 //! D2.20: Two-phase creation: `create_run` → `register_shards`.
 //! D2.21: Admin operations (unpark, cancel) are NOT lease-gated.
 //! D2.22: `RunManagement` is separate from `CoordinationBackend`.
-//! D2.23: `now: LogicalTime` is passed explicitly to every operation.
+//! D2.23: `now: LogicalTime` is passed explicitly to every mutating and
+//!        time-aware operation. Pure record lookups (`get_run`) are exempt.
 //! D2.24: Shard listing returns `ShardSummary` (lightweight).
 //! D2.25: `RunRecord` gets its own bounded op-log (cap: 8).
 
@@ -32,7 +33,7 @@ use crate::identity::{
 };
 
 // ============================================================================
-// § RunStatus
+// RunStatus
 // ============================================================================
 
 /// Run lifecycle state.
@@ -103,16 +104,10 @@ impl fmt::Display for RunStatus {
     }
 }
 
-// Compile-time discriminant stability assertions.
-const _: () = assert!(RunStatus::Initializing as u8 == 0);
-const _: () = assert!(RunStatus::Active as u8 == 1);
-const _: () = assert!(RunStatus::Done as u8 == 2);
-const _: () = assert!(RunStatus::Failed as u8 == 3);
-const _: () = assert!(RunStatus::Cancelled as u8 == 4);
 const _: () = assert!(core::mem::size_of::<RunStatus>() == 1);
 
 // ============================================================================
-// § RunConfigError
+// RunConfigError
 // ============================================================================
 
 /// Error returned by [`RunConfig::try_new`] when validation fails.
@@ -134,7 +129,7 @@ impl fmt::Display for RunConfigError {
 impl std::error::Error for RunConfigError {}
 
 // ============================================================================
-// § RunConfig
+// RunConfig
 // ============================================================================
 
 /// Per-run configuration, immutable after creation.
@@ -176,19 +171,17 @@ impl RunConfig {
         assert!(self.lease_duration > 0, "lease_duration must be > 0");
     }
 
-    #[inline]
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
         self.cursor_semantics
     }
 
-    #[inline]
+    /// Lease duration in [`LogicalTime`] ticks.
     #[must_use]
     pub fn lease_duration(&self) -> u64 {
         self.lease_duration
     }
 
-    #[inline]
     #[must_use]
     pub fn max_shard_retries(&self) -> Option<u32> {
         self.max_shard_retries
@@ -196,7 +189,7 @@ impl RunConfig {
 }
 
 // ============================================================================
-// § RunOpKind
+// RunOpKind
 // ============================================================================
 
 /// Discriminant for run-level op-log entries.
@@ -244,14 +237,10 @@ impl fmt::Display for RunOpKind {
     }
 }
 
-const _: () = assert!(RunOpKind::RegisterShards as u8 == 0);
-const _: () = assert!(RunOpKind::CompleteRun as u8 == 1);
-const _: () = assert!(RunOpKind::FailRun as u8 == 2);
-const _: () = assert!(RunOpKind::CancelRun as u8 == 3);
 const _: () = assert!(core::mem::size_of::<RunOpKind>() == 1);
 
 // ============================================================================
-// § RunOpResult
+// RunOpResult
 // ============================================================================
 
 /// Result payload stored in a run op-log entry.
@@ -269,7 +258,7 @@ pub enum RunOpResult {
 }
 
 // ============================================================================
-// § RunOpLogEntry
+// RunOpLogEntry
 // ============================================================================
 
 /// A single entry in the run-level bounded op-log.
@@ -316,31 +305,26 @@ impl RunOpLogEntry {
         }
     }
 
-    #[inline]
     #[must_use]
     pub fn op_id(&self) -> OpId {
         self.op_id
     }
 
-    #[inline]
     #[must_use]
     pub fn kind(&self) -> RunOpKind {
         self.kind
     }
 
-    #[inline]
     #[must_use]
     pub fn payload_hash(&self) -> u64 {
         self.payload_hash
     }
 
-    #[inline]
     #[must_use]
     pub fn executed_at(&self) -> LogicalTime {
         self.executed_at
     }
 
-    #[inline]
     #[must_use]
     pub fn result(&self) -> &RunOpResult {
         &self.result
@@ -348,7 +332,7 @@ impl RunOpLogEntry {
 }
 
 // ============================================================================
-// § RunOpIdConflict
+// RunOpIdConflict
 // ============================================================================
 
 /// OpId reuse detected with a different payload hash.
@@ -385,7 +369,7 @@ impl fmt::Display for RunOpIdConflict {
 impl std::error::Error for RunOpIdConflict {}
 
 // ============================================================================
-// § RunRecord
+// RunRecord
 // ============================================================================
 
 /// The coordinator's authoritative record for a scan run.
@@ -400,6 +384,10 @@ impl std::error::Error for RunOpIdConflict {}
 /// 6. `op_log.len() <= OP_LOG_CAP`.
 /// 7. No duplicate `OpId` values in `op_log`.
 /// 8. Config valid: `lease_duration > 0`.
+/// 9. No duplicate `ShardId` values in `root_shards`.
+/// 10. Op-log timestamps non-decreasing.
+/// 11. Kind-result consistency: `RegisterShards` entries have `RegisteredShards`
+///     result; all other ops have `Ack` result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunRecord {
     pub(crate) tenant: TenantId,
@@ -420,6 +408,19 @@ impl RunRecord {
     /// 8 provides headroom for the worst case: `register_shards` + up to 7
     /// terminal/admin operations before the first is evicted. `create_run`
     /// does NOT write to the op-log (no `OpId`), so cap=8 is adequate.
+    ///
+    /// ## Eviction safety
+    ///
+    /// When the op-log is full, `op_log_push` evicts the oldest entry.
+    /// Eviction is safe because every run-level operation has a secondary
+    /// status-check barrier: even if the op-log entry is evicted and a
+    /// stale retry is treated as "new," the status check (e.g., "run must
+    /// be Active") prevents re-execution on an already-transitioned run.
+    ///
+    /// This assumes a single-writer model per run. Production backends
+    /// with concurrent writers need external serialization (e.g., database
+    /// transactions) to prevent TOCTOU races between the op-log check and
+    /// the status check.
     pub const OP_LOG_CAP: usize = 8;
 
     /// Assert all structural invariants.
@@ -476,6 +477,19 @@ impl RunRecord {
                 self.created_at,
             );
         }
+
+        // INV-9: No duplicate ShardIds in root_shards.
+        // O(n²) scan like INV-7: n is bounded by MAX_INITIAL_SHARDS.
+        for i in 0..self.root_shards.len() {
+            for j in (i + 1)..self.root_shards.len() {
+                assert!(
+                    self.root_shards[i] != self.root_shards[j],
+                    "Run {:?}: duplicate ShardId {:?} in root_shards at indices {i} and {j}",
+                    self.run,
+                    self.root_shards[i],
+                );
+            }
+        }
     }
 
     fn assert_oplog_invariants(&self) {
@@ -489,6 +503,8 @@ impl RunRecord {
         );
 
         // INV-7: No duplicate OpIds in op-log.
+        // O(n²) scan is intentional: n ≤ OP_LOG_CAP (8), so max 28 comparisons.
+        // A HashSet would add allocation overhead that dominates at this scale.
         for i in 0..self.op_log.len() {
             for j in (i + 1)..self.op_log.len() {
                 assert!(
@@ -500,6 +516,39 @@ impl RunRecord {
             }
         }
 
+        // INV-10: Op-log timestamps non-decreasing.
+        for pair in self.op_log.windows(2) {
+            assert!(
+                pair[1].executed_at() >= pair[0].executed_at(),
+                "Run {:?}: op_log timestamps not non-decreasing: {:?} followed by {:?}",
+                self.run,
+                pair[0].executed_at(),
+                pair[1].executed_at(),
+            );
+        }
+
+        // INV-11: Kind-result consistency.
+        // RegisterShards entries must have RegisteredShards result (not Ack).
+        // All other ops must have Ack result (not RegisteredShards).
+        for entry in &self.op_log {
+            match (entry.kind(), entry.result()) {
+                (RunOpKind::RegisterShards, RunOpResult::RegisteredShards { .. }) => {}
+                (RunOpKind::RegisterShards, RunOpResult::Ack) => {
+                    panic!(
+                        "Run {:?}: RegisterShards op-log entry must have RegisteredShards result, not Ack",
+                        self.run,
+                    );
+                }
+                (_, RunOpResult::Ack) => {}
+                (kind, RunOpResult::RegisteredShards { .. }) => {
+                    panic!(
+                        "Run {:?}: {kind:?} op-log entry must not have RegisteredShards result",
+                        self.run,
+                    );
+                }
+            }
+        }
+
         // INV-8: Config valid.
         self.config.assert_valid();
     }
@@ -508,6 +557,7 @@ impl RunRecord {
     ///
     /// Reverse scan for retry optimization — retries involve the most
     /// recent operations.
+    #[must_use]
     pub fn op_log_lookup(&self, op: OpId) -> Option<&RunOpLogEntry> {
         debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
         self.op_log.iter().rev().find(|e| e.op_id() == op)
@@ -527,6 +577,9 @@ impl RunRecord {
             entry.op_id(),
         );
         if self.op_log.len() >= Self::OP_LOG_CAP {
+            // O(n) shift via remove(0). n ≤ OP_LOG_CAP (8), so at most 7
+            // element copies — negligible at this scale. VecDeque would be
+            // O(1) but adds indirection overhead that dominates at this cap size.
             self.op_log.remove(0);
         }
         self.op_log.push(entry);
@@ -566,43 +619,36 @@ impl RunRecord {
 
     // -- Public accessors --
 
-    #[inline]
     #[must_use]
     pub fn tenant(&self) -> TenantId {
         self.tenant
     }
 
-    #[inline]
     #[must_use]
     pub fn run(&self) -> RunId {
         self.run
     }
 
-    #[inline]
     #[must_use]
     pub fn config(&self) -> &RunConfig {
         &self.config
     }
 
-    #[inline]
     #[must_use]
     pub fn status(&self) -> RunStatus {
         self.status
     }
 
-    #[inline]
     #[must_use]
     pub fn created_at(&self) -> LogicalTime {
         self.created_at
     }
 
-    #[inline]
     #[must_use]
     pub fn completed_at(&self) -> Option<LogicalTime> {
         self.completed_at
     }
 
-    #[inline]
     #[must_use]
     pub fn root_shards(&self) -> &[ShardId] {
         &self.root_shards
@@ -616,7 +662,7 @@ const _: () = assert!(RunRecord::OP_LOG_CAP <= 64);
 const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 
 // ============================================================================
-// § RunProgress + RunTerminalEvaluation
+// RunProgress + RunTerminalEvaluation
 // ============================================================================
 
 /// Aggregated shard status counts for a run.
@@ -636,78 +682,109 @@ pub struct RunProgress {
 }
 
 impl RunProgress {
-    #[inline]
     #[must_use]
     pub fn total(&self) -> u32 {
         self.total
     }
 
-    #[inline]
     #[must_use]
     pub fn active(&self) -> u32 {
         self.active
     }
 
-    #[inline]
     #[must_use]
     pub fn done(&self) -> u32 {
         self.done
     }
 
-    #[inline]
     #[must_use]
     pub fn split(&self) -> u32 {
         self.split
     }
 
-    #[inline]
     #[must_use]
     pub fn parked(&self) -> u32 {
         self.parked
     }
 
-    #[inline]
     #[must_use]
     pub fn leased(&self) -> u32 {
         self.leased
     }
 
     /// Whether all active work is complete (no Active shards remain).
-    #[inline]
     #[must_use]
     pub fn is_settled(&self) -> bool {
         self.active == 0
     }
 
     /// Settled with zero parked shards — clean completion.
-    #[inline]
     #[must_use]
     pub fn is_success(&self) -> bool {
         self.is_settled() && self.parked == 0
     }
 
     /// Any shards parked (error/poison).
-    #[inline]
     #[must_use]
     pub fn has_failures(&self) -> bool {
         self.parked > 0
     }
 
+    /// Evaluate whether this run should transition to a terminal state.
+    ///
+    /// Equivalent to [`evaluate_run_terminal`], but called as a method.
+    #[must_use]
+    pub fn terminal_evaluation(&self) -> RunTerminalEvaluation {
+        evaluate_run_terminal(self)
+    }
+
     /// Count a shard into the progress tallies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any counter overflows `u32::MAX`.
     pub fn count_shard(&mut self, status: ShardStatus, is_leased: bool) {
-        self.total += 1;
+        assert!(
+            !is_leased || status == ShardStatus::Active,
+            "is_leased=true is only valid for Active shards, got status: {status:?}"
+        );
+        self.total = self
+            .total
+            .checked_add(1)
+            .expect("RunProgress::total overflow");
         match status {
             ShardStatus::Active => {
-                self.active += 1;
+                self.active = self
+                    .active
+                    .checked_add(1)
+                    .expect("RunProgress::active overflow");
                 if is_leased {
-                    self.leased += 1;
+                    self.leased = self
+                        .leased
+                        .checked_add(1)
+                        .expect("RunProgress::leased overflow");
                 }
             }
-            ShardStatus::Done => self.done += 1,
-            ShardStatus::Split => self.split += 1,
-            ShardStatus::Parked => self.parked += 1,
+            ShardStatus::Done => {
+                self.done = self
+                    .done
+                    .checked_add(1)
+                    .expect("RunProgress::done overflow");
+            }
+            ShardStatus::Split => {
+                self.split = self
+                    .split
+                    .checked_add(1)
+                    .expect("RunProgress::split overflow");
+            }
+            ShardStatus::Parked => {
+                self.parked = self
+                    .parked
+                    .checked_add(1)
+                    .expect("RunProgress::parked overflow");
+            }
         }
-        debug_assert_eq!(
+        assert_eq!(
             self.total,
             self.active + self.done + self.split + self.parked,
             "RunProgress: total must equal sum of per-status counts"
@@ -739,6 +816,10 @@ pub enum RunTerminalEvaluation {
 /// when and whether to auto-transition (D2.19: external terminal evaluation).
 #[must_use]
 pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
+    debug_assert!(
+        progress.total > 0,
+        "evaluate_run_terminal called with zero-total progress"
+    );
     if progress.active > 0 {
         RunTerminalEvaluation::StillActive
     } else if progress.parked > 0 {
@@ -749,7 +830,7 @@ pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
 }
 
 // ============================================================================
-// § InitialShard + Manifest Validation
+// InitialShard + Manifest Validation
 // ============================================================================
 
 /// Maximum number of shards in a single `register_shards` call (SEC-3).
@@ -776,6 +857,7 @@ pub struct InitialShard {
 }
 
 impl InitialShard {
+    #[must_use]
     pub fn new(shard: ShardId, spec: ShardSpec, cursor: Cursor) -> Self {
         Self {
             shard,
@@ -784,19 +866,16 @@ impl InitialShard {
         }
     }
 
-    #[inline]
     #[must_use]
     pub fn shard(&self) -> ShardId {
         self.shard
     }
 
-    #[inline]
     #[must_use]
     pub fn spec(&self) -> &ShardSpec {
         &self.spec
     }
 
-    #[inline]
     #[must_use]
     pub fn cursor(&self) -> &Cursor {
         &self.cursor
@@ -856,8 +935,9 @@ impl std::error::Error for ManifestValidationError {}
 /// 1. SEC-3: count <= `MAX_INITIAL_SHARDS` (FIRST check, before allocation).
 /// 2. Non-empty.
 /// 3. No duplicate IDs.
-/// 4. No overlapping key ranges (gaps are allowed).
-/// 5. Cursor bounds for non-initial cursors.
+/// 4. Spec validity: `start < end` for bounded key ranges.
+/// 5. No overlapping key ranges (gaps are allowed).
+/// 6. Cursor bounds for non-initial cursors.
 pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
@@ -929,7 +1009,7 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
 }
 
 // ============================================================================
-// § ShardSummary
+// ShardSummary
 // ============================================================================
 
 /// Lightweight shard summary for listing and observability.
@@ -941,6 +1021,11 @@ pub struct ShardSummary {
     pub(crate) status: ShardStatus,
     pub(crate) park_reason: Option<ParkReason>,
     pub(crate) is_leased: bool,
+    /// Number of times this shard has been acquired.
+    ///
+    /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore`
+    /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
+    /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,
     pub(crate) last_key: Option<Box<[u8]>>,
     pub(crate) key_range_start: Box<[u8]>,
@@ -956,73 +1041,66 @@ impl ShardSummary {
             status: record.status,
             park_reason: record.park_reason,
             is_leased: record.is_leased_at(now),
-            acquire_count: record
-                .fence_epoch
-                .as_raw()
-                .saturating_sub(FenceEpoch::INITIAL.as_raw()) as u32,
+            acquire_count: u32::try_from(
+                record
+                    .fence_epoch
+                    .as_raw()
+                    .saturating_sub(FenceEpoch::INITIAL.as_raw()),
+            )
+            .unwrap_or(u32::MAX),
             last_key: record.cursor.last_key().map(|k| k.into()),
             key_range_start: record.spec.key_range_start().into(),
             key_range_end: record.spec.key_range_end().into(),
             parent: record.parent,
-            spawned_count: record.spawned.len() as u32,
+            spawned_count: u32::try_from(record.spawned.len()).unwrap_or(u32::MAX),
         }
     }
 
-    #[inline]
     #[must_use]
     pub fn shard(&self) -> ShardId {
         self.shard
     }
 
-    #[inline]
     #[must_use]
     pub fn status(&self) -> ShardStatus {
         self.status
     }
 
-    #[inline]
     #[must_use]
     pub fn park_reason(&self) -> Option<ParkReason> {
         self.park_reason
     }
 
-    #[inline]
     #[must_use]
     pub fn is_leased(&self) -> bool {
         self.is_leased
     }
 
-    #[inline]
     #[must_use]
     pub fn acquire_count(&self) -> u32 {
         self.acquire_count
     }
 
-    #[inline]
     #[must_use]
     pub fn last_key(&self) -> Option<&[u8]> {
         self.last_key.as_deref()
     }
 
-    #[inline]
     #[must_use]
     pub fn key_range_start(&self) -> &[u8] {
         &self.key_range_start
     }
 
-    #[inline]
     #[must_use]
     pub fn key_range_end(&self) -> &[u8] {
         &self.key_range_end
     }
 
-    #[inline]
     #[must_use]
     pub fn parent(&self) -> Option<ShardId> {
         self.parent
     }
 
-    #[inline]
     #[must_use]
     pub fn spawned_count(&self) -> u32 {
         self.spawned_count
@@ -1030,7 +1108,7 @@ impl ShardSummary {
 }
 
 // ============================================================================
-// § ShardFilter
+// ShardFilter
 // ============================================================================
 
 /// Filter criteria for [`RunManagement::list_shards`].
@@ -1082,6 +1160,7 @@ impl ShardFilter {
     }
 
     /// Test whether a [`ShardSummary`] passes all filter criteria.
+    #[must_use]
     pub fn matches(&self, summary: &ShardSummary) -> bool {
         if let Some(status) = self.status
             && summary.status != status
@@ -1101,7 +1180,7 @@ impl ShardFilter {
 }
 
 // ============================================================================
-// § Payload hash functions
+// Payload hash functions
 // ============================================================================
 
 /// Payload hash for `register_shards`.
@@ -1127,7 +1206,9 @@ pub fn hash_register_shards_payload(shards: &[InitialShard]) -> u64 {
 ///
 /// Terminal ops (complete, fail, cancel) carry no per-invocation parameters
 /// beyond the `RunId` (implicit in the call site), so the payload is just
-/// the domain-separated tag. Each tag produces a distinct non-zero hash.
+/// the domain-separated tag. Each tag produces a distinct hash (non-zero
+/// with overwhelming probability ~1-2^{-64}; verified by
+/// `hash_terminal_ops_distinct` test).
 fn hash_run_terminal_payload(tag: &[u8]) -> u64 {
     op_payload_hash(tag, |_h| {})
 }
@@ -1163,7 +1244,7 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 }
 
 // ============================================================================
-// § RunManagement trait
+// RunManagement trait
 // ============================================================================
 
 /// Run-level management operations.
@@ -1210,6 +1291,15 @@ pub trait RunManagement {
     ///
     /// On retry, if the run already exists with the same config, attempts
     /// to re-apply `register_shards` (idempotent via `op_id`).
+    ///
+    /// # Production note
+    ///
+    /// The default implementation is **not atomic**: `create_run` and
+    /// `register_shards` are separate calls with a TOCTOU window between
+    /// the existence check and the registration. The in-memory backend
+    /// serializes via `&mut self`, but production backends should override
+    /// this with a transactional implementation to avoid partial-creation
+    /// races under concurrent callers.
     fn create_run_with_shards(
         &mut self,
         now: LogicalTime,
@@ -1222,31 +1312,17 @@ pub trait RunManagement {
         match self.create_run(now, tenant, run, config) {
             Ok(_) => {}
             Err(CreateRunError::RunAlreadyExists { .. }) => {
-                let existing =
-                    self.get_run(tenant, run)
-                        .map_err(|e| CreateRunError::RegistrationFailed {
-                            reason: format!("get_run after RunAlreadyExists: {e:?}"),
-                        })?;
+                let existing = self.get_run(tenant, run)?;
                 if existing.config != config {
-                    return Err(CreateRunError::RegistrationFailed {
-                        reason: "run exists with different config".into(),
-                    });
+                    return Err(CreateRunError::ConfigMismatch { run });
                 }
             }
             Err(e) => return Err(e),
         }
 
-        let outcome = self
-            .register_shards(now, tenant, run, shards, op_id)
-            .map_err(|e| CreateRunError::RegistrationFailed {
-                reason: format!("register_shards: {e:?}"),
-            })?;
+        let outcome = self.register_shards(now, tenant, run, shards, op_id)?;
 
-        let record = self
-            .get_run(tenant, run)
-            .map_err(|e| CreateRunError::RegistrationFailed {
-                reason: format!("get_run after register: {e:?}"),
-            })?;
+        let record = self.get_run(tenant, run)?;
 
         Ok(outcome.map(|_| record))
     }
@@ -1314,7 +1390,7 @@ pub trait RunManagement {
 }
 
 // ============================================================================
-// § Tests
+// Tests
 // ============================================================================
 
 #[cfg(test)]
@@ -1323,6 +1399,7 @@ mod tests {
     use crate::coordination::cursor::Cursor;
     use crate::coordination::shard_spec::CursorSemantics;
     use crate::identity::{OpId, RunId, ShardId};
+    use rstest::rstest;
 
     // -- Test fixtures --
 
@@ -1360,52 +1437,45 @@ mod tests {
     }
 
     fn make_op_log_entry(op_id: u64, kind: RunOpKind) -> RunOpLogEntry {
+        let result = match kind {
+            RunOpKind::RegisterShards => RunOpResult::RegisteredShards {
+                shard_ids: Box::new([ShardId::from_raw(0)]),
+            },
+            _ => RunOpResult::Ack,
+        };
         RunOpLogEntry::new(
             OpId::from_raw(op_id),
             kind,
             42, // non-zero payload hash
             LogicalTime::from_raw(1),
-            RunOpResult::Ack,
+            result,
         )
     }
 
     // -- RunStatus --
 
-    #[test]
-    fn run_status_terminal() {
-        assert!(!RunStatus::Initializing.is_terminal());
-        assert!(!RunStatus::Active.is_terminal());
-        assert!(RunStatus::Done.is_terminal());
-        assert!(RunStatus::Failed.is_terminal());
-        assert!(RunStatus::Cancelled.is_terminal());
+    #[rstest]
+    #[case::initializing(RunStatus::Initializing, 0, false, "Initializing")]
+    #[case::active(RunStatus::Active, 1, false, "Active")]
+    #[case::done(RunStatus::Done, 2, true, "Done")]
+    #[case::failed(RunStatus::Failed, 3, true, "Failed")]
+    #[case::cancelled(RunStatus::Cancelled, 4, true, "Cancelled")]
+    fn run_status_properties(
+        #[case] status: RunStatus,
+        #[case] disc: u8,
+        #[case] terminal: bool,
+        #[case] display: &str,
+    ) {
+        assert_eq!(status.as_u8(), disc);
+        assert_eq!(RunStatus::from_u8(disc), Some(status));
+        assert_eq!(status.is_terminal(), terminal);
+        assert_eq!(status.to_string(), display);
     }
 
     #[test]
-    fn run_status_roundtrip() {
-        for v in 0..=4u8 {
-            let status = RunStatus::from_u8(v).unwrap();
-            assert_eq!(status.as_u8(), v);
-        }
+    fn run_status_from_u8_out_of_range() {
         assert_eq!(RunStatus::from_u8(5), None);
         assert_eq!(RunStatus::from_u8(u8::MAX), None);
-    }
-
-    #[test]
-    fn run_status_discriminants_stable() {
-        assert_eq!(RunStatus::Initializing.as_u8(), 0);
-        assert_eq!(RunStatus::Active.as_u8(), 1);
-        assert_eq!(RunStatus::Done.as_u8(), 2);
-        assert_eq!(RunStatus::Failed.as_u8(), 3);
-        assert_eq!(RunStatus::Cancelled.as_u8(), 4);
-    }
-
-    #[test]
-    fn run_status_display() {
-        assert_eq!(RunStatus::Initializing.to_string(), "Initializing");
-        assert_eq!(RunStatus::Active.to_string(), "Active");
-        assert_eq!(RunStatus::Done.to_string(), "Done");
-        assert_eq!(RunStatus::Failed.to_string(), "Failed");
-        assert_eq!(RunStatus::Cancelled.to_string(), "Cancelled");
     }
 
     // -- RunConfig --
@@ -1441,29 +1511,20 @@ mod tests {
 
     // -- RunOpKind --
 
+    #[rstest]
+    #[case::register_shards(RunOpKind::RegisterShards, 0, "RegisterShards")]
+    #[case::complete_run(RunOpKind::CompleteRun, 1, "CompleteRun")]
+    #[case::fail_run(RunOpKind::FailRun, 2, "FailRun")]
+    #[case::cancel_run(RunOpKind::CancelRun, 3, "CancelRun")]
+    fn run_op_kind_properties(#[case] kind: RunOpKind, #[case] disc: u8, #[case] display: &str) {
+        assert_eq!(kind.as_u8(), disc);
+        assert_eq!(RunOpKind::from_u8(disc), Some(kind));
+        assert_eq!(kind.to_string(), display);
+    }
+
     #[test]
-    fn run_op_kind_roundtrip() {
-        for v in 0..=3u8 {
-            let kind = RunOpKind::from_u8(v).unwrap();
-            assert_eq!(kind.as_u8(), v);
-        }
+    fn run_op_kind_from_u8_out_of_range() {
         assert_eq!(RunOpKind::from_u8(4), None);
-    }
-
-    #[test]
-    fn run_op_kind_discriminants_stable() {
-        assert_eq!(RunOpKind::RegisterShards.as_u8(), 0);
-        assert_eq!(RunOpKind::CompleteRun.as_u8(), 1);
-        assert_eq!(RunOpKind::FailRun.as_u8(), 2);
-        assert_eq!(RunOpKind::CancelRun.as_u8(), 3);
-    }
-
-    #[test]
-    fn run_op_kind_display() {
-        assert_eq!(RunOpKind::RegisterShards.to_string(), "RegisterShards");
-        assert_eq!(RunOpKind::CompleteRun.to_string(), "CompleteRun");
-        assert_eq!(RunOpKind::FailRun.to_string(), "FailRun");
-        assert_eq!(RunOpKind::CancelRun.to_string(), "CancelRun");
     }
 
     // -- RunOpLogEntry --
@@ -1530,32 +1591,23 @@ mod tests {
     // -- RunRecord invariants --
 
     #[test]
-    fn rr_active_ok() {
+    fn run_record_valid_states_pass_invariants() {
         test_run_record().assert_invariants();
-    }
 
-    #[test]
-    fn rr_done_ok() {
         RunRecord {
             status: RunStatus::Done,
             completed_at: Some(LogicalTime::from_raw(100)),
             ..test_run_record()
         }
         .assert_invariants();
-    }
 
-    #[test]
-    fn rr_initializing_empty_shards_ok() {
         RunRecord {
             status: RunStatus::Initializing,
             root_shards: vec![],
             ..test_run_record()
         }
         .assert_invariants();
-    }
 
-    #[test]
-    fn rr_cancelled_ok() {
         RunRecord {
             status: RunStatus::Cancelled,
             completed_at: Some(LogicalTime::from_raw(100)),
@@ -1774,81 +1826,41 @@ mod tests {
 
     // -- evaluate_run_terminal --
 
-    #[test]
-    fn eval_still_active() {
-        assert_eq!(
-            evaluate_run_terminal(&RunProgress {
-                active: 1,
-                ..Default::default()
-            }),
-            RunTerminalEvaluation::StillActive,
-        );
-    }
-
-    #[test]
-    fn eval_all_done() {
-        assert_eq!(
-            evaluate_run_terminal(&RunProgress {
-                total: 3,
-                done: 2,
-                split: 1,
-                ..Default::default()
-            }),
-            RunTerminalEvaluation::AllDone,
-        );
-    }
-
-    #[test]
-    fn eval_has_failures() {
-        assert_eq!(
-            evaluate_run_terminal(&RunProgress {
-                total: 3,
-                done: 1,
-                parked: 2,
-                ..Default::default()
-            }),
-            RunTerminalEvaluation::HasFailures,
-        );
+    #[rstest]
+    #[case::still_active(
+        RunProgress { total: 1, active: 1, ..Default::default() },
+        RunTerminalEvaluation::StillActive,
+    )]
+    #[case::all_done(
+        RunProgress { total: 3, done: 2, split: 1, ..Default::default() },
+        RunTerminalEvaluation::AllDone,
+    )]
+    #[case::has_failures(
+        RunProgress { total: 3, done: 1, parked: 2, ..Default::default() },
+        RunTerminalEvaluation::HasFailures,
+    )]
+    fn evaluate_run_terminal_cases(
+        #[case] progress: RunProgress,
+        #[case] expected: RunTerminalEvaluation,
+    ) {
+        assert_eq!(evaluate_run_terminal(&progress), expected);
     }
 
     // -- validate_manifest --
 
-    #[test]
-    fn manifest_ok() {
-        assert!(
-            validate_manifest(&[
-                make_initial_shard(0, b"a", b"m"),
-                make_initial_shard(1, b"m", b"z"),
-            ])
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn manifest_ok_gaps() {
-        assert!(
-            validate_manifest(&[
-                make_initial_shard(0, b"a", b"f"),
-                make_initial_shard(1, b"m", b"z"),
-            ])
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn manifest_ok_unordered() {
-        assert!(
-            validate_manifest(&[
-                make_initial_shard(1, b"m", b"z"),
-                make_initial_shard(0, b"a", b"m"),
-            ])
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn manifest_ok_single() {
-        assert!(validate_manifest(&[make_initial_shard(0, b"a", b"z")]).is_ok());
+    #[rstest]
+    #[case::two_adjacent(
+        vec![make_initial_shard(0, b"a", b"m"), make_initial_shard(1, b"m", b"z")]
+    )]
+    #[case::gap_between_shards(
+        vec![make_initial_shard(0, b"a", b"f"), make_initial_shard(1, b"m", b"z")]
+    )]
+    #[case::unordered_input(
+        vec![make_initial_shard(1, b"m", b"z"), make_initial_shard(0, b"a", b"m")]
+    )]
+    #[case::single_shard(vec![make_initial_shard(0, b"a", b"z")])]
+    fn manifest_valid_cases(#[case] shards: Vec<InitialShard>) {
+        assert!(validate_manifest(&shards).is_ok());
     }
 
     #[test]
@@ -1918,91 +1930,55 @@ mod tests {
 
     // -- ShardFilter --
 
-    #[test]
-    fn filter_all_matches_everything() {
-        let summary = ShardSummary {
+    fn make_shard_summary(
+        status: ShardStatus,
+        leased: bool,
+        parent: Option<ShardId>,
+    ) -> ShardSummary {
+        ShardSummary {
             shard: ShardId::from_raw(0),
-            status: ShardStatus::Active,
+            status,
             park_reason: None,
-            is_leased: false,
+            is_leased: leased,
             acquire_count: 0,
             last_key: None,
             key_range_start: b"a".to_vec().into(),
             key_range_end: b"z".to_vec().into(),
-            parent: None,
+            parent,
             spawned_count: 0,
-        };
-        assert!(ShardFilter::all().matches(&summary));
+        }
     }
 
-    #[test]
-    fn filter_active_rejects_done() {
-        let done = ShardSummary {
-            shard: ShardId::from_raw(0),
-            status: ShardStatus::Done,
-            park_reason: None,
-            is_leased: false,
-            acquire_count: 0,
-            last_key: None,
-            key_range_start: b"a".to_vec().into(),
-            key_range_end: b"z".to_vec().into(),
-            parent: None,
-            spawned_count: 0,
-        };
-        assert!(!ShardFilter::active().matches(&done));
-    }
-
-    #[test]
-    fn filter_available_rejects_leased() {
-        let leased = ShardSummary {
-            shard: ShardId::from_raw(0),
-            status: ShardStatus::Active,
-            park_reason: None,
-            is_leased: true,
-            acquire_count: 1,
-            last_key: None,
-            key_range_start: b"a".to_vec().into(),
-            key_range_end: b"z".to_vec().into(),
-            parent: None,
-            spawned_count: 0,
-        };
-        assert!(!ShardFilter::available().matches(&leased));
-    }
-
-    #[test]
-    fn filter_root_only_rejects_children() {
-        let child = ShardSummary {
-            shard: ShardId::from_raw(0),
-            status: ShardStatus::Active,
-            park_reason: None,
-            is_leased: false,
-            acquire_count: 0,
-            last_key: None,
-            key_range_start: b"a".to_vec().into(),
-            key_range_end: b"z".to_vec().into(),
-            parent: Some(ShardId::from_raw(99)),
-            spawned_count: 0,
-        };
-        let f = ShardFilter {
-            root_only: true,
-            ..ShardFilter::default()
-        };
-        assert!(!f.matches(&child));
+    #[rstest]
+    #[case::all_matches_everything(
+        ShardFilter::all(),
+        make_shard_summary(ShardStatus::Active, false, None),
+        true
+    )]
+    #[case::active_rejects_done(
+        ShardFilter::active(),
+        make_shard_summary(ShardStatus::Done, false, None),
+        false
+    )]
+    #[case::available_rejects_leased(
+        ShardFilter::available(),
+        make_shard_summary(ShardStatus::Active, true, None),
+        false
+    )]
+    #[case::root_only_rejects_children(
+        ShardFilter { root_only: true, ..ShardFilter::default() },
+        make_shard_summary(ShardStatus::Active, false, Some(ShardId::from_raw(99))),
+        false,
+    )]
+    fn shard_filter_matching(
+        #[case] filter: ShardFilter,
+        #[case] summary: ShardSummary,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(filter.matches(&summary), expected);
     }
 
     // -- Payload hashes --
-
-    #[test]
-    fn hash_register_shards_deterministic() {
-        let shards = [
-            make_initial_shard(0, b"a", b"m"),
-            make_initial_shard(1, b"m", b"z"),
-        ];
-        let h1 = hash_register_shards_payload(&shards);
-        let h2 = hash_register_shards_payload(&shards);
-        assert_eq!(h1, h2);
-        assert_ne!(h1, 0);
-    }
 
     #[test]
     fn hash_register_shards_order_independent() {
@@ -2011,6 +1987,7 @@ mod tests {
         let h_forward = hash_register_shards_payload(&[s1.clone(), s2.clone()]);
         let h_reverse = hash_register_shards_payload(&[s2, s1]);
         assert_eq!(h_forward, h_reverse);
+        assert_ne!(h_forward, 0);
     }
 
     #[test]
@@ -2030,24 +2007,211 @@ mod tests {
     fn hash_unpark_different_shards_differ() {
         let k1 = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(10));
         let k2 = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(20));
-        assert_ne!(hash_unpark_payload(&k1), hash_unpark_payload(&k2));
+        let h1 = hash_unpark_payload(&k1);
+        let h2 = hash_unpark_payload(&k2);
+        assert_ne!(h1, h2);
+        assert_ne!(h1, 0);
+        assert_ne!(h2, 0);
+    }
+
+    // -- INV-11: Kind-result consistency --
+
+    #[test]
+    #[should_panic(expected = "RegisterShards op-log entry must have RegisteredShards result")]
+    fn assert_invariants_catches_register_shards_with_ack() {
+        let mut r = test_run_record();
+        r.op_log.push(RunOpLogEntry::new(
+            OpId::from_raw(1),
+            RunOpKind::RegisterShards,
+            42,
+            LogicalTime::from_raw(1),
+            RunOpResult::Ack,
+        ));
+        r.assert_invariants();
     }
 
     #[test]
-    fn hash_unpark_nonzero() {
-        let k = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(10));
-        assert_ne!(hash_unpark_payload(&k), 0);
+    #[should_panic(expected = "must not have RegisteredShards result")]
+    fn assert_invariants_catches_terminal_op_with_registered_shards() {
+        let mut r = test_run_record();
+        r.op_log.push(RunOpLogEntry::new(
+            OpId::from_raw(1),
+            RunOpKind::CompleteRun,
+            42,
+            LogicalTime::from_raw(1),
+            RunOpResult::RegisteredShards {
+                shard_ids: Box::new([]),
+            },
+        ));
+        r.assert_invariants();
     }
 
-    // -- Size regression --
-
     #[test]
-    fn run_status_size() {
-        assert_eq!(core::mem::size_of::<RunStatus>(), 1);
+    #[should_panic(expected = "duplicate ShardId")]
+    fn rr_duplicate_root_shards_panics() {
+        let dup = ShardId::from_raw(0);
+        RunRecord {
+            root_shards: vec![dup, dup],
+            ..test_run_record()
+        }
+        .assert_invariants();
     }
 
     #[test]
-    fn run_op_kind_size() {
-        assert_eq!(core::mem::size_of::<RunOpKind>(), 1);
+    #[should_panic(expected = "timestamps not non-decreasing")]
+    fn rr_oplog_timestamps_non_decreasing_panics() {
+        let mut r = test_run_record();
+        r.op_log.push(RunOpLogEntry::new(
+            OpId::from_raw(1),
+            RunOpKind::CompleteRun,
+            42,
+            LogicalTime::from_raw(10),
+            RunOpResult::Ack,
+        ));
+        r.op_log.push(RunOpLogEntry::new(
+            OpId::from_raw(2),
+            RunOpKind::FailRun,
+            43,
+            LogicalTime::from_raw(5), // earlier than previous — violates INV-10
+            RunOpResult::Ack,
+        ));
+        r.assert_invariants();
+    }
+
+    // -- Finding 3: ShardSummary acquire_count saturation --
+
+    #[test]
+    fn shard_summary_acquire_count_saturates_at_u32_max() {
+        use crate::coordination::record::ShardRecord;
+
+        let large_epoch = FenceEpoch::from_raw(u64::from(u32::MAX) + 2);
+        let record = ShardRecord::from_raw_parts(
+            test_tenant(),
+            test_run(),
+            ShardId::from_raw(1),
+            ShardStatus::Active,
+            None,
+            ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            large_epoch,
+            None,
+            vec![],
+            vec![],
+        );
+        let summary = ShardSummary::from_record(&record, LogicalTime::from_raw(1));
+        assert_eq!(
+            summary.acquire_count(),
+            u32::MAX,
+            "acquire_count must saturate at u32::MAX, not truncate"
+        );
+    }
+
+    // -- Finding 2: validate_manifest InvalidSpec path --
+
+    #[test]
+    fn manifest_inverted_spec_detected_by_validate_manifest() {
+        let inverted_spec = ShardSpec::from_raw_parts(
+            b"z".to_vec().into_boxed_slice(),
+            b"a".to_vec().into_boxed_slice(),
+            Box::new([]),
+        );
+        let shard = InitialShard::new(ShardId::from_raw(0), inverted_spec, Cursor::initial());
+        let result = validate_manifest(&[shard]);
+        assert!(
+            matches!(result, Err(ManifestValidationError::InvalidSpec { .. })),
+            "validate_manifest must catch inverted specs: {result:?}"
+        );
+    }
+
+    // -- Finding 4: count_shard assert (promoted from debug_assert) --
+
+    #[test]
+    #[should_panic(expected = "is_leased=true is only valid for Active shards")]
+    fn count_shard_leased_non_active_panics() {
+        let mut p = RunProgress::default();
+        p.count_shard(ShardStatus::Done, true);
+    }
+
+    // -- Finding 5: evaluate_run_terminal debug_assert --
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "evaluate_run_terminal called with zero-total progress")]
+    fn evaluate_run_terminal_zero_total_panics_in_debug() {
+        let _ = evaluate_run_terminal(&RunProgress::default());
+    }
+
+    // -- F16: RunOpIdConflict Display does not leak hashes --
+
+    #[test]
+    fn run_op_id_conflict_display_no_hash_leak() {
+        let c = RunOpIdConflict {
+            op_id: OpId::from_raw(1),
+            expected_hash: 0xDEAD_BEEF,
+            actual_hash: 0xCAFE_BABE,
+        };
+        let display = c.to_string();
+        assert!(
+            !display.contains("DEAD") && !display.contains("CAFE"),
+            "Display leaks hex hash: {display}"
+        );
+        assert!(
+            !display.contains("3735928559") && !display.contains("3405691582"),
+            "Display leaks decimal hash: {display}"
+        );
+    }
+
+    // -- F17: Exact boundary tests --
+
+    #[test]
+    fn manifest_exactly_max_initial_shards_succeeds() {
+        let shards: Vec<_> = (0..MAX_INITIAL_SHARDS)
+            .map(|i| {
+                let start = format!("{:05}", i);
+                let end = format!("{:05}", i + 1);
+                make_initial_shard(i as u64, start.as_bytes(), end.as_bytes())
+            })
+            .collect();
+        assert!(validate_manifest(&shards).is_ok());
+    }
+
+    #[test]
+    fn op_log_exactly_at_cap_maintains_invariants() {
+        let mut r = test_run_record();
+        for i in 0..RunRecord::OP_LOG_CAP {
+            r.op_log_push(make_op_log_entry(i as u64, RunOpKind::CompleteRun));
+        }
+        assert_eq!(r.op_log.len(), RunRecord::OP_LOG_CAP);
+        r.assert_invariants();
+
+        // One more should evict the oldest.
+        r.op_log_push(make_op_log_entry(
+            RunRecord::OP_LOG_CAP as u64,
+            RunOpKind::FailRun,
+        ));
+        assert_eq!(r.op_log.len(), RunRecord::OP_LOG_CAP);
+        // Oldest (op_id=0) evicted.
+        assert!(r.op_log_lookup(OpId::from_raw(0)).is_none());
+        // Newest still present.
+        assert!(
+            r.op_log_lookup(OpId::from_raw(RunRecord::OP_LOG_CAP as u64))
+                .is_some()
+        );
+        r.assert_invariants();
+    }
+
+    #[test]
+    fn count_shard_overflow_panics() {
+        let mut p = RunProgress {
+            total: u32::MAX,
+            active: u32::MAX,
+            ..Default::default()
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.count_shard(ShardStatus::Active, false);
+        }));
+        assert!(result.is_err(), "count_shard must panic on u32 overflow");
     }
 }
