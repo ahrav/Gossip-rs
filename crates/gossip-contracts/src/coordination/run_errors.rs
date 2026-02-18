@@ -53,8 +53,10 @@ pub enum CreateRunError {
     InvalidConfig(RunConfigError),
     /// A run with this `RunId` already exists for this tenant.
     RunAlreadyExists { run: RunId },
-    /// Registration step failed during `create_run_with_shards`.
-    RegistrationFailed { reason: String },
+    /// Shard registration failed during `create_run_with_shards`.
+    RegisterShardsFailed(RegisterShardsError),
+    /// Run lookup failed during `create_run_with_shards`.
+    GetRunFailed(GetRunError),
     /// A run with this `RunId` already exists with a different `RunConfig`.
     ConfigMismatch { run: RunId },
 }
@@ -64,9 +66,8 @@ impl fmt::Display for CreateRunError {
         match self {
             Self::InvalidConfig(e) => write!(f, "invalid run config: {e}"),
             Self::RunAlreadyExists { run } => write!(f, "run already exists: {run:?}"),
-            Self::RegistrationFailed { reason } => {
-                write!(f, "registration failed: {reason}")
-            }
+            Self::RegisterShardsFailed(e) => write!(f, "shard registration failed: {e}"),
+            Self::GetRunFailed(e) => write!(f, "run lookup failed: {e}"),
             Self::ConfigMismatch { run } => {
                 write!(f, "run {run:?} exists with different config")
             }
@@ -78,6 +79,8 @@ impl std::error::Error for CreateRunError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidConfig(e) => Some(e),
+            Self::RegisterShardsFailed(e) => Some(e),
+            Self::GetRunFailed(e) => Some(e),
             _ => None,
         }
     }
@@ -86,6 +89,18 @@ impl std::error::Error for CreateRunError {
 impl From<RunConfigError> for CreateRunError {
     fn from(e: RunConfigError) -> Self {
         Self::InvalidConfig(e)
+    }
+}
+
+impl From<RegisterShardsError> for CreateRunError {
+    fn from(e: RegisterShardsError) -> Self {
+        Self::RegisterShardsFailed(e)
+    }
+}
+
+impl From<GetRunError> for CreateRunError {
+    fn from(e: GetRunError) -> Self {
+        Self::GetRunFailed(e)
     }
 }
 
@@ -590,6 +605,8 @@ mod tests {
     #[rstest]
     #[case::create_run_already_exists(Box::new(CreateRunError::RunAlreadyExists { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>)]
     #[case::create_config_mismatch(Box::new(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>)]
+    #[case::create_register_shards_failed(Box::new(CreateRunError::RegisterShardsFailed(RegisterShardsError::RunNotFound)) as Box<dyn std::error::Error>)]
+    #[case::create_get_run_failed(Box::new(CreateRunError::GetRunFailed(GetRunError::RunNotFound)) as Box<dyn std::error::Error>)]
     #[case::register_shards_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>)]
     #[case::register_shard_limit(Box::new(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }) as Box<dyn std::error::Error>)]
     #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>)]
@@ -608,7 +625,8 @@ mod tests {
     #[rstest]
     #[case::create_invalid_config(Box::new(CreateRunError::InvalidConfig(RunConfigError::ZeroLeaseDuration)) as Box<dyn std::error::Error>, true)]
     #[case::create_already_exists(Box::new(CreateRunError::RunAlreadyExists { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>, false)]
-    #[case::create_registration_failed(Box::new(CreateRunError::RegistrationFailed { reason: "test".into() }) as Box<dyn std::error::Error>, false)]
+    #[case::create_register_shards_failed(Box::new(CreateRunError::RegisterShardsFailed(RegisterShardsError::RunNotFound)) as Box<dyn std::error::Error>, true)]
+    #[case::create_get_run_failed(Box::new(CreateRunError::GetRunFailed(GetRunError::RunNotFound)) as Box<dyn std::error::Error>, true)]
     #[case::create_config_mismatch(Box::new(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>, false)]
     #[case::register_manifest_invalid(Box::new(RegisterShardsError::ManifestInvalid(ManifestValidationError::Empty)) as Box<dyn std::error::Error>, true)]
     #[case::register_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>, false)]
@@ -628,7 +646,8 @@ mod tests {
     // CreateRunError
     #[case::create_invalid_config(CreateRunError::InvalidConfig(RunConfigError::ZeroLeaseDuration).to_string())]
     #[case::create_already_exists(CreateRunError::RunAlreadyExists { run: RunId::from_raw(1) }.to_string())]
-    #[case::create_registration_failed(CreateRunError::RegistrationFailed { reason: "test".into() }.to_string())]
+    #[case::create_register_shards_failed(CreateRunError::RegisterShardsFailed(RegisterShardsError::RunNotFound).to_string())]
+    #[case::create_get_run_failed(CreateRunError::GetRunFailed(GetRunError::RunNotFound).to_string())]
     #[case::create_config_mismatch(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }.to_string())]
     // RegisterShardsError
     #[case::register_not_found(RegisterShardsError::RunNotFound.to_string())]
@@ -681,14 +700,30 @@ mod tests {
     }
 
     #[test]
-    fn create_run_registration_failed_display_includes_reason() {
-        let e = CreateRunError::RegistrationFailed {
-            reason: "some failure context".into(),
-        };
+    fn create_run_register_shards_failed_display_includes_inner() {
+        let e = CreateRunError::RegisterShardsFailed(RegisterShardsError::RunNotFound);
         let s = e.to_string();
         assert!(
-            s.contains("some failure context"),
-            "RegistrationFailed display must include reason: {s}"
+            s.contains("shard registration failed"),
+            "RegisterShardsFailed display must include prefix: {s}"
+        );
+        assert!(
+            s.contains("run not found"),
+            "RegisterShardsFailed display must include inner error: {s}"
+        );
+    }
+
+    #[test]
+    fn create_run_get_run_failed_display_includes_inner() {
+        let e = CreateRunError::GetRunFailed(GetRunError::RunNotFound);
+        let s = e.to_string();
+        assert!(
+            s.contains("run lookup failed"),
+            "GetRunFailed display must include prefix: {s}"
+        );
+        assert!(
+            s.contains("run not found"),
+            "GetRunFailed display must include inner error: {s}"
         );
     }
 }
