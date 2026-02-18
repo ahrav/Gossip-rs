@@ -268,6 +268,7 @@ mod tests {
     use crate::coordination::record::ShardRecord;
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use crate::identity::{FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
+    use gossip_stdx::RingBuffer;
 
     // -- Test fixtures ---------------------------------------------------
 
@@ -320,7 +321,7 @@ mod tests {
             FenceEpoch::from_raw(2),
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
         r
@@ -672,7 +673,7 @@ mod tests {
     #[test]
     fn check_op_idempotency_replay() {
         let mut record = active_unleased_record();
-        record.op_log.push(make_entry(42, 0xABCD));
+        record.op_log.push_back(make_entry(42, 0xABCD)).unwrap();
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xABCD);
         assert!(matches!(result, Ok(Some(_))));
     }
@@ -680,7 +681,7 @@ mod tests {
     #[test]
     fn check_op_idempotency_conflict() {
         let mut record = active_unleased_record();
-        record.op_log.push(make_entry(42, 0xABCD));
+        record.op_log.push_back(make_entry(42, 0xABCD)).unwrap();
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xDEAD);
         assert!(
             matches!(result, Err(CoordError::OpIdConflict { .. })),
@@ -693,7 +694,10 @@ mod tests {
         let mut record = active_unleased_record();
         // Fill op-log to capacity.
         for i in 0..ShardRecord::OP_LOG_CAP as u64 {
-            record.op_log.push(make_entry(i + 1, 0x1000 + i));
+            record
+                .op_log
+                .push_back(make_entry(i + 1, 0x1000 + i))
+                .unwrap();
         }
         assert_eq!(record.op_log.len(), ShardRecord::OP_LOG_CAP);
         // Query the oldest entry — should still be found.
@@ -715,7 +719,10 @@ mod tests {
     fn check_op_idempotency_evicted_entry_returns_none() {
         let mut record = active_unleased_record();
         for i in 0..ShardRecord::OP_LOG_CAP as u64 {
-            record.op_log.push(make_entry(i + 1, 0x1000 + i));
+            record
+                .op_log
+                .push_back(make_entry(i + 1, 0x1000 + i))
+                .unwrap();
         }
         // Evict oldest (op_id=1) by pushing beyond capacity.
         record.op_log_push(make_entry(ShardRecord::OP_LOG_CAP as u64 + 1, 0x2000));
@@ -766,7 +773,7 @@ mod tests {
                 FenceEpoch::INITIAL,
                 None,
                 vec![],
-                vec![],
+                RingBuffer::new(),
             );
 
             let new_cursor = match new_key {

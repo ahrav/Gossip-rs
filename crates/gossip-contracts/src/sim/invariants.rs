@@ -316,6 +316,7 @@ mod tests {
     use crate::coordination::record::ShardRecord;
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use crate::identity::{LogicalTime, RunId, ShardId, ShardKey, TenantId};
+    use gossip_stdx::RingBuffer;
 
     const TENANT: TenantId = TenantId::from_bytes([0x01; 32]);
     const LEASE_DUR: u64 = 100;
@@ -381,7 +382,7 @@ mod tests {
             FenceEpoch::from_raw(5),
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
         let mut checker = InvariantChecker::new();
         assert!(checker.check_all(&coord, &[], TENANT, now).is_empty());
@@ -400,7 +401,7 @@ mod tests {
             FenceEpoch::from_raw(3),
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let v = checker.check_all(&coord, &[], TENANT, now);
@@ -434,7 +435,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
         let mut checker = InvariantChecker::new();
         assert!(checker.check_all(&coord, &[], TENANT, now).is_empty());
@@ -453,7 +454,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let v = checker.check_all(&coord, &[], TENANT, now);
@@ -486,7 +487,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let mut checker = InvariantChecker::new();
@@ -521,7 +522,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
         let mut checker = InvariantChecker::new();
         assert!(checker.check_all(&coord, &[], TENANT, now).is_empty());
@@ -540,7 +541,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let v = checker.check_all(&coord, &[], TENANT, now);
@@ -573,7 +574,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let mut checker = InvariantChecker::new();
@@ -607,7 +608,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let mut checker = InvariantChecker::new();
@@ -649,7 +650,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let mut checker = InvariantChecker::new();
@@ -689,7 +690,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![missing_child],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let mut checker = InvariantChecker::new();
@@ -728,7 +729,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![child_shard],
-            vec![],
+            RingBuffer::new(),
         ));
 
         // Child shard exists but points to wrong parent (derived 999 instead of 1).
@@ -745,7 +746,7 @@ mod tests {
             FenceEpoch::INITIAL,
             Some(ShardId::from_raw(999)),
             vec![],
-            vec![],
+            RingBuffer::new(),
         ));
 
         let mut checker = InvariantChecker::new();

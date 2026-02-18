@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, MAX_KEY_SIZE};
 use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
@@ -31,6 +31,7 @@ use crate::coordination::split::op_payload_hash;
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
 };
+use gossip_stdx::RingBuffer;
 
 // ============================================================================
 // RunStatus
@@ -399,7 +400,7 @@ pub struct RunRecord {
     /// Root shard IDs registered at creation. Does not include split children.
     pub(crate) root_shards: Vec<ShardId>,
     /// Bounded op-log for idempotent replay of run-level ops.
-    pub(crate) op_log: Vec<RunOpLogEntry>,
+    pub(crate) op_log: RingBuffer<RunOpLogEntry, { RunRecord::OP_LOG_CAP }>,
 }
 
 impl RunRecord {
@@ -493,8 +494,8 @@ impl RunRecord {
     }
 
     fn assert_oplog_invariants(&self) {
-        // INV-6: Op-log bounded.
-        assert!(
+        // INV-6: Op-log bounded (structurally guaranteed by RingBuffer).
+        debug_assert!(
             self.op_log.len() <= Self::OP_LOG_CAP,
             "Run {:?}: op_log length {} exceeds cap {}",
             self.run,
@@ -508,23 +509,27 @@ impl RunRecord {
         for i in 0..self.op_log.len() {
             for j in (i + 1)..self.op_log.len() {
                 assert!(
-                    self.op_log[i].op_id() != self.op_log[j].op_id(),
+                    self.op_log.get(i).unwrap().op_id() != self.op_log.get(j).unwrap().op_id(),
                     "Run {:?}: duplicate OpId {:?} in op_log at indices {i} and {j}",
                     self.run,
-                    self.op_log[i].op_id(),
+                    self.op_log.get(i).unwrap().op_id(),
                 );
             }
         }
 
         // INV-10: Op-log timestamps non-decreasing.
-        for pair in self.op_log.windows(2) {
-            assert!(
-                pair[1].executed_at() >= pair[0].executed_at(),
-                "Run {:?}: op_log timestamps not non-decreasing: {:?} followed by {:?}",
-                self.run,
-                pair[0].executed_at(),
-                pair[1].executed_at(),
-            );
+        let mut iter = self.op_log.iter();
+        if let Some(mut prev) = iter.next() {
+            for entry in iter {
+                assert!(
+                    entry.executed_at() >= prev.executed_at(),
+                    "Run {:?}: op_log timestamps not non-decreasing: {:?} followed by {:?}",
+                    self.run,
+                    prev.executed_at(),
+                    entry.executed_at(),
+                );
+                prev = entry;
+            }
         }
 
         // INV-11: Kind-result consistency.
@@ -576,14 +581,8 @@ impl RunRecord {
             self.run,
             entry.op_id(),
         );
-        if self.op_log.len() >= Self::OP_LOG_CAP {
-            // O(n) shift via remove(0). n ≤ OP_LOG_CAP (8), so at most 7
-            // element copies — negligible at this scale. VecDeque would be
-            // O(1) but adds indirection overhead that dominates at this cap size.
-            self.op_log.remove(0);
-        }
-        self.op_log.push(entry);
-        assert!(self.op_log.len() <= Self::OP_LOG_CAP);
+        self.op_log.push_back_overwrite(entry);
+        debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
     }
 
     /// Check idempotency for a run-level operation.
@@ -656,9 +655,7 @@ impl RunRecord {
 }
 
 // Compile-time guards for OP_LOG_CAP.
-const _: () = assert!(RunRecord::OP_LOG_CAP > 0);
-const _: () = assert!(RunRecord::OP_LOG_CAP >= 4);
-const _: () = assert!(RunRecord::OP_LOG_CAP <= 64);
+const _: () = assert!(RunRecord::OP_LOG_CAP == 8);
 const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 
 // ============================================================================
@@ -898,6 +895,12 @@ pub enum ManifestValidationError {
     TooManyShards { count: usize, max: usize },
     /// A non-initial cursor falls outside the shard's key range.
     CursorOutOfBounds { shard_id: ShardId },
+    /// A cursor's `last_key` exceeds [`MAX_KEY_SIZE`] bytes.
+    CursorKeyTooLarge {
+        shard_id: ShardId,
+        size: usize,
+        max: usize,
+    },
 }
 
 impl fmt::Display for ManifestValidationError {
@@ -923,6 +926,17 @@ impl fmt::Display for ManifestValidationError {
             Self::CursorOutOfBounds { shard_id } => {
                 write!(f, "cursor out of bounds for shard {:?}", shard_id)
             }
+            Self::CursorKeyTooLarge {
+                shard_id,
+                size,
+                max,
+            } => {
+                write!(
+                    f,
+                    "cursor key too large for shard {:?}: {size} bytes exceeds max {max}",
+                    shard_id,
+                )
+            }
         }
     }
 }
@@ -937,7 +951,8 @@ impl std::error::Error for ManifestValidationError {}
 /// 3. No duplicate IDs.
 /// 4. Spec validity: `start < end` for bounded key ranges.
 /// 5. No overlapping key ranges (gaps are allowed).
-/// 6. Cursor bounds for non-initial cursors.
+/// 6. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
+/// 7. Cursor bounds for non-initial cursors.
 pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
@@ -987,6 +1002,20 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
             return Err(ManifestValidationError::OverlappingRanges {
                 shard_a: a.shard,
                 shard_b: b.shard,
+            });
+        }
+    }
+
+    // Cursor key size check (defense-in-depth; Cursor::try_with_last_key
+    // also validates, but callers may use the panicking constructors).
+    for shard in shards {
+        if let Some(key) = shard.cursor.last_key()
+            && key.len() > MAX_KEY_SIZE
+        {
+            return Err(ManifestValidationError::CursorKeyTooLarge {
+                shard_id: shard.shard,
+                size: key.len(),
+                max: MAX_KEY_SIZE,
             });
         }
     }
@@ -1399,6 +1428,7 @@ mod tests {
     use crate::coordination::cursor::Cursor;
     use crate::coordination::shard_spec::CursorSemantics;
     use crate::identity::{OpId, RunId, ShardId};
+    use gossip_stdx::RingBuffer;
     use rstest::rstest;
 
     // -- Test fixtures --
@@ -1424,7 +1454,7 @@ mod tests {
             created_at: LogicalTime::from_raw(1),
             completed_at: None,
             root_shards: vec![ShardId::from_raw(0), ShardId::from_raw(1)],
-            op_log: vec![],
+            op_log: RingBuffer::new(),
         }
     }
 
@@ -1928,6 +1958,52 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn manifest_cursor_key_too_large() {
+        use crate::coordination::cursor::MAX_KEY_SIZE;
+
+        let oversized_key = vec![0xAA; MAX_KEY_SIZE + 1];
+        let shard = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::unbounded(),
+            Cursor::with_last_key(oversized_key),
+        );
+        let result = validate_manifest(&[shard]);
+        assert!(
+            matches!(
+                result,
+                Err(ManifestValidationError::CursorKeyTooLarge { size, max, .. })
+                    if size == MAX_KEY_SIZE + 1 && max == MAX_KEY_SIZE
+            ),
+            "expected CursorKeyTooLarge, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn manifest_cursor_key_at_exact_max_succeeds() {
+        use crate::coordination::cursor::MAX_KEY_SIZE;
+
+        let exact_key = vec![0xBB; MAX_KEY_SIZE];
+        let shard = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::unbounded(),
+            Cursor::with_last_key(exact_key),
+        );
+        assert!(validate_manifest(&[shard]).is_ok());
+    }
+
+    #[test]
+    fn manifest_cursor_key_too_large_display() {
+        let err = ManifestValidationError::CursorKeyTooLarge {
+            shard_id: ShardId::from_raw(42),
+            size: 5000,
+            max: 4096,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("5000"), "display must include actual size");
+        assert!(msg.contains("4096"), "display must include max size");
+    }
+
     // -- ShardFilter --
 
     fn make_shard_summary(
@@ -2020,13 +2096,15 @@ mod tests {
     #[should_panic(expected = "RegisterShards op-log entry must have RegisteredShards result")]
     fn assert_invariants_catches_register_shards_with_ack() {
         let mut r = test_run_record();
-        r.op_log.push(RunOpLogEntry::new(
-            OpId::from_raw(1),
-            RunOpKind::RegisterShards,
-            42,
-            LogicalTime::from_raw(1),
-            RunOpResult::Ack,
-        ));
+        r.op_log
+            .push_back(RunOpLogEntry::new(
+                OpId::from_raw(1),
+                RunOpKind::RegisterShards,
+                42,
+                LogicalTime::from_raw(1),
+                RunOpResult::Ack,
+            ))
+            .unwrap();
         r.assert_invariants();
     }
 
@@ -2034,15 +2112,17 @@ mod tests {
     #[should_panic(expected = "must not have RegisteredShards result")]
     fn assert_invariants_catches_terminal_op_with_registered_shards() {
         let mut r = test_run_record();
-        r.op_log.push(RunOpLogEntry::new(
-            OpId::from_raw(1),
-            RunOpKind::CompleteRun,
-            42,
-            LogicalTime::from_raw(1),
-            RunOpResult::RegisteredShards {
-                shard_ids: Box::new([]),
-            },
-        ));
+        r.op_log
+            .push_back(RunOpLogEntry::new(
+                OpId::from_raw(1),
+                RunOpKind::CompleteRun,
+                42,
+                LogicalTime::from_raw(1),
+                RunOpResult::RegisteredShards {
+                    shard_ids: Box::new([]),
+                },
+            ))
+            .unwrap();
         r.assert_invariants();
     }
 
@@ -2061,20 +2141,24 @@ mod tests {
     #[should_panic(expected = "timestamps not non-decreasing")]
     fn rr_oplog_timestamps_non_decreasing_panics() {
         let mut r = test_run_record();
-        r.op_log.push(RunOpLogEntry::new(
-            OpId::from_raw(1),
-            RunOpKind::CompleteRun,
-            42,
-            LogicalTime::from_raw(10),
-            RunOpResult::Ack,
-        ));
-        r.op_log.push(RunOpLogEntry::new(
-            OpId::from_raw(2),
-            RunOpKind::FailRun,
-            43,
-            LogicalTime::from_raw(5), // earlier than previous — violates INV-10
-            RunOpResult::Ack,
-        ));
+        r.op_log
+            .push_back(RunOpLogEntry::new(
+                OpId::from_raw(1),
+                RunOpKind::CompleteRun,
+                42,
+                LogicalTime::from_raw(10),
+                RunOpResult::Ack,
+            ))
+            .unwrap();
+        r.op_log
+            .push_back(RunOpLogEntry::new(
+                OpId::from_raw(2),
+                RunOpKind::FailRun,
+                43,
+                LogicalTime::from_raw(5), // earlier than previous — violates INV-10
+                RunOpResult::Ack,
+            ))
+            .unwrap();
         r.assert_invariants();
     }
 
@@ -2098,7 +2182,7 @@ mod tests {
             large_epoch,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         );
         let summary = ShardSummary::from_record(&record, LogicalTime::from_raw(1));
         assert_eq!(
@@ -2213,5 +2297,101 @@ mod tests {
             p.count_shard(ShardStatus::Active, false);
         }));
         assert!(result.is_err(), "count_shard must panic on u32 overflow");
+    }
+
+    // -- F8: Proptest for validate_manifest --
+
+    mod prop_manifest {
+        use super::*;
+        use crate::test_util::miri_proptest_config;
+        use proptest::prelude::*;
+
+        /// Strategy for a valid shard ID (non-zero, bounded).
+        fn arb_shard_id() -> impl Strategy<Value = ShardId> {
+            (1u64..10_000).prop_map(ShardId::from_raw)
+        }
+
+        /// Strategy for a valid InitialShard with non-overlapping key range.
+        fn arb_initial_shard(idx: usize) -> impl Strategy<Value = InitialShard> {
+            arb_shard_id().prop_map(move |id| {
+                let start = format!("{:06}", idx);
+                let end = format!("{:06}", idx + 1);
+                InitialShard::new(
+                    id,
+                    ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
+                    Cursor::initial(),
+                )
+            })
+        }
+
+        /// Generate a vec of `n` initial shards with unique, non-overlapping
+        /// key ranges (indexed by position).
+        fn arb_manifest(max_len: usize) -> impl Strategy<Value = Vec<InitialShard>> {
+            (1..=max_len).prop_flat_map(|n| {
+                // Generate n unique shard IDs.
+                proptest::collection::hash_set(1u64..100_000, n).prop_map(move |ids| {
+                    ids.into_iter()
+                        .enumerate()
+                        .map(|(idx, raw)| {
+                            let start = format!("{:06}", idx);
+                            let end = format!("{:06}", idx + 1);
+                            InitialShard::new(
+                                ShardId::from_raw(raw),
+                                ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
+                                Cursor::initial(),
+                            )
+                        })
+                        .collect()
+                })
+            })
+        }
+
+        proptest! {
+            #![proptest_config(miri_proptest_config())]
+
+            /// Well-formed manifests always pass validation.
+            #[test]
+            fn valid_manifests_accepted(shards in arb_manifest(50)) {
+                prop_assert!(validate_manifest(&shards).is_ok());
+            }
+
+            /// Manifests with a duplicate ID always fail.
+            #[test]
+            fn duplicate_id_always_rejected(base in arb_initial_shard(0)) {
+                let dup = InitialShard::new(
+                    base.shard(),
+                    ShardSpec::with_range(b"x".to_vec(), b"y".to_vec()),
+                    Cursor::initial(),
+                );
+                let result = validate_manifest(&[base, dup]);
+                prop_assert!(
+                    matches!(result, Err(ManifestValidationError::DuplicateIds { .. })),
+                    "expected DuplicateIds, got: {result:?}",
+                );
+            }
+
+            /// Overlapping ranges always fail.
+            #[test]
+            fn overlapping_ranges_always_rejected(
+                id_a in 1u64..50_000,
+                id_b in 50_000u64..100_000,
+            ) {
+                let a = InitialShard::new(
+                    ShardId::from_raw(id_a),
+                    ShardSpec::with_range(b"a".to_vec(), b"n".to_vec()),
+                    Cursor::initial(),
+                );
+                let b = InitialShard::new(
+                    ShardId::from_raw(id_b),
+                    ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+                    Cursor::initial(),
+                );
+                let result = validate_manifest(&[a, b]);
+                prop_assert!(
+                    matches!(result, Err(ManifestValidationError::OverlappingRanges { .. })),
+                    "expected OverlappingRanges, got: {result:?}",
+                );
+            }
+        }
     }
 }

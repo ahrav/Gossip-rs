@@ -6,6 +6,7 @@
 use super::*;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::identity::{FenceEpoch, RunId};
+use gossip_stdx::RingBuffer;
 
 // -- Test fixtures ---------------------------------------------------
 
@@ -581,7 +582,7 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
         FenceEpoch::INITIAL,
         None,
         spawned,
-        Vec::new(),
+        RingBuffer::new(),
     );
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord.seed_shard(record);
@@ -1694,6 +1695,693 @@ fn register_shards_preserves_non_initial_cursors() {
         result.snapshot.cursor().last_key(),
         Some(b"f".as_slice()),
         "non-initial cursor must be preserved after register_shards",
+    );
+}
+
+// -- F1: Terminal run operations (complete_run, fail_run, cancel_run) --
+
+#[test]
+fn complete_run_happy_path() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let result = coord
+        .complete_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    assert!(result.is_executed());
+
+    let record = coord.get_run(test_tenant(), test_run()).unwrap();
+    assert_eq!(record.status(), RunStatus::Done);
+}
+
+#[test]
+fn complete_run_from_initializing_rejected() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let err = coord
+        .complete_run(now(2), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap_err();
+    assert!(
+        matches!(err, CompleteRunError::WrongStatus { .. }),
+        "expected WrongStatus, got: {err:?}",
+    );
+}
+
+#[test]
+fn complete_run_from_terminal_rejected() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let _ = coord
+        .complete_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+
+    let err = coord
+        .complete_run(now(11), test_tenant(), test_run(), OpId::from_raw(51))
+        .unwrap_err();
+    assert!(
+        matches!(err, CompleteRunError::RunTerminal { .. }),
+        "expected RunTerminal, got: {err:?}",
+    );
+}
+
+#[test]
+fn complete_run_idempotent_replay() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let op = OpId::from_raw(50);
+    let first = coord
+        .complete_run(now(10), test_tenant(), test_run(), op)
+        .unwrap();
+    assert!(first.is_executed());
+
+    let second = coord
+        .complete_run(now(11), test_tenant(), test_run(), op)
+        .unwrap();
+    assert!(second.is_replay());
+}
+
+#[test]
+fn complete_run_wrong_tenant() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let err = coord
+        .complete_run(now(10), other_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap_err();
+    assert!(
+        matches!(err, CompleteRunError::RunNotFound),
+        "expected RunNotFound, got: {err:?}",
+    );
+}
+
+// -- fail_run tests --
+
+#[test]
+fn fail_run_happy_path() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let result = coord
+        .fail_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    assert!(result.is_executed());
+
+    let record = coord.get_run(test_tenant(), test_run()).unwrap();
+    assert_eq!(record.status(), RunStatus::Failed);
+}
+
+#[test]
+fn fail_run_from_initializing_rejected() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let err = coord
+        .fail_run(now(2), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap_err();
+    assert!(
+        matches!(err, FailRunError::WrongStatus { .. }),
+        "expected WrongStatus, got: {err:?}",
+    );
+}
+
+#[test]
+fn fail_run_from_terminal_rejected() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let _ = coord
+        .fail_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+
+    let err = coord
+        .fail_run(now(11), test_tenant(), test_run(), OpId::from_raw(51))
+        .unwrap_err();
+    assert!(
+        matches!(err, FailRunError::RunTerminal { .. }),
+        "expected RunTerminal, got: {err:?}",
+    );
+}
+
+#[test]
+fn fail_run_idempotent_replay() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let op = OpId::from_raw(50);
+    let first = coord
+        .fail_run(now(10), test_tenant(), test_run(), op)
+        .unwrap();
+    assert!(first.is_executed());
+
+    let second = coord
+        .fail_run(now(11), test_tenant(), test_run(), op)
+        .unwrap();
+    assert!(second.is_replay());
+}
+
+#[test]
+fn fail_run_wrong_tenant() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let err = coord
+        .fail_run(now(10), other_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap_err();
+    assert!(
+        matches!(err, FailRunError::RunNotFound),
+        "expected RunNotFound, got: {err:?}",
+    );
+}
+
+// -- cancel_run tests --
+
+#[test]
+fn cancel_run_from_initializing() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let result = coord
+        .cancel_run(now(2), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    assert!(result.is_executed());
+
+    let record = coord.get_run(test_tenant(), test_run()).unwrap();
+    assert_eq!(record.status(), RunStatus::Cancelled);
+}
+
+#[test]
+fn cancel_run_from_active() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let result = coord
+        .cancel_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    assert!(result.is_executed());
+
+    let record = coord.get_run(test_tenant(), test_run()).unwrap();
+    assert_eq!(record.status(), RunStatus::Cancelled);
+}
+
+#[test]
+fn cancel_run_from_terminal_rejected() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let _ = coord
+        .cancel_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+
+    let err = coord
+        .cancel_run(now(11), test_tenant(), test_run(), OpId::from_raw(51))
+        .unwrap_err();
+    assert!(
+        matches!(err, CancelRunError::RunTerminal { .. }),
+        "expected RunTerminal, got: {err:?}",
+    );
+}
+
+#[test]
+fn cancel_run_idempotent_replay() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let op = OpId::from_raw(50);
+    let first = coord
+        .cancel_run(now(10), test_tenant(), test_run(), op)
+        .unwrap();
+    assert!(first.is_executed());
+
+    let second = coord
+        .cancel_run(now(11), test_tenant(), test_run(), op)
+        .unwrap();
+    assert!(second.is_replay());
+}
+
+#[test]
+fn cancel_run_wrong_tenant() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let err = coord
+        .cancel_run(now(10), other_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap_err();
+    assert!(
+        matches!(err, CancelRunError::RunNotFound),
+        "expected RunNotFound, got: {err:?}",
+    );
+}
+
+// -- terminal_run_rejects_all_transitions (cross-product) --
+//
+// Once a run reaches a terminal state (Done, Failed, Cancelled), every
+// subsequent transition attempt (complete, fail, cancel) with a *new* op_id
+// must be rejected with the appropriate RunTerminal error.
+
+fn make_done_coordinator() -> InMemoryCoordinator {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let _ = coord
+        .complete_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    coord
+}
+
+fn make_failed_coordinator() -> InMemoryCoordinator {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let _ = coord
+        .fail_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    coord
+}
+
+fn make_cancelled_coordinator() -> InMemoryCoordinator {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let _ = coord
+        .cancel_run(now(10), test_tenant(), test_run(), OpId::from_raw(50))
+        .unwrap();
+    coord
+}
+
+#[test]
+fn done_rejects_complete() {
+    let mut coord = make_done_coordinator();
+    let err = coord
+        .complete_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, CompleteRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn done_rejects_fail() {
+    let mut coord = make_done_coordinator();
+    let err = coord
+        .fail_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, FailRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn done_rejects_cancel() {
+    let mut coord = make_done_coordinator();
+    let err = coord
+        .cancel_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, CancelRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn failed_rejects_complete() {
+    let mut coord = make_failed_coordinator();
+    let err = coord
+        .complete_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, CompleteRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn failed_rejects_fail() {
+    let mut coord = make_failed_coordinator();
+    let err = coord
+        .fail_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, FailRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn failed_rejects_cancel() {
+    let mut coord = make_failed_coordinator();
+    let err = coord
+        .cancel_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, CancelRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn cancelled_rejects_complete() {
+    let mut coord = make_cancelled_coordinator();
+    let err = coord
+        .complete_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, CompleteRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn cancelled_rejects_fail() {
+    let mut coord = make_cancelled_coordinator();
+    let err = coord
+        .fail_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, FailRunError::RunTerminal { .. }));
+}
+
+#[test]
+fn cancelled_rejects_cancel() {
+    let mut coord = make_cancelled_coordinator();
+    let err = coord
+        .cancel_run(now(20), test_tenant(), test_run(), OpId::from_raw(99))
+        .unwrap_err();
+    assert!(matches!(err, CancelRunError::RunTerminal { .. }));
+}
+
+// -- unpark_shard tests --
+
+#[test]
+fn unpark_shard_happy_path() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    // Park the shard first.
+    let _ = coord
+        .park_shard(
+            now(5),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    // Unpark it.
+    let result = coord
+        .unpark_shard(now(6), test_tenant(), key, OpId::from_raw(20))
+        .unwrap();
+    assert!(result.is_executed());
+
+    // Shard should be acquirable again (Active).
+    let acq = coord
+        .acquire_and_restore(now(7), test_tenant(), key, test_worker(2))
+        .unwrap();
+    assert_eq!(acq.snapshot.status(), ShardStatus::Active);
+}
+
+#[test]
+fn unpark_shard_not_parked_rejected() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    let err = coord
+        .unpark_shard(now(5), test_tenant(), key, OpId::from_raw(20))
+        .unwrap_err();
+    assert!(
+        matches!(err, UnparkError::NotParked { .. }),
+        "expected NotParked, got: {err:?}",
+    );
+}
+
+#[test]
+fn unpark_shard_idempotent_replay() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    let _ = coord
+        .park_shard(
+            now(5),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let op = OpId::from_raw(20);
+    let first = coord.unpark_shard(now(6), test_tenant(), key, op).unwrap();
+    assert!(first.is_executed());
+
+    let second = coord.unpark_shard(now(7), test_tenant(), key, op).unwrap();
+    assert!(second.is_replay());
+}
+
+#[test]
+fn unpark_shard_wrong_tenant() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    let _ = coord
+        .park_shard(
+            now(5),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let err = coord
+        .unpark_shard(now(6), other_tenant(), key, OpId::from_raw(20))
+        .unwrap_err();
+    assert!(
+        matches!(err, UnparkError::ShardNotFound),
+        "expected ShardNotFound, got: {err:?}",
+    );
+}
+
+#[test]
+fn unpark_shard_fence_epoch_bumped() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    // Record the fence from the initial acquire.
+    let initial_fence = lease.fence();
+
+    let _ = coord
+        .park_shard(
+            now(5),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let _ = coord
+        .unpark_shard(now(6), test_tenant(), key, OpId::from_raw(20))
+        .unwrap();
+
+    // Re-acquire and verify fence was bumped.
+    let acq = coord
+        .acquire_and_restore(now(7), test_tenant(), key, test_worker(2))
+        .unwrap();
+    // Fence should be > initial_fence (unpark bumps it, then acquire bumps again).
+    assert!(
+        acq.lease.fence() > initial_fence,
+        "fence epoch must be bumped after unpark: {:?} <= {:?}",
+        acq.lease.fence(),
+        initial_fence,
+    );
+}
+
+// -- create_run tests --
+
+#[test]
+fn create_run_basic() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let record = coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+    assert_eq!(record.status(), RunStatus::Initializing);
+    assert_eq!(record.run(), test_run());
+    assert_eq!(record.tenant(), test_tenant());
+}
+
+#[test]
+fn create_run_duplicate_rejected() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let err = coord
+        .create_run(now(2), test_tenant(), test_run(), test_run_config())
+        .unwrap_err();
+    assert!(
+        matches!(err, CreateRunError::RunAlreadyExists { .. }),
+        "expected RunAlreadyExists, got: {err:?}",
+    );
+}
+
+// -- get_run tests --
+
+#[test]
+fn get_run_wrong_tenant() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let err = coord.get_run(other_tenant(), test_run()).unwrap_err();
+    assert!(
+        matches!(err, GetRunError::RunNotFound),
+        "expected RunNotFound, got: {err:?}",
+    );
+}
+
+// -- register_shards additional tests --
+
+#[test]
+fn register_shards_idempotent_replay() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let shards = vec![InitialShard::new(
+        ShardId::from_raw(10),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let op = OpId::from_raw(1);
+
+    let first = coord
+        .register_shards(now(2), test_tenant(), test_run(), &shards, op)
+        .unwrap();
+    assert!(first.is_executed());
+    let first_ids = first.into_inner();
+
+    let second = coord
+        .register_shards(now(3), test_tenant(), test_run(), &shards, op)
+        .unwrap();
+    assert!(second.is_replay());
+    let second_ids = second.into_inner();
+
+    assert_eq!(first_ids, second_ids);
+}
+
+#[test]
+fn register_shards_op_id_conflict() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), test_run_config())
+        .unwrap();
+
+    let shards_a = vec![InitialShard::new(
+        ShardId::from_raw(10),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let op = OpId::from_raw(1);
+    let _ = coord
+        .register_shards(now(2), test_tenant(), test_run(), &shards_a, op)
+        .unwrap();
+
+    // Same op_id, different shards.
+    let shards_b = vec![InitialShard::new(
+        ShardId::from_raw(20),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let err = coord
+        .register_shards(now(3), test_tenant(), test_run(), &shards_b, op)
+        .unwrap_err();
+    assert!(
+        matches!(err, RegisterShardsError::OpIdConflict(_)),
+        "expected OpIdConflict, got: {err:?}",
+    );
+}
+
+#[test]
+fn register_shards_wrong_status() {
+    let (mut coord, _lease) = coordinator_with_run_and_lease();
+
+    // Run is already Active (register_shards was called in the helper).
+    let shards = vec![InitialShard::new(
+        ShardId::from_raw(20),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let err = coord
+        .register_shards(
+            now(10),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(99),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, RegisterShardsError::WrongStatus { .. }),
+        "expected WrongStatus, got: {err:?}",
+    );
+}
+
+// -- F4: create_run_with_shards default implementation tests --
+
+use crate::coordination::run_errors::{
+    CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
+    RegisterShardsError, UnparkError,
+};
+
+#[test]
+fn create_run_with_shards_happy_path() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let shards = vec![InitialShard::new(
+        ShardId::from_raw(10),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let result = coord
+        .create_run_with_shards(
+            now(1),
+            test_tenant(),
+            test_run(),
+            test_run_config(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+    assert!(result.is_executed());
+
+    let record = result.into_inner();
+    assert_eq!(record.status(), RunStatus::Active);
+    assert_eq!(record.root_shards().len(), 1);
+}
+
+#[test]
+fn create_run_with_shards_retry_after_exists() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let config = test_run_config();
+
+    // Create the run first (simulating a partial failure where create succeeded
+    // but register_shards did not).
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+
+    // Retry via create_run_with_shards — should succeed (idempotent retry).
+    let shards = vec![InitialShard::new(
+        ShardId::from_raw(10),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let result = coord
+        .create_run_with_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            config,
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+    assert!(result.is_executed());
+
+    let record = result.into_inner();
+    assert_eq!(record.status(), RunStatus::Active);
+}
+
+#[test]
+fn create_run_with_shards_config_mismatch() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let config_a = test_run_config();
+
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config_a)
+        .unwrap();
+
+    // Call create_run_with_shards with a different config.
+    let config_b = RunConfig::try_new(CursorSemantics::Completed, 60, Some(10)).unwrap();
+    let shards = vec![InitialShard::new(
+        ShardId::from_raw(10),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let err = coord
+        .create_run_with_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            config_b,
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, CreateRunError::ConfigMismatch { .. }),
+        "expected ConfigMismatch, got: {err:?}",
     );
 }
 

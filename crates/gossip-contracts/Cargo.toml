@@ -14,6 +14,7 @@ default = []
 test-support = ["dep:rand", "dep:rand_chacha"]
 
 [dependencies]
+gossip-stdx = { workspace = true }
 blake3 = "1.8"
 subtle = "2.6"
 rand = { version = "0.9", optional = true }
