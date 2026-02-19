@@ -153,13 +153,12 @@ jobs:
     needs: [changes]
     env:
       RUSTDOCFLAGS: -D warnings
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: ./.github/actions/setup-rust
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
         with:
           toolchain: stable
-          shared-key: stable-linux
-          save-cache: "false"
 
       - run: cargo doc --no-deps --all-features
 
