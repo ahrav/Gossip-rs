@@ -76,7 +76,7 @@ pub fn validate_lease(
         "validate_lease: now must be > ZERO"
     );
 
-    // 1. Tenant isolation (SEC-1: no `actual` field).
+    // 1. Tenant isolation (no `actual` field — prevents cross-tenant enumeration).
     if record.tenant != tenant {
         return Err(CoordError::TenantMismatch { expected: tenant });
     }

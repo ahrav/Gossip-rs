@@ -2,18 +2,13 @@
 //! (in-memory, FoundationDB, PostgreSQL, deterministic simulator)
 //! must implement.
 //!
-//! ## Design Decisions (locked)
+//! The trait is synchronous (returns `Result<T, E>`, not futures). Async
+//! adaptation is the backend's responsibility — the contract defines
+//! semantics, not execution model. This keeps the deterministic simulator
+//! simple (no async runtime needed).
 //!
-//! **D2.13:** The trait is synchronous (returns `Result<T, E>`, not futures).
-//! Async adaptation is the backend's responsibility — the contract
-//! defines semantics, not execution model. This keeps the
-//! deterministic simulator simple (no async runtime needed).
-//! Reference: FoundationDB's simulation approach — the simulation
-//! layer controls scheduling; the API surface is synchronous from
-//! the protocol's perspective (Zhou et al., SIGMOD 2021).
-//!
-//! **D2.14:** Lease-gated operations take `(TenantId, Lease)` — the
-//! backend extracts the `ShardKey` from the lease via `lease.shard_key()`.
+//! Lease-gated operations take `(TenantId, Lease)` — the backend extracts
+//! the `ShardKey` from the lease via `lease.shard_key()`.
 //! `acquire_and_restore` is the exception: it takes
 //! `(TenantId, ShardKey, WorkerId)` since no lease exists yet.
 //! The backend validates:
@@ -26,17 +21,10 @@
 //! Reference: Kleppmann, "How to do distributed locking" (2016);
 //! Gray & Cheriton, "Leases" (SOSP 1989).
 //!
-//! **D2.15:** `AcquireAndRestore` is the only operation that does NOT require
-//! a pre-existing lease. It creates or renews one. All other
-//! operations require the caller to present a valid lease.
-//!
-//! **D2.16:** Error types are operation-specific enums that convert from
-//! a shared `CoordError` via `From<CoordError>` (see `error.rs`).
-//!
-//! **D2.17:** `now: LogicalTime` is passed explicitly to every operation.
-//! The coordinator never reads a clock — time is an input.
-//! This is essential for deterministic simulation.
-//! Reference: §9 Anti-Pattern #5; FoundationDB simulation.
+//! `now: LogicalTime` is passed explicitly to every operation. The
+//! coordinator never reads a clock — time is an input. This is
+//! essential for deterministic simulation.
+//! Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021).
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{

@@ -2,8 +2,8 @@
 //!
 //! Shares these conventions with shard-level `error.rs`:
 //! - `#[non_exhaustive]` on all enums
-//! - Custom `Debug` impls that redact hash values (SEC-6)
-//! - No `actual` field in `TenantMismatch` (SEC-1)
+//! - Custom `Debug` impls that redact hash values
+//! - No `actual` field in `TenantMismatch` (tenant isolation)
 //!
 //! Differs from `error.rs` in error composition: shard-level errors use a
 //! shared `CoordError` base with `From<CoordError>` narrowing per operation.
@@ -11,7 +11,7 @@
 //! conversion is `From<RunOpIdConflict>` (for types with an `OpIdConflict`
 //! variant); individual types may have additional operation-specific `From` impls.
 //!
-//! ## SEC-6: Hash Redaction via Opaque Wrapper
+//! ## Hash Redaction via Opaque Wrapper
 //!
 //! All `OpIdConflict` variants wrap [`RunOpIdConflict`] as a tuple variant
 //! (`OpIdConflict(RunOpIdConflict)`) rather than exposing `expected_hash`
@@ -114,7 +114,7 @@ impl From<GetRunError> for CreateRunError {
 #[non_exhaustive]
 pub enum RegisterShardsError {
     RunNotFound,
-    /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
+    /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
     TenantMismatch {
         expected: TenantId,
     },
@@ -125,7 +125,7 @@ pub enum RegisterShardsError {
     /// Manifest validation failed.
     ManifestInvalid(ManifestValidationError),
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-    /// to prevent external access to raw hash values (SEC-6).
+    /// to prevent external access to raw hash values (hash redaction).
     OpIdConflict(RunOpIdConflict),
     /// Shard count limit exceeded (per-tenant or global).
     ShardLimitExceeded {
@@ -213,7 +213,7 @@ impl_from_run_op_id_conflict!(RegisterShardsError);
 #[non_exhaustive]
 pub enum GetRunError {
     RunNotFound,
-    /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
+    /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
     TenantMismatch {
         expected: TenantId,
     },
@@ -256,7 +256,7 @@ macro_rules! define_terminal_run_error {
         $(#[$meta])*
         $vis enum $name {
             RunNotFound,
-            /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
+            /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
             TenantMismatch { expected: TenantId },
             /// Run is already in a terminal state.
             RunTerminal { status: RunStatus },
@@ -265,7 +265,7 @@ macro_rules! define_terminal_run_error {
                 $extra_variant { status: RunStatus },
             )*
             /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-            /// to prevent external access to raw hash values (SEC-6).
+            /// to prevent external access to raw hash values (hash redaction).
             OpIdConflict(RunOpIdConflict),
         }
 
@@ -384,14 +384,14 @@ define_terminal_run_error! {
 pub enum UnparkError {
     /// The shard does not exist.
     ShardNotFound,
-    /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
+    /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
     TenantMismatch { expected: TenantId },
     /// The run is already in a terminal state — unparking is pointless.
     RunTerminal { status: RunStatus },
     /// The shard is not in `Parked` status.
     NotParked { status: ShardStatus },
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-    /// to prevent external access to raw hash values (SEC-6).
+    /// to prevent external access to raw hash values (hash redaction).
     OpIdConflict(RunOpIdConflict),
 }
 

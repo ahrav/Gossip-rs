@@ -9,11 +9,6 @@
 //! committed progress — per-run configuration that affects the strength
 //! of the progress guarantee.
 //!
-//! ## Design Decisions (locked)
-//!
-//! D2.2: ShardSpec has a half-open key range `[start, end)` with
-//! lex-ordered byte boundaries, plus opaque connector metadata.
-//!
 //! Reference: Bigtable (Chang et al., OSDI 2006) — tablets as
 //! contiguous row ranges; Spanner (Corbett et al., OSDI 2012) —
 //! half-open key-range splits; CockroachDB —

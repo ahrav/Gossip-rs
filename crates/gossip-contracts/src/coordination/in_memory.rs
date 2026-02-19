@@ -403,7 +403,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// checkpointed state so the worker can resume processing.
     ///
     /// The protocol enforces the following invariants, checked in order:
-    ///   1. **Tenant isolation (SEC-1)** — a request for the wrong tenant is
+    ///   1. **Tenant isolation** — a request for the wrong tenant is
     ///      rejected before any internal state is revealed.
     ///   2. **Shard liveness** — only `Active` shards can be acquired;
     ///      non-Active states (Done, Split, Parked) are refused.

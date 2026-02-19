@@ -4,18 +4,6 @@
 //! collectively cover the target data source. The coordinator tracks run
 //! status, validates shard manifests, and provides progress aggregation.
 //!
-//! ## Design Decisions (locked)
-//!
-//! D2.18: `RunRecord` is the coordinator's authoritative record for a run.
-//! D2.19: `RunStatus` has 5 states: Initializing → Active → Done | Failed;
-//!        Cancelled is reachable from Initializing or Active via `cancel_run`.
-//! D2.20: Two-phase creation: `create_run` → `register_shards`.
-//! D2.21: Admin operations (unpark, cancel) are NOT lease-gated.
-//! D2.22: `RunManagement` is separate from `CoordinationBackend`.
-//! D2.23: `now: LogicalTime` is passed explicitly to every mutating and
-//!        time-aware operation. Pure record lookups (`get_run`) are exempt.
-//! D2.24: Shard listing returns `ShardSummary` (lightweight).
-//! D2.25: `RunRecord` gets its own bounded op-log (cap: 8).
 
 use std::fmt;
 use std::num::NonZeroU64;

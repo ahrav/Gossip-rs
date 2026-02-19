@@ -1,12 +1,10 @@
 //! Error types, result types, and idempotent outcome wrapper for
 //! the coordination protocol.
 //!
-//! ## Design Decisions (locked)
-//!
-//! D2.16: Error types are operation-specific newtypes over a shared
-//!        `CoordError` enum. Callers get precise error matching (e.g.,
-//!        `CheckpointError` can't produce `AlreadyLeased`). The tradeoff
-//!        is boilerplate `From` impls, which are finite and mechanical.
+//! Error types are operation-specific newtypes over a shared `CoordError`
+//! enum. Callers get precise error matching (e.g., `CheckpointError` can't
+//! produce `AlreadyLeased`). The tradeoff is boilerplate `From` impls,
+//! which are finite and mechanical.
 //!
 //! The `From<CoordError>` impls enumerate all rejected variants explicitly
 //! rather than using a wildcard `_` catch-all. This means adding a new
@@ -60,8 +58,7 @@ pub enum CoordError {
     /// the shard record's tenant. This is always a bug.
     ///
     /// Only `expected` (the caller's tenant) is exposed. The actual
-    /// tenant is deliberately omitted to prevent cross-tenant enumeration
-    /// (SEC-1).
+    /// tenant is deliberately omitted to prevent cross-tenant enumeration.
     TenantMismatch { expected: TenantId },
 
     /// The lease's fence epoch does not match the record's current epoch
@@ -94,7 +91,7 @@ pub enum CoordError {
     /// reuse of an OpId for a semantically different operation.
     ///
     /// `OpId` values must be generated via CSPRNG or a coordinated
-    /// counter to prevent collisions (SEC-6).
+    /// counter to prevent collisions.
     ///
     /// Reference: Stripe idempotency key pattern (Brandur Leach, 2017).
     OpIdConflict {
@@ -106,7 +103,7 @@ pub enum CoordError {
     /// Cursor monotonicity violation: the new cursor's `last_key` is
     /// lexicographically less than the current cursor's `last_key`.
     ///
-    /// Reference: D2.3 -- cursor monotonicity is a hard safety invariant.
+    /// Cursor monotonicity is a hard safety invariant.
     CursorRegression {
         old_key: Option<Box<[u8]>>,
         new_key: Option<Box<[u8]>>,
@@ -117,7 +114,7 @@ pub enum CoordError {
     ///
     /// Boxed to keep `CoordError` at ~40 bytes instead of ~64.
     ///
-    /// Reference: D2.4 -- cursor bounds checking is a hard safety invariant.
+    /// Cursor bounds checking is a hard safety invariant.
     CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
 
     /// Split validation failed. Wraps the detailed error from
@@ -153,8 +150,8 @@ impl fmt::Debug for CursorOutOfBoundsDetail {
     }
 }
 
-// Custom Debug: redacts sensitive fields -- hash values in OpIdConflict
-// (SEC-6), raw key bytes in CursorRegression and CursorOutOfBounds.
+// Custom Debug: redacts sensitive fields -- hash values in OpIdConflict,
+// raw key bytes in CursorRegression and CursorOutOfBounds.
 impl fmt::Debug for CoordError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -264,7 +261,7 @@ pub enum AcquireError {
 
     /// Tenant isolation violation.
     ///
-    /// Only `expected` (the caller's tenant) is exposed (SEC-1).
+    /// Only `expected` (the caller's tenant) is exposed.
     TenantMismatch { expected: TenantId },
 
     /// The shard is terminal -- cannot be acquired.
@@ -276,7 +273,7 @@ pub enum AcquireError {
     /// Another worker currently holds a valid (non-expired) lease.
     /// The caller must wait or try a different shard.
     ///
-    /// **Security note (SEC-5):** `current_owner` exposes worker identity.
+    /// **Security note:** `current_owner` exposes worker identity.
     /// Redact this field before surfacing to external clients.
     AlreadyLeased {
         current_owner: WorkerId,
@@ -285,7 +282,7 @@ pub enum AcquireError {
 }
 
 // Custom Debug: redacts `current_owner` to prevent worker identity
-// leakage (SEC-5). Display already redacts via `..`.
+// leakage. Display already redacts via `..`.
 impl fmt::Debug for AcquireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -321,7 +318,7 @@ impl fmt::Display for AcquireError {
             Self::ShardTerminal { shard, status } => {
                 write!(f, "shard {shard:?} is terminal ({status})")
             }
-            // Omit current_owner in Display output (SEC-5).
+            // Omit current_owner in Display output (redact worker identity).
             Self::AlreadyLeased { lease_deadline, .. } => {
                 write!(f, "shard already leased (deadline {lease_deadline:?})")
             }

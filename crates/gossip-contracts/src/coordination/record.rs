@@ -3,23 +3,6 @@
 //! Contains the lifecycle state machine ([`ShardStatus`]), park reasons
 //! ([`ParkReason`]), the full [`ShardRecord`] with runtime invariant
 //! assertions, and the worker-visible [`ShardSnapshot`].
-//!
-//! ## Design Decisions (locked)
-//!
-//! D2.6: ShardStatus has exactly 4 states: Active, Done, Split, Parked.
-//!       Done, Split, and Parked are terminal within the coordination
-//!       protocol. Unparking is an out-of-band admin operation.
-//!
-//! D2.7: `park_reason.is_some()` iff `status == Parked`.
-//!       Asserted at every state transition via `assert_invariants`.
-//!
-//! D2.11: ShardRecord is self-contained — no back-references to RunConfig.
-//!        `cursor_semantics` is embedded directly.
-//!
-//! D2.12: ShardSnapshot excludes lease, fence, op_log, tenant, and
-//!        park_reason. Identity fields (run, shard) are also omitted —
-//!        the worker knows these from the acquire context. Workers get
-//!        lease info from the Lease return value.
 
 use std::fmt;
 

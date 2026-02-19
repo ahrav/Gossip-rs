@@ -11,22 +11,8 @@
 //!   or resume state. The coordinator stores and returns this verbatim
 //!   but never inspects it.
 //!
-//! ## Design Decisions (locked)
-//!
-//! D2.1: Two-layer `(last_key, token)` cursor structure.
-//!       Reference: Bacon et al., "Spanner: Becoming a SQL System" (2017) —
-//!       query restart protocol with opaque restart tokens + ordered resume
-//!       keys.
-//!
-//! D2.3: Cursor monotonicity is a hard safety invariant.
-//!       `new.last_key >= old.last_key` (lex) on every checkpoint.
-//!
-//! D2.4: Cursor bounds checking is a hard safety invariant.
-//!       `cursor.last_key ∈ [spec.start, spec.end)`.
-//!
-//! D2.5: A checkpoint requires a `last_key`.
-//!       Connector-internal bookkeeping without committed items is not
-//!       coordination state.
+//! Reference: Bacon et al., "Spanner: Becoming a SQL System" (2017) —
+//! query restart protocol with opaque restart tokens + ordered resume keys.
 
 use std::fmt;
 
