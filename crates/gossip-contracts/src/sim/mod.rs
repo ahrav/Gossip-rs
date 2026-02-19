@@ -55,10 +55,14 @@
 //! - TigerBeetle VOPR (deterministic simulation testing)
 //! - sled simulation harness
 
+pub mod backend;
+pub mod fault_injector;
 mod harness;
 mod invariants;
 mod worker;
 
+pub use backend::{SimIntrospection, SimulationBackend};
+pub use fault_injector::FaultInjectingIntrospector;
 pub use harness::{CoordinationSim, RejectionKind, SimEvent, SimEventKind, SimOp, SimReport};
 pub use invariants::{InvariantChecker, InvariantViolation};
 pub use worker::SimWorker;

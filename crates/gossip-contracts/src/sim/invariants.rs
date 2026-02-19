@@ -2,27 +2,63 @@
 //!
 //! This module verifies coordination invariants **from outside** the system
 //! under test, following the FoundationDB simulation principle: never trust
-//! the system's own validation for correctness verification.
+//! the system's own validation for correctness verification. The coordinator
+//! already runs `ShardRecord::assert_invariants()` after every mutation, but
+//! those internal checks cannot detect cross-shard violations (S1 mutual
+//! exclusion), temporal regressions that span multiple steps (S2 fence
+//! monotonicity, S3 terminal irreversibility, S5 cursor monotonicity), or
+//! referential integrity across parent/child records (S7 split coverage).
+//! An external observer with its own accumulated history is required.
+//!
+//! # Architecture
+//!
+//! [`InvariantChecker`] is a stateful observer that maintains per-shard
+//! history across calls. The simulation harness calls [`InvariantChecker::check_all`]
+//! after **every** operation (successful or rejected), ensuring no operation
+//! can leave the coordinator in a violating state without immediate detection.
+//!
+//! All checks derive solely from coordinator ground truth
+//! ([`SimIntrospection`](super::backend::SimIntrospection)), never from
+//! worker-side bookkeeping, to avoid false positives from stale worker views.
 //!
 //! # Checked invariants
 //!
-//! | Label | Name | Rule |
-//! |-------|------|------|
-//! | S1 | **MutualExclusion** | At most one worker holds a non-expired lease per shard. |
-//! | S2 | **FenceMonotonicity** | `fence_epoch` never decreases for a given `(RunId, ShardId)`. |
-//! | S3 | **TerminalIrreversibility** | Terminal states (`Done`, `Split`, `Parked`) never revert. |
-//! | S4 | **RecordInvariant** | `ShardRecord::assert_invariants()` does not panic. |
-//! | S5 | **CursorMonotonicity** | `cursor.last_key()` never decreases per shard (B2 extension). |
-//! | S6 | **CursorBounds** | Non-initial cursors remain within shard spec range (B3 extension). |
-//! | S7 | **SplitCoverage** | Split-parent's spawned children exist and reference the parent. |
+//! | Label | Name | Kind | Rule |
+//! |-------|------|------|------|
+//! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a non-expired lease per shard. |
+//! | S2 | **FenceMonotonicity** | temporal | `fence_epoch` never decreases for a given `(RunId, ShardId)`. |
+//! | S3 | **TerminalIrreversibility** | temporal | Terminal states (`Done`, `Split`, `Parked`) never revert, except `Parked`->`Active` (unpark) which requires a fence bump. |
+//! | S4 | **RecordInvariant** | structural | `ShardRecord::assert_invariants()` does not panic. |
+//! | S5 | **CursorMonotonicity** | temporal | `cursor.last_key()` never decreases per shard. |
+//! | S6 | **CursorBounds** | structural | Non-initial cursors remain within shard spec range. |
+//! | S7 | **SplitCoverage** | referential | Split-parent's spawned children exist and reference the parent. |
+//!
+//! # Algorithm
+//!
+//! [`check_all`](InvariantChecker::check_all) performs a **single pass** over
+//! all shard records from the coordinator. S2 through S7 are checked inline
+//! during the pass. S1 requires a post-pass duplicate check because mutual
+//! exclusion is a cross-record property: active lease holders are accumulated
+//! into a `HashMap<ShardKey, Vec<WorkerId>>` during the pass, then scanned
+//! for duplicates afterward.
+//!
+//! # Performance considerations
+//!
+//! - Scratch buffers (`active_holders`, `scratch_missing`, `scratch_wrong_parent`)
+//!   are retained across calls and `.clear()`'d rather than reallocated,
+//!   reducing per-call allocation pressure on the hot path. (The `shards`
+//!   collection and per-shard cursor boxing still allocate each call.)
+//! - S5 compares `Option<&[u8]>` directly rather than constructing `Cursor`
+//!   objects, avoiding per-shard heap allocation for what is a simple
+//!   lexicographic comparison.
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic;
 
 use crate::coordination::cursor::{CursorBoundsCheck, check_cursor_bounds};
-use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardStatus;
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
+use crate::sim::backend::SimIntrospection;
 
 use super::worker::SimWorker;
 
@@ -30,45 +66,80 @@ use super::worker::SimWorker;
 // InvariantViolation
 // ---------------------------------------------------------------------------
 
-/// A detected invariant violation.
+/// A detected invariant violation with enough context to diagnose the failure.
+///
+/// Each variant corresponds to one of the seven safety properties (S1-S7)
+/// or a sub-property thereof. The harness collects all violations from a
+/// simulation run into a `Vec<InvariantViolation>` for post-run analysis;
+/// an empty vec means the run passed.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum InvariantViolation {
-    /// Two workers hold non-expired leases on the same shard simultaneously.
+    /// S1: Two workers hold non-expired leases on the same shard simultaneously.
+    ///
+    /// Only the first two conflicting workers are reported even if more exist,
+    /// since the invariant is already violated with two.
     MutualExclusion {
         key: ShardKey,
         workers: [WorkerId; 2],
     },
-    /// A shard's fence epoch decreased.
+    /// S2: A shard's fence epoch decreased between consecutive `check_all` calls.
+    ///
+    /// Fence epochs are monotonic counters that invalidate stale leases after
+    /// re-acquisition. A decrease would allow a zombie worker to operate on a
+    /// shard it no longer owns.
     FenceMonotonicity {
         run: RunId,
         shard: ShardId,
         prev: FenceEpoch,
         current: FenceEpoch,
     },
-    /// A terminal shard status changed to a different state.
+    /// S3: A terminal shard status (`Done`, `Split`, or `Parked`) reverted to
+    /// a non-terminal state through a transition other than the allowed
+    /// `Parked`->`Active` unpark path.
     TerminalIrreversibility {
         run: RunId,
         shard: ShardId,
         was: ShardStatus,
         now: ShardStatus,
     },
-    /// `ShardRecord::assert_invariants()` panicked.
+    /// S4: `ShardRecord::assert_invariants()` panicked, indicating a structural
+    /// invariant violation in the record (e.g., `Parked` without `park_reason`,
+    /// terminal shard with an active lease, fence epoch below `INITIAL`).
     RecordInvariant {
         run: RunId,
         shard: ShardId,
         message: String,
     },
-    /// Cursor `last_key` decreased or was reset to `None` for a shard.
+    /// S5: Cursor `last_key` regressed -- either decreased lexicographically
+    /// or was reset from `Some` to `None`. Cursor progress must be monotonic
+    /// because it represents committed scan progress; regression would cause
+    /// duplicate processing.
     CursorMonotonicity { run: RunId, shard: ShardId },
-    /// Cursor `last_key` is outside the shard spec range.
+    /// S6: Cursor `last_key` is outside the shard's `[start, end)` spec range.
+    /// A worker reporting progress outside its assigned key range indicates a
+    /// routing or validation bug.
     CursorOutOfBounds { run: RunId, shard: ShardId },
-    /// A split-parent's spawned children fail referential integrity:
-    /// children do not exist or do not reference the expected parent.
+    /// S7: A split-parent's spawned children fail referential integrity.
+    ///
+    /// Three sub-cases: (a) the split shard has an empty `spawned` list,
+    /// (b) a referenced child shard does not exist in the coordinator,
+    /// (c) a child shard's `parent` field does not reference this parent.
     SplitCoverage {
         run: RunId,
         shard: ShardId,
         detail: String,
+    },
+    /// S3 sub-property: `Parked`->`Active` transition (unpark) occurred without
+    /// incrementing `fence_epoch`. The safety argument for allowing this
+    /// otherwise-forbidden terminal reversion depends on the fence bump
+    /// invalidating all pre-park leases. Without the bump, a worker that
+    /// acquired during the parked state could operate with a stale fence.
+    UnparkWithoutFenceBump {
+        run: RunId,
+        shard: ShardId,
+        fence_at_park: FenceEpoch,
+        fence_at_unpark: FenceEpoch,
     },
 }
 
@@ -76,20 +147,35 @@ pub enum InvariantViolation {
 // InvariantChecker
 // ---------------------------------------------------------------------------
 
-/// Stateful checker that tracks per-shard history to detect violations.
+/// Stateful external observer that tracks per-shard history across
+/// simulation steps to detect temporal invariant violations.
 ///
-/// Uses `BTreeMap<(RunId, ShardId), _>` because `ShardKey` intentionally
-/// has no `Ord`.
+/// The `prev_*` maps grow monotonically as new `(RunId, ShardId)` pairs
+/// appear (e.g., from split operations that create child shards). They are
+/// never pruned because temporal invariants (S2, S3, S5) must be checked
+/// against the *entire* history of each shard's key, not just recent state.
+///
+/// Uses `BTreeMap<(RunId, ShardId), _>` for deterministic iteration order.
+/// `ShardKey` intentionally omits `Ord` (it is an opaque identity, not an
+/// ordered quantity), so the raw `(RunId, ShardId)` tuple serves as a
+/// comparable surrogate.
 pub struct InvariantChecker {
+    /// Last-seen fence epoch per shard, for S2 monotonicity checks.
     prev_epochs: BTreeMap<(RunId, ShardId), FenceEpoch>,
+    /// Last-seen shard status per shard, for S3 terminal irreversibility.
     prev_terminal: BTreeMap<(RunId, ShardId), ShardStatus>,
+    /// Last-seen cursor `last_key` per shard, for S5 cursor monotonicity.
+    /// `None` means the cursor was in its initial (no-key) state.
     prev_cursors: BTreeMap<(RunId, ShardId), Option<Box<[u8]>>>,
-    /// Reusable buffer for S1 mutual-exclusion check.
-    /// Cleared at the start of each `check_all` call to avoid per-call allocation.
+    /// Reusable buffer for S1 mutual-exclusion post-pass check.
+    /// Cleared at the start of each `check_all` call; retained across calls
+    /// so the backing allocation is reused in steady state.
     active_holders: HashMap<ShardKey, Vec<WorkerId>>,
-    /// Reusable buffer for S7 split-coverage missing-child accumulation.
+    /// Reusable scratch buffer for S7 split-coverage: accumulates `ShardId`s
+    /// of children referenced by a parent but missing from the coordinator.
     scratch_missing: Vec<ShardId>,
-    /// Reusable buffer for S7 split-coverage wrong-parent accumulation.
+    /// Reusable scratch buffer for S7 split-coverage: accumulates `ShardId`s
+    /// of children whose `parent` field does not match the expected parent.
     scratch_wrong_parent: Vec<ShardId>,
 }
 
@@ -106,28 +192,41 @@ impl InvariantChecker {
         }
     }
 
-    /// Run all invariant checks (S1–S7) against the current coordinator state.
+    /// Run all invariant checks (S1-S7) against the current coordinator state.
     ///
-    /// Performs a **single pass** over `coordinator.shards()`, checking S2–S7
-    /// inline and accumulating S1 data for a post-pass duplicate check. This
-    /// avoids 7 separate iterations and eliminates per-call `Cursor`
-    /// allocations in S5.
+    /// Performs a **single pass** over `coordinator.shards()`, checking S2-S7
+    /// inline per record and accumulating S1 data for a post-pass duplicate
+    /// check. This avoids 7 separate iterations and reuses scratch buffers
+    /// across calls to reduce allocation pressure.
     ///
-    /// Returns an empty `Vec` when all invariants hold.
+    /// # Returns
     ///
-    /// `_workers` is accepted for forward-compatibility (e.g., future checks
-    /// that compare worker-side bookkeeping against coordinator truth) but is
-    /// not read by any current check. All current invariants derive solely
-    /// from coordinator state to avoid false positives from stale worker views.
+    /// An empty `Vec` when all invariants hold; otherwise one
+    /// [`InvariantViolation`] per detected failure. Multiple violations can
+    /// be reported from a single call (e.g., a corrupt coordinator state
+    /// might violate both S4 and S3 simultaneously).
+    ///
+    /// # Parameters
+    ///
+    /// - `coordinator`: read-only view of the coordinator's shard records.
+    /// - `_workers`: accepted for forward-compatibility (e.g., future checks
+    ///   that compare worker-side bookkeeping against coordinator truth) but
+    ///   not read by any current check. All current invariants derive solely
+    ///   from coordinator state to avoid false positives from stale worker views.
+    /// - `tenant`: only shards belonging to this tenant are checked; others
+    ///   are skipped silently.
+    /// - `now`: current logical time, used to determine whether leases are
+    ///   active for S1.
     pub fn check_all(
         &mut self,
-        coordinator: &InMemoryCoordinator,
-        _workers: &[SimWorker],
+        coordinator: &impl SimIntrospection,
+        _workers: &[&SimWorker],
         tenant: TenantId,
         now: LogicalTime,
     ) -> Vec<InvariantViolation> {
         let mut violations = Vec::new();
-        // Collect into a Vec so we can iterate AND do point lookups.
+        // Collect into a Vec so we can iterate AND do S7 point lookups
+        // (child shard existence) within the same pass.
         let shards: Vec<_> = coordinator.shards().collect();
 
         // Reuse S1 buffer across calls to avoid per-call allocation.
@@ -155,7 +254,8 @@ impl InvariantChecker {
 
             // --- S2: fence monotonicity ---
             let current_epoch = record.fence_epoch;
-            if let Some(&prev) = self.prev_epochs.get(&id)
+            let prev_epoch = self.prev_epochs.get(&id).copied();
+            if let Some(prev) = prev_epoch
                 && current_epoch < prev
             {
                 violations.push(InvariantViolation::FenceMonotonicity {
@@ -169,22 +269,45 @@ impl InvariantChecker {
 
             // --- S3: terminal irreversibility ---
             let current_status = record.status;
-            if let Some(&prev) = self.prev_terminal.get(&id)
+            let prev_status = self.prev_terminal.get(&id).copied();
+            if let Some(prev) = prev_status
                 && prev.is_terminal()
                 && current_status != prev
-                // Parked→Active is a legitimate transition via `unpark_shard`.
-                && !(prev == ShardStatus::Parked && current_status == ShardStatus::Active)
             {
-                violations.push(InvariantViolation::TerminalIrreversibility {
-                    run: id.0,
-                    shard: id.1,
-                    was: prev,
-                    now: current_status,
-                });
+                if prev == ShardStatus::Parked && current_status == ShardStatus::Active {
+                    // Parked→Active is a legitimate transition via `unpark_shard`,
+                    // but it MUST bump the fence epoch to invalidate pre-park leases.
+                    if let Some(old_epoch) = prev_epoch
+                        && current_epoch <= old_epoch
+                    {
+                        violations.push(InvariantViolation::UnparkWithoutFenceBump {
+                            run: id.0,
+                            shard: id.1,
+                            fence_at_park: old_epoch,
+                            fence_at_unpark: current_epoch,
+                        });
+                    }
+                } else {
+                    violations.push(InvariantViolation::TerminalIrreversibility {
+                        run: id.0,
+                        shard: id.1,
+                        was: prev,
+                        now: current_status,
+                    });
+                }
             }
             self.prev_terminal.insert(id, current_status);
 
-            // --- S4: record invariants ---
+            // --- S4: record structural invariants ---
+            // Delegates to the record's own self-check. Two code paths are
+            // needed because `catch_unwind` is a no-op under `panic=abort`:
+            //
+            // - `panic=unwind` (default, test, Miri): catch the panic, extract
+            //   the message, and report it as a non-fatal violation so the
+            //   simulation can continue checking other shards.
+            // - `panic=abort`: call directly. If the assertion fires, the
+            //   process aborts -- there is no way to recover, but the panic
+            //   message printed to stderr identifies the failing shard.
             #[cfg(panic = "unwind")]
             {
                 let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
@@ -205,23 +328,20 @@ impl InvariantChecker {
                     });
                 }
             }
-            // Under panic=abort, catch_unwind cannot intercept panics.
-            // Call assert_invariants() directly; a panic will abort the
-            // process, which is the best we can do since the invariant
-            // truly failed.
             #[cfg(not(panic = "unwind"))]
             {
                 record.assert_invariants();
             }
 
-            // --- S5: cursor monotonicity (Cursor-allocation-free) ---
-            // Direct Option<&[u8]> comparison instead of constructing Cursor objects.
+            // --- S5: cursor monotonicity ---
+            // Compares raw `Option<&[u8]>` slices rather than constructing
+            // `Cursor` objects, avoiding a heap allocation per shard per step.
             let prev_key = self.prev_cursors.get(&id).and_then(|o| o.as_deref());
             let curr_key = record.cursor.last_key();
             let cursor_regressed = match (prev_key, curr_key) {
-                (Some(_), None) => true,                         // ResetToNone
-                (Some(prev), Some(curr)) if curr < prev => true, // Regression
-                _ => false,                                      // Forward or no-op
+                (Some(_), None) => true,                         // reset to initial
+                (Some(prev), Some(curr)) if curr < prev => true, // lexicographic regression
+                _ => false,                                      // forward progress or unchanged
             };
             if cursor_regressed {
                 violations.push(InvariantViolation::CursorMonotonicity {
@@ -244,7 +364,9 @@ impl InvariantChecker {
                 });
             }
 
-            // --- S7: split coverage ---
+            // --- S7: split coverage (referential integrity) ---
+            // For each Split-status shard, verify that every child ID in
+            // `spawned` exists in the coordinator and points back to this parent.
             if record.status == ShardStatus::Split {
                 if record.spawned.is_empty() {
                     violations.push(InvariantViolation::SplitCoverage {
@@ -287,7 +409,11 @@ impl InvariantChecker {
             }
         }
 
-        // --- S1 post-pass: check for mutual exclusion violations ---
+        // --- S1 post-pass: mutual exclusion ---
+        // S1 is a cross-record property (two records for the same ShardKey
+        // with overlapping active leases), so it cannot be checked inline
+        // per record. Instead, active holders were accumulated during the
+        // pass and are now scanned for duplicates.
         for (key, holders) in &self.active_holders {
             if holders.len() > 1 {
                 violations.push(InvariantViolation::MutualExclusion {
@@ -815,6 +941,66 @@ mod tests {
         assert!(
             v.is_empty(),
             "Parked→Active should not trigger S3 TerminalIrreversibility, got: {v:?}"
+        );
+    }
+
+    /// Parked→Active without bumping fence_epoch triggers UnparkWithoutFenceBump.
+    #[test]
+    fn detects_unpark_without_fence_bump() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+        let now = LogicalTime::from_raw(1);
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Seed as Parked with fence epoch 3.
+        coord.seed_shard(ShardRecord::from_raw_parts(
+            TENANT,
+            run,
+            shard,
+            ShardStatus::Parked,
+            Some(crate::coordination::record::ParkReason::Other),
+            spec.clone(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::from_raw(3),
+            None,
+            vec![],
+            RingBuffer::new(),
+        ));
+        let mut checker = InvariantChecker::new();
+        assert!(checker.check_all(&coord, &[], TENANT, now).is_empty());
+
+        // Re-seed as Active with SAME fence epoch — missing fence bump.
+        coord.seed_shard(ShardRecord::from_raw_parts(
+            TENANT,
+            run,
+            shard,
+            ShardStatus::Active,
+            None,
+            spec,
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::from_raw(3),
+            None,
+            vec![],
+            RingBuffer::new(),
+        ));
+
+        let v = checker.check_all(&coord, &[], TENANT, now);
+        assert_eq!(v.len(), 1);
+        assert!(
+            matches!(
+                &v[0],
+                InvariantViolation::UnparkWithoutFenceBump {
+                    fence_at_park,
+                    fence_at_unpark,
+                    ..
+                } if fence_at_park.as_raw() == 3 && fence_at_unpark.as_raw() == 3
+            ),
+            "expected UnparkWithoutFenceBump, got: {v:?}"
         );
     }
 }

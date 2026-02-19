@@ -6,6 +6,7 @@
 use super::*;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::identity::{FenceEpoch, RunId};
+use crate::sim::backend::SimIntrospection;
 use gossip_stdx::RingBuffer;
 
 // -- Test fixtures ---------------------------------------------------

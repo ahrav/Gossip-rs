@@ -1,15 +1,55 @@
 //! Full simulation harness for deterministic coordination testing.
 //!
-//! Drives the real [`InMemoryCoordinator`] under configurable fault injection,
-//! verifying protocol invariants at every step. Inspired by FoundationDB's
-//! simulation framework and TigerBeetle's VOPR.
+//! Drives a [`SimulationBackend`] (defaulting to [`InMemoryCoordinator`]) under
+//! configurable fault injection, verifying protocol invariants (S1--S7) at every
+//! step. Inspired by FoundationDB's simulation framework and TigerBeetle's VOPR.
 //!
-//! # Two-phase run
+//! # Execution model
 //!
-//! 1. **Safety phase**: Random operations under fault injection. Verifies that
-//!    no invariant is ever violated regardless of operation ordering or timing.
-//! 2. **Liveness phase**: Biased toward acquire + complete. Verifies that the
-//!    system converges to terminal states.
+//! A simulation run consists of three sequential stages:
+//!
+//! 1. **Zombie scenario** (deterministic preamble): A scripted sequence that
+//!    exercises the bookkeeping-cleanup path (B1) by expiring a lease and
+//!    re-acquiring on a different worker. Runs unconditionally before random ops.
+//! 2. **Safety phase** (`safety_ops` iterations): Weighted random operations
+//!    with fault injection. The first [`WARMUP_OPS`] suppress faults to let
+//!    workers establish leases before time-jumps can expire them. Verifies that
+//!    no invariant is ever violated regardless of operation ordering.
+//! 3. **Liveness phase** (`liveness_ops` iterations): Biased toward acquire +
+//!    complete, verifying that the system converges to terminal states.
+//!
+//! Every operation in every phase is followed by a full invariant sweep
+//! ([`InvariantChecker::check_all`]). This is the core safety guarantee.
+//!
+//! # Two entry points
+//!
+//! - **[`CoordinationSim::run`]**: Canned three-stage execution (zombie preamble +
+//!   safety phase + liveness phase) that returns a [`SimReport`]. Suitable for
+//!   proptest and regression tests.
+//! - **[`CoordinationSim::step`]**: Execute a single [`SimOp`] and check
+//!   invariants. Suitable for custom simulation loops that need fine-grained
+//!   control over operation sequencing.
+//!
+//! # Key design decisions
+//!
+//! - **Forward-only cursors**: [`generate_forward_cursor`](CoordinationSim::generate_forward_cursor)
+//!   tracks per-worker cursor progress and only generates cursors that advance.
+//!   Without this, random cursors would frequently regress, flooding the run with
+//!   expected `CursorRegression` rejections that mask real bugs.
+//!
+//! - **Stale lease tracking**: When worker B acquires a shard previously held by
+//!   worker A, the harness saves A's superseded lease. These stale leases feed
+//!   [`SimOp::ZombieCheckpoint`], which bypasses bookkeeping cleanup to exercise
+//!   the coordinator's fence-based `StaleFence` rejection path directly.
+//!
+//! - **Active shard set**: The harness maintains [`active_shard_keys`](CoordinationSim::active_shard_keys)
+//!   as a subset of all shard keys, excluding terminal shards. This prevents op
+//!   generation from selecting shards that would always be rejected, improving
+//!   coverage of meaningful coordinator paths.
+//!
+//! - **Allocation-free rejections**: [`RejectionKind`] is a `Copy` enum rather
+//!   than a `String`, avoiding heap allocation on the hot path where fault-heavy
+//!   modes produce many rejections per run.
 
 use std::collections::BTreeMap;
 
@@ -21,15 +61,16 @@ use crate::coordination::error::{
     AcquireError, CheckpointError, CompleteError, IdempotentOutcome, ParkError, RenewError,
     SplitError,
 };
-use crate::coordination::facade::{ClaimError, ShardClaiming};
+use crate::coordination::facade::ClaimError;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord};
+use crate::coordination::session::WorkerSession;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
-use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
+use crate::sim::backend::SimulationBackend;
 
 use super::invariants::{InvariantChecker, InvariantViolation};
 use super::worker::SimWorker;
@@ -41,9 +82,21 @@ use super::{FaultConfig, FaultLevel, SimContext};
 
 /// A single operation in the simulation.
 ///
-/// Operations fall into two categories: *coordinator ops* that invoke real
-/// [`InMemoryCoordinator`] methods, and *environmental ops* that manipulate
-/// simulation state (clock, worker health).
+/// Operations fall into three categories:
+///
+/// - **Coordinator ops** (`Acquire`, `Renew`, `Checkpoint`, `Complete`, `Park`,
+///   `SplitReplace`, `SplitResidual`, `ClaimNext`, `SessionLifecycle`): invoke
+///   real coordinator methods through the [`SimulationBackend`] trait.
+/// - **Idempotency/conflict ops** (`ReplayCheckpoint`, `ConflictCheckpoint`,
+///   `ZombieCheckpoint`): exercise edge cases in the coordinator's op-log and
+///   fencing protocol.
+/// - **Environmental ops** (`AdvanceTime`, `PauseWorker`, `ResumeWorker`):
+///   manipulate simulation state (clock, worker health) without touching the
+///   coordinator.
+///
+/// All variants carry enough context (worker, shard key) for the harness to
+/// dispatch to the appropriate executor. The harness generates ops via weighted
+/// random selection in [`CoordinationSim::generate_random_op`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SimOp {
@@ -78,6 +131,14 @@ pub enum SimOp {
     PauseWorker { worker: WorkerId },
     /// Resume a previously paused worker.
     ResumeWorker { worker: WorkerId },
+    /// Execute a complete WorkerSession lifecycle on a shard:
+    /// acquire → checkpoint(1–3x) → complete|park.
+    ///
+    /// Exercises the ergonomic `WorkerSession` wrapper that the real
+    /// orchestrator uses. The session holds `&mut coordinator` exclusively,
+    /// so invariant checking happens at the session boundary (after drop),
+    /// not between individual session operations.
+    SessionLifecycle { worker: WorkerId, key: ShardKey },
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +146,11 @@ pub enum SimOp {
 // ---------------------------------------------------------------------------
 
 /// Outcome of executing a [`SimOp`].
+///
+/// Every execution produces exactly one `SimEvent`. Successful operations carry
+/// their result payloads (e.g., the new fence epoch from an acquire); rejected
+/// operations carry a [`RejectionKind`] that categorizes the failure without
+/// heap allocation.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SimEvent {
@@ -118,6 +184,8 @@ pub enum SimEvent {
     WorkerResumed { worker: WorkerId },
     /// Operation could not be dispatched (e.g., unknown worker).
     Skipped,
+    /// WorkerSession lifecycle completed (acquire → checkpoints → terminal).
+    SessionLifecycleOk,
 }
 
 /// Categorized rejection reason (no heap allocation).
@@ -251,7 +319,11 @@ impl From<SplitError> for RejectionKind {
     }
 }
 
-/// Typed event category for counting (no payload).
+/// Payload-free event discriminant for histogram counting.
+///
+/// Used by [`SimReport::event_counts`] to summarize operation coverage
+/// without carrying per-event payloads. The `Ord` derive enables `BTreeMap`
+/// keying for deterministic report output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimEventKind {
     AcquireOk,
@@ -269,6 +341,7 @@ pub enum SimEventKind {
     WorkerPaused,
     WorkerResumed,
     Skipped,
+    SessionLifecycleOk,
 }
 
 impl SimEvent {
@@ -289,6 +362,7 @@ impl SimEvent {
             SimEvent::WorkerPaused { .. } => SimEventKind::WorkerPaused,
             SimEvent::WorkerResumed { .. } => SimEventKind::WorkerResumed,
             SimEvent::Skipped => SimEventKind::Skipped,
+            SimEvent::SessionLifecycleOk => SimEventKind::SessionLifecycleOk,
         }
     }
 }
@@ -299,8 +373,17 @@ impl SimEvent {
 
 /// Summary of a simulation run.
 ///
-/// Includes both safety results (violations) and liveness results (convergence),
-/// plus enough metadata to reproduce the exact run.
+/// Includes both safety results (invariant violations) and liveness results
+/// (convergence to terminal states), plus enough metadata to reproduce the
+/// exact run from its seed.
+///
+/// The typical assertion pattern in tests is:
+///
+/// ```rust,ignore
+/// let report = sim.run(500, 200);
+/// assert!(report.violations.is_empty(), "seed {}: {:?}", report.seed, report.violations);
+/// assert!(report.converged, "seed {}: not converged", report.seed);
+/// ```
 #[must_use]
 #[derive(Debug)]
 pub struct SimReport {
@@ -322,7 +405,11 @@ pub struct SimReport {
 // CoordinationSim
 // ---------------------------------------------------------------------------
 
-/// Default lease duration for the simulated coordinator.
+/// Default lease duration (in logical ticks) for the simulated coordinator.
+///
+/// Chosen to be large enough that warmup operations can acquire and checkpoint
+/// before expiry, but small enough that moderate time-jumps (50--200 ticks in
+/// Stormy mode) can expire leases and create interesting fault scenarios.
 const DEFAULT_LEASE_DURATION: u64 = 100;
 
 /// Number of initial operations where faults are suppressed to let the
@@ -335,6 +422,11 @@ const WARMUP_OPS: usize = 5;
 
 /// Maximum retries when generating a random op before falling back to
 /// `AdvanceTime`.
+///
+/// Op generation can fail when no suitable target exists (e.g., no active
+/// workers, no held shards for a renew). Retrying with a fresh random roll
+/// usually finds a valid op within a few attempts. The `AdvanceTime` fallback
+/// is always valid and advances the simulation meaningfully.
 const MAX_OP_RETRIES: usize = 10;
 
 /// Maximum number of stale leases retained for zombie checkpoint injection.
@@ -343,7 +435,12 @@ const MAX_OP_RETRIES: usize = 10;
 /// the limit is exceeded, random entries are evicted via `swap_remove`.
 const MAX_STALE_LEASES: usize = 64;
 
-/// Saved checkpoint data: `(OpId, Cursor, WorkerId, ShardKey)` keyed by raw IDs.
+/// Saved checkpoint data for idempotency and conflict testing.
+///
+/// Keyed by `(worker_raw, run_raw, shard_raw)` because `ShardKey` intentionally
+/// omits `Ord`. Each entry stores the `(OpId, Cursor, WorkerId, ShardKey)` from
+/// the last successful checkpoint, enabling [`SimOp::ReplayCheckpoint`] (same
+/// OpId + payload) and [`SimOp::ConflictCheckpoint`] (same OpId, different payload).
 type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Cursor, WorkerId, ShardKey)>;
 
 /// Check that `worker` exists, is not paused, holds a lease on `key`,
@@ -370,13 +467,40 @@ fn require_lease_and_op(
     Ok((lease, op_id))
 }
 
-/// Full deterministic simulation harness.
+/// Full deterministic simulation harness for the coordination protocol.
 ///
-/// Drives [`InMemoryCoordinator`] through random operations, injecting faults
-/// per [`FaultConfig`], and checking invariants at every step.
-pub struct CoordinationSim {
+/// Maintains two parallel views of the world:
+///
+/// - **Coordinator truth** (`coordinator: B`): the real shard records, leases,
+///   and fence epochs. All mutations go through the [`SimulationBackend`] trait.
+/// - **Worker bookkeeping** (`workers: BTreeMap<WorkerId, SimWorker>`): each
+///   worker's *local belief* about which shards it holds. This view can diverge
+///   from coordinator truth (e.g., after a lease expires silently), which is
+///   intentional -- the divergence is what creates interesting fault scenarios.
+///
+/// The [`InvariantChecker`] always validates against coordinator truth, never
+/// against worker bookkeeping, to avoid masking real violations.
+///
+/// # Generics
+///
+/// Generic over the backend type `B`, defaulting to [`InMemoryCoordinator`]
+/// so `CoordinationSim::new(...)` compiles without turbofish. The generic impl
+/// block provides all simulation logic; `InMemoryCoordinator`-specific setup
+/// methods (`new`, `register_shard`, `with_workers_and_shards`, `seed_all_runs`)
+/// live in a specialized impl block.
+///
+/// # State management
+///
+/// | Field | Purpose |
+/// |-------|---------|
+/// | `shard_keys` | All registered shard keys (including terminal). Grows on splits. |
+/// | `active_shard_keys` | Non-terminal subset. Shrinks on complete/park/split-replace. |
+/// | `stale_leases` | Superseded leases for zombie checkpoint injection. Capped at [`MAX_STALE_LEASES`]. |
+/// | `last_checkpoint_ops` | Per-(worker, run, shard) checkpoint history for replay/conflict testing. |
+/// | `run_shard_ids` | Shard IDs per run, seeded into the coordinator for `claim_next_available`. |
+pub struct CoordinationSim<B: SimulationBackend = InMemoryCoordinator> {
     context: SimContext,
-    coordinator: InMemoryCoordinator,
+    coordinator: B,
     workers: BTreeMap<WorkerId, SimWorker>,
     fault_config: FaultConfig,
     checker: InvariantChecker,
@@ -397,31 +521,31 @@ pub struct CoordinationSim {
     run_shard_ids: BTreeMap<RunId, Vec<ShardId>>,
 }
 
-impl CoordinationSim {
-    /// Create a new simulation with the given seed and fault level.
+// ============================================================================
+// InMemoryCoordinator-specific constructors and setup
+// ============================================================================
+
+impl CoordinationSim<InMemoryCoordinator> {
+    /// Create a new simulation backed by [`InMemoryCoordinator`] with default
+    /// lease duration.
+    ///
+    /// Call [`with_workers_and_shards`](Self::with_workers_and_shards) to add
+    /// participants, or use [`add_worker`](CoordinationSim::add_worker) and
+    /// [`register_shard`](Self::register_shard) for fine-grained setup.
     pub fn new(seed: u64, level: FaultLevel) -> Self {
-        Self {
-            context: SimContext::new(seed),
-            coordinator: InMemoryCoordinator::new(DEFAULT_LEASE_DURATION),
-            workers: BTreeMap::new(),
-            fault_config: FaultConfig::for_level(level),
-            checker: InvariantChecker::new(),
-            shard_keys: Vec::new(),
-            active_shard_keys: Vec::new(),
-            tenant: TenantId::from_bytes([0x01; 32]),
-            ops_executed: 0,
-            stale_leases: Vec::new(),
-            last_checkpoint_ops: BTreeMap::new(),
-            run_shard_ids: BTreeMap::new(),
-        }
+        Self::with_backend(
+            seed,
+            level,
+            InMemoryCoordinator::new(DEFAULT_LEASE_DURATION),
+        )
     }
 
-    /// Add a worker to the simulation.
-    pub fn add_worker(&mut self, id: WorkerId) {
-        self.workers.insert(id, SimWorker::new(id));
-    }
-
-    /// Register a shard in the coordinator.
+    /// Register a shard in the coordinator with a default spec range `[b'a', b'z')`.
+    ///
+    /// The shard is added to `shard_keys` and its run is tracked in `run_shard_ids`
+    /// for later `claim_next_available` seeding. Does **not** add to
+    /// `active_shard_keys` -- call [`with_workers_and_shards`](Self::with_workers_and_shards)
+    /// or set `active_shard_keys` manually after registration.
     pub fn register_shard(&mut self, run: RunId, shard: ShardId) {
         let record = ShardRecord::new_active(
             self.tenant,
@@ -435,7 +559,12 @@ impl CoordinationSim {
         self.run_shard_ids.entry(run).or_default().push(shard);
     }
 
-    /// Convenience: add N workers (IDs 1..=n) and M shards (run=1, shard IDs 1..=m).
+    /// Builder: add `n_workers` workers (IDs `1..=n`) and `n_shards` shards
+    /// (run=1, shard IDs `1..=m`), seed run records, and initialize the active
+    /// shard set.
+    ///
+    /// This is the standard one-liner for test setup. For multi-run scenarios,
+    /// use [`register_shard`](Self::register_shard) directly.
     pub fn with_workers_and_shards(mut self, n_workers: u64, n_shards: u64) -> Self {
         for i in 1..=n_workers {
             self.add_worker(WorkerId::from_raw(i));
@@ -458,6 +587,39 @@ impl CoordinationSim {
                 .seed_run(self.tenant, *run, shard_ids.clone(), DEFAULT_LEASE_DURATION);
         }
     }
+}
+
+// ============================================================================
+// Generic simulation logic
+// ============================================================================
+
+impl<B: SimulationBackend> CoordinationSim<B> {
+    /// Create a simulation harness with a custom [`SimulationBackend`].
+    ///
+    /// The backend is used as-is; callers are responsible for seeding shards
+    /// and configuring run records before calling [`run`](Self::run) or
+    /// [`step`](Self::step).
+    pub fn with_backend(seed: u64, level: FaultLevel, backend: B) -> Self {
+        Self {
+            context: SimContext::new(seed),
+            coordinator: backend,
+            workers: BTreeMap::new(),
+            fault_config: FaultConfig::for_level(level),
+            checker: InvariantChecker::new(),
+            shard_keys: Vec::new(),
+            active_shard_keys: Vec::new(),
+            tenant: TenantId::from_bytes([0x01; 32]),
+            ops_executed: 0,
+            stale_leases: Vec::new(),
+            last_checkpoint_ops: BTreeMap::new(),
+            run_shard_ids: BTreeMap::new(),
+        }
+    }
+
+    /// Add a worker to the simulation.
+    pub fn add_worker(&mut self, id: WorkerId) {
+        self.workers.insert(id, SimWorker::new(id));
+    }
 
     /// Execute a single step: run the operation, then check **all** invariants.
     ///
@@ -469,19 +631,33 @@ impl CoordinationSim {
         let event = self.execute_op(&op);
         self.ops_executed += 1;
 
-        let violations =
-            self.checker
-                .check_all(&self.coordinator, &[], self.tenant, self.context.now());
+        let worker_refs: Vec<&SimWorker> = self.workers.values().collect();
+        let violations = self.checker.check_all(
+            &self.coordinator,
+            &worker_refs,
+            self.tenant,
+            self.context.now(),
+        );
         (event, violations)
     }
 
-    /// Run a two-phase simulation.
+    /// Run a complete simulation and consume the harness, returning a report.
     ///
-    /// 1. Safety phase: `safety_ops` random operations (first `WARMUP_OPS`
-    ///    without faults, remainder with full fault injection).
-    /// 2. Liveness phase: `liveness_ops` convergence-biased operations.
+    /// Execution proceeds in three stages (see module docs):
     ///
-    /// Returns a [`SimReport`] summarizing the run.
+    /// 1. **Zombie preamble**: One scripted acquire-expire-reacquire-checkpoint
+    ///    sequence that deterministically exercises the B1 bookkeeping cleanup
+    ///    path.
+    /// 2. **Safety phase** (`safety_ops` random ops): The first [`WARMUP_OPS`]
+    ///    suppress faults; the remainder use full fault injection including
+    ///    random time-jumps that can expire leases mid-flight.
+    /// 3. **Liveness phase** (`liveness_ops` convergence-biased ops): Weighted
+    ///    toward acquire + complete to drive shards to terminal states.
+    ///
+    /// After all phases, checks whether every registered shard reached a
+    /// terminal state (`converged` flag in the report).
+    ///
+    /// Consumes `self` to prevent accidental reuse of simulation state.
     pub fn run(mut self, safety_ops: usize, liveness_ops: usize) -> SimReport {
         let mut all_violations = Vec::new();
         let mut event_counts = BTreeMap::new();
@@ -527,6 +703,12 @@ impl CoordinationSim {
     // Op execution
     // -----------------------------------------------------------------------
 
+    /// Top-level dispatch: route a [`SimOp`] to the appropriate executor.
+    ///
+    /// Does **not** increment `ops_executed` or run invariant checks -- that
+    /// is [`step`](Self::step)'s responsibility. This separation allows
+    /// internal callers (like `inject_zombie_scenario`) to use `step` and
+    /// get full invariant coverage.
     fn execute_op(&mut self, op: &SimOp) -> SimEvent {
         match op {
             SimOp::Acquire { worker, key }
@@ -546,6 +728,8 @@ impl CoordinationSim {
             SimOp::ZombieCheckpoint => self.exec_zombie_checkpoint(),
 
             SimOp::ClaimNext { worker } => self.exec_claim_next(*worker),
+
+            SimOp::SessionLifecycle { worker, key } => self.exec_session_lifecycle(*worker, *key),
 
             SimOp::AdvanceTime { ticks } => {
                 self.context.advance(*ticks);
@@ -620,6 +804,10 @@ impl CoordinationSim {
         }
     }
 
+    /// Attempt to acquire a shard lease.
+    ///
+    /// On success, updates worker bookkeeping via [`record_acquire_bookkeeping`](Self::record_acquire_bookkeeping),
+    /// which also saves any superseded leases for zombie checkpoint injection.
     fn exec_acquire(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
             return SimEvent::Rejected {
@@ -642,6 +830,11 @@ impl CoordinationSim {
         }
     }
 
+    /// Renew a lease and update the worker's local copy to reflect the new deadline.
+    ///
+    /// The worker's lease object is reconstructed with the coordinator-returned
+    /// deadline to keep bookkeeping consistent. Without this update, subsequent
+    /// operations using the stale deadline would misrepresent expiry timing.
     fn exec_renew(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
             return SimEvent::Rejected {
@@ -682,6 +875,10 @@ impl CoordinationSim {
         }
     }
 
+    /// Checkpoint cursor progress on a held shard.
+    ///
+    /// On success, records the cursor position on the worker (for forward-cursor
+    /// generation) and saves the `(OpId, Cursor)` pair for replay/conflict testing.
     fn exec_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
             Ok(pair) => pair,
@@ -712,6 +909,8 @@ impl CoordinationSim {
         }
     }
 
+    /// Mark a shard as done (terminal). Releases the shard from the worker
+    /// and removes it from the active set.
     fn exec_complete(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
             Ok(pair) => pair,
@@ -738,6 +937,8 @@ impl CoordinationSim {
         }
     }
 
+    /// Park a shard for later retry (terminal). Releases the shard from the
+    /// worker and removes it from the active set.
     fn exec_park(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
             Ok(pair) => pair,
@@ -765,7 +966,8 @@ impl CoordinationSim {
     // Split helpers
     // -----------------------------------------------------------------------
 
-    /// Look up a shard's spec from the coordinator.
+    /// Look up a shard's spec from the coordinator, returning a rejection
+    /// event if the shard does not exist.
     fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
         match self.coordinator.shard_lookup(&self.tenant, &key) {
             Some(record) => Ok(record.spec.clone()),
@@ -775,8 +977,11 @@ impl CoordinationSim {
         }
     }
 
-    /// Compute a random split point between `start[0]+1` and `end[0]`.
-    /// Returns `Err` if the range is too small to split.
+    /// Compute a random single-byte split point in `(start[0], end[0])`.
+    ///
+    /// Returns `Err(Rejected)` if the range is too narrow (fewer than 2 byte
+    /// values between start and end), which can happen after repeated splits
+    /// shrink a shard's range down to adjacent bytes.
     fn compute_split_byte(&mut self, start: &[u8], end: &[u8]) -> Result<u8, SimEvent> {
         if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
             return Err(SimEvent::Rejected {
@@ -797,7 +1002,13 @@ impl CoordinationSim {
     // Split operations
     // -----------------------------------------------------------------------
 
-    /// Execute a split-replace: parent → 2 children covering the parent's range.
+    /// Execute a split-replace: parent is retired (terminal) and replaced by
+    /// 2 children whose ranges together cover the parent's full range.
+    ///
+    /// On success, releases the parent from the worker, registers both child
+    /// shard keys in `shard_keys` and `active_shard_keys`, and removes the
+    /// parent from the active set. The children start with `Cursor::initial()`
+    /// (no progress) and are available for future acquire operations.
     fn exec_split_replace(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
             Ok(pair) => pair,
@@ -860,7 +1071,13 @@ impl CoordinationSim {
         }
     }
 
-    /// Execute a split-residual: parent shrinks, residual covers remainder.
+    /// Execute a split-residual: parent's range shrinks to cover only the
+    /// already-scanned prefix, and a new residual shard covers the remainder.
+    ///
+    /// Unlike split-replace, the parent remains active (non-terminal) and the
+    /// worker keeps its lease. The split point is chosen after the parent's
+    /// current cursor position so the parent retains all scanned data.
+    /// The residual shard is registered in `shard_keys` and `active_shard_keys`.
     fn exec_split_residual(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
             Ok(pair) => pair,
@@ -1126,15 +1343,16 @@ impl CoordinationSim {
     /// lease-lifecycle operations (acquire, renew, checkpoint, complete, park).
     ///
     /// Weight rationale (normal mode):
-    /// - acquire (15%) and checkpoint (15%) exercise the happy path
+    /// - acquire (13%) and checkpoint (13%) exercise the happy path
     /// - renew (10%) keeps leases alive
     /// - complete (8%) and park (4%) are terminal (over-weighting starves coverage)
     /// - split_replace (4%) and split_residual (4%) exercise split paths
     /// - replay/conflict (4%) exercise idempotency
     /// - zombie (3%) exercises stale-fence rejection
     /// - claim_next (3%) exercises the list-then-acquire retry loop
+    /// - session_lifecycle (8%) exercises WorkerSession wrapper end-to-end
     /// - time advances (10%) create expiry windows
-    /// - pause (10%) and resume (10%) model worker failures
+    /// - pause (8%) and resume (8%) model worker failures
     fn generate_random_op(&mut self, suppress_faults: bool) -> SimOp {
         for _ in 0..MAX_OP_RETRIES {
             // Weighted selection.
@@ -1150,19 +1368,20 @@ impl CoordinationSim {
                 }
             } else {
                 match roll {
-                    0..15 => self.try_gen_acquire(),
-                    15..25 => self.try_gen_renew(),
-                    25..40 => self.try_gen_checkpoint(),
-                    40..48 => self.try_gen_complete(),
-                    48..52 => self.try_gen_park(),
-                    52..56 => self.try_gen_split_replace(),
-                    56..60 => self.try_gen_split_residual(),
-                    60..62 => self.try_gen_replay_checkpoint(),
-                    62..64 => self.try_gen_conflict_checkpoint(),
-                    64..67 => self.try_gen_zombie_checkpoint(),
-                    67..70 => self.try_gen_claim_next(),
-                    70..80 => Some(self.gen_advance_time()),
-                    80..90 => self.try_gen_pause(),
+                    0..13 => self.try_gen_acquire(),
+                    13..23 => self.try_gen_renew(),
+                    23..36 => self.try_gen_checkpoint(),
+                    36..44 => self.try_gen_complete(),
+                    44..48 => self.try_gen_park(),
+                    48..52 => self.try_gen_split_replace(),
+                    52..56 => self.try_gen_split_residual(),
+                    56..58 => self.try_gen_replay_checkpoint(),
+                    58..60 => self.try_gen_conflict_checkpoint(),
+                    60..63 => self.try_gen_zombie_checkpoint(),
+                    63..66 => self.try_gen_claim_next(),
+                    66..74 => self.try_gen_session_lifecycle(),
+                    74..84 => Some(self.gen_advance_time()),
+                    84..92 => self.try_gen_pause(),
                     _ => self.try_gen_resume(),
                 }
             };
@@ -1183,7 +1402,14 @@ impl CoordinationSim {
         self.gen_advance_time()
     }
 
-    /// Generate a liveness-biased operation (more acquire + complete).
+    /// Generate a liveness-biased operation for the convergence phase.
+    ///
+    /// Heavily weighted toward acquire (30%) and complete (30%) to drive all
+    /// shards to terminal states. Omits faults, splits, idempotency tests,
+    /// and pauses to avoid creating new non-terminal shards or blocking
+    /// progress. Includes AdvanceTime and resume as environmental ops
+    /// (time advances keep leases cycling; resume unblocks workers paused
+    /// during the safety phase).
     fn generate_liveness_op(&mut self) -> SimOp {
         for _ in 0..MAX_OP_RETRIES {
             let roll: u32 = self.context.rng().random_range(0..100);
@@ -1202,6 +1428,7 @@ impl CoordinationSim {
         self.gen_advance_time()
     }
 
+    /// Select a uniformly random non-paused worker, or `None` if all are paused.
     fn pick_random_active_worker(&mut self) -> Option<WorkerId> {
         let count = self.workers.values().filter(|w| !w.is_paused()).count();
         if count == 0 {
@@ -1215,6 +1442,7 @@ impl CoordinationSim {
             .nth(idx)
     }
 
+    /// Select a uniformly random active (non-terminal) shard key, or `None` if empty.
     fn pick_random_shard_key(&mut self) -> Option<ShardKey> {
         if self.active_shard_keys.is_empty() {
             return None;
@@ -1349,6 +1577,12 @@ impl CoordinationSim {
             return None;
         }
         Some(SimOp::ZombieCheckpoint)
+    }
+
+    fn try_gen_session_lifecycle(&mut self) -> Option<SimOp> {
+        let worker = self.pick_random_active_worker()?;
+        let key = self.pick_random_shard_key()?;
+        Some(SimOp::SessionLifecycle { worker, key })
     }
 
     // -----------------------------------------------------------------------
@@ -1501,10 +1735,136 @@ impl CoordinationSim {
     }
 
     // -----------------------------------------------------------------------
+    // Session lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Execute a complete WorkerSession lifecycle on a shard.
+    ///
+    /// acquire → checkpoint(1–3x) → complete|park
+    ///
+    /// All random decisions are pre-computed before the session is created
+    /// so the PRNG stream position is deterministic regardless of session
+    /// outcome. The session block borrows only `self.coordinator`; sim-level
+    /// bookkeeping runs after the session drops.
+    ///
+    /// Invariant checks happen at the session boundary (after drop), not
+    /// between individual session operations. This is justified because:
+    /// - WorkerSession's `&mut B` prevents external observation mid-session
+    /// - Backend-internal `record.assert_invariants()` maintains per-op safety
+    /// - S1 cannot be violated mid-session (exclusive borrow prevents concurrent acquire)
+    fn exec_session_lifecycle(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
+            return SimEvent::Rejected {
+                kind: RejectionKind::WorkerPaused,
+            };
+        }
+
+        // --- Pre-compute all random decisions (touches self.context only) ---
+
+        // Look up spec bounds before session acquires exclusive coordinator access.
+        let (range_lo, range_hi) = self
+            .coordinator
+            .shard_lookup(&self.tenant, &key)
+            .map(|r| {
+                let lo = r.spec.key_range_start().first().copied().unwrap_or(b'a');
+                let hi = r.spec.key_range_end().first().copied().unwrap_or(b'z');
+                (lo, hi)
+            })
+            .unwrap_or((b'a', b'z'));
+
+        let num_checkpoints: u32 = self.context.rng().random_range(1..=3);
+        let should_park: bool = self.context.rng().random_range(0u32..10) < 2;
+
+        // Build forward-progressing cursor sequence.
+        let total_cursors = num_checkpoints as usize + 1;
+        let mut cursors: Vec<Cursor> = Vec::with_capacity(total_cursors);
+        let mut lo = range_lo;
+        for _ in 0..total_cursors {
+            if lo >= range_hi {
+                let byte = cursors
+                    .last()
+                    .and_then(|c| c.last_key().and_then(|k| k.first().copied()))
+                    .unwrap_or(range_hi.saturating_sub(1));
+                cursors.push(Cursor::with_last_key(vec![byte]));
+            } else {
+                let byte = self.context.rng().random_range(lo..range_hi);
+                cursors.push(Cursor::with_last_key(vec![byte]));
+                lo = byte.saturating_add(1);
+            }
+        }
+
+        // Generate op IDs from the worker.
+        let w = match self.workers.get_mut(&worker) {
+            Some(w) => w,
+            None => return SimEvent::Skipped,
+        };
+        let op_ids: Vec<OpId> = (0..total_cursors).map(|_| w.next_op_id()).collect();
+
+        // --- Execute session in a scoped block (borrows only self.coordinator) ---
+
+        let now = self.context.now();
+        let tenant = self.tenant;
+
+        let session_result: Result<(Lease, bool), SimEvent> = (|| {
+            let mut sess = WorkerSession::new(&mut self.coordinator, now, tenant, key, worker)
+                .map_err(|e| SimEvent::Rejected {
+                    kind: RejectionKind::from(e),
+                })?;
+
+            let lease = *sess.lease();
+
+            // Checkpoint phase.
+            for i in 0..num_checkpoints as usize {
+                let _ = sess.checkpoint(now, cursors[i].clone(), op_ids[i]);
+            }
+
+            // Terminal phase.
+            let terminal_idx = num_checkpoints as usize;
+            let is_terminal = if should_park {
+                sess.park(now, ParkReason::Other, op_ids[terminal_idx])
+                    .is_ok()
+            } else {
+                sess.complete(now, cursors[terminal_idx].clone(), op_ids[terminal_idx])
+                    .is_ok()
+            };
+
+            Ok((lease, is_terminal))
+        })();
+        // Session dropped here — coordinator borrow released.
+
+        // --- Sim-level bookkeeping (touches self.workers, self.active_shard_keys) ---
+
+        let (lease, is_terminal) = match session_result {
+            Ok(pair) => pair,
+            Err(event) => return event,
+        };
+
+        self.record_acquire_bookkeeping(worker, key, lease);
+
+        if is_terminal {
+            if let Some(w) = self.workers.get_mut(&worker) {
+                w.record_release(&key);
+            }
+            self.active_shard_keys.retain(|k| *k != key);
+        }
+
+        SimEvent::SessionLifecycleOk
+    }
+
+    // -----------------------------------------------------------------------
     // Convergence check
     // -----------------------------------------------------------------------
 
-    /// Check if all shards reached a terminal state (Done, Split, or Parked).
+    /// Check whether every registered shard reached a terminal state.
+    ///
+    /// Terminal states are `Done`, `Split`, and `Parked`. This iterates
+    /// `shard_keys` (which includes split children registered during the run),
+    /// so the convergence check covers the full expanded shard population.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a shard key is not found in the coordinator, which indicates
+    /// a registration bug in the harness.
     fn check_convergence(&self) -> bool {
         for key in &self.shard_keys {
             let record = self
@@ -1915,6 +2275,7 @@ mod tests {
         let mut split_residual_seen = false;
         let mut replayed_seen = false;
         let mut claim_seen = false;
+        let mut session_lifecycle_seen = false;
         // Run with a large enough op count and enough seeds to trigger
         // the probabilistic generation paths.
         for seed in 0..20u64 {
@@ -1942,6 +2303,12 @@ mod tests {
             if report.event_counts.contains_key(&SimEventKind::ClaimOk) {
                 claim_seen = true;
             }
+            if report
+                .event_counts
+                .contains_key(&SimEventKind::SessionLifecycleOk)
+            {
+                session_lifecycle_seen = true;
+            }
         }
         assert!(
             split_replace_seen,
@@ -1953,5 +2320,9 @@ mod tests {
         );
         assert!(replayed_seen, "ReplayedOk never observed across 20 seeds");
         assert!(claim_seen, "ClaimOk never observed across 20 seeds");
+        assert!(
+            session_lifecycle_seen,
+            "SessionLifecycleOk never observed across 20 seeds"
+        );
     }
 }
