@@ -207,7 +207,9 @@ impl ShardSpec {
     ///
     /// # Panics
     ///
-    /// Panics if `start` and `end` are both non-empty and `start >= end`.
+    /// - `start` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `end` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `start` and `end` are both non-empty and `start >= end`.
     #[must_use = "creates a shard spec that should be stored or used"]
     pub fn with_range(start: Vec<u8>, end: Vec<u8>) -> Self {
         Self::with_range_and_metadata(start, end, vec![])
@@ -217,7 +219,10 @@ impl ShardSpec {
     ///
     /// # Panics
     ///
-    /// Panics if `start` and `end` are both non-empty and `start >= end`.
+    /// - `start` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `end` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `metadata` exceeds [`MAX_METADATA_SIZE`] bytes.
+    /// - `start` and `end` are both non-empty and `start >= end`.
     #[must_use = "creates a shard spec that should be stored or used"]
     pub fn with_range_and_metadata(start: Vec<u8>, end: Vec<u8>, metadata: Vec<u8>) -> Self {
         assert!(
@@ -391,12 +396,14 @@ impl ShardSpec {
 ///
 /// Encoding:
 /// ```text
-/// key_range_start : length-prefixed bytes
-/// key_range_end   : length-prefixed bytes
-/// metadata        : length-prefixed bytes
+/// key_range_start : 4-byte LE length prefix + bytes
+/// key_range_end   : 4-byte LE length prefix + bytes
+/// metadata        : 4-byte LE length prefix + bytes
 /// ```
 ///
-/// All three fields are variable-length, so all are length-prefixed.
+/// All three fields are variable-length, so all use the
+/// [`CanonicalBytes for [u8]`](crate::identity::CanonicalBytes) 4-byte
+/// little-endian length prefix.
 impl CanonicalBytes for ShardSpec {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {

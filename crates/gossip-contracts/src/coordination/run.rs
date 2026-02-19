@@ -787,7 +787,8 @@ impl RunProgress {
     ///
     /// # Panics
     ///
-    /// Panics if any counter overflows `u32::MAX`.
+    /// - `is_leased` is `true` but `status` is not `Active`.
+    /// - Any counter overflows `u32::MAX`.
     pub fn count_shard(&mut self, status: ShardStatus, is_leased: bool) {
         assert!(
             !is_leased || status == ShardStatus::Active,

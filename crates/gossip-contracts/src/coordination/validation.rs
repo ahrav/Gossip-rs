@@ -137,13 +137,17 @@ pub fn validate_lease(
 /// Checks:
 /// 1. The new cursor has a `last_key` — an initial (keyless) cursor means
 ///    no data has been processed yet, so there is nothing to checkpoint.
-/// 2. Monotonicity: `new.last_key >= old.last_key` (lexicographic).
+/// 2. Monotonicity: `new.last_key` must not regress below `old.last_key`
+///    (lexicographic). `None → Some` is forward progress; `Some → None`
+///    and `Some(b) where b < a` are regressions.
 /// 3. Bounds: `new.last_key ∈ [spec.start, spec.end)`.
 ///
 /// # Preconditions
 ///
 /// The caller MUST call [`validate_lease`] before this function on every
-/// lease-gated code path. This function does not check lease validity.
+/// lease-gated code path. On idempotent paths, [`check_op_idempotency`]
+/// precedes both and may short-circuit before this function is reached.
+/// This function does not check lease validity.
 ///
 /// # Errors
 ///
@@ -209,8 +213,9 @@ pub fn validate_cursor_update(new_cursor: &Cursor, record: &ShardRecord) -> Resu
 ///
 /// # Preconditions
 ///
-/// The caller MUST call [`validate_lease`] before this function on every
-/// lease-gated code path. This function does not check lease validity.
+/// On idempotent paths this function is called BEFORE [`validate_lease`],
+/// so that a successful replay is never blocked by an expired lease or
+/// terminal shard status. This function does not check lease validity.
 ///
 /// `payload_hash` must be non-zero; a zero hash indicates the caller
 /// failed to compute a hash (see `OpLogEntry::new` assertion).

@@ -56,7 +56,8 @@
 //! # Split operation memory-safety pattern
 //!
 //! Both split operations temporarily **remove** the parent record from the map,
-//! mutate it inside a closure, then **restore** it unconditionally. This avoids
+//! mutate it inside a closure, then **restore** it on both success and failure
+//! paths. This avoids
 //! holding a `&mut ShardRecord` (from `get_mut`) while also inserting new child
 //! entries into the same `HashMap`. If the closure panics (invariant violation),
 //! the parent is intentionally *not* restored — an invariant panic indicates
@@ -103,8 +104,9 @@ use crate::coordination::validation::{
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_stdx::RingBuffer;
 
-/// aHash-backed `HashMap` — ~3x faster hashing than SipHash for point
-/// lookups, with equal DOS resistance (keyed via AES-NI hardware).
+/// aHash-backed `HashMap` — faster hashing than SipHash for point
+/// lookups. aHash provides DOS resistance via keyed hashing (uses
+/// AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 /// In-memory coordinator for shard-level operations.
@@ -596,9 +598,9 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// Uses the *remove-mutate-restore* pattern: the parent record is
     /// temporarily removed from `self.shards` so that both `&mut parent`
     /// and `&mut self.shards` (for child insertion) can coexist. The
-    /// parent is unconditionally re-inserted at the end regardless of
-    /// success or failure. A shard-count limit guard prevents
-    /// split-flooding (CWE-400).
+    /// parent is re-inserted at the end on both success and failure
+    /// paths (see module-level docs for the panic exception). A
+    /// shard-count limit guard prevents split-flooding (CWE-400).
     fn split_replace(
         &mut self,
         now: LogicalTime,

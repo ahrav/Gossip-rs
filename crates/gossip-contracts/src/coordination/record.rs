@@ -576,8 +576,8 @@ impl ShardRecord {
     /// Look up an op-log entry by [`OpId`].
     ///
     /// Returns `None` if the OpId is not in the log (either never seen
-    /// or evicted). Linear scan in reverse order for retry optimization
-    /// (~5ns avg improvement — retries involve the most recent operations).
+    /// or evicted). Linear scan in reverse order — retries involve the
+    /// most recent operations, so reverse iteration finds them sooner.
     ///
     /// ## Eviction failure mode
     ///
@@ -740,7 +740,7 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
 /// Excludes coordination-internal state:
 /// - `run`, `shard` — the worker already knows its identity from the acquire call
 /// - `tenant` — the worker already knows its tenant
-/// - `lease_*`, `fence_epoch` — the worker gets these from the Lease
+/// - `lease`, `fence_epoch` — the worker gets these from the Lease
 /// - `op_log` — internal to the coordinator
 /// - `park_reason` — only relevant for parked shards, which aren't acquired
 #[derive(Clone, Debug, PartialEq, Eq)]
