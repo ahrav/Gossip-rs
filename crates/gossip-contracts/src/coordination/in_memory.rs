@@ -208,6 +208,10 @@ impl InMemoryCoordinator {
     pub fn seed_shard(&mut self, record: ShardRecord) {
         record.assert_invariants();
         let key = ShardKey::new(record.run, record.shard);
+        self.run_shards
+            .entry((record.tenant, record.run))
+            .or_default()
+            .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
     }
 
@@ -218,7 +222,47 @@ impl InMemoryCoordinator {
     #[cfg(test)]
     pub fn seed_shard_unchecked(&mut self, record: ShardRecord) {
         let key = ShardKey::new(record.run, record.shard);
+        self.run_shards
+            .entry((record.tenant, record.run))
+            .or_default()
+            .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
+    }
+
+    /// Seed a run record directly (test/fixture helper).
+    ///
+    /// Creates an `Active` run with `shard_ids` as root shards, bypassing
+    /// the two-phase `create_run` → `register_shards` flow. Paired with
+    /// [`seed_shard`](Self::seed_shard) for constructing specific states.
+    ///
+    /// No-op if the run already exists (idempotent for multi-shard setups).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_run(
+        &mut self,
+        tenant: TenantId,
+        run: RunId,
+        shard_ids: Vec<ShardId>,
+        lease_duration: u64,
+    ) {
+        use crate::coordination::shard_spec::CursorSemantics;
+
+        if self.runs.contains_key(&(tenant, run)) {
+            return;
+        }
+        let config = RunConfig::try_new(CursorSemantics::Completed, lease_duration, Some(5))
+            .expect("seed_run: invalid lease_duration");
+        let record = RunRecord {
+            tenant,
+            run,
+            config,
+            status: RunStatus::Active,
+            created_at: LogicalTime::from_raw(1),
+            completed_at: None,
+            root_shards: shard_ids,
+            op_log: RingBuffer::new(),
+        };
+        record.assert_invariants();
+        self.runs.insert((tenant, run), record);
     }
 
     /// Read-only access to the shard map for external invariant checking.

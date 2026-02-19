@@ -1,16 +1,53 @@
-//! Lease and per-shard op-log types.
+//! Lease and per-shard op-log types for the coordination protocol.
 //!
-//! A [`Lease`] is the capability returned by `acquire_and_restore` and required
-//! by lease-gated shard mutations. It contains a **fence epoch** used as a
-//! fencing token.
+//! This module defines the types that govern exclusive shard ownership and
+//! idempotent mutation replay — the two mechanisms that allow workers to
+//! mutate shard state safely in a distributed setting.
 //!
-//! The op-log implements bounded idempotency per shard: mutating operations
-//! (except `acquire_and_restore` and `renew`, which are coordinator-level and
-//! do not appear in the op-log) carry an [`OpId`]. The shard record caches the
-//! last N (cap=16) operation fingerprints so the coordinator can detect retries
-//! and return cached results instead of re-executing.
+//! ## Type overview
 //!
-//! ## Idempotency window semantics
+//! ```text
+//! ┌──────────────┐           ┌──────────────────┐
+//! │  LeaseHolder  │◄─stored──│   ShardRecord    │
+//! │(owner+deadline)│  in      │  Option<lease>   │
+//! └──────────────┘           │  op_log: Ring<16> │
+//!                            └────────┬─────────┘
+//!      ┌───────┐                      │ entries
+//!      │ Lease │─────fence────►  FenceEpoch
+//!      │(token)│                      │
+//!      └───────┘              ┌───────▼────────┐
+//!                             │  OpLogEntry     │
+//!                             │  op_id + kind   │
+//!                             │  result + hash  │
+//!                             └────────────────┘
+//! ```
+//!
+//! - [`LeaseHolder`] — stored *in* the [`ShardRecord`](super::record::ShardRecord)
+//!   to track who currently owns the shard and when the lease expires.
+//! - [`Lease`] — the capability *returned to the worker* by `acquire_and_restore`.
+//!   Workers present this token on every subsequent mutation. The coordinator
+//!   validates the embedded [`FenceEpoch`] against the record's current epoch.
+//! - [`OpKind`], [`OpResult`], [`OpLogEntry`] — the vocabulary and storage for
+//!   the per-shard idempotency log (see below).
+//!
+//! ## Fencing protocol
+//!
+//! The [`FenceEpoch`] is the primary defense against zombie workers — workers
+//! that hold an expired lease but continue issuing mutations due to GC pauses,
+//! network partitions, or slow processing. Every ownership transfer
+//! (`acquire_and_restore`) increments the epoch; mutations carrying a stale
+//! epoch are rejected before any state change.
+//!
+//! Reference: Kleppmann, "How to do distributed locking" (2016);
+//!            Gray & Cheriton, "Leases" (SOSP 1989).
+//!
+//! ## Idempotency window
+//!
+//! Mutating operations (except `acquire_and_restore` and `renew`, which are
+//! coordinator-level and do not appear in the op-log) carry an [`OpId`]. The
+//! shard record caches the last 16 operation fingerprints in a ring buffer so
+//! the coordinator can detect retries and return cached results instead of
+//! re-executing.
 //!
 //! The op-log is a **bounded sliding window**, not a permanent record. Once an
 //! entry is evicted (after 16 newer operations), the coordinator can no longer
@@ -26,6 +63,17 @@
 //!
 //! If non-idempotent re-execution is a concern, callers must ensure retries
 //! complete within the 16-operation window.
+//!
+//! ## Replay detection flow
+//!
+//! When a mutation arrives with an `OpId`:
+//! 1. Look up the `OpId` in the shard's op-log (reverse scan, most-recent first).
+//! 2. **Found, same `payload_hash`** → return the cached [`OpResult`] (idempotent replay).
+//! 3. **Found, different `payload_hash`** → reject as `OpIdConflict` (same key, different payload).
+//! 4. **Not found** → execute the mutation, record the entry.
+//!
+//! See [`check_op_idempotency`](super::validation::check_op_idempotency) for
+//! the implementation.
 
 use crate::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
@@ -38,9 +86,13 @@ use crate::identity::{
 /// Identity and deadline of the worker currently holding a shard lease.
 ///
 /// Bundles `owner` and `deadline` into a single value so that the
-/// `ShardRecord` can store `Option<LeaseHolder>` instead of two separate
-/// `Option` fields — making the "both-present-or-both-absent" invariant
-/// structurally impossible to violate.
+/// [`ShardRecord`](super::record::ShardRecord) can store
+/// `Option<LeaseHolder>` instead of two separate `Option` fields — making the
+/// "both-present-or-both-absent" invariant structurally impossible to violate.
+///
+/// This type lives *inside* the shard record (coordinator-side). Workers
+/// receive a [`Lease`] instead, which additionally carries the
+/// [`FenceEpoch`] and shard identity needed to present a fencing token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeaseHolder {
     owner: WorkerId,
@@ -48,7 +100,11 @@ pub struct LeaseHolder {
 }
 
 impl LeaseHolder {
-    /// Construct a new lease holder.
+    /// Create a new lease-holder binding.
+    ///
+    /// No validation is performed here — the coordinator is responsible
+    /// for ensuring `deadline` is in the future relative to the current
+    /// logical time.
     #[must_use]
     pub fn new(owner: WorkerId, deadline: LogicalTime) -> Self {
         Self { owner, deadline }
@@ -62,6 +118,9 @@ impl LeaseHolder {
     }
 
     /// The logical time at which the lease expires.
+    ///
+    /// The coordinator uses a half-open interval: `now < deadline` means
+    /// the lease is active; `now >= deadline` means expired.
     #[inline]
     #[must_use]
     pub fn deadline(&self) -> LogicalTime {
@@ -73,14 +132,26 @@ impl LeaseHolder {
 // Lease
 // ============================================================================
 
-/// A lease grants exclusive, temporary rights to mutate a shard.
+/// A capability token granting exclusive, temporary rights to mutate a shard.
 ///
-/// The `fence` field is a monotonically increasing epoch stored in the shard
-/// record. Every time the shard is acquired (or administratively unparked), the
-/// epoch increments. Workers must present the current fence epoch to mutate.
+/// Returned by `acquire_and_restore` and required by every lease-gated
+/// mutation (`checkpoint`, `complete`, `park_shard`, `split_replace`,
+/// `split_residual`). The coordinator validates two properties on each call:
 ///
-/// Fields are private — the coordinator constructs leases and workers read
-/// them via accessors (private fields, public getters).
+/// 1. **Fence epoch** — `lease.fence == record.fence_epoch`. A mismatch means
+///    the lease was superseded by a newer acquisition and the caller is a
+///    zombie. The epoch is monotonically increasing: it increments on every
+///    `acquire_and_restore` and on administrative unpark.
+///
+/// 2. **Deadline** — `now < lease.deadline`. An expired lease does not
+///    authorize mutations; the worker must re-acquire.
+///
+/// ## Construction and visibility
+///
+/// The constructor is `pub(crate)` — only the coordinator produces leases.
+/// Workers receive them as opaque tokens and present them back via public
+/// accessors. This prevents workers from forging or extending their own
+/// leases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
     tenant: TenantId,
@@ -92,9 +163,16 @@ pub struct Lease {
 }
 
 impl Lease {
-    /// Construct a new lease.
+    /// Construct a new lease binding a worker to a shard for a bounded duration.
     ///
     /// Only callable within the crate — the coordinator is the sole producer.
+    ///
+    /// # Panics
+    ///
+    /// - If `fence` is less than [`FenceEpoch::INITIAL`] (epoch 1). A zero
+    ///   epoch is reserved as a sentinel and must never appear in a live lease.
+    /// - If `deadline` is [`LogicalTime::ZERO`]. A zero deadline would make
+    ///   the lease instantly expired, which is never valid.
     #[must_use]
     pub(crate) fn new(
         tenant: TenantId,
@@ -150,7 +228,8 @@ impl Lease {
         self.owner
     }
 
-    /// The fencing epoch for this lease.
+    /// The fencing epoch — compared against the shard record's current epoch
+    /// on every lease-gated operation to detect zombie workers.
     #[inline]
     #[must_use]
     pub fn fence(&self) -> FenceEpoch {
@@ -158,17 +237,43 @@ impl Lease {
     }
 
     /// The logical time at which this lease expires.
+    ///
+    /// The lease is active while `now < deadline` (half-open). At the
+    /// deadline or after, the coordinator rejects mutations and allows
+    /// other workers to re-acquire the shard.
     #[inline]
     #[must_use]
     pub fn deadline(&self) -> LogicalTime {
         self.deadline
     }
 
-    /// Convenience: reconstruct the [`ShardKey`] for coordinator lookups.
+    /// Reconstruct the [`ShardKey`] for coordinator lookups.
+    ///
+    /// Avoids requiring callers to separately track the `(RunId, ShardId)`
+    /// pair — the lease already carries both.
     #[inline]
     #[must_use]
     pub fn shard_key(&self) -> ShardKey {
         ShardKey::new(self.run, self.shard)
+    }
+
+    /// Extend the lease deadline after a successful renewal.
+    ///
+    /// Only callable within the crate — workers cannot extend their
+    /// own deadlines without going through the coordinator's `renew` path.
+    /// The fence epoch is **not** changed; renewal is a deadline extension,
+    /// not an ownership transfer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `deadline` is [`LogicalTime::ZERO`].
+    #[inline]
+    pub(crate) fn set_deadline(&mut self, deadline: LogicalTime) {
+        assert!(
+            deadline > LogicalTime::ZERO,
+            "Lease deadline must be > ZERO, got {deadline:?}",
+        );
+        self.deadline = deadline;
     }
 }
 
@@ -181,39 +286,79 @@ impl Lease {
 /// Every mutation in the shard's op-log carries an `OpKind` so the coordinator
 /// can detect retries via [`OpId`] + payload hash and safely replay them.
 ///
-/// Most variants are **lease-gated** — they require a valid lease held by the
-/// calling worker. The exception is [`Unpark`](Self::Unpark), which is an
+/// Most variants are **lease-gated** — they require a valid [`Lease`] held by
+/// the calling worker. The exception is [`Unpark`](Self::Unpark), which is an
 /// admin operation the coordinator may perform without a lease.
+///
+/// ## Relationship to shard status transitions
+///
+/// ```text
+/// OpKind          │ Status change          │ Lease required?
+/// ────────────────┼────────────────────────┼────────────────
+/// Checkpoint      │ none (cursor advances) │ yes
+/// Complete        │ Active → Done          │ yes
+/// Park            │ Active → Parked        │ yes
+/// SplitReplace    │ Active → Split         │ yes
+/// SplitResidual   │ none (parent stays Active, residual created) │ yes
+/// Unpark          │ Parked → Active (admin)│ no
+/// ```
 ///
 /// ## Invariants
 ///
 /// **Safety (discriminant stability)**: The `u8` discriminant values are
 /// persisted in the op-log. Existing values MUST NOT be reused or reordered.
+/// Compile-time assertions below enforce this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpKind {
-    /// Save progress without changing shard status.
+    /// Save scan progress without changing shard status.
+    ///
+    /// Advances the shard's cursor to a new position within its key range.
+    /// The most frequent operation during normal scanning.
     Checkpoint = 0,
-    /// Mark the shard as fully processed (terminal — transitions to `Done`).
+
+    /// Mark the shard as fully processed — terminal transition to
+    /// [`Done`](super::record::ShardStatus::Done).
+    ///
+    /// After completion, the lease is released and no further mutations
+    /// are accepted on this shard.
     Complete = 1,
-    /// Suspend the shard (terminal — transitions to `Parked`; resumption
-    /// requires an out-of-band [`Unpark`](Self::Unpark)).
+
+    /// Suspend the shard due to an error condition — terminal transition to
+    /// [`Parked`](super::record::ShardStatus::Parked).
+    ///
+    /// Resumption requires an out-of-band administrative [`Unpark`](Self::Unpark)
+    /// which increments the fence epoch.
     Park = 2,
-    /// Replace the parent shard with split children (terminal — transitions to `Split`).
+
+    /// Replace the parent shard with N child shards — terminal transition to
+    /// [`Split`](super::record::ShardStatus::Split).
+    ///
+    /// The children collectively cover the parent's key range (no gaps,
+    /// no overlaps). The parent lease is released.
     SplitReplace = 3,
-    /// Create the residual shard that covers the remainder of the key range.
+
+    /// Shrink the current shard and create a residual shard for the
+    /// unprocessed upper portion of the key range.
+    ///
+    /// Unlike `SplitReplace`, this is **non-terminal** — the parent
+    /// stays `Active` with a smaller range and retains its lease.
     SplitResidual = 4,
-    /// Administrative: resume a parked shard. Not lease-gated (the coordinator
-    /// may unpark a shard without the worker that parked it). See
-    /// [`ShardStatus`](super::record::ShardStatus) for the out-of-band
-    /// unpark transition.
+
+    /// Administrative: resume a parked shard (Parked -> Active).
+    ///
+    /// Not lease-gated — the coordinator may unpark a shard without
+    /// the worker that originally parked it. Unparking increments the
+    /// fence epoch and clears the park reason.
     Unpark = 5,
 }
 
 impl OpKind {
-    /// Parse a `u8` discriminant to the corresponding variant.
+    /// Decode a `u8` discriminant to the corresponding variant.
     ///
-    /// Returns `None` for unrecognized values — forward compatibility.
+    /// Returns `None` for values outside the known range, allowing
+    /// callers to handle unknown discriminants gracefully (e.g., when
+    /// reading an op-log produced by a newer code version).
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -227,7 +372,7 @@ impl OpKind {
         }
     }
 
-    /// Return the stable `u8` discriminant.
+    /// Encode as the stable `u8` discriminant for persistence.
     #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
@@ -235,7 +380,8 @@ impl OpKind {
     }
 }
 
-// Compile-time assertions for OpKind discriminant stability.
+// Compile-time assertions: discriminant values must never drift from their
+// persisted encoding. If a variant is added, add a corresponding assertion.
 const _: () = assert!(OpKind::Checkpoint as u8 == 0);
 const _: () = assert!(OpKind::Complete as u8 == 1);
 const _: () = assert!(OpKind::Park as u8 == 2);
@@ -250,29 +396,41 @@ const _: () = assert!(core::mem::size_of::<OpKind>() == 1);
 
 /// Stored result status for an executed operation.
 ///
-/// Recorded alongside [`OpKind`] in the op-log so retries can return the
-/// original outcome without re-executing.
+/// Recorded alongside [`OpKind`] in the [`OpLogEntry`] so retries can return
+/// the original outcome without re-executing. When a worker retries with
+/// the same `(OpId, payload_hash)`, the coordinator returns this cached
+/// status directly.
 ///
 /// ## Invariants
 ///
 /// **Safety (discriminant stability)**: The `u8` discriminant values are
 /// persisted in the op-log. Existing values MUST NOT be reused or reordered.
+/// Compile-time assertions below enforce this.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpResult {
-    /// The operation executed successfully.
+    /// The operation executed successfully and the shard record was mutated.
     Completed = 0,
-    /// The operation failed (the shard record was not mutated).
+
+    /// The operation failed validation — the shard record was **not** mutated.
+    ///
+    /// On retry, the coordinator returns this cached failure rather than
+    /// re-validating, since the same inputs will fail the same way.
     Error = 1,
-    /// The operation was valid but overtaken by a later mutation (e.g., a
-    /// checkpoint whose cursor was already advanced past by a subsequent op).
+
+    /// The operation was valid at the time of submission but was overtaken by
+    /// a later mutation that makes it redundant.
+    ///
+    /// Example: a checkpoint whose cursor position was already advanced past
+    /// by a subsequent checkpoint or complete. The shard's state is consistent
+    /// but the specific mutation this entry records had no visible effect.
     Superseded = 2,
 }
 
 impl OpResult {
-    /// Parse a `u8` discriminant to the corresponding variant.
+    /// Decode a `u8` discriminant to the corresponding variant.
     ///
-    /// Returns `None` for unrecognized values — forward compatibility.
+    /// Returns `None` for values outside the known range.
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -283,7 +441,7 @@ impl OpResult {
         }
     }
 
-    /// Return the stable `u8` discriminant.
+    /// Encode as the stable `u8` discriminant for persistence.
     #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
@@ -291,7 +449,7 @@ impl OpResult {
     }
 }
 
-// Compile-time assertions for OpResult discriminant stability.
+// Compile-time assertions: discriminant values must never drift.
 const _: () = assert!(OpResult::Completed as u8 == 0);
 const _: () = assert!(OpResult::Error as u8 == 1);
 const _: () = assert!(OpResult::Superseded as u8 == 2);
@@ -303,14 +461,24 @@ const _: () = assert!(core::mem::size_of::<OpResult>() == 1);
 
 /// A single entry in the bounded per-shard operation log.
 ///
-/// The shard record caches the last *N* entries (cap = 16). When a worker
-/// retries an operation with the same [`OpId`], the coordinator looks up the
-/// matching entry and returns the cached [`OpResult`] instead of re-executing.
-/// If the retry carries a different `payload_hash`, it is rejected as a
-/// conflicting mutation.
+/// The shard record caches the last 16 entries in a ring buffer (see
+/// [`ShardRecord::OP_LOG_CAP`](super::record::ShardRecord::OP_LOG_CAP)).
+/// When a worker retries an operation with the same [`OpId`], the coordinator
+/// looks up the matching entry and returns the cached [`OpResult`] instead of
+/// re-executing. If the retry carries a different `payload_hash`, the
+/// coordinator rejects it as a conflicting mutation.
 ///
-/// Fields are private — the coordinator constructs entries, tests and
-/// snapshot consumers read via accessors.
+/// ## Deduplication key
+///
+/// The deduplication key is `(OpId, payload_hash)`:
+/// - **Same pair** → idempotent replay, return cached result.
+/// - **Same `OpId`, different hash** → conflict, reject.
+/// - **`OpId` not found** → new operation (or evicted; see module docs).
+///
+/// ## Construction
+///
+/// The constructor is `pub(crate)` — only the coordinator creates entries.
+/// Tests and snapshot consumers read via public accessors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpLogEntry {
     op_id: OpId,
@@ -321,9 +489,19 @@ pub struct OpLogEntry {
 }
 
 impl OpLogEntry {
-    /// Construct a new op-log entry.
+    /// Record a completed operation in the op-log.
     ///
     /// Only callable within the crate — the coordinator is the sole producer.
+    /// The caller must ensure `op_id` uniqueness within the shard's op-log
+    /// (checked by [`ShardRecord::op_log_push`](super::record::ShardRecord::op_log_push)).
+    ///
+    /// # Panics
+    ///
+    /// - If `executed_at` is [`LogicalTime::ZERO`] — a zero timestamp would
+    ///   violate the "time is always positive" invariant.
+    /// - If `payload_hash` is 0 — zero is reserved as a sentinel indicating
+    ///   the caller failed to compute a hash, which would break conflict
+    ///   detection.
     #[must_use]
     pub(crate) fn new(
         op_id: OpId,
@@ -349,21 +527,25 @@ impl OpLogEntry {
         }
     }
 
-    /// The operation's idempotency key.
+    /// The operation's unique idempotency key.
+    ///
+    /// Together with [`payload_hash`](Self::payload_hash), forms the
+    /// deduplication pair used by
+    /// [`check_op_idempotency`](super::validation::check_op_idempotency).
     #[inline]
     #[must_use]
     pub fn op_id(&self) -> OpId {
         self.op_id
     }
 
-    /// The kind of operation.
+    /// The kind of operation that was executed.
     #[inline]
     #[must_use]
     pub fn kind(&self) -> OpKind {
         self.kind
     }
 
-    /// The result status.
+    /// The cached result status returned to retrying callers.
     #[inline]
     #[must_use]
     pub fn result(&self) -> OpResult {

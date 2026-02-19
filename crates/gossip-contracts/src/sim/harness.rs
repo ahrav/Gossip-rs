@@ -381,6 +381,8 @@ pub struct CoordinationSim {
     /// Last successful checkpoint info per `(worker_raw, run_raw, shard_raw)`.
     /// Uses raw u64 keys because `ShardKey` intentionally omits `Ord`.
     last_checkpoint_ops: CheckpointOpMap,
+    /// Shard IDs per run, used to seed run records for `claim_next_available`.
+    run_shard_ids: BTreeMap<RunId, Vec<ShardId>>,
 }
 
 impl CoordinationSim {
@@ -398,6 +400,7 @@ impl CoordinationSim {
             ops_executed: 0,
             stale_leases: Vec::new(),
             last_checkpoint_ops: BTreeMap::new(),
+            run_shard_ids: BTreeMap::new(),
         }
     }
 
@@ -417,6 +420,7 @@ impl CoordinationSim {
         );
         self.coordinator.seed_shard(record);
         self.shard_keys.push(ShardKey::new(run, shard));
+        self.run_shard_ids.entry(run).or_default().push(shard);
     }
 
     /// Convenience: add N workers (IDs 1..=n) and M shards (run=1, shard IDs 1..=m).
@@ -428,9 +432,19 @@ impl CoordinationSim {
         for i in 1..=n_shards {
             self.register_shard(run, ShardId::from_raw(i));
         }
+        // Seed run records so `claim_next_available` can discover shards.
+        self.seed_all_runs();
         // At creation all shards are active (non-terminal).
         self.active_shard_keys = self.shard_keys.clone();
         self
+    }
+
+    /// Create run records for all registered runs.
+    pub fn seed_all_runs(&mut self) {
+        for (run, shard_ids) in &self.run_shard_ids {
+            self.coordinator
+                .seed_run(self.tenant, *run, shard_ids.clone(), DEFAULT_LEASE_DURATION);
+        }
     }
 
     /// Execute a single step: run the operation, then check **all** invariants.
@@ -1668,6 +1682,8 @@ mod tests {
             sim.register_shard(run2, ShardId::from_raw(i));
         }
 
+        // Seed run records for claim_next_available.
+        sim.seed_all_runs();
         // All registered shards start as active (non-terminal).
         sim.active_shard_keys = sim.shard_keys.clone();
 

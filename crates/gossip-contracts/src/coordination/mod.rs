@@ -23,11 +23,14 @@
 
 pub mod cursor;
 pub mod error;
+pub mod events;
+pub mod facade;
 pub mod in_memory;
 pub mod lease;
 pub mod record;
 pub mod run;
 pub mod run_errors;
+pub mod session;
 pub mod shard_spec;
 pub mod split;
 pub mod traits;
@@ -42,6 +45,8 @@ pub use error::{
     CursorOutOfBoundsDetail, IdempotentOutcome, ParkError, RenewError, RenewResult, SplitError,
     SplitReplaceError, SplitResidualError,
 };
+pub use events::{EventCollector, EventKind, RedactedKey, StateTransitionEvent};
+pub use facade::{ClaimError, CoordinationFacade, ShardClaiming, default_claim_next_available};
 pub use in_memory::InMemoryCoordinator;
 pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};
@@ -57,6 +62,7 @@ pub use run_errors::{
     CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
     RegisterShardsError, UnparkError,
 };
+pub use session::WorkerSession;
 pub use shard_spec::{
     CursorSemantics, MAX_KEY_SIZE as ShardSpecMaxKeySize,
     MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardSpec, ShardSpecInputError,
