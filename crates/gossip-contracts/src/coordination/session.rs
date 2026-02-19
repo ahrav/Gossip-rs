@@ -261,7 +261,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         self.worker
     }
 
-    /// The shard key (run + shard_id).
+    /// The shard key (`RunId`, `ShardId`).
     #[inline]
     #[must_use]
     pub fn shard_key(&self) -> ShardKey {
@@ -420,10 +420,15 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// process the lower portion. For full subdivision (retiring the
     /// parent entirely), use [`split_replace`](Self::split_replace).
     ///
-    /// On success, the session's cached snapshot is rebuilt with:
+    /// When the operation executes for the first time (`Executed`, not
+    /// `Replayed`), the session's cached snapshot is rebuilt with:
     /// - The narrowed spec from the plan
-    /// - The original cursor and cursor semantics (unchanged)
+    /// - The original status, cursor, cursor semantics, and parent (unchanged)
     /// - The residual's `ShardId` appended to the spawned list
+    ///
+    /// On `Replayed`, the snapshot is left unchanged — the first call in
+    /// this session already narrowed it, or (after crash-recovery) the
+    /// snapshot from `acquire_and_restore` already reflects the narrowed spec.
     ///
     /// This rebuild is necessary because the backend validates cursor
     /// bounds against the shard record's spec (which has been narrowed).
@@ -898,6 +903,67 @@ mod tests {
             .complete(now(4), test_tenant(), &lease, cursor, op)
             .unwrap();
         assert!(second.is_replay());
+    }
+
+    // -- Snapshot staleness tests ----------------------------------------
+
+    /// Checkpoint does NOT update the session's cached snapshot.
+    /// The cursor returned by `session.cursor()` should still reflect
+    /// the acquisition-time cursor, not the checkpoint value.
+    #[test]
+    fn checkpoint_does_not_update_cached_snapshot() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+        let initial_cursor = session.cursor().clone();
+
+        let checkpoint_cursor = Cursor::with_last_key(vec![0x10]);
+        let result = session.checkpoint(now(3), checkpoint_cursor.clone(), OpId::from_raw(600));
+        assert!(result.is_ok());
+
+        // Session's cached cursor must still be the acquisition-time value.
+        assert_eq!(
+            session.cursor(),
+            &initial_cursor,
+            "checkpoint must not update cached snapshot cursor"
+        );
+        assert_ne!(
+            session.cursor(),
+            &checkpoint_cursor,
+            "cached cursor must differ from checkpointed cursor"
+        );
+    }
+
+    /// A failed `split_residual` must not corrupt the session's cached
+    /// snapshot. We trigger a `LeaseExpired` error by advancing time
+    /// past the deadline.
+    #[test]
+    fn split_residual_error_does_not_corrupt_snapshot() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+        let spec_before = session.spec().clone();
+        let cursor_before = session.cursor().clone();
+        let spawned_before: Vec<_> = session.initial_snapshot().spawned().to_vec();
+
+        // Attempt split_residual with expired lease (deadline=32, now=50).
+        let parent_new_spec =
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
+        let residual_spec =
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
+        let plan = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
+        let err = session.split_residual(now(50), plan, OpId::from_raw(900));
+        assert!(
+            err.is_err(),
+            "split_residual should fail with expired lease"
+        );
+
+        // Snapshot must be unchanged after the error.
+        assert_eq!(session.spec(), &spec_before);
+        assert_eq!(session.cursor(), &cursor_before);
+        assert_eq!(session.initial_snapshot().spawned(), &spawned_before);
     }
 
     // -- Successive split_residual test ------------------------------------

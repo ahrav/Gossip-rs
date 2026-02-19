@@ -104,9 +104,9 @@ use crate::coordination::validation::{
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_stdx::RingBuffer;
 
-/// aHash-backed `HashMap` — faster hashing than SipHash for point
-/// lookups. aHash provides DOS resistance via keyed hashing (uses
-/// AES-NI where available).
+/// aHash-backed `HashMap` — faster hashing than the std default
+/// (`SipHasher13`) for point lookups. aHash provides hash-flooding
+/// resistance via per-instance random keys (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 /// In-memory coordinator for shard-level operations.

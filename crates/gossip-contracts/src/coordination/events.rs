@@ -33,6 +33,9 @@
 //! minimal for testing and simulation, while enabling rich
 //! observability in production.
 //!
+//! This integration pattern is planned but not yet implemented in the
+//! current codebase.
+//!
 //! ## Event / Operation Correspondence
 //!
 //! | Backend operation   | Event(s) emitted                             |
@@ -69,7 +72,24 @@ use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, TenantId, WorkerI
 /// sensitive key material. The `Debug` impl shows byte length
 /// instead of contents (e.g., `Some(<15 bytes>)`).
 #[derive(PartialEq, Eq)]
-pub struct RedactedKey(pub Option<Box<[u8]>>);
+pub struct RedactedKey(Option<Box<[u8]>>);
+
+impl RedactedKey {
+    /// Wrap key bytes for redacted display.
+    #[must_use]
+    pub fn new(key: Option<Box<[u8]>>) -> Self {
+        Self(key)
+    }
+
+    /// Consume the wrapper and return the raw key bytes.
+    ///
+    /// Use sparingly — this defeats the redaction guarantee. Intended
+    /// for serialization layers that apply their own redaction.
+    #[must_use]
+    pub fn into_raw(self) -> Option<Box<[u8]>> {
+        self.0
+    }
+}
 
 impl fmt::Debug for RedactedKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -353,7 +373,8 @@ const _: () = assert!(std::mem::size_of::<StateTransitionEvent>() <= 80);
 /// the minimal semantic contract. Backends that want event emission
 /// would provide companion `_with_events` methods that accept
 /// `&mut EventCollector`. This keeps the trait simple for testing and
-/// deterministic simulation.
+/// deterministic simulation. This extension pattern is planned but
+/// not yet implemented in the current codebase.
 ///
 /// ## Reuse
 ///
@@ -494,7 +515,7 @@ mod tests {
             (
                 EventKind::ShardCheckpointed {
                     shard: s,
-                    last_key: RedactedKey(Some(b"k".to_vec().into_boxed_slice())),
+                    last_key: RedactedKey::new(Some(b"k".to_vec().into_boxed_slice())),
                 },
                 true,
                 false,
@@ -593,7 +614,7 @@ mod tests {
         }));
         c.emit(evt(EventKind::ShardCheckpointed {
             shard: ShardId::from_raw(0),
-            last_key: RedactedKey(Some(b"k".to_vec().into_boxed_slice())),
+            last_key: RedactedKey::new(Some(b"k".to_vec().into_boxed_slice())),
         }));
         c.emit(evt(EventKind::ShardCompleted {
             shard: ShardId::from_raw(0),
@@ -632,7 +653,7 @@ mod tests {
     fn debug_redacts_checkpoint_last_key() {
         let event = evt(EventKind::ShardCheckpointed {
             shard: ShardId::from_raw(0),
-            last_key: RedactedKey(Some(b"secret-key-data".to_vec().into_boxed_slice())),
+            last_key: RedactedKey::new(Some(b"secret-key-data".to_vec().into_boxed_slice())),
         });
         let debug = format!("{event:?}");
         assert!(

@@ -128,16 +128,17 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 
 /// Default implementation of [`ShardClaiming::claim_next_available`].
 ///
-/// Exposed as a free function so backends that override the trait
-/// method can still delegate to the generic logic as a fallback.
+/// Exposed as a free function so orchestration layers that implement
+/// a custom claim path can delegate to it as a fallback.
 ///
 /// ## Algorithm
 ///
 /// 1. Fetch the candidate list via
 ///    `list_shards(ShardFilter::available())` -- active, unleased shards.
 /// 2. If the list is empty, return `NoneAvailable` immediately.
-/// 3. Iterate candidates in the order returned by `list_shards`
-///    (ordered by `(key_range_start, shard_id)` for determinism).
+/// 3. Iterate candidates in the order returned by `list_shards`.
+///    The in-memory backend orders by `(key_range_start, shard_id)`
+///    for determinism; other backends may use a different order.
 ///    For each candidate, attempt `acquire_and_restore`.
 /// 4. On success, return the `AcquireResult` (lease + snapshot).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
@@ -198,10 +199,9 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
                 continue;
             }
             Err(AcquireError::ShardNotFound { .. }) => {
-                // Defensive: no current operation deletes shard records, so
-                // this arm should be unreachable in normal operation. It
-                // exists as a guard against future record-removal paths or
-                // storage-layer inconsistencies.
+                // A shard listed by list_shards does not exist in acquire.
+                // This indicates a backend data inconsistency — production
+                // wrappers should log this at warn level.
                 continue;
             }
             Err(AcquireError::TenantMismatch { expected }) => {
@@ -261,7 +261,8 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
     ///
     /// On success, returns an [`AcquireResult`] containing the lease
     /// (proof of ownership with fencing token) and the shard snapshot
-    /// (cursor, spec, lineage) so the worker knows where to resume.
+    /// (status, spec, cursor, cursor_semantics, lineage) so the
+    /// worker knows where to resume.
     ///
     /// The `Self: Sized` bound is required because the default body
     /// passes `self` to the free function
@@ -526,6 +527,27 @@ mod tests {
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.lease.shard(), ShardId::from_raw(1));
+    }
+
+    // -- TenantMismatch test -----------------------------------------------
+
+    /// Claiming with a wrong tenant is rejected immediately.
+    ///
+    /// The in-memory coordinator keys runs by `(TenantId, RunId)`, so
+    /// a wrong tenant surfaces as `RunNotFound` (the run does not
+    /// exist under that tenant). Backends that key by `RunId` alone
+    /// would return `TenantMismatch` instead — both prevent
+    /// cross-tenant shard access.
+    #[test]
+    fn claim_wrong_tenant_rejected() {
+        let mut coord = setup_coordinator(2);
+        let wrong_tenant = TenantId::from_bytes([0x02; 32]);
+
+        let result = coord.claim_next_available(now(2), wrong_tenant, test_run(), test_worker(1));
+        assert!(result.is_err(), "cross-tenant claim must not succeed");
+        // InMemoryCoordinator keys runs by (tenant, run) — wrong
+        // tenant means the run is not found under that tenant.
+        assert_eq!(result, Err(ClaimError::RunNotFound));
     }
 
     // -- From<GetRunError> conversion tests --------------------------------

@@ -266,12 +266,19 @@ impl Lease {
     ///
     /// # Panics
     ///
-    /// Panics if `deadline` is [`LogicalTime::ZERO`].
+    /// - Panics if `deadline` is [`LogicalTime::ZERO`].
+    /// - Debug-only: panics if `deadline` does not advance past the
+    ///   current deadline (monotonicity violation).
     #[inline]
     pub(crate) fn set_deadline(&mut self, deadline: LogicalTime) {
         assert!(
             deadline > LogicalTime::ZERO,
             "Lease deadline must be > ZERO, got {deadline:?}",
+        );
+        debug_assert!(
+            deadline > self.deadline,
+            "set_deadline: new deadline {deadline:?} must advance past current {:?}",
+            self.deadline,
         );
         self.deadline = deadline;
     }
@@ -357,9 +364,9 @@ pub enum OpKind {
 impl OpKind {
     /// Decode a `u8` discriminant to the corresponding variant.
     ///
-    /// Returns `None` for values outside the known range, allowing
-    /// callers to handle unknown discriminants gracefully (e.g., when
-    /// reading an op-log produced by a newer code version).
+    /// Returns `None` for values outside the known range, providing
+    /// a safe parsing boundary when decoding potentially corrupt or
+    /// unexpected `u8` values.
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
