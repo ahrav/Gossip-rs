@@ -1,7 +1,8 @@
 //! Fixed-capacity ring buffer with stack-allocated storage and `MaybeUninit<T>`.
 //!
 //! # Invariants
-//! - `N` is a power of 2 and fits in `u32` (validated at compile time).
+//! - `N <= u32::MAX / 2` (validated at compile time). The half-u32 limit
+//!   ensures `head + len` never overflows.
 //! - `head < capacity` and `len <= capacity`.
 //! - Slots in the logical range `[head, head + len)` (wrapping by mask) are
 //!   initialized; all other slots are uninitialized.
@@ -36,7 +37,9 @@ fn index(i: u32) -> usize {
 ///
 /// This is a single-producer/single-consumer style queue in the pipeline, but
 /// the implementation itself is not synchronized; it relies on single-threaded
-/// usage. Insertion past capacity is a logic error unless handled via `push_back`.
+/// usage. `push_back` returns `Err(value)` on overflow; `push_back_overwrite`
+/// evicts the oldest element; `push_back_assume_capacity` is `pub(crate)` and
+/// assumes the caller has checked capacity.
 ///
 /// # Invariants
 /// - `head` always indexes the logical front.
@@ -117,6 +120,7 @@ impl<T, const N: usize> RingBuffer<T, N> {
         if index >= self.len as usize {
             return None;
         }
+        // `index as u32` cannot truncate: index < len <= CAPACITY <= u32::MAX/2.
         let physical = (self.head + index as u32) & Self::MASK;
         // SAFETY: physical < CAPACITY by mask. The element is initialized
         // because index < len and slots [head, head+len) are initialized.
@@ -139,13 +143,14 @@ impl<T, const N: usize> RingBuffer<T, N> {
 
     /// Appends `value` assuming spare capacity exists.
     ///
-    /// # Panics
+    /// # Safety contract
     ///
-    /// Panics in debug builds if the buffer is full. Use `push_back` when the
-    /// caller cannot guarantee capacity.
+    /// The caller **must** ensure `!self.is_full()`. In debug builds, a
+    /// violated precondition panics. In release builds, the buffer's internal
+    /// invariants are silently corrupted.
     #[inline]
-    pub fn push_back_assume_capacity(&mut self, value: T) {
-        debug_assert!(
+    pub(crate) fn push_back_assume_capacity(&mut self, value: T) {
+        assert!(
             self.len < Self::CAPACITY,
             "push_back_assume_capacity called on full buffer"
         );
@@ -208,41 +213,13 @@ impl<T, const N: usize> RingBuffer<T, N> {
 
     /// Removes all elements, dropping them in FIFO order.
     ///
-    /// Buffer remains usable afterwards without reallocating. The drop path
-    /// walks either one contiguous region or two wrapped regions to preserve
-    /// FIFO order.
+    /// Buffer remains usable afterwards without reallocating. Delegates to
+    /// `pop_front()` so that `head` and `len` are updated *before* each
+    /// element is dropped. This guarantees that if `T::drop()` panics, the
+    /// `Drop` impl during unwinding sees correct bookkeeping and will not
+    /// double-drop already-freed elements.
     pub fn clear(&mut self) {
-        if self.len == 0 {
-            return;
-        }
-
-        let head = self.head as usize;
-        let len = self.len as usize;
-
-        if head + len <= N {
-            // Contiguous region: [head..head+len]
-            for i in head..head + len {
-                // SAFETY: All elements in [head, head+len) are initialized.
-                unsafe { self.buf.get_unchecked_mut(i).assume_init_drop() };
-            }
-        } else {
-            // Wrapped region: [head..N] + [0..wrap_len]
-            let wrap_len = (head + len) - N;
-
-            for i in head..N {
-                // SAFETY: Elements in [head, N) are initialized.
-                unsafe { self.buf.get_unchecked_mut(i).assume_init_drop() };
-            }
-            for i in 0..wrap_len {
-                // SAFETY: Elements in [0, wrap_len) are initialized.
-                unsafe { self.buf.get_unchecked_mut(i).assume_init_drop() };
-            }
-        }
-
-        self.head = 0;
-        self.len = 0;
-
-        debug_assert!(self.is_empty());
+        while self.pop_front().is_some() {}
     }
 
     /// Returns an iterator over references to the elements in FIFO order.
@@ -300,6 +277,17 @@ impl<T: PartialEq, const N: usize> PartialEq for RingBuffer<T, N> {
 
 impl<T: Eq, const N: usize> Eq for RingBuffer<T, N> {}
 
+// Compile-time proof that RingBuffer is Send+Sync when T is.
+#[allow(dead_code)]
+const _: () = {
+    fn assert_send<T: Send>() {}
+    fn assert_sync<T: Sync>() {}
+    fn check<T: Send + Sync>() {
+        assert_send::<RingBuffer<T, 1>>();
+        assert_sync::<RingBuffer<T, 1>>();
+    }
+};
+
 impl<T, const N: usize> FromIterator<T> for RingBuffer<T, N> {
     /// Collects items into a `RingBuffer`.
     ///
@@ -346,6 +334,7 @@ impl<'a, T, const N: usize> Iterator for Iter<'a, T, N> {
         if self.front >= self.back {
             return None;
         }
+        // `self.front as u32` cannot truncate: front < back <= len <= CAPACITY <= u32::MAX/2.
         let physical = (self.ring.head + self.front as u32) & RingBuffer::<T, N>::MASK;
         self.front += 1;
         // SAFETY: physical < CAPACITY by mask. Element is initialized because
@@ -372,6 +361,7 @@ impl<'a, T, const N: usize> DoubleEndedIterator for Iter<'a, T, N> {
             return None;
         }
         self.back -= 1;
+        // `self.back as u32` cannot truncate: back <= len <= CAPACITY <= u32::MAX/2.
         let physical = (self.ring.head + self.back as u32) & RingBuffer::<T, N>::MASK;
         // SAFETY: physical < CAPACITY by mask. Element is initialized because
         // back was > front and back <= len.
@@ -385,6 +375,8 @@ impl<'a, T, const N: usize> DoubleEndedIterator for Iter<'a, T, N> {
 }
 
 impl<T, const N: usize> ExactSizeIterator for Iter<'_, T, N> {}
+
+impl<T, const N: usize> std::iter::FusedIterator for Iter<'_, T, N> {}
 
 // ============================================================================
 // Tests
@@ -508,7 +500,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Drop -- exercises the contiguous and wrapped drop paths.
+    // Drop -- exercises drop with different buffer layouts.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -558,7 +550,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Clear -- exercises both contiguous and wrapped clear paths + reuse.
+    // Clear -- exercises clear with different buffer layouts + reuse.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -620,6 +612,18 @@ mod tests {
     // -----------------------------------------------------------------------
     // push_back_assume_capacity -- exercises the unchecked fast path.
     // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "push_back_assume_capacity called on full buffer")]
+    fn push_back_assume_capacity_panics_when_full() {
+        let mut ring = RingBuffer::<u32, 4>::new();
+        for i in 0..4 {
+            ring.push_back(i).unwrap();
+        }
+        assert!(ring.is_full());
+        // Must panic in ALL build profiles — not just debug.
+        ring.push_back_assume_capacity(99);
+    }
 
     #[test]
     fn push_back_assume_capacity_fifo() {
@@ -934,6 +938,161 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Capacity-1 edge case
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn capacity_one_push_pop_overwrite() {
+        // N=1 where MASK=0 and head/tail always alias slot 0.
+        let mut ring = RingBuffer::<u32, 1>::new();
+        assert_eq!(ring.capacity(), 1);
+        assert!(ring.push_back(1).is_ok());
+        assert!(ring.is_full());
+        assert_eq!(ring.push_back(2), Err(2));
+        assert_eq!(ring.push_back_overwrite(99), Some(1));
+        assert_eq!(ring.pop_front(), Some(99));
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn capacity_one_drop_tracking() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let mut ring = RingBuffer::<DropTracker, 1>::new();
+            ring.push_back(dt(&drops)).unwrap();
+            let evicted = ring.push_back_overwrite(dt(&drops));
+            assert!(evicted.is_some());
+            drop(evicted);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Clone of wrapped buffer
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn clone_wrapped_buffer() {
+        let mut ring = RingBuffer::<u32, 4>::new();
+        // Advance head to 2.
+        ring.push_back(99).unwrap();
+        ring.push_back(99).unwrap();
+        ring.pop_front();
+        ring.pop_front();
+        // Fill 4 elements, wrapping: physical slots [2,3,0,1].
+        for v in [10, 20, 30, 40] {
+            ring.push_back(v).unwrap();
+        }
+        assert!(ring.is_full());
+        let cloned = ring.clone();
+        assert_eq!(ring, cloned);
+        let vals: Vec<_> = cloned.iter().copied().collect();
+        assert_eq!(vals, vec![10, 20, 30, 40]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Drop ordering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn drop_fifo_ordering() {
+        use std::sync::Mutex;
+        let order = Arc::new(Mutex::new(Vec::new()));
+
+        #[derive(Debug)]
+        struct OrderedDrop {
+            id: u32,
+            order: Arc<Mutex<Vec<u32>>>,
+        }
+        impl Drop for OrderedDrop {
+            fn drop(&mut self) {
+                self.order.lock().unwrap().push(self.id);
+            }
+        }
+
+        {
+            let mut ring = RingBuffer::<OrderedDrop, 4>::new();
+            // Advance head to 2 to force wrapping.
+            ring.push_back(OrderedDrop {
+                id: 100,
+                order: order.clone(),
+            })
+            .unwrap();
+            ring.push_back(OrderedDrop {
+                id: 101,
+                order: order.clone(),
+            })
+            .unwrap();
+            ring.pop_front();
+            ring.pop_front();
+            order.lock().unwrap().clear(); // Reset after warmup pops.
+
+            // Fill 4 elements wrapping: physical [2,3,0,1], logical [10,20,30,40].
+            for id in [10, 20, 30, 40] {
+                ring.push_back(OrderedDrop {
+                    id,
+                    order: order.clone(),
+                })
+                .unwrap();
+            }
+        }
+        // Drop should happen in FIFO (logical) order.
+        assert_eq!(*order.lock().unwrap(), vec![10, 20, 30, 40]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional iterator edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn iter_interleaved_next_next_back() {
+        let mut ring = RingBuffer::<u32, 4>::new();
+        for v in [10, 20, 30, 40] {
+            ring.push_back(v).unwrap();
+        }
+        let mut iter = ring.iter();
+        assert_eq!(iter.next(), Some(&10));
+        assert_eq!(iter.next_back(), Some(&40));
+        assert_eq!(iter.next(), Some(&20));
+        assert_eq!(iter.next_back(), Some(&30));
+        assert_eq!(iter.next(), None);
+        assert_eq!(iter.next_back(), None);
+    }
+
+    #[test]
+    fn from_iter_empty() {
+        let ring: RingBuffer<u32, 4> = std::iter::empty().collect();
+        assert!(ring.is_empty());
+        assert_eq!(ring.len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-cycle overwrite drop tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn multi_cycle_overwrite_drops() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut ring = RingBuffer::<DropTracker, 2>::new();
+        // Fill.
+        ring.push_back(dt(&drops)).unwrap();
+        ring.push_back(dt(&drops)).unwrap();
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+
+        // Overwrite 10 times — each evicts one.
+        for _ in 0..10 {
+            let evicted = ring.push_back_overwrite(dt(&drops));
+            drop(evicted);
+        }
+        // 10 evictions dropped + 0 still alive = 10.
+        assert_eq!(drops.load(Ordering::Relaxed), 10);
+        drop(ring);
+        // 10 evicted + 2 remaining = 12.
+        assert_eq!(drops.load(Ordering::Relaxed), 12);
+    }
+
+    // -----------------------------------------------------------------------
     // Debug
     // -----------------------------------------------------------------------
 
@@ -951,11 +1110,31 @@ mod tests {
     // Property tests
     // -----------------------------------------------------------------------
 
+    /// Returns a [`proptest::test_runner::Config`] tuned for the current environment.
+    ///
+    /// Under Miri, disables file-based failure persistence (filesystem I/O is
+    /// blocked by Miri's default isolation mode) and reduces cases from the
+    /// proptest default of 256 to 32, since Miri interpretation is far slower
+    /// than native execution.
+    fn miri_proptest_config() -> proptest::test_runner::Config {
+        if cfg!(miri) {
+            proptest::test_runner::Config {
+                failure_persistence: None,
+                cases: 32,
+                ..Default::default()
+            }
+        } else {
+            proptest::test_runner::Config::default()
+        }
+    }
+
     mod prop {
         use super::*;
         use proptest::prelude::*;
 
         proptest! {
+            #![proptest_config(super::miri_proptest_config())]
+
             /// FIFO ordering is preserved under arbitrary push_back_overwrite sequences.
             #[test]
             fn push_back_overwrite_preserves_fifo(values in proptest::collection::vec(0u32..1000, 0..200)) {
@@ -988,6 +1167,82 @@ mod tests {
                         expected_len -= 1;
                     }
                     prop_assert_eq!(ring.len(), expected_len);
+                }
+            }
+
+            /// State-machine test: VecDeque oracle verifies all operations.
+            ///
+            /// Operations: PushBack, PushBackOverwrite, PopFront, Clear, Get, Clone.
+            /// After each operation, ring buffer state is compared against VecDeque.
+            #[test]
+            fn state_machine_oracle(
+                ops in proptest::collection::vec(
+                    prop_oneof![
+                        (0u32..1000).prop_map(|v| (0u8, v)),  // PushBack
+                        (0u32..1000).prop_map(|v| (1u8, v)),  // PushBackOverwrite
+                        Just((2u8, 0u32)),                      // PopFront
+                        Just((3u8, 0u32)),                      // Clear
+                        (0u32..8).prop_map(|v| (4u8, v)),      // Get(index)
+                        Just((5u8, 0u32)),                      // Clone
+                    ],
+                    0..200,
+                )
+            ) {
+                let mut ring = RingBuffer::<u32, 4>::new();
+                let mut model = std::collections::VecDeque::with_capacity(4);
+
+                for (op, val) in &ops {
+                    match op {
+                        0 => {
+                            // PushBack
+                            let ring_result = ring.push_back(*val);
+                            if model.len() < 4 {
+                                model.push_back(*val);
+                                prop_assert!(ring_result.is_ok());
+                            } else {
+                                prop_assert_eq!(ring_result, Err(*val));
+                            }
+                        }
+                        1 => {
+                            // PushBackOverwrite
+                            let ring_evicted = ring.push_back_overwrite(*val);
+                            let model_evicted = if model.len() == 4 {
+                                model.pop_front()
+                            } else {
+                                None
+                            };
+                            model.push_back(*val);
+                            prop_assert_eq!(ring_evicted, model_evicted);
+                        }
+                        2 => {
+                            // PopFront
+                            prop_assert_eq!(ring.pop_front(), model.pop_front());
+                        }
+                        3 => {
+                            // Clear
+                            ring.clear();
+                            model.clear();
+                        }
+                        4 => {
+                            // Get
+                            let idx = *val as usize;
+                            prop_assert_eq!(ring.get(idx), model.get(idx));
+                        }
+                        5 => {
+                            // Clone
+                            let cloned = ring.clone();
+                            let ring_vals: Vec<_> = cloned.iter().copied().collect();
+                            let model_vals: Vec<_> = model.iter().copied().collect();
+                            prop_assert_eq!(ring_vals, model_vals);
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    // After every operation, verify len and contents match.
+                    prop_assert_eq!(ring.len(), model.len());
+                    let ring_vals: Vec<_> = ring.iter().copied().collect();
+                    let model_vals: Vec<_> = model.iter().copied().collect();
+                    prop_assert_eq!(ring_vals, model_vals);
                 }
             }
         }

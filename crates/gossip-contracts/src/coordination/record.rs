@@ -482,8 +482,9 @@ impl ShardRecord {
             self.shard,
         );
 
-        // INV-5: Op-log bounded — structurally guaranteed by RingBuffer<_, OP_LOG_CAP>.
-        debug_assert!(
+        // INV-5: Op-log bounded — defense-in-depth: RingBuffer enforces capacity
+        // structurally, but this assertion catches corruption before persistence.
+        assert!(
             self.op_log.len() <= Self::OP_LOG_CAP,
             "Shard {:?}: op_log length {} exceeds cap {}",
             self.shard,
@@ -625,7 +626,9 @@ impl ShardRecord {
             entry.op_id(),
         );
         self.op_log.push_back_overwrite(entry);
-        debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
+        // Defense-in-depth: RingBuffer enforces capacity structurally, but
+        // this assertion catches corruption before persistence.
+        assert!(self.op_log.len() <= Self::OP_LOG_CAP);
     }
 
     /// Assert that transitioning to `new_status` is legal from the current state.

@@ -57,9 +57,9 @@
 //!
 //! Both split operations temporarily **remove** the parent record from the map,
 //! mutate it inside a closure, then **restore** it on both success and failure
-//! paths. This avoids
-//! holding a `&mut ShardRecord` (from `get_mut`) while also inserting new child
-//! entries into the same `HashMap`. If the closure panics (invariant violation),
+//! paths. This avoids holding a `&mut ShardRecord` (from `get_mut`) while also
+//! inserting new child entries into the same `HashMap`. If the closure panics
+//! (invariant violation),
 //! the parent is intentionally *not* restored — an invariant panic indicates
 //! irrecoverable corruption.
 //!

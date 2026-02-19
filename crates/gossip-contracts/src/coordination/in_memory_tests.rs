@@ -2500,7 +2500,7 @@ fn create_run_with_shards_config_mismatch() {
     );
 }
 
-// -- Full run lifecycle end-to-end test (F18) ---------------------------------
+// -- Full run lifecycle end-to-end test ----------------------------------------
 
 #[test]
 fn full_run_lifecycle_create_register_process_complete() {
@@ -2600,7 +2600,7 @@ fn full_run_lifecycle_create_register_process_complete() {
     assert_eq!(record.completed_at(), Some(now(9)));
 }
 
-// -- list_shards filter correctness tests (F19) -------------------------------
+// -- list_shards filter correctness tests -------------------------------------
 
 #[test]
 fn list_shards_filter_active() {

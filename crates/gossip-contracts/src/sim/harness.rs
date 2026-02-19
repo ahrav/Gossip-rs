@@ -1646,7 +1646,7 @@ mod tests {
         }
     }
 
-    // -- Task C3: multi-tenant (multi-run) isolation ---------------------------
+    // -- Multi-tenant (multi-run) isolation -------------------------------------
 
     /// Interleave operations on shards from two different runs and verify no
     /// invariant violations occur. Since the coordinator uses a single tenant,
@@ -1680,7 +1680,7 @@ mod tests {
         );
     }
 
-    // -- Task H9: generate_forward_cursor edge cases --------------------------
+    // -- generate_forward_cursor edge cases ------------------------------------
 
     /// Worker with no prior cursor generates a cursor within spec bounds.
     #[test]

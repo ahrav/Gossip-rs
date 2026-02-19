@@ -3,7 +3,7 @@ use gossip_stdx::RingBuffer;
 
 const OPS_PER_ITER: u64 = 10_000;
 
-/// Benchmarks the hot path: push when full requires pop first.
+/// Benchmarks the hot path: sustained push_back_overwrite with automatic eviction.
 fn bench_push_pop_cycle(c: &mut Criterion) {
     let mut group = c.benchmark_group("ring_buffer");
     group.throughput(Throughput::Elements(OPS_PER_ITER));
@@ -13,10 +13,7 @@ fn bench_push_pop_cycle(c: &mut Criterion) {
         let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                if rb.is_full() {
-                    black_box(rb.pop_front());
-                }
-                rb.push_back_assume_capacity(black_box(i));
+                rb.push_back_overwrite(black_box(i));
             }
             rb.clear();
         })
@@ -26,10 +23,7 @@ fn bench_push_pop_cycle(c: &mut Criterion) {
         let mut rb: RingBuffer<u64, 16> = RingBuffer::new();
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                if rb.is_full() {
-                    black_box(rb.pop_front());
-                }
-                rb.push_back_assume_capacity(black_box(i));
+                rb.push_back_overwrite(black_box(i));
             }
             rb.clear();
         })
@@ -39,10 +33,7 @@ fn bench_push_pop_cycle(c: &mut Criterion) {
         let mut rb: RingBuffer<u64, 64> = RingBuffer::new();
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                if rb.is_full() {
-                    black_box(rb.pop_front());
-                }
-                rb.push_back_assume_capacity(black_box(i));
+                rb.push_back_overwrite(black_box(i));
             }
             rb.clear();
         })
@@ -60,7 +51,7 @@ fn bench_alternating(c: &mut Criterion) {
         let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                rb.push_back_assume_capacity(black_box(i));
+                let _ = rb.push_back(black_box(i));
                 black_box(rb.pop_front());
             }
         })
@@ -70,7 +61,7 @@ fn bench_alternating(c: &mut Criterion) {
         let mut rb: RingBuffer<u64, 16> = RingBuffer::new();
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                rb.push_back_assume_capacity(black_box(i));
+                let _ = rb.push_back(black_box(i));
                 black_box(rb.pop_front());
             }
         })
@@ -93,11 +84,9 @@ fn bench_fill_drain(c: &mut Criterion) {
                     let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
                     b.iter(|| {
                         for _ in 0..iterations {
-                            // Fill
                             for i in 0..8u64 {
-                                rb.push_back_assume_capacity(black_box(i));
+                                let _ = rb.push_back(black_box(i));
                             }
-                            // Drain
                             while rb.pop_front().is_some() {}
                         }
                     })
@@ -109,7 +98,7 @@ fn bench_fill_drain(c: &mut Criterion) {
                     b.iter(|| {
                         for _ in 0..iterations {
                             for i in 0..16u64 {
-                                rb.push_back_assume_capacity(black_box(i));
+                                let _ = rb.push_back(black_box(i));
                             }
                             while rb.pop_front().is_some() {}
                         }
@@ -122,7 +111,7 @@ fn bench_fill_drain(c: &mut Criterion) {
                     b.iter(|| {
                         for _ in 0..iterations {
                             for i in 0..32u64 {
-                                rb.push_back_assume_capacity(black_box(i));
+                                let _ = rb.push_back(black_box(i));
                             }
                             while rb.pop_front().is_some() {}
                         }
@@ -135,7 +124,7 @@ fn bench_fill_drain(c: &mut Criterion) {
                     b.iter(|| {
                         for _ in 0..iterations {
                             for i in 0..64u64 {
-                                rb.push_back_assume_capacity(black_box(i));
+                                let _ = rb.push_back(black_box(i));
                             }
                             while rb.pop_front().is_some() {}
                         }
@@ -158,7 +147,7 @@ fn bench_wraparound(c: &mut Criterion) {
         let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
         // Pre-fill and pop to create head offset
         for i in 0..4u64 {
-            rb.push_back_assume_capacity(i);
+            let _ = rb.push_back(i);
         }
         for _ in 0..4 {
             rb.pop_front();
@@ -167,7 +156,7 @@ fn bench_wraparound(c: &mut Criterion) {
 
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                rb.push_back_assume_capacity(black_box(i));
+                let _ = rb.push_back(black_box(i));
                 black_box(rb.pop_front());
             }
         })
@@ -176,7 +165,7 @@ fn bench_wraparound(c: &mut Criterion) {
     group.finish();
 }
 
-/// Compare push_back (with capacity check) vs push_back_assume_capacity.
+/// Compare push_back (with external full check) vs push_back_overwrite (integrated).
 fn bench_push_variants(c: &mut Criterion) {
     let mut group = c.benchmark_group("ring_buffer");
     group.throughput(Throughput::Elements(OPS_PER_ITER));
@@ -194,14 +183,11 @@ fn bench_push_variants(c: &mut Criterion) {
         })
     });
 
-    group.bench_function("push_back_unchecked", |b| {
+    group.bench_function("push_back_overwrite", |b| {
         let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
         b.iter(|| {
             for i in 0..OPS_PER_ITER {
-                if rb.is_full() {
-                    rb.pop_front();
-                }
-                rb.push_back_assume_capacity(black_box(i));
+                rb.push_back_overwrite(black_box(i));
             }
             rb.clear();
         })
@@ -264,6 +250,102 @@ fn bench_iter_rev_find(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark iter().rev().find() miss — worst case: exhaustive scan with no match.
+fn bench_iter_rev_find_worst_case(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ring_buffer");
+
+    group.bench_function("iter_rev_find_miss_cap8", |b| {
+        let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
+        for i in 0..8u64 {
+            let _ = rb.push_back(i);
+        }
+        b.iter(|| {
+            // 999 is not in buffer — forces full reverse scan.
+            black_box(rb.iter().rev().find(|&&x| x == 999))
+        })
+    });
+
+    group.bench_function("iter_rev_find_miss_cap16", |b| {
+        let mut rb: RingBuffer<u64, 16> = RingBuffer::new();
+        for i in 0..16u64 {
+            let _ = rb.push_back(i);
+        }
+        b.iter(|| black_box(rb.iter().rev().find(|&&x| x == 999)))
+    });
+
+    group.finish();
+}
+
+/// Benchmark push_back_overwrite with realistic entry size (~32 bytes, matching OpLogEntry).
+fn bench_push_back_overwrite_realistic(c: &mut Criterion) {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Entry([u8; 32]);
+
+    let mut group = c.benchmark_group("ring_buffer");
+    group.throughput(Throughput::Elements(OPS_PER_ITER));
+
+    group.bench_function("overwrite_32b_cap8", |b| {
+        let mut rb: RingBuffer<Entry, 8> = RingBuffer::new();
+        let entry = Entry([0xAB; 32]);
+        b.iter(|| {
+            for _ in 0..OPS_PER_ITER {
+                rb.push_back_overwrite(black_box(entry));
+            }
+            rb.clear();
+        })
+    });
+
+    group.bench_function("overwrite_32b_cap16", |b| {
+        let mut rb: RingBuffer<Entry, 16> = RingBuffer::new();
+        let entry = Entry([0xAB; 32]);
+        b.iter(|| {
+            for _ in 0..OPS_PER_ITER {
+                rb.push_back_overwrite(black_box(entry));
+            }
+            rb.clear();
+        })
+    });
+
+    group.finish();
+}
+
+/// VecDeque baseline for apples-to-apples comparison with RingBuffer.
+fn bench_vecdeque_baseline(c: &mut Criterion) {
+    use std::collections::VecDeque;
+
+    let mut group = c.benchmark_group("ring_buffer");
+    group.throughput(Throughput::Elements(OPS_PER_ITER));
+
+    group.bench_function("vecdeque_overwrite_cap8", |b| {
+        let mut vd = VecDeque::with_capacity(8);
+        b.iter(|| {
+            for i in 0..OPS_PER_ITER {
+                if vd.len() == 8 {
+                    vd.pop_front();
+                }
+                vd.push_back(black_box(i));
+            }
+            vd.clear();
+        })
+    });
+
+    group.bench_function("vecdeque_overwrite_cap16", |b| {
+        let mut vd = VecDeque::with_capacity(16);
+        b.iter(|| {
+            for i in 0..OPS_PER_ITER {
+                if vd.len() == 16 {
+                    vd.pop_front();
+                }
+                vd.push_back(black_box(i));
+            }
+            vd.clear();
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_push_pop_cycle,
@@ -273,6 +355,9 @@ criterion_group!(
     bench_push_variants,
     bench_push_back_overwrite,
     bench_iter_rev_find,
+    bench_iter_rev_find_worst_case,
+    bench_push_back_overwrite_realistic,
+    bench_vecdeque_baseline,
 );
 
 criterion_main!(benches);

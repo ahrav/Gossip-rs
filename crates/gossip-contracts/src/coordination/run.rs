@@ -508,8 +508,9 @@ impl RunRecord {
     }
 
     fn assert_oplog_invariants(&self) {
-        // INV-6: Op-log bounded (structurally guaranteed by RingBuffer).
-        debug_assert!(
+        // INV-6: Op-log bounded — defense-in-depth: RingBuffer enforces capacity
+        // structurally, but this assertion catches corruption before persistence.
+        assert!(
             self.op_log.len() <= Self::OP_LOG_CAP,
             "Run {:?}: op_log length {} exceeds cap {}",
             self.run,
@@ -596,7 +597,9 @@ impl RunRecord {
             entry.op_id(),
         );
         self.op_log.push_back_overwrite(entry);
-        debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
+        // Defense-in-depth: RingBuffer enforces capacity structurally, but
+        // this assertion catches corruption before persistence.
+        assert!(self.op_log.len() <= Self::OP_LOG_CAP);
     }
 
     /// Check idempotency for a run-level operation.
@@ -1024,8 +1027,8 @@ impl std::error::Error for ManifestValidationError {}
 /// 4. No unbounded ranges (empty start or end).
 /// 5. Spec validity: `start < end` for bounded key ranges.
 /// 6. No overlapping key ranges (gaps are allowed).
-///    6b. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
-/// 7. Cursor bounds for non-initial cursors.
+/// 7. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
+/// 8. Cursor bounds for non-initial cursors.
 pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
@@ -2324,7 +2327,7 @@ mod tests {
         let _ = evaluate_run_terminal(&RunProgress::default());
     }
 
-    // -- F16: RunOpIdConflict Display does not leak hashes --
+    // -- RunOpIdConflict Display does not leak hashes --
 
     #[test]
     fn run_op_id_conflict_display_no_hash_leak() {
@@ -2344,7 +2347,7 @@ mod tests {
         );
     }
 
-    // -- F17: Exact boundary tests --
+    // -- Exact boundary tests --
 
     #[test]
     fn manifest_exactly_max_initial_shards_succeeds() {
@@ -2396,7 +2399,7 @@ mod tests {
         assert!(result.is_err(), "count_shard must panic on u32 overflow");
     }
 
-    // -- F8: Proptest for validate_manifest --
+    // -- Proptest for validate_manifest --
 
     mod prop_manifest {
         use super::*;
