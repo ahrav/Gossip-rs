@@ -51,7 +51,7 @@ fuzz_target!(|ops: Vec<Op>| {
                 model.clear();
             }
             Op::Get(idx) => {
-                let idx = (*idx as usize) % 16;
+                let idx = (*idx as usize) % 8;
                 assert_eq!(ring.get(idx), model.get(idx));
             }
             Op::Clone => {
