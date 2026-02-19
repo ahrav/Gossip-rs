@@ -75,7 +75,7 @@
 //! the session's cached snapshot. Updating the snapshot on every
 //! checkpoint would add allocation overhead for no correctness benefit.
 //! Similarly, [`renew`](WorkerSession::renew) updates only the lease
-//! deadline (via [`Lease::set_deadline`]), not the snapshot.
+//! deadline (via `Lease::set_deadline`), not the snapshot.
 //!
 //! The snapshot **is** updated by [`split_residual`](WorkerSession::split_residual)
 //! because the key range narrows, and subsequent [`checkpoint`](WorkerSession::checkpoint)
