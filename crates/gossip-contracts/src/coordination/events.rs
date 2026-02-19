@@ -68,7 +68,7 @@ use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, TenantId, WorkerI
 /// Wraps `Option<Box<[u8]>>` to prevent accidental logging of
 /// sensitive key material. The `Debug` impl shows byte length
 /// instead of contents (e.g., `Some(<15 bytes>)`).
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct RedactedKey(pub Option<Box<[u8]>>);
 
 impl fmt::Debug for RedactedKey {
@@ -90,7 +90,7 @@ impl fmt::Debug for RedactedKey {
 /// Classification methods ([`is_shard_event`](Self::is_shard_event),
 /// [`is_terminal`](Self::is_terminal)) use exhaustive `match` so the
 /// compiler forces updates when new variants are added.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum EventKind {
     // —— Shard events ——————————————————————————————————————————
     /// A worker acquired (or re-acquired) a shard.
@@ -109,6 +109,11 @@ pub enum EventKind {
     /// `last_key` is the opaque resume position the worker persisted.
     /// `None` means the cursor had no key (should not happen in
     /// practice; checkpoint requires a non-empty key).
+    ///
+    /// **Serialization warning:** `RedactedKey` only redacts `Debug`
+    /// output. A naive `#[derive(Serialize)]` on `EventKind` would
+    /// leak raw key bytes. Any future serialization must use a custom
+    /// impl that redacts or omits `last_key`.
     ShardCheckpointed {
         shard: ShardId,
         last_key: RedactedKey,
@@ -131,10 +136,11 @@ pub enum EventKind {
     ///
     /// The parent shard transitions to `Split` and is no longer
     /// processable. The `children` collectively cover the parent's
-    /// key range with no gaps or overlaps.
+    /// key range with no gaps or overlaps. Stored as `Box<[ShardId]>`
+    /// because children are immutable after creation.
     ShardSplit {
         parent: ShardId,
-        children: Vec<ShardId>,
+        children: Box<[ShardId]>,
     },
 
     /// A residual shard was carved off via SplitResidual. **Not terminal.**
@@ -245,6 +251,10 @@ impl EventKind {
     }
 }
 
+// Compile-time guard: EventKind should stay small (currently 32 bytes on 64-bit).
+// Bump this limit deliberately if adding a new variant with large inline data.
+const _: () = assert!(std::mem::size_of::<EventKind>() <= 40);
+
 // ============================================================================
 // StateTransitionEvent
 // ============================================================================
@@ -273,7 +283,11 @@ impl EventKind {
 /// `ShardCheckpointed` carries `last_key: RedactedKey` which wraps
 /// opaque key material. `RedactedKey`'s `Debug` impl redacts raw
 /// bytes to byte lengths (e.g., `Some(<15 bytes>)`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Do NOT add `#[derive(Serialize)]` without a custom `Serialize` impl
+/// that redacts `EventKind::ShardCheckpointed::last_key`. The
+/// `RedactedKey` wrapper only protects `Debug` output — a naive
+/// `Serialize` derive would leak raw key bytes.
+#[derive(Debug, PartialEq, Eq)]
 pub struct StateTransitionEvent {
     pub tenant: TenantId,
     pub run: RunId,
@@ -300,6 +314,10 @@ impl StateTransitionEvent {
         self.kind.is_terminal()
     }
 }
+
+// Compile-time guard: StateTransitionEvent should stay ≤ 88 bytes (currently 80).
+// Bump deliberately if adding new envelope fields.
+const _: () = assert!(std::mem::size_of::<StateTransitionEvent>() <= 88);
 
 // ============================================================================
 // EventCollector
@@ -338,7 +356,7 @@ impl StateTransitionEvent {
 /// calling [`drain()`](Self::drain) between them. Draining transfers
 /// ownership of the accumulated events to the caller and resets the
 /// collector to empty.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct EventCollector {
     events: Vec<StateTransitionEvent>,
 }
@@ -512,7 +530,7 @@ mod tests {
             (
                 EventKind::ShardSplit {
                     parent: s,
-                    children: vec![ShardId::from_raw(1), ShardId::from_raw(2)],
+                    children: vec![ShardId::from_raw(1), ShardId::from_raw(2)].into_boxed_slice(),
                 },
                 true,
                 true,
@@ -530,11 +548,12 @@ mod tests {
     #[test]
     fn event_classification_exhaustive() {
         for (kind, expect_shard, expect_terminal) in classification_table() {
-            let event = evt(kind.clone());
+            // Check EventKind methods directly before moving into envelope.
             assert_eq!(kind.is_shard_event(), expect_shard, "{kind:?}");
             assert_eq!(kind.is_run_event(), !expect_shard, "{kind:?}");
             assert_eq!(kind.is_terminal(), expect_terminal, "{kind:?}");
-            // Delegation through the envelope should agree.
+            // Move kind into envelope and verify delegation agrees.
+            let event = evt(kind);
             assert_eq!(event.is_shard_event(), expect_shard, "{event:?}");
             assert_eq!(event.is_run_event(), !expect_shard, "{event:?}");
             assert_eq!(event.is_terminal(), expect_terminal, "{event:?}");
