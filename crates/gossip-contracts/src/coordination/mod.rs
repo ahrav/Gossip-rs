@@ -19,7 +19,9 @@
 //! - OpId idempotency — replayed operations return cached results; conflicting
 //!   payloads for the same `OpId` are rejected.
 //! - Terminal irreversibility — `Done`, `Parked`, and `Split` shards (and
-//!   `Done` / `Failed` / `Cancelled` runs) reject all further mutations.
+//!   `Done` / `Failed` / `Cancelled` runs) reject all worker-level mutations.
+//!   `Parked` shards may be resumed via `unpark_shard` (admin `RunManagement`
+//!   operation).
 
 pub mod cursor;
 pub mod error;

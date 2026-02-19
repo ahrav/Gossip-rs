@@ -108,6 +108,10 @@ impl LeaseHolder {
     /// logical time.
     #[must_use]
     pub fn new(owner: WorkerId, deadline: LogicalTime) -> Self {
+        debug_assert!(
+            deadline > LogicalTime::ZERO,
+            "LeaseHolder deadline must be non-zero"
+        );
         Self { owner, deadline }
     }
 

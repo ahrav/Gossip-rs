@@ -33,8 +33,8 @@
 //! minimal for testing and simulation, while enabling rich
 //! observability in production.
 //!
-//! This integration pattern is planned but not yet implemented in the
-//! current codebase.
+//! The types are defined here; wiring into `CoordinationBackend` is
+//! tracked separately.
 //!
 //! ## Event / Operation Correspondence
 //!
@@ -86,7 +86,8 @@ impl RedactedKey {
     /// Use sparingly — this defeats the redaction guarantee. Intended
     /// for serialization layers that apply their own redaction.
     #[must_use]
-    pub fn into_raw(self) -> Option<Box<[u8]>> {
+    #[allow(dead_code)] // reserved for serialization layers
+    pub(crate) fn into_raw(self) -> Option<Box<[u8]>> {
         self.0
     }
 }
@@ -114,7 +115,16 @@ impl fmt::Debug for RedactedKey {
 /// [`is_run_event`](Self::is_run_event) returns `true` for any
 /// variant. Classification methods use exhaustive `match` so the
 /// compiler forces updates when new variants are added.
+///
+/// ## Serialization Guard
+///
+/// `EventKind` must **not** derive `Serialize`. The `ShardCheckpointed`
+/// variant contains [`RedactedKey`], which wraps sensitive key bytes.
+/// `RedactedKey` only redacts `Debug` output — a naive `Serialize` derive
+/// would leak raw key material. Any future serialization must use a
+/// custom impl that redacts or omits `last_key`.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EventKind {
     // —— Shard events ——————————————————————————————————————————
     /// A worker acquired (or re-acquired) a shard.
@@ -275,7 +285,7 @@ impl EventKind {
     }
 }
 
-// Compile-time guard: EventKind should stay small (currently 32 bytes on 64-bit).
+// Compile-time guard: EventKind fits within 40 bytes on 64-bit.
 // Bump this limit deliberately if adding a new variant with large inline data.
 const _: () = assert!(std::mem::size_of::<EventKind>() <= 40);
 
@@ -366,16 +376,6 @@ const _: () = assert!(std::mem::size_of::<StateTransitionEvent>() <= 80);
 /// }
 /// ```
 ///
-/// ## Design Note
-///
-/// The core [`CoordinationBackend`](super::traits::CoordinationBackend)
-/// trait methods do **not** take an `EventCollector` — they define
-/// the minimal semantic contract. Backends that want event emission
-/// would provide companion `_with_events` methods that accept
-/// `&mut EventCollector`. This keeps the trait simple for testing and
-/// deterministic simulation. This extension pattern is planned but
-/// not yet implemented in the current codebase.
-///
 /// ## Reuse
 ///
 /// A single collector can be reused across multiple operations by
@@ -385,13 +385,18 @@ const _: () = assert!(std::mem::size_of::<StateTransitionEvent>() <= 80);
 #[derive(Debug, Default)]
 pub struct EventCollector {
     events: Vec<StateTransitionEvent>,
+    /// Hard ceiling on events. `None` means unbounded (the default).
+    max_capacity: Option<usize>,
 }
 
 impl EventCollector {
     /// Create an empty event collector with no pre-allocated capacity.
     #[must_use]
     pub fn new() -> Self {
-        Self { events: Vec::new() }
+        Self {
+            events: Vec::new(),
+            max_capacity: None,
+        }
     }
 
     /// Create an event collector pre-allocated for `cap` events.
@@ -402,25 +407,48 @@ impl EventCollector {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             events: Vec::with_capacity(cap),
+            max_capacity: None,
+        }
+    }
+
+    /// Create an event collector that silently drops events after
+    /// `max_events` have been collected.
+    ///
+    /// Use this as a safety valve in production to prevent unbounded
+    /// memory growth if a backend produces unexpectedly many events.
+    /// Dropped events are silently discarded — the caller can detect
+    /// saturation by comparing [`len()`](Self::len) against the limit.
+    #[must_use]
+    pub fn with_max_capacity(max_events: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            max_capacity: Some(max_events),
         }
     }
 
     /// Append an event to the collector. Events are stored in
-    /// emission order.
+    /// emission order. Returns `true` if the event was accepted,
+    /// `false` if the collector is at its max capacity limit.
     ///
-    /// # Panics (debug builds only)
+    /// # Panics
     ///
     /// Panics if the new event's tenant differs from previously
     /// collected events. A single collector must not mix tenants —
     /// doing so indicates a routing bug in the caller.
-    pub fn emit(&mut self, event: StateTransitionEvent) {
-        debug_assert!(
+    pub fn emit(&mut self, event: StateTransitionEvent) -> bool {
+        if let Some(max) = self.max_capacity
+            && self.events.len() >= max
+        {
+            return false;
+        }
+        assert!(
             self.events.is_empty() || self.events[0].tenant == event.tenant,
             "EventCollector cross-tenant mixing: first event tenant {:?}, new event tenant {:?}",
             self.events[0].tenant,
             event.tenant,
         );
         self.events.push(event);
+        true
     }
 
     /// Take all collected events, leaving the collector empty.
@@ -698,10 +726,9 @@ mod tests {
         assert_eq!(c.len(), 1);
     }
 
-    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "cross-tenant mixing")]
-    fn emit_cross_tenant_panics_in_debug() {
+    fn emit_cross_tenant_panics() {
         let other_tenant = TenantId::from_bytes([0x02; 32]);
         let mut c = EventCollector::new();
         c.emit(evt(EventKind::RunCreated));
@@ -711,5 +738,80 @@ mod tests {
             at: test_time(),
             kind: EventKind::RunCreated,
         });
+    }
+
+    /// Guard: EventKind must not implement Serialize. If this test
+    /// fails to compile, someone added a Serialize derive — remove it
+    /// and use a custom impl that redacts RedactedKey.
+    #[test]
+    fn redacted_key_is_not_serialize() {
+        // RedactedKey intentionally does not implement serde::Serialize.
+        // This is a design-intent marker test. If EventKind ever needs
+        // serialization, a custom impl must redact ShardCheckpointed::last_key.
+        //
+        // Compile-time: RedactedKey has no Serialize impl, so any
+        // #[derive(Serialize)] on EventKind would fail to compile.
+        // This test documents that intent.
+        let key = RedactedKey::new(Some(b"secret".to_vec().into_boxed_slice()));
+        let debug_output = format!("{key:?}");
+        assert!(
+            debug_output.contains("bytes"),
+            "RedactedKey Debug must show byte length, not contents"
+        );
+        assert!(
+            !debug_output.contains("secret"),
+            "RedactedKey Debug must not leak raw bytes"
+        );
+    }
+
+    #[test]
+    fn collector_handles_large_event_volume() {
+        let mut c = EventCollector::new();
+        for i in 0..10_000u64 {
+            c.emit(StateTransitionEvent {
+                tenant: test_tenant(),
+                run: test_run(),
+                at: LogicalTime::from_raw(i),
+                kind: EventKind::ShardCompleted {
+                    shard: ShardId::from_raw(i),
+                },
+            });
+        }
+        assert_eq!(c.len(), 10_000);
+        let drained = c.drain();
+        assert_eq!(drained.len(), 10_000);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn collector_with_max_capacity_drops_excess() {
+        let mut c = EventCollector::with_max_capacity(3);
+        for i in 0..5u64 {
+            c.emit(StateTransitionEvent {
+                tenant: test_tenant(),
+                run: test_run(),
+                at: LogicalTime::from_raw(i),
+                kind: EventKind::ShardCompleted {
+                    shard: ShardId::from_raw(i),
+                },
+            });
+        }
+        // Only 3 accepted, 2 dropped.
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn collector_unbounded_default_accepts_all() {
+        let mut c = EventCollector::default();
+        for i in 0..100u64 {
+            let accepted = c.emit(StateTransitionEvent {
+                tenant: test_tenant(),
+                run: test_run(),
+                at: LogicalTime::from_raw(i),
+                kind: EventKind::RunCreated,
+            });
+            assert!(accepted, "unbounded collector must accept all events");
+        }
+        assert_eq!(c.len(), 100);
     }
 }

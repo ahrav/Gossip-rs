@@ -136,9 +136,10 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// 1. Fetch the candidate list via
 ///    `list_shards(ShardFilter::available())` -- active, unleased shards.
 /// 2. If the list is empty, return `NoneAvailable` immediately.
-/// 3. Iterate candidates in the order returned by `list_shards`.
-///    The in-memory backend orders by `(key_range_start, shard_id)`
-///    for determinism; other backends may use a different order.
+/// 3. Start iteration at offset `worker.as_raw() % len` so that
+///    different workers begin at different candidates, reducing
+///    contention on the first shard. The offset is deterministic
+///    (no RNG) — the same worker always starts at the same position.
 ///    For each candidate, attempt `acquire_and_restore`.
 /// 4. On success, return the `AcquireResult` (lease + snapshot).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
@@ -186,7 +187,11 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
         return Err(ClaimError::NoneAvailable);
     }
 
-    for summary in &summaries {
+    let len = summaries.len();
+    let offset = worker.as_raw() as usize % len;
+    let mut inconsistency_count = 0usize;
+    for i in 0..len {
+        let summary = &summaries[(offset + i) % len];
         let key = ShardKey::new(run, summary.shard());
         match backend.acquire_and_restore(now, tenant, key, worker) {
             Ok(result) => return Ok(result),
@@ -199,9 +204,16 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
                 continue;
             }
             Err(AcquireError::ShardNotFound { .. }) => {
-                // A shard listed by list_shards does not exist in acquire.
-                // This indicates a backend data inconsistency — production
-                // wrappers should log this at warn level.
+                // list_shards returned this shard but acquire_and_restore
+                // says it doesn't exist — signals a data inconsistency.
+                // Crashes in debug builds to catch backend bugs early;
+                // continues in release where production logging handles this.
+                debug_assert!(
+                    false,
+                    "claim_next_available: list_shards returned shard {key:?} \
+                     but acquire_and_restore reports ShardNotFound"
+                );
+                inconsistency_count += 1;
                 continue;
             }
             Err(AcquireError::TenantMismatch { expected }) => {
@@ -210,7 +222,16 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
         }
     }
 
-    // All candidates were claimed by other workers.
+    // If every candidate failed with ShardNotFound, the backend's index
+    // is inconsistent with its primary shard map — this is data corruption,
+    // not a legitimate race condition.
+    debug_assert!(
+        inconsistency_count < summaries.len(),
+        "all {} candidates returned ShardNotFound — backend index vs shard map inconsistency",
+        summaries.len(),
+    );
+
+    // All candidates were claimed by other workers (or disappeared).
     Err(ClaimError::NoneAvailable)
 }
 

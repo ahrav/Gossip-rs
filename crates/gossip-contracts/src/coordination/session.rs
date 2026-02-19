@@ -192,7 +192,8 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         worker: WorkerId,
     ) -> Result<Self, AcquireError> {
         let result = backend.acquire_and_restore(now, tenant, key, worker)?;
-        debug_assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
+        // Tenant is a security boundary — must hold in all builds.
+        assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
         debug_assert_eq!(result.lease.shard_key(), key, "lease shard_key mismatch");
         debug_assert_eq!(result.lease.owner(), worker, "lease owner mismatch");
         debug_assert!(
@@ -291,7 +292,8 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     pub fn renew(&mut self, now: LogicalTime) -> Result<RenewResult, RenewError> {
         let fence_before = self.lease.fence();
         let result = self.backend.renew(now, self.tenant, &self.lease)?;
-        debug_assert!(result.new_deadline > now, "renewal deadline not after now");
+        // An expired deadline after a "successful" renewal is always a backend bug.
+        assert!(result.new_deadline > now, "renewal deadline not after now");
         self.lease.set_deadline(result.new_deadline);
         debug_assert_eq!(
             self.lease.fence(),
@@ -447,8 +449,10 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// the split_residual entry from the bounded op-log (cap = 16).
     /// If a retry occurs after eviction, the backend cannot detect the
     /// replay via op-log lookup. Instead, it checks whether the derived
-    /// residual shard ID already exists — if it does and matches the
-    /// plan, it returns `Replayed`.
+    /// residual shard ID already exists — if it does, the backend
+    /// returns `Replayed` (payload-hash verification is lost after
+    /// op-log eviction; see `split_residual` in `in_memory.rs` for
+    /// the full fallback rationale).
     pub fn split_residual(
         &mut self,
         now: LogicalTime,
@@ -475,7 +479,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             spawned.push(res.residual);
             self.snapshot = ShardSnapshot::new(
                 self.snapshot.status(),
-                new_spec,
+                new_spec.clone(),
                 self.snapshot.cursor().clone(),
                 self.snapshot.cursor_semantics(),
                 self.snapshot.parent(),
@@ -485,6 +489,13 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
                 self.snapshot.status(),
                 ShardStatus::Active,
                 "status changed after split_residual"
+            );
+        }
+        if let IdempotentOutcome::Replayed(_) = &result {
+            debug_assert_eq!(
+                self.snapshot.spec().key_range_end(),
+                new_spec.key_range_end(),
+                "Replayed split_residual but snapshot spec not yet narrowed"
             );
         }
         Ok(result)
@@ -717,6 +728,76 @@ mod tests {
 
         assert_eq!(session.spec(), &spec_after_first);
         assert_eq!(session.initial_snapshot().spawned(), &spawned_after_first);
+    }
+
+    /// After op-log eviction (16+ subsequent ops), the backend falls
+    /// back to a spawned-probe to detect the residual. This test
+    /// verifies that the fallback returns `Replayed` even though the
+    /// original op-log entry has been evicted.
+    #[test]
+    fn split_residual_replayed_after_oplog_eviction() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+        // Shard 0 covers [0x00, 0x40). Split into [0x00, 0x20) + residual [0x20, 0x40).
+        let parent_new_spec =
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
+        let residual_spec =
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
+        let split_op = OpId::from_raw(700);
+        let plan =
+            SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec.clone()).unwrap();
+        let r = session.split_residual(now(3), plan, split_op).unwrap();
+        assert!(r.is_executed(), "first call must be Executed");
+
+        // Execute 17 checkpoints to evict the split op-log entry.
+        // OP_LOG_CAP = 16, so 17 pushes guarantee eviction.
+        let mut t = 10u64;
+        for i in 0..17u64 {
+            // Cursor bytes 0x01..=0x11, all within narrowed range [0x00, 0x20).
+            let cursor = Cursor::with_last_key(vec![(i + 1) as u8]);
+            let _ = session
+                .checkpoint(now(t), cursor, OpId::from_raw(801 + i))
+                .unwrap();
+            t += 1;
+        }
+
+        // Retry split_residual with the same OpId — op-log entry is
+        // evicted, but the spawned-probe fallback detects the residual.
+        let plan2 = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
+        let r2 = session.split_residual(now(t), plan2, split_op).unwrap();
+        assert!(
+            r2.is_replay(),
+            "must return Replayed via spawned-probe fallback after op-log eviction"
+        );
+    }
+
+    /// Renewing a lease must not change the fence epoch — renewal is a
+    /// deadline extension, not an ownership transfer.
+    #[test]
+    fn renew_postconditions_fence_stable() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+        let fence_before = session.lease().fence();
+
+        // First renewal.
+        let _ = session.renew(now(10)).unwrap();
+        assert_eq!(
+            session.lease().fence(),
+            fence_before,
+            "fence must not change after first renewal"
+        );
+
+        // Second renewal.
+        let _ = session.renew(now(20)).unwrap();
+        assert_eq!(
+            session.lease().fence(),
+            fence_before,
+            "fence must not change after second renewal"
+        );
     }
 
     /// After `split_residual` narrows `[0x00, 0x40)` → `[0x00, 0x20)`,

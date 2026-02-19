@@ -599,6 +599,27 @@ impl CoordinationSim {
         }
     }
 
+    /// Update worker bookkeeping after a successful acquire.
+    ///
+    /// Records the new lease on `worker`, clears the shard from every
+    /// other worker (saving superseded leases for zombie injection),
+    /// and trims `stale_leases` to prevent unbounded growth.
+    fn record_acquire_bookkeeping(&mut self, worker: WorkerId, key: ShardKey, lease: Lease) {
+        for (wid, w) in &mut self.workers {
+            if *wid == worker {
+                w.record_acquire(key, lease);
+            } else if let Some(stale) = w.lease_for(&key) {
+                self.stale_leases.push((*wid, key, *stale));
+                w.record_release(&key);
+            }
+        }
+
+        while self.stale_leases.len() > MAX_STALE_LEASES {
+            let idx = self.context.rng().random_range(0..self.stale_leases.len());
+            let _ = self.stale_leases.swap_remove(idx);
+        }
+    }
+
     fn exec_acquire(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
             return SimEvent::Rejected {
@@ -614,29 +635,7 @@ impl CoordinationSim {
             Ok(result) => {
                 let fence = result.lease.fence();
                 let lease = result.lease;
-
-                // When worker W acquires shard K, clear K from every other
-                // worker's local bookkeeping. Without this, a worker whose
-                // lease expired silently still "thinks" it holds the shard
-                // and would produce confusing Rejected events.
-                //
-                // Save superseded leases for zombie checkpoint injection so
-                // the coordinator's StaleFence rejection path gets exercised.
-                for (wid, w) in &mut self.workers {
-                    if *wid == worker {
-                        w.record_acquire(key, lease);
-                    } else if let Some(stale) = w.lease_for(&key) {
-                        self.stale_leases.push((*wid, key, *stale));
-                        w.record_release(&key);
-                    }
-                }
-
-                // Trim stale_leases to prevent unbounded growth.
-                while self.stale_leases.len() > MAX_STALE_LEASES {
-                    let idx = self.context.rng().random_range(0..self.stale_leases.len());
-                    let _ = self.stale_leases.swap_remove(idx);
-                }
-
+                self.record_acquire_bookkeeping(worker, key, lease);
                 SimEvent::AcquireOk { fence }
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -939,32 +938,47 @@ impl CoordinationSim {
     // OpId replay/conflict
     // -----------------------------------------------------------------------
 
-    /// Replay a previous checkpoint with the same OpId and payload.
-    /// Exercises the `IdempotentOutcome::Replayed` path.
-    fn exec_replay_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+    /// Common preamble for replay and conflict checkpoint operations.
+    ///
+    /// Validates the worker is active, looks up the prior checkpoint for
+    /// the given `(worker, key)`, and retrieves the worker's current lease.
+    fn checkpoint_preamble(
+        &self,
+        worker: WorkerId,
+        key: ShardKey,
+    ) -> Result<(OpId, Cursor, Lease), SimEvent> {
         if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
+            return Err(SimEvent::Rejected {
                 kind: RejectionKind::WorkerPaused,
-            };
+            });
         }
 
         let ck = (worker.as_raw(), key.run().as_raw(), key.shard().as_raw());
-        let (prev_op_id, prev_cursor) = match self.last_checkpoint_ops.get(&ck) {
-            Some((op_id, cursor, ..)) => (*op_id, cursor.clone()),
-            None => {
-                return SimEvent::Rejected {
+        let (prev_op_id, prev_cursor, ..) =
+            self.last_checkpoint_ops
+                .get(&ck)
+                .ok_or(SimEvent::Rejected {
                     kind: RejectionKind::NoPriorCheckpoint,
-                };
-            }
-        };
+                })?;
 
-        let lease = match self.workers.get(&worker).and_then(|w| w.lease_for(&key)) {
-            Some(l) => *l,
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let lease = self
+            .workers
+            .get(&worker)
+            .and_then(|w| w.lease_for(&key))
+            .copied()
+            .ok_or(SimEvent::Rejected {
+                kind: RejectionKind::NotLeased,
+            })?;
+
+        Ok((*prev_op_id, prev_cursor.clone(), lease))
+    }
+
+    /// Replay a previous checkpoint with the same OpId and payload.
+    /// Exercises the `IdempotentOutcome::Replayed` path.
+    fn exec_replay_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
+        let (prev_op_id, prev_cursor, lease) = match self.checkpoint_preamble(worker, key) {
+            Ok(t) => t,
+            Err(rejection) => return rejection,
         };
 
         let now = self.context.now();
@@ -986,29 +1000,9 @@ impl CoordinationSim {
     /// Replay a previous OpId with a different cursor payload.
     /// Exercises the `OpIdConflict` error path.
     fn exec_conflict_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
-        if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
-            return SimEvent::Rejected {
-                kind: RejectionKind::WorkerPaused,
-            };
-        }
-
-        let ck = (worker.as_raw(), key.run().as_raw(), key.shard().as_raw());
-        let prev_op_id = match self.last_checkpoint_ops.get(&ck) {
-            Some((op_id, ..)) => *op_id,
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NoPriorCheckpoint,
-                };
-            }
-        };
-
-        let lease = match self.workers.get(&worker).and_then(|w| w.lease_for(&key)) {
-            Some(l) => *l,
-            None => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::NotLeased,
-                };
-            }
+        let (prev_op_id, _prev_cursor, lease) = match self.checkpoint_preamble(worker, key) {
+            Ok(t) => t,
+            Err(rejection) => return rejection,
         };
 
         // Generate a *different* cursor to trigger a payload hash mismatch.
@@ -1079,7 +1073,7 @@ impl CoordinationSim {
 
     /// Exercise `claim_next_available`: list-then-acquire retry loop.
     ///
-    /// Picks the run from the first active shard key and delegates to
+    /// Picks a random run from the active shard keys and delegates to
     /// [`ShardClaiming::claim_next_available`]. On success, records the
     /// lease in the worker's bookkeeping (same as `exec_acquire`).
     fn exec_claim_next(&mut self, worker: WorkerId) -> SimEvent {
@@ -1089,13 +1083,16 @@ impl CoordinationSim {
             };
         }
 
-        // Pick a run from the active shard keys.
-        let run = match self.active_shard_keys.first() {
-            Some(key) => key.run(),
-            None => {
-                return SimEvent::ClaimNoneAvailable;
-            }
-        };
+        // Collect unique runs from active shard keys and pick one randomly,
+        // ensuring multi-run scenarios exercise claiming across all runs.
+        if self.active_shard_keys.is_empty() {
+            return SimEvent::ClaimNoneAvailable;
+        }
+        let mut runs: Vec<RunId> = self.active_shard_keys.iter().map(|k| k.run()).collect();
+        runs.sort();
+        runs.dedup();
+        let idx = self.context.rng().random_range(0..runs.len());
+        let run = runs[idx];
 
         let now = self.context.now();
         match self
@@ -1106,23 +1103,7 @@ impl CoordinationSim {
                 let shard = result.lease.shard();
                 let key = ShardKey::new(run, shard);
                 let lease = result.lease;
-
-                // Same B1 bookkeeping as exec_acquire: clear the shard
-                // from other workers and record the new lease.
-                for (wid, w) in &mut self.workers {
-                    if *wid == worker {
-                        w.record_acquire(key, lease);
-                    } else if let Some(stale) = w.lease_for(&key) {
-                        self.stale_leases.push((*wid, key, *stale));
-                        w.record_release(&key);
-                    }
-                }
-
-                while self.stale_leases.len() > MAX_STALE_LEASES {
-                    let idx = self.context.rng().random_range(0..self.stale_leases.len());
-                    let _ = self.stale_leases.swap_remove(idx);
-                }
-
+                self.record_acquire_bookkeeping(worker, key, lease);
                 SimEvent::ClaimOk { shard }
             }
             Err(ClaimError::NoneAvailable) => SimEvent::ClaimNoneAvailable,

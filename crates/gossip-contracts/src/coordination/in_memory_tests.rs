@@ -793,19 +793,30 @@ fn split_residual_op_id_conflict() {
     );
 }
 
-// -- Lease deadline overflow -----------------------------------------------
+// -- Lease deadline saturation ------------------------------------------------
 
+/// When `now + lease_duration` overflows, the deadline saturates to
+/// `LogicalTime::from_raw(u64::MAX)` instead of panicking. This produces
+/// a very-long lease, which is safe — it will still expire eventually or
+/// be superseded by a fence bump.
 #[test]
-#[should_panic(expected = "lease deadline overflow")]
-fn acquire_panics_on_lease_deadline_overflow() {
+fn acquire_saturates_on_lease_deadline_overflow() {
     let mut coord = seeded_coordinator();
-    // Using u64::MAX as `now` will cause checked_add to return None,
-    // triggering the expect("lease deadline overflow") panic.
-    let _ = coord.acquire_and_restore(
+    let result = coord.acquire_and_restore(
         LogicalTime::from_raw(u64::MAX),
         test_tenant(),
         test_key(),
         test_worker(1),
+    );
+    assert!(
+        result.is_ok(),
+        "acquire should succeed with saturated deadline"
+    );
+    let lease = result.unwrap().lease;
+    assert_eq!(
+        lease.deadline(),
+        LogicalTime::from_raw(u64::MAX),
+        "deadline should saturate to u64::MAX"
     );
 }
 

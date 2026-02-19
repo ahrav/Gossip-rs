@@ -40,9 +40,11 @@
 //!    ▼    split_replace      ▼
 //! ┌──────┐      │       ┌────────┐
 //! │ Done │      ▼       │ Parked │
-//! └──────┘  ┌───────┐   └────────┘
-//!           │ Split  │
-//!           └───────┘
+//! └──────┘  ┌───────┐   └───┬────┘
+//!           │ Split  │       │ unpark_shard
+//!           └───────┘       │ (admin, bumps fence)
+//!                           ▼
+//!                      back to Active
 //! ```
 //!
 //! All transitions originate from `Active`. `Done` and `Split` are permanently
@@ -65,9 +67,9 @@
 //!
 //! # Performance note
 //!
-//! A future `claim_next_available` would scan all shards — O(S) for a linear
-//! pass, or O(S log S) if sorted by priority. Acceptable here; production
-//! backends need a secondary available-shards index.
+//! `claim_next_available` (via `ShardClaiming`) scans all shards — O(S)
+//! for a linear pass. Acceptable here; production backends need a
+//! secondary available-shards index.
 
 use std::collections::{HashMap, HashSet};
 
@@ -457,9 +459,11 @@ impl CoordinationBackend for InMemoryCoordinator {
         let new_fence = record.advance_fence();
 
         // 5) Grant a new lease with a fresh deadline.
+        // Saturate rather than panicking: a very-long lease is safe — it will
+        // still expire eventually or be superseded by a fence bump.
         let deadline = now
             .checked_add(lease_duration)
-            .expect("lease deadline overflow — LogicalTime near max");
+            .unwrap_or(LogicalTime::from_raw(u64::MAX));
         record.lease = Some(LeaseHolder::new(worker, deadline));
 
         // 6) Return the fencing lease + shard snapshot.
@@ -488,9 +492,11 @@ impl CoordinationBackend for InMemoryCoordinator {
 
         validate_lease(now, tenant, lease, record)?;
 
+        // Saturate rather than panicking: a very-long lease is safe — it will
+        // still expire eventually or be superseded by a fence bump.
         let deadline = now
             .checked_add(lease_duration)
-            .expect("lease deadline overflow — LogicalTime near max");
+            .unwrap_or(LogicalTime::from_raw(u64::MAX));
         record.lease = Some(LeaseHolder::new(lease.owner(), deadline));
 
         record.assert_invariants();
@@ -1484,8 +1490,9 @@ impl RunManagement for InMemoryCoordinator {
     ) -> Result<Vec<ShardSummary>, GetRunError> {
         let _ = self.lookup_run(tenant, run)?;
 
-        let mut summaries = Vec::new();
-        if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+        let shard_ids = self.run_shards.get(&(tenant, run));
+        let mut summaries = Vec::with_capacity(shard_ids.map_or(0, |ids| ids.len()));
+        if let Some(shard_ids) = shard_ids {
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
                 let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
@@ -1709,7 +1716,20 @@ impl RunManagement for InMemoryCoordinator {
                     expected_hash,
                     actual_hash,
                 }),
-                other => unreachable!("unexpected CoordError: {other:?}"),
+                // check_op_idempotency only returns OpIdConflict.
+                // Exhaustive listing ensures the compiler forces updates
+                // if new CoordError variants are added.
+                crate::coordination::error::CoordError::ShardNotFound { .. }
+                | crate::coordination::error::CoordError::TenantMismatch { .. }
+                | crate::coordination::error::CoordError::StaleFence { .. }
+                | crate::coordination::error::CoordError::LeaseExpired { .. }
+                | crate::coordination::error::CoordError::ShardTerminal { .. }
+                | crate::coordination::error::CoordError::CursorRegression { .. }
+                | crate::coordination::error::CoordError::CursorOutOfBounds(_)
+                | crate::coordination::error::CoordError::SplitInvalid(_)
+                | crate::coordination::error::CoordError::CheckpointMissingKey => {
+                    unreachable!("check_op_idempotency only returns OpIdConflict")
+                }
             })?
             .is_some()
         {
