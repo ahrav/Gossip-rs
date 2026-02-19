@@ -19,6 +19,7 @@
 //!                             │  OpLogEntry     │
 //!                             │  op_id + kind   │
 //!                             │  result + hash  │
+//!                             │  executed_at    │
 //!                             └────────────────┘
 //! ```
 //!
@@ -135,7 +136,7 @@ impl LeaseHolder {
 /// A capability token granting exclusive, temporary rights to mutate a shard.
 ///
 /// Returned by `acquire_and_restore` and required by every lease-gated
-/// mutation (`checkpoint`, `complete`, `park_shard`, `split_replace`,
+/// op-log mutation (`checkpoint`, `complete`, `park_shard`, `split_replace`,
 /// `split_residual`). The coordinator validates two properties on each call:
 ///
 /// 1. **Fence epoch** — `lease.fence == record.fence_epoch`. A mismatch means
