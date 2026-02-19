@@ -13,4 +13,4 @@
 
 mod ring_buffer;
 
-pub use ring_buffer::{IntoIter, RingBuffer};
+pub use ring_buffer::{IntoIter, Iter, RingBuffer};

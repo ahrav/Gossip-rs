@@ -72,6 +72,16 @@ impl<T, const N: usize> RingBuffer<T, N> {
     const MASK: u32 = Self::CAPACITY - 1;
 
     /// Constructs an empty ring buffer with capacity `N` without heap allocation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gossip_stdx::RingBuffer;
+    ///
+    /// let ring = RingBuffer::<u32, 4>::new();
+    /// assert!(ring.is_empty());
+    /// assert_eq!(ring.capacity(), 4);
+    /// ```
     pub fn new() -> Self {
         let _ = Self::CAPACITY;
 
@@ -115,6 +125,21 @@ impl<T, const N: usize> RingBuffer<T, N> {
     /// if the index is out of bounds.
     ///
     /// Logical index 0 is the oldest (front) element.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gossip_stdx::RingBuffer;
+    ///
+    /// let mut ring = RingBuffer::<u32, 4>::new();
+    /// ring.push_back(10).unwrap();
+    /// ring.push_back(20).unwrap();
+    /// ring.push_back(30).unwrap();
+    ///
+    /// assert_eq!(ring.get(0), Some(&10)); // oldest element
+    /// assert_eq!(ring.get(2), Some(&30)); // newest element
+    /// assert_eq!(ring.get(3), None);      // out of bounds
+    /// ```
     #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len as usize {
@@ -132,6 +157,17 @@ impl<T, const N: usize> RingBuffer<T, N> {
     ///
     /// This keeps ownership with the caller on overflow instead of dropping
     /// silently.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gossip_stdx::RingBuffer;
+    ///
+    /// let mut ring = RingBuffer::<u32, 2>::new();
+    /// assert!(ring.push_back(10).is_ok());
+    /// assert!(ring.push_back(20).is_ok());
+    /// assert_eq!(ring.push_back(30), Err(30)); // full
+    /// ```
     #[inline]
     pub fn push_back(&mut self, value: T) -> Result<(), T> {
         if self.is_full() {
@@ -174,6 +210,18 @@ impl<T, const N: usize> RingBuffer<T, N> {
     /// Returns `Some(evicted)` if an element was evicted, `None` if there was
     /// spare capacity. This is the O(1) replacement for the
     /// `if full { remove(0) } push()` pattern.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gossip_stdx::RingBuffer;
+    ///
+    /// let mut ring = RingBuffer::<u32, 2>::new();
+    /// assert_eq!(ring.push_back_overwrite(10), None);
+    /// assert_eq!(ring.push_back_overwrite(20), None);
+    /// assert_eq!(ring.push_back_overwrite(30), Some(10)); // 10 evicted
+    /// assert_eq!(ring.pop_front(), Some(20));
+    /// ```
     #[inline]
     pub fn push_back_overwrite(&mut self, value: T) -> Option<T> {
         let evicted = if self.is_full() {
@@ -221,6 +269,24 @@ impl<T, const N: usize> RingBuffer<T, N> {
     }
 
     /// Returns an iterator over references to the elements in FIFO order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gossip_stdx::RingBuffer;
+    ///
+    /// let mut ring = RingBuffer::<u32, 4>::new();
+    /// ring.push_back(10).unwrap();
+    /// ring.push_back(20).unwrap();
+    /// ring.push_back(30).unwrap();
+    ///
+    /// let vals: Vec<_> = ring.iter().copied().collect();
+    /// assert_eq!(vals, [10, 20, 30]);
+    ///
+    /// // Reverse iteration to find the last element divisible by 10:
+    /// let last_div10 = ring.iter().rev().find(|&&x| x % 10 == 0);
+    /// assert_eq!(last_div10, Some(&30));
+    /// ```
     pub fn iter(&self) -> Iter<'_, T, N> {
         Iter {
             ring: self,
