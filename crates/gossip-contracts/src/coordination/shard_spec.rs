@@ -220,6 +220,21 @@ impl ShardSpec {
     /// Panics if `start` and `end` are both non-empty and `start >= end`.
     #[must_use = "creates a shard spec that should be stored or used"]
     pub fn with_range_and_metadata(start: Vec<u8>, end: Vec<u8>, metadata: Vec<u8>) -> Self {
+        assert!(
+            start.len() <= MAX_KEY_SIZE,
+            "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
+            start.len(),
+        );
+        assert!(
+            end.len() <= MAX_KEY_SIZE,
+            "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
+            end.len(),
+        );
+        assert!(
+            metadata.len() <= MAX_METADATA_SIZE,
+            "ShardSpec: metadata too large ({} bytes, max {MAX_METADATA_SIZE})",
+            metadata.len(),
+        );
         if !start.is_empty() && !end.is_empty() {
             assert!(
                 start.as_slice() < end.as_slice(),
@@ -744,11 +759,11 @@ pub fn validate_split_coverage(
     // If parent was validated, children cannot exceed MAX_KEY_SIZE.
     // This assert catches logic bugs where specs are constructed without validation.
     for &(_, child) in &indexed {
-        debug_assert!(
+        assert!(
             child.key_range_start().len() <= MAX_KEY_SIZE,
             "child start key exceeds MAX_KEY_SIZE"
         );
-        debug_assert!(
+        assert!(
             child.key_range_end().len() <= MAX_KEY_SIZE || child.key_range_end().is_empty(),
             "child end key exceeds MAX_KEY_SIZE"
         );
@@ -818,6 +833,8 @@ pub fn validate_residual_split(
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
     use crate::test_util::{
         arb_bounded_shard_spec, arb_bounded_shard_spec_with_metadata, arb_shard_spec,
@@ -859,75 +876,29 @@ mod tests {
     // ShardSpec construction
     // -------------------------------------------------------------------
 
-    // (label, spec, expected_start, expected_end, start_ub, end_ub, full_ub)
-    type ConstructionCase<'a> = (&'a str, ShardSpec, &'a [u8], &'a [u8], bool, bool, bool);
+    #[rstest]
+    #[case::unbounded(ShardSpec::unbounded(), b"" as &[u8], b"" as &[u8], true, true, true)]
+    #[case::bounded_a_m(ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()), b"a", b"m", false, false, false)]
+    #[case::start_unbounded(ShardSpec::with_range(vec![], b"m".to_vec()), b"", b"m", true, false, false)]
+    #[case::end_unbounded(ShardSpec::with_range(b"m".to_vec(), vec![]), b"m", b"", false, true, false)]
+    fn shard_spec_construction_truth_table(
+        #[case] spec: ShardSpec,
+        #[case] exp_start: &[u8],
+        #[case] exp_end: &[u8],
+        #[case] start_ub: bool,
+        #[case] end_ub: bool,
+        #[case] full_ub: bool,
+    ) {
+        assert_eq!(spec.key_range_start(), exp_start);
+        assert_eq!(spec.key_range_end(), exp_end);
+        assert_eq!(spec.is_start_unbounded(), start_ub);
+        assert_eq!(spec.is_end_unbounded(), end_ub);
+        assert_eq!(spec.is_unbounded(), full_ub);
+    }
 
     #[test]
-    fn shard_spec_construction_truth_table() {
-        let cases: &[ConstructionCase<'_>] = &[
-            (
-                "unbounded",
-                ShardSpec::unbounded(),
-                b"",
-                b"",
-                true,
-                true,
-                true,
-            ),
-            (
-                "bounded [a,m)",
-                ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-                b"a",
-                b"m",
-                false,
-                false,
-                false,
-            ),
-            (
-                "start-unbounded [,m)",
-                ShardSpec::with_range(vec![], b"m".to_vec()),
-                b"",
-                b"m",
-                true,
-                false,
-                false,
-            ),
-            (
-                "end-unbounded [m,)",
-                ShardSpec::with_range(b"m".to_vec(), vec![]),
-                b"m",
-                b"",
-                false,
-                true,
-                false,
-            ),
-        ];
-
-        for (label, spec, exp_start, exp_end, start_ub, end_ub, full_ub) in cases {
-            assert_eq!(
-                spec.key_range_start(),
-                *exp_start,
-                "{label}: key_range_start"
-            );
-            assert_eq!(spec.key_range_end(), *exp_end, "{label}: key_range_end");
-            assert_eq!(
-                spec.is_start_unbounded(),
-                *start_ub,
-                "{label}: is_start_unbounded"
-            );
-            assert_eq!(
-                spec.is_end_unbounded(),
-                *end_ub,
-                "{label}: is_end_unbounded"
-            );
-            assert_eq!(spec.is_unbounded(), *full_ub, "{label}: is_unbounded");
-        }
-
-        // Unbounded spec also has empty metadata.
-        assert!(
-            ShardSpec::unbounded().metadata().is_empty(),
-            "unbounded: metadata"
-        );
+    fn shard_spec_unbounded_has_empty_metadata() {
+        assert!(ShardSpec::unbounded().metadata().is_empty());
     }
 
     #[test]
@@ -940,6 +911,28 @@ mod tests {
     #[should_panic(expected = "start must be strictly less than end")]
     fn shard_spec_equal_bounds_panics() {
         let _ = ShardSpec::with_range(b"a".to_vec(), b"a".to_vec());
+    }
+
+    #[test]
+    #[should_panic(expected = "key too large")]
+    fn with_range_panics_on_oversized_start_key() {
+        let _ = ShardSpec::with_range(vec![0x01; MAX_KEY_SIZE + 1], vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "key too large")]
+    fn with_range_panics_on_oversized_end_key() {
+        let _ = ShardSpec::with_range(vec![], vec![0xFF; MAX_KEY_SIZE + 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "metadata too large")]
+    fn with_range_and_metadata_panics_on_oversized_metadata() {
+        let _ = ShardSpec::with_range_and_metadata(
+            b"a".to_vec(),
+            b"z".to_vec(),
+            vec![0xAA; MAX_METADATA_SIZE + 1],
+        );
     }
 
     // -------------------------------------------------------------------

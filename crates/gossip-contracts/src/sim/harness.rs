@@ -161,6 +161,88 @@ pub enum RejectionKind {
     Other,
 }
 
+impl From<AcquireError> for RejectionKind {
+    fn from(e: AcquireError) -> Self {
+        match e {
+            AcquireError::ShardTerminal { .. } => Self::TerminalState,
+            AcquireError::ShardNotFound { .. } => Self::ShardNotFound,
+            AcquireError::TenantMismatch { .. } => Self::TenantMismatch,
+            AcquireError::AlreadyLeased { .. } => Self::AlreadyLeased,
+        }
+    }
+}
+
+impl From<RenewError> for RejectionKind {
+    fn from(e: RenewError) -> Self {
+        match e {
+            RenewError::StaleFence { .. } => Self::StaleFence,
+            RenewError::LeaseExpired { .. } => Self::LeaseExpired,
+            RenewError::ShardTerminal { .. } => Self::TerminalState,
+            RenewError::ShardNotFound { .. } => Self::ShardNotFound,
+            RenewError::TenantMismatch { .. } => Self::TenantMismatch,
+        }
+    }
+}
+
+impl From<CheckpointError> for RejectionKind {
+    fn from(e: CheckpointError) -> Self {
+        match e {
+            CheckpointError::StaleFence { .. } => Self::StaleFence,
+            CheckpointError::LeaseExpired { .. } => Self::LeaseExpired,
+            CheckpointError::ShardTerminal { .. } => Self::TerminalState,
+            CheckpointError::OpIdConflict { .. } => Self::OpIdConflict,
+            CheckpointError::CursorRegression { .. } => Self::CursorRegression,
+            CheckpointError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
+            CheckpointError::ShardNotFound { .. } => Self::ShardNotFound,
+            CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
+            CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
+        }
+    }
+}
+
+impl From<CompleteError> for RejectionKind {
+    fn from(e: CompleteError) -> Self {
+        match e {
+            CompleteError::StaleFence { .. } => Self::StaleFence,
+            CompleteError::LeaseExpired { .. } => Self::LeaseExpired,
+            CompleteError::ShardTerminal { .. } => Self::TerminalState,
+            CompleteError::OpIdConflict { .. } => Self::OpIdConflict,
+            CompleteError::CursorRegression { .. } => Self::CursorRegression,
+            CompleteError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
+            CompleteError::ShardNotFound { .. } => Self::ShardNotFound,
+            CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
+            CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
+        }
+    }
+}
+
+impl From<ParkError> for RejectionKind {
+    fn from(e: ParkError) -> Self {
+        match e {
+            ParkError::StaleFence { .. } => Self::StaleFence,
+            ParkError::LeaseExpired { .. } => Self::LeaseExpired,
+            ParkError::ShardTerminal { .. } => Self::TerminalState,
+            ParkError::OpIdConflict { .. } => Self::OpIdConflict,
+            ParkError::ShardNotFound { .. } => Self::ShardNotFound,
+            ParkError::TenantMismatch { .. } => Self::TenantMismatch,
+        }
+    }
+}
+
+impl From<SplitError> for RejectionKind {
+    fn from(e: SplitError) -> Self {
+        match e {
+            SplitError::StaleFence { .. } => Self::StaleFence,
+            SplitError::LeaseExpired { .. } => Self::LeaseExpired,
+            SplitError::ShardTerminal { .. } => Self::TerminalState,
+            SplitError::OpIdConflict { .. } => Self::OpIdConflict,
+            SplitError::SplitInvalid(_) => Self::SplitValidation,
+            SplitError::ShardNotFound { .. } => Self::ShardNotFound,
+            SplitError::TenantMismatch { .. } => Self::TenantMismatch,
+        }
+    }
+}
+
 /// Typed event category for counting (no payload).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SimEventKind {
@@ -529,14 +611,7 @@ impl CoordinationSim {
 
                 SimEvent::AcquireOk { fence }
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    AcquireError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    AcquireError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    AcquireError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                    AcquireError::AlreadyLeased { .. } => RejectionKind::AlreadyLeased,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -576,15 +651,7 @@ impl CoordinationSim {
                     new_deadline: result.new_deadline,
                 }
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    RenewError::StaleFence { .. } => RejectionKind::StaleFence,
-                    RenewError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    RenewError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    RenewError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    RenewError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -614,19 +681,7 @@ impl CoordinationSim {
                     .insert(ck, (op_id, cursor, worker, key));
                 SimEvent::CheckpointOk
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
-                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
-                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
-                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -652,19 +707,7 @@ impl CoordinationSim {
                 self.active_shard_keys.retain(|k| *k != key);
                 SimEvent::CompleteOk
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    CompleteError::StaleFence { .. } => RejectionKind::StaleFence,
-                    CompleteError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    CompleteError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    CompleteError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    CompleteError::CursorRegression { .. } => RejectionKind::CursorRegression,
-                    CompleteError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
-                    CompleteError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    CompleteError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                    CompleteError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -687,16 +730,7 @@ impl CoordinationSim {
                 self.active_shard_keys.retain(|k| *k != key);
                 SimEvent::ParkOk
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    ParkError::StaleFence { .. } => RejectionKind::StaleFence,
-                    ParkError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    ParkError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    ParkError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    ParkError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    ParkError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -706,7 +740,7 @@ impl CoordinationSim {
 
     /// Look up a shard's spec from the coordinator.
     fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
-        match self.coordinator.shards().get(&(self.tenant, key)) {
+        match self.coordinator.shard_lookup(&self.tenant, &key) {
             Some(record) => Ok(record.spec.clone()),
             None => Err(SimEvent::Rejected {
                 kind: RejectionKind::ShardNotFound,
@@ -795,17 +829,7 @@ impl CoordinationSim {
                 self.active_shard_keys.retain(|k| *k != key);
                 SimEvent::SplitReplaceOk { children }
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    SplitError::StaleFence { .. } => RejectionKind::StaleFence,
-                    SplitError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    SplitError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    SplitError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    SplitError::SplitInvalid(_) => RejectionKind::SplitValidation,
-                    SplitError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    SplitError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -823,8 +847,7 @@ impl CoordinationSim {
         };
         let parent_cursor_key = self
             .coordinator
-            .shards()
-            .get(&(self.tenant, key))
+            .shard_lookup(&self.tenant, &key)
             .and_then(|r| r.cursor.last_key().map(|k| k.to_vec()));
 
         let start = parent_spec.key_range_start();
@@ -880,17 +903,7 @@ impl CoordinationSim {
                 self.active_shard_keys.push(residual_key);
                 SimEvent::SplitResidualOk { residual }
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    SplitError::StaleFence { .. } => RejectionKind::StaleFence,
-                    SplitError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    SplitError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    SplitError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    SplitError::SplitInvalid(_) => RejectionKind::SplitValidation,
-                    SplitError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    SplitError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -938,19 +951,7 @@ impl CoordinationSim {
                     SimEvent::CheckpointOk
                 }
             },
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
-                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
-                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
-                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -995,19 +996,7 @@ impl CoordinationSim {
                 // was treated as a fresh execution. Still valid.
                 SimEvent::CheckpointOk
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
-                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
-                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
-                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -1052,19 +1041,7 @@ impl CoordinationSim {
                      fencing protocol is broken"
                 );
             }
-            Err(e) => SimEvent::Rejected {
-                kind: match e {
-                    CheckpointError::StaleFence { .. } => RejectionKind::StaleFence,
-                    CheckpointError::LeaseExpired { .. } => RejectionKind::LeaseExpired,
-                    CheckpointError::ShardTerminal { .. } => RejectionKind::TerminalState,
-                    CheckpointError::OpIdConflict { .. } => RejectionKind::OpIdConflict,
-                    CheckpointError::CursorRegression { .. } => RejectionKind::CursorRegression,
-                    CheckpointError::CursorOutOfBounds(_) => RejectionKind::CursorOutOfBounds,
-                    CheckpointError::ShardNotFound { .. } => RejectionKind::ShardNotFound,
-                    CheckpointError::TenantMismatch { .. } => RejectionKind::TenantMismatch,
-                    CheckpointError::CheckpointMissingKey => RejectionKind::CheckpointMissingKey,
-                },
-            },
+            Err(e) => SimEvent::Rejected { kind: e.into() },
         }
     }
 
@@ -1321,8 +1298,7 @@ impl CoordinationSim {
         // Look up this shard's actual spec bounds from the coordinator.
         let (spec_start, spec_end) = self
             .coordinator
-            .shards()
-            .get(&(self.tenant, key))
+            .shard_lookup(&self.tenant, &key)
             .map(|r| {
                 (
                     r.spec.key_range_start().to_vec(),
@@ -1455,8 +1431,7 @@ impl CoordinationSim {
         for key in &self.shard_keys {
             let record = self
                 .coordinator
-                .shards()
-                .get(&(self.tenant, *key))
+                .shard_lookup(&self.tenant, key)
                 .expect("shard key missing from coordinator — registration bug");
             if !record.status.is_terminal() {
                 return false;
