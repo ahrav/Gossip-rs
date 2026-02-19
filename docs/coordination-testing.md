@@ -222,9 +222,10 @@ random calls shifts counts but must not break behavioral assertions.
 | `deterministic_replay_cross_config` | Runs each config twice | Field-identical reports (`event_counts`, `ops_executed`, `end_time`) |
 | `all_event_kinds_enumerated` | — | Tripwire: `ALL_EVENT_KINDS.len() == 15` catches variant additions |
 
-Event coverage checks are fault-level-dependent: `SunnyDay` cannot produce
-`WorkerPaused`/`WorkerResumed`, so those are only required under
-`Stormy`/`Radioactive`.
+Event coverage checks are fault-level-dependent: under `SunnyDay` with a
+small op budget, `WorkerPaused`/`WorkerResumed` may or may not appear
+depending on the PRNG sequence, so those are only required under
+`Stormy`/`Radioactive` where higher op counts make them reliable.
 
 ### Mega Simulation Tests (`mega_sim_tests.rs`)
 
