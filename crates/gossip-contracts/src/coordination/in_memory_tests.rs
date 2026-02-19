@@ -1491,8 +1491,8 @@ use crate::coordination::shard_spec::ShardLimitScope;
 
 /// Standard [`RunConfig`] for run-management tests.
 ///
-/// Uses `CursorSemantics::Completed`, a 30-tick checkpoint interval,
-/// and an error threshold of 5. The specific values are not critical;
+/// Uses `CursorSemantics::Completed`, a 30-tick lease duration,
+/// and max shard retries of 5. The specific values are not critical;
 /// what matters is that they are valid and consistent across tests.
 fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
@@ -2934,9 +2934,10 @@ enum Op {
 ///
 /// Weights are tuned to produce realistic mixes: Checkpoint is most
 /// common (4x) because it is the most frequent production operation;
-/// Acquire (3x) and Renew/TimeAdvance (2x each) ensure frequent lease
-/// churn; terminal and split operations are rare (1x each) to avoid
-/// sequences that immediately deadlock on a terminal shard.
+/// Acquire (3x), Complete (2x), and Renew/TimeAdvance (2x each) ensure
+/// frequent lease and lifecycle churn; Park, split, and run-level
+/// terminal operations are rare (1x each) to avoid sequences that
+/// immediately deadlock on a terminal shard.
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => (0u8..4).prop_map(|w| Op::Acquire { worker: w }),
@@ -2956,11 +2957,13 @@ fn arb_op() -> impl Strategy<Value = Op> {
 
 /// Applies a single [`Op`] to the coordinator, threading time and op counter.
 ///
-/// Returns `(new_time, new_op_counter)`. Operations that consume an OpId
-/// increment the counter; operations that fail or do not use an OpId
-/// leave it unchanged. All errors are silently discarded because the
-/// property tests assert invariants *after* each op, not individual
-/// success/failure outcomes.
+/// Returns `(new_time, new_op_counter)`. Operations that are dispatched
+/// with an OpId always increment the counter (even if the coordinator
+/// rejects the operation). Operations that cannot be dispatched (no
+/// lease available, invalid cursor) or that do not use an OpId (Acquire,
+/// Renew, TimeAdvance) leave the counter unchanged. All errors are
+/// silently discarded because the property tests assert invariants
+/// *after* each op, not individual success/failure outcomes.
 fn apply_op(
     coord: &mut InMemoryCoordinator,
     op: &Op,
