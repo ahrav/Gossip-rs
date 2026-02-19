@@ -1222,7 +1222,7 @@ impl InMemoryCoordinator {
 impl RunManagement for InMemoryCoordinator {
     /// Create a new run in `Initializing` status with no shards.
     ///
-    /// The config is validated eagerly via [`RunConfig::assert_valid`].
+    /// The config is validated eagerly via `RunConfig::assert_valid`.
     /// Duplicate run IDs within the same tenant are rejected. The run
     /// must subsequently receive a [`register_shards`](Self::register_shards)
     /// call to transition to `Active`.
