@@ -1,82 +1,56 @@
-//! Tests for `InMemoryCoordinator`.
+//! Unit tests for [`InMemoryCoordinator`], the in-memory reference
+//! implementation of the coordination backend.
 //!
-//! Extracted from `in_memory.rs` to reduce file size. Both `mod tests`
-//! and `mod prop_tests` content lives here as top-level items.
+//! # Testing strategy
+//!
+//! Each test targets **one operation or one edge case** of the
+//! `CoordinationBackend` trait. Tests are deterministic: logical time is
+//! advanced manually via [`now(t)`](crate::coordination::test_fixtures::now),
+//! and shared fixtures from [`test_fixtures`] supply canonical identities
+//! (tenant, run, shard, worker) so every test starts from the same baseline.
+//!
+//! Property-based tests (proptest) complement the unit tests by generating
+//! random operation sequences and verifying structural invariants that must
+//! hold regardless of order.
+//!
+//! # Relationship to other test modules
+//!
+//! | Module | Focus |
+//! |--------|-------|
+//! | **This module** | Unit tests: one backend operation per test |
+//! | [`conformance_tests`] | Invariant interactions: two or more safety invariants composed |
+//! | [`scenario_tests`] | End-to-end multi-step workflows |
+//!
+//! # Section organization
+//!
+//! Deterministic unit tests are grouped by the operation they exercise:
+//! acquire, renew, checkpoint, complete, park, split (replace and residual),
+//! fencing, op-log eviction, idempotent replay, tenant isolation, shard
+//! count limits, run lifecycle, unpark, and list_shards filtering. Two
+//! integration tests (`full_lifecycle_*`) chain multiple operations to
+//! verify end-to-end shard progression.
+//!
+//! The final section contains property-based tests that fuzz random
+//! operation sequences against the coordinator, asserting structural
+//! invariants (record consistency, fence monotonicity, cursor monotonicity,
+//! idempotent replay) after every step.
 
 use super::*;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::test_fixtures::{
+    LEASE_DURATION, acquire_shard, now, seeded_coordinator, test_cursor, test_key, test_run,
+    test_shard, test_spec, test_tenant, test_worker,
+};
 use crate::identity::{FenceEpoch, RunId};
 use gossip_stdx::RingBuffer;
 
-// -- Test fixtures ---------------------------------------------------
-
-fn test_tenant() -> TenantId {
-    TenantId::from_bytes([0x01; 32])
-}
-
-fn test_run() -> RunId {
-    RunId::from_raw(1)
-}
-
-fn test_shard() -> ShardId {
-    ShardId::from_raw(10)
-}
-
-fn test_spec() -> ShardSpec {
-    ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
-}
-
-fn test_worker(id: u64) -> WorkerId {
-    WorkerId::from_raw(id)
-}
-
-fn now(t: u64) -> LogicalTime {
-    LogicalTime::from_raw(t)
-}
-
-const LEASE_DURATION: u64 = 100;
-
-fn seeded_coordinator() -> InMemoryCoordinator {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    // Use a high op_id to avoid conflicts with prop test op counters
-    // which start at 1.
-    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
-    coord
-        .create_run(now(1), test_tenant(), test_run(), config)
-        .unwrap();
-    let shards = vec![InitialShard::new(
-        test_shard(),
-        test_spec(),
-        Cursor::initial(),
-    )];
-    let _ = coord
-        .register_shards(
-            now(2),
-            test_tenant(),
-            test_run(),
-            &shards,
-            OpId::from_raw(u64::MAX),
-        )
-        .unwrap();
-    coord
-}
-
-fn acquire_shard(coord: &mut InMemoryCoordinator, t: u64, worker_id: u64) -> Lease {
-    let result = coord
-        .acquire_and_restore(now(t), test_tenant(), test_key(), test_worker(worker_id))
-        .expect("acquire should succeed");
-    result.lease
-}
-
-fn test_key() -> ShardKey {
-    ShardKey::new(test_run(), test_shard())
-}
-
-fn test_cursor(key: &[u8]) -> Cursor {
-    Cursor::with_last_key(key.to_vec())
-}
-
 // -- acquire_and_restore tests ----------------------------------------
+//
+// Validates the shard acquisition contract: successful acquire returns a
+// valid lease (correct owner, fence bumped from INITIAL, deadline =
+// now + LEASE_DURATION), the shard snapshot is Active, and the operation
+// rejects non-existent shards, already-leased shards, and terminal shards.
+// Also verifies that a lease can be stolen after expiry.
 
 #[test]
 fn acquire_basic() {
@@ -136,7 +110,7 @@ fn acquire_terminal_rejected() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
-    // Complete the shard (terminal).
+    // Drive shard to terminal (Done) so we can test that acquire rejects it.
     let cursor = test_cursor(b"m");
     let _ = coord
         .complete(now(2), test_tenant(), &lease, cursor, OpId::from_raw(1))
@@ -149,6 +123,9 @@ fn acquire_terminal_rejected() {
 }
 
 // -- renew tests -------------------------------------------------------
+//
+// Lease renewal extends the deadline without bumping the fence. A stale
+// fence (from a superseded lease) is rejected.
 
 #[test]
 fn renew_basic() {
@@ -184,6 +161,10 @@ fn renew_stale_fence() {
 }
 
 // -- checkpoint tests --------------------------------------------------
+//
+// Checkpointing persists a cursor position. Verifies basic execution
+// and that reusing the same OpId with a different payload triggers
+// OpIdConflict (bounded idempotency).
 
 #[test]
 fn checkpoint_basic() {
@@ -215,6 +196,9 @@ fn checkpoint_op_id_conflict() {
 }
 
 // -- complete tests ----------------------------------------------------
+//
+// Completing a shard transitions it to Done (terminal). Subsequent
+// acquire attempts must fail with ShardTerminal.
 
 #[test]
 fn complete_basic() {
@@ -235,6 +219,9 @@ fn complete_basic() {
 }
 
 // -- park tests --------------------------------------------------------
+//
+// Parking a shard transitions it to Parked (terminal from the worker's
+// perspective, but reversible via unpark_shard admin op).
 
 #[test]
 fn park_basic() {
@@ -254,6 +241,11 @@ fn park_basic() {
 }
 
 // -- split_replace tests -----------------------------------------------
+//
+// split_replace atomically retires the parent shard (terminal, status=Split)
+// and spawns N child shards. Tests cover: basic execution, idempotent
+// replay (same OpId+payload returns Replayed with identical child IDs),
+// and deterministic child ID generation across independent coordinators.
 
 #[test]
 fn split_replace_basic() {
@@ -345,6 +337,11 @@ fn split_replace_child_id_determinism() {
 }
 
 // -- split_residual tests ----------------------------------------------
+//
+// split_residual shrinks the parent's key range and spawns a residual
+// child for the remainder. Unlike split_replace, the parent stays Active.
+// Tests cover: basic execution, cursor-out-of-bounds rejection (cursor
+// must fall within the new parent range), and parent continuity after split.
 
 #[test]
 fn split_residual_basic() {
@@ -412,6 +409,12 @@ fn split_residual_cursor_out_of_bounds() {
 }
 
 // -- Op-log eviction edge case ----------------------------------------
+//
+// The per-shard op-log is a 16-entry FIFO ring buffer. Once an entry is
+// evicted, a retry of that OpId is treated as a fresh operation (no
+// replay detection). This test pushes 17 ops to evict the first, then
+// retries it and verifies it is rejected on semantic grounds (cursor
+// regression) rather than recognized as a replay.
 
 #[test]
 fn op_log_eviction_treats_old_op_as_new() {
@@ -425,7 +428,7 @@ fn op_log_eviction_treats_old_op_as_new() {
         let _ = coord
             .checkpoint(now(i + 1), test_tenant(), &lease, cursor, OpId::from_raw(i))
             .unwrap();
-        cursor_key[0] = b'b' + (i as u8).min(23); // advance within range
+        cursor_key[0] = b'b' + (i as u8).min(23); // advance monotonically, clamped to stay within [a, z)
     }
 
     // Retry the first op — it was evicted, so it's treated as a new op
@@ -441,11 +444,15 @@ fn op_log_eviction_treats_old_op_as_new() {
             OpId::from_raw(1),
         )
         .unwrap_err();
-    // After eviction, it's treated as new — cursor regression check fails.
     assert!(matches!(err, CheckpointError::CursorRegression { .. }));
 }
 
 // -- Fencing mutual exclusion -----------------------------------------
+//
+// Validates the Kleppmann-style fencing invariant: once a new worker
+// acquires a shard (bumping the fence epoch), the previous lease holder
+// is locked out of all mutations (checkpoint, complete, park), while the
+// current holder can proceed.
 
 #[test]
 fn only_latest_fence_holder_can_mutate() {
@@ -512,6 +519,12 @@ fn only_latest_fence_holder_can_mutate() {
 }
 
 // -- split_residual replay via spawned.contains() ---------------------
+//
+// split_residual has a two-tier replay detection: (1) the op-log, and
+// (2) the `spawned` set on the shard record. If the op-log entry has
+// been evicted, the coordinator can still detect a replay by checking
+// whether the residual ShardId is already in `spawned`. This test
+// forces eviction of the op-log entry and verifies the fallback path.
 
 #[test]
 fn split_residual_replay_via_spawned_after_eviction() {
@@ -568,15 +581,27 @@ fn split_residual_replay_via_spawned_after_eviction() {
 }
 
 // -- spawn-cap guard tests -----------------------------------------------
+//
+// Each shard tracks a `spawned` set of child ShardIds. When this set
+// reaches MAX_SPAWNED_PER_SHARD, further splits are rejected with
+// SplitInvalid. This prevents unbounded recursive splitting.
 
-/// Helper to create a derived ShardId (bit 63 set).
+/// Creates a derived `ShardId` by setting bit 63 on `base`.
+///
+/// Derived IDs are what the coordinator generates for split children.
+/// This helper constructs them directly for pre-populating the `spawned`
+/// set in [`coordinator_with_spawned_count`].
 fn derived_shard_id(base: u64) -> ShardId {
     ShardId::from_raw(base | (1u64 << 63))
 }
 
-/// Build a coordinator with a shard that already has `spawned_count`
-/// derived entries in `spawned`. The shard is Active with spec [a, z)
-/// and cursor at "d" (within the [a, m) split range).
+/// Builds a coordinator whose single shard already has `spawned_count`
+/// derived entries in its `spawned` set.
+///
+/// The shard is Active with spec `[a, z)` and cursor at `"d"` (within
+/// the standard `[a, m)` split range used by split tests). This setup
+/// lets spawn-cap tests start at an exact distance from the limit
+/// without performing actual split operations.
 fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
     let spawned: Vec<ShardId> = (0..spawned_count as u64)
         .map(|i| derived_shard_id(i + 1))
@@ -660,6 +685,11 @@ fn split_residual_below_cap_succeeds() {
 }
 
 // -- Idempotent replay after terminal state --------------------------------
+//
+// A terminal shard (Done or Parked) must still honor idempotent replay
+// for the operation that caused the terminal transition. Without this,
+// a client retry after a network timeout would get ShardTerminal instead
+// of the expected Replayed acknowledgment.
 
 #[test]
 fn complete_replay_after_terminal() {
@@ -705,6 +735,10 @@ fn park_replay_after_terminal() {
 }
 
 // -- OpIdConflict tests for split operations --------------------------------
+//
+// Reusing the same OpId with a different split plan (different split
+// point) must trigger OpIdConflict, not silently apply the new plan.
+// This is the bounded-idempotency safety check for split operations.
 
 #[test]
 fn split_replace_op_id_conflict() {
@@ -794,11 +828,11 @@ fn split_residual_op_id_conflict() {
 }
 
 // -- Lease deadline saturation ------------------------------------------------
-
-/// When `now + lease_duration` overflows, the deadline saturates to
-/// `LogicalTime::from_raw(u64::MAX)` instead of panicking. This produces
-/// a very-long lease, which is safe — it will still expire eventually or
-/// be superseded by a fence bump.
+//
+// Exercises the u64 overflow edge case for lease deadlines. When
+// now + lease_duration would exceed u64::MAX, the deadline must
+// saturate rather than panic. The resulting very-long lease is safe
+// because fence bumps can still supersede it.
 #[test]
 fn acquire_saturates_on_lease_deadline_overflow() {
     let mut coord = seeded_coordinator();
@@ -821,7 +855,16 @@ fn acquire_saturates_on_lease_deadline_overflow() {
 }
 
 // -- Shard count limit tests -----------------------------------------------
+//
+// The coordinator enforces two independent shard count limits: per-tenant
+// and global. split_replace and split_residual must reject the operation
+// when adding children would breach either limit. Limits are configured
+// via `InMemoryCoordinator::with_limits`.
 
+/// Returns a tenant distinct from [`test_tenant()`] for isolation tests.
+///
+/// Uses `[0x02; 32]` so it is deterministic and visually distinguishable
+/// from `test_tenant()` (`[0x01; 32]`).
 fn other_tenant() -> TenantId {
     TenantId::from_bytes([0x02; 32])
 }
@@ -1056,6 +1099,11 @@ fn split_residual_wrong_tenant_returns_not_found() {
 }
 
 // -- split_residual replay via op-log (before eviction) --------------------
+//
+// Exercises the primary replay path for split_residual: the op-log entry
+// is still present (no eviction). Verifies that same OpId+plan returns
+// Replayed with the same residual ShardId, and that same OpId+different
+// plan returns OpIdConflict.
 
 #[test]
 fn split_residual_replay_via_oplog_returns_replayed() {
@@ -1110,6 +1158,11 @@ fn split_residual_replay_via_oplog_returns_replayed() {
 }
 
 // -- split_residual then continued parent ops ---------------------------
+//
+// After split_residual, the parent's key range is shrunk. Operations on
+// the parent must respect the new bounds: checkpoints within the shrunk
+// range succeed, checkpoints outside it fail with CursorOutOfBounds,
+// and complete within the shrunk range succeeds.
 
 #[test]
 fn split_residual_parent_continues_with_shrunk_range() {
@@ -1179,6 +1232,12 @@ fn split_residual_parent_continues_with_shrunk_range() {
 }
 
 // -- Lifecycle integration tests -----------------------------------------------
+//
+// Multi-step tests that chain operations into complete shard lifecycles.
+// These verify that the coordinator's state machine transitions compose
+// correctly across acquire, checkpoint, split, re-acquire, and complete.
+// The first test exercises a single split_residual; the second performs
+// two successive splits to verify iterative parent narrowing.
 
 #[test]
 fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
@@ -1418,18 +1477,39 @@ fn lifecycle_split_residual_twice_then_complete_children() {
 }
 
 // -- RunManagement tests --------------------------------------------------
+//
+// Tests for the RunManagement trait: create_run, register_shards,
+// complete_run, fail_run, cancel_run, unpark_shard, list_shards, and
+// create_run_with_shards. Covers the run state machine
+// (Initializing -> Active -> Done|Failed|Cancelled), idempotent replay,
+// OpIdConflict, wrong-status rejections, terminal irreversibility,
+// shard count limits on register_shards, and split-index visibility
+// (children appear in list_shards and get_run_progress after split).
 
 use crate::coordination::run::{InitialShard, RunConfig, RunManagement, RunStatus, ShardFilter};
 use crate::coordination::shard_spec::ShardLimitScope;
 
+/// Standard [`RunConfig`] for run-management tests.
+///
+/// Uses `CursorSemantics::Completed`, a 30-tick checkpoint interval,
+/// and an error threshold of 5. The specific values are not critical;
+/// what matters is that they are valid and consistent across tests.
 fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
 }
 
 // -- Split index consistency tests --
+//
+// After a split, child shards must be visible through the run-level
+// APIs (get_run_progress, list_shards). These tests verify the
+// coordinator's split index is updated atomically with the split.
 
-/// Setup helper: create a run with one root shard [a,z), register it,
-/// and acquire a lease. Returns `(coordinator, lease)`.
+/// Creates a coordinator with a fully initialized run and an acquired lease.
+///
+/// Performs: `create_run` -> `register_shards` (one shard `[a,z)`) ->
+/// `acquire_and_restore`. Returns `(coordinator, lease)` ready for
+/// split, park, or completion tests. Time advances through t=1..3;
+/// callers should start at t=4.
 fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord
@@ -1457,7 +1537,11 @@ fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
     (coord, lease)
 }
 
-/// Perform a split_replace on [a,z) into [a,m) and [m,z).
+/// Performs the canonical `split_replace` on `[a,z)` into `[a,m)` and `[m,z)`.
+///
+/// Uses t=4 and OpId=2. Panics on failure. Intended to be called after
+/// [`coordinator_with_run_and_lease`] to set up a post-split state for
+/// index-consistency and filter tests.
 fn do_split_replace(coord: &mut InMemoryCoordinator, lease: &Lease) {
     let plan = SplitReplacePlan::try_new(vec![
         SplitReplaceChild::new(
@@ -1554,6 +1638,10 @@ fn split_residual_child_visible_in_list_shards() {
 }
 
 // -- Shard count limit tests for register_shards --
+//
+// register_shards is subject to the same per-tenant and global shard
+// count limits as split operations. These tests verify that bulk
+// registration rejects the entire batch when limits would be breached.
 
 #[test]
 fn register_shards_exceeds_per_tenant_limit() {
@@ -1687,6 +1775,10 @@ fn register_shards_within_limits_succeeds() {
 }
 
 // -- register_shards cursor preservation (regression guard) --
+//
+// Shards can be registered with a non-initial cursor (e.g., resuming a
+// previous run). The coordinator must preserve the cursor as-is rather
+// than resetting it to initial.
 
 #[test]
 fn register_shards_preserves_non_initial_cursors() {
@@ -1722,8 +1814,18 @@ fn register_shards_preserves_non_initial_cursors() {
 }
 
 // -- complete_run tests -------------------------------------------------------
+//
+// Transitions a run from Active to Done. Verifies: happy path, rejection
+// from Initializing state, terminal irreversibility (Done -> Done fails),
+// not-found error, and idempotent replay.
 
-/// Helper: create a run in Active state with one shard registered.
+/// Creates a coordinator with a run in Active state (one shard registered).
+///
+/// Performs: `create_run` -> `register_shards`. Unlike
+/// [`coordinator_with_run_and_lease`], this does **not** acquire a lease,
+/// making it suitable for run-level operation tests (complete_run,
+/// fail_run, cancel_run) that do not need a shard lease. Time advances
+/// through t=1..2; callers should start at t=3.
 fn active_run_coordinator() -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord
@@ -1826,6 +1928,10 @@ fn complete_run_idempotent_replay() {
 }
 
 // -- fail_run tests -----------------------------------------------------------
+//
+// Transitions a run from Active to Failed. Mirrors complete_run tests:
+// happy path, wrong-status rejection, terminal irreversibility, and
+// idempotent replay.
 
 #[test]
 fn fail_run_happy_path() {
@@ -1898,6 +2004,10 @@ fn fail_run_idempotent_replay() {
 }
 
 // -- cancel_run tests ---------------------------------------------------------
+//
+// cancel_run is the only terminal transition allowed from Initializing
+// (in addition to Active). Covers both source states, terminal
+// irreversibility, and idempotent replay.
 
 #[test]
 fn cancel_run_from_initializing() {
@@ -1965,6 +2075,9 @@ fn cancel_run_idempotent_replay() {
 }
 
 // -- Terminal ops timestamp tests ---------------------------------------------
+//
+// All three terminal run transitions (complete, fail, cancel) must
+// persist the timestamp of the transition in `completed_at`.
 
 #[test]
 fn terminal_ops_set_completed_at() {
@@ -2006,6 +2119,10 @@ fn terminal_ops_set_completed_at() {
 }
 
 // -- OpIdConflict across run operations ---------------------------------------
+//
+// Run-level operations share a single per-run op-log. An OpId used by
+// register_shards cannot be reused by complete_run (different payload
+// hash), even though they are different operation types.
 
 #[test]
 fn run_op_id_conflict_across_ops() {
@@ -2022,6 +2139,13 @@ fn run_op_id_conflict_across_ops() {
 }
 
 // -- unpark_shard tests -------------------------------------------------------
+//
+// unpark_shard is an admin operation that transitions Parked -> Active,
+// bumps the fence epoch (invalidating any stale leases), clears the
+// park_reason, and preserves the cursor. Tests cover: happy path,
+// fence bump verification, cursor preservation, idempotent replay,
+// not-parked rejection, not-found error, full park->unpark->reacquire
+// workflow, and rejection when the owning run is terminal.
 
 #[test]
 fn unpark_shard_happy_path() {
@@ -2229,6 +2353,10 @@ fn unpark_then_reacquire_and_checkpoint() {
 }
 
 // -- unpark_shard run-status check tests -----------------------------------
+//
+// Unparking must be blocked when the owning run has reached a terminal
+// state (Cancelled or Done). Reactivating a shard in a dead run would
+// violate the run lifecycle contract.
 
 #[test]
 fn unpark_shard_rejected_when_run_cancelled() {
@@ -2303,6 +2431,11 @@ fn unpark_shard_rejected_when_run_done() {
 }
 
 // -- register_shards error path tests -----------------------------------------
+//
+// Covers register_shards edge cases: idempotent replay (same OpId +
+// payload returns Replayed with identical shard IDs), OpIdConflict
+// (same OpId + different shard list), wrong-status rejection (run
+// already Active), and not-found error.
 
 #[test]
 fn register_shards_idempotent_replay() {
@@ -2413,6 +2546,11 @@ fn register_shards_run_not_found() {
 }
 
 // -- create_run_with_shards tests ---------------------------------------------
+//
+// Atomic create+register convenience method. Covers: fresh creation
+// (run lands in Active immediately), idempotent retry with same config
+// and OpId, and config mismatch detection on retry with different
+// RunConfig.
 
 #[test]
 fn create_run_with_shards_fresh() {
@@ -2512,6 +2650,11 @@ fn create_run_with_shards_config_mismatch() {
 }
 
 // -- Full run lifecycle end-to-end test ----------------------------------------
+//
+// Exercises the complete run lifecycle: create_run -> register_shards ->
+// acquire -> checkpoint -> complete (per shard) -> verify progress ->
+// complete_run. Verifies that all state transitions compose correctly
+// and that run progress reflects shard completion accurately.
 
 #[test]
 fn full_run_lifecycle_create_register_process_complete() {
@@ -2612,6 +2755,10 @@ fn full_run_lifecycle_create_register_process_complete() {
 }
 
 // -- list_shards filter correctness tests -------------------------------------
+//
+// list_shards supports predicate-based filtering (active, available,
+// parked, root_only). Tests verify each filter correctly includes or
+// excludes shards based on status, lease state, and parentage.
 
 #[test]
 fn list_shards_filter_active() {
@@ -2742,11 +2889,19 @@ fn list_shards_filter_root_only() {
 // ============================================================================
 // Property tests
 // ============================================================================
+//
+// These tests use proptest to generate random operation sequences and verify
+// that structural invariants hold after every step. They complement the
+// deterministic unit tests above by exploring operation orderings and
+// parameter combinations that a human would not enumerate by hand.
 
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
 
-/// Operations that can be applied to the coordinator.
+/// The universe of operations that can be applied to a coordinator in the
+/// property tests. Each variant maps to one `CoordinationBackend` or
+/// `RunManagement` method. `TimeAdvance` simulates the passage of logical
+/// time (enabling lease expiry between operations).
 #[derive(Debug, Clone)]
 enum Op {
     Acquire {
@@ -2775,6 +2930,13 @@ enum Op {
     UnparkShard,
 }
 
+/// Proptest strategy that generates random coordinator operations.
+///
+/// Weights are tuned to produce realistic mixes: Checkpoint is most
+/// common (4x) because it is the most frequent production operation;
+/// Acquire (3x) and Renew/TimeAdvance (2x each) ensure frequent lease
+/// churn; terminal and split operations are rare (1x each) to avoid
+/// sequences that immediately deadlock on a terminal shard.
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => (0u8..4).prop_map(|w| Op::Acquire { worker: w }),
@@ -2792,7 +2954,13 @@ fn arb_op() -> impl Strategy<Value = Op> {
     ]
 }
 
-/// Apply a single `Op` to the coordinator, returning `(time, op_counter)`.
+/// Applies a single [`Op`] to the coordinator, threading time and op counter.
+///
+/// Returns `(new_time, new_op_counter)`. Operations that consume an OpId
+/// increment the counter; operations that fail or do not use an OpId
+/// leave it unchanged. All errors are silently discarded because the
+/// property tests assert invariants *after* each op, not individual
+/// success/failure outcomes.
 fn apply_op(
     coord: &mut InMemoryCoordinator,
     op: &Op,
@@ -2899,10 +3067,13 @@ fn apply_op(
 proptest! {
     #![proptest_config(miri_proptest_config())]
 
-    /// Random operation sequences preserve all invariants.
+    /// Fuzz test: random operation sequences must preserve shard record invariants.
     ///
-    /// After every operation (success or failure), all shard records
-    /// in the coordinator satisfy `assert_invariants()`.
+    /// Generates 1..100 random operations and applies them to a seeded
+    /// coordinator. After *every* operation (whether it succeeds or fails),
+    /// every shard record's `assert_invariants()` must pass. This catches
+    /// state-machine corruption that only manifests under unusual operation
+    /// orderings.
     #[test]
     fn random_ops_preserve_invariants(ops in proptest::collection::vec(arb_op(), 1..100)) {
         let mut coord = seeded_coordinator();
@@ -2921,7 +3092,11 @@ proptest! {
         }
     }
 
-    /// Fence epoch never decreases across acquisitions.
+    /// Fence epoch strictly increases across successive acquisitions.
+    ///
+    /// Generates 2..20 worker IDs, each acquiring the shard after the
+    /// previous lease expires. The fence epoch must be strictly greater
+    /// than the previous maximum after every successful acquisition.
     #[test]
     fn fence_monotonicity_property(
         worker_ids in proptest::collection::vec(0u8..4, 2..20),
@@ -2948,9 +3123,12 @@ proptest! {
         }
     }
 
-    /// Any idempotent operation (checkpoint, complete, park), when
-    /// replayed with the same op_id and identical payload, returns
-    /// `Replayed`.
+    /// Idempotent replay: any mutating operation (checkpoint, complete, park),
+    /// when replayed with the same OpId and identical payload, returns
+    /// `Replayed` rather than executing a second time or returning an error.
+    ///
+    /// Parameterized over random cursor keys, OpId values, and operation
+    /// kinds to exercise the replay path with diverse inputs.
     #[test]
     fn idempotent_replay_across_operations(
         cursor_key in b'b'..b'y',
@@ -3017,8 +3195,13 @@ proptest! {
         }
     }
 
-    /// Cursor monotonicity: cursor.last_key never regresses within
-    /// the same lease epoch.
+    /// Cursor monotonicity: within a single lease, checkpoint succeeds only
+    /// when the cursor advances (or stays equal), and is rejected with
+    /// `CursorRegression` when it would move backwards.
+    ///
+    /// Generates 2..20 random key bytes and attempts checkpoints in order.
+    /// Verifies that success implies `key >= max_seen` and regression
+    /// rejection implies `key < max_seen`.
     #[test]
     fn cursor_monotonicity_property(
         keys in proptest::collection::vec(b'a'..b'y', 2..20),

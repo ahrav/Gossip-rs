@@ -59,6 +59,11 @@ mod harness;
 mod invariants;
 mod worker;
 
+#[cfg(test)]
+mod mega_sim_tests;
+#[cfg(test)]
+mod sim_behavioral_tests;
+
 pub use harness::{CoordinationSim, RejectionKind, SimEvent, SimEventKind, SimOp, SimReport};
 pub use invariants::{InvariantChecker, InvariantViolation};
 pub use worker::SimWorker;
