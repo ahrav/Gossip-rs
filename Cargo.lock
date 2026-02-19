@@ -390,6 +390,7 @@ dependencies = [
  "ahash",
  "blake3",
  "criterion",
+ "gossip-stdx",
  "proptest",
  "rand",
  "rand_chacha",
@@ -417,6 +418,14 @@ version = "0.1.0"
 dependencies = [
  "gossip-contracts",
  "gossip-engine",
+]
+
+[[package]]
+name = "gossip-stdx"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "proptest",
 ]
 
 [[package]]

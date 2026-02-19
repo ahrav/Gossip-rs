@@ -1,0 +1,16 @@
+//! Shared low-level data structures for gossip-rs.
+//!
+//! This crate encapsulates `unsafe` internals (e.g., `MaybeUninit`-based
+//! storage) behind safe public APIs. It exists separately from
+//! `gossip-contracts` because that crate uses `#![forbid(unsafe_code)]`.
+//!
+//! # Miri testing
+//!
+//! All tests in this crate should be run under Miri to verify memory safety:
+//! ```sh
+//! cargo +nightly miri test -p gossip-stdx
+//! ```
+
+mod ring_buffer;
+
+pub use ring_buffer::{IntoIter, RingBuffer};

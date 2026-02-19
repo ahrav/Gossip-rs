@@ -6,6 +6,7 @@
 use super::*;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::identity::{FenceEpoch, RunId};
+use gossip_stdx::RingBuffer;
 
 // -- Test fixtures ---------------------------------------------------
 
@@ -593,7 +594,7 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
         FenceEpoch::INITIAL,
         None,
         spawned,
-        Vec::new(),
+        RingBuffer::new(),
     );
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord.seed_shard(record);
@@ -2499,7 +2500,7 @@ fn create_run_with_shards_config_mismatch() {
     );
 }
 
-// -- Full run lifecycle end-to-end test (F18) ---------------------------------
+// -- Full run lifecycle end-to-end test ----------------------------------------
 
 #[test]
 fn full_run_lifecycle_create_register_process_complete() {
@@ -2599,7 +2600,7 @@ fn full_run_lifecycle_create_register_process_complete() {
     assert_eq!(record.completed_at(), Some(now(9)));
 }
 
-// -- list_shards filter correctness tests (F19) -------------------------------
+// -- list_shards filter correctness tests -------------------------------------
 
 #[test]
 fn list_shards_filter_active() {

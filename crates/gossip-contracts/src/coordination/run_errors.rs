@@ -7,8 +7,9 @@
 //!
 //! Differs from `error.rs` in error composition: shard-level errors use a
 //! shared `CoordError` base with `From<CoordError>` narrowing per operation.
-//! Run-level errors are standalone per-operation enums with only
-//! `From<RunOpIdConflict>` for types that have an `OpIdConflict` variant.
+//! Run-level errors are standalone per-operation enums whose only shared
+//! conversion is `From<RunOpIdConflict>` (for types with an `OpIdConflict`
+//! variant); individual types may have additional operation-specific `From` impls.
 //!
 //! ## SEC-6: Hash Redaction via Opaque Wrapper
 //!

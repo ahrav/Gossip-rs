@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gossip-stdx",
     "crates/gossip-contracts",
     "crates/gossip-engine",
     "crates/gossip-scan-pipeline",
@@ -18,6 +19,7 @@ repository = "https://github.com/ahrav/gossip-rs"
 
 [workspace.dependencies]
 # Internal crate dependencies
+gossip-stdx = { path = "crates/gossip-stdx" }
 gossip-contracts = { path = "crates/gossip-contracts" }
 gossip-engine = { path = "crates/gossip-engine" }
 gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }

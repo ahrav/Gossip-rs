@@ -244,6 +244,36 @@ shims, or parallel old/new code paths will be rejected. No exceptions.
 
 <!-- end-no-versioning -->
 
+<!-- comment-policy-v1 -->
+
+## Comment Policy — Code Comments Are About Code
+
+Comments in source files must describe the code they annotate — its behavior,
+invariants, edge cases, or non-obvious reasoning. They must not reference
+external tracking systems.
+
+### Rules
+
+1. **No issue/tracking IDs in comments.** Do not embed beads IDs, finding
+   numbers (F4, C3, H9), priority tags (P0–P4), or any other external tracker
+   references in code comments. These belong in the tracker, not the source.
+2. **Descriptive text stays.** Section headers like `// -- Exact boundary tests --`
+   are fine. The tracking ID portion is what gets removed.
+3. **Code-internal naming schemes are fine.** Stable identifiers that exist
+   purely to cross-reference within the codebase (e.g., invariant labels S1–S7
+   in the simulation checker) are documentation, not tracking noise.
+4. **Comments explain *why*, not *what*.** Prefer comments that explain
+   non-obvious reasoning, invariants, or edge cases over comments that restate
+   what the code already says.
+
+### Enforcement
+
+Any PR that introduces external tracking IDs in code comments will be
+rejected. If a comment only makes sense when paired with an external tracker,
+rewrite it to stand on its own.
+
+<!-- end-comment-policy -->
+
 ## Rust Code Modification Workflow
 
 After modifying Rust code, ALWAYS run these steps:

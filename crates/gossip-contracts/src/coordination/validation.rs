@@ -137,13 +137,17 @@ pub fn validate_lease(
 /// Checks:
 /// 1. The new cursor has a `last_key` — an initial (keyless) cursor means
 ///    no data has been processed yet, so there is nothing to checkpoint.
-/// 2. Monotonicity: `new.last_key >= old.last_key` (lexicographic).
+/// 2. Monotonicity: `new.last_key` must not regress below `old.last_key`
+///    (lexicographic). `None → Some` is forward progress; `Some → None`
+///    and `Some(b) where b < a` are regressions.
 /// 3. Bounds: `new.last_key ∈ [spec.start, spec.end)`.
 ///
 /// # Preconditions
 ///
 /// The caller MUST call [`validate_lease`] before this function on every
-/// lease-gated code path. This function does not check lease validity.
+/// lease-gated code path. On idempotent paths, [`check_op_idempotency`]
+/// precedes both and may short-circuit before this function is reached.
+/// This function does not check lease validity.
 ///
 /// # Errors
 ///
@@ -209,8 +213,9 @@ pub fn validate_cursor_update(new_cursor: &Cursor, record: &ShardRecord) -> Resu
 ///
 /// # Preconditions
 ///
-/// The caller MUST call [`validate_lease`] before this function on every
-/// lease-gated code path. This function does not check lease validity.
+/// On idempotent paths this function is called BEFORE [`validate_lease`],
+/// so that a successful replay is never blocked by an expired lease or
+/// terminal shard status. This function does not check lease validity.
 ///
 /// `payload_hash` must be non-zero; a zero hash indicates the caller
 /// failed to compute a hash (see `OpLogEntry::new` assertion).
@@ -268,6 +273,7 @@ mod tests {
     use crate::coordination::record::ShardRecord;
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use crate::identity::{FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
+    use gossip_stdx::RingBuffer;
 
     // -- Test fixtures ---------------------------------------------------
 
@@ -320,7 +326,7 @@ mod tests {
             FenceEpoch::from_raw(2),
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
         r
@@ -672,7 +678,7 @@ mod tests {
     #[test]
     fn check_op_idempotency_replay() {
         let mut record = active_unleased_record();
-        record.op_log.push(make_entry(42, 0xABCD));
+        record.op_log.push_back(make_entry(42, 0xABCD)).unwrap();
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xABCD);
         assert!(matches!(result, Ok(Some(_))));
     }
@@ -680,7 +686,7 @@ mod tests {
     #[test]
     fn check_op_idempotency_conflict() {
         let mut record = active_unleased_record();
-        record.op_log.push(make_entry(42, 0xABCD));
+        record.op_log.push_back(make_entry(42, 0xABCD)).unwrap();
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xDEAD);
         assert!(
             matches!(result, Err(CoordError::OpIdConflict { .. })),
@@ -693,7 +699,10 @@ mod tests {
         let mut record = active_unleased_record();
         // Fill op-log to capacity.
         for i in 0..ShardRecord::OP_LOG_CAP as u64 {
-            record.op_log.push(make_entry(i + 1, 0x1000 + i));
+            record
+                .op_log
+                .push_back(make_entry(i + 1, 0x1000 + i))
+                .unwrap();
         }
         assert_eq!(record.op_log.len(), ShardRecord::OP_LOG_CAP);
         // Query the oldest entry — should still be found.
@@ -715,7 +724,10 @@ mod tests {
     fn check_op_idempotency_evicted_entry_returns_none() {
         let mut record = active_unleased_record();
         for i in 0..ShardRecord::OP_LOG_CAP as u64 {
-            record.op_log.push(make_entry(i + 1, 0x1000 + i));
+            record
+                .op_log
+                .push_back(make_entry(i + 1, 0x1000 + i))
+                .unwrap();
         }
         // Evict oldest (op_id=1) by pushing beyond capacity.
         record.op_log_push(make_entry(ShardRecord::OP_LOG_CAP as u64 + 1, 0x2000));
@@ -766,7 +778,7 @@ mod tests {
                 FenceEpoch::INITIAL,
                 None,
                 vec![],
-                vec![],
+                RingBuffer::new(),
             );
 
             let new_cursor = match new_key {

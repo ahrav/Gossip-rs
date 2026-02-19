@@ -24,6 +24,7 @@
 use std::fmt;
 
 use blake3::Hasher;
+use gossip_stdx::RingBuffer;
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
@@ -296,11 +297,12 @@ pub struct ShardRecord {
 
     // -- Idempotency --
     /// Bounded operation log for idempotent replay.
-    /// Oldest entries are evicted when capacity is reached.
-    /// After eviction, retries are treated as new operations — safe
-    /// because of convergent state transitions and [`FenceEpoch`] zombie
-    /// fencing. See [`op_log_lookup`](Self::op_log_lookup) for details.
-    pub(crate) op_log: Vec<OpLogEntry>,
+    /// Oldest entries are evicted when capacity is reached via O(1)
+    /// ring buffer eviction. After eviction, retries are treated as new
+    /// operations — safe because of convergent state transitions and
+    /// [`FenceEpoch`] zombie fencing.
+    /// See [`op_log_lookup`](Self::op_log_lookup) for details.
+    pub(crate) op_log: RingBuffer<OpLogEntry, { ShardRecord::OP_LOG_CAP }>,
 }
 
 impl ShardRecord {
@@ -332,7 +334,7 @@ impl ShardRecord {
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
             spawned: Vec::new(),
-            op_log: Vec::with_capacity(Self::OP_LOG_CAP),
+            op_log: RingBuffer::new(),
         };
         record.assert_invariants();
         record
@@ -361,7 +363,7 @@ impl ShardRecord {
             fence_epoch: FenceEpoch::INITIAL,
             parent: Some(parent),
             spawned: Vec::new(),
-            op_log: Vec::with_capacity(Self::OP_LOG_CAP),
+            op_log: RingBuffer::new(),
         };
         record.assert_invariants();
         record
@@ -386,7 +388,7 @@ impl ShardRecord {
         fence_epoch: FenceEpoch,
         parent: Option<ShardId>,
         spawned: Vec<ShardId>,
-        op_log: Vec<OpLogEntry>,
+        op_log: RingBuffer<OpLogEntry, { ShardRecord::OP_LOG_CAP }>,
     ) -> Self {
         Self {
             tenant,
@@ -480,7 +482,8 @@ impl ShardRecord {
             self.shard,
         );
 
-        // INV-5: Op-log bounded.
+        // INV-5: Op-log bounded — defense-in-depth: RingBuffer enforces capacity
+        // structurally, but this assertion catches corruption before persistence.
         assert!(
             self.op_log.len() <= Self::OP_LOG_CAP,
             "Shard {:?}: op_log length {} exceeds cap {}",
@@ -530,12 +533,14 @@ impl ShardRecord {
 
         // INV-9: Op-log entries have unique OpId values.
         for i in 0..self.op_log.len() {
+            let a = self.op_log.get(i).unwrap();
             for j in (i + 1)..self.op_log.len() {
+                let b = self.op_log.get(j).unwrap();
                 assert!(
-                    self.op_log[i].op_id() != self.op_log[j].op_id(),
+                    a.op_id() != b.op_id(),
                     "Shard {:?}: duplicate OpId {:?} in op_log at indices {i} and {j}",
                     self.shard,
-                    self.op_log[i].op_id(),
+                    a.op_id(),
                 );
             }
         }
@@ -572,8 +577,8 @@ impl ShardRecord {
     /// Look up an op-log entry by [`OpId`].
     ///
     /// Returns `None` if the OpId is not in the log (either never seen
-    /// or evicted). Linear scan in reverse order for retry optimization
-    /// (~5ns avg improvement — retries involve the most recent operations).
+    /// or evicted). Linear scan in reverse order — retries involve the
+    /// most recent operations, so reverse iteration finds them sooner.
     ///
     /// ## Eviction failure mode
     ///
@@ -596,19 +601,9 @@ impl ShardRecord {
 
     /// Push an op-log entry, evicting the oldest if at capacity.
     ///
-    /// Eviction is FIFO: the oldest entry (index 0) is removed first.
-    /// This is correct because older operations are less likely to be
-    /// retried — retry storms typically involve the most recent operations.
-    ///
-    /// ## Why `Vec::remove(0)` instead of `VecDeque`
-    ///
-    /// At cap=16, `remove(0)` shifts at most 15 entries (~480 bytes).
-    /// This fits in L1 cache as a single `memmove` and benchmarks show
-    /// no measurable difference from `VecDeque::pop_front`. `VecDeque`
-    /// would add ring-buffer indirection (modular indexing, two-region
-    /// iteration) for no benefit at this scale. The compile-time guard
-    /// [`OP_LOG_CAP`](Self::OP_LOG_CAP) `<= 64` prevents silent
-    /// regression if the cap is ever increased.
+    /// Eviction is FIFO via O(1) ring buffer overwrite. Older operations
+    /// are evicted first because they are less likely to be retried —
+    /// retry storms typically involve the most recent operations.
     ///
     /// ## Persistence atomicity
     ///
@@ -630,10 +625,9 @@ impl ShardRecord {
             self.shard,
             entry.op_id(),
         );
-        if self.op_log.len() >= Self::OP_LOG_CAP {
-            self.op_log.remove(0);
-        }
-        self.op_log.push(entry);
+        self.op_log.push_back_overwrite(entry);
+        // Defense-in-depth: RingBuffer enforces capacity structurally, but
+        // this assertion catches corruption before persistence.
         assert!(self.op_log.len() <= Self::OP_LOG_CAP);
     }
 
@@ -729,12 +723,9 @@ impl ShardRecord {
     }
 }
 
-// Guard against future cap increases — Vec::remove(0) on more than 64
-// entries would become a noticeable memcpy. At 64 entries × ~32 bytes
-// each, the shift is ~2 KiB — still comfortably L1-resident. Beyond
-// that threshold, switch to VecDeque for O(1) pop-front.
-const _: () = assert!(ShardRecord::OP_LOG_CAP > 0);
-const _: () = assert!(ShardRecord::OP_LOG_CAP <= 64);
+// Compile-time binding: OP_LOG_CAP matches the RingBuffer's const capacity.
+// RingBuffer's own compile-time checks enforce N > 0 and power-of-2.
+const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
 
 // ============================================================================
 // ShardSnapshot
@@ -752,7 +743,7 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP <= 64);
 /// Excludes coordination-internal state:
 /// - `run`, `shard` — the worker already knows its identity from the acquire call
 /// - `tenant` — the worker already knows its tenant
-/// - `lease_*`, `fence_epoch` — the worker gets these from the Lease
+/// - `lease`, `fence_epoch` — the worker gets these from the Lease
 /// - `op_log` — internal to the coordinator
 /// - `park_reason` — only relevant for parked shards, which aren't acquired
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -841,6 +832,7 @@ mod tests {
     use super::*;
     use crate::coordination::lease::{OpKind, OpResult};
     use crate::test_util::canonical_digest;
+    use gossip_stdx::RingBuffer;
     use proptest::prelude::*;
 
     // -- Test fixtures ---------------------------------------------------
@@ -1038,7 +1030,7 @@ mod tests {
                     FenceEpoch::INITIAL,
                     None,
                     vec![],
-                    vec![],
+                    RingBuffer::new(),
                 ),
             ),
             (
@@ -1056,7 +1048,7 @@ mod tests {
                     FenceEpoch::INITIAL,
                     None,
                     vec![],
-                    vec![],
+                    RingBuffer::new(),
                 ),
             ),
             (
@@ -1074,7 +1066,7 @@ mod tests {
                     FenceEpoch::INITIAL,
                     None,
                     vec![derived_shard_id(1), derived_shard_id(2)],
-                    vec![],
+                    RingBuffer::new(),
                 ),
             ),
         ];
@@ -1097,29 +1089,8 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(expected = "exceeds cap")]
-    fn assert_invariants_op_log_overflow_panics() {
-        let entries: Vec<OpLogEntry> = (0..=ShardRecord::OP_LOG_CAP as u64)
-            .map(make_entry)
-            .collect();
-        let r = ShardRecord::from_raw_parts(
-            test_tenant(),
-            test_run(),
-            ShardId::from_raw(10),
-            ShardStatus::Active,
-            None,
-            test_spec(),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            entries,
-        );
-        r.assert_invariants();
-    }
+    // NOTE: op_log overflow test removed — RingBuffer prevents overflow at the
+    // type level, making the scenario unrepresentable.
 
     #[test]
     #[should_panic(expected = "not derived")]
@@ -1138,7 +1109,7 @@ mod tests {
             FenceEpoch::INITIAL,
             Some(ShardId::from_raw(5)), // has parent
             vec![],
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
     }
@@ -1168,7 +1139,7 @@ mod tests {
             FenceEpoch::ZERO,
             None,
             vec![],
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
     }
@@ -1189,7 +1160,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             vec![], // empty spawned
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
     }
@@ -1197,7 +1168,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "duplicate OpId")]
     fn assert_invariants_duplicate_op_id_panics() {
-        let entries = vec![make_entry(42), make_entry(42)]; // same OpId
+        let mut entries = RingBuffer::<OpLogEntry, { ShardRecord::OP_LOG_CAP }>::new();
+        entries.push_back(make_entry(42)).unwrap();
+        entries.push_back(make_entry(42)).unwrap();
         let r = ShardRecord::from_raw_parts(
             test_tenant(),
             test_run(),
@@ -1235,7 +1208,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None,
             spawned,
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
     }
@@ -1341,7 +1314,7 @@ mod tests {
             FenceEpoch::INITIAL,
             None, // parent = None -- violates INV-7b
             vec![],
-            vec![],
+            RingBuffer::new(),
         );
         r.assert_invariants();
     }

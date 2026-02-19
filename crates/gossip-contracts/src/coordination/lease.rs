@@ -196,7 +196,8 @@ pub enum OpKind {
     Checkpoint = 0,
     /// Mark the shard as fully processed (terminal — transitions to `Done`).
     Complete = 1,
-    /// Suspend the shard for later resumption (terminal — transitions to `Parked`).
+    /// Suspend the shard (terminal — transitions to `Parked`; resumption
+    /// requires an out-of-band [`Unpark`](Self::Unpark)).
     Park = 2,
     /// Replace the parent shard with split children (terminal — transitions to `Split`).
     SplitReplace = 3,
