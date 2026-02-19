@@ -1395,7 +1395,7 @@ fn lifecycle_split_residual_twice_then_complete_children() {
 
 // -- RunManagement tests --------------------------------------------------
 
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement, ShardFilter};
+use crate::coordination::run::{InitialShard, RunConfig, RunManagement, RunStatus, ShardFilter};
 use crate::coordination::shard_spec::ShardLimitScope;
 
 fn test_run_config() -> RunConfig {
@@ -2202,6 +2202,80 @@ fn unpark_then_reacquire_and_checkpoint() {
         )
         .unwrap();
     assert!(cp.is_executed());
+}
+
+// -- F1: unpark_shard run-status check tests -----------------------------------
+
+#[test]
+fn unpark_shard_rejected_when_run_cancelled() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    // Park the shard.
+    let _ = coord
+        .park_shard(
+            now(4),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    // Cancel the run.
+    let _ = coord
+        .cancel_run(now(5), test_tenant(), test_run(), OpId::from_raw(11))
+        .unwrap();
+
+    // Attempt unpark → should fail with RunTerminal.
+    let err = coord
+        .unpark_shard(now(6), test_tenant(), key, OpId::from_raw(12))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            UnparkError::RunTerminal {
+                status: RunStatus::Cancelled
+            }
+        ),
+        "expected RunTerminal(Cancelled), got: {err:?}",
+    );
+}
+
+#[test]
+fn unpark_shard_rejected_when_run_done() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+
+    // Park the shard.
+    let _ = coord
+        .park_shard(
+            now(4),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    // Complete the run.
+    let _ = coord
+        .complete_run(now(5), test_tenant(), test_run(), OpId::from_raw(11))
+        .unwrap();
+
+    // Attempt unpark → should fail with RunTerminal.
+    let err = coord
+        .unpark_shard(now(6), test_tenant(), key, OpId::from_raw(12))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            UnparkError::RunTerminal {
+                status: RunStatus::Done
+            }
+        ),
+        "expected RunTerminal(Done), got: {err:?}",
+    );
 }
 
 // -- register_shards error path tests -----------------------------------------

@@ -1519,6 +1519,20 @@ impl RunManagement for InMemoryCoordinator {
             return Err(UnparkError::TenantMismatch { expected: tenant });
         }
 
+        // Reject unpark if the run is already terminal. Unparking a shard in a
+        // Cancelled/Done/Failed run wastes worker effort and can create orphaned
+        // Active shards that no run-level operation will ever collect.
+        let run_key = (tenant, key.run());
+        let run_record = self
+            .runs
+            .get(&run_key)
+            .expect("run record must exist for a registered shard");
+        if run_record.status.is_terminal() {
+            return Err(UnparkError::RunTerminal {
+                status: run_record.status,
+            });
+        }
+
         // NOTE(limitation): Unlike split_residual, unpark has no permanent marker
         // for defense-in-depth replay detection after op-log eviction. After 16+
         // shard-level operations, a stale unpark retry is treated as new. This is

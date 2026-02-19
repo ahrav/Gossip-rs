@@ -960,6 +960,12 @@ pub enum ManifestValidationError {
     TooManyShards { count: usize, max: usize },
     /// A non-initial cursor falls outside the shard's key range.
     CursorOutOfBounds { shard_id: ShardId },
+    /// A shard has an unbounded key range (empty start or end).
+    ///
+    /// Unbounded specs are test-only constructs. Production manifests must
+    /// have finite, bounded key ranges so that overlap detection and shard
+    /// coordination operate on well-defined intervals.
+    UnboundedRange { shard_id: ShardId },
 }
 
 impl fmt::Display for ManifestValidationError {
@@ -984,6 +990,9 @@ impl fmt::Display for ManifestValidationError {
             }
             Self::CursorOutOfBounds { shard_id } => {
                 write!(f, "cursor out of bounds for shard {:?}", shard_id)
+            }
+            Self::UnboundedRange { shard_id } => {
+                write!(f, "unbounded range for shard {:?}", shard_id)
             }
         }
     }
@@ -1024,8 +1033,16 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
         }
     }
 
+    // Reject unbounded ranges: production manifests must have finite bounds.
+    for shard in shards {
+        if shard.spec.key_range_start().is_empty() || shard.spec.key_range_end().is_empty() {
+            return Err(ManifestValidationError::UnboundedRange {
+                shard_id: shard.shard,
+            });
+        }
+    }
+
     // Sort by key_range_start for overlap detection.
-    // Only check ranges if both start and end are non-empty (bounded specs).
     let mut sorted: Vec<&InitialShard> = shards.iter().collect();
     sorted.sort_by(|a, b| a.spec.key_range_start().cmp(b.spec.key_range_start()));
 
@@ -2299,8 +2316,7 @@ mod tests {
 
     #[test]
     fn manifest_detects_overlap_with_unbounded_end() {
-        // PR #11 comment #8: overlap check skips comparison when a_end is empty.
-        // [a, ∞) + [m, z) should be detected as overlapping.
+        // Unbounded end is now rejected before overlap detection.
         let shard_a = InitialShard::new(
             ShardId::from_raw(0),
             ShardSpec::from_raw_parts(
@@ -2313,17 +2329,14 @@ mod tests {
         let shard_b = make_initial_shard(1, b"m", b"z");
         let result = validate_manifest(&[shard_a, shard_b]);
         assert!(
-            matches!(
-                result,
-                Err(ManifestValidationError::OverlappingRanges { .. })
-            ),
-            "unbounded end [a, ∞) must overlap with [m, z)"
+            matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
+            "unbounded end must be rejected: {result:?}"
         );
     }
 
     #[test]
     fn manifest_detects_overlap_with_both_starts_empty() {
-        // Two shards both starting at ∅ always overlap.
+        // Unbounded start is now rejected before overlap detection.
         let shard_a = InitialShard::new(
             ShardId::from_raw(0),
             ShardSpec::from_raw_parts(
@@ -2344,17 +2357,14 @@ mod tests {
         );
         let result = validate_manifest(&[shard_a, shard_b]);
         assert!(
-            matches!(
-                result,
-                Err(ManifestValidationError::OverlappingRanges { .. })
-            ),
-            "[∅, m) and [∅, z) must be detected as overlapping"
+            matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
+            "unbounded start must be rejected: {result:?}"
         );
     }
 
     #[test]
-    fn manifest_valid_unbounded_start_contiguous() {
-        // [∅, m) + [m, z) is a valid contiguous partition — no overlap.
+    fn manifest_unbounded_start_rejected() {
+        // Unbounded start is no longer accepted in production manifests.
         let shard_a = InitialShard::new(
             ShardId::from_raw(0),
             ShardSpec::from_raw_parts(
@@ -2365,6 +2375,44 @@ mod tests {
             Cursor::initial(),
         );
         let shard_b = make_initial_shard(1, b"m", b"z");
-        assert!(validate_manifest(&[shard_a, shard_b]).is_ok());
+        let result = validate_manifest(&[shard_a, shard_b]);
+        assert!(
+            matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
+            "unbounded start must be rejected: {result:?}"
+        );
+    }
+
+    // -- F2: Unbounded range rejection tests --
+
+    #[test]
+    fn manifest_unbounded_end_rejected() {
+        let shard = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::from_raw_parts(b"a".to_vec().into_boxed_slice(), Box::new([]), Box::new([])),
+            Cursor::initial(),
+        );
+        assert!(
+            matches!(
+                validate_manifest(&[shard]),
+                Err(ManifestValidationError::UnboundedRange { .. })
+            ),
+            "shard with unbounded end must be rejected"
+        );
+    }
+
+    #[test]
+    fn manifest_fully_unbounded_rejected() {
+        let shard = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::unbounded(),
+            Cursor::initial(),
+        );
+        assert!(
+            matches!(
+                validate_manifest(&[shard]),
+                Err(ManifestValidationError::UnboundedRange { .. })
+            ),
+            "fully unbounded shard must be rejected"
+        );
     }
 }
