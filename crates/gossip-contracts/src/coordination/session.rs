@@ -440,7 +440,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         let result = self
             .backend
             .split_residual(now, self.tenant, &self.lease, plan, op_id)?;
-        if result.is_executed() {
+        if let IdempotentOutcome::Executed(ref res) = result {
             // Rebuild the cached snapshot so that subsequent operations
             // (especially checkpoint) validate against the narrowed range.
             //
@@ -452,9 +452,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             //     from `acquire_and_restore` is already correct.
             // In both cases, skipping the rebuild is safe.
             let mut spawned = self.snapshot.spawned().to_vec();
-            if let IdempotentOutcome::Executed(ref res) = result {
-                spawned.push(res.residual);
-            }
+            spawned.push(res.residual);
             self.snapshot = ShardSnapshot::new(
                 self.snapshot.status(),
                 new_spec,

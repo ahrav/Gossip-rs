@@ -137,7 +137,7 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///    `list_shards(ShardFilter::available())` -- active, unleased shards.
 /// 2. If the list is empty, return `NoneAvailable` immediately.
 /// 3. Iterate candidates in the order returned by `list_shards`
-///    (ordered by `key_range_start`, per the `list_shards` contract).
+///    (ordered by `(key_range_start, shard_id)` for determinism).
 ///    For each candidate, attempt `acquire_and_restore`.
 /// 4. On success, return the `AcquireResult` (lease + snapshot).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
@@ -342,6 +342,9 @@ impl<T: CoordinationBackend + RunManagement + ShardClaiming> CoordinationFacade 
 /// - Lease expiry: expired leases free shards for re-claiming.
 /// - Terminal skip: completed shards are filtered by `ShardFilter::available`.
 /// - Trait composition: `InMemoryCoordinator` satisfies `CoordinationFacade`.
+/// - Error conversion: `From<GetRunError>` maps both variants correctly.
+/// - Mixed states: Done + leased + available shards (property test).
+/// - Expired leases: re-claiming after lease timeout (property test).
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +526,29 @@ mod tests {
         assert_eq!(r.lease.shard(), ShardId::from_raw(1));
     }
 
+    // -- From<GetRunError> conversion tests --------------------------------
+
+    #[test]
+    fn claim_error_from_get_run_error_tenant_mismatch() {
+        let err = GetRunError::TenantMismatch {
+            expected: test_tenant(),
+        };
+        let claim_err: ClaimError = err.into();
+        assert_eq!(
+            claim_err,
+            ClaimError::TenantMismatch {
+                expected: test_tenant()
+            }
+        );
+    }
+
+    #[test]
+    fn claim_error_from_get_run_error_run_not_found() {
+        let err = GetRunError::RunNotFound;
+        let claim_err: ClaimError = err.into();
+        assert_eq!(claim_err, ClaimError::RunNotFound);
+    }
+
     // -- Property tests --------------------------------------------------
 
     proptest! {
@@ -558,6 +584,85 @@ mod tests {
                 // Must not be one of the leased shards.
                 prop_assert!(claimed >= num_leased as u64);
             }
+        }
+
+        /// Mixed shard states: Done + leased + available.
+        /// Claim must skip Done and leased shards and return an available one,
+        /// or `NoneAvailable` if none remain.
+        #[test]
+        fn claim_skips_terminal_and_leased_shards(
+            shard_count in 2_usize..=8,
+            num_done in 0_usize..=4,
+            num_leased in 0_usize..=4,
+        ) {
+            let num_done = num_done.min(shard_count);
+            let num_leased = num_leased.min(shard_count - num_done);
+            let mut coord = setup_coordinator(shard_count);
+            let tenant = test_tenant();
+            let run = test_run();
+
+            // Complete first `num_done` shards (Done/terminal).
+            for i in 0..num_done {
+                let key = ShardKey::new(run, ShardId::from_raw(i as u64));
+                let acq = coord
+                    .acquire_and_restore(now(2), tenant, key, test_worker(200 + i as u64))
+                    .unwrap();
+                let cursor = Cursor::with_last_key(vec![i as u8]);
+                let _ = coord
+                    .complete(now(3), tenant, &acq.lease, cursor, OpId::from_raw(300 + i as u64))
+                    .unwrap();
+            }
+
+            // Lease the next `num_leased` shards (Active + leased).
+            for i in 0..num_leased {
+                let idx = num_done + i;
+                let key = ShardKey::new(run, ShardId::from_raw(idx as u64));
+                let _ = coord
+                    .acquire_and_restore(now(4), tenant, key, test_worker(400 + i as u64))
+                    .unwrap();
+            }
+
+            let available = shard_count - num_done - num_leased;
+            let result = coord.claim_next_available(now(5), tenant, run, test_worker(999));
+
+            if available == 0 {
+                prop_assert_eq!(result, Err(ClaimError::NoneAvailable));
+            } else {
+                let acq = result.unwrap();
+                let claimed = acq.lease.shard().as_raw() as usize;
+                // Must be one of the available (unleased, non-terminal) shards.
+                prop_assert!(claimed >= num_done + num_leased);
+                prop_assert!(claimed < shard_count);
+            }
+        }
+
+        /// Expired leases free shards for re-claiming.
+        #[test]
+        fn claim_reclaims_expired_leases(
+            shard_count in 1_usize..=4,
+        ) {
+            let mut coord = setup_coordinator(shard_count);
+            let tenant = test_tenant();
+            let run = test_run();
+
+            // Lease all shards at now=2 (lease_duration=30).
+            for i in 0..shard_count {
+                let key = ShardKey::new(run, ShardId::from_raw(i as u64));
+                let _ = coord
+                    .acquire_and_restore(now(2), tenant, key, test_worker(100 + i as u64))
+                    .unwrap();
+            }
+
+            // At now=3, all leased — claim fails.
+            let result = coord.claim_next_available(now(3), tenant, run, test_worker(999));
+            prop_assert_eq!(result, Err(ClaimError::NoneAvailable));
+
+            // Advance past lease expiry (lease_duration=30, so deadline=32).
+            // At now=33, all leases expired — claim succeeds.
+            let result = coord.claim_next_available(now(33), tenant, run, test_worker(888));
+            prop_assert!(result.is_ok(), "claim should succeed after lease expiry");
+            let acq = result.unwrap();
+            prop_assert_eq!(acq.lease.owner(), test_worker(888));
         }
     }
 }

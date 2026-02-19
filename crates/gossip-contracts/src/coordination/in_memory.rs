@@ -193,7 +193,9 @@ impl InMemoryCoordinator {
     /// Seed a shard record directly (test/fixture helper).
     ///
     /// Does not enforce shard count limits — this is a test helper for
-    /// constructing specific states.
+    /// constructing specific states. Also updates the `run_shards` index
+    /// so that `list_shards` can discover seeded shards (required by
+    /// `claim_next_available`).
     ///
     /// # Panics
     ///
@@ -1504,7 +1506,11 @@ impl RunManagement for InMemoryCoordinator {
             }
         }
 
-        summaries.sort_by(|a, b| a.key_range_start().cmp(b.key_range_start()));
+        summaries.sort_by(|a, b| {
+            a.key_range_start()
+                .cmp(b.key_range_start())
+                .then_with(|| a.shard().cmp(&b.shard()))
+        });
         Ok(summaries)
     }
 
