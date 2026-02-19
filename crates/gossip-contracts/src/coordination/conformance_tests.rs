@@ -1,7 +1,7 @@
 //! Conformance tests for the coordination protocol.
 //!
-//! Where [`in_memory_tests`] exercises each backend operation in isolation and
-//! [`scenario_tests`] follows multi-step workflows, this module sits in the
+//! Where `in_memory_tests` exercises each backend operation in isolation and
+//! `scenario_tests` follows multi-step workflows, this module sits in the
 //! middle: it verifies that the protocol's safety invariants hold when two or
 //! more concerns interact. The focus is on invariant *combinations*, not on
 //! individual operations or end-to-end stories.
@@ -37,15 +37,16 @@ use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement, RunStatus};
-use crate::coordination::run_errors::UnparkError;
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
-use crate::coordination::split::{
-    MAX_SPAWNED_PER_SHARD, SplitReplaceChild, SplitReplacePlan, SplitResidualPlan,
+use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
+use crate::coordination::run_errors::{
+    CancelRunError, CompleteRunError, FailRunError, UnparkError,
 };
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, acquire_shard, now, seeded_coordinator, seeded_coordinator_with_semantics,
-    test_cursor, test_key, test_run, test_shard, test_tenant, test_worker,
+    LEASE_DURATION, acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
+    seeded_coordinator_with_semantics, test_cursor, test_key, test_run, test_run_config,
+    test_shard, test_split_replace_plan, test_split_residual_plan, test_tenant, test_worker,
 };
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{OpId, RunId, ShardId, ShardKey};
@@ -55,6 +56,7 @@ use crate::identity::{OpId, RunId, ShardId, ShardKey};
 
 const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
 const _: () = assert!(MAX_SPAWNED_PER_SHARD == 1024);
+const _: () = assert!(LEASE_DURATION == 100);
 
 // ============================================================================
 // Group A: Cross-Cutting Invariant Interactions
@@ -82,15 +84,7 @@ fn fence_monotonicity_across_full_lifecycle() {
     let lease1 = acquire_shard(&mut coord, 10, 1);
     let f1 = lease1.fence();
 
-    let _ = coord
-        .checkpoint(
-            now(11),
-            test_tenant(),
-            &lease1,
-            test_cursor(b"d"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 11, &lease1, b"d", 1);
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.fence_epoch, f1, "checkpoint must not change fence");
@@ -102,38 +96,16 @@ fn fence_monotonicity_across_full_lifecycle() {
     assert!(f2 > f1, "re-acquire fence must exceed worker 1's fence");
 
     // Worker 2: checkpoint -> complete.
-    let _ = coord
-        .checkpoint(
-            now(LEASE_DURATION + 12),
-            test_tenant(),
-            &lease2,
-            test_cursor(b"p"),
-            OpId::from_raw(3),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, LEASE_DURATION + 12, &lease2, b"p", 3);
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.fence_epoch, f2, "checkpoint must not change fence");
 
-    let _ = coord
-        .complete(
-            now(LEASE_DURATION + 13),
-            test_tenant(),
-            &lease2,
-            test_cursor(b"y"),
-            OpId::from_raw(4),
-        )
-        .unwrap();
+    complete_ok(&mut coord, LEASE_DURATION + 13, &lease2, b"y", 4);
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.fence_epoch, f2, "complete must not change fence");
     assert_eq!(rec.status, ShardStatus::Done);
-
-    // Full sequence: f1 < f2, and fence never decreased at any step.
-    assert!(
-        f2 > f1,
-        "fence strictly increases across ownership transfers"
-    );
 }
 
 /// Cursor bounds enforcement tracks a narrowed spec after split_residual.
@@ -152,22 +124,10 @@ fn cursor_monotonicity_combined_with_split_residual() {
     let lease = acquire_shard(&mut coord, 10, 1);
 
     // Checkpoint at "d" (within original [a,z)).
-    let _ = coord
-        .checkpoint(
-            now(11),
-            test_tenant(),
-            &lease,
-            test_cursor(b"d"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
 
     // Split residual: parent narrows to [a,m), residual gets [m,z).
-    let plan = SplitResidualPlan::try_new(
-        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-    )
-    .unwrap();
+    let plan = test_split_residual_plan();
     let result = coord
         .split_residual(now(12), test_tenant(), &lease, plan, OpId::from_raw(2))
         .unwrap();
@@ -220,15 +180,7 @@ fn idempotency_before_lease_validation() {
     let lease = acquire_shard(&mut coord, 10, 1);
 
     // Checkpoint then complete.
-    let _ = coord
-        .checkpoint(
-            now(11),
-            test_tenant(),
-            &lease,
-            test_cursor(b"d"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
     let complete_cursor = test_cursor(b"m");
     let complete_op = OpId::from_raw(2);
     let _ = coord
@@ -246,6 +198,19 @@ fn idempotency_before_lease_validation() {
     assert!(
         matches!(replay, Ok(IdempotentOutcome::Replayed(()))),
         "replay on terminal shard must return Replayed, got: {replay:?}"
+    );
+
+    // Tiger Style: verify replay did not mutate shard state.
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(
+        rec.status,
+        ShardStatus::Done,
+        "replay must not change terminal status"
+    );
+    assert_eq!(
+        rec.cursor.last_key(),
+        Some(b"m".as_slice()),
+        "replay must not mutate cursor"
     );
 }
 
@@ -287,6 +252,23 @@ fn owner_divergence_with_matching_fence() {
         matches!(err, CheckpointError::StaleFence { .. }),
         "wrong owner with matching fence must produce StaleFence, got: {err:?}"
     );
+
+    // Tiger Style: verify the rejected operation did not corrupt shard state.
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(
+        rec.fence_epoch, fence,
+        "rejected checkpoint must not change fence"
+    );
+    assert_eq!(
+        rec.cursor.last_key(),
+        None,
+        "rejected checkpoint must not advance cursor"
+    );
+    assert_eq!(
+        rec.status,
+        ShardStatus::Active,
+        "rejected checkpoint must not change status"
+    );
 }
 
 /// All terminal operations release the lease (clear owner and deadline).
@@ -305,15 +287,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
-        let _ = coord
-            .complete(
-                now(11),
-                test_tenant(),
-                &lease,
-                test_cursor(b"m"),
-                OpId::from_raw(1),
-            )
-            .unwrap();
+        complete_ok(&mut coord, 11, &lease, b"m", 1);
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(
             rec.lease_owner().is_none(),
@@ -330,15 +304,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
-        let _ = coord
-            .park_shard(
-                now(11),
-                test_tenant(),
-                &lease,
-                ParkReason::TooManyErrors,
-                OpId::from_raw(1),
-            )
-            .unwrap();
+        park_ok(&mut coord, 11, &lease, ParkReason::TooManyErrors, 1);
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(rec.lease_owner().is_none(), "park must clear lease owner");
         assert!(
@@ -352,17 +318,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
-        let plan = SplitReplacePlan::try_new(vec![
-            SplitReplaceChild::new(
-                ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-                Cursor::initial(),
-            ),
-            SplitReplaceChild::new(
-                ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-                Cursor::initial(),
-            ),
-        ])
-        .unwrap();
+        let plan = test_split_replace_plan();
         let _ = coord
             .split_replace(now(11), test_tenant(), &lease, plan, OpId::from_raw(1))
             .unwrap();
@@ -414,24 +370,8 @@ fn cursor_semantics_dispatched_through_coordinator() {
     assert_eq!(rec.cursor_semantics, CursorSemantics::Dispatched);
 
     // Operations work normally.
-    let _ = coord
-        .checkpoint(
-            now(11),
-            test_tenant(),
-            &lease,
-            test_cursor(b"d"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
-    let _ = coord
-        .complete(
-            now(12),
-            test_tenant(),
-            &lease,
-            test_cursor(b"m"),
-            OpId::from_raw(2),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
+    complete_ok(&mut coord, 12, &lease, b"m", 2);
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.status, ShardStatus::Done);
@@ -487,17 +427,7 @@ fn split_coverage_key_range_partition() {
     let mut coord = seeded_coordinator();
 
     let lease = acquire_shard(&mut coord, 10, 1);
-    let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
-        ),
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
-    ])
-    .unwrap();
+    let plan = test_split_replace_plan();
 
     let result = coord
         .split_replace(now(11), test_tenant(), &lease, plan, OpId::from_raw(1))
@@ -555,26 +485,10 @@ fn oplog_eviction_then_replay() {
     }
 
     // One more checkpoint to evict op_id=1.
-    let _ = coord
-        .checkpoint(
-            now(27),
-            test_tenant(),
-            &lease,
-            test_cursor(b"s"),
-            OpId::from_raw(17),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 27, &lease, b"s", 17);
 
     // Complete the shard (terminal). Op_id=18.
-    let _ = coord
-        .complete(
-            now(28),
-            test_tenant(),
-            &lease,
-            test_cursor(b"y"),
-            OpId::from_raw(18),
-        )
-        .unwrap();
+    complete_ok(&mut coord, 28, &lease, b"y", 18);
 
     // Replay surviving op (op_id=18, the complete) -> Replayed.
     let replay_surviving = coord.complete(
@@ -623,26 +537,10 @@ fn unpark_lifecycle_fence_and_cursor_preserved() {
     // Acquire and checkpoint at "d".
     let lease = acquire_shard(&mut coord, 10, 1);
     let f_before_park = lease.fence();
-    let _ = coord
-        .checkpoint(
-            now(11),
-            test_tenant(),
-            &lease,
-            test_cursor(b"d"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
 
     // Park the shard.
-    let _ = coord
-        .park_shard(
-            now(12),
-            test_tenant(),
-            &lease,
-            ParkReason::TooManyErrors,
-            OpId::from_raw(2),
-        )
-        .unwrap();
+    park_ok(&mut coord, 12, &lease, ParkReason::TooManyErrors, 2);
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.status, ShardStatus::Parked);
@@ -669,15 +567,7 @@ fn unpark_lifecycle_fence_and_cursor_preserved() {
         "acquire after unpark must bump fence again"
     );
 
-    let _ = coord
-        .checkpoint(
-            now(15),
-            test_tenant(),
-            &lease2,
-            test_cursor(b"f"),
-            OpId::from_raw(4),
-        )
-        .unwrap();
+    checkpoint_ok(&mut coord, 15, &lease2, b"f", 4);
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.cursor.last_key(), Some(b"f".as_slice()));
 }
@@ -753,15 +643,7 @@ fn run_terminal_irreversibility() {
 
     // Complete the shard so we can complete the run.
     let lease = acquire_shard(&mut coord, 10, 1);
-    let _ = coord
-        .complete(
-            now(11),
-            test_tenant(),
-            &lease,
-            test_cursor(b"y"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    complete_ok(&mut coord, 11, &lease, b"y", 1);
 
     // Complete the run -> Done.
     let _ = coord
@@ -771,17 +653,47 @@ fn run_terminal_irreversibility() {
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(rec.status(), RunStatus::Done);
 
-    // Try complete_run again with a different op_id -> error.
-    let err = coord.complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101));
-    assert!(err.is_err(), "complete_run on Done run must fail");
+    // Try complete_run again with a different op_id -> RunTerminal(Done).
+    let err = coord
+        .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CompleteRunError::RunTerminal {
+                status: RunStatus::Done
+            }
+        ),
+        "complete_run on Done run must return RunTerminal(Done), got: {err:?}"
+    );
 
-    // Try fail_run -> error.
-    let err = coord.fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102));
-    assert!(err.is_err(), "fail_run on Done run must fail");
+    // Try fail_run -> RunTerminal(Done).
+    let err = coord
+        .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            FailRunError::RunTerminal {
+                status: RunStatus::Done
+            }
+        ),
+        "fail_run on Done run must return RunTerminal(Done), got: {err:?}"
+    );
 
-    // Try cancel_run -> error.
-    let err = coord.cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103));
-    assert!(err.is_err(), "cancel_run on Done run must fail");
+    // Try cancel_run -> RunTerminal(Done).
+    let err = coord
+        .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CancelRunError::RunTerminal {
+                status: RunStatus::Done
+            }
+        ),
+        "cancel_run on Done run must return RunTerminal(Done), got: {err:?}"
+    );
 }
 
 /// `register_shards` is rejected on an Active run (requires Initializing).
@@ -843,15 +755,7 @@ fn run_completed_at_consistency() {
 
     // Complete the shard, then complete the run.
     let lease = acquire_shard(&mut coord, 10, 1);
-    let _ = coord
-        .complete(
-            now(11),
-            test_tenant(),
-            &lease,
-            test_cursor(b"y"),
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    complete_ok(&mut coord, 11, &lease, b"y", 1);
     let _ = coord
         .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
         .unwrap();
@@ -865,7 +769,7 @@ fn run_completed_at_consistency() {
 
     // -- Separate run: Cancelled --
     let run2 = RunId::from_raw(2);
-    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    let config = test_run_config();
     coord
         .create_run(now(20), test_tenant(), run2, config)
         .unwrap();
@@ -900,15 +804,7 @@ fn unpark_after_run_terminal_rejected() {
 
     // Acquire and park the shard.
     let lease = acquire_shard(&mut coord, 10, 1);
-    let _ = coord
-        .park_shard(
-            now(11),
-            test_tenant(),
-            &lease,
-            ParkReason::TooManyErrors,
-            OpId::from_raw(1),
-        )
-        .unwrap();
+    park_ok(&mut coord, 11, &lease, ParkReason::TooManyErrors, 1);
 
     // Cancel the run (run becomes Cancelled).
     let _ = coord

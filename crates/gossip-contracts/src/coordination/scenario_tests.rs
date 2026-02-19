@@ -9,8 +9,8 @@
 //!
 //! # Relationship to Other Test Modules
 //!
-//! - [`in_memory_tests`] — unit tests: one backend operation per test.
-//! - [`conformance_tests`] — invariant-interaction tests: two or more safety
+//! - `in_memory_tests` — unit tests: one backend operation per test.
+//! - `conformance_tests` — invariant-interaction tests: two or more safety
 //!   invariants composed, with assertions on both success and absence of
 //!   side effects.
 //! - **This module** — scenario tests: multi-step user stories that exercise
@@ -37,10 +37,10 @@ use crate::coordination::error::CheckpointError;
 use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardStatus;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement, RunStatus};
+use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
 use crate::coordination::run_errors::{CancelRunError, RegisterShardsError};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
-use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
+use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::split::SplitResidualPlan;
 use crate::coordination::test_fixtures::*;
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{OpId, RunId, ShardId, ShardKey};
@@ -69,7 +69,7 @@ fn scenario_full_run_lifecycle() {
     let run = test_run();
 
     // -- Create run --
-    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    let config = test_run_config();
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     // -- Register one shard [a, z) --
@@ -263,17 +263,7 @@ fn scenario_split_replace_and_children_completion() {
 
     // -- Acquire parent and split --
     let lease = acquire_shard(&mut coord, 10, 1);
-    let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
-        ),
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
-    ])
-    .unwrap();
+    let plan = test_split_replace_plan();
     let split_result = coord
         .split_replace(now(11), tenant, &lease, plan, OpId::from_raw(1))
         .unwrap()
@@ -393,11 +383,7 @@ fn scenario_split_chain_double_residual() {
         .unwrap();
 
     // -- First residual split: [a,z) -> parent=[a,m), residual=[m,z) --
-    let plan1 = SplitResidualPlan::try_new(
-        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-    )
-    .unwrap();
+    let plan1 = test_split_residual_plan();
     let result1 = coord
         .split_residual(now(12), tenant, &lease, plan1, OpId::from_raw(2))
         .unwrap()
@@ -594,7 +580,7 @@ fn scenario_cancel_from_initializing() {
     let run = RunId::from_raw(42);
 
     // -- Create run (stays Initializing) --
-    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    let config = test_run_config();
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let run_record = coord.get_run(tenant, run).unwrap();
@@ -777,7 +763,7 @@ fn scenario_claim_contention() {
     let run = RunId::from_raw(1);
 
     // -- Set up run with 2 shards --
-    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    let config = test_run_config();
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard1 = ShardId::from_raw(1);

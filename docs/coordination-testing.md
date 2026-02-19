@@ -124,11 +124,12 @@ Run lifecycle state machine tests.
 ```rust
 const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
 const _: () = assert!(MAX_SPAWNED_PER_SHARD == 1024);
+const _: () = assert!(LEASE_DURATION == 100);
 ```
 
 These prevent silent constant changes from invalidating test assumptions.
-If `OP_LOG_CAP` or `MAX_SPAWNED_PER_SHARD` change, the conformance tests
-fail at compile time.
+If `OP_LOG_CAP`, `MAX_SPAWNED_PER_SHARD`, or `LEASE_DURATION` change, the
+conformance tests fail at compile time.
 
 ---
 
@@ -172,7 +173,12 @@ Shared factory functions consumed by all three coordination test modules.
 | `test_cursor(key)` | `Cursor::with_last_key(key.to_vec())` |
 | `seeded_coordinator()` | `InMemoryCoordinator` with one run containing one shard `[a, z)`, `CursorSemantics::Completed`, already in Active status |
 | `seeded_coordinator_with_semantics(s)` | Same as above but with the specified `CursorSemantics` |
+| `test_split_replace_plan()` | Canonical `[a,m) + [m,z)` `SplitReplacePlan` |
+| `test_split_residual_plan()` | Canonical `[a,m)` parent + `[m,z)` residual `SplitResidualPlan` |
 | `acquire_shard(coord, t, worker_id)` | Shorthand for `acquire_and_restore`; returns the `Lease` |
+| `checkpoint_ok(coord, t, lease, cursor_key, op_id)` | Fire-and-forget `checkpoint` using `test_tenant()` |
+| `complete_ok(coord, t, lease, cursor_key, op_id)` | Fire-and-forget `complete` using `test_tenant()` |
+| `park_ok(coord, t, lease, reason, op_id)` | Fire-and-forget `park_shard` using `test_tenant()` |
 | `LEASE_DURATION` | `100` logical time ticks |
 
 `seeded_coordinator()` calls `create_run` and `register_shards` during
@@ -220,7 +226,11 @@ random calls shifts counts but must not break behavioral assertions.
 | `behavioral_seed_99_sunny` | seed=99, SunnyDay, 2 workers, 3 shards, 300 ops | No violations, converged, event coverage |
 | `behavioral_seed_7_radioactive` | seed=7, Radioactive, 4 workers, 8 shards, 1500 ops | No violations (convergence not asserted under aggressive faults) |
 | `deterministic_replay_cross_config` | Runs each config twice | Field-identical reports (`event_counts`, `ops_executed`, `end_time`) |
-| `all_event_kinds_enumerated` | — | Tripwire: `ALL_EVENT_KINDS.len() == 15` catches variant additions |
+
+A compile-time `const` match block provides exhaustiveness enforcement:
+if a variant is added to `SimEventKind` without updating the match, the
+build fails. This replaces the former `all_event_kinds_enumerated`
+runtime test, which was strictly weaker.
 
 Event coverage checks are fault-level-dependent: under `SunnyDay` with a
 small op budget, `WorkerPaused`/`WorkerResumed` may or may not appear

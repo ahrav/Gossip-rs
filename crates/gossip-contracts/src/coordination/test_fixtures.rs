@@ -8,8 +8,10 @@
 use crate::coordination::cursor::Cursor;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::lease::Lease;
+use crate::coordination::record::ParkReason;
 use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
@@ -80,10 +82,98 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
     coord
 }
 
+pub fn test_run_config() -> RunConfig {
+    RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap()
+}
+
+/// The canonical `[a,m) + [m,z)` replace plan used by most split tests.
+pub fn test_split_replace_plan() -> SplitReplacePlan {
+    SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ])
+    .unwrap()
+}
+
+/// The canonical `[a,m)` parent + `[m,z)` residual plan.
+pub fn test_split_residual_plan() -> SplitResidualPlan {
+    SplitResidualPlan::try_new(
+        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+    )
+    .unwrap()
+}
+
 /// Acquire the default test shard with the given worker at the given time.
 pub fn acquire_shard(coord: &mut InMemoryCoordinator, t: u64, worker_id: u64) -> Lease {
     let result = coord
         .acquire_and_restore(now(t), test_tenant(), test_key(), test_worker(worker_id))
         .expect("acquire should succeed");
     result.lease
+}
+
+/// Checkpoint the default test shard, discarding the result.
+///
+/// Panics on failure. Use this only for fire-and-forget checkpoints where
+/// the return value is not needed (e.g. setting up state for a later assertion).
+pub fn checkpoint_ok(
+    coord: &mut InMemoryCoordinator,
+    t: u64,
+    lease: &Lease,
+    cursor_key: &[u8],
+    op_id: u64,
+) {
+    let _ = coord
+        .checkpoint(
+            now(t),
+            test_tenant(),
+            lease,
+            test_cursor(cursor_key),
+            OpId::from_raw(op_id),
+        )
+        .expect("checkpoint should succeed");
+}
+
+/// Complete the default test shard, discarding the result.
+///
+/// Panics on failure. Use this only for fire-and-forget completes where
+/// the return value is not needed.
+pub fn complete_ok(
+    coord: &mut InMemoryCoordinator,
+    t: u64,
+    lease: &Lease,
+    cursor_key: &[u8],
+    op_id: u64,
+) {
+    let _ = coord
+        .complete(
+            now(t),
+            test_tenant(),
+            lease,
+            test_cursor(cursor_key),
+            OpId::from_raw(op_id),
+        )
+        .expect("complete should succeed");
+}
+
+/// Park the default test shard, discarding the result.
+///
+/// Panics on failure. Use this only for fire-and-forget parks where
+/// the return value is not needed.
+pub fn park_ok(
+    coord: &mut InMemoryCoordinator,
+    t: u64,
+    lease: &Lease,
+    reason: ParkReason,
+    op_id: u64,
+) {
+    let _ = coord
+        .park_shard(now(t), test_tenant(), lease, reason, OpId::from_raw(op_id))
+        .expect("park should succeed");
 }

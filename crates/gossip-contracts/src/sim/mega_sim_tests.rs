@@ -10,7 +10,7 @@
 //!
 //! Two complementary approaches sweep the seed space:
 //!
-//! 1. **Hand-rolled parallel sweep** ([`mega_sim_10k_steps`]) -- divides seeds
+//! 1. **Hand-rolled parallel sweep** (`mega_sim_10k_steps`) -- divides seeds
 //!    across OS threads with static chunking, collects failures with
 //!    reproduction commands, and asserts event-kind coverage across the
 //!    aggregate. This is the primary CI gate.
@@ -40,40 +40,72 @@ use std::collections::BTreeMap;
 use super::FaultLevel;
 use super::harness::{CoordinationSim, SimEventKind};
 
+/// Map a [`FaultLevel`] to the string accepted by `GOSSIP_SIM_FAULT`.
+fn fault_level_name(level: FaultLevel) -> &'static str {
+    match level {
+        FaultLevel::SunnyDay => "sunny",
+        FaultLevel::Stormy => "stormy",
+        FaultLevel::Radioactive => "radioactive",
+    }
+}
+
 /// Read `GOSSIP_SIM_SEEDS` from the environment, defaulting to 100.
 ///
-/// Silently falls back to the default on parse errors so that an
-/// accidentally empty or malformed variable does not panic.
+/// Warns on parse errors so that accidentally malformed values are
+/// visible in test output rather than silently ignored.
 fn parse_seed_count() -> usize {
-    std::env::var("GOSSIP_SIM_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100)
+    match std::env::var("GOSSIP_SIM_SEEDS") {
+        Ok(s) => match s.parse() {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!(
+                    "warning: GOSSIP_SIM_SEEDS={s:?} is not a valid number ({e}), \
+                     falling back to default 100"
+                );
+                100
+            }
+        },
+        Err(_) => 100,
+    }
 }
 
 /// Read `GOSSIP_SIM_SEED` to enter single-seed reproduction mode.
 ///
 /// When set, the mega sim skips the parallel sweep and runs only the
 /// specified seed, making failure investigation fast and deterministic.
+/// Warns on parse errors so typos are visible.
 fn parse_single_seed() -> Option<u64> {
-    std::env::var("GOSSIP_SIM_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
+    match std::env::var("GOSSIP_SIM_SEED") {
+        Ok(s) => match s.parse() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                eprintln!("warning: GOSSIP_SIM_SEED={s:?} is not a valid number ({e}), ignoring");
+                None
+            }
+        },
+        Err(_) => None,
+    }
 }
 
 /// Read `GOSSIP_SIM_FAULT` to override the default fault level.
 ///
-/// Defaults to `Stormy` when unset or unrecognized, which provides a good
-/// balance between fault pressure and convergence probability.
+/// Defaults to `Stormy` when unset, which provides a good balance between
+/// fault pressure and convergence probability. Warns on unrecognized values.
 fn parse_fault_level() -> FaultLevel {
-    match std::env::var("GOSSIP_SIM_FAULT")
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
-        "sunny" | "sunnyday" => FaultLevel::SunnyDay,
-        "radioactive" => FaultLevel::Radioactive,
-        _ => FaultLevel::Stormy,
+    match std::env::var("GOSSIP_SIM_FAULT") {
+        Ok(s) => match s.to_lowercase().as_str() {
+            "sunny" | "sunnyday" => FaultLevel::SunnyDay,
+            "radioactive" => FaultLevel::Radioactive,
+            "stormy" => FaultLevel::Stormy,
+            _ => {
+                eprintln!(
+                    "warning: GOSSIP_SIM_FAULT={s:?} is not recognized \
+                     (expected sunny|stormy|radioactive), falling back to Stormy"
+                );
+                FaultLevel::Stormy
+            }
+        },
+        Err(_) => FaultLevel::Stormy,
     }
 }
 
@@ -119,10 +151,11 @@ fn mega_sim_10k_steps() {
         let report = CoordinationSim::new(seed, fault_level)
             .with_workers_and_shards(4, 15)
             .run(10_000, 2_000);
+        let fault_name = fault_level_name(fault_level);
         assert!(
             report.violations.is_empty(),
             "Invariant violation at seed {seed}.\n\
-             Reproduce: GOSSIP_SIM_SEED={seed} cargo test -p gossip-contracts mega_sim -- --ignored --nocapture\n\
+             Reproduce: GOSSIP_SIM_SEED={seed} GOSSIP_SIM_FAULT={fault_name} cargo test -p gossip-contracts mega_sim -- --ignored --nocapture\n\
              Violations: {:#?}",
             report.violations
         );
@@ -130,6 +163,10 @@ fn mega_sim_10k_steps() {
     }
 
     let seed_count = parse_seed_count();
+    if seed_count == 0 {
+        return;
+    }
+
     let parallelism = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -180,6 +217,7 @@ fn mega_sim_10k_steps() {
     });
 
     // Report failures with reproduction commands.
+    let fault_name = fault_level_name(fault_level);
     assert!(
         all_failures.is_empty(),
         "Invariant violations in {}/{seed_count} seeds:\n{}",
@@ -188,7 +226,7 @@ fn mega_sim_10k_steps() {
             .iter()
             .map(|(seed, v)| format!(
                 "  seed {seed}: {v}\n  \
-                 Reproduce: GOSSIP_SIM_SEED={seed} cargo test -p gossip-contracts mega_sim -- --ignored --nocapture"
+                 Reproduce: GOSSIP_SIM_SEED={seed} GOSSIP_SIM_FAULT={fault_name} cargo test -p gossip-contracts mega_sim -- --ignored --nocapture"
             ))
             .collect::<Vec<_>>()
             .join("\n\n")
@@ -212,6 +250,26 @@ fn mega_sim_10k_steps() {
     }
 }
 
+/// Zero seed count must not reach `chunks()` -- the early return guard
+/// prevents a panic from `chunks(0)`.
+///
+/// Exercises the same arithmetic path as `mega_sim_10k_steps` with
+/// `seed_count == 0` to confirm the guard catches it.
+#[test]
+fn zero_seed_count_does_not_panic() {
+    let seed_count: usize = 0;
+    let parallelism = 4;
+
+    // Without the early-return guard this panics: div_ceil(0, 4) == 0
+    // and chunks(0) is unconditionally illegal.
+    if seed_count == 0 {
+        return;
+    }
+    let seeds: Vec<u64> = (0..seed_count as u64).collect();
+    let chunk_size = seeds.len().div_ceil(parallelism);
+    let _chunks: Vec<_> = seeds.chunks(chunk_size).collect();
+}
+
 // -- Proptest seed sweeper --------------------------------------------------
 //
 // Complements the hand-rolled sweep above by leveraging proptest's automatic
@@ -232,7 +290,7 @@ mod proptest_mega {
             cfg
         })]
 
-        /// Proptest seed sweeper: same simulation config as [`mega_sim_10k_steps`]
+        /// Proptest seed sweeper: same simulation config as `mega_sim_10k_steps`
         /// but with proptest-managed seed generation and regression persistence.
         #[test]
         #[ignore]

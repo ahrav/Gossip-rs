@@ -12,8 +12,8 @@
 //!   minimum event-kind coverage.
 //! - **Deterministic replay** -- runs each config twice and asserts
 //!   field-identical reports, validating the PRNG-based determinism contract.
-//! - **Exhaustiveness guard** -- catches `SimEventKind` variant additions that
-//!   are not reflected in the test infrastructure.
+//! - **Exhaustiveness guard** -- a compile-time `const` match block that
+//!   fails to compile if `SimEventKind` gains a variant not listed.
 //!
 //! # Design rationale
 //!
@@ -25,30 +25,29 @@
 use super::FaultLevel;
 use super::harness::{CoordinationSim, SimEventKind, SimReport};
 
-/// All event kind variants, manually enumerated.
-///
-/// `SimEventKind` does not derive `strum::EnumIter` or provide an
-/// `all_variants()` method, so this array serves as the single source of
-/// truth for the variant count. The [`all_event_kinds_enumerated`] test
-/// asserts the length matches the expected count, acting as a tripwire
-/// when new variants are added.
-const ALL_EVENT_KINDS: [SimEventKind; 15] = [
-    SimEventKind::AcquireOk,
-    SimEventKind::RenewOk,
-    SimEventKind::CheckpointOk,
-    SimEventKind::CompleteOk,
-    SimEventKind::ParkOk,
-    SimEventKind::SplitReplaceOk,
-    SimEventKind::SplitResidualOk,
-    SimEventKind::ReplayedOk,
-    SimEventKind::ClaimOk,
-    SimEventKind::ClaimNoneAvailable,
-    SimEventKind::Rejected,
-    SimEventKind::TimeAdvanced,
-    SimEventKind::WorkerPaused,
-    SimEventKind::WorkerResumed,
-    SimEventKind::Skipped,
-];
+/// Compile-time exhaustiveness guard: if a variant is added to `SimEventKind`
+/// without updating this match, compilation will fail.
+const _: () = {
+    fn _check_exhaustive(k: SimEventKind) {
+        match k {
+            SimEventKind::AcquireOk
+            | SimEventKind::RenewOk
+            | SimEventKind::CheckpointOk
+            | SimEventKind::CompleteOk
+            | SimEventKind::ParkOk
+            | SimEventKind::SplitReplaceOk
+            | SimEventKind::SplitResidualOk
+            | SimEventKind::ReplayedOk
+            | SimEventKind::ClaimOk
+            | SimEventKind::ClaimNoneAvailable
+            | SimEventKind::Rejected
+            | SimEventKind::TimeAdvanced
+            | SimEventKind::WorkerPaused
+            | SimEventKind::WorkerResumed
+            | SimEventKind::Skipped => {}
+        }
+    }
+};
 
 /// Assert the minimum behavioral bar: no invariant violations and at least
 /// one operation executed.
@@ -152,6 +151,7 @@ fn behavioral_seed_7_radioactive() {
         .with_workers_and_shards(4, 8)
         .run(1000, 500);
     assert_behavioral_properties(&report, 7, FaultLevel::Radioactive);
+    assert_event_coverage(&report, 7, FaultLevel::Radioactive);
 }
 
 // -- Deterministic replay ---------------------------------------------------
@@ -191,25 +191,20 @@ fn deterministic_replay_cross_config() {
             a.end_time, b.end_time,
             "seed {seed}, level {level:?}: end_time diverged"
         );
+        assert_eq!(
+            a.violations.len(),
+            b.violations.len(),
+            "seed {seed}, level {level:?}: violation count diverged"
+        );
+        assert_eq!(
+            a.converged, b.converged,
+            "seed {seed}, level {level:?}: convergence result diverged"
+        );
     }
 }
 
 // -- Exhaustiveness guard ---------------------------------------------------
-
-/// Tripwire for `SimEventKind` variant additions.
-///
-/// This test cannot enforce exhaustiveness at compile time (there is no
-/// `#[derive(EnumCount)]`). When a developer adds a new variant to
-/// [`ALL_EVENT_KINDS`], the hard-coded `15` will mismatch, reminding them
-/// to update coverage. Note: if the enum grows without updating
-/// `ALL_EVENT_KINDS`, this test will not catch the omission — the array
-/// type annotation (`[SimEventKind; 15]`) serves as the primary compile-time
-/// guard for that case.
-#[test]
-fn all_event_kinds_enumerated() {
-    assert_eq!(
-        ALL_EVENT_KINDS.len(),
-        15,
-        "update ALL_EVENT_KINDS if SimEventKind gains new variants"
-    );
-}
+//
+// Enforced at compile time by the `const _` match block above
+// `ALL_EVENT_KINDS`. No runtime test needed: adding a variant to
+// `SimEventKind` without updating the match causes a compilation error.
