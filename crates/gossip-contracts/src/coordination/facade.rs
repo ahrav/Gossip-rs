@@ -118,8 +118,8 @@ impl From<GetRunError> for ClaimError {
     }
 }
 
-// Compile-time size guard: keeps `ClaimError` within a cache line,
-// preventing the error side from inflating `Result<AcquireResult, ClaimError>`.
+// Compile-time size guard: keeps `ClaimError` small so the error path of
+// `Result<_, ClaimError>` is lightweight.
 const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 
 // ============================================================================
@@ -198,7 +198,10 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
                 continue;
             }
             Err(AcquireError::ShardNotFound { .. }) => {
-                // Defensive: shard disappeared. Skip.
+                // Defensive: no current operation deletes shard records, so
+                // this arm should be unreachable in normal operation. It
+                // exists as a guard against future record-removal paths or
+                // storage-layer inconsistencies.
                 continue;
             }
             Err(AcquireError::TenantMismatch { expected }) => {
@@ -246,9 +249,8 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
 ///   a single FoundationDB transaction that atomically picks and
 ///   leases a shard.
 /// - **Randomized offset**: start iteration at
-///   `worker.as_raw() % len` to spread contention across the
-///   candidate list (cf. Mitzenmacher, "The Power of Two Choices,"
-///   TPDS 2001).
+///   `worker.as_raw() % len` to spread contention deterministically
+///   across the candidate list.
 /// - **Locality-aware**: prefer shards whose key range is near the
 ///   worker's previously held shard, reducing cache churn.
 ///

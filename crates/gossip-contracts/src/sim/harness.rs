@@ -634,7 +634,7 @@ impl CoordinationSim {
                 // Trim stale_leases to prevent unbounded growth.
                 while self.stale_leases.len() > MAX_STALE_LEASES {
                     let idx = self.context.rng().random_range(0..self.stale_leases.len());
-                    self.stale_leases.swap_remove(idx);
+                    let _ = self.stale_leases.swap_remove(idx);
                 }
 
                 SimEvent::AcquireOk { fence }
@@ -1120,7 +1120,7 @@ impl CoordinationSim {
 
                 while self.stale_leases.len() > MAX_STALE_LEASES {
                     let idx = self.context.rng().random_range(0..self.stale_leases.len());
-                    self.stale_leases.swap_remove(idx);
+                    let _ = self.stale_leases.swap_remove(idx);
                 }
 
                 SimEvent::ClaimOk { shard }

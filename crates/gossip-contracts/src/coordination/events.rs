@@ -87,8 +87,12 @@ impl fmt::Debug for RedactedKey {
 /// Discriminant for a [`StateTransitionEvent`], carrying only
 /// variant-specific fields.
 ///
-/// Classification methods ([`is_shard_event`](Self::is_shard_event),
-/// [`is_terminal`](Self::is_terminal)) use exhaustive `match` so the
+/// Variants partition into two mutually exclusive categories:
+/// **shard events** (individual shard lifecycle) and **run events**
+/// (aggregate run lifecycle). Exactly one of
+/// [`is_shard_event`](Self::is_shard_event) /
+/// [`is_run_event`](Self::is_run_event) returns `true` for any
+/// variant. Classification methods use exhaustive `match` so the
 /// compiler forces updates when new variants are added.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EventKind {
@@ -291,6 +295,7 @@ const _: () = assert!(std::mem::size_of::<EventKind>() <= 40);
 pub struct StateTransitionEvent {
     pub tenant: TenantId,
     pub run: RunId,
+    /// Coordinator logical clock at the time this event was produced.
     pub at: LogicalTime,
     pub kind: EventKind,
 }
@@ -315,9 +320,9 @@ impl StateTransitionEvent {
     }
 }
 
-// Compile-time guard: StateTransitionEvent should stay ≤ 88 bytes (currently 80).
+// Compile-time guard: StateTransitionEvent should stay ≤ 80 bytes.
 // Bump deliberately if adding new envelope fields.
-const _: () = assert!(std::mem::size_of::<StateTransitionEvent>() <= 88);
+const _: () = assert!(std::mem::size_of::<StateTransitionEvent>() <= 80);
 
 // ============================================================================
 // EventCollector
@@ -405,6 +410,7 @@ impl EventCollector {
     ///
     /// Prefer [`drain_with`](Self::drain_with) when the collector
     /// will be reused and allocation preservation matters.
+    #[must_use = "drain transfers ownership of events; dropping the result discards them"]
     pub fn drain(&mut self) -> Vec<StateTransitionEvent> {
         std::mem::take(&mut self.events)
     }

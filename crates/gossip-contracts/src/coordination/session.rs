@@ -74,6 +74,8 @@
 //! authoritative [`ShardRecord`](super::record::ShardRecord), not
 //! the session's cached snapshot. Updating the snapshot on every
 //! checkpoint would add allocation overhead for no correctness benefit.
+//! Similarly, [`renew`](WorkerSession::renew) updates only the lease
+//! deadline (via [`Lease::set_deadline`]), not the snapshot.
 //!
 //! The snapshot **is** updated by [`split_residual`](WorkerSession::split_residual)
 //! because the key range narrows, and subsequent [`checkpoint`](WorkerSession::checkpoint)
@@ -87,7 +89,7 @@ use crate::coordination::error::{
     RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::lease::Lease;
-use crate::coordination::record::{ParkReason, ShardSnapshot};
+use crate::coordination::record::{ParkReason, ShardSnapshot, ShardStatus};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::split::{
     SplitReplacePlan, SplitReplaceResult, SplitResidualPlan, SplitResidualResult,
@@ -190,6 +192,13 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         worker: WorkerId,
     ) -> Result<Self, AcquireError> {
         let result = backend.acquire_and_restore(now, tenant, key, worker)?;
+        debug_assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
+        debug_assert_eq!(result.lease.shard_key(), key, "lease shard_key mismatch");
+        debug_assert_eq!(result.lease.owner(), worker, "lease owner mismatch");
+        debug_assert!(
+            !result.snapshot.status().is_terminal(),
+            "acquired terminal shard"
+        );
         Ok(Self {
             backend,
             tenant,
@@ -203,7 +212,6 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// The deadline is updated in place after a successful [`renew`](Self::renew).
     #[inline]
-    #[must_use]
     pub fn lease(&self) -> &Lease {
         &self.lease
     }
@@ -281,8 +289,15 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// the shard), the shard is in a terminal state, or tenant isolation
     /// fails.
     pub fn renew(&mut self, now: LogicalTime) -> Result<RenewResult, RenewError> {
+        let fence_before = self.lease.fence();
         let result = self.backend.renew(now, self.tenant, &self.lease)?;
+        debug_assert!(result.new_deadline > now, "renewal deadline not after now");
         self.lease.set_deadline(result.new_deadline);
+        debug_assert_eq!(
+            self.lease.fence(),
+            fence_before,
+            "fence changed during renewal"
+        );
         Ok(result)
     }
 
@@ -460,6 +475,11 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
                 self.snapshot.cursor_semantics(),
                 self.snapshot.parent(),
                 spawned,
+            );
+            debug_assert_eq!(
+                self.snapshot.status(),
+                ShardStatus::Active,
+                "status changed after split_residual"
             );
         }
         Ok(result)
@@ -782,12 +802,182 @@ mod tests {
         }
     }
 
+    // -- Stale-fence & crash-recovery tests ------------------------------
+
+    /// A stale lease (from a previous session whose fence was superseded)
+    /// is rejected with `StaleFence` when presented for a checkpoint.
+    /// Tests the fencing protocol through the coordination backend after
+    /// two successive session acquisitions on the same shard.
+    #[test]
+    fn stale_fence_rejected_through_session() {
+        let (mut coord, keys) = setup_coordinator(1);
+        // Worker 1 acquires at t=2, deadline=32.
+        let session_w1 =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+        let stale_lease = *session_w1.lease();
+        // Drop session (release borrow), expire the lease, then worker 2 acquires.
+        drop(session_w1);
+        let _session_w2 =
+            WorkerSession::new(&mut coord, now(50), test_tenant(), keys[0], test_worker(2))
+                .unwrap();
+        drop(_session_w2);
+        // Use raw backend with stale_lease to verify StaleFence.
+        let cp_err = coord
+            .checkpoint(
+                now(51),
+                test_tenant(),
+                &stale_lease,
+                Cursor::with_last_key(vec![0x10]),
+                OpId::from_raw(950),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(cp_err, CheckpointError::StaleFence { .. }),
+            "expected StaleFence, got {cp_err:?}"
+        );
+    }
+
+    /// Simulates a crash by dropping session 1 without a terminal op, then
+    /// re-acquiring. The checkpoint written by session 1 must be restored
+    /// in session 2's initial cursor.
+    #[test]
+    fn crash_recovery_restores_cursor() {
+        let (mut coord, keys) = setup_coordinator(1);
+        // Session 1: acquire and checkpoint to 0x15.
+        {
+            let mut s1 =
+                WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1))
+                    .unwrap();
+            let cursor = Cursor::with_last_key(vec![0x15]);
+            let _ = s1.checkpoint(now(3), cursor, OpId::from_raw(1000)).unwrap();
+            // Session dropped (simulated crash) without terminal op.
+        }
+        // Session 2: re-acquire after lease expiry, verify restored cursor.
+        let s2 = WorkerSession::new(&mut coord, now(50), test_tenant(), keys[0], test_worker(2))
+            .unwrap();
+        assert_eq!(s2.cursor().last_key(), Some(&[0x15u8][..]));
+    }
+
+    // -- Idempotency tests ------------------------------------------------
+
+    /// Replaying a checkpoint with the same OpId and identical cursor
+    /// returns `Replayed` rather than `Executed`.
+    #[test]
+    fn checkpoint_replayed_returns_replayed() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+        let cursor = Cursor::with_last_key(vec![0x10]);
+        let op = OpId::from_raw(1100);
+        let first = session.checkpoint(now(3), cursor.clone(), op).unwrap();
+        assert!(first.is_executed());
+
+        let second = session.checkpoint(now(4), cursor, op).unwrap();
+        assert!(second.is_replay());
+    }
+
+    /// Replaying a complete with the same OpId returns `Replayed`.
+    /// Since `complete` consumes the session, the replay is tested via
+    /// a raw backend call with the same lease.
+    #[test]
+    fn complete_replayed_returns_replayed() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+        let lease = *session.lease();
+
+        let cursor = Cursor::with_last_key(vec![0x10]);
+        let op = OpId::from_raw(1200);
+        let first = session.complete(now(3), cursor.clone(), op).unwrap();
+        assert!(first.is_executed());
+
+        // Replay via raw backend — the shard is now Done, but the backend
+        // recognizes the idempotent replay by matching the OpId.
+        let second = coord
+            .complete(now(4), test_tenant(), &lease, cursor, op)
+            .unwrap();
+        assert!(second.is_replay());
+    }
+
+    // -- Successive split_residual test ------------------------------------
+
+    /// Two successive `split_residual` calls accumulate spawned entries and
+    /// correctly narrow the shard's key range at each step.
+    /// Shard starts as [0x00, 0x60). First split -> [0x00, 0x40) + residual
+    /// [0x40, 0x60). Second split -> [0x00, 0x20) + residual [0x20, 0x40).
+    #[test]
+    fn successive_split_residual_accumulates_spawned() {
+        // Use a shard with range [0x00, 0x60) for room.
+        let mut coord = InMemoryCoordinator::new(30);
+        let tenant = test_tenant();
+        let run = test_run();
+        let config = test_run_config();
+        coord.create_run(now(1), tenant, run, config).unwrap();
+
+        let shard_spec =
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x60]);
+        let shard = InitialShard::new(ShardId::from_raw(0), shard_spec, Cursor::initial());
+        let _ = coord
+            .register_shards(now(1), tenant, run, &[shard], OpId::from_raw(100))
+            .unwrap();
+        let key = ShardKey::new(run, ShardId::from_raw(0));
+
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), tenant, key, test_worker(1)).unwrap();
+
+        // First split: [0x00, 0x60) -> [0x00, 0x40) + residual [0x40, 0x60).
+        let plan1 = SplitResidualPlan::try_new(
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x40]),
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x40], vec![0x60]),
+        )
+        .unwrap();
+        let r1 = session
+            .split_residual(now(3), plan1, OpId::from_raw(300))
+            .unwrap();
+        assert!(r1.is_executed());
+        assert_eq!(session.spec().key_range_end(), &[0x40]);
+        assert_eq!(session.initial_snapshot().spawned().len(), 1);
+
+        // Second split: [0x00, 0x40) -> [0x00, 0x20) + residual [0x20, 0x40).
+        let plan2 = SplitResidualPlan::try_new(
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]),
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]),
+        )
+        .unwrap();
+        let r2 = session
+            .split_residual(now(4), plan2, OpId::from_raw(301))
+            .unwrap();
+        assert!(r2.is_executed());
+        assert_eq!(session.spec().key_range_end(), &[0x20]);
+        assert_eq!(session.initial_snapshot().spawned().len(), 2);
+
+        // Checkpoint within the twice-narrowed range succeeds.
+        let cursor = Cursor::with_last_key(vec![0x10]);
+        let cp = session
+            .checkpoint(now(5), cursor, OpId::from_raw(302))
+            .unwrap();
+        assert!(cp.is_executed());
+    }
+
     // -- Property tests --------------------------------------------------
 
-    // Random operation sequences preserve identity invariants throughout
-    // the session lifecycle. Generates random Renew / Checkpoint(byte)
-    // sequences and verifies that tenant(), worker(), and shard_key()
-    // never change, all operations succeed, and complete() succeeds.
+    /// Operation kinds for the property test. Generated up front by
+    /// proptest, then interpreted against runtime state (current range,
+    /// last cursor position). Operations that are invalid in the current
+    /// state are skipped rather than rejected.
+    #[derive(Debug, Clone)]
+    enum PropOp {
+        Renew,
+        Checkpoint(u8),
+        SplitResidual,
+    }
+
+    // Random operation sequences — including split_residual — preserve
+    // identity invariants throughout the session lifecycle. Generates
+    // random Renew / Checkpoint(byte) / SplitResidual sequences and
+    // verifies that tenant(), worker(), and shard_key() never change,
+    // all operations succeed, and complete() succeeds.
     proptest! {
         #![proptest_config(miri_proptest_config())]
 
@@ -795,10 +985,11 @@ mod tests {
         fn prop_session_lifecycle_invariants(
             ops in proptest::collection::vec(
                 prop_oneof![
-                    Just(None),                         // Renew
-                    (0x01u8..=0x3Eu8).prop_map(Some),   // Checkpoint(byte)
+                    2 => Just(PropOp::Renew),
+                    5 => (0x01u8..=0x3Eu8).prop_map(PropOp::Checkpoint),
+                    1 => Just(PropOp::SplitResidual),
                 ],
-                0..8,
+                0..10,
             ),
         ) {
             let (mut coord, keys) = setup_coordinator(1);
@@ -814,6 +1005,9 @@ mod tests {
             let mut t = 3u64;
             let mut last_cursor_byte: u8 = 0;
             let mut op_counter = 1000u64;
+            // Track current key range (single-byte boundaries).
+            let range_start: u8 = 0x00;
+            let mut range_end: u8 = 0x40;
 
             for op in &ops {
                 // Identity invariants hold before every operation.
@@ -822,14 +1016,17 @@ mod tests {
                 prop_assert_eq!(session.shard_key(), expected_key);
 
                 match op {
-                    None => {
+                    PropOp::Renew => {
                         let _ = session.renew(now(t)).map_err(|e| {
                             TestCaseError::Fail(format!("renew failed at t={t}: {e:?}").into())
                         })?;
                     }
-                    Some(byte) => {
-                        // Skip if this would regress the cursor.
-                        if *byte <= last_cursor_byte {
+                    PropOp::Checkpoint(byte) => {
+                        // Skip if out of narrowed range or would regress cursor.
+                        if *byte <= last_cursor_byte
+                            || *byte < range_start
+                            || *byte >= range_end
+                        {
                             continue;
                         }
                         let cursor = Cursor::with_last_key(vec![*byte]);
@@ -844,16 +1041,54 @@ mod tests {
                         last_cursor_byte = *byte;
                         op_counter += 1;
                     }
+                    PropOp::SplitResidual => {
+                        // Need at least 4 bytes of range to split meaningfully.
+                        if range_end.saturating_sub(range_start) < 4 {
+                            continue;
+                        }
+                        let mid = range_start + (range_end - range_start) / 2;
+                        // Split point must leave the cursor inside the new
+                        // parent range [range_start, mid).
+                        if mid <= last_cursor_byte {
+                            continue;
+                        }
+                        let parent_new =
+                            crate::coordination::shard_spec::ShardSpec::with_range(
+                                vec![range_start],
+                                vec![mid],
+                            );
+                        let residual =
+                            crate::coordination::shard_spec::ShardSpec::with_range(
+                                vec![mid],
+                                vec![range_end],
+                            );
+                        let plan =
+                            SplitResidualPlan::try_new(parent_new, residual).unwrap();
+                        let result = session
+                            .split_residual(now(t), plan, OpId::from_raw(op_counter))
+                            .map_err(|e| {
+                                TestCaseError::Fail(
+                                    format!("split_residual at t={t}: {e:?}").into(),
+                                )
+                            })?;
+                        prop_assert!(result.is_executed());
+                        prop_assert_eq!(session.spec().key_range_end(), &[mid]);
+                        range_end = mid;
+                        op_counter += 1;
+                    }
                 }
                 t += 1;
             }
 
-            // Terminal operation succeeds.
-            let final_byte = last_cursor_byte.max(0x01);
-            let final_cursor = Cursor::with_last_key(vec![final_byte]);
-            let _ = session.complete(now(t), final_cursor, OpId::from_raw(op_counter)).map_err(|e| {
-                TestCaseError::Fail(format!("complete failed: {e:?}").into())
-            })?;
+            // Terminal operation — cursor must be in [range_start, range_end).
+            let final_byte = last_cursor_byte.max(range_start + 1);
+            if final_byte < range_end {
+                let final_cursor = Cursor::with_last_key(vec![final_byte]);
+                let _ = session.complete(now(t), final_cursor, OpId::from_raw(op_counter)).map_err(|e| {
+                    TestCaseError::Fail(format!("complete failed: {e:?}").into())
+                })?;
+            }
+            // If range too narrow for any valid cursor, session is dropped.
         }
     }
 }

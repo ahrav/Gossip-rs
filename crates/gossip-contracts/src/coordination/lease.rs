@@ -152,6 +152,7 @@ impl LeaseHolder {
 /// Workers receive them as opaque tokens and present them back via public
 /// accessors. This prevents workers from forging or extending their own
 /// leases.
+#[must_use = "discarding a Lease wastes the shard's availability window until expiry"]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lease {
     tenant: TenantId,
@@ -173,7 +174,6 @@ impl Lease {
     ///   epoch is reserved as a sentinel and must never appear in a live lease.
     /// - If `deadline` is [`LogicalTime::ZERO`]. A zero deadline would make
     ///   the lease instantly expired, which is never valid.
-    #[must_use]
     pub(crate) fn new(
         tenant: TenantId,
         run: RunId,
@@ -306,8 +306,9 @@ impl Lease {
 /// ## Invariants
 ///
 /// **Safety (discriminant stability)**: The `u8` discriminant values are
-/// persisted in the op-log. Existing values MUST NOT be reused or reordered.
-/// Compile-time assertions below enforce this.
+/// persisted in the op-log. Existing values should not be reassigned
+/// without updating all existing op-log entries. Compile-time assertions
+/// below enforce the current mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpKind {
@@ -404,8 +405,9 @@ const _: () = assert!(core::mem::size_of::<OpKind>() == 1);
 /// ## Invariants
 ///
 /// **Safety (discriminant stability)**: The `u8` discriminant values are
-/// persisted in the op-log. Existing values MUST NOT be reused or reordered.
-/// Compile-time assertions below enforce this.
+/// persisted in the op-log. Existing values should not be reassigned
+/// without updating all existing op-log entries. Compile-time assertions
+/// below enforce the current mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpResult {
