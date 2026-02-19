@@ -40,9 +40,11 @@
 //!    ▼    split_replace      ▼
 //! ┌──────┐      │       ┌────────┐
 //! │ Done │      ▼       │ Parked │
-//! └──────┘  ┌───────┐   └────────┘
-//!           │ Split  │
-//!           └───────┘
+//! └──────┘  ┌───────┐   └───┬────┘
+//!           │ Split  │       │ unpark_shard
+//!           └───────┘       │ (admin, bumps fence)
+//!                           ▼
+//!                      back to Active
 //! ```
 //!
 //! All transitions originate from `Active`. `Done` and `Split` are permanently
@@ -65,9 +67,9 @@
 //!
 //! # Performance note
 //!
-//! A future `claim_next_available` would scan all shards — O(S) for a linear
-//! pass, or O(S log S) if sorted by priority. Acceptable here; production
-//! backends need a secondary available-shards index.
+//! `claim_next_available` (via `ShardClaiming`) scans all shards — O(S)
+//! for a linear pass. Acceptable here; production backends need a
+//! secondary available-shards index.
 
 use std::collections::{HashMap, HashSet};
 
@@ -104,9 +106,9 @@ use crate::coordination::validation::{
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_stdx::RingBuffer;
 
-/// aHash-backed `HashMap` — faster hashing than SipHash for point
-/// lookups. aHash provides DOS resistance via keyed hashing (uses
-/// AES-NI where available).
+/// aHash-backed `HashMap` — faster hashing than the std default
+/// (`SipHasher13`) for point lookups. aHash provides hash-flooding
+/// resistance via per-instance random keys (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 /// In-memory coordinator for shard-level operations.
@@ -193,7 +195,9 @@ impl InMemoryCoordinator {
     /// Seed a shard record directly (test/fixture helper).
     ///
     /// Does not enforce shard count limits — this is a test helper for
-    /// constructing specific states.
+    /// constructing specific states. Also updates the `run_shards` index
+    /// so that `list_shards` can discover seeded shards (required by
+    /// `claim_next_available`).
     ///
     /// # Panics
     ///
@@ -208,6 +212,10 @@ impl InMemoryCoordinator {
     pub fn seed_shard(&mut self, record: ShardRecord) {
         record.assert_invariants();
         let key = ShardKey::new(record.run, record.shard);
+        self.run_shards
+            .entry((record.tenant, record.run))
+            .or_default()
+            .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
     }
 
@@ -218,7 +226,47 @@ impl InMemoryCoordinator {
     #[cfg(test)]
     pub fn seed_shard_unchecked(&mut self, record: ShardRecord) {
         let key = ShardKey::new(record.run, record.shard);
+        self.run_shards
+            .entry((record.tenant, record.run))
+            .or_default()
+            .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
+    }
+
+    /// Seed a run record directly (test/fixture helper).
+    ///
+    /// Creates an `Active` run with `shard_ids` as root shards, bypassing
+    /// the two-phase `create_run` → `register_shards` flow. Paired with
+    /// [`seed_shard`](Self::seed_shard) for constructing specific states.
+    ///
+    /// No-op if the run already exists (idempotent for multi-shard setups).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn seed_run(
+        &mut self,
+        tenant: TenantId,
+        run: RunId,
+        shard_ids: Vec<ShardId>,
+        lease_duration: u64,
+    ) {
+        use crate::coordination::shard_spec::CursorSemantics;
+
+        if self.runs.contains_key(&(tenant, run)) {
+            return;
+        }
+        let config = RunConfig::try_new(CursorSemantics::Completed, lease_duration, Some(5))
+            .expect("seed_run: invalid lease_duration");
+        let record = RunRecord {
+            tenant,
+            run,
+            config,
+            status: RunStatus::Active,
+            created_at: LogicalTime::from_raw(1),
+            completed_at: None,
+            root_shards: shard_ids,
+            op_log: RingBuffer::new(),
+        };
+        record.assert_invariants();
+        self.runs.insert((tenant, run), record);
     }
 
     /// Read-only access to the shard map for external invariant checking.
@@ -411,9 +459,11 @@ impl CoordinationBackend for InMemoryCoordinator {
         let new_fence = record.advance_fence();
 
         // 5) Grant a new lease with a fresh deadline.
+        // Saturate rather than panicking: a very-long lease is safe — it will
+        // still expire eventually or be superseded by a fence bump.
         let deadline = now
             .checked_add(lease_duration)
-            .expect("lease deadline overflow — LogicalTime near max");
+            .unwrap_or(LogicalTime::from_raw(u64::MAX));
         record.lease = Some(LeaseHolder::new(worker, deadline));
 
         // 6) Return the fencing lease + shard snapshot.
@@ -442,9 +492,11 @@ impl CoordinationBackend for InMemoryCoordinator {
 
         validate_lease(now, tenant, lease, record)?;
 
+        // Saturate rather than panicking: a very-long lease is safe — it will
+        // still expire eventually or be superseded by a fence bump.
         let deadline = now
             .checked_add(lease_duration)
-            .expect("lease deadline overflow — LogicalTime near max");
+            .unwrap_or(LogicalTime::from_raw(u64::MAX));
         record.lease = Some(LeaseHolder::new(lease.owner(), deadline));
 
         record.assert_invariants();
@@ -1438,8 +1490,9 @@ impl RunManagement for InMemoryCoordinator {
     ) -> Result<Vec<ShardSummary>, GetRunError> {
         let _ = self.lookup_run(tenant, run)?;
 
-        let mut summaries = Vec::new();
-        if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+        let shard_ids = self.run_shards.get(&(tenant, run));
+        let mut summaries = Vec::with_capacity(shard_ids.map_or(0, |ids| ids.len()));
+        if let Some(shard_ids) = shard_ids {
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
                 let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
@@ -1460,7 +1513,11 @@ impl RunManagement for InMemoryCoordinator {
             }
         }
 
-        summaries.sort_by(|a, b| a.key_range_start().cmp(b.key_range_start()));
+        summaries.sort_by(|a, b| {
+            a.key_range_start()
+                .cmp(b.key_range_start())
+                .then_with(|| a.shard().cmp(&b.shard()))
+        });
         Ok(summaries)
     }
 
@@ -1659,7 +1716,20 @@ impl RunManagement for InMemoryCoordinator {
                     expected_hash,
                     actual_hash,
                 }),
-                other => unreachable!("unexpected CoordError: {other:?}"),
+                // check_op_idempotency only returns OpIdConflict.
+                // Exhaustive listing ensures the compiler forces updates
+                // if new CoordError variants are added.
+                crate::coordination::error::CoordError::ShardNotFound { .. }
+                | crate::coordination::error::CoordError::TenantMismatch { .. }
+                | crate::coordination::error::CoordError::StaleFence { .. }
+                | crate::coordination::error::CoordError::LeaseExpired { .. }
+                | crate::coordination::error::CoordError::ShardTerminal { .. }
+                | crate::coordination::error::CoordError::CursorRegression { .. }
+                | crate::coordination::error::CoordError::CursorOutOfBounds(_)
+                | crate::coordination::error::CoordError::SplitInvalid(_)
+                | crate::coordination::error::CoordError::CheckpointMissingKey => {
+                    unreachable!("check_op_idempotency only returns OpIdConflict")
+                }
             })?
             .is_some()
         {

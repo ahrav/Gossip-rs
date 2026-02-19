@@ -1238,6 +1238,8 @@ impl ShardSummary {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardFilter {
     pub(crate) status: Option<ShardStatus>,
+    /// Evaluated at the `now` parameter passed to [`RunManagement::list_shards`]:
+    /// a lease whose deadline has passed is treated as unleased.
     pub(crate) is_leased: Option<bool>,
     /// When `true`, excludes split children (shards with a `parent`).
     pub(crate) root_only: bool,
@@ -1480,7 +1482,10 @@ pub trait RunManagement {
         run: RunId,
     ) -> Result<RunProgress, GetRunError>;
 
-    /// List shards for a run, filtered. Ordered by `key_range_start`.
+    /// List shards for a run, filtered. Ordered by `key_range_start` ascending.
+    ///
+    /// `ShardFilter::is_leased` must be evaluated against `now`: a lease whose
+    /// deadline has passed counts as unleased, not leased.
     fn list_shards(
         &self,
         now: LogicalTime,
