@@ -273,7 +273,10 @@ impl InMemoryCoordinator {
         let inner = self.shards.get_mut(tenant)?;
         let removed = inner.remove(key);
         if removed.is_some() {
-            self.total_shard_count -= 1;
+            self.total_shard_count = self
+                .total_shard_count
+                .checked_sub(1)
+                .expect("total_shard_count underflow");
         }
         self.assert_shard_count();
         removed
@@ -311,8 +314,12 @@ impl InMemoryCoordinator {
         temporarily_removed: usize,
     ) -> Result<(), SplitValidationError> {
         // Per-tenant limit: O(1) via inner map len().
-        let tenant_count = self.shards.get(&tenant).map_or(0, |m| m.len()) + temporarily_removed;
-        if tenant_count + additional > self.max_shards_per_tenant {
+        let tenant_count = self
+            .shards
+            .get(&tenant)
+            .map_or(0, |m| m.len())
+            .saturating_add(temporarily_removed);
+        if tenant_count.saturating_add(additional) > self.max_shards_per_tenant {
             return Err(SplitValidationError::ShardLimitExceeded {
                 current: tenant_count,
                 additional,
@@ -322,8 +329,8 @@ impl InMemoryCoordinator {
         }
 
         // Global limit: O(1) via maintained counter.
-        let total_count = self.total_shard_count + temporarily_removed;
-        if total_count + additional > self.max_total_shards {
+        let total_count = self.total_shard_count.saturating_add(temporarily_removed);
+        if total_count.saturating_add(additional) > self.max_total_shards {
             return Err(SplitValidationError::ShardLimitExceeded {
                 current: total_count,
                 additional,
@@ -1111,6 +1118,33 @@ impl InMemoryCoordinator {
     #[cfg(not(debug_assertions))]
     fn debug_assert_run_shards_consistent(&self, _tenant: TenantId, _run: RunId) {}
 
+    /// Apply the terminal mutation shared by `complete_run`, `fail_run`, and `cancel_run`.
+    ///
+    /// Sets the target status, records `completed_at`, pushes an op-log entry,
+    /// and verifies invariants. Callers are responsible for all precondition
+    /// checks (lookup, tenant, idempotency, terminal, wrong-status) before
+    /// calling this helper.
+    fn apply_terminal_run_transition(
+        record: &mut RunRecord,
+        now: LogicalTime,
+        op_id: OpId,
+        payload_hash: u64,
+        target_status: RunStatus,
+        op_kind: RunOpKind,
+    ) {
+        record.assert_transition_legal(target_status);
+        record.status = target_status;
+        record.completed_at = Some(now);
+        record.op_log_push(RunOpLogEntry::new(
+            op_id,
+            op_kind,
+            payload_hash,
+            now,
+            RunOpResult::Ack,
+        ));
+        record.assert_invariants();
+    }
+
     /// Look up a run record, checking tenant isolation.
     fn lookup_run(&self, tenant: TenantId, run: RunId) -> Result<&RunRecord, GetRunError> {
         let record = self
@@ -1227,6 +1261,13 @@ impl RunManagement for InMemoryCoordinator {
             })?;
 
         // 6. Build and insert shard records in a single pass.
+        //
+        // NOTE(atomicity): Shard records are inserted into the map before
+        // RunRecord is updated below. If `assert_invariants` panics mid-loop,
+        // orphaned shard records exist without a matching RunRecord update.
+        // This is acceptable in the in-memory backend because the panic is
+        // intentionally fatal (crash-to-prevent-corruption). Production
+        // backends must use a transaction to make the entire operation atomic.
         let cursor_semantics = record.config.cursor_semantics();
         let shard_ids: Vec<ShardId> = shards.iter().map(|s| s.shard()).collect();
 
@@ -1352,7 +1393,6 @@ impl RunManagement for InMemoryCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteRunError> {
         let payload_hash = hash_complete_run_payload();
-
         let record = self
             .runs
             .get_mut(&(tenant, run))
@@ -1360,44 +1400,29 @@ impl RunManagement for InMemoryCoordinator {
         if record.tenant != tenant {
             return Err(CompleteRunError::TenantMismatch { expected: tenant });
         }
-
-        // Idempotency check FIRST.
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            assert_eq!(
-                entry.kind(),
-                RunOpKind::CompleteRun,
-                "idempotent replay kind mismatch: expected CompleteRun, got {:?}",
-                entry.kind(),
-            );
+            assert_eq!(entry.kind(), RunOpKind::CompleteRun);
             return Ok(IdempotentOutcome::Replayed(()));
         }
-
-        // Terminal check.
         if record.status.is_terminal() {
             return Err(CompleteRunError::RunTerminal {
                 status: record.status,
             });
         }
-
-        // Must be Active.
+        // Must be Active (not Initializing).
         if record.status != RunStatus::Active {
             return Err(CompleteRunError::WrongStatus {
                 status: record.status,
             });
         }
-
-        record.assert_transition_legal(RunStatus::Done);
-        record.status = RunStatus::Done;
-        record.completed_at = Some(now);
-        record.op_log_push(RunOpLogEntry::new(
-            op_id,
-            RunOpKind::CompleteRun,
-            payload_hash,
+        Self::apply_terminal_run_transition(
+            record,
             now,
-            RunOpResult::Ack,
-        ));
-        record.assert_invariants();
-
+            op_id,
+            payload_hash,
+            RunStatus::Done,
+            RunOpKind::CompleteRun,
+        );
         Ok(IdempotentOutcome::Executed(()))
     }
 
@@ -1409,7 +1434,6 @@ impl RunManagement for InMemoryCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, FailRunError> {
         let payload_hash = hash_fail_run_payload();
-
         let record = self
             .runs
             .get_mut(&(tenant, run))
@@ -1417,44 +1441,29 @@ impl RunManagement for InMemoryCoordinator {
         if record.tenant != tenant {
             return Err(FailRunError::TenantMismatch { expected: tenant });
         }
-
-        // Idempotency check FIRST.
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            assert_eq!(
-                entry.kind(),
-                RunOpKind::FailRun,
-                "idempotent replay kind mismatch: expected FailRun, got {:?}",
-                entry.kind(),
-            );
+            assert_eq!(entry.kind(), RunOpKind::FailRun);
             return Ok(IdempotentOutcome::Replayed(()));
         }
-
-        // Terminal check.
         if record.status.is_terminal() {
             return Err(FailRunError::RunTerminal {
                 status: record.status,
             });
         }
-
         // Must be Active (PD-2: not Initializing).
         if record.status != RunStatus::Active {
             return Err(FailRunError::WrongStatus {
                 status: record.status,
             });
         }
-
-        record.assert_transition_legal(RunStatus::Failed);
-        record.status = RunStatus::Failed;
-        record.completed_at = Some(now);
-        record.op_log_push(RunOpLogEntry::new(
-            op_id,
-            RunOpKind::FailRun,
-            payload_hash,
+        Self::apply_terminal_run_transition(
+            record,
             now,
-            RunOpResult::Ack,
-        ));
-        record.assert_invariants();
-
+            op_id,
+            payload_hash,
+            RunStatus::Failed,
+            RunOpKind::FailRun,
+        );
         Ok(IdempotentOutcome::Executed(()))
     }
 
@@ -1466,7 +1475,6 @@ impl RunManagement for InMemoryCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CancelRunError> {
         let payload_hash = hash_cancel_run_payload();
-
         let record = self
             .runs
             .get_mut(&(tenant, run))
@@ -1474,37 +1482,24 @@ impl RunManagement for InMemoryCoordinator {
         if record.tenant != tenant {
             return Err(CancelRunError::TenantMismatch { expected: tenant });
         }
-
-        // Idempotency check FIRST.
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            assert_eq!(
-                entry.kind(),
-                RunOpKind::CancelRun,
-                "idempotent replay kind mismatch: expected CancelRun, got {:?}",
-                entry.kind(),
-            );
+            assert_eq!(entry.kind(), RunOpKind::CancelRun);
             return Ok(IdempotentOutcome::Replayed(()));
         }
-
-        // Terminal check.
         if record.status.is_terminal() {
             return Err(CancelRunError::RunTerminal {
                 status: record.status,
             });
         }
-
         // Accepts both Initializing and Active (unlike fail_run).
-        record.assert_transition_legal(RunStatus::Cancelled);
-        record.status = RunStatus::Cancelled;
-        record.completed_at = Some(now);
-        record.op_log_push(RunOpLogEntry::new(
-            op_id,
-            RunOpKind::CancelRun,
-            payload_hash,
+        Self::apply_terminal_run_transition(
+            record,
             now,
-            RunOpResult::Ack,
-        ));
-        record.assert_invariants();
+            op_id,
+            payload_hash,
+            RunStatus::Cancelled,
+            RunOpKind::CancelRun,
+        );
 
         Ok(IdempotentOutcome::Executed(()))
     }
@@ -1577,7 +1572,7 @@ impl RunManagement for InMemoryCoordinator {
             .expect("shard record must exist: verified by read-only check above");
 
         // Bump fence FIRST (fence any zombie workers from the prior lease).
-        record.fence_epoch = record.fence_epoch.increment();
+        record.advance_fence();
 
         // Clear park state, restore Active.
         record.park_reason = None;

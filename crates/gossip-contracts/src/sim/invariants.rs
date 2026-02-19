@@ -172,6 +172,8 @@ impl InvariantChecker {
             if let Some(&prev) = self.prev_terminal.get(&id)
                 && prev.is_terminal()
                 && current_status != prev
+                // Parked→Active is a legitimate transition via `unpark_shard`.
+                && !(prev == ShardStatus::Parked && current_status == ShardStatus::Active)
             {
                 violations.push(InvariantViolation::TerminalIrreversibility {
                     run: id.0,
@@ -759,6 +761,59 @@ mod tests {
         assert!(
             matches!(s7[0], InvariantViolation::SplitCoverage { detail, .. }
                 if detail.contains("incorrect parent"))
+        );
+    }
+
+    /// S3: Parked→Active is a legitimate unpark transition, not an S3 violation.
+    #[test]
+    fn parked_to_active_not_flagged_as_terminal_reversion() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+        let now = LogicalTime::from_raw(1);
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Seed as Parked (terminal per is_terminal()).
+        coord.seed_shard(ShardRecord::from_raw_parts(
+            TENANT,
+            run,
+            shard,
+            ShardStatus::Parked,
+            Some(crate::coordination::record::ParkReason::Other),
+            spec.clone(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::INITIAL,
+            None,
+            vec![],
+            vec![],
+        ));
+        let mut checker = InvariantChecker::new();
+        assert!(checker.check_all(&coord, &[], TENANT, now).is_empty());
+
+        // Re-seed as Active — simulates unpark_shard.
+        // Bump fence epoch to match what unpark_shard does.
+        coord.seed_shard(ShardRecord::from_raw_parts(
+            TENANT,
+            run,
+            shard,
+            ShardStatus::Active,
+            None,
+            spec,
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::INITIAL.increment(),
+            None,
+            vec![],
+            vec![],
+        ));
+
+        let v = checker.check_all(&coord, &[], TENANT, now);
+        assert!(
+            v.is_empty(),
+            "Parked→Active should not trigger S3 TerminalIrreversibility, got: {v:?}"
         );
     }
 }
