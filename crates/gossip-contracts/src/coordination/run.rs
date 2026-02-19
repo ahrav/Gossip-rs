@@ -1006,9 +1006,10 @@ impl std::error::Error for ManifestValidationError {}
 /// 1. SEC-3: count <= `MAX_INITIAL_SHARDS` (FIRST check, before allocation).
 /// 2. Non-empty.
 /// 3. No duplicate IDs.
-/// 4. Spec validity: `start < end` for bounded key ranges.
-/// 5. No overlapping key ranges (gaps are allowed).
-/// 6. Cursor bounds for non-initial cursors.
+/// 4. No unbounded ranges (empty start or end).
+/// 5. Spec validity: `start < end` for bounded key ranges.
+/// 6. No overlapping key ranges (gaps are allowed).
+/// 7. Cursor bounds for non-initial cursors.
 pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
@@ -2382,7 +2383,7 @@ mod tests {
         );
     }
 
-    // -- F2: Unbounded range rejection tests --
+    // -- Unbounded range rejection tests --
 
     #[test]
     fn manifest_unbounded_end_rejected() {

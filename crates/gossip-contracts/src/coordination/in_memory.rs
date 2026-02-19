@@ -201,6 +201,7 @@ impl InMemoryCoordinator {
     /// In production paths, shards are created through `register_shards`
     /// (root shards) or split operations (derived children), both of
     /// which construct records with correct invariants by construction.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn seed_shard(&mut self, record: ShardRecord) {
         record.assert_invariants();
         let key = ShardKey::new(record.run, record.shard);
@@ -1208,7 +1209,7 @@ impl RunManagement for InMemoryCoordinator {
         // 4. Validate manifest.
         validate_manifest(shards).map_err(RegisterShardsError::ManifestInvalid)?;
 
-        // 5. Shard count limit check (F3: register_shards must respect limits).
+        // 5. Shard count limit check — register_shards must respect limits.
         self.check_shard_limits(tenant, shards.len(), 0)
             .map_err(|e| match e {
                 SplitValidationError::ShardLimitExceeded {
@@ -1231,6 +1232,11 @@ impl RunManagement for InMemoryCoordinator {
 
         for s in shards {
             let key = ShardKey::new(run, s.shard());
+            assert!(
+                !self.shard_contains(&tenant, &key),
+                "register_shards: ShardKey collision for {key:?} — \
+                 manifest validation should prevent this"
+            );
             let mut sr =
                 ShardRecord::new_active(tenant, run, s.shard(), s.spec().clone(), cursor_semantics);
             if !s.cursor().is_initial() {

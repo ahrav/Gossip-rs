@@ -37,14 +37,26 @@ const LEASE_DURATION: u64 = 100;
 
 fn seeded_coordinator() -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let record = ShardRecord::new_active(
-        test_tenant(),
-        test_run(),
+    // Use a high op_id to avoid conflicts with prop test op counters
+    // which start at 1.
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+    let shards = vec![InitialShard::new(
         test_shard(),
         test_spec(),
-        CursorSemantics::Completed,
-    );
-    coord.seed_shard(record);
+        Cursor::initial(),
+    )];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(u64::MAX),
+        )
+        .unwrap();
     coord
 }
 
@@ -1402,7 +1414,7 @@ fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
 }
 
-// -- F1: Split index consistency tests --
+// -- Split index consistency tests --
 
 /// Setup helper: create a run with one root shard [a,z), register it,
 /// and acquire a lease. Returns `(coordinator, lease)`.
@@ -1529,7 +1541,7 @@ fn split_residual_child_visible_in_list_shards() {
     assert!(has_residual, "residual [m,z) should be in listing");
 }
 
-// -- F3: Shard count limit tests for register_shards --
+// -- Shard count limit tests for register_shards --
 
 #[test]
 fn register_shards_exceeds_per_tenant_limit() {
@@ -1662,7 +1674,7 @@ fn register_shards_within_limits_succeeds() {
     assert!(result.is_executed());
 }
 
-// -- F2: register_shards cursor preservation (regression guard) --
+// -- register_shards cursor preservation (regression guard) --
 
 #[test]
 fn register_shards_preserves_non_initial_cursors() {
@@ -2204,7 +2216,7 @@ fn unpark_then_reacquire_and_checkpoint() {
     assert!(cp.is_executed());
 }
 
-// -- F1: unpark_shard run-status check tests -----------------------------------
+// -- unpark_shard run-status check tests -----------------------------------
 
 #[test]
 fn unpark_shard_rejected_when_run_cancelled() {
@@ -2882,7 +2894,8 @@ proptest! {
     #[test]
     fn random_ops_preserve_invariants(ops in proptest::collection::vec(arb_op(), 1..100)) {
         let mut coord = seeded_coordinator();
-        let mut time = 1u64;
+        // Start time after seeded_coordinator setup (which uses t=1, t=2).
+        let mut time = 3u64;
         let mut op_counter = 1u64;
         let mut last_lease: Option<Lease> = None;
 
