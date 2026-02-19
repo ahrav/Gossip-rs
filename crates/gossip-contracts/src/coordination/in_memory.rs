@@ -135,15 +135,15 @@ pub struct InMemoryCoordinator {
     /// Global shard count, maintained inline on insert/remove.
     ///
     /// Invariant: `total_shard_count == self.shards.values().map(|m| m.len()).sum::<usize>()`.
-    /// Verified via `debug_assert!` after mutations.
+    /// Verified via `assert!` after mutations.
     total_shard_count: usize,
     runs: AHashMap<(TenantId, RunId), RunRecord>,
     /// Secondary index: run → shard IDs (root + split children).
     ///
-    /// Avoids a full `shards` map scan when computing run progress or
-    /// listing shards for a single run. Updated by `register_shards`
-    /// and split operations (`split_replace`, `split_residual`).
-    run_shards: AHashMap<(TenantId, RunId), Vec<ShardId>>,
+    /// Uses `HashSet` for O(1) dedup in `index_shard`.
+    /// Iteration order doesn't matter — `list_shards`
+    /// sorts results by `key_range_start` afterward.
+    run_shards: AHashMap<(TenantId, RunId), HashSet<ShardId, ahash::RandomState>>,
     default_lease_duration: u64,
     max_shards_per_tenant: usize,
     max_total_shards: usize,
@@ -263,7 +263,7 @@ impl InMemoryCoordinator {
         if inner.insert(key, record).is_none() {
             self.total_shard_count += 1;
         }
-        self.debug_assert_shard_count();
+        self.assert_shard_count();
     }
 
     /// Remove a shard record, maintaining `total_shard_count`.
@@ -274,7 +274,7 @@ impl InMemoryCoordinator {
         if removed.is_some() {
             self.total_shard_count -= 1;
         }
-        self.debug_assert_shard_count();
+        self.assert_shard_count();
         removed
     }
 
@@ -283,9 +283,14 @@ impl InMemoryCoordinator {
         self.shards.get(tenant).is_some_and(|m| m.contains_key(key))
     }
 
-    /// Assert `total_shard_count` invariant in debug/test builds.
-    fn debug_assert_shard_count(&self) {
-        debug_assert_eq!(
+    /// Assert `total_shard_count` invariant.
+    ///
+    /// A desynchronized counter means silent data
+    /// corruption (wrong shard-limit decisions), which
+    /// must crash immediately per the project's crash-to-prevent-corruption
+    /// philosophy.
+    fn assert_shard_count(&self) {
+        assert_eq!(
             self.total_shard_count,
             self.shards.values().map(|m| m.len()).sum::<usize>(),
             "total_shard_count drift detected"
@@ -606,7 +611,10 @@ impl CoordinationBackend for InMemoryCoordinator {
         })();
 
         // Always restore the parent record (mutated or not).
+        let run = parent.run;
         self.shard_insert(tenant, key, parent);
+        // Consistency check after parent is restored to the map.
+        self.debug_assert_run_shards_consistent(tenant, run);
         result
     }
 
@@ -680,7 +688,10 @@ impl CoordinationBackend for InMemoryCoordinator {
             }))
         })();
 
+        let run = parent.run;
         self.shard_insert(tenant, key, parent);
+        // Consistency check after parent is restored to the map.
+        self.debug_assert_run_shards_consistent(tenant, run);
         result
     }
 }
@@ -724,7 +735,7 @@ fn split_replace_validate_preconditions<'a>(
 fn split_replace_sort_children(plan: &SplitReplacePlan) -> Vec<&SplitReplaceChild> {
     let mut sorted: Vec<&SplitReplaceChild> = plan.children().iter().collect();
     sorted.sort_by(|a, b| a.spec().key_range_start().cmp(b.spec().key_range_start()));
-    debug_assert!(sorted.len() >= 2, "split_replace requires >= 2 children");
+    assert!(sorted.len() >= 2, "split_replace requires >= 2 children");
     sorted
 }
 
@@ -792,7 +803,7 @@ fn split_replace_build_children(
             DerivedShardKind::Child,
             idx,
         );
-        debug_assert!(child_id.is_derived(), "derived child must have bit 63 set");
+        assert!(child_id.is_derived(), "derived child must have bit 63 set");
 
         let child_key = ShardKey::new(parent.run, child_id);
         let record = ShardRecord::new_split_child(
@@ -809,7 +820,7 @@ fn split_replace_build_children(
         to_insert.push(((tenant, child_key), record));
     }
 
-    debug_assert_eq!(
+    assert_eq!(
         child_ids.len(),
         sorted.len(),
         "child count mismatch after build",
@@ -831,7 +842,7 @@ fn split_replace_apply_parent(
     payload_hash: u64,
     now: LogicalTime,
 ) {
-    debug_assert!(!child_ids.is_empty(), "split_replace requires children");
+    assert!(!child_ids.is_empty(), "split_replace requires children");
 
     parent.assert_transition_legal(ShardStatus::Split);
     parent.status = ShardStatus::Split;
@@ -1024,7 +1035,7 @@ fn split_residual_build_record(
     tenant: TenantId,
     residual_id: ShardId,
 ) -> ShardRecord {
-    debug_assert!(residual_id.is_derived(), "residual must be derived");
+    assert!(residual_id.is_derived(), "residual must be derived");
     ShardRecord::new_split_child(
         tenant,
         parent.run,
@@ -1051,7 +1062,7 @@ fn split_residual_apply_parent(
     payload_hash: u64,
     now: LogicalTime,
 ) {
-    debug_assert!(residual_id.is_derived(), "residual must be derived");
+    assert!(residual_id.is_derived(), "residual must be derived");
 
     parent.spec = new_spec;
     parent.spawned.push(residual_id);
@@ -1072,11 +1083,32 @@ fn split_residual_apply_parent(
 impl InMemoryCoordinator {
     /// Register a shard in the run→shards index.
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
-        let entry = self.run_shards.entry((tenant, run)).or_default();
-        if !entry.contains(&shard) {
-            entry.push(shard);
+        self.run_shards
+            .entry((tenant, run))
+            .or_default()
+            .insert(shard);
+    }
+
+    /// Cross-validate the `run_shards` index against the primary `shards` map.
+    ///
+    /// Every shard ID in the index must exist in the primary map.
+    #[cfg(debug_assertions)]
+    fn debug_assert_run_shards_consistent(&self, tenant: TenantId, run: RunId) {
+        if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+            for &shard_id in shard_ids {
+                let key = ShardKey::new(run, shard_id);
+                debug_assert!(
+                    self.shard_get(&tenant, &key).is_some(),
+                    "run_shards index contains {:?} for run {:?} but primary map has no record",
+                    shard_id,
+                    run,
+                );
+            }
         }
     }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_run_shards_consistent(&self, _tenant: TenantId, _run: RunId) {}
 
     /// Look up a run record, checking tenant isolation.
     fn lookup_run(&self, tenant: TenantId, run: RunId) -> Result<&RunRecord, GetRunError> {
@@ -1146,7 +1178,7 @@ impl RunManagement for InMemoryCoordinator {
 
         // 2. Idempotency check FIRST (before status).
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            debug_assert_eq!(
+            assert_eq!(
                 entry.kind(),
                 RunOpKind::RegisterShards,
                 "idempotent replay kind mismatch: expected RegisterShards, got {:?}",
@@ -1212,10 +1244,14 @@ impl RunManagement for InMemoryCoordinator {
         self.run_shards
             .entry((tenant, run))
             .or_default()
-            .extend_from_slice(&shard_ids);
+            .extend(shard_ids.iter().copied());
 
         // 7. Update RunRecord: status → Active, root_shards, op-log.
-        let record = self.runs.get_mut(&(tenant, run)).unwrap();
+        let record = self
+            .runs
+            .get_mut(&(tenant, run))
+            .expect("run record must exist: verified by lookup_run above");
+        record.assert_transition_legal(RunStatus::Active);
         record.status = RunStatus::Active;
         record.root_shards = shard_ids.clone();
         record.op_log_push(RunOpLogEntry::new(
@@ -1228,6 +1264,7 @@ impl RunManagement for InMemoryCoordinator {
             },
         ));
         record.assert_invariants();
+        self.debug_assert_run_shards_consistent(tenant, run);
 
         Ok(IdempotentOutcome::Executed(shard_ids))
     }
@@ -1250,10 +1287,16 @@ impl RunManagement for InMemoryCoordinator {
             // Order-independent: iterate shard_ids, look up each record.
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
-                if let Some(record) = self.shard_get(&tenant, &key) {
-                    let is_leased = record.is_leased_at(now);
-                    progress.count_shard(record.status, is_leased);
-                }
+                let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
+                    panic!(
+                        "run_shards index contains shard {:?} for run {:?} \
+                         but no record exists in the primary shard map — \
+                         index desynchronization",
+                        shard_id, run,
+                    )
+                });
+                let is_leased = record.is_leased_at(now);
+                progress.count_shard(record.status, is_leased);
             }
         }
         Ok(progress)
@@ -1272,15 +1315,21 @@ impl RunManagement for InMemoryCoordinator {
         if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
-                if let Some(record) = self.shard_get(&tenant, &key) {
-                    // Pre-filter on record fields before constructing
-                    // ShardSummary (which heap-allocates key ranges).
-                    if !filter.matches_record(record, now) {
-                        continue;
-                    }
-                    let summary = ShardSummary::from_record(record, now);
-                    summaries.push(summary);
+                let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
+                    panic!(
+                        "run_shards index contains shard {:?} for run {:?} \
+                         but no record exists in the primary shard map — \
+                         index desynchronization",
+                        shard_id, run,
+                    )
+                });
+                // Pre-filter on record fields before constructing
+                // ShardSummary (which heap-allocates key ranges).
+                if !filter.matches_record(record, now) {
+                    continue;
                 }
+                let summary = ShardSummary::from_record(record, now);
+                summaries.push(summary);
             }
         }
 
@@ -1308,7 +1357,7 @@ impl RunManagement for InMemoryCoordinator {
 
         // Idempotency check FIRST.
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            debug_assert_eq!(
+            assert_eq!(
                 entry.kind(),
                 RunOpKind::CompleteRun,
                 "idempotent replay kind mismatch: expected CompleteRun, got {:?}",
@@ -1331,6 +1380,7 @@ impl RunManagement for InMemoryCoordinator {
             });
         }
 
+        record.assert_transition_legal(RunStatus::Done);
         record.status = RunStatus::Done;
         record.completed_at = Some(now);
         record.op_log_push(RunOpLogEntry::new(
@@ -1364,7 +1414,7 @@ impl RunManagement for InMemoryCoordinator {
 
         // Idempotency check FIRST.
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            debug_assert_eq!(
+            assert_eq!(
                 entry.kind(),
                 RunOpKind::FailRun,
                 "idempotent replay kind mismatch: expected FailRun, got {:?}",
@@ -1387,6 +1437,7 @@ impl RunManagement for InMemoryCoordinator {
             });
         }
 
+        record.assert_transition_legal(RunStatus::Failed);
         record.status = RunStatus::Failed;
         record.completed_at = Some(now);
         record.op_log_push(RunOpLogEntry::new(
@@ -1420,7 +1471,7 @@ impl RunManagement for InMemoryCoordinator {
 
         // Idempotency check FIRST.
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-            debug_assert_eq!(
+            assert_eq!(
                 entry.kind(),
                 RunOpKind::CancelRun,
                 "idempotent replay kind mismatch: expected CancelRun, got {:?}",
@@ -1437,7 +1488,7 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         // Accepts both Initializing and Active (unlike fail_run).
-
+        record.assert_transition_legal(RunStatus::Cancelled);
         record.status = RunStatus::Cancelled;
         record.completed_at = Some(now);
         record.op_log_push(RunOpLogEntry::new(
@@ -1501,7 +1552,9 @@ impl RunManagement for InMemoryCoordinator {
             });
         }
 
-        let record = self.shard_get_mut(&tenant, &key).unwrap();
+        let record = self
+            .shard_get_mut(&tenant, &key)
+            .expect("shard record must exist: verified by read-only check above");
 
         // Bump fence FIRST (fence any zombie workers from the prior lease).
         record.fence_epoch = record.fence_epoch.increment();
