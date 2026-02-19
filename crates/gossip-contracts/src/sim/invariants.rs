@@ -127,12 +127,13 @@ impl InvariantChecker {
         now: LogicalTime,
     ) -> Vec<InvariantViolation> {
         let mut violations = Vec::new();
-        let shards = coordinator.shards();
+        // Collect into a Vec so we can iterate AND do point lookups.
+        let shards: Vec<_> = coordinator.shards().collect();
 
         // Reuse S1 buffer across calls to avoid per-call allocation.
         self.active_holders.clear();
 
-        for (&(tid, key), record) in shards {
+        for &((tid, key), record) in &shards {
             if tid != tenant {
                 continue;
             }
@@ -171,6 +172,8 @@ impl InvariantChecker {
             if let Some(&prev) = self.prev_terminal.get(&id)
                 && prev.is_terminal()
                 && current_status != prev
+                // Parked→Active is a legitimate transition via `unpark_shard`.
+                && !(prev == ShardStatus::Parked && current_status == ShardStatus::Active)
             {
                 violations.push(InvariantViolation::TerminalIrreversibility {
                     run: id.0,
@@ -254,7 +257,7 @@ impl InvariantChecker {
                     self.scratch_wrong_parent.clear();
                     for &child_id in &record.spawned {
                         let child_key = ShardKey::new(record.run, child_id);
-                        match shards.get(&(tenant, child_key)) {
+                        match coordinator.shard_lookup(&tenant, &child_key) {
                             Some(child_record) => {
                                 if child_record.parent != Some(record.shard) {
                                     self.scratch_wrong_parent.push(child_id);
@@ -759,6 +762,59 @@ mod tests {
         assert!(
             matches!(s7[0], InvariantViolation::SplitCoverage { detail, .. }
                 if detail.contains("incorrect parent"))
+        );
+    }
+
+    /// S3: Parked→Active is a legitimate unpark transition, not an S3 violation.
+    #[test]
+    fn parked_to_active_not_flagged_as_terminal_reversion() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+        let now = LogicalTime::from_raw(1);
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Seed as Parked (terminal per is_terminal()).
+        coord.seed_shard(ShardRecord::from_raw_parts(
+            TENANT,
+            run,
+            shard,
+            ShardStatus::Parked,
+            Some(crate::coordination::record::ParkReason::Other),
+            spec.clone(),
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::INITIAL,
+            None,
+            vec![],
+            RingBuffer::new(),
+        ));
+        let mut checker = InvariantChecker::new();
+        assert!(checker.check_all(&coord, &[], TENANT, now).is_empty());
+
+        // Re-seed as Active — simulates unpark_shard.
+        // Bump fence epoch to match what unpark_shard does.
+        coord.seed_shard(ShardRecord::from_raw_parts(
+            TENANT,
+            run,
+            shard,
+            ShardStatus::Active,
+            None,
+            spec,
+            Cursor::initial(),
+            CursorSemantics::Completed,
+            None,
+            FenceEpoch::INITIAL.increment(),
+            None,
+            vec![],
+            RingBuffer::new(),
+        ));
+
+        let v = checker.check_all(&coord, &[], TENANT, now);
+        assert!(
+            v.is_empty(),
+            "Parked→Active should not trigger S3 TerminalIrreversibility, got: {v:?}"
         );
     }
 }

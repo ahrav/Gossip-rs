@@ -18,6 +18,7 @@
 //! D2.25: `RunRecord` gets its own bounded op-log (cap: 8).
 
 use std::fmt;
+use std::num::NonZeroU64;
 
 use crate::coordination::cursor::{Cursor, MAX_KEY_SIZE};
 use crate::coordination::error::IdempotentOutcome;
@@ -140,7 +141,9 @@ impl std::error::Error for RunConfigError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunConfig {
     pub(crate) cursor_semantics: CursorSemantics,
-    pub(crate) lease_duration: u64,
+    /// Lease duration in [`LogicalTime`] ticks. `NonZeroU64` makes the
+    /// zero-duration invariant unrepresentable — no runtime check needed.
+    pub(crate) lease_duration: NonZeroU64,
     pub(crate) max_shard_retries: Option<u32>,
 }
 
@@ -155,9 +158,8 @@ impl RunConfig {
         lease_duration: u64,
         max_shard_retries: Option<u32>,
     ) -> Result<Self, RunConfigError> {
-        if lease_duration == 0 {
-            return Err(RunConfigError::ZeroLeaseDuration);
-        }
+        let lease_duration =
+            NonZeroU64::new(lease_duration).ok_or(RunConfigError::ZeroLeaseDuration)?;
         Ok(Self {
             cursor_semantics,
             lease_duration,
@@ -169,7 +171,8 @@ impl RunConfig {
     ///
     /// Use [`try_new`](Self::try_new) for external input.
     pub(crate) fn assert_valid(&self) {
-        assert!(self.lease_duration > 0, "lease_duration must be > 0");
+        // lease_duration > 0 is guaranteed by NonZeroU64.
+        let _ = self.lease_duration;
     }
 
     #[must_use]
@@ -180,7 +183,7 @@ impl RunConfig {
     /// Lease duration in [`LogicalTime`] ticks.
     #[must_use]
     pub fn lease_duration(&self) -> u64 {
-        self.lease_duration
+        self.lease_duration.get()
     }
 
     #[must_use]
@@ -297,6 +300,17 @@ impl RunOpLogEntry {
             executed_at > LogicalTime::ZERO,
             "RunOpLogEntry: executed_at must be > ZERO"
         );
+        // INV-11 at construction: kind-result consistency.
+        match (&kind, &result) {
+            (RunOpKind::RegisterShards, RunOpResult::RegisteredShards { .. }) => {}
+            (RunOpKind::RegisterShards, RunOpResult::Ack) => {
+                panic!("RunOpLogEntry: RegisterShards must have RegisteredShards result, not Ack");
+            }
+            (_, RunOpResult::Ack) => {}
+            (k, RunOpResult::RegisteredShards { .. }) => {
+                panic!("RunOpLogEntry: {k:?} must have Ack result, not RegisteredShards",);
+            }
+        }
         Self {
             op_id,
             kind,
@@ -616,6 +630,40 @@ impl RunRecord {
         }
     }
 
+    /// Assert that transitioning to `new_status` is legal from the current state.
+    ///
+    /// Legal transitions (see [`RunStatus`] state machine):
+    /// - Initializing → Active (via `register_shards`)
+    /// - Initializing → Cancelled (via `cancel_run`)
+    /// - Active → Done (via `complete_run`)
+    /// - Active → Failed (via `fail_run`)
+    /// - Active → Cancelled (via `cancel_run`)
+    ///
+    /// Terminal states (Done, Failed, Cancelled) cannot transition to any
+    /// other state. Mirrors [`ShardRecord::assert_transition_legal`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the transition is illegal.
+    pub(crate) fn assert_transition_legal(&self, new_status: RunStatus) {
+        let legal = match (self.status, new_status) {
+            (RunStatus::Initializing, RunStatus::Active) => true,
+            (RunStatus::Initializing, RunStatus::Cancelled) => true,
+            (RunStatus::Active, RunStatus::Done) => true,
+            (RunStatus::Active, RunStatus::Failed) => true,
+            (RunStatus::Active, RunStatus::Cancelled) => true,
+            // Same-state is legal (idempotent path, not used inline but
+            // keeps the guard compatible with replay-then-assert patterns).
+            (s, t) if s == t => true,
+            _ => false,
+        };
+        assert!(
+            legal,
+            "Run {:?}: illegal transition from {:?} to {:?}",
+            self.run, self.status, new_status,
+        );
+    }
+
     // -- Public accessors --
 
     #[must_use]
@@ -781,10 +829,24 @@ impl RunProgress {
                     .expect("RunProgress::parked overflow");
             }
         }
+        self.assert_invariants();
+    }
+
+    /// Assert structural invariants of the progress tallies.
+    ///
+    /// - `total == active + done + split + parked`
+    /// - `leased <= active`
+    pub fn assert_invariants(&self) {
         assert_eq!(
             self.total,
             self.active + self.done + self.split + self.parked,
             "RunProgress: total must equal sum of per-status counts"
+        );
+        assert!(
+            self.leased <= self.active,
+            "RunProgress: leased ({}) must not exceed active ({})",
+            self.leased,
+            self.active,
         );
     }
 }
@@ -813,7 +875,7 @@ pub enum RunTerminalEvaluation {
 /// when and whether to auto-transition (D2.19: external terminal evaluation).
 #[must_use]
 pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
-    debug_assert!(
+    assert!(
         progress.total > 0,
         "evaluate_run_terminal called with zero-total progress"
     );
@@ -901,6 +963,12 @@ pub enum ManifestValidationError {
         size: usize,
         max: usize,
     },
+    /// A shard has an unbounded key range (empty start or end).
+    ///
+    /// Unbounded specs are test-only constructs. Production manifests must
+    /// have finite, bounded key ranges so that overlap detection and shard
+    /// coordination operate on well-defined intervals.
+    UnboundedRange { shard_id: ShardId },
 }
 
 impl fmt::Display for ManifestValidationError {
@@ -937,6 +1005,9 @@ impl fmt::Display for ManifestValidationError {
                     shard_id,
                 )
             }
+            Self::UnboundedRange { shard_id } => {
+                write!(f, "unbounded range for shard {:?}", shard_id)
+            }
         }
     }
 }
@@ -949,9 +1020,10 @@ impl std::error::Error for ManifestValidationError {}
 /// 1. SEC-3: count <= `MAX_INITIAL_SHARDS` (FIRST check, before allocation).
 /// 2. Non-empty.
 /// 3. No duplicate IDs.
-/// 4. Spec validity: `start < end` for bounded key ranges.
-/// 5. No overlapping key ranges (gaps are allowed).
-/// 6. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
+/// 4. No unbounded ranges (empty start or end).
+/// 5. Spec validity: `start < end` for bounded key ranges.
+/// 6. No overlapping key ranges (gaps are allowed).
+///    6b. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
 /// 7. Cursor bounds for non-initial cursors.
 pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
@@ -977,8 +1049,16 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
         }
     }
 
+    // Reject unbounded ranges: production manifests must have finite bounds.
+    for shard in shards {
+        if shard.spec.key_range_start().is_empty() || shard.spec.key_range_end().is_empty() {
+            return Err(ManifestValidationError::UnboundedRange {
+                shard_id: shard.shard,
+            });
+        }
+    }
+
     // Sort by key_range_start for overlap detection.
-    // Only check ranges if both start and end are non-empty (bounded specs).
     let mut sorted: Vec<&InitialShard> = shards.iter().collect();
     sorted.sort_by(|a, b| a.spec.key_range_start().cmp(b.spec.key_range_start()));
 
@@ -994,11 +1074,16 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
     }
 
     // Check for overlapping ranges.
+    // Ranges are sorted by key_range_start. Two adjacent ranges [a_start, a_end)
+    // and [b_start, b_end) overlap iff a_end > b_start, where:
+    //   - empty a_end means [a_start, ∞) → always overlaps with the next shard
+    //   - empty b_start means [min, b_end) → any non-empty a_end exceeds min
     for window in sorted.windows(2) {
         let (a, b) = (window[0], window[1]);
         let a_end = a.spec.key_range_end();
         let b_start = b.spec.key_range_start();
-        if !a_end.is_empty() && !b_start.is_empty() && a_end > b_start {
+        let overlaps = a_end.is_empty() || b_start.is_empty() || a_end > b_start;
+        if overlaps {
             return Err(ManifestValidationError::OverlappingRanges {
                 shard_a: a.shard,
                 shard_b: b.shard,
@@ -1202,6 +1287,31 @@ impl ShardFilter {
             return false;
         }
         if self.root_only && summary.parent.is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// Pre-filter on [`ShardRecord`] fields before constructing a
+    /// [`ShardSummary`] (which heap-allocates key ranges).
+    ///
+    /// Equivalent to `self.matches(&ShardSummary::from_record(record, now))`
+    /// but avoids the 2-3 heap allocations per record that `from_record`
+    /// performs. At 10K shards with a selective filter, this turns ~30K
+    /// wasted allocations into ~30.
+    #[must_use]
+    pub fn matches_record(&self, record: &ShardRecord, now: LogicalTime) -> bool {
+        if let Some(status) = self.status
+            && record.status != status
+        {
+            return false;
+        }
+        if let Some(leased) = self.is_leased
+            && record.is_leased_at(now) != leased
+        {
+            return false;
+        }
+        if self.root_only && record.parent.is_some() {
             return false;
         }
         true
@@ -1529,15 +1639,8 @@ mod tests {
         test_config().assert_valid();
     }
 
-    #[test]
-    #[should_panic(expected = "lease_duration must be > 0")]
-    fn run_config_assert_valid_panics() {
-        RunConfig {
-            lease_duration: 0,
-            ..test_config()
-        }
-        .assert_valid();
-    }
+    // Zero-lease-duration panicking test removed — `NonZeroU64` enforces
+    // this invariant at the type level; you can't construct the invalid state.
 
     // -- RunOpKind --
 
@@ -1965,7 +2068,7 @@ mod tests {
         let oversized_key = vec![0xAA; MAX_KEY_SIZE + 1];
         let shard = InitialShard::new(
             ShardId::from_raw(0),
-            ShardSpec::unbounded(),
+            ShardSpec::with_range(vec![0x00], vec![0xFF]),
             Cursor::with_last_key(oversized_key),
         );
         let result = validate_manifest(&[shard]);
@@ -1986,7 +2089,7 @@ mod tests {
         let exact_key = vec![0xBB; MAX_KEY_SIZE];
         let shard = InitialShard::new(
             ShardId::from_raw(0),
-            ShardSpec::unbounded(),
+            ShardSpec::with_range(vec![0x00], vec![0xFF]),
             Cursor::with_last_key(exact_key),
         );
         assert!(validate_manifest(&[shard]).is_ok());
@@ -2093,37 +2196,31 @@ mod tests {
     // -- INV-11: Kind-result consistency --
 
     #[test]
-    #[should_panic(expected = "RegisterShards op-log entry must have RegisteredShards result")]
-    fn assert_invariants_catches_register_shards_with_ack() {
-        let mut r = test_run_record();
-        r.op_log
-            .push_back(RunOpLogEntry::new(
-                OpId::from_raw(1),
-                RunOpKind::RegisterShards,
-                42,
-                LogicalTime::from_raw(1),
-                RunOpResult::Ack,
-            ))
-            .unwrap();
-        r.assert_invariants();
+    #[should_panic(expected = "RegisterShards must have RegisteredShards result")]
+    fn construction_rejects_register_shards_with_ack() {
+        // INV-11 now enforced at construction time in RunOpLogEntry::new().
+        let _ = RunOpLogEntry::new(
+            OpId::from_raw(1),
+            RunOpKind::RegisterShards,
+            42,
+            LogicalTime::from_raw(1),
+            RunOpResult::Ack,
+        );
     }
 
     #[test]
-    #[should_panic(expected = "must not have RegisteredShards result")]
-    fn assert_invariants_catches_terminal_op_with_registered_shards() {
-        let mut r = test_run_record();
-        r.op_log
-            .push_back(RunOpLogEntry::new(
-                OpId::from_raw(1),
-                RunOpKind::CompleteRun,
-                42,
-                LogicalTime::from_raw(1),
-                RunOpResult::RegisteredShards {
-                    shard_ids: Box::new([]),
-                },
-            ))
-            .unwrap();
-        r.assert_invariants();
+    #[should_panic(expected = "must have Ack result, not RegisteredShards")]
+    fn construction_rejects_terminal_op_with_registered_shards() {
+        // INV-11 now enforced at construction time in RunOpLogEntry::new().
+        let _ = RunOpLogEntry::new(
+            OpId::from_raw(1),
+            RunOpKind::CompleteRun,
+            42,
+            LogicalTime::from_raw(1),
+            RunOpResult::RegisteredShards {
+                shard_ids: Box::new([]),
+            },
+        );
     }
 
     #[test]
@@ -2221,9 +2318,8 @@ mod tests {
     // -- Finding 5: evaluate_run_terminal debug_assert --
 
     #[test]
-    #[cfg(debug_assertions)]
     #[should_panic(expected = "evaluate_run_terminal called with zero-total progress")]
-    fn evaluate_run_terminal_zero_total_panics_in_debug() {
+    fn evaluate_run_terminal_zero_total_panics() {
         let _ = evaluate_run_terminal(&RunProgress::default());
     }
 
@@ -2393,5 +2489,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -- Unbounded range rejection tests --
+
+    #[test]
+    fn manifest_detects_overlap_with_unbounded_end() {
+        // Unbounded end is now rejected before overlap detection.
+        let shard_a = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::from_raw_parts(
+                b"a".to_vec().into_boxed_slice(),
+                Box::new([]), // unbounded end = [a, ∞)
+                Box::new([]),
+            ),
+            Cursor::initial(),
+        );
+        let shard_b = make_initial_shard(1, b"m", b"z");
+        let result = validate_manifest(&[shard_a, shard_b]);
+        assert!(
+            matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
+            "unbounded end must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_detects_overlap_with_both_starts_empty() {
+        // Unbounded start is now rejected before overlap detection.
+        let shard_a = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::from_raw_parts(
+                Box::new([]), // unbounded start
+                b"m".to_vec().into_boxed_slice(),
+                Box::new([]),
+            ),
+            Cursor::initial(),
+        );
+        let shard_b = InitialShard::new(
+            ShardId::from_raw(1),
+            ShardSpec::from_raw_parts(
+                Box::new([]), // unbounded start
+                b"z".to_vec().into_boxed_slice(),
+                Box::new([]),
+            ),
+            Cursor::initial(),
+        );
+        let result = validate_manifest(&[shard_a, shard_b]);
+        assert!(
+            matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
+            "unbounded start must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_unbounded_start_rejected() {
+        // Unbounded start is no longer accepted in production manifests.
+        let shard_a = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::from_raw_parts(
+                Box::new([]), // unbounded start
+                b"m".to_vec().into_boxed_slice(),
+                Box::new([]),
+            ),
+            Cursor::initial(),
+        );
+        let shard_b = make_initial_shard(1, b"m", b"z");
+        let result = validate_manifest(&[shard_a, shard_b]);
+        assert!(
+            matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
+            "unbounded start must be rejected: {result:?}"
+        );
+    }
+
+    #[test]
+    fn manifest_unbounded_end_rejected() {
+        let shard = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::from_raw_parts(b"a".to_vec().into_boxed_slice(), Box::new([]), Box::new([])),
+            Cursor::initial(),
+        );
+        assert!(
+            matches!(
+                validate_manifest(&[shard]),
+                Err(ManifestValidationError::UnboundedRange { .. })
+            ),
+            "shard with unbounded end must be rejected"
+        );
+    }
+
+    #[test]
+    fn manifest_fully_unbounded_rejected() {
+        let shard = InitialShard::new(
+            ShardId::from_raw(0),
+            ShardSpec::unbounded(),
+            Cursor::initial(),
+        );
+        assert!(
+            matches!(
+                validate_manifest(&[shard]),
+                Err(ManifestValidationError::UnboundedRange { .. })
+            ),
+            "fully unbounded shard must be rejected"
+        );
     }
 }

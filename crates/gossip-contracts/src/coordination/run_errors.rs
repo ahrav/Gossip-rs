@@ -232,212 +232,143 @@ impl fmt::Display for GetRunError {
 impl std::error::Error for GetRunError {}
 
 // ============================================================================
+// Terminal run error macro
+// ============================================================================
+
+/// Generates a terminal run error enum with common variants (RunNotFound,
+/// TenantMismatch, RunTerminal, OpIdConflict) plus optional extra variants.
+///
+/// All generated enums get identical Debug (hash-redacting), Display, Error,
+/// and `From<RunOpIdConflict>` implementations.
+macro_rules! define_terminal_run_error {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$extra_meta:meta])*
+                $extra_variant:ident { status: RunStatus }
+                    => debug: $debug_name:literal,
+                    => display: $display_msg:literal
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        $vis enum $name {
+            RunNotFound,
+            /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
+            TenantMismatch { expected: TenantId },
+            /// Run is already in a terminal state.
+            RunTerminal { status: RunStatus },
+            $(
+                $(#[$extra_meta])*
+                $extra_variant { status: RunStatus },
+            )*
+            /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
+            /// to prevent external access to raw hash values (SEC-6).
+            OpIdConflict(RunOpIdConflict),
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::RunNotFound => write!(f, "RunNotFound"),
+                    Self::TenantMismatch { expected } => f
+                        .debug_struct("TenantMismatch")
+                        .field("expected", expected)
+                        .finish(),
+                    Self::RunTerminal { status } => f
+                        .debug_struct("RunTerminal")
+                        .field("status", status)
+                        .finish(),
+                    $(
+                        Self::$extra_variant { status } => f
+                            .debug_struct($debug_name)
+                            .field("status", status)
+                            .finish(),
+                    )*
+                    Self::OpIdConflict(c) => c.fmt(f),
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self {
+                    Self::RunNotFound => f.write_str("run not found"),
+                    Self::TenantMismatch { expected } => {
+                        write!(f, "tenant mismatch (expected {expected:?})")
+                    }
+                    Self::RunTerminal { status } => {
+                        write!(f, "run is already terminal (status: {status})")
+                    }
+                    $(
+                        Self::$extra_variant { status } => {
+                            write!(f, $display_msg, status = status)
+                        }
+                    )*
+                    Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
+                }
+            }
+        }
+
+        impl std::error::Error for $name {}
+
+        impl_from_run_op_id_conflict!($name);
+    };
+}
+
+// ============================================================================
 // CompleteRunError
 // ============================================================================
 
-/// Error from `complete_run`.
-///
-/// `complete_run` requires Active status.
-#[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CompleteRunError {
-    RunNotFound,
-    /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
-    TenantMismatch {
-        expected: TenantId,
-    },
-    /// Run is already in a terminal state.
-    RunTerminal {
-        status: RunStatus,
-    },
-    /// Run is not in `Active` status (e.g., still Initializing).
-    WrongStatus {
-        status: RunStatus,
-    },
-    /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-    /// to prevent external access to raw hash values (SEC-6).
-    OpIdConflict(RunOpIdConflict),
-}
-
-impl fmt::Debug for CompleteRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RunNotFound => write!(f, "RunNotFound"),
-            Self::TenantMismatch { expected } => f
-                .debug_struct("TenantMismatch")
-                .field("expected", expected)
-                .finish(),
-            Self::RunTerminal { status } => f
-                .debug_struct("RunTerminal")
-                .field("status", status)
-                .finish(),
-            Self::WrongStatus { status } => f
-                .debug_struct("WrongStatus")
-                .field("status", status)
-                .finish(),
-            Self::OpIdConflict(c) => c.fmt(f),
-        }
+define_terminal_run_error! {
+    /// Error from `complete_run`.
+    ///
+    /// `complete_run` requires Active status.
+    #[derive(Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum CompleteRunError {
+        /// Run is not in `Active` status (e.g., still Initializing).
+        WrongStatus { status: RunStatus }
+            => debug: "WrongStatus",
+            => display: "run is not Active (status: {status})",
     }
 }
-
-impl fmt::Display for CompleteRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RunNotFound => f.write_str("run not found"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::RunTerminal { status } => {
-                write!(f, "run is already terminal (status: {status})")
-            }
-            Self::WrongStatus { status } => {
-                write!(f, "run is not Active (status: {status})")
-            }
-            Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
-        }
-    }
-}
-
-impl std::error::Error for CompleteRunError {}
-
-impl_from_run_op_id_conflict!(CompleteRunError);
 
 // ============================================================================
 // FailRunError
 // ============================================================================
 
-/// Error from `fail_run`.
-///
-/// Separate from `CompleteRunError` (PD-6) because `fail_run` transitions
-/// to `Failed` (not `Done`), warranting a distinct error type for callers
-/// who need to distinguish completion failures from explicit failure marking.
-#[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FailRunError {
-    RunNotFound,
-    /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
-    TenantMismatch {
-        expected: TenantId,
-    },
-    /// Run is already in a terminal state.
-    RunTerminal {
-        status: RunStatus,
-    },
-    /// Run is not in `Active` status. For Initializing runs, use `cancel_run`.
-    WrongStatus {
-        status: RunStatus,
-    },
-    /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-    /// to prevent external access to raw hash values (SEC-6).
-    OpIdConflict(RunOpIdConflict),
-}
-
-impl fmt::Debug for FailRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RunNotFound => write!(f, "RunNotFound"),
-            Self::TenantMismatch { expected } => f
-                .debug_struct("TenantMismatch")
-                .field("expected", expected)
-                .finish(),
-            Self::RunTerminal { status } => f
-                .debug_struct("RunTerminal")
-                .field("status", status)
-                .finish(),
-            Self::WrongStatus { status } => f
-                .debug_struct("WrongStatus")
-                .field("status", status)
-                .finish(),
-            Self::OpIdConflict(c) => c.fmt(f),
-        }
+define_terminal_run_error! {
+    /// Error from `fail_run`.
+    ///
+    /// Separate from `CompleteRunError` (PD-6) because `fail_run` transitions
+    /// to `Failed` (not `Done`), warranting a distinct error type for callers
+    /// who need to distinguish completion failures from explicit failure marking.
+    #[derive(Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum FailRunError {
+        /// Run is not in `Active` status. For Initializing runs, use `cancel_run`.
+        WrongStatus { status: RunStatus }
+            => debug: "WrongStatus",
+            => display: "run is not Active, use cancel_run for Initializing (status: {status})",
     }
 }
-
-impl fmt::Display for FailRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RunNotFound => f.write_str("run not found"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::RunTerminal { status } => {
-                write!(f, "run is already terminal (status: {status})")
-            }
-            Self::WrongStatus { status } => {
-                write!(
-                    f,
-                    "run is not Active, use cancel_run for Initializing (status: {status})"
-                )
-            }
-            Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
-        }
-    }
-}
-
-impl std::error::Error for FailRunError {}
-
-impl_from_run_op_id_conflict!(FailRunError);
 
 // ============================================================================
 // CancelRunError
 // ============================================================================
 
-/// Error from `cancel_run`.
-///
-/// `cancel_run` accepts both Initializing and Active (no `WrongStatus`
-/// under normal operation — only terminal runs are rejected).
-#[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CancelRunError {
-    RunNotFound,
-    /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
-    TenantMismatch {
-        expected: TenantId,
-    },
-    /// Run is already in a terminal state.
-    RunTerminal {
-        status: RunStatus,
-    },
-    /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-    /// to prevent external access to raw hash values (SEC-6).
-    OpIdConflict(RunOpIdConflict),
-}
-
-impl fmt::Debug for CancelRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RunNotFound => write!(f, "RunNotFound"),
-            Self::TenantMismatch { expected } => f
-                .debug_struct("TenantMismatch")
-                .field("expected", expected)
-                .finish(),
-            Self::RunTerminal { status } => f
-                .debug_struct("RunTerminal")
-                .field("status", status)
-                .finish(),
-            Self::OpIdConflict(c) => c.fmt(f),
-        }
+define_terminal_run_error! {
+    /// Error from `cancel_run`.
+    ///
+    /// `cancel_run` accepts both Initializing and Active (no `WrongStatus`
+    /// under normal operation — only terminal runs are rejected).
+    #[derive(Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum CancelRunError {
     }
 }
-
-impl fmt::Display for CancelRunError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::RunNotFound => f.write_str("run not found"),
-            Self::TenantMismatch { expected } => {
-                write!(f, "tenant mismatch (expected {expected:?})")
-            }
-            Self::RunTerminal { status } => {
-                write!(f, "run is already terminal (status: {status})")
-            }
-            Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
-        }
-    }
-}
-
-impl std::error::Error for CancelRunError {}
-
-impl_from_run_op_id_conflict!(CancelRunError);
 
 // ============================================================================
 // UnparkError
@@ -454,6 +385,8 @@ pub enum UnparkError {
     ShardNotFound,
     /// Tenant isolation violation. Only `expected` is exposed (SEC-1).
     TenantMismatch { expected: TenantId },
+    /// The run is already in a terminal state — unparking is pointless.
+    RunTerminal { status: RunStatus },
     /// The shard is not in `Parked` status.
     NotParked { status: ShardStatus },
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
@@ -469,6 +402,10 @@ impl fmt::Debug for UnparkError {
                 .debug_struct("TenantMismatch")
                 .field("expected", expected)
                 .finish(),
+            Self::RunTerminal { status } => f
+                .debug_struct("RunTerminal")
+                .field("status", status)
+                .finish(),
             Self::NotParked { status } => {
                 f.debug_struct("NotParked").field("status", status).finish()
             }
@@ -483,6 +420,9 @@ impl fmt::Display for UnparkError {
             Self::ShardNotFound => f.write_str("shard not found"),
             Self::TenantMismatch { expected } => {
                 write!(f, "tenant mismatch (expected {expected:?})")
+            }
+            Self::RunTerminal { status } => {
+                write!(f, "run is already terminal (status: {status})")
             }
             Self::NotParked { status } => {
                 write!(f, "shard is not parked (status: {status})")
@@ -505,7 +445,7 @@ mod tests {
     use super::*;
     use crate::coordination::run::{ManifestValidationError, RunConfigError, RunOpIdConflict};
     use crate::coordination::shard_spec::ShardLimitScope;
-    use crate::identity::{OpId, RunId, TenantId};
+    use crate::identity::{OpId, RunId, ShardId, TenantId};
     use rstest::rstest;
 
     fn test_tenant() -> TenantId {
@@ -614,6 +554,7 @@ mod tests {
     #[case::fail_run_wrong_status(Box::new(FailRunError::WrongStatus { status: RunStatus::Initializing }) as Box<dyn std::error::Error>)]
     #[case::cancel_run_terminal(Box::new(CancelRunError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>)]
     #[case::unpark_shard_not_found(Box::new(UnparkError::ShardNotFound) as Box<dyn std::error::Error>)]
+    #[case::unpark_run_terminal(Box::new(UnparkError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>)]
     fn error_display_deterministic(#[case] err: Box<dyn std::error::Error>) {
         let s1 = err.to_string();
         let s2 = err.to_string();
@@ -629,6 +570,7 @@ mod tests {
     #[case::create_get_run_failed(Box::new(CreateRunError::GetRunFailed(GetRunError::RunNotFound)) as Box<dyn std::error::Error>, true)]
     #[case::create_config_mismatch(Box::new(CreateRunError::ConfigMismatch { run: RunId::from_raw(1) }) as Box<dyn std::error::Error>, false)]
     #[case::register_manifest_invalid(Box::new(RegisterShardsError::ManifestInvalid(ManifestValidationError::Empty)) as Box<dyn std::error::Error>, true)]
+    #[case::register_manifest_unbounded(Box::new(RegisterShardsError::ManifestInvalid(ManifestValidationError::UnboundedRange { shard_id: ShardId::from_raw(0) })) as Box<dyn std::error::Error>, true)]
     #[case::register_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>, false)]
     #[case::register_shard_limit(Box::new(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }) as Box<dyn std::error::Error>, false)]
     #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>, false)]
@@ -636,6 +578,7 @@ mod tests {
     #[case::fail_run_wrong_status(Box::new(FailRunError::WrongStatus { status: RunStatus::Initializing }) as Box<dyn std::error::Error>, false)]
     #[case::cancel_run_terminal(Box::new(CancelRunError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>, false)]
     #[case::unpark_shard_not_found(Box::new(UnparkError::ShardNotFound) as Box<dyn std::error::Error>, false)]
+    #[case::unpark_run_terminal(Box::new(UnparkError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>, false)]
     fn error_source_chaining(#[case] err: Box<dyn std::error::Error>, #[case] has_source: bool) {
         assert_eq!(err.source().is_some(), has_source);
     }
@@ -654,6 +597,7 @@ mod tests {
     #[case::register_tenant_mismatch(RegisterShardsError::TenantMismatch { expected: test_tenant() }.to_string())]
     #[case::register_wrong_status(RegisterShardsError::WrongStatus { status: RunStatus::Active }.to_string())]
     #[case::register_manifest_invalid(RegisterShardsError::ManifestInvalid(ManifestValidationError::Empty).to_string())]
+    #[case::register_manifest_unbounded(RegisterShardsError::ManifestInvalid(ManifestValidationError::UnboundedRange { shard_id: ShardId::from_raw(0) }).to_string())]
     #[case::register_op_id_conflict(RegisterShardsError::OpIdConflict(test_conflict()).to_string())]
     #[case::register_shard_limit_exceeded(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }.to_string())]
     // GetRunError
@@ -679,6 +623,7 @@ mod tests {
     // UnparkError
     #[case::unpark_not_found(UnparkError::ShardNotFound.to_string())]
     #[case::unpark_tenant_mismatch(UnparkError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::unpark_run_terminal(UnparkError::RunTerminal { status: RunStatus::Cancelled }.to_string())]
     #[case::unpark_not_parked(UnparkError::NotParked { status: ShardStatus::Active }.to_string())]
     #[case::unpark_op_id_conflict(UnparkError::OpIdConflict(test_conflict()).to_string())]
     fn all_variants_display_non_empty(#[case] display: String) {
