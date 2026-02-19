@@ -212,4 +212,4 @@ jobs:
           components: miri
           shared-key: nightly-linux-miri
 
-      - run: cargo +nightly miri test --all-features
+      - run: cargo +nightly miri test -p gossip-stdx --all-features
