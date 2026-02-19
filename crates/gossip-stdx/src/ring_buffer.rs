@@ -143,11 +143,10 @@ impl<T, const N: usize> RingBuffer<T, N> {
 
     /// Appends `value` assuming spare capacity exists.
     ///
-    /// # Safety contract
+    /// # Panics
     ///
-    /// The caller **must** ensure `!self.is_full()`. In debug builds, a
-    /// violated precondition panics. In release builds, the buffer's internal
-    /// invariants are silently corrupted.
+    /// Panics if `self.is_full()`. The assertion is unconditional (not
+    /// debug-only) so that callers cannot silently corrupt the buffer.
     #[inline]
     pub(crate) fn push_back_assume_capacity(&mut self, value: T) {
         assert!(
@@ -162,8 +161,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
 
         debug_assert!(tail < Self::CAPACITY, "tail out of bounds");
 
-        // SAFETY: tail < CAPACITY guaranteed by mask operation on power-of-2 capacity.
-        // The mask ensures the result is always in [0, CAPACITY).
+        // SAFETY: tail < CAPACITY by mask. The slot at `tail` is uninitialized
+        // because len < CAPACITY ensures tail falls outside [head, head+len).
         unsafe { self.buf.get_unchecked_mut(index(tail)).write(value) };
         self.len += 1;
 
@@ -177,14 +176,13 @@ impl<T, const N: usize> RingBuffer<T, N> {
     /// `if full { remove(0) } push()` pattern.
     #[inline]
     pub fn push_back_overwrite(&mut self, value: T) -> Option<T> {
-        if self.is_full() {
-            let evicted = self.pop_front();
-            self.push_back_assume_capacity(value);
-            evicted
+        let evicted = if self.is_full() {
+            self.pop_front()
         } else {
-            self.push_back_assume_capacity(value);
             None
-        }
+        };
+        self.push_back_assume_capacity(value);
+        evicted
     }
 
     /// Removes and returns the oldest element, or `None` when empty.
@@ -253,8 +251,8 @@ impl<T: Clone, const N: usize> Clone for RingBuffer<T, N> {
             // SAFETY: physical < CAPACITY by mask. Element is initialized
             // because i < len.
             let val = unsafe { self.buf.get_unchecked(index(physical)).assume_init_ref() };
-            new.push_back(val.clone())
-                .unwrap_or_else(|_| unreachable!("clone: capacity mismatch"));
+            // Loop invariant: new.len() == i < self.len <= CAPACITY.
+            new.push_back_assume_capacity(val.clone());
         }
         new
     }
@@ -326,6 +324,26 @@ pub struct Iter<'a, T, const N: usize> {
     back: usize,
 }
 
+impl<'a, T, const N: usize> Iter<'a, T, N> {
+    /// Returns a reference to the element at logical offset `logical`.
+    ///
+    /// # Safety
+    ///
+    /// `logical` must be less than `self.ring.len`, ensuring the slot is initialized.
+    #[inline]
+    unsafe fn get_unchecked(&self, logical: usize) -> &'a T {
+        // Truncation safe: logical < len <= CAPACITY <= u32::MAX/2.
+        let physical = (self.ring.head + logical as u32) & RingBuffer::<T, N>::MASK;
+        // SAFETY: physical < CAPACITY by mask. Element is initialized per caller contract.
+        unsafe {
+            self.ring
+                .buf
+                .get_unchecked(index(physical))
+                .assume_init_ref()
+        }
+    }
+}
+
 impl<'a, T, const N: usize> Iterator for Iter<'a, T, N> {
     type Item = &'a T;
 
@@ -334,17 +352,10 @@ impl<'a, T, const N: usize> Iterator for Iter<'a, T, N> {
         if self.front >= self.back {
             return None;
         }
-        // `self.front as u32` cannot truncate: front < back <= len <= CAPACITY <= u32::MAX/2.
-        let physical = (self.ring.head + self.front as u32) & RingBuffer::<T, N>::MASK;
+        // SAFETY: front < back <= len, so the slot is initialized.
+        let val = unsafe { self.get_unchecked(self.front) };
         self.front += 1;
-        // SAFETY: physical < CAPACITY by mask. Element is initialized because
-        // front < back <= len, and slots [head, head+len) are initialized.
-        Some(unsafe {
-            self.ring
-                .buf
-                .get_unchecked(index(physical))
-                .assume_init_ref()
-        })
+        Some(val)
     }
 
     #[inline]
@@ -361,22 +372,51 @@ impl<'a, T, const N: usize> DoubleEndedIterator for Iter<'a, T, N> {
             return None;
         }
         self.back -= 1;
-        // `self.back as u32` cannot truncate: back <= len <= CAPACITY <= u32::MAX/2.
-        let physical = (self.ring.head + self.back as u32) & RingBuffer::<T, N>::MASK;
-        // SAFETY: physical < CAPACITY by mask. Element is initialized because
-        // back was > front and back <= len.
-        Some(unsafe {
-            self.ring
-                .buf
-                .get_unchecked(index(physical))
-                .assume_init_ref()
-        })
+        // SAFETY: back was > front and back <= len, so the slot is initialized.
+        Some(unsafe { self.get_unchecked(self.back) })
     }
 }
 
 impl<T, const N: usize> ExactSizeIterator for Iter<'_, T, N> {}
 
 impl<T, const N: usize> std::iter::FusedIterator for Iter<'_, T, N> {}
+
+// ============================================================================
+// IntoIter (consuming)
+// ============================================================================
+
+/// Consuming iterator over a [`RingBuffer`], yielding owned elements in FIFO order.
+pub struct IntoIter<T, const N: usize> {
+    ring: RingBuffer<T, N>,
+}
+
+impl<T, const N: usize> Iterator for IntoIter<T, N> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.ring.pop_front()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.ring.len();
+        (len, Some(len))
+    }
+}
+
+impl<T, const N: usize> ExactSizeIterator for IntoIter<T, N> {}
+
+impl<T, const N: usize> std::iter::FusedIterator for IntoIter<T, N> {}
+
+impl<T, const N: usize> IntoIterator for RingBuffer<T, N> {
+    type Item = T;
+    type IntoIter = IntoIter<T, N>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter { ring: self }
+    }
+}
 
 // ============================================================================
 // Tests
@@ -1104,6 +1144,60 @@ mod tests {
         ring.push_back(3).unwrap();
         let debug = format!("{ring:?}");
         assert_eq!(debug, "[1, 2, 3]");
+    }
+
+    // -----------------------------------------------------------------------
+    // IntoIter (consuming)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn into_iter_empty() {
+        let ring = RingBuffer::<u32, 4>::new();
+        let v: Vec<_> = ring.into_iter().collect();
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn into_iter_partial() {
+        let mut ring = RingBuffer::<u32, 4>::new();
+        ring.push_back(10).unwrap();
+        ring.push_back(20).unwrap();
+        ring.push_back(30).unwrap();
+        let v: Vec<_> = ring.into_iter().collect();
+        assert_eq!(v, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn into_iter_full() {
+        let ring: RingBuffer<u32, 4> = (0..4).collect();
+        let v: Vec<_> = ring.into_iter().collect();
+        assert_eq!(v, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn into_iter_drops_remaining_on_abandon() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut ring = RingBuffer::<DropTracker, 4>::new();
+        ring.push_back(dt(&drops)).unwrap();
+        ring.push_back(dt(&drops)).unwrap();
+        ring.push_back(dt(&drops)).unwrap();
+        ring.push_back(dt(&drops)).unwrap();
+
+        let mut iter = ring.into_iter();
+        // Consume 2, abandon 2.
+        let _ = iter.next();
+        let _ = iter.next();
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        drop(iter);
+        // Remaining 2 dropped via RingBuffer::drop inside IntoIter.
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn into_iter_exact_size() {
+        let ring: RingBuffer<u32, 4> = (0..3).collect();
+        let iter = ring.into_iter();
+        assert_eq!(iter.len(), 3);
     }
 
     // -----------------------------------------------------------------------

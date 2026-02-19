@@ -533,8 +533,8 @@ impl ShardRecord {
 
         // INV-9: Op-log entries have unique OpId values.
         for i in 0..self.op_log.len() {
+            let a = self.op_log.get(i).unwrap();
             for j in (i + 1)..self.op_log.len() {
-                let a = self.op_log.get(i).unwrap();
                 let b = self.op_log.get(j).unwrap();
                 assert!(
                     a.op_id() != b.op_id(),

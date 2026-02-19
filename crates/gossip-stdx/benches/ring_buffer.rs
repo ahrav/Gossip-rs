@@ -70,6 +70,22 @@ fn bench_alternating(c: &mut Criterion) {
     group.finish();
 }
 
+macro_rules! bench_fill_drain_cap {
+    ($group:expr, $iterations:expr, $cap:literal) => {{
+        $group.bench_with_input(BenchmarkId::new("fill_drain", $cap), &$cap, |b, _| {
+            let mut rb: RingBuffer<u64, $cap> = RingBuffer::new();
+            b.iter(|| {
+                for _ in 0..$iterations {
+                    for i in 0..($cap as u64) {
+                        let _ = rb.push_back(black_box(i));
+                    }
+                    while rb.pop_front().is_some() {}
+                }
+            })
+        });
+    }};
+}
+
 /// Fill then drain - tests bulk operations.
 fn bench_fill_drain(c: &mut Criterion) {
     let mut group = c.benchmark_group("ring_buffer");
@@ -79,58 +95,10 @@ fn bench_fill_drain(c: &mut Criterion) {
         group.throughput(Throughput::Elements(iterations * cap as u64));
 
         match cap {
-            8 => {
-                group.bench_with_input(BenchmarkId::new("fill_drain", cap), &cap, |b, _| {
-                    let mut rb: RingBuffer<u64, 8> = RingBuffer::new();
-                    b.iter(|| {
-                        for _ in 0..iterations {
-                            for i in 0..8u64 {
-                                let _ = rb.push_back(black_box(i));
-                            }
-                            while rb.pop_front().is_some() {}
-                        }
-                    })
-                });
-            }
-            16 => {
-                group.bench_with_input(BenchmarkId::new("fill_drain", cap), &cap, |b, _| {
-                    let mut rb: RingBuffer<u64, 16> = RingBuffer::new();
-                    b.iter(|| {
-                        for _ in 0..iterations {
-                            for i in 0..16u64 {
-                                let _ = rb.push_back(black_box(i));
-                            }
-                            while rb.pop_front().is_some() {}
-                        }
-                    })
-                });
-            }
-            32 => {
-                group.bench_with_input(BenchmarkId::new("fill_drain", cap), &cap, |b, _| {
-                    let mut rb: RingBuffer<u64, 32> = RingBuffer::new();
-                    b.iter(|| {
-                        for _ in 0..iterations {
-                            for i in 0..32u64 {
-                                let _ = rb.push_back(black_box(i));
-                            }
-                            while rb.pop_front().is_some() {}
-                        }
-                    })
-                });
-            }
-            64 => {
-                group.bench_with_input(BenchmarkId::new("fill_drain", cap), &cap, |b, _| {
-                    let mut rb: RingBuffer<u64, 64> = RingBuffer::new();
-                    b.iter(|| {
-                        for _ in 0..iterations {
-                            for i in 0..64u64 {
-                                let _ = rb.push_back(black_box(i));
-                            }
-                            while rb.pop_front().is_some() {}
-                        }
-                    })
-                });
-            }
+            8 => bench_fill_drain_cap!(group, iterations, 8),
+            16 => bench_fill_drain_cap!(group, iterations, 16),
+            32 => bench_fill_drain_cap!(group, iterations, 32),
+            64 => bench_fill_drain_cap!(group, iterations, 64),
             _ => unreachable!(),
         }
     }

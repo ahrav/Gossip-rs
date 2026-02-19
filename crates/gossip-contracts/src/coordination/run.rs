@@ -522,12 +522,13 @@ impl RunRecord {
         // O(n²) scan is intentional: n ≤ OP_LOG_CAP (8), so max 28 comparisons.
         // A HashSet would add allocation overhead that dominates at this scale.
         for i in 0..self.op_log.len() {
+            let a = self.op_log.get(i).unwrap();
             for j in (i + 1)..self.op_log.len() {
                 assert!(
-                    self.op_log.get(i).unwrap().op_id() != self.op_log.get(j).unwrap().op_id(),
+                    a.op_id() != self.op_log.get(j).unwrap().op_id(),
                     "Run {:?}: duplicate OpId {:?} in op_log at indices {i} and {j}",
                     self.run,
-                    self.op_log.get(i).unwrap().op_id(),
+                    a.op_id(),
                 );
             }
         }
