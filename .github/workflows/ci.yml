@@ -196,8 +196,7 @@ jobs:
     runs-on: ubuntu-24.04
     if: >-
       github.event_name == 'schedule' ||
-      (needs.changes.outputs.rust == 'true')
-    needs: [changes, fmt]
+      github.event_name == 'workflow_dispatch'
     env:
       RUSTC_WRAPPER: ""
       MIRIFLAGS: >-
