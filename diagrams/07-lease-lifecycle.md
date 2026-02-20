@@ -49,8 +49,8 @@ sequenceDiagram
     WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
 
     alt No idle shards available
-        CO-->>WS: Err(NoIdleShards)
-        WS-->>W: Err(NoIdleShards)
+        CO-->>WS: Err(NoneAvailable { earliest_deadline })
+        WS-->>W: Err(NoneAvailable { earliest_deadline })
     end
 
     rect rgb(220, 252, 231)
@@ -60,18 +60,22 @@ sequenceDiagram
         CO->>CO: Generate new fencing token (increment)
         CO->>CO: Grant lease on Active shard
         CO->>CO: Set lease expiry time
+        CO->>CO: count_available_for_run() → CapacityHint
     end
 
     Note over CO: Fencing token generated atomically<br/>with state transition
 
-    CO-->>WS: AcquireResult { lease, snapshot }
-    WS-->>W: AcquireResult { lease, snapshot }
+    CO-->>WS: AcquireResult { lease, snapshot, capacity }
+    WS-->>W: AcquireResult { lease, snapshot, capacity }
 ```
 
 The `AcquireResult` returned to the worker contains everything it needs to begin
 scanning: the shard's key range (what to scan), the cursor position (where to
 resume if this is a re-acquisition after expiry), the fencing token (to
-authenticate all subsequent mutations), and the expiry time (when to renew by).
+authenticate all subsequent mutations), the expiry time (when to renew by), and
+a `CapacityHint` reflecting how many shards remain available in the run after
+this acquisition (see [Diagram 5](#diagram-5-credit-based-capacity-piggybacking)
+for the piggybacking design).
 
 Note that the fencing token is not a random value -- it is a monotonically
 increasing counter incremented on each new lease acquisition (INV-S11). This
@@ -84,9 +88,13 @@ with move and borrow semantics that enforce the shard lifecycle at compile time:
 - **Terminal ops** (`complete`, `park`, `split_replace`) consume `self` — the session
   cannot be used after a terminal transition (compile-time enforcement).
 - **Non-terminal ops** (`checkpoint`, `renew`, `split_residual`) take `&mut self` —
-  the session remains usable after these operations.
-- **Accessors** (`lease`, `cursor`, `spec`) take `&self` — read-only access to
-  cached state.
+  the session remains usable after these operations. `renew` additionally updates
+  the cached `CapacityHint` from the `RenewResult`.
+- **Accessors** (`lease`, `cursor`, `spec`, `capacity`) take `&self` — read-only
+  access to cached state. `capacity()` returns the `CapacityHint` from the last
+  acquire or renew. `checkpoint` and `split_residual` do not refresh the
+  cached hint; terminal operations (`complete`, `park`, `split_replace`)
+  consume the session, so there is no cache to update.
 - **No Drop implementation** — if a session is dropped without a terminal op, the
   lease simply expires at its deadline, and the shard becomes available for re-acquisition.
 
@@ -215,8 +223,8 @@ sequenceDiagram
     Note over W,BE: Phase 2: Claim
     W->>WS: acquire_and_restore(run_id, worker_id)
     WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
-    CO-->>WS: AcquireResult { lease, snapshot }
-    WS-->>W: AcquireResult { lease(token=42), snapshot }
+    CO-->>WS: AcquireResult { lease, snapshot, capacity }
+    WS-->>W: AcquireResult { lease(token=42), snapshot, capacity }
 
     Note over W,BE: Phase 3: Scan Loop
 
@@ -243,10 +251,10 @@ sequenceDiagram
     Note over W,BE: Phase 5: Claim next shard
     W->>WS: acquire_and_restore(run_id, worker_id)
     WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
-    CO-->>WS: Err(NoIdleShards)
-    WS-->>W: Err(NoIdleShards)
+    CO-->>WS: Err(NoneAvailable { earliest_deadline })
+    WS-->>W: Err(NoneAvailable { earliest_deadline })
 
-    Note over W: No more work — Worker exits
+    Note over W: No more work — sleep until earliest_deadline or exit
 ```
 
 The lifecycle has a clean five-phase structure:
@@ -256,7 +264,7 @@ The lifecycle has a clean five-phase structure:
    state is allocated yet.
 2. **Claim.** The session calls `acquire_and_restore` to find and claim an idle shard.
    If successful, the worker receives an `AcquireResult` containing the lease (with fencing
-   token, key range, cursor position, and expiry time) and a snapshot.
+   token, key range, cursor position, and expiry time), a snapshot, and a `CapacityHint`.
 3. **Scan.** The worker iterates through pages, advancing the cursor after each
    one. Every cursor advancement is fenced -- a stale token halts the worker
    immediately. The lease renewal heartbeat runs concurrently.
@@ -264,8 +272,9 @@ The lifecycle has a clean five-phase structure:
    completed. This is a terminal transition (the shard can never return to
    `Active`). The lease is released.
 5. **Next or exit.** The worker attempts to claim another shard. If none are
-   available (all shards are either leased or terminal), the worker exits
-   gracefully.
+   available, the claim returns `NoneAvailable { earliest_deadline }`. The worker
+   can sleep until `earliest_deadline` (the soonest lease expiry in the run) to
+   avoid busy-spinning, or exit gracefully if no active leases remain.
 
 The `WorkerSession` pattern ensures that if any phase fails unexpectedly (panic,
 network error, process crash), the shard's lease expires at its deadline and
@@ -354,13 +363,183 @@ progress.
 
 ---
 
+## Diagram 5: Credit-Based Capacity Piggybacking
+
+Workers need to know when to back off from claiming shards (all shards busy) and
+when to retry (a lease is about to expire). A naive approach would add a separate
+RPC -- "how many shards are available?" -- but this doubles coordination traffic
+during high-contention periods, exactly when the system can least afford it.
+
+The solution is **credit-based capacity piggybacking**, inspired by Breakwater
+(Cho et al., OSDI 2020). Every `acquire_and_restore` and `renew` response
+already returns to the worker; the coordinator attaches a `CapacityHint` to
+these responses at zero additional RPC cost. The hint is computed atomically
+with the operation (inside the same critical section), so it reflects the
+post-operation state of the run.
+
+Key design properties:
+
+- **Fail-open advisory.** The hint is a point-in-time snapshot that may be stale
+  by the time the worker reads it. Workers MUST NOT rely on it for safety-critical
+  decisions -- it informs backoff/retry heuristics only.
+- **Zero extra RPCs.** Capacity information piggybacks on existing responses.
+  No new protocol messages, no polling loop.
+- **Compact.** `CapacityHint` is ≤ 24 bytes (compile-time enforced) to avoid
+  inflating the hot-path `Result` enums.
+- **Updated only on acquire and renew.** `checkpoint` and `split_residual` do
+  not refresh the cached hint in `WorkerSession`; terminal operations
+  (`complete`, `park`, `split_replace`) consume the session. This avoids
+  unnecessary computation on the highest-frequency operation (checkpoint).
+
+### `CapacityHint` fields
+
+| Field | Type | Meaning |
+|:------|:-----|:--------|
+| `available_count` | `u32` | Number of Active, unleased shards in the run at operation time |
+| `earliest_deadline` | `Option<LogicalTime>` | Soonest lease expiry among Active leased shards; `None` if no active shards are leased |
+
+Helper methods: `CapacityHint::ZERO` (sentinel when capacity is unknown),
+`is_saturated()` (returns `true` when `available_count == 0`).
+
+### Capacity flow through the worker lifecycle
+
+```mermaid
+%% Diagram: capacity-piggybacking-sequence
+sequenceDiagram
+    autonumber
+    participant W as Worker
+    participant WS as WorkerSession
+    participant CO as Coordinator
+
+    Note over W,CO: Acquire — capacity populated
+    W->>WS: acquire_and_restore(run_id, worker_id)
+    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    CO->>CO: grant lease + count_available_for_run()
+    CO-->>WS: AcquireResult { lease, snapshot, capacity }
+    WS->>WS: cache capacity hint
+    WS-->>W: AcquireResult
+
+    Note over W,CO: Renew — capacity refreshed
+    W->>WS: renew(now)
+    WS->>CO: renew(tenant, lease)
+    CO->>CO: extend deadline + count_available_for_run()
+    CO-->>WS: RenewResult { new_deadline, capacity }
+    WS->>WS: update cached capacity hint
+    WS-->>W: Ok
+
+    Note over W,CO: Checkpoint — capacity NOT updated
+    W->>WS: checkpoint(cursor, op_id)
+    WS->>CO: checkpoint(shard_id, token, cursor, op_id)
+    CO-->>WS: Ok
+    WS-->>W: Ok (capacity unchanged)
+
+    Note over W,CO: Claim failure — earliest_deadline for retry
+    W->>WS: acquire_and_restore(run_id, worker_id)
+    WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
+    CO-->>WS: Err(NoneAvailable { earliest_deadline })
+    WS-->>W: Err — sleep until earliest_deadline
+```
+
+The sequence above shows the **facade-level view**: `WorkerSession` delegates to
+`claim_next_available` (in `facade.rs`), which internally retries
+`acquire_and_restore` across candidate shards. The coordinator's
+`acquire_and_restore` returns `AcquireError::AlreadyLeased` for individual
+shards; the facade absorbs these and surfaces `ClaimError::NoneAvailable` when
+all candidates are exhausted.
+
+### `count_available_for_run()` algorithm
+
+The coordinator computes `CapacityHint` by scanning all shards in the run.
+Terminal shards (Done, Split, Parked) are skipped entirely. Active shards are
+classified as either unleased (increment `available_count`) or leased (track
+the minimum `deadline` for `earliest_deadline`).
+
+```mermaid
+%% Diagram: count-available-for-run-flowchart
+flowchart TD
+    START["count_available_for_run(now, tenant, run)"]
+    LOOKUP["Look up run_shards index"]
+    MISSING{"Index entry<br/>exists?"}
+    ZERO["Return CapacityHint::ZERO"]
+
+    INIT["available_count = 0<br/>earliest_deadline = None"]
+    LOOP{"Next shard<br/>in run?"}
+
+    GET["Get ShardRecord"]
+    ACTIVE{"status ==<br/>Active?"}
+    SKIP_TERMINAL["Skip (terminal)"]
+
+    LEASED{"is_leased_at<br/>(now)?"}
+    COUNT["available_count += 1"]
+    DEADLINE["earliest_deadline =<br/>min(earliest_deadline,<br/>lease.deadline())"]
+
+    DONE["Return CapacityHint {<br/>available_count,<br/>earliest_deadline }"]
+
+    START --> LOOKUP
+    LOOKUP --> MISSING
+    MISSING -- "No" --> ZERO
+    MISSING -- "Yes" --> INIT
+    INIT --> LOOP
+    LOOP -- "Yes" --> GET
+    LOOP -- "No" --> DONE
+    GET --> ACTIVE
+    ACTIVE -- "No" --> SKIP_TERMINAL
+    SKIP_TERMINAL --> LOOP
+    ACTIVE -- "Yes" --> LEASED
+    LEASED -- "No (unleased)" --> COUNT
+    LEASED -- "Yes (leased)" --> DEADLINE
+    COUNT --> LOOP
+    DEADLINE --> LOOP
+
+    style START fill:#DCFCE7,stroke:#166534,color:#166534
+    style DONE fill:#DCFCE7,stroke:#166534,color:#166534
+    style ZERO fill:#F3F4F6,stroke:#374151,color:#374151
+    style COUNT fill:#DCFCE7,stroke:#166534,color:#166534
+    style DEADLINE fill:#DCFCE7,stroke:#166534,color:#166534
+    style SKIP_TERMINAL fill:#F3F4F6,stroke:#374151,color:#374151
+```
+
+### Claim retry logic
+
+When `claim_next_available` (the facade function in `facade.rs`) exhausts all
+candidates, it returns `ClaimError::NoneAvailable { earliest_deadline }`. The
+`earliest_deadline` value comes from one of two paths:
+
+1. **Primary path — candidates exist but all are leased.** The facade iterates
+   candidate shards and calls `acquire_and_restore` on each. Every
+   `AcquireError::AlreadyLeased` rejection carries the shard's current lease
+   deadline. The facade tracks the minimum across all rejections and surfaces it
+   as `earliest_deadline`.
+2. **Secondary fast path — no unleased candidates at all.** When the initial
+   candidate query returns zero shards, the facade falls back to
+   `list_shards(ShardFilter::active())` and computes the minimum
+   `lease_deadline()` across all active shards in the run. This avoids returning
+   `None` (which signals "no active leases, stop retrying") when shards do exist
+   but are all leased.
+
+Workers use `earliest_deadline` to schedule their next claim attempt: sleeping
+until roughly that time avoids busy-spinning on a fully-leased run while still
+reacting promptly when a shard becomes available.
+
+When `earliest_deadline` is `None`, no active leased shards were encountered --
+all shards are terminal or the run has no shards, so retrying is unlikely to help
+and the worker should exit.
+
+Note: the `earliest_deadline` in `ClaimError::NoneAvailable` is computed by the
+facade's claiming scan (tracking `AlreadyLeased` rejections), not by
+`count_available_for_run()`. Both represent the soonest lease expiry in the run,
+but they are computed independently at different abstraction levels.
+
+---
+
 ## Cross-References
 
 - [Fencing Protocol](06-fencing-protocol.md) -- the 5-check validation
   preamble that executes on every fenced mutation, including cursor advancement
 - [Shard and Run State Machines](05-shard-and-run-state-machines.md) -- the
   state machine transitions that leases enable (unleased Active -> leased Active)
-  and that shard completion triggers (Active -> Done)
+  and that shard completion triggers (Active -> Done); only Active shards
+  contribute to `CapacityHint` counts
 - [System Overview](01-system-overview.md) -- the five-boundary architecture
   that places lease management within B2 Coordination
 - [ID Derivation DAG](03-id-derivation-dag.md) -- `ShardId` and `FenceEpoch`
@@ -376,3 +555,6 @@ progress.
 | `crates/gossip-contracts/src/coordination/lease.rs` | `Lease`, `ShardLease`, and `LeaseHolder` types |
 | `crates/gossip-contracts/src/coordination/record.rs` | `ShardRecord` with lease state and cursor position |
 | `crates/gossip-contracts/src/coordination/traits.rs` | `CoordinationBackend` trait defining `acquire_and_restore`, `checkpoint`, `complete` |
+| `crates/gossip-contracts/src/coordination/error.rs` | `CapacityHint`, `AcquireResult`, `RenewResult` types |
+| `crates/gossip-contracts/src/coordination/facade.rs` | `ClaimError::NoneAvailable { earliest_deadline }`, `default_claim_next_available` retry loop |
+| `crates/gossip-contracts/src/coordination/session.rs` | `WorkerSession` with `capacity` field and `capacity()` accessor |
