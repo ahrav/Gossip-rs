@@ -17,7 +17,7 @@ const MAX_HELD_SHARDS: usize = 64;
 /// Size of each worker's op-ID partition.
 ///
 /// Worker N generates op-IDs in `[N * PARTITION, (N+1) * PARTITION)`.
-const OP_ID_PARTITION: u64 = 1_000_000;
+pub(crate) const OP_ID_PARTITION: u64 = 1_000_000;
 
 /// Simulated worker that tracks lease bookkeeping, op-ID generation, and
 /// cursor progress for the simulation harness.
