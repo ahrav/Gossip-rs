@@ -68,6 +68,8 @@ pub use fault_injector::FaultInjectingIntrospector;
 mod mega_sim_tests;
 #[cfg(test)]
 mod sim_behavioral_tests;
+#[cfg(test)]
+mod test_util;
 pub use harness::{CoordinationSim, RejectionKind, SimEvent, SimEventKind, SimOp, SimReport};
 pub use invariants::{InvariantChecker, InvariantViolation};
 pub use worker::SimWorker;
@@ -172,10 +174,8 @@ impl SimContext {
 
 /// Fault injection severity level.
 ///
-/// Discriminants are stable; match exhaustively only with `_` fallback
-/// (`#[non_exhaustive]`).
+/// Discriminants are stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
 #[repr(u8)]
 pub enum FaultLevel {
     /// No faults injected.
@@ -211,12 +211,13 @@ const PPM_MAX: u32 = 1_000_000;
 /// The public methods on this struct ([`should_expire_lease`](Self::should_expire_lease),
 /// [`should_pause`](Self::should_pause), [`should_time_jump`](Self::should_time_jump),
 /// [`pause_ticks`](Self::pause_ticks), [`time_jump_ticks`](Self::time_jump_ticks)) are
-/// building blocks for custom simulation drivers. The built-in
+/// building blocks for property tests and custom simulation drivers. The built-in
 /// [`CoordinationSim::run`](CoordinationSim::run) does **not** call
 /// `should_expire_lease` or `should_pause` directly — it generates operations via
 /// weighted random op selection and injects faults through `should_time_jump` only.
-/// If you are writing your own simulation loop, you can call any of these methods
-/// to tailor fault injection to your scenario.
+/// `should_expire_lease` and `should_pause` are exercised by the
+/// `prop_fault_rates_monotonic_across_levels` property test, and are available for
+/// custom simulation loops that need per-step fault decisions.
 ///
 /// # Fields (sealed)
 ///
@@ -267,18 +268,20 @@ impl FaultConfig {
 
     /// Whether to inject a lease-expiry fault this step.
     ///
-    /// Available for custom simulation drivers; the built-in
-    /// [`CoordinationSim::run`](CoordinationSim::run)
-    /// does not call this method directly.
+    /// Used by `prop_fault_rates_monotonic_across_levels` to validate rate
+    /// ordering. Also available for custom simulation drivers; the built-in
+    /// [`CoordinationSim::run`](CoordinationSim::run) does not call this
+    /// method directly.
     pub fn should_expire_lease(&self, rng: &mut ChaCha8Rng) -> bool {
         should_inject(rng, self.lease_expiry_ppm)
     }
 
     /// Whether to inject a worker-pause fault this step.
     ///
-    /// Available for custom simulation drivers; the built-in
-    /// [`CoordinationSim::run`](CoordinationSim::run)
-    /// does not call this method directly.
+    /// Used by `prop_fault_rates_monotonic_across_levels` to validate rate
+    /// ordering. Also available for custom simulation drivers; the built-in
+    /// [`CoordinationSim::run`](CoordinationSim::run) does not call this
+    /// method directly.
     pub fn should_pause(&self, rng: &mut ChaCha8Rng) -> bool {
         should_inject(rng, self.pause_ppm)
     }

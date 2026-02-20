@@ -98,7 +98,6 @@ use super::{FaultConfig, FaultLevel, SimContext};
 /// dispatch to the appropriate executor. The harness generates ops via weighted
 /// random selection in `CoordinationSim::generate_random_op`.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum SimOp {
     /// Attempt to acquire (or re-acquire) a lease on a shard.
     Acquire { worker: WorkerId, key: ShardKey },
@@ -152,7 +151,6 @@ pub enum SimOp {
 /// operations carry a [`RejectionKind`] that categorizes the failure without
 /// heap allocation.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
 pub enum SimEvent {
     /// Lease acquired; `fence` is the new fence epoch for the shard.
     AcquireOk { fence: FenceEpoch },
@@ -193,7 +191,6 @@ pub enum SimEvent {
 /// Used instead of `String` to avoid hot-path allocation in fault-heavy
 /// simulation modes where a large fraction of operations are rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum RejectionKind {
     /// Worker does not hold a lease on the target shard.
     NotLeased,
@@ -631,13 +628,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let event = self.execute_op(&op);
         self.ops_executed += 1;
 
-        let worker_refs: Vec<&SimWorker> = self.workers.values().collect();
-        let violations = self.checker.check_all(
-            &self.coordinator,
-            &worker_refs,
-            self.tenant,
-            self.context.now(),
-        );
+        let violations = self
+            .checker
+            .check_all(&self.coordinator, self.tenant, self.context.now());
         (event, violations)
     }
 

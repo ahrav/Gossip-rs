@@ -152,37 +152,17 @@ mod tests {
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::lease::LeaseHolder;
     use crate::coordination::record::{ShardRecord, ShardStatus};
-    use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
-    use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
+    use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, WorkerId};
     use crate::sim::invariants::{InvariantChecker, InvariantViolation};
-    use gossip_stdx::RingBuffer;
-
-    const TENANT: TenantId = TenantId::from_bytes([0x01; 32]);
-    const LEASE_DUR: u64 = 100;
-
-    fn make_key(run: u64, shard: u64) -> ShardKey {
-        ShardKey::new(RunId::from_raw(run), ShardId::from_raw(shard))
-    }
+    use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder, make_key};
 
     fn active_record_with_lease(run: u64, shard: u64, worker: u64, deadline: u64) -> ShardRecord {
-        ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(run),
-            ShardId::from_raw(shard),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            Some(LeaseHolder::new(
+        TestRecordBuilder::new(TENANT, RunId::from_raw(run), ShardId::from_raw(shard))
+            .lease(LeaseHolder::new(
                 WorkerId::from_raw(worker),
                 LogicalTime::from_raw(deadline),
-            )),
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            RingBuffer::new(),
-        )
+            ))
+            .build()
     }
 
     /// S1: Checker detects mutual exclusion violation via injected duplicate.
@@ -211,7 +191,7 @@ mod tests {
         // Run checker — should detect S1 violation.
         let now = LogicalTime::from_raw(100);
         let mut checker = InvariantChecker::new();
-        let violations = checker.check_all(&injector, &[], TENANT, now);
+        let violations = checker.check_all(&injector, TENANT, now);
 
         let s1: Vec<_> = violations
             .iter()
@@ -240,21 +220,16 @@ mod tests {
     #[test]
     fn no_injection_no_violations() {
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
-        let record = ShardRecord::new_active(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            CursorSemantics::Completed,
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, RunId::from_raw(1), ShardId::from_raw(1)).build(),
         );
-        coord.seed_shard(record);
 
         let injector = FaultInjectingIntrospector::new(coord);
         assert_eq!(injector.shard_count(), 1);
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
-        let violations = checker.check_all(&injector, &[], TENANT, now);
+        let violations = checker.check_all(&injector, TENANT, now);
         assert!(violations.is_empty());
     }
 
@@ -278,14 +253,9 @@ mod tests {
     #[test]
     fn injection_does_not_modify_inner() {
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
-        let record = ShardRecord::new_active(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            CursorSemantics::Completed,
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, RunId::from_raw(1), ShardId::from_raw(1)).build(),
         );
-        coord.seed_shard(record);
 
         let mut injector = FaultInjectingIntrospector::new(coord);
         let synthetic = active_record_with_lease(1, 1, 2, 200);
@@ -298,31 +268,23 @@ mod tests {
     /// S2: Checker detects fence epoch regression via injected record.
     #[test]
     fn detects_fence_regression_via_injection() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
         // Seed with fence epoch 5.
         let key = make_key(1, 1);
-        coord.seed_shard(ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::from_raw(5),
-            None,
-            vec![],
-            RingBuffer::new(),
-        ));
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .fence_epoch(FenceEpoch::from_raw(5))
+                .build(),
+        );
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
 
         // First check establishes baseline.
-        let v = checker.check_all(&coord, &[], TENANT, now);
+        let v = checker.check_all(&coord, TENANT, now);
         assert!(v.is_empty());
 
         // Now wrap in injector and replace the shard with lower epoch.
@@ -331,24 +293,12 @@ mod tests {
         // sees the (run, shard) pair twice — first at epoch 5, then at 3.
         // The second observation regresses, triggering S2.
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let regressed = ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::from_raw(3),
-            None,
-            vec![],
-            RingBuffer::new(),
-        );
+        let regressed = TestRecordBuilder::new(TENANT, run, shard)
+            .fence_epoch(FenceEpoch::from_raw(3))
+            .build();
         injector.inject_shard(TENANT, key, regressed);
 
-        let v = checker.check_all(&injector, &[], TENANT, now);
+        let v = checker.check_all(&injector, TENANT, now);
         let s2: Vec<_> = v
             .iter()
             .filter(|v| matches!(v, InvariantViolation::FenceMonotonicity { .. }))
@@ -366,53 +316,31 @@ mod tests {
     /// same (run, shard) — triggers TerminalIrreversibility.
     #[test]
     fn detects_terminal_reversion_via_injection() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
         // Seed as Done (terminal).
         let key = make_key(1, 1);
-        coord.seed_shard(ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Done,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            RingBuffer::new(),
-        ));
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .status(ShardStatus::Done)
+                .build(),
+        );
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
 
         // First check establishes Done baseline.
-        let v = checker.check_all(&coord, &[], TENANT, now);
+        let v = checker.check_all(&coord, TENANT, now);
         assert!(v.is_empty());
 
         // Inject a synthetic Active record for the same shard.
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let reverted = ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            RingBuffer::new(),
-        );
+        let reverted = TestRecordBuilder::new(TENANT, run, shard).build();
         injector.inject_shard(TENANT, key, reverted);
 
-        let v = checker.check_all(&injector, &[], TENANT, now);
+        let v = checker.check_all(&injector, TENANT, now);
         let s3: Vec<_> = v
             .iter()
             .filter(|v| matches!(v, InvariantViolation::TerminalIrreversibility { .. }))
@@ -430,53 +358,33 @@ mod tests {
     /// to 'c' for the same (run, shard) — triggers CursorMonotonicity.
     #[test]
     fn detects_cursor_regression_via_injection() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
         // Seed with cursor at 'h'.
         let key = make_key(1, 1);
-        coord.seed_shard(ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::with_last_key(vec![b'h']),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            RingBuffer::new(),
-        ));
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .cursor(Cursor::with_last_key(vec![b'h']))
+                .build(),
+        );
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
 
         // First check establishes cursor at 'h'.
-        let v = checker.check_all(&coord, &[], TENANT, now);
+        let v = checker.check_all(&coord, TENANT, now);
         assert!(v.is_empty());
 
         // Inject a synthetic record with cursor regressed to 'c'.
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let regressed = ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::with_last_key(vec![b'c']),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            RingBuffer::new(),
-        );
+        let regressed = TestRecordBuilder::new(TENANT, run, shard)
+            .cursor(Cursor::with_last_key(vec![b'c']))
+            .build();
         injector.inject_shard(TENANT, key, regressed);
 
-        let v = checker.check_all(&injector, &[], TENANT, now);
+        let v = checker.check_all(&injector, TENANT, now);
         let s5: Vec<_> = v
             .iter()
             .filter(|v| matches!(v, InvariantViolation::CursorMonotonicity { .. }))
@@ -494,30 +402,20 @@ mod tests {
     /// spec range [a=97, z=122).
     #[test]
     fn detects_cursor_out_of_bounds_via_injection() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
         let coord = InMemoryCoordinator::new(LEASE_DUR);
 
         let mut injector = FaultInjectingIntrospector::new(coord);
         let key = make_key(1, 1);
-        let out_of_bounds = ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Active,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::with_last_key(vec![b'{']),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![],
-            RingBuffer::new(),
-        );
+        let out_of_bounds = TestRecordBuilder::new(TENANT, run, shard)
+            .cursor(Cursor::with_last_key(vec![b'{']))
+            .build();
         injector.inject_shard(TENANT, key, out_of_bounds);
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
-        let v = checker.check_all(&injector, &[], TENANT, now);
+        let v = checker.check_all(&injector, TENANT, now);
         let s6: Vec<_> = v
             .iter()
             .filter(|v| matches!(v, InvariantViolation::CursorOutOfBounds { .. }))
@@ -536,31 +434,22 @@ mod tests {
     /// in the coordinator — triggers SplitCoverage.
     #[test]
     fn detects_missing_split_child_via_injection() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
         let coord = InMemoryCoordinator::new(LEASE_DUR);
 
         let mut injector = FaultInjectingIntrospector::new(coord);
         let key = make_key(1, 1);
         let missing_child = ShardId::from_raw((1u64 << 63) | 99);
-        let split_record = ShardRecord::from_raw_parts(
-            TENANT,
-            RunId::from_raw(1),
-            ShardId::from_raw(1),
-            ShardStatus::Split,
-            None,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            Cursor::initial(),
-            CursorSemantics::Completed,
-            None,
-            FenceEpoch::INITIAL,
-            None,
-            vec![missing_child],
-            RingBuffer::new(),
-        );
+        let split_record = TestRecordBuilder::new(TENANT, run, shard)
+            .status(ShardStatus::Split)
+            .spawned(vec![missing_child])
+            .build();
         injector.inject_shard(TENANT, key, split_record);
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
-        let v = checker.check_all(&injector, &[], TENANT, now);
+        let v = checker.check_all(&injector, TENANT, now);
 
         // Filter for S7 violations specifically (S4 may also fire for
         // Split without proper parent field).
