@@ -74,9 +74,9 @@ pub trait SimIntrospection {
     /// Iterate all shard records across all tenants.
     ///
     /// This is the primary observation method. The invariant checker
-    /// performs a single pass over this iterator to check S1–S6, then
-    /// uses [`shard_lookup()`](Self::shard_lookup) for S7 follow-up
-    /// queries on specific child shards.
+    /// performs a single pass over this iterator to check S1–S7 inline,
+    /// with S7 issuing [`shard_lookup()`](Self::shard_lookup) calls
+    /// within the same iteration to verify child shard references.
     fn shards(&self) -> Self::ShardIter<'_>;
 
     /// Total number of shard records across all tenants.

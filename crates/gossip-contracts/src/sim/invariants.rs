@@ -28,7 +28,7 @@
 //! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a non-expired lease per shard. |
 //! | S2 | **FenceMonotonicity** | temporal | `fence_epoch` never decreases for a given `(RunId, ShardId)`. |
 //! | S3 | **TerminalIrreversibility** | temporal | Terminal states (`Done`, `Split`, `Parked`) never revert, except `Parked`->`Active` (unpark) which requires a fence bump. |
-//! | S4 | **RecordInvariant** | structural | `ShardRecord::assert_invariants()` does not panic. |
+//! | S4 | **RecordInvariant** | structural | `ShardRecord::validate_invariants()` returns `Ok`. |
 //! | S5 | **CursorMonotonicity** | temporal | `cursor.last_key()` never decreases per shard. |
 //! | S6 | **CursorBounds** | structural | Non-initial cursors remain within shard spec range. |
 //! | S7 | **SplitCoverage** | referential | Split-parent's spawned children exist and reference the parent. |
@@ -123,7 +123,7 @@ pub enum InvariantViolation {
         was: ShardStatus,
         now: ShardStatus,
     },
-    /// S4: `ShardRecord::assert_invariants()` panicked, indicating a structural
+    /// S4: `ShardRecord::validate_invariants()` detected a structural
     /// invariant violation in the record (e.g., `Parked` without `park_reason`,
     /// terminal shard with an active lease, fence epoch below `INITIAL`).
     RecordInvariant {
