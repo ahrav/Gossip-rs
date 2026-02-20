@@ -14,8 +14,8 @@ For simulation architecture see [simulation-harness.md](simulation-harness.md).
 
 ```text
                     ┌──────────────┐
-                    │  Simulation  │  Tier 4: randomized seed sweep
-                    │  (sim/)      │  across 100+ seeds, 12K ops each
+                    │  Simulation  │  Tier 4: safety seed sweeps,
+                    │  (sim/)      │  convergence, stress, isolation
                     ├──────────────┤
                     │  Scenario    │  Tier 3: multi-step user stories
                     │              │  (8 end-to-end workflows)
@@ -212,7 +212,7 @@ invariant accidentally violates another.
 **Files:** `sim/sim_behavioral_tests.rs`, `sim/mega_sim_tests.rs`
 **Declared in:** `sim/mod.rs` (`#[cfg(test)]`)
 
-Two sub-tiers exercise the full simulation harness.
+Six sub-tiers exercise the full simulation harness.
 
 ### Behavioral Regression Tests (`sim_behavioral_tests.rs`)
 
@@ -252,6 +252,73 @@ kinds. Failures include reproduction commands.
 by default), gaining automatic shrinking and `.proptest-regressions` file
 persistence. Same simulation config as `mega_sim_10k_steps`.
 
+### Stress Tests (`mega_sim_tests.rs`)
+
+Scale-sensitive tests that push configurations well beyond the normal
+test suite. Both are `#[ignore]`.
+
+**`stress_200_shards_stormy`** — 8 workers, 200 shards, Stormy, 5 seeds,
+5K safety + 2K liveness ops. At ~13x the shard count of the mega sweep,
+this test exercises two scale-sensitive paths: `InvariantChecker` pruning
+overhead as many shards reach terminal states, and worker contention with
+8 workers competing for 200 shards.
+
+**`stress_split_cascade`** — 4 workers, 20 shards, Radioactive, 10 seeds,
+3K safety + 1K liveness ops. Radioactive mode's aggressive time-jumps and
+high lease-expiry rate create conditions for multi-level split cascades.
+Asserts at least one `SplitReplaceOk` event fires across all seeds,
+catching regressions in op-generation weights or split-plan construction.
+Invariants S1–S7 are validated even as the shard set grows dynamically
+from splits.
+
+### Convergence Proptests (`mega_sim_tests.rs`)
+
+Bounded-liveness tests that complement the mega sweep's safety focus.
+The Alpern-Schneider decomposition (1985) states that every correctness
+property is the intersection of a safety property and a liveness property.
+The mega sweep covers safety (S1–S7); these tests cover the complementary
+liveness half — that every shard eventually reaches a terminal state.
+Both are `#[ignore]`.
+
+**`proptest_convergence_sunny`** — SunnyDay, 200 cases, 50 safety + 2000
+liveness ops. Asserts both safety (no violations) and liveness (all shards
+terminal). Zero faults, but splits during the safety phase grow the shard
+count from the initial 15 to ~20-25, requiring proportionally more
+liveness ops for reliable acquire→complete cycles.
+
+**`proptest_convergence_stormy`** — Stormy, 200 cases, 500 safety + 15000
+liveness ops. Same dual assertion under ~10% fault pressure. Faults cause
+lease expiry mid-operation, forcing re-acquisition cycles that consume
+extra ops. The ~7.5× raw budget over SunnyDay compensates for the ~10%
+rejection rate and larger active shard set from the longer safety phase.
+
+### Multi-Tenant Isolation (`mega_sim_tests.rs`)
+
+**`multi_tenant_isolation`** — Two tenants sharing one
+`InMemoryCoordinator` instance. This is the only test that exercises the
+cross-tenant rejection path (tenant-scoped lookup returning `ShardNotFound`)
+and tenant-scoped checker history.
+Runs in the default `cargo test` cycle (not `#[ignore]`).
+
+The test verifies three properties:
+
+1. **Cross-tenant rejection**: tenant B cannot acquire tenant A's shards
+   (tenant-scoped lookup returns `ShardNotFound`).
+2. **Independent lifecycles**: each tenant's shards progress through
+   acquire → checkpoint → terminal independently, exercising both
+   terminal paths (`Complete` for tenant A, `Park` for tenant B).
+3. **Checker isolation**: the `InvariantChecker` uses
+   `(TenantId, RunId, ShardId)` history keys, so tenant A's fence epoch
+   history does not contaminate tenant B's S2 checks.
+
+### Regression Guard
+
+**`zero_seed_count_does_not_panic`** — Protects against a `chunks(0)`
+panic when `GOSSIP_SIM_SEEDS=0`. The mega sweep's `div_ceil` and
+`chunks()` calls would panic unconditionally without the early-return
+guard; this test mirrors the arithmetic path to verify the guard remains
+effective.
+
 For simulation architecture, the invariant table (S1–S7), determinism
 model, fault injection levels, and two-phase run model, see
 [simulation-harness.md](simulation-harness.md).
@@ -280,6 +347,15 @@ cargo test --all-features -p gossip-contracts -- sim
 
 # Mega simulation (slow, #[ignore])
 cargo test -p gossip-contracts mega_sim -- --ignored --nocapture
+
+# Convergence proptests (slow, #[ignore])
+cargo test -p gossip-contracts proptest_convergence -- --ignored --nocapture
+
+# Stress tests (slow, #[ignore])
+cargo test -p gossip-contracts stress_ -- --ignored --nocapture
+
+# Multi-tenant isolation (fast, runs in default cargo test)
+cargo test -p gossip-contracts multi_tenant -- --nocapture
 ```
 
 ### Environment variables
