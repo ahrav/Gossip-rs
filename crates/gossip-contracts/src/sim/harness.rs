@@ -84,7 +84,7 @@ use super::{FaultConfig, FaultLevel, SimContext};
 
 /// A single operation in the simulation.
 ///
-/// Operations fall into three categories:
+/// Operations fall into four categories:
 ///
 /// - **Coordinator ops** (`Acquire`, `Renew`, `Checkpoint`, `Complete`, `Park`,
 ///   `SplitReplace`, `SplitResidual`, `ClaimNext`, `SessionLifecycle`): invoke
@@ -1263,6 +1263,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     ///
     /// On success: transitions Parked→Active, bumps fence_epoch, adds the
     /// shard back to `active_shard_keys` (it was removed when parked).
+    /// Idempotent replays (same OpId) return `UnparkOk` but skip the
+    /// `active_shard_keys` push since the shard was already re-added on
+    /// the original execution.
     fn exec_unpark(&mut self, key: ShardKey) -> SimEvent {
         let op_id = self.next_admin_op_id();
         let now = self.context.now();
@@ -1848,10 +1851,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
     /// Pick a random parked shard for an admin unpark operation.
     ///
-    /// Scans `shard_keys` via coordinator lookup to find shards with Parked
-    /// status. Returns `None` if no parked shards exist (the op will be
-    /// retried by `generate_random_op`'s retry loop, eventually falling
-    /// back to AdvanceTime).
+    /// Scans all `shard_keys` via coordinator lookup — O(N) where N is the
+    /// total shard count (including terminal). Acceptable for simulation
+    /// sizes (15–200 shards). Returns `None` if no parked shards exist
+    /// (the op will be retried by `generate_random_op`'s retry loop,
+    /// eventually falling back to AdvanceTime).
     fn try_gen_unpark(&mut self) -> Option<SimOp> {
         let parked: Vec<ShardKey> = self
             .shard_keys
