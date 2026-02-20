@@ -283,8 +283,6 @@ since both are Tier 0 and would still compile before anything else.
 | B2 Coordination contracts | `crates/gossip-contracts/src/coordination/` |
 | B4 Connector contracts | `crates/gossip-contracts/src/connector/` |
 | B5 Persistence contracts | `crates/gossip-contracts/src/persistence/` |
-| B5 cross-boundary dependency map | `boundary_5_chunk_5.rs` section 5.62 |
-| B4 cross-boundary dependency map | `boundary_4_chunk_5.rs` cross-boundary section |
 | Cargo workspace manifest | `Cargo.toml` (root) |
 | gossip-contracts manifest | `crates/gossip-contracts/Cargo.toml` |
 | gossip-coordination manifest | `crates/gossip-coordination/Cargo.toml` |

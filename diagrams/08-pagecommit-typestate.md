@@ -398,13 +398,12 @@ commit.
   shard lifecycle that the cursor advancement feeds into
 - [Fencing Protocol](06-fencing-protocol.md) -- the `checkpoint` call in
   step 14 passes through the 5-check fencing preamble
+- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) -- steps 8-9 of the scan pipeline
+  show PageCommit accumulation and atomic commit in context
 - [System Overview](01-system-overview.md) -- where PageCommit fits in the
   overall architecture
 
 ## Source Code References
 
 - **Deep dive document**: `07-boundary-5-persistence/04-commit-protocol-typestate.md`
-- **Persistence contracts**: `crates/gossip-contracts/src/persistence/`
-- **Typestate markers**: `crates/gossip-contracts/src/persistence/`
-- **Done-ledger interface**: `crates/gossip-contracts/src/persistence/`
-- **Findings sink interface**: `crates/gossip-contracts/src/persistence/`
+- **Persistence contracts** (PageCommit typestate, DoneLedger, FindingsSink): `crates/gossip-contracts/src/persistence/mod.rs`

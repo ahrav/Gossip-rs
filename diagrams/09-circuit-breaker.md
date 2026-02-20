@@ -294,16 +294,9 @@ Key observations:
   no traffic flows on this path while the circuit is open. The API receives zero
   requests, giving it maximum opportunity to recover.
 
-**ParkReason variants** — when a circuit breaker trips, the worker parks the shard with one
-of these coordination-level categories:
-
-| Variant | Discriminant | Meaning |
-|---------|-------------|---------|
-| `PermissionDenied` | 0 | Source denied access |
-| `NotFound` | 1 | Source no longer exists |
-| `Poisoned` | 2 | Shard data corrupted |
-| `TooManyErrors` | 3 | Circuit breaker tripped |
-| `Other` | 4 | Catch-all |
+**ParkReason variants** — when a circuit breaker trips, the worker parks the shard with
+`ParkReason::TooManyErrors`. For the full `ParkReason` enum and all variants, see
+[Shard and Run State Machines — ParkReason table](05-shard-and-run-state-machines.md).
 
 ---
 
@@ -314,118 +307,45 @@ the shard so that it can be retried later when the source recovers. The decision
 below traces the complete path from a connector call through circuit breaker evaluation
 to either successful processing or shard parking.
 
-The flow has three main branches corresponding to the three circuit breaker states.
-In the Closed state, requests flow through normally and failures are tracked. In the
-Open state, requests are rejected immediately. In the HalfOpen state, a single probe
-request determines whether the circuit should close or reopen.
+The diagram below focuses on the parking integration -- what happens after the
+circuit breaker rejects a request. For the full CB state machine (Closed, Open,
+HalfOpen transitions), see Diagram 1 above.
 
 ```mermaid
 %% Diagram: shard-parking-flow
 graph TD
     START(["Worker calls<br/>connector.enumerate()"])
-    CB_CALL["Connector calls<br/>circuit_breaker.call(api_request)"]
-    STATE{"Circuit<br/>state?"}
+    CB_CHECK{"Circuit<br/>breaker<br/>state?"}
+    SUCCESS["Request succeeds<br/>Return page data"]
+    CB_OPEN["CircuitBreakerOpen<br/>(immediate reject)"]
+    PARK["Park shard<br/>(ParkReason::TooManyErrors)"]
+    RELEASE["Release lease"]
+    NEXT["Claim next<br/>available shard"]
 
-    %% Closed path
-    CLOSED_CALL["Make API call<br/>to external source"]
-    CLOSED_RESULT{"API call<br/>result?"}
-    CLOSED_OK["Return page data<br/>Reset failure count"]
-    CLOSED_FAIL["Record failure<br/>in sliding window"]
-    THRESHOLD{"Failure count<br/>>= threshold?"}
-    TRIP["Trip circuit to OPEN<br/>Start cooldown timer"]
-    TRIP_ERR["Return<br/>CircuitBreakerOpen"]
-    BELOW["Return error<br/>Worker retries<br/>with backoff"]
-
-    %% Open path
-    OPEN_CHECK{"Cooldown<br/>expired?"}
-    OPEN_REJECT["Return<br/>CircuitBreakerOpen<br/>immediately"]
-    HALF_OPEN["Transition to<br/>HALF-OPEN"]
-
-    %% HalfOpen path
-    PROBE["Make single<br/>probe request"]
-    PROBE_RESULT{"Probe<br/>result?"}
-    PROBE_OK["Close circuit<br/>Return page data"]
-    PROBE_FAIL["Reopen circuit<br/>Reset cooldown timer"]
-    PROBE_ERR["Return<br/>CircuitBreakerOpen"]
-
-    %% Parking path
-    PARK["Worker calls<br/>coordinator.park_shard<br/>(ParkReason::TooManyErrors)"]
-    RELEASE["Worker releases lease"]
-    NEXT["Worker moves to<br/>next available shard"]
-
-    START --> CB_CALL
-    CB_CALL --> STATE
-
-    STATE -->|"Closed"| CLOSED_CALL
-    STATE -->|"Open"| OPEN_CHECK
-    STATE -->|"HalfOpen"| PROBE
-
-    CLOSED_CALL --> CLOSED_RESULT
-    CLOSED_RESULT -->|"Success"| CLOSED_OK
-    CLOSED_RESULT -->|"Failure"| CLOSED_FAIL
-    CLOSED_FAIL --> THRESHOLD
-    THRESHOLD -->|"Yes"| TRIP
-    TRIP --> TRIP_ERR
-    THRESHOLD -->|"No"| BELOW
-
-    OPEN_CHECK -->|"No"| OPEN_REJECT
-    OPEN_CHECK -->|"Yes"| HALF_OPEN
-    HALF_OPEN --> PROBE
-
-    PROBE --> PROBE_RESULT
-    PROBE_RESULT -->|"Success"| PROBE_OK
-    PROBE_RESULT -->|"Failure"| PROBE_FAIL
-    PROBE_FAIL --> PROBE_ERR
-
-    TRIP_ERR --> PARK
-    OPEN_REJECT --> PARK
-    PROBE_ERR --> PARK
-
+    START --> CB_CHECK
+    CB_CHECK -->|"Closed: call succeeds"| SUCCESS
+    CB_CHECK -->|"Open: reject immediately"| CB_OPEN
+    CB_CHECK -->|"HalfOpen: probe fails"| CB_OPEN
+    CB_OPEN --> PARK
     PARK --> RELEASE
     RELEASE --> NEXT
 
+    NOTE["See Diagram 1 for full<br/>CB state machine details"]
+
     style START fill:#FEE2E2,stroke:#991B1B,color:#000
-    style CB_CALL fill:#FEE2E2,stroke:#991B1B,color:#000
-    style STATE fill:#FEE2E2,stroke:#991B1B,color:#000
-
-    style CLOSED_CALL fill:#FEE2E2,stroke:#991B1B,color:#000
-    style CLOSED_RESULT fill:#FEE2E2,stroke:#991B1B,color:#000
-    style CLOSED_OK fill:#22C55E,stroke:#166534,color:#FFF
-    style CLOSED_FAIL fill:#EF4444,stroke:#991B1B,color:#FFF
-    style THRESHOLD fill:#FEE2E2,stroke:#991B1B,color:#000
-    style TRIP fill:#EF4444,stroke:#991B1B,color:#FFF
-    style TRIP_ERR fill:#EF4444,stroke:#991B1B,color:#FFF
-    style BELOW fill:#FEE2E2,stroke:#991B1B,color:#000
-
-    style OPEN_CHECK fill:#FEE2E2,stroke:#991B1B,color:#000
-    style OPEN_REJECT fill:#EF4444,stroke:#991B1B,color:#FFF
-    style HALF_OPEN fill:#FEE2E2,stroke:#991B1B,color:#000
-
-    style PROBE fill:#FEE2E2,stroke:#991B1B,color:#000
-    style PROBE_RESULT fill:#FEE2E2,stroke:#991B1B,color:#000
-    style PROBE_OK fill:#22C55E,stroke:#166534,color:#FFF
-    style PROBE_FAIL fill:#EF4444,stroke:#991B1B,color:#FFF
-    style PROBE_ERR fill:#EF4444,stroke:#991B1B,color:#FFF
-
+    style CB_CHECK fill:#FEE2E2,stroke:#991B1B,color:#000
+    style SUCCESS fill:#22C55E,stroke:#166534,color:#FFF
+    style CB_OPEN fill:#EF4444,stroke:#991B1B,color:#FFF
     style PARK fill:#F3F4F6,stroke:#374151,color:#000
     style RELEASE fill:#F3F4F6,stroke:#374151,color:#000
     style NEXT fill:#F3F4F6,stroke:#374151,color:#000
-
-    linkStyle 8 stroke:#22C55E
-    linkStyle 9 stroke:#EF4444,stroke-dasharray:5
-    linkStyle 13 stroke:#EF4444,stroke-dasharray:5
-    linkStyle 15 stroke:#EF4444,stroke-dasharray:5
-    linkStyle 19 stroke:#22C55E
-    linkStyle 20 stroke:#EF4444,stroke-dasharray:5
-    linkStyle 21 stroke:#EF4444,stroke-dasharray:5
-    linkStyle 22 stroke:#EF4444,stroke-dasharray:5
-    linkStyle 23 stroke:#EF4444,stroke-dasharray:5
+    style NOTE fill:#F3F4F6,stroke:#374151,color:#6B7280
 ```
 
-The three `CircuitBreakerOpen` return paths (from threshold exceeded, from open-state
-rejection, and from failed probe) all converge on the same parking flow. This
-convergence is deliberate: regardless of *how* the circuit breaker determined the
-source is unavailable, the worker's response is the same -- park the shard and move on.
+Regardless of *how* the circuit breaker determined the source is unavailable (threshold
+exceeded, open-state rejection, or failed probe), the worker's response is the same --
+park the shard and move on. All `CircuitBreakerOpen` paths converge on the same
+parking flow.
 
 The parking flow is significant because it integrates the circuit breaker with the
 coordination protocol (B2). When a worker parks a shard:
@@ -440,8 +360,8 @@ coordination protocol (B2). When a worker parks a shard:
    different source. The worker thread is never blocked -- it is always doing productive
    work or quickly discovering that it cannot.
 
-This is the fundamental throughput guarantee: **INV-L30** states that if a source API is
-healthy, enumeration eventually completes. The circuit breaker is the mechanism that
+This is the fundamental throughput guarantee: **INV-L30** (if a source API is healthy,
+enumeration of its shards eventually completes) is enforced by the circuit breaker. The circuit breaker is the mechanism that
 ensures unhealthy sources do not prevent healthy ones from making progress. Workers are
 a shared resource, and the circuit breaker prevents any single source from monopolizing
 them.

@@ -21,6 +21,10 @@ Together, these checks guarantee that **at most one valid lease exists per shard
 point in time** (INV-S10). A zombie worker's token will always be less than the current
 token, so its mutations are rejected before they can cause harm.
 
+> **Notation.** Solid lines represent valid/success paths. Dashed lines represent
+> error paths or rejected operations. All diagrams use the B2 Coordination color
+> palette (green theme: fill `#22C55E`, light fill `#DCFCE7`, stroke `#166534`).
+
 ---
 
 ## Diagram 1: 5-Check Validation Flow
@@ -32,8 +36,8 @@ applied, or the first failing check returns an error and nothing changes.
 
 The sequence below traces a concrete `checkpoint` call. Worker submits the call
 with its fencing token (42). The coordinator looks up the shard, verifies tenant
-ownership, compares the token against the current value, checks that the shard state
-allows cursor advancement, and finally applies the update.
+ownership, checks that the shard is not in a terminal state, compares the token
+against the current value, and finally applies the update.
 
 ```mermaid
 %% Diagram: 5-check-validation-flow
@@ -55,24 +59,24 @@ sequenceDiagram
         Note over C,S: Check 2: Tenant ID matches
         C->>C: verify tenant_id == shard.tenant_id
 
-        Note over C,S: Check 3: Fencing token valid (INV-S11, INV-S12)
+        Note over C,S: Check 3: Shard not terminal
+        C->>C: shard.state != terminal?
+
+        alt Terminal state
+            C-->>W: Err(ShardTerminal)
+            Note right of W: Shard in terminal state
+        end
+
+        Note over C,S: Check 4: Fencing token valid (INV-S11, INV-S12)
         C->>C: provided_token (42) == shard.fence_epoch?
 
         alt Stale token (provided < current)
             C-->>W: Err(StaleFence)
             Note right of W: Zombie detected!
         end
-
-        Note over C,S: Check 4: State allows mutation
-        C->>C: shard.state == Active?
-
-        alt Invalid state
-            C-->>W: Err(ShardTerminal)
-            Note right of W: Shard not in mutable state
-        end
     end
 
-    Note over C: ---- All 4 checks passed ----
+    Note over C: ---- All checks passed ----
 
     C->>S: update cursor = new_cursor
     C->>S: update token = 42
@@ -81,8 +85,10 @@ sequenceDiagram
 
 The two `alt` blocks represent the error exits. In practice, if Check 1 fails (shard
 not found), the coordinator returns `ShardNotFound` before reaching Check 2. The
-diagram collapses Checks 1 and 2 into the success path for clarity, but all five checks
-are evaluated in strict order. Failure at any step short-circuits the remaining checks.
+diagram collapses Checks 1 and 2 into the success path for clarity, and omits lease
+expiry and owner divergence checks for brevity (these are shown in Diagram 4 and the
+[Validation Check Ordering](#validation-check-ordering) table). All checks are
+evaluated in strict order. Failure at any step short-circuits the remaining checks.
 
 ---
 
@@ -217,15 +223,15 @@ graph TD
     START(["Mutating operation received"])
     CHECK1{"Shard exists<br/>in run?"}
     CHECK2{"Tenant<br/>matches?"}
-    CHECK3{"Token ==<br/>current?"}
-    CHECK4{"State allows<br/>operation?"}
+    CHECK3{"State<br/>terminal?"}
+    CHECK4{"Token ==<br/>current?"}
     CHECK5{"Owner matches<br/>lease holder?"}
     SUCCESS["Apply mutation<br/>atomically"]
 
     ERR1["ShardNotFound"]
     ERR2["TenantMismatch"]
-    ERR3["StaleFence<br/>(zombie!)"]
-    ERR4["ShardTerminal"]
+    ERR3["ShardTerminal"]
+    ERR4["StaleFence<br/>(zombie!)"]
     ERR5["StaleFence<br/>(owner divergence!)"]
 
     START --> CHECK1
@@ -233,10 +239,10 @@ graph TD
     CHECK1 -.->|"No"| ERR1
     CHECK2 -->|"Yes"| CHECK3
     CHECK2 -.->|"No"| ERR2
-    CHECK3 -->|"Yes (INV-S12)"| CHECK4
-    CHECK3 -.->|"No (stale token)"| ERR3
-    CHECK4 -->|"Yes"| CHECK5
-    CHECK4 -.->|"No"| ERR4
+    CHECK3 -->|"No (not terminal)"| CHECK4
+    CHECK3 -.->|"Yes"| ERR3
+    CHECK4 -->|"Yes (INV-S12)"| CHECK5
+    CHECK4 -.->|"No (stale token)"| ERR4
     CHECK5 -->|"Yes"| SUCCESS
     CHECK5 -.->|"No"| ERR5
 
@@ -261,16 +267,17 @@ The five checks correspond to five distinct categories of safety:
 |-------|----------|---------------|------------------|
 | 1 | Identity | `ShardNotFound` | Operating on a shard that does not exist or belongs to a different run |
 | 2 | Tenant isolation | `TenantMismatch` | Cross-tenant data access in multi-tenant deployments |
-| 3 | Temporal ordering | `StaleFence` | Zombie workers writing to shards they no longer own (INV-S11, INV-S12) |
-| 4 | State validity | `ShardTerminal` | Mutations that violate the shard state machine (e.g., advancing cursor on a completed shard) |
+| 3 | State validity | `ShardTerminal` | Mutations on shards in a terminal state (e.g., advancing cursor on a completed shard) |
+| 4 | Temporal ordering | `StaleFence` | Zombie workers writing to shards they no longer own (INV-S11, INV-S12) |
 | 5 | Owner identity | `StaleFence` | Identity mismatches when fence epochs agree (catches logic errors in lease-handoff) |
 
 The ordering is deliberate. Identity is checked first because there is no point
 validating a token for a shard that does not exist. Tenant isolation comes next because
 a tenant mismatch is a security boundary violation that should be caught before any
-business logic. The fencing token check is third because it is the most common failure
-mode in practice (zombie workers). State validity is last because it represents
-application-level logic rather than coordination-level safety.
+business logic. Terminal status is third for fast rejection of dead shards before
+more expensive checks. The fencing token check is fourth because it is the most common
+failure mode in practice (zombie workers). Owner identity is last because it catches
+edge cases where fence epochs agree but lease holders diverge.
 
 ---
 
@@ -314,7 +321,7 @@ shard coordination:
 ## Cross-References
 
 - [Shard and Run State Machines](05-shard-and-run-state-machines.md) -- the state
-  transitions that Check 4 validates against
+  transitions that Check 3 (terminal status) validates against
 - [Lease Lifecycle](07-lease-lifecycle.md) -- how leases are granted, renewed, and
   expired, feeding into the fencing token lifecycle
 - [Boundary Dependency Graph](02-boundary-dependency-graph.md) -- the broader

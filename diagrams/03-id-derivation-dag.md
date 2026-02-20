@@ -5,7 +5,7 @@ The identity system in Gossip defines 15 types organized into a directed acyclic
 Three invariants govern the entire DAG:
 
 - **INV-S01 (Determinism):** Every derivation is a pure function of its inputs. Same inputs always produce the same output.
-- **INV-S02 (Collision resistance):** All 32-byte outputs provide collision resistance below 2^-128, inherited from BLAKE3's 256-bit security margin.
+- **INV-S02 (Collision resistance):** All 32-byte outputs provide 128-bit collision resistance (birthday bound ≈ 2^128 operations to find a collision), inherited from BLAKE3's 256-bit output.
 - **INV-S03 (Tenant isolation):** Tenant-keyed `SecretHash` derivation prevents cross-tenant correlation of secret values.
 
 ---
@@ -335,6 +335,10 @@ This two-level design means operators never need to re-triage findings just beca
 | Shard algebra split ID | Uses `SPLIT_ID_V1` from the same domain registry (B2: Coordination) |
 | Policy-driven rescan | `PolicyHash` change forces new `RunId` and full rescan |
 | Triage group key | `TRIAGE_GROUP_KEY_V1` groups findings by `(tenant, item)` for persistence |
+| Boundary dependency graph (which boundaries consume which ID types) | [02-boundary-dependency-graph.md](02-boundary-dependency-graph.md) |
+| End-to-end scan flow (StableItemId in step 4, FindingId in step 7) | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) |
+| Tenant isolation (SecretHash keyed-mode derivation, cross-tenant unlinkability) | [11-tenant-isolation.md](11-tenant-isolation.md) |
+| Split operations (SPLIT_ID_V1 domain separator for child shard IDs) | [12-split-operations.md](12-split-operations.md) |
 
 ## Source Code References
 

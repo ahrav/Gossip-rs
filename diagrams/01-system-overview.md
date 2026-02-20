@@ -201,40 +201,22 @@ sequenceDiagram
 
 ## Build DAG
 
-The build DAG reflects the tier structure of the crate graph. Understanding the
-compilation order is important for two reasons: it tells you which crates can be
-compiled in parallel (reducing CI wall-clock time), and it tells you where a
-change will trigger downstream rebuilds.
-
-Tier 0 contains only `gossip-contracts`. This crate has no internal dependencies
-and compiles first. Because it contains the pure-logic boundaries (B1 and B3),
-changes here are infrequent but far-reaching -- every downstream crate must
-recompile.
-
-Tier 1 contains `gossip-coordination` and `gossip-connectors`. These two crates
-depend only on `gossip-contracts` and are independent of each other, so they
-compile in parallel. This is a deliberate design choice: connector code and
-coordination code evolve on different cadences and should never block each
-other's builds.
-
-Tier 2 contains `gossip-engine`, which depends on `gossip-contracts`,
-`gossip-coordination`, and `gossip-connectors`. It cannot begin compiling
-until both Tier 0 and Tier 1 are done. `gossip-scan-pipeline` sits above
-`gossip-engine` in the dependency graph.
-
-Tier 3 is `gossip-worker`, the final binary. It depends on the pipeline crate
-and is always the last to compile.
+The crate graph compiles in four tiers. Tier 0 (`gossip-contracts`) has no
+internal dependencies and compiles first. Tier 1 (`gossip-coordination` and
+`gossip-connectors`) compiles in parallel once Tier 0 finishes -- these two
+crates are independent by design. Tier 2 (`gossip-engine`, `gossip-scan-pipeline`)
+depends on everything below it, and Tier 3 (`gossip-worker`) is the final binary.
 
 ```mermaid
 %% Diagram: build-dag
 graph TD
-    subgraph "Tier 0 -- No dependencies"
-        contracts["gossip-contracts<br/>(B1 + B3)"]
+    subgraph "Tier 0"
+        contracts["gossip-contracts"]
     end
 
-    subgraph "Tier 1 -- Parallel compilation"
-        coordination["gossip-coordination<br/>(B2)"]
-        connectors["gossip-connectors<br/>(B4)"]
+    subgraph "Tier 1"
+        coordination["gossip-coordination"]
+        connectors["gossip-connectors"]
     end
 
     subgraph "Tier 2"
@@ -242,7 +224,7 @@ graph TD
         pipeline["gossip-scan-pipeline"]
     end
 
-    subgraph "Tier 3 -- Final binary"
+    subgraph "Tier 3"
         worker["gossip-worker"]
     end
 
@@ -261,6 +243,8 @@ graph TD
     style pipeline fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style worker fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
+
+For the full type-annotated dependency DAG and tiered compilation analysis, see [Boundary Dependency Graph](02-boundary-dependency-graph.md).
 
 ---
 

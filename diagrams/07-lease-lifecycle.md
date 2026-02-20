@@ -159,8 +159,9 @@ The original worker's lease is still technically valid, but it has no guarantee
 of renewal. If the worker is aware that renewal failed, it should stop
 processing immediately -- continuing to scan would be wasted work at best, and
 could lead to fencing errors when it tries to commit results after the lease
-has expired and been reassigned. The `WorkerSession` pattern (described below)
-handles this by triggering cleanup through the `Drop` trait.
+has expired and been reassigned. If the session is dropped without a terminal
+op, the shard's lease simply expires at its deadline, making it available for
+re-acquisition.
 
 Key timing properties:
 
@@ -267,9 +268,9 @@ The lifecycle has a clean five-phase structure:
    gracefully.
 
 The `WorkerSession` pattern ensures that if any phase fails unexpectedly (panic,
-network error, process crash), the shard's lease is released through the `Drop`
-trait implementation. This prevents shard starvation where a crashed worker
-holds a lease until natural expiry.
+network error, process crash), the shard's lease expires at its deadline and
+becomes available for re-acquisition by another worker. There is no `Drop`
+impl — lease expiry is the recovery mechanism.
 
 ---
 

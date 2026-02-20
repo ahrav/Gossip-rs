@@ -39,9 +39,9 @@ graph TD
     ID[03-id-derivation-dag.md<br/>15-type identity hierarchy<br/>6 diagrams]
     E2E[04-end-to-end-scan-flow.md<br/>13-step scan sequence<br/>3 diagrams]
 
-    SM[05-shard-and-run-state-machines.md<br/>Shard + Run state machines<br/>5 diagrams]
+    SM[05-shard-and-run-state-machines.md<br/>Shard + Run state machines<br/>4 diagrams]
     FP[06-fencing-protocol.md<br/>5-check validation<br/>4 diagrams]
-    LL[07-lease-lifecycle.md<br/>Lease acquisition/renewal<br/>4 diagrams]
+    LL[07-lease-lifecycle.md<br/>Lease acquisition/renewal<br/>5 diagrams]
     PC[08-pagecommit-typestate.md<br/>Compile-time state enforcement<br/>4 diagrams]
     CB[09-circuit-breaker.md<br/>CB state machine + isolation<br/>4 diagrams]
 
@@ -53,6 +53,7 @@ graph TD
     SO --> BD
     SO --> E2E
     BD --> ID
+    BD --> SP
     E2E --> SM
     SM --> FP
     FP --> LL
@@ -61,6 +62,7 @@ graph TD
     SM --> SP
     FP --> FM
     FP --> TI
+    ID --> TI
 
     style R fill:#F3F4F6,stroke:#374151
     style SO fill:#F3F4F6,stroke:#374151
@@ -110,7 +112,7 @@ graph TD
 | 02 | `02-boundary-dependency-graph.md` | 3 | B1, All | Type-annotated DAG, tiered compilation, anti-patterns |
 | 03 | `03-id-derivation-dag.md` | 6 | B1 | 15-type hierarchy, item/secret/finding/occurrence chains |
 | 04 | `04-end-to-end-scan-flow.md` | 3 | All | 13-step sequence, atomic commit boundary |
-| 05 | `05-shard-and-run-state-machines.md` | 5 | B2 | Shard SM, run SM, splits lifecycle, illegal transitions |
+| 05 | `05-shard-and-run-state-machines.md` | 4 | B2 | Shard SM, run SM, splits lifecycle, illegal transitions |
 | 06 | `06-fencing-protocol.md` | 4 | B2 | 5-check validation, zombie resolution, decision tree |
 | 07 | `07-lease-lifecycle.md` | 5 | B2 | Acquisition, renewal timeline, cursor monotonicity |
 | 08 | `08-pagecommit-typestate.md` | 4 | B5 | Typestate SM, partial write failures, compile-time safety |
@@ -118,7 +120,7 @@ graph TD
 | 10 | `10-failure-modes-and-recovery.md` | 6 | All | Worker crash, coordinator crash, partitions, split-brain |
 | 11 | `11-tenant-isolation.md` | 5 | B1, B2 | 3 isolation layers, correlation attack, TenantSecretKey |
 | 12 | `12-split-operations.md` | 5 | B2, B3 | split_replace, split_residual, coverage validation |
-| | **Total** | **55** | | |
+| | **Total** | **54** | | |
 
 ## Implementation Status Legend
 

@@ -81,7 +81,7 @@ stateDiagram-v2
 Key observations from the source code:
 
 - **`ShardStatus` is a `#[repr(u8)]` enum** with discriminants `Active=0`, `Done=1`, `Split=2`, `Parked=3`. These values are persisted and must never change.
-- **`is_terminal()`** returns `true` for `Done`, `Split`, and `Parked`. Terminal shards also release their lease (`lease = None`) as enforced by INV-3.
+- **`is_terminal()`** returns `true` for `Done`, `Split`, and `Parked`. Terminal shards also release their lease (`lease = None`) as enforced by INV-S30 (`is_terminal()` implies `lease.is_none()`).
 - **`assert_transition_legal()`** panics on any attempt to leave a terminal state. This is the crash-to-prevent-corruption strategy from Tiger Style.
 - **`split_residual`** is a non-terminal split that keeps the parent `Active`. It narrows the parent's key range (an `Active -> Active` self-transition) rather than retiring the parent to `Split`. This contrasts with `split_replace`, which terminates the parent.
 
@@ -246,31 +246,6 @@ machine and indicates whether the transition is valid. Only transitions FROM
 `Active` are permitted. Terminal states reject all outgoing transitions via
 `assert_transition_legal()`.
 
-```mermaid
-%% Diagram: shard-transition-matrix
-graph LR
-    subgraph Matrix["Shard Transition Matrix"]
-        direction TB
-
-        Header["From \\ To | Active | Done | Split | Parked"]
-        Row1["Active    |   -    |  OK  |  OK   |  OK   "]
-        Row2["Done      |   X    |  -   |  X    |  X    "]
-        Row3["Split     |   X    |  X   |  -    |  X    "]
-        Row4["Parked    |   X    |  X   |  X    |  -    "]
-
-        Header --- Row1
-        Row1 --- Row2
-        Row2 --- Row3
-        Row3 --- Row4
-    end
-
-    style Header fill:#166534,stroke:#166534,color:#FFFFFF
-    style Row1 fill:#DCFCE7,stroke:#166534,color:#166534
-    style Row2 fill:#DCFCE7,stroke:#166534,color:#166534
-    style Row3 fill:#DCFCE7,stroke:#166534,color:#166534
-    style Row4 fill:#DCFCE7,stroke:#166534,color:#166534
-```
-
 | From \ To  | Active          | Done              | Split              | Parked            |
 |:-----------|:----------------|:------------------|:-------------------|:------------------|
 | **Active** | ownership change | `complete`  | `split_replace`    | `park`      |
@@ -350,7 +325,7 @@ The backend's enforcement strategy is layered:
 
 1. **Typed errors** (`ShardTerminal`, `AlreadyLeased`, `StaleFence`) are returned for expected protocol violations -- clients handle these gracefully.
 2. **`assert_transition_legal()`** panics for internal bugs -- if the coordinator's own code attempts an illegal transition, the process crashes before persisting corrupt state.
-3. **INV-3 (`is_terminal() implies lease.is_none()`)** is checked by `assert_invariants()` after every state transition, catching lease leaks on terminal shards.
+3. **INV-S30 (`is_terminal() implies lease.is_none()`)** is checked by `assert_invariants()` after every state transition, catching lease leaks on terminal shards.
 
 ---
 

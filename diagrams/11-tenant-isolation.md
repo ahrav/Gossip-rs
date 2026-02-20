@@ -367,10 +367,13 @@ in, because those checks are never reached.
 ## Diagram 5: Same-Tenant Correlation (Intentional)
 
 Cross-tenant correlation is forbidden, but *same-tenant* correlation is a feature.
-When the same secret appears in multiple files within a single tenant, the system
-deliberately produces the same FindingId for all occurrences. This enables triage
-grouping: an operator marks a finding as "accepted" once, and that decision
-automatically applies to every occurrence of the same secret across all scanned files.
+When the same secret appears in multiple files within a single tenant, each occurrence
+gets a distinct FindingId (because FindingId depends on StableItemId, which varies per
+file). However, all occurrences share the same **SecretHash** -- since SecretHash is
+derived solely from TenantSecretKey and NormHash, it is independent of where the secret
+was found. The triage system groups findings by SecretHash (via a TriageGroupKey), so
+an operator marks a secret as "accepted" once and that decision automatically applies
+to every occurrence across all scanned files.
 
 ```mermaid
 %% Diagram: same-tenant-correlation
@@ -381,17 +384,18 @@ graph LR
         subgraph FileAPath ["File A"]
             SIA["StableItemId_A<br/>(src/config.rs)"]
             SHA_SAME["SecretHash_same<br/>= BLAKE3-keyed(Key_T, NormHash)"]
-            FIDA_SAME["FindingId_X"]
+            FIDA_SAME["FindingId_A<br/>(unique to File A)"]
         end
 
         subgraph FileBPath ["File B"]
             SIB["StableItemId_B<br/>(deploy/env.yaml)"]
             SHB_SAME["SecretHash_same<br/>= BLAKE3-keyed(Key_T, NormHash)"]
-            FIDB_SAME["FindingId_X<br/>(SAME!)"]
+            FIDB_SAME["FindingId_B<br/>(unique to File B)"]
         end
 
-        GROUP["Both occurrences grouped<br/>under FindingId_X"]
-        TRIAGE["Triage: mark as accepted once<br/>--> applies to all occurrences"]
+        SHARED_HASH["Both share SecretHash_same<br/>(same TenantSecretKey + NormHash)"]
+        GROUP["Triage groups by SecretHash:<br/>different FindingIds, same secret"]
+        TRIAGE["Mark as accepted once<br/>--> applies to all occurrences"]
 
         SECRET_SAME --> SIA
         SECRET_SAME --> SIB
@@ -399,8 +403,11 @@ graph LR
         SIB --> SHB_SAME
         SHA_SAME --> FIDA_SAME
         SHB_SAME --> FIDB_SAME
-        FIDA_SAME --> GROUP
-        FIDB_SAME --> GROUP
+        SHA_SAME --> SHARED_HASH
+        SHB_SAME --> SHARED_HASH
+        SHARED_HASH --> GROUP
+        FIDA_SAME -.-> GROUP
+        FIDB_SAME -.-> GROUP
         GROUP --> TRIAGE
     end
 
@@ -422,8 +429,9 @@ graph LR
     style SIB fill:#F3F4F6,stroke:#374151,color:#000
     style SHA_SAME fill:#3B82F6,stroke:#1E40AF,color:#FFF
     style SHB_SAME fill:#3B82F6,stroke:#1E40AF,color:#FFF
-    style FIDA_SAME fill:#3B82F6,stroke:#1E40AF,color:#FFF
-    style FIDB_SAME fill:#3B82F6,stroke:#1E40AF,color:#FFF
+    style FIDA_SAME fill:#F3F4F6,stroke:#374151,color:#000
+    style FIDB_SAME fill:#F3F4F6,stroke:#374151,color:#000
+    style SHARED_HASH fill:#3B82F6,stroke:#1E40AF,color:#FFF
     style GROUP fill:#DCFCE7,stroke:#166534,color:#000
     style TRIAGE fill:#22C55E,stroke:#166534,color:#FFF
 
@@ -438,10 +446,11 @@ graph LR
 
 The left side shows same-tenant behavior. Both `src/config.rs` and `deploy/env.yaml`
 contain the same GitHub PAT. Because both files are scanned under the same tenant, they
-use the same TenantSecretKey, producing the same SecretHash. Combined with the same
-RuleFingerprint and TenantId, both derivations converge on the same FindingId_X. The
-triage system groups all occurrences under this FindingId, so marking the finding as
-"accepted" in one file automatically applies to the other.
+use the same TenantSecretKey, producing the same SecretHash. However, each file has a
+distinct StableItemId, so the FindingIds differ (FindingId_A vs FindingId_B). The triage
+system correlates findings by SecretHash (via a TriageGroupKey), not by FindingId
+equality. Marking the secret as "accepted" once applies to every occurrence that shares
+the same SecretHash, regardless of which file it appears in.
 
 The right side shows cross-tenant behavior. The same GitHub PAT exists in both tenant A
 and tenant B. Despite the raw secret being identical, the different TenantSecretKeys

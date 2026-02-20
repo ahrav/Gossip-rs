@@ -157,6 +157,10 @@ Every split operation must satisfy two invariants:
 - **INV-S21**: Shards cover the entire keyspace. The union of all child ranges
   must exactly equal the parent's original range.
 
+These invariants are enforced by the `validate_coverage()` function in the coordination
+backend and are verified in the shard lifecycle tests (see [Shard and Run State Machines](./05-shard-and-run-state-machines.md)
+for the shard state machine that constrains when splits can occur).
+
 The coordinator checks three conditions to enforce these invariants:
 
 1. The first child's start must equal the parent's start.

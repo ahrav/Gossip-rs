@@ -372,56 +372,30 @@ but only the one with the highest token can *write* to it.
 %% Diagram: split-brain-prevention-fencing
 sequenceDiagram
     autonumber
-    participant W1 as Worker 1 (old lease)
+    participant W1 as Worker 1 (stale token=5)
     participant CO as Coordinator (B2)
-    participant W2 as Worker 2 (new lease)
+    participant W2 as Worker 2 (current token=6)
 
-    Note over W1,CO: Worker 1 acquires shard
-    W1->>CO: acquire_and_restore(shard_1)
-    CO-->>W1: Ok(token=5)
-
-    W1->>CO: commit(token=5, cursor=page_2)
-    CO-->>W1: Ok (token 5 == 5 ✓)
-
-    rect rgb(254, 226, 226)
-        Note over W1,CO: ═══ NETWORK PARTITION ═══<br/>Worker 1 isolated from Coordinator
-
-        Note over W1: Worker 1 continues scanning locally.<br/>Believes it still owns shard_1.
-
-        CO->>CO: Lease expires for Worker 1
-        CO->>CO: Release shard_1 lease (Active, unleased)
-    end
-
-    Note over CO,W2: Worker 2 claims the shard
-    W2->>CO: acquire_and_restore(shard_1)
-    CO-->>W2: Ok(token=6)
-
-    Note over W2: Worker 2 is now the SOLE valid owner (INV-S10)
-
+    Note over W1,W2: After partition heals
     W2->>CO: commit(token=6, cursor=page_3)
-    Note over CO: Check: 6 == 6 ✓
-    CO-->>W2: Ok (commit accepted)
-
-    Note over W1,CO: ═══ PARTITION HEALS ═══
+    CO-->>W2: Ok (6 == 6 ✓)
 
     W1->>CO: commit(token=5, cursor=page_3)
-    Note over CO: Check: 5 != 6 ✗ STALE
-    CO--xW1: Err(StaleFence)
+    CO--xW1: Err(StaleFence: 5 != 6)
 
-    rect rgb(220, 252, 231)
-        Note over W1,W2: Single-writer invariant maintained (INV-S10).<br/>No data corruption. No conflicting writes.<br/>Worker 1 detects stale lease and stops.
-    end
-
-    Note over W1: Worker 1 stops processing shard_1.<br/>Discards uncommitted work.
+    Note over W1,W2: Single-writer invariant maintained (INV-S10)
 ```
 
+> For the full sequence including partition onset, lease expiry, and shard
+> re-acquisition, see
+> [Fencing Protocol -- Diagram 2: Zombie Worker Resolution](06-fencing-protocol.md).
+
 The diagram illustrates the fundamental asymmetry of the fencing protocol.
-Worker 2's commit at step 7 succeeds because `6 == 6` is true -- it holds the
-current token and is the rightful owner. Worker 1's commit at step 9 fails
-because `5 != 6` -- its token is stale, and no amount of retrying will
-make it valid again. The only option for Worker 1 is to stop, discard its
-in-flight work, and re-acquire the shard if it wants to continue (which would
-give it token 7).
+Worker 2's commit succeeds because `6 == 6` is true -- it holds the current
+token and is the rightful owner. Worker 1's commit fails because `5 != 6` --
+its token is stale, and no amount of retrying will make it valid again. The
+only option for Worker 1 is to stop, discard its in-flight work, and
+re-acquire the shard if it wants to continue (which would give it token 7).
 
 This is not eventual consistency -- it is **immediate rejection**. There is no
 window of ambiguity, no reconciliation phase, no conflict resolution. The stale
@@ -636,6 +610,8 @@ skipped.
   and atomic commit boundary that define cursor semantics
 - [System Overview](./01-system-overview.md) -- the five architectural
   boundaries (B1-B5) referenced by color coding
+- [Circuit Breaker](./09-circuit-breaker.md) -- the circuit breaker state machine
+  and cascade prevention that underpin Diagrams 4 and 6
 
 ## Source Code References
 
