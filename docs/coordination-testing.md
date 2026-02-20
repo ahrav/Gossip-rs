@@ -1,3 +1,4 @@
+# Coordination Testing Strategy
 
 Testing strategy for the shard coordination protocol and its simulation
 infrastructure. Four tiers target distinct quality dimensions: isolation,
@@ -288,14 +289,15 @@ liveness ops for reliable acquire→complete cycles.
 **`proptest_convergence_stormy`** — Stormy, 200 cases, 500 safety + 15000
 liveness ops. Same dual assertion under ~10% fault pressure. Faults cause
 lease expiry mid-operation, forcing re-acquisition cycles that consume
-extra ops. The 3x proportional budget over SunnyDay accounts for this
-overhead plus additional splits from the longer safety phase.
+extra ops. The ~7.5× raw budget over SunnyDay compensates for the ~10%
+rejection rate and larger active shard set from the longer safety phase.
 
 ### Multi-Tenant Isolation (`mega_sim_tests.rs`)
 
 **`multi_tenant_isolation`** — Two tenants sharing one
-`InMemoryCoordinator` instance. This is the only test that exercises
-`RejectionKind::TenantMismatch` and tenant-scoped checker history.
+`InMemoryCoordinator` instance. This is the only test that exercises the
+cross-tenant rejection path (tenant-scoped lookup returning `ShardNotFound`)
+and tenant-scoped checker history.
 Runs in the default `cargo test` cycle (not `#[ignore]`).
 
 The test verifies three properties:

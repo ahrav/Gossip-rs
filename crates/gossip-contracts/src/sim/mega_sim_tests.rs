@@ -133,13 +133,15 @@ fn parse_fault_level() -> FaultLevel {
 ///
 /// Each seed runs 4 workers contending over 15 shards through 10K safety
 /// ops (random operations under fault injection) followed by 2K liveness
-/// ops (biased toward acquire + complete to test convergence).
+/// ops (biased toward acquire + complete — 60% combined — with supporting
+/// time-advance, renew, checkpoint, and resume ops to test convergence).
 ///
 /// # Execution model
 ///
 /// Seeds are divided into equal-sized chunks across `available_parallelism()`
 /// OS threads using `std::thread::scope`. Static chunking keeps load balanced
-/// because every seed performs the same amount of work (~12K ops). Each thread
+/// because every seed performs the same amount of work (zombie preamble + 10K safety
+/// + 2K liveness ops). Each thread
 /// accumulates failures and event counts locally, then the main thread merges
 /// results to avoid contention.
 ///
@@ -228,7 +230,14 @@ fn mega_sim_10k_steps() {
             .collect();
 
         for handle in handles {
-            let (failures, local_counts) = handle.join().expect("thread panicked");
+            let (failures, local_counts) = handle.join().unwrap_or_else(|panic_val| {
+                let msg = panic_val
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| panic_val.downcast_ref::<&str>().copied())
+                    .unwrap_or("(non-string panic)");
+                panic!("simulation thread panicked: {msg}");
+            });
             all_failures.extend(failures);
             for (kind, count) in local_counts {
                 *aggregate_counts.entry(kind).or_insert(0) += count;
@@ -513,8 +522,10 @@ mod proptest_convergence {
     //!   needs ~80 liveness ops for a reliable acquire→complete cycle.
     //! - **Stormy** (500 safety + 15000 liveness): ~10% fault rate causes
     //!   lease expiry and rejected operations on top of additional splits
-    //!   from the longer safety phase. 15000 liveness ops provides ~3x
-    //!   proportional headroom over SunnyDay.
+    //!   from the longer safety phase. 15_000 liveness ops provides ~7.5×
+    //!   the raw budget of SunnyDay (2_000), compensating for the ~10%
+    //!   fault-induced rejection rate and a larger active shard set from
+    //!   the longer safety phase.
 
     use super::*;
     use crate::test_util::miri_proptest_config;
@@ -559,12 +570,13 @@ mod proptest_convergence {
             assert_convergence(seed, FaultLevel::SunnyDay, 50, 2_000);
         }
 
-        /// Stormy convergence: ~10% fault rate, 3x proportional budget.
+        /// Stormy convergence: ~10% fault rate, ~7.5× raw budget.
         ///
         /// Faults cause lease expiry mid-operation, forcing re-acquisition
         /// cycles that consume extra ops. Combined with additional splits
-        /// from the longer safety phase, the 3x proportional budget over
-        /// SunnyDay accounts for this overhead.
+        /// from the longer safety phase, the ~7.5× raw budget over
+        /// SunnyDay compensates for the ~10% rejection rate and larger
+        /// active shard set.
         #[test]
         #[ignore]
         fn proptest_convergence_stormy(seed in any::<u64>()) {
