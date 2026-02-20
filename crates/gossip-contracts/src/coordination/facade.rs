@@ -105,7 +105,15 @@ pub enum ClaimError {
 impl fmt::Display for ClaimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoneAvailable { .. } => f.write_str("no available shards for this run"),
+            Self::NoneAvailable {
+                earliest_deadline: Some(deadline),
+            } => write!(
+                f,
+                "no available shards for this run (earliest lease expiry: {deadline:?})"
+            ),
+            Self::NoneAvailable {
+                earliest_deadline: None,
+            } => f.write_str("no available shards for this run (no active leases)"),
             Self::RunNotFound => f.write_str("run not found"),
             Self::TenantMismatch { expected } => {
                 write!(f, "tenant mismatch (expected {expected:?})")
@@ -271,8 +279,8 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
 
     // Partial ShardNotFound is tolerable (concurrent mutations).
     // All-not-found means the backend's shard index is fundamentally
-    // inconsistent with the shard map -- flag as data corruption.
-    debug_assert!(
+    // inconsistent with the shard map — unconditional panic (data corruption).
+    assert!(
         inconsistency_count < summaries.len(),
         "all {} candidates returned ShardNotFound — backend index vs shard map inconsistency",
         summaries.len(),

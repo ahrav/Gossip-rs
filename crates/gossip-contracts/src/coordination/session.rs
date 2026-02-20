@@ -1324,7 +1324,7 @@ mod tests {
             WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
         // 2 shards total, 1 just acquired ⇒ 1 available.
         assert_eq!(session.capacity().available_count, 1);
-        assert!(session.capacity().has_capacity());
+        assert!(!session.capacity().is_saturated());
 
         // Renew — capacity hint is refreshed.
         let _ = session.renew(now(10)).unwrap();

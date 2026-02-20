@@ -1110,41 +1110,27 @@ pub struct CapacityHint {
     /// Number of active, unleased shards in the run at operation time.
     pub available_count: u32,
     /// Earliest lease deadline among all active leased shards.  `None`
-    /// when no leases are held (all active shards are available).
+    /// when no active shards are currently leased — either because all
+    /// active shards are available (unleased), or because no active shards
+    /// exist in the run (all terminal or run has no shards).  Callers can
+    /// check `available_count` to distinguish the two cases.
     pub earliest_deadline: Option<LogicalTime>,
 }
 
 impl CapacityHint {
-    /// Sentinel for "no capacity information available."
+    /// Sentinel returned when capacity cannot be determined (e.g., the
+    /// run has no registered shards yet).  `is_saturated()` returns
+    /// `true` but `earliest_deadline` is `None`, meaning there is
+    /// no lease to wait on.
     pub const ZERO: Self = Self {
         available_count: 0,
         earliest_deadline: None,
     };
 
-    /// Whether any shards are available for immediate acquisition.
-    #[inline]
-    pub const fn has_capacity(self) -> bool {
-        self.available_count > 0
-    }
-
     /// Whether all active shards in the run are currently claimed.
     #[inline]
     pub const fn is_saturated(self) -> bool {
         self.available_count == 0
-    }
-
-    /// Validate internal consistency (extension point).
-    ///
-    /// Called from the counting helper after computing a hint. The body
-    /// is intentionally minimal: the only non-trivial invariant
-    /// ("no leases held implies `earliest_deadline` is `None`") cannot
-    /// be checked here because `CapacityHint` does not carry enough
-    /// context to distinguish "no leases in the run" from "available
-    /// shards exist alongside leased ones." Stronger assertions belong
-    /// in the coordinator's counting logic, which has full run context.
-    pub(crate) fn assert_invariants(self) {
-        // available_count > 0 with Some(deadline) is valid: it means
-        // some shards are leased and some are free.
     }
 }
 
@@ -1183,6 +1169,13 @@ pub struct RenewResult {
     pub new_deadline: LogicalTime,
     pub capacity: CapacityHint,
 }
+
+// Compile-time size assertions: these types live on hot-path return types.
+// RenewResult is Copy (two scalars + CapacityHint), so should stay compact.
+// AcquireResult contains heap-backed ShardSnapshot, so its inline size is
+// larger but still bounded by pointer-width fields.
+const _: () = assert!(core::mem::size_of::<RenewResult>() <= 32);
+const _: () = assert!(core::mem::size_of::<AcquireResult>() <= 224);
 
 // Checkpoint, Complete, and Park return `IdempotentOutcome<()>` on
 // success (the operation either executed or was replayed, with no

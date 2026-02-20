@@ -492,6 +492,10 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// Validates tenant isolation, fence epoch, and lease ownership via
     /// [`validate_lease`], then writes a fresh deadline. Returns the new
     /// deadline on success.
+    ///
+    /// **Complexity**: Computing the capacity hint adds an O(S) scan over the
+    /// run's shards, where S is the total shard count. Production backends
+    /// should maintain a running counter for O(1) capacity hints.
     fn renew(
         &mut self,
         now: LogicalTime,
@@ -1370,16 +1374,16 @@ impl InMemoryCoordinator {
                     None => deadline,
                 });
             } else {
-                available_count = available_count.saturating_add(1);
+                available_count = available_count
+                    .checked_add(1)
+                    .expect("available_count overflow: more active unleased shards than u32::MAX");
             }
         }
 
-        let hint = CapacityHint {
+        CapacityHint {
             available_count,
             earliest_deadline,
-        };
-        hint.assert_invariants();
-        hint
+        }
     }
 
     /// Look up a run record with tenant isolation enforcement.
