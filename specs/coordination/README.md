@@ -80,11 +80,11 @@ omitted or derivable within the single-tenant model.
 | TLA+ name | Sim label | Property |
 |-----------|-----------|----------|
 | `TypeOK` | -- | Type invariant: all variables in declared domains |
-| `MutualExclusion` | S1 | At most one worker with valid lease per shard |
+| `MutualExclusion` | S1 | At most one worker with valid lease per shard (tautological for function-valued `owner`; `ZombieRejection` is the operative guarantee) |
 | `ZombieRejection` | -- | Stale-epoch worker cannot hold valid lease |
 | `SplitAtomicity` | S7 | Split shards have non-empty spawned set; all children are Active or beyond |
 | `ChildImpliesParentSplit` | S7 | Child becoming non-NotCreated implies parent is Split |
-| `TerminalUnleased` | S4 | Terminal shards (Done, Split) hold no lease |
+| `TerminalUnleased` | S4 | Terminal shards (Done, Split, Parked) hold no lease |
 | `FenceEpochSanity` | S2 | Non-NotCreated shards have fence_epoch >= 1 (INITIAL) |
 | `CursorMonotonicity` | S5 | Cursor never decreases (ghost variable comparison) |
 
@@ -225,8 +225,14 @@ non-vacuity check passes).
 | 4 | Don't activate children in SplitReplace | `SplitAtomicity` | Children must be Active after split |
 | 5 | Allow `Done -> Active` in Unpark | `TerminalIrreversibility` | Done is irreversible |
 | 6 | Swap cursor/prev_cursor in Checkpoint | `CursorMonotonicity` | Cursor must advance, not regress |
-| 7 | Non-vacuity: `EventuallyAcquired` under `LiveSpec` | (should pass) | Model is not vacuous |
+| 7 | Non-vacuity: `EventuallyAcquired` under `LiveSpec` | (should pass) | Acquisition is satisfiable under WF |
 | 8 | Non-vacuity: `Liveness` (INV-L01) under `LiveSpec` | (should pass) | Liveness property is satisfiable |
+| 9 | Keep parent Active in SplitReplace | `ChildImpliesParentSplit` | Parent must transition to Split |
+| 10 | Set children `fence_epoch = 0` in SplitReplace | `FenceEpochSanity` | Children start at INITIAL (1) |
+| 11 | Reset epoch to 0 in Unpark | `AlwaysFenceMonotonicity` | Fence epoch never decreases |
+| 12 | Park resets cursor to 0 | `AlwaysCursorNonRegression` | Cursor never regresses |
+| 13 | Non-vacuity: `NeverSplit` (negation invariant) | `NeverSplit` | Split state is reachable |
+| 14 | Non-vacuity: `NeverDone` (negation invariant) | `NeverDone` | Done state is reachable |
 
 ### Running
 
@@ -237,7 +243,7 @@ bash specs/coordination/run_mutations.sh
 ### Expected output
 
 ```
-Total: 8  Passed: 8  Failed: 0
+Total: 14  Passed: 14  Failed: 0
 ```
 
 ---
@@ -291,7 +297,7 @@ in production.
 | `ShardFencing.cfg` | Production safety config (3 workers, exhaustive) |
 | `ShardFencing_dev.cfg` | Development safety config (2 workers, fast) |
 | `ShardFencing_liveness.cfg` | Liveness config (no SYMMETRY, no CONSTRAINT) |
-| `run_mutations.sh` | Mutation test suite (8 mutations) |
+| `run_mutations.sh` | Mutation test suite (14 mutations) |
 
 The `tla2tools.jar` model checker lives at `specs/tla2tools.jar` (shared
 across all specs in the repository).

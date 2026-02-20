@@ -302,8 +302,6 @@ Fairness ==
     /\ \A w \in Workers, s \in AllShards : WF_vars(Acquire(w, s))
     \* NO fairness on Checkpoint, Complete, Park, SplitReplace, Unpark
 
-FairSpec == Init /\ [][Next]_vars /\ Fairness
-
 \* Liveness specification without Tick. For liveness checking in a bounded
 \* model, Tick advances the clock to MaxTime before Acquire can fire,
 \* producing instantly-expired leases. Since Tick is an environment action
@@ -329,17 +327,21 @@ LiveSpec == Init /\ [][NextLive]_vars /\ Fairness
 \* Safety invariants
 \*-------------------------------------------------------------
 
-(* P1: Mutual exclusion -- at most one worker with valid lease per shard. *)
+(* P1: Mutual exclusion -- at most one worker with valid lease per shard.
+   NOTE: In this model, owner is [AllShards -> Workers ∪ {none}] -- a
+   function returning exactly one value per shard. Therefore owner[s] = w
+   holds for at most one w, making this invariant a tautology: the
+   cardinality of the valid-leaseholder set is <= 1 by construction.
+   The operative safety guarantee is ZombieRejection (P2), which ensures
+   that any worker holding a valid lease has a matching epoch, preventing
+   stale workers from acting on shards. Retained for documentation of
+   the intended property and consistency with simulation S1. *)
 MutualExclusion ==
     \A s \in AllShards :
-        \A w1, w2 \in Workers :
-            /\ w1 /= w2
-            /\ owner[s] = w1
-            /\ worker_epoch[w1][s] = fence_epoch[s]
-            /\ clock < deadline[s]
-            => ~(owner[s] = w2
-                 /\ worker_epoch[w2][s] = fence_epoch[s]
-                 /\ clock < deadline[s])
+        Cardinality({w \in Workers :
+            /\ owner[s] = w
+            /\ worker_epoch[w][s] = fence_epoch[s]
+            /\ clock < deadline[s]}) <= 1
 
 (* P2: Zombie rejection -- stale-epoch worker cannot hold valid lease. *)
 ZombieRejection ==
@@ -373,10 +375,14 @@ ChildImpliesParentSplit ==
     \A c \in {child1, child2} :
         status[c] /= "NotCreated" => status[parent] = "Split"
 
-(* INV-3: Terminal shards are unleased. *)
+(* INV-3: Terminal shards are unleased.
+   Uses TerminalStatuses to include Parked alongside Done and Split.
+   Safe by construction (Park clears owner, Acquire requires Active,
+   Unpark does not set owner), but stated for defense in depth and
+   consistency with Rust INV-3. *)
 TerminalUnleased ==
     \A s \in AllShards :
-        status[s] \in {"Done", "Split"} => owner[s] = none
+        status[s] \in TerminalStatuses => owner[s] = none
 
 (* INV-4: Non-NotCreated shards have fence_epoch >= 1 (INITIAL). *)
 FenceEpochSanity ==
