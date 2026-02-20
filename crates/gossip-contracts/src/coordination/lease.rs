@@ -76,6 +76,8 @@
 //! See [`check_op_idempotency`](super::validation::check_op_idempotency) for
 //! the implementation.
 
+use std::fmt;
+
 use crate::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
@@ -393,6 +395,19 @@ impl OpKind {
     }
 }
 
+impl fmt::Display for OpKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Checkpoint => "Checkpoint",
+            Self::Complete => "Complete",
+            Self::Park => "Park",
+            Self::SplitReplace => "SplitReplace",
+            Self::SplitResidual => "SplitResidual",
+            Self::Unpark => "Unpark",
+        })
+    }
+}
+
 // Compile-time assertions: discriminant values must never drift from their
 // persisted encoding. If a variant is added, add a corresponding assertion.
 const _: () = assert!(OpKind::Checkpoint as u8 == 0);
@@ -460,6 +475,16 @@ impl OpResult {
     #[must_use]
     pub const fn as_u8(self) -> u8 {
         self as u8
+    }
+}
+
+impl fmt::Display for OpResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Completed => "Completed",
+            Self::Error => "Error",
+            Self::Superseded => "Superseded",
+        })
     }
 }
 
@@ -637,6 +662,41 @@ mod tests {
             if let Some(result) = expected {
                 assert_eq!(result.as_u8(), disc, "OpResult::as_u8({result:?})");
             }
+        }
+    }
+
+    // -- OpKind Display ---------------------------------------------------
+
+    #[test]
+    fn op_kind_display_all_variants() {
+        let cases: &[(OpKind, &str)] = &[
+            (OpKind::Checkpoint, "Checkpoint"),
+            (OpKind::Complete, "Complete"),
+            (OpKind::Park, "Park"),
+            (OpKind::SplitReplace, "SplitReplace"),
+            (OpKind::SplitResidual, "SplitResidual"),
+            (OpKind::Unpark, "Unpark"),
+        ];
+        for &(kind, expected) in cases {
+            assert_eq!(kind.to_string(), expected, "OpKind::Display for {kind:?}");
+        }
+    }
+
+    // -- OpResult Display -------------------------------------------------
+
+    #[test]
+    fn op_result_display_all_variants() {
+        let cases: &[(OpResult, &str)] = &[
+            (OpResult::Completed, "Completed"),
+            (OpResult::Error, "Error"),
+            (OpResult::Superseded, "Superseded"),
+        ];
+        for &(result, expected) in cases {
+            assert_eq!(
+                result.to_string(),
+                expected,
+                "OpResult::Display for {result:?}"
+            );
         }
     }
 

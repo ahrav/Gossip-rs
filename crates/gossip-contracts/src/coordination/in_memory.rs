@@ -88,8 +88,7 @@ use crate::coordination::run::{
     hash_unpark_payload, validate_manifest,
 };
 use crate::coordination::run_errors::{
-    CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
-    RegisterShardsError, UnparkError,
+    CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 use crate::coordination::shard_spec::{
     ShardLimitScope, SplitValidationError, validate_residual_split, validate_split_coverage,
@@ -1764,14 +1763,14 @@ impl RunManagement for InMemoryCoordinator {
         tenant: TenantId,
         run: RunId,
         op_id: OpId,
-    ) -> Result<IdempotentOutcome<()>, CompleteRunError> {
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
         let payload_hash = hash_complete_run_payload();
         let record = self
             .runs
             .get_mut(&(tenant, run))
-            .ok_or(CompleteRunError::RunNotFound)?;
+            .ok_or(RunTransitionError::RunNotFound)?;
         if record.tenant != tenant {
-            return Err(CompleteRunError::TenantMismatch { expected: tenant });
+            return Err(RunTransitionError::TenantMismatch { expected: tenant });
         }
 
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
@@ -1780,14 +1779,15 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         if record.status.is_terminal() {
-            return Err(CompleteRunError::RunTerminal {
+            return Err(RunTransitionError::RunTerminal {
                 status: record.status,
             });
         }
         // Must be Active (not Initializing).
         if record.status != RunStatus::Active {
-            return Err(CompleteRunError::WrongStatus {
+            return Err(RunTransitionError::WrongStatus {
                 status: record.status,
+                target: RunStatus::Done,
             });
         }
         Self::apply_terminal_run_transition(
@@ -1815,14 +1815,14 @@ impl RunManagement for InMemoryCoordinator {
         tenant: TenantId,
         run: RunId,
         op_id: OpId,
-    ) -> Result<IdempotentOutcome<()>, FailRunError> {
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
         let payload_hash = hash_fail_run_payload();
         let record = self
             .runs
             .get_mut(&(tenant, run))
-            .ok_or(FailRunError::RunNotFound)?;
+            .ok_or(RunTransitionError::RunNotFound)?;
         if record.tenant != tenant {
-            return Err(FailRunError::TenantMismatch { expected: tenant });
+            return Err(RunTransitionError::TenantMismatch { expected: tenant });
         }
 
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
@@ -1831,14 +1831,15 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         if record.status.is_terminal() {
-            return Err(FailRunError::RunTerminal {
+            return Err(RunTransitionError::RunTerminal {
                 status: record.status,
             });
         }
         // Must be Active — Initializing runs use cancel_run instead.
         if record.status != RunStatus::Active {
-            return Err(FailRunError::WrongStatus {
+            return Err(RunTransitionError::WrongStatus {
                 status: record.status,
+                target: RunStatus::Failed,
             });
         }
         Self::apply_terminal_run_transition(
@@ -1863,14 +1864,14 @@ impl RunManagement for InMemoryCoordinator {
         tenant: TenantId,
         run: RunId,
         op_id: OpId,
-    ) -> Result<IdempotentOutcome<()>, CancelRunError> {
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
         let payload_hash = hash_cancel_run_payload();
         let record = self
             .runs
             .get_mut(&(tenant, run))
-            .ok_or(CancelRunError::RunNotFound)?;
+            .ok_or(RunTransitionError::RunNotFound)?;
         if record.tenant != tenant {
-            return Err(CancelRunError::TenantMismatch { expected: tenant });
+            return Err(RunTransitionError::TenantMismatch { expected: tenant });
         }
 
         if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
@@ -1879,7 +1880,7 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         if record.status.is_terminal() {
-            return Err(CancelRunError::RunTerminal {
+            return Err(RunTransitionError::RunTerminal {
                 status: record.status,
             });
         }

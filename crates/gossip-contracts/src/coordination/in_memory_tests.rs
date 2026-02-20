@@ -1831,8 +1831,9 @@ fn complete_run_wrong_status_initializing() {
     assert!(
         matches!(
             err,
-            CompleteRunError::WrongStatus {
-                status: RunStatus::Initializing
+            RunTransitionError::WrongStatus {
+                status: RunStatus::Initializing,
+                target: RunStatus::Done,
             }
         ),
         "expected WrongStatus(Initializing), got: {err:?}",
@@ -1852,7 +1853,7 @@ fn complete_run_terminal_already_done() {
     assert!(
         matches!(
             err,
-            CompleteRunError::RunTerminal {
+            RunTransitionError::RunTerminal {
                 status: RunStatus::Done
             }
         ),
@@ -1866,7 +1867,7 @@ fn complete_run_not_found() {
     let err = coord
         .complete_run(now(1), test_tenant(), test_run(), OpId::from_raw(1))
         .unwrap_err();
-    assert!(matches!(err, CompleteRunError::RunNotFound));
+    assert!(matches!(err, RunTransitionError::RunNotFound));
 }
 
 #[test]
@@ -1916,8 +1917,9 @@ fn fail_run_wrong_status_initializing() {
     assert!(
         matches!(
             err,
-            FailRunError::WrongStatus {
-                status: RunStatus::Initializing
+            RunTransitionError::WrongStatus {
+                status: RunStatus::Initializing,
+                target: RunStatus::Failed,
             }
         ),
         "expected WrongStatus(Initializing), got: {err:?}",
@@ -1937,7 +1939,7 @@ fn fail_run_terminal() {
     assert!(
         matches!(
             err,
-            FailRunError::RunTerminal {
+            RunTransitionError::RunTerminal {
                 status: RunStatus::Done
             }
         ),
@@ -2008,7 +2010,7 @@ fn cancel_run_terminal() {
     assert!(
         matches!(
             err,
-            CancelRunError::RunTerminal {
+            RunTransitionError::RunTerminal {
                 status: RunStatus::Done
             }
         ),
@@ -2090,7 +2092,7 @@ fn run_op_id_conflict_across_ops() {
         .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(1))
         .unwrap_err();
     assert!(
-        matches!(err, CompleteRunError::OpIdConflict(_)),
+        matches!(err, RunTransitionError::OpIdConflict(_)),
         "expected OpIdConflict when reusing register_shards op_id for complete_run, got: {err:?}",
     );
 }

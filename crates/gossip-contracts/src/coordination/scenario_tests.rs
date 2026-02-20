@@ -38,7 +38,7 @@ use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardStatus;
 use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
-use crate::coordination::run_errors::{CancelRunError, RegisterShardsError};
+use crate::coordination::run_errors::{RegisterShardsError, RunTransitionError};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::split::SplitResidualPlan;
 use crate::coordination::test_fixtures::*;
@@ -635,7 +635,7 @@ fn scenario_cancel_from_initializing() {
     // -- New cancel with different op_id -> RunTerminal --
     let terminal_result = coord.cancel_run(now(5), tenant, run, OpId::from_raw(3));
     assert!(
-        matches!(terminal_result, Err(CancelRunError::RunTerminal { .. })),
+        matches!(terminal_result, Err(RunTransitionError::RunTerminal { .. })),
         "cancel on terminal run with new op_id should fail with RunTerminal, got: {terminal_result:?}"
     );
 }

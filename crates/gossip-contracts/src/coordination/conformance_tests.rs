@@ -38,9 +38,7 @@ use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
-use crate::coordination::run_errors::{
-    CancelRunError, CompleteRunError, FailRunError, UnparkError,
-};
+use crate::coordination::run_errors::{RunTransitionError, UnparkError};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
 use crate::coordination::test_fixtures::{
@@ -661,7 +659,7 @@ fn run_terminal_irreversibility() {
     assert!(
         matches!(
             err,
-            CompleteRunError::RunTerminal {
+            RunTransitionError::RunTerminal {
                 status: RunStatus::Done
             }
         ),
@@ -675,7 +673,7 @@ fn run_terminal_irreversibility() {
     assert!(
         matches!(
             err,
-            FailRunError::RunTerminal {
+            RunTransitionError::RunTerminal {
                 status: RunStatus::Done
             }
         ),
@@ -689,7 +687,7 @@ fn run_terminal_irreversibility() {
     assert!(
         matches!(
             err,
-            CancelRunError::RunTerminal {
+            RunTransitionError::RunTerminal {
                 status: RunStatus::Done
             }
         ),

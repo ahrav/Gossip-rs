@@ -7,9 +7,13 @@
 //!
 //! Differs from `error.rs` in error composition: shard-level errors use a
 //! shared `CoordError` base with `From<CoordError>` narrowing per operation.
-//! Run-level errors are standalone per-operation enums whose only shared
-//! conversion is `From<RunOpIdConflict>` (for types with an `OpIdConflict`
-//! variant); individual types may have additional operation-specific `From` impls.
+//! Run-level errors are per-operation where the variants differ meaningfully
+//! (`CreateRunError`, `RegisterShardsError`, `GetRunError`, `UnparkError`).
+//! Terminal transitions (`complete_run`, `fail_run`, `cancel_run`) share
+//! [`RunTransitionError`] because their variant sets are structurally identical.
+//! The only shared `From` conversion across all types is `From<RunOpIdConflict>`
+//! (for types with an `OpIdConflict` variant); individual types may have
+//! additional operation-specific `From` impls.
 //!
 //! ## Hash Redaction via Opaque Wrapper
 //!
@@ -233,143 +237,98 @@ impl fmt::Display for GetRunError {
 impl std::error::Error for GetRunError {}
 
 // ============================================================================
-// Terminal run error macro
+// RunTransitionError
 // ============================================================================
 
-/// Generates a terminal run error enum with common variants (RunNotFound,
-/// TenantMismatch, RunTerminal, OpIdConflict) plus optional extra variants.
+/// Error from terminal run transitions (`complete_run`, `fail_run`,
+/// `cancel_run`).
 ///
-/// All generated enums get identical Debug (hash-redacting), Display, Error,
-/// and `From<RunOpIdConflict>` implementations.
-macro_rules! define_terminal_run_error {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $(
-                $(#[$extra_meta:meta])*
-                $extra_variant:ident { status: RunStatus }
-                    => debug: $debug_name:literal,
-                    => display: $display_msg:literal
-            ),* $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        $vis enum $name {
-            RunNotFound,
-            /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
-            TenantMismatch { expected: TenantId },
-            /// Run is already in a terminal state.
-            RunTerminal { status: RunStatus },
-            $(
-                $(#[$extra_meta])*
-                $extra_variant { status: RunStatus },
-            )*
-            /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
-            /// to prevent external access to raw hash values (hash redaction).
-            OpIdConflict(RunOpIdConflict),
-        }
+/// Unifies the formerly separate `CompleteRunError`, `FailRunError`, and
+/// `CancelRunError` — they shared 4 of 5 variants identically. The only
+/// structural difference was that `cancel_run` never produces `WrongStatus`
+/// (it accepts both Initializing and Active), and `complete_run` vs `fail_run`
+/// had different Display messages for `WrongStatus`. The `target` field in
+/// `WrongStatus` preserves those context-specific messages.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunTransitionError {
+    RunNotFound,
+    /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
+    TenantMismatch {
+        expected: TenantId,
+    },
+    /// Run is already in a terminal state.
+    RunTerminal {
+        status: RunStatus,
+    },
+    /// Run is not in the required status for this transition.
+    ///
+    /// `target` is the terminal status the caller attempted to transition to,
+    /// enabling context-specific Display messages (e.g., "use cancel_run for
+    /// Initializing" when target is `Failed`).
+    ///
+    /// `complete_run` produces `target: Done`; `fail_run` produces `target: Failed`.
+    /// `cancel_run` never produces this variant.
+    WrongStatus {
+        status: RunStatus,
+        target: RunStatus,
+    },
+    /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
+    /// to prevent external access to raw hash values (hash redaction).
+    OpIdConflict(RunOpIdConflict),
+}
 
-        impl fmt::Debug for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                match self {
-                    Self::RunNotFound => write!(f, "RunNotFound"),
-                    Self::TenantMismatch { expected } => f
-                        .debug_struct("TenantMismatch")
-                        .field("expected", expected)
-                        .finish(),
-                    Self::RunTerminal { status } => f
-                        .debug_struct("RunTerminal")
-                        .field("status", status)
-                        .finish(),
-                    $(
-                        Self::$extra_variant { status } => f
-                            .debug_struct($debug_name)
-                            .field("status", status)
-                            .finish(),
-                    )*
-                    Self::OpIdConflict(c) => c.fmt(f),
-                }
+impl fmt::Debug for RunTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RunNotFound => write!(f, "RunNotFound"),
+            Self::TenantMismatch { expected } => f
+                .debug_struct("TenantMismatch")
+                .field("expected", expected)
+                .finish(),
+            Self::RunTerminal { status } => f
+                .debug_struct("RunTerminal")
+                .field("status", status)
+                .finish(),
+            Self::WrongStatus { status, target } => f
+                .debug_struct("WrongStatus")
+                .field("status", status)
+                .field("target", target)
+                .finish(),
+            Self::OpIdConflict(c) => c.fmt(f),
+        }
+    }
+}
+
+impl fmt::Display for RunTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RunNotFound => f.write_str("run not found"),
+            Self::TenantMismatch { expected } => {
+                write!(f, "tenant mismatch (expected {expected:?})")
             }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                match self {
-                    Self::RunNotFound => f.write_str("run not found"),
-                    Self::TenantMismatch { expected } => {
-                        write!(f, "tenant mismatch (expected {expected:?})")
-                    }
-                    Self::RunTerminal { status } => {
-                        write!(f, "run is already terminal (status: {status})")
-                    }
-                    $(
-                        Self::$extra_variant { status } => {
-                            write!(f, $display_msg, status = status)
-                        }
-                    )*
-                    Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
-                }
+            Self::RunTerminal { status } => {
+                write!(f, "run is already terminal (status: {status})")
             }
+            Self::WrongStatus { status, target } => match target {
+                RunStatus::Failed => write!(
+                    f,
+                    "run is not Active, use cancel_run for Initializing (status: {status})"
+                ),
+                RunStatus::Done => write!(f, "run is not Active (status: {status})"),
+                other => write!(
+                    f,
+                    "run cannot transition to {other} from current status (status: {status})"
+                ),
+            },
+            Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
         }
-
-        impl std::error::Error for $name {}
-
-        impl_from_run_op_id_conflict!($name);
-    };
-}
-
-// ============================================================================
-// CompleteRunError
-// ============================================================================
-
-define_terminal_run_error! {
-    /// Error from `complete_run`.
-    ///
-    /// `complete_run` requires Active status.
-    #[derive(Clone, PartialEq, Eq)]
-    #[non_exhaustive]
-    pub enum CompleteRunError {
-        /// Run is not in `Active` status (e.g., still Initializing).
-        WrongStatus { status: RunStatus }
-            => debug: "WrongStatus",
-            => display: "run is not Active (status: {status})",
     }
 }
 
-// ============================================================================
-// FailRunError
-// ============================================================================
+impl std::error::Error for RunTransitionError {}
 
-define_terminal_run_error! {
-    /// Error from `fail_run`.
-    ///
-    /// Separate from `CompleteRunError` (PD-6) because `fail_run` transitions
-    /// to `Failed` (not `Done`), warranting a distinct error type for callers
-    /// who need to distinguish completion failures from explicit failure marking.
-    #[derive(Clone, PartialEq, Eq)]
-    #[non_exhaustive]
-    pub enum FailRunError {
-        /// Run is not in `Active` status. For Initializing runs, use `cancel_run`.
-        WrongStatus { status: RunStatus }
-            => debug: "WrongStatus",
-            => display: "run is not Active, use cancel_run for Initializing (status: {status})",
-    }
-}
-
-// ============================================================================
-// CancelRunError
-// ============================================================================
-
-define_terminal_run_error! {
-    /// Error from `cancel_run`.
-    ///
-    /// `cancel_run` accepts both Initializing and Active (no `WrongStatus`
-    /// under normal operation — only terminal runs are rejected).
-    #[derive(Clone, PartialEq, Eq)]
-    #[non_exhaustive]
-    pub enum CancelRunError {
-    }
-}
+impl_from_run_op_id_conflict!(RunTransitionError);
 
 // ============================================================================
 // UnparkError
@@ -467,9 +426,7 @@ mod tests {
     #[rstest]
     #[case::register_shards(RegisterShardsError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
     #[case::get_run(GetRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
-    #[case::complete_run(CompleteRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
-    #[case::fail_run(FailRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
-    #[case::cancel_run(CancelRunError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
+    #[case::run_transition(RunTransitionError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
     #[case::unpark(UnparkError::TenantMismatch { expected: TenantId::from_bytes([0x01; 32]) }.to_string())]
     fn tenant_mismatch_no_actual_tenant(#[case] display: String) {
         assert!(
@@ -486,9 +443,7 @@ mod tests {
 
     #[rstest]
     #[case::register_shards(format!("{:?}", RegisterShardsError::OpIdConflict(test_conflict())))]
-    #[case::complete_run(format!("{:?}", CompleteRunError::OpIdConflict(test_conflict())))]
-    #[case::fail_run(format!("{:?}", FailRunError::OpIdConflict(test_conflict())))]
-    #[case::cancel_run(format!("{:?}", CancelRunError::OpIdConflict(test_conflict())))]
+    #[case::run_transition(format!("{:?}", RunTransitionError::OpIdConflict(test_conflict())))]
     #[case::unpark(format!("{:?}", UnparkError::OpIdConflict(test_conflict())))]
     fn op_id_conflict_debug_redacted(#[case] debug: String) {
         assert!(
@@ -509,9 +464,7 @@ mod tests {
 
     #[rstest]
     #[case::register_shards(RegisterShardsError::OpIdConflict(test_conflict()).to_string())]
-    #[case::complete_run(CompleteRunError::OpIdConflict(test_conflict()).to_string())]
-    #[case::fail_run(FailRunError::OpIdConflict(test_conflict()).to_string())]
-    #[case::cancel_run(CancelRunError::OpIdConflict(test_conflict()).to_string())]
+    #[case::run_transition(RunTransitionError::OpIdConflict(test_conflict()).to_string())]
     #[case::unpark(UnparkError::OpIdConflict(test_conflict()).to_string())]
     fn op_id_conflict_display_no_hash_leak(#[case] display: String) {
         assert!(
@@ -535,9 +488,7 @@ mod tests {
         };
 
         let _: RegisterShardsError = conflict.clone().into();
-        let _: CompleteRunError = conflict.clone().into();
-        let _: FailRunError = conflict.clone().into();
-        let _: CancelRunError = conflict.clone().into();
+        let _: RunTransitionError = conflict.clone().into();
         let _: UnparkError = conflict.into();
     }
 
@@ -551,9 +502,9 @@ mod tests {
     #[case::register_shards_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>)]
     #[case::register_shard_limit(Box::new(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }) as Box<dyn std::error::Error>)]
     #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>)]
-    #[case::complete_run_terminal(Box::new(CompleteRunError::RunTerminal { status: RunStatus::Done }) as Box<dyn std::error::Error>)]
-    #[case::fail_run_wrong_status(Box::new(FailRunError::WrongStatus { status: RunStatus::Initializing }) as Box<dyn std::error::Error>)]
-    #[case::cancel_run_terminal(Box::new(CancelRunError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>)]
+    #[case::transition_terminal(Box::new(RunTransitionError::RunTerminal { status: RunStatus::Done }) as Box<dyn std::error::Error>)]
+    #[case::transition_wrong_status_done(Box::new(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }) as Box<dyn std::error::Error>)]
+    #[case::transition_wrong_status_failed(Box::new(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Failed }) as Box<dyn std::error::Error>)]
     #[case::unpark_shard_not_found(Box::new(UnparkError::ShardNotFound) as Box<dyn std::error::Error>)]
     #[case::unpark_run_terminal(Box::new(UnparkError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>)]
     fn error_display_deterministic(#[case] err: Box<dyn std::error::Error>) {
@@ -575,9 +526,8 @@ mod tests {
     #[case::register_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>, false)]
     #[case::register_shard_limit(Box::new(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }) as Box<dyn std::error::Error>, false)]
     #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>, false)]
-    #[case::complete_run_terminal(Box::new(CompleteRunError::RunTerminal { status: RunStatus::Done }) as Box<dyn std::error::Error>, false)]
-    #[case::fail_run_wrong_status(Box::new(FailRunError::WrongStatus { status: RunStatus::Initializing }) as Box<dyn std::error::Error>, false)]
-    #[case::cancel_run_terminal(Box::new(CancelRunError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>, false)]
+    #[case::transition_terminal(Box::new(RunTransitionError::RunTerminal { status: RunStatus::Done }) as Box<dyn std::error::Error>, false)]
+    #[case::transition_wrong_status(Box::new(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }) as Box<dyn std::error::Error>, false)]
     #[case::unpark_shard_not_found(Box::new(UnparkError::ShardNotFound) as Box<dyn std::error::Error>, false)]
     #[case::unpark_run_terminal(Box::new(UnparkError::RunTerminal { status: RunStatus::Cancelled }) as Box<dyn std::error::Error>, false)]
     fn error_source_chaining(#[case] err: Box<dyn std::error::Error>, #[case] has_source: bool) {
@@ -604,23 +554,13 @@ mod tests {
     // GetRunError
     #[case::get_not_found(GetRunError::RunNotFound.to_string())]
     #[case::get_tenant_mismatch(GetRunError::TenantMismatch { expected: test_tenant() }.to_string())]
-    // CompleteRunError
-    #[case::complete_not_found(CompleteRunError::RunNotFound.to_string())]
-    #[case::complete_tenant_mismatch(CompleteRunError::TenantMismatch { expected: test_tenant() }.to_string())]
-    #[case::complete_terminal(CompleteRunError::RunTerminal { status: RunStatus::Done }.to_string())]
-    #[case::complete_wrong_status(CompleteRunError::WrongStatus { status: RunStatus::Initializing }.to_string())]
-    #[case::complete_op_id_conflict(CompleteRunError::OpIdConflict(test_conflict()).to_string())]
-    // FailRunError
-    #[case::fail_not_found(FailRunError::RunNotFound.to_string())]
-    #[case::fail_tenant_mismatch(FailRunError::TenantMismatch { expected: test_tenant() }.to_string())]
-    #[case::fail_terminal(FailRunError::RunTerminal { status: RunStatus::Done }.to_string())]
-    #[case::fail_wrong_status(FailRunError::WrongStatus { status: RunStatus::Initializing }.to_string())]
-    #[case::fail_op_id_conflict(FailRunError::OpIdConflict(test_conflict()).to_string())]
-    // CancelRunError
-    #[case::cancel_not_found(CancelRunError::RunNotFound.to_string())]
-    #[case::cancel_tenant_mismatch(CancelRunError::TenantMismatch { expected: test_tenant() }.to_string())]
-    #[case::cancel_terminal(CancelRunError::RunTerminal { status: RunStatus::Cancelled }.to_string())]
-    #[case::cancel_op_id_conflict(CancelRunError::OpIdConflict(test_conflict()).to_string())]
+    // RunTransitionError
+    #[case::transition_not_found(RunTransitionError::RunNotFound.to_string())]
+    #[case::transition_tenant_mismatch(RunTransitionError::TenantMismatch { expected: test_tenant() }.to_string())]
+    #[case::transition_terminal(RunTransitionError::RunTerminal { status: RunStatus::Done }.to_string())]
+    #[case::transition_wrong_status_done(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }.to_string())]
+    #[case::transition_wrong_status_failed(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Failed }.to_string())]
+    #[case::transition_op_id_conflict(RunTransitionError::OpIdConflict(test_conflict()).to_string())]
     // UnparkError
     #[case::unpark_not_found(UnparkError::ShardNotFound.to_string())]
     #[case::unpark_tenant_mismatch(UnparkError::TenantMismatch { expected: test_tenant() }.to_string())]
@@ -632,6 +572,29 @@ mod tests {
     }
 
     // -- Variant-specific Display content --
+
+    #[test]
+    fn wrong_status_display_differs_by_target() {
+        let done_err = RunTransitionError::WrongStatus {
+            status: RunStatus::Initializing,
+            target: RunStatus::Done,
+        };
+        let fail_err = RunTransitionError::WrongStatus {
+            status: RunStatus::Initializing,
+            target: RunStatus::Failed,
+        };
+        let done_msg = done_err.to_string();
+        let fail_msg = fail_err.to_string();
+        assert!(
+            done_msg.contains("not Active"),
+            "Done target must mention Active: {done_msg}"
+        );
+        assert!(
+            fail_msg.contains("cancel_run"),
+            "Failed target must suggest cancel_run: {fail_msg}"
+        );
+        assert_ne!(done_msg, fail_msg, "Display messages must differ by target");
+    }
 
     #[test]
     fn unpark_not_parked_display_includes_status() {
