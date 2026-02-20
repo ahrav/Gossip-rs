@@ -280,4 +280,12 @@ After modifying Rust code, ALWAYS run these steps:
 
 1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
-3. If adding new components, update relevant docs: `architecture-overview.md`, `detection-engine.md`, `memory-management.md`, `transform-chain.md`
+3. If adding new components, update relevant docs: `docs/coordination-testing.md`, `docs/simulation-harness.md`, `docs/boundary-2-coordination.md`
+
+## Architecture References
+
+- `diagrams/` — 12 Mermaid diagram files covering all 5 boundaries (start with `diagrams/00-README.md`)
+- `docs/coordination-testing.md` — Test tier breakdown and cargo test commands
+- `docs/simulation-harness.md` — Simulation architecture, invariants S1–S7, fault levels
+- `docs/boundary-2-coordination.md` — Coordination protocol specification
+- `docs/boundary-1-identity-spine.md` — Identity type hierarchy
