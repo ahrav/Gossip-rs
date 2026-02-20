@@ -8,7 +8,7 @@
 //!
 //! # Test structure
 //!
-//! Three complementary approaches sweep the seed space:
+//! Six complementary approaches sweep the seed space:
 //!
 //! 1. **Hand-rolled parallel sweep** (`mega_sim_10k_steps`) -- divides seeds
 //!    across OS threads with static chunking, collects failures with
@@ -25,6 +25,20 @@
 //!    delegates seed generation to proptest, gaining automatic shrinking and
 //!    `.proptest-regressions` file persistence. Useful for minimizing a failing
 //!    seed range after the hand-rolled sweep detects a problem.
+//!
+//! 4. **Convergence proptests** (`proptest_convergence`) -- assert bounded
+//!    liveness (all shards reach terminal state) under SunnyDay and Stormy
+//!    faults, closing the safety/liveness gap left by the mega-sim sweep.
+//!
+//! 5. **Multi-tenant isolation** (`multi_tenant::multi_tenant_isolation`) --
+//!    runs two tenants against a shared coordinator to verify cross-tenant
+//!    rejection, independent shard lifecycles, and checker history isolation.
+//!
+//! 6. **Regression guard** (`zero_seed_count_does_not_panic`) -- locks down
+//!    edge-case arithmetic (e.g., zero-seed chunking) that would otherwise
+//!    panic silently.
+//!
+//! See `docs/coordination-testing.md` for the full tier breakdown.
 //!
 //! All `#[ignore]`'d tests are too slow for the default `cargo test` cycle.
 //! Run them explicitly:
@@ -491,6 +505,26 @@ mod proptest_convergence {
     use crate::test_util::miri_proptest_config;
     use proptest::prelude::*;
 
+    /// Run a convergence simulation and assert both safety and liveness.
+    ///
+    /// Panics (which proptest catches) if any invariant violation is found
+    /// or if the system fails to converge within the given op budgets.
+    fn assert_convergence(seed: u64, level: FaultLevel, safety: usize, liveness: usize) {
+        let report = CoordinationSim::new(seed, level)
+            .with_workers_and_shards(4, 15)
+            .run(safety, liveness);
+        assert!(
+            report.violations.is_empty(),
+            "seed {seed}: safety violation: {:#?}",
+            report.violations
+        );
+        assert!(
+            report.converged,
+            "seed {seed}: failed to converge under {level:?} after {} ops",
+            report.ops_executed
+        );
+    }
+
     proptest! {
         #![proptest_config({
             let mut cfg = miri_proptest_config();
@@ -506,21 +540,7 @@ mod proptest_convergence {
         #[test]
         #[ignore]
         fn proptest_convergence_sunny(seed in any::<u64>()) {
-            let report = CoordinationSim::new(seed, FaultLevel::SunnyDay)
-                .with_workers_and_shards(4, 15)
-                .run(50, 2_000);
-            prop_assert!(
-                report.violations.is_empty(),
-                "seed {}: safety violation: {:#?}",
-                seed,
-                report.violations
-            );
-            prop_assert!(
-                report.converged,
-                "seed {}: failed to converge under SunnyDay after {} ops",
-                seed,
-                report.ops_executed
-            );
+            assert_convergence(seed, FaultLevel::SunnyDay, 50, 2_000);
         }
 
         /// Stormy convergence: ~10% fault rate, 3x proportional budget.
@@ -532,21 +552,7 @@ mod proptest_convergence {
         #[test]
         #[ignore]
         fn proptest_convergence_stormy(seed in any::<u64>()) {
-            let report = CoordinationSim::new(seed, FaultLevel::Stormy)
-                .with_workers_and_shards(4, 15)
-                .run(500, 15_000);
-            prop_assert!(
-                report.violations.is_empty(),
-                "seed {}: safety violation: {:#?}",
-                seed,
-                report.violations
-            );
-            prop_assert!(
-                report.converged,
-                "seed {}: failed to converge under Stormy after {} ops",
-                seed,
-                report.ops_executed
-            );
+            assert_convergence(seed, FaultLevel::Stormy, 500, 15_000);
         }
     }
 }
@@ -574,6 +580,7 @@ mod multi_tenant {
     //! `Park` for tenant B) to maximize coverage of tenant-scoped behavior.
 
     use crate::coordination::cursor::Cursor;
+    use crate::coordination::error::AcquireError;
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::record::ParkReason;
     use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
@@ -700,8 +707,8 @@ mod multi_tenant {
 
         let cross_result = coord.acquire_and_restore(now(5), tenant_b, key_a0, worker_b);
         assert!(
-            cross_result.is_err(),
-            "cross-tenant acquire should be rejected, got: {cross_result:?}"
+            matches!(cross_result, Err(AcquireError::ShardNotFound { .. })),
+            "cross-tenant acquire should be ShardNotFound, got: {cross_result:?}"
         );
 
         // --- Tenant B: independent lifecycle on its own shard ---

@@ -1900,9 +1900,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
         // --- Phase 1: Pre-compute all random decisions (touches self.context only) ---
         //
-        // Every RNG call for the session happens here, before the coordinator
-        // borrow begins. This keeps the PRNG stream position deterministic
-        // regardless of which session operations succeed or fail.
+        // Every RNG call that determines session behavior happens here, before
+        // the coordinator borrow begins. This keeps the PRNG stream position
+        // deterministic regardless of which session operations succeed or fail.
 
         // Look up spec bounds before session acquires exclusive coordinator access.
         let (range_lo, range_hi) = self
@@ -2006,13 +2006,25 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                             // Range is very tight — reuse the last checkpoint byte.
                             last_cp_byte.min(mid.saturating_sub(1))
                         };
-                        (plan, mid, Cursor::with_last_key(vec![complete_byte]))
+                        (plan, Cursor::with_last_key(vec![complete_byte]))
                     })
             } else {
                 None
             }
         } else {
             None
+        };
+
+        // Normalize split actions to Complete when the plan could not be constructed,
+        // so the match below has a single Complete path instead of duplicated fallbacks.
+        let terminal_action = match terminal_action {
+            SessionTerminalAction::SplitReplace if split_replace_plan.is_none() => {
+                SessionTerminalAction::Complete
+            }
+            SessionTerminalAction::SplitResidualThenComplete if split_residual_plan.is_none() => {
+                SessionTerminalAction::Complete
+            }
+            other => other,
         };
 
         // Generate op IDs from the worker.
@@ -2035,6 +2047,24 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             checkpoints_ok: u32,
             checkpoints_rejected: u32,
             split_children: Vec<ShardId>,
+        }
+
+        impl SessionOutcome {
+            /// Build an outcome for a terminal action that produced no child shards.
+            fn terminal(
+                lease: Lease,
+                is_terminal: bool,
+                checkpoints_ok: u32,
+                checkpoints_rejected: u32,
+            ) -> Self {
+                Self {
+                    lease,
+                    is_terminal,
+                    checkpoints_ok,
+                    checkpoints_rejected,
+                    split_children: Vec::new(),
+                }
+            }
         }
 
         let now = self.context.now();
@@ -2066,25 +2096,23 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     let is_terminal = sess
                         .park(now, ParkReason::Other, op_ids[terminal_idx])
                         .is_ok();
-                    Ok(SessionOutcome {
+                    Ok(SessionOutcome::terminal(
                         lease,
                         is_terminal,
                         checkpoints_ok,
                         checkpoints_rejected,
-                        split_children: Vec::new(),
-                    })
+                    ))
                 }
                 SessionTerminalAction::Complete => {
                     let is_terminal = sess
                         .complete(now, cursors[terminal_idx].clone(), op_ids[terminal_idx])
                         .is_ok();
-                    Ok(SessionOutcome {
+                    Ok(SessionOutcome::terminal(
                         lease,
                         is_terminal,
                         checkpoints_ok,
                         checkpoints_rejected,
-                        split_children: Vec::new(),
-                    })
+                    ))
                 }
                 SessionTerminalAction::SplitReplace => {
                     if let Some(plan) = split_replace_plan {
@@ -2099,30 +2127,19 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                                     split_children: children,
                                 })
                             }
-                            Err(_) => Ok(SessionOutcome {
+                            Err(_) => Ok(SessionOutcome::terminal(
                                 lease,
-                                is_terminal: false,
+                                false,
                                 checkpoints_ok,
                                 checkpoints_rejected,
-                                split_children: Vec::new(),
-                            }),
+                            )),
                         }
                     } else {
-                        // Plan construction failed — fall back to complete.
-                        let is_terminal = sess
-                            .complete(now, cursors[terminal_idx].clone(), op_ids[terminal_idx])
-                            .is_ok();
-                        Ok(SessionOutcome {
-                            lease,
-                            is_terminal,
-                            checkpoints_ok,
-                            checkpoints_rejected,
-                            split_children: Vec::new(),
-                        })
+                        unreachable!("terminal_action normalized away SplitReplace without plan")
                     }
                 }
                 SessionTerminalAction::SplitResidualThenComplete => {
-                    if let Some((plan, _mid, complete_cursor)) = split_residual_plan {
+                    if let Some((plan, complete_cursor)) = split_residual_plan {
                         // split_residual is non-terminal (&mut self) — session stays active.
                         let split_ok = sess.split_residual(now, plan, op_ids[terminal_idx]).is_ok();
                         if split_ok {
@@ -2147,26 +2164,17 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         } else {
                             // split_residual failed (e.g., lease expired) — session
                             // is still alive but in an uncertain state. Drop it.
-                            Ok(SessionOutcome {
+                            Ok(SessionOutcome::terminal(
                                 lease,
-                                is_terminal: false,
+                                false,
                                 checkpoints_ok,
                                 checkpoints_rejected,
-                                split_children: Vec::new(),
-                            })
+                            ))
                         }
                     } else {
-                        // Plan construction failed — fall back to complete.
-                        let is_terminal = sess
-                            .complete(now, cursors[terminal_idx].clone(), op_ids[terminal_idx])
-                            .is_ok();
-                        Ok(SessionOutcome {
-                            lease,
-                            is_terminal,
-                            checkpoints_ok,
-                            checkpoints_rejected,
-                            split_children: Vec::new(),
-                        })
+                        unreachable!(
+                            "terminal_action normalized away SplitResidualThenComplete without plan"
+                        )
                     }
                 }
             }
@@ -2444,13 +2452,12 @@ mod tests {
         }
     }
 
-    // -- Multi-tenant (multi-run) isolation -------------------------------------
+    // -- Multi-run isolation ----------------------------------------------------
 
-    /// Interleave operations on shards from two different runs and verify no
-    /// invariant violations occur. Since the coordinator uses a single tenant,
-    /// this exercises cross-run isolation within the same tenant.
+    /// Interleave operations on shards from two different runs within a single
+    /// tenant and verify no invariant violations occur.
     #[test]
-    fn multi_tenant_isolation() {
+    fn multi_run_isolation() {
         let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
 
         // Add workers.
