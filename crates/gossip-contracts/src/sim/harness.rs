@@ -612,7 +612,7 @@ fn precompute_split_residual_plan(
         .ok()
         .map(|plan| {
             let complete_byte = if last_checkpoint_byte < mid.saturating_sub(1) {
-                rng.random_range(last_checkpoint_byte.saturating_add(1)..mid.min(range_hi))
+                rng.random_range(last_checkpoint_byte.saturating_add(1)..mid)
             } else {
                 // Range is very tight — reuse the last checkpoint byte.
                 last_checkpoint_byte.min(mid.saturating_sub(1))
