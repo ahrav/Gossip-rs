@@ -1348,7 +1348,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 self.record_acquire_bookkeeping(worker, key, lease);
                 SimEvent::ClaimOk { shard }
             }
-            Err(ClaimError::NoneAvailable) => SimEvent::ClaimNoneAvailable,
+            Err(ClaimError::NoneAvailable { .. }) => SimEvent::ClaimNoneAvailable,
             Err(ClaimError::RunNotFound) => SimEvent::Rejected {
                 kind: RejectionKind::RunNotFound,
             },

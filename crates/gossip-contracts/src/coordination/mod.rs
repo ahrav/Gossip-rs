@@ -43,7 +43,7 @@ pub use cursor::{
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
 pub use error::{
-    AcquireError, AcquireResult, CheckpointError, CompleteError, CoordError,
+    AcquireError, AcquireResult, CapacityHint, CheckpointError, CompleteError, CoordError,
     CursorOutOfBoundsDetail, IdempotentOutcome, ParkError, RenewError, RenewResult, SplitError,
     SplitReplaceError, SplitResidualError,
 };
