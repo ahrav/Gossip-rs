@@ -140,10 +140,9 @@ fn parse_fault_level() -> FaultLevel {
 ///
 /// Seeds are divided into equal-sized chunks across `available_parallelism()`
 /// OS threads using `std::thread::scope`. Static chunking keeps load balanced
-/// because every seed performs the same amount of work (zombie preamble + 10K safety
-/// + 2K liveness ops). Each thread
-/// accumulates failures and event counts locally, then the main thread merges
-/// results to avoid contention.
+/// because every seed performs the same amount of work (zombie preamble, 10K
+/// safety ops, 2K liveness ops). Each thread accumulates failures and event
+/// counts locally, then the main thread merges results to avoid contention.
 ///
 /// # Assertions
 ///

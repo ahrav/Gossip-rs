@@ -417,6 +417,9 @@ impl SimEvent {
 ///   then complete the narrowed parent -- exercises the `WorkerSession`
 ///   snapshot-rebuild path under simulation fault injection.
 ///
+/// See the `random_range(0u32..10)` match in `exec_session_lifecycle` for
+/// the authoritative weight table.
+///
 /// When the range is too narrow for splits, `SplitReplace` and
 /// `SplitResidualThenComplete` fall back to `Complete`, raising its
 /// effective rate to up to 80%.
@@ -558,9 +561,11 @@ fn require_lease_and_op(
 /// range into two children. Returns `None` when the range is too narrow for
 /// a valid split (fewer than 2 byte values between lo and hi).
 ///
-/// This mirrors the plan construction in [`CoordinationSim::exec_split_replace`]
-/// but operates on bare range bounds and an external RNG so it can run
-/// *before* the exclusive coordinator borrow in `exec_session_lifecycle`.
+/// This duplicates the plan construction logic from
+/// [`CoordinationSim::exec_split_replace`] — if that function's split-point
+/// selection changes, update this function to match. Operates on bare range
+/// bounds and an external RNG so it can run *before* the exclusive coordinator
+/// borrow in `exec_session_lifecycle`.
 fn precompute_split_replace_plan(
     rng: &mut ChaCha8Rng,
     range_lo: u8,
@@ -601,9 +606,11 @@ fn precompute_split_replace_plan(
 ///
 /// Returns `None` when the range is too narrow for a valid split.
 ///
-/// This mirrors the plan construction in [`CoordinationSim::exec_split_residual`]
-/// but operates on bare range bounds and an external RNG so it can run
-/// *before* the exclusive coordinator borrow in `exec_session_lifecycle`.
+/// This duplicates the plan construction logic from
+/// [`CoordinationSim::exec_split_residual`] — if that function's split-point
+/// selection changes, update this function to match. Operates on bare range
+/// bounds and an external RNG so it can run *before* the exclusive coordinator
+/// borrow in `exec_session_lifecycle`.
 fn precompute_split_residual_plan(
     rng: &mut ChaCha8Rng,
     range_lo: u8,
@@ -896,11 +903,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
     /// Remove a single shard key from `active_shard_keys`.
     ///
-    /// Uses `position` + `swap_remove` (O(n) scan, O(1) removal) instead of
-    /// `retain` (O(n) scan, O(n) shift). The position scan is unavoidable
-    /// because `active_shard_keys` is an unordered `Vec`, but the removal
-    /// itself is constant-time. Order does not matter because the only
-    /// consumer (`pick_random_shard_key`) accesses by random index.
+    /// Uses `position` + `swap_remove` instead of `retain`. Both scan the full
+    /// Vec, but `swap_remove` moves only one element (a swap) whereas `retain`
+    /// shifts all subsequent elements down by one. Order does not matter because
+    /// the only consumer (`pick_random_shard_key`) accesses by random index.
     fn remove_active_shard(&mut self, key: ShardKey) {
         if let Some(pos) = self.active_shard_keys.iter().position(|k| *k == key) {
             self.active_shard_keys.swap_remove(pos);
