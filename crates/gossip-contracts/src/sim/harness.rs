@@ -859,7 +859,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     }
 
     /// Add a worker to the simulation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is 0. Partition 0 is reserved for admin operations
+    /// (e.g. unpark); allowing worker 0 would produce op-ID collisions.
     pub fn add_worker(&mut self, id: WorkerId) {
+        assert!(
+            id.as_raw() != 0,
+            "worker ID 0 is reserved — partition 0 is used for admin op-IDs"
+        );
         self.workers.insert(id, SimWorker::new(id));
     }
 
@@ -1263,9 +1272,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     ///
     /// On success: transitions Parked→Active, bumps fence_epoch, adds the
     /// shard back to `active_shard_keys` (it was removed when parked).
-    /// Idempotent replays (same OpId) return `UnparkOk` but skip the
-    /// `active_shard_keys` push since the shard was already re-added on
-    /// the original execution.
+    /// The `is_executed()` guard is defensive — `next_admin_op_id()` always
+    /// produces a fresh op-ID, so replays won't occur through this path,
+    /// but the check prevents double-push if the caller model ever changes.
     fn exec_unpark(&mut self, key: ShardKey) -> SimEvent {
         let op_id = self.next_admin_op_id();
         let now = self.context.now();
@@ -1857,21 +1866,18 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// (the op will be retried by `generate_random_op`'s retry loop,
     /// eventually falling back to AdvanceTime).
     fn try_gen_unpark(&mut self) -> Option<SimOp> {
-        let parked: Vec<ShardKey> = self
-            .shard_keys
-            .iter()
-            .filter(|k| {
-                self.coordinator
-                    .shard_lookup(&self.tenant, k)
-                    .is_some_and(|r| r.status == ShardStatus::Parked)
-            })
-            .copied()
-            .collect();
-        if parked.is_empty() {
+        let is_parked = |k: &&ShardKey| {
+            self.coordinator
+                .shard_lookup(&self.tenant, k)
+                .is_some_and(|r| r.status == ShardStatus::Parked)
+        };
+        let count = self.shard_keys.iter().filter(is_parked).count();
+        if count == 0 {
             return None;
         }
-        let idx = self.context.rng().random_range(0..parked.len());
-        Some(SimOp::Unpark { key: parked[idx] })
+        let idx = self.context.rng().random_range(0..count);
+        let key = *self.shard_keys.iter().filter(is_parked).nth(idx)?;
+        Some(SimOp::Unpark { key })
     }
 
     /// Generate a time-advance op with 1--50 ticks.
@@ -3196,6 +3202,60 @@ mod tests {
             report.violations.is_empty(),
             "seed 42: violations: {:?}",
             report.violations,
+        );
+    }
+
+    /// Worker ID 0 is rejected because partition 0 is reserved for admin ops.
+    #[test]
+    #[should_panic(expected = "worker ID 0 is reserved")]
+    fn add_worker_rejects_id_zero() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
+        sim.add_worker(WorkerId::from_raw(0));
+    }
+
+    /// Admin unpark succeeds on a shard previously held by worker 1 — no
+    /// op-ID collision because worker IDs start at 1 and admin uses partition 0.
+    #[test]
+    fn admin_unpark_no_op_id_collision_with_workers() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
+
+        let worker = WorkerId::from_raw(1);
+        sim.add_worker(worker);
+
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        sim.register_shard(run, shard);
+        sim.seed_all_runs();
+        sim.active_shard_keys = sim.shard_keys.clone();
+
+        let key = sim.shard_keys[0];
+        sim.context.advance(1);
+
+        // Worker 1 acquires: generates op_id from partition 1.
+        let (event, violations) = sim.step(SimOp::Acquire { worker, key });
+        assert!(
+            matches!(event, SimEvent::AcquireOk { .. }),
+            "expected AcquireOk, got {event:?}"
+        );
+        assert!(violations.is_empty());
+
+        // Park the shard.
+        let (event, violations) = sim.step(SimOp::Park { worker, key });
+        assert!(
+            matches!(event, SimEvent::ParkOk),
+            "expected ParkOk, got {event:?}"
+        );
+        assert!(violations.is_empty());
+
+        // Admin unpark draws from partition 0 — disjoint from worker 1's partition.
+        let (event, violations) = sim.step(SimOp::Unpark { key });
+        assert!(
+            matches!(event, SimEvent::UnparkOk),
+            "expected UnparkOk but got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "invariant violations on unpark: {violations:?}"
         );
     }
 }

@@ -188,7 +188,7 @@ impl RunConfig {
 /// Note: `UnparkShard` is intentionally absent. Unpark idempotency lives in
 /// the shard op-log (cap=16), not the run op-log, because unpark targets a
 /// specific shard and the run op-log would need a keying scheme to distinguish
-/// `unpark(shard_A)` from `unpark(shard_B)`. See PD-4 in the plan.
+/// `unpark(shard_A)` from `unpark(shard_B)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunOpKind {
@@ -1556,6 +1556,14 @@ pub trait RunManagement {
     /// restores Active status. Preserves cursor position.
     ///
     /// Idempotency is stored in the **shard** op-log, not the run op-log.
+    ///
+    /// # Errors
+    ///
+    /// - [`UnparkError::ShardNotFound`] — shard does not exist.
+    /// - [`UnparkError::TenantMismatch`] — tenant isolation violation.
+    /// - [`UnparkError::RunTerminal`] — run is already in a terminal state.
+    /// - [`UnparkError::NotParked`] — shard is not in Parked status.
+    /// - [`UnparkError::OpIdConflict`] — `op_id` reused with different payload.
     fn unpark_shard(
         &mut self,
         now: LogicalTime,
