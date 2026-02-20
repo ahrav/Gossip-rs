@@ -498,9 +498,8 @@ mod tests {
         RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
     }
 
-    /// Set up a coordinator with a run containing `shard_count` shards.
-    fn setup_coordinator(shard_count: usize) -> InMemoryCoordinator {
-        let mut coord = InMemoryCoordinator::new(30);
+    /// Populate the coordinator with a run and `shard_count` shards.
+    fn populate_run(coord: &mut InMemoryCoordinator, shard_count: usize) {
         let tenant = test_tenant();
         let run = test_run();
         let config = test_run_config();
@@ -522,7 +521,12 @@ mod tests {
         let _ = coord
             .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
             .unwrap();
+    }
 
+    /// Set up a coordinator with a run containing `shard_count` shards.
+    fn setup_coordinator(shard_count: usize) -> InMemoryCoordinator {
+        let mut coord = InMemoryCoordinator::new(30);
+        populate_run(&mut coord, shard_count);
         coord
     }
 
@@ -857,28 +861,7 @@ mod tests {
     ) -> InMemoryCoordinator {
         let mut coord =
             InMemoryCoordinator::with_cooldown(30, 100_000, 1_000_000, cooldown_interval);
-        let tenant = test_tenant();
-        let run = test_run();
-        let config = test_run_config();
-
-        coord.create_run(now(1), tenant, run, config).unwrap();
-
-        let shards: Vec<InitialShard> = (0..shard_count)
-            .map(|i| {
-                let start = vec![i as u8];
-                let end = vec![(i + 1) as u8];
-                InitialShard::new(
-                    ShardId::from_raw(i as u64),
-                    crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                    Cursor::initial(),
-                )
-            })
-            .collect();
-
-        let _ = coord
-            .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
-            .unwrap();
-
+        populate_run(&mut coord, shard_count);
         coord
     }
 
@@ -984,6 +967,61 @@ mod tests {
     }
 
     #[test]
+    fn claim_cooldown_spans_runs() {
+        // Cooldown is per-worker, not per-run: a successful claim in run A
+        // puts the worker in cooldown for run B too.
+        let mut coord = InMemoryCoordinator::with_cooldown(30, 100_000, 1_000_000, 5);
+        let tenant = test_tenant();
+        let run_a = RunId::from_raw(1);
+        let run_b = RunId::from_raw(2);
+        let config = test_run_config();
+
+        // Create run A with one shard.
+        coord.create_run(now(1), tenant, run_a, config).unwrap();
+        let shards_a = vec![InitialShard::new(
+            ShardId::from_raw(0),
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![0], vec![1]),
+            Cursor::initial(),
+        )];
+        let _ = coord
+            .register_shards(now(1), tenant, run_a, &shards_a, OpId::from_raw(100))
+            .unwrap();
+
+        // Create run B with one shard (different shard ID).
+        coord.create_run(now(1), tenant, run_b, config).unwrap();
+        let shards_b = vec![InitialShard::new(
+            ShardId::from_raw(10),
+            crate::coordination::shard_spec::ShardSpec::with_range(vec![10], vec![11]),
+            Cursor::initial(),
+        )];
+        let _ = coord
+            .register_shards(now(1), tenant, run_b, &shards_b, OpId::from_raw(101))
+            .unwrap();
+
+        // Worker claims in run A at t=10.
+        assert!(
+            coord
+                .claim_next_available(now(10), tenant, run_a, test_worker(1))
+                .is_ok(),
+            "initial claim in run A should succeed"
+        );
+
+        // Same worker tries run B at t=12 (within cooldown window of 5) — Throttled.
+        let r = coord.claim_next_available(now(12), tenant, run_b, test_worker(1));
+        assert!(
+            matches!(r, Err(ClaimError::Throttled { .. })),
+            "cooldown should span runs, got {r:?}"
+        );
+
+        // After cooldown elapses (t=15), run B claim succeeds.
+        let r2 = coord.claim_next_available(now(15), tenant, run_b, test_worker(1));
+        assert!(
+            r2.is_ok(),
+            "after cooldown elapses, cross-run claim should succeed, got {r2:?}"
+        );
+    }
+
+    #[test]
     fn claim_error_throttled_display() {
         let err = ClaimError::Throttled {
             retry_after: LogicalTime::from_raw(42),
@@ -1046,5 +1084,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Cooldown gate fires before the run lookup, so `Throttled` takes
+    /// priority over `RunNotFound` when a worker is in cooldown and
+    /// targets a nonexistent run.
+    #[test]
+    fn claim_cooldown_takes_priority_over_run_not_found() {
+        let mut coord = setup_coordinator_with_cooldown(3, 5);
+        let tenant = test_tenant();
+        let run = test_run();
+
+        // Claim successfully at t=10 to start cooldown.
+        assert!(
+            coord
+                .claim_next_available(now(10), tenant, run, test_worker(1))
+                .is_ok()
+        );
+
+        // Try to claim from a nonexistent run while in cooldown.
+        let bogus_run = RunId::from_raw(999);
+        let r = coord.claim_next_available(now(11), tenant, bogus_run, test_worker(1));
+        assert!(
+            matches!(r, Err(ClaimError::Throttled { .. })),
+            "cooldown gate should reject before run lookup, got {r:?}"
+        );
+    }
+
+    /// When the cooldown interval is `u64::MAX`, `checked_add` overflows
+    /// and the implementation saturates the deadline to `u64::MAX`,
+    /// effectively creating a permanent cooldown. This test pins the
+    /// saturation behavior at the boundary.
+    #[test]
+    fn claim_cooldown_overflow_saturates_to_permanent() {
+        // With cooldown = u64::MAX, checked_add(10, u64::MAX) overflows
+        // and saturates to u64::MAX (effectively permanent cooldown).
+        //
+        // Construct manually because the `setup_coordinator_with_cooldown`
+        // helper uses `default_lease_duration=30`, and the debug_assert in
+        // `with_cooldown` requires `cooldown <= lease_duration`.
+        let mut coord = InMemoryCoordinator::with_cooldown(u64::MAX, 100_000, 1_000_000, u64::MAX);
+        let tenant = test_tenant();
+        let run = test_run();
+        let config = test_run_config();
+
+        coord.create_run(now(1), tenant, run, config).unwrap();
+
+        let shards: Vec<InitialShard> = (0..3)
+            .map(|i| {
+                let start = vec![i as u8];
+                let end = vec![(i + 1) as u8];
+                InitialShard::new(
+                    ShardId::from_raw(i as u64),
+                    crate::coordination::shard_spec::ShardSpec::with_range(start, end),
+                    Cursor::initial(),
+                )
+            })
+            .collect();
+
+        let _ = coord
+            .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+            .unwrap();
+
+        // First claim succeeds at t=10.
+        assert!(
+            coord
+                .claim_next_available(now(10), tenant, run, test_worker(1))
+                .is_ok()
+        );
+
+        // At any time < u64::MAX, worker is throttled (saturated deadline).
+        let r = coord.claim_next_available(
+            LogicalTime::from_raw(u64::MAX - 1),
+            tenant,
+            run,
+            test_worker(1),
+        );
+        assert!(
+            matches!(r, Err(ClaimError::Throttled { .. })),
+            "with saturated deadline, times < u64::MAX should be throttled, got {r:?}"
+        );
+
+        // At exactly now == u64::MAX == retry_after, boundary convention
+        // says cooldown elapsed (now >= deadline), so worker passes through.
+        let r2 = coord.claim_next_available(
+            LogicalTime::from_raw(u64::MAX),
+            tenant,
+            run,
+            test_worker(1),
+        );
+        assert!(
+            r2.is_ok() || matches!(r2, Err(ClaimError::NoneAvailable { .. })),
+            "at now=u64::MAX with saturated deadline, worker should pass cooldown gate, got {r2:?}"
+        );
     }
 }

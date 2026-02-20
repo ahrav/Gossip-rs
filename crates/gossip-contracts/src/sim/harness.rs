@@ -175,8 +175,9 @@ pub enum SimEvent {
     ClaimOk { shard: ShardId },
     /// No available shards for the run (all leased/terminal).
     ClaimNoneAvailable,
-    /// Worker's claim was throttled by per-worker cooldown.
-    ClaimThrottled,
+    /// Worker's claim was throttled by per-worker cooldown; `retry_after`
+    /// indicates the earliest logical time the worker may retry.
+    ClaimThrottled { retry_after: LogicalTime },
     /// Operation was rejected by the coordinator or skipped due to precondition.
     Rejected { kind: RejectionKind },
     /// Logical clock advanced.
@@ -392,7 +393,7 @@ impl SimEvent {
             SimEvent::ReplayedOk => SimEventKind::ReplayedOk,
             SimEvent::ClaimOk { .. } => SimEventKind::ClaimOk,
             SimEvent::ClaimNoneAvailable => SimEventKind::ClaimNoneAvailable,
-            SimEvent::ClaimThrottled => SimEventKind::ClaimThrottled,
+            SimEvent::ClaimThrottled { .. } => SimEventKind::ClaimThrottled,
             SimEvent::Rejected { .. } => SimEventKind::Rejected,
             SimEvent::TimeAdvanced { .. } => SimEventKind::TimeAdvanced,
             SimEvent::WorkerPaused { .. } => SimEventKind::WorkerPaused,
@@ -725,6 +726,25 @@ impl CoordinationSim<InMemoryCoordinator> {
             level,
             InMemoryCoordinator::new(DEFAULT_LEASE_DURATION),
         )
+    }
+
+    /// Enable per-worker claim cooldown for the simulation.
+    ///
+    /// Replaces the internal coordinator with one configured for the
+    /// given `interval`. Must be called **before**
+    /// [`with_workers_and_shards`](Self::with_workers_and_shards) --
+    /// calling it after seeding discards registered shards and runs.
+    ///
+    /// An interval of 0 disables throttling (the default when
+    /// constructed via [`new`](Self::new)).
+    pub fn with_cooldown(mut self, interval: u64) -> Self {
+        self.coordinator = InMemoryCoordinator::with_cooldown(
+            DEFAULT_LEASE_DURATION,
+            100_000,
+            1_000_000,
+            interval,
+        );
+        self
     }
 
     /// Register a shard in the coordinator with a default spec range `[b'a', b'z')`.
@@ -1568,7 +1588,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 SimEvent::ClaimOk { shard }
             }
             Err(ClaimError::NoneAvailable { .. }) => SimEvent::ClaimNoneAvailable,
-            Err(ClaimError::Throttled { .. }) => SimEvent::ClaimThrottled,
+            Err(ClaimError::Throttled { retry_after }) => SimEvent::ClaimThrottled { retry_after },
             Err(ClaimError::RunNotFound) => SimEvent::Rejected {
                 kind: RejectionKind::RunNotFound,
             },
@@ -2879,6 +2899,59 @@ mod tests {
         assert!(
             matches!(event, SimEvent::Rejected { .. }),
             "expected Rejected for paused worker, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+    }
+
+    /// `with_cooldown` enables per-worker throttling in the simulation:
+    /// first claim succeeds, immediate retry is throttled, post-cooldown
+    /// claim succeeds.
+    #[test]
+    fn with_cooldown_throttles_and_then_allows() {
+        let cooldown = 50;
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay)
+            .with_cooldown(cooldown)
+            .with_workers_and_shards(2, 3);
+
+        let worker = WorkerId::from_raw(1);
+
+        // Advance past t=0 so the first claim can succeed.
+        sim.context.advance(1);
+
+        // First claim should succeed.
+        let (event, violations) = sim.step(SimOp::ClaimNext { worker });
+        assert!(
+            matches!(event, SimEvent::ClaimOk { .. }),
+            "expected ClaimOk, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+
+        // Immediate retry (no time advance) should be throttled.
+        let (event, violations) = sim.step(SimOp::ClaimNext { worker });
+        assert!(
+            matches!(event, SimEvent::ClaimThrottled { .. }),
+            "expected ClaimThrottled, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+
+        // Advance past the cooldown window.
+        let (_, adv_violations) = sim.step(SimOp::AdvanceTime { ticks: cooldown });
+        assert!(adv_violations.is_empty());
+
+        // Post-cooldown claim should succeed.
+        let (event, violations) = sim.step(SimOp::ClaimNext { worker });
+        assert!(
+            matches!(event, SimEvent::ClaimOk { .. }),
+            "expected ClaimOk after cooldown, got {event:?}"
         );
         assert!(
             violations.is_empty(),

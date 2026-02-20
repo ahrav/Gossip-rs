@@ -177,6 +177,13 @@ pub struct InMemoryCoordinator {
     /// which aids simulation debugging. Only accessed via point lookups
     /// (`get`/`insert`). Grows at most one entry per distinct `WorkerId`
     /// that successfully claims a shard.
+    ///
+    /// Entries are never evicted: once a worker claims, its timestamp
+    /// remains for the coordinator's lifetime. This is acceptable
+    /// because (a) worker count is bounded by deployment size, and
+    /// (b) adding periodic eviction would turn the O(1)
+    /// `check_cooldown` path into O(N). Production backends should
+    /// use TTL-based eviction at the storage layer.
     claim_cooldowns: BTreeMap<WorkerId, LogicalTime>,
     /// Minimum logical time units between successive successful claims
     /// by the same worker. Zero disables cooldown entirely.
@@ -228,9 +235,17 @@ impl InMemoryCoordinator {
 
     /// Create a coordinator with explicit shard limits and claim cooldown.
     ///
-    /// `claim_cooldown_interval` is the minimum logical time units between
-    /// successive successful claims by the same worker. Zero disables
-    /// cooldown.
+    /// # Parameters
+    ///
+    /// - `default_lease_duration` -- duration (in logical time units)
+    ///   applied to every new lease. Must be > 0.
+    /// - `max_shards_per_tenant` -- upper bound on shards a single
+    ///   tenant may hold across all runs. Must be > 0.
+    /// - `max_total_shards` -- hard cap on total shards across all
+    ///   tenants. Must be > 0.
+    /// - `claim_cooldown_interval` -- minimum logical time units between
+    ///   successive successful claims by the same worker. Zero disables
+    ///   cooldown entirely.
     ///
     /// # Panics
     ///
@@ -247,6 +262,12 @@ impl InMemoryCoordinator {
             max_total_shards,
         );
         coord.claim_cooldown_interval = claim_cooldown_interval;
+        debug_assert!(
+            claim_cooldown_interval == 0 || claim_cooldown_interval <= default_lease_duration,
+            "claim_cooldown_interval ({claim_cooldown_interval}) exceeds \
+             default_lease_duration ({default_lease_duration}); a worker cannot \
+             claim a second shard within one lease period"
+        );
         coord
     }
 
@@ -2020,9 +2041,15 @@ impl InMemoryCoordinator {
     /// Check whether `worker` is still in cooldown at time `now`.
     ///
     /// Returns `Some(retry_after)` if the worker must wait, `None` if
-    /// the worker may proceed. The boundary is exclusive: at exactly
-    /// `last_claim + interval`, the worker is allowed through (matches
-    /// the lease expiry convention where `now == deadline` means expired).
+    /// the worker may proceed. The cooldown window is the half-open
+    /// interval `[last_claim, last_claim + interval)`: at exactly
+    /// `last_claim + interval` the worker is allowed through. This
+    /// matches the lease expiry convention where `now >= deadline`
+    /// means expired.
+    ///
+    /// On arithmetic overflow (`last_claim + interval > u64::MAX`), the deadline
+    /// saturates to `LogicalTime::MAX`, making the cooldown effectively permanent.
+    /// This matches the lease deadline saturation in `acquire_and_restore`.
     fn check_cooldown(&self, worker: WorkerId, now: LogicalTime) -> Option<LogicalTime> {
         if self.claim_cooldown_interval == 0 {
             return None;
@@ -2045,6 +2072,15 @@ impl InMemoryCoordinator {
     /// that don't use the feature.
     fn record_claim(&mut self, worker: WorkerId, now: LogicalTime) {
         if self.claim_cooldown_interval > 0 {
+            debug_assert!(
+                now >= *self
+                    .claim_cooldowns
+                    .get(&worker)
+                    .unwrap_or(&LogicalTime::from_raw(0)),
+                "record_claim: time went backward for worker {worker:?}: \
+                 now={now:?}, previous={:?}",
+                self.claim_cooldowns.get(&worker),
+            );
             self.claim_cooldowns.insert(worker, now);
         }
     }
