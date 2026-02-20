@@ -884,11 +884,7 @@ mod tests {
         #[case] second_t: u64,
         #[case] expect_throttled_until: Option<u64>,
     ) {
-        let mut coord = if cooldown > 0 {
-            setup_coordinator_with_cooldown(shard_count, cooldown)
-        } else {
-            setup_coordinator(shard_count)
-        };
+        let mut coord = setup_coordinator_with_cooldown(shard_count, cooldown);
         let tenant = test_tenant();
         let run = test_run();
         let worker = test_worker(1);
@@ -1108,6 +1104,31 @@ mod tests {
         assert!(
             matches!(r, Err(ClaimError::Throttled { .. })),
             "cooldown gate should reject before run lookup, got {r:?}"
+        );
+    }
+
+    /// Cooldown gate fires before the candidate scan, so `Throttled` takes
+    /// priority over `NoneAvailable` when a worker is in cooldown and all
+    /// shards are already leased.
+    #[test]
+    fn claim_cooldown_takes_priority_over_none_available() {
+        let mut coord = setup_coordinator_with_cooldown(1, 5);
+        let tenant = test_tenant();
+        let run = test_run();
+
+        // Worker 1 claims the only shard at t=10.
+        assert!(
+            coord
+                .claim_next_available(now(10), tenant, run, test_worker(1))
+                .is_ok()
+        );
+
+        // Worker 1 retries at t=11: in cooldown (10+5=15 > 11) AND no shards
+        // available (the only shard is leased). Cooldown fires first -> Throttled.
+        let r = coord.claim_next_available(now(11), tenant, run, test_worker(1));
+        assert!(
+            matches!(r, Err(ClaimError::Throttled { retry_after }) if retry_after == now(15)),
+            "cooldown should take priority over NoneAvailable, got {r:?}"
         );
     }
 
