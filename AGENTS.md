@@ -17,7 +17,7 @@ After modifying Rust code, ALWAYS run these steps:
 
 1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
-3. If adding new components, update relevant docs: `architecture-overview.md`, `detection-engine.md`, `memory-management.md`, `transform-chain.md`
+3. If adding new components, update relevant docs: `docs/coordination-testing.md`, `docs/simulation-harness.md`, `docs/boundary-2-coordination.md`
 
 <!-- bv-agent-instructions-v1 -->
 
@@ -138,7 +138,7 @@ bd create --title="..." --type=task --priority=2
 bd update <id> --status=in_progress
 bd close <id> --reason="Completed"
 bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+bd sync --flush-only  # Export beads to JSONL (no git ops)
 ```
 
 ### Workflow Pattern
@@ -147,7 +147,7 @@ bd sync               # Commit and push changes
 2. **Claim**: Use `bd update <id> --status=in_progress`
 3. **Work**: Implement the task
 4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
+5. **Sync**: Always run `bd sync --flush-only` at session end
 
 ### Key Concepts
 
@@ -158,7 +158,7 @@ bd sync               # Commit and push changes
 
 ### Session Protocol
 
-**Before ending any session, run `bd sync` to persist beads state.**
+**Before ending any session, run `bd sync --flush-only` to persist beads state.**
 
 Do NOT stage, commit, or push code changes. Leave that to the user.
 
