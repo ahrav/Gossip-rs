@@ -175,6 +175,9 @@ pub enum SimEvent {
     ClaimOk { shard: ShardId },
     /// No available shards for the run (all leased/terminal).
     ClaimNoneAvailable,
+    /// Worker's claim was throttled by per-worker cooldown; `retry_after`
+    /// indicates the earliest logical time the worker may retry.
+    ClaimThrottled { retry_after: LogicalTime },
     /// Operation was rejected by the coordinator or skipped due to precondition.
     Rejected { kind: RejectionKind },
     /// Logical clock advanced.
@@ -366,6 +369,7 @@ pub enum SimEventKind {
     ReplayedOk,
     ClaimOk,
     ClaimNoneAvailable,
+    ClaimThrottled,
     Rejected,
     TimeAdvanced,
     WorkerPaused,
@@ -389,6 +393,7 @@ impl SimEvent {
             SimEvent::ReplayedOk => SimEventKind::ReplayedOk,
             SimEvent::ClaimOk { .. } => SimEventKind::ClaimOk,
             SimEvent::ClaimNoneAvailable => SimEventKind::ClaimNoneAvailable,
+            SimEvent::ClaimThrottled { .. } => SimEventKind::ClaimThrottled,
             SimEvent::Rejected { .. } => SimEventKind::Rejected,
             SimEvent::TimeAdvanced { .. } => SimEventKind::TimeAdvanced,
             SimEvent::WorkerPaused { .. } => SimEventKind::WorkerPaused,
@@ -721,6 +726,25 @@ impl CoordinationSim<InMemoryCoordinator> {
             level,
             InMemoryCoordinator::new(DEFAULT_LEASE_DURATION),
         )
+    }
+
+    /// Enable per-worker claim cooldown for the simulation.
+    ///
+    /// Replaces the internal coordinator with one configured for the
+    /// given `interval`. Must be called **before**
+    /// [`with_workers_and_shards`](Self::with_workers_and_shards) --
+    /// calling it after seeding discards registered shards and runs.
+    ///
+    /// An interval of 0 disables throttling (the default when
+    /// constructed via [`new`](Self::new)).
+    pub fn with_cooldown(mut self, interval: u64) -> Self {
+        self.coordinator = InMemoryCoordinator::with_cooldown(
+            DEFAULT_LEASE_DURATION,
+            100_000,
+            1_000_000,
+            interval,
+        );
+        self
     }
 
     /// Register a shard in the coordinator with a default spec range `[b'a', b'z')`.
@@ -1564,6 +1588,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 SimEvent::ClaimOk { shard }
             }
             Err(ClaimError::NoneAvailable { .. }) => SimEvent::ClaimNoneAvailable,
+            Err(ClaimError::Throttled { retry_after }) => SimEvent::ClaimThrottled { retry_after },
             Err(ClaimError::RunNotFound) => SimEvent::Rejected {
                 kind: RejectionKind::RunNotFound,
             },
@@ -1587,7 +1612,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// - renew (10%) keeps leases alive
     /// - complete (8%) and park (4%) are terminal (over-weighting starves coverage)
     /// - split_replace (4%) and split_residual (4%) exercise split paths
-    /// - replay/conflict (4%) exercise idempotency
+    /// - replay (2%) and conflict (2%) exercise idempotency
     /// - zombie (3%) exercises stale-fence rejection
     /// - claim_next (3%) exercises the list-then-acquire retry loop
     /// - session_lifecycle (8%) exercises WorkerSession wrapper end-to-end
@@ -1705,12 +1730,20 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .unwrap_or_default()
     }
 
+    /// Pick a random active worker and a random non-terminal shard for an acquire op.
+    ///
+    /// Unlike the `try_gen_held_shard_op` family, acquire targets any active
+    /// shard (not just one the worker already holds), modeling contention.
     fn try_gen_acquire(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         let key = self.pick_random_shard_key()?;
         Some(SimOp::Acquire { worker, key })
     }
 
+    /// Pick a random active worker for a claim-next op.
+    ///
+    /// No shard key is needed — `claim_next_available` discovers the shard
+    /// internally via the coordinator's run record.
     fn try_gen_claim_next(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         Some(SimOp::ClaimNext { worker })
@@ -1759,6 +1792,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         SimOp::AdvanceTime { ticks }
     }
 
+    /// Select a random active (non-paused) worker to pause.
     fn try_gen_pause(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         Some(SimOp::PauseWorker { worker })
@@ -1791,6 +1825,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         self.try_gen_held_shard_op(|worker, key| SimOp::SplitResidual { worker, key })
     }
 
+    /// Pick a random entry from the checkpoint history for idempotent replay.
+    ///
+    /// Returns `None` when no checkpoints have been recorded yet, which is
+    /// the expected early-simulation case before any checkpoint succeeds.
     fn try_gen_replay_checkpoint(&mut self) -> Option<SimOp> {
         if self.last_checkpoint_ops.is_empty() {
             return None;
@@ -1807,6 +1845,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         })
     }
 
+    /// Pick a random entry from the checkpoint history for conflict testing.
+    ///
+    /// Same selection logic as [`try_gen_replay_checkpoint`](Self::try_gen_replay_checkpoint);
+    /// the conflict (different payload, same OpId) is constructed at execution time.
     fn try_gen_conflict_checkpoint(&mut self) -> Option<SimOp> {
         if self.last_checkpoint_ops.is_empty() {
             return None;
@@ -1822,6 +1864,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         })
     }
 
+    /// Generate a zombie checkpoint op if stale leases are available.
     fn try_gen_zombie_checkpoint(&mut self) -> Option<SimOp> {
         if self.stale_leases.is_empty() {
             return None;
@@ -1829,6 +1872,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         Some(SimOp::ZombieCheckpoint)
     }
 
+    /// Pick a random active worker and a random non-terminal shard for a
+    /// full session lifecycle.
     fn try_gen_session_lifecycle(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         let key = self.pick_random_shard_key()?;
@@ -1977,7 +2022,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         *event_counts.entry(event.kind()).or_insert(0) += 1;
         all_violations.extend(violations);
 
-        // The checkpoint must have been rejected (either NotLeased or StaleFence).
+        // The checkpoint must have been rejected with NotLeased (B1 cleanup
+        // cleared Worker A's lease when Worker B acquired).
         assert!(
             matches!(event, SimEvent::Rejected { .. }),
             "zombie worker checkpoint should be rejected, got: {event:?}",
@@ -2853,6 +2899,59 @@ mod tests {
         assert!(
             matches!(event, SimEvent::Rejected { .. }),
             "expected Rejected for paused worker, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+    }
+
+    /// `with_cooldown` enables per-worker throttling in the simulation:
+    /// first claim succeeds, immediate retry is throttled, post-cooldown
+    /// claim succeeds.
+    #[test]
+    fn with_cooldown_throttles_and_then_allows() {
+        let cooldown = 50;
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay)
+            .with_cooldown(cooldown)
+            .with_workers_and_shards(2, 3);
+
+        let worker = WorkerId::from_raw(1);
+
+        // Advance past t=0 so the first claim can succeed.
+        sim.context.advance(1);
+
+        // First claim should succeed.
+        let (event, violations) = sim.step(SimOp::ClaimNext { worker });
+        assert!(
+            matches!(event, SimEvent::ClaimOk { .. }),
+            "expected ClaimOk, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+
+        // Immediate retry (no time advance) should be throttled.
+        let (event, violations) = sim.step(SimOp::ClaimNext { worker });
+        assert!(
+            matches!(event, SimEvent::ClaimThrottled { .. }),
+            "expected ClaimThrottled, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+
+        // Advance past the cooldown window.
+        let (_, adv_violations) = sim.step(SimOp::AdvanceTime { ticks: cooldown });
+        assert!(adv_violations.is_empty());
+
+        // Post-cooldown claim should succeed.
+        let (event, violations) = sim.step(SimOp::ClaimNext { worker });
+        assert!(
+            matches!(event, SimEvent::ClaimOk { .. }),
+            "expected ClaimOk after cooldown, got {event:?}"
         );
         assert!(
             violations.is_empty(),
