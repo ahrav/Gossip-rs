@@ -2027,7 +2027,7 @@ impl ShardClaiming for InMemoryCoordinator {
         run: RunId,
         worker: WorkerId,
     ) -> Result<AcquireResult, ClaimError> {
-        // Cooldown gate: O(1) rejection before the O(S) candidate scan.
+        // Cooldown gate: O(log W) rejection before the O(S) candidate scan.
         if let Some(retry_after) = self.check_cooldown(worker, now) {
             return Err(ClaimError::Throttled { retry_after });
         }

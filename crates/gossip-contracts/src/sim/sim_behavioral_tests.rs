@@ -206,6 +206,40 @@ fn deterministic_replay_cross_config() {
     }
 }
 
+// -- Cooldown coverage ------------------------------------------------------
+
+/// Cooldown-enabled simulation: verifies that `ClaimThrottled` events appear
+/// when claim cooldown is active, and all invariants (S1--S7) still hold.
+///
+/// Uses `with_cooldown(99)` -- the maximum allowed value under the
+/// `DEFAULT_LEASE_DURATION` (100) cap.  Eight workers with 20 shards
+/// ensures some shards remain available for claiming, and the high
+/// worker count increases `ClaimNext` frequency so that a worker's
+/// second claim is likely to land within the 99-tick cooldown window.
+/// A large safety budget (2000 ops) gives the random scheduler enough
+/// attempts to produce back-to-back claims for the same worker.
+#[test]
+fn behavioral_cooldown_fires_under_simulation() {
+    let report = CoordinationSim::new(42, FaultLevel::SunnyDay)
+        .with_cooldown(99)
+        .with_workers_and_shards(8, 20)
+        .run(2000, 200);
+
+    assert_behavioral_properties(&report, 42, FaultLevel::SunnyDay);
+
+    assert!(
+        report
+            .event_counts
+            .get(&SimEventKind::ClaimThrottled)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "cooldown=99 with 8 workers and 20 shards should produce at least one \
+         ClaimThrottled event; event_counts: {:?}",
+        report.event_counts
+    );
+}
+
 // -- Exhaustiveness guard ---------------------------------------------------
 //
 // Enforced at compile time by the `const _` match block above
