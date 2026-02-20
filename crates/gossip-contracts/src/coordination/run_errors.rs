@@ -243,12 +243,10 @@ impl std::error::Error for GetRunError {}
 /// Error from terminal run transitions (`complete_run`, `fail_run`,
 /// `cancel_run`).
 ///
-/// Unifies the formerly separate `CompleteRunError`, `FailRunError`, and
-/// `CancelRunError` — they shared 4 of 5 variants identically. The only
-/// structural difference was that `cancel_run` never produces `WrongStatus`
-/// (it accepts both Initializing and Active), and `complete_run` vs `fail_run`
-/// had different Display messages for `WrongStatus`. The `target` field in
-/// `WrongStatus` preserves those context-specific messages.
+/// All three operations share the same variant set. The only behavioral
+/// difference is that `cancel_run` never produces `WrongStatus` (it
+/// accepts both Initializing and Active). The `target` field in
+/// `WrongStatus` preserves operation-specific Display messages.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RunTransitionError {
@@ -594,6 +592,19 @@ mod tests {
             "Failed target must suggest cancel_run: {fail_msg}"
         );
         assert_ne!(done_msg, fail_msg, "Display messages must differ by target");
+    }
+
+    #[test]
+    fn wrong_status_catchall_target_produces_generic_message() {
+        let err = RunTransitionError::WrongStatus {
+            status: RunStatus::Initializing,
+            target: RunStatus::Cancelled,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot transition to"),
+            "catch-all must produce generic message: {msg}"
+        );
     }
 
     #[test]
