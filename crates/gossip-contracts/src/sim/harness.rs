@@ -96,7 +96,7 @@ use super::{FaultConfig, FaultLevel, SimContext};
 ///
 /// All variants carry enough context (worker, shard key) for the harness to
 /// dispatch to the appropriate executor. The harness generates ops via weighted
-/// random selection in [`CoordinationSim::generate_random_op`].
+/// random selection in `CoordinationSim::generate_random_op`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum SimOp {
@@ -495,7 +495,7 @@ fn require_lease_and_op(
 /// |-------|---------|
 /// | `shard_keys` | All registered shard keys (including terminal). Grows on splits. |
 /// | `active_shard_keys` | Non-terminal subset. Shrinks on complete/park/split-replace. |
-/// | `stale_leases` | Superseded leases for zombie checkpoint injection. Capped at [`MAX_STALE_LEASES`]. |
+/// | `stale_leases` | Superseded leases for zombie checkpoint injection. Capped at `MAX_STALE_LEASES`. |
 /// | `last_checkpoint_ops` | Per-(worker, run, shard) checkpoint history for replay/conflict testing. |
 /// | `run_shard_ids` | Shard IDs per run, seeded into the coordinator for `claim_next_available`. |
 pub struct CoordinationSim<B: SimulationBackend = InMemoryCoordinator> {
@@ -648,7 +648,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// 1. **Zombie preamble**: One scripted acquire-expire-reacquire-checkpoint
     ///    sequence that deterministically exercises the B1 bookkeeping cleanup
     ///    path.
-    /// 2. **Safety phase** (`safety_ops` random ops): The first [`WARMUP_OPS`]
+    /// 2. **Safety phase** (`safety_ops` random ops): The first `WARMUP_OPS`
     ///    suppress faults; the remainder use full fault injection including
     ///    random time-jumps that can expire leases mid-flight.
     /// 3. **Liveness phase** (`liveness_ops` convergence-biased ops): Weighted

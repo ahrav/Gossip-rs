@@ -44,6 +44,7 @@ use crate::coordination::split::SplitResidualPlan;
 use crate::coordination::test_fixtures::*;
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{OpId, RunId, ShardId, ShardKey};
+use crate::sim::backend::SimIntrospection;
 
 // ============================================================================
 // S1: Full run lifecycle
