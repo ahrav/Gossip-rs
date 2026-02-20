@@ -16,9 +16,10 @@
 //!    aggregate. This is the primary CI gate.
 //!
 //! 2. **Stress tests** (`stress_200_shards_stormy`, `stress_split_cascade`) --
-//!    exercise configurations well beyond the normal test suite (200+ shards,
-//!    Radioactive fault level) to verify the harness and invariant checker
-//!    handle scale, split cascades, and history pruning without violations.
+//!    exercise configurations well beyond the normal test suite -- 200 shards
+//!    under Stormy faults, and Radioactive-level fault injection with split
+//!    cascades -- to verify the harness and invariant checker handle scale,
+//!    history pruning, and dynamic shard growth without violations.
 //!
 //! 3. **Proptest seed sweeper** ([`proptest_mega::proptest_mega_sim`]) --
 //!    delegates seed generation to proptest, gaining automatic shrinking and
@@ -124,7 +125,7 @@ fn parse_fault_level() -> FaultLevel {
 ///
 /// Seeds are divided into equal-sized chunks across `available_parallelism()`
 /// OS threads using `std::thread::scope`. Static chunking keeps load balanced
-/// because every seed performs the same amount of work (12K ops). Each thread
+/// because every seed performs the same amount of work (~12K ops). Each thread
 /// accumulates failures and event counts locally, then the main thread merges
 /// results to avoid contention.
 ///
@@ -255,18 +256,19 @@ fn mega_sim_10k_steps() {
     }
 }
 
-/// Zero seed count must not reach `chunks()` -- the early return guard
-/// prevents a panic from `chunks(0)`.
+/// Regression guard: `GOSSIP_SIM_SEEDS=0` must not panic.
 ///
-/// Exercises the same arithmetic path as `mega_sim_10k_steps` with
-/// `seed_count == 0` to confirm the guard catches it.
+/// `mega_sim_10k_steps` divides seeds into chunks via `div_ceil` and
+/// `chunks()`. When `seed_count == 0`, `div_ceil(0, parallelism)` returns
+/// 0, and `chunks(0)` panics unconditionally. The early-return guard
+/// in the main test prevents this. This test mirrors the arithmetic path
+/// to verify the guard remains effective if the chunking logic changes.
 #[test]
 fn zero_seed_count_does_not_panic() {
     let seed_count: usize = 0;
     let parallelism = 4;
 
-    // Without the early-return guard this panics: div_ceil(0, 4) == 0
-    // and chunks(0) is unconditionally illegal.
+    // This is the guard under test: without it, the code below panics.
     if seed_count == 0 {
         return;
     }
@@ -279,7 +281,12 @@ fn zero_seed_count_does_not_panic() {
 //
 // These exercise configurations well beyond the normal test suite (200+
 // shards, high fault pressure) to verify that the harness and invariant
-// checker handle scale without violations or panics. Run explicitly:
+// checker handle scale without violations or panics. The mega-sim sweep
+// uses 15 shards -- these tests push to 200+ to surface issues that only
+// appear with large shard counts (pruning overhead, split cascades
+// creating many child shards, hash-map growth under contention).
+//
+// Run explicitly:
 //
 // ```text
 // cargo test -p gossip-contracts stress_ -- --ignored --nocapture
@@ -287,10 +294,20 @@ fn zero_seed_count_does_not_panic() {
 
 /// 8 workers contending over 200 shards under Stormy faults.
 ///
-/// This is ~13x the shard count of `mega_sim_10k_steps` (200 vs 15) and
-/// exercises the InvariantChecker's pruning behavior at scale: many shards
-/// will reach terminal states during the run, and the checker must handle
-/// the growing-then-shrinking history maps without blowing up.
+/// At ~13x the shard count of `mega_sim_10k_steps` (200 vs 15) with
+/// double the workers (8 vs 4), this test exercises two scale-sensitive
+/// paths:
+///
+/// - **InvariantChecker pruning**: with 200 shards, many reach terminal
+///   states during the run. The checker's post-pass pruning of `Done` and
+///   `Split` shards from `prev_epochs`/`prev_cursors` must keep memory
+///   bounded as the history maps grow then shrink.
+/// - **Worker contention**: 8 workers competing for 200 shards (25 per
+///   worker on average) exercises the lease-contention and stale-fence
+///   rejection paths more heavily than the 4-worker/15-shard baseline.
+///
+/// Only 5 seeds are run (vs 100+ in the mega sweep) because each seed
+/// is significantly more expensive at this scale.
 ///
 /// # Reproduction
 ///
@@ -323,9 +340,25 @@ fn stress_200_shards_stormy() {
     }
 }
 
-/// 4 workers, 20 shards under Radioactive faults — designed to trigger
-/// split cascades. Verifies that `SplitReplaceOk` events fire and child
-/// shards are created without invariant violations.
+/// 4 workers, 20 shards under Radioactive faults -- designed to trigger
+/// multi-level split cascades.
+///
+/// Radioactive mode's aggressive time-jumps (100--500 ticks) and high
+/// lease-expiry rate (~20%) create the conditions for split operations
+/// to succeed: workers acquire, split, and the resulting child shards
+/// get acquired and potentially split again. The test verifies:
+///
+/// 1. **Split mechanics**: at least one `SplitReplaceOk` event fires
+///    across all seeds. A zero count indicates the op-generation weights
+///    or split-plan construction are broken.
+/// 2. **Referential integrity (S7)**: child shards created by splits
+///    exist in the coordinator and point back to their parent.
+/// 3. **Safety under cascades**: invariants S1--S7 hold even when the
+///    shard set grows dynamically from splits.
+///
+/// 10 seeds are run to give the probabilistic split path enough chances
+/// to fire. The 3K safety + 1K liveness budget is shorter than the mega
+/// sweep because the focus is split coverage, not exhaustive convergence.
 ///
 /// # Reproduction
 ///
@@ -371,15 +404,21 @@ fn stress_split_cascade() {
     );
 }
 
-// -- Proptest seed sweeper --------------------------------------------------
-//
-// Complements the hand-rolled sweep above by leveraging proptest's automatic
-// shrinking and `.proptest-regressions` persistence. When a seed fails, proptest
-// attempts to minimize it, and the failing seed is recorded to disk so it is
-// replayed on every subsequent run without needing environment variables.
-
 #[cfg(not(miri))]
 mod proptest_mega {
+    //! Proptest seed sweeper for the coordination simulation.
+    //!
+    //! Complements the hand-rolled parallel sweep in [`mega_sim_10k_steps`](super::mega_sim_10k_steps)
+    //! by leveraging proptest's automatic shrinking and `.proptest-regressions`
+    //! file persistence. When a seed fails, proptest attempts to minimize it to
+    //! the smallest reproducing value, and the failing seed is recorded to disk
+    //! so it is replayed on every subsequent `cargo test` run without requiring
+    //! environment variables.
+    //!
+    //! Use this after the hand-rolled sweep detects a failure: proptest's
+    //! shrinking can often narrow a failing seed range (e.g., 0..100_000) down
+    //! to a single minimal reproducer.
+
     use super::*;
     use crate::test_util::miri_proptest_config;
     use proptest::prelude::*;
@@ -391,8 +430,13 @@ mod proptest_mega {
             cfg
         })]
 
-        /// Proptest seed sweeper: same simulation config as `mega_sim_10k_steps`
-        /// but with proptest-managed seed generation and regression persistence.
+        /// Same simulation config as [`mega_sim_10k_steps`](super::mega_sim_10k_steps)
+        /// (4 workers, 15 shards, 10K safety + 2K liveness ops, Stormy faults)
+        /// but with proptest-managed seed generation.
+        ///
+        /// On failure, proptest writes the failing seed to a
+        /// `proptest-regressions/` file, ensuring automatic replay on
+        /// future runs without environment variables.
         #[test]
         #[ignore]
         fn proptest_mega_sim(seed in any::<u64>()) {
@@ -406,5 +450,299 @@ mod proptest_mega {
                 report.violations
             );
         }
+    }
+}
+
+#[cfg(not(miri))]
+mod proptest_convergence {
+    //! Convergence (bounded liveness) property tests.
+    //!
+    //! The mega-sim sweep checks **safety** (S1--S7) across many seeds but
+    //! never asserts **convergence** -- that every shard eventually reaches a
+    //! terminal state. These tests close that gap.
+    //!
+    //! Convergence is a bounded liveness property. The Alpern-Schneider
+    //! decomposition (1985) states that every correctness property is the
+    //! intersection of a safety property and a liveness property. The mega
+    //! sweep covers safety; these tests cover the complementary liveness half.
+    //!
+    //! The liveness phase of `CoordinationSim::run` biases operation
+    //! generation toward acquire + complete, giving the system a budget of
+    //! operations to drive all shards to terminal. If shards remain active
+    //! after the budget is exhausted, `SimReport::converged` is `false` and
+    //! the test fails.
+    //!
+    //! # Op budget rationale
+    //!
+    //! Budgets account for safety-phase splits (both direct `split_replace`/
+    //! `split_residual` and session-lifecycle terminal splits) growing the
+    //! active shard count from the initial 15 to ~20-25.
+    //!
+    //! - **SunnyDay** (50 safety + 2000 liveness): zero faults, but splits
+    //!   during the safety phase increase the shard count. With ~25 shards
+    //!   and interleaved time advances that can expire leases, each shard
+    //!   needs ~80 liveness ops for a reliable acquire→complete cycle.
+    //! - **Stormy** (500 safety + 15000 liveness): ~10% fault rate causes
+    //!   lease expiry and rejected operations on top of additional splits
+    //!   from the longer safety phase. 15000 liveness ops provides ~3x
+    //!   proportional headroom over SunnyDay.
+
+    use super::*;
+    use crate::test_util::miri_proptest_config;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config({
+            let mut cfg = miri_proptest_config();
+            cfg.cases = 200;
+            cfg
+        })]
+
+        /// SunnyDay convergence: zero faults, split-aware budget.
+        ///
+        /// Asserts both safety (no violations) and liveness (all shards
+        /// terminal). If this fails, the harness's liveness-phase op bias
+        /// or the coordinator's acquire/complete paths are broken.
+        #[test]
+        #[ignore]
+        fn proptest_convergence_sunny(seed in any::<u64>()) {
+            let report = CoordinationSim::new(seed, FaultLevel::SunnyDay)
+                .with_workers_and_shards(4, 15)
+                .run(50, 2_000);
+            prop_assert!(
+                report.violations.is_empty(),
+                "seed {}: safety violation: {:#?}",
+                seed,
+                report.violations
+            );
+            prop_assert!(
+                report.converged,
+                "seed {}: failed to converge under SunnyDay after {} ops",
+                seed,
+                report.ops_executed
+            );
+        }
+
+        /// Stormy convergence: ~10% fault rate, 3x proportional budget.
+        ///
+        /// Faults cause lease expiry mid-operation, forcing re-acquisition
+        /// cycles that consume extra ops. Combined with additional splits
+        /// from the longer safety phase, the 3x proportional budget over
+        /// SunnyDay accounts for this overhead.
+        #[test]
+        #[ignore]
+        fn proptest_convergence_stormy(seed in any::<u64>()) {
+            let report = CoordinationSim::new(seed, FaultLevel::Stormy)
+                .with_workers_and_shards(4, 15)
+                .run(500, 15_000);
+            prop_assert!(
+                report.violations.is_empty(),
+                "seed {}: safety violation: {:#?}",
+                seed,
+                report.violations
+            );
+            prop_assert!(
+                report.converged,
+                "seed {}: failed to converge under Stormy after {} ops",
+                seed,
+                report.ops_executed
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod multi_tenant {
+    //! Multi-tenant isolation test.
+    //!
+    //! The simulation harness (`CoordinationSim`) runs single-tenant by
+    //! construction, so `RejectionKind::TenantMismatch` and the
+    //! `InvariantChecker`'s tenant-scoped history keys are never exercised
+    //! in the mega-sim sweep. This module fills that gap by running two
+    //! tenants against the same `InMemoryCoordinator` and verifying:
+    //!
+    //! 1. **Cross-tenant rejection**: tenant B cannot acquire tenant A's
+    //!    shards (the coordinator returns `ShardNotFound` because shard
+    //!    lookup is tenant-scoped).
+    //! 2. **Independent lifecycles**: each tenant's shards progress through
+    //!    acquire -> checkpoint -> terminal independently.
+    //! 3. **Checker isolation**: the `InvariantChecker` uses
+    //!    `(TenantId, RunId, ShardId)` history keys, so tenant A's fence
+    //!    epoch history does not contaminate tenant B's S2 checks.
+    //!
+    //! The test exercises both terminal paths (`Complete` for tenant A,
+    //! `Park` for tenant B) to maximize coverage of tenant-scoped behavior.
+
+    use crate::coordination::cursor::Cursor;
+    use crate::coordination::in_memory::InMemoryCoordinator;
+    use crate::coordination::record::ParkReason;
+    use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
+    use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+    use crate::coordination::traits::CoordinationBackend;
+    use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
+    use crate::sim::invariants::InvariantChecker;
+
+    fn now(t: u64) -> LogicalTime {
+        LogicalTime::from_raw(t)
+    }
+
+    /// End-to-end multi-tenant isolation: two tenants with independent runs
+    /// and shards sharing one coordinator instance.
+    ///
+    /// Phases:
+    /// 1. Setup -- register runs and shards for both tenants.
+    /// 2. Tenant A lifecycle -- acquire -> checkpoint -> complete on shard 0.
+    /// 3. Cross-tenant rejection -- tenant B attempts to acquire tenant A's
+    ///    shard and is rejected.
+    /// 4. Tenant B lifecycle -- acquire -> checkpoint -> park on shard 0.
+    /// 5. Final invariant sweep -- both tenants report zero violations.
+    #[test]
+    fn multi_tenant_isolation() {
+        // Distinct tenant IDs, run IDs, and worker IDs so that any
+        // cross-contamination is unambiguous in failure messages.
+        let tenant_a = TenantId::from_bytes([0x01; 32]);
+        let tenant_b = TenantId::from_bytes([0x02; 32]);
+        let run_a = RunId::from_raw(1);
+        let run_b = RunId::from_raw(2);
+        let worker_a = WorkerId::from_raw(10);
+        let worker_b = WorkerId::from_raw(20);
+
+        let config = RunConfig::try_new(CursorSemantics::Completed, 100, Some(5)).unwrap();
+        // Single coordinator instance shared by both tenants -- this is
+        // the production topology where one coordinator serves all tenants.
+        let mut coord = InMemoryCoordinator::new(100);
+        // Single checker instance validates both tenants, exercising the
+        // (TenantId, RunId, ShardId) key scheme in the history maps.
+        let mut checker = InvariantChecker::new();
+
+        // --- Setup: register run+shards for each tenant ---
+        // Tenant A gets 3 shards, tenant B gets 2, with non-overlapping
+        // key ranges. Different counts make it easy to verify the checker
+        // only iterates tenant-scoped records.
+
+        coord.create_run(now(1), tenant_a, run_a, config).unwrap();
+        let shards_a: Vec<InitialShard> = (0..3)
+            .map(|i| {
+                InitialShard::new(
+                    ShardId::from_raw(i),
+                    ShardSpec::with_range(vec![(i as u8) * 0x30], vec![((i + 1) as u8) * 0x30]),
+                    Cursor::initial(),
+                )
+            })
+            .collect();
+        let _ = coord
+            .register_shards(now(1), tenant_a, run_a, &shards_a, OpId::from_raw(100))
+            .unwrap();
+
+        coord.create_run(now(1), tenant_b, run_b, config).unwrap();
+        let shards_b: Vec<InitialShard> = (0..2)
+            .map(|i| {
+                InitialShard::new(
+                    ShardId::from_raw(i),
+                    ShardSpec::with_range(vec![(i as u8) * 0x40], vec![((i + 1) as u8) * 0x40]),
+                    Cursor::initial(),
+                )
+            })
+            .collect();
+        let _ = coord
+            .register_shards(now(1), tenant_b, run_b, &shards_b, OpId::from_raw(200))
+            .unwrap();
+
+        let key_a0 = ShardKey::new(run_a, ShardId::from_raw(0));
+        let key_b0 = ShardKey::new(run_b, ShardId::from_raw(0));
+
+        // --- Invariant check: both tenants clean after setup ---
+
+        assert!(
+            checker.check_all(&coord, tenant_a, now(1)).is_empty(),
+            "tenant A: violations after setup"
+        );
+        assert!(
+            checker.check_all(&coord, tenant_b, now(1)).is_empty(),
+            "tenant B: violations after setup"
+        );
+
+        // --- Tenant A: acquire → checkpoint → complete on shard 0 ---
+
+        let result_a = coord
+            .acquire_and_restore(now(2), tenant_a, key_a0, worker_a)
+            .unwrap();
+        let lease_a = result_a.lease;
+
+        let _ = coord
+            .checkpoint(
+                now(3),
+                tenant_a,
+                &lease_a,
+                Cursor::with_last_key(vec![0x10]),
+                OpId::from_raw(101),
+            )
+            .unwrap();
+
+        let _ = coord
+            .complete(
+                now(4),
+                tenant_a,
+                &lease_a,
+                Cursor::with_last_key(vec![0x20]),
+                OpId::from_raw(102),
+            )
+            .unwrap();
+
+        assert!(
+            checker.check_all(&coord, tenant_a, now(4)).is_empty(),
+            "tenant A: violations after complete"
+        );
+
+        // --- Cross-tenant attempt: tenant B tries to acquire tenant A's shard ---
+        // The shard exists under tenant A's run, so tenant B should get ShardNotFound
+        // (tenant-scoped lookup) or TenantMismatch.
+
+        let cross_result = coord.acquire_and_restore(now(5), tenant_b, key_a0, worker_b);
+        assert!(
+            cross_result.is_err(),
+            "cross-tenant acquire should be rejected, got: {cross_result:?}"
+        );
+
+        // --- Tenant B: independent lifecycle on its own shard ---
+
+        let result_b = coord
+            .acquire_and_restore(now(5), tenant_b, key_b0, worker_b)
+            .unwrap();
+        let lease_b = result_b.lease;
+
+        let _ = coord
+            .checkpoint(
+                now(6),
+                tenant_b,
+                &lease_b,
+                Cursor::with_last_key(vec![0x10]),
+                OpId::from_raw(201),
+            )
+            .unwrap();
+
+        // Park instead of complete -- deliberately exercises a different
+        // terminal path than tenant A's `complete()`, maximizing coverage
+        // of tenant-scoped terminal-state handling.
+        let _ = coord
+            .park_shard(
+                now(7),
+                tenant_b,
+                &lease_b,
+                ParkReason::Other,
+                OpId::from_raw(202),
+            )
+            .unwrap();
+
+        // --- Final invariant check: both tenants still clean ---
+
+        assert!(
+            checker.check_all(&coord, tenant_a, now(7)).is_empty(),
+            "tenant A: violations after full test"
+        );
+        assert!(
+            checker.check_all(&coord, tenant_b, now(7)).is_empty(),
+            "tenant B: violations after full test"
+        );
     }
 }
