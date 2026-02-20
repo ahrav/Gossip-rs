@@ -7,9 +7,13 @@
 //!
 //! Differs from `error.rs` in error composition: shard-level errors use a
 //! shared `CoordError` base with `From<CoordError>` narrowing per operation.
-//! Run-level errors are standalone per-operation enums whose only shared
-//! conversion is `From<RunOpIdConflict>` (for types with an `OpIdConflict`
-//! variant); individual types may have additional operation-specific `From` impls.
+//! Run-level errors are per-operation where the variants differ meaningfully
+//! (`CreateRunError`, `RegisterShardsError`, `GetRunError`, `UnparkError`).
+//! Terminal transitions (`complete_run`, `fail_run`, `cancel_run`) share
+//! [`RunTransitionError`] because their variant sets are structurally identical.
+//! The only shared `From` conversion across all types is `From<RunOpIdConflict>`
+//! (for types with an `OpIdConflict` variant); individual types may have
+//! additional operation-specific `From` impls.
 //!
 //! ## Hash Redaction via Opaque Wrapper
 //!
@@ -262,6 +266,9 @@ pub enum RunTransitionError {
     /// `target` is the terminal status the caller attempted to transition to,
     /// enabling context-specific Display messages (e.g., "use cancel_run for
     /// Initializing" when target is `Failed`).
+    ///
+    /// `complete_run` produces `target: Done`; `fail_run` produces `target: Failed`.
+    /// `cancel_run` never produces this variant.
     WrongStatus {
         status: RunStatus,
         target: RunStatus,
@@ -308,7 +315,11 @@ impl fmt::Display for RunTransitionError {
                     f,
                     "run is not Active, use cancel_run for Initializing (status: {status})"
                 ),
-                _ => write!(f, "run is not Active (status: {status})"),
+                RunStatus::Done => write!(f, "run is not Active (status: {status})"),
+                other => write!(
+                    f,
+                    "run cannot transition to {other} from current status (status: {status})"
+                ),
             },
             Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
         }

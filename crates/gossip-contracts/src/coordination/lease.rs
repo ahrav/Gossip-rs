@@ -665,6 +665,41 @@ mod tests {
         }
     }
 
+    // -- OpKind Display ---------------------------------------------------
+
+    #[test]
+    fn op_kind_display_all_variants() {
+        let cases: &[(OpKind, &str)] = &[
+            (OpKind::Checkpoint, "Checkpoint"),
+            (OpKind::Complete, "Complete"),
+            (OpKind::Park, "Park"),
+            (OpKind::SplitReplace, "SplitReplace"),
+            (OpKind::SplitResidual, "SplitResidual"),
+            (OpKind::Unpark, "Unpark"),
+        ];
+        for &(kind, expected) in cases {
+            assert_eq!(kind.to_string(), expected, "OpKind::Display for {kind:?}");
+        }
+    }
+
+    // -- OpResult Display -------------------------------------------------
+
+    #[test]
+    fn op_result_display_all_variants() {
+        let cases: &[(OpResult, &str)] = &[
+            (OpResult::Completed, "Completed"),
+            (OpResult::Error, "Error"),
+            (OpResult::Superseded, "Superseded"),
+        ];
+        for &(result, expected) in cases {
+            assert_eq!(
+                result.to_string(),
+                expected,
+                "OpResult::Display for {result:?}"
+            );
+        }
+    }
+
     // -- Lease construction and accessors --------------------------------
 
     #[test]

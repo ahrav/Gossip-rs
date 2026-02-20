@@ -1833,7 +1833,7 @@ fn complete_run_wrong_status_initializing() {
             err,
             RunTransitionError::WrongStatus {
                 status: RunStatus::Initializing,
-                ..
+                target: RunStatus::Done,
             }
         ),
         "expected WrongStatus(Initializing), got: {err:?}",
@@ -1919,7 +1919,7 @@ fn fail_run_wrong_status_initializing() {
             err,
             RunTransitionError::WrongStatus {
                 status: RunStatus::Initializing,
-                ..
+                target: RunStatus::Failed,
             }
         ),
         "expected WrongStatus(Initializing), got: {err:?}",

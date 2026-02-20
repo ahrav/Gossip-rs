@@ -1496,6 +1496,14 @@ pub trait RunManagement {
     ) -> Result<Vec<ShardSummary>, GetRunError>;
 
     /// Mark run as Done. Precondition: Active. Idempotent via `op_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunTransitionError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`RunTransitionError::TenantMismatch`] — tenant isolation violation.
+    /// - [`RunTransitionError::RunTerminal`] — run is already in a terminal state.
+    /// - [`RunTransitionError::WrongStatus`] (target = `Done`) — run is not `Active`.
+    /// - [`RunTransitionError::OpIdConflict`] — `op_id` reused with different payload.
     fn complete_run(
         &mut self,
         now: LogicalTime,
@@ -1506,6 +1514,14 @@ pub trait RunManagement {
 
     /// Mark run as Failed. Precondition: **Active only** (not Initializing).
     /// Use `cancel_run` for Initializing runs. Idempotent via `op_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunTransitionError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`RunTransitionError::TenantMismatch`] — tenant isolation violation.
+    /// - [`RunTransitionError::RunTerminal`] — run is already in a terminal state.
+    /// - [`RunTransitionError::WrongStatus`] (target = `Failed`) — run is not `Active`.
+    /// - [`RunTransitionError::OpIdConflict`] — `op_id` reused with different payload.
     fn fail_run(
         &mut self,
         now: LogicalTime,
@@ -1516,6 +1532,16 @@ pub trait RunManagement {
 
     /// Cancel run (sets Cancelled). Accepts Initializing OR Active.
     /// Idempotent via `op_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunTransitionError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`RunTransitionError::TenantMismatch`] — tenant isolation violation.
+    /// - [`RunTransitionError::RunTerminal`] — run is already in a terminal state.
+    /// - [`RunTransitionError::OpIdConflict`] — `op_id` reused with different payload.
+    ///
+    /// Never returns [`RunTransitionError::WrongStatus`] — both Initializing and
+    /// Active are accepted.
     fn cancel_run(
         &mut self,
         now: LogicalTime,
