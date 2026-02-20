@@ -13,19 +13,21 @@ For simulation architecture see [simulation-harness.md](simulation-harness.md).
 ## 1. Testing Pyramid
 
 ```text
-                    ┌──────────────┐
-                    │  Simulation  │  Tier 4: safety seed sweeps,
-                    │  (sim/)      │  convergence, stress, isolation
-                    ├──────────────┤
-                    │  Scenario    │  Tier 3: multi-step user stories
-                    │              │  (8 end-to-end workflows)
-                ┌───┴──────────────┴───┐
-                │    Conformance       │  Tier 2: invariant interactions
-                │                      │  (3 groups, ~15 tests)
-            ┌───┴──────────────────────┴───┐
-            │         Unit Tests           │  Tier 1: single-operation
-            │                              │  isolation (~90 tests)
-            └──────────────────────────────┘
+                                                ┌─────────────────────┐
+                    ┌──────────────┐            │  TLA+ Model Check   │
+                    │  Simulation  │  Tier 4    │  (specs/)           │
+                    │  (sim/)      │            │                     │
+                    ├──────────────┤            │  Exhaustive design  │
+                    │  Scenario    │  Tier 3    │  verification of    │
+                    │              │            │  protocol safety    │
+                ┌───┴──────────────┴───┐       │  and liveness       │
+                │    Conformance       │ T2    │  properties.        │
+                │                      │       │                     │
+            ┌───┴──────────────────────┴───┐   │  Parallel layer,    │
+            │         Unit Tests           │ T1│  not a pyramid tier │
+            │                              │   │  (verifies design,  │
+            └──────────────────────────────┘   │  not Rust code).    │
+                                                └─────────────────────┘
 ```
 
 Each tier builds on the one below it. Unit tests validate individual
@@ -33,7 +35,8 @@ operations against the `InMemoryCoordinator`. Conformance tests compose
 two or more invariants and verify they hold simultaneously. Scenario tests
 chain operations into realistic workflows. Simulation tests sweep hundreds
 of random seeds under fault injection, validating all seven safety
-invariants at every step.
+invariants at every step. TLA+ model checking (Section 11) operates as a
+parallel verification layer that exhaustively verifies the protocol design.
 
 ---
 
@@ -447,3 +450,46 @@ Full invariant definitions and the checker implementation are in
 | `sim/invariants.rs`                 | External invariant checker (S1–S7)                               |
 | `sim/worker.rs`                     | Simulated worker bookkeeping                                     |
 | `sim/mod.rs`                        | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
+
+---
+
+## 11. Formal Verification (TLA+)
+
+Tiers 1-4 verify the **Rust implementation** of the coordination protocol.
+TLA+ model checking verifies the **protocol design** -- an abstract model
+that exhaustively explores all reachable states to prove safety and liveness
+properties hold regardless of timing, interleaving, or worker behavior.
+
+### Invariant correspondence
+
+| TLA+ invariant | Sim label | Property |
+|----------------|-----------|----------|
+| `MutualExclusion` | S1 | At most one valid lease per shard |
+| `AlwaysFenceMonotonicity` | S2 | Fence epoch never decreases |
+| `AlwaysTerminalIrreversibility` | S3 | Done and Split never revert |
+| `TerminalUnleased` | S4 | Terminal shards hold no lease |
+| `CursorMonotonicity` | S5 | Cursor never decreases |
+| `AlwaysCursorNonRegression` | S5 | Cursor never decreases (action property) |
+| -- | S6 | CursorBounds (byte-key ranges not modeled in TLA+) |
+| `SplitAtomicity` | S7 | Split parent has non-empty spawned set |
+| `ChildImpliesParentSplit` | S7 | Child non-NotCreated implies parent Split |
+| `ZombieRejection` | -- | Stale-epoch worker cannot hold valid lease |
+| `Liveness` (INV-L01) | -- | Active unleased shard eventually leased |
+
+Gaps are intentional: S6 (CursorBounds) depends on byte-key ranges not
+present in the abstract model; ZombieRejection and Liveness have no
+simulation label because they were introduced by the TLA+ spec.
+
+### Running the model checker
+
+See [specs/coordination/README.md](../specs/coordination/README.md) for
+prerequisites, TLC commands, and mutation tests.
+
+### Source files
+
+| File | Purpose |
+|------|---------|
+| `specs/coordination/ShardFencing.tla` | TLA+ specification |
+| `specs/coordination/ShardFencing.cfg` | Production safety config |
+| `specs/coordination/ShardFencing_liveness.cfg` | Liveness config |
+| `specs/coordination/run_mutations.sh` | Mutation test suite (8 mutations) |

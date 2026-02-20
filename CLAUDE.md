@@ -280,7 +280,31 @@ After modifying Rust code, ALWAYS run these steps:
 
 1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
-3. If adding new components, update relevant docs: `docs/coordination-testing.md`, `docs/simulation-harness.md`, `docs/boundary-2-coordination.md`
+3. If a hook fires naming a design doc (`DESIGN DOC CHECK`), open that doc and verify
+   it still matches the code. If the hook says `[NEW FILE]`, update the doc's file list.
+
+## Design Doc Maintenance
+
+Design docs in `docs/` describe architecture and invariants for specific source
+directories. The `design-doc-scope-check.sh` hook fires automatically when editing
+`.rs` files and produces three kinds of alerts:
+
+| Alert | Meaning |
+|-------|---------|
+| `DESIGN DOC CHECK: <path> is in scope of: -> <doc>` | Existing file — verify doc still matches code |
+| `DESIGN DOC CHECK [NEW FILE]: <path> is NEW and in scope of: -> <doc>` | New file — update doc's file list and counts |
+| `NOTE: <path> has no design doc coverage.` | No doc covers this directory — consider adding one |
+
+### Rules
+
+- **Act on hook reminders.** When the hook names a doc, open it and verify the code
+  change is consistent with what the doc describes.
+- **Update docs for new files.** `[NEW FILE]` alerts mean the doc's file inventory
+  is out of date. Add the new file and adjust any counts.
+- **Add scopes for new docs.** When creating a new design doc, add a `[[scopes]]`
+  entry in `docs/scope-map.toml` so the hook knows about it.
+- **Check docs before closing tasks.** Before marking work complete, verify any
+  in-scope design docs are still accurate.
 
 ## Architecture References
 

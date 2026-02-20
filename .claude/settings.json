@@ -11,6 +11,10 @@
           {
             "type": "command",
             "command": ".claude/hooks/doc-rigor-gate.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/design-doc-scope-check.sh"
           }
         ]
       }

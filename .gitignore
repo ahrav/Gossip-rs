@@ -27,3 +27,10 @@ debug
 .bv/
 
 todos/*
+
+# TLC (TLA+ model checker) trace files and state directories
+*_TTrace_*.bin
+specs/coordination/states/
+
+# TLA+ tooling (download from tlaplus/tlaplus releases)
+specs/tla2tools.jar
