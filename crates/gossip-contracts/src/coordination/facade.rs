@@ -148,7 +148,8 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///
 /// 1. Fetch the candidate list via
 ///    `list_shards(ShardFilter::available())` -- active, unleased shards.
-/// 2. If the list is empty, return `NoneAvailable` immediately.
+/// 2. If the list is empty, query `active()` shards to find the earliest
+///    lease deadline, then return `NoneAvailable` with that deadline.
 /// 3. Start iteration at offset `worker.as_raw() % len` so that
 ///    different workers begin at different candidates, reducing
 ///    contention on the first shard. The offset is deterministic
@@ -207,9 +208,16 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
         .map_err(ClaimError::from)?;
 
     if summaries.is_empty() {
-        return Err(ClaimError::NoneAvailable {
-            earliest_deadline: None,
-        });
+        // No unleased shards.  Query active shards (including leased) to
+        // surface the earliest lease deadline so callers can schedule a
+        // retry near the soonest expiry instead of busy-spinning.
+        let earliest_deadline = backend
+            .list_shards(now, tenant, run, ShardFilter::active())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s.lease_deadline())
+            .min();
+        return Err(ClaimError::NoneAvailable { earliest_deadline });
     }
 
     let len = summaries.len();
@@ -595,6 +603,40 @@ mod tests {
         assert!(result.is_ok());
         let r = result.unwrap();
         assert_eq!(r.lease.shard(), ShardId::from_raw(1));
+    }
+
+    /// When all shards are leased, `earliest_deadline` should be populated
+    /// so callers can schedule a retry near the soonest lease expiry.
+    #[test]
+    fn claim_all_leased_reports_earliest_deadline() {
+        let mut coord = setup_coordinator(2);
+        let tenant = test_tenant();
+        let run = test_run();
+
+        // Lease both shards at now=10 (lease_duration=30 → deadline=40).
+        let key0 = ShardKey::new(run, ShardId::from_raw(0));
+        let _ = coord
+            .acquire_and_restore(now(10), tenant, key0, test_worker(1))
+            .unwrap();
+
+        // Lease second shard at now=15 (deadline=45).
+        let key1 = ShardKey::new(run, ShardId::from_raw(1));
+        let _ = coord
+            .acquire_and_restore(now(15), tenant, key1, test_worker(2))
+            .unwrap();
+
+        // All shards leased — claim should fail with earliest_deadline = Some(40).
+        let result = coord.claim_next_available(now(20), tenant, run, test_worker(3));
+        match result {
+            Err(ClaimError::NoneAvailable { earliest_deadline }) => {
+                assert_eq!(
+                    earliest_deadline,
+                    Some(now(40)),
+                    "should report earliest lease deadline so callers can schedule retry"
+                );
+            }
+            other => panic!("expected NoneAvailable, got {other:?}"),
+        }
     }
 
     // -- TenantMismatch test -----------------------------------------------
