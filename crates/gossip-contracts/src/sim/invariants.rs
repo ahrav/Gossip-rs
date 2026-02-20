@@ -44,15 +44,19 @@
 //!
 //! # Performance considerations
 //!
-//! - Scratch buffers (`active_holders`, `scratch_missing`, `scratch_wrong_parent`)
-//!   are retained across calls and `.clear()`'d rather than reallocated,
-//!   reducing per-call allocation pressure on the hot path.
+//! - Scratch buffers (`active_holders`, `scratch_missing`, `scratch_wrong_parent`,
+//!   `scratch_prune`) are retained across calls and `.clear()`'d rather than
+//!   reallocated, reducing per-call allocation pressure on the hot path.
 //! - The main pass iterates `coordinator.shards()` directly rather than
 //!   collecting into a `Vec`, since all coordinator borrows are shared (`&`)
 //!   and coexist without conflict.
 //! - S5 compares raw `Option<&[u8]>` slices and only updates `prev_cursors`
 //!   when the value actually changed, avoiding a `Box<[u8]>` allocation on
 //!   the common unchanged-cursor path.
+//! - After each pass, permanently terminal shards (`Done`, `Split`) are
+//!   pruned from `prev_epochs` and `prev_cursors` to bound memory growth
+//!   in long-running simulations with many split cascades. `prev_terminal`
+//!   is retained so S3 can still detect illegal reversions.
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic;
@@ -146,26 +150,36 @@ pub enum InvariantViolation {
 // InvariantChecker
 // ---------------------------------------------------------------------------
 
+/// Composite key for per-shard temporal history, scoped by tenant to prevent
+/// cross-contamination when a single checker validates multiple tenants.
+type HistoryKey = (TenantId, RunId, ShardId);
+
 /// Stateful external observer that tracks per-shard history across
 /// simulation steps to detect temporal invariant violations.
 ///
-/// The `prev_*` maps grow monotonically as new `(RunId, ShardId)` pairs
-/// appear (e.g., from split operations that create child shards). They are
-/// never pruned because temporal invariants (S2, S3, S5) must be checked
-/// against the *entire* history of each shard's key, not just recent state.
+/// The `prev_*` maps grow as new `(RunId, ShardId)` pairs appear (e.g.,
+/// from split operations that create child shards). After each `check_all`
+/// pass, permanently terminal shards (`Done`, `Split`) have their
+/// `prev_epochs` and `prev_cursors` entries pruned — no future operation
+/// can change their fence or cursor. `prev_terminal` is retained so S3
+/// can still detect illegal reversions. `Parked` shards are *not* pruned
+/// because the `Parked`→`Active` unpark transition requires continued
+/// monitoring.
 ///
-/// Uses `BTreeMap<(RunId, ShardId), _>` for deterministic iteration order.
-/// `ShardKey` intentionally omits `Ord` (it is an opaque identity, not an
-/// ordered quantity), so the raw `(RunId, ShardId)` tuple serves as a
-/// comparable surrogate.
+/// Map keys include `TenantId` so a single checker instance can validate
+/// multiple tenants without cross-contamination. Uses `BTreeMap` for
+/// deterministic iteration order. `ShardKey` intentionally omits `Ord`
+/// (it is an opaque identity, not an ordered quantity), so the raw
+/// `(TenantId, RunId, ShardId)` tuple serves as a comparable surrogate.
 pub struct InvariantChecker {
-    /// Last-seen fence epoch per shard, for S2 monotonicity checks.
-    prev_epochs: BTreeMap<(RunId, ShardId), FenceEpoch>,
-    /// Last-seen shard status per shard, for S3 terminal irreversibility.
-    prev_terminal: BTreeMap<(RunId, ShardId), ShardStatus>,
-    /// Last-seen cursor `last_key` per shard, for S5 cursor monotonicity.
-    /// `None` means the cursor was in its initial (no-key) state.
-    prev_cursors: BTreeMap<(RunId, ShardId), Option<Box<[u8]>>>,
+    /// Last-seen fence epoch per (tenant, run, shard), for S2 monotonicity.
+    prev_epochs: BTreeMap<HistoryKey, FenceEpoch>,
+    /// Last-seen shard status per (tenant, run, shard), for S3 terminal
+    /// irreversibility.
+    prev_terminal: BTreeMap<HistoryKey, ShardStatus>,
+    /// Last-seen cursor `last_key` per (tenant, run, shard), for S5 cursor
+    /// monotonicity. `None` means the cursor was in its initial state.
+    prev_cursors: BTreeMap<HistoryKey, Option<Box<[u8]>>>,
     /// Reusable buffer for S1 mutual-exclusion post-pass check.
     /// Cleared at the start of each `check_all` call; retained across calls
     /// so the backing allocation is reused in steady state.
@@ -176,6 +190,9 @@ pub struct InvariantChecker {
     /// Reusable scratch buffer for S7 split-coverage: accumulates `ShardId`s
     /// of children whose `parent` field does not match the expected parent.
     scratch_wrong_parent: Vec<ShardId>,
+    /// Reusable scratch buffer for post-pass pruning: accumulates keys of
+    /// permanently terminal shards whose history entries can be discarded.
+    scratch_prune: Vec<HistoryKey>,
 }
 
 impl InvariantChecker {
@@ -188,15 +205,17 @@ impl InvariantChecker {
             active_holders: HashMap::new(),
             scratch_missing: Vec::new(),
             scratch_wrong_parent: Vec::new(),
+            scratch_prune: Vec::new(),
         }
     }
 
     /// Run all invariant checks (S1-S7) against the current coordinator state.
     ///
     /// Performs a **single pass** over `coordinator.shards()`, delegating to
-    /// per-invariant helpers (S1–S7) for each record and running a post-pass
-    /// duplicate check for S1 (mutual exclusion). Scratch buffers are reused
-    /// across calls to reduce allocation pressure.
+    /// per-invariant helpers (S1–S7) for each record, running a post-pass
+    /// duplicate check for S1 (mutual exclusion), and pruning epoch/cursor
+    /// history for permanently terminal shards (`Done`, `Split`). Scratch
+    /// buffers are reused across calls to reduce allocation pressure.
     ///
     /// # Returns
     ///
@@ -226,7 +245,7 @@ impl InvariantChecker {
                 continue;
             }
 
-            let id = (record.run, record.shard);
+            let id = (tenant, record.run, record.shard);
 
             self.accumulate_active_holder(key, record, now);
             let prev_epoch = self.check_fence_monotonicity(id, record.fence_epoch, &mut violations);
@@ -244,6 +263,25 @@ impl InvariantChecker {
         }
 
         self.check_mutual_exclusion(&mut violations);
+
+        // Prune permanently terminal shards (Done, Split) from epoch and
+        // cursor history. These shards will never have new operations, so
+        // their S2/S5 histories cannot change.  `prev_terminal` is *not*
+        // pruned: S3 (terminal irreversibility) must retain the last-seen
+        // status to detect illegal reversions if a coordinator bug reverts a
+        // terminal shard.  Parked is excluded because unpark can revert it
+        // to Active.
+        self.scratch_prune.clear();
+        for (&id, &status) in &self.prev_terminal {
+            if matches!(status, ShardStatus::Done | ShardStatus::Split) {
+                self.scratch_prune.push(id);
+            }
+        }
+        for &id in &self.scratch_prune {
+            self.prev_epochs.remove(&id);
+            self.prev_cursors.remove(&id);
+        }
+
         violations
     }
 
@@ -271,7 +309,7 @@ impl InvariantChecker {
     /// for the Parked→Active fence-bump check.
     fn check_fence_monotonicity(
         &mut self,
-        id: (RunId, ShardId),
+        id: (TenantId, RunId, ShardId),
         current_epoch: FenceEpoch,
         violations: &mut Vec<InvariantViolation>,
     ) -> Option<FenceEpoch> {
@@ -280,8 +318,8 @@ impl InvariantChecker {
             && current_epoch < prev
         {
             violations.push(InvariantViolation::FenceMonotonicity {
-                run: id.0,
-                shard: id.1,
+                run: id.1,
+                shard: id.2,
                 prev,
                 current: current_epoch,
             });
@@ -298,7 +336,7 @@ impl InvariantChecker {
     /// to validate the unpark fence-bump requirement.
     fn check_terminal_irreversibility(
         &mut self,
-        id: (RunId, ShardId),
+        id: (TenantId, RunId, ShardId),
         current_status: ShardStatus,
         prev_epoch: Option<FenceEpoch>,
         current_epoch: FenceEpoch,
@@ -314,16 +352,16 @@ impl InvariantChecker {
                     && current_epoch <= old_epoch
                 {
                     violations.push(InvariantViolation::UnparkWithoutFenceBump {
-                        run: id.0,
-                        shard: id.1,
+                        run: id.1,
+                        shard: id.2,
                         fence_at_park: old_epoch,
                         fence_at_unpark: current_epoch,
                     });
                 }
             } else {
                 violations.push(InvariantViolation::TerminalIrreversibility {
-                    run: id.0,
-                    shard: id.1,
+                    run: id.1,
+                    shard: id.2,
                     was: prev,
                     now: current_status,
                 });
@@ -371,7 +409,7 @@ impl InvariantChecker {
     /// objects, avoiding a heap allocation per shard per step.
     fn check_cursor_monotonicity(
         &mut self,
-        id: (RunId, ShardId),
+        id: (TenantId, RunId, ShardId),
         record: &ShardRecord,
         violations: &mut Vec<InvariantViolation>,
     ) {
@@ -384,8 +422,8 @@ impl InvariantChecker {
         };
         if cursor_regressed {
             violations.push(InvariantViolation::CursorMonotonicity {
-                run: id.0,
-                shard: id.1,
+                run: id.1,
+                shard: id.2,
             });
         }
         if prev_key != curr_key {
@@ -877,6 +915,161 @@ mod tests {
                 } if fence_at_park.as_raw() == 3 && fence_at_unpark.as_raw() == 3
             ),
             "expected UnparkWithoutFenceBump, got: {v:?}"
+        );
+    }
+
+    // -- Pruning: prev_* maps shrink for permanently terminal shards ----------
+
+    /// Permanently terminal shards (Done, Split) have their epoch and cursor
+    /// history pruned after check_all. `prev_terminal` is retained so S3 can
+    /// still catch illegal reversions. Parked shards are never pruned.
+    #[test]
+    fn prunes_permanently_terminal_shards_from_history() {
+        let run = RunId::from_raw(1);
+        let done_shard = ShardId::from_raw(1);
+        let split_shard = ShardId::from_raw(2);
+        let parked_shard = ShardId::from_raw(3);
+        let active_shard = ShardId::from_raw(4);
+        let now = LogicalTime::from_raw(1);
+
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Seed four shards in different states.
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, done_shard)
+                .status(ShardStatus::Done)
+                .build(),
+        );
+
+        let child = ShardId::from_raw((1u64 << 63) | 10);
+        coord.seed_shard_unchecked(
+            TestRecordBuilder::new(TENANT, run, split_shard)
+                .status(ShardStatus::Split)
+                .spawned(vec![child])
+                .build(),
+        );
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, child)
+                .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
+                .parent(split_shard)
+                .build(),
+        );
+
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, parked_shard)
+                .status(ShardStatus::Parked)
+                .park_reason(crate::coordination::record::ParkReason::Other)
+                .build(),
+        );
+
+        coord.seed_shard(TestRecordBuilder::new(TENANT, run, active_shard).build());
+
+        let mut checker = InvariantChecker::new();
+        let v = checker.check_all(&coord, TENANT, now);
+        assert!(v.is_empty(), "unexpected violations: {v:?}");
+
+        // Done and Split should have epoch/cursor history pruned.
+        let done_id = (TENANT, run, done_shard);
+        let split_id = (TENANT, run, split_shard);
+        assert!(
+            !checker.prev_epochs.contains_key(&done_id),
+            "Done shard should be pruned from prev_epochs"
+        );
+        assert!(
+            !checker.prev_epochs.contains_key(&split_id),
+            "Split shard should be pruned from prev_epochs"
+        );
+        assert!(
+            !checker.prev_cursors.contains_key(&done_id),
+            "Done shard should be pruned from prev_cursors"
+        );
+        assert!(
+            !checker.prev_cursors.contains_key(&split_id),
+            "Split shard should be pruned from prev_cursors"
+        );
+
+        // prev_terminal is intentionally kept for S3 reversion detection.
+        assert!(
+            checker.prev_terminal.contains_key(&done_id),
+            "Done shard should be kept in prev_terminal for S3"
+        );
+        assert!(
+            checker.prev_terminal.contains_key(&split_id),
+            "Split shard should be kept in prev_terminal for S3"
+        );
+
+        // Parked and Active should still be in all maps.
+        let parked_id = (TENANT, run, parked_shard);
+        let active_id = (TENANT, run, active_shard);
+        assert!(
+            checker.prev_epochs.contains_key(&parked_id),
+            "Parked shard should be kept in prev_epochs"
+        );
+        assert!(
+            checker.prev_epochs.contains_key(&active_id),
+            "Active shard should be kept in prev_epochs"
+        );
+    }
+
+    // -- Cross-tenant isolation -----------------------------------------------
+
+    /// Two tenants sharing the same (RunId, ShardId) must not have their
+    /// fence histories cross-contaminate. Advancing tenant A's epoch must
+    /// not affect the checker's view of tenant B.
+    #[test]
+    fn cross_tenant_isolation_in_temporal_checks() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let now = LogicalTime::from_raw(1);
+        let tenant_a = TenantId::from_bytes([0xAA; 32]);
+        let tenant_b = TenantId::from_bytes([0xBB; 32]);
+
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+        let mut checker = InvariantChecker::new();
+
+        // Tenant A: seed shard with fence epoch 5.
+        coord.seed_shard(
+            TestRecordBuilder::new(tenant_a, run, shard)
+                .fence_epoch(FenceEpoch::from_raw(5))
+                .build(),
+        );
+        assert!(checker.check_all(&coord, tenant_a, now).is_empty());
+
+        // Tenant B: seed same (run, shard) with fence epoch 2.
+        // If keys were only (RunId, ShardId), this would look like a
+        // regression from 5→2 and trigger an S2 violation.
+        coord.seed_shard(
+            TestRecordBuilder::new(tenant_b, run, shard)
+                .fence_epoch(FenceEpoch::from_raw(2))
+                .build(),
+        );
+        let v = checker.check_all(&coord, tenant_b, now);
+        assert!(
+            v.is_empty(),
+            "cross-tenant contamination: tenant B got violations from tenant A's history: {v:?}"
+        );
+
+        // Verify tenant A's history is still intact — advancing A's epoch
+        // from 5 to 6 should not violate.
+        coord.seed_shard(
+            TestRecordBuilder::new(tenant_a, run, shard)
+                .fence_epoch(FenceEpoch::from_raw(6))
+                .build(),
+        );
+        assert!(checker.check_all(&coord, tenant_a, now).is_empty());
+
+        // Regressing tenant A from 6 to 4 SHOULD trigger S2.
+        coord.seed_shard(
+            TestRecordBuilder::new(tenant_a, run, shard)
+                .fence_epoch(FenceEpoch::from_raw(4))
+                .build(),
+        );
+        let v = checker.check_all(&coord, tenant_a, now);
+        assert_eq!(v.len(), 1);
+        assert!(
+            matches!(&v[0], InvariantViolation::FenceMonotonicity { prev, current, .. }
+                if prev.as_raw() == 6 && current.as_raw() == 4),
+            "expected FenceMonotonicity for tenant A, got: {v:?}"
         );
     }
 }

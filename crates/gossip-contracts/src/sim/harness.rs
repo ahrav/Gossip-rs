@@ -693,6 +693,20 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     }
 
     // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Remove a single shard key from `active_shard_keys` using O(1)
+    /// `swap_remove` instead of O(n) `retain`. Order does not matter
+    /// because `active_shard_keys` is only accessed by random index
+    /// (`pick_random_shard_key`).
+    fn remove_active_shard(&mut self, key: ShardKey) {
+        if let Some(pos) = self.active_shard_keys.iter().position(|k| *k == key) {
+            self.active_shard_keys.swap_remove(pos);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Op execution
     // -----------------------------------------------------------------------
 
@@ -923,7 +937,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     w.record_release(&key);
                 }
                 // Shard is now terminal — remove from active set.
-                self.active_shard_keys.retain(|k| *k != key);
+                self.remove_active_shard(key);
                 SimEvent::CompleteOk
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -948,7 +962,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     w.record_release(&key);
                 }
                 // Shard is now terminal — remove from active set.
-                self.active_shard_keys.retain(|k| *k != key);
+                self.remove_active_shard(key);
                 SimEvent::ParkOk
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -1057,7 +1071,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     self.active_shard_keys.push(child_key);
                 }
                 // Parent is now terminal — remove from active set.
-                self.active_shard_keys.retain(|k| *k != key);
+                self.remove_active_shard(key);
                 SimEvent::SplitReplaceOk { children }
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -1838,7 +1852,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             if let Some(w) = self.workers.get_mut(&worker) {
                 w.record_release(&key);
             }
-            self.active_shard_keys.retain(|k| *k != key);
+            self.remove_active_shard(key);
         }
 
         SimEvent::SessionLifecycleOk
@@ -2316,6 +2330,67 @@ mod tests {
         assert!(
             session_lifecycle_seen,
             "SessionLifecycleOk never observed across 20 seeds"
+        );
+    }
+
+    // -- step() public API tests ----------------------------------------------
+
+    /// `step()` returns events and violations, and increments `ops_executed`.
+    #[test]
+    fn step_returns_violations_and_increments_counter() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(1, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        // Advance time so acquire can succeed.
+        sim.context.advance(1);
+
+        let initial_ops = sim.ops_executed;
+        let (event, violations) = sim.step(SimOp::Acquire { worker, key });
+
+        assert!(
+            matches!(event, SimEvent::AcquireOk { .. }),
+            "expected AcquireOk, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
+        );
+        assert_eq!(
+            sim.ops_executed,
+            initial_ops + 1,
+            "step() should increment ops_executed"
+        );
+    }
+
+    /// `step()` on a paused worker returns a Rejected event with no violations.
+    #[test]
+    fn step_on_paused_worker_returns_rejection() {
+        let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(2, 1);
+
+        let worker = WorkerId::from_raw(1);
+        let key = sim.shard_keys[0];
+
+        sim.context.advance(1);
+
+        // Pause the worker.
+        let (pause_event, pause_violations) = sim.step(SimOp::PauseWorker { worker });
+        assert!(
+            matches!(pause_event, SimEvent::WorkerPaused { .. }),
+            "expected WorkerPaused, got {pause_event:?}"
+        );
+        assert!(pause_violations.is_empty());
+
+        // Checkpoint on paused worker should be rejected.
+        let (event, violations) = sim.step(SimOp::Checkpoint { worker, key });
+        assert!(
+            matches!(event, SimEvent::Rejected { .. }),
+            "expected Rejected for paused worker, got {event:?}"
+        );
+        assert!(
+            violations.is_empty(),
+            "unexpected violations: {violations:?}"
         );
     }
 }
