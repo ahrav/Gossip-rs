@@ -1015,8 +1015,8 @@ mod tests {
         );
     }
 
-    /// Parked→Active fires both S2 and S3 when using <=.
-    /// This verifies the reviewer's claim about overlapping violation detection.
+    /// A fence regression during Parked→Active (epoch 5→3) must fire only S2
+    /// (FenceMonotonicity), not the S3 sub-property (UnparkWithoutFenceBump).
     #[test]
     fn fence_regression_during_unpark_does_not_double_report() {
         let run = RunId::from_raw(1);
