@@ -45,9 +45,10 @@
 # violations, which is the *expected* outcome for safety mutations.
 set -uo pipefail
 
-# -- Paths --
-SPEC_DIR="/Users/ahrav/Projects/Gossip-rs/specs/coordination"
-TOOLS_JAR="/Users/ahrav/Projects/Gossip-rs/specs/tla2tools.jar"
+# -- Paths (derived from script location for portability) --
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SPEC_DIR="$SCRIPT_DIR"
+TOOLS_JAR="$(cd "$SCRIPT_DIR/../.." && pwd)/specs/tla2tools.jar"
 BASE_SPEC="$SPEC_DIR/ShardFencing.tla"
 BASE_CFG="$SPEC_DIR/ShardFencing_dev.cfg"
 
@@ -59,6 +60,16 @@ BASE_CFG="$SPEC_DIR/ShardFencing_dev.cfg"
 #   -terse        Suppress progress output; only print errors and summaries.
 #   -cleanup      Remove TLC's working directories after each run.
 TLC_CMD="java -XX:+UseParallelGC -Xmx2g -cp $TOOLS_JAR tlc2.TLC -workers 1 -deadlock -terse -cleanup"
+
+# sed_inplace <file> <sed-args...>
+#
+# Portable in-place sed using temp file + mv. BSD sed (-i '') and GNU sed
+# (-i) have incompatible flag syntax; this sidesteps the issue entirely.
+sed_inplace() {
+    local file="$1"
+    shift
+    sed "$@" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
+}
 
 # -- Aggregate results --
 PASS_COUNT=0
@@ -107,10 +118,10 @@ run_mutation() {
 
     local result=""
     if [ "$expect_violation" = "yes" ]; then
-        if [ "$exit_code" -ne 0 ] || grep -q "Error:" "$outfile" 2>/dev/null; then
-            local violated
-            violated=$(grep -oE "Invariant [^ ]+ is violated|Property [^ ]+ is violated" "$outfile" 2>/dev/null | head -1)
-            if [ -n "$expected_prop" ] && ! grep -q "$expected_prop" "$outfile" 2>/dev/null; then
+        local violated
+        violated=$(grep -oE "Invariant [^ ]+ is violated|Property [^ ]+ is violated" "$outfile" 2>/dev/null | head -1)
+        if [ -n "$violated" ]; then
+            if [ -n "$expected_prop" ] && ! echo "$violated" | grep -q "$expected_prop"; then
                 result="FAIL"
                 echo "  >>> FAIL (exit=$exit_code): wrong invariant violated. Expected=$expected_prop Got: $violated"
             else
@@ -119,7 +130,11 @@ run_mutation() {
             fi
         else
             result="FAIL"
-            echo "  >>> FAIL (exit=$exit_code): NO violation found"
+            if [ "$exit_code" -ne 0 ]; then
+                echo "  >>> FAIL (exit=$exit_code): TLC error without invariant violation (infrastructure failure?)"
+            else
+                echo "  >>> FAIL (exit=$exit_code): NO violation found"
+            fi
         fi
     else
         if [ "$exit_code" -eq 0 ] && ! grep -q "Error:" "$outfile" 2>/dev/null; then
@@ -204,9 +219,9 @@ echo "========================================"
 # ---------------------------------------------------------------
 create_spec 1
 create_cfg 1 ""
-sed -i '' '/^Acquire(w, s) ==/,/UNCHANGED timeVars/ {
+sed_inplace "$SPEC_DIR/ShardFencing_mut1.tla" '/^Acquire(w, s) ==/,/UNCHANGED timeVars/ {
     s|/\\ worker_epoch. = \[worker_epoch EXCEPT !\[w\]\[s\] = newEpoch\]|/\\ UNCHANGED workerVars  \\\* MUTATED: worker does not cache epoch|
-}' "$SPEC_DIR/ShardFencing_mut1.tla"
+}'
 assert_mutated 1
 run_mutation 1 "Remove worker_epoch cache from Acquire (zombie)" "yes" "no" "ZombieRejection"
 
@@ -217,9 +232,9 @@ run_mutation 1 "Remove worker_epoch cache from Acquire (zombie)" "yes" "no" "Zom
 # ---------------------------------------------------------------
 create_spec 2
 create_cfg 2 ""
-sed -i '' '/^Acquire(w, s) ==/,/UNCHANGED ghostVars/ {
+sed_inplace "$SPEC_DIR/ShardFencing_mut2.tla" '/^Acquire(w, s) ==/,/UNCHANGED ghostVars/ {
     s|/\\ status\[s\] = "Active"|/\\ TRUE  \\\* MUTATED: removed Active check|
-}' "$SPEC_DIR/ShardFencing_mut2.tla"
+}'
 assert_mutated 2
 run_mutation 2 "Remove status=Active check from Acquire" "yes" "no" "TerminalUnleased"
 
@@ -230,9 +245,9 @@ run_mutation 2 "Remove status=Active check from Acquire" "yes" "no" "TerminalUnl
 # ---------------------------------------------------------------
 create_spec 3
 create_cfg 3 ""
-sed -i '' '/^Complete(w, s) ==/,/UNCHANGED timeVars/ {
+sed_inplace "$SPEC_DIR/ShardFencing_mut3.tla" '/^Complete(w, s) ==/,/UNCHANGED timeVars/ {
     s|/\\ owner. = \[owner EXCEPT !\[s\] = none\]|/\\ UNCHANGED owner  \\\* MUTATED: owner not cleared|
-}' "$SPEC_DIR/ShardFencing_mut3.tla"
+}'
 assert_mutated 3
 run_mutation 3 "Don't clear owner in Complete (terminal leased)" "yes" "no" "TerminalUnleased"
 
@@ -243,9 +258,9 @@ run_mutation 3 "Don't clear owner in Complete (terminal leased)" "yes" "no" "Ter
 # ---------------------------------------------------------------
 create_spec 4
 create_cfg 4 ""
-sed -i '' '/^SplitReplace(w, s) ==/,/UNCHANGED timeVars/ {
+sed_inplace "$SPEC_DIR/ShardFencing_mut4.tla" '/^SplitReplace(w, s) ==/,/UNCHANGED timeVars/ {
     s|ELSE IF s2 \\in children THEN "Active"|ELSE IF s2 \\in children THEN "NotCreated"  \\\* MUTATED|
-}' "$SPEC_DIR/ShardFencing_mut4.tla"
+}'
 assert_mutated 4
 run_mutation 4 "Don't activate children in SplitReplace" "yes" "no" "SplitAtomicity"
 
@@ -287,9 +302,9 @@ PROPERTY AlwaysTerminalIrreversibility
 PROPERTY AlwaysCursorNonRegression
 LCFG
 )"
-sed -i '' '/^Unpark(s) ==/,/UNCHANGED timeVars/ {
+sed_inplace "$SPEC_DIR/ShardFencing_mut5.tla" '/^Unpark(s) ==/,/UNCHANGED timeVars/ {
     s|/\\ status\[s\] = "Parked"|/\\ status[s] \\in {"Parked", "Done"}  \\\* MUTATED: allow Done unpark|
-}' "$SPEC_DIR/ShardFencing_mut5.tla"
+}'
 assert_mutated 5
 run_mutation 5 "Allow Done->Active in Unpark (terminal irreversibility)" "yes" "no" "AlwaysTerminalIrreversibility"
 
@@ -300,10 +315,10 @@ run_mutation 5 "Allow Done->Active in Unpark (terminal irreversibility)" "yes" "
 # ---------------------------------------------------------------
 create_spec 6
 create_cfg 6 ""
-sed -i '' '/^Checkpoint(w, s) ==/,/UNCHANGED timeVars/ {
+sed_inplace "$SPEC_DIR/ShardFencing_mut6.tla" '/^Checkpoint(w, s) ==/,/UNCHANGED timeVars/ {
     s|/\\ cursor. = \[cursor EXCEPT !\[s\] = newCursor\]|/\\ cursor'\'' = [cursor EXCEPT ![s] = cursor[s]]  \\\* MUTATED: no advance|
     s|/\\ prev_cursor. = \[prev_cursor EXCEPT !\[s\] = cursor\[s\]\]|/\\ prev_cursor'\'' = [prev_cursor EXCEPT ![s] = newCursor]  \\\* MUTATED: prev jumps|
-}' "$SPEC_DIR/ShardFencing_mut6.tla"
+}'
 assert_mutated 6
 run_mutation 6 "Swap cursor/prev_cursor in Checkpoint (monotonicity)" "yes" "no" "CursorMonotonicity"
 
@@ -391,9 +406,9 @@ run_mutation 8 "Non-vacuity: Liveness (INV-L01) with LiveSpec" "no" "yes"
 # ---------------------------------------------------------------
 create_spec 9
 create_cfg 9 ""
-sed -i '' '/^SplitReplace(w, s) ==/,/UNCHANGED timeVars/{
+sed_inplace "$SPEC_DIR/ShardFencing_mut9.tla" '/^SplitReplace(w, s) ==/,/UNCHANGED timeVars/{
 s|IF s2 = s THEN "Split"|IF s2 = s THEN "Active"  \\\* MUTATED: parent stays Active|
-}' "$SPEC_DIR/ShardFencing_mut9.tla"
+}'
 assert_mutated 9
 run_mutation 9 "Keep parent Active in SplitReplace (ChildImpliesParentSplit)" "yes" "no" "ChildImpliesParentSplit"
 
@@ -404,9 +419,9 @@ run_mutation 9 "Keep parent Active in SplitReplace (ChildImpliesParentSplit)" "y
 # ---------------------------------------------------------------
 create_spec 10
 create_cfg 10 ""
-sed -i '' '/^SplitReplace(w, s) ==/,/UNCHANGED timeVars/{
+sed_inplace "$SPEC_DIR/ShardFencing_mut10.tla" '/^SplitReplace(w, s) ==/,/UNCHANGED timeVars/{
 s|IF s2 \\in children THEN 1  \\\* FenceEpoch::INITIAL|IF s2 \\in children THEN 0  \\\* MUTATED: epoch 0|
-}' "$SPEC_DIR/ShardFencing_mut10.tla"
+}'
 assert_mutated 10
 run_mutation 10 "Set children fence_epoch=0 in SplitReplace (FenceEpochSanity)" "yes" "no" "FenceEpochSanity"
 
@@ -439,9 +454,9 @@ PROPERTY AlwaysFenceMonotonicity
 LCFG
 )"
 # Replace the entire fence_epoch EXCEPT line to avoid comment-inside-bracket parse error.
-sed -i '' '/^Unpark(s) ==/,/UNCHANGED timeVars/{
+sed_inplace "$SPEC_DIR/ShardFencing_mut11.tla" '/^Unpark(s) ==/,/UNCHANGED timeVars/{
 s|fence_epoch. = \[fence_epoch EXCEPT !\[s\] = fence_epoch\[s\] + 1\]|fence_epoch'\'' = [fence_epoch EXCEPT ![s] = 0]  \\\* MUTATED: epoch reset|
-}' "$SPEC_DIR/ShardFencing_mut11.tla"
+}'
 assert_mutated 11
 run_mutation 11 "Reset epoch to 0 in Unpark (FenceMonotonicity)" "yes" "no" "AlwaysFenceMonotonicity"
 
@@ -452,10 +467,10 @@ run_mutation 11 "Reset epoch to 0 in Unpark (FenceMonotonicity)" "yes" "no" "Alw
 # ---------------------------------------------------------------
 create_spec 12
 create_cfg 12 ""
-sed -i '' '/^Park(w, s) ==/,/UNCHANGED timeVars/{
+sed_inplace "$SPEC_DIR/ShardFencing_mut12.tla" '/^Park(w, s) ==/,/UNCHANGED timeVars/{
 s|UNCHANGED <<fence_epoch, cursor, spawned>>|/\\ cursor'\''= [cursor EXCEPT ![s] = 0]  \\\* MUTATED: cursor reset on park\
         /\\ UNCHANGED <<fence_epoch, spawned>>|
-}' "$SPEC_DIR/ShardFencing_mut12.tla"
+}'
 assert_mutated 12
 run_mutation 12 "Park resets cursor to 0 (CursorNonRegression)" "yes" "no" "AlwaysCursorNonRegression"
 
@@ -478,10 +493,10 @@ run_mutation 12 "Park resets cursor to 0 (CursorNonRegression)" "yes" "no" "Alwa
 # ---------------------------------------------------------------
 create_spec 13
 # Inject negation invariant before the ==== line
-sed -i '' '/^====$/i\
+sed_inplace "$SPEC_DIR/ShardFencing_mut13.tla" '/^====$/i\
 \\\* Non-vacuity: negation of Split reachability (expected to be violated).\
 NeverSplit == status[parent] /= "Split"  \\\* MUTATED\
-' "$SPEC_DIR/ShardFencing_mut13.tla"
+'
 create_cfg 13 "$(cat <<'LCFG'
 SPECIFICATION SafetySpec
 
@@ -511,10 +526,10 @@ run_mutation 13 "Non-vacuity: Split reachable (NeverSplit violated)" "yes" "no" 
 #   can reach Done from Init.
 # ---------------------------------------------------------------
 create_spec 14
-sed -i '' '/^====$/i\
+sed_inplace "$SPEC_DIR/ShardFencing_mut14.tla" '/^====$/i\
 \\\* Non-vacuity: negation of Done reachability (expected to be violated).\
 NeverDone == \\A s \\in AllShards : status[s] /= "Done"  \\\* MUTATED\
-' "$SPEC_DIR/ShardFencing_mut14.tla"
+'
 create_cfg 14 "$(cat <<'LCFG'
 SPECIFICATION SafetySpec
 
