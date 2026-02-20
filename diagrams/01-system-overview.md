@@ -146,6 +146,11 @@ lease and a new worker takes over the same shard, the old worker's fencing token
 becomes stale and its writes are rejected. This is how the system prevents
 duplicate processing without distributed locks.
 
+The acquire response also carries a `CapacityHint` -- an advisory count of
+remaining available shards and the earliest lease deadline -- so workers can
+make backoff/retry decisions without additional RPCs (see
+[07-lease-lifecycle.md](07-lease-lifecycle.md) Diagram 5).
+
 Once the worker has a shard assignment, it uses B4 (Connector) to enumerate
 items from the external data source -- a Git repository, an S3 bucket, a
 Confluence space, or any other supported source. For each item, the worker

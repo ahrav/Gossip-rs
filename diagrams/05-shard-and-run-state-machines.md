@@ -49,6 +49,8 @@ stateDiagram-v2
         Worker holds lease with fencing token.
         Unleased shards are available for claim.
         FenceEpoch increments on every acquire.
+        Unleased Active → CapacityHint.available_count
+        Leased Active → CapacityHint.earliest_deadline
     end note
 
     note right of Done
@@ -263,6 +265,11 @@ The "ownership change" within `Active` (acquire/release/lease expiry) does not
 change `ShardStatus` -- it only changes the lease holder and increments
 `FenceEpoch`. This is why `Active -> Active` is listed as a dash rather than a
 transition: the status does not change.
+
+`count_available_for_run()` computes `CapacityHint` by scanning only `Active`
+shards in the run. Terminal shards (`Done`, `Split`, `Parked`) are skipped
+entirely -- they cannot be acquired and do not hold leases, so they contribute
+nothing to capacity or deadline calculations.
 
 ---
 

@@ -50,7 +50,7 @@ sequenceDiagram
     W->>C: acquire_and_restore(tenant, run_id, worker_id)
     activate C
     C->>C: grant lease on Active shard<br/>increment FenceEpoch
-    C-->>W: AcquireResult { lease, snapshot }
+    C-->>W: AcquireResult { lease, snapshot, capacity }
     deactivate C
 
     rect rgb(245, 245, 245)
@@ -340,7 +340,9 @@ subsystems but tightly choreographed participants in a single pipeline:
 
 - **Coordination (B2)** bookends the flow. It creates the run (step 1), assigns
   shards (step 2), and determines completion (steps 12-13). It also owns the
-  cursor that tracks progress within each shard.
+  cursor that tracks progress within each shard. Acquire and renew responses
+  carry a `CapacityHint` (available shard count and earliest lease deadline) so
+  workers can make backoff/retry decisions without additional RPCs.
 
 - **Connector (B4)** provides the raw material. Enumeration (step 3) and content
   retrieval (step 6) are the only points where the system touches external data
