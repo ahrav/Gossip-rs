@@ -1644,20 +1644,19 @@ impl RunManagement for InMemoryCoordinator {
         record.assert_transition_legal(RunStatus::Active);
         record.status = RunStatus::Active;
         record.root_shards = shard_ids.clone();
-        let boxed_ids = shard_ids.into_boxed_slice();
         record.op_log_push(RunOpLogEntry::new(
             op_id,
             RunOpKind::RegisterShards,
             payload_hash,
             now,
             RunOpResult::RegisteredShards {
-                shard_ids: boxed_ids.clone(),
+                shard_ids: shard_ids.clone().into_boxed_slice(),
             },
         ));
         record.assert_invariants();
         self.debug_assert_run_shards_consistent(tenant, run);
 
-        Ok(IdempotentOutcome::Executed(boxed_ids.into_vec()))
+        Ok(IdempotentOutcome::Executed(shard_ids))
     }
 
     /// Return a clone of the run record after validating tenant isolation.
