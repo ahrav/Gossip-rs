@@ -1128,6 +1128,10 @@ pub struct ShardSummary {
     pub(crate) status: ShardStatus,
     pub(crate) park_reason: Option<ParkReason>,
     pub(crate) is_leased: bool,
+    /// Deadline of the current lease, if any.  `Some` only when
+    /// `is_leased` is `true`.  Callers use this to schedule retry
+    /// attempts near the soonest expiry without a separate query.
+    pub(crate) lease_deadline: Option<LogicalTime>,
     /// Number of times this shard has been acquired.
     ///
     /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore`
@@ -1148,6 +1152,11 @@ impl ShardSummary {
             status: record.status,
             park_reason: record.park_reason,
             is_leased: record.is_leased_at(now),
+            lease_deadline: if record.is_leased_at(now) {
+                record.lease_deadline()
+            } else {
+                None
+            },
             acquire_count: u32::try_from(
                 record
                     .fence_epoch
@@ -1181,6 +1190,11 @@ impl ShardSummary {
     #[must_use]
     pub fn is_leased(&self) -> bool {
         self.is_leased
+    }
+
+    #[must_use]
+    pub fn lease_deadline(&self) -> Option<LogicalTime> {
+        self.lease_deadline
     }
 
     #[must_use]
@@ -2117,6 +2131,7 @@ mod tests {
             status,
             park_reason: None,
             is_leased: leased,
+            lease_deadline: None,
             acquire_count: 0,
             last_key: None,
             key_range_start: b"a".to_vec().into(),

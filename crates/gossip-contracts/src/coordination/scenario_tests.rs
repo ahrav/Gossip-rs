@@ -792,7 +792,7 @@ fn scenario_claim_contention() {
     for worker_id in 1..=3u64 {
         match coord.claim_next_available(now(3), tenant, run, test_worker(worker_id)) {
             Ok(result) => successes.push(result),
-            Err(ClaimError::NoneAvailable) => failures += 1,
+            Err(ClaimError::NoneAvailable { .. }) => failures += 1,
             Err(e) => panic!("worker {worker_id}: unexpected claim error: {e:?}"),
         }
     }

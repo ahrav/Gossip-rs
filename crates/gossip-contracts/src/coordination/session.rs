@@ -74,8 +74,9 @@
 //! authoritative [`ShardRecord`](super::record::ShardRecord), not
 //! the session's cached snapshot. Updating the snapshot on every
 //! checkpoint would add allocation overhead for no correctness benefit.
-//! Similarly, [`renew`](WorkerSession::renew) updates only the lease
-//! deadline (via `Lease::set_deadline`), not the snapshot.
+//! Similarly, [`renew`](WorkerSession::renew) updates the lease
+//! deadline (via `Lease::set_deadline`) and the capacity hint, but
+//! not the snapshot.
 //!
 //! The snapshot **is** updated by [`split_residual`](WorkerSession::split_residual)
 //! because the key range narrows, and subsequent [`checkpoint`](WorkerSession::checkpoint)
@@ -85,8 +86,8 @@
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{
-    AcquireError, CheckpointError, CompleteError, IdempotentOutcome, ParkError, RenewError,
-    RenewResult, SplitReplaceError, SplitResidualError,
+    AcquireError, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
+    RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardSnapshot, ShardStatus};
@@ -158,6 +159,14 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
     /// cursor). Rebuilt by [`Self::split_residual()`] to reflect the
     /// narrowed key range so subsequent cursor-bounds checks are accurate.
     snapshot: ShardSnapshot,
+
+    /// Advisory capacity hint from the last acquire or renew.
+    ///
+    /// Reflects the run's available-shard count at the time of the last
+    /// acquire or renew.  Not updated by checkpoint, complete, park, or
+    /// split operations.  Workers should not make safety decisions based
+    /// on this value — it is a best-effort backoff signal.
+    capacity: CapacityHint,
 }
 
 impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
@@ -177,6 +186,14 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// so no other session or raw backend call can be made until this
     /// session is dropped or consumed by a terminal operation.
     ///
+    /// # Panics
+    ///
+    /// Panics (in all builds) if the returned lease's tenant does not
+    /// match `tenant`. Tenant isolation is a security boundary: a
+    /// backend that returns a cross-tenant lease is fatally broken.
+    /// Additional debug-only assertions verify shard key, owner, and
+    /// non-terminal status consistency.
+    ///
     /// # Errors
     ///
     /// Returns [`AcquireError`] if:
@@ -194,6 +211,10 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         let result = backend.acquire_and_restore(now, tenant, key, worker)?;
         // Tenant is a security boundary — must hold in all builds.
         assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
+        // The remaining assertions are correctness sanity checks: if the
+        // backend returns inconsistent identity or a terminal shard, the
+        // bug is in the backend, not the caller. These are debug-only to
+        // avoid redundant checks on the hot path in release builds.
         debug_assert_eq!(result.lease.shard_key(), key, "lease shard_key mismatch");
         debug_assert_eq!(result.lease.owner(), worker, "lease owner mismatch");
         debug_assert!(
@@ -206,6 +227,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             worker,
             lease: result.lease,
             snapshot: result.snapshot,
+            capacity: result.capacity,
         })
     }
 
@@ -269,6 +291,17 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         self.lease.shard_key()
     }
 
+    /// Advisory capacity hint from the last acquire or renew.
+    ///
+    /// Reflects the run's available-shard count at the time of the last
+    /// acquire or renew.  Not updated by checkpoint, complete, park, or
+    /// split operations.  Workers should not make safety decisions based
+    /// on this value — it is a best-effort backoff signal.
+    #[inline]
+    pub fn capacity(&self) -> CapacityHint {
+        self.capacity
+    }
+
     /// Renew the lease, extending the deadline.
     ///
     /// The worker must call this periodically before the current deadline
@@ -277,11 +310,18 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// worker may acquire the shard, causing all subsequent operations on
     /// this session to fail with `StaleFence` or `LeaseExpired`.
     ///
-    /// On success, the session's cached lease deadline is updated in
-    /// place so that `session.lease().deadline()` reflects the new value.
+    /// On success, the session's cached lease deadline and capacity hint
+    /// are updated in place so that `session.lease().deadline()` and
+    /// `session.capacity()` reflect the refreshed values.
     ///
     /// The fence epoch does not change — renewal is a deadline extension,
     /// not an ownership transfer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the backend returns a new deadline that is not strictly
+    /// after `now`. A renewal that does not extend the deadline into the
+    /// future is always a backend bug.
     ///
     /// # Errors
     ///
@@ -295,6 +335,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         // An expired deadline after a "successful" renewal is always a backend bug.
         assert!(result.new_deadline > now, "renewal deadline not after now");
         self.lease.set_deadline(result.new_deadline);
+        self.capacity = result.capacity;
         debug_assert_eq!(
             self.lease.fence(),
             fence_before,
@@ -316,6 +357,12 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// updates the session's snapshot) or via a terminal operation
     /// (which consumes the session).
     ///
+    /// # Idempotency
+    ///
+    /// Idempotent via `op_id`: if the same `(op_id, cursor)` pair was
+    /// already executed, returns `Ok(Replayed(()))`. If the same `op_id`
+    /// was used with a different cursor, returns `Err(OpIdConflict)`.
+    ///
     /// # Preconditions
     ///
     /// - `new_cursor.last_key` must be `Some` (non-empty progress).
@@ -325,9 +372,8 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// # Errors
     ///
     /// Returns [`CheckpointError`] on lease validation failure, cursor
-    /// monotonicity violation, out-of-bounds cursor, or `OpId` conflict.
-    /// Returns `Ok(Replayed(()))` if the same `op_id` was already executed
-    /// with an identical payload.
+    /// monotonicity violation, out-of-bounds cursor, missing `last_key`,
+    /// or `OpId` conflict.
     pub fn checkpoint(
         &mut self,
         now: LogicalTime,
@@ -511,6 +557,19 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
 /// single run and verifies that session methods correctly delegate to the
 /// backend, update internal state (lease deadline, snapshot), and enforce
 /// ownership semantics (terminal ops consume the session).
+///
+/// ## Test organization
+///
+/// - **Happy path**: `new_ok`, `complete_consumes`, `split_residual_keeps_session`,
+///   `renew_updates_internal_deadline`, `park_consumes_session`,
+///   `split_replace_consumes_session`, `checkpoint_advances_cursor_via_session`
+/// - **Error paths**: expired lease, already-leased rejection, stale fence
+/// - **Idempotency**: checkpoint and complete replays, split_residual replays
+///   (including after op-log eviction)
+/// - **Snapshot staleness**: checkpoint does not update cache, split_residual
+///   error does not corrupt cache, successive splits accumulate spawned entries
+/// - **Property tests**: random operation sequences preserve identity invariants
+/// - **Capacity hints**: verify advisory shard availability counts
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +596,8 @@ mod tests {
         LogicalTime::from_raw(t)
     }
 
+    /// Returns a run config with `CursorSemantics::Completed`, a 30-tick
+    /// lease duration, and a max-workers-per-run of 5.
     fn test_run_config() -> RunConfig {
         RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
     }
@@ -545,6 +606,8 @@ mod tests {
     ///
     /// Each shard covers a wide range: shard i covers `[i*0x40, (i+1)*0x40)`.
     /// This gives enough room for cursor values and split operations.
+    /// The lease duration is 30 ticks (from `test_run_config`), so acquiring
+    /// at `now(2)` yields a deadline of 32.
     fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>) {
         let mut coord = InMemoryCoordinator::new(30);
         let tenant = test_tenant();
@@ -1109,10 +1172,14 @@ mod tests {
 
     // -- Property tests --------------------------------------------------
 
-    /// Operation kinds for the property test. Generated up front by
-    /// proptest, then interpreted against runtime state (current range,
-    /// last cursor position). Operations that are invalid in the current
-    /// state are skipped rather than rejected.
+    /// Operation kinds for the property test.
+    ///
+    /// Generated up front by proptest and then interpreted against
+    /// runtime state (current key range, last cursor position).
+    /// Operations that are invalid in the current state (e.g., a
+    /// checkpoint with a cursor that would regress, or a split on
+    /// a range too narrow to subdivide) are skipped rather than
+    /// rejected, keeping the shrinking behavior stable.
     #[derive(Debug, Clone)]
     enum PropOp {
         Renew,
@@ -1121,10 +1188,17 @@ mod tests {
     }
 
     // Random operation sequences — including split_residual — preserve
-    // identity invariants throughout the session lifecycle. Generates
-    // random Renew / Checkpoint(byte) / SplitResidual sequences and
-    // verifies that tenant(), worker(), and shard_key() never change,
-    // all operations succeed, and complete() succeeds.
+    // identity invariants throughout the session lifecycle.
+    //
+    // Generates random Renew / Checkpoint(byte) / SplitResidual sequences
+    // and verifies that:
+    // - `tenant()`, `worker()`, and `shard_key()` never change (identity stability)
+    // - All valid operations succeed (no spurious errors)
+    // - `complete()` succeeds at the end (session terminates cleanly)
+    //
+    // The weight distribution (2:5:1) biases toward checkpoints (the
+    // most common real-world operation) while still exercising renew
+    // and the tricky split_residual path.
     proptest! {
         #![proptest_config(miri_proptest_config())]
 
@@ -1237,5 +1311,34 @@ mod tests {
             }
             // If range too narrow for any valid cursor, session is dropped.
         }
+    }
+
+    // -- capacity hint tests --
+
+    /// After acquiring one of two shards, the session's capacity hint
+    /// shows the remaining shard as available.
+    #[test]
+    fn session_capacity_updated_on_renew() {
+        let (mut coord, keys) = setup_coordinator(2);
+        let mut session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+        // 2 shards total, 1 just acquired ⇒ 1 available.
+        assert_eq!(session.capacity().available_count, 1);
+        assert!(!session.capacity().is_saturated());
+
+        // Renew — capacity hint is refreshed.
+        let _ = session.renew(now(10)).unwrap();
+        assert_eq!(session.capacity().available_count, 1);
+    }
+
+    /// With a single shard, after acquiring it the session sees 0 available.
+    #[test]
+    fn session_capacity_zero_when_all_leased() {
+        let (mut coord, keys) = setup_coordinator(1);
+        let session =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+        assert_eq!(session.capacity().available_count, 0);
+        assert!(session.capacity().is_saturated());
+        assert!(session.capacity().earliest_deadline.is_some());
     }
 }

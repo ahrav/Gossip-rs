@@ -1,15 +1,66 @@
 //! Error types, result types, and idempotent outcome wrapper for
 //! the coordination protocol.
 //!
-//! Error types are operation-specific newtypes over a shared `CoordError`
-//! enum. Callers get precise error matching (e.g., `CheckpointError` can't
-//! produce `AlreadyLeased`). The tradeoff is boilerplate `From` impls,
-//! which are finite and mechanical.
+//! ## Architecture
+//!
+//! [`CoordError`] is the shared building block. Each coordination operation
+//! has a dedicated error type ([`CheckpointError`], [`CompleteError`], etc.)
+//! that accepts only the [`CoordError`] variants semantically valid for that
+//! operation. This gives callers precise `match` arms: a [`CheckpointError`]
+//! can never produce `AlreadyLeased`, and a [`RenewError`] can never produce
+//! `OpIdConflict`.
+//!
+//! The tradeoff is boilerplate `From<CoordError>` impls -- one per operation
+//! error type -- which are finite and mechanical.
+//!
+//! ## Compile-Time Exhaustiveness
 //!
 //! The `From<CoordError>` impls enumerate all rejected variants explicitly
 //! rather than using a wildcard `_` catch-all. This means adding a new
 //! `CoordError` variant triggers a compile error in every `From` impl,
 //! forcing a conscious decision about where the new variant maps.
+//!
+//! All error enums are `#[non_exhaustive]` so that adding variants is a
+//! non-breaking change for downstream crate consumers who match on them.
+//!
+//! ## Variant Routing Matrix
+//!
+//! Each operation error type accepts a subset of `CoordError` variants via
+//! its `From<CoordError>` impl. Rejected variants panic at `unreachable!()`.
+//!
+//! | `CoordError` variant   | Renew | Checkpoint | Complete | Park | Split |
+//! |------------------------|:-----:|:----------:|:--------:|:----:|:-----:|
+//! | `ShardNotFound`        |  yes  |    yes     |   yes    | yes  |  yes  |
+//! | `TenantMismatch`       |  yes  |    yes     |   yes    | yes  |  yes  |
+//! | `StaleFence`           |  yes  |    yes     |   yes    | yes  |  yes  |
+//! | `LeaseExpired`         |  yes  |    yes     |   yes    | yes  |  yes  |
+//! | `ShardTerminal`        |  yes  |    yes     |   yes    | yes  |  yes  |
+//! | `OpIdConflict`         |   --  |    yes     |   yes    | yes  |  yes  |
+//! | `CursorRegression`     |   --  |    yes     |   yes    |  --  |   --  |
+//! | `CursorOutOfBounds`    |   --  |    yes     |   yes    |  --  |   --  |
+//! | `SplitInvalid`         |   --  |     --     |    --    |  --  |  yes  |
+//! | `CheckpointMissingKey` |   --  |    yes     |   yes    |  --  |   --  |
+//!
+//! [`AcquireError`] is not in the table because it has **no**
+//! `From<CoordError>` impl. It defines its own variants directly
+//! (`ShardNotFound`, `TenantMismatch`, `ShardTerminal`, `AlreadyLeased`)
+//! because acquire does not require a pre-existing lease and therefore
+//! cannot produce `StaleFence` or `LeaseExpired`.
+//!
+//! ## Security: Debug and Display Redaction
+//!
+//! Custom `Debug` and `Display` impls on error types redact sensitive
+//! fields to prevent information leakage in logs and error messages:
+//!
+//! - **`OpIdConflict`**: hash values are redacted in `Debug` and omitted
+//!   from `Display` (prevents oracle attacks on payload hashing).
+//! - **`AlreadyLeased`**: `current_owner` (worker identity) is redacted
+//!   in both `Debug` and `Display`.
+//! - **`CursorRegression` / `CursorOutOfBounds`**: raw key bytes are
+//!   replaced with byte-length summaries (prevents data exfiltration).
+//! - **`TenantMismatch`**: only the caller's `expected` tenant is shown;
+//!   the record's actual tenant is deliberately omitted to prevent
+//!   cross-tenant enumeration.
 //!
 //! ## OpId CSPRNG Requirement
 //!
@@ -112,7 +163,7 @@ pub enum CoordError {
     /// Cursor bounds violation: the cursor's `last_key` falls outside
     /// the shard's key range.
     ///
-    /// Boxed to keep `CoordError` at ~40 bytes instead of ~64.
+    /// Boxed to keep `CoordError` at ≤ 48 bytes (compile-time checked).
     ///
     /// Cursor bounds checking is a hard safety invariant.
     CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
@@ -120,7 +171,7 @@ pub enum CoordError {
     /// Split validation failed. Wraps the detailed error from
     /// `validate_split_coverage` / `validate_residual_split`.
     ///
-    /// Boxed to keep `CoordError` at ~40 bytes instead of ~64.
+    /// Boxed to keep `CoordError` at ≤ 48 bytes (compile-time checked).
     SplitInvalid(Box<SplitValidationError>),
 
     /// Checkpoint requires a `last_key` but the provided cursor has none.
@@ -129,11 +180,19 @@ pub enum CoordError {
 
 /// Detail payload for [`CoordError::CursorOutOfBounds`].
 ///
-/// Boxed to keep the `CoordError` enum at ~40 bytes instead of ~64.
+/// Captures the three values needed for a diagnostic message: the cursor
+/// key that violated bounds and the shard spec's `[start, end)` range.
+/// Boxed in `CoordError` to keep the enum at ~40 bytes.
+///
+/// `Debug` is manually implemented to show byte lengths rather than raw
+/// key bytes, matching the redaction policy for cursor data.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CursorOutOfBoundsDetail {
+    /// The cursor key that fell outside the shard's range.
     pub last_key: Box<[u8]>,
+    /// Inclusive lower bound of the shard's key range.
     pub spec_start: Box<[u8]>,
+    /// Exclusive upper bound of the shard's key range.
     pub spec_end: Box<[u8]>,
 }
 
@@ -338,20 +397,21 @@ impl std::error::Error for AcquireError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RenewError {
-    ShardNotFound {
-        shard: ShardKey,
-    },
-    TenantMismatch {
-        expected: TenantId,
-    },
+    /// See [`CoordError::ShardNotFound`].
+    ShardNotFound { shard: ShardKey },
+    /// See [`CoordError::TenantMismatch`].
+    TenantMismatch { expected: TenantId },
+    /// See [`CoordError::StaleFence`].
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
+    /// See [`CoordError::LeaseExpired`].
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
+    /// See [`CoordError::ShardTerminal`].
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
@@ -394,33 +454,37 @@ impl std::error::Error for RenewError {}
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CheckpointError {
-    ShardNotFound {
-        shard: ShardKey,
-    },
-    TenantMismatch {
-        expected: TenantId,
-    },
+    /// See [`CoordError::ShardNotFound`].
+    ShardNotFound { shard: ShardKey },
+    /// See [`CoordError::TenantMismatch`].
+    TenantMismatch { expected: TenantId },
+    /// See [`CoordError::StaleFence`].
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
+    /// See [`CoordError::LeaseExpired`].
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
+    /// See [`CoordError::ShardTerminal`].
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
+    /// See [`CoordError::OpIdConflict`].
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
         actual_hash: u64,
     },
+    /// See [`CoordError::CursorRegression`].
     CursorRegression {
         old_key: Option<Box<[u8]>>,
         new_key: Option<Box<[u8]>>,
     },
+    /// See [`CoordError::CursorOutOfBounds`].
     CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
     /// The checkpoint cursor did not contain a `last_key`, which is required
     /// to track scan progress.
@@ -522,33 +586,37 @@ impl std::error::Error for CheckpointError {}
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CompleteError {
-    ShardNotFound {
-        shard: ShardKey,
-    },
-    TenantMismatch {
-        expected: TenantId,
-    },
+    /// See [`CoordError::ShardNotFound`].
+    ShardNotFound { shard: ShardKey },
+    /// See [`CoordError::TenantMismatch`].
+    TenantMismatch { expected: TenantId },
+    /// See [`CoordError::StaleFence`].
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
+    /// See [`CoordError::LeaseExpired`].
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
+    /// See [`CoordError::ShardTerminal`].
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
+    /// See [`CoordError::OpIdConflict`].
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
         actual_hash: u64,
     },
+    /// See [`CoordError::CursorRegression`].
     CursorRegression {
         old_key: Option<Box<[u8]>>,
         new_key: Option<Box<[u8]>>,
     },
+    /// See [`CoordError::CursorOutOfBounds`].
     CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
     /// Complete requires a final cursor with a `last_key` to confirm
     /// the worker reached the end of its assigned range.
@@ -648,24 +716,26 @@ impl std::error::Error for CompleteError {}
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ParkError {
-    ShardNotFound {
-        shard: ShardKey,
-    },
-    TenantMismatch {
-        expected: TenantId,
-    },
+    /// See [`CoordError::ShardNotFound`].
+    ShardNotFound { shard: ShardKey },
+    /// See [`CoordError::TenantMismatch`].
+    TenantMismatch { expected: TenantId },
+    /// See [`CoordError::StaleFence`].
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
+    /// See [`CoordError::LeaseExpired`].
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
+    /// See [`CoordError::ShardTerminal`].
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
+    /// See [`CoordError::OpIdConflict`].
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
@@ -746,29 +816,32 @@ impl std::error::Error for ParkError {}
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SplitError {
-    ShardNotFound {
-        shard: ShardKey,
-    },
-    TenantMismatch {
-        expected: TenantId,
-    },
+    /// See [`CoordError::ShardNotFound`].
+    ShardNotFound { shard: ShardKey },
+    /// See [`CoordError::TenantMismatch`].
+    TenantMismatch { expected: TenantId },
+    /// See [`CoordError::StaleFence`].
     StaleFence {
         presented: FenceEpoch,
         current: FenceEpoch,
     },
+    /// See [`CoordError::LeaseExpired`].
     LeaseExpired {
         deadline: LogicalTime,
         now: LogicalTime,
     },
+    /// See [`CoordError::ShardTerminal`].
     ShardTerminal {
         shard: ShardKey,
         status: ShardStatus,
     },
+    /// See [`CoordError::OpIdConflict`].
     OpIdConflict {
         op_id: OpId,
         expected_hash: u64,
         actual_hash: u64,
     },
+    /// See [`CoordError::SplitInvalid`].
     SplitInvalid(Box<SplitValidationError>),
 }
 
@@ -809,10 +882,16 @@ impl fmt::Debug for SplitError {
     }
 }
 
-/// Backward-compatible alias for `split_replace` callers.
+/// Semantic alias: `split_replace` returns this type.
+///
+/// Both split operations share the same error surface, so this is
+/// a type alias rather than a distinct enum.
 pub type SplitReplaceError = SplitError;
 
-/// Backward-compatible alias for `split_residual` callers.
+/// Semantic alias: `split_residual` returns this type.
+///
+/// Both split operations share the same error surface, so this is
+/// a type alias rather than a distinct enum.
 pub type SplitResidualError = SplitError;
 
 impl fmt::Display for SplitError {
@@ -1009,6 +1088,58 @@ impl From<CoordError> for RenewError {
 }
 
 // ============================================================================
+// CapacityHint
+// ============================================================================
+
+/// Advisory capacity information piggybacked on acquire/renew results.
+///
+/// Represents the post-operation state: how many shards are available
+/// for acquisition in the run after the operation completed.  Workers
+/// may use this to inform backoff decisions (e.g., backing off when
+/// `available_count` is zero, scheduling retry near `earliest_deadline`).
+///
+/// This is fail-open advisory metadata — it does not affect correctness.
+/// The hint is a point-in-time snapshot that may be stale by the time
+/// the caller reads it.  Workers MUST NOT rely on these values for
+/// safety-critical decisions.
+///
+/// Reference: Breakwater (Cho et al., OSDI 2020) — credit piggybacking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "capacity hint should inform backoff/retry decisions"]
+pub struct CapacityHint {
+    /// Number of active, unleased shards in the run at operation time.
+    pub available_count: u32,
+    /// Earliest lease deadline among all active leased shards.  `None`
+    /// when no active shards are currently leased — either because all
+    /// active shards are available (unleased), or because no active shards
+    /// exist in the run (all terminal or run has no shards).  Callers can
+    /// check `available_count` to distinguish the two cases.
+    pub earliest_deadline: Option<LogicalTime>,
+}
+
+impl CapacityHint {
+    /// Sentinel returned when capacity cannot be determined (e.g., the
+    /// run has no registered shards yet).  `is_saturated()` returns
+    /// `true` but `earliest_deadline` is `None`, meaning there is
+    /// no lease to wait on.
+    pub const ZERO: Self = Self {
+        available_count: 0,
+        earliest_deadline: None,
+    };
+
+    /// Whether all active shards in the run are currently claimed.
+    #[inline]
+    pub const fn is_saturated(self) -> bool {
+        self.available_count == 0
+    }
+}
+
+// Compile-time size assertion: CapacityHint is embedded in AcquireResult
+// and RenewResult which live on hot-path Result<T, E> return types. Keeping
+// it at or below 24 bytes avoids inflating those Result enums.
+const _: () = assert!(core::mem::size_of::<CapacityHint>() <= 24);
+
+// ============================================================================
 // Operation result types
 // ============================================================================
 
@@ -1025,6 +1156,7 @@ impl From<CoordError> for RenewError {
 pub struct AcquireResult {
     pub lease: Lease,
     pub snapshot: ShardSnapshot,
+    pub capacity: CapacityHint,
 }
 
 /// Result of a successful `renew` operation.
@@ -1035,11 +1167,22 @@ pub struct AcquireResult {
 #[must_use = "renew result contains the new deadline"]
 pub struct RenewResult {
     pub new_deadline: LogicalTime,
+    pub capacity: CapacityHint,
 }
 
-// Note: Checkpoint, Complete, and Park return `()` on success (via the
-// IdempotentOutcome wrapper). SplitReplace and SplitResidual return
-// their respective result types from the split module.
+// Compile-time size assertions: these types live on hot-path return types.
+// RenewResult is Copy (two scalars + CapacityHint), so should stay compact.
+// AcquireResult contains heap-backed ShardSnapshot, so its inline size is
+// larger but still bounded by pointer-width fields.
+const _: () = assert!(core::mem::size_of::<RenewResult>() <= 32);
+const _: () = assert!(core::mem::size_of::<AcquireResult>() <= 224);
+
+// Checkpoint, Complete, and Park return `IdempotentOutcome<()>` on
+// success (the operation either executed or was replayed, with no
+// meaningful return value beyond that distinction). SplitReplace and
+// SplitResidual return `IdempotentOutcome<SplitReplaceResult>` and
+// `IdempotentOutcome<SplitResidualResult>` respectively, carrying
+// the newly created child shard identifiers.
 
 // ============================================================================
 // IdempotentOutcome
@@ -1048,8 +1191,11 @@ pub struct RenewResult {
 /// The outcome of an idempotent operation: either freshly executed or
 /// replayed from the op-log.
 ///
-/// Callers generally don't need to distinguish -- the result is the same.
-/// The distinction is useful for observability (metrics, logging).
+/// Callers generally don't need to distinguish -- the result is the same
+/// either way. Use [`into_inner`](Self::into_inner) to discard the
+/// execution-path metadata. The `Executed` vs `Replayed` distinction
+/// exists for observability: metrics can track retry rates, and logging
+/// can flag unexpected replay storms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "idempotent outcome should be inspected"]
@@ -1101,8 +1247,11 @@ impl<T> AsRef<T> for IdempotentOutcome<T> {
     }
 }
 
-// Compile-time size assertion to prevent future regressions.
-// 48 bytes allows room for alignment; actual size is ~40 bytes.
+// Compile-time size assertion: CoordError is returned in Result<T, E>
+// on every coordination call path. The 48-byte ceiling (with ~40 bytes
+// actual) is maintained by boxing the large payloads (CursorOutOfBounds,
+// SplitInvalid). Exceeding this budget inflates every Result that wraps
+// an operation-specific error type (which embeds the same variants).
 #[cfg(test)]
 const _: () = {
     assert!(std::mem::size_of::<CoordError>() <= 48);

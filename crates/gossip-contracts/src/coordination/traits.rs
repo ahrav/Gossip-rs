@@ -128,7 +128,8 @@ pub trait CoordinationBackend {
     /// 6. Set `lease_owner = worker`, `lease_deadline = now + lease_duration`.
     ///    `lease_duration` is a backend configuration parameter, not a
     ///    per-call argument.
-    /// 7. Return `(Lease, ShardSnapshot)`.
+    /// 7. Return `AcquireResult`: the lease, shard snapshot, and a
+    ///    `CapacityHint` reflecting post-acquisition shard availability.
     ///
     /// ## Idempotency
     ///
@@ -147,6 +148,8 @@ pub trait CoordinationBackend {
     /// **Safety**: The returned `Lease.fence` matches the record's new epoch.
     /// **Safety**: The returned snapshot reflects the record's state at
     /// acquisition time (after epoch bump, before any worker mutations).
+    /// **Capacity**: The `capacity` field in the result reflects the run's
+    /// available-shard count computed *after* this operation completes.
     fn acquire_and_restore(
         &mut self,
         now: LogicalTime,
@@ -165,7 +168,10 @@ pub trait CoordinationBackend {
     ///
     /// 1. Validate lease (tenant, fence epoch, not expired at `now`).
     /// 2. Set `lease_deadline = now + lease_duration`.
-    /// 3. Return the new deadline.
+    /// 3. Return `RenewResult`: the new deadline and a `CapacityHint`
+    ///    reflecting current shard availability. Production backends may
+    ///    cache or approximate the capacity hint rather than recomputing
+    ///    on every renewal.
     ///
     /// ## Idempotency
     ///
@@ -178,6 +184,8 @@ pub trait CoordinationBackend {
     /// **Safety**: The fence epoch does not change on renewal.
     /// **Safety**: The lease owner does not change on renewal.
     /// **Liveness**: The new deadline is strictly after `now`.
+    /// **Capacity**: The `capacity` field in the result reflects the run's
+    /// available-shard count computed *after* this operation completes.
     fn renew(
         &mut self,
         now: LogicalTime,

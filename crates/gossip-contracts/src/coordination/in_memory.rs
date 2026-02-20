@@ -75,8 +75,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{
-    AcquireError, AcquireResult, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
-    RenewError, RenewResult, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireResult, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome,
+    ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
@@ -107,8 +107,9 @@ use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, Wor
 use gossip_stdx::RingBuffer;
 
 /// aHash-backed `HashMap` — faster hashing than the std default
-/// (`SipHasher13`) for point lookups. aHash provides hash-flooding
-/// resistance via per-instance random keys (uses AES-NI where available).
+/// (`DefaultHasher`, which uses SipHash-1-3) for point lookups. aHash
+/// provides hash-flooding resistance via per-instance random keys
+/// (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
 /// In-memory coordinator for shard-level operations.
@@ -303,6 +304,11 @@ impl InMemoryCoordinator {
     }
 
     /// Insert a shard record, maintaining `total_shard_count`.
+    ///
+    /// If a record already exists at `(tenant, key)`, it is replaced and
+    /// the count is unchanged (upsert semantics).  This is intentional:
+    /// the remove-mutate-restore pattern in split operations removes a
+    /// parent, then re-inserts the mutated parent at the same key.
     fn shard_insert(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
         let inner = self.shards.entry(tenant).or_default();
         if inner.insert(key, record).is_none() {
@@ -312,7 +318,10 @@ impl InMemoryCoordinator {
     }
 
     /// Remove a shard record, maintaining `total_shard_count`.
-    /// Returns the removed record, or `None` if not found.
+    ///
+    /// Returns the removed record, or `None` if the key was not present.
+    /// Uses `checked_sub` for the decrement — an underflow would indicate
+    /// the counter drifted from the map contents, which is always a bug.
     fn shard_remove(&mut self, tenant: &TenantId, key: &ShardKey) -> Option<ShardRecord> {
         let inner = self.shards.get_mut(tenant)?;
         let removed = inner.remove(key);
@@ -395,11 +404,18 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// Attempt to acquire exclusive ownership of a shard and return its last
     /// checkpointed state so the worker can resume processing.
     ///
-    /// The protocol enforces the following invariants, checked in order:
-    ///   1. **Tenant isolation** — a request for the wrong tenant is
-    ///      rejected before any internal state is revealed.
+    /// The two-level map (`TenantId → ShardKey → ShardRecord`) structurally
+    /// provides tenant isolation: a lookup with the wrong tenant misses at
+    /// the outer map and returns `ShardNotFound` without revealing any
+    /// internal state. After the record is found, the following checks are
+    /// performed in order:
+    ///   1. **Tenant isolation (defense-in-depth)** — `record.tenant` must
+    ///      match the request's tenant. This catches internal consistency
+    ///      bugs where the record's tenant field disagrees with its map key.
     ///   2. **Shard liveness** — only `Active` shards can be acquired;
-    ///      non-Active states (Done, Split, Parked) are refused.
+    ///      non-Active states (Done, Split, Parked) return `ShardTerminal`.
+    ///      Note: `Parked` shards can be resumed via [`RunManagement::unpark_shard`] but
+    ///      are not acquirable until unparked.
     ///   3. **At-most-once lease** — if another worker still holds a valid
     ///      lease the call fails rather than preempting, preserving the
     ///      at-most-once processing guarantee within a lease window.
@@ -459,11 +475,16 @@ impl CoordinationBackend for InMemoryCoordinator {
             .unwrap_or(LogicalTime::from_raw(u64::MAX));
         record.lease = Some(LeaseHolder::new(worker, deadline));
 
-        // 6) Return the fencing lease + shard snapshot.
+        // 6) Return the fencing lease + shard snapshot + capacity hint.
         let lease = Lease::new(tenant, key.run(), key.shard(), worker, new_fence, deadline);
         let snapshot = record.snapshot(); // asserts invariants internally
+        let capacity = self.count_available_for_run(now, tenant, key.run());
         // TODO(events): emit ShardAcquired
-        Ok(AcquireResult { lease, snapshot })
+        Ok(AcquireResult {
+            lease,
+            snapshot,
+            capacity,
+        })
     }
 
     /// Extend an existing lease by resetting its deadline.
@@ -471,6 +492,10 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// Validates tenant isolation, fence epoch, and lease ownership via
     /// [`validate_lease`], then writes a fresh deadline. Returns the new
     /// deadline on success.
+    ///
+    /// **Complexity**: Computing the capacity hint adds an O(S) scan over the
+    /// run's shards, where S is the total shard count. Production backends
+    /// should maintain a running counter for O(1) capacity hints.
     fn renew(
         &mut self,
         now: LogicalTime,
@@ -493,8 +518,10 @@ impl CoordinationBackend for InMemoryCoordinator {
         record.lease = Some(LeaseHolder::new(lease.owner(), deadline));
 
         record.assert_invariants();
+        let capacity = self.count_available_for_run(now, tenant, key.run());
         Ok(RenewResult {
             new_deadline: deadline,
+            capacity,
         })
     }
 
@@ -809,6 +836,19 @@ impl CoordinationBackend for InMemoryCoordinator {
 // ============================================================================
 // split_replace helpers
 // ============================================================================
+//
+// These are extracted as free functions (not methods on `InMemoryCoordinator`)
+// for two reasons:
+//
+// 1. **Borrow splitting** — `split_replace` temporarily removes the parent
+//    from `self.shards` and passes `&mut parent` into a closure.  Free
+//    functions that take `&ShardRecord` / `&mut ShardRecord` avoid borrowing
+//    `self`, which would conflict with the closure's `&mut self` captures
+//    (needed for `shard_insert`, `index_shard`, etc.).
+//
+// 2. **Purity** — validation and record construction are pure computations
+//    over their arguments.  Keeping them free of `self` makes this explicit
+//    and simplifies unit testing (no coordinator setup required).
 
 /// Validate split_replace preconditions: coverage and spawn-cap.
 ///
@@ -845,6 +885,9 @@ fn split_replace_validate_preconditions<'a>(
 fn split_replace_sort_children(plan: &SplitReplacePlan) -> Vec<&SplitReplaceChild> {
     let mut sorted: Vec<&SplitReplaceChild> = plan.children().iter().collect();
     sorted.sort_by(|a, b| a.spec().key_range_start().cmp(b.spec().key_range_start()));
+    // Defense-in-depth: `SplitReplacePlan::try_new` already enforces >= 2
+    // children at construction time, but this assertion guards against
+    // future refactors that might bypass the constructor.
     assert!(sorted.len() >= 2, "split_replace requires >= 2 children");
     sorted
 }
@@ -884,7 +927,11 @@ fn split_replace_replay_child_ids(
         .collect()
 }
 
-/// A shard map entry: the HashMap key and the record to insert.
+/// A pending shard map insertion: `((tenant, shard_key), record)`.
+///
+/// Used by `split_replace_build_children` to batch-construct child entries
+/// before inserting them into the coordinator's two-level map.  The tuple
+/// mirrors `shard_insert`'s `(TenantId, ShardKey, ShardRecord)` signature.
 type ShardMapEntry = ((TenantId, ShardKey), ShardRecord);
 
 /// Derive child IDs and build child `ShardRecord`s (pure — no map mutation).
@@ -971,6 +1018,12 @@ fn split_replace_apply_parent(
 // ============================================================================
 // split_residual helpers
 // ============================================================================
+//
+// Extracted as free functions for the same borrow-splitting and purity
+// reasons as the split_replace helpers above.  Additionally,
+// `split_residual_check_replay` encapsulates the two-tier replay
+// detection logic (op-log + spawned probe) which is specific to
+// residual splits and would clutter the main method body.
 
 /// Search `parent.spawned` for a residual derived from the given `op_id`.
 ///
@@ -1189,6 +1242,11 @@ fn split_residual_apply_parent(
 // ============================================================================
 // Run-level helpers
 // ============================================================================
+//
+// Shared infrastructure for run lifecycle operations (create, register,
+// complete, fail, cancel) and the run→shard secondary index.  These are
+// methods on `InMemoryCoordinator` (not free functions) because they need
+// access to `self.runs`, `self.run_shards`, and `self.shards`.
 
 impl InMemoryCoordinator {
     /// Register a shard in the run→shards secondary index.
@@ -1253,6 +1311,81 @@ impl InMemoryCoordinator {
         record.assert_invariants();
     }
 
+    /// Count available shards and find the earliest lease deadline for a run.
+    ///
+    /// O(S) where S = shards in run.  The reference in-memory backend
+    /// accepts this cost because [`list_shards`](Self::list_shards) and the
+    /// claiming loop already perform O(S) scans.  Production backends should
+    /// maintain a secondary counter or compute this from an index.
+    ///
+    /// The result is order-independent — iteration order of the `run_shards`
+    /// `HashSet` does not affect the output (sum and min are commutative).
+    ///
+    /// See also [`get_run_progress`](Self::get_run_progress) which performs a
+    /// similar iteration for run-level status reporting (different consumer,
+    /// different output shape).
+    fn count_available_for_run(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+    ) -> CapacityHint {
+        // A missing index entry means the run has no registered shards yet
+        // (e.g., still in `Initializing` status).  Return ZERO rather than
+        // panicking — the caller already validated the run exists via
+        // `lookup_run` or shard-level lookup.
+        let shard_ids = match self.run_shards.get(&(tenant, run)) {
+            Some(ids) => ids,
+            None => return CapacityHint::ZERO,
+        };
+
+        debug_assert!(
+            shard_ids.len() <= self.max_total_shards,
+            "run_shards index size {} exceeds max_total_shards {}",
+            shard_ids.len(),
+            self.max_total_shards,
+        );
+
+        let mut available_count: u32 = 0;
+        let mut earliest_deadline: Option<LogicalTime> = None;
+
+        for &shard_id in shard_ids {
+            let key = ShardKey::new(run, shard_id);
+            let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
+                panic!(
+                    "run_shards index contains shard {:?} for run {:?} \
+                     but no record exists in the primary shard map — \
+                     index desynchronization",
+                    shard_id, run,
+                )
+            });
+
+            if record.status != ShardStatus::Active {
+                continue;
+            }
+
+            if record.is_leased_at(now) {
+                let deadline = record
+                    .lease()
+                    .expect("is_leased_at returned true but lease is None")
+                    .deadline();
+                earliest_deadline = Some(match earliest_deadline {
+                    Some(prev) => core::cmp::min(prev, deadline),
+                    None => deadline,
+                });
+            } else {
+                available_count = available_count
+                    .checked_add(1)
+                    .expect("available_count overflow: more active unleased shards than u32::MAX");
+            }
+        }
+
+        CapacityHint {
+            available_count,
+            earliest_deadline,
+        }
+    }
+
     /// Look up a run record with tenant isolation enforcement.
     ///
     /// Shared precondition helper for read-only run queries (`get_run`,
@@ -1273,6 +1406,12 @@ impl InMemoryCoordinator {
 // ============================================================================
 // RunManagement implementation
 // ============================================================================
+//
+// Run lifecycle follows a two-phase pattern: `create_run` (Initializing) →
+// `register_shards` (Active) → terminal (`complete_run`, `fail_run`, or
+// `cancel_run`).  The three terminal transitions share a common validation
+// sequence (lookup → tenant → idempotency → terminal check → status check)
+// and delegate to `apply_terminal_run_transition` for the actual mutation.
 
 impl RunManagement for InMemoryCoordinator {
     /// Create a new run in `Initializing` status with no shards.
@@ -1423,10 +1562,14 @@ impl RunManagement for InMemoryCoordinator {
             .extend(shard_ids.iter().copied());
 
         // 7. Transition run → Active.
+        //
+        // Re-borrow mutably: the immutable borrow from step 1 (`self.runs.get`)
+        // was dropped before step 6's `self.shard_insert` calls.  We must look
+        // up again because `&mut self` was consumed by the intervening inserts.
         let record = self
             .runs
             .get_mut(&(tenant, run))
-            .expect("run record must exist: verified by lookup_run above");
+            .expect("run record must exist: verified by step 1 lookup");
         record.assert_transition_legal(RunStatus::Active);
         record.status = RunStatus::Active;
         record.root_shards = shard_ids.clone();
@@ -1457,8 +1600,9 @@ impl RunManagement for InMemoryCoordinator {
     /// Compute an aggregate progress snapshot for a run by iterating its
     /// shards and counting statuses and lease states.
     ///
-    /// The result is order-independent — shard iteration order does not
-    /// affect the returned [`RunProgress`].
+    /// The result is order-independent — `count_shard` accumulates via
+    /// addition, which is commutative.  This is important because
+    /// `run_shards` is a `HashSet` with non-deterministic iteration order.
     fn get_run_progress(
         &self,
         now: LogicalTime,
@@ -1488,6 +1632,15 @@ impl RunManagement for InMemoryCoordinator {
 
     /// Return summaries for shards in a run that match `filter`, sorted
     /// by `key_range_start` for deterministic output.
+    ///
+    /// Sort tie-breaking: when two shards share the same `key_range_start`
+    /// (possible after split operations that create zero-width residuals),
+    /// the secondary sort key is `shard` ID for stable ordering.
+    ///
+    /// Applies `filter.matches_record()` *before* constructing
+    /// [`ShardSummary`], which avoids heap-allocating cloned key ranges
+    /// for shards that will be discarded. This matters when a run has
+    /// many terminal shards and the caller only wants active ones.
     fn list_shards(
         &self,
         now: LogicalTime,
@@ -1715,6 +1868,13 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         // Idempotency via shard op-log.
+        //
+        // `unpark_shard` lives on `RunManagement` (not `CoordinationBackend`)
+        // and uses `UnparkError` (not a `CoordError`-derived type).  The
+        // `map_err` below manually routes `CoordError::OpIdConflict` to
+        // `UnparkError::OpIdConflict`.  All other `CoordError` variants are
+        // listed exhaustively (no wildcard `_`) so that adding a new variant
+        // triggers a compile error here, forcing a conscious routing decision.
         if check_op_idempotency(record, op_id, payload_hash)
             .map_err(|e| match e {
                 crate::coordination::error::CoordError::OpIdConflict {
@@ -1726,9 +1886,6 @@ impl RunManagement for InMemoryCoordinator {
                     expected_hash,
                     actual_hash,
                 }),
-                // check_op_idempotency only returns OpIdConflict.
-                // Exhaustive listing ensures the compiler forces updates
-                // if new CoordError variants are added.
                 crate::coordination::error::CoordError::ShardNotFound { .. }
                 | crate::coordination::error::CoordError::TenantMismatch { .. }
                 | crate::coordination::error::CoordError::StaleFence { .. }
@@ -1789,6 +1946,13 @@ impl RunManagement for InMemoryCoordinator {
 /// as first-class verification infrastructure — not gated behind `#[cfg(test)]`
 /// alone, but also available via the `test-support` feature for integration
 /// harnesses.
+///
+/// `ShardIter` uses `Box<dyn Iterator>` because the concrete type is a
+/// nested `FlatMap` over two levels of `AHashMap` iterators — unnameable
+/// without `impl Trait` in associated type position (TAIT), which is not
+/// yet stable in trait impls. The boxing cost is negligible: this iterator
+/// is only used by the simulation checker after each step, not on any hot
+/// path.
 #[cfg(any(test, feature = "test-support"))]
 impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
     type ShardIter<'a> = Box<dyn Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)> + 'a>;

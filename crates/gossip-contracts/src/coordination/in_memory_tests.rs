@@ -3240,3 +3240,258 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// Capacity hint tests
+// ============================================================================
+
+/// Helper: create a coordinator with `n` shards in a single run.
+fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
+    use crate::coordination::test_fixtures::test_run_config as run_config;
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let tenant = test_tenant();
+    let run = test_run();
+    coord.create_run(now(1), tenant, run, run_config()).unwrap();
+    let shards: Vec<InitialShard> = (0..n)
+        .map(|i| {
+            let start = vec![i as u8];
+            let end = vec![(i + 1) as u8];
+            InitialShard::new(
+                ShardId::from_raw(i as u64),
+                ShardSpec::with_range(start, end),
+                Cursor::initial(),
+            )
+        })
+        .collect();
+    let _ = coord
+        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+        .unwrap();
+    coord
+}
+
+/// Acquire 3 shards sequentially; capacity hint decrements each time.
+#[test]
+fn acquire_capacity_hint_reflects_remaining() {
+    let mut coord = multi_shard_coordinator(3);
+    let tenant = test_tenant();
+    let run = test_run();
+
+    let r0 = coord
+        .acquire_and_restore(
+            now(2),
+            tenant,
+            ShardKey::new(run, ShardId::from_raw(0)),
+            test_worker(1),
+        )
+        .unwrap();
+    assert_eq!(r0.capacity.available_count, 2);
+    assert!(!r0.capacity.is_saturated());
+    assert!(r0.capacity.earliest_deadline.is_some());
+
+    let r1 = coord
+        .acquire_and_restore(
+            now(2),
+            tenant,
+            ShardKey::new(run, ShardId::from_raw(1)),
+            test_worker(2),
+        )
+        .unwrap();
+    assert_eq!(r1.capacity.available_count, 1);
+
+    let r2 = coord
+        .acquire_and_restore(
+            now(2),
+            tenant,
+            ShardKey::new(run, ShardId::from_raw(2)),
+            test_worker(3),
+        )
+        .unwrap();
+    assert_eq!(r2.capacity.available_count, 0);
+    assert!(r2.capacity.is_saturated());
+    // All leases granted at now(2) with LEASE_DURATION — earliest deadline
+    // is now(2 + LEASE_DURATION).
+    assert_eq!(r2.capacity.earliest_deadline, Some(now(2 + LEASE_DURATION)),);
+}
+
+/// Acquires shards at different times; earliest_deadline tracks the minimum.
+#[test]
+fn capacity_hint_earliest_deadline_is_minimum() {
+    let mut coord = multi_shard_coordinator(3);
+    let tenant = test_tenant();
+    let run = test_run();
+
+    // Acquire shard 0 at now(5) → deadline = 5 + LEASE_DURATION.
+    let r0 = coord
+        .acquire_and_restore(
+            now(5),
+            tenant,
+            ShardKey::new(run, ShardId::from_raw(0)),
+            test_worker(1),
+        )
+        .unwrap();
+    // Only shard 0 is leased; its deadline is the earliest (and only).
+    assert_eq!(r0.capacity.earliest_deadline, Some(now(5 + LEASE_DURATION)),);
+
+    // Acquire shard 1 at now(10) → deadline = 10 + LEASE_DURATION.
+    // Shard 0's deadline (105) < shard 1's deadline (110) — min is 105.
+    let r1 = coord
+        .acquire_and_restore(
+            now(10),
+            tenant,
+            ShardKey::new(run, ShardId::from_raw(1)),
+            test_worker(2),
+        )
+        .unwrap();
+    assert_eq!(
+        r1.capacity.earliest_deadline,
+        Some(now(5 + LEASE_DURATION)),
+        "earliest_deadline should be the minimum across all leased shards",
+    );
+
+    // Acquire shard 2 at now(2) → deadline = 2 + LEASE_DURATION.
+    // Now shard 2's deadline (102) < shard 0's (105) < shard 1's (110).
+    let r2 = coord
+        .acquire_and_restore(
+            now(2),
+            tenant,
+            ShardKey::new(run, ShardId::from_raw(2)),
+            test_worker(3),
+        )
+        .unwrap();
+    assert_eq!(
+        r2.capacity.earliest_deadline,
+        Some(now(2 + LEASE_DURATION)),
+        "earliest_deadline should update to the new minimum",
+    );
+    assert_eq!(r2.capacity.available_count, 0);
+}
+
+/// Renew returns a capacity hint reflecting current state.
+#[test]
+fn renew_capacity_hint_basic() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 3, 1);
+
+    let result = coord.renew(now(50), test_tenant(), &lease).unwrap();
+    assert_eq!(result.capacity.available_count, 0);
+    // After renewal the deadline is now(50) + LEASE_DURATION.
+    assert_eq!(
+        result.capacity.earliest_deadline,
+        Some(now(50 + LEASE_DURATION)),
+    );
+}
+
+/// After a lease expires, re-acquiring sees the freed shard.
+#[test]
+fn capacity_hint_after_lease_expiry() {
+    let mut coord = seeded_coordinator();
+    let _lease = acquire_shard(&mut coord, 3, 1);
+
+    // Lease deadline = 3 + 100 = 103. At now(104), lease expired.
+    let r = coord
+        .acquire_and_restore(now(104), test_tenant(), test_key(), test_worker(2))
+        .unwrap();
+    // Just acquired the only shard — 0 available remain.
+    assert_eq!(r.capacity.available_count, 0);
+}
+
+/// Terminal (completed) shards are excluded from the capacity count.
+#[test]
+fn capacity_hint_excludes_terminal_shards() {
+    let mut coord = multi_shard_coordinator(2);
+    let tenant = test_tenant();
+    let run = test_run();
+
+    // Acquire shard 0 and complete it.
+    let key0 = ShardKey::new(run, ShardId::from_raw(0));
+    let r0 = coord
+        .acquire_and_restore(now(2), tenant, key0, test_worker(1))
+        .unwrap();
+    let _ = coord
+        .complete(
+            now(3),
+            tenant,
+            &r0.lease,
+            Cursor::with_last_key(vec![0]),
+            OpId::from_raw(200),
+        )
+        .unwrap();
+
+    // Acquire shard 1 — shard 0 is terminal and not counted.
+    let key1 = ShardKey::new(run, ShardId::from_raw(1));
+    let r1 = coord
+        .acquire_and_restore(now(4), tenant, key1, test_worker(2))
+        .unwrap();
+    assert_eq!(r1.capacity.available_count, 0);
+    assert!(r1.capacity.earliest_deadline.is_some());
+}
+
+/// Parked shards are terminal and excluded from the available capacity count.
+#[test]
+fn capacity_hint_excludes_parked_shards() {
+    let mut coord = multi_shard_coordinator(2);
+    let tenant = test_tenant();
+    let run = test_run();
+
+    // Acquire shard 0 and park it.
+    let key0 = ShardKey::new(run, ShardId::from_raw(0));
+    let r0 = coord
+        .acquire_and_restore(now(2), tenant, key0, test_worker(1))
+        .unwrap();
+    let _ = coord
+        .park_shard(
+            now(3),
+            tenant,
+            &r0.lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(100),
+        )
+        .unwrap();
+
+    // Acquire shard 1 — shard 0 is Parked (terminal), so the only active
+    // shard is shard 1 which we just acquired. Available count = 0.
+    let key1 = ShardKey::new(run, ShardId::from_raw(1));
+    let r1 = coord
+        .acquire_and_restore(now(4), tenant, key1, test_worker(2))
+        .unwrap();
+    assert_eq!(r1.capacity.available_count, 0);
+    assert!(r1.capacity.is_saturated());
+    // Shard 0 is parked, shard 1 is leased — earliest deadline reflects shard 1.
+    assert!(r1.capacity.earliest_deadline.is_some());
+}
+
+/// Capacity hint at the exact deadline boundary (half-open interval).
+#[test]
+fn capacity_hint_at_deadline_boundary() {
+    let mut coord = seeded_coordinator();
+    let _lease = acquire_shard(&mut coord, 3, 1);
+
+    // Lease deadline = 3 + 100 = 103.
+    // At now(103): now < deadline is false ⇒ lease expired.
+    let r = coord
+        .acquire_and_restore(now(103), test_tenant(), test_key(), test_worker(2))
+        .unwrap();
+    assert_eq!(r.capacity.available_count, 0);
+}
+
+/// CapacityHint helper methods work correctly.
+#[test]
+fn capacity_hint_helpers() {
+    use crate::coordination::error::CapacityHint;
+
+    let saturated = CapacityHint {
+        available_count: 0,
+        earliest_deadline: Some(now(100)),
+    };
+    assert!(saturated.is_saturated());
+
+    let available = CapacityHint {
+        available_count: 3,
+        earliest_deadline: None,
+    };
+    assert!(!available.is_saturated());
+
+    assert_eq!(CapacityHint::ZERO.available_count, 0);
+    assert_eq!(CapacityHint::ZERO.earliest_deadline, None);
+    assert!(CapacityHint::ZERO.is_saturated());
+}
