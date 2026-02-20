@@ -381,8 +381,13 @@ impl InvariantChecker {
             && current_status != prev
         {
             if prev == ShardStatus::Parked && current_status == ShardStatus::Active {
+                // Use `==` (not `<=`): a fence *regression* (current < old) is
+                // already caught by S2 (FenceMonotonicity). This check targets
+                // only the "unpark without bump" case where the epoch stayed the
+                // same. Using `<=` would double-report regressions as both S2
+                // and UnparkWithoutFenceBump.
                 if let Some(old_epoch) = prev_epoch
-                    && current_epoch <= old_epoch
+                    && current_epoch == old_epoch
                 {
                     violations.push(InvariantViolation::UnparkWithoutFenceBump {
                         run: id.1,
@@ -1007,6 +1012,53 @@ mod tests {
                 } if fence_at_park.as_raw() == 3 && fence_at_unpark.as_raw() == 3
             ),
             "expected UnparkWithoutFenceBump, got: {v:?}"
+        );
+    }
+
+    /// A fence regression during Parked→Active (epoch 5→3) must fire only S2
+    /// (FenceMonotonicity), not the S3 sub-property (UnparkWithoutFenceBump).
+    #[test]
+    fn fence_regression_during_unpark_does_not_double_report() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let now = LogicalTime::from_raw(1);
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Seed as Parked with fence epoch 5.
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .status(ShardStatus::Parked)
+                .park_reason(crate::coordination::record::ParkReason::Other)
+                .fence_epoch(FenceEpoch::from_raw(5))
+                .build(),
+        );
+        let mut checker = InvariantChecker::new();
+        assert!(checker.check_all(&coord, TENANT, now).is_empty());
+
+        // Re-seed as Active with LOWER fence epoch (regression: 5→3).
+        // S2 should fire (fence regression), but S3 sub-property
+        // (UnparkWithoutFenceBump) should NOT also fire for the same event.
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .fence_epoch(FenceEpoch::from_raw(3))
+                .build(),
+        );
+
+        let v = checker.check_all(&coord, TENANT, now);
+
+        let s2_count = v
+            .iter()
+            .filter(|v| matches!(v, InvariantViolation::FenceMonotonicity { .. }))
+            .count();
+        let s3_count = v
+            .iter()
+            .filter(|v| matches!(v, InvariantViolation::UnparkWithoutFenceBump { .. }))
+            .count();
+
+        assert_eq!(s2_count, 1, "S2 (FenceMonotonicity) should fire");
+        assert_eq!(
+            s3_count, 0,
+            "S3 sub (UnparkWithoutFenceBump) should NOT also fire for fence regression"
         );
     }
 
