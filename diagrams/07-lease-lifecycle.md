@@ -92,8 +92,9 @@ with move and borrow semantics that enforce the shard lifecycle at compile time:
   the cached `CapacityHint` from the `RenewResult`.
 - **Accessors** (`lease`, `cursor`, `spec`, `capacity`) take `&self` — read-only
   access to cached state. `capacity()` returns the `CapacityHint` from the last
-  acquire or renew; it is NOT updated by `checkpoint`, `complete`, `park`, or
-  `split` operations.
+  acquire or renew. `checkpoint` and `split_residual` do not refresh the
+  cached hint; terminal operations (`complete`, `park`, `split_replace`)
+  consume the session, so there is no cache to update.
 - **No Drop implementation** — if a session is dropped without a terminal op, the
   lease simply expires at its deadline, and the shard becomes available for re-acquisition.
 
@@ -385,9 +386,10 @@ Key design properties:
   No new protocol messages, no polling loop.
 - **Compact.** `CapacityHint` is ≤ 24 bytes (compile-time enforced) to avoid
   inflating the hot-path `Result` enums.
-- **Updated only on acquire and renew.** `checkpoint`, `complete`, `park`, and
-  `split` operations do not update the cached hint in `WorkerSession`. This
-  avoids unnecessary computation on the highest-frequency operation (checkpoint).
+- **Updated only on acquire and renew.** `checkpoint` and `split_residual` do
+  not refresh the cached hint in `WorkerSession`; terminal operations
+  (`complete`, `park`, `split_replace`) consume the session. This avoids
+  unnecessary computation on the highest-frequency operation (checkpoint).
 
 ### `CapacityHint` fields
 
@@ -437,6 +439,13 @@ sequenceDiagram
     CO-->>WS: Err(NoneAvailable { earliest_deadline })
     WS-->>W: Err — sleep until earliest_deadline
 ```
+
+The sequence above shows the **facade-level view**: `WorkerSession` delegates to
+`claim_next_available` (in `facade.rs`), which internally retries
+`acquire_and_restore` across candidate shards. The coordinator's
+`acquire_and_restore` returns `AcquireError::AlreadyLeased` for individual
+shards; the facade absorbs these and surfaces `ClaimError::NoneAvailable` when
+all candidates are exhausted.
 
 ### `count_available_for_run()` algorithm
 
@@ -494,15 +503,32 @@ flowchart TD
 
 When `claim_next_available` (the facade function in `facade.rs`) exhausts all
 candidates, it returns `ClaimError::NoneAvailable { earliest_deadline }`. The
-`earliest_deadline` is the minimum lease expiry observed across all
-`AlreadyLeased` rejections during the claiming scan. Workers use this to
-schedule their next claim attempt: sleeping until roughly `earliest_deadline`
-avoids busy-spinning on a fully-leased run while still reacting promptly when
-a shard becomes available.
+`earliest_deadline` value comes from one of two paths:
+
+1. **Primary path — candidates exist but all are leased.** The facade iterates
+   candidate shards and calls `acquire_and_restore` on each. Every
+   `AcquireError::AlreadyLeased` rejection carries the shard's current lease
+   deadline. The facade tracks the minimum across all rejections and surfaces it
+   as `earliest_deadline`.
+2. **Secondary fast path — no unleased candidates at all.** When the initial
+   candidate query returns zero shards, the facade falls back to
+   `list_shards(ShardFilter::active())` and computes the minimum
+   `lease_deadline()` across all active shards in the run. This avoids returning
+   `None` (which signals "no active leases, stop retrying") when shards do exist
+   but are all leased.
+
+Workers use `earliest_deadline` to schedule their next claim attempt: sleeping
+until roughly that time avoids busy-spinning on a fully-leased run while still
+reacting promptly when a shard becomes available.
 
 When `earliest_deadline` is `None`, no active leased shards were encountered --
 all shards are terminal or the run has no shards, so retrying is unlikely to help
 and the worker should exit.
+
+Note: the `earliest_deadline` in `ClaimError::NoneAvailable` is computed by the
+facade's claiming scan (tracking `AlreadyLeased` rejections), not by
+`count_available_for_run()`. Both represent the soonest lease expiry in the run,
+but they are computed independently at different abstraction levels.
 
 ---
 
