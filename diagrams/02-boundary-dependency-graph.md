@@ -266,12 +266,12 @@ since both are Tier 0 and would still compile before anything else.
 
 | Topic | Diagram File |
 |-------|-------------|
-| System overview and five-boundary architecture | `diagrams/01-system-overview.md` |
-| Identity boundary deep-dive | `diagrams/03-identity.md` |
-| Shard algebra operations | `diagrams/04-shard-algebra.md` |
-| Coordination protocol | `diagrams/05-coordination.md` |
-| Connector lifecycle | `diagrams/06-connectors.md` |
-| Persistence guarantees | `diagrams/07-persistence.md` |
+| System overview and five-boundary architecture | [01-system-overview.md](01-system-overview.md) |
+| Identity boundary deep-dive | [03-id-derivation-dag.md](03-id-derivation-dag.md) |
+| Shard algebra operations | [12-split-operations.md](12-split-operations.md) |
+| Coordination protocol | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
+| Connector lifecycle | [09-circuit-breaker.md](09-circuit-breaker.md) |
+| Persistence guarantees | [08-pagecommit-typestate.md](08-pagecommit-typestate.md) |
 
 ## Source Code References
 
