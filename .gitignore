@@ -27,3 +27,6 @@ debug
 .bv/
 
 todos/*
+
+# TLC (TLA+ model checker) trace files
+*_TTrace_*.bin

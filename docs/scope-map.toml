@@ -1,0 +1,27 @@
+# Scope map: pairs design docs with the source directories they describe.
+# A file is "in scope" if its repo-relative path starts with `dir`.
+# Overlap is intentional — a file can be in scope of multiple docs.
+
+[[scopes]]
+doc = "docs/boundary-1-identity-spine.md"
+dir = "crates/gossip-contracts/src/identity/"
+
+[[scopes]]
+doc = "docs/boundary-2-coordination.md"
+dir = "crates/gossip-contracts/src/coordination/"
+
+[[scopes]]
+doc = "docs/simulation-harness.md"
+dir = "crates/gossip-contracts/src/sim/"
+
+[[scopes]]
+doc = "docs/coordination-testing.md"
+dir = "crates/gossip-contracts/src/coordination/"
+
+[[scopes]]
+doc = "docs/coordination-testing.md"
+dir = "crates/gossip-contracts/src/sim/"
+
+[[scopes]]
+doc = "specs/coordination/README.md"
+dir = "specs/coordination/"

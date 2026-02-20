@@ -421,6 +421,13 @@ Every mutation path calls `ShardRecord::assert_invariants()` before returning.
 INV-9 is O(n^2) where n <= 16 (at most 120 comparisons) -- dominated by
 the per-transition persistence cost.
 
+The core safety properties (mutual exclusion, zombie rejection, fence
+monotonicity, terminal irreversibility, split atomicity, and cursor
+monotonicity) are also verified exhaustively by the TLA+ model checker
+across all reachable states. See
+[specs/coordination/README.md](../specs/coordination/README.md) for the
+specification, property mapping, and instructions for running TLC.
+
 ### Operational guidance
 
 Invariant panics should be treated as critical bugs. Monitor for coordinator
@@ -677,3 +684,7 @@ remove-mutate-restore pattern.
 - Bacon, D. et al. "Spanner: Becoming a SQL System." SIGMOD 2017.
 - TigerBeetle. VOPR (Viewstamped Operation Replayer) deterministic
   simulation.
+- Lamport, L. *Specifying Systems: The TLA+ Language and Tools for Hardware
+  and Software Engineers.* Addison-Wesley, 2002.
+- Newcombe, C. et al. "How Amazon Web Services Uses Formal Methods."
+  Communications of the ACM 58(4), April 2015.
