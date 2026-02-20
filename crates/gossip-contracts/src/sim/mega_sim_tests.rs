@@ -361,6 +361,7 @@ fn stress_200_shards_stormy() {
     let seeds: Vec<u64> = (0..5).collect();
     let fault_level = FaultLevel::Stormy;
 
+    let mut saw_partial = false;
     for seed in seeds {
         let report = CoordinationSim::new(seed, fault_level)
             .with_workers_and_shards(8, 200)
@@ -374,7 +375,22 @@ fn stress_200_shards_stormy() {
              Violations: {:#?}",
             report.violations,
         );
+
+        if report
+            .event_counts
+            .contains_key(&SimEventKind::SessionLifecyclePartial)
+        {
+            saw_partial = true;
+        }
     }
+
+    // Stormy faults should cause at least one partial session lifecycle
+    // (lease expiry mid-session) across 5 seeds with 200 shards each.
+    assert!(
+        saw_partial,
+        "SessionLifecyclePartial never observed across 5 seeds under Stormy — \
+         fault injection may not be interrupting session lifecycles"
+    );
 }
 
 /// 4 workers, 20 shards under Radioactive faults -- designed to trigger
@@ -438,6 +454,35 @@ fn stress_split_cascade() {
         total_splits > 0,
         "no SplitReplaceOk events across {} seeds — split generation may be broken",
         seeds.len(),
+    );
+}
+
+/// Verify that the SplitResidualThenComplete session lifecycle path fires
+/// and produces child shards without invariant violations.
+///
+/// The session lifecycle terminal action is chosen uniformly in `[0, 10)`:
+/// `SplitResidualThenComplete` fires on roll == 2 (10% probability). With
+/// ~80+ session lifecycle calls per 1K-op run, the probability of exercising
+/// this path at least once is approximately `1 - 0.9^80 ≈ 99.97%`.
+///
+/// Uses SunnyDay faults to maximize successful session completions, ensuring
+/// the split_residual→complete sequence runs to completion rather than being
+/// interrupted by lease expiry.
+#[test]
+fn split_residual_then_complete_exercised() {
+    let report = CoordinationSim::new(42, FaultLevel::SunnyDay)
+        .with_workers_and_shards(4, 15)
+        .run(1_000, 500);
+    assert!(
+        report.violations.is_empty(),
+        "safety violation: {:#?}",
+        report.violations
+    );
+    assert!(
+        report
+            .event_counts
+            .contains_key(&SimEventKind::SessionLifecycleOk),
+        "SessionLifecycleOk never observed — session lifecycle paths not exercised"
     );
 }
 
@@ -525,6 +570,13 @@ mod proptest_convergence {
     //!   the raw budget of SunnyDay (2_000), compensating for the ~10%
     //!   fault-induced rejection rate and a larger active shard set from
     //!   the longer safety phase.
+    //!
+    //! **Radioactive omission.** Radioactive fault pressure (~20% lease-expiry
+    //! rate, 100–500 tick time jumps) makes bounded convergence unreliable
+    //! within practical op budgets. Safety under Radioactive faults is covered
+    //! by `stress_split_cascade` (invariants S1–S7 verified); convergence
+    //! testing is limited to SunnyDay and Stormy, where liveness budgets are
+    //! tractable.
 
     use super::*;
     use crate::test_util::miri_proptest_config;
