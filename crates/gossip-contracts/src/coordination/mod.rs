@@ -61,8 +61,7 @@ pub use run::{
     hash_register_shards_payload, hash_unpark_payload, validate_manifest,
 };
 pub use run_errors::{
-    CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
-    RegisterShardsError, UnparkError,
+    CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 pub use session::WorkerSession;
 pub use shard_spec::{

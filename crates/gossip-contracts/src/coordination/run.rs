@@ -12,8 +12,7 @@ use crate::coordination::cursor::{Cursor, MAX_KEY_SIZE};
 use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
-    CancelRunError, CompleteRunError, CreateRunError, FailRunError, GetRunError,
-    RegisterShardsError, UnparkError,
+    CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::op_payload_hash;
@@ -1503,7 +1502,7 @@ pub trait RunManagement {
         tenant: TenantId,
         run: RunId,
         op_id: OpId,
-    ) -> Result<IdempotentOutcome<()>, CompleteRunError>;
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
 
     /// Mark run as Failed. Precondition: **Active only** (not Initializing).
     /// Use `cancel_run` for Initializing runs. Idempotent via `op_id`.
@@ -1513,7 +1512,7 @@ pub trait RunManagement {
         tenant: TenantId,
         run: RunId,
         op_id: OpId,
-    ) -> Result<IdempotentOutcome<()>, FailRunError>;
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
 
     /// Cancel run (sets Cancelled). Accepts Initializing OR Active.
     /// Idempotent via `op_id`.
@@ -1523,7 +1522,7 @@ pub trait RunManagement {
         tenant: TenantId,
         run: RunId,
         op_id: OpId,
-    ) -> Result<IdempotentOutcome<()>, CancelRunError>;
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
 
     /// Unpark a parked shard. Admin-only, NOT lease-gated.
     ///
