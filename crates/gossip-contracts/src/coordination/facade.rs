@@ -270,8 +270,10 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
         summaries.len(),
     );
 
-    // All candidates were claimed by other workers (or disappeared).
-    Err(ClaimError::NoneAvailable)
+    // All candidates were claimed by other workers, became terminal,
+    // or disappeared.  Surface the earliest deadline (if any) so
+    // callers can schedule a retry without busy-spinning.
+    Err(ClaimError::NoneAvailable { earliest_deadline })
 }
 
 // ============================================================================
