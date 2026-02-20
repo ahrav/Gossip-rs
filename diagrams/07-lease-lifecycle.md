@@ -60,18 +60,22 @@ sequenceDiagram
         CO->>CO: Generate new fencing token (increment)
         CO->>CO: Grant lease on Active shard
         CO->>CO: Set lease expiry time
+        CO->>CO: count_available_for_run() → CapacityHint
     end
 
     Note over CO: Fencing token generated atomically<br/>with state transition
 
-    CO-->>WS: AcquireResult { lease, snapshot }
-    WS-->>W: AcquireResult { lease, snapshot }
+    CO-->>WS: AcquireResult { lease, snapshot, capacity }
+    WS-->>W: AcquireResult { lease, snapshot, capacity }
 ```
 
 The `AcquireResult` returned to the worker contains everything it needs to begin
 scanning: the shard's key range (what to scan), the cursor position (where to
 resume if this is a re-acquisition after expiry), the fencing token (to
-authenticate all subsequent mutations), and the expiry time (when to renew by).
+authenticate all subsequent mutations), the expiry time (when to renew by), and
+a `CapacityHint` reflecting how many shards remain available in the run after
+this acquisition (see [Diagram 5](#diagram-5-credit-based-capacity-piggybacking)
+for the piggybacking design).
 
 Note that the fencing token is not a random value -- it is a monotonically
 increasing counter incremented on each new lease acquisition (INV-S11). This
@@ -84,9 +88,12 @@ with move and borrow semantics that enforce the shard lifecycle at compile time:
 - **Terminal ops** (`complete`, `park`, `split_replace`) consume `self` — the session
   cannot be used after a terminal transition (compile-time enforcement).
 - **Non-terminal ops** (`checkpoint`, `renew`, `split_residual`) take `&mut self` —
-  the session remains usable after these operations.
-- **Accessors** (`lease`, `cursor`, `spec`) take `&self` — read-only access to
-  cached state.
+  the session remains usable after these operations. `renew` additionally updates
+  the cached `CapacityHint` from the `RenewResult`.
+- **Accessors** (`lease`, `cursor`, `spec`, `capacity`) take `&self` — read-only
+  access to cached state. `capacity()` returns the `CapacityHint` from the last
+  acquire or renew; it is NOT updated by `checkpoint`, `complete`, `park`, or
+  `split` operations.
 - **No Drop implementation** — if a session is dropped without a terminal op, the
   lease simply expires at its deadline, and the shard becomes available for re-acquisition.
 
@@ -215,8 +222,8 @@ sequenceDiagram
     Note over W,BE: Phase 2: Claim
     W->>WS: acquire_and_restore(run_id, worker_id)
     WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
-    CO-->>WS: AcquireResult { lease, snapshot }
-    WS-->>W: AcquireResult { lease(token=42), snapshot }
+    CO-->>WS: AcquireResult { lease, snapshot, capacity }
+    WS-->>W: AcquireResult { lease(token=42), snapshot, capacity }
 
     Note over W,BE: Phase 3: Scan Loop
 
@@ -243,10 +250,10 @@ sequenceDiagram
     Note over W,BE: Phase 5: Claim next shard
     W->>WS: acquire_and_restore(run_id, worker_id)
     WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
-    CO-->>WS: Err(NoIdleShards)
-    WS-->>W: Err(NoIdleShards)
+    CO-->>WS: Err(NoneAvailable { earliest_deadline })
+    WS-->>W: Err(NoneAvailable { earliest_deadline })
 
-    Note over W: No more work — Worker exits
+    Note over W: No more work — sleep until earliest_deadline or exit
 ```
 
 The lifecycle has a clean five-phase structure:
@@ -256,7 +263,7 @@ The lifecycle has a clean five-phase structure:
    state is allocated yet.
 2. **Claim.** The session calls `acquire_and_restore` to find and claim an idle shard.
    If successful, the worker receives an `AcquireResult` containing the lease (with fencing
-   token, key range, cursor position, and expiry time) and a snapshot.
+   token, key range, cursor position, and expiry time), a snapshot, and a `CapacityHint`.
 3. **Scan.** The worker iterates through pages, advancing the cursor after each
    one. Every cursor advancement is fenced -- a stale token halts the worker
    immediately. The lease renewal heartbeat runs concurrently.
@@ -264,8 +271,9 @@ The lifecycle has a clean five-phase structure:
    completed. This is a terminal transition (the shard can never return to
    `Active`). The lease is released.
 5. **Next or exit.** The worker attempts to claim another shard. If none are
-   available (all shards are either leased or terminal), the worker exits
-   gracefully.
+   available, the claim returns `NoneAvailable { earliest_deadline }`. The worker
+   can sleep until `earliest_deadline` (the soonest lease expiry in the run) to
+   avoid busy-spinning, or exit gracefully if no active leases remain.
 
 The `WorkerSession` pattern ensures that if any phase fails unexpectedly (panic,
 network error, process crash), the shard's lease expires at its deadline and
