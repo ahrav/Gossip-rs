@@ -70,9 +70,17 @@ runs:
         components: ${{ inputs.components }}
         targets: ${{ inputs.targets }}
 
+    - name: Configure sccache startup timeout
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.config/sccache"
+        printf 'server_startup_timeout_ms = 30000\n' > "$HOME/.config/sccache/config"
+        echo "SCCACHE_CONF=$HOME/.config/sccache/config" >> "$GITHUB_ENV"
+
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@d651010b8da762cde178750d8eda7b5febfe147a # v0.0.9
       with:
+        version: "v0.14.0"
         token: ${{ inputs.github-token }}
 
     - name: Configure Rust cache

@@ -79,3 +79,10 @@ pub use split::{
 };
 pub use traits::CoordinationBackend;
 pub use validation::{check_op_idempotency, validate_cursor_update, validate_lease};
+
+#[cfg(test)]
+mod conformance_tests;
+#[cfg(test)]
+mod scenario_tests;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
