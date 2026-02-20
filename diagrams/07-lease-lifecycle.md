@@ -49,8 +49,8 @@ sequenceDiagram
     WS->>CO: acquire_and_restore(tenant, run_id, worker_id)
 
     alt No idle shards available
-        CO-->>WS: Err(NoIdleShards)
-        WS-->>W: Err(NoIdleShards)
+        CO-->>WS: Err(NoneAvailable { earliest_deadline })
+        WS-->>W: Err(NoneAvailable { earliest_deadline })
     end
 
     rect rgb(220, 252, 231)
