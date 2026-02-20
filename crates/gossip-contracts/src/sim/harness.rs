@@ -417,6 +417,9 @@ impl SimEvent {
 ///   then complete the narrowed parent -- exercises the `WorkerSession`
 ///   snapshot-rebuild path under simulation fault injection.
 ///
+/// See the `random_range(0u32..10)` match in `exec_session_lifecycle` for
+/// the authoritative weight table.
+///
 /// When the range is too narrow for splits, `SplitReplace` and
 /// `SplitResidualThenComplete` fall back to `Complete`, raising its
 /// effective rate to up to 80%.
@@ -522,7 +525,9 @@ type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Cursor, WorkerId, ShardK
 
 /// Validate worker preconditions and consume the next op-ID in one shot.
 ///
-/// Checks that `worker` exists, is not paused, holds a lease on `key`,
+/// Checks that `worker` exists and is not paused (both conditions return
+/// `WorkerPaused` — the harness registers all workers at init, so a missing
+/// worker is a harness bug, not an expected rejection), holds a lease on `key`,
 /// and advances its op-ID counter. Returns the lease and fresh op-ID on
 /// success, or a `Rejected` event on failure.
 ///
@@ -550,33 +555,51 @@ fn require_lease_and_op(
     Ok((lease, op_id))
 }
 
+/// Compute a random split midpoint in the half-open interval `[lo, hi)`.
+///
+/// Returns `None` when the interval is empty (`lo >= hi`).
+/// Used by the precompute functions (session lifecycle Phase 1) and
+/// `compute_split_byte` (standalone split ops) to eliminate the duplicated
+/// range-check + sample pattern.
+fn random_midpoint(rng: &mut ChaCha8Rng, lo: u8, hi: u8) -> Option<u8> {
+    if lo >= hi {
+        return None;
+    }
+    Some(rng.random_range(lo..hi))
+}
+
 /// Pre-compute a split-replace plan from the parent's key range.
 ///
 /// Chooses a random midpoint to divide the parent's `[range_lo, range_hi)`
 /// range into two children. Returns `None` when the range is too narrow for
 /// a valid split (fewer than 2 byte values between lo and hi).
 ///
-/// This mirrors the plan construction in [`CoordinationSim::exec_split_replace`]
-/// but operates on bare range bounds and an external RNG so it can run
-/// *before* the exclusive coordinator borrow in `exec_session_lifecycle`.
+/// This duplicates the plan construction logic from
+/// [`CoordinationSim::exec_split_replace`] — if that function's split-point
+/// selection changes, update this function to match. Operates on bare range
+/// bounds and an external RNG so it can run *before* the exclusive coordinator
+/// borrow in `exec_session_lifecycle`.
 fn precompute_split_replace_plan(
     rng: &mut ChaCha8Rng,
     range_lo: u8,
     range_hi: u8,
 ) -> Option<SplitReplacePlan> {
-    let lo_byte = range_lo + 1;
-    let hi_byte = range_hi;
-    if lo_byte >= hi_byte {
-        return None;
-    }
-    let mid = rng.random_range(lo_byte..hi_byte);
+    let mid = random_midpoint(rng, range_lo + 1, range_hi)?;
     let child_a = ShardSpec::with_range(vec![range_lo], vec![mid]);
     let child_b = ShardSpec::with_range(vec![mid], vec![range_hi]);
-    SplitReplacePlan::try_new(vec![
+    match SplitReplacePlan::try_new(vec![
         SplitReplaceChild::new(child_a, Cursor::initial()),
         SplitReplaceChild::new(child_b, Cursor::initial()),
-    ])
-    .ok()
+    ]) {
+        Ok(plan) => Some(plan),
+        Err(e) => {
+            debug_assert!(
+                false,
+                "precompute_split_replace_plan: validated range produced invalid plan: {e:?}"
+            );
+            None
+        }
+    }
 }
 
 /// Pre-compute a split-residual plan and a post-split completion cursor.
@@ -591,9 +614,11 @@ fn precompute_split_replace_plan(
 ///
 /// Returns `None` when the range is too narrow for a valid split.
 ///
-/// This mirrors the plan construction in [`CoordinationSim::exec_split_residual`]
-/// but operates on bare range bounds and an external RNG so it can run
-/// *before* the exclusive coordinator borrow in `exec_session_lifecycle`.
+/// This duplicates the plan construction logic from
+/// [`CoordinationSim::exec_split_residual`] — if that function's split-point
+/// selection changes, update this function to match. Operates on bare range
+/// bounds and an external RNG so it can run *before* the exclusive coordinator
+/// borrow in `exec_session_lifecycle`.
 fn precompute_split_residual_plan(
     rng: &mut ChaCha8Rng,
     range_lo: u8,
@@ -601,24 +626,28 @@ fn precompute_split_residual_plan(
     last_checkpoint_byte: u8,
 ) -> Option<(SplitResidualPlan, Cursor)> {
     let split_lo = last_checkpoint_byte.saturating_add(1).max(range_lo + 1);
-    let split_hi = range_hi;
-    if split_lo >= split_hi {
-        return None;
-    }
-    let mid = rng.random_range(split_lo..split_hi);
+    let mid = random_midpoint(rng, split_lo, range_hi)?;
     let new_parent = ShardSpec::with_range(vec![range_lo], vec![mid]);
     let residual = ShardSpec::with_range(vec![mid], vec![range_hi]);
-    SplitResidualPlan::try_new(new_parent, residual)
-        .ok()
-        .map(|plan| {
-            let complete_byte = if last_checkpoint_byte < mid.saturating_sub(1) {
-                rng.random_range(last_checkpoint_byte.saturating_add(1)..mid)
-            } else {
-                // Range is very tight — reuse the last checkpoint byte.
-                last_checkpoint_byte.min(mid.saturating_sub(1))
-            };
-            (plan, Cursor::with_last_key(vec![complete_byte]))
-        })
+    match SplitResidualPlan::try_new(new_parent, residual) {
+        Ok(plan) => Some(plan),
+        Err(e) => {
+            debug_assert!(
+                false,
+                "precompute_split_residual_plan: validated range produced invalid plan: {e:?}"
+            );
+            None
+        }
+    }
+    .map(|plan| {
+        let complete_byte = if last_checkpoint_byte < mid.saturating_sub(1) {
+            rng.random_range(last_checkpoint_byte.saturating_add(1)..mid)
+        } else {
+            // Range is very tight — reuse the last checkpoint byte.
+            last_checkpoint_byte.min(mid.saturating_sub(1))
+        };
+        (plan, Cursor::with_last_key(vec![complete_byte]))
+    })
 }
 
 /// Full deterministic simulation harness for the coordination protocol.
@@ -878,11 +907,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
     /// Remove a single shard key from `active_shard_keys`.
     ///
-    /// Uses `position` + `swap_remove` (O(n) scan, O(1) removal) instead of
-    /// `retain` (O(n) scan, O(n) shift). The position scan is unavoidable
-    /// because `active_shard_keys` is an unordered `Vec`, but the removal
-    /// itself is constant-time. Order does not matter because the only
-    /// consumer (`pick_random_shard_key`) accesses by random index.
+    /// Uses `position` + `swap_remove` instead of `retain`. Both scan the full
+    /// Vec, but `swap_remove` moves only one element (a swap) whereas `retain`
+    /// shifts all subsequent elements down by one. Order does not matter because
+    /// the only consumer (`pick_random_shard_key`) accesses by random index.
     fn remove_active_shard(&mut self, key: ShardKey) {
         if let Some(pos) = self.active_shard_keys.iter().position(|k| *k == key) {
             self.active_shard_keys.swap_remove(pos);
@@ -1193,14 +1221,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 kind: RejectionKind::SplitValidation,
             });
         }
-        let lo = start[0] + 1;
-        let hi = end[0];
-        if lo >= hi {
-            return Err(SimEvent::Rejected {
-                kind: RejectionKind::SplitValidation,
-            });
-        }
-        Ok(self.context.rng().random_range(lo..hi))
+        random_midpoint(self.context.rng(), start[0] + 1, end[0]).ok_or(SimEvent::Rejected {
+            kind: RejectionKind::SplitValidation,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -2095,41 +2118,6 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             split_children: Vec<ShardId>,
         }
 
-        impl SessionOutcome {
-            /// Build an outcome for a terminal action that produced no child shards.
-            fn terminal(
-                lease: Lease,
-                is_terminal: bool,
-                checkpoints_ok: u32,
-                checkpoints_rejected: u32,
-            ) -> Self {
-                Self {
-                    lease,
-                    is_terminal,
-                    checkpoints_ok,
-                    checkpoints_rejected,
-                    split_children: Vec::new(),
-                }
-            }
-
-            /// Build an outcome for a split action that produced child shards.
-            fn with_children(
-                lease: Lease,
-                is_terminal: bool,
-                checkpoints_ok: u32,
-                checkpoints_rejected: u32,
-                split_children: Vec<ShardId>,
-            ) -> Self {
-                Self {
-                    lease,
-                    is_terminal,
-                    checkpoints_ok,
-                    checkpoints_rejected,
-                    split_children,
-                }
-            }
-        }
-
         let now = self.context.now();
         let tenant = self.tenant;
 
@@ -2145,10 +2133,19 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             let mut checkpoints_ok: u32 = 0;
             let mut checkpoints_rejected: u32 = 0;
             for i in 0..num_checkpoints as usize {
-                if sess.checkpoint(now, cursors[i].clone(), op_ids[i]).is_ok() {
-                    checkpoints_ok += 1;
-                } else {
-                    checkpoints_rejected += 1;
+                match sess.checkpoint(now, cursors[i].clone(), op_ids[i]) {
+                    Ok(_) => checkpoints_ok += 1,
+                    Err(e) => {
+                        debug_assert!(
+                            !matches!(
+                                e,
+                                CheckpointError::TenantMismatch { .. }
+                                    | CheckpointError::ShardNotFound { .. }
+                            ),
+                            "session checkpoint hit impossible error: {e:?}"
+                        );
+                        checkpoints_rejected += 1;
+                    }
                 }
             }
 
@@ -2159,82 +2156,131 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     let is_terminal = sess
                         .park(now, ParkReason::Other, op_ids[terminal_idx])
                         .is_ok();
-                    Ok(SessionOutcome::terminal(
+                    Ok(SessionOutcome {
                         lease,
                         is_terminal,
                         checkpoints_ok,
                         checkpoints_rejected,
-                    ))
+                        split_children: Vec::new(),
+                    })
                 }
                 SessionTerminalAction::Complete => {
-                    let is_terminal = sess
-                        .complete(now, cursors[terminal_idx].clone(), op_ids[terminal_idx])
-                        .is_ok();
-                    Ok(SessionOutcome::terminal(
+                    let is_terminal = match sess.complete(
+                        now,
+                        cursors[terminal_idx].clone(),
+                        op_ids[terminal_idx],
+                    ) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug_assert!(
+                                !matches!(
+                                    e,
+                                    CompleteError::TenantMismatch { .. }
+                                        | CompleteError::ShardNotFound { .. }
+                                ),
+                                "session complete hit impossible error: {e:?}"
+                            );
+                            false
+                        }
+                    };
+                    Ok(SessionOutcome {
                         lease,
                         is_terminal,
                         checkpoints_ok,
                         checkpoints_rejected,
-                    ))
+                        split_children: Vec::new(),
+                    })
                 }
                 SessionTerminalAction::SplitReplace => {
-                    if let Some(plan) = split_replace_plan {
-                        match sess.split_replace(now, plan, op_ids[terminal_idx]) {
-                            Ok(outcome) => {
-                                let children = outcome.into_inner().children;
-                                Ok(SessionOutcome::with_children(
-                                    lease,
-                                    true,
-                                    checkpoints_ok,
-                                    checkpoints_rejected,
-                                    children,
-                                ))
-                            }
-                            Err(_) => Ok(SessionOutcome::terminal(
+                    let plan = split_replace_plan
+                        .expect("terminal_action normalized away SplitReplace without plan");
+                    match sess.split_replace(now, plan, op_ids[terminal_idx]) {
+                        Ok(outcome) => {
+                            let children = outcome.into_inner().children;
+                            Ok(SessionOutcome {
                                 lease,
-                                false,
+                                is_terminal: true,
                                 checkpoints_ok,
                                 checkpoints_rejected,
-                            )),
+                                split_children: children,
+                            })
                         }
-                    } else {
-                        unreachable!("terminal_action normalized away SplitReplace without plan")
+                        Err(e) => {
+                            debug_assert!(
+                                !matches!(
+                                    e,
+                                    SplitError::TenantMismatch { .. }
+                                        | SplitError::ShardNotFound { .. }
+                                ),
+                                "session split_replace hit impossible error: {e:?}"
+                            );
+                            Ok(SessionOutcome {
+                                lease,
+                                is_terminal: false,
+                                checkpoints_ok,
+                                checkpoints_rejected,
+                                split_children: Vec::new(),
+                            })
+                        }
                     }
                 }
                 SessionTerminalAction::SplitResidualThenComplete => {
-                    if let Some((plan, complete_cursor)) = split_residual_plan {
-                        // split_residual is non-terminal (&mut self) — session stays active.
-                        let split_ok = sess.split_residual(now, plan, op_ids[terminal_idx]).is_ok();
-                        if split_ok {
-                            // Extract the residual shard ID from the narrowed session.
-                            let residual_id = sess.initial_snapshot().spawned().last().copied();
-                            // Complete the (now-narrowed) parent.
-                            let complete_idx = terminal_idx + 1;
-                            let is_terminal = sess
-                                .complete(now, complete_cursor, op_ids[complete_idx])
-                                .is_ok();
-                            let children: Vec<ShardId> = residual_id.into_iter().collect();
-                            Ok(SessionOutcome::with_children(
-                                lease,
-                                is_terminal,
-                                checkpoints_ok,
-                                checkpoints_rejected,
-                                children,
-                            ))
-                        } else {
-                            // split_residual failed (e.g., lease expired) — session
-                            // is still alive but in an uncertain state. Drop it.
-                            Ok(SessionOutcome::terminal(
-                                lease,
-                                false,
-                                checkpoints_ok,
-                                checkpoints_rejected,
-                            ))
+                    let (plan, complete_cursor) = split_residual_plan.expect(
+                        "terminal_action normalized away SplitResidualThenComplete without plan",
+                    );
+                    // split_residual is non-terminal (&mut self) — session stays active.
+                    let split_ok = match sess.split_residual(now, plan, op_ids[terminal_idx]) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            debug_assert!(
+                                !matches!(
+                                    e,
+                                    SplitError::TenantMismatch { .. }
+                                        | SplitError::ShardNotFound { .. }
+                                ),
+                                "session split_residual hit impossible error: {e:?}"
+                            );
+                            false
                         }
+                    };
+                    if split_ok {
+                        // Extract the residual shard ID from the narrowed session.
+                        let residual_id = sess.initial_snapshot().spawned().last().copied();
+                        // Complete the (now-narrowed) parent.
+                        let complete_idx = terminal_idx + 1;
+                        let is_terminal =
+                            match sess.complete(now, complete_cursor, op_ids[complete_idx]) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    debug_assert!(
+                                        !matches!(
+                                            e,
+                                            CompleteError::TenantMismatch { .. }
+                                                | CompleteError::ShardNotFound { .. }
+                                        ),
+                                        "session complete hit impossible error: {e:?}"
+                                    );
+                                    false
+                                }
+                            };
+                        let children: Vec<ShardId> = residual_id.into_iter().collect();
+                        Ok(SessionOutcome {
+                            lease,
+                            is_terminal,
+                            checkpoints_ok,
+                            checkpoints_rejected,
+                            split_children: children,
+                        })
                     } else {
-                        unreachable!(
-                            "terminal_action normalized away SplitResidualThenComplete without plan"
-                        )
+                        // split_residual failed (e.g., lease expired) — session
+                        // is still alive but in an uncertain state. Drop it.
+                        Ok(SessionOutcome {
+                            lease,
+                            is_terminal: false,
+                            checkpoints_ok,
+                            checkpoints_rejected,
+                            split_children: Vec::new(),
+                        })
                     }
                 }
             }
