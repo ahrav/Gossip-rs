@@ -4,7 +4,7 @@
 //! shard lifecycle (`CoordinationBackend`), run management
 //! (`RunManagement`), **and** shard assignment (`ShardClaiming`).
 //! This module provides that bound as `CoordinationFacade`, plus a
-//! default shard-claiming algorithm that any backend gets for free.
+//! default shard-claiming algorithm available to all backends.
 //!
 //! ## Trait Hierarchy
 //!
@@ -15,15 +15,18 @@
 //!   └── ShardClaiming        (this file: shard assignment)
 //! ```
 //!
-//! `ShardClaiming` has a blanket impl for any `T: CoordinationBackend
-//! + RunManagement`. Its sole method, [`ShardClaiming::claim_next_available`],
-//! has a default body that composes `list_shards(available)` with
-//! `acquire_and_restore` in a retry loop.
+//! Backends must implement `ShardClaiming` explicitly. The trait
+//! provides a default method body that delegates to the free function
+//! [`default_claim_next_available`], so a one-line empty impl is
+//! sufficient for backends that need no custom claim logic:
 //!
-//! The blanket impl means individual backends cannot provide their own
-//! `ShardClaiming` impl (Rust coherence). To supply a custom claim
-//! strategy, the orchestration layer can call the free function
-//! `default_claim_next_available` and add optimized logic around it.
+//! ```rust,ignore
+//! impl ShardClaiming for MyBackend {}
+//! ```
+//!
+//! Backends that need custom behavior (e.g., per-worker claim
+//! cooldown) override `claim_next_available` and may delegate to
+//! `default_claim_next_available` internally.
 //!
 //! ## Design Rationale
 //!
@@ -37,8 +40,8 @@
 //! and acquire is safe (losers simply retry the next candidate).
 //!
 //! The default logic is also exposed as the free function
-//! [`default_claim_next_available`] so orchestration layers that
-//! implement a custom claim path can delegate to it as a fallback.
+//! [`default_claim_next_available`] so backends that override
+//! `claim_next_available` can delegate to it as a building block.
 
 use std::fmt;
 
@@ -100,6 +103,14 @@ pub enum ClaimError {
     /// Tenant isolation violation. Only `expected` is exposed to
     /// prevent cross-tenant information leakage.
     TenantMismatch { expected: TenantId },
+    /// The worker's claim cooldown has not elapsed since its last
+    /// successful acquisition. `retry_after` is the earliest logical
+    /// time at which the worker may next attempt a claim.
+    ///
+    /// Cooldown is per-worker (not per-run) to prevent a single worker
+    /// from flooding the coordinator across multiple runs. Only
+    /// successful claims trigger cooldown; failed claims do not.
+    Throttled { retry_after: LogicalTime },
 }
 
 impl fmt::Display for ClaimError {
@@ -117,6 +128,12 @@ impl fmt::Display for ClaimError {
             Self::RunNotFound => f.write_str("run not found"),
             Self::TenantMismatch { expected } => {
                 write!(f, "tenant mismatch (expected {expected:?})")
+            }
+            Self::Throttled { retry_after } => {
+                write!(
+                    f,
+                    "claim throttled: worker in cooldown (retry after {retry_after:?})"
+                )
             }
         }
     }
@@ -161,14 +178,17 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// 3. Start iteration at offset `worker.as_raw() % len` so that
 ///    different workers begin at different candidates, reducing
 ///    contention on the first shard. The offset is deterministic
-///    (no RNG) — the same worker always starts at the same position.
+///    (no RNG) — for a given candidate list length, the same worker
+///    always starts at the same position.
 ///    For each candidate, attempt `acquire_and_restore`.
 /// 4. On success, return the `AcquireResult` (lease, snapshot, capacity hint).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
 ///    `ShardNotFound`), skip that candidate and try the next.
 /// 6. On `TenantMismatch`, fail immediately -- this indicates a
 ///    logic bug, not a race.
-/// 7. If all candidates fail, return `NoneAvailable`.
+/// 7. If all candidates fail, return `NoneAvailable`. (If every
+///    candidate returned `ShardNotFound`, this indicates index
+///    corruption and the function panics instead.)
 ///
 /// ## Concurrency
 ///
@@ -178,7 +198,8 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// guarantees at-most-one winner per shard. Workers that lose the
 /// race simply advance to the next candidate. The worst case for a
 /// single worker is O(S) failed acquire attempts where S is the
-/// shard count, since it tries each candidate at most once.
+/// number of available shards, since it tries each candidate at
+/// most once.
 ///
 /// ## Parameters
 ///
@@ -305,16 +326,22 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
 /// shard to work on" operation. `ShardClaiming` composes the two into
 /// that higher-level primitive.
 ///
-/// ## Blanket implementation
+/// ## Implementation
 ///
-/// A blanket `impl<T: CoordinationBackend + RunManagement> ShardClaiming for T`
-/// means backends never implement this trait directly. Rust coherence
-/// rules prevent a concrete type from overriding the blanket impl.
-/// To supply a custom claim strategy, the orchestration layer should
-/// call [`default_claim_next_available`] as a fallback and add
-/// optimized logic (e.g. SQL `SKIP LOCKED`) around it.
+/// Backends must implement this trait explicitly. The default method
+/// body delegates to [`default_claim_next_available`], so a minimal
+/// impl needs no method bodies:
 ///
-/// ## Default vs Override
+/// ```rust,ignore
+/// impl ShardClaiming for MyBackend {}
+/// ```
+///
+/// Backends that need custom claim behavior (e.g., per-worker cooldown,
+/// SQL `SKIP LOCKED`, locality-aware selection) override
+/// [`claim_next_available`](Self::claim_next_available) and may
+/// delegate to [`default_claim_next_available`] internally.
+///
+/// ## Default Algorithm
 ///
 /// The default [`claim_next_available`](Self::claim_next_available)
 /// calls `list_shards(available)` then tries `acquire_and_restore` on
@@ -323,16 +350,7 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
 /// or giving up.
 ///
 /// The default already spreads contention by starting iteration at
-/// `worker.as_raw() % len` (deterministic per-worker offset). For
-/// higher contention, production deployments should consider:
-/// - **Atomic claim**: `SELECT ... FOR UPDATE SKIP LOCKED` (SQL) or
-///   a single FoundationDB transaction that atomically picks and
-///   leases a shard, avoiding the sequential scan entirely.
-/// - **Locality-aware**: prefer shards whose key range is near the
-///   worker's previously held shard, reducing cache churn.
-///
-/// These are **performance optimizations** -- they do not affect
-/// correctness. Any available shard is a valid choice.
+/// `worker.as_raw() % len` (deterministic per-worker offset).
 pub trait ShardClaiming: CoordinationBackend + RunManagement {
     /// Attempt to claim the next available shard for `run`.
     ///
@@ -342,10 +360,27 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
     /// [`CapacityHint`](crate::coordination::error::CapacityHint)
     /// indicating how many shards remain available.
     ///
-    /// The `Self: Sized` bound is required because the default body
-    /// passes `self` to the free function
-    /// [`default_claim_next_available`], which takes `&mut B` by
-    /// generic parameter.
+    /// ## Errors
+    ///
+    /// - [`ClaimError::NoneAvailable`] -- no shards to claim.
+    /// - [`ClaimError::RunNotFound`] -- the run does not exist.
+    /// - [`ClaimError::TenantMismatch`] -- tenant isolation violation.
+    /// - [`ClaimError::Throttled`] -- the worker's claim cooldown has
+    ///   not elapsed. Only returned by backends with per-worker rate
+    ///   limiting (e.g., [`InMemoryCoordinator`] with a non-zero
+    ///   cooldown interval). The default implementation never returns
+    ///   `Throttled`; backends that add rate limiting must override
+    ///   this method to enforce it before delegating.
+    ///
+    /// [`InMemoryCoordinator`]: crate::coordination::in_memory::InMemoryCoordinator
+    ///
+    /// ## `Self: Sized` bound
+    ///
+    /// Required because the default body passes `self` to the free
+    /// function [`default_claim_next_available`], which takes `&mut B`
+    /// by generic parameter. This means `claim_next_available` is
+    /// excluded from the vtable and cannot be called on `dyn
+    /// ShardClaiming`.
     fn claim_next_available(
         &mut self,
         now: LogicalTime,
@@ -360,11 +395,11 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
     }
 }
 
-// Blanket impl: every `T: CoordinationBackend + RunManagement`
-// automatically satisfies `ShardClaiming` with the default method.
-// This means backends only need to implement the two base traits to
-// get claiming behaviour.
-impl<T: CoordinationBackend + RunManagement> ShardClaiming for T {}
+// No blanket impl: backends must implement `ShardClaiming` explicitly.
+// The trait provides a default method body that delegates to
+// `default_claim_next_available`, so a one-line empty impl suffices
+// for backends with no custom claim logic. Backends that need custom
+// behavior (e.g., per-worker cooldown) override the method directly.
 
 // ============================================================================
 // CoordinationFacade — combined super-trait
@@ -375,11 +410,9 @@ impl<T: CoordinationBackend + RunManagement> ShardClaiming for T {}
 ///
 /// Callers that need the full coordination surface (typically the
 /// orchestrator and scheduler layers) constrain on this trait
-/// instead of listing three separate bounds. Because `ShardClaiming`
-/// and `CoordinationFacade` both have blanket impls, any concrete
-/// backend that implements `CoordinationBackend` and `RunManagement`
-/// automatically satisfies `CoordinationFacade` -- no additional
-/// code required.
+/// instead of listing three separate bounds. `CoordinationFacade`
+/// has a blanket impl, so any backend that implements all three
+/// component traits automatically satisfies it.
 ///
 /// ## Object safety
 ///
@@ -421,6 +454,8 @@ impl<T: CoordinationBackend + RunManagement + ShardClaiming> CoordinationFacade 
 // ============================================================================
 
 /// Tests verify the default claim algorithm against `InMemoryCoordinator`:
+///
+/// ## Core claim behavior
 /// - Happy path: claim succeeds and returns a valid lease.
 /// - Exhaustion: all shards leased -> `NoneAvailable`.
 /// - Race skip: already-leased shards are skipped, next candidate returned.
@@ -428,10 +463,24 @@ impl<T: CoordinationBackend + RunManagement + ShardClaiming> CoordinationFacade 
 /// - Sequential drain: N claims exhaust N shards; (N+1)th fails.
 /// - Lease expiry: expired leases free shards for re-claiming.
 /// - Terminal skip: completed shards are filtered by `ShardFilter::available`.
+/// - Earliest deadline: `NoneAvailable` reports soonest lease expiry.
+/// - Wrong tenant: cross-tenant claim rejected.
+///
+/// ## Trait composition and error conversion
 /// - Trait composition: `InMemoryCoordinator` satisfies `CoordinationFacade`.
 /// - Error conversion: `From<GetRunError>` maps both variants correctly.
-/// - Mixed states: Done + leased + available shards (property test).
-/// - Expired leases: re-claiming after lease timeout (property test).
+///
+/// ## Property tests
+/// - Mixed states: Done + leased + available shards.
+/// - Expired leases: re-claiming after lease timeout.
+///
+/// ## Claim cooldown
+/// - Single-worker timing (parameterized): throttled within window,
+///   succeeds at boundary, disabled with zero, retry_after value.
+/// - Failed claims do not trigger cooldown.
+/// - Cooldown is per-worker (not global).
+/// - `Throttled` display format.
+/// - Property: no successful claim within cooldown of previous success.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,25 +488,11 @@ mod tests {
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
     use crate::coordination::shard_spec::CursorSemantics;
+    use crate::coordination::test_fixtures::{now, test_run, test_tenant, test_worker};
     use crate::identity::{OpId, ShardId};
     use crate::test_util::miri_proptest_config;
     use proptest::prelude::*;
-
-    fn test_tenant() -> TenantId {
-        TenantId::from_bytes([0x01; 32])
-    }
-
-    fn test_run() -> RunId {
-        RunId::from_raw(1)
-    }
-
-    fn test_worker(id: u64) -> WorkerId {
-        WorkerId::from_raw(id)
-    }
-
-    fn now(t: u64) -> LogicalTime {
-        LogicalTime::from_raw(t)
-    }
+    use rstest::rstest;
 
     fn test_run_config() -> RunConfig {
         RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
@@ -808,6 +843,208 @@ mod tests {
             prop_assert!(result.is_ok(), "claim should succeed after lease expiry");
             let acq = result.unwrap();
             prop_assert_eq!(acq.lease.owner(), test_worker(888));
+        }
+    }
+
+    // ========================================================================
+    // Claim cooldown tests
+    // ========================================================================
+
+    /// Helper: set up a coordinator with cooldown enabled and `shard_count` shards.
+    fn setup_coordinator_with_cooldown(
+        shard_count: usize,
+        cooldown_interval: u64,
+    ) -> InMemoryCoordinator {
+        let mut coord =
+            InMemoryCoordinator::with_cooldown(30, 100_000, 1_000_000, cooldown_interval);
+        let tenant = test_tenant();
+        let run = test_run();
+        let config = test_run_config();
+
+        coord.create_run(now(1), tenant, run, config).unwrap();
+
+        let shards: Vec<InitialShard> = (0..shard_count)
+            .map(|i| {
+                let start = vec![i as u8];
+                let end = vec![(i + 1) as u8];
+                InitialShard::new(
+                    ShardId::from_raw(i as u64),
+                    crate::coordination::shard_spec::ShardSpec::with_range(start, end),
+                    Cursor::initial(),
+                )
+            })
+            .collect();
+
+        let _ = coord
+            .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+            .unwrap();
+
+        coord
+    }
+
+    /// Single-worker cooldown timing: after a successful claim at `first_t`,
+    /// a second claim at `second_t` is either throttled or succeeds depending
+    /// on whether `second_t >= first_t + cooldown`.
+    ///
+    /// `expect_throttled_until` is `Some(deadline)` when the second claim should
+    /// return `Throttled { retry_after: deadline }`, or `None` when it should
+    /// succeed.
+    #[rstest]
+    #[case::throttled_within_window(5, 3, 10, 11, Some(15))]
+    #[case::succeeds_at_boundary(5, 3, 10, 15, None)]
+    #[case::disabled_with_zero(0, 3, 10, 10, None)]
+    #[case::retry_after_tracks_interval(7, 3, 20, 25, Some(27))]
+    fn claim_cooldown_single_worker(
+        #[case] cooldown: u64,
+        #[case] shard_count: usize,
+        #[case] first_t: u64,
+        #[case] second_t: u64,
+        #[case] expect_throttled_until: Option<u64>,
+    ) {
+        let mut coord = if cooldown > 0 {
+            setup_coordinator_with_cooldown(shard_count, cooldown)
+        } else {
+            setup_coordinator(shard_count)
+        };
+        let tenant = test_tenant();
+        let run = test_run();
+        let worker = test_worker(1);
+
+        let r1 = coord.claim_next_available(now(first_t), tenant, run, worker);
+        assert!(r1.is_ok(), "first claim should succeed: {r1:?}");
+
+        let r2 = coord.claim_next_available(now(second_t), tenant, run, worker);
+        match expect_throttled_until {
+            Some(deadline) => {
+                assert!(
+                    matches!(r2, Err(ClaimError::Throttled { retry_after }) if retry_after == now(deadline)),
+                    "expected Throttled with retry_after={deadline}, got {r2:?}"
+                );
+            }
+            None => {
+                assert!(r2.is_ok(), "expected success, got {r2:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn claim_cooldown_not_triggered_on_failure() {
+        let mut coord = setup_coordinator_with_cooldown(1, 5);
+        let tenant = test_tenant();
+        let run = test_run();
+
+        // Worker 1 claims the only shard at now=10.
+        assert!(
+            coord
+                .claim_next_available(now(10), tenant, run, test_worker(1))
+                .is_ok()
+        );
+
+        // Worker 2 tries at now=10 — fails with NoneAvailable (not Throttled).
+        let r1 = coord.claim_next_available(now(10), tenant, run, test_worker(2));
+        assert!(
+            matches!(r1, Err(ClaimError::NoneAvailable { .. })),
+            "expected NoneAvailable, got {r1:?}"
+        );
+
+        // Worker 2 retries immediately at now=11 — still NoneAvailable, not Throttled.
+        let r2 = coord.claim_next_available(now(11), tenant, run, test_worker(2));
+        assert!(
+            matches!(r2, Err(ClaimError::NoneAvailable { .. })),
+            "failed claims should not trigger cooldown, got {r2:?}"
+        );
+    }
+
+    #[test]
+    fn claim_cooldown_per_worker_isolation() {
+        let mut coord = setup_coordinator_with_cooldown(3, 5);
+        let tenant = test_tenant();
+        let run = test_run();
+
+        // Worker 1 claims at now=10.
+        assert!(
+            coord
+                .claim_next_available(now(10), tenant, run, test_worker(1))
+                .is_ok()
+        );
+
+        // Worker 2 claims at now=11 — succeeds (not affected by worker 1's cooldown).
+        let r2 = coord.claim_next_available(now(11), tenant, run, test_worker(2));
+        assert!(
+            r2.is_ok(),
+            "worker 2 should not be affected by worker 1's cooldown, got {r2:?}"
+        );
+
+        // Worker 1 tries at now=12 — throttled.
+        let r3 = coord.claim_next_available(now(12), tenant, run, test_worker(1));
+        assert!(
+            matches!(r3, Err(ClaimError::Throttled { .. })),
+            "worker 1 should be throttled, got {r3:?}"
+        );
+    }
+
+    #[test]
+    fn claim_error_throttled_display() {
+        let err = ClaimError::Throttled {
+            retry_after: LogicalTime::from_raw(42),
+        };
+        let display = err.to_string();
+        assert!(
+            display.contains("throttled"),
+            "Display should mention 'throttled', got: {display}"
+        );
+        assert!(
+            display.contains("42"),
+            "Display should mention retry_after value, got: {display}"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(miri_proptest_config())]
+
+        /// Across random claim sequences, no successful claim occurs within
+        /// the cooldown window of the previous success for the same worker.
+        #[test]
+        fn claim_cooldown_invariant_holds(
+            cooldown_interval in 1u64..=20,
+            shard_count in 2usize..=6,
+            timestamps in proptest::collection::vec(1u64..=100, 2..15),
+        ) {
+            let mut coord = setup_coordinator_with_cooldown(shard_count, cooldown_interval);
+            let tenant = test_tenant();
+            let run = test_run();
+            let worker = test_worker(1);
+            let mut last_success: Option<u64> = None;
+
+            for &t in &timestamps {
+                let result = coord.claim_next_available(now(t), tenant, run, worker);
+                match result {
+                    Ok(_) => {
+                        if let Some(prev) = last_success {
+                            prop_assert!(
+                                t >= prev + cooldown_interval,
+                                "successful claim at t={t} within cooldown of prev={prev} + interval={cooldown_interval}"
+                            );
+                        }
+                        last_success = Some(t);
+                    }
+                    Err(ClaimError::Throttled { retry_after }) => {
+                        if let Some(prev) = last_success {
+                            prop_assert_eq!(
+                                retry_after,
+                                now(prev + cooldown_interval),
+                                "retry_after should be last_success + interval"
+                            );
+                        }
+                    }
+                    Err(ClaimError::NoneAvailable { .. }) => {
+                        // Exhausted shards — not a cooldown issue.
+                    }
+                    Err(other) => {
+                        prop_assert!(false, "unexpected error: {other:?}");
+                    }
+                }
+            }
         }
     }
 }

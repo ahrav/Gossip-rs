@@ -175,6 +175,8 @@ pub enum SimEvent {
     ClaimOk { shard: ShardId },
     /// No available shards for the run (all leased/terminal).
     ClaimNoneAvailable,
+    /// Worker's claim was throttled by per-worker cooldown.
+    ClaimThrottled,
     /// Operation was rejected by the coordinator or skipped due to precondition.
     Rejected { kind: RejectionKind },
     /// Logical clock advanced.
@@ -366,6 +368,7 @@ pub enum SimEventKind {
     ReplayedOk,
     ClaimOk,
     ClaimNoneAvailable,
+    ClaimThrottled,
     Rejected,
     TimeAdvanced,
     WorkerPaused,
@@ -389,6 +392,7 @@ impl SimEvent {
             SimEvent::ReplayedOk => SimEventKind::ReplayedOk,
             SimEvent::ClaimOk { .. } => SimEventKind::ClaimOk,
             SimEvent::ClaimNoneAvailable => SimEventKind::ClaimNoneAvailable,
+            SimEvent::ClaimThrottled => SimEventKind::ClaimThrottled,
             SimEvent::Rejected { .. } => SimEventKind::Rejected,
             SimEvent::TimeAdvanced { .. } => SimEventKind::TimeAdvanced,
             SimEvent::WorkerPaused { .. } => SimEventKind::WorkerPaused,
@@ -1564,6 +1568,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 SimEvent::ClaimOk { shard }
             }
             Err(ClaimError::NoneAvailable { .. }) => SimEvent::ClaimNoneAvailable,
+            Err(ClaimError::Throttled { .. }) => SimEvent::ClaimThrottled,
             Err(ClaimError::RunNotFound) => SimEvent::Rejected {
                 kind: RejectionKind::RunNotFound,
             },
@@ -1587,7 +1592,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// - renew (10%) keeps leases alive
     /// - complete (8%) and park (4%) are terminal (over-weighting starves coverage)
     /// - split_replace (4%) and split_residual (4%) exercise split paths
-    /// - replay/conflict (4%) exercise idempotency
+    /// - replay (2%) and conflict (2%) exercise idempotency
     /// - zombie (3%) exercises stale-fence rejection
     /// - claim_next (3%) exercises the list-then-acquire retry loop
     /// - session_lifecycle (8%) exercises WorkerSession wrapper end-to-end
@@ -1705,12 +1710,20 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .unwrap_or_default()
     }
 
+    /// Pick a random active worker and a random non-terminal shard for an acquire op.
+    ///
+    /// Unlike the `try_gen_held_shard_op` family, acquire targets any active
+    /// shard (not just one the worker already holds), modeling contention.
     fn try_gen_acquire(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         let key = self.pick_random_shard_key()?;
         Some(SimOp::Acquire { worker, key })
     }
 
+    /// Pick a random active worker for a claim-next op.
+    ///
+    /// No shard key is needed — `claim_next_available` discovers the shard
+    /// internally via the coordinator's run record.
     fn try_gen_claim_next(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         Some(SimOp::ClaimNext { worker })
@@ -1759,6 +1772,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         SimOp::AdvanceTime { ticks }
     }
 
+    /// Select a random active (non-paused) worker to pause.
     fn try_gen_pause(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         Some(SimOp::PauseWorker { worker })
@@ -1791,6 +1805,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         self.try_gen_held_shard_op(|worker, key| SimOp::SplitResidual { worker, key })
     }
 
+    /// Pick a random entry from the checkpoint history for idempotent replay.
+    ///
+    /// Returns `None` when no checkpoints have been recorded yet, which is
+    /// the expected early-simulation case before any checkpoint succeeds.
     fn try_gen_replay_checkpoint(&mut self) -> Option<SimOp> {
         if self.last_checkpoint_ops.is_empty() {
             return None;
@@ -1807,6 +1825,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         })
     }
 
+    /// Pick a random entry from the checkpoint history for conflict testing.
+    ///
+    /// Same selection logic as [`try_gen_replay_checkpoint`](Self::try_gen_replay_checkpoint);
+    /// the conflict (different payload, same OpId) is constructed at execution time.
     fn try_gen_conflict_checkpoint(&mut self) -> Option<SimOp> {
         if self.last_checkpoint_ops.is_empty() {
             return None;
@@ -1822,6 +1844,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         })
     }
 
+    /// Generate a zombie checkpoint op if stale leases are available.
     fn try_gen_zombie_checkpoint(&mut self) -> Option<SimOp> {
         if self.stale_leases.is_empty() {
             return None;
@@ -1829,6 +1852,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         Some(SimOp::ZombieCheckpoint)
     }
 
+    /// Pick a random active worker and a random non-terminal shard for a
+    /// full session lifecycle.
     fn try_gen_session_lifecycle(&mut self) -> Option<SimOp> {
         let worker = self.pick_random_active_worker()?;
         let key = self.pick_random_shard_key()?;
@@ -1977,7 +2002,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         *event_counts.entry(event.kind()).or_insert(0) += 1;
         all_violations.extend(violations);
 
-        // The checkpoint must have been rejected (either NotLeased or StaleFence).
+        // The checkpoint must have been rejected with NotLeased (B1 cleanup
+        // cleared Worker A's lease when Worker B acquired).
         assert!(
             matches!(event, SimEvent::Rejected { .. }),
             "zombie worker checkpoint should be rejected, got: {event:?}",

@@ -71,13 +71,14 @@
 //! target run — O(S) where S is the run's shard count. Acceptable here;
 //! production backends need a secondary available-shards index.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{
     AcquireError, AcquireResult, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome,
     ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
+use crate::coordination::facade::{ClaimError, ShardClaiming, default_claim_next_available};
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run::{
@@ -170,6 +171,19 @@ pub struct InMemoryCoordinator {
     /// Hard upper bound to prevent unbounded memory growth from
     /// split-flooding (CWE-400). Checked alongside `max_shards_per_tenant`.
     max_total_shards: usize,
+    /// Per-worker claim cooldown: worker -> last successful claim time.
+    ///
+    /// Uses `BTreeMap` (not `HashMap`) for deterministic `Debug` output,
+    /// which aids simulation debugging. Only accessed via point lookups
+    /// (`get`/`insert`). Grows at most one entry per distinct `WorkerId`
+    /// that successfully claims a shard.
+    claim_cooldowns: BTreeMap<WorkerId, LogicalTime>,
+    /// Minimum logical time units between successive successful claims
+    /// by the same worker. Zero disables cooldown entirely.
+    ///
+    /// Like `default_lease_duration`, this is a deployment-level
+    /// operational parameter, not a per-shard or per-run property.
+    claim_cooldown_interval: u64,
 }
 
 impl InMemoryCoordinator {
@@ -207,7 +221,33 @@ impl InMemoryCoordinator {
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
+            claim_cooldowns: BTreeMap::new(),
+            claim_cooldown_interval: 0,
         }
+    }
+
+    /// Create a coordinator with explicit shard limits and claim cooldown.
+    ///
+    /// `claim_cooldown_interval` is the minimum logical time units between
+    /// successive successful claims by the same worker. Zero disables
+    /// cooldown.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`with_limits`](Self::with_limits).
+    pub fn with_cooldown(
+        default_lease_duration: u64,
+        max_shards_per_tenant: usize,
+        max_total_shards: usize,
+        claim_cooldown_interval: u64,
+    ) -> Self {
+        let mut coord = Self::with_limits(
+            default_lease_duration,
+            max_shards_per_tenant,
+            max_total_shards,
+        );
+        coord.claim_cooldown_interval = claim_cooldown_interval;
+        coord
     }
 
     /// Seed a shard record directly (test/fixture helper).
@@ -1155,8 +1195,9 @@ fn split_residual_validate_preconditions(
 
 /// Verify the parent's cursor remains within the shrunk key range.
 ///
-/// After a residual split, the parent keeps the lower portion of the
-/// keyspace. If the cursor's `last_key` falls outside the new range,
+/// After a residual split, the parent keeps a subset of the original
+/// keyspace (typically a prefix, but the validation is position-agnostic).
+/// If the cursor's `last_key` falls outside the new range,
 /// the parent would violate cursor-bounds invariants (INV: `last_key ∈
 /// [spec.start, spec.end)`). This would strand progress — the worker
 /// could never advance past a key that's no longer in its range.
@@ -1249,10 +1290,12 @@ fn split_residual_apply_parent(
 // access to `self.runs`, `self.run_shards`, and `self.shards`.
 
 impl InMemoryCoordinator {
-    /// Register a shard in the run→shards secondary index.
+    /// Register a shard in the run-to-shards secondary index.
     ///
     /// This index enables `list_shards` and `get_run_progress` to enumerate
     /// a run's shards without scanning the entire tenant shard map.
+    /// Idempotent — `HashSet::insert` is a no-op if the shard is already
+    /// indexed, so calling this on both register and split paths is safe.
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
         self.run_shards
             .entry((tenant, run))
@@ -1262,7 +1305,10 @@ impl InMemoryCoordinator {
 
     /// Cross-validate the `run_shards` index against the primary `shards` map.
     ///
-    /// Every shard ID in the index must exist in the primary map.
+    /// Every shard ID in the index must exist in the primary map. Called after
+    /// split operations and `register_shards` to catch index desynchronization
+    /// (e.g., a shard inserted into the index but not into the primary map).
+    /// Compiled out in release builds (`#[cfg(debug_assertions)]`).
     #[cfg(debug_assertions)]
     fn debug_assert_run_shards_consistent(&self, tenant: TenantId, run: RunId) {
         if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
@@ -1288,8 +1334,9 @@ impl InMemoryCoordinator {
     /// checks (lookup, tenant, idempotency, terminal, wrong-status) before
     /// calling this helper.
     ///
-    /// Takes `&mut RunRecord` (not `&mut self`) because the caller already
-    /// holds a mutable borrow of the run record from `self.runs.get_mut`.
+    /// This is an associated function (takes `&mut RunRecord`, not `&mut self`)
+    /// because the caller already holds a mutable borrow from `self.runs.get_mut`.
+    /// An `&mut self` method would conflict with that outstanding borrow.
     fn apply_terminal_run_transition(
         record: &mut RunRecord,
         now: LogicalTime,
@@ -1412,6 +1459,10 @@ impl InMemoryCoordinator {
 // `cancel_run`).  The three terminal transitions share a common validation
 // sequence (lookup → tenant → idempotency → terminal check → status check)
 // and delegate to `apply_terminal_run_transition` for the actual mutation.
+//
+// Idempotency is checked before status in every idempotent path so that
+// replays succeed even after the run has since transitioned (e.g., a
+// `register_shards` replay after the run is already Active).
 
 impl RunManagement for InMemoryCoordinator {
     /// Create a new run in `Initializing` status with no shards.
@@ -1930,6 +1981,72 @@ impl RunManagement for InMemoryCoordinator {
         record.assert_invariants();
 
         Ok(IdempotentOutcome::Executed(()))
+    }
+}
+
+// ============================================================================
+// ShardClaiming — per-worker claim cooldown
+// ============================================================================
+
+impl ShardClaiming for InMemoryCoordinator {
+    /// Claim the next available shard with per-worker cooldown enforcement.
+    ///
+    /// Overrides the default [`ShardClaiming`] implementation to add a
+    /// cooldown gate: if the worker's last successful claim was less than
+    /// `claim_cooldown_interval` logical time units ago, the request is
+    /// rejected with [`ClaimError::Throttled`] *before* the O(S) candidate
+    /// scan. On success, the worker's cooldown timer is reset. Failed
+    /// claims (no shards available, run not found) do not trigger cooldown,
+    /// so a worker competing for scarce shards is never penalized for losing
+    /// a race.
+    fn claim_next_available(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        worker: WorkerId,
+    ) -> Result<AcquireResult, ClaimError> {
+        // Cooldown gate: O(1) rejection before the O(S) candidate scan.
+        if let Some(retry_after) = self.check_cooldown(worker, now) {
+            return Err(ClaimError::Throttled { retry_after });
+        }
+        let result = default_claim_next_available(self, now, tenant, run, worker)?;
+        self.record_claim(worker, now);
+        Ok(result)
+    }
+}
+
+impl InMemoryCoordinator {
+    /// Check whether `worker` is still in cooldown at time `now`.
+    ///
+    /// Returns `Some(retry_after)` if the worker must wait, `None` if
+    /// the worker may proceed. The boundary is exclusive: at exactly
+    /// `last_claim + interval`, the worker is allowed through (matches
+    /// the lease expiry convention where `now == deadline` means expired).
+    fn check_cooldown(&self, worker: WorkerId, now: LogicalTime) -> Option<LogicalTime> {
+        if self.claim_cooldown_interval == 0 {
+            return None;
+        }
+        let last_claim = self.claim_cooldowns.get(&worker)?;
+        let retry_after = last_claim
+            .checked_add(self.claim_cooldown_interval)
+            .unwrap_or(LogicalTime::from_raw(u64::MAX));
+        if now < retry_after {
+            Some(retry_after)
+        } else {
+            None
+        }
+    }
+
+    /// Record that `worker` successfully claimed a shard at time `now`.
+    ///
+    /// No-op when cooldown is disabled (`claim_cooldown_interval == 0`),
+    /// avoiding unbounded growth of `claim_cooldowns` in deployments
+    /// that don't use the feature.
+    fn record_claim(&mut self, worker: WorkerId, now: LogicalTime) {
+        if self.claim_cooldown_interval > 0 {
+            self.claim_cooldowns.insert(worker, now);
+        }
     }
 }
 
