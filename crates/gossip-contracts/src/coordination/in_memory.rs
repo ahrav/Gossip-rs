@@ -414,7 +414,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     ///      bugs where the record's tenant field disagrees with its map key.
     ///   2. **Shard liveness** — only `Active` shards can be acquired;
     ///      non-Active states (Done, Split, Parked) return `ShardTerminal`.
-    ///      Note: `Parked` shards can be resumed via [`unpark_shard`] but
+    ///      Note: `Parked` shards can be resumed via [`RunManagement::unpark_shard`] but
     ///      are not acquirable until unparked.
     ///   3. **At-most-once lease** — if another worker still holds a valid
     ///      lease the call fails rather than preempting, preserving the
