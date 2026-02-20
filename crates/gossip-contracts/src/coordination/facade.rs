@@ -1178,4 +1178,39 @@ mod tests {
             "at now=u64::MAX with saturated deadline, worker should pass cooldown gate, got {r2:?}"
         );
     }
+
+    /// Cooldown is enforced only in `claim_next_available`, not in direct
+    /// `acquire_and_restore` calls. This is intentional: cooldown gates the
+    /// high-level claiming facade, while direct acquire targets a known shard.
+    #[test]
+    fn cooldown_not_enforced_on_direct_acquire() {
+        let mut coord = setup_coordinator_with_cooldown(3, 10);
+        let tenant = test_tenant();
+        let run = test_run();
+        let worker = test_worker(1);
+
+        // Claim via facade at t=10 — puts worker in cooldown until t=20.
+        let _ = coord
+            .claim_next_available(now(10), tenant, run, worker)
+            .expect("first claim succeeds");
+
+        // Verify cooldown is active for the facade path.
+        assert!(
+            matches!(
+                coord.claim_next_available(now(12), tenant, run, worker),
+                Err(ClaimError::Throttled { .. })
+            ),
+            "facade path should be throttled"
+        );
+
+        // Direct acquire_and_restore on a different shard is NOT gated by cooldown.
+        // We created 3 shards (IDs 0..3); target shard 1 which wasn't claimed above.
+        let other_shard = ShardKey::new(run, ShardId::from_raw(1));
+        let direct = coord.acquire_and_restore(now(12), tenant, other_shard, worker);
+        // Should succeed or fail for shard-state reasons, never for cooldown.
+        assert!(
+            !matches!(direct, Err(ref e) if format!("{e:?}").contains("Throttled")),
+            "direct acquire must not enforce cooldown, got {direct:?}"
+        );
+    }
 }
