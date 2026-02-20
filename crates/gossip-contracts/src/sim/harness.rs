@@ -183,11 +183,20 @@ pub enum SimEvent {
     /// Operation could not be dispatched (e.g., unknown worker).
     Skipped,
     /// WorkerSession lifecycle completed (acquire → checkpoints → terminal).
-    SessionLifecycleOk,
+    ///
+    /// Carries checkpoint outcome counts so the report accurately reflects
+    /// checkpoint throughput during session lifecycles.
+    SessionLifecycleOk {
+        checkpoints_ok: u32,
+        checkpoints_rejected: u32,
+    },
     /// WorkerSession lifecycle completed with partial success — acquire succeeded but
     /// one or more checkpoints or the terminal operation failed. This is expected under
     /// fault injection (lease expiry mid-session) but must be visible for coverage analysis.
-    SessionLifecyclePartial,
+    SessionLifecyclePartial {
+        checkpoints_ok: u32,
+        checkpoints_rejected: u32,
+    },
 }
 
 /// Categorized rejection reason (no heap allocation).
@@ -368,8 +377,8 @@ impl SimEvent {
             SimEvent::WorkerPaused { .. } => SimEventKind::WorkerPaused,
             SimEvent::WorkerResumed { .. } => SimEventKind::WorkerResumed,
             SimEvent::Skipped => SimEventKind::Skipped,
-            SimEvent::SessionLifecycleOk => SimEventKind::SessionLifecycleOk,
-            SimEvent::SessionLifecyclePartial => SimEventKind::SessionLifecyclePartial,
+            SimEvent::SessionLifecycleOk { .. } => SimEventKind::SessionLifecycleOk,
+            SimEvent::SessionLifecyclePartial { .. } => SimEventKind::SessionLifecyclePartial,
         }
     }
 }
@@ -1821,7 +1830,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let now = self.context.now();
         let tenant = self.tenant;
 
-        let session_result: Result<(Lease, bool, bool), SimEvent> = (|| {
+        let session_result: Result<(Lease, bool, u32, u32), SimEvent> = (|| {
             let mut sess = WorkerSession::new(&mut self.coordinator, now, tenant, key, worker)
                 .map_err(|e| SimEvent::Rejected {
                     kind: RejectionKind::from(e),
@@ -1829,12 +1838,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
             let lease = *sess.lease();
 
-            // Checkpoint phase — break on first failure.
-            let mut checkpoint_failed = false;
+            // Checkpoint phase — track outcomes for event reporting.
+            let mut checkpoints_ok: u32 = 0;
+            let mut checkpoints_rejected: u32 = 0;
             for i in 0..num_checkpoints as usize {
-                if sess.checkpoint(now, cursors[i].clone(), op_ids[i]).is_err() {
-                    checkpoint_failed = true;
-                    break;
+                if sess.checkpoint(now, cursors[i].clone(), op_ids[i]).is_ok() {
+                    checkpoints_ok += 1;
+                } else {
+                    checkpoints_rejected += 1;
                 }
             }
 
@@ -1848,14 +1859,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     .is_ok()
             };
 
-            Ok((lease, is_terminal, checkpoint_failed))
+            Ok((lease, is_terminal, checkpoints_ok, checkpoints_rejected))
         })();
         // Session dropped here — coordinator borrow released.
 
         // --- Sim-level bookkeeping (touches self.workers, self.active_shard_keys) ---
 
-        let (lease, is_terminal, checkpoint_failed) = match session_result {
-            Ok(triple) => triple,
+        let (lease, is_terminal, checkpoints_ok, checkpoints_rejected) = match session_result {
+            Ok(tuple) => tuple,
             Err(event) => return event,
         };
 
@@ -1865,10 +1876,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             self.mark_shard_terminal(worker, key);
         }
 
-        if is_terminal && !checkpoint_failed {
-            SimEvent::SessionLifecycleOk
+        if is_terminal && checkpoints_rejected == 0 {
+            SimEvent::SessionLifecycleOk {
+                checkpoints_ok,
+                checkpoints_rejected,
+            }
         } else {
-            SimEvent::SessionLifecyclePartial
+            SimEvent::SessionLifecyclePartial {
+                checkpoints_ok,
+                checkpoints_rejected,
+            }
         }
     }
 
