@@ -291,6 +291,21 @@ fn zero_seed_count_does_not_panic() {
     let _chunks: Vec<_> = seeds.chunks(chunk_size).collect();
 }
 
+/// Negative convergence guard: running with zero liveness ops must *not*
+/// converge. This prevents `check_convergence` from being hardcoded to
+/// `true`, which would silently invalidate all 200 convergence proptest
+/// cases.
+#[test]
+fn zero_liveness_does_not_converge() {
+    let report = CoordinationSim::new(42, FaultLevel::SunnyDay)
+        .with_workers_and_shards(4, 15)
+        .run(0, 0);
+    assert!(
+        !report.converged,
+        "expected non-convergence with zero ops, but converged=true"
+    );
+}
+
 // -- Stress tests for large shard counts ------------------------------------
 //
 // These exercise configurations well beyond the normal test suite (200+
@@ -520,8 +535,9 @@ mod proptest_convergence {
         );
         assert!(
             report.converged,
-            "seed {seed}: failed to converge under {level:?} after {} ops",
-            report.ops_executed
+            "seed {seed}: failed to converge under {level:?} after {} ops \
+             ({} shards still non-terminal)",
+            report.ops_executed, report.non_terminal_count
         );
     }
 
@@ -562,7 +578,7 @@ mod multi_tenant {
     //! Multi-tenant isolation test.
     //!
     //! The simulation harness (`CoordinationSim`) runs single-tenant by
-    //! construction, so `RejectionKind::TenantMismatch` and the
+    //! construction, so the coordinator's tenant-scoped rejection path and the
     //! `InvariantChecker`'s tenant-scoped history keys are never exercised
     //! in the mega-sim sweep. This module fills that gap by running two
     //! tenants against the same `InMemoryCoordinator` and verifying:
@@ -706,10 +722,16 @@ mod multi_tenant {
         // (tenant-scoped lookup) or TenantMismatch.
 
         let cross_result = coord.acquire_and_restore(now(5), tenant_b, key_a0, worker_b);
-        assert!(
-            matches!(cross_result, Err(AcquireError::ShardNotFound { .. })),
-            "cross-tenant acquire should be ShardNotFound, got: {cross_result:?}"
-        );
+        match cross_result {
+            Err(AcquireError::ShardNotFound { .. } | AcquireError::TenantMismatch { .. }) => {
+                // Tenant-scoped lookup correctly rejects cross-tenant access.
+            }
+            Err(other) => panic!(
+                "cross-tenant acquire returned unexpected error {other:?} — \
+                 implies tenant B found tenant A's shard (isolation breach)"
+            ),
+            Ok(result) => panic!("cross-tenant acquire succeeded — isolation breach: {result:?}"),
+        }
 
         // --- Tenant B: independent lifecycle on its own shard ---
 

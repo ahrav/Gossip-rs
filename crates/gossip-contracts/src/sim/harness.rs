@@ -54,6 +54,7 @@
 use std::collections::BTreeMap;
 
 use rand::Rng;
+use rand_chacha::ChaCha8Rng;
 
 use crate::coordination::Lease;
 use crate::coordination::cursor::Cursor;
@@ -255,8 +256,8 @@ pub enum RejectionKind {
 
 // -- Error-to-RejectionKind conversions ------------------------------------
 //
-// Each coordinator error type maps 1:1 to a RejectionKind variant. The
-// mapping centralizes rejection categorization so executor methods can use
+// Each error variant maps to exactly one RejectionKind, centralizing
+// rejection categorization so executor methods can use
 // `e.into()` without repeating match arms. The mapping is exhaustive:
 // every error variant is covered, and adding a new variant triggers a
 // compile error here (thanks to non-wildcard matches).
@@ -459,6 +460,9 @@ pub struct SimReport {
     pub end_time: LogicalTime,
     /// Whether all shards are in a terminal state at the end of the simulation.
     pub converged: bool,
+    /// Number of shards not in a terminal state at end of run.
+    /// Zero when `converged` is true.
+    pub non_terminal_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -544,6 +548,77 @@ fn require_lease_and_op(
     })?;
     let op_id = w.next_op_id();
     Ok((lease, op_id))
+}
+
+/// Pre-compute a split-replace plan from the parent's key range.
+///
+/// Chooses a random midpoint to divide the parent's `[range_lo, range_hi)`
+/// range into two children. Returns `None` when the range is too narrow for
+/// a valid split (fewer than 2 byte values between lo and hi).
+///
+/// This mirrors the plan construction in [`CoordinationSim::exec_split_replace`]
+/// but operates on bare range bounds and an external RNG so it can run
+/// *before* the exclusive coordinator borrow in `exec_session_lifecycle`.
+fn precompute_split_replace_plan(
+    rng: &mut ChaCha8Rng,
+    range_lo: u8,
+    range_hi: u8,
+) -> Option<SplitReplacePlan> {
+    let lo_byte = range_lo + 1;
+    let hi_byte = range_hi;
+    if lo_byte >= hi_byte {
+        return None;
+    }
+    let mid = rng.random_range(lo_byte..hi_byte);
+    let child_a = ShardSpec::with_range(vec![range_lo], vec![mid]);
+    let child_b = ShardSpec::with_range(vec![mid], vec![range_hi]);
+    SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(child_a, Cursor::initial()),
+        SplitReplaceChild::new(child_b, Cursor::initial()),
+    ])
+    .ok()
+}
+
+/// Pre-compute a split-residual plan and a post-split completion cursor.
+///
+/// Chooses a random midpoint *after* `last_checkpoint_byte` so the parent
+/// retains all previously scanned data. Returns the plan and a cursor
+/// suitable for completing the narrowed parent after the split.
+///
+/// `last_checkpoint_byte` is the first byte of the last checkpoint cursor
+/// in the pre-computed sequence — the split point must land after it so the
+/// narrowed parent's range still covers every byte the session checkpointed.
+///
+/// Returns `None` when the range is too narrow for a valid split.
+///
+/// This mirrors the plan construction in [`CoordinationSim::exec_split_residual`]
+/// but operates on bare range bounds and an external RNG so it can run
+/// *before* the exclusive coordinator borrow in `exec_session_lifecycle`.
+fn precompute_split_residual_plan(
+    rng: &mut ChaCha8Rng,
+    range_lo: u8,
+    range_hi: u8,
+    last_checkpoint_byte: u8,
+) -> Option<(SplitResidualPlan, Cursor)> {
+    let split_lo = last_checkpoint_byte.saturating_add(1).max(range_lo + 1);
+    let split_hi = range_hi;
+    if split_lo >= split_hi {
+        return None;
+    }
+    let mid = rng.random_range(split_lo..split_hi);
+    let new_parent = ShardSpec::with_range(vec![range_lo], vec![mid]);
+    let residual = ShardSpec::with_range(vec![mid], vec![range_hi]);
+    SplitResidualPlan::try_new(new_parent, residual)
+        .ok()
+        .map(|plan| {
+            let complete_byte = if last_checkpoint_byte < mid.saturating_sub(1) {
+                rng.random_range(last_checkpoint_byte.saturating_add(1)..mid.min(range_hi))
+            } else {
+                // Range is very tight — reuse the last checkpoint byte.
+                last_checkpoint_byte.min(mid.saturating_sub(1))
+            };
+            (plan, Cursor::with_last_key(vec![complete_byte]))
+        })
 }
 
 /// Full deterministic simulation harness for the coordination protocol.
@@ -773,6 +848,18 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         }
 
         let converged = self.check_convergence();
+        let non_terminal_count = if converged {
+            0
+        } else {
+            self.shard_keys
+                .iter()
+                .filter(|k| {
+                    self.coordinator
+                        .shard_lookup(&self.tenant, k)
+                        .is_some_and(|r| !r.status.is_terminal())
+                })
+                .count()
+        };
 
         SimReport {
             ops_executed: self.ops_executed,
@@ -781,6 +868,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             seed: self.context.seed(),
             end_time: self.context.now(),
             converged,
+            non_terminal_count,
         }
     }
 
@@ -1955,21 +2043,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         // Pre-compute split plans (if applicable) while we still have
         // mutable access to self.context for the RNG.
         let split_replace_plan = if matches!(terminal_action, SessionTerminalAction::SplitReplace) {
-            // Full parent replacement: two children covering [start, mid) + [mid, end).
-            let lo_byte = range_lo + 1;
-            let hi_byte = range_hi;
-            if lo_byte < hi_byte {
-                let mid = self.context.rng().random_range(lo_byte..hi_byte);
-                let child_a = ShardSpec::with_range(vec![range_lo], vec![mid]);
-                let child_b = ShardSpec::with_range(vec![mid], vec![range_hi]);
-                SplitReplacePlan::try_new(vec![
-                    SplitReplaceChild::new(child_a, Cursor::initial()),
-                    SplitReplaceChild::new(child_b, Cursor::initial()),
-                ])
-                .ok()
-            } else {
-                None
-            }
+            precompute_split_replace_plan(self.context.rng(), range_lo, range_hi)
         } else {
             None
         };
@@ -1978,39 +2052,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             terminal_action,
             SessionTerminalAction::SplitResidualThenComplete
         ) {
-            // Residual split: parent shrinks to [start, mid), residual is [mid, end).
-            // Split point must be after the last checkpoint cursor so the parent
-            // retains all scanned data. The last checkpoint cursor byte is
-            // cursors[num_checkpoints-1]'s first byte (the checkpoint phase
-            // uses indices 0..num_checkpoints).
             let last_cp_byte = cursors
                 .get(num_checkpoints.saturating_sub(1) as usize)
                 .and_then(|c| c.last_key().and_then(|k| k.first().copied()))
                 .unwrap_or(range_lo);
-            let split_lo = last_cp_byte.saturating_add(1).max(range_lo + 1);
-            let split_hi = range_hi;
-            if split_lo < split_hi {
-                let mid = self.context.rng().random_range(split_lo..split_hi);
-                let new_parent = ShardSpec::with_range(vec![range_lo], vec![mid]);
-                let residual = ShardSpec::with_range(vec![mid], vec![range_hi]);
-                SplitResidualPlan::try_new(new_parent, residual)
-                    .ok()
-                    .map(|plan| {
-                        // Pre-compute a final cursor within the narrowed range
-                        // [range_lo, mid) for the complete after the split.
-                        let complete_byte = if last_cp_byte < mid.saturating_sub(1) {
-                            self.context
-                                .rng()
-                                .random_range(last_cp_byte.saturating_add(1)..mid.min(range_hi))
-                        } else {
-                            // Range is very tight — reuse the last checkpoint byte.
-                            last_cp_byte.min(mid.saturating_sub(1))
-                        };
-                        (plan, Cursor::with_last_key(vec![complete_byte]))
-                    })
-            } else {
-                None
-            }
+            precompute_split_residual_plan(self.context.rng(), range_lo, range_hi, last_cp_byte)
         } else {
             None
         };
@@ -2063,6 +2109,23 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     checkpoints_ok,
                     checkpoints_rejected,
                     split_children: Vec::new(),
+                }
+            }
+
+            /// Build an outcome for a split action that produced child shards.
+            fn with_children(
+                lease: Lease,
+                is_terminal: bool,
+                checkpoints_ok: u32,
+                checkpoints_rejected: u32,
+                split_children: Vec<ShardId>,
+            ) -> Self {
+                Self {
+                    lease,
+                    is_terminal,
+                    checkpoints_ok,
+                    checkpoints_rejected,
+                    split_children,
                 }
             }
         }
@@ -2119,13 +2182,13 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         match sess.split_replace(now, plan, op_ids[terminal_idx]) {
                             Ok(outcome) => {
                                 let children = outcome.into_inner().children;
-                                Ok(SessionOutcome {
+                                Ok(SessionOutcome::with_children(
                                     lease,
-                                    is_terminal: true,
+                                    true,
                                     checkpoints_ok,
                                     checkpoints_rejected,
-                                    split_children: children,
-                                })
+                                    children,
+                                ))
                             }
                             Err(_) => Ok(SessionOutcome::terminal(
                                 lease,
@@ -2150,17 +2213,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                             let is_terminal = sess
                                 .complete(now, complete_cursor, op_ids[complete_idx])
                                 .is_ok();
-                            let mut children = Vec::new();
-                            if let Some(rid) = residual_id {
-                                children.push(rid);
-                            }
-                            Ok(SessionOutcome {
+                            let children: Vec<ShardId> = residual_id.into_iter().collect();
+                            Ok(SessionOutcome::with_children(
                                 lease,
                                 is_terminal,
                                 checkpoints_ok,
                                 checkpoints_rejected,
-                                split_children: children,
-                            })
+                                children,
+                            ))
                         } else {
                             // split_residual failed (e.g., lease expired) — session
                             // is still alive but in an uncertain state. Drop it.

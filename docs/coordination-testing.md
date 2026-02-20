@@ -1,4 +1,3 @@
-# Coordination Testing Strategy
 
 Testing strategy for the shard coordination protocol and its simulation
 infrastructure. Four tiers target distinct quality dimensions: isolation,
