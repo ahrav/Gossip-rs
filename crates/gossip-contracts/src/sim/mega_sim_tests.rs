@@ -8,20 +8,25 @@
 //!
 //! # Test structure
 //!
-//! Two complementary approaches sweep the seed space:
+//! Three complementary approaches sweep the seed space:
 //!
 //! 1. **Hand-rolled parallel sweep** (`mega_sim_10k_steps`) -- divides seeds
 //!    across OS threads with static chunking, collects failures with
 //!    reproduction commands, and asserts event-kind coverage across the
 //!    aggregate. This is the primary CI gate.
 //!
-//! 2. **Proptest seed sweeper** ([`proptest_mega::proptest_mega_sim`]) --
+//! 2. **Stress tests** (`stress_200_shards_stormy`, `stress_split_cascade`) --
+//!    exercise configurations well beyond the normal test suite (200+ shards,
+//!    Radioactive fault level) to verify the harness and invariant checker
+//!    handle scale, split cascades, and history pruning without violations.
+//!
+//! 3. **Proptest seed sweeper** ([`proptest_mega::proptest_mega_sim`]) --
 //!    delegates seed generation to proptest, gaining automatic shrinking and
 //!    `.proptest-regressions` file persistence. Useful for minimizing a failing
 //!    seed range after the hand-rolled sweep detects a problem.
 //!
-//! Both tests are `#[ignore]` because they are too slow for the default
-//! `cargo test` cycle (~100 seeds x 12K ops each). Run them explicitly:
+//! All `#[ignore]`'d tests are too slow for the default `cargo test` cycle.
+//! Run them explicitly:
 //!
 //! ```text
 //! cargo test -p gossip-contracts mega_sim -- --ignored --nocapture
@@ -268,6 +273,102 @@ fn zero_seed_count_does_not_panic() {
     let seeds: Vec<u64> = (0..seed_count as u64).collect();
     let chunk_size = seeds.len().div_ceil(parallelism);
     let _chunks: Vec<_> = seeds.chunks(chunk_size).collect();
+}
+
+// -- Stress tests for large shard counts ------------------------------------
+//
+// These exercise configurations well beyond the normal test suite (200+
+// shards, high fault pressure) to verify that the harness and invariant
+// checker handle scale without violations or panics. Run explicitly:
+//
+// ```text
+// cargo test -p gossip-contracts stress_ -- --ignored --nocapture
+// ```
+
+/// 8 workers contending over 200 shards under Stormy faults.
+///
+/// This is ~13x the shard count of `mega_sim_10k_steps` (200 vs 15) and
+/// exercises the InvariantChecker's pruning behavior at scale: many shards
+/// will reach terminal states during the run, and the checker must handle
+/// the growing-then-shrinking history maps without blowing up.
+///
+/// # Reproduction
+///
+/// ```text
+/// GOSSIP_SIM_SEED=<seed> GOSSIP_SIM_FAULT=stormy cargo test -p gossip-contracts stress_200_shards_stormy -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn stress_200_shards_stormy() {
+    if cfg!(miri) {
+        return;
+    }
+
+    let seeds: Vec<u64> = (0..5).collect();
+    let fault_level = FaultLevel::Stormy;
+
+    for seed in seeds {
+        let report = CoordinationSim::new(seed, fault_level)
+            .with_workers_and_shards(8, 200)
+            .run(5_000, 2_000);
+
+        assert!(
+            report.violations.is_empty(),
+            "seed {seed}: invariant violation with 200 shards under Stormy.\n\
+             Reproduce: GOSSIP_SIM_SEED={seed} GOSSIP_SIM_FAULT=stormy \
+             cargo test -p gossip-contracts stress_200_shards_stormy -- --ignored --nocapture\n\
+             Violations: {:#?}",
+            report.violations,
+        );
+    }
+}
+
+/// 4 workers, 20 shards under Radioactive faults — designed to trigger
+/// split cascades. Verifies that `SplitReplaceOk` events fire and child
+/// shards are created without invariant violations.
+///
+/// # Reproduction
+///
+/// ```text
+/// GOSSIP_SIM_SEED=<seed> GOSSIP_SIM_FAULT=radioactive cargo test -p gossip-contracts stress_split_cascade -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn stress_split_cascade() {
+    if cfg!(miri) {
+        return;
+    }
+
+    let seeds: Vec<u64> = (0..10).collect();
+    let fault_level = FaultLevel::Radioactive;
+
+    let mut total_splits: usize = 0;
+    for seed in &seeds {
+        let report = CoordinationSim::new(*seed, fault_level)
+            .with_workers_and_shards(4, 20)
+            .run(3_000, 1_000);
+
+        assert!(
+            report.violations.is_empty(),
+            "seed {seed}: invariant violation during split cascade.\n\
+             Reproduce: GOSSIP_SIM_SEED={seed} GOSSIP_SIM_FAULT=radioactive \
+             cargo test -p gossip-contracts stress_split_cascade -- --ignored --nocapture\n\
+             Violations: {:#?}",
+            report.violations,
+        );
+
+        total_splits += report
+            .event_counts
+            .get(&SimEventKind::SplitReplaceOk)
+            .copied()
+            .unwrap_or(0);
+    }
+
+    assert!(
+        total_splits > 0,
+        "no SplitReplaceOk events across {} seeds — split generation may be broken",
+        seeds.len(),
+    );
 }
 
 // -- Proptest seed sweeper --------------------------------------------------

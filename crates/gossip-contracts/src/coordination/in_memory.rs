@@ -67,9 +67,9 @@
 //!
 //! # Performance note
 //!
-//! `claim_next_available` (via `ShardClaiming`) scans all shards — O(S)
-//! for a linear pass. Acceptable here; production backends need a
-//! secondary available-shards index.
+//! `claim_next_available` (via `ShardClaiming`) scans all shards in the
+//! target run — O(S) where S is the run's shard count. Acceptable here;
+//! production backends need a secondary available-shards index.
 
 use std::collections::{HashMap, HashSet};
 
@@ -142,6 +142,11 @@ pub struct InMemoryCoordinator {
     /// Invariant: `total_shard_count == self.shards.values().map(|m| m.len()).sum::<usize>()`.
     /// Verified via `assert!` after mutations.
     total_shard_count: usize,
+    /// Run records keyed by `(tenant, run)`.
+    ///
+    /// A run groups a set of shards that collectively cover a single scan
+    /// target. The run record tracks lifecycle status (Initializing, Active,
+    /// terminal) and the root shard manifest.
     runs: AHashMap<(TenantId, RunId), RunRecord>,
     /// Secondary index: run → shard IDs (root + split children).
     ///
@@ -149,8 +154,20 @@ pub struct InMemoryCoordinator {
     /// Iteration order doesn't matter — `list_shards`
     /// sorts results by `key_range_start` afterward.
     run_shards: AHashMap<(TenantId, RunId), HashSet<ShardId, ahash::RandomState>>,
+    /// Duration (in logical time units) applied to every new lease.
+    ///
+    /// Stored on the coordinator rather than per-shard because lease
+    /// length is a deployment-level parameter shared across all shards.
     default_lease_duration: u64,
+    /// Maximum number of shards a single tenant may have across all runs.
+    ///
+    /// Prevents a single tenant from monopolizing coordinator resources.
+    /// Checked on shard creation (register, split).
     max_shards_per_tenant: usize,
+    /// Maximum total shards across all tenants.
+    ///
+    /// Hard upper bound to prevent unbounded memory growth from
+    /// split-flooding (CWE-400). Checked alongside `max_shards_per_tenant`.
     max_total_shards: usize,
 }
 
@@ -201,7 +218,7 @@ impl InMemoryCoordinator {
     ///
     /// # Panics
     ///
-    /// Panics if `record` violates any of the 10 `ShardRecord` invariants.
+    /// Panics if `record` violates any [`ShardRecord`] invariant.
     /// This catches malformed test fixtures early rather than letting them
     /// propagate to confusing failures later.
     ///
@@ -269,33 +286,9 @@ impl InMemoryCoordinator {
         self.runs.insert((tenant, run), record);
     }
 
-    /// Read-only access to the shard map for external invariant checking.
-    ///
-    /// Returns a flat iterator over `((TenantId, ShardKey), &ShardRecord)`
-    /// to preserve the API contract for test callers.
-    ///
-    /// Gated behind `test-support` or `#[cfg(test)]` -- not part of the
-    /// production API surface.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn shards(&self) -> impl Iterator<Item = ((TenantId, ShardKey), &ShardRecord)> {
-        self.shards.iter().flat_map(|(&tenant, inner)| {
-            inner
-                .iter()
-                .map(move |(&key, record)| ((tenant, key), record))
-        })
-    }
-
-    /// Total number of shard records across all tenants.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn shard_count(&self) -> usize {
-        self.total_shard_count
-    }
-
-    /// Point-lookup a shard record by `(TenantId, ShardKey)` for test code.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
-        self.shard_get(tenant, key)
-    }
+    // `shards()`, `shard_count()`, and `shard_lookup()` are provided via
+    // the `SimIntrospection` trait impl below. Simulation is first-class
+    // verification (FoundationDB model), not unit testing — no cfg gates.
 
     // -- Internal two-level map helpers --
 
@@ -1198,7 +1191,10 @@ fn split_residual_apply_parent(
 // ============================================================================
 
 impl InMemoryCoordinator {
-    /// Register a shard in the run→shards index.
+    /// Register a shard in the run→shards secondary index.
+    ///
+    /// This index enables `list_shards` and `get_run_progress` to enumerate
+    /// a run's shards without scanning the entire tenant shard map.
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
         self.run_shards
             .entry((tenant, run))
@@ -1233,6 +1229,9 @@ impl InMemoryCoordinator {
     /// and verifies invariants. Callers are responsible for all precondition
     /// checks (lookup, tenant, idempotency, terminal, wrong-status) before
     /// calling this helper.
+    ///
+    /// Takes `&mut RunRecord` (not `&mut self`) because the caller already
+    /// holds a mutable borrow of the run record from `self.runs.get_mut`.
     fn apply_terminal_run_transition(
         record: &mut RunRecord,
         now: LogicalTime,
@@ -1254,7 +1253,11 @@ impl InMemoryCoordinator {
         record.assert_invariants();
     }
 
-    /// Look up a run record, checking tenant isolation.
+    /// Look up a run record with tenant isolation enforcement.
+    ///
+    /// Shared precondition helper for read-only run queries (`get_run`,
+    /// `get_run_progress`, `list_shards`). Callers that need `&mut` must
+    /// look up the record directly via `self.runs.get_mut`.
     fn lookup_run(&self, tenant: TenantId, run: RunId) -> Result<&RunRecord, GetRunError> {
         let record = self
             .runs
@@ -1443,6 +1446,10 @@ impl RunManagement for InMemoryCoordinator {
     }
 
     /// Return a clone of the run record after validating tenant isolation.
+    ///
+    /// Clones to decouple the caller from the coordinator's internal state,
+    /// matching the trait's by-value return signature (production backends
+    /// would reconstruct from a database row, not hand out references).
     fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {
         self.lookup_run(tenant, run).cloned()
     }
@@ -1571,9 +1578,12 @@ impl RunManagement for InMemoryCoordinator {
 
     /// Transition an `Active` run to `Failed` (terminal, idempotent).
     ///
-    /// Only `Active` runs can be failed (PD-2: `Initializing` runs must
-    /// be cancelled instead). Follows the same idempotency-first,
-    /// terminal-check, status-check order as [`complete_run`](Self::complete_run).
+    /// Only `Active` runs can be failed — `Initializing` runs that have
+    /// not yet received their shard manifest must use
+    /// [`cancel_run`](Self::cancel_run) instead, which is the only
+    /// termination path for pre-manifest runs. Follows the same
+    /// idempotency-first, terminal-check, status-check order as
+    /// [`complete_run`](Self::complete_run).
     fn fail_run(
         &mut self,
         now: LogicalTime,
@@ -1600,7 +1610,7 @@ impl RunManagement for InMemoryCoordinator {
                 status: record.status,
             });
         }
-        // Must be Active (PD-2: not Initializing).
+        // Must be Active — Initializing runs use cancel_run instead.
         if record.status != RunStatus::Active {
             return Err(FailRunError::WrongStatus {
                 status: record.status,
@@ -1763,6 +1773,40 @@ impl RunManagement for InMemoryCoordinator {
         record.assert_invariants();
 
         Ok(IdempotentOutcome::Executed(()))
+    }
+}
+
+// ============================================================================
+// SimIntrospection — read-only observation for simulation
+// ============================================================================
+
+/// Read-only observation interface for the deterministic simulation harness.
+///
+/// Exposes the coordinator's internal shard state without mutation, enabling
+/// the simulation invariant checker to verify protocol properties (coverage
+/// gaps, lease consistency, cursor bounds) across all shards after each
+/// simulated step. Following the FoundationDB model, simulation is treated
+/// as first-class verification infrastructure — not gated behind `#[cfg(test)]`
+/// alone, but also available via the `test-support` feature for integration
+/// harnesses.
+#[cfg(any(test, feature = "test-support"))]
+impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
+    type ShardIter<'a> = Box<dyn Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)> + 'a>;
+
+    fn shards(&self) -> Self::ShardIter<'_> {
+        Box::new(self.shards.iter().flat_map(|(&tenant, inner)| {
+            inner
+                .iter()
+                .map(move |(&key, record)| ((tenant, key), record))
+        }))
+    }
+
+    fn shard_count(&self) -> usize {
+        self.total_shard_count
+    }
+
+    fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
+        self.shard_get(tenant, key)
     }
 }
 

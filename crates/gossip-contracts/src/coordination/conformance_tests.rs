@@ -50,6 +50,7 @@ use crate::coordination::test_fixtures::{
 };
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{OpId, RunId, ShardId, ShardKey};
+use crate::sim::backend::SimIntrospection;
 
 // -- Compile-time assertions -------------------------------------------------
 // Guard against silent constant changes that would invalidate test assumptions.

@@ -95,10 +95,10 @@ state (Done, Split, or Parked).
 ## Fault Injection Levels
 
 | Level       | Lease Expiry | Worker Pause | Time Jump | Use Case                |
-|-------------|-------------|-------------|-----------|-------------------------|
-| SunnyDay    | 0%          | 0%          | 0%        | Happy-path correctness  |
-| Stormy      | 10%         | 5%          | 10%       | Moderate fault coverage  |
-| Radioactive | 20%         | 10%         | 20%       | Stress/edge-case search |
+|-------------|--------------|--------------|-----------|-------------------------|
+| SunnyDay    | 0%           | 0%           | 0%        | Happy-path correctness  |
+| Stormy      | 10%          | 5%           | 10%       | Moderate fault coverage |
+| Radioactive | 20%          | 10%          | 20%       | Stress/edge-case search |
 
 Pause durations and time-jump magnitudes scale with the level. See
 `FaultConfig::for_level` for exact PPM values.

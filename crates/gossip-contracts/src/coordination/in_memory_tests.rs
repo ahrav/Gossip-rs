@@ -43,6 +43,7 @@ use crate::coordination::test_fixtures::{
     test_worker,
 };
 use crate::identity::{FenceEpoch, RunId};
+use crate::sim::backend::SimIntrospection;
 use gossip_stdx::RingBuffer;
 
 // -- acquire_and_restore tests ----------------------------------------
