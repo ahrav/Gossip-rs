@@ -346,7 +346,7 @@ impl From<SplitError> for RejectionKind {
 
 /// Payload-free event discriminant for histogram counting.
 ///
-/// Every [`SimEvent`] maps to exactly one `SimEventKind` via [`SimEvent::kind()`].
+/// Every [`SimEvent`] maps to exactly one `SimEventKind` via its `kind()` method.
 /// [`SimReport::event_counts`] aggregates these to summarize operation coverage
 /// without carrying per-event payloads. The `Ord` derive enables `BTreeMap`
 /// keying for deterministic report output.
