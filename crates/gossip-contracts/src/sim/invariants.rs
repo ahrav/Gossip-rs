@@ -59,12 +59,29 @@
 //!   is retained so S3 can still detect illegal reversions.
 
 use std::collections::{BTreeMap, HashMap};
-use std::panic;
 
 use crate::coordination::cursor::{CursorBoundsCheck, check_cursor_bounds};
 use crate::coordination::record::{ShardRecord, ShardStatus};
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use crate::sim::backend::SimIntrospection;
+
+// ---------------------------------------------------------------------------
+// SplitCoverageDetail
+// ---------------------------------------------------------------------------
+
+/// Sub-classification for S7 (SplitCoverage) violations, replacing
+/// untyped string descriptions with pattern-matchable variants.
+#[derive(Debug, Clone)]
+pub enum SplitCoverageDetail {
+    /// Split shard has an empty `spawned` list — no children were created.
+    EmptySpawned,
+    /// One or more child shard IDs referenced by the parent do not exist
+    /// in the coordinator.
+    MissingChildren { children: Vec<ShardId> },
+    /// One or more child shards exist but their `parent` field does not
+    /// reference this parent shard.
+    WrongParent { children: Vec<ShardId> },
+}
 
 // ---------------------------------------------------------------------------
 // InvariantViolation
@@ -118,7 +135,14 @@ pub enum InvariantViolation {
     /// or was reset from `Some` to `None`. Cursor progress must be monotonic
     /// because it represents committed scan progress; regression would cause
     /// duplicate processing.
-    CursorMonotonicity { run: RunId, shard: ShardId },
+    CursorMonotonicity {
+        run: RunId,
+        shard: ShardId,
+        /// The previous cursor value (cloned at violation time for diagnostics).
+        prev: Option<Box<[u8]>>,
+        /// The current (regressed) cursor value.
+        current: Option<Box<[u8]>>,
+    },
     /// S6: Cursor `last_key` is outside the shard's `[start, end)` spec range.
     /// A worker reporting progress outside its assigned key range indicates a
     /// routing or validation bug.
@@ -131,7 +155,7 @@ pub enum InvariantViolation {
     SplitCoverage {
         run: RunId,
         shard: ShardId,
-        detail: String,
+        detail: SplitCoverageDetail,
     },
     /// S3 sub-property: `Parked`->`Active` transition (unpark) occurred without
     /// incrementing `fence_epoch`. The safety argument for allowing this
@@ -290,6 +314,15 @@ impl InvariantChecker {
     /// Uses `>=` (not `>`) to be conservative: a lease at its exact deadline
     /// is treated as active for mutual-exclusion checking, even though the
     /// coordinator's `is_leased_at()` treats `now == deadline` as expired.
+    ///
+    /// This intentional off-by-one accepts false positives at boundary ticks
+    /// over false negatives. A false positive (flagging a non-violation) is
+    /// harmless — the simulation simply sees a spurious `MutualExclusion`
+    /// that the coordinator would never actually produce. A false negative
+    /// (missing a real dual-holder scenario because the checker discards a
+    /// boundary-tick lease) would undermine the safety guarantee. Since
+    /// `LogicalTime` advances in discrete ticks, the boundary-tick window
+    /// is exactly one tick wide.
     fn accumulate_active_holder(&mut self, key: ShardKey, record: &ShardRecord, now: LogicalTime) {
         if let Some(holder) = record.lease()
             && holder.deadline() >= now
@@ -372,34 +405,15 @@ impl InvariantChecker {
 
     /// S4: record structural invariant.
     ///
-    /// Delegates to the record's own self-check. Two code paths handle
-    /// `panic=unwind` vs `panic=abort`: under unwind, panics are caught and
-    /// reported as non-fatal violations so the simulation can continue
-    /// checking other shards.
+    /// Delegates to the record's non-panicking [`validate_invariants`](ShardRecord::validate_invariants),
+    /// which works correctly under both `panic=unwind` and `panic=abort`.
     fn check_record_invariant(record: &ShardRecord, violations: &mut Vec<InvariantViolation>) {
-        #[cfg(panic = "unwind")]
-        {
-            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                record.assert_invariants();
-            }));
-            if let Err(payload) = result {
-                let message = if let Some(s) = payload.downcast_ref::<&str>() {
-                    (*s).to_owned()
-                } else if let Some(s) = payload.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic".to_owned()
-                };
-                violations.push(InvariantViolation::RecordInvariant {
-                    run: record.run,
-                    shard: record.shard,
-                    message,
-                });
-            }
-        }
-        #[cfg(not(panic = "unwind"))]
-        {
-            record.assert_invariants();
+        if let Err(message) = record.validate_invariants() {
+            violations.push(InvariantViolation::RecordInvariant {
+                run: record.run,
+                shard: record.shard,
+                message,
+            });
         }
     }
 
@@ -424,6 +438,8 @@ impl InvariantChecker {
             violations.push(InvariantViolation::CursorMonotonicity {
                 run: id.1,
                 shard: id.2,
+                prev: prev_key.map(Box::from),
+                current: curr_key.map(Box::from),
             });
         }
         if prev_key != curr_key {
@@ -463,7 +479,7 @@ impl InvariantChecker {
             violations.push(InvariantViolation::SplitCoverage {
                 run: record.run,
                 shard: record.shard,
-                detail: "Split shard has no spawned children".to_owned(),
+                detail: SplitCoverageDetail::EmptySpawned,
             });
             return;
         }
@@ -484,17 +500,18 @@ impl InvariantChecker {
             violations.push(InvariantViolation::SplitCoverage {
                 run: record.run,
                 shard: record.shard,
-                detail: format!("Missing child shards: {:?}", self.scratch_missing),
+                detail: SplitCoverageDetail::MissingChildren {
+                    children: self.scratch_missing.clone(),
+                },
             });
         }
         if !self.scratch_wrong_parent.is_empty() {
             violations.push(InvariantViolation::SplitCoverage {
                 run: record.run,
                 shard: record.shard,
-                detail: format!(
-                    "Children with incorrect parent reference: {:?}",
-                    self.scratch_wrong_parent
-                ),
+                detail: SplitCoverageDetail::WrongParent {
+                    children: self.scratch_wrong_parent.clone(),
+                },
             });
         }
     }
@@ -691,6 +708,34 @@ mod tests {
         ));
     }
 
+    /// S5: Checker detects cursor reset from Some to None (back to initial).
+    #[test]
+    fn detects_cursor_reset_to_initial() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let now = LogicalTime::from_raw(1);
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Seed with cursor at 'h'.
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .cursor(Cursor::with_last_key(vec![b'h']))
+                .build(),
+        );
+        let mut checker = InvariantChecker::new();
+        assert!(checker.check_all(&coord, TENANT, now).is_empty());
+
+        // Re-seed with initial cursor (None) — S5 violation.
+        coord.seed_shard(TestRecordBuilder::new(TENANT, run, shard).build());
+
+        let v = checker.check_all(&coord, TENANT, now);
+        assert_eq!(v.len(), 1);
+        assert!(matches!(
+            &v[0],
+            InvariantViolation::CursorMonotonicity { .. }
+        ));
+    }
+
     /// S6: Checker detects cursor above shard spec range.
     #[test]
     fn detects_cursor_above_range() {
@@ -769,10 +814,13 @@ mod tests {
             .filter(|v| matches!(v, InvariantViolation::SplitCoverage { .. }))
             .collect();
         assert_eq!(s7.len(), 1);
-        assert!(
-            matches!(s7[0], InvariantViolation::SplitCoverage { detail, .. }
-                if detail.contains("no spawned children"))
-        );
+        assert!(matches!(
+            s7[0],
+            InvariantViolation::SplitCoverage {
+                detail: SplitCoverageDetail::EmptySpawned,
+                ..
+            }
+        ));
     }
 
     /// S7: Checker detects a Split shard whose spawned child does not exist.
@@ -800,10 +848,13 @@ mod tests {
             .filter(|v| matches!(v, InvariantViolation::SplitCoverage { .. }))
             .collect();
         assert_eq!(s7.len(), 1);
-        assert!(
-            matches!(s7[0], InvariantViolation::SplitCoverage { detail, .. }
-                if detail.contains("Missing child"))
-        );
+        assert!(matches!(
+            s7[0],
+            InvariantViolation::SplitCoverage {
+                detail: SplitCoverageDetail::MissingChildren { .. },
+                ..
+            }
+        ));
     }
 
     /// S7: Checker detects a spawned child with an incorrect parent reference.
@@ -838,9 +889,50 @@ mod tests {
             .filter(|v| matches!(v, InvariantViolation::SplitCoverage { .. }))
             .collect();
         assert_eq!(s7.len(), 1);
+        assert!(matches!(
+            s7[0],
+            InvariantViolation::SplitCoverage {
+                detail: SplitCoverageDetail::WrongParent { .. },
+                ..
+            }
+        ));
+    }
+
+    /// S3: Checker detects Split→Active reversion.
+    #[test]
+    fn detects_split_to_active_reversion() {
+        let run = RunId::from_raw(1);
+        let shard = ShardId::from_raw(1);
+        let now = LogicalTime::from_raw(1);
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        let child = ShardId::from_raw((1u64 << 63) | 10);
+
+        // Seed as Split (terminal) with one child.
+        coord.seed_shard_unchecked(
+            TestRecordBuilder::new(TENANT, run, shard)
+                .status(ShardStatus::Split)
+                .spawned(vec![child])
+                .build(),
+        );
+        // Seed the child so S7 doesn't fire on the parent.
+        coord.seed_shard(
+            TestRecordBuilder::new(TENANT, run, child)
+                .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
+                .parent(shard)
+                .build(),
+        );
+        let mut checker = InvariantChecker::new();
+        assert!(checker.check_all(&coord, TENANT, now).is_empty());
+
+        // Re-seed as Active — S3 violation (terminal reverted).
+        coord.seed_shard(TestRecordBuilder::new(TENANT, run, shard).build());
+
+        let v = checker.check_all(&coord, TENANT, now);
+        assert_eq!(v.len(), 1);
         assert!(
-            matches!(s7[0], InvariantViolation::SplitCoverage { detail, .. }
-                if detail.contains("incorrect parent"))
+            matches!(&v[0], InvariantViolation::TerminalIrreversibility { was, now: cur, .. }
+                if *was == ShardStatus::Split && *cur == ShardStatus::Active)
         );
     }
 

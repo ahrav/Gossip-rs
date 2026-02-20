@@ -184,6 +184,10 @@ pub enum SimEvent {
     Skipped,
     /// WorkerSession lifecycle completed (acquire → checkpoints → terminal).
     SessionLifecycleOk,
+    /// WorkerSession lifecycle completed with partial success — acquire succeeded but
+    /// one or more checkpoints or the terminal operation failed. This is expected under
+    /// fault injection (lease expiry mid-session) but must be visible for coverage analysis.
+    SessionLifecyclePartial,
 }
 
 /// Categorized rejection reason (no heap allocation).
@@ -230,6 +234,10 @@ pub enum RejectionKind {
     NoStaleLease,
     /// No previous checkpoint to replay.
     NoPriorCheckpoint,
+    /// Target worker does not exist in the simulation's worker registry.
+    WorkerNotFound,
+    /// Target run does not exist in the coordinator.
+    RunNotFound,
     /// Coordinator returned an error not matching a specific category.
     Other,
 }
@@ -339,6 +347,7 @@ pub enum SimEventKind {
     WorkerResumed,
     Skipped,
     SessionLifecycleOk,
+    SessionLifecyclePartial,
 }
 
 impl SimEvent {
@@ -360,6 +369,7 @@ impl SimEvent {
             SimEvent::WorkerResumed { .. } => SimEventKind::WorkerResumed,
             SimEvent::Skipped => SimEventKind::Skipped,
             SimEvent::SessionLifecycleOk => SimEventKind::SessionLifecycleOk,
+            SimEvent::SessionLifecyclePartial => SimEventKind::SessionLifecyclePartial,
         }
     }
 }
@@ -706,6 +716,18 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         }
     }
 
+    /// Release a shard from its owning worker and remove it from the active set.
+    ///
+    /// Consolidates the two-step terminal-shard bookkeeping
+    /// (worker release + active-set removal) used by `exec_complete`,
+    /// `exec_park`, `exec_split_replace`, and `exec_session_lifecycle`.
+    fn mark_shard_terminal(&mut self, worker: WorkerId, key: ShardKey) {
+        if let Some(w) = self.workers.get_mut(&worker) {
+            w.record_release(&key);
+        }
+        self.remove_active_shard(key);
+    }
+
     // -----------------------------------------------------------------------
     // Op execution
     // -----------------------------------------------------------------------
@@ -932,12 +954,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .complete(now, self.tenant, &lease, cursor, op_id)
         {
             Ok(_) => {
-                // Release the shard from the worker.
-                if let Some(w) = self.workers.get_mut(&worker) {
-                    w.record_release(&key);
-                }
-                // Shard is now terminal — remove from active set.
-                self.remove_active_shard(key);
+                self.mark_shard_terminal(worker, key);
                 SimEvent::CompleteOk
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -958,11 +975,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .park_shard(now, self.tenant, &lease, ParkReason::Other, op_id)
         {
             Ok(_) => {
-                if let Some(w) = self.workers.get_mut(&worker) {
-                    w.record_release(&key);
-                }
-                // Shard is now terminal — remove from active set.
-                self.remove_active_shard(key);
+                self.mark_shard_terminal(worker, key);
                 SimEvent::ParkOk
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -1059,10 +1072,6 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Ok(outcome) => {
                 let result = outcome.into_inner();
                 let children = result.children;
-                // Release parent from worker (it's now terminal).
-                if let Some(w) = self.workers.get_mut(&worker) {
-                    w.record_release(&key);
-                }
                 // Register child shards so future ops can exercise them.
                 let run = key.run();
                 for &child_id in &children {
@@ -1070,8 +1079,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     self.shard_keys.push(child_key);
                     self.active_shard_keys.push(child_key);
                 }
-                // Parent is now terminal — remove from active set.
-                self.remove_active_shard(key);
+                // Parent is now terminal — release and remove.
+                self.mark_shard_terminal(worker, key);
                 SimEvent::SplitReplaceOk { children }
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
@@ -1269,7 +1278,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Some(w) => w.next_op_id(),
             None => {
                 return SimEvent::Rejected {
-                    kind: RejectionKind::Other,
+                    kind: RejectionKind::WorkerNotFound,
                 };
             }
         };
@@ -1332,7 +1341,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             }
             Err(ClaimError::NoneAvailable) => SimEvent::ClaimNoneAvailable,
             Err(ClaimError::RunNotFound) => SimEvent::Rejected {
-                kind: RejectionKind::ShardNotFound,
+                kind: RejectionKind::RunNotFound,
             },
             Err(ClaimError::TenantMismatch { .. }) => SimEvent::Rejected {
                 kind: RejectionKind::TenantMismatch,
@@ -1624,7 +1633,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     r.spec.key_range_end().to_vec(),
                 )
             })
-            .unwrap_or_else(|| (vec![b'a'], vec![b'z']));
+            .expect("generate_forward_cursor: shard missing from coordinator -- harness bug");
 
         // The first byte determines the "slot". We advance forward from the
         // last cursor's first byte (or the spec start).
@@ -1777,7 +1786,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 let hi = r.spec.key_range_end().first().copied().unwrap_or(b'z');
                 (lo, hi)
             })
-            .unwrap_or((b'a', b'z'));
+            .expect("exec_session_lifecycle: shard missing from coordinator -- harness bug");
 
         let num_checkpoints: u32 = self.context.rng().random_range(1..=3);
         let should_park: bool = self.context.rng().random_range(0u32..10) < 2;
@@ -1812,7 +1821,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let now = self.context.now();
         let tenant = self.tenant;
 
-        let session_result: Result<(Lease, bool), SimEvent> = (|| {
+        let session_result: Result<(Lease, bool, bool), SimEvent> = (|| {
             let mut sess = WorkerSession::new(&mut self.coordinator, now, tenant, key, worker)
                 .map_err(|e| SimEvent::Rejected {
                     kind: RejectionKind::from(e),
@@ -1820,9 +1829,13 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
             let lease = *sess.lease();
 
-            // Checkpoint phase.
+            // Checkpoint phase — break on first failure.
+            let mut checkpoint_failed = false;
             for i in 0..num_checkpoints as usize {
-                let _ = sess.checkpoint(now, cursors[i].clone(), op_ids[i]);
+                if sess.checkpoint(now, cursors[i].clone(), op_ids[i]).is_err() {
+                    checkpoint_failed = true;
+                    break;
+                }
             }
 
             // Terminal phase.
@@ -1835,27 +1848,28 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     .is_ok()
             };
 
-            Ok((lease, is_terminal))
+            Ok((lease, is_terminal, checkpoint_failed))
         })();
         // Session dropped here — coordinator borrow released.
 
         // --- Sim-level bookkeeping (touches self.workers, self.active_shard_keys) ---
 
-        let (lease, is_terminal) = match session_result {
-            Ok(pair) => pair,
+        let (lease, is_terminal, checkpoint_failed) = match session_result {
+            Ok(triple) => triple,
             Err(event) => return event,
         };
 
         self.record_acquire_bookkeeping(worker, key, lease);
 
         if is_terminal {
-            if let Some(w) = self.workers.get_mut(&worker) {
-                w.record_release(&key);
-            }
-            self.remove_active_shard(key);
+            self.mark_shard_terminal(worker, key);
         }
 
-        SimEvent::SessionLifecycleOk
+        if is_terminal && !checkpoint_failed {
+            SimEvent::SessionLifecycleOk
+        } else {
+            SimEvent::SessionLifecyclePartial
+        }
     }
 
     // -----------------------------------------------------------------------

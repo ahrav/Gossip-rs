@@ -216,6 +216,41 @@ mod tests {
         }
     }
 
+    /// S1: No false positive when one lease holder has expired.
+    ///
+    /// Worker A has an active lease (deadline 200), Worker B has an expired
+    /// lease (deadline 50). With `now = 100`, only Worker A is active, so
+    /// the checker should NOT report a mutual-exclusion violation.
+    #[test]
+    fn s1_no_false_positive_for_expired_lease() {
+        let mut coord = InMemoryCoordinator::new(LEASE_DUR);
+
+        // Real record: worker 1 holds lease expiring at 200.
+        let key = make_key(1, 1);
+        let real_record = active_record_with_lease(1, 1, 1, 200);
+        coord.seed_shard(real_record);
+
+        // Inject synthetic: worker 2 had a lease that expired at 50.
+        let mut injector = FaultInjectingIntrospector::new(coord);
+        let expired = active_record_with_lease(1, 1, 2, 50);
+        injector.inject_shard(TENANT, key, expired);
+
+        // now=100: worker 1 active (200 >= 100), worker 2 expired (50 < 100).
+        let now = LogicalTime::from_raw(100);
+        let mut checker = InvariantChecker::new();
+        let violations = checker.check_all(&injector, TENANT, now);
+
+        let s1: Vec<_> = violations
+            .iter()
+            .filter(|v| matches!(v, InvariantViolation::MutualExclusion { .. }))
+            .collect();
+        assert!(
+            s1.is_empty(),
+            "expected no S1 violation when one lease is expired, got: {:?}",
+            s1,
+        );
+    }
+
     /// Injector with no synthetic records passes through cleanly.
     #[test]
     fn no_injection_no_violations() {
@@ -303,9 +338,10 @@ mod tests {
             .iter()
             .filter(|v| matches!(v, InvariantViolation::FenceMonotonicity { .. }))
             .collect();
-        assert!(
-            !s2.is_empty(),
-            "expected S2 fence regression violation, got: {:?}",
+        assert_eq!(
+            s2.len(),
+            1,
+            "expected exactly 1 S2 fence regression violation, got: {:?}",
             v,
         );
     }
@@ -345,9 +381,10 @@ mod tests {
             .iter()
             .filter(|v| matches!(v, InvariantViolation::TerminalIrreversibility { .. }))
             .collect();
-        assert!(
-            !s3.is_empty(),
-            "expected S3 terminal reversion violation, got: {:?}",
+        assert_eq!(
+            s3.len(),
+            1,
+            "expected exactly 1 S3 terminal reversion violation, got: {:?}",
             v,
         );
     }
@@ -389,9 +426,10 @@ mod tests {
             .iter()
             .filter(|v| matches!(v, InvariantViolation::CursorMonotonicity { .. }))
             .collect();
-        assert!(
-            !s5.is_empty(),
-            "expected S5 cursor regression violation, got: {:?}",
+        assert_eq!(
+            s5.len(),
+            1,
+            "expected exactly 1 S5 cursor regression violation, got: {:?}",
             v,
         );
     }
@@ -457,9 +495,10 @@ mod tests {
             .iter()
             .filter(|v| matches!(v, InvariantViolation::SplitCoverage { .. }))
             .collect();
-        assert!(
-            !s7.is_empty(),
-            "expected S7 split coverage violation for missing child, got: {:?}",
+        assert_eq!(
+            s7.len(),
+            1,
+            "expected exactly 1 S7 split coverage violation for missing child, got: {:?}",
             v,
         );
     }

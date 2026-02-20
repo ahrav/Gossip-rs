@@ -538,6 +538,133 @@ impl ShardRecord {
         );
     }
 
+    /// Validate all structural invariants without panicking.
+    ///
+    /// Returns `Ok(())` when all invariants hold, or `Err(message)` with
+    /// a diagnostic string describing the first violated invariant.
+    /// Suitable for contexts where panic-based detection is unavailable
+    /// (e.g., `panic=abort` builds).
+    ///
+    /// This is the non-panicking counterpart to [`assert_invariants`](Self::assert_invariants).
+    /// Both check the same set of invariants (INV-1 through INV-10).
+    pub fn validate_invariants(&self) -> Result<(), String> {
+        self.validate_lifecycle_invariants()?;
+        self.validate_lineage_invariants()
+    }
+
+    /// INV-1 through INV-5 (non-panicking).
+    fn validate_lifecycle_invariants(&self) -> Result<(), String> {
+        // INV-1: park_reason consistency.
+        match self.status {
+            ShardStatus::Parked => {
+                if self.park_reason.is_none() {
+                    return Err(format!(
+                        "Parked shard {:?} must have park_reason",
+                        self.shard,
+                    ));
+                }
+            }
+            _ => {
+                if self.park_reason.is_some() {
+                    return Err(format!(
+                        "Non-parked shard {:?} (status: {:?}) must not have park_reason",
+                        self.shard, self.status,
+                    ));
+                }
+            }
+        }
+
+        // INV-3: Terminal shards must not hold a lease.
+        if self.status.is_terminal() && self.lease.is_some() {
+            return Err(format!(
+                "Terminal shard {:?} (status: {:?}) must not have a lease",
+                self.shard, self.status,
+            ));
+        }
+
+        // INV-4: Fence epoch minimum.
+        if self.fence_epoch < FenceEpoch::INITIAL {
+            return Err(format!(
+                "Shard {:?}: fence_epoch must be >= INITIAL (1)",
+                self.shard,
+            ));
+        }
+
+        // INV-5: Op-log bounded.
+        if self.op_log.len() > Self::OP_LOG_CAP {
+            return Err(format!(
+                "Shard {:?}: op_log length {} exceeds cap {}",
+                self.shard,
+                self.op_log.len(),
+                Self::OP_LOG_CAP,
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// INV-6 through INV-10 (non-panicking).
+    fn validate_lineage_invariants(&self) -> Result<(), String> {
+        // INV-6: Split implies spawned is non-empty.
+        if self.status == ShardStatus::Split && self.spawned.is_empty() {
+            return Err(format!(
+                "Split shard {:?} must have spawned children",
+                self.shard,
+            ));
+        }
+
+        // INV-7: parent.is_some() iff shard.is_derived().
+        if self.parent.is_some() && !self.shard.is_derived() {
+            return Err(format!(
+                "Shard {:?} claims parentage but is not derived (bit 63 not set)",
+                self.shard,
+            ));
+        }
+        if self.shard.is_derived() && self.parent.is_none() {
+            return Err(format!(
+                "Shard {:?}: derived (bit 63 set) but has no parent",
+                self.shard,
+            ));
+        }
+
+        // INV-8: All spawned entries must be derived.
+        for (i, spawned_id) in self.spawned.iter().enumerate() {
+            if !spawned_id.is_derived() {
+                return Err(format!(
+                    "Shard {:?}: spawned[{i}] ({:?}) is not derived (bit 63 not set)",
+                    self.shard, spawned_id,
+                ));
+            }
+        }
+
+        // INV-9: Op-log entries have unique OpId values.
+        for i in 0..self.op_log.len() {
+            let a = self.op_log.get(i).unwrap();
+            for j in (i + 1)..self.op_log.len() {
+                let b = self.op_log.get(j).unwrap();
+                if a.op_id() == b.op_id() {
+                    return Err(format!(
+                        "Shard {:?}: duplicate OpId {:?} in op_log at indices {i} and {j}",
+                        self.shard,
+                        a.op_id(),
+                    ));
+                }
+            }
+        }
+
+        // INV-10: Spawned count bounded.
+        if self.spawned.len() > MAX_SPAWNED_PER_SHARD {
+            return Err(format!(
+                "Shard {:?}: spawned count {} exceeds cap {}",
+                self.shard,
+                self.spawned.len(),
+                MAX_SPAWNED_PER_SHARD,
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Create a [`ShardSnapshot`] for returning to a worker on acquisition.
     ///
     /// Contains only the information a worker needs to resume scanning.

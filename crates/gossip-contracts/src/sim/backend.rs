@@ -20,7 +20,7 @@
 //!
 //! - [`InvariantChecker::check_all`](super::invariants::InvariantChecker::check_all)
 //!   takes `&impl SimIntrospection` and uses [`shards()`](SimIntrospection::shards)
-//!   for the S1–S6 sweep and [`shard_lookup()`](SimIntrospection::shard_lookup)
+//!   for the S1–S7 invariant pass and [`shard_lookup()`](SimIntrospection::shard_lookup)
 //!   for S7 split-coverage child verification.
 //! - [`CoordinationSim`](super::harness::CoordinationSim) is generic over
 //!   `B: SimulationBackend`, combining mutation and observation in one bound.

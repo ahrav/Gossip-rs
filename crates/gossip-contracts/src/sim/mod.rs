@@ -20,7 +20,7 @@
 //!   seven safety properties (S1–S7) against coordinator ground truth at every
 //!   simulation step. It never trusts worker-side bookkeeping.
 //! - **`harness`** — [`CoordinationSim`], the top-level driver. Runs a
-//!   two-phase simulation (safety then liveness) with weighted random op
+//!   three-stage simulation (zombie preamble, safety, liveness) with weighted random op
 //!   generation, fault injection, and full invariant checking.
 //!
 //! # Determinism model
@@ -71,7 +71,7 @@ mod sim_behavioral_tests;
 #[cfg(test)]
 mod test_util;
 pub use harness::{CoordinationSim, RejectionKind, SimEvent, SimEventKind, SimOp, SimReport};
-pub use invariants::{InvariantChecker, InvariantViolation};
+pub use invariants::{InvariantChecker, InvariantViolation, SplitCoverageDetail};
 pub use worker::SimWorker;
 
 use rand::Rng;

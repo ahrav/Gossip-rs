@@ -45,7 +45,8 @@ const _: () = {
             | SimEventKind::WorkerPaused
             | SimEventKind::WorkerResumed
             | SimEventKind::Skipped
-            | SimEventKind::SessionLifecycleOk => {}
+            | SimEventKind::SessionLifecycleOk
+            | SimEventKind::SessionLifecyclePartial => {}
         }
     }
 };
