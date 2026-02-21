@@ -554,7 +554,7 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// deadline on success.
     ///
     /// **Complexity**: Computing the capacity hint adds an O(S) scan over the
-    /// run's shards, where S is the total shard count. Production backends
+    /// run's shards, where S is the run's shard count. Production backends
     /// should maintain a running counter for O(1) capacity hints.
     fn renew(
         &mut self,
