@@ -1,10 +1,9 @@
 //! Shared test utilities for the simulation module.
 //!
 //! Centralizes proptest strategies, canonical constants, and a fluent builder
-//! so that simulation test modules (`proptest_state_machine_tests`,
-//! `mega_sim_tests`, `sim_behavioral_tests`) and subsystem tests
-//! (`invariants`, `fault_injector`) share one source of truth for test data
-//! construction.
+//! so that simulation test modules (`proptest_state_machine_tests`),
+//! harness property tests, and subsystem tests (`invariants`,
+//! `fault_injector`) share one source of truth for test data construction.
 //!
 //! # Contents
 //!
@@ -35,8 +34,8 @@ use gossip_stdx::RingBuffer;
 /// Proptest strategy producing a uniform choice among the three [`FaultLevel`] variants.
 ///
 /// Each level has equal weight (`1:1:1`). Used by
-/// `prop_safety_across_fault_levels` to sweep all severity tiers in a
-/// single proptest run.
+/// `prop_safety_across_fault_levels` and harness-level property tests to
+/// sweep all severity tiers in a single proptest run.
 pub(crate) fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
     prop_oneof![
         Just(FaultLevel::SunnyDay),
@@ -62,7 +61,7 @@ pub(crate) fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
 ///
 /// # Weight distribution
 ///
-/// Total weight across the 15 included variants is **36**. Weights bias
+/// Total weight across the 15 included variants is **37**. Weights bias
 /// toward ops that drive forward progress (Acquire=6, AdvanceTime=5,
 /// Checkpoint=5, Complete=4) while exotic variants (Split*, Replay/Conflict
 /// Checkpoint) appear at weight 1 to exercise rejection paths without
@@ -111,7 +110,7 @@ pub(crate) const LEASE_DUR: u64 = 100;
 
 /// Convenience constructor for [`ShardKey`] from raw integer IDs.
 ///
-/// Wraps the two-step `RunId::from_raw` + `ShardId::from_raw` + `ShardKey::new`
+/// Wraps the three-step `RunId::from_raw` + `ShardId::from_raw` + `ShardKey::new`
 /// dance into a single call, keeping test setup concise.
 pub(crate) fn make_key(run: u64, shard: u64) -> ShardKey {
     ShardKey::new(RunId::from_raw(run), ShardId::from_raw(shard))
