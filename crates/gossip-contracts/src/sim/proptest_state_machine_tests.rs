@@ -144,14 +144,10 @@ mod deep_safety {
         /// The longer sequences increase the probability of reaching
         /// interesting coordinator states (e.g., all shards acquired then
         /// expired, cascaded splits, park/unpark cycles) that short sequences
-        /// rarely explore. `Stormy` is chosen as a middle ground: enough
-        /// fault surface to be interesting, but not so aggressive that most
-        /// ops are rejected before exercising real state transitions.
-        ///
-        /// Note: while `FaultLevel::Stormy` is passed to the constructor,
-        /// `step()` does not consult `FaultConfig`. The `Stormy` label here
-        /// serves as documentation of intent and future-proofs against any
-        /// coupling added later.
+        /// rarely explore. `Stormy` is passed as a label documenting intended
+        /// fault severity; since `step()` does not consult `FaultConfig`, the
+        /// level has no runtime effect but future-proofs against any coupling
+        /// added later.
         ///
         /// Run with: `cargo test --lib -- --ignored prop_safety_under_random_ops`
         #[test]
