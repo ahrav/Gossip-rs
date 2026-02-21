@@ -10,8 +10,9 @@
 //! # Complementary role with seed-based tests
 //!
 //! The seed-based mega-sim (`run()`) provides depth: long sequences with implicit
-//! fault injection (time jumps, lease expiry, worker pauses) driven by
-//! [`FaultConfig`](super::FaultConfig). These proptest tests provide *shrinkability*:
+//! time-jump fault injection driven by [`FaultConfig`](super::FaultConfig), plus
+//! worker pauses and lease expiry via weighted random op generation. These proptest
+//! tests provide *shrinkability*:
 //! shorter sequences where proptest can isolate a minimal failing subsequence. The
 //! two approaches cover different failure-finding trade-offs and are not redundant.
 //!
