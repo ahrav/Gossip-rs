@@ -322,6 +322,34 @@ panic when `GOSSIP_SIM_SEEDS=0`. The mega sweep's `div_ceil` and
 guard; this test mirrors the arithmetic path to verify the guard remains
 effective.
 
+### Proptest State Machine Tests (`proptest_state_machine_tests.rs`)
+
+Proptest-driven operation sequence tests that generate `Vec<SimOp>` via
+stateless strategies and feed them through `CoordinationSim::step()`.
+Unlike the mega-sim tests (which shrink only the seed), these tests shrink
+the operation sequence itself — when a bug is found, proptest minimizes to
+the smallest failing sequence of coordinator operations.
+
+Operations are generated without state tracking. The harness handles
+rejected/skipped ops gracefully, and the invariant checker (S1–S7) runs
+after every step regardless of outcome. Expected rejection rate is ~45-55%
+for held-shard ops; rejections verify the coordinator's rejection path
+preserves safety.
+
+| Test | Config | Assertions |
+|------|--------|------------|
+| `prop_short_sequences_preserve_invariants` | SunnyDay, 256 cases, 5-50 ops | No violations (CI gate) |
+| `prop_safety_under_random_ops` (`#[ignore]`) | Stormy, 200 cases, 5-200 ops | No violations |
+| `prop_safety_across_fault_levels` (`#[ignore]`) | All levels, 100 cases, 5-200 ops | No violations |
+
+```bash
+# CI-friendly (not ignored)
+cargo test -p gossip-contracts prop_short_sequences_preserve_invariants
+
+# Deep tests (ignored)
+cargo test -p gossip-contracts proptest_state_machine -- --ignored --nocapture
+```
+
 For simulation architecture, the invariant table (S1–S7), determinism
 model, fault injection levels, and two-phase run model, see
 [simulation-harness.md](simulation-harness.md).
@@ -446,9 +474,11 @@ Full invariant definitions and the checker implementation are in
 | `coordination/test_fixtures.rs`     | Shared factory functions and seeded coordinator setup            |
 | `sim/sim_behavioral_tests.rs`       | Tier 4a: fixed-seed behavioral regression + deterministic replay |
 | `sim/mega_sim_tests.rs`             | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
+| `sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking    |
 | `sim/harness.rs`                    | Simulation driver (CoordinationSim, two-phase run model)         |
 | `sim/invariants.rs`                 | External invariant checker (S1–S7)                               |
 | `sim/worker.rs`                     | Simulated worker bookkeeping                                     |
+| `sim/test_util.rs`                  | Shared test helpers: record builder, proptest strategies         |
 | `sim/mod.rs`                        | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
 
 ---

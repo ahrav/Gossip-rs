@@ -67,6 +67,8 @@ pub use fault_injector::FaultInjectingIntrospector;
 #[cfg(test)]
 mod mega_sim_tests;
 #[cfg(test)]
+mod proptest_state_machine_tests;
+#[cfg(test)]
 mod sim_behavioral_tests;
 #[cfg(test)]
 mod test_util;

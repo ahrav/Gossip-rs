@@ -1,12 +1,61 @@
 //! Shared test utilities for the simulation module.
 
+use proptest::prelude::*;
+
 use crate::coordination::cursor::Cursor;
 use crate::coordination::lease::LeaseHolder;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::record::ShardStatus;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
-use crate::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId};
+use crate::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId, WorkerId};
+use crate::sim::FaultLevel;
+use crate::sim::harness::SimOp;
 use gossip_stdx::RingBuffer;
+
+/// Proptest strategy producing a uniform choice among the three fault levels.
+pub(crate) fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
+    prop_oneof![
+        Just(FaultLevel::SunnyDay),
+        Just(FaultLevel::Stormy),
+        Just(FaultLevel::Radioactive),
+    ]
+}
+
+/// Proptest strategy producing a single [`SimOp`].
+///
+/// Workers are drawn from `1..=n_workers`, shard keys from `(run=1, shard=1..=n_shards)`.
+/// `ZombieCheckpoint` is excluded because it requires harness-internal `stale_leases`
+/// state and always produces a trivial `NoStaleLease` rejection when called externally.
+///
+/// Weights bias toward ops that drive state forward (Acquire, AdvanceTime, Checkpoint)
+/// while still including exotic variants (Split*, ReplayCheckpoint, ConflictCheckpoint)
+/// at lower probability to exercise rejection paths.
+pub(crate) fn arb_sim_op(n_workers: u64, n_shards: u64) -> impl Strategy<Value = SimOp> {
+    let worker = (1..=n_workers).prop_map(WorkerId::from_raw);
+    let key = (1..=n_shards).prop_map(|s| ShardKey::new(RunId::from_raw(1), ShardId::from_raw(s)));
+
+    let w = worker.clone();
+    let k = key.clone();
+    prop_oneof![
+        6 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Acquire { worker, key }),
+        // Tick range 1..=50 stays below DEFAULT_LEASE_DURATION (100) to prevent
+        // a single advance from expiring all leases at once.
+        5 => (1u64..=50).prop_map(|ticks| SimOp::AdvanceTime { ticks }),
+        5 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Checkpoint { worker, key }),
+        4 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Complete { worker, key }),
+        3 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Renew { worker, key }),
+        2 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::SessionLifecycle { worker, key }),
+        2 => w.clone().prop_map(|worker| SimOp::ClaimNext { worker }),
+        2 => w.clone().prop_map(|worker| SimOp::PauseWorker { worker }),
+        2 => w.clone().prop_map(|worker| SimOp::ResumeWorker { worker }),
+        1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::Park { worker, key }),
+        1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::SplitReplace { worker, key }),
+        1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::SplitResidual { worker, key }),
+        1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::ReplayCheckpoint { worker, key }),
+        1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::ConflictCheckpoint { worker, key }),
+        1 => k.clone().prop_map(|key| SimOp::Unpark { key }),
+    ]
+}
 
 /// Standard test tenant used across simulation test modules.
 pub(crate) const TENANT: TenantId = TenantId::from_bytes([0x01; 32]);
