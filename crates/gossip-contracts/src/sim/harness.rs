@@ -2528,13 +2528,7 @@ mod tests {
         }
     }
 
-    fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
-        prop_oneof![
-            Just(FaultLevel::SunnyDay),
-            Just(FaultLevel::Stormy),
-            Just(FaultLevel::Radioactive),
-        ]
-    }
+    use crate::sim::test_util::arb_fault_level;
 
     // -- Cluster 1: no-violations property (replaces 5 tests) ----------------
 
