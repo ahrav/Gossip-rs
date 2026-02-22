@@ -325,7 +325,7 @@ mod tests {
             )),
             FenceEpoch::from_raw(2),
             None,
-            vec![],
+            gossip_stdx::InlineVec::new(),
             RingBuffer::new(),
         );
         r.assert_invariants();
@@ -777,7 +777,7 @@ mod tests {
                 None,
                 FenceEpoch::INITIAL,
                 None,
-                vec![],
+                gossip_stdx::InlineVec::new(),
                 RingBuffer::new(),
             );
 

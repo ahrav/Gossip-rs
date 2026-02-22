@@ -67,11 +67,12 @@
 //!
 //! # Performance note
 //!
-//! `claim_next_available` (via `ShardClaiming`) scans all shards in the
-//! target run — O(S) where S is the run's shard count. Acceptable here;
+//! `claim_next_available` (via `ShardClaiming`) delegates to `list_shards`,
+//! which sorts candidates by key range in this backend. The resulting worst
+//! case is O(S log S) where S is the run's shard count. Acceptable here;
 //! production backends need a secondary available-shards index.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{
@@ -111,6 +112,289 @@ use gossip_stdx::RingBuffer;
 /// provides hash-flooding resistance via per-instance random keys
 /// (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
+
+// Initial map/set capacity policy.
+//
+// These values are intentionally conservative. They reduce eager allocation
+// compared with the previous fixed-capacity (64/16) policy while keeping
+// behavior identical as structures grow.
+const TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
+const TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 16;
+const TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY: usize = 8;
+const TOP_LEVEL_RUN_SHARDS_MAP_INITIAL_CAPACITY: usize = 8;
+const TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY: usize = 8;
+const TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
+const TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 32;
+const RUN_SHARD_SET_INITIAL_CAPACITY: usize = 8;
+const DEFAULT_MAX_SHARDS_PER_TENANT: usize = 100_000;
+const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
+
+#[inline]
+fn ahash_map_with_capacity<K, V>(capacity: usize) -> AHashMap<K, V> {
+    AHashMap::with_capacity_and_hasher(capacity, ahash::RandomState::default())
+}
+
+#[inline]
+fn ahash_set_with_capacity<T>(capacity: usize) -> HashSet<T, ahash::RandomState> {
+    HashSet::with_capacity_and_hasher(capacity, ahash::RandomState::default())
+}
+
+#[inline]
+fn top_level_shards_map_initial_capacity(
+    max_total_shards: usize,
+    max_shards_per_tenant: usize,
+) -> usize {
+    // Estimate tenant cardinality from shard limits, then clamp to a small
+    // startup range so tiny deployments do not pre-allocate aggressively.
+    let tenant_limit = max_shards_per_tenant.max(1);
+    let estimated_tenants = max_total_shards.div_ceil(tenant_limit);
+    estimated_tenants.clamp(
+        TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY,
+        TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY,
+    )
+}
+
+#[inline]
+fn tenant_shards_map_initial_capacity(max_shards_per_tenant: usize) -> usize {
+    max_shards_per_tenant.clamp(
+        TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY,
+        TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY,
+    )
+}
+
+/// Runtime constructor configuration for [`InMemoryCoordinator`].
+///
+/// This type drives operational constructor behavior:
+/// lease duration, shard limits, and optional claim cooldown.
+/// It intentionally excludes planning-only budget knobs from
+/// [`CoordinatorConfig`] so runtime enforcement and capacity estimation can
+/// evolve independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorRuntimeConfig {
+    /// Duration (in logical time units) applied to every new lease.
+    pub default_lease_duration: u64,
+    /// Maximum number of shards a single tenant may own.
+    pub max_shards_per_tenant: usize,
+    /// Maximum total shards across all tenants.
+    pub max_total_shards: usize,
+    /// Minimum logical time units between successful claims by the same worker.
+    /// Zero disables cooldown.
+    pub claim_cooldown_interval: u64,
+}
+
+impl CoordinatorRuntimeConfig {
+    /// Create a runtime config with explicit parameters.
+    #[must_use]
+    pub const fn new(
+        default_lease_duration: u64,
+        max_shards_per_tenant: usize,
+        max_total_shards: usize,
+        claim_cooldown_interval: u64,
+    ) -> Self {
+        Self {
+            default_lease_duration,
+            max_shards_per_tenant,
+            max_total_shards,
+            claim_cooldown_interval,
+        }
+    }
+
+    /// Create a runtime config with explicit shard limits and no cooldown.
+    #[must_use]
+    pub const fn with_limits(
+        default_lease_duration: u64,
+        max_shards_per_tenant: usize,
+        max_total_shards: usize,
+    ) -> Self {
+        Self::new(
+            default_lease_duration,
+            max_shards_per_tenant,
+            max_total_shards,
+            0,
+        )
+    }
+}
+
+/// Planning-only configuration for memory budget estimation.
+///
+/// Models expected memory needs from deployment-level parameters using a
+/// static formula. See `docs/memory-budget-audit.md`.
+///
+/// This configuration does not configure runtime behavior and is not
+/// runtime-enforced. Coordinator construction uses
+/// [`CoordinatorRuntimeConfig`] (via
+/// [`InMemoryCoordinator::with_runtime_config`]); this type remains for
+/// capacity planning and memory-budget estimation only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+    /// Global shard cap.
+    pub max_total_shards: usize,
+    /// Per-tenant shard cap.
+    pub max_shards_per_tenant: usize,
+    /// Maximum concurrent runs.
+    pub max_runs: usize,
+    /// Maximum distinct workers.
+    pub max_workers: usize,
+    /// Per-shard byte budget for variable-length fields (keys, metadata, token, spawned).
+    pub per_shard_budget: usize,
+    /// Per-run byte budget for root_shards + op results.
+    pub per_run_budget: usize,
+}
+
+impl CoordinatorConfig {
+    /// Create a config with explicit parameters.
+    #[must_use]
+    pub const fn new(
+        max_total_shards: usize,
+        max_shards_per_tenant: usize,
+        max_runs: usize,
+        max_workers: usize,
+        per_shard_budget: usize,
+        per_run_budget: usize,
+    ) -> Self {
+        Self {
+            max_total_shards,
+            max_shards_per_tenant,
+            max_runs,
+            max_workers,
+            per_shard_budget,
+            per_run_budget,
+        }
+    }
+
+    /// Defaults for local development and unit tests.
+    ///
+    /// ~3 MiB: 512 shards, 64 runs, 16 workers.
+    #[must_use]
+    pub const fn dev_defaults() -> Self {
+        Self {
+            max_total_shards: 512,
+            max_shards_per_tenant: 256,
+            max_runs: 64,
+            max_workers: 16,
+            per_shard_budget: 4_096,
+            per_run_budget: 2_048,
+        }
+    }
+
+    /// Defaults for staging / integration tests.
+    ///
+    /// ~91 MiB: 10 K shards, 1 K runs, 256 workers.
+    #[must_use]
+    pub const fn staging_defaults() -> Self {
+        Self {
+            max_total_shards: 10_000,
+            max_shards_per_tenant: 2_000,
+            max_runs: 1_000,
+            max_workers: 256,
+            per_shard_budget: 8_192,
+            per_run_budget: 4_096,
+        }
+    }
+
+    /// Defaults for production deployments.
+    ///
+    /// ~17 GiB: 1 M shards, 100 K runs, 10 K workers.
+    #[must_use]
+    pub const fn prod_defaults() -> Self {
+        Self {
+            max_total_shards: 1_000_000,
+            max_shards_per_tenant: 100_000,
+            max_runs: 100_000,
+            max_workers: 10_000,
+            per_shard_budget: 16_384,
+            per_run_budget: 8_192,
+        }
+    }
+
+    /// Estimate planning memory budget in bytes.
+    ///
+    /// Formula: `M = S * (776 + B_s + 72) + R * (512 + B_r + 80) + W * 16 + 4096`
+    ///
+    /// Where:
+    /// - `S` = `max_total_shards`, `B_s` = `per_shard_budget`
+    /// - `R` = `max_runs`, `B_r` = `per_run_budget`
+    /// - `W` = `max_workers`
+    /// - 776 = `size_of::<ShardRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
+    /// - 72 = per-entry HashMap overhead (key + bucket metadata)
+    /// - 512 = `size_of::<RunRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
+    /// - 80 = per-entry HashMap overhead for run entries
+    /// - 16 = per-entry in claim_cooldowns
+    /// - 4096 = base coordinator struct + map headers
+    ///
+    /// Assumptions:
+    /// - Struct-size constants (`776`, `512`) match this target's layout
+    ///   (validated by `memory_budget_constants_match_struct_sizes`).
+    /// - HashMap overhead terms (`72`, `80`, `16`) are modeling estimates
+    ///   for current key/bucket metadata behavior.
+    /// - One cooldown entry exists per distinct worker.
+    /// - Allocator fragmentation, transient resize peaks, and runtime
+    ///   implementation variance are excluded.
+    ///
+    /// Planning-only contract: this estimate is not a hard runtime bound and
+    /// is not consulted by allocation paths.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a deterministic message if any intermediate arithmetic
+    /// overflows `usize`.
+    #[must_use]
+    pub const fn memory_budget(&self) -> usize {
+        let per_shard_base = match 776usize.checked_add(self.per_shard_budget) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-shard base"),
+        };
+        let per_shard = match per_shard_base.checked_add(72) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-shard overhead"),
+        };
+
+        let per_run_base = match 512usize.checked_add(self.per_run_budget) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-run base"),
+        };
+        let per_run = match per_run_base.checked_add(80) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-run overhead"),
+        };
+
+        let shard_bytes = match self.max_total_shards.checked_mul(per_shard) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: shard contribution"),
+        };
+        let run_bytes = match self.max_runs.checked_mul(per_run) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: run contribution"),
+        };
+        let worker_bytes = match self.max_workers.checked_mul(16) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: worker contribution"),
+        };
+
+        let with_runs = match shard_bytes.checked_add(run_bytes) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: shard+run total"),
+        };
+        let with_workers = match with_runs.checked_add(worker_bytes) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: shard+run+worker total"),
+        };
+        match with_workers.checked_add(4096) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: final total"),
+        }
+    }
+
+    /// Estimate planning memory budget in mebibytes (rounded up).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any overflow panic from [`memory_budget`](Self::memory_budget).
+    #[must_use]
+    pub const fn memory_budget_mb(&self) -> usize {
+        self.memory_budget().div_ceil(1 << 20)
+    }
+}
 
 /// In-memory coordinator for shard-level operations.
 ///
@@ -172,18 +456,17 @@ pub struct InMemoryCoordinator {
     max_total_shards: usize,
     /// Per-worker claim cooldown: worker -> last successful claim time.
     ///
-    /// Uses `BTreeMap` (not `HashMap`) for deterministic `Debug` output,
-    /// which aids simulation debugging. Only accessed via point lookups
-    /// (`get`/`insert`). Grows at most one entry per distinct `WorkerId`
-    /// that successfully claims a shard.
+    /// Only accessed via point lookups (`get`/`insert`). Grows at most one
+    /// entry per distinct `WorkerId` that successfully claims a shard.
     ///
     /// Entries are never evicted: once a worker claims, its timestamp
     /// remains for the coordinator's lifetime. This is acceptable
-    /// because (a) worker count is bounded by deployment size, and
-    /// (b) adding periodic eviction would turn the O(1)
-    /// `check_cooldown` path into O(N). Production backends should
-    /// use TTL-based eviction at the storage layer.
-    claim_cooldowns: BTreeMap<WorkerId, LogicalTime>,
+    /// because bounded worker population is an operational assumption
+    /// of the deployment, not local enforcement in this coordinator.
+    /// Adding periodic eviction here would turn the average O(1)
+    /// `check_cooldown` path into O(N). Production backends should use
+    /// TTL-based eviction at the storage layer.
+    claim_cooldowns: AHashMap<WorkerId, LogicalTime>,
     /// Minimum logical time units between successive successful claims
     /// by the same worker. Zero disables cooldown entirely.
     ///
@@ -200,10 +483,66 @@ impl InMemoryCoordinator {
     ///
     /// Panics if `default_lease_duration` is 0.
     pub fn new(default_lease_duration: u64) -> Self {
-        Self::with_limits(default_lease_duration, 100_000, 1_000_000)
+        Self::with_runtime_config(CoordinatorRuntimeConfig::with_limits(
+            default_lease_duration,
+            DEFAULT_MAX_SHARDS_PER_TENANT,
+            DEFAULT_MAX_TOTAL_SHARDS,
+        ))
+    }
+
+    /// Create a coordinator from explicit runtime constructor config.
+    ///
+    /// `new`, `with_limits`, and `with_cooldown` all delegate here so
+    /// constructor behavior stays aligned while preserving existing call sites.
+    /// The config also seeds conservative initial map/set capacities; shard
+    /// limits are enforced by runtime checks, not by those initial capacities.
+    /// In debug builds, `claim_cooldown_interval > default_lease_duration`
+    /// triggers a `debug_assert!` because it is usually a misconfiguration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `default_lease_duration` is 0 or if either shard limit is 0.
+    pub fn with_runtime_config(config: CoordinatorRuntimeConfig) -> Self {
+        let CoordinatorRuntimeConfig {
+            default_lease_duration,
+            max_shards_per_tenant,
+            max_total_shards,
+            claim_cooldown_interval,
+        } = config;
+
+        assert!(default_lease_duration > 0, "lease duration must be > 0");
+        assert!(
+            max_shards_per_tenant > 0,
+            "max_shards_per_tenant must be > 0"
+        );
+        assert!(max_total_shards > 0, "max_total_shards must be > 0");
+        debug_assert!(
+            claim_cooldown_interval == 0 || claim_cooldown_interval <= default_lease_duration,
+            "claim_cooldown_interval ({claim_cooldown_interval}) exceeds \
+             default_lease_duration ({default_lease_duration}); a worker cannot \
+             claim a second shard within one lease period"
+        );
+
+        let top_level_shards_capacity =
+            top_level_shards_map_initial_capacity(max_total_shards, max_shards_per_tenant);
+        Self {
+            shards: ahash_map_with_capacity(top_level_shards_capacity),
+            total_shard_count: 0,
+            runs: ahash_map_with_capacity(TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY),
+            run_shards: ahash_map_with_capacity(TOP_LEVEL_RUN_SHARDS_MAP_INITIAL_CAPACITY),
+            default_lease_duration,
+            max_shards_per_tenant,
+            max_total_shards,
+            claim_cooldowns: ahash_map_with_capacity(
+                TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY,
+            ),
+            claim_cooldown_interval,
+        }
     }
 
     /// Create a coordinator with explicit shard count limits.
+    ///
+    /// Compatibility wrapper for call sites that do not need claim cooldown.
     ///
     /// # Panics
     ///
@@ -213,26 +552,16 @@ impl InMemoryCoordinator {
         max_shards_per_tenant: usize,
         max_total_shards: usize,
     ) -> Self {
-        assert!(default_lease_duration > 0, "lease duration must be > 0");
-        assert!(
-            max_shards_per_tenant > 0,
-            "max_shards_per_tenant must be > 0"
-        );
-        assert!(max_total_shards > 0, "max_total_shards must be > 0");
-        Self {
-            shards: AHashMap::default(),
-            total_shard_count: 0,
-            runs: AHashMap::default(),
-            run_shards: AHashMap::default(),
+        Self::with_runtime_config(CoordinatorRuntimeConfig::with_limits(
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
-            claim_cooldowns: BTreeMap::new(),
-            claim_cooldown_interval: 0,
-        }
+        ))
     }
 
     /// Create a coordinator with explicit shard limits and claim cooldown.
+    ///
+    /// Compatibility wrapper for call sites that set cooldown explicitly.
     ///
     /// # Parameters
     ///
@@ -255,19 +584,12 @@ impl InMemoryCoordinator {
         max_total_shards: usize,
         claim_cooldown_interval: u64,
     ) -> Self {
-        let mut coord = Self::with_limits(
+        Self::with_runtime_config(CoordinatorRuntimeConfig::new(
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
-        );
-        coord.claim_cooldown_interval = claim_cooldown_interval;
-        debug_assert!(
-            claim_cooldown_interval == 0 || claim_cooldown_interval <= default_lease_duration,
-            "claim_cooldown_interval ({claim_cooldown_interval}) exceeds \
-             default_lease_duration ({default_lease_duration}); a worker cannot \
-             claim a second shard within one lease period"
-        );
-        coord
+            claim_cooldown_interval,
+        ))
     }
 
     /// Seed a shard record directly (test/fixture helper).
@@ -292,7 +614,7 @@ impl InMemoryCoordinator {
         let key = ShardKey::new(record.run, record.shard);
         self.run_shards
             .entry((record.tenant, record.run))
-            .or_default()
+            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY))
             .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
     }
@@ -306,7 +628,7 @@ impl InMemoryCoordinator {
         let key = ShardKey::new(record.run, record.shard);
         self.run_shards
             .entry((record.tenant, record.run))
-            .or_default()
+            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY))
             .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
     }
@@ -370,7 +692,11 @@ impl InMemoryCoordinator {
     /// the remove-mutate-restore pattern in split operations removes a
     /// parent, then re-inserts the mutated parent at the same key.
     fn shard_insert(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
-        let inner = self.shards.entry(tenant).or_default();
+        let inner_initial_capacity = tenant_shards_map_initial_capacity(self.max_shards_per_tenant);
+        let inner = self
+            .shards
+            .entry(tenant)
+            .or_insert_with(|| ahash_map_with_capacity(inner_initial_capacity));
         if inner.insert(key, record).is_none() {
             self.total_shard_count += 1;
         }
@@ -1319,7 +1645,7 @@ impl InMemoryCoordinator {
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
         self.run_shards
             .entry((tenant, run))
-            .or_default()
+            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY))
             .insert(shard);
     }
 
@@ -1629,7 +1955,7 @@ impl RunManagement for InMemoryCoordinator {
 
         self.run_shards
             .entry((tenant, run))
-            .or_default()
+            .or_insert_with(|| ahash_set_with_capacity(shard_ids.len()))
             .extend(shard_ids.iter().copied());
 
         // 7. Transition run → Active.
@@ -2016,8 +2342,9 @@ impl ShardClaiming for InMemoryCoordinator {
     /// Overrides the default [`ShardClaiming`] implementation to add a
     /// cooldown gate: if the worker's last successful claim was less than
     /// `claim_cooldown_interval` logical time units ago, the request is
-    /// rejected with [`ClaimError::Throttled`] *before* the O(S) candidate
-    /// scan. On success, the worker's cooldown timer is reset. Failed
+    /// rejected with [`ClaimError::Throttled`] *before* invoking candidate
+    /// selection (O(S log S) in this backend because `list_shards` sorts
+    /// candidates by key range). On success, the worker's cooldown timer is reset. Failed
     /// claims (no shards available, run not found) do not trigger cooldown,
     /// so a worker competing for scarce shards is never penalized for losing
     /// a race.
@@ -2028,7 +2355,8 @@ impl ShardClaiming for InMemoryCoordinator {
         run: RunId,
         worker: WorkerId,
     ) -> Result<AcquireResult, ClaimError> {
-        // Cooldown gate: O(log W) rejection before the O(S) candidate scan.
+        // Cooldown gate: average O(1) hash lookup before candidate selection
+        // (O(S log S) in this backend due to `list_shards` sorting).
         if let Some(retry_after) = self.check_cooldown(worker, now) {
             return Err(ClaimError::Throttled { retry_after });
         }

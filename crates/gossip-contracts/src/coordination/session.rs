@@ -474,6 +474,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// - The original status, cursor, cursor semantics, and parent (unchanged)
     /// - The residual's `ShardId` appended to the spawned list
     ///
+    /// The rebuild uses iterator composition instead of depending on any
+    /// specific spawned-list container representation.
+    ///
     /// On `Replayed`, the snapshot is left unchanged — the first call in
     /// this session already narrowed it, or (after crash-recovery) the
     /// snapshot from `acquire_and_restore` already reflects the narrowed spec.
@@ -521,15 +524,17 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             //     record already reflects the narrowed spec, so the snapshot
             //     from `acquire_and_restore` is already correct.
             // In both cases, skipping the rebuild is safe.
-            let mut spawned = self.snapshot.spawned().to_vec();
-            spawned.push(res.residual);
             self.snapshot = ShardSnapshot::new(
                 self.snapshot.status(),
                 new_spec.clone(),
                 self.snapshot.cursor().clone(),
                 self.snapshot.cursor_semantics(),
                 self.snapshot.parent(),
-                spawned,
+                self.snapshot
+                    .spawned()
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(res.residual)),
             );
             debug_assert_eq!(
                 self.snapshot.status(),

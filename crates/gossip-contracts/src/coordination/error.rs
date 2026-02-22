@@ -1172,10 +1172,10 @@ pub struct RenewResult {
 
 // Compile-time size assertions: these types live on hot-path return types.
 // RenewResult is Copy (two scalars + CapacityHint), so should stay compact.
-// AcquireResult contains heap-backed ShardSnapshot, so its inline size is
-// larger but still bounded by pointer-width fields.
+// AcquireResult contains ShardSnapshot with inline SpawnedList, so its size
+// is larger than a pure-pointer layout but still bounded.
 const _: () = assert!(core::mem::size_of::<RenewResult>() <= 32);
-const _: () = assert!(core::mem::size_of::<AcquireResult>() <= 224);
+const _: () = assert!(core::mem::size_of::<AcquireResult>() <= 288);
 
 // Checkpoint, Complete, and Park return `IdempotentOutcome<()>` on
 // success (the operation either executed or was replayed, with no

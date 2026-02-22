@@ -642,7 +642,7 @@ fn derived_shard_id(base: u64) -> ShardId {
 /// lets spawn-cap tests start at an exact distance from the limit
 /// without performing actual split operations.
 fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
-    let spawned: Vec<ShardId> = (0..spawned_count as u64)
+    let spawned: crate::coordination::record::SpawnedList = (0..spawned_count as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
     let record = ShardRecord::from_raw_parts(
@@ -3496,4 +3496,144 @@ fn capacity_hint_helpers() {
     assert_eq!(CapacityHint::ZERO.available_count, 0);
     assert_eq!(CapacityHint::ZERO.earliest_deadline, None);
     assert!(CapacityHint::ZERO.is_saturated());
+}
+
+/// Asserts constructor wrappers are behaviorally equivalent at initialization.
+///
+/// This guards the runtime-config migration: legacy constructor entry points
+/// must preserve both limits/cooldown semantics and initial capacity policy.
+fn assert_constructor_equivalent(lhs: &InMemoryCoordinator, rhs: &InMemoryCoordinator) {
+    assert_eq!(lhs.default_lease_duration, rhs.default_lease_duration);
+    assert_eq!(lhs.max_shards_per_tenant, rhs.max_shards_per_tenant);
+    assert_eq!(lhs.max_total_shards, rhs.max_total_shards);
+    assert_eq!(lhs.claim_cooldown_interval, rhs.claim_cooldown_interval);
+    assert_eq!(lhs.shards.capacity(), rhs.shards.capacity());
+    assert_eq!(lhs.runs.capacity(), rhs.runs.capacity());
+    assert_eq!(lhs.run_shards.capacity(), rhs.run_shards.capacity());
+    assert_eq!(
+        lhs.claim_cooldowns.capacity(),
+        rhs.claim_cooldowns.capacity()
+    );
+    assert_eq!(lhs.total_shard_count, rhs.total_shard_count);
+    assert_eq!(lhs.total_shard_count, 0);
+    assert!(lhs.shards.is_empty());
+    assert!(lhs.runs.is_empty());
+    assert!(lhs.run_shards.is_empty());
+    assert!(lhs.claim_cooldowns.is_empty());
+}
+
+#[test]
+fn runtime_constructor_matches_new_defaults() {
+    let runtime = InMemoryCoordinator::with_runtime_config(CoordinatorRuntimeConfig::with_limits(
+        LEASE_DURATION,
+        DEFAULT_MAX_SHARDS_PER_TENANT,
+        DEFAULT_MAX_TOTAL_SHARDS,
+    ));
+    let legacy = InMemoryCoordinator::new(LEASE_DURATION);
+    assert_constructor_equivalent(&runtime, &legacy);
+}
+
+#[test]
+fn runtime_constructor_matches_with_limits() {
+    let runtime = InMemoryCoordinator::with_runtime_config(CoordinatorRuntimeConfig::with_limits(
+        LEASE_DURATION,
+        123,
+        456,
+    ));
+    let legacy = InMemoryCoordinator::with_limits(LEASE_DURATION, 123, 456);
+    assert_constructor_equivalent(&runtime, &legacy);
+}
+
+#[test]
+fn runtime_constructor_matches_with_cooldown() {
+    let runtime = InMemoryCoordinator::with_runtime_config(CoordinatorRuntimeConfig::new(
+        LEASE_DURATION,
+        123,
+        456,
+        9,
+    ));
+    let legacy = InMemoryCoordinator::with_cooldown(LEASE_DURATION, 123, 456, 9);
+    assert_constructor_equivalent(&runtime, &legacy);
+}
+
+// -- CoordinatorConfig memory budget smoke tests ------------------------------
+
+#[test]
+fn coordinator_config_dev_defaults_budget() {
+    let cfg = super::CoordinatorConfig::dev_defaults();
+    let mb = cfg.memory_budget_mb();
+    // Dev defaults: ~3 MiB. Allow 1-100 MiB range for formula drift.
+    assert!(
+        (1..=100).contains(&mb),
+        "dev_defaults budget {mb} MB outside expected 1-100 MB range"
+    );
+}
+
+#[test]
+fn coordinator_config_prod_defaults_budget() {
+    let cfg = super::CoordinatorConfig::prod_defaults();
+    let mb = cfg.memory_budget_mb();
+    // Prod defaults: 1M shards × ~17 KiB each ≈ 17 GB. Allow 5-25 GB range.
+    assert!(
+        (5_000..=25_000).contains(&mb),
+        "prod_defaults budget {mb} MB outside expected 5000-25000 MB range"
+    );
+}
+
+#[test]
+fn coordinator_config_memory_budget_mb_rounds_up() {
+    // A config that produces a non-MiB-aligned byte count should round up.
+    let cfg = super::CoordinatorConfig::new(1, 1, 1, 1, 1, 1);
+    let bytes = cfg.memory_budget();
+    let mb = cfg.memory_budget_mb();
+    let expected_mb = bytes.div_ceil(1 << 20);
+    assert_eq!(mb, expected_mb);
+}
+
+#[test]
+#[should_panic(expected = "CoordinatorConfig::memory_budget overflow: shard contribution")]
+fn coordinator_config_memory_budget_overflow_panics_deterministically() {
+    let cfg = super::CoordinatorConfig::new(usize::MAX, 1, 1, 1, 0, 0);
+    let _ = cfg.memory_budget();
+}
+
+#[test]
+#[should_panic(expected = "CoordinatorConfig::memory_budget overflow: per-shard base")]
+fn coordinator_config_memory_budget_per_shard_add_overflow_panics_deterministically() {
+    let cfg = super::CoordinatorConfig::new(1, 1, 1, 1, usize::MAX, 0);
+    let _ = cfg.memory_budget();
+}
+
+#[test]
+#[should_panic(expected = "CoordinatorConfig::memory_budget overflow: shard contribution")]
+fn coordinator_config_memory_budget_mb_overflow_panics_deterministically() {
+    let cfg = super::CoordinatorConfig::new(usize::MAX, 1, 1, 1, 0, 0);
+    let _ = cfg.memory_budget_mb();
+}
+
+/// Validates that the planning constants in `memory_budget()` match
+/// actual struct sizes on this platform. If this test fails, the
+/// constants in `CoordinatorConfig::memory_budget()` need updating.
+#[test]
+fn memory_budget_constants_match_struct_sizes() {
+    use super::ShardRecord;
+    use crate::coordination::run::RunRecord;
+    use std::mem::size_of;
+
+    let shard_size = size_of::<ShardRecord>();
+    let run_size = size_of::<RunRecord>();
+
+    // The planning formula uses 776 for ShardRecord and 512 for RunRecord.
+    // These are documented in `CoordinatorConfig::memory_budget()`.
+    // Keep this test in lockstep with the implementation and docs.
+    assert_eq!(
+        shard_size, 776,
+        "ShardRecord size changed from 776 to {shard_size}; \
+         update the constant in CoordinatorConfig::memory_budget()"
+    );
+    assert_eq!(
+        run_size, 512,
+        "RunRecord size changed from 512 to {run_size}; \
+         update the constant in CoordinatorConfig::memory_budget()"
+    );
 }

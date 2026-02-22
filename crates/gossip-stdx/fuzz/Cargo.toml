@@ -18,3 +18,8 @@ gossip-stdx = { path = ".." }
 name = "fuzz_ring_buffer"
 path = "fuzz_targets/fuzz_ring_buffer.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_inline_vec"
+path = "fuzz_targets/fuzz_inline_vec.rs"
+doc = false

@@ -2324,7 +2324,7 @@ mod tests {
             None,
             large_epoch,
             None,
-            vec![],
+            gossip_stdx::InlineVec::new(),
             RingBuffer::new(),
         );
         let summary = ShardSummary::from_record(&record, LogicalTime::from_raw(1));

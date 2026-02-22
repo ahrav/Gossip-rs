@@ -4,10 +4,11 @@
 //! ([`ParkReason`]), the full [`ShardRecord`] with runtime invariant
 //! assertions, and the worker-visible [`ShardSnapshot`].
 
+use std::borrow::Borrow;
 use std::fmt;
 
 use blake3::Hasher;
-use gossip_stdx::RingBuffer;
+use gossip_stdx::{InlineVec, RingBuffer};
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
@@ -17,6 +18,10 @@ use crate::identity::{
 };
 
 use super::split::MAX_SPAWNED_PER_SHARD;
+
+/// Inline-first list for shard spawn tracking. 8 inline slots cover 99%+
+/// of shards; only long split chains spill to heap.
+pub(crate) type SpawnedList = InlineVec<ShardId, 8>;
 
 // ============================================================================
 // ShardStatus
@@ -276,7 +281,7 @@ pub struct ShardRecord {
     /// Shards created by this shard via split operations.
     /// For `status == Split`: the replacement children.
     /// For `status == Active`: any residual shards spawned so far.
-    pub(crate) spawned: Vec<ShardId>,
+    pub(crate) spawned: SpawnedList,
 
     // -- Idempotency --
     /// Bounded operation log for idempotent replay.
@@ -316,7 +321,7 @@ impl ShardRecord {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
-            spawned: Vec::new(),
+            spawned: InlineVec::new(),
             op_log: RingBuffer::new(),
         };
         record.assert_invariants();
@@ -345,7 +350,7 @@ impl ShardRecord {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: Some(parent),
-            spawned: Vec::new(),
+            spawned: InlineVec::new(),
             op_log: RingBuffer::new(),
         };
         record.assert_invariants();
@@ -370,7 +375,7 @@ impl ShardRecord {
         lease: Option<LeaseHolder>,
         fence_epoch: FenceEpoch,
         parent: Option<ShardId>,
-        spawned: Vec<ShardId>,
+        spawned: SpawnedList,
         op_log: RingBuffer<OpLogEntry, { ShardRecord::OP_LOG_CAP }>,
     ) -> Self {
         Self {
@@ -670,7 +675,8 @@ impl ShardRecord {
     /// Contains only the information a worker needs to resume scanning.
     /// Excludes lease, fence, op_log, tenant, park_reason, and identity
     /// fields (run, shard). The worker gets lease info from the Lease
-    /// return value and already knows its tenant and shard identity.
+    /// return value and already knows its tenant and shard identity. Spawned
+    /// children are copied by ID without exposing the internal container type.
     #[must_use]
     pub fn snapshot(&self) -> ShardSnapshot {
         self.assert_invariants();
@@ -680,7 +686,7 @@ impl ShardRecord {
             self.cursor.clone(),
             self.cursor_semantics,
             self.parent,
-            self.spawned.clone(),
+            self.spawned.iter(),
         )
     }
 
@@ -863,7 +869,7 @@ pub struct ShardSnapshot {
     cursor: Cursor,
     cursor_semantics: CursorSemantics,
     parent: Option<ShardId>,
-    spawned: Vec<ShardId>,
+    spawned: SpawnedList,
 }
 
 impl ShardSnapshot {
@@ -871,15 +877,24 @@ impl ShardSnapshot {
     ///
     /// Prefer [`ShardRecord::snapshot()`] which validates invariants
     /// before constructing.
+    ///
+    /// Accepts any iterator of borrowed [`ShardId`] values so callers can pass
+    /// slices, iterators, or concrete spawned-list containers without coupling
+    /// this API to one storage representation.
     #[must_use]
-    pub(crate) fn new(
+    pub(crate) fn new<I, S>(
         status: ShardStatus,
         spec: ShardSpec,
         cursor: Cursor,
         cursor_semantics: CursorSemantics,
         parent: Option<ShardId>,
-        spawned: Vec<ShardId>,
-    ) -> Self {
+        spawned: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Borrow<ShardId>,
+    {
+        let spawned = spawned.into_iter().map(|id| *id.borrow()).collect();
         Self {
             status,
             spec,
@@ -929,7 +944,7 @@ impl ShardSnapshot {
     #[inline]
     #[must_use]
     pub fn spawned(&self) -> &[ShardId] {
-        &self.spawned
+        self.spawned.as_slice()
     }
 }
 
@@ -942,7 +957,7 @@ mod tests {
     use super::*;
     use crate::coordination::lease::{OpKind, OpResult};
     use crate::test_util::canonical_digest;
-    use gossip_stdx::RingBuffer;
+    use gossip_stdx::{InlineVec, RingBuffer};
     use proptest::prelude::*;
 
     // -- Test fixtures ---------------------------------------------------
@@ -1095,7 +1110,7 @@ mod tests {
     fn assert_invariants_split_ok() {
         let mut r = active_record();
         r.status = ShardStatus::Split;
-        r.spawned = vec![derived_shard_id(1), derived_shard_id(2)];
+        r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
         r.assert_invariants();
     }
 
@@ -1139,7 +1154,7 @@ mod tests {
                     lease,
                     FenceEpoch::INITIAL,
                     None,
-                    vec![],
+                    InlineVec::new(),
                     RingBuffer::new(),
                 ),
             ),
@@ -1157,7 +1172,7 @@ mod tests {
                     lease,
                     FenceEpoch::INITIAL,
                     None,
-                    vec![],
+                    InlineVec::new(),
                     RingBuffer::new(),
                 ),
             ),
@@ -1175,7 +1190,7 @@ mod tests {
                     lease,
                     FenceEpoch::INITIAL,
                     None,
-                    vec![derived_shard_id(1), derived_shard_id(2)],
+                    InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]),
                     RingBuffer::new(),
                 ),
             ),
@@ -1218,7 +1233,7 @@ mod tests {
             None,
             FenceEpoch::INITIAL,
             Some(ShardId::from_raw(5)), // has parent
-            vec![],
+            InlineVec::new(),
             RingBuffer::new(),
         );
         r.assert_invariants();
@@ -1229,7 +1244,7 @@ mod tests {
     fn assert_invariants_spawned_contains_non_derived_panics() {
         let mut r = active_record();
         r.status = ShardStatus::Split;
-        r.spawned = vec![ShardId::from_raw(42)]; // NOT derived (bit 63 clear)
+        r.spawned = InlineVec::from_slice(&[ShardId::from_raw(42)]); // NOT derived (bit 63 clear)
         r.assert_invariants();
     }
 
@@ -1248,7 +1263,7 @@ mod tests {
             None,
             FenceEpoch::ZERO,
             None,
-            vec![],
+            InlineVec::new(),
             RingBuffer::new(),
         );
         r.assert_invariants();
@@ -1269,7 +1284,7 @@ mod tests {
             None,
             FenceEpoch::INITIAL,
             None,
-            vec![], // empty spawned
+            InlineVec::new(), // empty spawned
             RingBuffer::new(),
         );
         r.assert_invariants();
@@ -1293,7 +1308,7 @@ mod tests {
             None,
             FenceEpoch::INITIAL,
             None,
-            vec![],
+            InlineVec::new(),
             entries,
         );
         r.assert_invariants();
@@ -1302,7 +1317,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "spawned count")]
     fn assert_invariants_spawned_exceeds_cap_panics() {
-        let spawned: Vec<ShardId> = (0..=MAX_SPAWNED_PER_SHARD as u64)
+        let spawned: SpawnedList = (0..=MAX_SPAWNED_PER_SHARD as u64)
             .map(|i| derived_shard_id(i + 1))
             .collect();
         let r = ShardRecord::from_raw_parts(
@@ -1423,7 +1438,7 @@ mod tests {
             None,
             FenceEpoch::INITIAL,
             None, // parent = None -- violates INV-7b
-            vec![],
+            InlineVec::new(),
             RingBuffer::new(),
         );
         r.assert_invariants();
@@ -1478,7 +1493,7 @@ mod tests {
     fn assert_transition_legal_split_to_done_panics() {
         let mut r = active_record();
         r.status = ShardStatus::Split;
-        r.spawned = vec![derived_shard_id(1), derived_shard_id(2)];
+        r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
         r.assert_transition_legal(ShardStatus::Done);
     }
 

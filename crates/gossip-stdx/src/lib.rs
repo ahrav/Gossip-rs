@@ -11,6 +11,11 @@
 //! cargo +nightly miri test -p gossip-stdx
 //! ```
 
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+
+mod inline_vec;
 mod ring_buffer;
 
+pub use inline_vec::InlineVec;
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};

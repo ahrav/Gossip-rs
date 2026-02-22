@@ -842,7 +842,7 @@ mod tests {
         coord.seed_shard_unchecked(
             TestRecordBuilder::new(TENANT, run, shard)
                 .status(ShardStatus::Split)
-                .spawned(vec![missing_child])
+                .spawned([missing_child])
                 .build(),
         );
 
@@ -875,7 +875,7 @@ mod tests {
         coord.seed_shard_unchecked(
             TestRecordBuilder::new(TENANT, run, parent_shard)
                 .status(ShardStatus::Split)
-                .spawned(vec![child_shard])
+                .spawned([child_shard])
                 .build(),
         );
 
@@ -917,7 +917,7 @@ mod tests {
         coord.seed_shard_unchecked(
             TestRecordBuilder::new(TENANT, run, shard)
                 .status(ShardStatus::Split)
-                .spawned(vec![child])
+                .spawned([child])
                 .build(),
         );
         // Seed the child so S7 doesn't fire on the parent.
@@ -1089,7 +1089,7 @@ mod tests {
         coord.seed_shard_unchecked(
             TestRecordBuilder::new(TENANT, run, split_shard)
                 .status(ShardStatus::Split)
-                .spawned(vec![child])
+                .spawned([child])
                 .build(),
         );
         coord.seed_shard(
