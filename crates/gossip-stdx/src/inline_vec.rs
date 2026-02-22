@@ -187,10 +187,11 @@ impl<T, const N: usize> InlineVec<T, N> {
                     // SAFETY: start + i < start + slice.len() <= N, so
                     // buf[start + i] is in bounds. The slot is uninitialized
                     // (past the last initialized slot). We write a valid T
-                    // and update len after the loop to maintain the invariant.
+                    // and increment len immediately so that InlineVec::drop
+                    // cleans up if a subsequent clone panics.
                     unsafe { buf.get_unchecked_mut(start + i).write(item.clone()) };
+                    *len += 1;
                 }
-                *len += slice.len() as u32;
             }
             _ => {
                 // Either already heap, or crosses inline boundary — per-element push.
@@ -304,30 +305,21 @@ impl<T: Clone, const N: usize> Clone for InlineVec<T, N> {
     ///
     /// # Panic safety
     ///
-    /// If `T::clone()` panics while cloning the inline path, the partially
-    /// constructed `new_buf` is dropped. Because `new_buf` is
-    /// `[MaybeUninit<T>; N]` (which has no `Drop` glue), the already-written
-    /// slots are leaked rather than double-freed. This is safe — it does not
-    /// violate memory safety — though it does mean a panic mid-clone can leak
-    /// the already-cloned elements.
+    /// Uses push-based construction so that `InlineVec::drop` runs on the
+    /// partially-built clone if `T::clone()` panics. All successfully cloned
+    /// elements are dropped; nothing is leaked.
     #[inline]
     fn clone(&self) -> Self {
         match &self.repr {
             Repr::Inline { buf, len } => {
                 let count = *len as usize;
-                let mut new_buf = uninit_array::<T, N>();
+                let mut cloned = Self::new();
                 for i in 0..count {
                     // SAFETY: i < len, so buf[i] is initialized.
                     let val = unsafe { buf.get_unchecked(i).assume_init_ref() };
-                    // SAFETY: i < N, so new_buf[i] is in bounds.
-                    unsafe { new_buf.get_unchecked_mut(i).write(val.clone()) };
+                    cloned.push(val.clone());
                 }
-                Self {
-                    repr: Repr::Inline {
-                        buf: new_buf,
-                        len: *len,
-                    },
-                }
+                cloned
             }
             Repr::Heap(v) => Self {
                 repr: Repr::Heap(v.clone()),
@@ -828,6 +820,138 @@ mod tests {
         COUNT.with(|c| c.set(0));
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| v.clone()));
         assert!(result.is_err()); // panicked — no UB, elements 1-2 leaked (safe)
+    }
+
+    /// Verify that partial clones are properly dropped when T::clone() panics.
+    ///
+    /// Creates 3 elements with drop tracking and a clone that panics on the
+    /// 3rd call. After the panic, the 2 successfully cloned elements should
+    /// be cleaned up (not leaked).
+    #[test]
+    fn clone_panic_drops_partial_clones() {
+        use std::cell::Cell;
+        use std::panic;
+
+        thread_local! { static CLONE_CTR: Cell<usize> = const { Cell::new(0) }; }
+
+        #[derive(Debug)]
+        struct TrackDrop {
+            drops: Arc<AtomicUsize>,
+        }
+        impl Clone for TrackDrop {
+            fn clone(&self) -> Self {
+                CLONE_CTR.with(|c| {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    if n == 3 {
+                        panic!("deliberate clone panic at element 3");
+                    }
+                });
+                TrackDrop { drops: self.drops.clone() }
+            }
+        }
+        impl Drop for TrackDrop {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut v = InlineVec::<TrackDrop, 4>::new();
+        v.push(TrackDrop { drops: drops.clone() });
+        v.push(TrackDrop { drops: drops.clone() });
+        v.push(TrackDrop { drops: drops.clone() });
+
+        CLONE_CTR.with(|c| c.set(0));
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| v.clone()));
+        assert!(result.is_err());
+
+        // The 2 successfully cloned elements should be dropped by the guard.
+        // (Original 3 elements are still alive in `v`.)
+        let partial_drops = drops.load(Ordering::Relaxed);
+        assert_eq!(partial_drops, 2, "partial clones should be dropped on panic, not leaked");
+    }
+
+    /// Verify that extend_from_slice tracks partial clones when T::clone() panics.
+    ///
+    /// Starts with 1 element, extends with a 3-element slice where the 2nd
+    /// clone panics. After the panic, `v` survives (via `catch_unwind`).
+    /// The successfully cloned element should be tracked in `len` so that
+    /// dropping `v` cleans it up — no leak.
+    #[test]
+    fn extend_from_slice_panic_drops_partial_clones() {
+        use std::cell::Cell;
+        use std::panic;
+
+        thread_local! { static EXT_CTR: Cell<usize> = const { Cell::new(0) }; }
+
+        #[derive(Debug)]
+        struct TrackDropExt {
+            drops: Arc<AtomicUsize>,
+        }
+        impl Clone for TrackDropExt {
+            fn clone(&self) -> Self {
+                EXT_CTR.with(|c| {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    if n == 2 {
+                        panic!("deliberate clone panic in extend_from_slice");
+                    }
+                });
+                TrackDropExt { drops: self.drops.clone() }
+            }
+        }
+        impl Drop for TrackDropExt {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut v = InlineVec::<TrackDropExt, 8>::new();
+        v.push(TrackDropExt { drops: drops.clone() });
+
+        let source = [
+            TrackDropExt { drops: drops.clone() },
+            TrackDropExt { drops: drops.clone() },
+            TrackDropExt { drops: drops.clone() },
+        ];
+
+        EXT_CTR.with(|c| c.set(0));
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            v.extend_from_slice(&source);
+        }));
+
+        // Drop source (3 elements).
+        drop(source);
+        let after_source = drops.load(Ordering::Relaxed);
+        assert_eq!(after_source, 3);
+
+        // Drop v. With the fix, v has 2 elements (1 original + 1 clone) → 2 drops.
+        // Without the fix, v has 1 element (clone leaked) → 1 drop.
+        drop(v);
+        let total = drops.load(Ordering::Relaxed);
+        assert_eq!(total, 5, "v should drop original + successfully cloned element (no leak)");
+    }
+
+    /// Verify that FromIterator correctly stays inline when size_hint underestimates.
+    ///
+    /// The reviewer claimed that if size_hint().0 < actual <= N, elements
+    /// spill unnecessarily. This test proves that claim is wrong — the inline
+    /// path handles growth via push, which stays inline until N is exceeded.
+    #[test]
+    fn from_iter_underestimate_stays_inline() {
+        // Create an iterator that reports lower=0 but yields 3 elements (fits in N=4).
+        struct BadHint(std::vec::IntoIter<u32>);
+        impl Iterator for BadHint {
+            type Item = u32;
+            fn next(&mut self) -> Option<u32> { self.0.next() }
+            fn size_hint(&self) -> (usize, Option<usize>) { (0, None) }
+        }
+
+        let v: InlineVec<u32, 4> = BadHint(vec![10, 20, 30].into_iter()).collect();
+        assert_eq!(v.as_slice(), &[10, 20, 30]);
+        assert!(matches!(v.repr, Repr::Inline { .. }), "should stay inline despite underestimate");
     }
 
     #[test]
