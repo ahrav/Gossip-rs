@@ -2459,3 +2459,11 @@ impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
 #[cfg(test)]
 #[path = "in_memory_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "in_memory_run_tests.rs"]
+mod run_tests;
+
+#[cfg(test)]
+#[path = "in_memory_filter_tests.rs"]
+mod filter_tests;
