@@ -323,6 +323,23 @@ impl Lease {
 /// persisted in the op-log. Existing values should not be reassigned
 /// without updating all existing op-log entries. Compile-time assertions
 /// below enforce the current mapping.
+///
+/// ## Convergence safety (bounded op-log)
+///
+/// The per-shard op-log is a 16-entry ring buffer. Once an entry is evicted,
+/// the coordinator cannot distinguish a retry from a new operation and will
+/// re-execute it. This is safe **only if every operation is convergent** —
+/// re-executing a previously completed operation must produce the same
+/// observable state as not re-executing it.
+///
+/// Convergence requires idempotency (f(f(x)) = f(x)) and, for operations
+/// that may be reordered with concurrent mutations, commutativity. Each
+/// variant documents its convergence justification below.
+///
+/// If a future variant is **not** convergent under re-execution, it must
+/// either: (a) guarantee it is never evicted from the op-log (as
+/// `SplitReplace` does — terminal status prevents further ops), or
+/// (b) use an external deduplication mechanism with unbounded retention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpKind {
@@ -330,6 +347,11 @@ pub enum OpKind {
     ///
     /// Advances the shard's cursor to a new position within its key range.
     /// The most frequent operation during normal scanning.
+    ///
+    /// Convergence: re-execution sets the cursor to the same value
+    /// (idempotent by payload hash). Concurrent checkpoints are
+    /// cursor-monotonic, so reordering produces the same final cursor
+    /// (max of the two).
     Checkpoint = 0,
 
     /// Mark the shard as fully processed — terminal transition to
@@ -337,6 +359,10 @@ pub enum OpKind {
     ///
     /// After completion, the lease is released and no further mutations
     /// are accepted on this shard.
+    ///
+    /// Convergence: terminal transition is irreversible. Re-execution on
+    /// an already-Done shard returns the cached op-log result. No state
+    /// change on replay.
     Complete = 1,
 
     /// Suspend the shard due to an error condition — terminal transition to
@@ -344,6 +370,9 @@ pub enum OpKind {
     ///
     /// Resumption requires an out-of-band administrative [`Unpark`](Self::Unpark)
     /// which increments the fence epoch.
+    ///
+    /// Convergence: same argument as Complete — terminal transition to
+    /// Parked is irreversible. Re-execution returns the cached result.
     Park = 2,
 
     /// Replace the parent shard with N child shards — terminal transition to
@@ -351,6 +380,10 @@ pub enum OpKind {
     ///
     /// The children collectively cover the parent's key range (no gaps,
     /// no overlaps). The parent lease is released.
+    ///
+    /// Convergence: terminal transition to Split. Additionally, the op-log
+    /// entry is structurally never evicted — after split, no further ops
+    /// can push entries, so the entry persists indefinitely.
     SplitReplace = 3,
 
     /// Shrink the current shard and create a residual shard for the
@@ -358,6 +391,12 @@ pub enum OpKind {
     ///
     /// Unlike `SplitReplace`, this is **non-terminal** — the parent
     /// stays `Active` with a smaller range and retains its lease.
+    ///
+    /// Convergence: re-execution with the same plan produces the same
+    /// residual shard (deterministic ID derivation from parent ID +
+    /// index) and the same parent spec update (idempotent by payload
+    /// hash). Duplicate creation is detected by the deterministic
+    /// residual ID.
     SplitResidual = 4,
 
     /// Administrative: resume a parked shard (Parked -> Active).
@@ -365,6 +404,11 @@ pub enum OpKind {
     /// Not lease-gated — the coordinator may unpark a shard without
     /// the worker that originally parked it. Unparking increments the
     /// fence epoch and clears the park reason.
+    ///
+    /// Convergence: Parked -> Active is idempotent (unparking an Active
+    /// shard is a no-op via status precondition check). Fence epoch
+    /// increment on re-execution is safe — it only invalidates stale
+    /// leases, which is the conservative direction.
     Unpark = 5,
 }
 
