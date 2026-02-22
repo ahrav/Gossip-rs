@@ -14,8 +14,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+mod byte_slab;
 mod inline_vec;
 mod ring_buffer;
 
+pub use byte_slab::{ByteSlab, ByteSlot, SlabFull};
 pub use inline_vec::InlineVec;
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};

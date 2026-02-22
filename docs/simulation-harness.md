@@ -33,9 +33,9 @@ See the invariant table below.
 
 ### Layer 4: CoordinationSim (`sim/harness.rs`)
 
-The top-level driver. Runs a two-phase simulation (safety then liveness) with
-weighted random op generation, fault injection, and full invariant checking
-after every step.
+The top-level driver. Runs a three-stage simulation (zombie preamble, safety,
+then liveness) with weighted random op generation, fault injection, and full
+invariant checking after every step.
 
 ## Determinism Model
 
@@ -69,11 +69,19 @@ platforms and prevent invalid probability construction.
 All seven invariants are checked in a single pass over coordinator state after
 every operation (both successful and rejected).
 
-## Two-Phase Run Model
+## Three-Stage Run Model
 
-`CoordinationSim::run(safety_ops, liveness_ops)` executes two phases:
+`CoordinationSim::run(safety_ops, liveness_ops)` executes three stages:
 
-### Phase 1: Safety
+### Stage 0: Zombie Preamble
+
+Before the main safety phase, the harness seeds initial leases and then
+immediately expires them, creating "zombie" workers that hold stale lease
+references. This exercises the fence-based rejection paths from the very
+first operation of the run, ensuring that stale-lease handling is tested
+even before normal operation begins.
+
+### Stage 1: Safety
 
 Runs `safety_ops` random operations under fault injection. The first few
 operations (warmup) suppress faults to let the system reach a healthy
@@ -84,7 +92,7 @@ weighted probabilities.
 **Goal:** Verify that no invariant (S1-S7) is ever violated regardless of
 operation ordering, timing, or fault injection.
 
-### Phase 2: Liveness
+### Stage 2: Liveness
 
 Runs `liveness_ops` operations biased toward acquire and complete. No faults
 are injected.

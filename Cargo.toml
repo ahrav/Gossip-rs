@@ -25,9 +25,3 @@ gossip-engine = { path = "crates/gossip-engine" }
 gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }
 gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }
-
-# Ensure debug_assert!() fires even in `cargo test --release` and benchmarks.
-# This project uses crash-to-prevent-corruption philosophy (tiger-style invariant
-# enforcement), so debug assertions should never be silently compiled out.
-# [profile.release]
-# debug-assertions = true
