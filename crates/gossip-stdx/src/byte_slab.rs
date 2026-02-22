@@ -614,13 +614,13 @@ impl ByteSlab {
             return &[];
         }
         self.assert_slot_owner(slot);
-        debug_assert!(
+        assert!(
             slot.len <= slot.alloc_size,
             "slot len ({}) exceeds alloc_size ({})",
             slot.len,
             slot.alloc_size,
         );
-        debug_assert!(
+        assert!(
             slot.offset + slot.alloc_size <= self.bump,
             "slot region [{}, {}) exceeds bump ({})",
             slot.offset,
@@ -657,13 +657,13 @@ impl ByteSlab {
             return;
         }
         self.assert_slot_owner(slot);
-        debug_assert!(
+        assert!(
             slot.len <= slot.alloc_size,
             "slot len ({}) exceeds alloc_size ({})",
             slot.len,
             slot.alloc_size,
         );
-        debug_assert!(
+        assert!(
             slot.offset + slot.alloc_size <= self.bump,
             "slot region [{}, {}) exceeds bump ({})",
             slot.offset,
@@ -1304,11 +1304,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Stale slot detection (debug_assert sanity checks)
+    // Stale slot detection (slot validity assertions)
     // -----------------------------------------------------------------------
 
     /// Allocate a single trailing block, deallocate it (bump retracts),
-    /// then use the stale copy. The `debug_assert!(offset + alloc_size <= bump)`
+    /// then use the stale copy. The `assert!(offset + alloc_size <= bump)`
     /// in `get()` catches the stale handle because the bump pointer has
     /// retracted past the slot's region.
     #[test]
@@ -1322,11 +1322,11 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.get(stale)));
         assert!(
             result.is_err(),
-            "stale slot after bump retraction must panic in debug builds"
+            "stale slot after bump retraction must panic"
         );
     }
 
-    /// Same scenario but through `deallocate()`: the debug_assert catches
+    /// Same scenario but through `deallocate()`: the assert catches
     /// the stale handle before it corrupts slab accounting.
     #[test]
     fn stale_slot_after_bump_retraction_panics_on_deallocate() {
@@ -1339,7 +1339,7 @@ mod tests {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.deallocate(stale)));
         assert!(
             result.is_err(),
-            "stale slot deallocation after bump retraction must panic in debug builds"
+            "stale slot deallocation after bump retraction must panic"
         );
     }
 
