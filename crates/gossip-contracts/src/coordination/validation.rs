@@ -204,6 +204,48 @@ pub fn validate_cursor_update(
     Ok(())
 }
 
+/// Validate a cursor update using pooled/slice views for the previous cursor
+/// key and shard bounds.
+///
+/// Equivalent to [`validate_cursor_update`] but avoids materializing owned
+/// `Cursor` / `ShardSpec` values when callers already have pooled accessors.
+pub(crate) fn validate_cursor_update_pooled(
+    new_cursor: &Cursor,
+    old_last_key: Option<&[u8]>,
+    spec_start: &[u8],
+    spec_end: &[u8],
+) -> Result<(), CoordError> {
+    // 1. Key presence.
+    let Some(new_last_key) = new_cursor.last_key() else {
+        return Err(CoordError::CheckpointMissingKey);
+    };
+
+    // 2. Monotonicity.
+    if let Some(old_key) = old_last_key
+        && new_last_key < old_key
+    {
+        return Err(CoordError::CursorRegression {
+            old_key: Some(old_key.to_vec().into_boxed_slice()),
+            new_key: Some(new_last_key.to_vec().into_boxed_slice()),
+        });
+    }
+
+    // 3. Bounds checking against [start, end).
+    if (!spec_start.is_empty() && new_last_key < spec_start)
+        || (!spec_end.is_empty() && new_last_key >= spec_end)
+    {
+        return Err(CoordError::CursorOutOfBounds(Box::new(
+            crate::coordination::error::CursorOutOfBoundsDetail {
+                last_key: new_last_key.to_vec().into_boxed_slice(),
+                spec_start: spec_start.to_vec().into_boxed_slice(),
+                spec_end: spec_end.to_vec().into_boxed_slice(),
+            },
+        )));
+    }
+
+    Ok(())
+}
+
 /// Check whether an operation is a replay (idempotent retry) or a new
 /// operation.
 ///
@@ -700,6 +742,54 @@ mod tests {
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "key at spec end should be AboveRange (exclusive)"
         );
+    }
+
+    #[test]
+    fn validate_cursor_update_pooled_matches_owned_validation() {
+        let cases = [
+            (Cursor::initial(), Cursor::with_last_key(b"f".to_vec())),
+            (
+                Cursor::with_last_key(b"f".to_vec()),
+                Cursor::with_last_key(b"m".to_vec()),
+            ),
+            (
+                Cursor::with_last_key(b"m".to_vec()),
+                Cursor::with_last_key(b"f".to_vec()),
+            ),
+            (Cursor::initial(), Cursor::initial()),
+            (Cursor::initial(), Cursor::with_last_key(vec![0x00])),
+            (Cursor::initial(), Cursor::with_last_key(b"z".to_vec())),
+        ];
+        let spec = test_spec();
+
+        for (old_cursor, new_cursor) in cases {
+            let owned = validate_cursor_update(&new_cursor, &old_cursor, &spec);
+            let pooled = validate_cursor_update_pooled(
+                &new_cursor,
+                old_cursor.last_key(),
+                spec.key_range_start(),
+                spec.key_range_end(),
+            );
+
+            let owned_kind = match &owned {
+                Ok(()) => "ok",
+                Err(CoordError::CheckpointMissingKey) => "missing_key",
+                Err(CoordError::CursorRegression { .. }) => "regression",
+                Err(CoordError::CursorOutOfBounds(_)) => "out_of_bounds",
+                Err(other) => panic!("unexpected owned error variant: {other:?}"),
+            };
+            let pooled_kind = match &pooled {
+                Ok(()) => "ok",
+                Err(CoordError::CheckpointMissingKey) => "missing_key",
+                Err(CoordError::CursorRegression { .. }) => "regression",
+                Err(CoordError::CursorOutOfBounds(_)) => "out_of_bounds",
+                Err(other) => panic!("unexpected pooled error variant: {other:?}"),
+            };
+            assert_eq!(
+                owned_kind, pooled_kind,
+                "owned={owned:?}, pooled={pooled:?}",
+            );
+        }
     }
 
     // -- check_op_idempotency tests --------------------------------------

@@ -102,7 +102,7 @@ use crate::coordination::split::{
 };
 use crate::coordination::traits::CoordinationBackend;
 use crate::coordination::validation::{
-    check_op_idempotency, validate_cursor_update, validate_lease,
+    check_op_idempotency, validate_cursor_update_pooled, validate_lease,
 };
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_stdx::{ByteSlab, RingBuffer};
@@ -1040,10 +1040,12 @@ impl CoordinationBackend for InMemoryCoordinator {
 
         validate_lease(now, tenant, lease, record)?;
 
-        // Materialize pooled cursor/spec for validation.
-        let old_cursor = record.cursor.to_cursor(&self.slab);
-        let spec = record.spec.to_spec(&self.slab);
-        validate_cursor_update(&new_cursor, &old_cursor, &spec)?;
+        validate_cursor_update_pooled(
+            &new_cursor,
+            record.cursor.last_key(&self.slab),
+            record.spec.key_range_start(&self.slab),
+            record.spec.key_range_end(&self.slab),
+        )?;
 
         record.cursor.update(&new_cursor, &mut self.slab)?;
         record.op_log_push(OpLogEntry::new(
@@ -1088,10 +1090,12 @@ impl CoordinationBackend for InMemoryCoordinator {
 
         validate_lease(now, tenant, lease, record)?;
 
-        // Materialize pooled cursor/spec for validation.
-        let old_cursor = record.cursor.to_cursor(&self.slab);
-        let spec = record.spec.to_spec(&self.slab);
-        validate_cursor_update(&final_cursor, &old_cursor, &spec)?;
+        validate_cursor_update_pooled(
+            &final_cursor,
+            record.cursor.last_key(&self.slab),
+            record.spec.key_range_start(&self.slab),
+            record.spec.key_range_end(&self.slab),
+        )?;
 
         record.cursor.update(&final_cursor, &mut self.slab)?;
         record.assert_transition_legal(ShardStatus::Done);
