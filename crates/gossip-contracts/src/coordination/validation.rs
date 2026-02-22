@@ -315,7 +315,7 @@ mod tests {
     use crate::coordination::cursor::Cursor;
     use crate::coordination::lease::{LeaseHolder, OpKind, OpResult};
     use crate::coordination::record::ShardRecord;
-    use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+    use crate::coordination::shard_spec::CursorSemantics;
     use crate::coordination::test_fixtures::{
         other_tenant, test_run, test_shard, test_spec, test_tenant,
     };
