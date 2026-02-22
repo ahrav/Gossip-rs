@@ -40,10 +40,8 @@
 //! assert that the slot's owner matches the slab's owner, rejecting slots
 //! from other slab instances.
 //!
-//! `clear` intentionally keeps the same owner id (see Slot provenance above).
-//! Consequently, slots created before `clear` are logically stale even though
-//! they may still pass the owner check; callers must discard all outstanding
-//! slots after `clear`.
+//! `clear` rotates the owner id, so stale slots from before clear are
+//! rejected by the provenance check, catching use-after-clear bugs.
 //!
 //! # Memory layout
 //!
@@ -63,7 +61,7 @@
 //!
 //! All offsets, lengths, and capacities are `u32`, limiting the maximum slab
 //! size to ~4 GiB. This keeps [`ByteSlot`] handles at 16 bytes (four `u32`
-//! fields) instead of 32 bytes with `usize`.
+//! fields) instead of 32 bytes with `usize` on 64-bit targets.
 //!
 //! # Invariants
 //!
@@ -79,8 +77,10 @@
 //! 6. Region `[0, bump)` fully partitioned into live allocations and
 //!    free-list blocks.
 //!
-//! Invariants are machine-checked via [`ByteSlab::debug_assert_invariants`],
-//! which runs after every mutation in debug builds.
+//! Invariants 1–5 are directly machine-checked via
+//! [`ByteSlab::debug_assert_invariants`], which runs after every mutation
+//! in debug builds. Invariant 6 is implied by byte conservation
+//! (invariant 5) rather than independently verified.
 //!
 //! # Threading
 //!
@@ -120,7 +120,7 @@ const MIN_BLOCK: u32 = 16;
 /// Reserved `ByteSlot` owner id used by [`ByteSlot::EMPTY`].
 const EMPTY_OWNER_ID: u32 = 0;
 
-/// Monotonically increasing slab owner ids.
+/// Incrementing slab owner ids (wraps after ~2^32 creations).
 ///
 /// `0` is reserved for [`ByteSlot::EMPTY`]. Non-empty slots always carry a
 /// non-zero owner id.
@@ -174,21 +174,19 @@ fn checked_len_u32(n: usize) -> Option<u32> {
 /// Rounds `n` up to the next power of 2, with a floor of [`MIN_BLOCK`] (16).
 /// Zero maps to zero (for [`ByteSlot::EMPTY`]).
 ///
-/// # Panics
-///
-/// Panics if `n > u32::MAX`. Callers should validate the logical length
-/// first (for example via [`checked_len_u32`]).
+/// Returns `None` when the rounded result would overflow `u32` (i.e., for
+/// inputs above `2^31`). [`ByteSlab::allocate`] maps this to [`SlabFull`].
 ///
 /// Worst-case internal fragmentation: ~50% (e.g., 17 -> 32).
 /// For the cursor-update workload (keys 50-4096 bytes, tokens 100-16384
 /// bytes), measured average waste is ~25%.
 #[inline]
-fn alloc_size(n: usize) -> u32 {
+fn alloc_size(n: usize) -> Option<u32> {
     if n == 0 {
-        return 0;
+        return Some(0);
     }
-    let n = u32::try_from(n).expect("alloc_size input must fit u32");
-    n.max(MIN_BLOCK).next_power_of_two()
+    let n = u32::try_from(n).ok()?;
+    n.max(MIN_BLOCK).checked_next_power_of_two()
 }
 
 // ============================================================================
@@ -212,9 +210,8 @@ fn alloc_size(n: usize) -> u32 {
 /// created it. Using a slot with a different slab is a logic error that
 /// panics.
 ///
-/// Slots created before [`ByteSlab::clear`] are logically invalid even though
-/// `clear` keeps the same owner id. Reusing such stale slots can yield stale
-/// reads from [`ByteSlab::get`] or panic in [`ByteSlab::deallocate`].
+/// Slots created before [`ByteSlab::clear`] are rejected because `clear`
+/// rotates the owner id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ByteSlot {
     offset: u32,
@@ -276,7 +273,7 @@ impl std::fmt::Display for SlabFull {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ByteSlab full: requested {} bytes, {} available",
+            "ByteSlab full: requested {} bytes, {} virgin bytes remaining",
             self.requested, self.available
         )
     }
@@ -489,8 +486,8 @@ impl ByteSlab {
 
     /// Panics when `slot` did not originate from this slab instance.
     ///
-    /// This enforces cross-slab provenance, but cannot detect stale slots
-    /// after [`clear`](Self::clear), which intentionally preserves owner id.
+    /// This enforces cross-slab provenance and also rejects stale slots
+    /// after [`clear`](Self::clear), which rotates the owner id.
     #[inline]
     fn assert_slot_owner(&self, slot: ByteSlot) {
         assert_eq!(
@@ -566,7 +563,10 @@ impl ByteSlab {
             Some(len) => len,
             None => return Err(slab_full_err(u32::MAX, self.available_virgin_bytes())),
         };
-        let needed = alloc_size(data.len());
+        let needed = match alloc_size(data.len()) {
+            Some(n) => n,
+            None => return Err(slab_full_err(u32::MAX, self.available_virgin_bytes())),
+        };
 
         // Phase 1: best-fit from free-list index.
         if let Some((offset, block_size)) = self.take_best_fit(needed) {
@@ -768,15 +768,17 @@ impl ByteSlab {
     /// Resets the slab to its initial state without releasing the backing
     /// buffer. All outstanding [`ByteSlot`] handles become invalid —
     /// passing them to [`get`](Self::get) or [`deallocate`](Self::deallocate)
-    /// after a clear is a logic error.
+    /// after a clear will panic (owner id mismatch).
     ///
-    /// `clear` preserves `owner_id`, so stale slots from before clear may still
-    /// pass provenance checks. Callers must drop all pre-clear slots.
+    /// `clear` rotates the `owner_id`, so stale slots from before clear are
+    /// rejected by the provenance check. This catches use-after-clear bugs
+    /// that would otherwise silently return stale data.
     ///
     /// Unlike deallocating every slot individually, `clear` runs in O(F)
     /// (BTreeMap/BTreeSet clear) rather than O(N_live * log F). It also
-    /// skips the debug-build leak assertion in [`Drop`] because the slab
-    /// is explicitly reset rather than abandoned.
+    /// satisfies the debug-build leak assertion in [`Drop`] (by resetting
+    /// `live_count` to zero) rather than requiring every slot to be
+    /// individually deallocated.
     pub fn clear(&mut self) {
         self.bump = 0;
         self.free_by_offset.clear();
@@ -784,6 +786,7 @@ impl ByteSlab {
         self.free_bytes = 0;
         self.live_bytes = 0;
         self.live_count = 0;
+        self.owner_id = next_slab_id();
         self.debug_assert_invariants();
     }
 
@@ -912,14 +915,21 @@ mod tests {
 
     #[test]
     fn power_of_two_rounding() {
-        assert_eq!(alloc_size(0), 0);
-        assert_eq!(alloc_size(1), 16);
-        assert_eq!(alloc_size(15), 16);
-        assert_eq!(alloc_size(16), 16);
-        assert_eq!(alloc_size(17), 32);
-        assert_eq!(alloc_size(100), 128);
-        assert_eq!(alloc_size(4096), 4096);
-        assert_eq!(alloc_size(16384), 16384);
+        assert_eq!(alloc_size(0), Some(0));
+        assert_eq!(alloc_size(1), Some(16));
+        assert_eq!(alloc_size(15), Some(16));
+        assert_eq!(alloc_size(16), Some(16));
+        assert_eq!(alloc_size(17), Some(32));
+        assert_eq!(alloc_size(100), Some(128));
+        assert_eq!(alloc_size(4096), Some(4096));
+        assert_eq!(alloc_size(16384), Some(16384));
+    }
+
+    #[test]
+    fn alloc_size_returns_none_on_overflow() {
+        assert_eq!(alloc_size((1u32 << 31) as usize + 1), None);
+        assert_eq!(alloc_size(u32::MAX as usize), None);
+        assert_eq!(alloc_size(u32::MAX as usize + 1), None);
     }
 
     #[test]
@@ -1284,6 +1294,17 @@ mod tests {
         assert!(slab.is_empty());
     }
 
+    #[test]
+    fn clear_rejects_stale_slots() {
+        let mut slab = ByteSlab::with_capacity(1024);
+        let stale = slab.allocate(b"before_clear").unwrap();
+        slab.clear();
+
+        // get() with a pre-clear slot must panic (owner id rotated).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.get(stale)));
+        assert!(result.is_err(), "stale slot after clear must be rejected");
+    }
+
     // -----------------------------------------------------------------------
     // SlabFull display
     // -----------------------------------------------------------------------
@@ -1330,7 +1351,7 @@ mod tests {
                     1..20,
                 )
             ) {
-                let total: usize = data_list.iter().map(|d| alloc_size(d.len()) as usize).sum();
+                let total: usize = data_list.iter().map(|d| alloc_size(d.len()).unwrap_or(0) as usize).sum();
                 let cap = total.max(1024);
                 let mut slab = ByteSlab::with_capacity(cap);
                 let mut live: Vec<(ByteSlot, Vec<u8>)> = Vec::new();
@@ -1431,7 +1452,7 @@ mod tests {
                     1..30,
                 )
             ) {
-                let total: usize = data_list.iter().map(|d| alloc_size(d.len()) as usize).sum();
+                let total: usize = data_list.iter().map(|d| alloc_size(d.len()).unwrap_or(0) as usize).sum();
                 let cap = total.max(1024);
                 let mut slab = ByteSlab::with_capacity(cap);
                 let mut live: Vec<ByteSlot> = Vec::new();
@@ -1463,18 +1484,19 @@ mod tests {
                 }
             }
 
-            /// alloc_size always returns 0 or a power of 2, and for nonzero input:
-            /// result >= MIN_BLOCK and result >= input.
+            /// alloc_size always returns Some(0) or Some(power of 2), and for
+            /// nonzero input: result >= MIN_BLOCK and result >= input.
             #[test]
             fn alloc_size_is_power_of_two(n in 0usize..100_000) {
                 let result = alloc_size(n);
                 if n == 0 {
-                    prop_assert_eq!(result, 0);
-                } else {
-                    prop_assert!(result >= MIN_BLOCK);
-                    prop_assert!(result >= n as u32);
-                    prop_assert!(result.is_power_of_two());
+                    prop_assert_eq!(result, Some(0));
+                } else if let Some(r) = result {
+                    prop_assert!(r >= MIN_BLOCK);
+                    prop_assert!(r >= n as u32);
+                    prop_assert!(r.is_power_of_two());
                 }
+                // None is valid for inputs > 2^31 (not exercised by this range).
             }
 
             /// No two adjacent free blocks exist after any dealloc sequence.

@@ -88,7 +88,8 @@ fn bench_deallocate_freelist_insert(c: &mut Criterion) {
     group.bench_function("deallocate_freelist_insert", |b| {
         let data = [0xABu8; 64];
         b.iter(|| {
-            let mut slab = ByteSlab::with_capacity(256 * 1024);
+            // 10k iterations × (64-byte target + 16-byte pin) = 800,000 bytes peak.
+            let mut slab = ByteSlab::with_capacity(1024 * 1024);
             let mut pins = Vec::with_capacity(OPS_PER_ITER as usize);
             let mut targets = Vec::with_capacity(OPS_PER_ITER as usize);
 
@@ -125,7 +126,8 @@ fn bench_deallocate_coalesce(c: &mut Criterion) {
     group.bench_function("deallocate_coalesce_pairs", |b| {
         let data = [0xABu8; 64];
         b.iter(|| {
-            let mut slab = ByteSlab::with_capacity(256 * 1024);
+            // 10k iterations × 2 × 64-byte blocks = 1,280,000 bytes peak.
+            let mut slab = ByteSlab::with_capacity(2 * 1024 * 1024);
             let mut slots = Vec::with_capacity((OPS_PER_ITER * 2) as usize);
 
             // Allocate pairs of adjacent blocks.
