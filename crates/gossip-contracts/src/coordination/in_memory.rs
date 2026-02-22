@@ -181,7 +181,8 @@ pub struct CoordinatorRuntimeConfig {
     /// Zero disables cooldown.
     pub claim_cooldown_interval: u64,
     /// Byte slab capacity for arena-pooled shard fields (spec + cursor).
-    /// Zero uses a default derived from `max_total_shards`.
+    /// Zero uses an auto-sized default derived from `max_total_shards`
+    /// and capped to avoid pathological eager allocation.
     pub slab_capacity: usize,
 }
 
@@ -194,6 +195,11 @@ pub struct CoordinatorRuntimeConfig {
 /// workloads; ES scroll tokens (10 KiB) and large metadata
 /// require a higher budget.
 const DEFAULT_PER_SHARD_SLAB_BUDGET: usize = 4_096;
+/// Upper bound for auto-sized slab capacity.
+///
+/// Without this cap, deriving from `max_total_shards` can over-allocate
+/// at startup (e.g., default limits imply ~4 GiB).
+const DEFAULT_MAX_AUTO_SLAB_CAPACITY: usize = 64 * 1024 * 1024;
 
 impl CoordinatorRuntimeConfig {
     /// Create a runtime config with explicit parameters.
@@ -229,18 +235,23 @@ impl CoordinatorRuntimeConfig {
     }
 
     /// Derive slab capacity from config, using the explicit value if set
-    /// or computing a default from `max_total_shards`.
+    /// or computing a capped default from `max_total_shards`.
     const fn effective_slab_capacity(&self) -> usize {
         if self.slab_capacity > 0 {
             self.slab_capacity
         } else {
             // Saturate to avoid overflow on pathological configs.
-            match self
+            let derived = match self
                 .max_total_shards
                 .checked_mul(DEFAULT_PER_SHARD_SLAB_BUDGET)
             {
                 Some(v) => v,
                 None => usize::MAX,
+            };
+            if derived > DEFAULT_MAX_AUTO_SLAB_CAPACITY {
+                DEFAULT_MAX_AUTO_SLAB_CAPACITY
+            } else {
+                derived
             }
         }
     }
@@ -1287,16 +1298,13 @@ impl CoordinationBackend for InMemoryCoordinator {
                 .map_err(|e| SplitResidualError::SplitInvalid(Box::new(e)))?;
 
             // Phase 2: Build residual record (allocates into slab).
-            let residual_record =
+            let mut residual_record =
                 split_residual_build_record(&parent, &plan, tenant, residual_id, &mut self.slab)?;
 
             // Phase 3: Apply mutations.
             let residual_key = ShardKey::new(parent.run, residual_id);
             if self.shard_contains(&tenant, &residual_key) {
                 // Deallocate the just-built residual before returning error.
-                // (Cannot call deallocate_fields on an owned value we haven't
-                // inserted, so we use a mutable binding.)
-                let mut residual_record = residual_record;
                 residual_record.deallocate_fields(&mut self.slab);
                 return Err(SplitResidualError::SplitInvalid(Box::new(
                     SplitValidationError::DerivedIdCollision {
@@ -1305,7 +1313,7 @@ impl CoordinationBackend for InMemoryCoordinator {
                 )));
             }
 
-            split_residual_apply_parent(
+            if let Err(e) = split_residual_apply_parent(
                 &mut parent,
                 plan.parent_new_spec(),
                 residual_id,
@@ -1313,7 +1321,10 @@ impl CoordinationBackend for InMemoryCoordinator {
                 payload_hash,
                 now,
                 &mut self.slab,
-            )?;
+            ) {
+                residual_record.deallocate_fields(&mut self.slab);
+                return Err(e);
+            }
 
             self.shard_insert(tenant, residual_key, residual_record);
             self.index_shard(tenant, parent.run, residual_id);
@@ -2063,16 +2074,13 @@ impl RunManagement for InMemoryCoordinator {
                 _ => unreachable!("check_shard_limits only returns ShardLimitExceeded"),
             })?;
 
-        // 6. Build and insert shard records.
+        // 6. Build shard records, then insert.
         //
-        // NOTE(atomicity): Shard records are inserted into the map before
-        // RunRecord is updated below. If `assert_invariants` panics mid-loop,
-        // orphaned shard records exist without a matching RunRecord update.
-        // This is acceptable in the in-memory backend because the panic is
-        // intentionally fatal (crash-to-prevent-corruption). Production
-        // backends must use a transaction to make the entire operation atomic.
+        // Build first so recoverable allocation failures (`SlabFull`) return
+        // an error without partially mutating shard maps.
         let cursor_semantics = record.config.cursor_semantics();
         let shard_ids: Vec<ShardId> = shards.iter().map(|s| s.shard()).collect();
+        let mut to_insert: Vec<(ShardKey, ShardRecord)> = Vec::with_capacity(shards.len());
 
         for s in shards {
             let key = ShardKey::new(run, s.shard());
@@ -2081,22 +2089,39 @@ impl RunManagement for InMemoryCoordinator {
                 "register_shards: ShardKey collision for {key:?} — \
                  manifest validation should prevent this"
             );
-            let mut sr = ShardRecord::new_active(
+            let mut sr = match ShardRecord::new_active(
                 tenant,
                 run,
                 s.shard(),
                 s.spec(),
                 cursor_semantics,
                 &mut self.slab,
-            )
-            .expect("register_shards: slab too small for shard spec");
+            ) {
+                Ok(record) => record,
+                Err(err) => {
+                    // Roll back staged records allocated so far.
+                    for (_, mut staged) in to_insert {
+                        staged.deallocate_fields(&mut self.slab);
+                    }
+                    return Err(err.into());
+                }
+            };
             if !s.cursor().is_initial() {
-                sr.cursor
-                    .update(s.cursor(), &mut self.slab)
-                    .expect("register_shards: slab too small for cursor");
+                if let Err(err) = sr.cursor.update(s.cursor(), &mut self.slab) {
+                    // Current record + all staged records were not inserted yet.
+                    sr.deallocate_fields(&mut self.slab);
+                    for (_, mut staged) in to_insert {
+                        staged.deallocate_fields(&mut self.slab);
+                    }
+                    return Err(err.into());
+                }
             }
             sr.assert_invariants();
-            self.shard_insert(tenant, key, sr);
+            to_insert.push((key, sr));
+        }
+
+        for (key, record) in to_insert {
+            self.shard_insert(tenant, key, record);
         }
 
         self.run_shards

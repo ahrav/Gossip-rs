@@ -1014,6 +1014,61 @@ fn register_shards_run_not_found() {
     assert!(matches!(err, RegisterShardsError::RunNotFound));
 }
 
+#[test]
+fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
+    // Two shards with bounded ranges need 4 non-empty spec slots total.
+    // With 16-byte minimum block size, that is 64 bytes. A 32-byte slab can
+    // allocate at most one shard spec before returning SlabFull.
+    let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 10, 10);
+    runtime.slab_capacity = 32;
+    let mut coord = InMemoryCoordinator::with_runtime_config(runtime);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let err = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, RegisterShardsError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got: {err:?}"
+    );
+
+    // Run must stay Initializing with no registered roots on failure.
+    let run = coord.get_run(test_tenant(), test_run()).unwrap();
+    assert_eq!(run.status(), RunStatus::Initializing);
+    assert!(run.root_shards().is_empty());
+
+    // No shards should have been inserted.
+    let summaries = coord
+        .list_shards(now(3), test_tenant(), test_run(), ShardFilter::all())
+        .unwrap();
+    assert!(summaries.is_empty(), "failed registration inserted shards");
+    assert_eq!(
+        coord.shard_count(),
+        0,
+        "failed registration changed shard count"
+    );
+}
+
 // -- create_run_with_shards tests ---------------------------------------------
 //
 // Atomic create+register convenience method. Covers: fresh creation

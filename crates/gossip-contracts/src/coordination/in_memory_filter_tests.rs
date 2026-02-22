@@ -783,6 +783,7 @@ fn assert_constructor_equivalent(lhs: &InMemoryCoordinator, rhs: &InMemoryCoordi
     assert_eq!(lhs.max_shards_per_tenant, rhs.max_shards_per_tenant);
     assert_eq!(lhs.max_total_shards, rhs.max_total_shards);
     assert_eq!(lhs.claim_cooldown_interval, rhs.claim_cooldown_interval);
+    assert_eq!(lhs.slab().capacity(), rhs.slab().capacity());
     assert_eq!(lhs.shards.capacity(), rhs.shards.capacity());
     assert_eq!(lhs.runs.capacity(), rhs.runs.capacity());
     assert_eq!(lhs.run_shards.capacity(), rhs.run_shards.capacity());
@@ -830,6 +831,20 @@ fn runtime_constructor_matches_with_cooldown() {
     ));
     let legacy = InMemoryCoordinator::with_cooldown(LEASE_DURATION, 123, 456, 9);
     assert_constructor_equivalent(&runtime, &legacy);
+}
+
+#[test]
+fn runtime_constructor_caps_auto_slab_capacity() {
+    let coord = InMemoryCoordinator::new(LEASE_DURATION);
+    assert_eq!(coord.slab().capacity(), DEFAULT_MAX_AUTO_SLAB_CAPACITY);
+}
+
+#[test]
+fn runtime_constructor_respects_explicit_slab_capacity() {
+    let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 123, 456);
+    config.slab_capacity = 8 * 1024;
+    let coord = InMemoryCoordinator::with_runtime_config(config);
+    assert_eq!(coord.slab().capacity(), 8 * 1024);
 }
 
 // -- CoordinatorConfig memory budget smoke tests ------------------------------

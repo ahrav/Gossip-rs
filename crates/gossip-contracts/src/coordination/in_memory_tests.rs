@@ -441,6 +441,75 @@ fn split_residual_cursor_out_of_bounds() {
     assert!(matches!(err, SplitResidualError::SplitInvalid(_)));
 }
 
+#[test]
+fn split_residual_parent_update_failure_deallocates_residual_fields() {
+    // Capacity math (16-byte min blocks):
+    // - Parent spec [a,z): 2 slots => 32 bytes
+    // - Residual spec [m,z): 2 slots => 32 bytes (total 64)
+    // - Parent update [a,m) needs +32 before releasing old parent slots
+    // With slab=64, residual build succeeds, parent update fails.
+    let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 100, 100);
+    runtime.slab_capacity = 64;
+    let mut coord = InMemoryCoordinator::with_runtime_config(runtime);
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+    let shards = vec![InitialShard::new(
+        test_shard(),
+        test_spec(),
+        Cursor::initial(),
+    )];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let lease = acquire_shard(&mut coord, 3, 1);
+    let live_before = coord.slab().live_count();
+
+    let err = coord
+        .split_residual(
+            now(4),
+            test_tenant(),
+            &lease,
+            test_split_residual_plan(),
+            OpId::from_raw(22),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SplitResidualError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got: {err:?}"
+    );
+
+    // Residual slots must be deallocated on parent-update failure.
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "residual fields leaked on split_residual failure"
+    );
+    assert_eq!(
+        coord.shard_count(),
+        1,
+        "failed split must not insert residual"
+    );
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    let slab = coord.slab();
+    assert_eq!(parent.spec.key_range_start(slab), b"a");
+    assert_eq!(parent.spec.key_range_end(slab), b"z");
+    assert!(
+        parent.spawned.is_empty(),
+        "parent spawned list must be unchanged"
+    );
+}
+
 // -- Op-log eviction edge case ----------------------------------------
 //
 // The per-shard op-log is a 16-entry FIFO ring buffer. Once an entry is
@@ -1456,4 +1525,85 @@ fn lifecycle_split_residual_twice_then_complete_children() {
         .acquire_and_restore(now(13), test_tenant(), r2_key, test_worker(4))
         .unwrap_err();
     assert!(matches!(r2_err, AcquireError::ShardTerminal { .. }));
+}
+
+// -- slab exhaustion: split_residual leak on apply-parent failure ----------
+//
+// When split_residual_apply_parent fails (e.g. SlabFull during
+// parent.spec.update), the residual_record built in Phase 2 is dropped
+// without calling deallocate_fields. Since pooled types have no Drop impl,
+// this permanently leaks slab allocations.
+
+#[test]
+fn split_residual_cleans_up_residual_on_apply_parent_failure() {
+    // Build a coordinator with a slab just large enough for the initial
+    // shard + the residual record, but NOT for the parent spec update
+    // inside split_residual_apply_parent.
+    //
+    // Layout (non-empty fields round to MIN_BLOCK=16 bytes; empty
+    // metadata returns ByteSlot::EMPTY, no allocation):
+    //   initial shard spec: 2 slots × 16 = 32 bytes  (start + end)
+    //   residual spec:      2 slots × 16 = 32 bytes
+    //   parent update:      2 slots × 16 = 32 bytes  (allocated BEFORE old freed)
+    //
+    // With slab_capacity=64 the first two succeed (bump at 64); the
+    // parent update needs 32 more bytes while 64 are in use → SlabFull.
+    let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 10, 10);
+    config.slab_capacity = 64;
+    let mut coord = InMemoryCoordinator::with_runtime_config(config);
+
+    // Seed the coordinator with one run + one shard (uses 48 bytes).
+    let run_config = crate::coordination::RunConfig::try_new(
+        CursorSemantics::Completed,
+        LEASE_DURATION,
+        Some(5),
+    )
+    .unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), run_config)
+        .unwrap();
+    let shards = vec![crate::coordination::InitialShard::new(
+        test_shard(),
+        test_spec(),
+        crate::coordination::Cursor::initial(),
+    )];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(u64::MAX),
+        )
+        .unwrap();
+
+    // Acquire the shard so we have a valid lease.
+    let lease = acquire_shard(&mut coord, 3, 1);
+
+    // Record slab state before the split attempt.
+    let live_before = coord.slab.live_count();
+
+    // Attempt split_residual. Phase 2 (build residual) will succeed,
+    // consuming another 48 bytes (total 96). Phase 3 (apply parent)
+    // needs to allocate 48 more bytes for the new parent spec before
+    // freeing the old — but the slab only has 96 bytes, so this fails.
+    let plan = test_split_residual_plan();
+    let err = coord
+        .split_residual(now(4), test_tenant(), &lease, plan, OpId::from_raw(1))
+        .unwrap_err();
+
+    assert!(
+        matches!(err, SplitResidualError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got {err:?}",
+    );
+
+    // The critical check: slab live_count must equal what it was before
+    // the split attempt. If the residual's allocations leaked, live_count
+    // will be higher.
+    let live_after = coord.slab.live_count();
+    assert_eq!(
+        live_before, live_after,
+        "slab leak: live_count was {live_before} before split, {live_after} after — \
+         residual allocations were not cleaned up on apply-parent failure",
+    );
 }
