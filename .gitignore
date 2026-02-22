@@ -25,6 +25,7 @@ debug
 
 # bv (beads viewer) local config and caches
 .bv/
+.beads/.bv.lock
 
 todos/*
 
