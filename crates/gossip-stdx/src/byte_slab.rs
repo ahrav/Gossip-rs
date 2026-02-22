@@ -614,6 +614,19 @@ impl ByteSlab {
             return &[];
         }
         self.assert_slot_owner(slot);
+        debug_assert!(
+            slot.len <= slot.alloc_size,
+            "slot len ({}) exceeds alloc_size ({})",
+            slot.len,
+            slot.alloc_size,
+        );
+        debug_assert!(
+            slot.offset + slot.alloc_size <= self.bump,
+            "slot region [{}, {}) exceeds bump ({})",
+            slot.offset,
+            slot.offset + slot.alloc_size,
+            self.bump,
+        );
         let start = slot.offset as usize;
         let end = start + slot.len as usize;
         &self.buf[start..end]
@@ -644,6 +657,19 @@ impl ByteSlab {
             return;
         }
         self.assert_slot_owner(slot);
+        debug_assert!(
+            slot.len <= slot.alloc_size,
+            "slot len ({}) exceeds alloc_size ({})",
+            slot.len,
+            slot.alloc_size,
+        );
+        debug_assert!(
+            slot.offset + slot.alloc_size <= self.bump,
+            "slot region [{}, {}) exceeds bump ({})",
+            slot.offset,
+            slot.offset + slot.alloc_size,
+            self.bump,
+        );
 
         let slot_start = slot.offset;
 
@@ -1275,6 +1301,46 @@ mod tests {
         // get() with a pre-clear slot must panic (owner id rotated).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.get(stale)));
         assert!(result.is_err(), "stale slot after clear must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale slot detection (debug_assert sanity checks)
+    // -----------------------------------------------------------------------
+
+    /// Allocate a single trailing block, deallocate it (bump retracts),
+    /// then use the stale copy. The `debug_assert!(offset + alloc_size <= bump)`
+    /// in `get()` catches the stale handle because the bump pointer has
+    /// retracted past the slot's region.
+    #[test]
+    fn stale_slot_after_bump_retraction_panics_on_get() {
+        let mut slab = ByteSlab::with_capacity(1024);
+        let slot = slab.allocate(b"hello").unwrap();
+        let stale = slot; // Copy the handle.
+        slab.deallocate(slot);
+
+        // Bump retracted: stale.offset + stale.alloc_size > slab.bump.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.get(stale)));
+        assert!(
+            result.is_err(),
+            "stale slot after bump retraction must panic in debug builds"
+        );
+    }
+
+    /// Same scenario but through `deallocate()`: the debug_assert catches
+    /// the stale handle before it corrupts slab accounting.
+    #[test]
+    fn stale_slot_after_bump_retraction_panics_on_deallocate() {
+        let mut slab = ByteSlab::with_capacity(1024);
+        let slot = slab.allocate(b"hello").unwrap();
+        let stale = slot;
+        slab.deallocate(slot);
+
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.deallocate(stale)));
+        assert!(
+            result.is_err(),
+            "stale slot deallocation after bump retraction must panic in debug builds"
+        );
     }
 
     // -----------------------------------------------------------------------
