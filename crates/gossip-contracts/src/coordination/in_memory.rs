@@ -216,19 +216,63 @@ impl CoordinatorConfig {
     /// - 80 = per-entry HashMap overhead for run entries
     /// - 16 = per-entry in claim_cooldowns
     /// - 4096 = base coordinator struct + map headers
+    ///
+    /// # Panics
+    ///
+    /// Panics with a deterministic message if any intermediate arithmetic
+    /// overflows `usize`.
     #[must_use]
     pub const fn memory_budget(&self) -> usize {
-        let per_shard = 776 + self.per_shard_budget + 72;
-        let per_run = 512 + self.per_run_budget + 80;
-        let per_worker = 16;
-        let base = 4096;
-        self.max_total_shards * per_shard
-            + self.max_runs * per_run
-            + self.max_workers * per_worker
-            + base
+        let per_shard_base = match 776usize.checked_add(self.per_shard_budget) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-shard base"),
+        };
+        let per_shard = match per_shard_base.checked_add(72) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-shard overhead"),
+        };
+
+        let per_run_base = match 512usize.checked_add(self.per_run_budget) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-run base"),
+        };
+        let per_run = match per_run_base.checked_add(80) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: per-run overhead"),
+        };
+
+        let shard_bytes = match self.max_total_shards.checked_mul(per_shard) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: shard contribution"),
+        };
+        let run_bytes = match self.max_runs.checked_mul(per_run) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: run contribution"),
+        };
+        let worker_bytes = match self.max_workers.checked_mul(16) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: worker contribution"),
+        };
+
+        let with_runs = match shard_bytes.checked_add(run_bytes) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: shard+run total"),
+        };
+        let with_workers = match with_runs.checked_add(worker_bytes) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: shard+run+worker total"),
+        };
+        match with_workers.checked_add(4096) {
+            Some(value) => value,
+            None => panic!("CoordinatorConfig::memory_budget overflow: final total"),
+        }
     }
 
     /// Estimate worst-case memory budget in mebibytes (rounded up).
+    ///
+    /// # Panics
+    ///
+    /// Propagates any overflow panic from [`memory_budget`](Self::memory_budget).
     #[must_use]
     pub const fn memory_budget_mb(&self) -> usize {
         self.memory_budget().div_ceil(1 << 20)

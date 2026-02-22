@@ -3532,6 +3532,27 @@ fn coordinator_config_memory_budget_mb_rounds_up() {
     assert_eq!(mb, expected_mb);
 }
 
+#[test]
+#[should_panic(expected = "CoordinatorConfig::memory_budget overflow: shard contribution")]
+fn coordinator_config_memory_budget_overflow_panics_deterministically() {
+    let cfg = super::CoordinatorConfig::new(usize::MAX, 1, 1, 1, 0, 0);
+    let _ = cfg.memory_budget();
+}
+
+#[test]
+#[should_panic(expected = "CoordinatorConfig::memory_budget overflow: per-shard base")]
+fn coordinator_config_memory_budget_per_shard_add_overflow_panics_deterministically() {
+    let cfg = super::CoordinatorConfig::new(1, 1, 1, 1, usize::MAX, 0);
+    let _ = cfg.memory_budget();
+}
+
+#[test]
+#[should_panic(expected = "CoordinatorConfig::memory_budget overflow: shard contribution")]
+fn coordinator_config_memory_budget_mb_overflow_panics_deterministically() {
+    let cfg = super::CoordinatorConfig::new(usize::MAX, 1, 1, 1, 0, 0);
+    let _ = cfg.memory_budget_mb();
+}
+
 /// Validates that the hardcoded constants in `memory_budget()` match
 /// actual struct sizes on this platform. If this test fails, the
 /// constants in `CoordinatorConfig::memory_budget()` need updating.

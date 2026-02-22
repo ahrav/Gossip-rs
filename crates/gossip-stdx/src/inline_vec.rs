@@ -20,7 +20,9 @@
 //!
 //! # Threading
 //!
-//! This type is not synchronized; it assumes single-threaded usage.
+//! This type has no internal synchronization. It is `Send + Sync` when
+//! `T` is, but concurrent mutation requires external synchronization
+//! (as with any `&mut`-based API).
 
 use std::mem::{self, MaybeUninit};
 
@@ -113,10 +115,10 @@ impl<T, const N: usize> InlineVec<T, N> {
         match &mut self.repr {
             Repr::Inline { len, .. } if (*len as usize) < N => {
                 let idx = *len as usize;
-                // Re-match rationale: the outer `match` borrows `self.repr`
-                // immutably (the guard reads `len`). We need a *mutable*
-                // borrow of `buf` and `len` to write, so we re-match inside
-                // the arm to start a fresh mutable borrow.
+                // Re-match rationale: the outer `match &mut self.repr` with a
+                // guard extends the borrow's lifetime through the arm body.
+                // We need a fresh mutable reborrow of `buf` and `len` to
+                // write, so we re-match inside the arm.
                 if let Repr::Inline { buf, len } = &mut self.repr {
                     // SAFETY: idx < N, so buf[idx] is in bounds. The slot is
                     // uninitialized (idx == len, which is past the last
@@ -179,6 +181,15 @@ impl<T, const N: usize> InlineVec<T, N> {
         self.repr = Repr::Heap(vec);
     }
 
+    /// Returns whether `additional` elements can be appended inline.
+    ///
+    /// Uses subtraction-based capacity math to avoid any `len + additional`
+    /// overflow while preserving the original fit semantics.
+    #[inline]
+    fn inline_extend_fits(len: usize, additional: usize) -> bool {
+        len <= N && additional <= N - len
+    }
+
     /// Appends all elements from a slice by cloning each one.
     ///
     /// If the combined length exceeds inline capacity, spills to heap.
@@ -202,7 +213,7 @@ impl<T, const N: usize> InlineVec<T, N> {
         T: Clone,
     {
         match &mut self.repr {
-            Repr::Inline { buf, len } if (*len as usize) + slice.len() <= N => {
+            Repr::Inline { buf, len } if Self::inline_extend_fits(*len as usize, slice.len()) => {
                 let start = *len as usize;
                 for (i, item) in slice.iter().enumerate() {
                     // SAFETY: start + i < start + slice.len() <= N, so
@@ -567,6 +578,18 @@ mod tests {
     }
 
     #[test]
+    fn extend_from_slice_inline_guard_exact_remaining_capacity() {
+        assert!(InlineVec::<u32, 8>::inline_extend_fits(5, 3));
+        assert!(!InlineVec::<u32, 8>::inline_extend_fits(5, 4));
+    }
+
+    #[test]
+    fn extend_from_slice_inline_guard_rejects_overflowing_addition() {
+        assert!(!InlineVec::<u32, 8>::inline_extend_fits(1, usize::MAX));
+        assert!(!InlineVec::<u32, 8>::inline_extend_fits(9, 0));
+    }
+
+    #[test]
     fn iter_delegates_to_slice() {
         let mut v = InlineVec::<u32, 4>::new();
         v.push(10);
@@ -873,7 +896,7 @@ mod tests {
 
         COUNT.with(|c| c.set(0));
         let result = panic::catch_unwind(panic::AssertUnwindSafe(|| v.clone()));
-        assert!(result.is_err()); // panicked — no UB, elements 1-2 leaked (safe)
+        assert!(result.is_err()); // panicked — no UB, partial clones dropped during unwinding
     }
 
     /// Verify that partial clones are properly dropped when T::clone() panics.
@@ -1156,8 +1179,9 @@ mod kani_proofs {
     //!
     //! Each proof targets one unsafe operation or invariant, verifying it
     //! holds for all valid inputs (symbolic, not sampled). Together they
-    //! establish that every `unsafe` block in `InlineVec` is free of
-    //! out-of-bounds access and uninitialized reads.
+    //! cover 8 of the 9 `unsafe` blocks in `InlineVec`; the remaining
+    //! block in `extend_from_slice` uses analogous bounds reasoning to
+    //! `push` but is not independently proven.
     //!
     //! Proofs use `CAP = 4` and bounded unwind depths; Kani explores all
     //! reachable states within those bounds exhaustively.
