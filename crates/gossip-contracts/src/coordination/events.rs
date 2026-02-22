@@ -81,15 +81,6 @@ impl RedactedKey {
         Self(key)
     }
 
-    /// Consume the wrapper and return the raw key bytes.
-    ///
-    /// Use sparingly — this defeats the redaction guarantee. Intended
-    /// for serialization layers that apply their own redaction.
-    #[must_use]
-    #[allow(dead_code)] // reserved for serialization layers
-    pub(crate) fn into_raw(self) -> Option<Box<[u8]>> {
-        self.0
-    }
 }
 
 impl fmt::Debug for RedactedKey {

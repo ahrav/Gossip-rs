@@ -881,6 +881,11 @@ impl ByteSlab {
     fn debug_assert_invariants(&self) {}
 }
 
+// Compile-time proof that ByteSlab is Send+Sync (all fields are).
+// Trait-bound impl fails to compile if the constraint is not satisfied.
+trait AssertSendSync: Send + Sync {}
+impl AssertSendSync for ByteSlab {}
+
 impl Drop for ByteSlab {
     /// Debug-only leak detector.
     ///

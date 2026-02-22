@@ -506,15 +506,9 @@ impl<'a, T, const N: usize> IntoIterator for &'a InlineVec<T, N> {
 }
 
 // Compile-time proof that InlineVec inherits Send/Sync from T.
-#[allow(dead_code)]
-const _: () = {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    fn check<T: Send + Sync>() {
-        assert_send::<InlineVec<T, 1>>();
-        assert_sync::<InlineVec<T, 1>>();
-    }
-};
+// Trait-bound impl fails to compile if the constraint is not satisfied.
+trait AssertSendSync: Send + Sync {}
+impl<T: Send + Sync, const N: usize> AssertSendSync for InlineVec<T, N> {}
 
 #[cfg(test)]
 #[path = "inline_vec_tests.rs"]
