@@ -345,7 +345,7 @@ impl<T: Eq, const N: usize> Eq for RingBuffer<T, N> {}
 // Closure-in-const pattern (from static_assertions) avoids dead_code warnings.
 const _: fn() = || {
     fn assert_impl<T: Send + Sync>() {}
-    assert_impl::<RingBuffer<T, 1>>();
+    assert_impl::<RingBuffer<u8, 1>>();
 };
 
 impl<T, const N: usize> FromIterator<T> for RingBuffer<T, N> {

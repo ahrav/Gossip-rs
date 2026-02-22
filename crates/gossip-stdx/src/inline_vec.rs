@@ -509,7 +509,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a InlineVec<T, N> {
 // Closure-in-const pattern (from static_assertions) avoids dead_code warnings.
 const _: fn() = || {
     fn assert_impl<T: Send + Sync>() {}
-    assert_impl::<InlineVec<T, 1>>();
+    assert_impl::<InlineVec<u8, 1>>();
 };
 
 #[cfg(test)]
