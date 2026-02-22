@@ -72,6 +72,8 @@
 
 use std::fmt;
 
+use gossip_stdx::SlabFull;
+
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ShardSnapshot, ShardStatus};
 use crate::coordination::shard_spec::SplitValidationError;
@@ -489,6 +491,9 @@ pub enum CheckpointError {
     /// The checkpoint cursor did not contain a `last_key`, which is required
     /// to track scan progress.
     CheckpointMissingKey,
+    /// The byte slab could not satisfy an allocation request.
+    /// Recoverable: the caller may retry after freeing slab space.
+    ResourceExhausted(SlabFull),
 }
 
 impl fmt::Debug for CheckpointError {
@@ -537,6 +542,7 @@ impl fmt::Debug for CheckpointError {
                 f.debug_tuple("CursorOutOfBounds").field(detail).finish()
             }
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
+            Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
         }
     }
 }
@@ -568,11 +574,18 @@ impl fmt::Display for CheckpointError {
                 detail.last_key.len()
             ),
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
+            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
         }
     }
 }
 
 impl std::error::Error for CheckpointError {}
+
+impl From<SlabFull> for CheckpointError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
+    }
+}
 
 /// Error from `complete`.
 ///
@@ -621,6 +634,9 @@ pub enum CompleteError {
     /// Complete requires a final cursor with a `last_key` to confirm
     /// the worker reached the end of its assigned range.
     CheckpointMissingKey,
+    /// The byte slab could not satisfy an allocation request.
+    /// Recoverable: the caller may retry after freeing slab space.
+    ResourceExhausted(SlabFull),
 }
 
 impl fmt::Debug for CompleteError {
@@ -669,6 +685,7 @@ impl fmt::Debug for CompleteError {
                 f.debug_tuple("CursorOutOfBounds").field(detail).finish()
             }
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
+            Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
         }
     }
 }
@@ -700,11 +717,18 @@ impl fmt::Display for CompleteError {
                 detail.last_key.len()
             ),
             Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
+            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
         }
     }
 }
 
 impl std::error::Error for CompleteError {}
+
+impl From<SlabFull> for CompleteError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
+    }
+}
 
 /// Error from `park_shard`.
 ///
@@ -843,6 +867,9 @@ pub enum SplitError {
     },
     /// See [`CoordError::SplitInvalid`].
     SplitInvalid(Box<SplitValidationError>),
+    /// The byte slab could not satisfy an allocation request.
+    /// Recoverable: the caller may retry after freeing slab space.
+    ResourceExhausted(SlabFull),
 }
 
 impl fmt::Debug for SplitError {
@@ -878,6 +905,7 @@ impl fmt::Debug for SplitError {
                 .field("actual_hash", &"<redacted>")
                 .finish(),
             Self::SplitInvalid(inner) => f.debug_tuple("SplitInvalid").field(inner).finish(),
+            Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
         }
     }
 }
@@ -915,6 +943,7 @@ impl fmt::Display for SplitError {
                 write!(f, "op-id conflict: {op_id:?} reused with different payload")
             }
             Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
+            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
         }
     }
 }
@@ -925,6 +954,12 @@ impl std::error::Error for SplitError {
             Self::SplitInvalid(inner) => Some(inner.as_ref()),
             _ => None,
         }
+    }
+}
+
+impl From<SlabFull> for SplitError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
     }
 }
 

@@ -899,12 +899,12 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The planning formula uses 776 for ShardRecord and 512 for RunRecord.
+    // The planning formula uses 784 for ShardRecord and 512 for RunRecord.
     // These are documented in `CoordinatorConfig::memory_budget()`.
     // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
-        shard_size, 776,
-        "ShardRecord size changed from 776 to {shard_size}; \
+        shard_size, 784,
+        "ShardRecord size changed from 784 to {shard_size}; \
          update the constant in CoordinatorConfig::memory_budget()"
     );
     assert_eq!(

@@ -60,6 +60,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use gossip_stdx::ByteSlab;
+
 use crate::coordination::cursor::{CursorBoundsCheck, check_cursor_bounds};
 use crate::coordination::record::{ShardRecord, ShardStatus};
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
@@ -263,6 +265,7 @@ impl InvariantChecker {
     ) -> Vec<InvariantViolation> {
         let mut violations = Vec::new();
         self.active_holders.clear();
+        let slab = coordinator.slab();
 
         for ((tid, key), record) in coordinator.shards() {
             if tid != tenant {
@@ -281,8 +284,8 @@ impl InvariantChecker {
                 &mut violations,
             );
             Self::check_record_invariant(record, &mut violations);
-            self.check_cursor_monotonicity(id, record, &mut violations);
-            Self::check_cursor_in_bounds(record, &mut violations);
+            self.check_cursor_monotonicity(id, record, slab, &mut violations);
+            Self::check_cursor_in_bounds(record, slab, &mut violations);
             self.check_split_coverage(record, tenant, coordinator, &mut violations);
         }
 
@@ -430,10 +433,11 @@ impl InvariantChecker {
         &mut self,
         id: (TenantId, RunId, ShardId),
         record: &ShardRecord,
+        slab: &ByteSlab,
         violations: &mut Vec<InvariantViolation>,
     ) {
         let prev_key = self.prev_cursors.get(&id).and_then(|o| o.as_deref());
-        let curr_key = record.cursor.last_key();
+        let curr_key = record.cursor.last_key(slab);
         let cursor_regressed = match (prev_key, curr_key) {
             (Some(_), None) => true,
             (Some(prev), Some(curr)) if curr < prev => true,
@@ -453,8 +457,14 @@ impl InvariantChecker {
     }
 
     /// S6: cursor bounds.
-    fn check_cursor_in_bounds(record: &ShardRecord, violations: &mut Vec<InvariantViolation>) {
-        let bounds = check_cursor_bounds(&record.cursor, &record.spec);
+    fn check_cursor_in_bounds(
+        record: &ShardRecord,
+        slab: &ByteSlab,
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        let cursor = record.cursor.to_cursor(slab);
+        let spec = record.spec.to_spec(slab);
+        let bounds = check_cursor_bounds(&cursor, &spec);
         if matches!(
             bounds,
             CursorBoundsCheck::BelowRange | CursorBoundsCheck::AboveRange

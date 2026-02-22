@@ -33,6 +33,8 @@
 //! The explicit `'a` lifetime tied to `&'a self` makes borrow contracts
 //! clear for downstream wrappers.
 
+use gossip_stdx::ByteSlab;
+
 use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
 use crate::identity::{ShardKey, TenantId};
@@ -98,6 +100,20 @@ pub trait SimIntrospection {
     /// See the [consistency contract](SimIntrospection#consistency-contract)
     /// discussion on the trait.
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord>;
+
+    /// Shared reference to the byte slab backing pooled record fields.
+    ///
+    /// Required by the invariant checker to materialize `PooledShardSpec`
+    /// and `PooledCursor` values for bounds-checking and monotonicity
+    /// verification.
+    fn slab(&self) -> &ByteSlab;
+
+    /// Mutable reference to the byte slab backing pooled record fields.
+    ///
+    /// Required for deallocating pooled fields from synthetic records
+    /// (e.g., in [`FaultInjectingIntrospector`](super::fault_injector::FaultInjectingIntrospector))
+    /// before the slab is dropped.
+    fn slab_mut(&mut self) -> &mut ByteSlab;
 }
 
 /// Combined trait bound for backends usable by the simulation harness.

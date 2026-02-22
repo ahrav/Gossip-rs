@@ -150,20 +150,26 @@ fn register_shards_exceeds_global_limit() {
 
     // Seed 2 existing shards from a different tenant.
     let other = TenantId::from_bytes([0x02; 32]);
-    coord.seed_shard(ShardRecord::new_active(
+    let sr1 = ShardRecord::new_active(
         other,
         RunId::from_raw(99),
         ShardId::from_raw(90),
-        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
         CursorSemantics::Completed,
-    ));
-    coord.seed_shard(ShardRecord::new_active(
+        coord.slab_mut(),
+    )
+    .unwrap();
+    coord.seed_shard(sr1);
+    let sr2 = ShardRecord::new_active(
         other,
         RunId::from_raw(99),
         ShardId::from_raw(91),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    ));
+        coord.slab_mut(),
+    )
+    .unwrap();
+    coord.seed_shard(sr2);
 
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
@@ -709,7 +715,7 @@ fn unpark_shard_cursor_preserved() {
 
     let record = coord.shard_lookup(&test_tenant(), &key).unwrap();
     assert_eq!(
-        record.cursor.last_key(),
+        record.cursor.last_key(coord.slab()),
         Some(b"f".as_slice()),
         "cursor must be preserved through park->unpark",
     );

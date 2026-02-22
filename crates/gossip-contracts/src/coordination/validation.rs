@@ -43,6 +43,7 @@ use crate::coordination::cursor::{CursorAdvance, CursorBoundsCheck};
 use crate::coordination::error::CoordError;
 use crate::coordination::lease::{Lease, OpLogEntry};
 use crate::coordination::record::ShardRecord;
+use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{LogicalTime, OpId, ShardKey, TenantId};
 
 /// Validate lease preconditions for a lease-gated operation.
@@ -152,28 +153,29 @@ pub fn validate_lease(
 /// # Errors
 ///
 /// Returns the first violated check as a `CoordError`.
-pub fn validate_cursor_update(new_cursor: &Cursor, record: &ShardRecord) -> Result<(), CoordError> {
+pub fn validate_cursor_update(
+    new_cursor: &Cursor,
+    old_cursor: &Cursor,
+    spec: &ShardSpec,
+) -> Result<(), CoordError> {
     // 1. Key presence.
     if new_cursor.last_key().is_none() {
         return Err(CoordError::CheckpointMissingKey);
     }
 
     // 2. Monotonicity.
-    match check_cursor_advance(&record.cursor, new_cursor) {
+    match check_cursor_advance(old_cursor, new_cursor) {
         CursorAdvance::Forward => { /* ok */ }
         CursorAdvance::Regression | CursorAdvance::ResetToNone => {
             return Err(CoordError::CursorRegression {
-                old_key: record
-                    .cursor
-                    .last_key()
-                    .map(|k| k.to_vec().into_boxed_slice()),
+                old_key: old_cursor.last_key().map(|k| k.to_vec().into_boxed_slice()),
                 new_key: new_cursor.last_key().map(|k| k.to_vec().into_boxed_slice()),
             });
         }
     }
 
     // 3. Bounds checking.
-    match check_cursor_bounds(new_cursor, &record.spec) {
+    match check_cursor_bounds(new_cursor, spec) {
         CursorBoundsCheck::InBounds => { /* ok */ }
         CursorBoundsCheck::NoKey => {
             // We already checked last_key().is_some() above, so this
@@ -189,8 +191,8 @@ pub fn validate_cursor_update(new_cursor: &Cursor, record: &ShardRecord) -> Resu
             return Err(CoordError::CursorOutOfBounds(Box::new(
                 crate::coordination::error::CursorOutOfBoundsDetail {
                     last_key,
-                    spec_start: record.spec.key_range_start().to_vec().into_boxed_slice(),
-                    spec_end: record.spec.key_range_end().to_vec().into_boxed_slice(),
+                    spec_start: spec.key_range_start().to_vec().into_boxed_slice(),
+                    spec_end: spec.key_range_end().to_vec().into_boxed_slice(),
                 },
             )));
         }
@@ -273,7 +275,31 @@ mod tests {
     use crate::coordination::record::ShardRecord;
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use crate::identity::{FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
-    use gossip_stdx::RingBuffer;
+    use gossip_stdx::{ByteSlab, RingBuffer};
+
+    /// Test slab wrapper that clears live allocations on drop.
+    struct TestSlab(ByteSlab);
+    impl TestSlab {
+        fn new() -> Self {
+            Self(ByteSlab::with_capacity(64 * 1024))
+        }
+    }
+    impl std::ops::Deref for TestSlab {
+        type Target = ByteSlab;
+        fn deref(&self) -> &ByteSlab {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for TestSlab {
+        fn deref_mut(&mut self) -> &mut ByteSlab {
+            &mut self.0
+        }
+    }
+    impl Drop for TestSlab {
+        fn drop(&mut self) {
+            self.0.clear();
+        }
+    }
 
     // -- Test fixtures ---------------------------------------------------
 
@@ -298,26 +324,28 @@ mod tests {
     }
 
     /// Active record, no lease, fence=INITIAL.
-    fn active_unleased_record() -> ShardRecord {
+    fn active_unleased_record(slab: &mut ByteSlab) -> ShardRecord {
         ShardRecord::new_active(
             test_tenant(),
             test_run(),
             test_shard(),
-            test_spec(),
+            &test_spec(),
             CursorSemantics::Completed,
+            slab,
         )
+        .expect("slab large enough for test record")
     }
 
     /// Active record, leased (owner=99, fence=2, deadline=100).
-    fn active_leased_record() -> ShardRecord {
+    fn active_leased_record(slab: &mut ByteSlab) -> ShardRecord {
         let r = ShardRecord::from_raw_parts(
             test_tenant(),
             test_run(),
             test_shard(),
             crate::coordination::record::ShardStatus::Active,
             None,
-            test_spec(),
-            Cursor::initial(),
+            &test_spec(),
+            &Cursor::initial(),
             CursorSemantics::Completed,
             Some(LeaseHolder::new(
                 WorkerId::from_raw(99),
@@ -327,6 +355,7 @@ mod tests {
             None,
             gossip_stdx::InlineVec::new(),
             RingBuffer::new(),
+            slab,
         );
         r.assert_invariants();
         r
@@ -348,7 +377,8 @@ mod tests {
 
     #[test]
     fn validate_lease_ok() {
-        let record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab);
         let lease = valid_lease_for(&record);
         let now = LogicalTime::from_raw(50); // before deadline=100
         assert!(validate_lease(now, test_tenant(), &lease, &record).is_ok());
@@ -356,7 +386,8 @@ mod tests {
 
     #[test]
     fn validate_lease_tenant_mismatch() {
-        let record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab);
         let lease = valid_lease_for(&record);
         let now = LogicalTime::from_raw(50);
         let result = validate_lease(now, other_tenant(), &lease, &record);
@@ -368,7 +399,8 @@ mod tests {
 
     #[test]
     fn validate_lease_terminal_shard() {
-        let mut record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let mut record = active_leased_record(&mut slab);
         record.status = crate::coordination::record::ShardStatus::Done;
         record.lease = None; // terminal shards don't hold leases
         let lease = Lease::new(
@@ -389,7 +421,8 @@ mod tests {
 
     #[test]
     fn validate_lease_stale_fence() {
-        let record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab);
         // Create a lease with an outdated fence.
         let stale_lease = Lease::new(
             test_tenant(),
@@ -409,7 +442,8 @@ mod tests {
 
     #[test]
     fn validate_lease_expired() {
-        let record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab);
         let lease = valid_lease_for(&record);
         let now = LogicalTime::from_raw(200); // after deadline=100
         let result = validate_lease(now, test_tenant(), &lease, &record);
@@ -421,8 +455,9 @@ mod tests {
 
     #[test]
     fn validate_lease_no_lease_returns_stale_fence() {
+        let mut slab = TestSlab::new();
         // Active record with INITIAL fence and no lease holder.
-        let record = active_unleased_record();
+        let record = active_unleased_record(&mut slab);
         // Caller presents a lease with INITIAL fence (matches record).
         let lease = Lease::new(
             test_tenant(),
@@ -448,7 +483,8 @@ mod tests {
 
     #[test]
     fn validate_lease_owner_divergence_returns_stale_fence() {
-        let record = active_leased_record(); // owner=99, fence=2
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab); // owner=99, fence=2
         // Create a lease with matching fence but different owner.
         let lease = Lease::new(
             test_tenant(),
@@ -471,7 +507,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "now must be > ZERO")]
     fn validate_lease_panics_on_zero_time() {
-        let record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab);
         let lease = valid_lease_for(&record);
         let _ = validate_lease(LogicalTime::ZERO, test_tenant(), &lease, &record);
     }
@@ -500,7 +537,8 @@ mod tests {
         #[case] expired: bool,
         #[case] expected: &str,
     ) {
-        let mut record = active_leased_record();
+        let mut slab = TestSlab::new();
+        let mut record = active_leased_record(&mut slab);
         let valid_fence = record.fence_epoch;
 
         if wrong_tenant {
@@ -546,7 +584,8 @@ mod tests {
 
     #[test]
     fn validate_lease_expired_at_exact_deadline() {
-        let record = active_leased_record(); // deadline=100
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab); // deadline=100
         let lease = valid_lease_for(&record);
         let now = LogicalTime::from_raw(100); // exactly at deadline
         let result = validate_lease(now, test_tenant(), &lease, &record);
@@ -558,7 +597,8 @@ mod tests {
 
     #[test]
     fn validate_lease_valid_one_tick_before_deadline() {
-        let record = active_leased_record(); // deadline=100
+        let mut slab = TestSlab::new();
+        let record = active_leased_record(&mut slab); // deadline=100
         let lease = valid_lease_for(&record);
         let now = LogicalTime::from_raw(99); // one tick before deadline
         assert!(validate_lease(now, test_tenant(), &lease, &record).is_ok());
@@ -568,42 +608,45 @@ mod tests {
 
     #[test]
     fn validate_cursor_update_ok_first_checkpoint() {
-        let record = active_unleased_record(); // cursor=initial
+        let spec = test_spec();
+        let old_cursor = Cursor::initial();
         let new_cursor = Cursor::with_last_key(b"f".to_vec());
-        assert!(validate_cursor_update(&new_cursor, &record).is_ok());
+        assert!(validate_cursor_update(&new_cursor, &old_cursor, &spec).is_ok());
     }
 
     #[test]
     fn validate_cursor_update_ok_forward() {
-        let mut record = active_unleased_record();
-        record.cursor = Cursor::with_last_key(b"f".to_vec());
+        let spec = test_spec();
+        let old_cursor = Cursor::with_last_key(b"f".to_vec());
         let new_cursor = Cursor::with_last_key(b"m".to_vec());
-        assert!(validate_cursor_update(&new_cursor, &record).is_ok());
+        assert!(validate_cursor_update(&new_cursor, &old_cursor, &spec).is_ok());
     }
 
     #[test]
     fn validate_cursor_update_missing_key() {
-        let record = active_unleased_record();
+        let spec = test_spec();
+        let old_cursor = Cursor::initial();
         let new_cursor = Cursor::initial(); // no last_key
-        let result = validate_cursor_update(&new_cursor, &record);
+        let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
         assert!(matches!(result, Err(CoordError::CheckpointMissingKey)));
     }
 
     #[test]
     fn validate_cursor_update_regression() {
-        let mut record = active_unleased_record();
-        record.cursor = Cursor::with_last_key(b"m".to_vec());
+        let spec = test_spec();
+        let old_cursor = Cursor::with_last_key(b"m".to_vec());
         let new_cursor = Cursor::with_last_key(b"f".to_vec()); // regression
-        let result = validate_cursor_update(&new_cursor, &record);
+        let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
         assert!(matches!(result, Err(CoordError::CursorRegression { .. })));
     }
 
     #[test]
     fn validate_cursor_update_below_range() {
         // spec range is [a, z), cursor at byte 0x00 which is below 'a'.
-        let record = active_unleased_record();
+        let spec = test_spec();
+        let old_cursor = Cursor::initial();
         let new_cursor = Cursor::with_last_key(vec![0x00]);
-        let result = validate_cursor_update(&new_cursor, &record);
+        let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "expected CursorOutOfBounds, got {result:?}"
@@ -613,9 +656,10 @@ mod tests {
     #[test]
     fn validate_cursor_update_above_range() {
         // spec range is [a, z), cursor at 'z' (exclusive end).
-        let record = active_unleased_record();
+        let spec = test_spec();
+        let old_cursor = Cursor::initial();
         let new_cursor = Cursor::with_last_key(b"z".to_vec());
-        let result = validate_cursor_update(&new_cursor, &record);
+        let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "expected CursorOutOfBounds, got {result:?}"
@@ -626,30 +670,32 @@ mod tests {
 
     #[test]
     fn validate_cursor_update_idempotent_same_key() {
-        let mut record = active_unleased_record();
-        record.cursor = Cursor::with_last_key(b"f".to_vec());
+        let spec = test_spec();
+        let old_cursor = Cursor::with_last_key(b"f".to_vec());
         let new_cursor = Cursor::with_last_key(b"f".to_vec()); // same key
         assert!(
-            validate_cursor_update(&new_cursor, &record).is_ok(),
+            validate_cursor_update(&new_cursor, &old_cursor, &spec).is_ok(),
             "same key should be Forward (idempotent)"
         );
     }
 
     #[test]
     fn validate_cursor_update_key_at_spec_start() {
-        let record = active_unleased_record(); // spec [a, z)
+        let spec = test_spec(); // spec [a, z)
+        let old_cursor = Cursor::initial();
         let new_cursor = Cursor::with_last_key(b"a".to_vec()); // at start (inclusive)
         assert!(
-            validate_cursor_update(&new_cursor, &record).is_ok(),
+            validate_cursor_update(&new_cursor, &old_cursor, &spec).is_ok(),
             "key at spec start should be InBounds (inclusive)"
         );
     }
 
     #[test]
     fn validate_cursor_update_key_at_spec_end() {
-        let record = active_unleased_record(); // spec [a, z)
+        let spec = test_spec(); // spec [a, z)
+        let old_cursor = Cursor::initial();
         let new_cursor = Cursor::with_last_key(b"z".to_vec()); // at end (exclusive)
-        let result = validate_cursor_update(&new_cursor, &record);
+        let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
             "key at spec end should be AboveRange (exclusive)"
@@ -670,14 +716,16 @@ mod tests {
 
     #[test]
     fn check_op_idempotency_new_op() {
-        let record = active_unleased_record();
+        let mut slab = TestSlab::new();
+        let record = active_unleased_record(&mut slab);
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xABCD);
         assert!(matches!(result, Ok(None)));
     }
 
     #[test]
     fn check_op_idempotency_replay() {
-        let mut record = active_unleased_record();
+        let mut slab = TestSlab::new();
+        let mut record = active_unleased_record(&mut slab);
         record.op_log.push_back(make_entry(42, 0xABCD)).unwrap();
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xABCD);
         assert!(matches!(result, Ok(Some(_))));
@@ -685,7 +733,8 @@ mod tests {
 
     #[test]
     fn check_op_idempotency_conflict() {
-        let mut record = active_unleased_record();
+        let mut slab = TestSlab::new();
+        let mut record = active_unleased_record(&mut slab);
         record.op_log.push_back(make_entry(42, 0xABCD)).unwrap();
         let result = check_op_idempotency(&record, OpId::from_raw(42), 0xDEAD);
         assert!(
@@ -696,7 +745,8 @@ mod tests {
 
     #[test]
     fn check_op_idempotency_at_op_log_capacity() {
-        let mut record = active_unleased_record();
+        let mut slab = TestSlab::new();
+        let mut record = active_unleased_record(&mut slab);
         // Fill op-log to capacity.
         for i in 0..ShardRecord::OP_LOG_CAP as u64 {
             record
@@ -716,13 +766,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "check_op_idempotency: payload_hash must be non-zero")]
     fn check_op_idempotency_panics_on_zero_hash() {
-        let record = active_unleased_record();
+        let mut slab = TestSlab::new();
+        let record = active_unleased_record(&mut slab);
         let _ = check_op_idempotency(&record, OpId::from_raw(1), 0);
     }
 
     #[test]
     fn check_op_idempotency_evicted_entry_returns_none() {
-        let mut record = active_unleased_record();
+        let mut slab = TestSlab::new();
+        let mut record = active_unleased_record(&mut slab);
         for i in 0..ShardRecord::OP_LOG_CAP as u64 {
             record
                 .op_log
@@ -760,33 +812,17 @@ mod tests {
             new_key in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..32)),
             spec in crate::test_util::arb_bounded_shard_spec(),
         ) {
-            // Build the record.
-            let cursor = match old_key {
+            let old_cursor = match old_key {
                 Some(k) => Cursor::with_last_key(k),
                 None => Cursor::initial(),
             };
-            let record = ShardRecord::from_raw_parts(
-                test_tenant(),
-                test_run(),
-                test_shard(),
-                crate::coordination::record::ShardStatus::Active,
-                None,
-                spec.clone(),
-                cursor,
-                CursorSemantics::Completed,
-                None,
-                FenceEpoch::INITIAL,
-                None,
-                gossip_stdx::InlineVec::new(),
-                RingBuffer::new(),
-            );
 
             let new_cursor = match new_key {
                 Some(k) => Cursor::with_last_key(k),
                 None => Cursor::initial(),
             };
 
-            let result = validate_cursor_update(&new_cursor, &record);
+            let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
 
             // Verify result matches the invariant that was violated (if any).
             match result {
@@ -795,12 +831,12 @@ mod tests {
                     prop_assert!(new_cursor.last_key().is_some());
                     // Must be forward.
                     prop_assert_eq!(
-                        check_cursor_advance(&record.cursor, &new_cursor),
+                        check_cursor_advance(&old_cursor, &new_cursor),
                         CursorAdvance::Forward,
                     );
                     // Must be in bounds.
                     prop_assert_eq!(
-                        check_cursor_bounds(&new_cursor, &record.spec),
+                        check_cursor_bounds(&new_cursor, &spec),
                         CursorBoundsCheck::InBounds,
                     );
                 }
@@ -808,13 +844,13 @@ mod tests {
                     prop_assert!(new_cursor.last_key().is_none());
                 }
                 Err(CoordError::CursorRegression { .. }) => {
-                    let adv = check_cursor_advance(&record.cursor, &new_cursor);
+                    let adv = check_cursor_advance(&old_cursor, &new_cursor);
                     prop_assert!(
                         adv == CursorAdvance::Regression || adv == CursorAdvance::ResetToNone,
                     );
                 }
                 Err(CoordError::CursorOutOfBounds(_)) => {
-                    let bounds = check_cursor_bounds(&new_cursor, &record.spec);
+                    let bounds = check_cursor_bounds(&new_cursor, &spec);
                     prop_assert!(
                         bounds == CursorBoundsCheck::BelowRange
                             || bounds == CursorBoundsCheck::AboveRange,

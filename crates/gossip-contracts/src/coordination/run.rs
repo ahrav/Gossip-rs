@@ -19,7 +19,7 @@ use crate::coordination::split::op_payload_hash;
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
 };
-use gossip_stdx::RingBuffer;
+use gossip_stdx::{ByteSlab, RingBuffer};
 
 // ============================================================================
 // RunStatus
@@ -1145,7 +1145,7 @@ pub struct ShardSummary {
 }
 
 impl ShardSummary {
-    pub(crate) fn from_record(record: &ShardRecord, now: LogicalTime) -> Self {
+    pub(crate) fn from_record(record: &ShardRecord, now: LogicalTime, slab: &ByteSlab) -> Self {
         Self {
             shard: record.shard,
             status: record.status,
@@ -1163,9 +1163,9 @@ impl ShardSummary {
                     .saturating_sub(FenceEpoch::INITIAL.as_raw()),
             )
             .unwrap_or(u32::MAX),
-            last_key: record.cursor.last_key().map(|k| k.into()),
-            key_range_start: record.spec.key_range_start().into(),
-            key_range_end: record.spec.key_range_end().into(),
+            last_key: record.cursor.last_key(slab).map(|k| k.into()),
+            key_range_start: record.spec.key_range_start(slab).into(),
+            key_range_end: record.spec.key_range_end(slab).into(),
             parent: record.parent,
             spawned_count: u32::try_from(record.spawned.len()).unwrap_or(u32::MAX),
         }

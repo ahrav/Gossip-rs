@@ -645,22 +645,23 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
     let spawned: crate::coordination::record::SpawnedList = (0..spawned_count as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     let record = ShardRecord::from_raw_parts(
         test_tenant(),
         test_run(),
         test_shard(),
         ShardStatus::Active,
         None,
-        test_spec(), // [a, z)
-        test_cursor(b"d"),
+        &test_spec(), // [a, z)
+        &test_cursor(b"d"),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         None,
         spawned,
         RingBuffer::new(),
+        coord.slab_mut(),
     );
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord.seed_shard(record);
     coord
 }
@@ -891,9 +892,11 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         test_shard(),
-        test_spec(),
+        &test_spec(),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record);
 
     // Seed two additional shards to fill tenant to limit.
@@ -901,17 +904,21 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record2);
     let record3 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
         ShardId::from_raw(30),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record3);
 
     let lease = acquire_shard(&mut coord, 1, 1);
@@ -938,9 +945,11 @@ fn split_residual_exceeds_global_limit() {
         test_tenant(),
         test_run(),
         test_shard(),
-        test_spec(),
+        &test_spec(),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record);
 
     // Seed a second shard (different tenant) to fill global limit.
@@ -948,9 +957,11 @@ fn split_residual_exceeds_global_limit() {
         other_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record2);
 
     let lease = acquire_shard(&mut coord, 1, 1);

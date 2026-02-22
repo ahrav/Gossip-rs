@@ -2,7 +2,7 @@ use super::*;
 use crate::coordination::cursor::Cursor;
 use crate::coordination::shard_spec::CursorSemantics;
 use crate::identity::{OpId, RunId, ShardId};
-use gossip_stdx::RingBuffer;
+use gossip_stdx::{ByteSlab, RingBuffer};
 use rstest::rstest;
 
 // -- Test fixtures --
@@ -726,6 +726,7 @@ fn rr_oplog_timestamps_non_decreasing_panics() {
 fn shard_summary_acquire_count_saturates_at_u32_max() {
     use crate::coordination::record::ShardRecord;
 
+    let mut slab = ByteSlab::with_capacity(64 * 1024);
     let large_epoch = FenceEpoch::from_raw(u64::from(u32::MAX) + 2);
     let record = ShardRecord::from_raw_parts(
         test_tenant(),
@@ -733,21 +734,25 @@ fn shard_summary_acquire_count_saturates_at_u32_max() {
         ShardId::from_raw(1),
         ShardStatus::Active,
         None,
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         large_epoch,
         None,
         gossip_stdx::InlineVec::new(),
         RingBuffer::new(),
+        &mut slab,
     );
-    let summary = ShardSummary::from_record(&record, LogicalTime::from_raw(1));
+    let summary = ShardSummary::from_record(&record, LogicalTime::from_raw(1), &slab);
     assert_eq!(
         summary.acquire_count(),
         u32::MAX,
         "acquire_count must saturate at u32::MAX, not truncate"
     );
+    drop(summary);
+    let mut record = record;
+    record.deallocate_fields(&mut slab);
 }
 
 // -- Finding 2: validate_manifest InvalidSpec path --

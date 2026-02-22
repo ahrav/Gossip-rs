@@ -25,6 +25,8 @@
 
 use std::fmt;
 
+use gossip_stdx::SlabFull;
+
 use crate::coordination::record::ShardStatus;
 use crate::coordination::run::{
     ManifestValidationError, RunConfigError, RunOpIdConflict, RunStatus,
@@ -138,6 +140,9 @@ pub enum RegisterShardsError {
         max: usize,
         scope: ShardLimitScope,
     },
+    /// The byte slab could not satisfy an allocation request.
+    /// Recoverable: the caller may retry after freeing slab space.
+    ResourceExhausted(SlabFull),
 }
 
 impl fmt::Debug for RegisterShardsError {
@@ -166,6 +171,7 @@ impl fmt::Debug for RegisterShardsError {
                 .field("max", max)
                 .field("scope", scope)
                 .finish(),
+            Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
         }
     }
 }
@@ -193,6 +199,7 @@ impl fmt::Display for RegisterShardsError {
                     "shard limit exceeded ({scope:?}): {current} + {additional} > {max}"
                 )
             }
+            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
         }
     }
 }
@@ -207,6 +214,12 @@ impl std::error::Error for RegisterShardsError {
 }
 
 impl_from_run_op_id_conflict!(RegisterShardsError);
+
+impl From<SlabFull> for RegisterShardsError {
+    fn from(e: SlabFull) -> Self {
+        Self::ResourceExhausted(e)
+    }
+}
 
 // ============================================================================
 // GetRunError

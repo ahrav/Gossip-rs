@@ -82,8 +82,8 @@
 //!
 //! # Threading
 //!
-//! Not synchronized; assumes single-threaded usage (same as `InlineVec`,
-//! `RingBuffer`).
+//! Not synchronized; assumes single-threaded usage (same as `InlineVec`
+//! and `RingBuffer`).
 //!
 //! # Examples
 //!
@@ -251,15 +251,16 @@ impl ByteSlot {
 /// Error returned when a [`ByteSlab`] cannot satisfy an allocation request.
 ///
 /// This error is produced when:
-/// 1. the request cannot be represented in `u32` (input length > 4 GiB), or
+/// 1. the rounded power-of-2 request overflows `u32` (input length > 2^31),
+///    or the raw input length exceeds `u32::MAX`, or
 /// 2. the free list and bump region cannot satisfy the rounded request.
 ///
 /// In case (2), free-list space may still exist but was either too fragmented
 /// or had no single block large enough.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlabFull {
-    /// The rounded power-of-2 request size. For oversized logical input
-    /// lengths (> 4 GiB), this field is `u32::MAX` as a sentinel.
+    /// The rounded power-of-2 request size. For inputs whose rounded size
+    /// overflows `u32` (input > 2^31), this field is `u32::MAX` as a sentinel.
     pub requested: u32,
     /// Remaining bytes in the virgin (bump) region. Does not include
     /// free-list bytes, which exist but could not satisfy the request.
@@ -524,7 +525,7 @@ impl ByteSlab {
     ///
     /// # Allocation strategy
     ///
-    /// 1. Search the free-list size index for a best-fit block.
+    /// 1. Search the free list for a best-fit block (linear scan).
     /// 2. Split the block if the remainder is large enough to stay useful.
     /// 3. Fall back to bump allocation from virgin memory.
     ///
@@ -554,7 +555,7 @@ impl ByteSlab {
             None => return Err(slab_full_err(u32::MAX, self.available_virgin_bytes())),
         };
 
-        // Phase 1: best-fit from free-list index.
+        // Phase 1: best-fit from free list.
         if let Some((offset, block_size)) = self.take_best_fit(needed) {
             let remainder = block_size - needed;
             let actual_size = if remainder >= MIN_BLOCK {
@@ -891,11 +892,16 @@ impl Drop for ByteSlab {
     /// because the backing `Vec<u8>` is freed regardless and there is no
     /// per-slot destructor to run.
     fn drop(&mut self) {
-        debug_assert_eq!(
-            self.live_count, 0,
-            "ByteSlab dropped with {} live allocations ({} bytes still allocated)",
-            self.live_count, self.live_bytes,
-        );
+        // Skip the leak check during unwinding to avoid double-panic aborts
+        // in `#[should_panic]` tests where the test intentionally panics
+        // before deallocating pooled fields.
+        if !std::thread::panicking() {
+            debug_assert_eq!(
+                self.live_count, 0,
+                "ByteSlab dropped with {} live allocations ({} bytes still allocated)",
+                self.live_count, self.live_bytes,
+            );
+        }
     }
 }
 

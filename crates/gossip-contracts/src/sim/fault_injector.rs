@@ -102,6 +102,15 @@ impl<B: SimIntrospection> FaultInjectingIntrospector<B> {
     pub fn inner(&self) -> &B {
         &self.inner
     }
+
+    /// Mutable access to the underlying backend (test helper).
+    ///
+    /// Allows allocating `ShardRecord` values from the inner coordinator's
+    /// slab after the coordinator has been moved into the injector.
+    #[cfg(test)]
+    pub fn inner_mut(&mut self) -> &mut B {
+        &mut self.inner
+    }
 }
 
 /// Composes real and synthetic records into a unified observation stream.
@@ -143,6 +152,25 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
         // missing children correctly fail the lookup.
         self.inner.shard_lookup(tenant, key)
     }
+
+    fn slab(&self) -> &gossip_stdx::ByteSlab {
+        self.inner.slab()
+    }
+
+    fn slab_mut(&mut self) -> &mut gossip_stdx::ByteSlab {
+        self.inner.slab_mut()
+    }
+}
+
+/// Deallocate pooled fields from synthetic records before the inner
+/// backend's slab is dropped.
+impl<B: SimIntrospection> Drop for FaultInjectingIntrospector<B> {
+    fn drop(&mut self) {
+        let slab = self.inner.slab_mut();
+        for (_, _, record) in &mut self.synthetic_records {
+            record.deallocate_fields(slab);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,13 +184,19 @@ mod tests {
     use crate::sim::invariants::{InvariantChecker, InvariantViolation};
     use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder, make_key};
 
-    fn active_record_with_lease(run: u64, shard: u64, worker: u64, deadline: u64) -> ShardRecord {
+    fn active_record_with_lease(
+        run: u64,
+        shard: u64,
+        worker: u64,
+        deadline: u64,
+        slab: &mut gossip_stdx::ByteSlab,
+    ) -> ShardRecord {
         TestRecordBuilder::new(TENANT, RunId::from_raw(run), ShardId::from_raw(shard))
             .lease(LeaseHolder::new(
                 WorkerId::from_raw(worker),
                 LogicalTime::from_raw(deadline),
             ))
-            .build()
+            .build(slab)
     }
 
     /// S1: Checker detects mutual exclusion violation via injected duplicate.
@@ -176,13 +210,13 @@ mod tests {
 
         // Real record: worker 1 holds lease on shard 1.
         let key = make_key(1, 1);
-        let real_record = active_record_with_lease(1, 1, 1, 200);
+        let real_record = active_record_with_lease(1, 1, 1, 200, coord.slab_mut());
         coord.seed_shard(real_record);
 
         // Wrap in fault injector and add synthetic record:
         // worker 2 also "holds" a lease on the same shard key.
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let synthetic = active_record_with_lease(1, 1, 2, 200);
+        let synthetic = active_record_with_lease(1, 1, 2, 200, injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, synthetic);
 
         // Verify shard_count reflects both real and synthetic.
@@ -227,12 +261,12 @@ mod tests {
 
         // Real record: worker 1 holds lease expiring at 200.
         let key = make_key(1, 1);
-        let real_record = active_record_with_lease(1, 1, 1, 200);
+        let real_record = active_record_with_lease(1, 1, 1, 200, coord.slab_mut());
         coord.seed_shard(real_record);
 
         // Inject synthetic: worker 2 had a lease that expired at 50.
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let expired = active_record_with_lease(1, 1, 2, 50);
+        let expired = active_record_with_lease(1, 1, 2, 50, injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, expired);
 
         // now=100: worker 1 active (200 >= 100), worker 2 expired (50 < 100).
@@ -255,9 +289,9 @@ mod tests {
     #[test]
     fn no_injection_no_violations() {
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
-        coord.seed_shard(
-            TestRecordBuilder::new(TENANT, RunId::from_raw(1), ShardId::from_raw(1)).build(),
-        );
+        let record = TestRecordBuilder::new(TENANT, RunId::from_raw(1), ShardId::from_raw(1))
+            .build(coord.slab_mut());
+        coord.seed_shard(record);
 
         let injector = FaultInjectingIntrospector::new(coord);
         assert_eq!(injector.shard_count(), 1);
@@ -275,7 +309,7 @@ mod tests {
         let mut injector = FaultInjectingIntrospector::new(coord);
 
         let key = make_key(1, 1);
-        let synthetic = active_record_with_lease(1, 1, 2, 200);
+        let synthetic = active_record_with_lease(1, 1, 2, 200, injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, synthetic);
 
         // Point lookup should return None (only synthetic exists).
@@ -288,12 +322,12 @@ mod tests {
     #[test]
     fn injection_does_not_modify_inner() {
         let mut coord = InMemoryCoordinator::new(LEASE_DUR);
-        coord.seed_shard(
-            TestRecordBuilder::new(TENANT, RunId::from_raw(1), ShardId::from_raw(1)).build(),
-        );
+        let record = TestRecordBuilder::new(TENANT, RunId::from_raw(1), ShardId::from_raw(1))
+            .build(coord.slab_mut());
+        coord.seed_shard(record);
 
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let synthetic = active_record_with_lease(1, 1, 2, 200);
+        let synthetic = active_record_with_lease(1, 1, 2, 200, injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, make_key(1, 1), synthetic);
 
         // Inner coordinator still has exactly 1 shard.
@@ -309,11 +343,10 @@ mod tests {
 
         // Seed with fence epoch 5.
         let key = make_key(1, 1);
-        coord.seed_shard(
-            TestRecordBuilder::new(TENANT, run, shard)
-                .fence_epoch(FenceEpoch::from_raw(5))
-                .build(),
-        );
+        let record = TestRecordBuilder::new(TENANT, run, shard)
+            .fence_epoch(FenceEpoch::from_raw(5))
+            .build(coord.slab_mut());
+        coord.seed_shard(record);
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
@@ -330,7 +363,7 @@ mod tests {
         let mut injector = FaultInjectingIntrospector::new(coord);
         let regressed = TestRecordBuilder::new(TENANT, run, shard)
             .fence_epoch(FenceEpoch::from_raw(3))
-            .build();
+            .build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, regressed);
 
         let v = checker.check_all(&injector, TENANT, now);
@@ -358,11 +391,10 @@ mod tests {
 
         // Seed as Done (terminal).
         let key = make_key(1, 1);
-        coord.seed_shard(
-            TestRecordBuilder::new(TENANT, run, shard)
-                .status(ShardStatus::Done)
-                .build(),
-        );
+        let record = TestRecordBuilder::new(TENANT, run, shard)
+            .status(ShardStatus::Done)
+            .build(coord.slab_mut());
+        coord.seed_shard(record);
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
@@ -373,7 +405,8 @@ mod tests {
 
         // Inject a synthetic Active record for the same shard.
         let mut injector = FaultInjectingIntrospector::new(coord);
-        let reverted = TestRecordBuilder::new(TENANT, run, shard).build();
+        let reverted =
+            TestRecordBuilder::new(TENANT, run, shard).build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, reverted);
 
         let v = checker.check_all(&injector, TENANT, now);
@@ -401,11 +434,10 @@ mod tests {
 
         // Seed with cursor at 'h'.
         let key = make_key(1, 1);
-        coord.seed_shard(
-            TestRecordBuilder::new(TENANT, run, shard)
-                .cursor(Cursor::with_last_key(vec![b'h']))
-                .build(),
-        );
+        let record = TestRecordBuilder::new(TENANT, run, shard)
+            .cursor(Cursor::with_last_key(vec![b'h']))
+            .build(coord.slab_mut());
+        coord.seed_shard(record);
 
         let now = LogicalTime::from_raw(1);
         let mut checker = InvariantChecker::new();
@@ -418,7 +450,7 @@ mod tests {
         let mut injector = FaultInjectingIntrospector::new(coord);
         let regressed = TestRecordBuilder::new(TENANT, run, shard)
             .cursor(Cursor::with_last_key(vec![b'c']))
-            .build();
+            .build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, regressed);
 
         let v = checker.check_all(&injector, TENANT, now);
@@ -448,7 +480,7 @@ mod tests {
         let key = make_key(1, 1);
         let out_of_bounds = TestRecordBuilder::new(TENANT, run, shard)
             .cursor(Cursor::with_last_key(vec![b'{']))
-            .build();
+            .build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, out_of_bounds);
 
         let now = LogicalTime::from_raw(1);
@@ -482,7 +514,7 @@ mod tests {
         let split_record = TestRecordBuilder::new(TENANT, run, shard)
             .status(ShardStatus::Split)
             .spawned([missing_child])
-            .build();
+            .build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, split_record);
 
         let now = LogicalTime::from_raw(1);

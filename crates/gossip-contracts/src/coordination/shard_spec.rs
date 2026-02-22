@@ -316,9 +316,10 @@ impl ShardSpec {
 
     /// Construct a `ShardSpec` from pre-built parts, bypassing validation.
     ///
-    /// Only available in test builds — allows constructing intentionally
-    /// invalid specs for testing validation logic.
-    #[cfg(test)]
+    /// Used by [`PooledShardSpec::to_spec`] to reconstruct an owned spec
+    /// from slab-backed bytes (which were originally validated on creation).
+    /// Also available in test builds for constructing intentionally invalid
+    /// specs.
     pub(crate) fn from_raw_parts(
         key_range_start: Box<[u8]>,
         key_range_end: Box<[u8]>,

@@ -264,6 +264,8 @@ pub enum RejectionKind {
     WorkerNotFound,
     /// Target run does not exist in the coordinator.
     RunNotFound,
+    /// Byte slab could not satisfy an allocation request.
+    ResourceExhausted,
     /// Coordinator returned an error not matching a specific category.
     Other,
 }
@@ -311,6 +313,7 @@ impl From<CheckpointError> for RejectionKind {
             CheckpointError::ShardNotFound { .. } => Self::ShardNotFound,
             CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
             CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
+            CheckpointError::ResourceExhausted(_) => Self::ResourceExhausted,
         }
     }
 }
@@ -327,6 +330,7 @@ impl From<CompleteError> for RejectionKind {
             CompleteError::ShardNotFound { .. } => Self::ShardNotFound,
             CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
             CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,
+            CompleteError::ResourceExhausted(_) => Self::ResourceExhausted,
         }
     }
 }
@@ -354,6 +358,7 @@ impl From<SplitError> for RejectionKind {
             SplitError::SplitInvalid(_) => Self::SplitValidation,
             SplitError::ShardNotFound { .. } => Self::ShardNotFound,
             SplitError::TenantMismatch { .. } => Self::TenantMismatch,
+            SplitError::ResourceExhausted(_) => Self::ResourceExhausted,
         }
     }
 }
@@ -790,9 +795,11 @@ impl CoordinationSim<InMemoryCoordinator> {
             self.tenant,
             run,
             shard,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
+            &ShardSpec::with_range(vec![b'a'], vec![b'z']),
             CursorSemantics::Completed,
-        );
+            self.coordinator.slab_mut(),
+        )
+        .expect("slab large enough for test shard");
         self.coordinator.seed_shard(record);
         self.shard_keys.push(ShardKey::new(run, shard));
         self.run_shard_ids.entry(run).or_default().push(shard);
@@ -1297,7 +1304,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// event if the shard does not exist.
     fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
         match self.coordinator.shard_lookup(&self.tenant, &key) {
-            Some(record) => Ok(record.spec.clone()),
+            Some(record) => Ok(record.spec.to_spec(self.coordinator.slab())),
             None => Err(SimEvent::Rejected {
                 kind: RejectionKind::ShardNotFound,
             }),
@@ -1415,7 +1422,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let parent_cursor_key = self
             .coordinator
             .shard_lookup(&self.tenant, &key)
-            .and_then(|r| r.cursor.last_key().map(|k| k.to_vec()));
+            .and_then(|r| {
+                r.cursor
+                    .last_key(self.coordinator.slab())
+                    .map(|k| k.to_vec())
+            });
 
         let start = parent_spec.key_range_start();
         let end = parent_spec.key_range_end();
@@ -2006,9 +2017,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .coordinator
             .shard_lookup(&self.tenant, &key)
             .map(|r| {
+                let slab = self.coordinator.slab();
                 (
-                    r.spec.key_range_start().to_vec(),
-                    r.spec.key_range_end().to_vec(),
+                    r.spec.key_range_start(slab).to_vec(),
+                    r.spec.key_range_end(slab).to_vec(),
                 )
             })
             .expect("generate_forward_cursor: shard missing from coordinator -- harness bug");
@@ -2165,8 +2177,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .coordinator
             .shard_lookup(&self.tenant, &key)
             .map(|r| {
-                let lo = r.spec.key_range_start().first().copied().unwrap_or(b'a');
-                let hi = r.spec.key_range_end().first().copied().unwrap_or(b'z');
+                let slab = self.coordinator.slab();
+                let lo = r
+                    .spec
+                    .key_range_start(slab)
+                    .first()
+                    .copied()
+                    .unwrap_or(b'a');
+                let hi = r.spec.key_range_end(slab).first().copied().unwrap_or(b'z');
                 (lo, hi)
             })
             .expect("exec_session_lifecycle: shard missing from coordinator -- harness bug");
