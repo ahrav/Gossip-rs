@@ -413,24 +413,6 @@ impl std::fmt::Debug for PooledCursor {
 
 #[cfg(test)]
 impl PooledShardSpec {
-    /// Returns `true` if the start bound is empty (unbounded).
-    #[inline]
-    pub(crate) fn is_start_unbounded(&self) -> bool {
-        self.key_range_start.is_empty()
-    }
-
-    /// Returns `true` if the end bound is empty (unbounded).
-    #[inline]
-    pub(crate) fn is_end_unbounded(&self) -> bool {
-        self.key_range_end.is_empty()
-    }
-
-    /// Returns `true` if both bounds are empty (full keyspace).
-    #[inline]
-    pub(crate) fn is_unbounded(&self) -> bool {
-        self.is_start_unbounded() && self.is_end_unbounded()
-    }
-
     /// Test whether `key` falls within `[start, end)`.
     pub(crate) fn contains_key(&self, key: &[u8], slab: &ByteSlab) -> bool {
         let start = self.key_range_start(slab);
@@ -468,7 +450,9 @@ impl PooledCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{arb_bounded_shard_spec, arb_cursor, arb_shard_spec, miri_proptest_config};
+    use crate::test_util::{
+        arb_bounded_shard_spec, arb_cursor, arb_shard_spec, miri_proptest_config,
+    };
     use proptest::prelude::*;
 
     proptest! {

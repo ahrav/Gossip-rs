@@ -30,8 +30,8 @@ pub(crate) fn canonical_digest<T: crate::identity::CanonicalBytes>(val: &T) -> b
 // Proptest strategies for ShardSpec — shared across coordination test modules
 // ---------------------------------------------------------------------------
 
-use crate::coordination::cursor::Cursor;
 use crate::coordination::ShardSpec;
+use crate::coordination::cursor::Cursor;
 use proptest::prelude::*;
 
 /// Generate a valid bounded [`ShardSpec`]: end = start ++ non-empty suffix,
