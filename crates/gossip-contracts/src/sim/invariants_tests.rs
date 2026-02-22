@@ -3,6 +3,7 @@ use crate::coordination::cursor::Cursor;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::test_fixtures::derived_shard_id;
 use crate::identity::{LogicalTime, RunId, ShardId, ShardKey};
 use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder};
 
@@ -229,12 +230,6 @@ fn detects_cursor_below_range() {
         &v[0],
         InvariantViolation::CursorOutOfBounds { .. }
     ));
-}
-
-/// Helper to create a derived `ShardId` (bit 63 set), matching the
-/// convention used by the split subsystem.
-fn derived_shard_id(base: u64) -> ShardId {
-    ShardId::from_raw((1u64 << 63) | base)
 }
 
 /// S7: Checker detects a Split shard with no spawned children.

@@ -38,9 +38,9 @@
 use super::*;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, acquire_shard, now, seeded_coordinator, test_cursor, test_key, test_run,
-    test_shard, test_spec, test_split_replace_plan, test_split_residual_plan, test_tenant,
-    test_worker,
+    LEASE_DURATION, acquire_shard, derived_shard_id, now, other_tenant, seeded_coordinator,
+    test_cursor, test_key, test_run, test_shard, test_spec, test_split_replace_plan,
+    test_split_residual_plan, test_tenant, test_worker,
 };
 use crate::identity::FenceEpoch;
 use crate::sim::backend::SimIntrospection;
@@ -695,15 +695,6 @@ fn split_residual_replay_via_spawned_after_eviction() {
 // reaches MAX_SPAWNED_PER_SHARD, further splits are rejected with
 // SplitInvalid. This prevents unbounded recursive splitting.
 
-/// Creates a derived `ShardId` by setting bit 63 on `base`.
-///
-/// Derived IDs are what the coordinator generates for split children.
-/// This helper constructs them directly for pre-populating the `spawned`
-/// set in [`coordinator_with_spawned_count`].
-fn derived_shard_id(base: u64) -> ShardId {
-    ShardId::from_raw(base | (1u64 << 63))
-}
-
 /// Builds a coordinator whose single shard already has `spawned_count`
 /// derived entries in its `spawned` set.
 ///
@@ -944,14 +935,6 @@ fn acquire_saturates_on_lease_deadline_overflow() {
 // and global. split_replace and split_residual must reject the operation
 // when adding children would breach either limit. Limits are configured
 // via `InMemoryCoordinator::with_limits`.
-
-/// Returns a tenant distinct from [`test_tenant()`] for isolation tests.
-///
-/// Uses `[0x02; 32]` so it is deterministic and visually distinguishable
-/// from `test_tenant()` (`[0x01; 32]`).
-fn other_tenant() -> TenantId {
-    TenantId::from_bytes([0x02; 32])
-}
 
 #[test]
 fn split_replace_exceeds_per_tenant_limit() {

@@ -1,22 +1,11 @@
 use super::*;
 use crate::coordination::lease::{OpKind, OpResult};
+use crate::coordination::test_fixtures::{derived_shard_id, test_run, test_spec, test_tenant};
 use crate::test_util::{TestSlab, canonical_digest};
 use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
 use proptest::prelude::*;
 
 // -- Test fixtures ---------------------------------------------------
-
-fn test_tenant() -> TenantId {
-    TenantId::from_bytes([0x01; 32])
-}
-
-fn test_run() -> RunId {
-    RunId::from_raw(1)
-}
-
-fn test_spec() -> ShardSpec {
-    ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
-}
 
 fn active_record(slab: &mut ByteSlab) -> ShardRecord {
     ShardRecord::new_active(
@@ -47,11 +36,6 @@ fn make_entry(op_raw: u64) -> OpLogEntry {
         0xABCD,
         LogicalTime::from_raw(100),
     )
-}
-
-/// Helper to create a derived ShardId (bit 63 set).
-fn derived_shard_id(base: u64) -> ShardId {
-    ShardId::from_raw(base | (1u64 << 63))
 }
 
 // -- ShardStatus -----------------------------------------------------

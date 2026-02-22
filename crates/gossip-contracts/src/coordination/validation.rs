@@ -316,31 +316,14 @@ mod tests {
     use crate::coordination::lease::{LeaseHolder, OpKind, OpResult};
     use crate::coordination::record::ShardRecord;
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
-    use crate::identity::{FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
+    use crate::coordination::test_fixtures::{
+        other_tenant, test_run, test_shard, test_spec, test_tenant,
+    };
+    use crate::identity::{FenceEpoch, LogicalTime, OpId, WorkerId};
     use crate::test_util::TestSlab;
     use gossip_stdx::{ByteSlab, RingBuffer};
 
     // -- Test fixtures ---------------------------------------------------
-
-    fn test_tenant() -> TenantId {
-        TenantId::from_bytes([0x01; 32])
-    }
-
-    fn other_tenant() -> TenantId {
-        TenantId::from_bytes([0x02; 32])
-    }
-
-    fn test_run() -> RunId {
-        RunId::from_raw(1)
-    }
-
-    fn test_shard() -> ShardId {
-        ShardId::from_raw(10)
-    }
-
-    fn test_spec() -> ShardSpec {
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
-    }
 
     /// Active record, no lease, fence=INITIAL.
     fn active_unleased_record(slab: &mut ByteSlab) -> ShardRecord {
