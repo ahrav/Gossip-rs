@@ -671,6 +671,21 @@ impl InMemoryCoordinator {
         ))
     }
 
+    /// Mutable reference to the coordinator's slab (test/fixture helper).
+    ///
+    /// Exposes the slab so tests can create `ShardRecord` values that
+    /// allocate into the same arena as production paths.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn slab_mut(&mut self) -> &mut ByteSlab {
+        &mut self.slab
+    }
+
+    /// Shared reference to the coordinator's slab (test/fixture helper).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn slab(&self) -> &ByteSlab {
+        &self.slab
+    }
+
     /// Seed a shard record directly (test/fixture helper).
     ///
     /// Does not enforce shard count limits — this is a test helper for
@@ -687,21 +702,6 @@ impl InMemoryCoordinator {
     /// In production paths, shards are created through `register_shards`
     /// (root shards) or split operations (derived children), both of
     /// which construct records with correct invariants by construction.
-    /// Mutable reference to the coordinator's slab (test/fixture helper).
-    ///
-    /// Exposes the slab so tests can create `ShardRecord` values that
-    /// allocate into the same arena as production paths.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn slab_mut(&mut self) -> &mut ByteSlab {
-        &mut self.slab
-    }
-
-    /// Shared reference to the coordinator's slab (test/fixture helper).
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn slab(&self) -> &ByteSlab {
-        &self.slab
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     pub fn seed_shard(&mut self, record: ShardRecord) {
         record.assert_invariants();

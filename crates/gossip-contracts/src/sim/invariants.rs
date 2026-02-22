@@ -97,7 +97,8 @@ pub enum SplitCoverageDetail {
 /// an empty vec means the run passed.
 #[derive(Debug, Clone)]
 pub enum InvariantViolation {
-    /// S1: Two workers hold non-expired leases on the same shard simultaneously.
+    /// S1: Two workers hold checker-active leases (`deadline >= now`) on the
+    /// same shard simultaneously.
     ///
     /// Only the first two conflicting workers are reported even if more exist,
     /// since the invariant is already violated with two.
