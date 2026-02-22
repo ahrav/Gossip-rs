@@ -342,9 +342,11 @@ impl<T: PartialEq, const N: usize> PartialEq for RingBuffer<T, N> {
 impl<T: Eq, const N: usize> Eq for RingBuffer<T, N> {}
 
 // Compile-time proof that RingBuffer is Send+Sync when T is.
-// Trait-bound impl fails to compile if the constraint is not satisfied.
-trait AssertSendSync: Send + Sync {}
-impl<T: Send + Sync, const N: usize> AssertSendSync for RingBuffer<T, N> {}
+// Closure-in-const pattern (from static_assertions) avoids dead_code warnings.
+const _: fn() = || {
+    fn assert_impl<T: Send + Sync>() {}
+    assert_impl::<RingBuffer<T, 1>>();
+};
 
 impl<T, const N: usize> FromIterator<T> for RingBuffer<T, N> {
     /// Collects items into a `RingBuffer`.

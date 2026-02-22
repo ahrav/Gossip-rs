@@ -882,9 +882,11 @@ impl ByteSlab {
 }
 
 // Compile-time proof that ByteSlab is Send+Sync (all fields are).
-// Trait-bound impl fails to compile if the constraint is not satisfied.
-trait AssertSendSync: Send + Sync {}
-impl AssertSendSync for ByteSlab {}
+// Closure-in-const pattern (from static_assertions) avoids dead_code warnings.
+const _: fn() = || {
+    fn assert_impl<T: Send + Sync>() {}
+    assert_impl::<ByteSlab>();
+};
 
 impl Drop for ByteSlab {
     /// Debug-only leak detector.

@@ -176,38 +176,6 @@ impl PooledShardSpec {
         slab.get(self.metadata)
     }
 
-    /// Returns `true` if the start bound is empty (unbounded).
-    #[inline]
-    #[allow(dead_code)] // Used in tests.
-    pub(crate) fn is_start_unbounded(&self) -> bool {
-        self.key_range_start.is_empty()
-    }
-
-    /// Returns `true` if the end bound is empty (unbounded).
-    #[inline]
-    #[allow(dead_code)] // Used in tests.
-    pub(crate) fn is_end_unbounded(&self) -> bool {
-        self.key_range_end.is_empty()
-    }
-
-    /// Returns `true` if both bounds are empty (full keyspace).
-    #[inline]
-    #[allow(dead_code)] // Used in tests.
-    pub(crate) fn is_unbounded(&self) -> bool {
-        self.is_start_unbounded() && self.is_end_unbounded()
-    }
-
-    /// Test whether `key` falls within `[start, end)`.
-    #[allow(dead_code)] // Used in tests.
-    pub(crate) fn contains_key(&self, key: &[u8], slab: &ByteSlab) -> bool {
-        let start = self.key_range_start(slab);
-        let end = self.key_range_end(slab);
-
-        let above_start = start.is_empty() || key >= start;
-        let below_end = end.is_empty() || key < end;
-        above_start && below_end
-    }
-
     /// Materialize an owned `ShardSpec` by copying bytes out of the slab
     /// into fresh `Box<[u8]>` allocations.
     ///
