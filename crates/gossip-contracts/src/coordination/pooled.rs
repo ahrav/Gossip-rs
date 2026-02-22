@@ -249,20 +249,6 @@ impl PooledShardSpec {
         slab.deallocate(meta);
     }
 
-    /// Count of slab slots currently held (non-EMPTY handles).
-    ///
-    /// Returns 0-3 depending on how many fields are populated. Used by
-    /// `ShardRecord::live_field_count` to verify SLAB-4 (conservation):
-    /// the sum of `live_field_count` across all records must equal
-    /// `slab.live_count()`.
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)] // Used by ShardRecord::live_field_count and tests.
-    pub(crate) fn live_field_count(&self) -> usize {
-        [self.key_range_start, self.key_range_end, self.metadata]
-            .iter()
-            .filter(|s| !s.is_empty())
-            .count()
-    }
 }
 
 impl std::fmt::Debug for PooledShardSpec {
@@ -355,13 +341,6 @@ impl PooledCursor {
         self.token.map(|slot| slab.get(slot))
     }
 
-    /// Returns `true` if this cursor represents the initial (no-progress) state.
-    #[inline]
-    #[allow(dead_code)] // Used in tests.
-    pub(crate) fn is_initial(&self) -> bool {
-        self.last_key.is_none()
-    }
-
     /// Materialize an owned `Cursor` by copying bytes out of the slab
     /// into heap allocations.
     ///
@@ -405,20 +384,6 @@ impl PooledCursor {
         Ok(())
     }
 
-    /// Deallocate all fields and consume the wrapper.
-    ///
-    /// Use when the `PooledCursor` itself is being discarded (e.g.,
-    /// rolling back a partially-constructed `ShardRecord`).
-    #[allow(dead_code)] // Used in tests.
-    pub(crate) fn deallocate(self, slab: &mut ByteSlab) {
-        if let Some(slot) = self.last_key {
-            slab.deallocate(slot);
-        }
-        if let Some(slot) = self.token {
-            slab.deallocate(slot);
-        }
-    }
-
     /// Deallocate all fields in-place, resetting both to `None`.
     ///
     /// After this call, `is_initial()` returns `true`. Safe to call
@@ -454,6 +419,60 @@ impl std::fmt::Debug for PooledCursor {
             .field("last_key", &self.last_key)
             .field("token", &self.token)
             .finish()
+    }
+}
+
+// ============================================================================
+// Test-only helpers
+// ============================================================================
+
+#[cfg(test)]
+impl PooledShardSpec {
+    /// Returns `true` if the start bound is empty (unbounded).
+    #[inline]
+    pub(crate) fn is_start_unbounded(&self) -> bool {
+        self.key_range_start.is_empty()
+    }
+
+    /// Returns `true` if the end bound is empty (unbounded).
+    #[inline]
+    pub(crate) fn is_end_unbounded(&self) -> bool {
+        self.key_range_end.is_empty()
+    }
+
+    /// Returns `true` if both bounds are empty (full keyspace).
+    #[inline]
+    pub(crate) fn is_unbounded(&self) -> bool {
+        self.is_start_unbounded() && self.is_end_unbounded()
+    }
+
+    /// Test whether `key` falls within `[start, end)`.
+    pub(crate) fn contains_key(&self, key: &[u8], slab: &ByteSlab) -> bool {
+        let start = self.key_range_start(slab);
+        let end = self.key_range_end(slab);
+
+        let above_start = start.is_empty() || key >= start;
+        let below_end = end.is_empty() || key < end;
+        above_start && below_end
+    }
+}
+
+#[cfg(test)]
+impl PooledCursor {
+    /// Returns `true` if this cursor represents the initial (no-progress) state.
+    #[inline]
+    pub(crate) fn is_initial(&self) -> bool {
+        self.last_key.is_none()
+    }
+
+    /// Deallocate all fields and consume the wrapper.
+    pub(crate) fn deallocate(self, slab: &mut ByteSlab) {
+        if let Some(slot) = self.last_key {
+            slab.deallocate(slot);
+        }
+        if let Some(slot) = self.token {
+            slab.deallocate(slot);
+        }
     }
 }
 
