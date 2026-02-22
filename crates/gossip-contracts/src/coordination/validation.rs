@@ -317,31 +317,8 @@ mod tests {
     use crate::coordination::record::ShardRecord;
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use crate::identity::{FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId};
+    use crate::test_util::TestSlab;
     use gossip_stdx::{ByteSlab, RingBuffer};
-
-    /// Test slab wrapper that clears live allocations on drop.
-    struct TestSlab(ByteSlab);
-    impl TestSlab {
-        fn new() -> Self {
-            Self(ByteSlab::with_capacity(64 * 1024))
-        }
-    }
-    impl std::ops::Deref for TestSlab {
-        type Target = ByteSlab;
-        fn deref(&self) -> &ByteSlab {
-            &self.0
-        }
-    }
-    impl std::ops::DerefMut for TestSlab {
-        fn deref_mut(&mut self) -> &mut ByteSlab {
-            &mut self.0
-        }
-    }
-    impl Drop for TestSlab {
-        fn drop(&mut self) {
-            self.0.clear();
-        }
-    }
 
     // -- Test fixtures ---------------------------------------------------
 

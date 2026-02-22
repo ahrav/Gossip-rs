@@ -125,6 +125,7 @@ fn allocate_with_rollback<const N: usize>(
 /// Duplicating a `ByteSlot` without going through `slab.allocate` would
 /// create two wrappers that "own" the same slab region, leading to
 /// double-deallocation.
+#[derive(Debug)]
 pub(crate) struct PooledShardSpec {
     key_range_start: ByteSlot,
     key_range_end: ByteSlot,
@@ -250,16 +251,6 @@ impl PooledShardSpec {
     }
 }
 
-impl std::fmt::Debug for PooledShardSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PooledShardSpec")
-            .field("key_range_start", &self.key_range_start)
-            .field("key_range_end", &self.key_range_end)
-            .field("metadata", &self.metadata)
-            .finish()
-    }
-}
-
 // ============================================================================
 // PooledCursor
 // ============================================================================
@@ -279,6 +270,7 @@ impl std::fmt::Debug for PooledShardSpec {
 /// returns `&[]`.
 ///
 /// Intentionally not `Copy` or `Clone` to enforce SLAB-2 (no aliasing).
+#[derive(Debug)]
 pub(crate) struct PooledCursor {
     last_key: Option<ByteSlot>,
     token: Option<ByteSlot>,
@@ -403,15 +395,6 @@ impl PooledCursor {
         if let Some(slot) = self.token.take() {
             slab.deallocate(slot);
         }
-    }
-}
-
-impl std::fmt::Debug for PooledCursor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PooledCursor")
-            .field("last_key", &self.last_key)
-            .field("token", &self.token)
-            .finish()
     }
 }
 
