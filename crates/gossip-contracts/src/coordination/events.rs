@@ -80,7 +80,6 @@ impl RedactedKey {
     pub fn new(key: Option<Box<[u8]>>) -> Self {
         Self(key)
     }
-
 }
 
 impl fmt::Debug for RedactedKey {

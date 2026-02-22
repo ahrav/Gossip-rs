@@ -248,7 +248,6 @@ impl PooledShardSpec {
         slab.deallocate(end);
         slab.deallocate(meta);
     }
-
 }
 
 impl std::fmt::Debug for PooledShardSpec {
@@ -397,7 +396,6 @@ impl PooledCursor {
             slab.deallocate(slot);
         }
     }
-
 }
 
 impl std::fmt::Debug for PooledCursor {
