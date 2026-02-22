@@ -17,9 +17,10 @@
 //! Allocation uses a two-phase strategy borrowed from production allocators
 //! (dlmalloc, linked-list-allocator):
 //!
-//! 1. **Free list first** — best-fit lookup via two indexes:
-//!    `(size, offset)` for candidate selection and `offset -> size` for
-//!    neighbor coalescing. Splits oversized blocks if remainder >= MIN_BLOCK.
+//! 1. **Free list first** — best-fit lookup via linear scan of a single
+//!    sorted `Vec<(offset, size)>`. For the typical F≤5 entries, this fits
+//!    in one cache line (40 bytes) and avoids all heap-allocated tree nodes.
+//!    Splits oversized blocks if remainder >= MIN_BLOCK.
 //! 2. **Bump pointer second** — advances through virgin memory. O(1), no
 //!    metadata overhead per allocation.
 //!
@@ -68,19 +69,16 @@
 //! 1. `bump <= capacity` (bump pointer never exceeds buffer).
 //! 2. Free list sorted by offset, non-overlapping, no adjacent blocks
 //!    (coalescing completeness).
-//! 3. Free-list indexes stay in sync:
-//!    `free_by_offset[offset] == size` iff `(size, offset)` exists in
-//!    `free_by_size`.
-//! 4. `free_bytes` equals the sum of all free-list block sizes.
-//! 5. `live_bytes + free_bytes + (capacity - bump) == capacity`
+//! 3. `free_bytes` equals the sum of all free-list block sizes.
+//! 4. `live_bytes + free_bytes + (capacity - bump) == capacity`
 //!    (byte conservation — every byte is live, free-listed, or virgin).
-//! 6. Region `[0, bump)` fully partitioned into live allocations and
+//! 5. Region `[0, bump)` fully partitioned into live allocations and
 //!    free-list blocks.
 //!
-//! Invariants 1–5 are directly machine-checked via
+//! Invariants 1–4 are directly machine-checked via
 //! [`ByteSlab::debug_assert_invariants`], which runs after every mutation
-//! in debug builds. Invariant 6 is implied by byte conservation
-//! (invariant 5) rather than independently verified.
+//! in debug builds. Invariant 5 is implied by byte conservation
+//! (invariant 4) rather than independently verified.
 //!
 //! # Threading
 //!
@@ -110,7 +108,6 @@
 //! slab.deallocate(token);
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Minimum allocation size in bytes. Prevents degenerate fragmentation
@@ -292,14 +289,17 @@ impl std::error::Error for SlabFull {}
 ///
 /// # Complexity
 ///
-/// | Operation    | Time                                         |
-/// |------------- |----------------------------------------------|
-/// | `allocate`   | O(log F) best-fit query + O(1) bump fallback |
-/// | `deallocate` | O(log F) neighbor merge + insert/reclaim     |
-/// | `get`        | O(1)                                         |
-/// | `clear`      | O(F)                                         |
+/// | Operation    | Time                                   |
+/// |------------- |----------------------------------------|
+/// | `allocate`   | O(F) best-fit scan + O(1) bump fallback|
+/// | `deallocate` | O(F) neighbor lookup + insert/reclaim  |
+/// | `get`        | O(1)                                   |
+/// | `clear`      | O(1) (Vec::clear)                      |
 ///
 /// Where F = number of free-list entries (typically 0-5 in practice).
+/// At F≤5, the entire free list fits in a single cache line (40 bytes),
+/// making the O(F) operations faster than O(log F) BTree operations
+/// that require pointer chasing through heap-allocated nodes.
 pub struct ByteSlab {
     /// Single allocation at construction, never resized.
     buf: Vec<u8>,
@@ -309,23 +309,17 @@ pub struct ByteSlab {
     bump: u32,
     /// `buf.len()` as `u32`, cached to avoid repeated conversion.
     capacity: u32,
-    /// Canonical free-list index: `offset -> size`.
+    /// Free blocks sorted by offset. Each entry is `(offset, size)`.
     ///
-    /// Used for neighbor lookups during coalescing (range queries on offset).
-    /// This is the source of truth; `free_by_size` is a derived index.
-    free_by_offset: BTreeMap<u32, u32>,
-    /// Derived free-list index: `(size, offset)` for best-fit allocation.
-    ///
-    /// The composite key gives best-fit semantics via `BTreeSet::range`:
-    /// scanning from `(needed, 0)` yields the smallest block that fits,
-    /// with ties broken by lowest offset. Must stay exactly in sync with
-    /// `free_by_offset`; the dual-index consistency is checked by
-    /// [`debug_assert_invariants`](Self::debug_assert_invariants).
-    free_by_size: BTreeSet<(u32, u32)>,
+    /// Single contiguous array replaces dual BTree indexes for cache
+    /// locality. Operations are O(F) but F is typically 0-5, fitting
+    /// in one cache line (40 bytes). Binary search locates neighbors
+    /// for coalescing; linear scan finds best-fit for allocation.
+    free_list: Vec<(u32, u32)>,
     /// Cached sum of all free-list bytes.
     ///
-    /// Maintained incrementally by `insert_free_block` / `remove_free_block`
-    /// so metric queries stay O(1) instead of re-summing the map.
+    /// Maintained incrementally on every insert/remove so metric queries
+    /// stay O(1) instead of re-summing.
     free_bytes: u32,
     /// Sum of `alloc_size` for all live slots. Participates in the
     /// byte-conservation invariant.
@@ -356,8 +350,7 @@ impl ByteSlab {
             buf: vec![0u8; capacity],
             bump: 0,
             capacity: capacity as u32,
-            free_by_offset: BTreeMap::new(),
-            free_by_size: BTreeSet::new(),
+            free_list: Vec::new(),
             free_bytes: 0,
             live_bytes: 0,
             live_count: 0,
@@ -376,12 +369,12 @@ impl ByteSlab {
         self.capacity.saturating_sub(self.bump)
     }
 
-    /// Inserts a free block into both free-list indexes and updates
+    /// Inserts a free block into the sorted free list and updates
     /// [`Self::free_bytes`].
     ///
-    /// This is the only valid way to add a free block. Calling code must
-    /// never insert into `free_by_offset` or `free_by_size` directly,
-    /// because that would desynchronize the dual-index invariant.
+    /// Uses binary search to find the correct insertion point by offset,
+    /// maintaining sorted order. This is the only valid way to add a free
+    /// block.
     ///
     /// Zero-size insertions are silently ignored (no-op) to simplify
     /// callers that may produce zero remainders from block splits.
@@ -390,57 +383,42 @@ impl ByteSlab {
         if size == 0 {
             return;
         }
-        let old = self.free_by_offset.insert(offset, size);
+        let pos = self.free_list.partition_point(|&(o, _)| o < offset);
         debug_assert!(
-            old.is_none(),
+            pos == self.free_list.len() || self.free_list[pos].0 != offset,
             "free block at offset {offset} inserted twice"
         );
-        let inserted = self.free_by_size.insert((size, offset));
-        debug_assert!(inserted, "free block ({size}, {offset}) inserted twice");
+        self.free_list.insert(pos, (offset, size));
         self.free_bytes = self
             .free_bytes
             .checked_add(size)
             .expect("free_bytes overflow");
     }
 
-    /// Removes a free block from both indexes by offset and decrements
-    /// [`Self::free_bytes`].
+    /// Finds and removes the smallest free block whose size is `>= needed`.
     ///
-    /// Returns `Some(size)` if the block existed, `None` otherwise.
-    /// This is the inverse of [`insert_free_block`](Self::insert_free_block)
-    /// and the only valid way to remove a free block.
+    /// Linear scan for best-fit: finds the smallest block that can satisfy
+    /// the request. For F≤5 this is a trivial 5-iteration loop over
+    /// contiguous memory. Ties are broken by lowest offset (natural from
+    /// scan order since the vec is sorted by offset).
     #[inline]
-    fn remove_free_block(&mut self, offset: u32) -> Option<u32> {
-        let size = self.free_by_offset.remove(&offset)?;
-        let removed = self.free_by_size.remove(&(size, offset));
-        debug_assert!(
-            removed,
-            "free block ({size}, {offset}) missing from size index"
-        );
+    fn take_best_fit(&mut self, needed: u32) -> Option<(u32, u32)> {
+        let mut best: Option<(usize, u32)> = None; // (index, size)
+        for (i, &(_, size)) in self.free_list.iter().enumerate() {
+            if size >= needed {
+                match best {
+                    Some((_, best_size)) if size < best_size => best = Some((i, size)),
+                    None => best = Some((i, size)),
+                    _ => {}
+                }
+            }
+        }
+        let (idx, _) = best?;
+        let (offset, size) = self.free_list.remove(idx);
         self.free_bytes = self
             .free_bytes
             .checked_sub(size)
             .expect("free_bytes underflow");
-        Some(size)
-    }
-
-    /// Finds and removes the smallest free block whose size is `>= needed`.
-    ///
-    /// This is the best-fit lookup: it scans `free_by_size` from the
-    /// `(needed, 0)` lower bound upward, picking the first (smallest)
-    /// candidate. Ties are broken by offset (lowest offset wins), which
-    /// biases reuse toward the start of the buffer and keeps the tail
-    /// available for bump reclamation.
-    ///
-    /// Lookup runs against the `(size, offset)` index, then validates both
-    /// indexes remained coherent.
-    #[inline]
-    fn take_best_fit(&mut self, needed: u32) -> Option<(u32, u32)> {
-        let (size, offset) = self.free_by_size.range((needed, 0)..).next().copied()?;
-        let removed = self
-            .remove_free_block(offset)
-            .expect("best-fit index out of sync");
-        debug_assert_eq!(removed, size, "best-fit size index out of sync");
         Some((offset, size))
     }
 
@@ -451,34 +429,42 @@ impl ByteSlab {
     /// already-coalesced form: if right-of-right were also free, it would
     /// have already been merged into right during a prior deallocation.
     ///
+    /// Since the vec is sorted by offset, binary search finds the insertion
+    /// point and neighbors are at adjacent indices.
+    ///
     /// Returns the `(offset, size)` of the final coalesced block.
     #[inline]
     fn merge_with_neighbors(&mut self, mut offset: u32, mut size: u32) -> (u32, u32) {
-        if let Some(expected_right_offset) = offset.checked_add(size)
-            && let Some((&right_offset, &right_size)) =
-                self.free_by_offset.range(expected_right_offset..).next()
-            && right_offset == expected_right_offset
-        {
-            let removed = self
-                .remove_free_block(right_offset)
-                .expect("right neighbor index out of sync");
-            debug_assert_eq!(removed, right_size);
-            size = size
-                .checked_add(right_size)
-                .expect("coalesced block size overflow");
+        // Right neighbor: the entry at offset+size (if it exists).
+        if let Some(end) = offset.checked_add(size) {
+            let pos = self.free_list.partition_point(|&(o, _)| o < end);
+            if pos < self.free_list.len() && self.free_list[pos].0 == end {
+                let (_, right_size) = self.free_list.remove(pos);
+                self.free_bytes = self
+                    .free_bytes
+                    .checked_sub(right_size)
+                    .expect("free_bytes underflow on right merge");
+                size = size
+                    .checked_add(right_size)
+                    .expect("coalesced block size overflow");
+            }
         }
 
-        if let Some((&left_offset, &left_size)) = self.free_by_offset.range(..offset).next_back()
-            && left_offset.checked_add(left_size) == Some(offset)
-        {
-            let removed = self
-                .remove_free_block(left_offset)
-                .expect("left neighbor index out of sync");
-            debug_assert_eq!(removed, left_size);
-            offset = left_offset;
-            size = size
-                .checked_add(left_size)
-                .expect("coalesced block size overflow");
+        // Left neighbor: the entry just before our offset whose end == offset.
+        let pos = self.free_list.partition_point(|&(o, _)| o < offset);
+        if pos > 0 {
+            let (left_off, left_size) = self.free_list[pos - 1];
+            if left_off.checked_add(left_size) == Some(offset) {
+                self.free_list.remove(pos - 1);
+                self.free_bytes = self
+                    .free_bytes
+                    .checked_sub(left_size)
+                    .expect("free_bytes underflow on left merge");
+                offset = left_off;
+                size = size
+                    .checked_add(left_size)
+                    .expect("coalesced block size overflow");
+            }
         }
 
         (offset, size)
@@ -660,15 +646,15 @@ impl ByteSlab {
         self.assert_slot_owner(slot);
 
         let slot_start = slot.offset;
-        let slot_end = slot_start
-            .checked_add(slot.alloc_size)
-            .expect("slot end overflow");
 
-        // Overlap check: if the slot being freed overlaps any existing free
-        // block, the caller likely double-freed or passed a stale slot.
+        // Overlap check and poison: only in debug builds.
         #[cfg(debug_assertions)]
         {
-            for (i, (&block_offset, &block_size)) in self.free_by_offset.iter().enumerate() {
+            let slot_end = slot_start
+                .checked_add(slot.alloc_size)
+                .expect("slot end overflow");
+
+            for (i, &(block_offset, block_size)) in self.free_list.iter().enumerate() {
                 let block_end = block_offset
                     .checked_add(block_size)
                     .expect("free block end overflow");
@@ -680,11 +666,9 @@ impl ByteSlab {
                     block_end
                 );
             }
-        }
 
-        // Debug: poison freed bytes.
-        #[cfg(debug_assertions)]
-        self.buf[slot_start as usize..slot_end as usize].fill(POISON);
+            self.buf[slot_start as usize..slot_end as usize].fill(POISON);
+        }
 
         self.live_bytes = self
             .live_bytes
@@ -740,7 +724,7 @@ impl ByteSlab {
     /// allocated and freed but are not yet reclaimable by the bump
     /// pointer (because a live allocation sits between them and the bump).
     ///
-    /// This is an O(1) cached metric (`free_bytes`), not a map traversal.
+    /// This is an O(1) cached metric (`free_bytes`), not a list traversal.
     #[inline]
     pub fn free_list_bytes(&self) -> usize {
         self.free_bytes as usize
@@ -774,15 +758,14 @@ impl ByteSlab {
     /// rejected by the provenance check. This catches use-after-clear bugs
     /// that would otherwise silently return stale data.
     ///
-    /// Unlike deallocating every slot individually, `clear` runs in O(F)
-    /// (BTreeMap/BTreeSet clear) rather than O(N_live * log F). It also
-    /// satisfies the debug-build leak assertion in [`Drop`] (by resetting
-    /// `live_count` to zero) rather than requiring every slot to be
-    /// individually deallocated.
+    /// Unlike deallocating every slot individually, `clear` runs in O(1)
+    /// (Vec::clear) rather than O(N_live * F). It also satisfies the
+    /// debug-build leak assertion in [`Drop`] (by resetting `live_count`
+    /// to zero) rather than requiring every slot to be individually
+    /// deallocated.
     pub fn clear(&mut self) {
         self.bump = 0;
-        self.free_by_offset.clear();
-        self.free_by_size.clear();
+        self.free_list.clear();
         self.free_bytes = 0;
         self.live_bytes = 0;
         self.live_count = 0;
@@ -811,8 +794,11 @@ impl ByteSlab {
 
         // Invariant 2: free list sorted by offset, non-overlapping,
         // no adjacent blocks.
+        let mut sum = 0u32;
         let mut prev: Option<(u32, u32)> = None;
-        for (&offset, &size) in &self.free_by_offset {
+        for &(offset, size) in &self.free_list {
+            sum = sum.checked_add(size).expect("free list total overflow");
+
             if let Some((prev_offset, prev_size)) = prev {
                 let prev_end = prev_offset
                     .checked_add(prev_size)
@@ -827,30 +813,8 @@ impl ByteSlab {
                     offset + size
                 );
             }
-            prev = Some((offset, size));
-        }
 
-        // Invariant 3: free-list indexes stay in sync.
-        let mut indexed_total = 0u32;
-        for &(size, offset) in &self.free_by_size {
-            indexed_total = indexed_total
-                .checked_add(size)
-                .expect("free size index total overflow");
-            let mapped = self.free_by_offset.get(&offset).copied();
-            debug_assert!(
-                mapped == Some(size),
-                "free size index out of sync for ({size}, {offset})"
-            );
-        }
-        // Invariant 4: free_bytes cached sum.
-        debug_assert_eq!(
-            indexed_total, self.free_bytes,
-            "free size index total ({indexed_total}) != cached free bytes ({})",
-            self.free_bytes
-        );
-
-        // Free list blocks must be within [0, bump).
-        for (&offset, &size) in &self.free_by_offset {
+            // Free list blocks must be within [0, bump).
             debug_assert!(
                 offset + size <= self.bump,
                 "free block [{}, {}) exceeds bump ({})",
@@ -858,20 +822,28 @@ impl ByteSlab {
                 offset + size,
                 self.bump
             );
+
+            prev = Some((offset, size));
         }
 
-        // Invariant 5: byte conservation.
-        let free_list_total = self.free_bytes;
+        // Invariant 3: free_bytes cached sum.
+        debug_assert_eq!(
+            sum, self.free_bytes,
+            "free list total ({sum}) != cached free bytes ({})",
+            self.free_bytes
+        );
+
+        // Invariant 4: byte conservation.
         let virgin = self
             .capacity
             .checked_sub(self.bump)
             .expect("bump exceeds capacity");
         debug_assert_eq!(
-            self.live_bytes + free_list_total + virgin,
+            self.live_bytes + self.free_bytes + virgin,
             self.capacity,
             "byte conservation violated: live={} + free_list={} + virgin={} != capacity={}",
             self.live_bytes,
-            free_list_total,
+            self.free_bytes,
             virgin,
             self.capacity
         );
