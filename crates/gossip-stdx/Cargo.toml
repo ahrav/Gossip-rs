@@ -31,3 +31,7 @@ harness = false
 [[bench]]
 name = "inline_vec"
 harness = false
+
+[[bench]]
+name = "byte_slab"
+harness = false

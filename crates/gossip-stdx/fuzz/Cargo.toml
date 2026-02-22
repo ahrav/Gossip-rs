@@ -23,3 +23,8 @@ doc = false
 name = "fuzz_inline_vec"
 path = "fuzz_targets/fuzz_inline_vec.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_byte_slab"
+path = "fuzz_targets/fuzz_byte_slab.rs"
+doc = false

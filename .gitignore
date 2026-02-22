@@ -36,3 +36,8 @@ specs/coordination/states/
 specs/tla2tools.jar
 
 *.tar.gz
+
+# Fuzz testing artifacts (corpus, crash inputs, build output)
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/
