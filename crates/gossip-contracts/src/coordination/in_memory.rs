@@ -2259,8 +2259,9 @@ impl RunManagement for InMemoryCoordinator {
     /// by `key_range_start` for deterministic output.
     ///
     /// Sort tie-breaking: when two shards share the same `key_range_start`
-    /// (possible after split operations that create zero-width residuals),
-    /// the secondary sort key is `shard` ID for stable ordering.
+    /// (for example split-replace where the parent and first child start at
+    /// the same boundary), the secondary sort key is `shard` ID for stable
+    /// ordering.
     ///
     /// Applies `filter.matches_record()` *before* constructing
     /// [`ShardSummary`], which avoids heap-allocating cloned key ranges

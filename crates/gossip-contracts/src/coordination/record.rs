@@ -226,8 +226,8 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 ///
 /// This is the coordinator's authoritative record. All state transitions
 /// (acquire, checkpoint, complete, park, split) are mutations of this
-/// record. The coordinator persists this to durable storage after every
-/// state transition.
+/// record. Durable backends persist this after transitions; the in-memory
+/// reference backend keeps it in process memory only.
 ///
 /// ## Visibility
 ///

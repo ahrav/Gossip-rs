@@ -25,7 +25,7 @@
 //!
 //! | Label | Name | Kind | Rule |
 //! |-------|------|------|------|
-//! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a non-expired lease per shard. |
+//! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a checker-active lease (`deadline >= now`) per shard. |
 //! | S2 | **FenceMonotonicity** | temporal | `fence_epoch` never decreases for a given `(RunId, ShardId)`. |
 //! | S3 | **TerminalIrreversibility** | temporal | Terminal states (`Done`, `Split`, `Parked`) never revert, except `Parked`->`Active` (unpark) which requires a fence bump. |
 //! | S4 | **RecordInvariant** | structural | `ShardRecord::validate_invariants()` returns `Ok`. |

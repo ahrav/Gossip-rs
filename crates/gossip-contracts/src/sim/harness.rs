@@ -239,8 +239,8 @@ pub enum RejectionKind {
     /// Target worker is paused.
     WorkerPaused,
     /// Worker holds no shards to operate on.
-    /// Not produced by the built-in harness (op generation retries instead),
-    /// but available for custom `step()` callers.
+    /// Reserved for external/custom harness integrations; the built-in
+    /// operation generators currently do not emit this variant.
     NoShardsHeld,
     /// OpId conflict: same OpId with different payload hash.
     OpIdConflict,
