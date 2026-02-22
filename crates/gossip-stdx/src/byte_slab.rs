@@ -174,8 +174,10 @@ fn checked_len_u32(n: usize) -> Option<u32> {
 /// Returns `None` when the rounded result would overflow `u32` (i.e., for
 /// inputs above `2^31`). [`ByteSlab::allocate`] maps this to [`SlabFull`].
 ///
-/// Worst-case internal fragmentation: ~50% (e.g., 17 -> 32).
-/// For the cursor-update workload (keys 50-4096 bytes, tokens 100-16384
+/// Worst-case internal fragmentation from power-of-2 rounding: ~50%
+/// (e.g., 17 → 32). For inputs below [`MIN_BLOCK`] (16), the minimum
+/// block floor adds additional overhead (e.g., 1 → 16 = 93.75% waste).
+/// For the cursor-update workload (keys 50–4096 bytes, tokens 100–16384
 /// bytes), measured average waste is ~25%.
 #[inline]
 fn alloc_size(n: usize) -> Option<u32> {
