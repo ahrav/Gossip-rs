@@ -694,6 +694,21 @@ pub fn validate_split_coverage(
     parent: &ShardSpec,
     children: &[&ShardSpec],
 ) -> Result<(), SplitValidationError> {
+    validate_split_coverage_bounds(parent.key_range_start(), parent.key_range_end(), children)
+}
+
+/// Validate split coverage using borrowed parent bounds.
+///
+/// Equivalent to [`validate_split_coverage`] but avoids requiring an owned
+/// parent `ShardSpec` when callers already have borrowed range bounds.
+/// This is the preferred entry point for pooled-record hot paths where
+/// parent bounds are already available as slab-backed slices.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn validate_split_coverage_bounds(
+    parent_start: &[u8],
+    parent_end: &[u8],
+    children: &[&ShardSpec],
+) -> Result<(), SplitValidationError> {
     if children.is_empty() {
         return Err(SplitValidationError::NoChildren);
     }
@@ -705,22 +720,22 @@ pub fn validate_split_coverage(
     // Pair each child with its original index, then sort by start key.
     // This lets us report the caller's input indices in errors.
     let mut indexed: Vec<(usize, &ShardSpec)> = children.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| a.1.key_range_start.cmp(&b.1.key_range_start));
+    indexed.sort_by(|a, b| a.1.key_range_start().cmp(b.1.key_range_start()));
 
     // First child start == parent start.
-    if indexed[0].1.key_range_start != parent.key_range_start {
+    if indexed[0].1.key_range_start() != parent_start {
         return Err(SplitValidationError::StartMismatch {
-            parent_start: parent.key_range_start.clone(),
-            first_child_start: indexed[0].1.key_range_start.clone(),
+            parent_start: parent_start.to_vec().into_boxed_slice(),
+            first_child_start: indexed[0].1.key_range_start().to_vec().into_boxed_slice(),
         });
     }
 
     // Last child end == parent end.
     let last = indexed[indexed.len() - 1];
-    if last.1.key_range_end != parent.key_range_end {
+    if last.1.key_range_end() != parent_end {
         return Err(SplitValidationError::EndMismatch {
-            parent_end: parent.key_range_end.clone(),
-            last_child_end: last.1.key_range_end.clone(),
+            parent_end: parent_end.to_vec().into_boxed_slice(),
+            last_child_end: last.1.key_range_end().to_vec().into_boxed_slice(),
         });
     }
 
@@ -731,15 +746,19 @@ pub fn validate_split_coverage(
     // fully-unbounded children `[[], [])` pass the equality check but
     // cover the same keyspace).
     for i in 0..indexed.len() - 1 {
-        if indexed[i].1.key_range_end != indexed[i + 1].1.key_range_start {
+        if indexed[i].1.key_range_end() != indexed[i + 1].1.key_range_start() {
             return Err(SplitValidationError::BoundaryMismatch {
                 child_index: indexed[i].0,
                 next_child_index: indexed[i + 1].0,
-                child_end: indexed[i].1.key_range_end.clone(),
-                next_child_start: indexed[i + 1].1.key_range_start.clone(),
+                child_end: indexed[i].1.key_range_end().to_vec().into_boxed_slice(),
+                next_child_start: indexed[i + 1]
+                    .1
+                    .key_range_start()
+                    .to_vec()
+                    .into_boxed_slice(),
             });
         }
-        if indexed[i].1.key_range_end.is_empty() {
+        if indexed[i].1.key_range_end().is_empty() {
             return Err(SplitValidationError::OverlappingChild {
                 child_index: indexed[i].0,
                 next_child_index: indexed[i + 1].0,
@@ -749,9 +768,9 @@ pub fn validate_split_coverage(
 
     // Each child individually well-formed.
     for &(orig_idx, child) in &indexed {
-        if !child.key_range_start.is_empty()
-            && !child.key_range_end.is_empty()
-            && child.key_range_start >= child.key_range_end
+        if !child.key_range_start().is_empty()
+            && !child.key_range_end().is_empty()
+            && child.key_range_start() >= child.key_range_end()
         {
             return Err(SplitValidationError::InvertedChild {
                 child_index: orig_idx,

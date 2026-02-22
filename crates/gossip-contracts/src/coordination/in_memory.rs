@@ -243,9 +243,17 @@ impl CoordinatorRuntimeConfig {
 
     /// Derive slab capacity from config, using the explicit value if set
     /// or computing the capped default formula from `max_total_shards`.
+    ///
+    /// Explicit capacities are clamped to [`MAX_SLAB_CAPACITY`]. Auto-sized
+    /// capacities are clamped to both startup budget
+    /// ([`DEFAULT_MAX_AUTO_SLAB_CAPACITY`]) and backend addressability.
     const fn effective_slab_capacity(&self) -> usize {
         if self.slab_capacity > 0 {
-            self.slab_capacity
+            if self.slab_capacity > MAX_SLAB_CAPACITY {
+                MAX_SLAB_CAPACITY
+            } else {
+                self.slab_capacity
+            }
         } else {
             // Saturate to avoid overflow on pathological configs.
             let derived = match self
