@@ -11,6 +11,7 @@ enum Op {
     Clone,
     AsSlice,
     FromSlice(Vec<u32>),
+    FromVec(Vec<u32>),
 }
 
 fuzz_target!(|ops: Vec<Op>| {
@@ -36,6 +37,10 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::FromSlice(vs) => {
                 let fresh = InlineVec::<u32, 4>::from_slice(vs);
+                assert_eq!(fresh.as_slice(), vs.as_slice());
+            }
+            Op::FromVec(vs) => {
+                let fresh: InlineVec<u32, 4> = vs.clone().into();
                 assert_eq!(fresh.as_slice(), vs.as_slice());
             }
         }

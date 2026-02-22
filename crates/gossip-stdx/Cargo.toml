@@ -10,6 +10,12 @@ description = "Shared low-level data structures for gossip-rs (may contain unsaf
 # NOTE: Run `cargo +nightly miri test -p gossip-stdx` to verify unsafe code.
 # All tests must pass under Miri (detects UB, use-after-free, uninit reads).
 
+[features]
+kani = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [lib]
 
 [dependencies]
@@ -20,4 +26,8 @@ proptest = "1.10"
 
 [[bench]]
 name = "ring_buffer"
+harness = false
+
+[[bench]]
+name = "inline_vec"
 harness = false

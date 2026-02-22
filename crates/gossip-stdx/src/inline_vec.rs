@@ -75,6 +75,7 @@ impl<T, const N: usize> InlineVec<T, N> {
     /// assert!(v.is_empty());
     /// assert_eq!(v.len(), 0);
     /// ```
+    #[inline]
     pub fn new() -> Self {
         // Force compile-time validation.
         let _ = Self::VALIDATED_CAP;
@@ -107,20 +108,21 @@ impl<T, const N: usize> InlineVec<T, N> {
     /// If the inline buffer is full, all inline elements are moved to a
     /// heap `Vec` and the new element is appended there. This spill is
     /// one-way: once on the heap, the vector stays on the heap.
+    #[inline]
     pub fn push(&mut self, value: T) {
         match &mut self.repr {
             Repr::Inline { len, .. } if (*len as usize) < N => {
                 let idx = *len as usize;
-                // SAFETY: idx < N, so buf[idx] is in bounds. The slot is
-                // uninitialized (idx == len, which is past the last initialized
-                // slot). We write a valid T into it and increment len to
-                // maintain the invariant that slots 0..len are initialized.
-                //
                 // Re-match rationale: the outer `match` borrows `self.repr`
                 // immutably (the guard reads `len`). We need a *mutable*
                 // borrow of `buf` and `len` to write, so we re-match inside
                 // the arm to start a fresh mutable borrow.
                 if let Repr::Inline { buf, len } = &mut self.repr {
+                    // SAFETY: idx < N, so buf[idx] is in bounds. The slot is
+                    // uninitialized (idx == len, which is past the last
+                    // initialized slot). We write a valid T into it and
+                    // increment len to maintain the invariant that slots
+                    // 0..len are initialized.
                     unsafe { buf.get_unchecked_mut(idx).write(value) };
                     *len += 1;
                 }
@@ -150,14 +152,14 @@ impl<T, const N: usize> InlineVec<T, N> {
         let mut vec = Vec::with_capacity(N + 1);
 
         if let Repr::Inline { buf, len } = old {
-            for i in 0..len as usize {
-                // SAFETY: i < len, so buf[i] is initialized per the
-                // inline invariant. We read each element exactly once
-                // (consuming it) and push it into the Vec. The old Repr
-                // has no Drop, so the now-uninitialized slots are never
-                // double-freed.
-                let elem = unsafe { buf.get_unchecked(i).assume_init_read() };
-                vec.push(elem);
+            let count = len as usize;
+            // SAFETY: buf[0..count] are initialized per the inline invariant.
+            // MaybeUninit<T> has the same layout as T. We copy count elements
+            // into vec's uninitialized spare capacity (which has room for N+1).
+            // The old Repr has no Drop, so the source slots are not double-freed.
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf.as_ptr().cast::<T>(), vec.as_mut_ptr(), count);
+                vec.set_len(count);
             }
             // buf (array of MaybeUninit) is dropped here. MaybeUninit's
             // drop is a no-op, so the moved-from slots are safe.
@@ -167,18 +169,35 @@ impl<T, const N: usize> InlineVec<T, N> {
         self.repr = Repr::Heap(vec);
     }
 
-    /// Appends all elements from a slice by cloning each one individually.
+    /// Appends all elements from a slice by cloning each one.
     ///
     /// If the combined length exceeds inline capacity, spills to heap.
-    /// Runs in O(n) time where n is `slice.len()`. Each element is cloned
-    /// via `T::clone()` and pushed one at a time; there is no bulk `memcpy`
-    /// optimization even for `Copy` types.
+    /// When all elements fit in the remaining inline capacity, performs a
+    /// single bounds check and writes directly — avoiding per-element match
+    /// dispatch and capacity checks.
+    #[inline]
     pub fn extend_from_slice(&mut self, slice: &[T])
     where
         T: Clone,
     {
-        for item in slice {
-            self.push(item.clone());
+        match &mut self.repr {
+            Repr::Inline { buf, len } if (*len as usize) + slice.len() <= N => {
+                let start = *len as usize;
+                for (i, item) in slice.iter().enumerate() {
+                    // SAFETY: start + i < start + slice.len() <= N, so
+                    // buf[start + i] is in bounds. The slot is uninitialized
+                    // (past the last initialized slot). We write a valid T
+                    // and update len after the loop to maintain the invariant.
+                    unsafe { buf.get_unchecked_mut(start + i).write(item.clone()) };
+                }
+                *len += slice.len() as u32;
+            }
+            _ => {
+                // Either already heap, or crosses inline boundary — per-element push.
+                for item in slice {
+                    self.push(item.clone());
+                }
+            }
         }
     }
 
@@ -211,17 +230,25 @@ impl<T, const N: usize> InlineVec<T, N> {
 
     /// Constructs an `InlineVec` from a slice.
     ///
-    /// If the slice fits in `N` slots, stores inline. Otherwise, copies
-    /// to a heap `Vec`.
+    /// If the slice fits in `N` slots, stores inline via bulk `memcpy`.
+    /// Otherwise, copies to a heap `Vec`.
+    #[inline]
     pub fn from_slice(slice: &[T]) -> Self
     where
         T: Copy,
     {
+        let _ = Self::VALIDATED_CAP;
         if slice.len() <= N {
             let mut buf = uninit_array::<T, N>();
-            for (i, item) in slice.iter().enumerate() {
-                // SAFETY: i < slice.len() <= N, so buf[i] is in bounds.
-                unsafe { buf.get_unchecked_mut(i).write(*item) };
+            // SAFETY: slice.len() <= N, so the copy stays within buf bounds.
+            // MaybeUninit<T> has the same layout as T, so the cast is valid.
+            // All copied slots become initialized.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    slice.as_ptr(),
+                    buf.as_mut_ptr().cast::<T>(),
+                    slice.len(),
+                );
             }
             Self {
                 repr: Repr::Inline {
@@ -248,6 +275,7 @@ fn uninit_array<T, const N: usize>() -> [MaybeUninit<T>; N] {
 // ============================================================================
 
 impl<T, const N: usize> Default for InlineVec<T, N> {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -282,6 +310,7 @@ impl<T: Clone, const N: usize> Clone for InlineVec<T, N> {
     /// slots are leaked rather than double-freed. This is safe — it does not
     /// violate memory safety — though it does mean a panic mid-clone can leak
     /// the already-cloned elements.
+    #[inline]
     fn clone(&self) -> Self {
         match &self.repr {
             Repr::Inline { buf, len } => {
@@ -330,7 +359,9 @@ impl<T, const N: usize> From<Vec<T>> for InlineVec<T, N> {
     /// When `v.len() <= N`, elements are moved out via `into_iter()` which
     /// consumes the `Vec` and its heap allocation (the allocator frees it).
     /// When `v.len() > N`, the `Vec` is adopted directly with no reallocation.
+    #[inline]
     fn from(v: Vec<T>) -> Self {
+        let _ = Self::VALIDATED_CAP;
         if v.len() <= N {
             let mut buf = uninit_array::<T, N>();
             let len = v.len() as u32;
@@ -352,7 +383,15 @@ impl<T, const N: usize> From<Vec<T>> for InlineVec<T, N> {
 }
 
 impl<T, const N: usize> FromIterator<T> for InlineVec<T, N> {
+    #[inline]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        if lower > N {
+            return Self {
+                repr: Repr::Heap(iter.collect()),
+            };
+        }
         let mut v = Self::new();
         for item in iter {
             v.push(item);
@@ -743,6 +782,75 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // ZST, clone-panic, from_iter spill, large N
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn zst_inline_and_spill() {
+        let mut v = InlineVec::<(), 4>::new();
+        for _ in 0..4 {
+            v.push(());
+        }
+        assert_eq!(v.len(), 4);
+        assert!(matches!(v.repr, Repr::Inline { .. }));
+        v.push(());
+        assert_eq!(v.len(), 5);
+        assert!(matches!(v.repr, Repr::Heap(_)));
+    }
+
+    #[test]
+    fn clone_panic_does_not_cause_ub() {
+        use std::cell::Cell;
+        use std::panic;
+
+        thread_local! { static COUNT: Cell<usize> = const { Cell::new(0) }; }
+
+        #[derive(Debug)]
+        struct PanicOnThird(u32);
+        impl Clone for PanicOnThird {
+            fn clone(&self) -> Self {
+                COUNT.with(|c| {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    if n == 3 {
+                        panic!("deliberate clone panic");
+                    }
+                });
+                PanicOnThird(self.0)
+            }
+        }
+
+        let mut v = InlineVec::<PanicOnThird, 4>::new();
+        v.push(PanicOnThird(1));
+        v.push(PanicOnThird(2));
+        v.push(PanicOnThird(3));
+
+        COUNT.with(|c| c.set(0));
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| v.clone()));
+        assert!(result.is_err()); // panicked — no UB, elements 1-2 leaked (safe)
+    }
+
+    #[test]
+    fn from_iter_spills() {
+        let v: InlineVec<u32, 2> = (0..5).collect();
+        assert_eq!(v.as_slice(), &[0, 1, 2, 3, 4]);
+        assert!(matches!(v.repr, Repr::Heap(_)));
+    }
+
+    #[test]
+    fn large_n_basic() {
+        let mut v = InlineVec::<u32, 64>::new();
+        for i in 0..64 {
+            v.push(i);
+        }
+        assert_eq!(v.len(), 64);
+        assert!(matches!(v.repr, Repr::Inline { .. }));
+        v.push(64);
+        assert_eq!(v.len(), 65);
+        assert!(matches!(v.repr, Repr::Heap(_)));
+    }
+
+    // -----------------------------------------------------------------------
     // Property tests (Vec oracle)
     // -----------------------------------------------------------------------
 
@@ -769,8 +877,8 @@ mod tests {
         proptest! {
             #![proptest_config(super::miri_proptest_config())]
 
-            /// State machine: random Push/ExtendFromSlice/Clone/AsSlice ops,
-            /// assert InlineVec matches Vec after every operation.
+            /// State machine: random Push/ExtendFromSlice/Clone/AsSlice/FromVec/FromSlice
+            /// ops, assert InlineVec matches Vec after every operation.
             #[test]
             fn state_machine_oracle(
                 ops in proptest::collection::vec(
@@ -780,6 +888,10 @@ mod tests {
                             .prop_map(|vs| (1u8, 0, vs)),              // ExtendFromSlice
                         Just((2u8, 0u32, vec![])),                      // Clone
                         Just((3u8, 0u32, vec![])),                      // AsSlice
+                        proptest::collection::vec(0u32..1000, 0..8)
+                            .prop_map(|vs| (4u8, 0, vs)),              // FromVec
+                        proptest::collection::vec(0u32..1000, 0..8)
+                            .prop_map(|vs| (5u8, 0, vs)),              // FromSlice
                     ],
                     0..200,
                 )
@@ -808,6 +920,16 @@ mod tests {
                             // AsSlice
                             prop_assert_eq!(iv.as_slice(), model.as_slice());
                         }
+                        4 => {
+                            // FromVec: construct a fresh InlineVec from Vec, verify it
+                            let fresh: InlineVec<u32, 4> = vals.clone().into();
+                            prop_assert_eq!(fresh.as_slice(), vals.as_slice());
+                        }
+                        5 => {
+                            // FromSlice: construct a fresh InlineVec from slice, verify it
+                            let fresh = InlineVec::<u32, 4>::from_slice(vals);
+                            prop_assert_eq!(fresh.as_slice(), vals.as_slice());
+                        }
                         _ => unreachable!(),
                     }
 
@@ -817,5 +939,156 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+// ============================================================================
+// Kani formal verification proofs
+// ============================================================================
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    // Proof 1: push never writes out of bounds (Block #1)
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn push_within_capacity_is_safe() {
+        const CAP: usize = 4;
+        let mut v = InlineVec::<u32, CAP>::new();
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for _ in 0..n {
+            v.push(kani::any());
+        }
+        assert_eq!(v.len(), n);
+    }
+
+    // Proof 2: spill reads only initialized slots (Block #2)
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn spill_reads_only_initialized() {
+        const CAP: usize = 4;
+        let mut v = InlineVec::<u32, CAP>::new();
+        for _ in 0..CAP {
+            v.push(kani::any());
+        }
+        // Trigger spill.
+        v.push(kani::any());
+        assert_eq!(v.len(), CAP + 1);
+        assert!(matches!(&v.repr, Repr::Heap(_)));
+    }
+
+    // Proof 3: as_slice returns valid slice of correct length (Block #3)
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn as_slice_covers_initialized_only() {
+        const CAP: usize = 4;
+        let mut v = InlineVec::<u32, CAP>::new();
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for _ in 0..n {
+            v.push(kani::any());
+        }
+        let s = v.as_slice();
+        assert_eq!(s.len(), n);
+        if n > 0 {
+            let idx: usize = kani::any();
+            kani::assume(idx < n);
+            let _ = s[idx]; // Kani verifies this dereference is valid
+        }
+    }
+
+    // Proof 4: drop visits exactly len elements (Block #4)
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn drop_visits_correct_count() {
+        const CAP: usize = 4;
+        let mut v = InlineVec::<u32, CAP>::new();
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for _ in 0..n {
+            v.push(kani::any());
+        }
+        assert_eq!(v.len(), n);
+        drop(v); // Kani verifies all assume_init_drop calls are in-bounds
+    }
+
+    // Proof 5: clone reads/writes only initialized slots (Block #5)
+    #[kani::proof]
+    #[kani::unwind(7)]
+    fn clone_inline_is_sound() {
+        const CAP: usize = 4;
+        let mut v = InlineVec::<u32, CAP>::new();
+        let n: usize = kani::any();
+        kani::assume(n <= CAP);
+        for _ in 0..n {
+            v.push(kani::any());
+        }
+        let cloned = v.clone();
+        assert_eq!(cloned.len(), v.len());
+        assert_eq!(cloned.as_slice(), v.as_slice());
+    }
+
+    // Proof 6: from_slice never indexes out of bounds (Block #6)
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn from_slice_bounds_are_sound() {
+        const CAP: usize = 4;
+        let backing: [u32; 4] = [kani::any(), kani::any(), kani::any(), kani::any()];
+        let len: usize = kani::any();
+        kani::assume(len <= CAP);
+        let v = InlineVec::<u32, CAP>::from_slice(&backing[..len]);
+        assert_eq!(v.len(), len);
+        assert_eq!(v.as_slice(), &backing[..len]);
+    }
+
+    // Proof 7: From<Vec> move-to-inline is in-bounds (Block #7)
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn from_vec_inline_is_sound() {
+        const CAP: usize = 4;
+        let len: usize = kani::any();
+        kani::assume(len <= CAP);
+        let mut vec = Vec::with_capacity(len);
+        for _ in 0..len {
+            vec.push(kani::any::<u32>());
+        }
+        let snapshot: Vec<u32> = vec.clone();
+        let v: InlineVec<u32, CAP> = vec.into();
+        assert_eq!(v.len(), len);
+        assert!(matches!(&v.repr, Repr::Inline { .. }));
+        for i in 0..len {
+            assert_eq!(v.as_slice()[i], snapshot[i]);
+        }
+    }
+
+    // Proof 8: uninit_array is trivially sound (Block #8 — compile-time check)
+    #[kani::proof]
+    fn uninit_array_is_valid() {
+        let _arr = uninit_array::<u32, 4>();
+        let _arr_zst = uninit_array::<(), 4>();
+        // MaybeUninit<T> is valid uninitialized by definition.
+        // Kani verifies no panic or UB.
+    }
+
+    // Proof 9: spill preserves all elements in order
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn spill_conserves_elements() {
+        const CAP: usize = 4;
+        let mut v = InlineVec::<u32, CAP>::new();
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        let c: u32 = kani::any();
+        let d: u32 = kani::any();
+        let e: u32 = kani::any();
+        v.push(a);
+        v.push(b);
+        v.push(c);
+        v.push(d);
+        assert_eq!(v.as_slice(), &[a, b, c, d]);
+        v.push(e); // spill
+        assert_eq!(v.as_slice(), &[a, b, c, d, e]);
     }
 }
