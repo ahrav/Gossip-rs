@@ -43,6 +43,10 @@
 //! (e.g., stale replicas visible in range scans but masked by read-repair
 //! on point lookups).
 //!
+//! Synthetic records may be slab-backed when the inner backend pools bytes.
+//! Cleanup runs through [`SimIntrospection::release_record_fields`] so this
+//! wrapper does not need direct slab access.
+//!
 //! # Scope
 //!
 //! This type is confined to dedicated checker tests — it is **not** used
@@ -51,6 +55,7 @@
 //! unexpected violations (real bugs), adding complexity for no safety gain.
 
 use crate::coordination::record::ShardRecord;
+use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{ShardKey, TenantId};
 use crate::sim::backend::SimIntrospection;
 
@@ -153,22 +158,32 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
         self.inner.shard_lookup(tenant, key)
     }
 
-    fn slab(&self) -> &gossip_stdx::ByteSlab {
-        self.inner.slab()
+    fn materialize_spec(&self, record: &ShardRecord) -> ShardSpec {
+        self.inner.materialize_spec(record)
     }
 
-    fn slab_mut(&mut self) -> &mut gossip_stdx::ByteSlab {
-        self.inner.slab_mut()
+    fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]> {
+        self.inner.cursor_last_key(record)
+    }
+
+    fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]) {
+        self.inner.spec_bounds(record)
+    }
+
+    fn release_record_fields(&mut self, record: &mut ShardRecord) {
+        self.inner.release_record_fields(record);
     }
 }
 
 /// Deallocate pooled fields from synthetic records before the inner
 /// backend's slab is dropped.
+///
+/// Uses the trait-level cleanup hook rather than backend-specific slab APIs,
+/// keeping fault injection compatible with any `SimIntrospection` backend.
 impl<B: SimIntrospection> Drop for FaultInjectingIntrospector<B> {
     fn drop(&mut self) {
-        let slab = self.inner.slab_mut();
         for (_, _, record) in &mut self.synthetic_records {
-            record.deallocate_fields(slab);
+            self.inner.release_record_fields(record);
         }
     }
 }

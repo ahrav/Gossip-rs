@@ -1302,9 +1302,13 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
     /// Look up a shard's spec from the coordinator, returning a rejection
     /// event if the shard does not exist.
+    ///
+    /// This helper intentionally materializes an owned spec because split-plan
+    /// builders own their `ShardSpec`s. Other harness paths prefer borrowed
+    /// accessors (`spec_bounds`, `cursor_last_key`) to avoid extra copies.
     fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
         match self.coordinator.shard_lookup(&self.tenant, &key) {
-            Some(record) => Ok(record.spec.to_spec(self.coordinator.slab())),
+            Some(record) => Ok(self.coordinator.materialize_spec(record)),
             None => Err(SimEvent::Rejected {
                 kind: RejectionKind::ShardNotFound,
             }),
@@ -1422,11 +1426,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let parent_cursor_key = self
             .coordinator
             .shard_lookup(&self.tenant, &key)
-            .and_then(|r| {
-                r.cursor
-                    .last_key(self.coordinator.slab())
-                    .map(|k| k.to_vec())
-            });
+            .and_then(|r| self.coordinator.cursor_last_key(r).map(|k| k.to_vec()));
 
         let start = parent_spec.key_range_start();
         let end = parent_spec.key_range_end();
@@ -2012,16 +2012,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .get(&worker)
             .and_then(|w| w.last_cursor_for(key.run(), key.shard()));
 
-        // Look up this shard's actual spec bounds from the coordinator.
+        // Borrow this shard's bounds from the coordinator and clone only the
+        // two boundary slices needed for local RNG range calculations.
         let (spec_start, spec_end) = self
             .coordinator
             .shard_lookup(&self.tenant, &key)
             .map(|r| {
-                let slab = self.coordinator.slab();
-                (
-                    r.spec.key_range_start(slab).to_vec(),
-                    r.spec.key_range_end(slab).to_vec(),
-                )
+                let (start, end) = self.coordinator.spec_bounds(r);
+                (start.to_vec(), end.to_vec())
             })
             .expect("generate_forward_cursor: shard missing from coordinator -- harness bug");
 
@@ -2177,14 +2175,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             .coordinator
             .shard_lookup(&self.tenant, &key)
             .map(|r| {
-                let slab = self.coordinator.slab();
-                let lo = r
-                    .spec
-                    .key_range_start(slab)
-                    .first()
-                    .copied()
-                    .unwrap_or(b'a');
-                let hi = r.spec.key_range_end(slab).first().copied().unwrap_or(b'z');
+                let (start, end) = self.coordinator.spec_bounds(r);
+                let lo = start.first().copied().unwrap_or(b'a');
+                let hi = end.first().copied().unwrap_or(b'z');
                 (lo, hi)
             })
             .expect("exec_session_lifecycle: shard missing from coordinator -- harness bug");

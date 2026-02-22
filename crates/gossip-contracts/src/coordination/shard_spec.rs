@@ -773,8 +773,8 @@ pub fn validate_split_coverage(
         );
     }
 
-    debug_assert!(indexed.first().unwrap().1.key_range_start == parent.key_range_start);
-    debug_assert!(indexed.last().unwrap().1.key_range_end == parent.key_range_end);
+    debug_assert!(indexed.first().unwrap().1.key_range_start() == parent_start);
+    debug_assert!(indexed.last().unwrap().1.key_range_end() == parent_end);
 
     Ok(())
 }
@@ -814,21 +814,42 @@ pub fn validate_residual_split(
     new_parent: &ShardSpec,
     residual: &ShardSpec,
 ) -> Result<(), SplitValidationError> {
+    validate_residual_split_bounds(
+        old_parent.key_range_start(),
+        old_parent.key_range_end(),
+        new_parent,
+        residual,
+    )
+}
+
+/// Validate residual split using borrowed old-parent bounds.
+///
+/// Equivalent to [`validate_residual_split`] but avoids requiring an owned
+/// old-parent `ShardSpec` when callers already have borrowed bounds.
+/// Used by coordinator split precondition checks to avoid materializing
+/// temporary parent specs from pooled storage.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn validate_residual_split_bounds(
+    old_parent_start: &[u8],
+    old_parent_end: &[u8],
+    new_parent: &ShardSpec,
+    residual: &ShardSpec,
+) -> Result<(), SplitValidationError> {
     // The parent must keep the left (lower) portion of the range.
-    if new_parent.key_range_start != old_parent.key_range_start {
+    if new_parent.key_range_start() != old_parent_start {
         return Err(SplitValidationError::StartMismatch {
-            parent_start: old_parent.key_range_start.clone(),
-            first_child_start: new_parent.key_range_start.clone(),
+            parent_start: old_parent_start.to_vec().into_boxed_slice(),
+            first_child_start: new_parent.key_range_start().to_vec().into_boxed_slice(),
         });
     }
     // The residual must cover the right (upper) portion.
-    if residual.key_range_end != old_parent.key_range_end {
+    if residual.key_range_end() != old_parent_end {
         return Err(SplitValidationError::EndMismatch {
-            parent_end: old_parent.key_range_end.clone(),
-            last_child_end: residual.key_range_end.clone(),
+            parent_end: old_parent_end.to_vec().into_boxed_slice(),
+            last_child_end: residual.key_range_end().to_vec().into_boxed_slice(),
         });
     }
-    validate_split_coverage(old_parent, &[new_parent, residual])
+    validate_split_coverage_bounds(old_parent_start, old_parent_end, &[new_parent, residual])
 }
 
 // ============================================================================

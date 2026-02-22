@@ -14,7 +14,7 @@
 //! [`ByteSlot`] handles into a shared [`ByteSlab`]. The slab pre-allocates
 //! a single contiguous buffer and carves out variable-size regions via
 //! bump-pointer + free-list, turning N heap allocations per shard into
-//! N slab operations with zero `malloc`/`free` overhead.
+//! N slab operations and removing per-field `malloc`/`free` on hot paths.
 //!
 //! ## Accessor lifetime pattern
 //!
@@ -346,14 +346,22 @@ impl PooledCursor {
     /// Used when crossing API boundaries (e.g., `ShardRecord::snapshot`).
     /// The pooled handle remains valid afterward.
     ///
-    /// The `(None, _)` arm covers both `(None, None)` and the theoretically
-    /// impossible `(None, Some(_))` case. `Cursor` does not support a token
-    /// without a last-key, so both map to `Cursor::initial()`.
+    /// The `(None, Some(_))` state is theoretically impossible: `Cursor`
+    /// does not support token-without-last-key. Keep an explicit arm so
+    /// debug builds surface invariant drift early; release builds degrade to
+    /// `Cursor::initial()` to keep conversion total even under corruption.
     pub(crate) fn to_cursor(&self, slab: &ByteSlab) -> Cursor {
         let last_key = self.last_key(slab).map(|k| k.to_vec());
         let token = self.token(slab).map(|t| t.to_vec());
         match (last_key, token) {
-            (None, _) => Cursor::initial(),
+            (None, None) => Cursor::initial(),
+            (None, Some(_)) => {
+                debug_assert!(
+                    false,
+                    "pooled cursor invariant violated: token present without last_key",
+                );
+                Cursor::initial()
+            }
             (Some(k), None) => Cursor::with_last_key(k),
             (Some(k), Some(t)) => Cursor::from_parts(k, t),
         }

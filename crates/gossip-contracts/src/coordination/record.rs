@@ -705,8 +705,10 @@ impl ShardRecord {
     ///
     /// Materializes owned `ShardSpec` and `Cursor` from the slab (heap
     /// allocations), since the snapshot crosses the API boundary.
+    /// Simulation hot paths should prefer `SimIntrospection` borrowed
+    /// accessors (`spec_bounds`, `cursor_last_key`) to avoid this copy.
     #[must_use]
-    pub fn snapshot(&self, slab: &ByteSlab) -> ShardSnapshot {
+    pub(crate) fn snapshot(&self, slab: &ByteSlab) -> ShardSnapshot {
         self.assert_invariants();
         ShardSnapshot::new(
             self.status,
@@ -722,6 +724,8 @@ impl ShardRecord {
     ///
     /// Must be called before dropping a `ShardRecord` to avoid slab leaks.
     /// After this call, spec and cursor fields are reset to empty/initial.
+    /// Used by coordinator drop/rollback paths and by simulation wrappers
+    /// via `SimIntrospection::release_record_fields`.
     pub(crate) fn deallocate_fields(&mut self, slab: &mut ByteSlab) {
         self.spec.release_fields(slab);
         self.cursor.release_fields(slab);

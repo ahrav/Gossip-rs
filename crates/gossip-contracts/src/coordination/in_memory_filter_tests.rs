@@ -843,11 +843,21 @@ fn runtime_constructor_caps_auto_slab_capacity() {
 
 #[test]
 fn runtime_constructor_respects_explicit_slab_capacity() {
-    // Explicit slab capacity bypasses the auto-sizing formula and cap.
+    // Explicit slab capacity bypasses auto-sizing and preserves valid values.
     let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 123, 456);
     config.slab_capacity = 8 * 1024;
     let coord = InMemoryCoordinator::with_runtime_config(config);
     assert_eq!(coord.slab().capacity(), 8 * 1024);
+}
+
+#[test]
+fn runtime_constructor_clamps_explicit_slab_capacity_to_backend_max() {
+    // ByteSlab uses a u32-addressed backing store, so oversized explicit
+    // requests must clamp rather than panic or wrap.
+    let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 123, 456);
+    config.slab_capacity = usize::MAX;
+    let coord = InMemoryCoordinator::with_runtime_config(config);
+    assert_eq!(coord.slab().capacity(), u32::MAX as usize);
 }
 
 // -- CoordinatorConfig memory budget smoke tests ------------------------------
