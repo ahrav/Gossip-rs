@@ -468,40 +468,51 @@ impl PooledCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{arb_bounded_shard_spec, arb_cursor, arb_shard_spec, miri_proptest_config};
+    use proptest::prelude::*;
 
-    #[test]
-    fn pooled_spec_roundtrip() {
-        let mut slab = ByteSlab::with_capacity(4096);
-        let spec =
-            ShardSpec::with_range_and_metadata(b"abc".to_vec(), b"xyz".to_vec(), b"meta".to_vec());
-        let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
-        assert_eq!(pooled.key_range_start(&slab), b"abc");
-        assert_eq!(pooled.key_range_end(&slab), b"xyz");
-        assert_eq!(pooled.metadata(&slab), b"meta");
+    proptest! {
+        #![proptest_config(miri_proptest_config())]
 
-        let reconstructed = pooled.to_spec(&slab);
-        assert_eq!(reconstructed.key_range_start(), spec.key_range_start());
-        assert_eq!(reconstructed.key_range_end(), spec.key_range_end());
-        assert_eq!(reconstructed.metadata(), spec.metadata());
+        #[test]
+        fn spec_roundtrip_property(spec in arb_shard_spec()) {
+            let mut slab = ByteSlab::with_capacity(4096);
+            let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
+            let reconstructed = pooled.to_spec(&slab);
 
-        pooled.deallocate(&mut slab);
-        assert_eq!(slab.live_count(), 0);
-    }
+            prop_assert_eq!(reconstructed.key_range_start(), spec.key_range_start());
+            prop_assert_eq!(reconstructed.key_range_end(), spec.key_range_end());
+            prop_assert_eq!(reconstructed.metadata(), spec.metadata());
 
-    #[test]
-    fn pooled_spec_unbounded_roundtrip() {
-        let mut slab = ByteSlab::with_capacity(4096);
-        let spec = ShardSpec::unbounded();
-        let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
-        assert!(pooled.is_unbounded());
-        assert!(pooled.is_start_unbounded());
-        assert!(pooled.is_end_unbounded());
+            pooled.deallocate(&mut slab);
+            prop_assert_eq!(slab.live_count(), 0);
+        }
 
-        let reconstructed = pooled.to_spec(&slab);
-        assert_eq!(reconstructed, spec);
+        #[test]
+        fn cursor_roundtrip_property(cursor in arb_cursor()) {
+            let mut slab = ByteSlab::with_capacity(4096);
+            let pooled = PooledCursor::from_cursor(&cursor, &mut slab).unwrap();
+            let reconstructed = pooled.to_cursor(&slab);
 
-        pooled.deallocate(&mut slab);
-        assert_eq!(slab.live_count(), 0);
+            prop_assert_eq!(reconstructed.last_key(), cursor.last_key());
+            prop_assert_eq!(reconstructed.token(), cursor.token());
+
+            pooled.deallocate(&mut slab);
+            prop_assert_eq!(slab.live_count(), 0);
+        }
+
+        #[test]
+        fn contains_key_cross_check(
+            spec in arb_bounded_shard_spec(),
+            key in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let mut slab = ByteSlab::with_capacity(4096);
+            let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
+
+            prop_assert_eq!(pooled.contains_key(&key, &slab), spec.contains_key(&key));
+
+            pooled.deallocate(&mut slab);
+        }
     }
 
     #[test]
@@ -514,39 +525,6 @@ mod tests {
 
         let cursor = pooled.to_cursor(&slab);
         assert!(cursor.is_initial());
-    }
-
-    #[test]
-    fn pooled_cursor_roundtrip_with_key() {
-        let mut slab = ByteSlab::with_capacity(4096);
-        let cursor = Cursor::with_last_key(b"hello".to_vec());
-        let pooled = PooledCursor::from_cursor(&cursor, &mut slab).unwrap();
-        assert!(!pooled.is_initial());
-        assert_eq!(pooled.last_key(&slab), Some(b"hello".as_slice()));
-        assert!(pooled.token(&slab).is_none());
-
-        let reconstructed = pooled.to_cursor(&slab);
-        assert_eq!(reconstructed.last_key(), cursor.last_key());
-        assert_eq!(reconstructed.token(), cursor.token());
-
-        pooled.deallocate(&mut slab);
-        assert_eq!(slab.live_count(), 0);
-    }
-
-    #[test]
-    fn pooled_cursor_roundtrip_with_key_and_token() {
-        let mut slab = ByteSlab::with_capacity(4096);
-        let cursor = Cursor::from_parts(b"key".to_vec(), b"token".to_vec());
-        let pooled = PooledCursor::from_cursor(&cursor, &mut slab).unwrap();
-        assert_eq!(pooled.last_key(&slab), Some(b"key".as_slice()));
-        assert_eq!(pooled.token(&slab), Some(b"token".as_slice()));
-
-        let reconstructed = pooled.to_cursor(&slab);
-        assert_eq!(reconstructed.last_key(), cursor.last_key());
-        assert_eq!(reconstructed.token(), cursor.token());
-
-        pooled.deallocate(&mut slab);
-        assert_eq!(slab.live_count(), 0);
     }
 
     #[test]
@@ -601,26 +579,6 @@ mod tests {
         let result = PooledCursor::from_cursor(&cursor, &mut slab);
         assert!(result.is_err(), "should fail: slab too small for 2 fields");
         assert_eq!(slab.live_count(), 0, "rollback must clean up partial alloc");
-    }
-
-    #[test]
-    fn contains_key_matches_spec_behavior() {
-        let mut slab = ByteSlab::with_capacity(4096);
-        let spec = ShardSpec::with_range(b"d".to_vec(), b"p".to_vec());
-        let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
-
-        assert!(pooled.contains_key(b"d", &slab), "start is inclusive");
-        assert!(pooled.contains_key(b"m", &slab), "mid-range");
-        assert!(!pooled.contains_key(b"p", &slab), "end is exclusive");
-        assert!(!pooled.contains_key(b"a", &slab), "below range");
-        assert!(!pooled.contains_key(b"z", &slab), "above range");
-
-        // Verify matches ShardSpec behavior.
-        assert_eq!(pooled.contains_key(b"d", &slab), spec.contains_key(b"d"));
-        assert_eq!(pooled.contains_key(b"p", &slab), spec.contains_key(b"p"));
-        assert_eq!(pooled.contains_key(b"a", &slab), spec.contains_key(b"a"));
-
-        pooled.deallocate(&mut slab);
     }
 
     #[test]

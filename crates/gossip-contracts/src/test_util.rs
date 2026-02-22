@@ -30,6 +30,7 @@ pub(crate) fn canonical_digest<T: crate::identity::CanonicalBytes>(val: &T) -> b
 // Proptest strategies for ShardSpec — shared across coordination test modules
 // ---------------------------------------------------------------------------
 
+use crate::coordination::cursor::Cursor;
 use crate::coordination::ShardSpec;
 use proptest::prelude::*;
 
@@ -73,5 +74,23 @@ pub(crate) fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
         1 => proptest::collection::vec(any::<u8>(), 1..64)
             .prop_map(|start| ShardSpec::with_range(start, vec![])),
         1 => Just(ShardSpec::unbounded()),
+    ]
+}
+
+/// Generate a valid [`Cursor`] covering all three states: initial (no
+/// progress), last-key only, and last-key + token.
+///
+/// `last_key` and `token` are 1..64 non-empty byte vectors, matching the
+/// `Cursor` constructor preconditions (`last_key` must not be empty).
+pub(crate) fn arb_cursor() -> impl Strategy<Value = Cursor> {
+    proptest::prop_oneof![
+        1 => Just(Cursor::initial()),
+        3 => proptest::collection::vec(any::<u8>(), 1..64)
+            .prop_map(Cursor::with_last_key),
+        3 => (
+            proptest::collection::vec(any::<u8>(), 1..64),
+            proptest::collection::vec(any::<u8>(), 1..64),
+        )
+            .prop_map(|(k, t)| Cursor::from_parts(k, t)),
     ]
 }
