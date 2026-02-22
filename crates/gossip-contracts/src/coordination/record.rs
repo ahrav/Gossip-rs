@@ -306,7 +306,6 @@ impl ShardRecord {
     /// # Errors
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec.
-    #[allow(dead_code)] // Used by test helpers (seeded_coordinator).
     pub(crate) fn new_active(
         tenant: TenantId,
         run: RunId,
