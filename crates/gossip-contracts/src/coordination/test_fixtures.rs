@@ -177,3 +177,59 @@ pub fn park_ok(
         .park_shard(now(t), test_tenant(), lease, reason, OpId::from_raw(op_id))
         .expect("park should succeed");
 }
+
+/// Standard [`RunConfig`] for run-management tests.
+///
+/// Uses `CursorSemantics::Completed`, a 30-tick lease duration,
+/// and max shard retries of 5. Named "short lease" to distinguish from
+/// [`test_run_config`] which uses [`LEASE_DURATION`] (100).
+pub fn short_lease_run_config() -> RunConfig {
+    RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
+}
+
+/// Creates a coordinator with a fully initialized run and an acquired lease.
+///
+/// Performs: `create_run` -> `register_shards` (one shard `[a,z)`) ->
+/// `acquire_and_restore`. Returns `(coordinator, lease)` ready for
+/// split, park, or completion tests. Time advances through t=1..3;
+/// callers should start at t=4.
+///
+/// Uses [`short_lease_run_config`] (30-tick lease) for run creation.
+pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![InitialShard::new(
+        ShardId::from_raw(10),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    )];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+    let lease = coord
+        .acquire_and_restore(now(3), test_tenant(), key, test_worker(1))
+        .unwrap()
+        .lease;
+    (coord, lease)
+}
+
+/// Performs the canonical `split_replace` on `[a,z)` into `[a,m)` and `[m,z)`.
+///
+/// Uses t=4 and OpId=2. Panics on failure. Intended to be called after
+/// [`coordinator_with_run_and_lease`] to set up a post-split state for
+/// index-consistency and filter tests.
+pub fn do_split_replace(coord: &mut InMemoryCoordinator, lease: &Lease) {
+    let plan = test_split_replace_plan();
+    let _ = coord
+        .split_replace(now(4), test_tenant(), lease, plan, OpId::from_raw(2))
+        .unwrap();
+}
