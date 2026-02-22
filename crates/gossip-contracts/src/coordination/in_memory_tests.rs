@@ -3531,3 +3531,32 @@ fn coordinator_config_memory_budget_mb_rounds_up() {
     let expected_mb = bytes.div_ceil(1 << 20);
     assert_eq!(mb, expected_mb);
 }
+
+/// Validates that the hardcoded constants in `memory_budget()` match
+/// actual struct sizes on this platform. If this test fails, the
+/// constants in `CoordinatorConfig::memory_budget()` need updating.
+#[test]
+fn memory_budget_constants_match_struct_sizes() {
+    use super::ShardRecord;
+    use crate::coordination::run::RunRecord;
+    use std::mem::size_of;
+
+    let shard_size = size_of::<ShardRecord>();
+    let run_size = size_of::<RunRecord>();
+
+    // The budget formula uses 736 for ShardRecord and 576 for RunRecord.
+    // These are documented in the memory_budget() doc comment.
+    // Allow some tolerance for future field additions, but flag large drift.
+    // These constants must match the values used in memory_budget().
+    // If this assertion fails, update BOTH the constant here AND in memory_budget().
+    assert_eq!(
+        shard_size, 776,
+        "ShardRecord size changed from 776 to {shard_size}; \
+         update the constant in CoordinatorConfig::memory_budget()"
+    );
+    assert_eq!(
+        run_size, 512,
+        "RunRecord size changed from 512 to {run_size}; \
+         update the constant in CoordinatorConfig::memory_budget()"
+    );
+}

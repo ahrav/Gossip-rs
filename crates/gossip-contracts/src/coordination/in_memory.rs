@@ -204,22 +204,22 @@ impl CoordinatorConfig {
 
     /// Estimate worst-case memory budget in bytes.
     ///
-    /// Formula: `M = S * (736 + B_s + 72) + R * (576 + B_r + 80) + W * 16 + 4096`
+    /// Formula: `M = S * (776 + B_s + 72) + R * (512 + B_r + 80) + W * 16 + 4096`
     ///
     /// Where:
     /// - `S` = `max_total_shards`, `B_s` = `per_shard_budget`
     /// - `R` = `max_runs`, `B_r` = `per_run_budget`
     /// - `W` = `max_workers`
-    /// - 736 = fixed-size portion of `ShardRecord`
+    /// - 776 = `size_of::<ShardRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
     /// - 72 = per-entry HashMap overhead (key + bucket metadata)
-    /// - 576 = fixed-size portion of `RunRecord`
+    /// - 512 = `size_of::<RunRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
     /// - 80 = per-entry HashMap overhead for run entries
     /// - 16 = per-entry in claim_cooldowns
     /// - 4096 = base coordinator struct + map headers
     #[must_use]
     pub const fn memory_budget(&self) -> usize {
-        let per_shard = 736 + self.per_shard_budget + 72;
-        let per_run = 576 + self.per_run_budget + 80;
+        let per_shard = 776 + self.per_shard_budget + 72;
+        let per_run = 512 + self.per_run_budget + 80;
         let per_worker = 16;
         let base = 4096;
         self.max_total_shards * per_shard
