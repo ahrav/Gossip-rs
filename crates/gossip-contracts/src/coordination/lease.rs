@@ -348,8 +348,11 @@ pub enum OpKind {
     /// Advances the shard's cursor to a new position within its key range.
     /// The most frequent operation during normal scanning.
     ///
-    /// Convergence: re-execution sets the cursor to the same value
-    /// (idempotent by payload hash). Concurrent checkpoints are
+    /// Convergence: if the op-log entry is present, replay returns the
+    /// cached result. If evicted and re-executed, the cursor update
+    /// either succeeds (setting the same value, idempotent by payload
+    /// hash) or is rejected by cursor-monotonicity (no state change).
+    /// Either outcome is convergent. Concurrent checkpoints are
     /// cursor-monotonic, so reordering produces the same final cursor
     /// (max of the two).
     Checkpoint = 0,
@@ -360,9 +363,10 @@ pub enum OpKind {
     /// After completion, the lease is released and no further mutations
     /// are accepted on this shard.
     ///
-    /// Convergence: terminal transition is irreversible. Re-execution on
-    /// an already-Done shard returns the cached op-log result. No state
-    /// change on replay.
+    /// Convergence: terminal transition is irreversible. The op-log entry
+    /// is structurally never evicted — after Done, no further ops can
+    /// push entries, so re-execution always hits the cached result. No
+    /// state change on replay.
     Complete = 1,
 
     /// Suspend the shard due to an error condition — terminal transition to
@@ -371,8 +375,11 @@ pub enum OpKind {
     /// Resumption requires an out-of-band administrative [`Unpark`](Self::Unpark)
     /// which increments the fence epoch.
     ///
-    /// Convergence: same argument as Complete — terminal transition to
-    /// Parked is irreversible. Re-execution returns the cached result.
+    /// Convergence: terminal within the lease scope. After Park, any
+    /// admin Unpark bumps the fence epoch, invalidating the parking
+    /// worker's lease. The old worker cannot re-execute Park after
+    /// eviction because it fails fence validation. If the op-log entry
+    /// is still present, re-execution returns the cached result.
     Park = 2,
 
     /// Replace the parent shard with N child shards — terminal transition to
@@ -405,8 +412,9 @@ pub enum OpKind {
     /// the worker that originally parked it. Unparking increments the
     /// fence epoch and clears the park reason.
     ///
-    /// Convergence: Parked -> Active is idempotent (unparking an Active
-    /// shard is a no-op via status precondition check). Fence epoch
+    /// Convergence: Parked -> Active is idempotent (unparking an
+    /// already-Active shard is rejected by the status precondition
+    /// check with `NotParked` — no state change). Fence epoch
     /// increment on re-execution is safe — it only invalidates stale
     /// leases, which is the conservative direction.
     Unpark = 5,

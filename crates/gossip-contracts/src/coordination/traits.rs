@@ -369,11 +369,11 @@ pub trait CoordinationBackend {
     ///
     /// ## Atomicity
     ///
-    /// Production backends must execute steps 4-7 (child creation, parent
-    /// status transition to Split, lease release, and op-log recording) in a
-    /// single atomic transaction. A partial commit — e.g., child1 written but
-    /// child2 not — violates the split coverage invariant and creates a gap
-    /// in the shard map.
+    /// Production backends must execute steps 4-8 (child ID derivation,
+    /// child creation, parent status transition to Split, lease release,
+    /// and op-log recording) in a single atomic transaction. A partial
+    /// commit — e.g., child1 written but child2 not — violates the split
+    /// coverage invariant and creates a gap in the shard map.
     ///
     /// Pattern: read the parent's `revision`, write children + parent update
     /// in one transaction, fail if the parent was modified concurrently
@@ -386,7 +386,7 @@ pub trait CoordinationBackend {
     /// ## Production note
     ///
     /// Backends with external storage must execute lease validation (step 2)
-    /// and the multi-record mutation (steps 4-7) as a single conditional
+    /// and the multi-record mutation (steps 4-8) as a single conditional
     /// transaction. See trait-level *Production Backend Requirements*.
     fn split_replace(
         &mut self,
@@ -424,11 +424,11 @@ pub trait CoordinationBackend {
     ///
     /// ## Atomicity
     ///
-    /// Production backends must execute steps 4-7 (parent spec update,
-    /// residual creation, `spawned` recording, and op-log recording) in a
-    /// single atomic transaction. A partial commit leaves the parent with a
-    /// smaller range but no corresponding residual shard, creating a
-    /// coverage gap.
+    /// Production backends must execute steps 4-9 (residual ID derivation,
+    /// parent spec update, residual creation, `spawned` recording, lease
+    /// retention, and op-log recording) in a single atomic transaction. A
+    /// partial commit leaves the parent with a smaller range but no
+    /// corresponding residual shard, creating a coverage gap.
     ///
     /// Same transactional pattern as `split_replace`: read the parent
     /// revision, write all changes in one transaction, fail on concurrent
@@ -437,7 +437,7 @@ pub trait CoordinationBackend {
     /// ## Production note
     ///
     /// Backends with external storage must execute lease validation (step 2)
-    /// and the multi-record mutation (steps 4-7) as a single conditional
+    /// and the multi-record mutation (steps 4-9) as a single conditional
     /// transaction. See trait-level *Production Backend Requirements*.
     fn split_residual(
         &mut self,
