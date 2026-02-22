@@ -290,7 +290,7 @@ impl std::error::Error for SlabFull {}
 
 /// Pre-allocated contiguous byte pool with hybrid bump + free-list allocator.
 ///
-/// See the [module-level documentation](self) for design details, memory
+/// See the module-level documentation for design details, memory
 /// layout, and invariants.
 ///
 /// # Complexity
