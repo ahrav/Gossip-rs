@@ -20,9 +20,11 @@
 //!
 //! # Threading
 //!
-//! This type has no internal synchronization. It is `Send + Sync` when
-//! `T` is, but concurrent mutation requires external synchronization
-//! (as with any `&mut`-based API).
+//! This type has no internal synchronization.
+//!
+//! Auto-traits follow `T`: `InlineVec<T, N>` is `Send` when `T: Send`,
+//! and `Sync` when `T: Sync`. Concurrent mutation still requires external
+//! synchronization (as with any `&mut`-based API).
 
 use std::mem::{self, MaybeUninit};
 
@@ -139,12 +141,16 @@ impl<T, const N: usize> InlineVec<T, N> {
         }
     }
 
-    /// Cold path: move all inline elements to a heap `Vec` and append `value`.
+    /// Cold path: move inline elements to heap mode and reserve `additional`
+    /// future slots.
     ///
     /// Marked `#[cold]` / `#[inline(never)]` to keep the spill machinery out of
     /// the hot `push` path. The compiler will not inline or speculate this code
     /// into the fast inline branch, keeping instruction-cache pressure low for
     /// the common case.
+    ///
+    /// Pre-reserving `additional` capacity lets both `push` and
+    /// `extend_from_slice` pay spill allocation cost once in the common case.
     ///
     /// Uses bulk `copy_nonoverlapping` instead of per-element moves because
     /// ownership is being *transferred*, not cloned: the source `MaybeUninit`
@@ -152,33 +158,48 @@ impl<T, const N: usize> InlineVec<T, N> {
     /// while the destination `Vec` takes ownership of the initialized bytes.
     #[cold]
     #[inline(never)]
-    fn spill_and_push(&mut self, value: T) {
-        // Extract the old Repr via mem::replace. The replacement is a
-        // dummy Heap(empty vec) that will be overwritten immediately.
-        // Repr has no Drop, so no double-free occurs.
-        let old = mem::replace(
-            &mut self.repr,
-            Repr::Heap(Vec::new()), // temporary placeholder
-        );
+    fn spill_inline_to_heap_with_additional(&mut self, additional: usize) {
+        let count = match &self.repr {
+            Repr::Inline { len, .. } => *len as usize,
+            Repr::Heap(_) => return,
+        };
 
-        let mut vec = Vec::with_capacity(N + 1);
+        // Prefer one-shot allocation for existing + additional elements.
+        // If the sum overflows, defer overflow handling to Vec::reserve.
+        let mut vec = match count.checked_add(additional) {
+            Some(total) => Vec::with_capacity(total),
+            None => {
+                let mut vec = Vec::with_capacity(count);
+                vec.reserve(additional);
+                vec
+            }
+        };
 
+        // Extract the inline buffer only after allocation succeeds so a
+        // capacity panic cannot discard already-initialized inline elements.
+        let old = mem::replace(&mut self.repr, Repr::Heap(Vec::new()));
         if let Repr::Inline { buf, len } = old {
-            let count = len as usize;
+            debug_assert_eq!(len as usize, count);
             // SAFETY: buf[0..count] are initialized per the inline invariant.
-            // MaybeUninit<T> has the same layout as T. We copy count elements
-            // into vec's uninitialized spare capacity (which has room for N+1).
-            // The old Repr has no Drop, so the source slots are not double-freed.
+            // MaybeUninit<T> has the same layout as T. vec has at least count
+            // spare slots by construction.
             unsafe {
                 std::ptr::copy_nonoverlapping(buf.as_ptr().cast::<T>(), vec.as_mut_ptr(), count);
                 vec.set_len(count);
             }
-            // buf (array of MaybeUninit) is dropped here. MaybeUninit's
-            // drop is a no-op, so the moved-from slots are safe.
         }
 
-        vec.push(value);
         self.repr = Repr::Heap(vec);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn spill_and_push(&mut self, value: T) {
+        self.spill_inline_to_heap_with_additional(1);
+        match &mut self.repr {
+            Repr::Heap(v) => v.push(value),
+            Repr::Inline { .. } => unreachable!("spill path must leave InlineVec in heap mode"),
+        }
     }
 
     /// Returns whether `additional` elements can be appended inline.
@@ -212,23 +233,37 @@ impl<T, const N: usize> InlineVec<T, N> {
     where
         T: Clone,
     {
-        match &mut self.repr {
-            Repr::Inline { buf, len } if Self::inline_extend_fits(*len as usize, slice.len()) => {
-                let start = *len as usize;
-                for (i, item) in slice.iter().enumerate() {
-                    // SAFETY: start + i < start + slice.len() <= N, so
-                    // buf[start + i] is in bounds. The slot is uninitialized
-                    // (past the last initialized slot). We write a valid T
-                    // then immediately increment len for panic safety (see
-                    // function-level doc).
-                    unsafe { buf.get_unchecked_mut(start + i).write(item.clone()) };
-                    *len += 1;
-                }
+        if let Repr::Inline { buf, len } = &mut self.repr
+            && Self::inline_extend_fits(*len as usize, slice.len())
+        {
+            let start = *len as usize;
+            for (i, item) in slice.iter().enumerate() {
+                // SAFETY: start + i < start + slice.len() <= N, so
+                // buf[start + i] is in bounds. The slot is uninitialized
+                // (past the last initialized slot). We write a valid T
+                // then immediately increment len for panic safety (see
+                // function-level doc).
+                unsafe { buf.get_unchecked_mut(start + i).write(item.clone()) };
+                *len += 1;
             }
-            _ => {
-                // Either already heap, or crosses inline boundary — per-element push.
-                for item in slice {
-                    self.push(item.clone());
+            return;
+        }
+
+        match &mut self.repr {
+            Repr::Heap(v) => {
+                // Reserve once, then clone-extend in bulk.
+                v.reserve(slice.len());
+                v.extend_from_slice(slice);
+            }
+            Repr::Inline { .. } => {
+                // Crossing the inline boundary: spill once with enough room,
+                // then bulk clone into the heap representation.
+                self.spill_inline_to_heap_with_additional(slice.len());
+                match &mut self.repr {
+                    Repr::Heap(v) => v.extend_from_slice(slice),
+                    Repr::Inline { .. } => {
+                        unreachable!("spill path must leave InlineVec in heap mode")
+                    }
                 }
             }
         }
@@ -425,13 +460,14 @@ impl<T, const N: usize> From<Vec<T>> for InlineVec<T, N> {
 impl<T, const N: usize> FromIterator<T> for InlineVec<T, N> {
     /// Collects an iterator into an `InlineVec`.
     ///
-    /// Uses `size_hint().0` to decide the strategy up front:
+    /// Uses `size_hint()` to decide the strategy up front:
     ///
     /// - **lower bound > N**: the iterator guarantees more elements than
     ///   inline capacity, so we skip inline entirely and delegate to
-    ///   `Vec::from_iter`, which can allocate the right heap size in one
-    ///   shot. This avoids filling the inline buffer only to immediately
-    ///   spill.
+    ///   a heap `Vec`. In this heap path, we preallocate from the upper
+    ///   bound when available (falling back to the lower bound otherwise)
+    ///   to reduce growth churn during collection. This may over-allocate
+    ///   when an iterator reports a loose upper bound.
     ///
     /// - **lower bound <= N**: we push element-by-element. If the actual
     ///   count stays within N, everything remains inline. If it exceeds N,
@@ -443,10 +479,13 @@ impl<T, const N: usize> FromIterator<T> for InlineVec<T, N> {
     #[inline]
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         let iter = iter.into_iter();
-        let (lower, _) = iter.size_hint();
+        let (lower, upper) = iter.size_hint();
         if lower > N {
+            let prealloc = upper.unwrap_or(lower).max(lower);
+            let mut heap = Vec::with_capacity(prealloc);
+            heap.extend(iter);
             return Self {
-                repr: Repr::Heap(iter.collect()),
+                repr: Repr::Heap(heap),
             };
         }
         let mut v = Self::new();
@@ -466,7 +505,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a InlineVec<T, N> {
     }
 }
 
-// Compile-time proof that InlineVec is Send+Sync when T is.
+// Compile-time proof that InlineVec inherits Send/Sync from T.
 #[allow(dead_code)]
 const _: () = {
     fn assert_send<T: Send>() {}
@@ -775,14 +814,15 @@ mod tests {
 
     #[test]
     fn eq_same_content_different_repr() {
-        // a: inline, b: heap — same content should still be equal.
+        // Both values are inline here; equality is content-based regardless
+        // of representation.
         let a = InlineVec::<u32, 4>::from_slice(&[1, 2, 3]);
         let b: InlineVec<u32, 4> = vec![1, 2, 3, 4, 5]
             .into_iter()
             .take(3)
             .collect::<Vec<_>>()
             .into();
-        // b was built from a 3-element vec so it fits inline.
+        // b was built from a 3-element vec, so it also fits inline.
         assert_eq!(a, b);
     }
 
@@ -1055,6 +1095,32 @@ mod tests {
             matches!(v.repr, Repr::Inline { .. }),
             "should stay inline despite underestimate"
         );
+    }
+
+    #[test]
+    fn from_iter_heap_uses_upper_bound_preallocation() {
+        struct WideUpperHint(std::vec::IntoIter<u32>);
+        impl Iterator for WideUpperHint {
+            type Item = u32;
+            fn next(&mut self) -> Option<u32> {
+                self.0.next()
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (5, Some(64))
+            }
+        }
+
+        let v: InlineVec<u32, 4> = WideUpperHint(vec![1, 2, 3, 4, 5].into_iter()).collect();
+        assert_eq!(v.as_slice(), &[1, 2, 3, 4, 5]);
+        match &v.repr {
+            Repr::Heap(heap) => assert!(
+                heap.capacity() >= 64,
+                "heap path should preallocate using size_hint upper bound"
+            ),
+            Repr::Inline { .. } => {
+                panic!("should use heap path when size_hint lower bound exceeds inline capacity")
+            }
+        }
     }
 
     #[test]

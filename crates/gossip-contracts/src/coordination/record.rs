@@ -4,6 +4,7 @@
 //! ([`ParkReason`]), the full [`ShardRecord`] with runtime invariant
 //! assertions, and the worker-visible [`ShardSnapshot`].
 
+use std::borrow::Borrow;
 use std::fmt;
 
 use blake3::Hasher;
@@ -674,7 +675,8 @@ impl ShardRecord {
     /// Contains only the information a worker needs to resume scanning.
     /// Excludes lease, fence, op_log, tenant, park_reason, and identity
     /// fields (run, shard). The worker gets lease info from the Lease
-    /// return value and already knows its tenant and shard identity.
+    /// return value and already knows its tenant and shard identity. Spawned
+    /// children are copied by ID without exposing the internal container type.
     #[must_use]
     pub fn snapshot(&self) -> ShardSnapshot {
         self.assert_invariants();
@@ -684,7 +686,7 @@ impl ShardRecord {
             self.cursor.clone(),
             self.cursor_semantics,
             self.parent,
-            self.spawned.clone(),
+            self.spawned.iter(),
         )
     }
 
@@ -875,15 +877,24 @@ impl ShardSnapshot {
     ///
     /// Prefer [`ShardRecord::snapshot()`] which validates invariants
     /// before constructing.
+    ///
+    /// Accepts any iterator of borrowed [`ShardId`] values so callers can pass
+    /// slices, iterators, or concrete spawned-list containers without coupling
+    /// this API to one storage representation.
     #[must_use]
-    pub(crate) fn new(
+    pub(crate) fn new<I, S>(
         status: ShardStatus,
         spec: ShardSpec,
         cursor: Cursor,
         cursor_semantics: CursorSemantics,
         parent: Option<ShardId>,
-        spawned: SpawnedList,
-    ) -> Self {
+        spawned: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Borrow<ShardId>,
+    {
+        let spawned = spawned.into_iter().map(|id| *id.borrow()).collect();
         Self {
             status,
             spec,

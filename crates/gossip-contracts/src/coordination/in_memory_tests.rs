@@ -3498,6 +3498,64 @@ fn capacity_hint_helpers() {
     assert!(CapacityHint::ZERO.is_saturated());
 }
 
+/// Asserts constructor wrappers are behaviorally equivalent at initialization.
+///
+/// This guards the runtime-config migration: legacy constructor entry points
+/// must preserve both limits/cooldown semantics and initial capacity policy.
+fn assert_constructor_equivalent(lhs: &InMemoryCoordinator, rhs: &InMemoryCoordinator) {
+    assert_eq!(lhs.default_lease_duration, rhs.default_lease_duration);
+    assert_eq!(lhs.max_shards_per_tenant, rhs.max_shards_per_tenant);
+    assert_eq!(lhs.max_total_shards, rhs.max_total_shards);
+    assert_eq!(lhs.claim_cooldown_interval, rhs.claim_cooldown_interval);
+    assert_eq!(lhs.shards.capacity(), rhs.shards.capacity());
+    assert_eq!(lhs.runs.capacity(), rhs.runs.capacity());
+    assert_eq!(lhs.run_shards.capacity(), rhs.run_shards.capacity());
+    assert_eq!(
+        lhs.claim_cooldowns.capacity(),
+        rhs.claim_cooldowns.capacity()
+    );
+    assert_eq!(lhs.total_shard_count, rhs.total_shard_count);
+    assert_eq!(lhs.total_shard_count, 0);
+    assert!(lhs.shards.is_empty());
+    assert!(lhs.runs.is_empty());
+    assert!(lhs.run_shards.is_empty());
+    assert!(lhs.claim_cooldowns.is_empty());
+}
+
+#[test]
+fn runtime_constructor_matches_new_defaults() {
+    let runtime = InMemoryCoordinator::with_runtime_config(CoordinatorRuntimeConfig::with_limits(
+        LEASE_DURATION,
+        DEFAULT_MAX_SHARDS_PER_TENANT,
+        DEFAULT_MAX_TOTAL_SHARDS,
+    ));
+    let legacy = InMemoryCoordinator::new(LEASE_DURATION);
+    assert_constructor_equivalent(&runtime, &legacy);
+}
+
+#[test]
+fn runtime_constructor_matches_with_limits() {
+    let runtime = InMemoryCoordinator::with_runtime_config(CoordinatorRuntimeConfig::with_limits(
+        LEASE_DURATION,
+        123,
+        456,
+    ));
+    let legacy = InMemoryCoordinator::with_limits(LEASE_DURATION, 123, 456);
+    assert_constructor_equivalent(&runtime, &legacy);
+}
+
+#[test]
+fn runtime_constructor_matches_with_cooldown() {
+    let runtime = InMemoryCoordinator::with_runtime_config(CoordinatorRuntimeConfig::new(
+        LEASE_DURATION,
+        123,
+        456,
+        9,
+    ));
+    let legacy = InMemoryCoordinator::with_cooldown(LEASE_DURATION, 123, 456, 9);
+    assert_constructor_equivalent(&runtime, &legacy);
+}
+
 // -- CoordinatorConfig memory budget smoke tests ------------------------------
 
 #[test]
@@ -3553,7 +3611,7 @@ fn coordinator_config_memory_budget_mb_overflow_panics_deterministically() {
     let _ = cfg.memory_budget_mb();
 }
 
-/// Validates that the hardcoded constants in `memory_budget()` match
+/// Validates that the planning constants in `memory_budget()` match
 /// actual struct sizes on this platform. If this test fails, the
 /// constants in `CoordinatorConfig::memory_budget()` need updating.
 #[test]
@@ -3565,11 +3623,9 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The budget formula uses 736 for ShardRecord and 576 for RunRecord.
-    // These are documented in the memory_budget() doc comment.
-    // Allow some tolerance for future field additions, but flag large drift.
-    // These constants must match the values used in memory_budget().
-    // If this assertion fails, update BOTH the constant here AND in memory_budget().
+    // The planning formula uses 776 for ShardRecord and 512 for RunRecord.
+    // These are documented in `CoordinatorConfig::memory_budget()`.
+    // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
         shard_size, 776,
         "ShardRecord size changed from 776 to {shard_size}; \

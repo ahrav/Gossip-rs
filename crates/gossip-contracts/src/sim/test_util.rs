@@ -20,6 +20,7 @@
 //!   `TestRecordBuilder::new(…).status(Done).build()`.
 
 use proptest::prelude::*;
+use std::borrow::Borrow;
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::lease::LeaseHolder;
@@ -142,7 +143,7 @@ pub(crate) fn make_key(run: u64, shard: u64) -> ShardKey {
 /// | `lease` | `None` (unleased) |
 /// | `fence_epoch` | `FenceEpoch::INITIAL` |
 /// | `parent` | `None` |
-/// | `spawned` | empty `SpawnedList` (`InlineVec<ShardId, 8>`) |
+/// | `spawned` | empty spawned-child list |
 /// | `op_log` | empty `RingBuffer` (always — no setter) |
 ///
 /// # Validation bypass
@@ -170,7 +171,7 @@ pub(crate) struct TestRecordBuilder {
     lease: Option<LeaseHolder>,
     fence_epoch: FenceEpoch,
     parent: Option<ShardId>,
-    spawned: crate::coordination::record::SpawnedList,
+    spawned: Vec<ShardId>,
 }
 
 impl TestRecordBuilder {
@@ -189,7 +190,7 @@ impl TestRecordBuilder {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
-            spawned: crate::coordination::record::SpawnedList::new(),
+            spawned: Vec::new(),
         }
     }
 
@@ -243,8 +244,15 @@ impl TestRecordBuilder {
     }
 
     /// Set the spawned children list (default: empty).
-    pub fn spawned(mut self, spawned: crate::coordination::record::SpawnedList) -> Self {
-        self.spawned = spawned;
+    ///
+    /// Accepts any iterator over `ShardId` values or references so test code
+    /// does not depend on the production spawned-list storage type.
+    pub fn spawned<I, S>(mut self, spawned: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Borrow<ShardId>,
+    {
+        self.spawned = spawned.into_iter().map(|id| *id.borrow()).collect();
         self
     }
 
@@ -265,7 +273,7 @@ impl TestRecordBuilder {
             self.lease,
             self.fence_epoch,
             self.parent,
-            self.spawned,
+            self.spawned.into_iter().collect(),
             RingBuffer::new(),
         )
     }
