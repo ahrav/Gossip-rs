@@ -728,13 +728,6 @@ impl ShardRecord {
         self.cursor.release_fields(slab);
     }
 
-    /// Count of live (non-empty) slab slots held by this record.
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)] // Used in tests and simulation invariant checks.
-    pub(crate) fn live_field_count(&self) -> usize {
-        self.spec.live_field_count() + self.cursor.live_field_count()
-    }
-
     /// Look up an op-log entry by [`OpId`].
     ///
     /// Returns `None` if the OpId is not in the log (either never seen

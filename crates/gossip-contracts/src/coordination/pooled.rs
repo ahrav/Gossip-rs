@@ -398,19 +398,6 @@ impl PooledCursor {
         }
     }
 
-    /// Count of slab slots currently held (non-EMPTY handles inside `Some`).
-    ///
-    /// Returns 0-2 depending on which fields are populated. A field that
-    /// is `Some(ByteSlot::EMPTY)` is not counted — this can happen if a
-    /// zero-length byte slice was allocated (though `Cursor` constructors
-    /// normalize empty tokens to `None`, making this case theoretical).
-    #[cfg(debug_assertions)]
-    #[allow(dead_code)] // Used by ShardRecord::live_field_count and tests.
-    pub(crate) fn live_field_count(&self) -> usize {
-        let key_live = self.last_key.is_some_and(|s| !s.is_empty());
-        let token_live = self.token.is_some_and(|s| !s.is_empty());
-        usize::from(key_live) + usize::from(token_live)
-    }
 }
 
 impl std::fmt::Debug for PooledCursor {
