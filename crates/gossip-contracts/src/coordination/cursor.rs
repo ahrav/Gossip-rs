@@ -27,12 +27,12 @@ use crate::identity::CanonicalBytes;
 /// this are almost certainly a serialisation bug, not legitimate progress.
 pub const MAX_KEY_SIZE: usize = 4_096;
 
-/// Maximum size of a cursor `token` in bytes (64 KiB).
+/// Maximum size of a cursor `token` in bytes (16 KiB).
 ///
-/// Generous ceiling for opaque connector resume state. Tokens are never
-/// interpreted by the coordinator, but unbounded tokens would bloat
-/// checkpoint storage.
-pub const MAX_TOKEN_SIZE: usize = 65_536;
+/// Ceiling for opaque connector resume state. Observed tokens:
+/// GitHub API (~50 B), Elasticsearch scroll (2-10 KB), Azure AD JWT (~15 KB).
+/// 16 KiB accommodates the largest observed token with minimal margin.
+pub const MAX_TOKEN_SIZE: usize = 16_384;
 
 // ============================================================================
 // Cursor
@@ -648,12 +648,12 @@ mod tests {
     #[test]
     fn cursor_input_error_display_token_too_large() {
         let err = CursorInputError::TokenTooLarge {
-            size: 70000,
-            max: 65536,
+            size: 20000,
+            max: 16384,
         };
         let msg = err.to_string();
-        assert!(msg.contains("70000"));
-        assert!(msg.contains("65536"));
+        assert!(msg.contains("20000"));
+        assert!(msg.contains("16384"));
     }
 
     // -------------------------------------------------------------------

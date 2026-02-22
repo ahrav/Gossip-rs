@@ -481,7 +481,7 @@ mod tests {
         let missing_child = ShardId::from_raw((1u64 << 63) | 99);
         let split_record = TestRecordBuilder::new(TENANT, run, shard)
             .status(ShardStatus::Split)
-            .spawned(vec![missing_child])
+            .spawned(gossip_stdx::InlineVec::from_slice(&[missing_child]))
             .build();
         injector.inject_shard(TENANT, key, split_record);
 

@@ -142,7 +142,7 @@ pub(crate) fn make_key(run: u64, shard: u64) -> ShardKey {
 /// | `lease` | `None` (unleased) |
 /// | `fence_epoch` | `FenceEpoch::INITIAL` |
 /// | `parent` | `None` |
-/// | `spawned` | empty `Vec` |
+/// | `spawned` | empty `SpawnedList` (`InlineVec<ShardId, 8>`) |
 /// | `op_log` | empty `RingBuffer` (always — no setter) |
 ///
 /// # Validation bypass
@@ -170,7 +170,7 @@ pub(crate) struct TestRecordBuilder {
     lease: Option<LeaseHolder>,
     fence_epoch: FenceEpoch,
     parent: Option<ShardId>,
-    spawned: Vec<ShardId>,
+    spawned: crate::coordination::record::SpawnedList,
 }
 
 impl TestRecordBuilder {
@@ -189,7 +189,7 @@ impl TestRecordBuilder {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
-            spawned: vec![],
+            spawned: crate::coordination::record::SpawnedList::new(),
         }
     }
 
@@ -243,7 +243,7 @@ impl TestRecordBuilder {
     }
 
     /// Set the spawned children list (default: empty).
-    pub fn spawned(mut self, spawned: Vec<ShardId>) -> Self {
+    pub fn spawned(mut self, spawned: crate::coordination::record::SpawnedList) -> Self {
         self.spawned = spawned;
         self
     }

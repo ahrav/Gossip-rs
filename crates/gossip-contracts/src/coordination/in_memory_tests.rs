@@ -642,7 +642,7 @@ fn derived_shard_id(base: u64) -> ShardId {
 /// lets spawn-cap tests start at an exact distance from the limit
 /// without performing actual split operations.
 fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
-    let spawned: Vec<ShardId> = (0..spawned_count as u64)
+    let spawned: crate::coordination::record::SpawnedList = (0..spawned_count as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
     let record = ShardRecord::from_raw_parts(
@@ -3496,4 +3496,38 @@ fn capacity_hint_helpers() {
     assert_eq!(CapacityHint::ZERO.available_count, 0);
     assert_eq!(CapacityHint::ZERO.earliest_deadline, None);
     assert!(CapacityHint::ZERO.is_saturated());
+}
+
+// -- CoordinatorConfig memory budget smoke tests ------------------------------
+
+#[test]
+fn coordinator_config_dev_defaults_budget() {
+    let cfg = super::CoordinatorConfig::dev_defaults();
+    let mb = cfg.memory_budget_mb();
+    // Dev defaults: ~3 MiB. Allow 1-100 MiB range for formula drift.
+    assert!(
+        (1..=100).contains(&mb),
+        "dev_defaults budget {mb} MB outside expected 1-100 MB range"
+    );
+}
+
+#[test]
+fn coordinator_config_prod_defaults_budget() {
+    let cfg = super::CoordinatorConfig::prod_defaults();
+    let mb = cfg.memory_budget_mb();
+    // Prod defaults: 1M shards × ~17 KiB each ≈ 17 GB. Allow 5-25 GB range.
+    assert!(
+        (5_000..=25_000).contains(&mb),
+        "prod_defaults budget {mb} MB outside expected 5000-25000 MB range"
+    );
+}
+
+#[test]
+fn coordinator_config_memory_budget_mb_rounds_up() {
+    // A config that produces a non-MiB-aligned byte count should round up.
+    let cfg = super::CoordinatorConfig::new(1, 1, 1, 1, 1, 1);
+    let bytes = cfg.memory_budget();
+    let mb = cfg.memory_budget_mb();
+    let expected_mb = bytes.div_ceil(1 << 20);
+    assert_eq!(mb, expected_mb);
 }

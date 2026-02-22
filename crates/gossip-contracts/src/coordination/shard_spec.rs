@@ -29,11 +29,12 @@ use crate::identity::CanonicalBytes;
 /// on an unrelated constant.
 pub const MAX_KEY_SIZE: usize = 4_096;
 
-/// Maximum size of shard-spec opaque metadata in bytes (64 KiB).
+/// Maximum size of shard-spec opaque metadata in bytes (16 KiB).
 ///
-/// Metadata is stored verbatim by the coordinator. Unbounded metadata
-/// would bloat coordination state.
-pub const MAX_METADATA_SIZE: usize = 65_536;
+/// Ceiling for opaque connector metadata. Observed metadata:
+/// TruffleHog (200-500 B), JWT (2-4 KB), config drift (~8 KB).
+/// 16 KiB provides 2x headroom over worst observed.
+pub const MAX_METADATA_SIZE: usize = 16_384;
 
 // ============================================================================
 // CursorSemantics
@@ -1051,12 +1052,12 @@ mod tests {
     #[test]
     fn shard_spec_input_error_display_metadata_too_large() {
         let err = ShardSpecInputError::MetadataTooLarge {
-            size: 70000,
-            max: 65536,
+            size: 20000,
+            max: 16384,
         };
         let msg = err.to_string();
-        assert!(msg.contains("70000"));
-        assert!(msg.contains("65536"));
+        assert!(msg.contains("20000"));
+        assert!(msg.contains("16384"));
     }
 
     // -------------------------------------------------------------------

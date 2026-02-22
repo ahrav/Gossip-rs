@@ -34,3 +34,5 @@ specs/coordination/states/
 
 # TLA+ tooling (download from tlaplus/tlaplus releases)
 specs/tla2tools.jar
+
+*.tar.gz

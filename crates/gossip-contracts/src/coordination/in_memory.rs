@@ -71,7 +71,7 @@
 //! target run — O(S) where S is the run's shard count. Acceptable here;
 //! production backends need a secondary available-shards index.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::coordination::cursor::Cursor;
 use crate::coordination::error::{
@@ -111,6 +111,129 @@ use gossip_stdx::RingBuffer;
 /// provides hash-flooding resistance via per-instance random keys
 /// (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
+
+/// Capacity planning configuration for memory budget estimation.
+///
+/// Models the coordinator's worst-case memory footprint based on
+/// deployment-level parameters. See `docs/memory-budget-audit.md`.
+///
+/// NOT wired into constructors — this is a standalone planning tool.
+/// The coordinator's existing constructors (`new`, `with_limits`,
+/// `with_cooldown`) remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoordinatorConfig {
+    /// Global shard cap.
+    pub max_total_shards: usize,
+    /// Per-tenant shard cap.
+    pub max_shards_per_tenant: usize,
+    /// Maximum concurrent runs.
+    pub max_runs: usize,
+    /// Maximum distinct workers.
+    pub max_workers: usize,
+    /// Per-shard byte budget for variable-length fields (keys, metadata, token, spawned).
+    pub per_shard_budget: usize,
+    /// Per-run byte budget for root_shards + op results.
+    pub per_run_budget: usize,
+}
+
+impl CoordinatorConfig {
+    /// Create a config with explicit parameters.
+    #[must_use]
+    pub const fn new(
+        max_total_shards: usize,
+        max_shards_per_tenant: usize,
+        max_runs: usize,
+        max_workers: usize,
+        per_shard_budget: usize,
+        per_run_budget: usize,
+    ) -> Self {
+        Self {
+            max_total_shards,
+            max_shards_per_tenant,
+            max_runs,
+            max_workers,
+            per_shard_budget,
+            per_run_budget,
+        }
+    }
+
+    /// Defaults for local development and unit tests.
+    ///
+    /// ~3 MiB: 512 shards, 64 runs, 16 workers.
+    #[must_use]
+    pub const fn dev_defaults() -> Self {
+        Self {
+            max_total_shards: 512,
+            max_shards_per_tenant: 256,
+            max_runs: 64,
+            max_workers: 16,
+            per_shard_budget: 4_096,
+            per_run_budget: 2_048,
+        }
+    }
+
+    /// Defaults for staging / integration tests.
+    ///
+    /// ~91 MiB: 10 K shards, 1 K runs, 256 workers.
+    #[must_use]
+    pub const fn staging_defaults() -> Self {
+        Self {
+            max_total_shards: 10_000,
+            max_shards_per_tenant: 2_000,
+            max_runs: 1_000,
+            max_workers: 256,
+            per_shard_budget: 8_192,
+            per_run_budget: 4_096,
+        }
+    }
+
+    /// Defaults for production deployments.
+    ///
+    /// ~17 GiB: 1 M shards, 100 K runs, 10 K workers.
+    #[must_use]
+    pub const fn prod_defaults() -> Self {
+        Self {
+            max_total_shards: 1_000_000,
+            max_shards_per_tenant: 100_000,
+            max_runs: 100_000,
+            max_workers: 10_000,
+            per_shard_budget: 16_384,
+            per_run_budget: 8_192,
+        }
+    }
+
+    /// Estimate worst-case memory budget in bytes.
+    ///
+    /// Formula: `M = S * (736 + B_s + 72) + R * (576 + B_r + 80) + W * 16 + 4096`
+    ///
+    /// Where:
+    /// - `S` = `max_total_shards`, `B_s` = `per_shard_budget`
+    /// - `R` = `max_runs`, `B_r` = `per_run_budget`
+    /// - `W` = `max_workers`
+    /// - 736 = fixed-size portion of `ShardRecord`
+    /// - 72 = per-entry HashMap overhead (key + bucket metadata)
+    /// - 576 = fixed-size portion of `RunRecord`
+    /// - 80 = per-entry HashMap overhead for run entries
+    /// - 16 = per-entry in claim_cooldowns
+    /// - 4096 = base coordinator struct + map headers
+    #[must_use]
+    pub const fn memory_budget(&self) -> usize {
+        let per_shard = 736 + self.per_shard_budget + 72;
+        let per_run = 576 + self.per_run_budget + 80;
+        let per_worker = 16;
+        let base = 4096;
+        self.max_total_shards * per_shard
+            + self.max_runs * per_run
+            + self.max_workers * per_worker
+            + base
+    }
+
+    /// Estimate worst-case memory budget in mebibytes (rounded up).
+    #[must_use]
+    pub const fn memory_budget_mb(&self) -> usize {
+        self.memory_budget().div_ceil(1 << 20)
+    }
+}
 
 /// In-memory coordinator for shard-level operations.
 ///
@@ -172,10 +295,8 @@ pub struct InMemoryCoordinator {
     max_total_shards: usize,
     /// Per-worker claim cooldown: worker -> last successful claim time.
     ///
-    /// Uses `BTreeMap` (not `HashMap`) for deterministic `Debug` output,
-    /// which aids simulation debugging. Only accessed via point lookups
-    /// (`get`/`insert`). Grows at most one entry per distinct `WorkerId`
-    /// that successfully claims a shard.
+    /// Only accessed via point lookups (`get`/`insert`). Grows at most one
+    /// entry per distinct `WorkerId` that successfully claims a shard.
     ///
     /// Entries are never evicted: once a worker claims, its timestamp
     /// remains for the coordinator's lifetime. This is acceptable
@@ -183,7 +304,7 @@ pub struct InMemoryCoordinator {
     /// (b) adding periodic eviction would turn the O(1)
     /// `check_cooldown` path into O(N). Production backends should
     /// use TTL-based eviction at the storage layer.
-    claim_cooldowns: BTreeMap<WorkerId, LogicalTime>,
+    claim_cooldowns: AHashMap<WorkerId, LogicalTime>,
     /// Minimum logical time units between successive successful claims
     /// by the same worker. Zero disables cooldown entirely.
     ///
@@ -220,14 +341,14 @@ impl InMemoryCoordinator {
         );
         assert!(max_total_shards > 0, "max_total_shards must be > 0");
         Self {
-            shards: AHashMap::default(),
+            shards: AHashMap::with_capacity_and_hasher(64, ahash::RandomState::default()),
             total_shard_count: 0,
-            runs: AHashMap::default(),
-            run_shards: AHashMap::default(),
+            runs: AHashMap::with_capacity_and_hasher(64, ahash::RandomState::default()),
+            run_shards: AHashMap::with_capacity_and_hasher(64, ahash::RandomState::default()),
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
-            claim_cooldowns: BTreeMap::new(),
+            claim_cooldowns: AHashMap::with_capacity_and_hasher(64, ahash::RandomState::default()),
             claim_cooldown_interval: 0,
         }
     }
@@ -292,7 +413,7 @@ impl InMemoryCoordinator {
         let key = ShardKey::new(record.run, record.shard);
         self.run_shards
             .entry((record.tenant, record.run))
-            .or_default()
+            .or_insert_with(|| HashSet::with_capacity_and_hasher(16, ahash::RandomState::default()))
             .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
     }
@@ -306,7 +427,7 @@ impl InMemoryCoordinator {
         let key = ShardKey::new(record.run, record.shard);
         self.run_shards
             .entry((record.tenant, record.run))
-            .or_default()
+            .or_insert_with(|| HashSet::with_capacity_and_hasher(16, ahash::RandomState::default()))
             .insert(record.shard);
         self.shard_insert(record.tenant, key, record);
     }
@@ -370,7 +491,9 @@ impl InMemoryCoordinator {
     /// the remove-mutate-restore pattern in split operations removes a
     /// parent, then re-inserts the mutated parent at the same key.
     fn shard_insert(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
-        let inner = self.shards.entry(tenant).or_default();
+        let inner = self.shards.entry(tenant).or_insert_with(|| {
+            AHashMap::with_capacity_and_hasher(64, ahash::RandomState::default())
+        });
         if inner.insert(key, record).is_none() {
             self.total_shard_count += 1;
         }
@@ -1319,7 +1442,7 @@ impl InMemoryCoordinator {
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
         self.run_shards
             .entry((tenant, run))
-            .or_default()
+            .or_insert_with(|| HashSet::with_capacity_and_hasher(16, ahash::RandomState::default()))
             .insert(shard);
     }
 
@@ -1629,7 +1752,9 @@ impl RunManagement for InMemoryCoordinator {
 
         self.run_shards
             .entry((tenant, run))
-            .or_default()
+            .or_insert_with(|| {
+                HashSet::with_capacity_and_hasher(shard_ids.len(), ahash::RandomState::default())
+            })
             .extend(shard_ids.iter().copied());
 
         // 7. Transition run → Active.

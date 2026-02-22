@@ -11,6 +11,8 @@
 //! cargo +nightly miri test -p gossip-stdx
 //! ```
 
+mod inline_vec;
 mod ring_buffer;
 
+pub use inline_vec::InlineVec;
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};
