@@ -181,8 +181,10 @@ pub struct CoordinatorRuntimeConfig {
     /// Zero disables cooldown.
     pub claim_cooldown_interval: u64,
     /// Byte slab capacity for arena-pooled shard fields (spec + cursor).
-    /// Zero uses an auto-sized default derived from `max_total_shards`
-    /// and capped to avoid pathological eager allocation.
+    /// Zero uses an auto-sized default:
+    /// `min(max_total_shards * DEFAULT_PER_SHARD_SLAB_BUDGET,
+    /// DEFAULT_MAX_AUTO_SLAB_CAPACITY)`.
+    /// The cap avoids pathological eager allocation on large shard limits.
     pub slab_capacity: usize,
 }
 
@@ -235,7 +237,7 @@ impl CoordinatorRuntimeConfig {
     }
 
     /// Derive slab capacity from config, using the explicit value if set
-    /// or computing a capped default from `max_total_shards`.
+    /// or computing the capped default formula from `max_total_shards`.
     const fn effective_slab_capacity(&self) -> usize {
         if self.slab_capacity > 0 {
             self.slab_capacity
@@ -1257,7 +1259,9 @@ impl CoordinationBackend for InMemoryCoordinator {
     ///   2. **Build** — derive the residual shard ID (BLAKE3 with domain
     ///      separation) and construct its record (pure).
     ///   3. **Apply** — update the parent's spec and spawned list, insert
-    ///      the residual into the map, and update indexes.
+    ///      the residual into the map, and update indexes. If parent update
+    ///      fails after build, staged residual allocations are explicitly
+    ///      deallocated before returning the error.
     ///
     /// Uses the same remove-mutate-restore pattern and shard-count limit
     /// guard as `split_replace`.
@@ -1322,6 +1326,8 @@ impl CoordinationBackend for InMemoryCoordinator {
                 now,
                 &mut self.slab,
             ) {
+                // Parent update failed after we built the residual record.
+                // Roll back staged residual slab allocations before returning.
                 residual_record.deallocate_fields(&mut self.slab);
                 return Err(e);
             }
@@ -2004,8 +2010,8 @@ impl RunManagement for InMemoryCoordinator {
     ///   3. Status — must be `Initializing`.
     ///   4. Manifest validation (uniqueness, non-empty, etc.).
     ///   5. Shard-count limit guard.
-    ///   6. Shard record creation + index update.
-    ///   7. Run record transition to `Active` with op-log entry.
+    ///   6. Stage shard record creation with rollback on allocation failure.
+    ///   7. Insert staged records, update index, transition run to `Active`.
     fn register_shards(
         &mut self,
         now: LogicalTime,
@@ -2077,7 +2083,8 @@ impl RunManagement for InMemoryCoordinator {
         // 6. Build shard records, then insert.
         //
         // Build first so recoverable allocation failures (`SlabFull`) return
-        // an error without partially mutating shard maps.
+        // an error without partially mutating shard maps. Any staged records
+        // are deallocated before returning so this path stays all-or-nothing.
         let cursor_semantics = record.config.cursor_semantics();
         let shard_ids: Vec<ShardId> = shards.iter().map(|s| s.shard()).collect();
         let mut to_insert: Vec<(ShardKey, ShardRecord)> = Vec::with_capacity(shards.len());
@@ -2109,7 +2116,8 @@ impl RunManagement for InMemoryCoordinator {
             if !s.cursor().is_initial()
                 && let Err(err) = sr.cursor.update(s.cursor(), &mut self.slab)
             {
-                // Current record + all staged records were not inserted yet.
+                // Current record + all staged records were not inserted yet;
+                // deallocate all staged slab fields before returning.
                 sr.deallocate_fields(&mut self.slab);
                 for (_, mut staged) in to_insert {
                     staged.deallocate_fields(&mut self.slab);

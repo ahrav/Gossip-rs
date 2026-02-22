@@ -443,6 +443,7 @@ fn split_residual_cursor_out_of_bounds() {
 
 #[test]
 fn split_residual_parent_update_failure_deallocates_residual_fields() {
+    // Regression guard for the phase-2/phase-3 boundary in split_residual.
     // Capacity math (16-byte min blocks):
     // - Parent spec [a,z): 2 slots => 32 bytes
     // - Residual spec [m,z): 2 slots => 32 bytes (total 64)
@@ -1527,12 +1528,11 @@ fn lifecycle_split_residual_twice_then_complete_children() {
     assert!(matches!(r2_err, AcquireError::ShardTerminal { .. }));
 }
 
-// -- slab exhaustion: split_residual leak on apply-parent failure ----------
+// -- slab exhaustion: split_residual cleanup on apply-parent failure --------
 //
-// When split_residual_apply_parent fails (e.g. SlabFull during
-// parent.spec.update), the residual_record built in Phase 2 is dropped
-// without calling deallocate_fields. Since pooled types have no Drop impl,
-// this permanently leaks slab allocations.
+// Regression guard: when `split_residual_apply_parent` fails (e.g. `SlabFull`
+// during `parent.spec.update`), the residual record built in phase 2 must be
+// explicitly deallocated before returning the error.
 
 #[test]
 fn split_residual_cleans_up_residual_on_apply_parent_failure() {
@@ -1540,19 +1540,19 @@ fn split_residual_cleans_up_residual_on_apply_parent_failure() {
     // shard + the residual record, but NOT for the parent spec update
     // inside split_residual_apply_parent.
     //
-    // Layout (non-empty fields round to MIN_BLOCK=16 bytes; empty
-    // metadata returns ByteSlot::EMPTY, no allocation):
-    //   initial shard spec: 2 slots × 16 = 32 bytes  (start + end)
-    //   residual spec:      2 slots × 16 = 32 bytes
-    //   parent update:      2 slots × 16 = 32 bytes  (allocated BEFORE old freed)
+    // Layout (non-empty fields round to MIN_BLOCK=16 bytes; empty metadata
+    // and `Cursor::initial()` allocate nothing):
+    //   initial shard spec: 2 slots x 16 = 32 bytes (start + end)
+    //   residual spec:      2 slots x 16 = 32 bytes
+    //   parent update:      2 slots x 16 = 32 bytes (allocated before old freed)
     //
-    // With slab_capacity=64 the first two succeed (bump at 64); the
-    // parent update needs 32 more bytes while 64 are in use → SlabFull.
+    // With slab_capacity=64 the first two succeed (usage reaches 64). The
+    // parent update needs 32 more bytes while 64 are still in use -> SlabFull.
     let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 10, 10);
     config.slab_capacity = 64;
     let mut coord = InMemoryCoordinator::with_runtime_config(config);
 
-    // Seed the coordinator with one run + one shard (uses 48 bytes).
+    // Seed the coordinator with one run + one shard (uses 32 slab bytes).
     let run_config = crate::coordination::RunConfig::try_new(
         CursorSemantics::Completed,
         LEASE_DURATION,
@@ -1583,10 +1583,9 @@ fn split_residual_cleans_up_residual_on_apply_parent_failure() {
     // Record slab state before the split attempt.
     let live_before = coord.slab.live_count();
 
-    // Attempt split_residual. Phase 2 (build residual) will succeed,
-    // consuming another 48 bytes (total 96). Phase 3 (apply parent)
-    // needs to allocate 48 more bytes for the new parent spec before
-    // freeing the old — but the slab only has 96 bytes, so this fails.
+    // Attempt split_residual. Phase 2 (build residual) succeeds, consuming
+    // another 32 bytes (total 64). Phase 3 (apply parent) needs 32 more bytes
+    // for the new parent spec before freeing the old, so this fails.
     let plan = test_split_residual_plan();
     let err = coord
         .split_residual(now(4), test_tenant(), &lease, plan, OpId::from_raw(1))

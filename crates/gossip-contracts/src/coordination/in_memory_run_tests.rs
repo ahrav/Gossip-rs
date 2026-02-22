@@ -904,7 +904,8 @@ fn unpark_shard_rejected_when_run_done() {
 // Covers register_shards edge cases: idempotent replay (same OpId +
 // payload returns Replayed with identical shard IDs), OpIdConflict
 // (same OpId + different shard list), wrong-status rejection (run
-// already Active), and not-found error.
+// already Active), not-found error, and staged-build rollback on
+// allocation failure (no partial inserts).
 
 #[test]
 fn register_shards_idempotent_replay() {
@@ -1018,7 +1019,9 @@ fn register_shards_run_not_found() {
 fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
     // Two shards with bounded ranges need 4 non-empty spec slots total.
     // With 16-byte minimum block size, that is 64 bytes. A 32-byte slab can
-    // allocate at most one shard spec before returning SlabFull.
+    // allocate at most one shard spec before returning SlabFull. The
+    // coordinator stages record builds, so this should roll back to zero
+    // inserted shards instead of leaving a partially registered run.
     let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 10, 10);
     runtime.slab_capacity = 32;
     let mut coord = InMemoryCoordinator::with_runtime_config(runtime);

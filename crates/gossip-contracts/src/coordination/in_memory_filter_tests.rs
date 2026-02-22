@@ -835,12 +835,15 @@ fn runtime_constructor_matches_with_cooldown() {
 
 #[test]
 fn runtime_constructor_caps_auto_slab_capacity() {
+    // `new()` uses runtime defaults (1_000_000 max shards). Auto sizing would
+    // exceed the configured startup cap, so capacity must clamp to the cap.
     let coord = InMemoryCoordinator::new(LEASE_DURATION);
     assert_eq!(coord.slab().capacity(), DEFAULT_MAX_AUTO_SLAB_CAPACITY);
 }
 
 #[test]
 fn runtime_constructor_respects_explicit_slab_capacity() {
+    // Explicit slab capacity bypasses the auto-sizing formula and cap.
     let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 123, 456);
     config.slab_capacity = 8 * 1024;
     let coord = InMemoryCoordinator::with_runtime_config(config);
