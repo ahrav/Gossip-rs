@@ -41,9 +41,13 @@ The module provides six core capabilities:
 | `lease.rs`      | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`            |
 | `cursor.rs`     | `Cursor` type with monotonicity and bounds semantics                  |
 | `shard_spec.rs` | `ShardSpec` key-range type, `CursorSemantics`, split validation       |
+| `pooled.rs`     | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers |
 | `error.rs`      | Shared `CoordError` and `IdempotentOutcome`                           |
 | `run_errors.rs` | Run-management error types                                            |
 | `validation.rs` | `validate_lease`, `validate_cursor_update`, `check_op_idempotency`    |
+| `events.rs`     | `EventCollector`, `EventKind`, `StateTransitionEvent`                 |
+| `facade.rs`     | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                   |
+| `session.rs`    | `WorkerSession` ergonomic wrapper with move/borrow lifecycle          |
 | `mod.rs`        | Module root and public re-exports                                     |
 
 ---
@@ -519,6 +523,13 @@ The `Cursor` type is a two-layer progress marker:
 └──────────────────────────────────────────────────────┘
 ```
 
+The `Cursor` type is the API-boundary representation used across
+`CoordinationBackend` trait methods. Internally, the in-memory coordinator
+stores cursor fields as `PooledCursor` — a pair of `Option<ByteSlot>` handles
+into a shared `ByteSlab` — eliminating per-checkpoint heap allocations on the
+hot path. The `to_cursor` / `from_cursor` methods convert between the pooled
+representation and the owned `Cursor` at API boundaries.
+
 ### Monotonicity rules
 
 | old.last_key | new.last_key             | Verdict                     |
@@ -584,6 +595,7 @@ half-open `[start, end)` byte-key ranges.
 | D2.23 | `LogicalTime` passed explicitly to all mutating operations                        |
 | D2.24 | Shard listing returns `ShardSummary` (lightweight)                                |
 | D2.25 | `RunRecord` has its own op-log (cap: 8)                                           |
+| D2.26 | Arena-pooled byte storage via `ByteSlab` for `ShardRecord` variable-size fields   |
 
 ---
 
@@ -651,6 +663,12 @@ coordination protocol. It implements both `CoordinationBackend` and
   concurrency concerns so invariants can be verified in-line.
 - **Purely in-memory** -- two-level `AHashMap<TenantId, AHashMap<ShardKey, ShardRecord>>`.
   No I/O, no transactions, no retries.
+- **Arena-pooled byte storage** -- a shared `slab: ByteSlab` owns all
+  variable-size byte data (key-range start/end, metadata, cursor last-key,
+  cursor token). `ShardRecord` fields hold `PooledShardSpec` and
+  `PooledCursor` wrappers whose `ByteSlot` handles index into the slab.
+  This replaces per-field `Box<[u8]>` heap allocations with slab operations
+  on the `checkpoint` and `acquire_and_restore` hot paths (D2.26).
 - **Tiger-style invariant enforcement** -- every mutation path calls
   `ShardRecord::assert_invariants()` before returning.
 
