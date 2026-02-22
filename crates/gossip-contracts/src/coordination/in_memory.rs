@@ -2106,15 +2106,15 @@ impl RunManagement for InMemoryCoordinator {
                     return Err(err.into());
                 }
             };
-            if !s.cursor().is_initial() {
-                if let Err(err) = sr.cursor.update(s.cursor(), &mut self.slab) {
-                    // Current record + all staged records were not inserted yet.
-                    sr.deallocate_fields(&mut self.slab);
-                    for (_, mut staged) in to_insert {
-                        staged.deallocate_fields(&mut self.slab);
-                    }
-                    return Err(err.into());
+            if !s.cursor().is_initial()
+                && let Err(err) = sr.cursor.update(s.cursor(), &mut self.slab)
+            {
+                // Current record + all staged records were not inserted yet.
+                sr.deallocate_fields(&mut self.slab);
+                for (_, mut staged) in to_insert {
+                    staged.deallocate_fields(&mut self.slab);
                 }
+                return Err(err.into());
             }
             sr.assert_invariants();
             to_insert.push((key, sr));
