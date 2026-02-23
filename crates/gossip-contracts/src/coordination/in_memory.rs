@@ -2225,9 +2225,19 @@ impl RunManagement for InMemoryCoordinator {
     /// Compute an aggregate progress snapshot for a run by iterating its
     /// shards and counting statuses and lease states.
     ///
-    /// The result is order-independent — `count_shard` accumulates via
-    /// addition, which is commutative.  This is important because
-    /// `run_shards` is a `HashSet` with non-deterministic iteration order.
+    /// The result is order-independent: status tallies use addition and the
+    /// watermark uses lexicographic minimum; both are commutative/associative.
+    /// This is important because `run_shards` is a `HashSet` with
+    /// non-deterministic iteration order.
+    ///
+    /// Watermark contract (matches `RunProgress` docs + tests):
+    /// - consider only `Active` shards,
+    /// - among those, consider only non-initial cursors (`last_key` present),
+    /// - return the lexicographic minimum of considered keys,
+    /// - return `None` when no active shard has a `last_key`.
+    ///
+    /// `leased` is evaluated at `now`, so a shard at lease deadline is treated
+    /// as unleased (`now >= deadline`).
     fn get_run_progress(
         &self,
         now: LogicalTime,
@@ -2237,6 +2247,7 @@ impl RunManagement for InMemoryCoordinator {
         let _ = self.lookup_run(tenant, run)?;
 
         let mut progress = RunProgress::default();
+        let mut min_active_last_key: Option<&[u8]> = None;
         if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
@@ -2250,8 +2261,19 @@ impl RunManagement for InMemoryCoordinator {
                 });
                 let is_leased = record.is_leased_at(now);
                 progress.count_shard(record.status, is_leased);
+                // Watermark is an in-flight frontier: only active shards with
+                // a concrete `last_key` participate.
+                if record.status == ShardStatus::Active
+                    && let Some(last_key) = record.cursor.last_key(&self.slab)
+                {
+                    min_active_last_key = Some(match min_active_last_key {
+                        Some(current_min) if current_min <= last_key => current_min,
+                        _ => last_key,
+                    });
+                }
             }
         }
+        progress.watermark = min_active_last_key.map(|k| k.to_vec().into_boxed_slice());
         Ok(progress)
     }
 

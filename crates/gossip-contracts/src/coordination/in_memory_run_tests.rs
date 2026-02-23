@@ -15,7 +15,7 @@ use crate::coordination::test_fixtures::{
     LEASE_DURATION, coordinator_with_run_and_lease, do_split_replace, now, short_lease_run_config,
     test_run, test_split_residual_plan, test_tenant, test_worker,
 };
-use crate::identity::{OpId, RunId, ShardId, ShardKey};
+use crate::identity::{FenceEpoch, OpId, RunId, ShardId, ShardKey};
 use crate::sim::backend::SimIntrospection;
 
 // -- Split index consistency tests --
@@ -96,6 +96,260 @@ fn split_residual_child_visible_in_list_shards() {
         .iter()
         .any(|s| s.key_range_start() == b"m" && s.key_range_end() == b"z");
     assert!(has_residual, "residual [m,z) should be in listing");
+}
+
+// -- get_run_progress watermark tests ---------------------------------------
+
+#[test]
+fn all_active_initial_cursors_watermark_none() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"g".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"g".to_vec(), b"n".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(12),
+            ShardSpec::with_range(b"n".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(3), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 3);
+    assert_eq!(progress.watermark(), None);
+}
+
+#[test]
+fn mixed_progressed_and_initial_active_watermark_is_min_progressed() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"g".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"g".to_vec(), b"n".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(12),
+            ShardSpec::with_range(b"n".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    let shard_10 = ShardKey::new(test_run(), ShardId::from_raw(10));
+    let lease_10 = coord
+        .acquire_and_restore(now(3), test_tenant(), shard_10, test_worker(1))
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease_10,
+            Cursor::with_last_key(b"c".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let shard_11 = ShardKey::new(test_run(), ShardId::from_raw(11));
+    let lease_11 = coord
+        .acquire_and_restore(now(5), test_tenant(), shard_11, test_worker(2))
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(6),
+            test_tenant(),
+            &lease_11,
+            Cursor::with_last_key(b"k".to_vec()),
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(7), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 3);
+    assert_eq!(progress.watermark(), Some(b"c".as_slice()));
+}
+
+#[test]
+fn done_split_parked_excluded_from_watermark() {
+    let (mut coord, root_lease) = coordinator_with_run_and_lease();
+
+    // Set parent cursor before split so Split parent carries a small key.
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &root_lease,
+            Cursor::with_last_key(b"b".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let split_plan = SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"m".to_vec(), b"t".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"t".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ])
+    .unwrap();
+    let _ = coord
+        .split_replace(
+            now(5),
+            test_tenant(),
+            &root_lease,
+            split_plan,
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let active_children = coord
+        .list_shards(now(6), test_tenant(), test_run(), ShardFilter::active())
+        .unwrap();
+    assert_eq!(active_children.len(), 3);
+
+    let child_done = active_children
+        .iter()
+        .find(|s| s.key_range_start() == b"a")
+        .unwrap()
+        .shard();
+    let child_parked = active_children
+        .iter()
+        .find(|s| s.key_range_start() == b"m")
+        .unwrap()
+        .shard();
+    let child_active = active_children
+        .iter()
+        .find(|s| s.key_range_start() == b"t")
+        .unwrap()
+        .shard();
+
+    let lease_done = coord
+        .acquire_and_restore(
+            now(7),
+            test_tenant(),
+            ShardKey::new(test_run(), child_done),
+            test_worker(2),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .complete(
+            now(8),
+            test_tenant(),
+            &lease_done,
+            Cursor::with_last_key(b"d".to_vec()),
+            OpId::from_raw(12),
+        )
+        .unwrap();
+
+    let lease_parked = coord
+        .acquire_and_restore(
+            now(9),
+            test_tenant(),
+            ShardKey::new(test_run(), child_parked),
+            test_worker(3),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(10),
+            test_tenant(),
+            &lease_parked,
+            Cursor::with_last_key(b"n".to_vec()),
+            OpId::from_raw(13),
+        )
+        .unwrap();
+    let _ = coord
+        .park_shard(
+            now(11),
+            test_tenant(),
+            &lease_parked,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(14),
+        )
+        .unwrap();
+
+    let lease_active = coord
+        .acquire_and_restore(
+            now(12),
+            test_tenant(),
+            ShardKey::new(test_run(), child_active),
+            test_worker(4),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(13),
+            test_tenant(),
+            &lease_active,
+            Cursor::with_last_key(b"x".to_vec()),
+            OpId::from_raw(15),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(14), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.total(), 4);
+    assert_eq!(progress.split(), 1);
+    assert_eq!(progress.done(), 1);
+    assert_eq!(progress.parked(), 1);
+    assert_eq!(progress.active(), 1);
+    assert_eq!(
+        progress.watermark(),
+        Some(b"x".as_slice()),
+        "watermark must ignore Done/Split/Parked cursor keys",
+    );
 }
 
 // -- Shard count limit tests for register_shards --
@@ -1300,4 +1554,79 @@ fn full_run_lifecycle_create_register_process_complete() {
     let record = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(record.status(), RunStatus::Done);
     assert_eq!(record.completed_at(), Some(now(9)));
+}
+
+mod prop_progress_watermark {
+    use super::*;
+    use crate::test_util::miri_proptest_config;
+    use proptest::prelude::*;
+
+    fn arb_active_cursor_keys() -> impl Strategy<Value = Vec<Option<Vec<u8>>>> {
+        proptest::collection::vec(
+            proptest::option::of(proptest::collection::vec(0u8..=254u8, 1..16)),
+            1..32,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(miri_proptest_config())]
+
+        #[test]
+        fn watermark_bounds_and_none_condition_for_active_shards(
+            cursor_keys in arb_active_cursor_keys(),
+        ) {
+            let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+            let shard_ids: Vec<ShardId> = (0..cursor_keys.len())
+                .map(|i| ShardId::from_raw((i as u64) + 1))
+                .collect();
+            coord.seed_run(test_tenant(), test_run(), shard_ids.clone(), LEASE_DURATION);
+
+            for (shard_id, key) in shard_ids.into_iter().zip(cursor_keys.iter()) {
+                let cursor = key
+                    .as_ref()
+                    .map_or_else(Cursor::initial, |k| Cursor::with_last_key(k.clone()));
+                let record = ShardRecord::from_raw_parts(
+                    test_tenant(),
+                    test_run(),
+                    shard_id,
+                    ShardStatus::Active,
+                    None,
+                    &ShardSpec::with_range(vec![0x00], vec![0xFF]),
+                    &cursor,
+                    CursorSemantics::Completed,
+                    None,
+                    FenceEpoch::INITIAL,
+                    None,
+                    gossip_stdx::InlineVec::new(),
+                    RingBuffer::new(),
+                    coord.slab_mut(),
+                );
+                coord.seed_shard(record);
+            }
+
+            let progress = coord
+                .get_run_progress(now(10), test_tenant(), test_run())
+                .unwrap();
+            let expected_min = cursor_keys.iter().filter_map(|k| k.as_deref()).min();
+
+            match (progress.watermark(), expected_min) {
+                (None, None) => {}
+                (Some(actual), Some(min_key)) => {
+                    prop_assert_eq!(actual, min_key);
+                    for key in cursor_keys.iter().filter_map(|k| k.as_deref()) {
+                        prop_assert!(actual <= key);
+                    }
+                }
+                (None, Some(_)) => {
+                    prop_assert!(false, "watermark must be Some when any active shard progressed");
+                }
+                (Some(_), None) => {
+                    prop_assert!(
+                        false,
+                        "watermark must be None when no active shard has a last_key"
+                    );
+                }
+            }
+        }
+    }
 }

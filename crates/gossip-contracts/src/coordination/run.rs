@@ -706,7 +706,12 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// Fields are `pub(crate)` with public accessors. Uses `u32` (not `u64`)
 /// because the maximum shard count is bounded by `MAX_INITIAL_SHARDS` plus
 /// spawned children, well within `u32::MAX`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// `watermark` is the run's conservative in-flight frontier: the smallest
+/// lexicographic `last_key` among shards that are currently `Active` and have
+/// emitted at least one checkpoint/complete key. Initial cursors (`last_key =
+/// None`) are excluded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunProgress {
     pub(crate) total: u32,
     pub(crate) active: u32,
@@ -715,6 +720,14 @@ pub struct RunProgress {
     pub(crate) parked: u32,
     /// Subset of `active`: shards currently held by a worker lease.
     pub(crate) leased: u32,
+    /// Lexicographic minimum `cursor.last_key` among `Active` shards whose
+    /// cursor is non-initial.
+    ///
+    /// Terminal shards (`Done`/`Split`/`Parked`) are deliberately ignored even
+    /// if they carry cursor keys; this tracks in-flight progress only.
+    /// `None` means no active shard has progressed yet (including runs with
+    /// zero active shards).
+    pub(crate) watermark: Option<Box<[u8]>>,
 }
 
 impl RunProgress {
@@ -746,6 +759,16 @@ impl RunProgress {
     #[must_use]
     pub fn leased(&self) -> u32 {
         self.leased
+    }
+
+    /// Lexicographic minimum last-key among active, progressed shards.
+    ///
+    /// Returns `None` if there are no active shards with a non-initial cursor.
+    /// This can happen when all active shards are still at `Cursor::initial()`
+    /// or when the run has no active shards.
+    #[must_use]
+    pub fn watermark(&self) -> Option<&[u8]> {
+        self.watermark.as_deref()
     }
 
     /// Whether all active work is complete (no Active shards remain).
@@ -1476,6 +1499,16 @@ pub trait RunManagement {
 
     fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError>;
 
+    /// Return a point-in-time progress snapshot for `run`.
+    ///
+    /// The snapshot is read-only and evaluated at `now`:
+    /// - status counters reflect current shard statuses,
+    /// - `leased` counts shards where lease is active at `now` (`now < deadline`),
+    /// - `watermark` is the lexicographic minimum `last_key` among `Active`
+    ///   shards with non-initial cursors only.
+    ///
+    /// `watermark` intentionally ignores `Done`/`Split`/`Parked` shards and
+    /// active shards still at `Cursor::initial()`.
     fn get_run_progress(
         &self,
         now: LogicalTime,
