@@ -126,7 +126,7 @@ impl LeaseHolder {
 
     /// The logical time at which the lease expires.
     ///
-    /// The coordinator uses a half-open interval: means
+    /// The coordinator uses a half-open interval: `now < deadline` means
     /// the lease is active; `now >= deadline` means expired.
     #[inline]
     #[must_use]
@@ -274,8 +274,9 @@ impl Lease {
     /// # Panics
     ///
     /// - Panics if `deadline` is [`LogicalTime::ZERO`].
-    /// - Panics if `deadline` does not advance past the current deadline
-    ///   (monotonicity violation).
+    /// - Panics if `deadline` is before the current deadline
+    ///   (monotonicity violation). Equal deadlines are allowed — a
+    ///   same-tick duplicate renewal is a harmless no-op on the deadline.
     #[inline]
     pub(crate) fn set_deadline(&mut self, deadline: LogicalTime) {
         assert!(
@@ -283,8 +284,8 @@ impl Lease {
             "Lease deadline must be > ZERO, got {deadline:?}",
         );
         assert!(
-            deadline > self.deadline,
-            "set_deadline: new deadline {deadline:?} must advance past current {:?}",
+            deadline >= self.deadline,
+            "set_deadline: new deadline {deadline:?} must be >= current {:?}",
             self.deadline,
         );
         self.deadline = deadline;

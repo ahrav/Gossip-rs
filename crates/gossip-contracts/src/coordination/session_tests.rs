@@ -287,6 +287,26 @@ fn renew_postconditions_fence_stable() {
     );
 }
 
+/// Two renew calls at the same logical time produce the same deadline
+/// (`now + lease_duration`). The second call must not panic — the trait
+/// contract only requires `new_deadline > now`, and duplicate renewals
+/// are documented as harmless.
+#[test]
+fn duplicate_same_tick_renew_does_not_panic() {
+    let (mut coord, keys) = setup_coordinator(1);
+    let mut session =
+        WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+    // First renew at now=10 → deadline = 10 + 30 = 40.
+    let r1 = session.renew(now(10)).unwrap();
+    assert_eq!(r1.new_deadline, now(40));
+
+    // Second renew at the same now=10 → backend computes the same deadline.
+    // This must not panic; duplicate renewals are documented as harmless.
+    let r2 = session.renew(now(10)).unwrap();
+    assert_eq!(r2.new_deadline, now(40));
+}
+
 /// After `split_residual` narrows `[0x00, 0x40)` → `[0x00, 0x20)`,
 /// a checkpoint within the narrowed range succeeds but a cursor
 /// outside it is rejected with `CursorOutOfBounds`.
