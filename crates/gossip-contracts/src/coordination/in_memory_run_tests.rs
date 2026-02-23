@@ -397,6 +397,74 @@ fn watermark_advances_when_min_shard_checkpoints() {
     );
 }
 
+#[test]
+fn single_active_shard_watermark_equals_its_key() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+
+    // Checkpoint the only shard to "f".
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(b"f".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(5), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 1);
+    assert_eq!(
+        progress.watermark(),
+        Some(b"f".as_slice()),
+        "single active shard's key must be the watermark",
+    );
+}
+
+#[test]
+fn watermark_includes_shards_registered_with_non_initial_cursors() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+
+    // Register two shards: one with a resume cursor, one with initial.
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::with_last_key(b"d".to_vec()),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    // Without any checkpoint, the resume cursor should contribute to watermark.
+    let progress = coord
+        .get_run_progress(now(3), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 2);
+    assert_eq!(
+        progress.watermark(),
+        Some(b"d".as_slice()),
+        "resume cursor from registration must be included in watermark",
+    );
+}
+
 // -- Shard count limit tests for register_shards --
 //
 // register_shards is subject to the same per-tenant and global shard
