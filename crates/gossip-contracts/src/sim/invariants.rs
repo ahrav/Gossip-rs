@@ -32,6 +32,7 @@
 //! | S5 | **CursorMonotonicity** | temporal | `cursor.last_key()` never decreases per shard. |
 //! | S6 | **CursorBounds** | structural | Non-initial cursors remain within shard spec range. |
 //! | S7 | **SplitCoverage** | referential | Split-parent's spawned children exist and reference the parent. |
+//! | S8 | **RunTerminalIrreversibility** | temporal | Terminal run states (`Done`, `Failed`, `Cancelled`) never revert. |
 //!
 //! # Algorithm
 //!
@@ -40,7 +41,8 @@
 //! during the pass. S1 requires a post-pass duplicate check because mutual
 //! exclusion is a cross-record property: active lease holders are accumulated
 //! into a `HashMap<ShardKey, Vec<WorkerId>>` during the pass, then scanned
-//! for duplicates afterward.
+//! for duplicates afterward. S8 iterates run records separately via
+//! [`runs()`](super::backend::SimIntrospection::runs).
 //!
 //! # Performance considerations
 //!
@@ -64,6 +66,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::coordination::record::{ShardRecord, ShardStatus};
+use crate::coordination::run::RunStatus;
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use crate::sim::backend::SimIntrospection;
 
@@ -91,7 +94,7 @@ pub enum SplitCoverageDetail {
 
 /// A detected invariant violation with enough context to diagnose the failure.
 ///
-/// Each variant corresponds to one of the seven safety properties (S1-S7)
+/// Each variant corresponds to one of the eight safety properties (S1-S8)
 /// or a sub-property thereof. The harness collects all violations from a
 /// simulation run into a `Vec<InvariantViolation>` for post-run analysis;
 /// an empty vec means the run passed.
@@ -171,6 +174,14 @@ pub enum InvariantViolation {
         fence_at_park: FenceEpoch,
         fence_at_unpark: FenceEpoch,
     },
+    /// S8: A terminal run status (Done, Failed, Cancelled) reverted to a
+    /// non-terminal state. Unlike S3, runs have no "unpark" exception —
+    /// all terminal-to-non-terminal transitions are violations.
+    RunTerminalIrreversibility {
+        run: RunId,
+        was: RunStatus,
+        now: RunStatus,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +231,9 @@ pub struct InvariantChecker {
     /// Reusable scratch buffer for post-pass pruning: accumulates keys of
     /// permanently terminal shards whose history entries can be discarded.
     scratch_prune: Vec<HistoryKey>,
+    /// Last-seen run status per (tenant, run), for S8 run-terminal
+    /// irreversibility.
+    prev_run_terminal: BTreeMap<(TenantId, RunId), RunStatus>,
 }
 
 impl InvariantChecker {
@@ -233,16 +247,19 @@ impl InvariantChecker {
             scratch_missing: Vec::new(),
             scratch_wrong_parent: Vec::new(),
             scratch_prune: Vec::new(),
+            prev_run_terminal: BTreeMap::new(),
         }
     }
 
-    /// Run all invariant checks (S1-S7) against the current coordinator state.
+    /// Run all invariant checks (S1-S8) against the current coordinator state.
     ///
     /// Performs a **single pass** over `coordinator.shards()`, delegating to
-    /// per-invariant helpers (S1–S7) for each record, running a post-pass
-    /// duplicate check for S1 (mutual exclusion), and pruning epoch/cursor
-    /// history for permanently terminal shards (`Done`, `Split`). Scratch
-    /// buffers are reused across calls to reduce allocation pressure.
+    /// per-invariant helpers (S1–S7) for each shard record, running a post-pass
+    /// duplicate check for S1 (mutual exclusion), then a separate pass over
+    /// `coordinator.runs()` for S8 (run-terminal irreversibility), and finally
+    /// pruning epoch/cursor history for permanently terminal shards (`Done`,
+    /// `Split`). Scratch buffers are reused across calls to reduce allocation
+    /// pressure.
     ///
     /// # Returns
     ///
@@ -298,6 +315,7 @@ impl InvariantChecker {
         }
 
         self.check_mutual_exclusion(&mut violations);
+        self.check_run_terminal_irreversibility(coordinator, tenant, &mut violations);
 
         // Prune permanently terminal shards (Done, Split) from epoch and
         // cursor history. These shards will never have new operations, so
@@ -556,6 +574,37 @@ impl InvariantChecker {
                     workers: [holders[0], holders[1]],
                 });
             }
+        }
+    }
+
+    /// S8: run-terminal irreversibility.
+    ///
+    /// Terminal run states (Done, Failed, Cancelled) must never revert.
+    /// Unlike S3 (shard terminals), there is no "unpark" exception for runs.
+    fn check_run_terminal_irreversibility(
+        &mut self,
+        coordinator: &impl SimIntrospection,
+        tenant: TenantId,
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        for ((tid, run_id), record) in coordinator.runs() {
+            if tid != tenant {
+                continue;
+            }
+            let current_status = record.status();
+            let prev_status = self.prev_run_terminal.get(&(tenant, run_id)).copied();
+            if let Some(prev) = prev_status
+                && prev.is_terminal()
+                && current_status != prev
+            {
+                violations.push(InvariantViolation::RunTerminalIrreversibility {
+                    run: run_id,
+                    was: prev,
+                    now: current_status,
+                });
+            }
+            self.prev_run_terminal
+                .insert((tenant, run_id), current_status);
         }
     }
 }

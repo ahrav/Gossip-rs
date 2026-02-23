@@ -130,6 +130,11 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
     where
         Self: 'a;
 
+    type RunIter<'a>
+        = <B as SimIntrospection>::RunIter<'a>
+    where
+        Self: 'a;
+
     /// Yields all real records first, then all synthetic records.
     ///
     /// The ordering is load-bearing: the checker processes records
@@ -143,6 +148,12 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
             .iter()
             .map(|(tenant, key, record)| ((*tenant, *key), record));
         Box::new(real.chain(synthetic))
+    }
+
+    /// Delegates to the inner backend — the fault injector only injects
+    /// synthetic *shard* records, not runs.
+    fn runs(&self) -> Self::RunIter<'_> {
+        self.inner.runs()
     }
 
     fn shard_count(&self) -> usize {
