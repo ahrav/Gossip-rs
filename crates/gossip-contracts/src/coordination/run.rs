@@ -1567,6 +1567,10 @@ pub trait RunManagement {
     /// active shards still at `Cursor::initial()`. It is a snapshot, not a
     /// monotonic stream, and may move backward between calls as shard
     /// membership changes.
+    ///
+    /// Implementations must return a consistent snapshot. The in-memory
+    /// backend achieves this via `&self` borrow exclusivity; database
+    /// backends should use snapshot isolation or equivalent.
     fn get_run_progress(
         &self,
         now: LogicalTime,

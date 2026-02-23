@@ -307,6 +307,96 @@ fn done_split_parked_excluded_from_watermark() {
     );
 }
 
+#[test]
+fn all_shards_terminal_watermark_none() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+
+    // Checkpoint then complete the only shard.
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(b"f".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+    let _ = coord
+        .complete(
+            now(5),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(b"y".to_vec()),
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(6), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 0, "no active shards remain");
+    assert_eq!(
+        progress.watermark(),
+        None,
+        "watermark must be None when zero active shards",
+    );
+}
+
+#[test]
+fn watermark_advances_when_min_shard_checkpoints() {
+    // Setup: 2-shard run with ranges [a,m) and [m,z).
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    // Checkpoint shard 10 at "c" and shard 11 at "p".
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(10), 1, 3, 4, 10, b"c");
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(11), 2, 5, 6, 11, b"p");
+
+    let progress = coord
+        .get_run_progress(now(7), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"c".as_slice()),
+        "watermark should be min of 'c' and 'p'",
+    );
+
+    // Advance shard 10: "c" -> "k" (still within [a,m), still below "p").
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(10), 1, 104, 105, 12, b"k");
+
+    let progress = coord
+        .get_run_progress(now(106), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"k".as_slice()),
+        "watermark should advance to 'k' (min of 'k' and 'p')",
+    );
+}
+
 // -- Shard count limit tests for register_shards --
 //
 // register_shards is subject to the same per-tenant and global shard
@@ -1463,48 +1553,70 @@ fn full_run_lifecycle_create_register_process_complete() {
     assert_eq!(record.completed_at(), Some(now(9)));
 }
 
+// Property-based tests verifying watermark correctness across arbitrary shard configurations.
 mod prop_progress_watermark {
     use super::*;
     use crate::test_util::miri_proptest_config;
     use proptest::prelude::*;
 
-    fn arb_active_cursor_keys() -> impl Strategy<Value = Vec<Option<Vec<u8>>>> {
-        proptest::collection::vec(
-            proptest::option::of(proptest::collection::vec(0u8..=254u8, 1..16)),
-            1..32,
-        )
+    fn arb_shard_snapshot() -> impl Strategy<Value = (ShardStatus, Option<Vec<u8>>)> {
+        let status = prop_oneof![
+            Just(ShardStatus::Active),
+            Just(ShardStatus::Done),
+            Just(ShardStatus::Split),
+            Just(ShardStatus::Parked),
+        ];
+        let key = proptest::option::of(proptest::collection::vec(0u8..=254u8, 1..16));
+        (status, key)
+    }
+
+    fn arb_shard_snapshots() -> impl Strategy<Value = Vec<(ShardStatus, Option<Vec<u8>>)>> {
+        proptest::collection::vec(arb_shard_snapshot(), 1..32)
     }
 
     proptest! {
         #![proptest_config(miri_proptest_config())]
 
         #[test]
-        fn watermark_bounds_and_none_condition_for_active_shards(
-            cursor_keys in arb_active_cursor_keys(),
+        fn watermark_bounds_and_none_condition(
+            snapshots in arb_shard_snapshots(),
         ) {
             let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-            let shard_ids: Vec<ShardId> = (0..cursor_keys.len())
+            let shard_ids: Vec<ShardId> = (0..snapshots.len())
                 .map(|i| ShardId::from_raw((i as u64) + 1))
                 .collect();
             coord.seed_run(test_tenant(), test_run(), shard_ids.clone(), LEASE_DURATION);
 
-            for (shard_id, key) in shard_ids.into_iter().zip(cursor_keys.iter()) {
+            for (shard_id, (status, key)) in shard_ids.into_iter().zip(snapshots.iter()) {
                 let cursor = key
                     .as_ref()
                     .map_or_else(Cursor::initial, |k| Cursor::with_last_key(k.clone()));
+                let park_reason = if *status == ShardStatus::Parked {
+                    Some(ParkReason::TooManyErrors)
+                } else {
+                    None
+                };
+                // Split shards need non-empty spawned list.
+                let spawned = if *status == ShardStatus::Split {
+                    let mut s = gossip_stdx::InlineVec::new();
+                    s.push(ShardId::from_raw(1u64 << 63));
+                    s
+                } else {
+                    gossip_stdx::InlineVec::new()
+                };
                 let record = ShardRecord::from_raw_parts(
                     test_tenant(),
                     test_run(),
                     shard_id,
-                    ShardStatus::Active,
-                    None,
+                    *status,
+                    park_reason,
                     &ShardSpec::with_range(vec![0x00], vec![0xFF]),
                     &cursor,
                     CursorSemantics::Completed,
                     None,
                     FenceEpoch::INITIAL,
                     None,
-                    gossip_stdx::InlineVec::new(),
+                    spawned,
                     RingBuffer::new(),
                     coord.slab_mut(),
                 );
@@ -1514,18 +1626,41 @@ mod prop_progress_watermark {
             let progress = coord
                 .get_run_progress(now(10), test_tenant(), test_run())
                 .unwrap();
-            let expected_min = cursor_keys.iter().filter_map(|k| k.as_deref()).min();
+
+            // Expected watermark: min of keys where status==Active && key.is_some().
+            let expected_min: Option<&[u8]> = snapshots
+                .iter()
+                .filter(|(s, _)| *s == ShardStatus::Active)
+                .filter_map(|(_, k)| k.as_deref())
+                .min();
 
             prop_assert_eq!(
                 progress.watermark(),
                 expected_min,
-                "watermark must equal the minimum active cursor key when present",
+                "watermark must equal the minimum active cursor key",
             );
 
+            // Verify watermark <= all active keys (lower bound property).
             if let Some(actual) = progress.watermark() {
-                for key in cursor_keys.iter().filter_map(|k| k.as_deref()) {
-                    prop_assert!(actual <= key);
+                for (status, key) in &snapshots {
+                    if *status == ShardStatus::Active
+                        && let Some(k) = key.as_deref()
+                    {
+                        prop_assert!(actual <= k);
+                    }
                 }
+            }
+
+            // Verify watermark ignores non-Active shards.
+            let has_active_with_key = snapshots
+                .iter()
+                .any(|(s, k)| *s == ShardStatus::Active && k.is_some());
+            if !has_active_with_key {
+                prop_assert_eq!(
+                    progress.watermark(),
+                    None,
+                    "watermark must be None when no active shard has a key",
+                );
             }
         }
     }
