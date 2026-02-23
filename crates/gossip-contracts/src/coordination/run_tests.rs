@@ -391,6 +391,20 @@ fn progress_count_shard() {
 }
 
 #[test]
+fn progress_watermark_accessor_and_default_behavior() {
+    let default_progress = RunProgress::default();
+    assert_eq!(default_progress.watermark(), None);
+
+    let progress = RunProgress {
+        total: 1,
+        active: 1,
+        watermark: Some(b"abc".to_vec().into_boxed_slice()),
+        ..Default::default()
+    };
+    assert_eq!(progress.watermark(), Some(b"abc".as_slice()));
+}
+
+#[test]
 fn progress_predicates() {
     let settled_success = RunProgress {
         total: 3,

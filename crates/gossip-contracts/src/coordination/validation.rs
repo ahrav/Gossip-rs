@@ -38,7 +38,9 @@
 //!   If it is `None`, the record is in an inconsistent state and `validate_lease`
 //!   returns `StaleFence` to force re-acquisition (see check 4).
 
-use crate::coordination::cursor::{Cursor, check_cursor_advance, check_cursor_bounds};
+use crate::coordination::cursor::{
+    Cursor, MAX_KEY_SIZE, check_cursor_advance, check_cursor_bounds,
+};
 use crate::coordination::cursor::{CursorAdvance, CursorBoundsCheck};
 use crate::coordination::error::CoordError;
 use crate::coordination::lease::{Lease, OpLogEntry};
@@ -138,10 +140,11 @@ pub fn validate_lease(
 /// Checks:
 /// 1. The new cursor has a `last_key` — an initial (keyless) cursor means
 ///    no data has been processed yet, so there is nothing to checkpoint.
-/// 2. Monotonicity: `new.last_key` must not regress below `old.last_key`
+/// 2. Key size: `new.last_key.len() <= MAX_KEY_SIZE`.
+/// 3. Monotonicity: `new.last_key` must not regress below `old.last_key`
 ///    (lexicographic). `None → Some` is forward progress; `Some → None`
 ///    and `Some(b) where b < a` are regressions.
-/// 3. Bounds: `new.last_key ∈ [spec.start, spec.end)`.
+/// 4. Bounds: `new.last_key ∈ [spec.start, spec.end)`.
 ///
 /// # Preconditions
 ///
@@ -163,7 +166,18 @@ pub fn validate_cursor_update(
         return Err(CoordError::CheckpointMissingKey);
     }
 
-    // 2. Monotonicity.
+    // 2. Key size.
+    let new_last_key = new_cursor
+        .last_key()
+        .expect("last_key validated as Some in check 1");
+    if new_last_key.len() > MAX_KEY_SIZE {
+        return Err(CoordError::CursorKeyTooLarge {
+            size: new_last_key.len(),
+            max: MAX_KEY_SIZE,
+        });
+    }
+
+    // 3. Monotonicity.
     match check_cursor_advance(old_cursor, new_cursor) {
         CursorAdvance::Forward => { /* ok */ }
         CursorAdvance::Regression | CursorAdvance::ResetToNone => {
@@ -174,7 +188,7 @@ pub fn validate_cursor_update(
         }
     }
 
-    // 3. Bounds checking.
+    // 4. Bounds checking.
     match check_cursor_bounds(new_cursor, spec) {
         CursorBoundsCheck::InBounds => { /* ok */ }
         CursorBoundsCheck::NoKey => {
@@ -209,6 +223,8 @@ pub fn validate_cursor_update(
 ///
 /// Equivalent to [`validate_cursor_update`] but avoids materializing owned
 /// `Cursor` / `ShardSpec` values when callers already have pooled accessors.
+/// Check ordering and error variants intentionally match the owned-path
+/// validator, including [`CoordError::CursorKeyTooLarge`].
 pub(crate) fn validate_cursor_update_pooled(
     new_cursor: &Cursor,
     old_last_key: Option<&[u8]>,
@@ -220,7 +236,15 @@ pub(crate) fn validate_cursor_update_pooled(
         return Err(CoordError::CheckpointMissingKey);
     };
 
-    // 2. Monotonicity.
+    // 2. Key size.
+    if new_last_key.len() > MAX_KEY_SIZE {
+        return Err(CoordError::CursorKeyTooLarge {
+            size: new_last_key.len(),
+            max: MAX_KEY_SIZE,
+        });
+    }
+
+    // 3. Monotonicity.
     if let Some(old_key) = old_last_key
         && new_last_key < old_key
     {
@@ -230,7 +254,7 @@ pub(crate) fn validate_cursor_update_pooled(
         });
     }
 
-    // 3. Bounds checking against [start, end).
+    // 4. Bounds checking against [start, end).
     if (!spec_start.is_empty() && new_last_key < spec_start)
         || (!spec_end.is_empty() && new_last_key >= spec_end)
     {
@@ -634,6 +658,22 @@ mod tests {
     }
 
     #[test]
+    fn validate_cursor_update_rejects_oversized_key() {
+        let spec = test_spec();
+        let old_cursor = Cursor::initial();
+        let new_cursor = Cursor::with_last_key(vec![0xAB; MAX_KEY_SIZE + 1]);
+        let result = validate_cursor_update(&new_cursor, &old_cursor, &spec);
+        assert!(
+            matches!(
+                result,
+                Err(CoordError::CursorKeyTooLarge { size, max })
+                    if size == MAX_KEY_SIZE + 1 && max == MAX_KEY_SIZE
+            ),
+            "expected CursorKeyTooLarge, got {result:?}",
+        );
+    }
+
+    #[test]
     fn validate_cursor_update_regression() {
         let spec = test_spec();
         let old_cursor = Cursor::with_last_key(b"m".to_vec());
@@ -719,6 +759,10 @@ mod tests {
             (Cursor::initial(), Cursor::initial()),
             (Cursor::initial(), Cursor::with_last_key(vec![0x00])),
             (Cursor::initial(), Cursor::with_last_key(b"z".to_vec())),
+            (
+                Cursor::initial(),
+                Cursor::with_last_key(vec![0xAB; MAX_KEY_SIZE + 1]),
+            ),
         ];
         let spec = test_spec();
 
@@ -736,6 +780,7 @@ mod tests {
                 Err(CoordError::CheckpointMissingKey) => "missing_key",
                 Err(CoordError::CursorRegression { .. }) => "regression",
                 Err(CoordError::CursorOutOfBounds(_)) => "out_of_bounds",
+                Err(CoordError::CursorKeyTooLarge { .. }) => "key_too_large",
                 Err(other) => panic!("unexpected owned error variant: {other:?}"),
             };
             let pooled_kind = match &pooled {
@@ -743,6 +788,7 @@ mod tests {
                 Err(CoordError::CheckpointMissingKey) => "missing_key",
                 Err(CoordError::CursorRegression { .. }) => "regression",
                 Err(CoordError::CursorOutOfBounds(_)) => "out_of_bounds",
+                Err(CoordError::CursorKeyTooLarge { .. }) => "key_too_large",
                 Err(other) => panic!("unexpected pooled error variant: {other:?}"),
             };
             assert_eq!(
@@ -905,6 +951,11 @@ mod tests {
                         bounds == CursorBoundsCheck::BelowRange
                             || bounds == CursorBoundsCheck::AboveRange,
                     );
+                }
+                Err(CoordError::CursorKeyTooLarge { .. }) => {
+                    // Generated keys are capped at 31 bytes, so this should
+                    // never fire in this property domain.
+                    prop_assert!(false, "unexpected CursorKeyTooLarge");
                 }
                 Err(other) => {
                     prop_assert!(false, "unexpected error: {other:?}");

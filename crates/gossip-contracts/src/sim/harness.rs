@@ -236,6 +236,10 @@ pub enum RejectionKind {
     /// Not produced by the built-in harness (cursor generation stays in-bounds),
     /// but available for custom `step()` callers.
     CursorOutOfBounds,
+    /// Cursor key exceeds MAX_KEY_SIZE.
+    /// Not produced by the built-in harness (cursor generation keeps keys
+    /// small), but available for custom `step()` callers.
+    CursorKeyTooLarge,
     /// Target worker is paused.
     WorkerPaused,
     /// Worker holds no shards to operate on.
@@ -310,6 +314,7 @@ impl From<CheckpointError> for RejectionKind {
             CheckpointError::OpIdConflict { .. } => Self::OpIdConflict,
             CheckpointError::CursorRegression { .. } => Self::CursorRegression,
             CheckpointError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
+            CheckpointError::CursorKeyTooLarge { .. } => Self::CursorKeyTooLarge,
             CheckpointError::ShardNotFound { .. } => Self::ShardNotFound,
             CheckpointError::TenantMismatch { .. } => Self::TenantMismatch,
             CheckpointError::CheckpointMissingKey => Self::CheckpointMissingKey,
@@ -327,6 +332,7 @@ impl From<CompleteError> for RejectionKind {
             CompleteError::OpIdConflict { .. } => Self::OpIdConflict,
             CompleteError::CursorRegression { .. } => Self::CursorRegression,
             CompleteError::CursorOutOfBounds(_) => Self::CursorOutOfBounds,
+            CompleteError::CursorKeyTooLarge { .. } => Self::CursorKeyTooLarge,
             CompleteError::ShardNotFound { .. } => Self::ShardNotFound,
             CompleteError::TenantMismatch { .. } => Self::TenantMismatch,
             CompleteError::CheckpointMissingKey => Self::CheckpointMissingKey,

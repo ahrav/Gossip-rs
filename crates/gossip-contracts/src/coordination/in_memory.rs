@@ -2225,9 +2225,13 @@ impl RunManagement for InMemoryCoordinator {
     /// Compute an aggregate progress snapshot for a run by iterating its
     /// shards and counting statuses and lease states.
     ///
-    /// The result is order-independent — `count_shard` accumulates via
-    /// addition, which is commutative.  This is important because
-    /// `run_shards` is a `HashSet` with non-deterministic iteration order.
+    /// The result is order-independent: status tallies use addition and the
+    /// watermark uses lexicographic minimum; both are commutative/associative.
+    /// This is important because `run_shards` is a `HashSet` with
+    /// non-deterministic iteration order.
+    ///
+    /// `leased` is evaluated at `now`, so a shard at lease deadline is treated
+    /// as unleased (`now >= deadline`).
     fn get_run_progress(
         &self,
         now: LogicalTime,
@@ -2249,7 +2253,11 @@ impl RunManagement for InMemoryCoordinator {
                     )
                 });
                 let is_leased = record.is_leased_at(now);
-                progress.count_shard(record.status, is_leased);
+                progress.observe_shard(
+                    record.status,
+                    is_leased,
+                    record.cursor.last_key(&self.slab),
+                );
             }
         }
         Ok(progress)
@@ -2521,6 +2529,7 @@ impl RunManagement for InMemoryCoordinator {
                 | crate::coordination::error::CoordError::ShardTerminal { .. }
                 | crate::coordination::error::CoordError::CursorRegression { .. }
                 | crate::coordination::error::CoordError::CursorOutOfBounds(_)
+                | crate::coordination::error::CoordError::CursorKeyTooLarge { .. }
                 | crate::coordination::error::CoordError::SplitInvalid(_)
                 | crate::coordination::error::CoordError::CheckpointMissingKey => {
                     unreachable!("check_op_idempotency only returns OpIdConflict")

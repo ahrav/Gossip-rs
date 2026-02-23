@@ -278,7 +278,7 @@ rewrite it to stand on its own.
 
 After modifying Rust code, ALWAYS run these steps:
 
-1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
+1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
 3. If a hook fires naming a design doc (`DESIGN DOC CHECK`), open that doc and verify
    it still matches the code. If the hook says `[NEW FILE]`, update the doc's file list.

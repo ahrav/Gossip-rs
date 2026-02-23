@@ -701,12 +701,15 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 // RunProgress + RunTerminalEvaluation
 // ============================================================================
 
-/// Aggregated shard status counts for a run.
+/// Aggregated shard status counts and in-flight watermark for a run.
 ///
 /// Fields are `pub(crate)` with public accessors. Uses `u32` (not `u64`)
 /// because the maximum shard count is bounded by `MAX_INITIAL_SHARDS` plus
 /// spawned children, well within `u32::MAX`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
+/// owns key bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunProgress {
     pub(crate) total: u32,
     pub(crate) active: u32,
@@ -715,6 +718,14 @@ pub struct RunProgress {
     pub(crate) parked: u32,
     /// Subset of `active`: shards currently held by a worker lease.
     pub(crate) leased: u32,
+    /// Lexicographic minimum `cursor.last_key` among `Active` shards whose
+    /// cursor is non-initial.
+    ///
+    /// Terminal shards (`Done`/`Split`/`Parked`) are deliberately ignored even
+    /// if they carry cursor keys; this tracks in-flight progress only.
+    /// `None` means no active shard currently has a non-initial cursor
+    /// (including runs with zero active shards).
+    pub(crate) watermark: Option<Box<[u8]>>,
 }
 
 impl RunProgress {
@@ -748,6 +759,22 @@ impl RunProgress {
         self.leased
     }
 
+    /// Lexicographic minimum last-key among active, non-initial shards.
+    ///
+    /// Returns `None` if there are no active shards with a non-initial cursor.
+    /// This can happen when all active shards are still at `Cursor::initial()`
+    /// or when the run has no active shards.
+    ///
+    /// **Non-monotonicity**: This is a point-in-time snapshot, not a monotonic
+    /// watermark stream. Splits, unparks, and new shard activations can
+    /// introduce active shards with earlier cursor positions, causing the
+    /// watermark to decrease. Consumers that need a monotonic progress bound
+    /// should maintain a running maximum externally.
+    #[must_use]
+    pub fn watermark(&self) -> Option<&[u8]> {
+        self.watermark.as_deref()
+    }
+
     /// Whether all active work is complete (no Active shards remain).
     #[must_use]
     pub fn is_settled(&self) -> bool {
@@ -775,6 +802,9 @@ impl RunProgress {
     }
 
     /// Count a shard into the progress tallies.
+    ///
+    /// This updates only status/lease counters. Call [`Self::observe_shard`] when
+    /// you need both counter updates and watermark tracking in one API.
     ///
     /// # Panics
     ///
@@ -824,10 +854,51 @@ impl RunProgress {
         self.assert_invariants();
     }
 
+    /// Observe one shard snapshot and update counters + watermark together.
+    ///
+    /// `cursor_last_key` is only considered when `status` is `Active`. If the
+    /// shard is terminal, the key is ignored.
+    ///
+    /// # Panics
+    ///
+    /// - Same panic conditions as [`Self::count_shard`].
+    /// - `cursor_last_key` exceeds [`MAX_KEY_SIZE`] when `status` is `Active`.
+    pub fn observe_shard(
+        &mut self,
+        status: ShardStatus,
+        is_leased: bool,
+        cursor_last_key: Option<&[u8]>,
+    ) {
+        self.count_shard(status, is_leased);
+
+        if status == ShardStatus::Active
+            && let Some(last_key) = cursor_last_key
+        {
+            assert!(
+                last_key.len() <= MAX_KEY_SIZE,
+                "RunProgress::observe_shard: last_key too large ({} bytes, max {MAX_KEY_SIZE})",
+                last_key.len(),
+            );
+            debug_assert!(
+                !last_key.is_empty(),
+                "RunProgress::observe_shard: last_key must be non-empty when present"
+            );
+
+            if self
+                .watermark
+                .as_deref()
+                .is_none_or(|current| last_key < current)
+            {
+                self.watermark = Some(last_key.to_vec().into_boxed_slice());
+            }
+        }
+    }
+
     /// Assert structural invariants of the progress tallies.
     ///
     /// - `total == active + done + split + parked`
     /// - `leased <= active`
+    /// - `watermark` must be `None` when `active == 0`
     pub fn assert_invariants(&self) {
         assert_eq!(
             self.total,
@@ -840,6 +911,13 @@ impl RunProgress {
             self.leased,
             self.active,
         );
+        // Watermark can only be Some when there are active shards.
+        if self.active == 0 {
+            assert!(
+                self.watermark.is_none(),
+                "RunProgress: watermark must be None when active == 0"
+            );
+        }
     }
 }
 
@@ -1476,6 +1554,23 @@ pub trait RunManagement {
 
     fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError>;
 
+    /// Return a point-in-time progress snapshot for `run`.
+    ///
+    /// The snapshot is read-only and evaluated at `now`:
+    /// - status counters reflect current shard statuses,
+    /// - `leased` counts shards where lease is active at `now` (`now < deadline`),
+    /// - `watermark` is the lexicographic minimum `last_key` among `Active`
+    ///   shards with non-initial cursors only (resume cursors and
+    ///   checkpoint cursors are both eligible while shard status is `Active`).
+    ///
+    /// `watermark` intentionally ignores `Done`/`Split`/`Parked` shards and
+    /// active shards still at `Cursor::initial()`. It is a snapshot, not a
+    /// monotonic stream, and may move backward between calls as shard
+    /// membership changes.
+    ///
+    /// Implementations must return a consistent snapshot. The in-memory
+    /// backend achieves this via `&self` borrow exclusivity; database
+    /// backends should use snapshot isolation or equivalent.
     fn get_run_progress(
         &self,
         now: LogicalTime,

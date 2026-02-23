@@ -15,8 +15,9 @@ use crate::coordination::test_fixtures::{
     LEASE_DURATION, coordinator_with_run_and_lease, do_split_replace, now, short_lease_run_config,
     test_run, test_split_residual_plan, test_tenant, test_worker,
 };
-use crate::identity::{OpId, RunId, ShardId, ShardKey};
+use crate::identity::{FenceEpoch, OpId, RunId, ShardId, ShardKey};
 use crate::sim::backend::SimIntrospection;
+use rstest::rstest;
 
 // -- Split index consistency tests --
 //
@@ -96,6 +97,372 @@ fn split_residual_child_visible_in_list_shards() {
         .iter()
         .any(|s| s.key_range_start() == b"m" && s.key_range_end() == b"z");
     assert!(has_residual, "residual [m,z) should be in listing");
+}
+
+// -- get_run_progress watermark tests ---------------------------------------
+
+/// Acquire `shard` and write a checkpoint key at a controlled logical time.
+fn checkpoint_shard_last_key(
+    coord: &mut InMemoryCoordinator,
+    shard: ShardId,
+    worker_id: u64,
+    acquire_t: u64,
+    checkpoint_t: u64,
+    op_id: u64,
+    last_key: &[u8],
+) {
+    let lease = coord
+        .acquire_and_restore(
+            now(acquire_t),
+            test_tenant(),
+            ShardKey::new(test_run(), shard),
+            test_worker(worker_id),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(checkpoint_t),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(last_key.to_vec()),
+            OpId::from_raw(op_id),
+        )
+        .unwrap();
+}
+
+/// Acquire `shard` and complete it with a controlled terminal cursor key.
+fn complete_shard_with_key(
+    coord: &mut InMemoryCoordinator,
+    shard: ShardId,
+    worker_id: u64,
+    acquire_t: u64,
+    complete_t: u64,
+    op_id: u64,
+    last_key: &[u8],
+) {
+    let lease = coord
+        .acquire_and_restore(
+            now(acquire_t),
+            test_tenant(),
+            ShardKey::new(test_run(), shard),
+            test_worker(worker_id),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .complete(
+            now(complete_t),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(last_key.to_vec()),
+            OpId::from_raw(op_id),
+        )
+        .unwrap();
+}
+
+/// Acquire, checkpoint, then park `shard` while preserving explicit timestamps.
+struct ParkAfterCheckpointStep<'a> {
+    worker_id: u64,
+    acquire_t: u64,
+    checkpoint_t: u64,
+    checkpoint_op_id: u64,
+    checkpoint_key: &'a [u8],
+    park_t: u64,
+    park_op_id: u64,
+}
+
+fn park_shard_after_checkpoint(
+    coord: &mut InMemoryCoordinator,
+    shard: ShardId,
+    step: ParkAfterCheckpointStep<'_>,
+) {
+    let lease = coord
+        .acquire_and_restore(
+            now(step.acquire_t),
+            test_tenant(),
+            ShardKey::new(test_run(), shard),
+            test_worker(step.worker_id),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(step.checkpoint_t),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(step.checkpoint_key.to_vec()),
+            OpId::from_raw(step.checkpoint_op_id),
+        )
+        .unwrap();
+    let _ = coord
+        .park_shard(
+            now(step.park_t),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(step.park_op_id),
+        )
+        .unwrap();
+}
+
+/// Build a split-replace topology and return children to drive watermark tests:
+/// one child later completed, one parked, one left active.
+fn coordinator_with_split_children_for_watermark()
+-> (InMemoryCoordinator, ShardId, ShardId, ShardId) {
+    let (mut coord, root_lease) = coordinator_with_run_and_lease();
+
+    // Make the parent carry a small cursor key before split.
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &root_lease,
+            Cursor::with_last_key(b"b".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let split_plan = SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"m".to_vec(), b"t".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"t".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ])
+    .unwrap();
+    let _ = coord
+        .split_replace(
+            now(5),
+            test_tenant(),
+            &root_lease,
+            split_plan,
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let active_children = coord
+        .list_shards(now(6), test_tenant(), test_run(), ShardFilter::active())
+        .unwrap();
+    assert_eq!(active_children.len(), 3);
+
+    let child_done = active_children
+        .iter()
+        .find(|s| s.key_range_start() == b"a")
+        .unwrap()
+        .shard();
+    let child_parked = active_children
+        .iter()
+        .find(|s| s.key_range_start() == b"m")
+        .unwrap()
+        .shard();
+    let child_active = active_children
+        .iter()
+        .find(|s| s.key_range_start() == b"t")
+        .unwrap()
+        .shard();
+
+    (coord, child_done, child_parked, child_active)
+}
+
+#[test]
+fn done_split_parked_excluded_from_watermark() {
+    let (mut coord, child_done, child_parked, child_active) =
+        coordinator_with_split_children_for_watermark();
+    complete_shard_with_key(&mut coord, child_done, 2, 7, 8, 12, b"d");
+    park_shard_after_checkpoint(
+        &mut coord,
+        child_parked,
+        ParkAfterCheckpointStep {
+            worker_id: 3,
+            acquire_t: 9,
+            checkpoint_t: 10,
+            checkpoint_op_id: 13,
+            checkpoint_key: b"n",
+            park_t: 11,
+            park_op_id: 14,
+        },
+    );
+    checkpoint_shard_last_key(&mut coord, child_active, 4, 12, 13, 15, b"x");
+
+    let progress = coord
+        .get_run_progress(now(14), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.total(), 4);
+    assert_eq!(progress.split(), 1);
+    assert_eq!(progress.done(), 1);
+    assert_eq!(progress.parked(), 1);
+    assert_eq!(progress.active(), 1);
+    assert_eq!(
+        progress.watermark(),
+        Some(b"x".as_slice()),
+        "watermark must ignore Done/Split/Parked cursor keys",
+    );
+}
+
+#[test]
+fn all_shards_terminal_watermark_none() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+
+    // Checkpoint then complete the only shard.
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(b"f".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+    let _ = coord
+        .complete(
+            now(5),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(b"y".to_vec()),
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(6), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 0, "no active shards remain");
+    assert_eq!(
+        progress.watermark(),
+        None,
+        "watermark must be None when zero active shards",
+    );
+}
+
+#[test]
+fn watermark_advances_when_min_shard_checkpoints() {
+    // Setup: 2-shard run with ranges [a,m) and [m,z).
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    // Checkpoint shard 10 at "c" and shard 11 at "p".
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(10), 1, 3, 4, 10, b"c");
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(11), 2, 5, 6, 11, b"p");
+
+    let progress = coord
+        .get_run_progress(now(7), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"c".as_slice()),
+        "watermark should be min of 'c' and 'p'",
+    );
+
+    // Advance shard 10: "c" -> "k" (still within [a,m), still below "p").
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(10), 1, 104, 105, 12, b"k");
+
+    let progress = coord
+        .get_run_progress(now(106), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"k".as_slice()),
+        "watermark should advance to 'k' (min of 'k' and 'p')",
+    );
+}
+
+#[test]
+fn single_active_shard_watermark_equals_its_key() {
+    let (mut coord, lease) = coordinator_with_run_and_lease();
+
+    // Checkpoint the only shard to "f".
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(b"f".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(5), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 1);
+    assert_eq!(
+        progress.watermark(),
+        Some(b"f".as_slice()),
+        "single active shard's key must be the watermark",
+    );
+}
+
+#[test]
+fn watermark_includes_shards_registered_with_non_initial_cursors() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+
+    // Register two shards: one with a resume cursor, one with initial.
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::with_last_key(b"d".to_vec()),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    // Without any checkpoint, the resume cursor should contribute to watermark.
+    let progress = coord
+        .get_run_progress(now(3), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 2);
+    assert_eq!(
+        progress.watermark(),
+        Some(b"d".as_slice()),
+        "resume cursor from registration must be included in watermark",
+    );
 }
 
 // -- Shard count limit tests for register_shards --
@@ -280,11 +647,13 @@ fn register_shards_preserves_non_initial_cursors() {
     );
 }
 
-// -- complete_run tests -------------------------------------------------------
+// -- Run terminal operation tests (complete_run / fail_run / cancel_run) ------
 //
-// Transitions a run from Active to Done. Verifies: happy path, rejection
-// from Initializing state, terminal irreversibility (Done -> Done fails),
-// not-found error, and idempotent replay.
+// All three terminal transitions share identical structure: happy path,
+// wrong-status rejection, terminal irreversibility, and idempotent
+// replay. A small dispatch enum + helper avoids repeating each scenario
+// three times. `cancel_run_from_initializing` and `complete_run_not_found`
+// remain individual tests because they have no parallel in other ops.
 
 /// Creates a coordinator with a run in Active state (one shard registered).
 ///
@@ -315,51 +684,109 @@ fn active_run_coordinator() -> InMemoryCoordinator {
     coord
 }
 
-#[test]
-fn complete_run_happy_path() {
+#[derive(Debug, Clone, Copy)]
+enum TerminalOp {
+    Complete,
+    Fail,
+    Cancel,
+}
+
+impl TerminalOp {
+    fn expected_status(self) -> RunStatus {
+        match self {
+            Self::Complete => RunStatus::Done,
+            Self::Fail => RunStatus::Failed,
+            Self::Cancel => RunStatus::Cancelled,
+        }
+    }
+}
+
+fn apply_terminal_op(
+    coord: &mut InMemoryCoordinator,
+    op: TerminalOp,
+    now: LogicalTime,
+    tenant: TenantId,
+    run: RunId,
+    op_id: OpId,
+) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+    match op {
+        TerminalOp::Complete => coord.complete_run(now, tenant, run, op_id),
+        TerminalOp::Fail => coord.fail_run(now, tenant, run, op_id),
+        TerminalOp::Cancel => coord.cancel_run(now, tenant, run, op_id),
+    }
+}
+
+#[rstest]
+#[case::complete(TerminalOp::Complete)]
+#[case::fail(TerminalOp::Fail)]
+#[case::cancel(TerminalOp::Cancel)]
+fn terminal_op_happy_path(#[case] op: TerminalOp) {
     let mut coord = active_run_coordinator();
-    let result = coord
-        .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
+    let result = apply_terminal_op(
+        &mut coord,
+        op,
+        now(3),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(2),
+    )
+    .unwrap();
     assert!(result.is_executed());
 
     let record = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(record.status(), RunStatus::Done);
+    assert_eq!(record.status(), op.expected_status());
     assert_eq!(record.completed_at(), Some(now(3)));
 }
 
-#[test]
-fn complete_run_wrong_status_initializing() {
+#[rstest]
+#[case::complete(TerminalOp::Complete, RunStatus::Done)]
+#[case::fail(TerminalOp::Fail, RunStatus::Failed)]
+fn terminal_op_wrong_status_initializing(#[case] op: TerminalOp, #[case] target: RunStatus) {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let err = coord
-        .complete_run(now(2), test_tenant(), test_run(), OpId::from_raw(1))
-        .unwrap_err();
+    let err = apply_terminal_op(
+        &mut coord,
+        op,
+        now(2),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(1),
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
             RunTransitionError::WrongStatus {
                 status: RunStatus::Initializing,
-                target: RunStatus::Done,
-            }
+                target: t,
+            } if t == target
         ),
-        "expected WrongStatus(Initializing), got: {err:?}",
+        "expected WrongStatus(Initializing -> {target:?}), got: {err:?}",
     );
 }
 
-#[test]
-fn complete_run_terminal_already_done() {
+#[rstest]
+#[case::complete_after_done(TerminalOp::Complete)]
+#[case::fail_after_done(TerminalOp::Fail)]
+#[case::cancel_after_done(TerminalOp::Cancel)]
+fn terminal_op_rejected_when_already_terminal(#[case] op: TerminalOp) {
     let mut coord = active_run_coordinator();
     let _ = coord
         .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
         .unwrap();
 
-    let err = coord
-        .complete_run(now(4), test_tenant(), test_run(), OpId::from_raw(3))
-        .unwrap_err();
+    let err = apply_terminal_op(
+        &mut coord,
+        op,
+        now(4),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(3),
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -371,112 +798,21 @@ fn complete_run_terminal_already_done() {
     );
 }
 
-#[test]
-fn complete_run_not_found() {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let err = coord
-        .complete_run(now(1), test_tenant(), test_run(), OpId::from_raw(1))
-        .unwrap_err();
-    assert!(matches!(err, RunTransitionError::RunNotFound));
-}
-
-#[test]
-fn complete_run_idempotent_replay() {
+#[rstest]
+#[case::complete(TerminalOp::Complete)]
+#[case::fail(TerminalOp::Fail)]
+#[case::cancel(TerminalOp::Cancel)]
+fn terminal_op_idempotent_replay(#[case] op: TerminalOp) {
     let mut coord = active_run_coordinator();
-    let op = OpId::from_raw(2);
-    let first = coord
-        .complete_run(now(3), test_tenant(), test_run(), op)
-        .unwrap();
+    let op_id = OpId::from_raw(2);
+    let first =
+        apply_terminal_op(&mut coord, op, now(3), test_tenant(), test_run(), op_id).unwrap();
     assert!(first.is_executed());
 
-    let second = coord
-        .complete_run(now(4), test_tenant(), test_run(), op)
-        .unwrap();
+    let second =
+        apply_terminal_op(&mut coord, op, now(4), test_tenant(), test_run(), op_id).unwrap();
     assert!(second.is_replay());
 }
-
-// -- fail_run tests -----------------------------------------------------------
-//
-// Transitions a run from Active to Failed. Mirrors complete_run tests:
-// happy path, wrong-status rejection, terminal irreversibility, and
-// idempotent replay.
-
-#[test]
-fn fail_run_happy_path() {
-    let mut coord = active_run_coordinator();
-    let result = coord
-        .fail_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert!(result.is_executed());
-
-    let record = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(record.status(), RunStatus::Failed);
-    assert_eq!(record.completed_at(), Some(now(3)));
-}
-
-#[test]
-fn fail_run_wrong_status_initializing() {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    coord
-        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
-        .unwrap();
-
-    let err = coord
-        .fail_run(now(2), test_tenant(), test_run(), OpId::from_raw(1))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            RunTransitionError::WrongStatus {
-                status: RunStatus::Initializing,
-                target: RunStatus::Failed,
-            }
-        ),
-        "expected WrongStatus(Initializing), got: {err:?}",
-    );
-}
-
-#[test]
-fn fail_run_terminal() {
-    let mut coord = active_run_coordinator();
-    let _ = coord
-        .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-
-    let err = coord
-        .fail_run(now(4), test_tenant(), test_run(), OpId::from_raw(3))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
-        ),
-        "expected RunTerminal(Done), got: {err:?}",
-    );
-}
-
-#[test]
-fn fail_run_idempotent_replay() {
-    let mut coord = active_run_coordinator();
-    let op = OpId::from_raw(2);
-    let first = coord
-        .fail_run(now(3), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(first.is_executed());
-
-    let second = coord
-        .fail_run(now(4), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(second.is_replay());
-}
-
-// -- cancel_run tests ---------------------------------------------------------
-//
-// cancel_run is the only terminal transition allowed from Initializing
-// (in addition to Active). Covers both source states, terminal
-// irreversibility, and idempotent replay.
 
 #[test]
 fn cancel_run_from_initializing() {
@@ -496,95 +832,12 @@ fn cancel_run_from_initializing() {
 }
 
 #[test]
-fn cancel_run_from_active() {
-    let mut coord = active_run_coordinator();
-    let result = coord
-        .cancel_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert!(result.is_executed());
-
-    let record = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(record.status(), RunStatus::Cancelled);
-}
-
-#[test]
-fn cancel_run_terminal() {
-    let mut coord = active_run_coordinator();
-    let _ = coord
-        .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-
+fn complete_run_not_found() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     let err = coord
-        .cancel_run(now(4), test_tenant(), test_run(), OpId::from_raw(3))
+        .complete_run(now(1), test_tenant(), test_run(), OpId::from_raw(1))
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
-        ),
-        "expected RunTerminal(Done), got: {err:?}",
-    );
-}
-
-#[test]
-fn cancel_run_idempotent_replay() {
-    let mut coord = active_run_coordinator();
-    let op = OpId::from_raw(2);
-    let first = coord
-        .cancel_run(now(3), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(first.is_executed());
-
-    let second = coord
-        .cancel_run(now(4), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(second.is_replay());
-}
-
-// -- Terminal ops timestamp tests ---------------------------------------------
-//
-// All three terminal run transitions (complete, fail, cancel) must
-// persist the timestamp of the transition in `completed_at`.
-
-#[test]
-fn terminal_ops_set_completed_at() {
-    // complete_run sets completed_at
-    let mut c1 = active_run_coordinator();
-    let _ = c1
-        .complete_run(now(10), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert_eq!(
-        c1.get_run(test_tenant(), test_run())
-            .unwrap()
-            .completed_at(),
-        Some(now(10)),
-    );
-
-    // fail_run sets completed_at
-    let mut c2 = active_run_coordinator();
-    let _ = c2
-        .fail_run(now(20), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert_eq!(
-        c2.get_run(test_tenant(), test_run())
-            .unwrap()
-            .completed_at(),
-        Some(now(20)),
-    );
-
-    // cancel_run from Active sets completed_at
-    let mut c3 = active_run_coordinator();
-    let _ = c3
-        .cancel_run(now(30), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert_eq!(
-        c3.get_run(test_tenant(), test_run())
-            .unwrap()
-            .completed_at(),
-        Some(now(30)),
-    );
+    assert!(matches!(err, RunTransitionError::RunNotFound));
 }
 
 // -- OpIdConflict across run operations ---------------------------------------
@@ -821,14 +1074,112 @@ fn unpark_then_reacquire_and_checkpoint() {
     assert!(cp.is_executed());
 }
 
+#[test]
+fn unpark_shard_reintroduces_cursor_into_watermark() {
+    // Setup: 2-shard run with ranges [a,m) and [m,z).
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    // Acquire shard 10, checkpoint at "c", keep the lease for parking.
+    let lease10 = coord
+        .acquire_and_restore(
+            now(3),
+            test_tenant(),
+            ShardKey::new(test_run(), ShardId::from_raw(10)),
+            test_worker(1),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease10,
+            Cursor::with_last_key(b"c".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    // Checkpoint shard 11 at "p".
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(11), 2, 5, 6, 11, b"p");
+
+    let progress = coord
+        .get_run_progress(now(7), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.watermark(), Some(b"c".as_slice()), "min of both");
+
+    // Park shard 10 using the lease from the acquire above.
+    let _ = coord
+        .park_shard(
+            now(8),
+            test_tenant(),
+            &lease10,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(12),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(9), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"p".as_slice()),
+        "only shard 11 active after park"
+    );
+
+    // Unpark shard 10 — its old cursor "c" re-enters the watermark pool.
+    let key10 = ShardKey::new(test_run(), ShardId::from_raw(10));
+    let _ = coord
+        .unpark_shard(now(10), test_tenant(), key10, OpId::from_raw(13))
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(11), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"c".as_slice()),
+        "shard 10 cursor re-enters, watermark moves backward"
+    );
+}
+
 // -- unpark_shard run-status check tests -----------------------------------
 //
 // Unparking must be blocked when the owning run has reached a terminal
 // state (Cancelled or Done). Reactivating a shard in a dead run would
 // violate the run lifecycle contract.
 
-#[test]
-fn unpark_shard_rejected_when_run_cancelled() {
+#[rstest]
+#[case::run_cancelled(TerminalOp::Cancel, RunStatus::Cancelled)]
+#[case::run_done(TerminalOp::Complete, RunStatus::Done)]
+fn unpark_shard_rejected_when_run_terminal(
+    #[case] op: TerminalOp,
+    #[case] expected_status: RunStatus,
+) {
     let (mut coord, lease) = coordinator_with_run_and_lease();
     let key = ShardKey::new(test_run(), ShardId::from_raw(10));
 
@@ -843,10 +1194,16 @@ fn unpark_shard_rejected_when_run_cancelled() {
         )
         .unwrap();
 
-    // Cancel the run.
-    let _ = coord
-        .cancel_run(now(5), test_tenant(), test_run(), OpId::from_raw(11))
-        .unwrap();
+    // Terminate the run.
+    let _ = apply_terminal_op(
+        &mut coord,
+        op,
+        now(5),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(11),
+    )
+    .unwrap();
 
     // Attempt unpark -> should fail with RunTerminal.
     let err = coord
@@ -855,47 +1212,9 @@ fn unpark_shard_rejected_when_run_cancelled() {
     assert!(
         matches!(
             err,
-            UnparkError::RunTerminal {
-                status: RunStatus::Cancelled
-            }
+            UnparkError::RunTerminal { status } if status == expected_status
         ),
-        "expected RunTerminal(Cancelled), got: {err:?}",
-    );
-}
-
-#[test]
-fn unpark_shard_rejected_when_run_done() {
-    let (mut coord, lease) = coordinator_with_run_and_lease();
-    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
-
-    // Park the shard.
-    let _ = coord
-        .park_shard(
-            now(4),
-            test_tenant(),
-            &lease,
-            ParkReason::TooManyErrors,
-            OpId::from_raw(10),
-        )
-        .unwrap();
-
-    // Complete the run.
-    let _ = coord
-        .complete_run(now(5), test_tenant(), test_run(), OpId::from_raw(11))
-        .unwrap();
-
-    // Attempt unpark -> should fail with RunTerminal.
-    let err = coord
-        .unpark_shard(now(6), test_tenant(), key, OpId::from_raw(12))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            UnparkError::RunTerminal {
-                status: RunStatus::Done
-            }
-        ),
-        "expected RunTerminal(Done), got: {err:?}",
+        "expected RunTerminal({expected_status:?}), got: {err:?}",
     );
 }
 
@@ -1300,4 +1619,117 @@ fn full_run_lifecycle_create_register_process_complete() {
     let record = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(record.status(), RunStatus::Done);
     assert_eq!(record.completed_at(), Some(now(9)));
+}
+
+// Property-based tests verifying watermark correctness across arbitrary shard configurations.
+mod prop_progress_watermark {
+    use super::*;
+    use crate::test_util::miri_proptest_config;
+    use proptest::prelude::*;
+
+    fn arb_shard_snapshot() -> impl Strategy<Value = (ShardStatus, Option<Vec<u8>>)> {
+        let status = prop_oneof![
+            Just(ShardStatus::Active),
+            Just(ShardStatus::Done),
+            Just(ShardStatus::Split),
+            Just(ShardStatus::Parked),
+        ];
+        let key = proptest::option::of(proptest::collection::vec(0u8..=254u8, 1..16));
+        (status, key)
+    }
+
+    fn arb_shard_snapshots() -> impl Strategy<Value = Vec<(ShardStatus, Option<Vec<u8>>)>> {
+        proptest::collection::vec(arb_shard_snapshot(), 1..32)
+    }
+
+    proptest! {
+        #![proptest_config(miri_proptest_config())]
+
+        #[test]
+        fn watermark_bounds_and_none_condition(
+            snapshots in arb_shard_snapshots(),
+        ) {
+            let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+            let shard_ids: Vec<ShardId> = (0..snapshots.len())
+                .map(|i| ShardId::from_raw((i as u64) + 1))
+                .collect();
+            coord.seed_run(test_tenant(), test_run(), shard_ids.clone(), LEASE_DURATION);
+
+            for (shard_id, (status, key)) in shard_ids.into_iter().zip(snapshots.iter()) {
+                let cursor = key
+                    .as_ref()
+                    .map_or_else(Cursor::initial, |k| Cursor::with_last_key(k.clone()));
+                let park_reason = if *status == ShardStatus::Parked {
+                    Some(ParkReason::TooManyErrors)
+                } else {
+                    None
+                };
+                // Split shards need non-empty spawned list.
+                let spawned = if *status == ShardStatus::Split {
+                    let mut s = gossip_stdx::InlineVec::new();
+                    s.push(ShardId::from_raw(1u64 << 63));
+                    s
+                } else {
+                    gossip_stdx::InlineVec::new()
+                };
+                let record = ShardRecord::from_raw_parts(
+                    test_tenant(),
+                    test_run(),
+                    shard_id,
+                    *status,
+                    park_reason,
+                    &ShardSpec::with_range(vec![0x00], vec![0xFF]),
+                    &cursor,
+                    CursorSemantics::Completed,
+                    None,
+                    FenceEpoch::INITIAL,
+                    None,
+                    spawned,
+                    RingBuffer::new(),
+                    coord.slab_mut(),
+                );
+                coord.seed_shard(record);
+            }
+
+            let progress = coord
+                .get_run_progress(now(10), test_tenant(), test_run())
+                .unwrap();
+
+            // Expected watermark: min of keys where status==Active && key.is_some().
+            let expected_min: Option<&[u8]> = snapshots
+                .iter()
+                .filter(|(s, _)| *s == ShardStatus::Active)
+                .filter_map(|(_, k)| k.as_deref())
+                .min();
+
+            prop_assert_eq!(
+                progress.watermark(),
+                expected_min,
+                "watermark must equal the minimum active cursor key",
+            );
+
+            // Verify watermark <= all active keys (lower bound property).
+            if let Some(actual) = progress.watermark() {
+                for (status, key) in &snapshots {
+                    if *status == ShardStatus::Active
+                        && let Some(k) = key.as_deref()
+                    {
+                        prop_assert!(actual <= k);
+                    }
+                }
+            }
+
+            // Verify watermark ignores non-Active shards.
+            let has_active_with_key = snapshots
+                .iter()
+                .any(|(s, k)| *s == ShardStatus::Active && k.is_some());
+            if !has_active_with_key {
+                prop_assert_eq!(
+                    progress.watermark(),
+                    None,
+                    "watermark must be None when no active shard has a key",
+                );
+            }
+        }
+    }
 }
