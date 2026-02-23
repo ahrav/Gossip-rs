@@ -48,7 +48,8 @@ const _: () = {
             | SimEventKind::Skipped
             | SimEventKind::SessionLifecycleOk
             | SimEventKind::SessionLifecyclePartial
-            | SimEventKind::UnparkOk => {}
+            | SimEventKind::UnparkOk
+            | SimEventKind::RunTerminalOk => {}
         }
     }
 };

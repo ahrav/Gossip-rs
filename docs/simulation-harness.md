@@ -86,8 +86,8 @@ even before normal operation begins.
 Runs `safety_ops` random operations under fault injection. The first few
 operations (warmup) suppress faults to let the system reach a healthy
 baseline. After warmup, time jumps, worker pauses, lease expiry, split
-operations, OpId replays, and zombie checkpoints are all exercised at
-weighted probabilities.
+operations, OpId replays, zombie checkpoints, and run-terminal transitions
+(complete/fail/cancel) are all exercised at weighted probabilities.
 
 **Goal:** Verify that no invariant (S1-S7) is ever violated regardless of
 operation ordering, timing, or fault injection.
