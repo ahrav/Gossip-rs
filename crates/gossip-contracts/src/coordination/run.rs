@@ -803,7 +803,7 @@ impl RunProgress {
 
     /// Count a shard into the progress tallies.
     ///
-    /// This updates only status/lease counters. Call [`observe_shard`] when
+    /// This updates only status/lease counters. Call [`Self::observe_shard`] when
     /// you need both counter updates and watermark tracking in one API.
     ///
     /// # Panics
@@ -861,7 +861,7 @@ impl RunProgress {
     ///
     /// # Panics
     ///
-    /// - Same panic conditions as [`count_shard`].
+    /// - Same panic conditions as [`Self::count_shard`].
     /// - `cursor_last_key` exceeds [`MAX_KEY_SIZE`] when `status` is `Active`.
     pub fn observe_shard(
         &mut self,
