@@ -285,6 +285,9 @@ pub enum RejectionKind {
     WorkerNotFound,
     /// Target run does not exist in the coordinator.
     RunNotFound,
+    /// Run is not in the required status for this terminal transition
+    /// (e.g., `complete_run` on an `Initializing` run).
+    WrongRunStatus,
     /// Byte slab could not satisfy an allocation request.
     ResourceExhausted,
     /// Coordinator returned an error not matching a specific category.
@@ -404,7 +407,7 @@ impl From<RunTransitionError> for RejectionKind {
             RunTransitionError::RunNotFound => Self::RunNotFound,
             RunTransitionError::TenantMismatch { .. } => Self::TenantMismatch,
             RunTransitionError::RunTerminal { .. } => Self::TerminalState,
-            RunTransitionError::WrongStatus { .. } => Self::Other,
+            RunTransitionError::WrongStatus { .. } => Self::WrongRunStatus,
             RunTransitionError::OpIdConflict(_) => Self::OpIdConflict,
         }
     }

@@ -384,6 +384,7 @@ fn new_op_types_exercised() {
     let mut replayed_seen = false;
     let mut claim_seen = false;
     let mut session_lifecycle_seen = false;
+    let mut run_terminal_seen = false;
     // Run with a large enough op count and enough seeds to trigger
     // the probabilistic generation paths.
     for seed in 0..20u64 {
@@ -417,6 +418,12 @@ fn new_op_types_exercised() {
         {
             session_lifecycle_seen = true;
         }
+        if report
+            .event_counts
+            .contains_key(&SimEventKind::RunTerminalOk)
+        {
+            run_terminal_seen = true;
+        }
     }
     assert!(
         split_replace_seen,
@@ -431,6 +438,10 @@ fn new_op_types_exercised() {
     assert!(
         session_lifecycle_seen,
         "SessionLifecycleOk never observed across 20 seeds"
+    );
+    assert!(
+        run_terminal_seen,
+        "RunTerminalOk never observed across 20 seeds"
     );
 }
 
