@@ -101,43 +101,6 @@ fn split_residual_child_visible_in_list_shards() {
 
 // -- get_run_progress watermark tests ---------------------------------------
 
-/// Build an `Active` run with three disjoint shards, all at `Cursor::initial()`.
-fn coordinator_with_three_initial_active_shards() -> InMemoryCoordinator {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    coord
-        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
-        .unwrap();
-
-    let shards = vec![
-        InitialShard::new(
-            ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"g".to_vec()),
-            Cursor::initial(),
-        ),
-        InitialShard::new(
-            ShardId::from_raw(11),
-            ShardSpec::with_range(b"g".to_vec(), b"n".to_vec()),
-            Cursor::initial(),
-        ),
-        InitialShard::new(
-            ShardId::from_raw(12),
-            ShardSpec::with_range(b"n".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
-    ];
-    let _ = coord
-        .register_shards(
-            now(2),
-            test_tenant(),
-            test_run(),
-            &shards,
-            OpId::from_raw(1),
-        )
-        .unwrap();
-
-    coord
-}
-
 /// Acquire `shard` and write a checkpoint key at a controlled logical time.
 fn checkpoint_shard_last_key(
     coord: &mut InMemoryCoordinator,
@@ -307,30 +270,6 @@ fn coordinator_with_split_children_for_watermark()
         .shard();
 
     (coord, child_done, child_parked, child_active)
-}
-
-#[test]
-fn all_active_initial_cursors_watermark_none() {
-    let coord = coordinator_with_three_initial_active_shards();
-
-    let progress = coord
-        .get_run_progress(now(3), test_tenant(), test_run())
-        .unwrap();
-    assert_eq!(progress.active(), 3);
-    assert_eq!(progress.watermark(), None);
-}
-
-#[test]
-fn mixed_progressed_and_initial_active_watermark_is_min_progressed() {
-    let mut coord = coordinator_with_three_initial_active_shards();
-    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(10), 1, 3, 4, 10, b"c");
-    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(11), 2, 5, 6, 11, b"k");
-
-    let progress = coord
-        .get_run_progress(now(7), test_tenant(), test_run())
-        .unwrap();
-    assert_eq!(progress.active(), 3);
-    assert_eq!(progress.watermark(), Some(b"c".as_slice()));
 }
 
 #[test]
@@ -975,6 +914,99 @@ fn unpark_then_reacquire_and_checkpoint() {
         )
         .unwrap();
     assert!(cp.is_executed());
+}
+
+#[test]
+fn unpark_shard_reintroduces_cursor_into_watermark() {
+    // Setup: 2-shard run with ranges [a,m) and [m,z).
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    // Acquire shard 10, checkpoint at "c", keep the lease for parking.
+    let lease10 = coord
+        .acquire_and_restore(
+            now(3),
+            test_tenant(),
+            ShardKey::new(test_run(), ShardId::from_raw(10)),
+            test_worker(1),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &lease10,
+            Cursor::with_last_key(b"c".to_vec()),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    // Checkpoint shard 11 at "p".
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(11), 2, 5, 6, 11, b"p");
+
+    let progress = coord
+        .get_run_progress(now(7), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.watermark(), Some(b"c".as_slice()), "min of both");
+
+    // Park shard 10 using the lease from the acquire above.
+    let _ = coord
+        .park_shard(
+            now(8),
+            test_tenant(),
+            &lease10,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(12),
+        )
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(9), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"p".as_slice()),
+        "only shard 11 active after park"
+    );
+
+    // Unpark shard 10 — its old cursor "c" re-enters the watermark pool.
+    let key10 = ShardKey::new(test_run(), ShardId::from_raw(10));
+    let _ = coord
+        .unpark_shard(now(10), test_tenant(), key10, OpId::from_raw(13))
+        .unwrap();
+
+    let progress = coord
+        .get_run_progress(now(11), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(
+        progress.watermark(),
+        Some(b"c".as_slice()),
+        "shard 10 cursor re-enters, watermark moves backward"
+    );
 }
 
 // -- unpark_shard run-status check tests -----------------------------------

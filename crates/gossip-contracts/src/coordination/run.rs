@@ -707,12 +707,6 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// because the maximum shard count is bounded by `MAX_INITIAL_SHARDS` plus
 /// spawned children, well within `u32::MAX`.
 ///
-/// `watermark` is the run's conservative in-flight frontier: the smallest
-/// lexicographic `last_key` among shards that are currently `Active` and have
-/// non-initial cursors. Non-initial cursors may come from resume state
-/// (initial manifest registration) or from checkpoint progress while active.
-/// Initial cursors (`last_key = None`) are excluded.
-///
 /// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
 /// owns key bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -771,10 +765,11 @@ impl RunProgress {
     /// This can happen when all active shards are still at `Cursor::initial()`
     /// or when the run has no active shards.
     ///
-    /// This is a point-in-time snapshot, not a monotonic watermark stream:
-    /// values may move backward across calls as active shard membership changes
-    /// (for example split/park transitions or newly active shards with smaller
-    /// cursor keys).
+    /// **Non-monotonicity**: This is a point-in-time snapshot, not a monotonic
+    /// watermark stream. Splits, unparks, and new shard activations can
+    /// introduce active shards with earlier cursor positions, causing the
+    /// watermark to decrease. Consumers that need a monotonic progress bound
+    /// should maintain a running maximum externally.
     #[must_use]
     pub fn watermark(&self) -> Option<&[u8]> {
         self.watermark.as_deref()
@@ -903,6 +898,7 @@ impl RunProgress {
     ///
     /// - `total == active + done + split + parked`
     /// - `leased <= active`
+    /// - `watermark` must be `None` when `active == 0`
     pub fn assert_invariants(&self) {
         assert_eq!(
             self.total,
@@ -915,6 +911,13 @@ impl RunProgress {
             self.leased,
             self.active,
         );
+        // Watermark can only be Some when there are active shards.
+        if self.active == 0 {
+            assert!(
+                self.watermark.is_none(),
+                "RunProgress: watermark must be None when active == 0"
+            );
+        }
     }
 }
 

@@ -2230,16 +2230,6 @@ impl RunManagement for InMemoryCoordinator {
     /// This is important because `run_shards` is a `HashSet` with
     /// non-deterministic iteration order.
     ///
-    /// Implementation note: each shard is routed through
-    /// [`RunProgress::observe_shard`] so counter logic and watermark rules stay
-    /// centralized in one place.
-    ///
-    /// Watermark contract (matches `RunProgress` docs + tests):
-    /// - consider only `Active` shards,
-    /// - among those, consider only non-initial cursors (`last_key` present),
-    /// - return the lexicographic minimum of considered keys,
-    /// - return `None` when no active shard has a `last_key`.
-    ///
     /// `leased` is evaluated at `now`, so a shard at lease deadline is treated
     /// as unleased (`now >= deadline`).
     fn get_run_progress(
