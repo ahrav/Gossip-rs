@@ -5,10 +5,9 @@ description: Use when a markdown plan file exists and needs validation before im
 
 # Plan Review
 
-A two-phase specialist review for markdown plan files. Four independent agents
-each review the same plan through a different lens, then a synthesizer merges
-findings into a focused, actionable report with RETHINK / REVISE / WATCH
-categories.
+A specialist review for markdown plan files. Selected agents review the same
+plan through different lenses, then a synthesizer merges findings into a
+focused, actionable report with RETHINK / REVISE / WATCH categories.
 
 ## When to Use
 
@@ -24,12 +23,39 @@ categories.
 /plan-review <path-to-plan-file>
 /plan-review --skip=performance path/to/plan.md
 /plan-review --focus=distributed path/to/plan.md
+/plan-review --mode=fast path/to/plan.md
+/plan-review --rerun-unresolved path/to/plan.md
 ```
 
 - `--skip=<agent>`: Drop a specialist (correctness, footguns, simplification,
   performance). Minimum 2 specialists must run.
 - `--focus=<domain>`: Adds domain context to all agent prompts (e.g.,
   `distributed`, `concurrency`, `security`).
+- `--mode=fast|standard`: `fast` is optimized for small features and convergence;
+  `standard` runs the full specialist set.
+- `--rerun-unresolved`: Re-review mode; only previously unresolved findings (and
+  regressions directly caused by edits) should be reported.
+
+## Convergence Defaults
+
+Use **Fast mode** by default when all are true:
+
+- Plan is small (typically <= 4 referenced code files and <= 2 core behavior
+  changes)
+- No new unsafe/concurrency/distributed/security architecture
+- No schema/storage identity contract changes
+- No broad runtime/backend rollout changes
+
+Fast mode reviewers:
+
+- Required: Correctness, Footguns
+- Optional: Simplification (only if plan introduces new flags/config/options,
+  new abstractions, or extra plumbing)
+- Optional: Performance (only if plan touches hot loops / scanner hot paths or
+  claims performance impact)
+
+Goal: for small features, converge in **one** review pass with minimal,
+high-signal findings.
 
 ## Phase 0 — Orchestrator Prep (no agents)
 
@@ -40,16 +66,27 @@ Before launching agents, the orchestrator:
 3. Quick Glob/Grep to confirm referenced codebase paths exist. Note any that
    are missing or have moved.
 4. If the plan references design docs in `docs/`, read them.
-5. Assemble two substitution variables:
+5. Determine review mode (`fast` or `standard`) from explicit flag or
+   convergence defaults above.
+6. Build a **Scope Charter**:
+   - In-scope changes the plan is allowed to make
+   - Explicit out-of-scope items
+   - Conditions that justify scope escalation (for example default runtime path
+     makes in-scope fix ineffective)
+7. If rerun mode is active, collect prior findings and mark them as
+   RESOLVED/PARTIAL/UNRESOLVED.
+8. Assemble substitution variables:
    - **{PLAN}**: the full plan text
    - **{CONTEXT}**: a summary of referenced paths, whether they exist, any
      design doc excerpts, and any discrepancies found
+   - **{SCOPE_CHARTER}**: explicit scope boundaries and escalation conditions
+   - **{PRIOR_FINDINGS}**: optional unresolved-finding list for rerun mode
 
 If the plan file is empty or cannot be read, tell the user and stop.
 
-## Phase 1 — Specialist Reviews (4 Parallel Agents)
+## Phase 1 — Specialist Reviews (2-4 Parallel Agents)
 
-Launch **all 4 agents in a single message** using the Task tool with
+Launch **all selected agents in a single message** using the Task tool with
 `subagent_type=general-purpose`. Each agent gets the same plan + context but a
 different review lens.
 
@@ -68,6 +105,14 @@ specialists are covering those.
 
 {CONTEXT}
 
+## Scope Charter
+
+{SCOPE_CHARTER}
+
+## Prior Findings (optional rerun mode)
+
+{PRIOR_FINDINGS}
+
 ## Rules
 
 - Only report findings within your specialty. Do NOT stray.
@@ -79,6 +124,10 @@ specialists are covering those.
   The most valuable findings come from gaps between plan assumptions and
   codebase reality.
 - For each finding, state the PROBLEM and the RECOMMENDED CHANGE to the plan.
+- Respect the Scope Charter. Do NOT expand scope unless you can prove the
+  default execution path makes the current scope invalid.
+- In rerun mode, only report unresolved prior findings or regressions directly
+  introduced by the revised plan.
 - Rate each finding:
   - impact (1-10): How much does this matter if unaddressed?
   - confidence (0-100): How sure are you this is a real issue?
@@ -206,15 +255,21 @@ tool with `subagent_type=general-purpose`.
 ### Synthesizer Prompt
 
 ```
-You are the Plan Review Synthesizer. Four specialist reviewers have
-independently reviewed the same implementation plan. Your job is to merge
-their findings into one focused, actionable report.
+You are the Plan Review Synthesizer. Specialist reviewers have independently
+reviewed the same implementation plan. Your job is to merge their findings into
+one focused, actionable report.
 
 ## Original Plan
 {PLAN}
 
 ## Specialist Reports
-{ALL_FOUR_REPORTS}
+{ALL_SPECIALIST_REPORTS}
+
+## Scope Charter
+{SCOPE_CHARTER}
+
+## Prior Findings (optional rerun mode)
+{PRIOR_FINDINGS}
 
 ## Your Task
 
@@ -267,11 +322,17 @@ final report must require action.
 Assign each surviving finding exactly one category:
 
 - **RETHINK** (impact >= 8, confidence >= 70): Stop. Fundamental approach
-  change needed before proceeding.
+  change needed before proceeding. Use this only when:
+  - plan contradicts a required correctness contract/invariant, OR
+  - default runtime path makes the proposed scope ineffective, OR
+  - clear data-loss/security/soundness risk exists.
 - **REVISE** (impact >= 6, confidence >= 60): Make specific plan edits before
   implementing.
 - **WATCH** (impact >= 4, confidence >= 50): Plan is sound but implementation
   must handle this explicitly.
+
+In rerun mode, do NOT introduce net-new categories/findings unless they are
+directly caused by changed plan sections or newly discovered hard evidence.
 
 ### 5. Output Format
 
@@ -279,7 +340,7 @@ Assign each surviving finding exactly one category:
 ## Plan Review Summary
 
 **Plan**: {plan file path or title}
-**Specialists**: Correctness, Footguns, Simplification, Performance
+**Specialists**: {SPECIALIST_LIST}
 **Unique findings**: N (after dedup and filtering)
 
 ### RETHINK
@@ -313,10 +374,9 @@ Items the plan handles correctly but implementation must be careful about.
 
 | Specialist | Findings | Assessment |
 |------------|----------|------------|
-| Correctness | N | {one-line summary} |
-| Footguns | N | {one-line summary} |
-| Simplification | N | {one-line summary} |
-| Performance | N | {one-line summary} |
+| {Specialist A} | N | {one-line summary} |
+| {Specialist B} | N | {one-line summary} |
+| ... | ... | ... |
 ```
 
 ### Rules
@@ -328,6 +388,10 @@ Items the plan handles correctly but implementation must be careful about.
   If it drops below 50%, discard it.
 - Preserve plan section references and codebase citations from specialist
   reports.
+- Enforce scope-lock: out-of-scope concerns cannot be elevated to RETHINK
+  unless Scope Charter escalation conditions are met.
+- For performance findings, require concrete hot-path evidence and at least one
+  measurable validation step; otherwise demote/discard.
 ```
 
 ## Final Presentation
@@ -343,11 +407,17 @@ rework" verdict as-is and recommend the user redesign before re-running
 
 ## Configuration
 
-Default: 4 specialists + 1 synthesizer (5 agents total).
+Default behavior:
+
+- `standard`: 4 specialists + 1 synthesizer (5 agents total)
+- `fast`: 2-4 specialists + 1 synthesizer (3-5 agents total), selected by
+  convergence defaults and `--skip` flags
 
 ```
 /plan-review --skip=performance     (3 specialists + 1 synthesizer)
 /plan-review --skip=footguns,performance  (2 specialists + 1 synthesizer)
+/plan-review --mode=fast            (adaptive 2-4 specialists + synthesizer)
+/plan-review --rerun-unresolved     (rerun unresolved-only mode)
 ```
 
 Minimum: at least 2 specialists must run. The synthesizer always runs.
@@ -365,5 +435,5 @@ attention to {domain}-specific concerns in your review.
   review after implementation). This skill fills the gap between them.
 - For plans that reference many codebase files, Phase 0's path validation
   catches stale references before agents waste time on them.
-- If the plan is short (< 20 lines), the overhead of 4 agents may not be worth
-  it — consider a single-pass review instead.
+- For small features, prefer `--mode=fast` to drive one-pass convergence.
+- On reruns, use `--rerun-unresolved` to prevent finding churn and scope creep.
