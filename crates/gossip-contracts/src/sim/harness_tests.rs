@@ -850,3 +850,36 @@ fn run_terminal_unpark_blocked_shard_ops_continue() {
     );
     assert!(v.is_empty());
 }
+
+/// `try_gen_terminate_run` should sample across all seeded runs so multi-run
+/// simulations do not starve run-terminal coverage for later run IDs.
+#[test]
+fn terminate_run_generator_targets_multiple_runs() {
+    use crate::identity::RunId;
+
+    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
+    let run1 = RunId::from_raw(1);
+    let run2 = RunId::from_raw(2);
+    for i in 1..=3 {
+        sim.register_shard(run1, ShardId::from_raw(i));
+        sim.register_shard(run2, ShardId::from_raw(i));
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..64 {
+        let op = sim
+            .try_gen_terminate_run()
+            .expect("terminate_run op should be generatable when runs are seeded");
+        match op {
+            SimOp::TerminateRun { run, .. } => {
+                seen.insert(run);
+            }
+            other => panic!("expected TerminateRun op, got {other:?}"),
+        }
+    }
+
+    assert!(
+        seen.contains(&run1) && seen.contains(&run2),
+        "terminate_run generator should target both runs, saw: {seen:?}"
+    );
+}

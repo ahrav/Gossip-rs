@@ -774,7 +774,7 @@ pub struct CoordinationSim<B: SimulationBackend = InMemoryCoordinator> {
     last_checkpoint_ops: CheckpointOpMap,
     /// Shard IDs per run, used to seed run records for `claim_next_available`.
     run_shard_ids: BTreeMap<RunId, Vec<ShardId>>,
-    /// Monotonic op-ID counter for admin operations (unpark).
+    /// Monotonic op-ID counter for admin operations (`Unpark`, `TerminateRun`).
     /// Uses partition 0 (workers start at 1), guaranteeing no collisions.
     admin_next_op: u64,
 }
@@ -1303,7 +1303,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Generate the next admin op-ID from the reserved partition 0.
     ///
     /// Worker IDs start at 1, so partition 0 `[0, OP_ID_PARTITION)` is unused
-    /// by workers. Admin operations (unpark) draw from this partition.
+    /// by workers. Admin operations (`Unpark`, `TerminateRun`) draw from this
+    /// partition so they cannot collide with worker-generated op-IDs.
     fn next_admin_op_id(&mut self) -> OpId {
         assert!(
             self.admin_next_op < super::worker::OP_ID_PARTITION,
@@ -1338,8 +1339,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Execute a run terminal transition (complete, fail, or cancel).
     ///
     /// On success: `debug_assert!` that the outcome is executed (fresh op-ID
-    /// means replay never occurs). No sim-level state mutation — the
-    /// coordinator handles the run transition; shard ops continue unaffected.
+    /// means replay never occurs). No harness-side mutation is required: run
+    /// status is coordinator-owned. This intentionally keeps shard lifecycle
+    /// ops available while letting the coordinator reject run-scoped admin
+    /// actions (for example, unpark after a run is terminal).
     ///
     /// On error: converts `RunTransitionError` to `RejectionKind` via the
     /// exhaustive `From` impl.
@@ -1965,15 +1968,17 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Pick a run and a random terminal kind for a run-termination op.
     ///
     /// Guards on `run_shard_ids` being non-empty (backends created via
-    /// `with_backend()` may have no seeded runs). Picks the first run
-    /// deterministically (single-run sim). Kind is chosen uniformly.
+    /// `with_backend()` may have no seeded runs). Picks a run uniformly
+    /// across seeded run IDs (not weighted by shard count), then picks a
+    /// terminal kind uniformly.
     /// No suppression after first success — subsequent attempts naturally
     /// exercise the `RunTerminal` rejection path (terminal irreversibility).
     fn try_gen_terminate_run(&mut self) -> Option<SimOp> {
         if self.run_shard_ids.is_empty() {
             return None;
         }
-        let run = *self.run_shard_ids.keys().next().unwrap();
+        let idx = self.context.rng().random_range(0..self.run_shard_ids.len());
+        let run = *self.run_shard_ids.keys().nth(idx)?;
         let kind = match self.context.rng().random_range(0u32..3) {
             0 => RunTerminalKind::Complete,
             1 => RunTerminalKind::Fail,
