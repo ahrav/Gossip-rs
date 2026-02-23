@@ -3,6 +3,7 @@ use crate::coordination::cursor::Cursor;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::test_fixtures::derived_shard_id;
 use crate::identity::{LogicalTime, RunId, ShardId, ShardKey};
 use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder};
 
@@ -13,9 +14,11 @@ fn make_coordinator_with_shard(shard_raw: u64) -> InMemoryCoordinator {
         TENANT,
         key.run(),
         key.shard(),
-        ShardSpec::with_range(vec![b'a'], vec![b'z']),
+        &ShardSpec::with_range(vec![b'a'], vec![b'z']),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .expect("slab large enough for test");
     coord.seed_shard(record);
     coord
 }
@@ -53,20 +56,18 @@ fn detects_fence_epoch_regression() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed with epoch 5.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(5))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(5))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed with lower epoch — S2 violation.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(3))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(3))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert_eq!(v.len(), 1);
@@ -85,16 +86,16 @@ fn detects_terminal_state_reversion() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed as Done (terminal).
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Done)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Done)
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed as Active — S3 violation (terminal reverted).
-    coord.seed_shard(TestRecordBuilder::new(TENANT, run, shard).build());
+    let record = TestRecordBuilder::new(TENANT, run, shard).build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert_eq!(v.len(), 1);
@@ -113,11 +114,10 @@ fn detects_record_invariant_violation() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Parked without park_reason — violates INV-1 in assert_invariants.
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Parked)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Parked)
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -137,20 +137,18 @@ fn detects_cursor_regression() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed with cursor at 'h'.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'h']))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .cursor(Cursor::with_last_key(vec![b'h']))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed with cursor regressed to 'd' — S5 violation.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'd']))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .cursor(Cursor::with_last_key(vec![b'd']))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert_eq!(v.len(), 1);
@@ -169,16 +167,16 @@ fn detects_cursor_reset_to_initial() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed with cursor at 'h'.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'h']))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .cursor(Cursor::with_last_key(vec![b'h']))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed with initial cursor (None) — S5 violation.
-    coord.seed_shard(TestRecordBuilder::new(TENANT, run, shard).build());
+    let record = TestRecordBuilder::new(TENANT, run, shard).build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert_eq!(v.len(), 1);
@@ -197,11 +195,10 @@ fn detects_cursor_above_range() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Cursor at '{' (ASCII 123) is above spec range [a=97, z=122).
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'{']))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .cursor(Cursor::with_last_key(vec![b'{']))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -221,11 +218,10 @@ fn detects_cursor_below_range() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Cursor at 0x01 is below spec range [a=97, z=122).
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![0x01]))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .cursor(Cursor::with_last_key(vec![0x01]))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -234,12 +230,6 @@ fn detects_cursor_below_range() {
         &v[0],
         InvariantViolation::CursorOutOfBounds { .. }
     ));
-}
-
-/// Helper to create a derived `ShardId` (bit 63 set), matching the
-/// convention used by the split subsystem.
-fn derived_shard_id(base: u64) -> ShardId {
-    ShardId::from_raw((1u64 << 63) | base)
 }
 
 /// S7: Checker detects a Split shard with no spawned children.
@@ -253,11 +243,10 @@ fn detects_split_no_children() {
     // Split with empty spawned vec — S7 violation.
     // Also triggers S4 (assert_invariants panics on empty spawned for Split),
     // so we filter for only SplitCoverage below.
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Split)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Split)
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -286,12 +275,11 @@ fn detects_split_missing_child() {
     // Parent is Split, references derived child 99 that doesn't exist
     // in the coordinator.
     let missing_child = derived_shard_id(99);
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Split)
-            .spawned([missing_child])
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Split)
+        .spawned([missing_child])
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -319,20 +307,18 @@ fn detects_split_wrong_parent_ref() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Parent shard 1 is Split, references derived child shard.
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, parent_shard)
-            .status(ShardStatus::Split)
-            .spawned([child_shard])
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, parent_shard)
+        .status(ShardStatus::Split)
+        .spawned([child_shard])
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
 
     // Child shard exists but points to wrong parent (derived 999 instead of 1).
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, child_shard)
-            .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
-            .parent(ShardId::from_raw(999))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, child_shard)
+        .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
+        .parent(ShardId::from_raw(999))
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -350,7 +336,7 @@ fn detects_split_wrong_parent_ref() {
     ));
 }
 
-/// S3: Checker detects Split→Active reversion.
+/// S3: Checker detects Split->Active reversion.
 #[test]
 fn detects_split_to_active_reversion() {
     let run = RunId::from_raw(1);
@@ -361,24 +347,23 @@ fn detects_split_to_active_reversion() {
     let child = ShardId::from_raw((1u64 << 63) | 10);
 
     // Seed as Split (terminal) with one child.
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Split)
-            .spawned([child])
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Split)
+        .spawned([child])
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
     // Seed the child so S7 doesn't fire on the parent.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, child)
-            .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
-            .parent(shard)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, child)
+        .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
+        .parent(shard)
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed as Active — S3 violation (terminal reverted).
-    coord.seed_shard(TestRecordBuilder::new(TENANT, run, shard).build());
+    let record = TestRecordBuilder::new(TENANT, run, shard).build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert_eq!(v.len(), 1);
@@ -388,7 +373,7 @@ fn detects_split_to_active_reversion() {
     );
 }
 
-/// S3: Parked→Active is a legitimate unpark transition, not an S3 violation.
+/// S3: Parked->Active is a legitimate unpark transition, not an S3 violation.
 #[test]
 fn parked_to_active_not_flagged_as_terminal_reversion() {
     let run = RunId::from_raw(1);
@@ -397,31 +382,29 @@ fn parked_to_active_not_flagged_as_terminal_reversion() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed as Parked (terminal per is_terminal()).
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Parked)
-            .park_reason(crate::coordination::record::ParkReason::Other)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Parked)
+        .park_reason(crate::coordination::record::ParkReason::Other)
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed as Active — simulates unpark_shard.
     // Bump fence epoch to match what unpark_shard does.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .fence_epoch(FenceEpoch::INITIAL.increment())
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .fence_epoch(FenceEpoch::INITIAL.increment())
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert!(
         v.is_empty(),
-        "Parked→Active should not trigger S3 TerminalIrreversibility, got: {v:?}"
+        "Parked->Active should not trigger S3 TerminalIrreversibility, got: {v:?}"
     );
 }
 
-/// Parked→Active without bumping fence_epoch triggers UnparkWithoutFenceBump.
+/// Parked->Active without bumping fence_epoch triggers UnparkWithoutFenceBump.
 #[test]
 fn detects_unpark_without_fence_bump() {
     let run = RunId::from_raw(1);
@@ -430,22 +413,20 @@ fn detects_unpark_without_fence_bump() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed as Parked with fence epoch 3.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Parked)
-            .park_reason(crate::coordination::record::ParkReason::Other)
-            .fence_epoch(FenceEpoch::from_raw(3))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Parked)
+        .park_reason(crate::coordination::record::ParkReason::Other)
+        .fence_epoch(FenceEpoch::from_raw(3))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
     // Re-seed as Active with SAME fence epoch — missing fence bump.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(3))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(3))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
     assert_eq!(v.len(), 1);
@@ -462,7 +443,7 @@ fn detects_unpark_without_fence_bump() {
     );
 }
 
-/// A fence regression during Parked→Active (epoch 5→3) must fire only S2
+/// A fence regression during Parked->Active (epoch 5->3) must fire only S2
 /// (FenceMonotonicity), not the S3 sub-property (UnparkWithoutFenceBump).
 #[test]
 fn fence_regression_during_unpark_does_not_double_report() {
@@ -472,24 +453,22 @@ fn fence_regression_during_unpark_does_not_double_report() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed as Parked with fence epoch 5.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .status(ShardStatus::Parked)
-            .park_reason(crate::coordination::record::ParkReason::Other)
-            .fence_epoch(FenceEpoch::from_raw(5))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .status(ShardStatus::Parked)
+        .park_reason(crate::coordination::record::ParkReason::Other)
+        .fence_epoch(FenceEpoch::from_raw(5))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
     assert!(checker.check_all(&coord, TENANT, now).is_empty());
 
-    // Re-seed as Active with LOWER fence epoch (regression: 5→3).
+    // Re-seed as Active with LOWER fence epoch (regression: 5->3).
     // S2 should fire (fence regression), but S3 sub-property
     // (UnparkWithoutFenceBump) should NOT also fire for the same event.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(3))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(3))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let v = checker.check_all(&coord, TENANT, now);
 
@@ -526,34 +505,31 @@ fn prunes_permanently_terminal_shards_from_history() {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
 
     // Seed four shards in different states.
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, done_shard)
-            .status(ShardStatus::Done)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, done_shard)
+        .status(ShardStatus::Done)
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let child = ShardId::from_raw((1u64 << 63) | 10);
-    coord.seed_shard_unchecked(
-        TestRecordBuilder::new(TENANT, run, split_shard)
-            .status(ShardStatus::Split)
-            .spawned([child])
-            .build(),
-    );
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, child)
-            .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
-            .parent(split_shard)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, split_shard)
+        .status(ShardStatus::Split)
+        .spawned([child])
+        .build(coord.slab_mut());
+    coord.seed_shard_unchecked(record);
+    let record = TestRecordBuilder::new(TENANT, run, child)
+        .spec(ShardSpec::with_range(vec![b'a'], vec![b'm']))
+        .parent(split_shard)
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
-    coord.seed_shard(
-        TestRecordBuilder::new(TENANT, run, parked_shard)
-            .status(ShardStatus::Parked)
-            .park_reason(crate::coordination::record::ParkReason::Other)
-            .build(),
-    );
+    let record = TestRecordBuilder::new(TENANT, run, parked_shard)
+        .status(ShardStatus::Parked)
+        .park_reason(crate::coordination::record::ParkReason::Other)
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
 
-    coord.seed_shard(TestRecordBuilder::new(TENANT, run, active_shard).build());
+    let record = TestRecordBuilder::new(TENANT, run, active_shard).build(coord.slab_mut());
+    coord.seed_shard(record);
 
     let mut checker = InvariantChecker::new();
     let v = checker.check_all(&coord, TENANT, now);
@@ -619,21 +595,19 @@ fn cross_tenant_isolation_in_temporal_checks() {
     let mut checker = InvariantChecker::new();
 
     // Tenant A: seed shard with fence epoch 5.
-    coord.seed_shard(
-        TestRecordBuilder::new(tenant_a, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(5))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(tenant_a, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(5))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     assert!(checker.check_all(&coord, tenant_a, now).is_empty());
 
     // Tenant B: seed same (run, shard) with fence epoch 2.
     // If keys were only (RunId, ShardId), this would look like a
-    // regression from 5→2 and trigger an S2 violation.
-    coord.seed_shard(
-        TestRecordBuilder::new(tenant_b, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(2))
-            .build(),
-    );
+    // regression from 5->2 and trigger an S2 violation.
+    let record = TestRecordBuilder::new(tenant_b, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(2))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let v = checker.check_all(&coord, tenant_b, now);
     assert!(
         v.is_empty(),
@@ -642,19 +616,17 @@ fn cross_tenant_isolation_in_temporal_checks() {
 
     // Verify tenant A's history is still intact — advancing A's epoch
     // from 5 to 6 should not violate.
-    coord.seed_shard(
-        TestRecordBuilder::new(tenant_a, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(6))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(tenant_a, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(6))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     assert!(checker.check_all(&coord, tenant_a, now).is_empty());
 
     // Regressing tenant A from 6 to 4 SHOULD trigger S2.
-    coord.seed_shard(
-        TestRecordBuilder::new(tenant_a, run, shard)
-            .fence_epoch(FenceEpoch::from_raw(4))
-            .build(),
-    );
+    let record = TestRecordBuilder::new(tenant_a, run, shard)
+        .fence_epoch(FenceEpoch::from_raw(4))
+        .build(coord.slab_mut());
+    coord.seed_shard(record);
     let v = checker.check_all(&coord, tenant_a, now);
     assert_eq!(v.len(), 1);
     assert!(

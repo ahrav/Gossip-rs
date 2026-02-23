@@ -35,12 +35,16 @@
 
 use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
+use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{ShardKey, TenantId};
 
 /// Read-only observation API for simulation backends.
 ///
 /// Provides the shard-level introspection that the invariant checker
 /// and simulation harness need to verify protocol correctness.
+/// The trait intentionally hides allocator internals (`ByteSlab` and
+/// `ByteSlot`): callers observe through borrowed/owned accessors so
+/// simulation logic stays storage-backend agnostic.
 ///
 /// # Consistency contract
 ///
@@ -98,6 +102,33 @@ pub trait SimIntrospection {
     /// See the [consistency contract](SimIntrospection#consistency-contract)
     /// discussion on the trait.
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord>;
+
+    /// Materialize an owned shard spec for API boundaries that require
+    /// detached data (for example split-plan construction in the harness).
+    ///
+    /// Prefer [`spec_bounds`](Self::spec_bounds) when only range checks are
+    /// needed: that path stays borrowed and avoids per-record heap copies.
+    fn materialize_spec(&self, record: &ShardRecord) -> ShardSpec;
+
+    /// Return the record cursor's last-key view without allocation.
+    ///
+    /// Borrow is tied to `self` because pooled fields are slab-backed.
+    /// Used by the checker/harness hot paths to avoid materializing owned
+    /// `Cursor` values just to compare bounds/order.
+    fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]>;
+
+    /// Return the shard range bounds `[start, end)` as borrowed slices.
+    ///
+    /// Borrow is tied to `self` because pooled fields are slab-backed.
+    /// This keeps split and cursor-bound validation allocation-free.
+    fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]);
+
+    /// Release pooled fields for an observation-only record.
+    ///
+    /// This cleanup hook lets wrappers that own synthetic records
+    /// (for example fault injectors) free slab-backed fields without
+    /// exposing raw slab handles in the public simulation interface.
+    fn release_record_fields(&mut self, record: &mut ShardRecord);
 }
 
 /// Combined trait bound for backends usable by the simulation harness.

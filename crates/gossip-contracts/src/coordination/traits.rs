@@ -108,6 +108,39 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 ///
 /// Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021);
 ///            TigerBeetle VOPR; Jepsen methodology.
+///
+/// ## Production Backend Requirements
+///
+/// ### Conditional writes (storage-layer fencing)
+///
+/// Production backends MUST enforce fencing at the storage mutation point
+/// using conditional writes (`WHERE fence_epoch = $expected` or equivalent).
+/// The in-memory backend validates the fence epoch in application code, which
+/// is correct only because mutations are single-threaded. Networked backends
+/// (FoundationDB, PostgreSQL, DynamoDB) must push this check into the storage
+/// transaction to close the TOCTTOU window between validation and write.
+///
+/// Without conditional writes, the following race is possible:
+/// 1. Worker A validates `fence_epoch == 5` in application code.
+/// 2. Worker B acquires the shard, bumping `fence_epoch` to 6.
+/// 3. Worker A's write lands with stale epoch — data corruption.
+///
+/// Conditional writes make step 3 fail atomically.
+///
+/// Reference: Kleppmann, "How to do distributed locking" (2016) — fencing
+/// tokens; Jepsen etcd 3.4.3 — lease revocation race; AWS KCL — DynamoDB
+/// conditional writes for shard leasing.
+///
+/// ### Data-plane fencing
+///
+/// Workers must carry `Lease.fence()` on all scan-result writes to downstream
+/// storage. A stale worker whose lease expired but continues writing scan
+/// results can corrupt data even though the coordination layer correctly
+/// rejected its shard mutations. The coordination layer fences shard record
+/// mutations; the data plane must independently fence scan-result persistence.
+///
+/// Pattern: include the `fence_epoch` in the downstream write's conditional
+/// expression, so the target store rejects writes from superseded workers.
 pub trait CoordinationBackend {
     // —— Shard lifecycle operations ——————————————————————————————
 
@@ -219,6 +252,12 @@ pub trait CoordinationBackend {
     /// - Same `(op_id, hash_checkpoint_payload(new_cursor))` → `Replayed(())`
     /// - Same `op_id`, different hash → `OpIdConflict`
     /// - New `op_id` → execute, record in op-log, `Executed(())`
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the cursor update (step 6) as a single conditional write or
+    /// transaction. See trait-level *Production Backend Requirements*.
     fn checkpoint(
         &mut self,
         now: LogicalTime,
@@ -250,6 +289,12 @@ pub trait CoordinationBackend {
     /// ## Idempotency
     ///
     /// Idempotent via `op_id` + `hash_complete_payload(final_cursor)`.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the status transition (step 4) as a single conditional write or
+    /// transaction. See trait-level *Production Backend Requirements*.
     fn complete(
         &mut self,
         now: LogicalTime,
@@ -278,6 +323,12 @@ pub trait CoordinationBackend {
     /// ## Idempotency
     ///
     /// Idempotent via `op_id` + `hash_park_payload(reason)`.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the status transition (step 3) as a single conditional write or
+    /// transaction. See trait-level *Production Backend Requirements*.
     fn park_shard(
         &mut self,
         now: LogicalTime,
@@ -315,6 +366,28 @@ pub trait CoordinationBackend {
     /// After split_replace, parent status becomes Split (terminal). No further
     /// ops can push entries, so the split_replace op_log entry is never evicted.
     /// `check_op_idempotency()` will always detect the replay.
+    ///
+    /// ## Atomicity
+    ///
+    /// Production backends must execute steps 4-8 (child ID derivation,
+    /// child creation, parent status transition to Split, lease release,
+    /// and op-log recording) in a single atomic transaction. A partial
+    /// commit — e.g., child1 written but child2 not — violates the split
+    /// coverage invariant and creates a gap in the shard map.
+    ///
+    /// Pattern: read the parent's `revision`, write children + parent update
+    /// in one transaction, fail if the parent was modified concurrently
+    /// (optimistic concurrency via revision check).
+    ///
+    /// The in-memory backend achieves this trivially (single-threaded
+    /// mutation). Networked backends must use multi-key transactions or
+    /// batch conditional writes.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the multi-record mutation (steps 4-8) as a single conditional
+    /// transaction. See trait-level *Production Backend Requirements*.
     fn split_replace(
         &mut self,
         now: LogicalTime,
@@ -348,6 +421,24 @@ pub trait CoordinationBackend {
     /// ## Idempotency
     ///
     /// Idempotent via `op_id` + `hash_split_residual_payload(plan)`.
+    ///
+    /// ## Atomicity
+    ///
+    /// Production backends must execute steps 4-9 (residual ID derivation,
+    /// parent spec update, residual creation, `spawned` recording, lease
+    /// retention, and op-log recording) in a single atomic transaction. A
+    /// partial commit leaves the parent with a smaller range but no
+    /// corresponding residual shard, creating a coverage gap.
+    ///
+    /// Same transactional pattern as `split_replace`: read the parent
+    /// revision, write all changes in one transaction, fail on concurrent
+    /// modification.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the multi-record mutation (steps 4-9) as a single conditional
+    /// transaction. See trait-level *Production Backend Requirements*.
     fn split_residual(
         &mut self,
         now: LogicalTime,

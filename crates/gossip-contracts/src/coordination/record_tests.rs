@@ -1,35 +1,26 @@
 use super::*;
 use crate::coordination::lease::{OpKind, OpResult};
-use crate::test_util::canonical_digest;
-use gossip_stdx::{InlineVec, RingBuffer};
+use crate::coordination::test_fixtures::{derived_shard_id, test_run, test_spec, test_tenant};
+use crate::test_util::{TestSlab, canonical_digest};
+use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
 use proptest::prelude::*;
 
 // -- Test fixtures ---------------------------------------------------
 
-fn test_tenant() -> TenantId {
-    TenantId::from_bytes([0x01; 32])
-}
-
-fn test_run() -> RunId {
-    RunId::from_raw(1)
-}
-
-fn test_spec() -> ShardSpec {
-    ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
-}
-
-fn active_record() -> ShardRecord {
+fn active_record(slab: &mut ByteSlab) -> ShardRecord {
     ShardRecord::new_active(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10),
-        test_spec(),
+        &test_spec(),
         CursorSemantics::Completed,
+        slab,
     )
+    .expect("slab large enough for test fixture")
 }
 
-fn leased_record() -> ShardRecord {
-    let mut r = active_record();
+fn leased_record(slab: &mut ByteSlab) -> ShardRecord {
+    let mut r = active_record(slab);
     r.lease = Some(LeaseHolder::new(
         WorkerId::from_raw(99),
         LogicalTime::from_raw(1000),
@@ -45,11 +36,6 @@ fn make_entry(op_raw: u64) -> OpLogEntry {
         0xABCD,
         LogicalTime::from_raw(100),
     )
-}
-
-/// Helper to create a derived ShardId (bit 63 set).
-fn derived_shard_id(base: u64) -> ShardId {
-    ShardId::from_raw(base | (1u64 << 63))
 }
 
 // -- ShardStatus -----------------------------------------------------
@@ -127,24 +113,28 @@ fn park_reason_roundtrip_table() {
 
 #[test]
 fn assert_invariants_active_unleased_ok() {
-    active_record().assert_invariants();
+    let mut slab = TestSlab::new();
+    active_record(&mut slab).assert_invariants();
 }
 
 #[test]
 fn assert_invariants_active_leased_ok() {
-    leased_record().assert_invariants();
+    let mut slab = TestSlab::new();
+    leased_record(&mut slab).assert_invariants();
 }
 
 #[test]
 fn assert_invariants_done_ok() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Done;
     r.assert_invariants();
 }
 
 #[test]
 fn assert_invariants_parked_ok() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Parked;
     r.park_reason = Some(ParkReason::TooManyErrors);
     r.assert_invariants();
@@ -152,7 +142,8 @@ fn assert_invariants_parked_ok() {
 
 #[test]
 fn assert_invariants_split_ok() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Split;
     r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
     r.assert_invariants();
@@ -163,7 +154,8 @@ fn assert_invariants_split_ok() {
 #[test]
 #[should_panic(expected = "must have park_reason")]
 fn assert_invariants_parked_without_reason_panics() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Parked;
     // park_reason left as None.
     r.assert_invariants();
@@ -172,13 +164,15 @@ fn assert_invariants_parked_without_reason_panics() {
 #[test]
 #[should_panic(expected = "must not have park_reason")]
 fn assert_invariants_active_with_reason_panics() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.park_reason = Some(ParkReason::Other);
     r.assert_invariants();
 }
 
 #[test]
 fn assert_invariants_terminal_with_lease_panics() {
+    let mut slab = TestSlab::new();
     let lease = Some(LeaseHolder::new(
         WorkerId::from_raw(1),
         LogicalTime::from_raw(100),
@@ -192,14 +186,15 @@ fn assert_invariants_terminal_with_lease_panics() {
                 ShardId::from_raw(10),
                 ShardStatus::Done,
                 None,
-                test_spec(),
-                Cursor::initial(),
+                &test_spec(),
+                &Cursor::initial(),
                 CursorSemantics::Completed,
                 lease,
                 FenceEpoch::INITIAL,
                 None,
                 InlineVec::new(),
                 RingBuffer::new(),
+                &mut slab,
             ),
         ),
         (
@@ -210,14 +205,15 @@ fn assert_invariants_terminal_with_lease_panics() {
                 ShardId::from_raw(10),
                 ShardStatus::Parked,
                 Some(ParkReason::TooManyErrors),
-                test_spec(),
-                Cursor::initial(),
+                &test_spec(),
+                &Cursor::initial(),
                 CursorSemantics::Completed,
                 lease,
                 FenceEpoch::INITIAL,
                 None,
                 InlineVec::new(),
                 RingBuffer::new(),
+                &mut slab,
             ),
         ),
         (
@@ -228,14 +224,15 @@ fn assert_invariants_terminal_with_lease_panics() {
                 ShardId::from_raw(10),
                 ShardStatus::Split,
                 None,
-                test_spec(),
-                Cursor::initial(),
+                &test_spec(),
+                &Cursor::initial(),
                 CursorSemantics::Completed,
                 lease,
                 FenceEpoch::INITIAL,
                 None,
                 InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]),
                 RingBuffer::new(),
+                &mut slab,
             ),
         ),
     ];
@@ -264,6 +261,7 @@ fn assert_invariants_terminal_with_lease_panics() {
 #[test]
 #[should_panic(expected = "not derived")]
 fn assert_invariants_parent_some_but_not_derived_panics() {
+    let mut slab = TestSlab::new();
     // ShardId with bit 63 clear but claiming a parent.
     let r = ShardRecord::from_raw_parts(
         test_tenant(),
@@ -271,14 +269,15 @@ fn assert_invariants_parent_some_but_not_derived_panics() {
         ShardId::from_raw(10), // NOT derived
         ShardStatus::Active,
         None,
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         Some(ShardId::from_raw(5)), // has parent
         InlineVec::new(),
         RingBuffer::new(),
+        &mut slab,
     );
     r.assert_invariants();
 }
@@ -286,7 +285,8 @@ fn assert_invariants_parent_some_but_not_derived_panics() {
 #[test]
 #[should_panic(expected = "not derived")]
 fn assert_invariants_spawned_contains_non_derived_panics() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Split;
     r.spawned = InlineVec::from_slice(&[ShardId::from_raw(42)]); // NOT derived (bit 63 clear)
     r.assert_invariants();
@@ -295,20 +295,22 @@ fn assert_invariants_spawned_contains_non_derived_panics() {
 #[test]
 #[should_panic(expected = "fence_epoch must be >= INITIAL")]
 fn assert_invariants_fence_epoch_zero_panics() {
+    let mut slab = TestSlab::new();
     let r = ShardRecord::from_raw_parts(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10),
         ShardStatus::Active,
         None,
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::ZERO,
         None,
         InlineVec::new(),
         RingBuffer::new(),
+        &mut slab,
     );
     r.assert_invariants();
 }
@@ -316,20 +318,22 @@ fn assert_invariants_fence_epoch_zero_panics() {
 #[test]
 #[should_panic(expected = "must have spawned children")]
 fn assert_invariants_split_without_spawned_panics() {
+    let mut slab = TestSlab::new();
     let r = ShardRecord::from_raw_parts(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10),
         ShardStatus::Split,
         None,
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         None,
         InlineVec::new(), // empty spawned
         RingBuffer::new(),
+        &mut slab,
     );
     r.assert_invariants();
 }
@@ -337,6 +341,7 @@ fn assert_invariants_split_without_spawned_panics() {
 #[test]
 #[should_panic(expected = "duplicate OpId")]
 fn assert_invariants_duplicate_op_id_panics() {
+    let mut slab = TestSlab::new();
     let mut entries = RingBuffer::<OpLogEntry, { ShardRecord::OP_LOG_CAP }>::new();
     entries.push_back(make_entry(42)).unwrap();
     entries.push_back(make_entry(42)).unwrap();
@@ -346,14 +351,15 @@ fn assert_invariants_duplicate_op_id_panics() {
         ShardId::from_raw(10),
         ShardStatus::Active,
         None,
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         None,
         InlineVec::new(),
         entries,
+        &mut slab,
     );
     r.assert_invariants();
 }
@@ -361,6 +367,7 @@ fn assert_invariants_duplicate_op_id_panics() {
 #[test]
 #[should_panic(expected = "spawned count")]
 fn assert_invariants_spawned_exceeds_cap_panics() {
+    let mut slab = TestSlab::new();
     let spawned: SpawnedList = (0..=MAX_SPAWNED_PER_SHARD as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
@@ -370,14 +377,15 @@ fn assert_invariants_spawned_exceeds_cap_panics() {
         ShardId::from_raw(10),
         ShardStatus::Split,
         None,
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         None,
         spawned,
         RingBuffer::new(),
+        &mut slab,
     );
     r.assert_invariants();
 }
@@ -386,7 +394,8 @@ fn assert_invariants_spawned_exceeds_cap_panics() {
 
 #[test]
 fn op_log_lookup_found() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     let entry = make_entry(42);
     r.op_log_push(entry);
     assert_eq!(
@@ -397,13 +406,15 @@ fn op_log_lookup_found() {
 
 #[test]
 fn op_log_lookup_not_found() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     assert!(r.op_log_lookup(OpId::from_raw(999)).is_none());
 }
 
 #[test]
 fn op_log_push_evicts_oldest() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     // Fill to capacity.
     for i in 0..ShardRecord::OP_LOG_CAP as u64 {
         r.op_log_push(make_entry(i));
@@ -421,7 +432,8 @@ fn op_log_push_evicts_oldest() {
 
 #[test]
 fn op_log_lookup_reverse_finds_recent_first() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.op_log_push(make_entry(1));
     r.op_log_push(make_entry(2));
     r.op_log_push(make_entry(3));
@@ -436,11 +448,17 @@ fn op_log_lookup_reverse_finds_recent_first() {
 
 #[test]
 fn snapshot_preserves_fields() {
-    let r = active_record();
-    let snap = r.snapshot();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
+    let snap = r.snapshot(&slab);
+
+    // Materialize pooled fields for comparison.
+    let spec = r.spec.to_spec(&slab);
+    let cursor = r.cursor.to_cursor(&slab);
+
     assert_eq!(snap.status(), r.status);
-    assert_eq!(snap.spec(), &r.spec);
-    assert_eq!(snap.cursor(), &r.cursor);
+    assert_eq!(snap.spec(), &spec);
+    assert_eq!(snap.cursor(), &cursor);
     assert_eq!(snap.cursor_semantics(), r.cursor_semantics);
     assert_eq!(snap.parent(), r.parent);
     assert_eq!(snap.spawned(), r.spawned.as_slice());
@@ -448,8 +466,9 @@ fn snapshot_preserves_fields() {
 
 #[test]
 fn snapshot_does_not_leak_coordination_state() {
-    let r = leased_record();
-    let snap = r.snapshot();
+    let mut slab = TestSlab::new();
+    let r = leased_record(&mut slab);
+    let snap = r.snapshot(&slab);
     let debug = format!("{snap:?}");
     assert!(
         !debug.contains("TenantId"),
@@ -470,20 +489,22 @@ fn snapshot_does_not_leak_coordination_state() {
 #[test]
 #[should_panic(expected = "derived (bit 63 set) but has no parent")]
 fn assert_invariants_derived_without_parent_panics() {
+    let mut slab = TestSlab::new();
     let r = ShardRecord::from_raw_parts(
         test_tenant(),
         test_run(),
         derived_shard_id(42), // derived, but parent is None
         ShardStatus::Active,
         None,
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         None, // parent = None -- violates INV-7b
         InlineVec::new(),
         RingBuffer::new(),
+        &mut slab,
     );
     r.assert_invariants();
 }
@@ -492,25 +513,29 @@ fn assert_invariants_derived_without_parent_panics() {
 
 #[test]
 fn assert_transition_legal_active_to_done_ok() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     r.assert_transition_legal(ShardStatus::Done);
 }
 
 #[test]
 fn assert_transition_legal_active_to_parked_ok() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     r.assert_transition_legal(ShardStatus::Parked);
 }
 
 #[test]
 fn assert_transition_legal_active_to_split_ok() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     r.assert_transition_legal(ShardStatus::Split);
 }
 
 #[test]
 fn assert_transition_legal_done_to_done_ok() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Done;
     r.assert_transition_legal(ShardStatus::Done);
 }
@@ -518,7 +543,8 @@ fn assert_transition_legal_done_to_done_ok() {
 #[test]
 #[should_panic(expected = "illegal transition from terminal")]
 fn assert_transition_legal_done_to_active_panics() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Done;
     r.assert_transition_legal(ShardStatus::Active);
 }
@@ -526,7 +552,8 @@ fn assert_transition_legal_done_to_active_panics() {
 #[test]
 #[should_panic(expected = "illegal transition from terminal")]
 fn assert_transition_legal_parked_to_active_panics() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Parked;
     r.park_reason = Some(ParkReason::TooManyErrors);
     r.assert_transition_legal(ShardStatus::Active);
@@ -535,7 +562,8 @@ fn assert_transition_legal_parked_to_active_panics() {
 #[test]
 #[should_panic(expected = "illegal transition from terminal")]
 fn assert_transition_legal_split_to_done_panics() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.status = ShardStatus::Split;
     r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
     r.assert_transition_legal(ShardStatus::Done);
@@ -545,7 +573,8 @@ fn assert_transition_legal_split_to_done_panics() {
 
 #[test]
 fn advance_fence_increments() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     assert_eq!(r.fence_epoch, FenceEpoch::INITIAL);
     let new = r.advance_fence();
     assert_eq!(new, FenceEpoch::INITIAL.increment());
@@ -553,7 +582,8 @@ fn advance_fence_increments() {
 
 #[test]
 fn advance_fence_monotonic() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     let f1 = r.advance_fence();
     let f2 = r.advance_fence();
     let f3 = r.advance_fence();
@@ -565,7 +595,8 @@ fn advance_fence_monotonic() {
 
 #[test]
 fn is_leased_at_no_lease() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     assert!(!r.is_leased_at(LogicalTime::from_raw(0)));
 }
 
@@ -573,14 +604,16 @@ fn is_leased_at_no_lease() {
 
 #[test]
 fn can_spawn_within_cap() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     assert!(r.can_spawn(1));
     assert!(r.can_spawn(MAX_SPAWNED_PER_SHARD));
 }
 
 #[test]
 fn can_spawn_at_cap() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.spawned = (0..MAX_SPAWNED_PER_SHARD as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
@@ -590,7 +623,8 @@ fn can_spawn_at_cap() {
 
 #[test]
 fn can_spawn_overflow() {
-    let r = active_record();
+    let mut slab = TestSlab::new();
+    let r = active_record(&mut slab);
     assert!(!r.can_spawn(usize::MAX));
 }
 
@@ -599,7 +633,8 @@ fn can_spawn_overflow() {
 #[test]
 #[should_panic(expected = "duplicate OpId")]
 fn op_log_push_rejects_duplicate() {
-    let mut r = active_record();
+    let mut slab = TestSlab::new();
+    let mut r = active_record(&mut slab);
     r.op_log_push(make_entry(42));
     r.op_log_push(make_entry(42)); // same OpId — should panic
 }
@@ -608,6 +643,7 @@ fn op_log_push_rejects_duplicate() {
 
 #[test]
 fn new_split_child_construction_and_fields() {
+    let mut slab = TestSlab::new();
     let parent_id = ShardId::from_raw(10);
     let child_id = derived_shard_id(1);
     let cursor = Cursor::with_last_key(b"middle-key".to_vec());
@@ -616,15 +652,21 @@ fn new_split_child_construction_and_fields() {
         test_tenant(),
         test_run(),
         child_id,
-        test_spec(),
-        cursor.clone(),
+        &test_spec(),
+        &cursor,
         CursorSemantics::Dispatched,
         parent_id,
-    );
+        &mut slab,
+    )
+    .expect("slab large enough for test");
 
     assert_eq!(record.status, ShardStatus::Active);
     assert_eq!(record.parent, Some(parent_id));
-    assert_eq!(record.cursor, cursor);
+
+    // Materialize pooled cursor for comparison.
+    let materialized_cursor = record.cursor.to_cursor(&slab);
+    assert_eq!(materialized_cursor, cursor);
+
     assert_eq!(record.cursor_semantics, CursorSemantics::Dispatched);
     assert_eq!(record.shard, child_id);
     assert!(record.spawned.is_empty());
@@ -635,14 +677,16 @@ fn new_split_child_construction_and_fields() {
 #[test]
 #[should_panic(expected = "not derived")]
 fn new_split_child_non_derived_shard_panics() {
+    let mut slab = TestSlab::new();
     let _ = ShardRecord::new_split_child(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10), // NOT derived
-        test_spec(),
-        Cursor::initial(),
+        &test_spec(),
+        &Cursor::initial(),
         CursorSemantics::Completed,
         ShardId::from_raw(5),
+        &mut slab,
     );
 }
 
@@ -653,7 +697,8 @@ proptest! {
 
     #[test]
     fn op_log_push_bounded(ops in proptest::collection::vec(1u64..10000, 0..64)) {
-        let mut r = active_record();
+        let mut slab = TestSlab::new();
+        let mut r = active_record(&mut slab);
         for (i, &raw) in ops.iter().enumerate() {
             // Ensure unique op IDs by adding index offset.
             r.op_log_push(make_entry(raw * 10000 + i as u64));
@@ -680,7 +725,8 @@ proptest! {
         deadline_raw in 1u64..u64::MAX,
         now_raw in 0u64..u64::MAX,
     ) {
-        let mut r = active_record();
+        let mut slab = TestSlab::new();
+        let mut r = active_record(&mut slab);
         r.lease = Some(LeaseHolder::new(
             WorkerId::from_raw(99),
             LogicalTime::from_raw(deadline_raw),

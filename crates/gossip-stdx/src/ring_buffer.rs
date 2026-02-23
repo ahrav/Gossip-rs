@@ -342,14 +342,10 @@ impl<T: PartialEq, const N: usize> PartialEq for RingBuffer<T, N> {
 impl<T: Eq, const N: usize> Eq for RingBuffer<T, N> {}
 
 // Compile-time proof that RingBuffer is Send+Sync when T is.
-#[allow(dead_code)]
-const _: () = {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    fn check<T: Send + Sync>() {
-        assert_send::<RingBuffer<T, 1>>();
-        assert_sync::<RingBuffer<T, 1>>();
-    }
+// Closure-in-const pattern (from static_assertions) avoids dead_code warnings.
+const _: fn() = || {
+    fn assert_impl<T: Send + Sync>() {}
+    assert_impl::<RingBuffer<u8, 1>>();
 };
 
 impl<T, const N: usize> FromIterator<T> for RingBuffer<T, N> {

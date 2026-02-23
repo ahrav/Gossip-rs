@@ -118,7 +118,7 @@ fn scenario_full_run_lifecycle() {
     // Verify cursor advanced to "m".
     let record = coord.shard_lookup(&tenant, &key).unwrap();
     assert_eq!(
-        record.cursor.last_key().map(|k| k.to_vec()),
+        record.cursor.last_key(coord.slab()).map(|k| k.to_vec()),
         Some(b"m".to_vec()),
         "cursor should be at 'm' after three checkpoints"
     );
@@ -202,7 +202,7 @@ fn scenario_lease_expiry_and_reacquire() {
     // Verify the snapshot restores cursor "f".
     let record = coord.shard_lookup(&tenant, &key).unwrap();
     assert_eq!(
-        record.cursor.last_key().map(|k| k.to_vec()),
+        record.cursor.last_key(coord.slab()).map(|k| k.to_vec()),
         Some(b"f".to_vec()),
         "W2 should see restored cursor at 'f' from W1's checkpoint"
     );
@@ -428,12 +428,12 @@ fn scenario_split_chain_double_residual() {
         "parent should have 2 spawned children after second residual split"
     );
     assert_eq!(
-        record.spec.key_range_start(),
+        record.spec.key_range_start(coord.slab()),
         b"a",
         "parent spec start should be 'a'"
     );
     assert_eq!(
-        record.spec.key_range_end(),
+        record.spec.key_range_end(coord.slab()),
         b"j",
         "parent spec end should be 'j' after second split"
     );
@@ -706,7 +706,7 @@ fn scenario_worker_self_recovery() {
     // Cursor should be restored to "h".
     let record = coord.shard_lookup(&tenant, &key).unwrap();
     assert_eq!(
-        record.cursor.last_key().map(|k| k.to_vec()),
+        record.cursor.last_key(coord.slab()).map(|k| k.to_vec()),
         Some(b"h".to_vec()),
         "cursor should be restored to 'h' from previous session"
     );

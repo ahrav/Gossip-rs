@@ -783,6 +783,7 @@ fn assert_constructor_equivalent(lhs: &InMemoryCoordinator, rhs: &InMemoryCoordi
     assert_eq!(lhs.max_shards_per_tenant, rhs.max_shards_per_tenant);
     assert_eq!(lhs.max_total_shards, rhs.max_total_shards);
     assert_eq!(lhs.claim_cooldown_interval, rhs.claim_cooldown_interval);
+    assert_eq!(lhs.slab().capacity(), rhs.slab().capacity());
     assert_eq!(lhs.shards.capacity(), rhs.shards.capacity());
     assert_eq!(lhs.runs.capacity(), rhs.runs.capacity());
     assert_eq!(lhs.run_shards.capacity(), rhs.run_shards.capacity());
@@ -830,6 +831,33 @@ fn runtime_constructor_matches_with_cooldown() {
     ));
     let legacy = InMemoryCoordinator::with_cooldown(LEASE_DURATION, 123, 456, 9);
     assert_constructor_equivalent(&runtime, &legacy);
+}
+
+#[test]
+fn runtime_constructor_caps_auto_slab_capacity() {
+    // `new()` uses runtime defaults (1_000_000 max shards). Auto sizing would
+    // exceed the configured startup cap, so capacity must clamp to the cap.
+    let coord = InMemoryCoordinator::new(LEASE_DURATION);
+    assert_eq!(coord.slab().capacity(), DEFAULT_MAX_AUTO_SLAB_CAPACITY);
+}
+
+#[test]
+fn runtime_constructor_respects_explicit_slab_capacity() {
+    // Explicit slab capacity bypasses auto-sizing and preserves valid values.
+    let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 123, 456);
+    config.slab_capacity = 8 * 1024;
+    let coord = InMemoryCoordinator::with_runtime_config(config);
+    assert_eq!(coord.slab().capacity(), 8 * 1024);
+}
+
+#[test]
+fn runtime_constructor_clamps_explicit_slab_capacity_to_backend_max() {
+    // ByteSlab uses a u32-addressed backing store, so oversized explicit
+    // requests must clamp rather than panic or wrap.
+    let mut config = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 123, 456);
+    config.slab_capacity = usize::MAX;
+    let coord = InMemoryCoordinator::with_runtime_config(config);
+    assert_eq!(coord.slab().capacity(), u32::MAX as usize);
 }
 
 // -- CoordinatorConfig memory budget smoke tests ------------------------------
@@ -899,12 +927,12 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The planning formula uses 776 for ShardRecord and 512 for RunRecord.
+    // The planning formula uses 784 for ShardRecord and 512 for RunRecord.
     // These are documented in `CoordinatorConfig::memory_budget()`.
     // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
-        shard_size, 776,
-        "ShardRecord size changed from 776 to {shard_size}; \
+        shard_size, 784,
+        "ShardRecord size changed from 784 to {shard_size}; \
          update the constant in CoordinatorConfig::memory_budget()"
     );
     assert_eq!(

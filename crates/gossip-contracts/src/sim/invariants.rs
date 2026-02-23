@@ -25,7 +25,7 @@
 //!
 //! | Label | Name | Kind | Rule |
 //! |-------|------|------|------|
-//! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a non-expired lease per shard. |
+//! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a checker-active lease (`deadline >= now`) per shard. |
 //! | S2 | **FenceMonotonicity** | temporal | `fence_epoch` never decreases for a given `(RunId, ShardId)`. |
 //! | S3 | **TerminalIrreversibility** | temporal | Terminal states (`Done`, `Split`, `Parked`) never revert, except `Parked`->`Active` (unpark) which requires a fence bump. |
 //! | S4 | **RecordInvariant** | structural | `ShardRecord::validate_invariants()` returns `Ok`. |
@@ -53,6 +53,9 @@
 //! - S5 compares raw `Option<&[u8]>` slices and only updates `prev_cursors`
 //!   when the value actually changed, avoiding a `Box<[u8]>` allocation on
 //!   the common unchanged-cursor path.
+//! - S6 consumes borrowed cursor/spec slices from `SimIntrospection`
+//!   (`cursor_last_key` + `spec_bounds`) so bounds checks run without
+//!   materializing `Cursor`/`ShardSpec` per record.
 //! - After each pass, permanently terminal shards (`Done`, `Split`) are
 //!   pruned from `prev_epochs` and `prev_cursors` to bound memory growth
 //!   in long-running simulations with many split cascades. `prev_terminal`
@@ -60,7 +63,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use crate::coordination::cursor::{CursorBoundsCheck, check_cursor_bounds};
 use crate::coordination::record::{ShardRecord, ShardStatus};
 use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use crate::sim::backend::SimIntrospection;
@@ -95,7 +97,8 @@ pub enum SplitCoverageDetail {
 /// an empty vec means the run passed.
 #[derive(Debug, Clone)]
 pub enum InvariantViolation {
-    /// S1: Two workers hold non-expired leases on the same shard simultaneously.
+    /// S1: Two workers hold checker-active leases (`deadline >= now`) on the
+    /// same shard simultaneously.
     ///
     /// Only the first two conflicting workers are reported even if more exist,
     /// since the invariant is already violated with two.
@@ -281,8 +284,16 @@ impl InvariantChecker {
                 &mut violations,
             );
             Self::check_record_invariant(record, &mut violations);
-            self.check_cursor_monotonicity(id, record, &mut violations);
-            Self::check_cursor_in_bounds(record, &mut violations);
+            let current_last_key = coordinator.cursor_last_key(record);
+            let (spec_start, spec_end) = coordinator.spec_bounds(record);
+            self.check_cursor_monotonicity(id, current_last_key, &mut violations);
+            Self::check_cursor_in_bounds(
+                record,
+                current_last_key,
+                spec_start,
+                spec_end,
+                &mut violations,
+            );
             self.check_split_coverage(record, tenant, coordinator, &mut violations);
         }
 
@@ -429,12 +440,11 @@ impl InvariantChecker {
     fn check_cursor_monotonicity(
         &mut self,
         id: (TenantId, RunId, ShardId),
-        record: &ShardRecord,
+        current_last_key: Option<&[u8]>,
         violations: &mut Vec<InvariantViolation>,
     ) {
         let prev_key = self.prev_cursors.get(&id).and_then(|o| o.as_deref());
-        let curr_key = record.cursor.last_key();
-        let cursor_regressed = match (prev_key, curr_key) {
+        let cursor_regressed = match (prev_key, current_last_key) {
             (Some(_), None) => true,
             (Some(prev), Some(curr)) if curr < prev => true,
             _ => false,
@@ -444,25 +454,36 @@ impl InvariantChecker {
                 run: id.1,
                 shard: id.2,
                 prev: prev_key.map(Box::from),
-                current: curr_key.map(Box::from),
+                current: current_last_key.map(Box::from),
             });
         }
-        if prev_key != curr_key {
-            self.prev_cursors.insert(id, curr_key.map(Box::from));
+        if prev_key != current_last_key {
+            self.prev_cursors
+                .insert(id, current_last_key.map(Box::from));
         }
     }
 
     /// S6: cursor bounds.
-    fn check_cursor_in_bounds(record: &ShardRecord, violations: &mut Vec<InvariantViolation>) {
-        let bounds = check_cursor_bounds(&record.cursor, &record.spec);
-        if matches!(
-            bounds,
-            CursorBoundsCheck::BelowRange | CursorBoundsCheck::AboveRange
-        ) {
-            violations.push(InvariantViolation::CursorOutOfBounds {
-                run: record.run,
-                shard: record.shard,
-            });
+    ///
+    /// Accepts borrowed slices from `SimIntrospection` accessors so the
+    /// checker can validate bounds directly on slab-backed data without
+    /// allocating temporary owned cursor/spec objects.
+    fn check_cursor_in_bounds(
+        record: &ShardRecord,
+        current_last_key: Option<&[u8]>,
+        spec_start: &[u8],
+        spec_end: &[u8],
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        if let Some(last_key) = current_last_key {
+            let below_start = !spec_start.is_empty() && last_key < spec_start;
+            let at_or_above_end = !spec_end.is_empty() && last_key >= spec_end;
+            if below_start || at_or_above_end {
+                violations.push(InvariantViolation::CursorOutOfBounds {
+                    run: record.run,
+                    shard: record.shard,
+                });
+            }
         }
     }
 

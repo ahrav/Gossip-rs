@@ -46,6 +46,20 @@ pub fn test_key() -> ShardKey {
     ShardKey::new(test_run(), test_shard())
 }
 
+/// Create a derived `ShardId` (bit 63 set), matching the convention
+/// used by the split subsystem for child shard IDs.
+pub fn derived_shard_id(base: u64) -> ShardId {
+    ShardId::from_raw(base | (1u64 << 63))
+}
+
+/// Returns a tenant distinct from [`test_tenant()`] for isolation tests.
+///
+/// Uses `[0x02; 32]` so it is deterministic and visually distinguishable
+/// from `test_tenant()` (`[0x01; 32]`).
+pub fn other_tenant() -> TenantId {
+    TenantId::from_bytes([0x02; 32])
+}
+
 pub fn test_cursor(key: &[u8]) -> Cursor {
     Cursor::with_last_key(key.to_vec())
 }

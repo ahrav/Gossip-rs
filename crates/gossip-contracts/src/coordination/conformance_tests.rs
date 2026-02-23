@@ -134,9 +134,9 @@ fn cursor_monotonicity_combined_with_split_residual() {
 
     // Cursor "d" is preserved within new range [a,m).
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
-    assert_eq!(rec.cursor.last_key(), Some(b"d".as_slice()));
-    assert_eq!(rec.spec.key_range_start(), b"a");
-    assert_eq!(rec.spec.key_range_end(), b"m");
+    assert_eq!(rec.cursor.last_key(coord.slab()), Some(b"d".as_slice()));
+    assert_eq!(rec.spec.key_range_start(coord.slab()), b"a");
+    assert_eq!(rec.spec.key_range_end(coord.slab()), b"m");
 
     // Checkpoint "f" succeeds (in bounds [a,m)).
     let ck_ok = coord.checkpoint(
@@ -207,7 +207,7 @@ fn idempotency_before_lease_validation() {
         "replay must not change terminal status"
     );
     assert_eq!(
-        rec.cursor.last_key(),
+        rec.cursor.last_key(coord.slab()),
         Some(b"m".as_slice()),
         "replay must not mutate cursor"
     );
@@ -259,7 +259,7 @@ fn owner_divergence_with_matching_fence() {
         "rejected checkpoint must not change fence"
     );
     assert_eq!(
-        rec.cursor.last_key(),
+        rec.cursor.last_key(coord.slab()),
         None,
         "rejected checkpoint must not advance cursor"
     );
@@ -441,13 +441,17 @@ fn split_coverage_key_range_partition() {
     let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
     let rec_b = coord.shard_lookup(&test_tenant(), &key_b).unwrap();
 
-    assert_eq!(rec_a.spec.key_range_start(), b"a");
-    assert_eq!(rec_a.spec.key_range_end(), b"m");
-    assert_eq!(rec_b.spec.key_range_start(), b"m");
-    assert_eq!(rec_b.spec.key_range_end(), b"z");
+    let slab = coord.slab();
+    assert_eq!(rec_a.spec.key_range_start(slab), b"a");
+    assert_eq!(rec_a.spec.key_range_end(slab), b"m");
+    assert_eq!(rec_b.spec.key_range_start(slab), b"m");
+    assert_eq!(rec_b.spec.key_range_end(slab), b"z");
 
     // No gap: child_a.end == child_b.start.
-    assert_eq!(rec_a.spec.key_range_end(), rec_b.spec.key_range_start());
+    assert_eq!(
+        rec_a.spec.key_range_end(slab),
+        rec_b.spec.key_range_start(slab)
+    );
     // Both children are Active.
     assert_eq!(rec_a.status, ShardStatus::Active);
     assert_eq!(rec_b.status, ShardStatus::Active);
@@ -553,7 +557,7 @@ fn unpark_lifecycle_fence_and_cursor_preserved() {
     assert_eq!(rec.status, ShardStatus::Active);
     assert!(rec.fence_epoch > f_before_park, "unpark must bump fence");
     assert_eq!(
-        rec.cursor.last_key(),
+        rec.cursor.last_key(coord.slab()),
         Some(b"d".as_slice()),
         "unpark must preserve cursor"
     );
@@ -568,7 +572,7 @@ fn unpark_lifecycle_fence_and_cursor_preserved() {
 
     checkpoint_ok(&mut coord, 15, &lease2, b"f", 4);
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
-    assert_eq!(rec.cursor.last_key(), Some(b"f".as_slice()));
+    assert_eq!(rec.cursor.last_key(coord.slab()), Some(b"f".as_slice()));
 }
 
 /// Re-acquisition by the same worker bumps the fence, invalidating the old lease.

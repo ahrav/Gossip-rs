@@ -341,9 +341,11 @@ fn generate_forward_cursor_single_byte_range() {
         sim.tenant,
         run,
         shard,
-        ShardSpec::with_range(vec![b'a'], vec![b'c']),
+        &ShardSpec::with_range(vec![b'a'], vec![b'c']),
         CursorSemantics::Completed,
-    );
+        sim.coordinator.slab_mut(),
+    )
+    .expect("slab large enough for test");
     sim.coordinator.seed_shard(record);
     let key = ShardKey::new(run, shard);
     sim.shard_keys.push(key);

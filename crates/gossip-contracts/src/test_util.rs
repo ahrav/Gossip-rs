@@ -31,6 +31,7 @@ pub(crate) fn canonical_digest<T: crate::identity::CanonicalBytes>(val: &T) -> b
 // ---------------------------------------------------------------------------
 
 use crate::coordination::ShardSpec;
+use crate::coordination::cursor::Cursor;
 use proptest::prelude::*;
 
 /// Generate a valid bounded [`ShardSpec`]: end = start ++ non-empty suffix,
@@ -73,5 +74,63 @@ pub(crate) fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
         1 => proptest::collection::vec(any::<u8>(), 1..64)
             .prop_map(|start| ShardSpec::with_range(start, vec![])),
         1 => Just(ShardSpec::unbounded()),
+    ]
+}
+
+// ---------------------------------------------------------------------------
+// TestSlab — shared drop-safe slab wrapper for test code
+// ---------------------------------------------------------------------------
+
+/// Test slab wrapper that clears live allocations on drop.
+///
+/// In test code, records are often created but not explicitly deallocated
+/// before the slab drops. This wrapper calls `clear()` in its `Drop` impl
+/// so the slab's debug leak detector does not panic.
+pub(crate) struct TestSlab(gossip_stdx::ByteSlab);
+
+impl TestSlab {
+    pub(crate) fn new() -> Self {
+        Self(gossip_stdx::ByteSlab::with_capacity(64 * 1024))
+    }
+}
+
+impl std::ops::Deref for TestSlab {
+    type Target = gossip_stdx::ByteSlab;
+    fn deref(&self) -> &gossip_stdx::ByteSlab {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TestSlab {
+    fn deref_mut(&mut self) -> &mut gossip_stdx::ByteSlab {
+        &mut self.0
+    }
+}
+
+impl Drop for TestSlab {
+    fn drop(&mut self) {
+        self.0.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proptest strategies for Cursor — shared across coordination test modules
+// ---------------------------------------------------------------------------
+
+/// Generate a valid [`Cursor`] covering all three states: initial (no
+/// progress), last-key only, and last-key + token.
+///
+/// `last_key` and `token` are 1..64 non-empty byte vectors, matching the
+/// `Cursor` constructor preconditions (`last_key` must not be empty).
+pub(crate) fn arb_cursor() -> impl Strategy<Value = Cursor> {
+    proptest::prop_oneof![
+        1 => Just(Cursor::initial()),
+        3 => proptest::collection::vec(any::<u8>(), 1..64)
+            .prop_map(Cursor::with_last_key),
+        3 => (
+            proptest::collection::vec(any::<u8>(), 1..64),
+            proptest::collection::vec(any::<u8>(), 1..64),
+        )
+            .prop_map(|(k, t)| Cursor::from_parts(k, t)),
     ]
 }

@@ -38,9 +38,9 @@
 use super::*;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, acquire_shard, now, seeded_coordinator, test_cursor, test_key, test_run,
-    test_shard, test_spec, test_split_replace_plan, test_split_residual_plan, test_tenant,
-    test_worker,
+    LEASE_DURATION, acquire_shard, derived_shard_id, now, other_tenant, seeded_coordinator,
+    test_cursor, test_key, test_run, test_shard, test_spec, test_split_replace_plan,
+    test_split_residual_plan, test_tenant, test_worker,
 };
 use crate::identity::FenceEpoch;
 use crate::sim::backend::SimIntrospection;
@@ -441,6 +441,76 @@ fn split_residual_cursor_out_of_bounds() {
     assert!(matches!(err, SplitResidualError::SplitInvalid(_)));
 }
 
+#[test]
+fn split_residual_parent_update_failure_deallocates_residual_fields() {
+    // Regression guard for the phase-2/phase-3 boundary in split_residual.
+    // Capacity math (16-byte min blocks):
+    // - Parent spec [a,z): 2 slots => 32 bytes
+    // - Residual spec [m,z): 2 slots => 32 bytes (total 64)
+    // - Parent update [a,m) needs +32 before releasing old parent slots
+    // With slab=64, residual build succeeds, parent update fails.
+    let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 100, 100);
+    runtime.slab_capacity = 64;
+    let mut coord = InMemoryCoordinator::with_runtime_config(runtime);
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+    let shards = vec![InitialShard::new(
+        test_shard(),
+        test_spec(),
+        Cursor::initial(),
+    )];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let lease = acquire_shard(&mut coord, 3, 1);
+    let live_before = coord.slab().live_count();
+
+    let err = coord
+        .split_residual(
+            now(4),
+            test_tenant(),
+            &lease,
+            test_split_residual_plan(),
+            OpId::from_raw(22),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SplitResidualError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got: {err:?}"
+    );
+
+    // Residual slots must be deallocated on parent-update failure.
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "residual fields leaked on split_residual failure"
+    );
+    assert_eq!(
+        coord.shard_count(),
+        1,
+        "failed split must not insert residual"
+    );
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    let slab = coord.slab();
+    assert_eq!(parent.spec.key_range_start(slab), b"a");
+    assert_eq!(parent.spec.key_range_end(slab), b"z");
+    assert!(
+        parent.spawned.is_empty(),
+        "parent spawned list must be unchanged"
+    );
+}
+
 // -- Op-log eviction edge case ----------------------------------------
 //
 // The per-shard op-log is a 16-entry FIFO ring buffer. Once an entry is
@@ -625,15 +695,6 @@ fn split_residual_replay_via_spawned_after_eviction() {
 // reaches MAX_SPAWNED_PER_SHARD, further splits are rejected with
 // SplitInvalid. This prevents unbounded recursive splitting.
 
-/// Creates a derived `ShardId` by setting bit 63 on `base`.
-///
-/// Derived IDs are what the coordinator generates for split children.
-/// This helper constructs them directly for pre-populating the `spawned`
-/// set in [`coordinator_with_spawned_count`].
-fn derived_shard_id(base: u64) -> ShardId {
-    ShardId::from_raw(base | (1u64 << 63))
-}
-
 /// Builds a coordinator whose single shard already has `spawned_count`
 /// derived entries in its `spawned` set.
 ///
@@ -645,22 +706,23 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
     let spawned: crate::coordination::record::SpawnedList = (0..spawned_count as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     let record = ShardRecord::from_raw_parts(
         test_tenant(),
         test_run(),
         test_shard(),
         ShardStatus::Active,
         None,
-        test_spec(), // [a, z)
-        test_cursor(b"d"),
+        &test_spec(), // [a, z)
+        &test_cursor(b"d"),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
         None,
         spawned,
         RingBuffer::new(),
+        coord.slab_mut(),
     );
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord.seed_shard(record);
     coord
 }
@@ -874,14 +936,6 @@ fn acquire_saturates_on_lease_deadline_overflow() {
 // when adding children would breach either limit. Limits are configured
 // via `InMemoryCoordinator::with_limits`.
 
-/// Returns a tenant distinct from [`test_tenant()`] for isolation tests.
-///
-/// Uses `[0x02; 32]` so it is deterministic and visually distinguishable
-/// from `test_tenant()` (`[0x01; 32]`).
-fn other_tenant() -> TenantId {
-    TenantId::from_bytes([0x02; 32])
-}
-
 #[test]
 fn split_replace_exceeds_per_tenant_limit() {
     let mut coord = InMemoryCoordinator::with_limits(LEASE_DURATION, 3, 100);
@@ -891,9 +945,11 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         test_shard(),
-        test_spec(),
+        &test_spec(),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record);
 
     // Seed two additional shards to fill tenant to limit.
@@ -901,17 +957,21 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record2);
     let record3 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
         ShardId::from_raw(30),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record3);
 
     let lease = acquire_shard(&mut coord, 1, 1);
@@ -938,9 +998,11 @@ fn split_residual_exceeds_global_limit() {
         test_tenant(),
         test_run(),
         test_shard(),
-        test_spec(),
+        &test_spec(),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record);
 
     // Seed a second shard (different tenant) to fill global limit.
@@ -948,9 +1010,11 @@ fn split_residual_exceeds_global_limit() {
         other_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    );
+        coord.slab_mut(),
+    )
+    .unwrap();
     coord.seed_shard(record2);
 
     let lease = acquire_shard(&mut coord, 1, 1);

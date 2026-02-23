@@ -150,20 +150,26 @@ fn register_shards_exceeds_global_limit() {
 
     // Seed 2 existing shards from a different tenant.
     let other = TenantId::from_bytes([0x02; 32]);
-    coord.seed_shard(ShardRecord::new_active(
+    let sr1 = ShardRecord::new_active(
         other,
         RunId::from_raw(99),
         ShardId::from_raw(90),
-        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        &ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
         CursorSemantics::Completed,
-    ));
-    coord.seed_shard(ShardRecord::new_active(
+        coord.slab_mut(),
+    )
+    .unwrap();
+    coord.seed_shard(sr1);
+    let sr2 = ShardRecord::new_active(
         other,
         RunId::from_raw(99),
         ShardId::from_raw(91),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
-    ));
+        coord.slab_mut(),
+    )
+    .unwrap();
+    coord.seed_shard(sr2);
 
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
@@ -709,7 +715,7 @@ fn unpark_shard_cursor_preserved() {
 
     let record = coord.shard_lookup(&test_tenant(), &key).unwrap();
     assert_eq!(
-        record.cursor.last_key(),
+        record.cursor.last_key(coord.slab()),
         Some(b"f".as_slice()),
         "cursor must be preserved through park->unpark",
     );
@@ -898,7 +904,8 @@ fn unpark_shard_rejected_when_run_done() {
 // Covers register_shards edge cases: idempotent replay (same OpId +
 // payload returns Replayed with identical shard IDs), OpIdConflict
 // (same OpId + different shard list), wrong-status rejection (run
-// already Active), and not-found error.
+// already Active), not-found error, and staged-build rollback on
+// allocation failure (no partial inserts).
 
 #[test]
 fn register_shards_idempotent_replay() {
@@ -1006,6 +1013,63 @@ fn register_shards_run_not_found() {
         )
         .unwrap_err();
     assert!(matches!(err, RegisterShardsError::RunNotFound));
+}
+
+#[test]
+fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
+    // Two shards with bounded ranges need 4 non-empty spec slots total.
+    // With 16-byte minimum block size, that is 64 bytes. A 32-byte slab can
+    // allocate at most one shard spec before returning SlabFull. The
+    // coordinator stages record builds, so this should roll back to zero
+    // inserted shards instead of leaving a partially registered run.
+    let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 10, 10);
+    runtime.slab_capacity = 32;
+    let mut coord = InMemoryCoordinator::with_runtime_config(runtime);
+    coord
+        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
+        .unwrap();
+
+    let shards = vec![
+        InitialShard::new(
+            ShardId::from_raw(10),
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        InitialShard::new(
+            ShardId::from_raw(11),
+            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
+        ),
+    ];
+    let err = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, RegisterShardsError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got: {err:?}"
+    );
+
+    // Run must stay Initializing with no registered roots on failure.
+    let run = coord.get_run(test_tenant(), test_run()).unwrap();
+    assert_eq!(run.status(), RunStatus::Initializing);
+    assert!(run.root_shards().is_empty());
+
+    // No shards should have been inserted.
+    let summaries = coord
+        .list_shards(now(3), test_tenant(), test_run(), ShardFilter::all())
+        .unwrap();
+    assert!(summaries.is_empty(), "failed registration inserted shards");
+    assert_eq!(
+        coord.shard_count(),
+        0,
+        "failed registration changed shard count"
+    );
 }
 
 // -- create_run_with_shards tests ---------------------------------------------

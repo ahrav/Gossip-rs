@@ -29,6 +29,7 @@ pub mod events;
 pub mod facade;
 pub mod in_memory;
 pub mod lease;
+pub(crate) mod pooled;
 pub mod record;
 pub mod run;
 pub mod run_errors;

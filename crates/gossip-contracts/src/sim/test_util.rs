@@ -30,7 +30,7 @@ use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use crate::sim::FaultLevel;
 use crate::sim::harness::SimOp;
-use gossip_stdx::RingBuffer;
+use gossip_stdx::{ByteSlab, RingBuffer};
 
 /// Proptest strategy producing a uniform choice among the three [`FaultLevel`] variants.
 ///
@@ -260,21 +260,22 @@ impl TestRecordBuilder {
     ///
     /// Delegates to `from_raw_parts`, bypassing invariant validation so
     /// tests can construct intentionally invalid records.
-    pub fn build(self) -> ShardRecord {
+    pub fn build(self, slab: &mut ByteSlab) -> ShardRecord {
         ShardRecord::from_raw_parts(
             self.tenant,
             self.run,
             self.shard,
             self.status,
             self.park_reason,
-            self.spec,
-            self.cursor,
+            &self.spec,
+            &self.cursor,
             self.cursor_semantics,
             self.lease,
             self.fence_epoch,
             self.parent,
             self.spawned.into_iter().collect(),
             RingBuffer::new(),
+            slab,
         )
     }
 }
