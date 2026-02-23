@@ -110,7 +110,7 @@ impl LeaseHolder {
     /// logical time.
     #[must_use]
     pub fn new(owner: WorkerId, deadline: LogicalTime) -> Self {
-        debug_assert!(
+        assert!(
             deadline > LogicalTime::ZERO,
             "LeaseHolder deadline must be non-zero"
         );
@@ -274,17 +274,18 @@ impl Lease {
     /// # Panics
     ///
     /// - Panics if `deadline` is [`LogicalTime::ZERO`].
-    /// - Debug-only: panics if `deadline` does not advance past the
-    ///   current deadline (monotonicity violation).
+    /// - Panics if `deadline` is before the current deadline
+    ///   (monotonicity violation). Equal deadlines are allowed — a
+    ///   same-tick duplicate renewal is a harmless no-op on the deadline.
     #[inline]
     pub(crate) fn set_deadline(&mut self, deadline: LogicalTime) {
         assert!(
             deadline > LogicalTime::ZERO,
             "Lease deadline must be > ZERO, got {deadline:?}",
         );
-        debug_assert!(
-            deadline > self.deadline,
-            "set_deadline: new deadline {deadline:?} must advance past current {:?}",
+        assert!(
+            deadline >= self.deadline,
+            "set_deadline: new deadline {deadline:?} must be >= current {:?}",
             self.deadline,
         );
         self.deadline = deadline;
