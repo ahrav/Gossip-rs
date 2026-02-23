@@ -185,7 +185,7 @@ pub struct CoordinatorRuntimeConfig {
     /// Zero uses an auto-sized default:
     /// `min(max_total_shards * DEFAULT_PER_SHARD_SLAB_BUDGET,
     /// DEFAULT_MAX_AUTO_SLAB_CAPACITY)`. Any explicit value above
-    /// [`MAX_SLAB_CAPACITY`] is clamped to that backend limit.
+    /// `MAX_SLAB_CAPACITY` is clamped to that backend limit.
     /// The caps avoid pathological eager allocation and keep construction
     /// compatible with `ByteSlab`'s `u32`-addressed backing store.
     pub slab_capacity: usize,
