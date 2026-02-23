@@ -645,23 +645,29 @@ mod kani_proofs {
 
     // Verifies that `From<Vec>` writes each element within the inline
     // buffer and preserves element values after the move.
+    //
+    // Uses concrete symbolic values and a plain array snapshot to keep
+    // the SAT problem tractable (avoids Vec clone and push-loop
+    // allocation machinery that caused CI timeouts).
     #[kani::proof]
     #[kani::unwind(6)]
     fn from_vec_inline_is_sound() {
         const CAP: usize = 4;
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        let c: u32 = kani::any();
+        let d: u32 = kani::any();
+        let snapshot = [a, b, c, d];
+
         let len: usize = kani::any();
         kani::assume(len <= CAP);
-        let mut vec = Vec::with_capacity(len);
-        for _ in 0..len {
-            vec.push(kani::any::<u32>());
-        }
-        let snapshot: Vec<u32> = vec.clone();
+
+        let vec: Vec<u32> = snapshot[..len].to_vec();
         let v: InlineVec<u32, CAP> = vec.into();
+
         assert_eq!(v.len(), len);
         assert!(matches!(&v.repr, Repr::Inline { .. }));
-        for i in 0..len {
-            assert_eq!(v.as_slice()[i], snapshot[i]);
-        }
+        assert_eq!(v.as_slice(), &snapshot[..len]);
     }
 
     // Verifies that `uninit_array` produces a valid array for both
