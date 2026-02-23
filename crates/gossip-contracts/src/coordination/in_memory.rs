@@ -2230,6 +2230,10 @@ impl RunManagement for InMemoryCoordinator {
     /// This is important because `run_shards` is a `HashSet` with
     /// non-deterministic iteration order.
     ///
+    /// Implementation note: each shard is routed through
+    /// [`RunProgress::observe_shard`] so counter logic and watermark rules stay
+    /// centralized in one place.
+    ///
     /// Watermark contract (matches `RunProgress` docs + tests):
     /// - consider only `Active` shards,
     /// - among those, consider only non-initial cursors (`last_key` present),
@@ -2247,7 +2251,6 @@ impl RunManagement for InMemoryCoordinator {
         let _ = self.lookup_run(tenant, run)?;
 
         let mut progress = RunProgress::default();
-        let mut min_active_last_key: Option<&[u8]> = None;
         if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
@@ -2260,20 +2263,13 @@ impl RunManagement for InMemoryCoordinator {
                     )
                 });
                 let is_leased = record.is_leased_at(now);
-                progress.count_shard(record.status, is_leased);
-                // Watermark is an in-flight frontier: only active shards with
-                // a concrete `last_key` participate.
-                if record.status == ShardStatus::Active
-                    && let Some(last_key) = record.cursor.last_key(&self.slab)
-                {
-                    min_active_last_key = Some(match min_active_last_key {
-                        Some(current_min) if current_min <= last_key => current_min,
-                        _ => last_key,
-                    });
-                }
+                progress.observe_shard(
+                    record.status,
+                    is_leased,
+                    record.cursor.last_key(&self.slab),
+                );
             }
         }
-        progress.watermark = min_active_last_key.map(|k| k.to_vec().into_boxed_slice());
         Ok(progress)
     }
 
@@ -2543,6 +2539,7 @@ impl RunManagement for InMemoryCoordinator {
                 | crate::coordination::error::CoordError::ShardTerminal { .. }
                 | crate::coordination::error::CoordError::CursorRegression { .. }
                 | crate::coordination::error::CoordError::CursorOutOfBounds(_)
+                | crate::coordination::error::CoordError::CursorKeyTooLarge { .. }
                 | crate::coordination::error::CoordError::SplitInvalid(_)
                 | crate::coordination::error::CoordError::CheckpointMissingKey => {
                     unreachable!("check_op_idempotency only returns OpIdConflict")

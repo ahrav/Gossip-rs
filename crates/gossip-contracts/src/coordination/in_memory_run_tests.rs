@@ -101,12 +101,13 @@ fn split_residual_child_visible_in_list_shards() {
 
 // -- get_run_progress watermark tests ---------------------------------------
 
-#[test]
-fn all_active_initial_cursors_watermark_none() {
+/// Build an `Active` run with three disjoint shards, all at `Cursor::initial()`.
+fn coordinator_with_three_initial_active_shards() -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
+
     let shards = vec![
         InitialShard::new(
             ShardId::from_raw(10),
@@ -134,88 +135,121 @@ fn all_active_initial_cursors_watermark_none() {
         )
         .unwrap();
 
-    let progress = coord
-        .get_run_progress(now(3), test_tenant(), test_run())
-        .unwrap();
-    assert_eq!(progress.active(), 3);
-    assert_eq!(progress.watermark(), None);
-}
-
-#[test]
-fn mixed_progressed_and_initial_active_watermark_is_min_progressed() {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord
-        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
-        .unwrap();
-    let shards = vec![
-        InitialShard::new(
-            ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"g".to_vec()),
-            Cursor::initial(),
-        ),
-        InitialShard::new(
-            ShardId::from_raw(11),
-            ShardSpec::with_range(b"g".to_vec(), b"n".to_vec()),
-            Cursor::initial(),
-        ),
-        InitialShard::new(
-            ShardId::from_raw(12),
-            ShardSpec::with_range(b"n".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
-    ];
-    let _ = coord
-        .register_shards(
-            now(2),
-            test_tenant(),
-            test_run(),
-            &shards,
-            OpId::from_raw(1),
-        )
-        .unwrap();
-
-    let shard_10 = ShardKey::new(test_run(), ShardId::from_raw(10));
-    let lease_10 = coord
-        .acquire_and_restore(now(3), test_tenant(), shard_10, test_worker(1))
-        .unwrap()
-        .lease;
-    let _ = coord
-        .checkpoint(
-            now(4),
-            test_tenant(),
-            &lease_10,
-            Cursor::with_last_key(b"c".to_vec()),
-            OpId::from_raw(10),
-        )
-        .unwrap();
-
-    let shard_11 = ShardKey::new(test_run(), ShardId::from_raw(11));
-    let lease_11 = coord
-        .acquire_and_restore(now(5), test_tenant(), shard_11, test_worker(2))
-        .unwrap()
-        .lease;
-    let _ = coord
-        .checkpoint(
-            now(6),
-            test_tenant(),
-            &lease_11,
-            Cursor::with_last_key(b"k".to_vec()),
-            OpId::from_raw(11),
-        )
-        .unwrap();
-
-    let progress = coord
-        .get_run_progress(now(7), test_tenant(), test_run())
-        .unwrap();
-    assert_eq!(progress.active(), 3);
-    assert_eq!(progress.watermark(), Some(b"c".as_slice()));
 }
 
-#[test]
-fn done_split_parked_excluded_from_watermark() {
+/// Acquire `shard` and write a checkpoint key at a controlled logical time.
+fn checkpoint_shard_last_key(
+    coord: &mut InMemoryCoordinator,
+    shard: ShardId,
+    worker_id: u64,
+    acquire_t: u64,
+    checkpoint_t: u64,
+    op_id: u64,
+    last_key: &[u8],
+) {
+    let lease = coord
+        .acquire_and_restore(
+            now(acquire_t),
+            test_tenant(),
+            ShardKey::new(test_run(), shard),
+            test_worker(worker_id),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(checkpoint_t),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(last_key.to_vec()),
+            OpId::from_raw(op_id),
+        )
+        .unwrap();
+}
+
+/// Acquire `shard` and complete it with a controlled terminal cursor key.
+fn complete_shard_with_key(
+    coord: &mut InMemoryCoordinator,
+    shard: ShardId,
+    worker_id: u64,
+    acquire_t: u64,
+    complete_t: u64,
+    op_id: u64,
+    last_key: &[u8],
+) {
+    let lease = coord
+        .acquire_and_restore(
+            now(acquire_t),
+            test_tenant(),
+            ShardKey::new(test_run(), shard),
+            test_worker(worker_id),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .complete(
+            now(complete_t),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(last_key.to_vec()),
+            OpId::from_raw(op_id),
+        )
+        .unwrap();
+}
+
+/// Acquire, checkpoint, then park `shard` while preserving explicit timestamps.
+struct ParkAfterCheckpointStep<'a> {
+    worker_id: u64,
+    acquire_t: u64,
+    checkpoint_t: u64,
+    checkpoint_op_id: u64,
+    checkpoint_key: &'a [u8],
+    park_t: u64,
+    park_op_id: u64,
+}
+
+fn park_shard_after_checkpoint(
+    coord: &mut InMemoryCoordinator,
+    shard: ShardId,
+    step: ParkAfterCheckpointStep<'_>,
+) {
+    let lease = coord
+        .acquire_and_restore(
+            now(step.acquire_t),
+            test_tenant(),
+            ShardKey::new(test_run(), shard),
+            test_worker(step.worker_id),
+        )
+        .unwrap()
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(step.checkpoint_t),
+            test_tenant(),
+            &lease,
+            Cursor::with_last_key(step.checkpoint_key.to_vec()),
+            OpId::from_raw(step.checkpoint_op_id),
+        )
+        .unwrap();
+    let _ = coord
+        .park_shard(
+            now(step.park_t),
+            test_tenant(),
+            &lease,
+            ParkReason::TooManyErrors,
+            OpId::from_raw(step.park_op_id),
+        )
+        .unwrap();
+}
+
+/// Build a split-replace topology and return children to drive watermark tests:
+/// one child later completed, one parked, one left active.
+fn coordinator_with_split_children_for_watermark()
+-> (InMemoryCoordinator, ShardId, ShardId, ShardId) {
     let (mut coord, root_lease) = coordinator_with_run_and_lease();
 
-    // Set parent cursor before split so Split parent carries a small key.
+    // Make the parent carry a small cursor key before split.
     let _ = coord
         .checkpoint(
             now(4),
@@ -272,71 +306,52 @@ fn done_split_parked_excluded_from_watermark() {
         .unwrap()
         .shard();
 
-    let lease_done = coord
-        .acquire_and_restore(
-            now(7),
-            test_tenant(),
-            ShardKey::new(test_run(), child_done),
-            test_worker(2),
-        )
-        .unwrap()
-        .lease;
-    let _ = coord
-        .complete(
-            now(8),
-            test_tenant(),
-            &lease_done,
-            Cursor::with_last_key(b"d".to_vec()),
-            OpId::from_raw(12),
-        )
-        .unwrap();
+    (coord, child_done, child_parked, child_active)
+}
 
-    let lease_parked = coord
-        .acquire_and_restore(
-            now(9),
-            test_tenant(),
-            ShardKey::new(test_run(), child_parked),
-            test_worker(3),
-        )
-        .unwrap()
-        .lease;
-    let _ = coord
-        .checkpoint(
-            now(10),
-            test_tenant(),
-            &lease_parked,
-            Cursor::with_last_key(b"n".to_vec()),
-            OpId::from_raw(13),
-        )
-        .unwrap();
-    let _ = coord
-        .park_shard(
-            now(11),
-            test_tenant(),
-            &lease_parked,
-            ParkReason::TooManyErrors,
-            OpId::from_raw(14),
-        )
-        .unwrap();
+#[test]
+fn all_active_initial_cursors_watermark_none() {
+    let coord = coordinator_with_three_initial_active_shards();
 
-    let lease_active = coord
-        .acquire_and_restore(
-            now(12),
-            test_tenant(),
-            ShardKey::new(test_run(), child_active),
-            test_worker(4),
-        )
-        .unwrap()
-        .lease;
-    let _ = coord
-        .checkpoint(
-            now(13),
-            test_tenant(),
-            &lease_active,
-            Cursor::with_last_key(b"x".to_vec()),
-            OpId::from_raw(15),
-        )
+    let progress = coord
+        .get_run_progress(now(3), test_tenant(), test_run())
         .unwrap();
+    assert_eq!(progress.active(), 3);
+    assert_eq!(progress.watermark(), None);
+}
+
+#[test]
+fn mixed_progressed_and_initial_active_watermark_is_min_progressed() {
+    let mut coord = coordinator_with_three_initial_active_shards();
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(10), 1, 3, 4, 10, b"c");
+    checkpoint_shard_last_key(&mut coord, ShardId::from_raw(11), 2, 5, 6, 11, b"k");
+
+    let progress = coord
+        .get_run_progress(now(7), test_tenant(), test_run())
+        .unwrap();
+    assert_eq!(progress.active(), 3);
+    assert_eq!(progress.watermark(), Some(b"c".as_slice()));
+}
+
+#[test]
+fn done_split_parked_excluded_from_watermark() {
+    let (mut coord, child_done, child_parked, child_active) =
+        coordinator_with_split_children_for_watermark();
+    complete_shard_with_key(&mut coord, child_done, 2, 7, 8, 12, b"d");
+    park_shard_after_checkpoint(
+        &mut coord,
+        child_parked,
+        ParkAfterCheckpointStep {
+            worker_id: 3,
+            acquire_t: 9,
+            checkpoint_t: 10,
+            checkpoint_op_id: 13,
+            checkpoint_key: b"n",
+            park_t: 11,
+            park_op_id: 14,
+        },
+    );
+    checkpoint_shard_last_key(&mut coord, child_active, 4, 12, 13, 15, b"x");
 
     let progress = coord
         .get_run_progress(now(14), test_tenant(), test_run())
@@ -1469,22 +1484,15 @@ mod prop_progress_watermark {
                 .unwrap();
             let expected_min = cursor_keys.iter().filter_map(|k| k.as_deref()).min();
 
-            match (progress.watermark(), expected_min) {
-                (None, None) => {}
-                (Some(actual), Some(min_key)) => {
-                    prop_assert_eq!(actual, min_key);
-                    for key in cursor_keys.iter().filter_map(|k| k.as_deref()) {
-                        prop_assert!(actual <= key);
-                    }
-                }
-                (None, Some(_)) => {
-                    prop_assert!(false, "watermark must be Some when any active shard progressed");
-                }
-                (Some(_), None) => {
-                    prop_assert!(
-                        false,
-                        "watermark must be None when no active shard has a last_key"
-                    );
+            prop_assert_eq!(
+                progress.watermark(),
+                expected_min,
+                "watermark must equal the minimum active cursor key when present",
+            );
+
+            if let Some(actual) = progress.watermark() {
+                for key in cursor_keys.iter().filter_map(|k| k.as_deref()) {
+                    prop_assert!(actual <= key);
                 }
             }
         }
