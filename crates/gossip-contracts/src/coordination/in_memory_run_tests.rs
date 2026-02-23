@@ -17,6 +17,7 @@ use crate::coordination::test_fixtures::{
 };
 use crate::identity::{FenceEpoch, OpId, RunId, ShardId, ShardKey};
 use crate::sim::backend::SimIntrospection;
+use rstest::rstest;
 
 // -- Split index consistency tests --
 //
@@ -534,11 +535,13 @@ fn register_shards_preserves_non_initial_cursors() {
     );
 }
 
-// -- complete_run tests -------------------------------------------------------
+// -- Run terminal operation tests (complete_run / fail_run / cancel_run) ------
 //
-// Transitions a run from Active to Done. Verifies: happy path, rejection
-// from Initializing state, terminal irreversibility (Done -> Done fails),
-// not-found error, and idempotent replay.
+// All three terminal transitions share identical structure: happy path,
+// wrong-status rejection, terminal irreversibility, and idempotent
+// replay. A small dispatch enum + helper avoids repeating each scenario
+// three times. `cancel_run_from_initializing` and `complete_run_not_found`
+// remain individual tests because they have no parallel in other ops.
 
 /// Creates a coordinator with a run in Active state (one shard registered).
 ///
@@ -569,51 +572,109 @@ fn active_run_coordinator() -> InMemoryCoordinator {
     coord
 }
 
-#[test]
-fn complete_run_happy_path() {
+#[derive(Debug, Clone, Copy)]
+enum TerminalOp {
+    Complete,
+    Fail,
+    Cancel,
+}
+
+impl TerminalOp {
+    fn expected_status(self) -> RunStatus {
+        match self {
+            Self::Complete => RunStatus::Done,
+            Self::Fail => RunStatus::Failed,
+            Self::Cancel => RunStatus::Cancelled,
+        }
+    }
+}
+
+fn apply_terminal_op(
+    coord: &mut InMemoryCoordinator,
+    op: TerminalOp,
+    now: LogicalTime,
+    tenant: TenantId,
+    run: RunId,
+    op_id: OpId,
+) -> Result<IdempotentOutcome<()>, RunTransitionError> {
+    match op {
+        TerminalOp::Complete => coord.complete_run(now, tenant, run, op_id),
+        TerminalOp::Fail => coord.fail_run(now, tenant, run, op_id),
+        TerminalOp::Cancel => coord.cancel_run(now, tenant, run, op_id),
+    }
+}
+
+#[rstest]
+#[case::complete(TerminalOp::Complete)]
+#[case::fail(TerminalOp::Fail)]
+#[case::cancel(TerminalOp::Cancel)]
+fn terminal_op_happy_path(#[case] op: TerminalOp) {
     let mut coord = active_run_coordinator();
-    let result = coord
-        .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
+    let result = apply_terminal_op(
+        &mut coord,
+        op,
+        now(3),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(2),
+    )
+    .unwrap();
     assert!(result.is_executed());
 
     let record = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(record.status(), RunStatus::Done);
+    assert_eq!(record.status(), op.expected_status());
     assert_eq!(record.completed_at(), Some(now(3)));
 }
 
-#[test]
-fn complete_run_wrong_status_initializing() {
+#[rstest]
+#[case::complete(TerminalOp::Complete, RunStatus::Done)]
+#[case::fail(TerminalOp::Fail, RunStatus::Failed)]
+fn terminal_op_wrong_status_initializing(#[case] op: TerminalOp, #[case] target: RunStatus) {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let err = coord
-        .complete_run(now(2), test_tenant(), test_run(), OpId::from_raw(1))
-        .unwrap_err();
+    let err = apply_terminal_op(
+        &mut coord,
+        op,
+        now(2),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(1),
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
             RunTransitionError::WrongStatus {
                 status: RunStatus::Initializing,
-                target: RunStatus::Done,
-            }
+                target: t,
+            } if t == target
         ),
-        "expected WrongStatus(Initializing), got: {err:?}",
+        "expected WrongStatus(Initializing -> {target:?}), got: {err:?}",
     );
 }
 
-#[test]
-fn complete_run_terminal_already_done() {
+#[rstest]
+#[case::complete_after_done(TerminalOp::Complete)]
+#[case::fail_after_done(TerminalOp::Fail)]
+#[case::cancel_after_done(TerminalOp::Cancel)]
+fn terminal_op_rejected_when_already_terminal(#[case] op: TerminalOp) {
     let mut coord = active_run_coordinator();
     let _ = coord
         .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
         .unwrap();
 
-    let err = coord
-        .complete_run(now(4), test_tenant(), test_run(), OpId::from_raw(3))
-        .unwrap_err();
+    let err = apply_terminal_op(
+        &mut coord,
+        op,
+        now(4),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(3),
+    )
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -625,112 +686,21 @@ fn complete_run_terminal_already_done() {
     );
 }
 
-#[test]
-fn complete_run_not_found() {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let err = coord
-        .complete_run(now(1), test_tenant(), test_run(), OpId::from_raw(1))
-        .unwrap_err();
-    assert!(matches!(err, RunTransitionError::RunNotFound));
-}
-
-#[test]
-fn complete_run_idempotent_replay() {
+#[rstest]
+#[case::complete(TerminalOp::Complete)]
+#[case::fail(TerminalOp::Fail)]
+#[case::cancel(TerminalOp::Cancel)]
+fn terminal_op_idempotent_replay(#[case] op: TerminalOp) {
     let mut coord = active_run_coordinator();
-    let op = OpId::from_raw(2);
-    let first = coord
-        .complete_run(now(3), test_tenant(), test_run(), op)
-        .unwrap();
+    let op_id = OpId::from_raw(2);
+    let first =
+        apply_terminal_op(&mut coord, op, now(3), test_tenant(), test_run(), op_id).unwrap();
     assert!(first.is_executed());
 
-    let second = coord
-        .complete_run(now(4), test_tenant(), test_run(), op)
-        .unwrap();
+    let second =
+        apply_terminal_op(&mut coord, op, now(4), test_tenant(), test_run(), op_id).unwrap();
     assert!(second.is_replay());
 }
-
-// -- fail_run tests -----------------------------------------------------------
-//
-// Transitions a run from Active to Failed. Mirrors complete_run tests:
-// happy path, wrong-status rejection, terminal irreversibility, and
-// idempotent replay.
-
-#[test]
-fn fail_run_happy_path() {
-    let mut coord = active_run_coordinator();
-    let result = coord
-        .fail_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert!(result.is_executed());
-
-    let record = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(record.status(), RunStatus::Failed);
-    assert_eq!(record.completed_at(), Some(now(3)));
-}
-
-#[test]
-fn fail_run_wrong_status_initializing() {
-    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    coord
-        .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
-        .unwrap();
-
-    let err = coord
-        .fail_run(now(2), test_tenant(), test_run(), OpId::from_raw(1))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            RunTransitionError::WrongStatus {
-                status: RunStatus::Initializing,
-                target: RunStatus::Failed,
-            }
-        ),
-        "expected WrongStatus(Initializing), got: {err:?}",
-    );
-}
-
-#[test]
-fn fail_run_terminal() {
-    let mut coord = active_run_coordinator();
-    let _ = coord
-        .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-
-    let err = coord
-        .fail_run(now(4), test_tenant(), test_run(), OpId::from_raw(3))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
-        ),
-        "expected RunTerminal(Done), got: {err:?}",
-    );
-}
-
-#[test]
-fn fail_run_idempotent_replay() {
-    let mut coord = active_run_coordinator();
-    let op = OpId::from_raw(2);
-    let first = coord
-        .fail_run(now(3), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(first.is_executed());
-
-    let second = coord
-        .fail_run(now(4), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(second.is_replay());
-}
-
-// -- cancel_run tests ---------------------------------------------------------
-//
-// cancel_run is the only terminal transition allowed from Initializing
-// (in addition to Active). Covers both source states, terminal
-// irreversibility, and idempotent replay.
 
 #[test]
 fn cancel_run_from_initializing() {
@@ -750,95 +720,12 @@ fn cancel_run_from_initializing() {
 }
 
 #[test]
-fn cancel_run_from_active() {
-    let mut coord = active_run_coordinator();
-    let result = coord
-        .cancel_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert!(result.is_executed());
-
-    let record = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(record.status(), RunStatus::Cancelled);
-}
-
-#[test]
-fn cancel_run_terminal() {
-    let mut coord = active_run_coordinator();
-    let _ = coord
-        .complete_run(now(3), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-
+fn complete_run_not_found() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     let err = coord
-        .cancel_run(now(4), test_tenant(), test_run(), OpId::from_raw(3))
+        .complete_run(now(1), test_tenant(), test_run(), OpId::from_raw(1))
         .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
-        ),
-        "expected RunTerminal(Done), got: {err:?}",
-    );
-}
-
-#[test]
-fn cancel_run_idempotent_replay() {
-    let mut coord = active_run_coordinator();
-    let op = OpId::from_raw(2);
-    let first = coord
-        .cancel_run(now(3), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(first.is_executed());
-
-    let second = coord
-        .cancel_run(now(4), test_tenant(), test_run(), op)
-        .unwrap();
-    assert!(second.is_replay());
-}
-
-// -- Terminal ops timestamp tests ---------------------------------------------
-//
-// All three terminal run transitions (complete, fail, cancel) must
-// persist the timestamp of the transition in `completed_at`.
-
-#[test]
-fn terminal_ops_set_completed_at() {
-    // complete_run sets completed_at
-    let mut c1 = active_run_coordinator();
-    let _ = c1
-        .complete_run(now(10), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert_eq!(
-        c1.get_run(test_tenant(), test_run())
-            .unwrap()
-            .completed_at(),
-        Some(now(10)),
-    );
-
-    // fail_run sets completed_at
-    let mut c2 = active_run_coordinator();
-    let _ = c2
-        .fail_run(now(20), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert_eq!(
-        c2.get_run(test_tenant(), test_run())
-            .unwrap()
-            .completed_at(),
-        Some(now(20)),
-    );
-
-    // cancel_run from Active sets completed_at
-    let mut c3 = active_run_coordinator();
-    let _ = c3
-        .cancel_run(now(30), test_tenant(), test_run(), OpId::from_raw(2))
-        .unwrap();
-    assert_eq!(
-        c3.get_run(test_tenant(), test_run())
-            .unwrap()
-            .completed_at(),
-        Some(now(30)),
-    );
+    assert!(matches!(err, RunTransitionError::RunNotFound));
 }
 
 // -- OpIdConflict across run operations ---------------------------------------
@@ -1081,8 +968,13 @@ fn unpark_then_reacquire_and_checkpoint() {
 // state (Cancelled or Done). Reactivating a shard in a dead run would
 // violate the run lifecycle contract.
 
-#[test]
-fn unpark_shard_rejected_when_run_cancelled() {
+#[rstest]
+#[case::run_cancelled(TerminalOp::Cancel, RunStatus::Cancelled)]
+#[case::run_done(TerminalOp::Complete, RunStatus::Done)]
+fn unpark_shard_rejected_when_run_terminal(
+    #[case] op: TerminalOp,
+    #[case] expected_status: RunStatus,
+) {
     let (mut coord, lease) = coordinator_with_run_and_lease();
     let key = ShardKey::new(test_run(), ShardId::from_raw(10));
 
@@ -1097,10 +989,16 @@ fn unpark_shard_rejected_when_run_cancelled() {
         )
         .unwrap();
 
-    // Cancel the run.
-    let _ = coord
-        .cancel_run(now(5), test_tenant(), test_run(), OpId::from_raw(11))
-        .unwrap();
+    // Terminate the run.
+    let _ = apply_terminal_op(
+        &mut coord,
+        op,
+        now(5),
+        test_tenant(),
+        test_run(),
+        OpId::from_raw(11),
+    )
+    .unwrap();
 
     // Attempt unpark -> should fail with RunTerminal.
     let err = coord
@@ -1109,47 +1007,9 @@ fn unpark_shard_rejected_when_run_cancelled() {
     assert!(
         matches!(
             err,
-            UnparkError::RunTerminal {
-                status: RunStatus::Cancelled
-            }
+            UnparkError::RunTerminal { status } if status == expected_status
         ),
-        "expected RunTerminal(Cancelled), got: {err:?}",
-    );
-}
-
-#[test]
-fn unpark_shard_rejected_when_run_done() {
-    let (mut coord, lease) = coordinator_with_run_and_lease();
-    let key = ShardKey::new(test_run(), ShardId::from_raw(10));
-
-    // Park the shard.
-    let _ = coord
-        .park_shard(
-            now(4),
-            test_tenant(),
-            &lease,
-            ParkReason::TooManyErrors,
-            OpId::from_raw(10),
-        )
-        .unwrap();
-
-    // Complete the run.
-    let _ = coord
-        .complete_run(now(5), test_tenant(), test_run(), OpId::from_raw(11))
-        .unwrap();
-
-    // Attempt unpark -> should fail with RunTerminal.
-    let err = coord
-        .unpark_shard(now(6), test_tenant(), key, OpId::from_raw(12))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            UnparkError::RunTerminal {
-                status: RunStatus::Done
-            }
-        ),
-        "expected RunTerminal(Done), got: {err:?}",
+        "expected RunTerminal({expected_status:?}), got: {err:?}",
     );
 }
 
