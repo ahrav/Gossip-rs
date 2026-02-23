@@ -87,7 +87,7 @@ use super::{FaultConfig, FaultLevel, SimContext};
 /// All three share identical coordinator signatures
 /// `(now, tenant, run, op_id) -> Result<IdempotentOutcome<()>, RunTransitionError>`
 /// so a single `SimOp::TerminateRun { run, kind }` variant covers all three.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunTerminalKind {
     Complete,
     Fail,
@@ -96,7 +96,7 @@ pub enum RunTerminalKind {
 
 /// A single operation in the simulation.
 ///
-/// Operations fall into five categories:
+/// Operations fall into four categories:
 ///
 /// - **Coordinator ops** (`Acquire`, `Renew`, `Checkpoint`, `Complete`, `Park`,
 ///   `SplitReplace`, `SplitResidual`, `ClaimNext`, `SessionLifecycle`): invoke

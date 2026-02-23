@@ -80,7 +80,7 @@ fn assert_behavioral_properties(report: &SimReport, seed: u64, level: FaultLevel
 /// not appear, so they are omitted from the required set to avoid flakiness.
 /// Under `Stormy` or `Radioactive`, the larger op budget makes pause/resume
 /// events reliable enough to require. This is intentionally *not* an
-/// exhaustive check of all 18 kinds -- rare kinds like `SplitResidualOk`
+/// exhaustive check of all 20 kinds -- rare kinds like `SplitResidualOk`
 /// depend on specific preconditions that a small-scale test may not hit.
 fn assert_event_coverage(report: &SimReport, seed: u64, level: FaultLevel) {
     let required: &[SimEventKind] = if level == FaultLevel::SunnyDay {
