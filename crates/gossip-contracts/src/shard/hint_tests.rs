@@ -3,10 +3,41 @@ use proptest::prelude::*;
 use super::*;
 use crate::coordination::shard_spec::MAX_METADATA_SIZE;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OwnedHint {
+    Range,
+    Prefix(Vec<u8>),
+    Manifest {
+        manifest_id: u64,
+        start_row: u64,
+        end_row: u64,
+    },
+}
+
+impl OwnedHint {
+    fn as_hint(&self) -> ShardHint<'_> {
+        match self {
+            Self::Range => ShardHint::Range,
+            Self::Prefix(prefix) => ShardHint::Prefix {
+                prefix: prefix.as_slice(),
+            },
+            Self::Manifest {
+                manifest_id,
+                start_row,
+                end_row,
+            } => ShardHint::Manifest {
+                manifest_id: *manifest_id,
+                start_row: *start_row,
+                end_row: *end_row,
+            },
+        }
+    }
+}
+
 #[test]
 fn shard_hint_range_roundtrip() {
     let hint = ShardHint::Range;
-    let encoded = hint.encode();
+    let encoded = encode_hint(hint);
     assert_eq!(encoded, vec![0x00]);
 
     let (decoded, consumed) = ShardHint::decode(&encoded).expect("range hint should decode");
@@ -16,17 +47,23 @@ fn shard_hint_range_roundtrip() {
 
 #[test]
 fn shard_hint_prefix_roundtrip() {
+    let prefix = vec![0xAA, 0xBB, 0xCC];
     let hint = ShardHint::Prefix {
-        prefix: vec![0xAA, 0xBB, 0xCC].into_boxed_slice(),
+        prefix: prefix.as_slice(),
     };
-    let encoded = hint.encode();
+    let encoded = encode_hint(hint);
     assert_eq!(
         encoded,
         vec![0x01, 0x00, 0x00, 0x00, 0x03, 0xAA, 0xBB, 0xCC]
     );
 
     let (decoded, consumed) = ShardHint::decode(&encoded).expect("prefix hint should decode");
-    assert_eq!(decoded, hint);
+    assert_eq!(
+        decoded,
+        ShardHint::Prefix {
+            prefix: &encoded[5..8]
+        }
+    );
     assert_eq!(consumed, encoded.len());
 }
 
@@ -37,7 +74,7 @@ fn shard_hint_manifest_roundtrip() {
         start_row: 11,
         end_row: 12,
     };
-    let encoded = hint.encode();
+    let encoded = encode_hint(hint);
 
     let (decoded, consumed) = ShardHint::decode(&encoded).expect("manifest hint should decode");
     assert_eq!(decoded, hint);
@@ -118,10 +155,10 @@ fn shard_hint_decode_rejects_equal_manifest_rows() {
 
 #[test]
 fn shard_hint_decode_returns_consumed_length_with_trailing_bytes() {
-    let mut bytes = ShardHint::Prefix {
-        prefix: vec![0x01, 0x02].into_boxed_slice(),
-    }
-    .encode();
+    let prefix = vec![0x01, 0x02];
+    let mut bytes = encode_hint(ShardHint::Prefix {
+        prefix: prefix.as_slice(),
+    });
     let consumed_expected = bytes.len();
     bytes.extend_from_slice(&[0xFE, 0xED]);
 
@@ -129,8 +166,8 @@ fn shard_hint_decode_returns_consumed_length_with_trailing_bytes() {
     assert_eq!(
         decoded,
         ShardHint::Prefix {
-            prefix: vec![0x01, 0x02].into_boxed_slice(),
-        },
+            prefix: &bytes[5..7]
+        }
     );
     assert_eq!(consumed, consumed_expected);
 }
@@ -138,13 +175,8 @@ fn shard_hint_decode_returns_consumed_length_with_trailing_bytes() {
 #[test]
 fn shard_metadata_decode_empty_defaults_to_range_hint() {
     let decoded = ShardMetadata::decode(&[]).expect("empty metadata should decode");
-    assert_eq!(
-        decoded,
-        ShardMetadata {
-            hint: ShardHint::Range,
-            connector_extra: Box::new([]),
-        },
-    );
+    assert_eq!(decoded.hint, ShardHint::Range);
+    assert_eq!(decoded.connector_extra, &[]);
 }
 
 #[test]
@@ -168,24 +200,29 @@ fn shard_metadata_decode_rejects_non_empty_non_conforming_input() {
 
 #[test]
 fn shard_metadata_encode_decode_roundtrip() {
+    let connector_extra = vec![0xDE, 0xAD, 0xBE, 0xEF];
     let metadata = ShardMetadata::new(
         ShardHint::Manifest {
             manifest_id: 42,
             start_row: 100,
             end_row: 200,
         },
-        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        connector_extra.as_slice(),
     );
-    let encoded = metadata.encode().expect("metadata should encode");
+    let encoded = encode_metadata(metadata);
     let decoded = ShardMetadata::decode(&encoded).expect("metadata should decode");
-    assert_eq!(decoded, metadata);
+    assert_eq!(decoded.hint, metadata.hint);
+    assert_eq!(decoded.connector_extra, connector_extra.as_slice());
 }
 
 #[test]
 fn shard_metadata_encode_rejects_oversized_payload() {
-    let metadata = ShardMetadata::new(ShardHint::Range, vec![0xAB; MAX_METADATA_SIZE - 4]);
+    let connector_extra = vec![0xAB; MAX_METADATA_SIZE - 4];
+    let metadata = ShardMetadata::new(ShardHint::Range, connector_extra.as_slice());
+    let mut buf = MetadataBuf::new();
+
     assert_eq!(
-        metadata.encode(),
+        metadata.encode_into(&mut buf),
         Err(MetadataEncodingError::MetadataTooLarge {
             size: MAX_METADATA_SIZE + 1,
             max: MAX_METADATA_SIZE,
@@ -197,41 +234,86 @@ proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
     #[test]
-    fn shard_hint_proptest_roundtrip(hint in arb_shard_hint()) {
-        let encoded = hint.encode();
+    fn shard_hint_proptest_roundtrip(hint in arb_owned_hint()) {
+        let mut buf = MetadataBuf::new();
+        let encoded = hint
+            .as_hint()
+            .encode_into(&mut buf)
+            .expect("encoded hint should fit metadata buffer")
+            .to_vec();
+
         let (decoded, consumed) = ShardHint::decode(&encoded)
             .expect("encoded hint should decode");
-        prop_assert_eq!(decoded, hint);
+
         prop_assert_eq!(consumed, encoded.len());
+        assert_hint_matches_owned(decoded, &hint)?;
     }
 
     #[test]
     fn shard_metadata_proptest_roundtrip(
-        hint in arb_shard_hint(),
+        hint in arb_owned_hint(),
         connector_extra in proptest::collection::vec(any::<u8>(), 0..=256),
     ) {
-        let metadata = ShardMetadata::new(hint, connector_extra);
-        let encoded = metadata.encode().expect("bounded metadata should encode");
-        let decoded = ShardMetadata::decode(&encoded).expect("encoded metadata should decode");
-        prop_assert_eq!(decoded, metadata);
+        let metadata = ShardMetadata::new(hint.as_hint(), connector_extra.as_slice());
+        let mut buf = MetadataBuf::new();
+        let encoded = metadata
+            .encode_into(&mut buf)
+            .expect("bounded metadata should encode")
+            .to_vec();
+
+        let decoded = ShardMetadata::decode(&encoded)
+            .expect("encoded metadata should decode");
+        assert_hint_matches_owned(decoded.hint, &hint)?;
+        prop_assert_eq!(decoded.connector_extra, connector_extra.as_slice());
     }
 }
 
-fn arb_shard_hint() -> impl Strategy<Value = ShardHint> {
+fn arb_owned_hint() -> impl Strategy<Value = OwnedHint> {
     prop_oneof![
-        Just(ShardHint::Range),
-        proptest::collection::vec(any::<u8>(), 0..=64).prop_map(|prefix| ShardHint::Prefix {
-            prefix: prefix.into_boxed_slice(),
-        }),
+        Just(OwnedHint::Range),
+        proptest::collection::vec(any::<u8>(), 0..=64).prop_map(OwnedHint::Prefix),
         (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(|(manifest_id, a, b)| {
             let (start_row, end_row) = ordered_rows(a, b);
-            ShardHint::Manifest {
+            OwnedHint::Manifest {
                 manifest_id,
                 start_row,
                 end_row,
             }
         }),
     ]
+}
+
+fn assert_hint_matches_owned(
+    decoded: ShardHint<'_>,
+    expected: &OwnedHint,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    match (decoded, expected) {
+        (ShardHint::Range, OwnedHint::Range) => Ok(()),
+        (ShardHint::Prefix { prefix }, OwnedHint::Prefix(expected_prefix)) => {
+            prop_assert_eq!(prefix, expected_prefix.as_slice());
+            Ok(())
+        }
+        (
+            ShardHint::Manifest {
+                manifest_id,
+                start_row,
+                end_row,
+            },
+            OwnedHint::Manifest {
+                manifest_id: expected_manifest_id,
+                start_row: expected_start,
+                end_row: expected_end,
+            },
+        ) => {
+            prop_assert_eq!(manifest_id, *expected_manifest_id);
+            prop_assert_eq!(start_row, *expected_start);
+            prop_assert_eq!(end_row, *expected_end);
+            Ok(())
+        }
+        (actual, expected) => Err(proptest::test_runner::TestCaseError::fail(format!(
+            "decoded hint {actual:?} did not match expected {expected:?}"
+        ))),
+    }
 }
 
 fn ordered_rows(a: u64, b: u64) -> (u64, u64) {
@@ -253,4 +335,19 @@ fn encode_raw_manifest(manifest_id: u64, start_row: u64, end_row: u64) -> Vec<u8
     data.extend_from_slice(&start_row.to_be_bytes());
     data.extend_from_slice(&end_row.to_be_bytes());
     data
+}
+
+fn encode_hint(hint: ShardHint<'_>) -> Vec<u8> {
+    let mut buf = MetadataBuf::new();
+    hint.encode_into(&mut buf)
+        .expect("hint should encode")
+        .to_vec()
+}
+
+fn encode_metadata(metadata: ShardMetadata<'_>) -> Vec<u8> {
+    let mut buf = MetadataBuf::new();
+    metadata
+        .encode_into(&mut buf)
+        .expect("metadata should encode")
+        .to_vec()
 }

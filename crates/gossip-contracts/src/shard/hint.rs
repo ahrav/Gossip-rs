@@ -1,15 +1,31 @@
 //! Shard-hint wire framing shared between coordination and connectors.
 //!
 //! This module defines the structured prefix of shard metadata. The
-//! coordinator decodes only the hint frame, then treats the trailing bytes as
+//! coordinator decodes only the hint frame, then treats trailing bytes as
 //! connector-owned opaque data.
+//!
+//! # Allocation discipline
+//!
+//! The public encode/decode APIs are designed for zero heap allocation in
+//! steady-state paths:
+//! - Decode returns borrowed views into caller-provided input bytes.
+//! - Encode writes into a caller-owned reusable [`MetadataBuf`].
+//!
+//! Decode outputs are lifetime-bound to the provided input slice. In
+//! particular, [`ShardHint::Prefix`] and [`ShardMetadata::connector_extra`]
+//! borrow from caller memory and must not outlive it.
+//!
+//! Encode is two-step:
+//! - [`ShardHint::encoded_len`] / [`ShardMetadata::encoded_len`] perform
+//!   preflight sizing checks.
+//! - [`ShardHint::encode_into`] / [`ShardMetadata::encode_into`] write into
+//!   caller scratch and return a slice borrowing that scratch.
 //!
 //! # No-versioning policy
 //!
 //! Hint encoding is intentionally versionless: there is no format version byte
-//! and no compatibility shim. A hint is encoded as a tag byte followed by
-//! variant-specific fields (fixed-size for Range and Manifest, length-prefixed
-//! for Prefix). Unknown tags are rejected immediately. Format evolution is additive
+//! and no compatibility shim. A hint is encoded as a tag plus fixed variant
+//! fields. Unknown tags are rejected immediately. Format evolution is additive
 //! by introducing new tags, not by in-band version negotiation.
 //!
 //! # Metadata envelope
@@ -26,6 +42,7 @@
 //! callers can treat malformed metadata as one hard failure mode.
 
 use crate::coordination::shard_spec::MAX_METADATA_SIZE;
+use core::fmt;
 
 const TAG_RANGE: u8 = 0x00;
 const TAG_PREFIX: u8 = 0x01;
@@ -34,15 +51,77 @@ const TAG_MANIFEST: u8 = 0x02;
 const PREFIX_HEADER_LEN: usize = 1 + 4;
 const MANIFEST_LEN: usize = 1 + 8 + 8 + 8;
 const METADATA_HINT_LEN_PREFIX: usize = 4;
+const U32_MAX_USIZE: usize = u32::MAX as usize;
+
+/// Reusable fixed-capacity metadata scratch buffer.
+///
+/// This buffer is intended to be allocated once (for example at startup) and
+/// reused across repeated metadata/hint encodes without heap allocation.
+#[derive(Clone)]
+pub struct MetadataBuf {
+    buf: [u8; Self::CAPACITY],
+    len: usize,
+}
+
+impl MetadataBuf {
+    /// Maximum number of bytes this buffer can hold.
+    pub const CAPACITY: usize = MAX_METADATA_SIZE;
+
+    /// Create an empty metadata buffer.
+    #[must_use = "creates a buffer that should be reused by callers"]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// View active bytes.
+    #[must_use = "returns encoded bytes that should be consumed by caller"]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Active byte length.
+    #[must_use = "returns current active length"]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no bytes are active.
+    #[must_use = "returns whether the buffer currently has active bytes"]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Mark this buffer empty without touching backing storage.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl Default for MetadataBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for MetadataBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MetadataBuf")
+            .field("len", &self.len)
+            .field("bytes", &self.as_bytes())
+            .finish()
+    }
+}
 
 /// Routing hint embedded in shard metadata.
 ///
 /// Hints let downstream components infer the intended key domain (range,
 /// prefix, or manifest rows) without inspecting connector-specific payload
-/// bytes. The encoding is intentionally compact and versionless to keep decode
-/// logic deterministic across components.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ShardHint {
+/// bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardHint<'a> {
     /// Generic byte-range shard with no extra structured narrowing.
     ///
     /// Wire form: `[0x00]`.
@@ -50,10 +129,7 @@ pub enum ShardHint {
     /// Prefix-bounded shard. `prefix` bytes are connector-defined.
     ///
     /// Wire form: `[0x01][prefix_len:u32 BE][prefix_bytes]`.
-    ///
-    /// This variant permits an empty prefix at the wire level; higher-level
-    /// constructors decide whether empty prefixes are semantically valid.
-    Prefix { prefix: Box<[u8]> },
+    Prefix { prefix: &'a [u8] },
     /// Intended half-open row range within one manifest: `[start_row, end_row)`.
     ///
     /// Wire form:
@@ -76,7 +152,7 @@ pub enum ShardHint {
 /// `ShardHint::decode` returns the specific variant below. `ShardMetadata::decode`
 /// uses only `NotShardMetadataFormat` for any non-empty malformed metadata
 /// input, regardless of the underlying hint-level reason.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardHintDecodeError {
     /// Input is empty where a hint tag is required.
     EmptyData,
@@ -92,59 +168,89 @@ pub enum ShardHintDecodeError {
     ///
     /// Used by [`ShardMetadata::decode`] when non-empty metadata fails strict
     /// envelope decoding for any reason (bad length prefix, invalid hint tag,
-    /// truncated hint payload, manifest row invariant violation, or unconsumed
-    /// hint bytes).
+    /// truncated hint payload, or manifest row invariant violation).
     NotShardMetadataFormat,
 }
 
-/// Encoding failures for [`ShardMetadata`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Encode failures for [`ShardHint::encode_into`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardHintEncodeError {
+    /// Prefix bytes exceed `u32` framing width.
+    PrefixTooLarge { size: usize, max: usize },
+    /// Encoded hint exceeds metadata capacity.
+    EncodedHintTooLarge { size: usize, max: usize },
+}
+
+/// Encode failures for [`ShardMetadata::encode_into`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetadataEncodingError {
     /// Encoded metadata exceeds [`MAX_METADATA_SIZE`].
     MetadataTooLarge { size: usize, max: usize },
+    /// Encoded hint is too large to frame in metadata.
+    HintTooLarge { size: usize, max: usize },
 }
 
 /// Structured shard metadata envelope.
 ///
 /// `hint` is coordination-visible and normalized by this module.
 /// `connector_extra` is opaque and copied through untouched.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShardMetadata {
-    pub hint: ShardHint,
-    pub connector_extra: Box<[u8]>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardMetadata<'a> {
+    /// Coordination-visible routing hint.
+    pub hint: ShardHint<'a>,
+    /// Connector-private bytes, preserved opaquely by this module.
+    pub connector_extra: &'a [u8],
 }
 
-impl ShardHint {
-    /// Encode this hint into the strict, versionless wire format.
+impl<'a> ShardHint<'a> {
+    /// Return encoded byte length for this hint.
     ///
-    /// The encoded bytes contain no trailing length or checksum; callers that
-    /// embed hints in a larger payload must frame them explicitly.
-    #[must_use = "returns encoded hint bytes"]
-    pub fn encode(&self) -> Vec<u8> {
+    /// This is a pure sizing preflight: it does not mutate caller buffers.
+    ///
+    /// # Errors
+    ///
+    /// - [`ShardHintEncodeError::PrefixTooLarge`] when a prefix exceeds
+    ///   `u32` length framing.
+    /// - [`ShardHintEncodeError::EncodedHintTooLarge`] when the resulting hint
+    ///   frame would exceed [`MAX_METADATA_SIZE`].
+    pub fn encoded_len(&self) -> Result<usize, ShardHintEncodeError> {
         match self {
-            Self::Range => vec![TAG_RANGE],
+            Self::Range => Ok(1),
             Self::Prefix { prefix } => {
-                let prefix_len =
-                    u32::try_from(prefix.len()).expect("ShardHint::Prefix length exceeds u32::MAX");
-                let mut encoded = Vec::with_capacity(PREFIX_HEADER_LEN + prefix.len());
-                encoded.push(TAG_PREFIX);
-                encoded.extend_from_slice(&prefix_len.to_be_bytes());
-                encoded.extend_from_slice(prefix);
-                encoded
+                if prefix.len() > U32_MAX_USIZE {
+                    return Err(ShardHintEncodeError::PrefixTooLarge {
+                        size: prefix.len(),
+                        max: U32_MAX_USIZE,
+                    });
+                }
+                let size = PREFIX_HEADER_LEN.saturating_add(prefix.len());
+                if size > MAX_METADATA_SIZE {
+                    return Err(ShardHintEncodeError::EncodedHintTooLarge {
+                        size,
+                        max: MAX_METADATA_SIZE,
+                    });
+                }
+                Ok(size)
             }
-            Self::Manifest {
-                manifest_id,
-                start_row,
-                end_row,
-            } => {
-                let mut encoded = Vec::with_capacity(MANIFEST_LEN);
-                encoded.push(TAG_MANIFEST);
-                encoded.extend_from_slice(&manifest_id.to_be_bytes());
-                encoded.extend_from_slice(&start_row.to_be_bytes());
-                encoded.extend_from_slice(&end_row.to_be_bytes());
-                encoded
-            }
+            Self::Manifest { .. } => Ok(MANIFEST_LEN),
         }
+    }
+
+    /// Encode this hint into `buf` without heap allocation.
+    ///
+    /// The returned slice borrows `buf` and is overwritten by subsequent
+    /// writes into the same [`MetadataBuf`].
+    ///
+    /// This method validates framing size only. It does not enforce semantic
+    /// invariants beyond framing (for example, manifest row ordering).
+    pub fn encode_into<'b>(
+        &self,
+        buf: &'b mut MetadataBuf,
+    ) -> Result<&'b [u8], ShardHintEncodeError> {
+        let hint_len = self.encoded_len()?;
+        encode_hint_into_slice(*self, &mut buf.buf[..hint_len]);
+        buf.len = hint_len;
+        Ok(buf.as_bytes())
     }
 
     /// Decode one hint from `data`, returning `(hint, bytes_consumed)`.
@@ -152,7 +258,9 @@ impl ShardHint {
     /// Trailing bytes after `bytes_consumed` are intentionally ignored. This
     /// allows callers to decode a hint from a larger frame and enforce exact
     /// consumption at the outer boundary.
-    pub fn decode(data: &[u8]) -> Result<(ShardHint, usize), ShardHintDecodeError> {
+    ///
+    /// For [`ShardHint::Prefix`], the decoded `prefix` borrows from `data`.
+    pub fn decode(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHintDecodeError> {
         let Some(&tag) = data.first() else {
             return Err(ShardHintDecodeError::EmptyData);
         };
@@ -166,15 +274,15 @@ impl ShardHint {
     }
 }
 
-impl ShardMetadata {
+impl<'a> ShardMetadata<'a> {
     /// Build metadata containing only a hint.
     ///
     /// Use this when no connector-private metadata bytes are needed.
     #[must_use = "creates shard metadata that should be used or stored"]
-    pub fn from_hint(hint: ShardHint) -> Self {
+    pub fn from_hint(hint: ShardHint<'a>) -> Self {
         Self {
             hint,
-            connector_extra: Box::new([]),
+            connector_extra: &[],
         }
     }
 
@@ -182,23 +290,22 @@ impl ShardMetadata {
     ///
     /// `connector_extra` is stored as-is and never interpreted by this module.
     #[must_use = "creates shard metadata that should be used or stored"]
-    pub fn new(hint: ShardHint, connector_extra: Vec<u8>) -> Self {
+    pub fn new(hint: ShardHint<'a>, connector_extra: &'a [u8]) -> Self {
         Self {
             hint,
-            connector_extra: connector_extra.into_boxed_slice(),
+            connector_extra,
         }
     }
 
-    /// Encode metadata as `[hint_len:u32 BE][hint_bytes][connector_extra]`.
+    /// Return encoded byte length for this metadata envelope.
     ///
-    /// # Errors
-    ///
-    /// Returns [`MetadataEncodingError::MetadataTooLarge`] when the total
-    /// envelope would exceed [`MAX_METADATA_SIZE`].
-    pub fn encode(&self) -> Result<Vec<u8>, MetadataEncodingError> {
-        let hint_bytes = self.hint.encode();
+    /// This preflights `[hint_len:u32][hint_bytes][connector_extra]` and
+    /// verifies the total framed metadata size fits within
+    /// [`MAX_METADATA_SIZE`].
+    pub fn encoded_len(&self) -> Result<usize, MetadataEncodingError> {
+        let hint_len = self.hint.encoded_len().map_err(map_hint_encode_error)?;
         let total_size = METADATA_HINT_LEN_PREFIX
-            .checked_add(hint_bytes.len())
+            .checked_add(hint_len)
             .and_then(|s| s.checked_add(self.connector_extra.len()))
             .unwrap_or(usize::MAX);
 
@@ -209,13 +316,34 @@ impl ShardMetadata {
             });
         }
 
-        let hint_len = u32::try_from(hint_bytes.len())
-            .expect("hint length is validated to fit in metadata u32 frame");
-        let mut encoded = Vec::with_capacity(total_size);
-        encoded.extend_from_slice(&hint_len.to_be_bytes());
-        encoded.extend_from_slice(&hint_bytes);
-        encoded.extend_from_slice(&self.connector_extra);
-        Ok(encoded)
+        Ok(total_size)
+    }
+
+    /// Encode metadata as `[hint_len:u32 BE][hint_bytes][connector_extra]`
+    /// into `buf` without heap allocation.
+    ///
+    /// The returned slice borrows `buf` and is overwritten by subsequent
+    /// writes into the same [`MetadataBuf`].
+    pub fn encode_into<'b>(
+        &self,
+        buf: &'b mut MetadataBuf,
+    ) -> Result<&'b [u8], MetadataEncodingError> {
+        let hint_len = self.hint.encoded_len().map_err(map_hint_encode_error)?;
+        let total_size = self.encoded_len()?;
+
+        let hint_len_u32 =
+            u32::try_from(hint_len).expect("hint_len is validated to fit in u32 framing");
+        let out = &mut buf.buf[..total_size];
+
+        out[..METADATA_HINT_LEN_PREFIX].copy_from_slice(&hint_len_u32.to_be_bytes());
+
+        let hint_start = METADATA_HINT_LEN_PREFIX;
+        let hint_end = hint_start + hint_len;
+        encode_hint_into_slice(self.hint, &mut out[hint_start..hint_end]);
+
+        out[hint_end..].copy_from_slice(self.connector_extra);
+        buf.len = total_size;
+        Ok(buf.as_bytes())
     }
 
     /// Decode metadata encoded as `[hint_len:u32 BE][hint_bytes][connector_extra]`.
@@ -227,7 +355,10 @@ impl ShardMetadata {
     /// returns [`ShardHintDecodeError::NotShardMetadataFormat`]. This includes
     /// invalid hint tags, truncated frames, and hint payloads that decode but
     /// leave unconsumed bytes.
-    pub fn decode(metadata: &[u8]) -> Result<Self, ShardHintDecodeError> {
+    ///
+    /// On success, both the decoded hint prefix bytes (if any) and
+    /// `connector_extra` borrow from `metadata`.
+    pub fn decode(metadata: &'a [u8]) -> Result<Self, ShardHintDecodeError> {
         if metadata.is_empty() {
             return Ok(Self::from_hint(ShardHint::Range));
         }
@@ -261,12 +392,46 @@ impl ShardMetadata {
 
         Ok(Self {
             hint,
-            connector_extra: metadata[hint_frame_end..].to_vec().into_boxed_slice(),
+            connector_extra: &metadata[hint_frame_end..],
         })
     }
 }
 
-fn decode_prefix(data: &[u8]) -> Result<(ShardHint, usize), ShardHintDecodeError> {
+fn map_hint_encode_error(err: ShardHintEncodeError) -> MetadataEncodingError {
+    match err {
+        ShardHintEncodeError::PrefixTooLarge { size, max }
+        | ShardHintEncodeError::EncodedHintTooLarge { size, max } => {
+            MetadataEncodingError::HintTooLarge { size, max }
+        }
+    }
+}
+
+fn encode_hint_into_slice(hint: ShardHint<'_>, out: &mut [u8]) {
+    match hint {
+        ShardHint::Range => {
+            out[0] = TAG_RANGE;
+        }
+        ShardHint::Prefix { prefix } => {
+            out[0] = TAG_PREFIX;
+            let prefix_len_u32 =
+                u32::try_from(prefix.len()).expect("prefix length validated before encoding");
+            out[1..5].copy_from_slice(&prefix_len_u32.to_be_bytes());
+            out[PREFIX_HEADER_LEN..PREFIX_HEADER_LEN + prefix.len()].copy_from_slice(prefix);
+        }
+        ShardHint::Manifest {
+            manifest_id,
+            start_row,
+            end_row,
+        } => {
+            out[0] = TAG_MANIFEST;
+            out[1..9].copy_from_slice(&manifest_id.to_be_bytes());
+            out[9..17].copy_from_slice(&start_row.to_be_bytes());
+            out[17..25].copy_from_slice(&end_row.to_be_bytes());
+        }
+    }
+}
+
+fn decode_prefix<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHintDecodeError> {
     if data.len() < PREFIX_HEADER_LEN {
         return Err(ShardHintDecodeError::TruncatedPrefix {
             expected_min: PREFIX_HEADER_LEN,
@@ -290,15 +455,10 @@ fn decode_prefix(data: &[u8]) -> Result<(ShardHint, usize), ShardHintDecodeError
         });
     };
 
-    Ok((
-        ShardHint::Prefix {
-            prefix: prefix.to_vec().into_boxed_slice(),
-        },
-        expected_min,
-    ))
+    Ok((ShardHint::Prefix { prefix }, expected_min))
 }
 
-fn decode_manifest(data: &[u8]) -> Result<(ShardHint, usize), ShardHintDecodeError> {
+fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHintDecodeError> {
     if data.len() < MANIFEST_LEN {
         return Err(ShardHintDecodeError::TruncatedManifest {
             expected_min: MANIFEST_LEN,
