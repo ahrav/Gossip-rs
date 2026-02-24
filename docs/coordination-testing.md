@@ -34,7 +34,7 @@ Each tier builds on the one below it. Unit tests validate individual
 operations against the `InMemoryCoordinator`. Conformance tests compose
 two or more invariants and verify they hold simultaneously. Scenario tests
 chain operations into realistic workflows. Simulation tests sweep hundreds
-of random seeds under fault injection, validating all seven safety
+of random seeds under fault injection, validating all nine safety
 invariants at every step. TLA+ model checking (Section 11) operates as a
 parallel verification layer that exhaustively verifies the protocol design.
 
