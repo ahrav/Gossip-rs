@@ -29,7 +29,7 @@ use crate::coordination::record::ShardStatus;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::identity::{FenceEpoch, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use crate::sim::FaultLevel;
-use crate::sim::harness::SimOp;
+use crate::sim::harness::{RunTerminalKind, SimOp};
 use gossip_stdx::{ByteSlab, RingBuffer};
 
 /// Proptest strategy producing a uniform choice among the three [`FaultLevel`] variants.
@@ -62,7 +62,7 @@ pub(crate) fn arb_fault_level() -> impl Strategy<Value = FaultLevel> {
 ///
 /// # Weight distribution
 ///
-/// Total weight across the 15 included variants is **37**. Weights bias
+/// Total weight across the 16 included variants is **38**. Weights bias
 /// toward ops that drive forward progress (Acquire=6, AdvanceTime=5,
 /// Checkpoint=5, Complete=4) while exotic variants (Split*, Replay/Conflict
 /// Checkpoint) appear at weight 1 to exercise rejection paths without
@@ -91,6 +91,14 @@ pub(crate) fn arb_sim_op(n_workers: u64, n_shards: u64) -> impl Strategy<Value =
         1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::ReplayCheckpoint { worker, key }),
         1 => (w.clone(), k.clone()).prop_map(|(worker, key)| SimOp::ConflictCheckpoint { worker, key }),
         1 => k.clone().prop_map(|key| SimOp::Unpark { key }),
+        1 => prop_oneof![
+            Just(RunTerminalKind::Complete),
+            Just(RunTerminalKind::Fail),
+            Just(RunTerminalKind::Cancel),
+        ].prop_map(|kind| SimOp::TerminateRun {
+            run: RunId::from_raw(1),
+            kind,
+        }),
     ]
 }
 

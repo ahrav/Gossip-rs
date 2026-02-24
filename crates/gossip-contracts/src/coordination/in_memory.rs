@@ -2704,6 +2704,7 @@ impl InMemoryCoordinator {
 #[cfg(any(test, feature = "test-support"))]
 impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
     type ShardIter<'a> = Box<dyn Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)> + 'a>;
+    type RunIter<'a> = Box<dyn Iterator<Item = ((TenantId, RunId), &'a RunRecord)> + 'a>;
 
     fn shards(&self) -> Self::ShardIter<'_> {
         Box::new(self.shards.iter().flat_map(|(&tenant, inner)| {
@@ -2711,6 +2712,10 @@ impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
                 .iter()
                 .map(move |(&key, record)| ((tenant, key), record))
         }))
+    }
+
+    fn runs(&self) -> Self::RunIter<'_> {
+        Box::new(self.runs.iter().map(|(&(t, r), rec)| ((t, r), rec)))
     }
 
     fn shard_count(&self) -> usize {

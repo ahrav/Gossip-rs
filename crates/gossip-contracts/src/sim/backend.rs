@@ -20,8 +20,10 @@
 //!
 //! - [`InvariantChecker::check_all`](super::invariants::InvariantChecker::check_all)
 //!   takes `&impl SimIntrospection` and uses [`shards()`](SimIntrospection::shards)
-//!   for the S1–S7 invariant pass and [`shard_lookup()`](SimIntrospection::shard_lookup)
-//!   for S7 split-coverage child verification.
+//!   for the S1–S7 shard-level invariant pass, [`runs()`](SimIntrospection::runs)
+//!   for the S8 run-terminal irreversibility check, and
+//!   [`shard_lookup()`](SimIntrospection::shard_lookup) for S7 split-coverage
+//!   child verification.
 //! - [`CoordinationSim`](super::harness::CoordinationSim) is generic over
 //!   `B: SimulationBackend`, combining mutation and observation in one bound.
 //!
@@ -35,8 +37,9 @@
 
 use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
+use crate::coordination::run::RunRecord;
 use crate::coordination::shard_spec::ShardSpec;
-use crate::identity::{ShardKey, TenantId};
+use crate::identity::{RunId, ShardKey, TenantId};
 
 /// Read-only observation API for simulation backends.
 ///
@@ -62,8 +65,8 @@ use crate::identity::{ShardKey, TenantId};
 /// # Ordering
 ///
 /// Iteration order of [`shards()`](Self::shards) is unspecified — callers
-/// must not depend on any particular ordering. All current invariant checks
-/// (S1–S7) are order-independent.
+/// must not depend on any particular ordering. All current shard-level
+/// invariant checks (S1–S7) are order-independent.
 pub trait SimIntrospection {
     /// Iterator over all shard records. Order is unspecified.
     ///
@@ -75,13 +78,24 @@ pub trait SimIntrospection {
     where
         Self: 'a;
 
+    /// Iterator over all run records. Order is unspecified.
+    type RunIter<'a>: Iterator<Item = ((TenantId, RunId), &'a RunRecord)>
+    where
+        Self: 'a;
+
     /// Iterate all shard records across all tenants.
     ///
-    /// This is the primary observation method. The invariant checker
+    /// This is the primary shard observation method. The invariant checker
     /// performs a single pass over this iterator to check S1–S7 inline,
     /// with S7 issuing [`shard_lookup()`](Self::shard_lookup) calls
     /// within the same iteration to verify child shard references.
     fn shards(&self) -> Self::ShardIter<'_>;
+
+    /// Iterate all run records across all tenants.
+    ///
+    /// Used by the S8 (RunTerminalIrreversibility) invariant check to
+    /// verify that terminal run states never revert.
+    fn runs(&self) -> Self::RunIter<'_>;
 
     /// Total number of shard records across all tenants.
     ///

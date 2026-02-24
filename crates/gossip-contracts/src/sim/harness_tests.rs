@@ -384,6 +384,7 @@ fn new_op_types_exercised() {
     let mut replayed_seen = false;
     let mut claim_seen = false;
     let mut session_lifecycle_seen = false;
+    let mut run_terminal_seen = false;
     // Run with a large enough op count and enough seeds to trigger
     // the probabilistic generation paths.
     for seed in 0..20u64 {
@@ -417,6 +418,12 @@ fn new_op_types_exercised() {
         {
             session_lifecycle_seen = true;
         }
+        if report
+            .event_counts
+            .contains_key(&SimEventKind::RunTerminalOk)
+        {
+            run_terminal_seen = true;
+        }
     }
     assert!(
         split_replace_seen,
@@ -431,6 +438,10 @@ fn new_op_types_exercised() {
     assert!(
         session_lifecycle_seen,
         "SessionLifecycleOk never observed across 20 seeds"
+    );
+    assert!(
+        run_terminal_seen,
+        "RunTerminalOk never observed across 20 seeds"
     );
 }
 
@@ -746,5 +757,140 @@ fn admin_unpark_no_op_id_collision_with_workers() {
     assert!(
         violations.is_empty(),
         "invariant violations on unpark: {violations:?}"
+    );
+}
+
+// -- Run-terminal behavioral tests ------------------------------------------
+
+/// Validates the coordinator contract around run termination:
+/// - Unpark is blocked after run terminal (`TerminalState` rejection).
+/// - Shard lifecycle ops (acquire) continue after run termination.
+/// - Terminal transitions are irreversible (second attempt rejected).
+#[test]
+fn run_terminal_unpark_blocked_shard_ops_continue() {
+    use crate::identity::{RunId, WorkerId};
+
+    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay).with_workers_and_shards(2, 5);
+    let worker1 = WorkerId::from_raw(1);
+    let worker2 = WorkerId::from_raw(2);
+
+    // Advance clock off ZERO (coordinator requires now > ZERO).
+    let (_, v) = sim.step(SimOp::AdvanceTime { ticks: 1 });
+    assert!(v.is_empty());
+
+    // Acquire a shard with worker 1, then park it.
+    let park_key = sim.shard_keys[0];
+    let (event, v) = sim.step(SimOp::Acquire {
+        worker: worker1,
+        key: park_key,
+    });
+    assert!(matches!(event, SimEvent::AcquireOk { .. }));
+    assert!(v.is_empty());
+
+    let (event, v) = sim.step(SimOp::Park {
+        worker: worker1,
+        key: park_key,
+    });
+    assert!(matches!(event, SimEvent::ParkOk));
+    assert!(v.is_empty());
+
+    // Acquire another shard with worker 2 (active lease for post-termination test).
+    let active_key = sim.shard_keys[1];
+    let (event, v) = sim.step(SimOp::Acquire {
+        worker: worker2,
+        key: active_key,
+    });
+    assert!(matches!(event, SimEvent::AcquireOk { .. }));
+    assert!(v.is_empty());
+
+    // Cancel the run.
+    let run = RunId::from_raw(1);
+    let (event, v) = sim.step(SimOp::TerminateRun {
+        run,
+        kind: RunTerminalKind::Cancel,
+    });
+    assert!(
+        matches!(
+            event,
+            SimEvent::RunTerminalOk {
+                kind: RunTerminalKind::Cancel
+            }
+        ),
+        "expected RunTerminalOk(Cancel), got {event:?}"
+    );
+    assert!(v.is_empty());
+
+    // Unpark should be rejected — run is terminal.
+    let (event, v) = sim.step(SimOp::Unpark { key: park_key });
+    assert!(
+        matches!(
+            event,
+            SimEvent::Rejected {
+                kind: RejectionKind::TerminalState
+            }
+        ),
+        "expected TerminalState rejection for unpark after run cancel, got {event:?}"
+    );
+    assert!(v.is_empty());
+
+    // Shard ops continue — acquire on another shard succeeds.
+    let another_key = sim.shard_keys[2];
+    let (event, v) = sim.step(SimOp::Acquire {
+        worker: worker2,
+        key: another_key,
+    });
+    assert!(
+        matches!(event, SimEvent::AcquireOk { .. }),
+        "shard acquire should succeed after run termination, got {event:?}"
+    );
+    assert!(v.is_empty());
+
+    // Terminal irreversibility: completing an already-cancelled run is rejected.
+    let (event, v) = sim.step(SimOp::TerminateRun {
+        run,
+        kind: RunTerminalKind::Complete,
+    });
+    assert!(
+        matches!(
+            event,
+            SimEvent::Rejected {
+                kind: RejectionKind::TerminalState
+            }
+        ),
+        "expected TerminalState rejection for complete after cancel, got {event:?}"
+    );
+    assert!(v.is_empty());
+}
+
+/// `try_gen_terminate_run` should sample across all seeded runs so multi-run
+/// simulations do not starve run-terminal coverage for later run IDs.
+#[test]
+fn terminate_run_generator_targets_multiple_runs() {
+    use crate::identity::RunId;
+
+    let mut sim = CoordinationSim::new(42, FaultLevel::SunnyDay);
+    let run1 = RunId::from_raw(1);
+    let run2 = RunId::from_raw(2);
+    for i in 1..=3 {
+        sim.register_shard(run1, ShardId::from_raw(i));
+        sim.register_shard(run2, ShardId::from_raw(i));
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..64 {
+        let op = sim
+            .try_gen_terminate_run()
+            .expect("terminate_run op should be generatable when runs are seeded");
+        match op {
+            SimOp::TerminateRun { run, .. } => {
+                seen.insert(run);
+            }
+            other => panic!("expected TerminateRun op, got {other:?}"),
+        }
+    }
+
+    assert!(
+        seen.contains(&run1) && seen.contains(&run2),
+        "terminate_run generator should target both runs, saw: {seen:?}"
     );
 }

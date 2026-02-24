@@ -65,7 +65,7 @@ use crate::coordination::error::{
 use crate::coordination::facade::ClaimError;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
-use crate::coordination::run_errors::UnparkError;
+use crate::coordination::run_errors::{RunTransitionError, UnparkError};
 use crate::coordination::session::WorkerSession;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
@@ -82,6 +82,18 @@ use super::{FaultConfig, FaultLevel, SimContext};
 // SimOp
 // ---------------------------------------------------------------------------
 
+/// Which terminal transition to apply to a run.
+///
+/// All three share identical coordinator signatures
+/// `(now, tenant, run, op_id) -> Result<IdempotentOutcome<()>, RunTransitionError>`
+/// so a single `SimOp::TerminateRun { run, kind }` variant covers all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunTerminalKind {
+    Complete,
+    Fail,
+    Cancel,
+}
+
 /// A single operation in the simulation.
 ///
 /// Operations fall into four categories:
@@ -89,8 +101,8 @@ use super::{FaultConfig, FaultLevel, SimContext};
 /// - **Coordinator ops** (`Acquire`, `Renew`, `Checkpoint`, `Complete`, `Park`,
 ///   `SplitReplace`, `SplitResidual`, `ClaimNext`, `SessionLifecycle`): invoke
 ///   real coordinator methods through the [`SimulationBackend`] trait.
-/// - **Admin ops** (`Unpark`): invoke run-management methods that operate outside
-///   the worker-lease model (no worker/lease required).
+/// - **Admin ops** (`Unpark`, `TerminateRun`): invoke run-management methods
+///   that operate outside the worker-lease model (no worker/lease required).
 /// - **Idempotency/conflict ops** (`ReplayCheckpoint`, `ConflictCheckpoint`,
 ///   `ZombieCheckpoint`): exercise edge cases in the coordinator's op-log and
 ///   fencing protocol.
@@ -148,6 +160,9 @@ pub enum SimOp {
     /// with a fence epoch bump, invalidating prior zombie workers.
     /// No worker field — unpark is not worker-initiated.
     Unpark { key: ShardKey },
+    /// Apply a terminal transition (complete/fail/cancel) to a run.
+    /// Admin operation — no worker or lease required.
+    TerminateRun { run: RunId, kind: RunTerminalKind },
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +227,8 @@ pub enum SimEvent {
     },
     /// Parked shard successfully unparked (admin, Parked→Active + fence bump).
     UnparkOk,
+    /// Run terminal transition succeeded (complete/fail/cancel).
+    RunTerminalOk { kind: RunTerminalKind },
 }
 
 /// Categorized rejection reason (no heap allocation).
@@ -268,6 +285,9 @@ pub enum RejectionKind {
     WorkerNotFound,
     /// Target run does not exist in the coordinator.
     RunNotFound,
+    /// Run is not in the required status for this terminal transition
+    /// (e.g., `complete_run` on an `Initializing` run).
+    WrongRunStatus,
     /// Byte slab could not satisfy an allocation request.
     ResourceExhausted,
     /// Coordinator returned an error not matching a specific category.
@@ -381,6 +401,18 @@ impl From<UnparkError> for RejectionKind {
     }
 }
 
+impl From<RunTransitionError> for RejectionKind {
+    fn from(e: RunTransitionError) -> Self {
+        match e {
+            RunTransitionError::RunNotFound => Self::RunNotFound,
+            RunTransitionError::TenantMismatch { .. } => Self::TenantMismatch,
+            RunTransitionError::RunTerminal { .. } => Self::TerminalState,
+            RunTransitionError::WrongStatus { .. } => Self::WrongRunStatus,
+            RunTransitionError::OpIdConflict(_) => Self::OpIdConflict,
+        }
+    }
+}
+
 /// Payload-free event discriminant for histogram counting.
 ///
 /// Every [`SimEvent`] maps to exactly one `SimEventKind` via its `kind()` method.
@@ -412,6 +444,7 @@ pub enum SimEventKind {
     SessionLifecycleOk,
     SessionLifecyclePartial,
     UnparkOk,
+    RunTerminalOk,
 }
 
 impl SimEvent {
@@ -437,6 +470,7 @@ impl SimEvent {
             SimEvent::SessionLifecycleOk { .. } => SimEventKind::SessionLifecycleOk,
             SimEvent::SessionLifecyclePartial { .. } => SimEventKind::SessionLifecyclePartial,
             SimEvent::UnparkOk => SimEventKind::UnparkOk,
+            SimEvent::RunTerminalOk { .. } => SimEventKind::RunTerminalOk,
         }
     }
 }
@@ -743,7 +777,7 @@ pub struct CoordinationSim<B: SimulationBackend = InMemoryCoordinator> {
     last_checkpoint_ops: CheckpointOpMap,
     /// Shard IDs per run, used to seed run records for `claim_next_available`.
     run_shard_ids: BTreeMap<RunId, Vec<ShardId>>,
-    /// Monotonic op-ID counter for admin operations (unpark).
+    /// Monotonic op-ID counter for admin operations (`Unpark`, `TerminateRun`).
     /// Uses partition 0 (workers start at 1), guaranteeing no collisions.
     admin_next_op: u64,
 }
@@ -1038,6 +1072,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
             SimOp::Unpark { key } => self.exec_unpark(*key),
 
+            SimOp::TerminateRun { run, kind } => self.exec_run_terminal(*run, *kind),
+
             SimOp::AdvanceTime { ticks } => {
                 self.context.advance(*ticks);
                 SimEvent::TimeAdvanced {
@@ -1270,7 +1306,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Generate the next admin op-ID from the reserved partition 0.
     ///
     /// Worker IDs start at 1, so partition 0 `[0, OP_ID_PARTITION)` is unused
-    /// by workers. Admin operations (unpark) draw from this partition.
+    /// by workers. Admin operations (`Unpark`, `TerminateRun`) draw from this
+    /// partition so they cannot collide with worker-generated op-IDs.
     fn next_admin_op_id(&mut self) -> OpId {
         assert!(
             self.admin_next_op < super::worker::OP_ID_PARTITION,
@@ -1297,6 +1334,38 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     self.active_shard_keys.push(key);
                 }
                 SimEvent::UnparkOk
+            }
+            Err(e) => SimEvent::Rejected { kind: e.into() },
+        }
+    }
+
+    /// Execute a run terminal transition (complete, fail, or cancel).
+    ///
+    /// On success: `debug_assert!` that the outcome is executed (fresh op-ID
+    /// means replay never occurs). No harness-side mutation is required: run
+    /// status is coordinator-owned. This intentionally keeps shard lifecycle
+    /// ops available while letting the coordinator reject run-scoped admin
+    /// actions (for example, unpark after a run is terminal).
+    ///
+    /// On error: converts `RunTransitionError` to `RejectionKind` via the
+    /// exhaustive `From` impl.
+    fn exec_run_terminal(&mut self, run: RunId, kind: RunTerminalKind) -> SimEvent {
+        let op_id = self.next_admin_op_id();
+        let now = self.context.now();
+        let result = match kind {
+            RunTerminalKind::Complete => {
+                self.coordinator.complete_run(now, self.tenant, run, op_id)
+            }
+            RunTerminalKind::Fail => self.coordinator.fail_run(now, self.tenant, run, op_id),
+            RunTerminalKind::Cancel => self.coordinator.cancel_run(now, self.tenant, run, op_id),
+        };
+        match result {
+            Ok(outcome) => {
+                debug_assert!(
+                    outcome.is_executed(),
+                    "fresh admin op-ID should never replay"
+                );
+                SimEvent::RunTerminalOk { kind }
             }
             Err(e) => SimEvent::Rejected { kind: e.into() },
         }
@@ -1710,7 +1779,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// - claim_next (3%) exercises the list-then-acquire retry loop
     /// - session_lifecycle (8%) exercises WorkerSession wrapper end-to-end
     /// - time advances (9%) create expiry windows
-    /// - pause (8%) and resume (8%) model worker failures
+    /// - pause (8%) and resume (6%) model worker failures
+    /// - terminate_run (2%) exercises run-level terminal transitions
     fn generate_random_op(&mut self, suppress_faults: bool) -> SimOp {
         for _ in 0..MAX_OP_RETRIES {
             // Weighted selection.
@@ -1741,6 +1811,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     67..75 => self.try_gen_session_lifecycle(),
                     75..84 => Some(self.gen_advance_time()),
                     84..92 => self.try_gen_pause(),
+                    92..94 => self.try_gen_terminate_run(),
                     _ => self.try_gen_resume(),
                 }
             };
@@ -1895,6 +1966,28 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let idx = self.context.rng().random_range(0..count);
         let key = *self.shard_keys.iter().filter(is_parked).nth(idx)?;
         Some(SimOp::Unpark { key })
+    }
+
+    /// Pick a run and a random terminal kind for a run-termination op.
+    ///
+    /// Guards on `run_shard_ids` being non-empty (backends created via
+    /// `with_backend()` may have no seeded runs). Picks a run uniformly
+    /// across seeded run IDs (not weighted by shard count), then picks a
+    /// terminal kind uniformly.
+    /// No suppression after first success — subsequent attempts naturally
+    /// exercise the `RunTerminal` rejection path (terminal irreversibility).
+    fn try_gen_terminate_run(&mut self) -> Option<SimOp> {
+        if self.run_shard_ids.is_empty() {
+            return None;
+        }
+        let idx = self.context.rng().random_range(0..self.run_shard_ids.len());
+        let run = *self.run_shard_ids.keys().nth(idx)?;
+        let kind = match self.context.rng().random_range(0u32..3) {
+            0 => RunTerminalKind::Complete,
+            1 => RunTerminalKind::Fail,
+            _ => RunTerminalKind::Cancel,
+        };
+        Some(SimOp::TerminateRun { run, kind })
     }
 
     /// Generate a time-advance op with 1--50 ticks.

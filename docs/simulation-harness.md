@@ -27,7 +27,7 @@ Per-worker bookkeeping that tracks:
 
 ### Layer 3: InvariantChecker (`sim/invariants.rs`)
 
-An external observer that verifies seven safety properties against coordinator
+An external observer that verifies eight safety properties against coordinator
 ground truth at every simulation step. It never trusts worker-side bookkeeping.
 See the invariant table below.
 
@@ -65,8 +65,9 @@ platforms and prevent invalid probability construction.
 | S5    | CursorMonotonicity      | `cursor.last_key()` never decreases per shard.                                    |
 | S6    | CursorBounds            | Non-initial cursors remain within shard spec key range.                           |
 | S7    | SplitCoverage           | Split-parent's spawned children exist and reference the correct parent.           |
+| S8    | RunTerminalIrreversibility | Terminal run states (Done, Failed, Cancelled) never revert.                    |
 
-All seven invariants are checked in a single pass over coordinator state after
+All eight invariants are checked after
 every operation (both successful and rejected).
 
 ## Three-Stage Run Model
@@ -86,10 +87,10 @@ even before normal operation begins.
 Runs `safety_ops` random operations under fault injection. The first few
 operations (warmup) suppress faults to let the system reach a healthy
 baseline. After warmup, time jumps, worker pauses, lease expiry, split
-operations, OpId replays, and zombie checkpoints are all exercised at
-weighted probabilities.
+operations, OpId replays, zombie checkpoints, and run-terminal transitions
+(complete/fail/cancel) are all exercised at weighted probabilities.
 
-**Goal:** Verify that no invariant (S1-S7) is ever violated regardless of
+**Goal:** Verify that no invariant (S1-S8) is ever violated regardless of
 operation ordering, timing, or fault injection.
 
 ### Stage 2: Liveness
