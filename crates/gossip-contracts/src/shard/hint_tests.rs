@@ -1,7 +1,18 @@
+//! Tests for shard hint framing, metadata envelope helpers, and split-hint
+//! propagation invariants.
+//!
+//! The suite covers both deterministic edge cases and proptest roundtrips so
+//! docs in `hint.rs` stay aligned with wire-format and validation behavior.
+
 use proptest::prelude::*;
 
 use super::*;
-use crate::coordination::shard_spec::MAX_METADATA_SIZE;
+use crate::coordination::shard_spec::{
+    MAX_KEY_SIZE, MAX_METADATA_SIZE, ShardSpec, ShardSpecInputError,
+};
+use crate::shard::key_encoding::{
+    KeyBuf, KeyEncoding, ManifestRowKey, PrefixShardError, decode_manifest_row_key,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedHint {
@@ -15,6 +26,11 @@ enum OwnedHint {
 }
 
 impl OwnedHint {
+    /// Convert owned test data into the borrowed API shape used by
+    /// [`ShardHint`].
+    ///
+    /// Keeping owned bytes in the test model avoids self-referential borrowed
+    /// fixtures in property strategies.
     fn as_hint(&self) -> ShardHint<'_> {
         match self {
             Self::Range => ShardHint::Range,
@@ -229,6 +245,254 @@ fn shard_metadata_encode_rejects_oversized_payload() {
     );
 }
 
+#[test]
+fn range_shard_roundtrip_with_decode_helpers() {
+    let spec = range_shard(b"a", b"z", b"ctx").expect("range shard should be valid");
+    assert_eq!(spec.key_range_start(), b"a");
+    assert_eq!(spec.key_range_end(), b"z");
+
+    let decoded = decode_metadata(&spec).expect("metadata should decode");
+    assert_eq!(decoded.hint, ShardHint::Range);
+    assert_eq!(decoded.connector_extra, b"ctx");
+
+    assert_eq!(
+        decode_hint(&spec).expect("hint should decode"),
+        ShardHint::Range
+    );
+    assert_eq!(
+        decode_connector_extra(&spec).expect("connector extra should decode"),
+        b"ctx"
+    );
+}
+
+#[test]
+fn range_shard_rejects_oversized_metadata() {
+    let extra = vec![0xAB; MAX_METADATA_SIZE - 4];
+    let err = range_shard(b"a", b"z", &extra).expect_err("oversized metadata should fail");
+    assert_eq!(
+        err,
+        ShardSpecInputError::MetadataTooLarge {
+            size: MAX_METADATA_SIZE + 1,
+            max: MAX_METADATA_SIZE,
+        }
+    );
+}
+
+#[test]
+fn prefix_shard_roundtrip_with_decode_helpers() {
+    let prefix = b"src/";
+    let spec = prefix_shard(prefix, b"bucket=prod").expect("prefix shard should be valid");
+
+    assert_eq!(spec.key_range_start(), prefix);
+    let mut expected_end_buf = KeyBuf::new();
+    let expected_end = prefix_successor(prefix, &mut expected_end_buf)
+        .expect("non-all-ff prefix should have successor");
+    assert_eq!(spec.key_range_end(), expected_end);
+
+    assert_eq!(
+        decode_hint(&spec).expect("hint should decode"),
+        ShardHint::Prefix { prefix }
+    );
+    assert_eq!(
+        decode_connector_extra(&spec).expect("connector extra should decode"),
+        b"bucket=prod"
+    );
+}
+
+#[test]
+fn prefix_shard_rejects_all_ff_prefix() {
+    let prefix = vec![0xFF; 8];
+    let err = prefix_shard(&prefix, b"ctx").expect_err("all-ff prefix has no successor");
+    assert_eq!(err, PrefixShardError::NoSuccessor);
+}
+
+#[test]
+fn manifest_shard_roundtrip_with_decode_helpers() {
+    let spec = manifest_shard(42, 10, 20, b"blob").expect("manifest shard should be valid");
+    let start = decode_manifest_row_key(spec.key_range_start())
+        .expect("start should be a valid manifest row key");
+    let end = decode_manifest_row_key(spec.key_range_end())
+        .expect("end should be a valid manifest row key");
+
+    assert_eq!(start, ManifestRowKey::new(42, 10));
+    assert_eq!(end, ManifestRowKey::new(42, 20));
+
+    assert_eq!(
+        decode_hint(&spec).expect("hint should decode"),
+        ShardHint::Manifest {
+            manifest_id: 42,
+            start_row: 10,
+            end_row: 20,
+        }
+    );
+    assert_eq!(
+        decode_connector_extra(&spec).expect("connector extra should decode"),
+        b"blob"
+    );
+}
+
+#[test]
+fn manifest_shard_rejects_inverted_rows() {
+    let err = manifest_shard(9, 99, 10, b"ctx").expect_err("inverted rows should fail");
+    assert_eq!(
+        err,
+        ShardSpecInputError::InvertedRange {
+            start_len: ManifestRowKey::ENCODED_LEN,
+            end_len: ManifestRowKey::ENCODED_LEN,
+        }
+    );
+}
+
+#[test]
+fn decode_helpers_propagate_malformed_metadata_errors() {
+    let spec = ShardSpec::with_range_and_metadata(b"a".to_vec(), b"b".to_vec(), vec![0x00]);
+    assert!(decode_metadata(&spec).is_err());
+    assert!(decode_hint(&spec).is_err());
+    assert!(decode_connector_extra(&spec).is_err());
+}
+
+#[test]
+fn propagate_hint_on_split_range_stays_range() {
+    let propagated = propagate_hint_on_split(&ShardHint::Range, b"a", b"b")
+        .expect("range propagation should always succeed");
+    assert_eq!(propagated, ShardHint::Range);
+}
+
+#[test]
+fn propagate_hint_on_split_prefix_demotes_to_range() {
+    let parent = ShardHint::Prefix { prefix: b"src/" };
+    let propagated = propagate_hint_on_split(&parent, b"src/", b"src/z")
+        .expect("valid prefix child bounds should propagate");
+    assert_eq!(propagated, ShardHint::Range);
+}
+
+#[test]
+fn propagate_hint_on_split_prefix_rejects_out_of_range_start() {
+    let parent = ShardHint::Prefix { prefix: b"src/" };
+    let err = propagate_hint_on_split(&parent, b"aaa", b"src/z")
+        .expect_err("out-of-range start should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::InvalidPrefixBoundary {
+            boundary: SplitBoundary::Start
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_prefix_rejects_out_of_range_end() {
+    let parent = ShardHint::Prefix { prefix: b"src/" };
+    let err = propagate_hint_on_split(&parent, b"src/", b"zzz")
+        .expect_err("out-of-range end should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::InvalidPrefixBoundary {
+            boundary: SplitBoundary::End
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_adjusts_child_rows() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let child_start = encode_manifest_row_key(7, 25);
+    let child_end = encode_manifest_row_key(7, 75);
+
+    let propagated = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect("valid manifest child bounds should propagate");
+    assert_eq!(
+        propagated,
+        ShardHint::Manifest {
+            manifest_id: 7,
+            start_row: 25,
+            end_row: 75,
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_rejects_non_manifest_boundaries() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let err = propagate_hint_on_split(&parent, b"not-a-row", b"also-not-a-row")
+        .expect_err("non-manifest boundaries should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::InvalidManifestBoundary {
+            boundary: SplitBoundary::Start
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_rejects_manifest_id_mismatch() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let child_start = encode_manifest_row_key(8, 25);
+    let child_end = encode_manifest_row_key(8, 75);
+
+    let err = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect_err("manifest-id mismatch should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::ManifestIdMismatch {
+            parent: 7,
+            child: 8
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_rejects_out_of_parent_bounds() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 10,
+        end_row: 20,
+    };
+    let child_start = encode_manifest_row_key(7, 0);
+    let child_end = encode_manifest_row_key(7, 15);
+
+    let err = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect_err("out-of-bounds child range should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::InvalidManifestBoundary {
+            boundary: SplitBoundary::Start
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_rejects_empty_child_range() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let child_start = encode_manifest_row_key(7, 50);
+    let child_end = encode_manifest_row_key(7, 50);
+
+    let err = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect_err("degenerate child range should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::EmptyManifestRange {
+            start_row: 50,
+            end_row: 50
+        }
+    );
+}
+
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
@@ -265,6 +529,23 @@ proptest! {
         prop_assert_eq!(decoded.hint, hint.as_hint());
         prop_assert_eq!(decoded.connector_extra, connector_extra.as_slice());
     }
+
+    #[test]
+    fn prefix_shard_contains_all_keys_with_prefix(
+        prefix in proptest::collection::vec(any::<u8>(), 1..=32),
+        suffix in proptest::collection::vec(any::<u8>(), 0..=32),
+    ) {
+        prop_assume!(prefix.iter().any(|&byte| byte != u8::MAX));
+        prop_assume!(prefix.len() + suffix.len() <= MAX_KEY_SIZE);
+
+        let spec = prefix_shard(prefix.as_slice(), b"ctx")
+            .expect("prefix shard should be constructible for bounded prefix");
+        let mut key = prefix.clone();
+        key.extend_from_slice(&suffix);
+
+        prop_assert!(key.starts_with(&prefix));
+        prop_assert!(spec.contains_key(&key));
+    }
 }
 
 fn arb_owned_hint() -> impl Strategy<Value = OwnedHint> {
@@ -282,6 +563,10 @@ fn arb_owned_hint() -> impl Strategy<Value = OwnedHint> {
     ]
 }
 
+/// Normalize two arbitrary rows into a valid half-open interval.
+///
+/// The equal-row case is widened to one row so generated manifest hints satisfy
+/// `start_row < end_row`.
 fn ordered_rows(a: u64, b: u64) -> (u64, u64) {
     if a < b {
         (a, b)
@@ -344,6 +629,10 @@ fn shard_hint_decode_rejects_raw_inverted_manifest() {
     );
 }
 
+/// Hand-build a manifest frame for decode-path tests.
+///
+/// This bypasses constructor/encode validation so tests can inject malformed
+/// row bounds directly at the wire level.
 fn encode_raw_manifest(manifest_id: u64, start_row: u64, end_row: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(25);
     data.push(0x02);
@@ -351,6 +640,12 @@ fn encode_raw_manifest(manifest_id: u64, start_row: u64, end_row: u64) -> Vec<u8
     data.extend_from_slice(&start_row.to_be_bytes());
     data.extend_from_slice(&end_row.to_be_bytes());
     data
+}
+
+fn encode_manifest_row_key(manifest_id: u64, row: u64) -> Vec<u8> {
+    let mut buf = KeyBuf::new();
+    ManifestRowKey::new(manifest_id, row).encode_into(&mut buf);
+    buf.as_bytes().to_vec()
 }
 
 fn encode_hint(hint: ShardHint<'_>) -> Vec<u8> {
