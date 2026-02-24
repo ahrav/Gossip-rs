@@ -5,7 +5,7 @@
 //! Each shard in the gossip protocol stores 3–5 variable-size byte fields
 //! (start key, end key, metadata, cursor last key, cursor token). Without pooling,
 //! each field is a separate `Box<[u8]>` heap allocation — the dominant
-//! allocation source on hot paths (`checkpoint`, `acquire_and_restore`).
+//! allocation source on hot paths (`checkpoint`, `complete`).
 //!
 //! `ByteSlab` pre-allocates a single contiguous buffer at startup and
 //! carves out variable-size regions from it. This turns N per-shard heap
@@ -178,7 +178,7 @@ fn checked_len_u32(n: usize) -> Option<u32> {
 /// (e.g., 17 → 32). For inputs below [`MIN_BLOCK`] (16), the minimum
 /// block floor adds additional overhead (e.g., 1 → 16 = 93.75% waste).
 /// For the cursor-update workload (keys 50–4096 bytes, tokens 100–16384
-/// bytes), measured average waste is ~25%.
+/// bytes), expected average waste is ~25%.
 #[inline]
 fn alloc_size(n: usize) -> Option<u32> {
     if n == 0 {
