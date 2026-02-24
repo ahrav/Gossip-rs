@@ -23,7 +23,8 @@
 //! - Metadata/hint no-allocation API: [`ShardMetadata`], [`ShardHint`], and
 //!   reusable encode scratch [`MetadataBuf`].
 //! - Metadata/hint failures: [`ShardHintDecodeError`],
-//!   [`ShardHintEncodeError`], and [`MetadataEncodingError`].
+//!   [`ShardMetadataDecodeError`], [`ShardHintEncodeError`], and
+//!   [`MetadataEncodingError`].
 //!
 //! Validation ownership remains single-sourced:
 //! - `key_encoding` enforces local key arithmetic contracts.

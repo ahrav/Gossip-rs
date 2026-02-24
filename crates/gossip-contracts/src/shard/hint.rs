@@ -324,6 +324,8 @@ impl<'a> ShardHint<'a> {
     ///   `u32` length framing.
     /// - [`ShardHintEncodeError::EncodedHintTooLarge`] when the resulting hint
     ///   frame would exceed [`MAX_METADATA_SIZE`].
+    /// - [`ShardHintEncodeError::InvertedManifestRows`] when a manifest's
+    ///   `start_row >= end_row`.
     pub fn encoded_len(&self) -> Result<usize, ShardHintEncodeError> {
         match self {
             Self::Range => Ok(1),
@@ -515,6 +517,11 @@ impl<'a> ShardMetadata<'a> {
     }
 }
 
+/// Translate a hint-level encode error into the metadata-level error type.
+///
+/// Both `PrefixTooLarge` and `EncodedHintTooLarge` collapse into
+/// `HintTooLarge` because the metadata envelope does not distinguish
+/// between prefix-framing overflow and total-size overflow.
 fn map_hint_encode_error(err: ShardHintEncodeError) -> MetadataEncodingError {
     match err {
         ShardHintEncodeError::PrefixTooLarge { size, max }
@@ -527,6 +534,10 @@ fn map_hint_encode_error(err: ShardHintEncodeError) -> MetadataEncodingError {
     }
 }
 
+/// Write the wire representation of `hint` into `out`.
+///
+/// Caller must size `out` to at least `hint.encoded_len()` bytes; the
+/// debug-assert fires if the slice is too small.
 fn encode_hint_into_slice(hint: ShardHint<'_>, out: &mut [u8]) {
     let required = match &hint {
         ShardHint::Range => 1,
@@ -563,6 +574,10 @@ fn encode_hint_into_slice(hint: ShardHint<'_>, out: &mut [u8]) {
     }
 }
 
+/// Decode a `TAG_PREFIX` frame: `[0x01][prefix_len:u32 BE][prefix_bytes]`.
+///
+/// `data` must start with the tag byte. Returns the decoded hint and
+/// total bytes consumed (header + payload).
 fn decode_prefix<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHintDecodeError> {
     if data.len() < PREFIX_HEADER_LEN {
         return Err(ShardHintDecodeError::TruncatedPrefix {
@@ -586,6 +601,10 @@ fn decode_prefix<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHint
     Ok((ShardHint::Prefix { prefix }, expected_min))
 }
 
+/// Decode a `TAG_MANIFEST` frame: `[0x02][manifest_id:u64 BE][start_row:u64 BE][end_row:u64 BE]`.
+///
+/// `data` must start with the tag byte. Rejects frames where
+/// `start_row >= end_row`.
 fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHintDecodeError> {
     if data.len() < MANIFEST_LEN {
         return Err(ShardHintDecodeError::TruncatedManifest {
