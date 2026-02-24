@@ -1,7 +1,7 @@
 //! Full simulation harness for deterministic coordination testing.
 //!
 //! Drives a [`SimulationBackend`] (defaulting to [`InMemoryCoordinator`]) under
-//! configurable fault injection, verifying protocol invariants (S1--S7) at every
+//! configurable fault injection, verifying protocol invariants (S1--S9) at every
 //! step. Inspired by FoundationDB's simulation framework and TigerBeetle's VOPR.
 //!
 //! # Execution model
@@ -10,7 +10,8 @@
 //!
 //! 1. **Zombie scenario** (deterministic preamble): A scripted sequence that
 //!    exercises the bookkeeping-cleanup path (B1) by expiring a lease and
-//!    re-acquiring on a different worker. Runs unconditionally before random ops.
+//!    re-acquiring on a different worker. Attempted before random ops; it
+//!    returns early when fewer than two workers or zero shards are available.
 //! 2. **Safety phase** (`safety_ops` iterations): Weighted random operations
 //!    with fault injection. The first [`WARMUP_OPS`] suppress faults to let
 //!    workers establish leases before time-jumps can expire them. Verifies that
@@ -21,7 +22,7 @@
 //! Every operation in every phase is followed by a full invariant sweep
 //! ([`InvariantChecker::check_all`]). This is the core safety guarantee.
 //!
-//! # Two entry points
+//! # Three entry points
 //!
 //! - **[`CoordinationSim::run`]**: Canned three-stage execution (zombie preamble +
 //!   safety phase + liveness phase) that returns a [`SimReport`]. Suitable for
@@ -29,13 +30,18 @@
 //! - **[`CoordinationSim::step`]**: Execute a single [`SimOp`] and check
 //!   invariants. Suitable for custom simulation loops that need fine-grained
 //!   control over operation sequencing.
+//! - **[`CoordinationSim::run_overload`]**: Warmup + scripted overload rounds +
+//!   bounded recovery, returning an [`OverloadReport`](super::OverloadReport)
+//!   with D1/L1 diagnostics.
 //!
 //! # Key design decisions
 //!
-//! - **Forward-only cursors**: [`generate_forward_cursor`](CoordinationSim::generate_forward_cursor)
-//!   tracks per-worker cursor progress and only generates cursors that advance.
-//!   Without this, random cursors would frequently regress, flooding the run with
-//!   expected `CursorRegression` rejections that mask real bugs.
+//! - **Non-regressing cursors**: [`generate_forward_cursor`](CoordinationSim::generate_forward_cursor)
+//!   tracks per-worker cursor progress and generates cursors that are never
+//!   less than the previous value (the exhausted-range case may reuse the
+//!   previous cursor exactly). Without this, random cursors would frequently
+//!   regress, flooding the run with expected `CursorRegression` rejections
+//!   that mask real bugs.
 //!
 //! - **Stale lease tracking**: When worker B acquires a shard previously held by
 //!   worker A, the harness saves A's superseded lease. These stale leases feed
@@ -75,6 +81,10 @@ use crate::identity::{
 use crate::sim::backend::SimulationBackend;
 
 use super::invariants::{InvariantChecker, InvariantViolation};
+use super::overload::{
+    D1Observation, GoodputTracker, OverloadKind, OverloadReport, OverloadScenario,
+    generate_burst_claim, generate_burst_shards, generate_capacity_drop,
+};
 use super::worker::SimWorker;
 use super::{FaultConfig, FaultLevel, SimContext};
 
@@ -817,6 +827,7 @@ impl CoordinationSim<InMemoryCoordinator> {
             1_000_000,
             interval,
         );
+        self.checker.set_cooldown_interval(interval);
         self
     }
 
@@ -873,6 +884,148 @@ impl CoordinationSim<InMemoryCoordinator> {
                 .seed_run(self.tenant, *run, shard_ids.clone(), DEFAULT_LEASE_DURATION);
         }
     }
+
+    /// Run a three-phase overload simulation and return a rich report.
+    ///
+    /// Phases:
+    /// 1. warmup (`warmup_ops`) to establish baseline leases
+    /// 2. scripted overload rounds (`scenario.rounds`)
+    /// 3. bounded recovery (`recovery_ops`) with periodic claim injection
+    ///
+    /// Consumes `self` to prevent accidental state reuse.
+    pub fn run_overload(
+        mut self,
+        warmup_ops: usize,
+        scenario: OverloadScenario,
+        recovery_ops: usize,
+    ) -> OverloadReport {
+        let mut all_violations = Vec::new();
+        let mut event_counts = BTreeMap::new();
+        let mut overload_goodput = GoodputTracker::default();
+        let mut d1_observations = Vec::new();
+
+        // Move clock off ZERO before lease-bearing operations.
+        let initial_ticks = self.context.rng().random_range(1u64..=10);
+        self.context.advance(initial_ticks);
+
+        // Keep parity with the regular harness run model.
+        self.inject_zombie_scenario(&mut all_violations, &mut event_counts);
+
+        // Phase 1: warmup (faults suppressed for the first WARMUP_OPS ops).
+        for i in 0..warmup_ops {
+            let suppress_faults = i < WARMUP_OPS;
+            let op = self.generate_random_op(suppress_faults);
+            let (event, violations) = self.step(op);
+            *event_counts.entry(event.kind()).or_insert(0) += 1;
+            all_violations.extend(violations);
+        }
+
+        let run = self
+            .run_shard_ids
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or_else(|| RunId::from_raw(1));
+
+        // Phase 2: scripted overload rounds.
+        for _ in 0..scenario.rounds {
+            let workers: Vec<WorkerId> = self.workers.keys().copied().collect();
+            let held_shards: Vec<(WorkerId, ShardKey)> = workers
+                .iter()
+                .flat_map(|worker| {
+                    self.workers
+                        .get(worker)
+                        .into_iter()
+                        .flat_map(|w| w.held_keys().copied().map(|key| (*worker, key)))
+                })
+                .collect();
+
+            let scripted_ops = match scenario.kind {
+                OverloadKind::BurstClaim => generate_burst_claim(&workers),
+                OverloadKind::CapacityDrop => generate_capacity_drop(&workers),
+                OverloadKind::BurstShards => generate_burst_shards(&workers, &held_shards),
+            };
+
+            for op in scripted_ops {
+                let (event, violations) = self.step(op);
+                overload_goodput.record(&event);
+                *event_counts.entry(event.kind()).or_insert(0) += 1;
+                all_violations.extend(violations);
+
+                if matches!(event, SimEvent::AcquireOk { .. } | SimEvent::ClaimOk { .. }) {
+                    let now = self.context.now();
+                    let reported = self
+                        .coordinator
+                        .count_available_for_run(now, self.tenant, run)
+                        .available_count;
+                    let ground_truth = self.count_available_ground_truth(run, now);
+                    d1_observations.push(D1Observation {
+                        at: now,
+                        reported,
+                        ground_truth,
+                    });
+                }
+            }
+        }
+
+        // Phase 3 prelude: resume all paused workers explicitly.
+        let workers: Vec<WorkerId> = self.workers.keys().copied().collect();
+        for worker in workers {
+            if self.workers.get(&worker).is_some_and(|w| w.is_paused()) {
+                let (event, violations) = self.step(SimOp::ResumeWorker { worker });
+                *event_counts.entry(event.kind()).or_insert(0) += 1;
+                all_violations.extend(violations);
+            }
+        }
+
+        // Phase 3: bounded recovery with periodic claim injection.
+        let mut l1_any_completed = false;
+        let mut l1_claim_attempts: u64 = 0;
+        let mut l1_claim_successes: u64 = 0;
+
+        for i in 0..recovery_ops {
+            let maybe_claim = if i % 10 == 0 {
+                self.pick_random_active_worker()
+                    .map(|worker| SimOp::ClaimNext { worker })
+            } else {
+                None
+            };
+            let op = maybe_claim.unwrap_or_else(|| self.generate_liveness_op());
+            if matches!(op, SimOp::ClaimNext { .. }) {
+                l1_claim_attempts += 1;
+            }
+
+            let (event, violations) = self.step(op);
+            if matches!(event, SimEvent::ClaimOk { .. }) {
+                l1_claim_successes += 1;
+            }
+            if matches!(event, SimEvent::CompleteOk) {
+                l1_any_completed = true;
+            }
+            *event_counts.entry(event.kind()).or_insert(0) += 1;
+            all_violations.extend(violations);
+        }
+
+        let l1_claim_success_rate = if l1_claim_attempts == 0 {
+            0.0
+        } else {
+            l1_claim_successes as f64 / l1_claim_attempts as f64
+        };
+        let l1_passed = l1_any_completed;
+
+        OverloadReport {
+            ops_executed: self.ops_executed,
+            violations: all_violations,
+            event_counts,
+            seed: self.context.seed(),
+            end_time: self.context.now(),
+            overload_goodput: overload_goodput.rate(),
+            d1_observations,
+            l1_any_completed,
+            l1_claim_success_rate,
+            l1_passed,
+        }
+    }
 }
 
 // ============================================================================
@@ -922,12 +1075,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Execute a single step: run the operation, then check **all** invariants.
     ///
     /// Every operation—successful or rejected—is followed by a full invariant
-    /// sweep (S1–S7). This is the core simulation guarantee: no operation can
+    /// sweep (S1–S9). This is the core simulation guarantee: no operation can
     /// leave the coordinator in a state that violates any checked invariant
     /// without immediate detection.
     pub fn step(&mut self, op: SimOp) -> (SimEvent, Vec<InvariantViolation>) {
         let event = self.execute_op(&op);
         self.ops_executed += 1;
+        if let (SimOp::ClaimNext { worker }, SimEvent::ClaimOk { .. }) = (&op, &event) {
+            self.checker
+                .record_claim_success(*worker, self.context.now());
+        }
 
         let violations = self
             .checker
@@ -2583,6 +2740,25 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     // -----------------------------------------------------------------------
     // Convergence check
     // -----------------------------------------------------------------------
+
+    /// Ground-truth available count for one run at `now`.
+    ///
+    /// Counts shards that are Active and not currently leased, derived purely
+    /// from coordinator state. Used by overload diagnostics to validate D1
+    /// (reported available-count accuracy).
+    fn count_available_ground_truth(&self, run: RunId, now: LogicalTime) -> u32 {
+        let count = self
+            .coordinator
+            .shards()
+            .filter(|((tenant, key), record)| {
+                *tenant == self.tenant
+                    && key.run() == run
+                    && record.status == ShardStatus::Active
+                    && !record.is_leased_at(now)
+            })
+            .count();
+        u32::try_from(count).expect("ground-truth available count exceeds u32::MAX")
+    }
 
     /// Check whether every registered shard reached a terminal state.
     ///

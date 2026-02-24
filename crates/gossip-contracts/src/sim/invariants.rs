@@ -33,6 +33,7 @@
 //! | S6 | **CursorBounds** | structural | Non-initial cursors remain within shard spec range. |
 //! | S7 | **SplitCoverage** | referential | Split-parent's spawned children exist and reference the parent. |
 //! | S8 | **RunTerminalIrreversibility** | temporal | Terminal run states (`Done`, `Failed`, `Cancelled`) never revert. |
+//! | S9 | **CooldownViolation** | temporal | A worker must not claim twice within `cooldown_interval` ticks. |
 //!
 //! # Algorithm
 //!
@@ -94,7 +95,7 @@ pub enum SplitCoverageDetail {
 
 /// A detected invariant violation with enough context to diagnose the failure.
 ///
-/// Each variant corresponds to one of the eight safety properties (S1-S8)
+/// Each variant corresponds to one of the nine safety properties (S1-S9)
 /// or a sub-property thereof. The harness collects all violations from a
 /// simulation run into a `Vec<InvariantViolation>` for post-run analysis;
 /// an empty vec means the run passed.
@@ -182,6 +183,14 @@ pub enum InvariantViolation {
         was: RunStatus,
         now: RunStatus,
     },
+    /// S9: the same worker successfully claimed twice in fewer than
+    /// `cooldown_interval` logical ticks.
+    CooldownViolation {
+        worker: WorkerId,
+        this_claim: LogicalTime,
+        prev_claim: LogicalTime,
+        min_interval: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -234,11 +243,24 @@ pub struct InvariantChecker {
     /// Last-seen run status per (tenant, run), for S8 run-terminal
     /// irreversibility.
     prev_run_terminal: BTreeMap<(TenantId, RunId), RunStatus>,
+    /// Last successful claim timestamp per worker, for S9 cooldown spacing.
+    last_claim_by_worker: BTreeMap<WorkerId, LogicalTime>,
+    /// Minimum tick spacing between successful claims by the same worker.
+    /// A value of zero disables S9 checking (vacuously true).
+    cooldown_interval: u64,
+    /// Buffered S9 violations pushed by `record_claim_success` and drained by
+    /// `check_all`, keeping all invariant reporting in one place.
+    cooldown_violations: Vec<InvariantViolation>,
 }
 
 impl InvariantChecker {
     /// Create a fresh checker with no history.
     pub fn new() -> Self {
+        Self::with_cooldown_interval(0)
+    }
+
+    /// Create a checker with an explicit S9 cooldown interval.
+    pub fn with_cooldown_interval(cooldown_interval: u64) -> Self {
         Self {
             prev_epochs: BTreeMap::new(),
             prev_terminal: BTreeMap::new(),
@@ -248,18 +270,53 @@ impl InvariantChecker {
             scratch_wrong_parent: Vec::new(),
             scratch_prune: Vec::new(),
             prev_run_terminal: BTreeMap::new(),
+            last_claim_by_worker: BTreeMap::new(),
+            cooldown_interval,
+            cooldown_violations: Vec::new(),
         }
     }
 
-    /// Run all invariant checks (S1-S8) against the current coordinator state.
+    /// Update the S9 cooldown interval.
+    ///
+    /// Setting to zero disables cooldown checking.
+    pub fn set_cooldown_interval(&mut self, interval: u64) {
+        self.cooldown_interval = interval;
+    }
+
+    /// Record a successful claim for S9 cooldown validation.
+    ///
+    /// This is a push-style check invoked by the harness when `ClaimNext`
+    /// succeeds. Violations are buffered and appended by `check_all` so the
+    /// caller sees a unified violation vector per simulation step.
+    pub fn record_claim_success(&mut self, worker: WorkerId, now: LogicalTime) {
+        if self.cooldown_interval == 0 {
+            return;
+        }
+
+        if let Some(prev_claim) = self.last_claim_by_worker.get(&worker).copied() {
+            let gap = now.as_raw().saturating_sub(prev_claim.as_raw());
+            if gap < self.cooldown_interval {
+                self.cooldown_violations
+                    .push(InvariantViolation::CooldownViolation {
+                        worker,
+                        this_claim: now,
+                        prev_claim,
+                        min_interval: self.cooldown_interval,
+                    });
+            }
+        }
+        self.last_claim_by_worker.insert(worker, now);
+    }
+
+    /// Run all invariant checks (S1-S9) against the current coordinator state.
     ///
     /// Performs a **single pass** over `coordinator.shards()`, delegating to
     /// per-invariant helpers (S1–S7) for each shard record, running a post-pass
     /// duplicate check for S1 (mutual exclusion), then a separate pass over
-    /// `coordinator.runs()` for S8 (run-terminal irreversibility), and finally
-    /// pruning epoch/cursor history for permanently terminal shards (`Done`,
-    /// `Split`). Scratch buffers are reused across calls to reduce allocation
-    /// pressure.
+    /// `coordinator.runs()` for S8 (run-terminal irreversibility), appending
+    /// queued S9 cooldown violations, and finally pruning epoch/cursor history
+    /// for permanently terminal shards (`Done`, `Split`). Scratch buffers are
+    /// reused across calls to reduce allocation pressure.
     ///
     /// # Returns
     ///
@@ -316,6 +373,7 @@ impl InvariantChecker {
 
         self.check_mutual_exclusion(&mut violations);
         self.check_run_terminal_irreversibility(coordinator, tenant, &mut violations);
+        violations.append(&mut self.cooldown_violations);
 
         // Prune permanently terminal shards (Done, Split) from epoch and
         // cursor history. These shards will never have new operations, so

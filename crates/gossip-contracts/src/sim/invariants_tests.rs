@@ -1,12 +1,28 @@
+//! Targeted unit tests for [`InvariantChecker`](super::InvariantChecker).
+//!
+//! The simulation harness already runs `check_all` after every operation
+//! across many seeds. This file complements that coverage with explicit,
+//! deterministic fixtures for edge cases that are hard to force
+//! probabilistically (for example split referential-integrity failures,
+//! Parked->Active fence-bump rules, and cooldown spacing math).
+//!
+//! Scope is intentionally checker-centric: several fixtures use
+//! `seed_shard_unchecked` to construct states production code would reject,
+//! because the goal here is validating checker detection logic, not backend
+//! mutation-path legality.
+
 use super::*;
 use crate::coordination::cursor::Cursor;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::derived_shard_id;
-use crate::identity::{LogicalTime, RunId, ShardId, ShardKey};
+use crate::identity::{LogicalTime, RunId, ShardId, ShardKey, WorkerId};
 use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder};
 
+/// Build a coordinator pre-seeded with one valid active shard.
+///
+/// Used by smoke tests that assert checker pass-through on healthy state.
 fn make_coordinator_with_shard(shard_raw: u64) -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
     let key = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(shard_raw));
@@ -634,4 +650,109 @@ fn cross_tenant_isolation_in_temporal_checks() {
             if prev.as_raw() == 6 && current.as_raw() == 4),
         "expected FenceMonotonicity for tenant A, got: {v:?}"
     );
+}
+
+// -- S9 cooldown spacing ---------------------------------------------------
+
+#[test]
+fn s9_detects_cooldown_violation() {
+    let mut checker = InvariantChecker::with_cooldown_interval(10);
+    let worker = WorkerId::from_raw(1);
+    checker.record_claim_success(worker, LogicalTime::from_raw(100));
+    checker.record_claim_success(worker, LogicalTime::from_raw(105));
+
+    let coord = InMemoryCoordinator::new(LEASE_DUR);
+    let v = checker.check_all(&coord, TENANT, LogicalTime::from_raw(105));
+
+    assert_eq!(v.len(), 1, "expected one S9 violation, got: {v:?}");
+    assert!(matches!(
+        &v[0],
+        InvariantViolation::CooldownViolation {
+            worker: w,
+            this_claim,
+            prev_claim,
+            min_interval
+        } if *w == worker
+            && this_claim.as_raw() == 105
+            && prev_claim.as_raw() == 100
+            && *min_interval == 10
+    ));
+}
+
+#[test]
+fn s9_vacuously_true_when_disabled() {
+    let mut checker = InvariantChecker::new();
+    let worker = WorkerId::from_raw(1);
+    checker.record_claim_success(worker, LogicalTime::from_raw(100));
+    checker.record_claim_success(worker, LogicalTime::from_raw(101));
+
+    let coord = InMemoryCoordinator::new(LEASE_DUR);
+    let v = checker.check_all(&coord, TENANT, LogicalTime::from_raw(101));
+    assert!(
+        v.is_empty(),
+        "disabled cooldown should be vacuously true: {v:?}"
+    );
+}
+
+#[test]
+fn s9_allows_claims_beyond_interval() {
+    let mut checker = InvariantChecker::with_cooldown_interval(10);
+    let worker = WorkerId::from_raw(1);
+    checker.record_claim_success(worker, LogicalTime::from_raw(100));
+    checker.record_claim_success(worker, LogicalTime::from_raw(110));
+
+    let coord = InMemoryCoordinator::new(LEASE_DUR);
+    let v = checker.check_all(&coord, TENANT, LogicalTime::from_raw(110));
+    assert!(
+        v.is_empty(),
+        "gap >= cooldown interval should not violate S9: {v:?}"
+    );
+}
+
+#[test]
+fn s9_independent_per_worker() {
+    let mut checker = InvariantChecker::with_cooldown_interval(10);
+    let worker1 = WorkerId::from_raw(1);
+    let worker2 = WorkerId::from_raw(2);
+
+    checker.record_claim_success(worker1, LogicalTime::from_raw(100));
+    checker.record_claim_success(worker2, LogicalTime::from_raw(101));
+    checker.record_claim_success(worker1, LogicalTime::from_raw(105));
+
+    let coord = InMemoryCoordinator::new(LEASE_DUR);
+    let v = checker.check_all(&coord, TENANT, LogicalTime::from_raw(105));
+    assert_eq!(v.len(), 1, "expected only worker1 violation: {v:?}");
+    assert!(matches!(
+        &v[0],
+        InvariantViolation::CooldownViolation { worker, .. } if *worker == worker1
+    ));
+}
+
+#[test]
+fn s9_set_cooldown_interval_activates_checking() {
+    let mut checker = InvariantChecker::new();
+    let worker = WorkerId::from_raw(1);
+
+    // Disabled mode: no history updates and no violations.
+    checker.record_claim_success(worker, LogicalTime::from_raw(10));
+    checker.record_claim_success(worker, LogicalTime::from_raw(11));
+
+    checker.set_cooldown_interval(5);
+    checker.record_claim_success(worker, LogicalTime::from_raw(20));
+    checker.record_claim_success(worker, LogicalTime::from_raw(22));
+
+    let coord = InMemoryCoordinator::new(LEASE_DUR);
+    let v = checker.check_all(&coord, TENANT, LogicalTime::from_raw(22));
+    assert_eq!(v.len(), 1, "expected one S9 violation after enable: {v:?}");
+    assert!(matches!(
+        &v[0],
+        InvariantViolation::CooldownViolation {
+            min_interval,
+            prev_claim,
+            this_claim,
+            ..
+        } if *min_interval == 5
+            && prev_claim.as_raw() == 20
+            && this_claim.as_raw() == 22
+    ));
 }

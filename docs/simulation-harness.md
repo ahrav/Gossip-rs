@@ -27,7 +27,7 @@ Per-worker bookkeeping that tracks:
 
 ### Layer 3: InvariantChecker (`sim/invariants.rs`)
 
-An external observer that verifies eight safety properties against coordinator
+An external observer that verifies nine safety properties against coordinator
 ground truth at every simulation step. It never trusts worker-side bookkeeping.
 See the invariant table below.
 
@@ -66,8 +66,9 @@ platforms and prevent invalid probability construction.
 | S6    | CursorBounds            | Non-initial cursors remain within shard spec key range.                           |
 | S7    | SplitCoverage           | Split-parent's spawned children exist and reference the correct parent.           |
 | S8    | RunTerminalIrreversibility | Terminal run states (Done, Failed, Cancelled) never revert.                    |
+| S9    | CooldownViolation          | A worker must not successfully claim twice within the configured cooldown.      |
 
-All eight invariants are checked after
+All nine invariants are checked after
 every operation (both successful and rejected).
 
 ## Three-Stage Run Model
@@ -90,7 +91,7 @@ baseline. After warmup, time jumps, worker pauses, lease expiry, split
 operations, OpId replays, zombie checkpoints, and run-terminal transitions
 (complete/fail/cancel) are all exercised at weighted probabilities.
 
-**Goal:** Verify that no invariant (S1-S8) is ever violated regardless of
+**Goal:** Verify that no invariant (S1-S9) is ever violated regardless of
 operation ordering, timing, or fault injection.
 
 ### Stage 2: Liveness
@@ -100,6 +101,29 @@ are injected.
 
 **Goal:** Verify that the system converges -- all shards reach a terminal
 state (Done, Split, or Parked).
+
+## Overload Scenarios
+
+`CoordinationSim::run_overload(warmup_ops, scenario, recovery_ops)` provides a
+targeted stress path for cooldown/capacity behavior.
+
+The run has three phases:
+
+1. Warmup random operations to establish baseline leases.
+2. Scripted overload rounds (`OverloadScenario`):
+   - `BurstClaim`: all workers issue `ClaimNext`.
+   - `CapacityDrop`: pause half the workers, then force a time jump.
+   - `BurstShards`: issue `SplitReplace` on all currently held shards.
+3. Recovery with periodic `ClaimNext` injection and liveness-biased ops.
+
+The overload report includes:
+
+- Standard simulation fields (`ops_executed`, `violations`, `event_counts`,
+  `seed`, `end_time`).
+- `overload_goodput` (completion ratio during overload rounds).
+- D1 diagnostics (`d1_observations`) comparing reported
+  `count_available_for_run` values with coordinator-derived ground truth.
+- L1 metrics (`l1_any_completed`, `l1_claim_success_rate`, `l1_passed`).
 
 ## Fault Injection Levels
 

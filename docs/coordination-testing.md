@@ -271,7 +271,7 @@ overhead as many shards reach terminal states, and worker contention with
 high lease-expiry rate create conditions for multi-level split cascades.
 Asserts at least one `SplitReplaceOk` event fires across all seeds,
 catching regressions in op-generation weights or split-plan construction.
-Invariants S1–S7 are validated even as the shard set grows dynamically
+Invariants S1–S9 are validated even as the shard set grows dynamically
 from splits.
 
 ### Convergence Proptests (`mega_sim_tests.rs`)
@@ -279,7 +279,7 @@ from splits.
 Bounded-liveness tests that complement the mega sweep's safety focus.
 The Alpern-Schneider decomposition (1985) states that every correctness
 property is the intersection of a safety property and a liveness property.
-The mega sweep covers safety (S1–S7); these tests cover the complementary
+The mega sweep covers safety (S1–S9); these tests cover the complementary
 liveness half — that every shard eventually reaches a terminal state.
 Both are `#[ignore]`.
 
@@ -331,7 +331,7 @@ the operation sequence itself — when a bug is found, proptest minimizes to
 the smallest failing sequence of coordinator operations.
 
 Operations are generated without state tracking. The harness handles
-rejected/skipped ops gracefully, and the invariant checker (S1–S7) runs
+rejected/skipped ops gracefully, and the invariant checker (S1–S9) runs
 after every step regardless of outcome. Expected rejection rate is ~45-55%
 for held-shard ops; rejections verify the coordinator's rejection path
 preserves safety.
@@ -350,7 +350,7 @@ cargo test -p gossip-contracts prop_short_sequences_preserve_invariants
 cargo test -p gossip-contracts proptest_state_machine -- --ignored --nocapture
 ```
 
-For simulation architecture, the invariant table (S1–S7), determinism
+For simulation architecture, the invariant table (S1–S9), determinism
 model, fault injection levels, and two-phase run model, see
 [simulation-harness.md](simulation-harness.md).
 
@@ -444,7 +444,7 @@ When adding a new protocol feature:
 
 ## 9. Invariants Under Test
 
-The simulation validates seven safety properties at every step. Unit,
+The simulation validates nine safety properties at every step. Unit,
 conformance, and scenario tests exercise these implicitly via
 `ShardRecord::assert_invariants()` (called on every mutation path), while
 the simulation validates them explicitly via `InvariantChecker::check_all()`.
@@ -458,6 +458,8 @@ the simulation validates them explicitly via `InvariantChecker::check_all()`.
 | S5    | CursorMonotonicity      | `cursor.last_key()` never decreases per shard                          |
 | S6    | CursorBounds            | Non-initial cursors remain within shard spec key range                 |
 | S7    | SplitCoverage           | Split-parent's spawned children exist and reference the correct parent |
+| S8    | RunTerminalIrreversibility | Terminal run states never revert                                     |
+| S9    | CooldownViolation       | A worker must not claim twice within cooldown interval                 |
 
 Full invariant definitions and the checker implementation are in
 [simulation-harness.md](simulation-harness.md).
@@ -470,13 +472,14 @@ Full invariant definitions and the checker implementation are in
 |-------------------------------------|------------------------------------------------------------------|
 | `coordination/in_memory_tests.rs`   | Tier 1: unit tests + proptest property tests                     |
 | `coordination/conformance_tests.rs` | Tier 2: invariant-interaction tests (Groups A, B, C)             |
-| `coordination/scenario_tests.rs`    | Tier 3: multi-step end-to-end workflows (S1–S8)                  |
+| `coordination/scenario_tests.rs`    | Tier 3: multi-step end-to-end workflows (S1–S9)                  |
 | `coordination/test_fixtures.rs`     | Shared factory functions and seeded coordinator setup            |
 | `sim/sim_behavioral_tests.rs`       | Tier 4a: fixed-seed behavioral regression + deterministic replay |
 | `sim/mega_sim_tests.rs`             | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
 | `sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking    |
-| `sim/harness.rs`                    | Simulation driver (CoordinationSim, two-phase run model)         |
-| `sim/invariants.rs`                 | External invariant checker (S1–S7)                               |
+| `sim/harness.rs`                    | Simulation driver (`run` + `run_overload`)                       |
+| `sim/invariants.rs`                 | External invariant checker (S1–S9)                               |
+| `sim/overload.rs`                   | Overload scenario/reports and scripted op generators             |
 | `sim/worker.rs`                     | Simulated worker bookkeeping                                     |
 | `sim/test_util.rs`                  | Shared test helpers: record builder, proptest strategies         |
 | `sim/mod.rs`                        | SimContext (PRNG + clock), FaultConfig, FaultLevel               |

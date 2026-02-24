@@ -2,13 +2,14 @@
 //!
 //! Provides a seeded PRNG ([`SimContext`]), fault injection ([`FaultConfig`],
 //! [`FaultLevel`]), simulated workers ([`SimWorker`]), external invariant
-//! checking ([`InvariantChecker`], [`InvariantViolation`]), and a full
-//! simulation harness ([`CoordinationSim`], [`SimOp`], [`SimEvent`],
+//! checking ([`InvariantChecker`], [`InvariantViolation`]), overload scenario
+//! support ([`OverloadScenario`], [`OverloadKind`], [`OverloadReport`]), and
+//! a full simulation harness ([`CoordinationSim`], [`SimOp`], [`SimEvent`],
 //! [`SimReport`]).
 //!
 //! # Architecture
 //!
-//! The module is split into four layers:
+//! The module is split into five layers:
 //!
 //! - **`mod.rs`** (this file) — [`SimContext`] (PRNG + clock) and
 //!   [`FaultConfig`]/[`FaultLevel`] (fault injection rates). These are the
@@ -17,8 +18,10 @@
 //!   lease claims, op-ID generation (partitioned for cross-worker uniqueness),
 //!   pause state, and cursor progress.
 //! - **`invariants`** — [`InvariantChecker`], an external observer that verifies
-//!   eight safety properties (S1–S8) against coordinator ground truth at every
+//!   nine safety properties (S1–S9) against coordinator ground truth at every
 //!   simulation step. It never trusts worker-side bookkeeping.
+//! - **`overload`** — scripted overload scenario definitions and report types
+//!   used by [`CoordinationSim::run_overload`] for targeted stress validation.
 //! - **`harness`** — [`CoordinationSim`], the top-level driver. Runs a
 //!   three-stage simulation (zombie preamble, safety, liveness) with weighted random op
 //!   generation, fault injection, and full invariant checking.
@@ -59,6 +62,7 @@ pub mod backend;
 pub mod fault_injector;
 mod harness;
 mod invariants;
+mod overload;
 mod worker;
 
 pub use backend::{SimIntrospection, SimulationBackend};
@@ -74,6 +78,7 @@ mod sim_behavioral_tests;
 mod test_util;
 pub use harness::{CoordinationSim, RejectionKind, SimEvent, SimEventKind, SimOp, SimReport};
 pub use invariants::{InvariantChecker, InvariantViolation, SplitCoverageDetail};
+pub use overload::{D1Observation, OverloadKind, OverloadReport, OverloadScenario};
 pub use worker::SimWorker;
 
 use rand::Rng;
