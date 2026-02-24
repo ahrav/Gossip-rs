@@ -171,6 +171,50 @@ Do NOT stage, commit, or push code changes. Leave that to the user.
 
 <!-- end-bv-agent-instructions -->
 
+<!-- task-quality-standard-v1 -->
+
+## Task Quality Standard — MANDATORY for All Task Creation
+
+Every beads task must be **self-contained**: an LLM agent reading it should
+have 90% of the information needed to complete it. The remaining 10% must
+have explicit pointers to where to look.
+
+### How to Create Tasks
+
+Use `/create-task` for all task creation. It auto-researches the codebase
+and produces a complete task description.
+
+    /create-task "Fix off-by-one in window boundary check" --type=bug --priority=1
+    /create-task --quick "..." --type=task --priority=2
+    /create-task --from-plan docs/plans/2026-02-23-feature-v3.md --step=3
+
+### Mandatory Sections (ALL Tasks)
+
+1. **Context** — Why this task exists
+2. **Current State** — What exists today (with code snippets and file:line refs)
+3. **Desired State** — What should exist after
+4. **Implementation Guidance** — Files to modify, patterns to follow, utilities to reuse
+5. **Code References** — Inline snippets of relevant current code
+6. **Related Work** — Links to related beads tasks (or "None found")
+7. **Acceptance Criteria** — Specific, verifiable conditions (always include cargo test/fmt/clippy)
+8. **Pointers** — Where to look for the remaining 10%
+
+### Never Do
+
+- Create a task with no description
+- Write "see review for details" or "see PR #N" instead of inlining context
+- Reference code without file paths and line numbers
+- Write acceptance criteria like "it works" — must be specific and verifiable
+- Skip the Related Work search — always check for existing related/duplicate tasks
+
+### Enforcement
+
+Tasks created with empty or stub descriptions will be flagged during review.
+When creating tasks outside `/create-task` (e.g., inside `/execute-review-findings`),
+include all mandatory sections in the description.
+
+<!-- end-task-quality-standard -->
+
 <!-- duplication-prevention-v1 -->
 
 ## Duplication Prevention — MANDATORY Pre-Coding Check
