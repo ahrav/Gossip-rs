@@ -2,7 +2,8 @@
 //!
 //! Re-exports from [`key_encoding`] (byte-order-preserving key encoders,
 //! range arithmetic, typed-to-`ShardSpec` helpers) and [`hint`] (versionless
-//! shard-hint wire framing with borrowed decode / caller-scratch encode).
+//! shard-hint wire framing, typed shard-spec constructors/decoders, and
+//! split-propagation helpers).
 //!
 //! **Dependency direction:** may depend on `identity` and `coordination`;
 //! must not reference `connector` or `persistence`.
@@ -11,8 +12,9 @@ pub mod hint;
 pub mod key_encoding;
 
 pub use hint::{
-    MetadataBuf, ShardEncodeError, ShardHint, ShardHintDecodeError, ShardMetadata,
-    ShardMetadataDecodeError,
+    HintPropagationError, MetadataBuf, ShardEncodeError, ShardHint, ShardHintDecodeError,
+    ShardMetadata, ShardMetadataDecodeError, SplitBoundary, decode_connector_extra, decode_hint,
+    decode_metadata, manifest_shard, prefix_shard, propagate_hint_on_split, range_shard,
 };
 pub use key_encoding::{
     KeyBuf, KeyEncoding, ManifestRowKey, PathKey, PrefixShardError, byte_midpoint,

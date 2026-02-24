@@ -10,6 +10,9 @@
 //! steady-state paths:
 //! - Decode returns borrowed views into caller-provided input bytes.
 //! - Encode writes into a caller-owned reusable [`MetadataBuf`].
+//! - Convenience constructors ([`range_shard`], [`prefix_shard`],
+//!   [`manifest_shard`]) return owned [`ShardSpec`] values and therefore
+//!   allocate for owned key/metadata storage.
 //!
 //! Decode outputs are lifetime-bound to the provided input slice. In
 //! particular, [`ShardHint::Prefix`] and [`ShardMetadata::connector_extra`]
@@ -41,7 +44,13 @@
 //! which preserves the inner [`ShardHintDecodeError`] when the envelope
 //! parsed but the hint payload did not.
 
-use crate::coordination::shard_spec::MAX_METADATA_SIZE;
+use super::key_encoding::{
+    KeyBuf, ManifestRowKey, PrefixShardError, decode_manifest_row_key, prefix_successor,
+    shard_spec_from_manifest_range, shard_spec_from_prefix,
+};
+use crate::coordination::shard_spec::{
+    MAX_KEY_SIZE, MAX_METADATA_SIZE, ShardSpec, ShardSpecInputError,
+};
 use core::fmt;
 
 const TAG_RANGE: u8 = 0x00;
@@ -452,9 +461,9 @@ impl<'a> ShardMetadata<'a> {
     /// `ShardHint::Range` with empty connector bytes.
     ///
     /// Any non-empty input that does not strictly conform to this envelope
-    /// returns [`ShardMetadataDecodeError`]. When the envelope structure was
-    /// valid but the inner hint payload was not, the returned error carries
-    /// the underlying [`ShardHintDecodeError`].
+    /// returns [`ShardMetadataDecodeError`]. When hint decode itself fails, the
+    /// returned error carries the underlying [`ShardHintDecodeError`]. Envelope
+    /// framing/consumption failures return `hint_error: None`.
     ///
     /// On success, both the decoded hint prefix bytes (if any) and
     /// `connector_extra` borrow from `metadata`.
@@ -590,6 +599,350 @@ fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHi
         },
         MANIFEST_LEN,
     ))
+}
+
+/// Construct a range shard with encoded metadata.
+///
+/// The returned [`ShardSpec`] covers `[start, end)` and carries
+/// [`ShardHint::Range`] plus `connector_extra` in the metadata envelope.
+///
+/// This helper produces an owned [`ShardSpec`], so it copies `start`, `end`,
+/// and encoded metadata into owned `Vec<u8>` fields.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn range_shard(
+    start: &[u8],
+    end: &[u8],
+    connector_extra: &[u8],
+) -> Result<ShardSpec, ShardSpecInputError> {
+    let metadata = encode_metadata_owned(ShardMetadata::new(ShardHint::Range, connector_extra))
+        .map_err(map_encode_to_spec_input_error)?;
+    ShardSpec::try_with_range_and_metadata(start.to_vec(), end.to_vec(), metadata)
+}
+
+/// Construct a prefix shard `[prefix, prefix_successor(prefix))` with encoded
+/// metadata.
+///
+/// On success, the metadata hint is [`ShardHint::Prefix`] and
+/// `connector_extra` is preserved as opaque bytes.
+///
+/// This uses [`shard_spec_from_prefix`] for range derivation and validation, so
+/// it inherits prefix constraints (for example, all-`0xFF` prefixes fail with
+/// [`PrefixShardError::NoSuccessor`]).
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn prefix_shard(prefix: &[u8], connector_extra: &[u8]) -> Result<ShardSpec, PrefixShardError> {
+    // Validate prefix size before metadata encoding so callers always see
+    // PrefixTooLarge for oversized prefixes, not a generic MetadataTooLarge
+    // from the hint encoder hitting the metadata capacity ceiling first.
+    if prefix.len() > MAX_KEY_SIZE {
+        return Err(PrefixShardError::PrefixTooLarge {
+            size: prefix.len(),
+            max: MAX_KEY_SIZE,
+        });
+    }
+    let metadata = encode_metadata_owned(ShardMetadata::new(
+        ShardHint::Prefix { prefix },
+        connector_extra,
+    ))
+    .map_err(map_encode_to_prefix_error)?;
+    shard_spec_from_prefix(prefix, &metadata)
+}
+
+/// Construct a same-manifest shard `[start_row, end_row)` with encoded
+/// metadata.
+///
+/// On success, key bounds are encoded as [`ManifestRowKey`] and metadata carries
+/// [`ShardHint::Manifest`] plus connector-opaque bytes.
+/// `start_row < end_row` is required.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn manifest_shard(
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    connector_extra: &[u8],
+) -> Result<ShardSpec, ShardSpecInputError> {
+    let metadata = encode_metadata_owned(ShardMetadata::new(
+        ShardHint::Manifest {
+            manifest_id,
+            start_row,
+            end_row,
+        },
+        connector_extra,
+    ))
+    .map_err(map_encode_to_spec_input_error)?;
+    shard_spec_from_manifest_range(manifest_id, start_row, end_row, &metadata)
+}
+
+/// Decode typed shard metadata from a [`ShardSpec`].
+///
+/// This applies strict envelope validation. Empty metadata is interpreted as
+/// absent hint bytes and maps to [`ShardHint::Range`] with empty
+/// `connector_extra`.
+#[must_use = "returns a Result that must be checked for metadata decode errors"]
+pub fn decode_metadata(spec: &ShardSpec) -> Result<ShardMetadata<'_>, ShardMetadataDecodeError> {
+    ShardMetadata::decode(spec.metadata())
+}
+
+/// Decode only the hint portion from a [`ShardSpec`] metadata envelope.
+///
+/// This still validates the full envelope first; malformed length prefixes or
+/// hint frames are surfaced as decode errors.
+#[must_use = "returns a Result that must be checked for metadata decode errors"]
+pub fn decode_hint(spec: &ShardSpec) -> Result<ShardHint<'_>, ShardMetadataDecodeError> {
+    decode_metadata(spec).map(|metadata| metadata.hint)
+}
+
+/// Decode only connector-opaque trailing bytes from a [`ShardSpec`] metadata
+/// envelope.
+///
+/// This still validates the hint frame and envelope length prefix; it is not a
+/// raw metadata slice accessor.
+///
+/// The returned slice borrows from `spec` and performs no allocation.
+#[must_use = "returns a Result that must be checked for metadata decode errors"]
+pub fn decode_connector_extra(spec: &ShardSpec) -> Result<&[u8], ShardMetadataDecodeError> {
+    decode_metadata(spec).map(|metadata| metadata.connector_extra)
+}
+
+/// Split boundary selector for hint-propagation errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitBoundary {
+    /// Child start key.
+    Start,
+    /// Child end key.
+    End,
+}
+
+impl fmt::Display for SplitBoundary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start => write!(f, "start"),
+            Self::End => write!(f, "end"),
+        }
+    }
+}
+
+/// Errors returned by [`propagate_hint_on_split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HintPropagationError {
+    /// Prefix child boundary falls outside the parent prefix range.
+    InvalidPrefixBoundary {
+        /// Which boundary failed validation.
+        boundary: SplitBoundary,
+    },
+    /// Manifest child boundary is malformed or out of parent bounds.
+    ///
+    /// This variant covers both key-decode failures (bytes not decodable as
+    /// [`ManifestRowKey`]) and decoded-key out-of-bounds conditions (row falls
+    /// outside the parent's `[start_row, end_row)` interval).  Splitting into
+    /// separate variants is a future option if downstream callers need to
+    /// distinguish the two failure modes.
+    InvalidManifestBoundary {
+        /// Which boundary failed validation.
+        boundary: SplitBoundary,
+    },
+    /// Manifest child boundary uses a different manifest ID than the parent.
+    ManifestIdMismatch {
+        /// Parent manifest ID.
+        parent: u64,
+        /// Child boundary manifest ID.
+        child: u64,
+    },
+    /// Manifest child rows are inverted or degenerate (`start_row >= end_row`).
+    EmptyManifestRange {
+        /// Child start row.
+        start_row: u64,
+        /// Child end row.
+        end_row: u64,
+    },
+}
+
+impl fmt::Display for HintPropagationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPrefixBoundary { boundary } => write!(
+                f,
+                "prefix split propagation: invalid child {boundary} boundary for prefix shard"
+            ),
+            Self::InvalidManifestBoundary { boundary } => write!(
+                f,
+                "manifest split propagation: invalid child {boundary} boundary"
+            ),
+            Self::ManifestIdMismatch { parent, child } => write!(
+                f,
+                "manifest split propagation: manifest_id mismatch (parent={parent}, child={child})"
+            ),
+            Self::EmptyManifestRange { start_row, end_row } => write!(
+                f,
+                "manifest split propagation: empty or inverted child range ({start_row} >= {end_row})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HintPropagationError {}
+
+/// Derive a child hint from `parent_hint` and child key-range boundaries.
+///
+/// Propagation rules:
+/// - `Range` stays `Range` unconditionally — no child-boundary validation is
+///   performed because Range hints carry no structural information to validate
+///   against.  Callers must validate child range ordering independently.
+/// - `Prefix` validates child bounds and demotes to `Range` because arbitrary
+///   split boundaries inside one prefix shard are not representable as a single
+///   child prefix.
+/// - `Manifest` validates row-key boundaries and returns a narrowed
+///   `Manifest` hint.
+///
+/// `child_start` and `child_end` follow the same half-open interval contract as
+/// [`ShardSpec`]: child range is `[child_start, child_end)`.
+#[must_use = "returns a Result that must be checked for boundary validation errors"]
+pub fn propagate_hint_on_split(
+    parent_hint: &ShardHint<'_>,
+    child_start: &[u8],
+    child_end: &[u8],
+) -> Result<ShardHint<'static>, HintPropagationError> {
+    match parent_hint {
+        ShardHint::Range => Ok(ShardHint::Range),
+        ShardHint::Prefix { prefix } => {
+            validate_prefix_child_bounds(prefix, child_start, child_end)?;
+            Ok(ShardHint::Range)
+        }
+        ShardHint::Manifest {
+            manifest_id,
+            start_row,
+            end_row,
+        } => {
+            let start = decode_manifest_row_key(child_start).ok_or(
+                HintPropagationError::InvalidManifestBoundary {
+                    boundary: SplitBoundary::Start,
+                },
+            )?;
+            let end = decode_manifest_row_key(child_end).ok_or(
+                HintPropagationError::InvalidManifestBoundary {
+                    boundary: SplitBoundary::End,
+                },
+            )?;
+
+            if start.manifest_id() != *manifest_id {
+                return Err(HintPropagationError::ManifestIdMismatch {
+                    parent: *manifest_id,
+                    child: start.manifest_id(),
+                });
+            }
+            if end.manifest_id() != *manifest_id {
+                return Err(HintPropagationError::ManifestIdMismatch {
+                    parent: *manifest_id,
+                    child: end.manifest_id(),
+                });
+            }
+
+            if start.row() < *start_row || start.row() >= *end_row {
+                return Err(HintPropagationError::InvalidManifestBoundary {
+                    boundary: SplitBoundary::Start,
+                });
+            }
+            if end.row() <= *start_row || end.row() > *end_row {
+                return Err(HintPropagationError::InvalidManifestBoundary {
+                    boundary: SplitBoundary::End,
+                });
+            }
+            if start.row() >= end.row() {
+                return Err(HintPropagationError::EmptyManifestRange {
+                    start_row: start.row(),
+                    end_row: end.row(),
+                });
+            }
+
+            Ok(ShardHint::Manifest {
+                manifest_id: *manifest_id,
+                start_row: start.row(),
+                end_row: end.row(),
+            })
+        }
+    }
+}
+
+/// Validate child bounds for a split of a prefix shard.
+///
+/// The child interval must remain within `[prefix, prefix_successor(prefix)]`
+/// and be non-empty (`child_start < child_end`).
+fn validate_prefix_child_bounds(
+    prefix: &[u8],
+    child_start: &[u8],
+    child_end: &[u8],
+) -> Result<(), HintPropagationError> {
+    let mut successor_buf = KeyBuf::new();
+    // When `prefix_successor` returns `None`, the parent prefix has no
+    // lexicographic successor (all-0xFF or empty).  `SplitBoundary::End` is
+    // reported because the successor *is* the end bound — no valid end bound
+    // exists.  This path is unreachable through the typed `prefix_shard` API,
+    // which rejects such prefixes with `PrefixShardError::NoSuccessor` at
+    // construction time.
+    let successor = prefix_successor(prefix, &mut successor_buf).ok_or(
+        HintPropagationError::InvalidPrefixBoundary {
+            boundary: SplitBoundary::End,
+        },
+    )?;
+
+    if child_start < prefix || child_start >= successor {
+        return Err(HintPropagationError::InvalidPrefixBoundary {
+            boundary: SplitBoundary::Start,
+        });
+    }
+    if child_end <= prefix || child_end > successor {
+        return Err(HintPropagationError::InvalidPrefixBoundary {
+            boundary: SplitBoundary::End,
+        });
+    }
+    if child_start >= child_end {
+        return Err(HintPropagationError::InvalidPrefixBoundary {
+            boundary: SplitBoundary::End,
+        });
+    }
+
+    Ok(())
+}
+
+fn encode_metadata_owned(metadata: ShardMetadata<'_>) -> Result<Vec<u8>, ShardEncodeError> {
+    let mut buf = MetadataBuf::new();
+    metadata.encode_into(&mut buf).map(|bytes| bytes.to_vec())
+}
+
+fn map_encode_to_spec_input_error(err: ShardEncodeError) -> ShardSpecInputError {
+    match err {
+        ShardEncodeError::PrefixTooLarge { size, .. } => ShardSpecInputError::KeyTooLarge {
+            size,
+            max: MAX_KEY_SIZE,
+        },
+        ShardEncodeError::HintTooLarge { size, max }
+        | ShardEncodeError::MetadataTooLarge { size, max } => {
+            ShardSpecInputError::MetadataTooLarge { size, max }
+        }
+        ShardEncodeError::InvertedManifestRows { .. } => ShardSpecInputError::InvertedRange {
+            start_len: ManifestRowKey::ENCODED_LEN,
+            end_len: ManifestRowKey::ENCODED_LEN,
+        },
+    }
+}
+
+fn map_encode_to_prefix_error(err: ShardEncodeError) -> PrefixShardError {
+    match err {
+        ShardEncodeError::PrefixTooLarge { size, .. } => PrefixShardError::PrefixTooLarge {
+            size,
+            max: MAX_KEY_SIZE,
+        },
+        ShardEncodeError::HintTooLarge { size, max }
+        | ShardEncodeError::MetadataTooLarge { size, max } => {
+            PrefixShardError::InvalidShardSpec(ShardSpecInputError::MetadataTooLarge { size, max })
+        }
+        ShardEncodeError::InvertedManifestRows { .. } => {
+            PrefixShardError::InvalidShardSpec(ShardSpecInputError::InvertedRange {
+                start_len: ManifestRowKey::ENCODED_LEN,
+                end_len: ManifestRowKey::ENCODED_LEN,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
