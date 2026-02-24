@@ -1,19 +1,32 @@
-//! Key encoding schemas, range arithmetic, and split computation.
+//! Public shard key primitives for split planning.
 //!
-//! Owns the shard algebra that governs how the scanner's keyspace is
-//! partitioned: key encoding schemas (`PathKey`, `NumericPrefixKey`, …),
-//! key-range types with intersection/union/containment operations, the split-key
-//! computation that divides oversize shards, ordering proofs, and the coverage
-//! verification logic that answers "did we scan everything?" after a run settles.
+//! This module is a stable re-export surface for allocation-free, byte-level
+//! shard key primitives from [`key_encoding`]:
+//! - [`KeyBuf`] for reusable stack-backed key output buffers.
+//! - [`KeyEncoding`] for mapping logical keys into lexicographically sortable
+//!   bytes via caller-provided buffers.
+//! - [`prefix_successor`], [`key_successor`], and [`byte_midpoint`] for
+//!   deterministic key-boundary derivation in split planning.
+//! - [`PrefixShardError`] for invalid prefix-based shard construction inputs.
 //!
-//! **Dependency direction:** May depend on `identity` and `coordination`
-//! (for ID types and shard metadata). Must not reference `connector` or
-//! `persistence`.
+//! Boundary helpers here are local key arithmetic only: they return either a
+//! representable boundary key or `None`, and they write results into
+//! caller-provided buffers.
 //!
-//! **Key invariants:**
-//! - Split coverage — child shard key ranges must exactly partition the
-//!   parent's range with no gaps and no overlaps.
-//! - Key ordering — split keys are deterministic pure functions of their
-//!   inputs; same inputs always produce the same split point.
-//! - Range algebra correctness — intersection, union, and containment
-//!   operations are consistent with lexicographic byte ordering.
+//! **Dependency direction:** May depend on `identity` and `coordination`.
+//! Must not reference `connector` or `persistence`.
+//!
+//! **Integration contracts:**
+//! - Ordering: byte encodings and derived boundaries are interpreted under
+//!   lexicographic byte order.
+//! - Buffer lifetime: helper return values borrow caller-provided [`KeyBuf`]
+//!   storage and are replaced on the next write to that buffer.
+//! - Partition validation: whole-partition invariants (coverage, disjointness,
+//!   child ordering) are enforced in [`crate::coordination::shard_spec`], not
+//!   in this re-export module.
+
+pub mod key_encoding;
+
+pub use key_encoding::{
+    KeyBuf, KeyEncoding, PrefixShardError, byte_midpoint, key_successor, prefix_successor,
+};

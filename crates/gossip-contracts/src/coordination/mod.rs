@@ -40,7 +40,7 @@ pub mod traits;
 pub mod validation;
 
 pub use cursor::{
-    Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, MAX_KEY_SIZE as CursorMaxKeySize,
+    Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, MAX_KEY_SIZE,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
 pub use error::{
@@ -66,8 +66,7 @@ pub use run_errors::{
 };
 pub use session::WorkerSession;
 pub use shard_spec::{
-    CursorSemantics, MAX_KEY_SIZE as ShardSpecMaxKeySize,
-    MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardSpec, ShardSpecInputError,
+    CursorSemantics, MAX_METADATA_SIZE as ShardSpecMaxMetadataSize, ShardSpec, ShardSpecInputError,
     SplitValidationError, validate_residual_split, validate_split_coverage,
 };
 pub use split::{
