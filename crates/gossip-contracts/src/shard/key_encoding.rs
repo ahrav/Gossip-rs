@@ -2,12 +2,14 @@
 //!
 //! Shards partition the keyspace into half-open intervals `[start, end)` over
 //! lexicographically ordered byte strings (the same model used by Bigtable,
-//! Spanner, and FoundationDB). This module provides three things:
+//! Spanner, and FoundationDB).
+//!
+//! This module provides three building blocks:
 //!
 //! 1. **Ordering contract** ([`KeyEncoding`]) -- a trait that connectors
 //!    implement so their typed keys produce byte encodings whose lexicographic
 //!    order matches logical order. The coordinator itself never touches this
-//!    trait; it works with raw `&[u8]` / `Vec<u8>`.
+//!    trait; it works with raw `&[u8]` boundaries.
 //!
 //! 2. **Key arithmetic** -- three pure functions for computing boundary keys
 //!    during split planning:
@@ -24,19 +26,110 @@
 //! 3. **Error type** ([`PrefixShardError`]) -- models the failure modes when
 //!    converting a user-supplied prefix into a bounded key range.
 //!
-//! **Scope boundary.** This module handles local, single-key arithmetic only.
+//! # Zero-allocation calling convention
+//!
+//! Arithmetic helpers take a mutable [`KeyBuf`] supplied by the caller and
+//! return a slice borrowed from that buffer. The returned slice remains valid
+//! only until the same buffer is written again. Callers that need to retain a
+//! key across later operations must copy it.
+//!
+//! # Scope boundary
+//!
+//! This module handles local, single-key arithmetic only.
 //! Whole-partition invariants (coverage, disjointness, child ordering across
 //! sibling shards) are validated in [`crate::coordination::shard_spec`].
 
 use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpecInputError};
 use core::fmt;
 
+/// Reusable stack buffer for shard-key arithmetic.
+///
+/// The buffer owns fixed-capacity storage and tracks the active key prefix via
+/// `len`. Bytes after `len` are scratch space and not part of the logical key.
+///
+/// Capacity is `MAX_KEY_SIZE + 1` to allow `byte_midpoint`'s internal
+/// carry-expanded arithmetic sum.
+#[derive(Clone)]
+pub struct KeyBuf {
+    buf: [u8; Self::CAPACITY],
+    len: usize,
+}
+
+impl KeyBuf {
+    /// Maximum number of bytes this buffer can hold.
+    pub const CAPACITY: usize = MAX_KEY_SIZE + 1;
+
+    /// Create an empty key buffer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buf: [0u8; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// View the active key bytes.
+    ///
+    /// The returned slice borrows this buffer and is invalidated by the next
+    /// mutating write to the same `KeyBuf`.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Active byte length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no bytes are active.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Copy `src` into this buffer and set the active length.
+    ///
+    /// This overwrites the active prefix `[0..src.len())`. Bytes beyond the new
+    /// length are left unchanged and remain scratch space.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src.len() > Self::CAPACITY`.
+    pub fn copy_from_slice(&mut self, src: &[u8]) {
+        assert!(
+            src.len() <= Self::CAPACITY,
+            "key bytes exceed KeyBuf capacity: {} > {}",
+            src.len(),
+            Self::CAPACITY
+        );
+        self.buf[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+    }
+}
+
+impl Default for KeyBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for KeyBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KeyBuf")
+            .field("len", &self.len)
+            .field("bytes", &self.as_bytes())
+            .finish()
+    }
+}
+
 /// Trait for key types that encode into lexicographically ordered bytes.
 ///
 /// # Ordering contract
 ///
 /// ```text
-/// a < b  (logical ordering)  =>  a.encode() < b.encode()  (byte lex ordering)
+/// a < b  (logical ordering)  =>  encode(a) < encode(b)  (byte lex ordering)
 /// ```
 ///
 /// This invariant is load-bearing: cursor monotonicity, shard range-membership
@@ -55,13 +148,19 @@ use core::fmt;
 /// # Usage
 ///
 /// Connectors implement this trait for their domain-specific key types (e.g.,
-/// file paths, manifest row IDs). The coordinator never calls `encode()`
+/// file paths, manifest row IDs). The coordinator never calls `encode_into`
 /// directly -- it operates on raw `&[u8]` boundaries produced by the shard
 /// builder or split planner.
+///
+/// # Buffer contract
+///
+/// Implementations must write a complete canonical encoding into `buf` whose
+/// length does not exceed [`KeyBuf::CAPACITY`]. Calling
+/// [`KeyBuf::copy_from_slice`] satisfies this contract.
 pub trait KeyEncoding: Sized {
     /// Encode this key into bytes that preserve logical ordering under
     /// lexicographic byte comparison.
-    fn encode(&self) -> Vec<u8>;
+    fn encode_into(&self, buf: &mut KeyBuf);
 }
 
 /// Compute the lexicographic successor of a byte prefix.
@@ -90,26 +189,43 @@ pub trait KeyEncoding: Sized {
 /// - Empty prefix: no bytes to increment.
 /// - All-`0xFF` prefix: the prefix already covers the top of the keyspace;
 ///   there is no byte string that can serve as an exclusive upper bound.
+/// - Prefix length exceeds [`KeyBuf::CAPACITY`].
+///
+/// # Output buffer semantics
+///
+/// The returned slice aliases `buf`; reusing `buf` for another operation
+/// overwrites that output.
+///
+/// # Complexity
+///
+/// `O(prefix.len())` time, no heap allocation.
 ///
 /// # Examples
 ///
 /// ```text
-/// prefix_successor(b"abc")     => Some(b"abd")
-/// prefix_successor(b"ab\xff")  => Some(b"ac")      // trailing 0xFF stripped
-/// prefix_successor(b"\xff")    => None              // top of keyspace
-/// prefix_successor(b"")        => None              // nothing to increment
+/// let mut buf = KeyBuf::new();
+/// prefix_successor(b"abc", &mut buf)     => Some(b"abd")
+/// prefix_successor(b"ab\xff", &mut buf)  => Some(b"ac")      // trailing 0xFF stripped
+/// prefix_successor(b"\xff", &mut buf)    => None              // top of keyspace
+/// prefix_successor(b"", &mut buf)        => None              // nothing to increment
 /// ```
 #[must_use]
-pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
+    if prefix.len() > KeyBuf::CAPACITY {
+        return None;
+    }
+
     // Strip trailing 0xFF bytes by finding the last byte that can be incremented.
     let last_non_ff = prefix.iter().rposition(|&byte| byte != u8::MAX)?;
+    let out_len = last_non_ff + 1;
 
     // Truncate and increment: the result is shorter than or equal to `prefix`,
     // which guarantees it is the tightest possible upper bound.
-    let mut next = prefix[..=last_non_ff].to_vec();
-    debug_assert!(next[last_non_ff] < u8::MAX);
-    next[last_non_ff] += 1;
-    Some(next)
+    buf.buf[..out_len].copy_from_slice(&prefix[..out_len]);
+    debug_assert!(buf.buf[last_non_ff] < u8::MAX);
+    buf.buf[last_non_ff] += 1;
+    buf.len = out_len;
+    Some(buf.as_bytes())
 }
 
 /// Compute a midpoint key in the open interval `(a, b)`.
@@ -149,11 +265,16 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// - Neither arithmetic candidate is strictly inside `(a, b)`, and
 ///   `key_successor(a)` is missing or `>= b`.
 ///
+/// # Output buffer semantics
+///
+/// The returned midpoint aliases `out`; subsequent writes to `out` replace it.
+///
 /// # Complexity
 ///
-/// `O(max(a.len(), b.len()))` time and space.
+/// `O(max(a.len(), b.len()))` time using stack-resident scratch buffers
+/// (bounded by [`KeyBuf::CAPACITY`]), with no heap allocation.
 #[must_use]
-pub fn byte_midpoint(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
+pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if a >= b {
         return None;
     }
@@ -164,63 +285,48 @@ pub fn byte_midpoint(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     }
 
     // Phase 1: Big-endian addition from LSB to MSB with direct positional writes.
-    //
-    // We walk the bytes in reverse (least-significant first) so that carry
-    // propagates naturally toward the most-significant byte. Shorter inputs
-    // are implicitly zero-padded on the right (i.e., lower-significance
-    // positions beyond their length contribute zero).
-    //
-    // The sum buffer is pre-allocated at `max_len + 1` to hold a possible
-    // carry into the most-significant position. Each byte is written
-    // directly at its final position (`idx + 1`), avoiding a post-loop
-    // reverse.
-    let sum_len = max_len + 1;
-    let mut sum = vec![0u8; sum_len];
+    let mut sum = KeyBuf::new();
     let mut carry: u16 = 0;
     for idx in (0..max_len).rev() {
         let a_byte = if idx < a.len() { u16::from(a[idx]) } else { 0 };
         let b_byte = if idx < b.len() { u16::from(b[idx]) } else { 0 };
         let total = a_byte + b_byte + carry;
-        sum[idx + 1] = (total & 0xFF) as u8;
+        sum.buf[idx + 1] = (total & 0xFF) as u8;
         carry = total >> 8;
     }
-    sum[0] = carry as u8;
+    sum.buf[0] = carry as u8;
+    sum.len = max_len + 1;
 
     // Phase 2: Divide by 2 from MSB to LSB.
-    //
-    // Standard long division: carry the remainder from each byte into the
-    // next lower byte. Because the dividend is the sum of two byte strings,
-    // the quotient is their arithmetic mean.
     let mut remainder: u16 = 0;
-    for byte in &mut sum {
-        let value = (remainder << 8) | u16::from(*byte);
-        *byte = (value / 2) as u8;
+    for idx in 0..sum.len {
+        let value = (remainder << 8) | u16::from(sum.buf[idx]);
+        sum.buf[idx] = (value / 2) as u8;
         remainder = value % 2;
     }
 
     // Phase 3: Validate arithmetic candidates.
-    //
-    // If addition overflowed by one byte, halving yields a synthetic leading
-    // zero because the carried byte is at most 0x01. Drop exactly one byte and
-    // test that normalized candidate first.
-    if sum.len() == max_len + 1 && sum[0] == 0 {
-        let normalized = &sum[1..];
+    if sum.len == max_len + 1 && sum.buf[0] == 0 {
+        let normalized = &sum.buf[1..sum.len];
         if normalized > a && normalized < b {
-            return Some(normalized.to_vec());
+            out.copy_from_slice(normalized);
+            return Some(out.as_bytes());
         }
     }
 
-    // Keep the fixed-width arithmetic candidate as-is when it lands in range.
-    // Leading zero bytes from input width are significant for lex ordering.
-    if sum.as_slice() > a && sum.as_slice() < b {
-        return Some(sum);
+    let arithmetic = &sum.buf[..sum.len];
+    if arithmetic.len() <= MAX_KEY_SIZE && arithmetic > a && arithmetic < b {
+        out.copy_from_slice(arithmetic);
+        return Some(out.as_bytes());
     }
 
     // Phase 4: If neither arithmetic candidate is interior, use the minimal
     // strict successor of `a`.
-    let successor = key_successor(a)?;
-    if successor.as_slice() < b {
-        return Some(successor);
+    let mut successor_buf = KeyBuf::new();
+    let successor = key_successor(a, &mut successor_buf)?;
+    if successor < b {
+        out.copy_from_slice(successor);
+        return Some(out.as_bytes());
     }
 
     None
@@ -249,8 +355,16 @@ pub fn byte_midpoint(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
 /// - Key exceeds `MAX_KEY_SIZE`.
 /// - Key is exactly `MAX_KEY_SIZE` bytes and all bytes are `0xFF` (no
 ///   successor exists within the representable keyspace).
+///
+/// # Output buffer semantics
+///
+/// The returned slice aliases `buf`; reusing `buf` overwrites that output.
+///
+/// # Complexity
+///
+/// `O(key.len())` time, no heap allocation.
 #[must_use]
-pub fn key_successor(key: &[u8]) -> Option<Vec<u8>> {
+pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if key.len() > MAX_KEY_SIZE {
         return None;
     }
@@ -258,14 +372,15 @@ pub fn key_successor(key: &[u8]) -> Option<Vec<u8>> {
     // Prefer append-zero: it is infallible and produces the tightest
     // possible successor (the key extended by the smallest byte value).
     if key.len() < MAX_KEY_SIZE {
-        let mut next = Vec::with_capacity(key.len() + 1);
-        next.extend_from_slice(key);
-        next.push(0);
-        return Some(next);
+        let out_len = key.len() + 1;
+        buf.buf[..key.len()].copy_from_slice(key);
+        buf.buf[key.len()] = 0;
+        buf.len = out_len;
+        return Some(buf.as_bytes());
     }
 
     // At the size ceiling: cannot grow, so fall back to in-place increment.
-    prefix_successor(key)
+    prefix_successor(key, buf)
 }
 
 /// Error for invalid prefix-based shard operations.
@@ -345,28 +460,35 @@ mod tests {
     struct BytesKey(Vec<u8>);
 
     impl KeyEncoding for BytesKey {
-        fn encode(&self) -> Vec<u8> {
-            self.0.clone()
+        fn encode_into(&self, buf: &mut KeyBuf) {
+            buf.copy_from_slice(&self.0);
         }
     }
 
     #[test]
     fn key_encoding_returns_encoded_bytes() {
         let key = BytesKey(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(key.encode(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let mut buf = KeyBuf::new();
+        key.encode_into(&mut buf);
+        assert_eq!(buf.as_bytes(), [0xDE, 0xAD, 0xBE, 0xEF].as_slice());
     }
 
     #[test]
     fn prefix_successor_basic() {
-        assert_eq!(prefix_successor(b"abc"), Some(b"abd".to_vec()));
-        assert_eq!(prefix_successor(b"ab\xff"), Some(b"ac".to_vec()));
-        assert_eq!(prefix_successor(b"\xff\xff"), None);
-        assert_eq!(prefix_successor(b""), None);
+        let mut buf = KeyBuf::new();
+        assert_eq!(prefix_successor(b"abc", &mut buf), Some(b"abd".as_slice()));
+        assert_eq!(
+            prefix_successor(b"ab\xff", &mut buf),
+            Some(b"ac".as_slice())
+        );
+        assert_eq!(prefix_successor(b"\xff\xff", &mut buf), None);
+        assert_eq!(prefix_successor(b"", &mut buf), None);
     }
 
     #[test]
     fn key_successor_prefers_append_when_capacity_available() {
-        assert_eq!(key_successor(b"abc"), Some(b"abc\0".to_vec()));
+        let mut buf = KeyBuf::new();
+        assert_eq!(key_successor(b"abc", &mut buf), Some(b"abc\0".as_slice()));
     }
 
     #[test]
@@ -375,21 +497,26 @@ mod tests {
         key[MAX_KEY_SIZE - 1] = 0x7F;
         let mut expected = key.clone();
         expected[MAX_KEY_SIZE - 1] = 0x80;
-        assert_eq!(key_successor(&key), Some(expected));
+
+        let mut buf = KeyBuf::new();
+        assert_eq!(key_successor(&key, &mut buf), Some(expected.as_slice()));
     }
 
     #[test]
     fn key_successor_none_for_all_ff_at_max_size() {
         let key = vec![u8::MAX; MAX_KEY_SIZE];
-        assert_eq!(key_successor(&key), None);
+        let mut buf = KeyBuf::new();
+        assert_eq!(key_successor(&key, &mut buf), None);
     }
 
     #[test]
     fn byte_midpoint_rejects_oversized_inputs() {
         let oversized_a = vec![0x40; MAX_KEY_SIZE + 1];
         let oversized_b = vec![0xC0; MAX_KEY_SIZE + 1];
+
+        let mut buf = KeyBuf::new();
         assert_eq!(
-            byte_midpoint(&oversized_a, &oversized_b),
+            byte_midpoint(&oversized_a, &oversized_b, &mut buf),
             None,
             "inputs exceeding MAX_KEY_SIZE should be rejected"
         );
@@ -399,7 +526,9 @@ mod tests {
     fn byte_midpoint_output_respects_max_key_size() {
         let a = vec![0x40; MAX_KEY_SIZE];
         let b = vec![0xC0; MAX_KEY_SIZE];
-        if let Some(mid) = byte_midpoint(&a, &b) {
+
+        let mut buf = KeyBuf::new();
+        if let Some(mid) = byte_midpoint(&a, &b, &mut buf) {
             assert!(
                 mid.len() <= MAX_KEY_SIZE,
                 "midpoint length {} exceeds MAX_KEY_SIZE {}",
@@ -411,12 +540,20 @@ mod tests {
 
     #[test]
     fn byte_midpoint_carry_regression() {
-        assert_eq!(byte_midpoint(&[0x40], &[0xC0]), Some(vec![0x80]));
+        let mut buf = KeyBuf::new();
+        assert_eq!(
+            byte_midpoint(&[0x40], &[0xC0], &mut buf),
+            Some([0x80].as_slice())
+        );
     }
 
     #[test]
     fn byte_midpoint_finds_interior_for_single_byte_gap() {
-        assert_eq!(byte_midpoint(&[0x01], &[0x02]), Some(vec![0x01, 0x00]));
+        let mut buf = KeyBuf::new();
+        assert_eq!(
+            byte_midpoint(&[0x01], &[0x02], &mut buf),
+            Some([0x01, 0x00].as_slice())
+        );
     }
 
     // -- rstest parameterized: byte_midpoint edge cases with different lengths --
@@ -435,7 +572,8 @@ mod tests {
         #[case] b: &[u8],
         #[case] expected: Option<Vec<u8>>,
     ) {
-        assert_eq!(byte_midpoint(a, b), expected);
+        let mut buf = KeyBuf::new();
+        assert_eq!(byte_midpoint(a, b, &mut buf), expected.as_deref());
     }
 
     // -- rstest parameterized: PrefixShardError Display formatting --
@@ -485,8 +623,9 @@ mod tests {
 
         #[test]
         fn prefix_successor_is_strictly_greater(prefix in proptest::collection::vec(any::<u8>(), 0..=32)) {
-            if let Some(succ) = prefix_successor(&prefix) {
-                prop_assert!(succ.as_slice() > prefix.as_slice());
+            let mut buf = KeyBuf::new();
+            if let Some(succ) = prefix_successor(&prefix, &mut buf) {
+                prop_assert!(succ > prefix.as_slice());
             } else {
                 let no_successor = prefix.is_empty() || prefix.iter().all(|&byte| byte == u8::MAX);
                 prop_assert!(no_successor);
@@ -499,12 +638,13 @@ mod tests {
             suffix in proptest::collection::vec(any::<u8>(), 0..=32),
         ) {
             prop_assume!(prefix.iter().any(|&byte| byte != u8::MAX));
-            let succ = prefix_successor(&prefix).expect("non-all-ff prefix has successor");
+            let mut buf = KeyBuf::new();
+            let succ = prefix_successor(&prefix, &mut buf).expect("non-all-ff prefix has successor");
 
             let mut key = prefix.clone();
             key.extend_from_slice(&suffix);
 
-            prop_assert!(key.as_slice() < succ.as_slice());
+            prop_assert!(key.as_slice() < succ);
         }
 
         #[test]
@@ -512,9 +652,10 @@ mod tests {
             a in proptest::collection::vec(any::<u8>(), 0..=32),
             b in proptest::collection::vec(any::<u8>(), 0..=32),
         ) {
-            if let Some(mid) = byte_midpoint(&a, &b) {
-                prop_assert!(a.as_slice() < mid.as_slice());
-                prop_assert!(mid.as_slice() < b.as_slice());
+            let mut buf = KeyBuf::new();
+            if let Some(mid) = byte_midpoint(&a, &b, &mut buf) {
+                prop_assert!(a.as_slice() < mid);
+                prop_assert!(mid < b.as_slice());
             }
         }
 
@@ -525,9 +666,10 @@ mod tests {
         fn key_successor_is_strictly_greater(
             key in proptest::collection::vec(any::<u8>(), 0..=MAX_KEY_SIZE),
         ) {
-            if let Some(succ) = key_successor(&key) {
+            let mut buf = KeyBuf::new();
+            if let Some(succ) = key_successor(&key, &mut buf) {
                 prop_assert!(
-                    succ.as_slice() > key.as_slice(),
+                    succ > key.as_slice(),
                     "successor {succ:?} must be > input {key:?}"
                 );
             }
@@ -539,7 +681,8 @@ mod tests {
         fn key_successor_none_only_when_expected(
             key in proptest::collection::vec(any::<u8>(), 0..=(MAX_KEY_SIZE + 8)),
         ) {
-            match key_successor(&key) {
+            let mut buf = KeyBuf::new();
+            match key_successor(&key, &mut buf) {
                 Some(_) => {
                     prop_assert!(key.len() <= MAX_KEY_SIZE);
                 }
@@ -562,10 +705,11 @@ mod tests {
         fn key_successor_appends_zero_when_below_max(
             key in proptest::collection::vec(any::<u8>(), 0..MAX_KEY_SIZE),
         ) {
-            let succ = key_successor(&key).expect("below MAX_KEY_SIZE always has a successor");
+            let mut buf = KeyBuf::new();
+            let succ = key_successor(&key, &mut buf).expect("below MAX_KEY_SIZE always has a successor");
             let mut expected = key.clone();
             expected.push(0x00);
-            prop_assert_eq!(succ, expected);
+            prop_assert_eq!(succ, expected.as_slice());
         }
 
         /// At `MAX_KEY_SIZE`, `key_successor` delegates to `prefix_successor`.
@@ -573,7 +717,11 @@ mod tests {
         fn key_successor_delegates_to_prefix_successor_at_max(
             key in proptest::collection::vec(any::<u8>(), MAX_KEY_SIZE..=MAX_KEY_SIZE),
         ) {
-            prop_assert_eq!(key_successor(&key), prefix_successor(&key));
+            let mut succ_buf = KeyBuf::new();
+            let mut prefix_buf = KeyBuf::new();
+            let succ = key_successor(&key, &mut succ_buf).map(|bytes| bytes.to_vec());
+            let prefix = prefix_successor(&key, &mut prefix_buf).map(|bytes| bytes.to_vec());
+            prop_assert_eq!(succ, prefix);
         }
 
         /// `byte_midpoint` with different-length inputs: the result (when `Some`)
@@ -587,11 +735,12 @@ mod tests {
             let mut b = a.clone();
             b.extend_from_slice(&extra);
             // Ensure a < b (skip if not — the function returns None anyway).
+            let mut buf = KeyBuf::new();
             if a.as_slice() < b.as_slice()
-                && let Some(mid) = byte_midpoint(&a, &b)
+                && let Some(mid) = byte_midpoint(&a, &b, &mut buf)
             {
-                prop_assert!(a.as_slice() < mid.as_slice());
-                prop_assert!(mid.as_slice() < b.as_slice());
+                prop_assert!(a.as_slice() < mid);
+                prop_assert!(mid < b.as_slice());
             }
         }
     }

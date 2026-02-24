@@ -1,32 +1,32 @@
 //! Public shard key primitives for split planning.
 //!
-//! This module currently exposes byte-level building blocks from
-//! [`key_encoding`]:
+//! This module is a stable re-export surface for allocation-free, byte-level
+//! shard key primitives from [`key_encoding`]:
+//! - [`KeyBuf`] for reusable stack-backed key output buffers.
 //! - [`KeyEncoding`] for mapping logical keys into lexicographically sortable
-//!   bytes.
+//!   bytes via caller-provided buffers.
 //! - [`prefix_successor`], [`key_successor`], and [`byte_midpoint`] for
 //!   deterministic key-boundary derivation in split planning.
 //! - [`PrefixShardError`] for invalid prefix-based shard construction inputs.
 //!
-//! It intentionally does not enforce whole-partition invariants (coverage,
-//! disjointness, child ordering). Those checks live in
-//! [`crate::coordination::shard_spec`].
+//! Boundary helpers here are local key arithmetic only: they return either a
+//! representable boundary key or `None`, and they write results into
+//! caller-provided buffers.
 //!
 //! **Dependency direction:** May depend on `identity` and `coordination`.
 //! Must not reference `connector` or `persistence`.
 //!
-//! **Key invariants:**
-//! - Split coverage -- child key ranges produced by split planning tile the
-//!   parent range without gaps or overlaps.
-//! - Key ordering -- all key-boundary functions preserve lexicographic byte
-//!   ordering; `prefix_successor` and `key_successor` produce strict
-//!   successors, `byte_midpoint` produces a value strictly between inputs.
-//! - Range algebra correctness -- midpoint, successor, and prefix-successor
-//!   results stay within representable bounds (`MAX_KEY_SIZE`) or return
-//!   `None`.
+//! **Integration contracts:**
+//! - Ordering: byte encodings and derived boundaries are interpreted under
+//!   lexicographic byte order.
+//! - Buffer lifetime: helper return values borrow caller-provided [`KeyBuf`]
+//!   storage and are replaced on the next write to that buffer.
+//! - Partition validation: whole-partition invariants (coverage, disjointness,
+//!   child ordering) are enforced in [`crate::coordination::shard_spec`], not
+//!   in this re-export module.
 
 pub mod key_encoding;
 
 pub use key_encoding::{
-    KeyEncoding, PrefixShardError, byte_midpoint, key_successor, prefix_successor,
+    KeyBuf, KeyEncoding, PrefixShardError, byte_midpoint, key_successor, prefix_successor,
 };
