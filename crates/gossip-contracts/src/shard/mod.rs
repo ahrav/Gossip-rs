@@ -22,8 +22,6 @@
 //! Must not reference `connector` or `persistence`.
 
 pub mod key_encoding;
-#[cfg(test)]
-mod key_encoding_tests;
 
 pub use key_encoding::{
     KeyBuf, KeyEncoding, ManifestRowKey, PathKey, PrefixShardError, byte_midpoint,

@@ -650,3 +650,7 @@ impl From<ShardSpecInputError> for PrefixShardError {
         Self::InvalidShardSpec(value)
     }
 }
+
+#[cfg(test)]
+#[path = "key_encoding_tests.rs"]
+mod tests;
