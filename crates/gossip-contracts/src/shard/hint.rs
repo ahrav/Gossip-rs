@@ -57,7 +57,6 @@ const U32_MAX_USIZE: usize = u32::MAX as usize;
 ///
 /// This buffer is intended to be allocated once (for example at startup) and
 /// reused across repeated metadata/hint encodes without heap allocation.
-#[derive(Clone)]
 pub struct MetadataBuf {
     buf: [u8; Self::CAPACITY],
     len: usize,
@@ -77,19 +76,16 @@ impl MetadataBuf {
     }
 
     /// View active bytes.
-    #[must_use = "returns encoded bytes that should be consumed by caller"]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 
     /// Active byte length.
-    #[must_use = "returns current active length"]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether no bytes are active.
-    #[must_use = "returns whether the buffer currently has active bytes"]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -178,26 +174,23 @@ pub struct ShardMetadataDecodeError {
     pub hint_error: Option<ShardHintDecodeError>,
 }
 
-/// Encode failures for [`ShardHint::encode_into`].
+/// Encode failures for [`ShardHint::encode_into`] and
+/// [`ShardMetadata::encode_into`].
+///
+/// A single error type covers both hint-level and metadata-level encode
+/// failures. Callers match on variant to distinguish prefix-framing overflow,
+/// hint-size overflow, total-metadata overflow, and invalid manifest bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShardHintEncodeError {
+#[non_exhaustive]
+pub enum ShardEncodeError {
     /// Prefix bytes exceed `u32` framing width.
     PrefixTooLarge { size: usize, max: usize },
     /// Encoded hint exceeds metadata capacity.
-    EncodedHintTooLarge { size: usize, max: usize },
-    /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
-    InvertedManifestRows { start_row: u64, end_row: u64 },
-}
-
-/// Encode failures for [`ShardMetadata::encode_into`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetadataEncodingError {
+    HintTooLarge { size: usize, max: usize },
     /// Encoded metadata exceeds [`MAX_METADATA_SIZE`].
     MetadataTooLarge { size: usize, max: usize },
-    /// Encoded hint is too large to frame in metadata.
-    HintTooLarge { size: usize, max: usize },
     /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
-    InvalidManifestRows { start_row: u64, end_row: u64 },
+    InvertedManifestRows { start_row: u64, end_row: u64 },
 }
 
 impl fmt::Display for ShardHintDecodeError {
@@ -251,55 +244,33 @@ impl std::error::Error for ShardMetadataDecodeError {
     }
 }
 
-impl fmt::Display for ShardHintEncodeError {
+impl fmt::Display for ShardEncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PrefixTooLarge { size, max } => {
                 write!(
                     f,
-                    "shard hint encode: prefix too large ({size} bytes, max {max})"
+                    "shard encode: prefix too large ({size} bytes, max {max})"
                 )
             }
-            Self::EncodedHintTooLarge { size, max } => {
+            Self::HintTooLarge { size, max } => {
+                write!(f, "shard encode: hint too large ({size} bytes, max {max})")
+            }
+            Self::MetadataTooLarge { size, max } => {
                 write!(
                     f,
-                    "shard hint encode: encoded hint too large ({size} bytes, max {max})"
+                    "shard encode: metadata too large ({size} bytes, max {max})"
                 )
             }
             Self::InvertedManifestRows { start_row, end_row } => write!(
                 f,
-                "shard hint encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
+                "shard encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
             ),
         }
     }
 }
 
-impl std::error::Error for ShardHintEncodeError {}
-
-impl fmt::Display for MetadataEncodingError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MetadataTooLarge { size, max } => {
-                write!(
-                    f,
-                    "shard metadata encode: metadata too large ({size} bytes, max {max})"
-                )
-            }
-            Self::HintTooLarge { size, max } => {
-                write!(
-                    f,
-                    "shard metadata encode: hint too large ({size} bytes, max {max})"
-                )
-            }
-            Self::InvalidManifestRows { start_row, end_row } => write!(
-                f,
-                "shard metadata encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for MetadataEncodingError {}
+impl std::error::Error for ShardEncodeError {}
 
 /// Structured shard metadata envelope.
 ///
@@ -320,25 +291,26 @@ impl<'a> ShardHint<'a> {
     ///
     /// # Errors
     ///
-    /// - [`ShardHintEncodeError::PrefixTooLarge`] when a prefix exceeds
+    /// - [`ShardEncodeError::PrefixTooLarge`] when a prefix exceeds
     ///   `u32` length framing.
-    /// - [`ShardHintEncodeError::EncodedHintTooLarge`] when the resulting hint
+    /// - [`ShardEncodeError::HintTooLarge`] when the resulting hint
     ///   frame would exceed [`MAX_METADATA_SIZE`].
-    /// - [`ShardHintEncodeError::InvertedManifestRows`] when a manifest's
+    /// - [`ShardEncodeError::InvertedManifestRows`] when a manifest's
     ///   `start_row >= end_row`.
-    pub fn encoded_len(&self) -> Result<usize, ShardHintEncodeError> {
+    #[inline]
+    pub fn encoded_len(&self) -> Result<usize, ShardEncodeError> {
         match self {
             Self::Range => Ok(1),
             Self::Prefix { prefix } => {
                 if prefix.len() > U32_MAX_USIZE {
-                    return Err(ShardHintEncodeError::PrefixTooLarge {
+                    return Err(ShardEncodeError::PrefixTooLarge {
                         size: prefix.len(),
                         max: U32_MAX_USIZE,
                     });
                 }
                 let size = PREFIX_HEADER_LEN.saturating_add(prefix.len());
                 if size > MAX_METADATA_SIZE {
-                    return Err(ShardHintEncodeError::EncodedHintTooLarge {
+                    return Err(ShardEncodeError::HintTooLarge {
                         size,
                         max: MAX_METADATA_SIZE,
                     });
@@ -349,7 +321,7 @@ impl<'a> ShardHint<'a> {
                 start_row, end_row, ..
             } => {
                 if *start_row >= *end_row {
-                    return Err(ShardHintEncodeError::InvertedManifestRows {
+                    return Err(ShardEncodeError::InvertedManifestRows {
                         start_row: *start_row,
                         end_row: *end_row,
                     });
@@ -363,10 +335,8 @@ impl<'a> ShardHint<'a> {
     ///
     /// The returned slice borrows `buf` and is overwritten by subsequent
     /// writes into the same [`MetadataBuf`].
-    pub fn encode_into<'b>(
-        &self,
-        buf: &'b mut MetadataBuf,
-    ) -> Result<&'b [u8], ShardHintEncodeError> {
+    #[inline]
+    pub fn encode_into<'b>(&self, buf: &'b mut MetadataBuf) -> Result<&'b [u8], ShardEncodeError> {
         let hint_len = self.encoded_len()?;
         encode_hint_into_slice(*self, &mut buf.buf[..hint_len]);
         buf.len = hint_len;
@@ -380,6 +350,7 @@ impl<'a> ShardHint<'a> {
     /// consumption at the outer boundary.
     ///
     /// For [`ShardHint::Prefix`], the decoded `prefix` borrows from `data`.
+    #[inline]
     pub fn decode(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHintDecodeError> {
         let Some(&tag) = data.first() else {
             return Err(ShardHintDecodeError::EmptyData);
@@ -422,15 +393,16 @@ impl<'a> ShardMetadata<'a> {
     /// This preflights `[hint_len:u32 BE][hint_bytes][connector_extra]` and
     /// verifies the total framed metadata size fits within
     /// [`MAX_METADATA_SIZE`].
-    pub fn encoded_len(&self) -> Result<usize, MetadataEncodingError> {
-        let hint_len = self.hint.encoded_len().map_err(map_hint_encode_error)?;
+    #[inline]
+    pub fn encoded_len(&self) -> Result<usize, ShardEncodeError> {
+        let hint_len = self.hint.encoded_len()?;
         let total_size = METADATA_HINT_LEN_PREFIX
             .checked_add(hint_len)
             .and_then(|s| s.checked_add(self.connector_extra.len()))
             .unwrap_or(usize::MAX);
 
         if total_size > MAX_METADATA_SIZE {
-            return Err(MetadataEncodingError::MetadataTooLarge {
+            return Err(ShardEncodeError::MetadataTooLarge {
                 size: total_size,
                 max: MAX_METADATA_SIZE,
             });
@@ -444,12 +416,20 @@ impl<'a> ShardMetadata<'a> {
     ///
     /// The returned slice borrows `buf` and is overwritten by subsequent
     /// writes into the same [`MetadataBuf`].
-    pub fn encode_into<'b>(
-        &self,
-        buf: &'b mut MetadataBuf,
-    ) -> Result<&'b [u8], MetadataEncodingError> {
-        let hint_len = self.hint.encoded_len().map_err(map_hint_encode_error)?;
-        let total_size = self.encoded_len()?;
+    #[inline]
+    pub fn encode_into<'b>(&self, buf: &'b mut MetadataBuf) -> Result<&'b [u8], ShardEncodeError> {
+        let hint_len = self.hint.encoded_len()?;
+        let total_size = METADATA_HINT_LEN_PREFIX
+            .checked_add(hint_len)
+            .and_then(|s| s.checked_add(self.connector_extra.len()))
+            .unwrap_or(usize::MAX);
+
+        if total_size > MAX_METADATA_SIZE {
+            return Err(ShardEncodeError::MetadataTooLarge {
+                size: total_size,
+                max: MAX_METADATA_SIZE,
+            });
+        }
 
         let hint_len_u32 =
             u32::try_from(hint_len).expect("hint_len is validated to fit in u32 framing");
@@ -478,6 +458,7 @@ impl<'a> ShardMetadata<'a> {
     ///
     /// On success, both the decoded hint prefix bytes (if any) and
     /// `connector_extra` borrow from `metadata`.
+    #[inline]
     pub fn decode(metadata: &'a [u8]) -> Result<Self, ShardMetadataDecodeError> {
         if metadata.is_empty() {
             return Ok(Self::from_hint(ShardHint::Range));
@@ -486,12 +467,7 @@ impl<'a> ShardMetadata<'a> {
         let Some(hint_len_bytes) = metadata.get(..METADATA_HINT_LEN_PREFIX) else {
             return Err(ShardMetadataDecodeError { hint_error: None });
         };
-        let hint_len = u32::from_be_bytes([
-            hint_len_bytes[0],
-            hint_len_bytes[1],
-            hint_len_bytes[2],
-            hint_len_bytes[3],
-        ]) as usize;
+        let hint_len = u32::from_be_bytes(hint_len_bytes.try_into().unwrap()) as usize;
 
         let hint_frame_end = METADATA_HINT_LEN_PREFIX
             .checked_add(hint_len)
@@ -514,23 +490,6 @@ impl<'a> ShardMetadata<'a> {
             hint,
             connector_extra: &metadata[hint_frame_end..],
         })
-    }
-}
-
-/// Translate a hint-level encode error into the metadata-level error type.
-///
-/// Both `PrefixTooLarge` and `EncodedHintTooLarge` collapse into
-/// `HintTooLarge` because the metadata envelope does not distinguish
-/// between prefix-framing overflow and total-size overflow.
-fn map_hint_encode_error(err: ShardHintEncodeError) -> MetadataEncodingError {
-    match err {
-        ShardHintEncodeError::PrefixTooLarge { size, max }
-        | ShardHintEncodeError::EncodedHintTooLarge { size, max } => {
-            MetadataEncodingError::HintTooLarge { size, max }
-        }
-        ShardHintEncodeError::InvertedManifestRows { start_row, end_row } => {
-            MetadataEncodingError::InvalidManifestRows { start_row, end_row }
-        }
     }
 }
 
@@ -586,7 +545,7 @@ fn decode_prefix<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHint
         });
     }
 
-    let prefix_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+    let prefix_len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
     let expected_min = PREFIX_HEADER_LEN.saturating_add(prefix_len);
     if data.len() < expected_min {
         return Err(ShardHintDecodeError::TruncatedPrefix {
@@ -615,15 +574,9 @@ fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHi
 
     // Bounds validated: data.len() >= MANIFEST_LEN (25 bytes), so all
     // fixed-offset reads below are in-bounds.
-    let manifest_id = u64::from_be_bytes([
-        data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
-    ]);
-    let start_row = u64::from_be_bytes([
-        data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
-    ]);
-    let end_row = u64::from_be_bytes([
-        data[17], data[18], data[19], data[20], data[21], data[22], data[23], data[24],
-    ]);
+    let manifest_id = u64::from_be_bytes(data[1..9].try_into().unwrap());
+    let start_row = u64::from_be_bytes(data[9..17].try_into().unwrap());
+    let end_row = u64::from_be_bytes(data[17..25].try_into().unwrap());
 
     if start_row >= end_row {
         return Err(ShardHintDecodeError::InvertedManifestRows { start_row, end_row });
@@ -638,3 +591,7 @@ fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHi
         MANIFEST_LEN,
     ))
 }
+
+#[cfg(test)]
+#[path = "hint_tests.rs"]
+mod tests;

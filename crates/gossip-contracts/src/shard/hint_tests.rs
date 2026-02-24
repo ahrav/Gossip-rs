@@ -222,7 +222,7 @@ fn shard_metadata_encode_rejects_oversized_payload() {
 
     assert_eq!(
         metadata.encode_into(&mut buf),
-        Err(MetadataEncodingError::MetadataTooLarge {
+        Err(ShardEncodeError::MetadataTooLarge {
             size: MAX_METADATA_SIZE + 1,
             max: MAX_METADATA_SIZE,
         }),
@@ -245,7 +245,7 @@ proptest! {
             .expect("encoded hint should decode");
 
         prop_assert_eq!(consumed, encoded.len());
-        assert_hint_matches_owned(decoded, &hint)?;
+        prop_assert_eq!(decoded, hint.as_hint());
     }
 
     #[test]
@@ -262,7 +262,7 @@ proptest! {
 
         let decoded = ShardMetadata::decode(&encoded)
             .expect("encoded metadata should decode");
-        assert_hint_matches_owned(decoded.hint, &hint)?;
+        prop_assert_eq!(decoded.hint, hint.as_hint());
         prop_assert_eq!(decoded.connector_extra, connector_extra.as_slice());
     }
 }
@@ -280,39 +280,6 @@ fn arb_owned_hint() -> impl Strategy<Value = OwnedHint> {
             }
         }),
     ]
-}
-
-fn assert_hint_matches_owned(
-    decoded: ShardHint<'_>,
-    expected: &OwnedHint,
-) -> Result<(), proptest::test_runner::TestCaseError> {
-    match (decoded, expected) {
-        (ShardHint::Range, OwnedHint::Range) => Ok(()),
-        (ShardHint::Prefix { prefix }, OwnedHint::Prefix(expected_prefix)) => {
-            prop_assert_eq!(prefix, expected_prefix.as_slice());
-            Ok(())
-        }
-        (
-            ShardHint::Manifest {
-                manifest_id,
-                start_row,
-                end_row,
-            },
-            OwnedHint::Manifest {
-                manifest_id: expected_manifest_id,
-                start_row: expected_start,
-                end_row: expected_end,
-            },
-        ) => {
-            prop_assert_eq!(manifest_id, *expected_manifest_id);
-            prop_assert_eq!(start_row, *expected_start);
-            prop_assert_eq!(end_row, *expected_end);
-            Ok(())
-        }
-        (actual, expected) => Err(proptest::test_runner::TestCaseError::fail(format!(
-            "decoded hint {actual:?} did not match expected {expected:?}"
-        ))),
-    }
 }
 
 fn ordered_rows(a: u64, b: u64) -> (u64, u64) {
@@ -337,7 +304,7 @@ fn shard_hint_encode_rejects_inverted_manifest_rows() {
     let mut buf = MetadataBuf::new();
     assert_eq!(
         hint.encode_into(&mut buf),
-        Err(ShardHintEncodeError::InvertedManifestRows {
+        Err(ShardEncodeError::InvertedManifestRows {
             start_row: 22,
             end_row: 10,
         }),
@@ -354,9 +321,25 @@ fn shard_hint_encode_rejects_equal_manifest_rows() {
     let mut buf = MetadataBuf::new();
     assert_eq!(
         hint.encode_into(&mut buf),
-        Err(ShardHintEncodeError::InvertedManifestRows {
+        Err(ShardEncodeError::InvertedManifestRows {
             start_row: 10,
             end_row: 10,
+        }),
+    );
+}
+
+/// Encode bypasses the invalid-row check by writing raw bytes, but decode
+/// must still reject the frame. This confirms the encode/decode asymmetry:
+/// the enum can represent inverted rows, encode refuses them, and decode
+/// independently rejects them even if the wire bytes were hand-crafted.
+#[test]
+fn shard_hint_decode_rejects_raw_inverted_manifest() {
+    let raw = encode_raw_manifest(42, 100, 50);
+    assert_eq!(
+        ShardHint::decode(&raw),
+        Err(ShardHintDecodeError::InvertedManifestRows {
+            start_row: 100,
+            end_row: 50,
         }),
     );
 }
