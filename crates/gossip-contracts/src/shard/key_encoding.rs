@@ -69,7 +69,6 @@ impl KeyBuf {
     pub const CAPACITY: usize = MAX_KEY_SIZE + 1;
 
     /// Create an empty key buffer.
-    #[must_use]
     pub fn new() -> Self {
         Self {
             buf: [0u8; Self::CAPACITY],
@@ -81,19 +80,16 @@ impl KeyBuf {
     ///
     /// The returned slice borrows this buffer and is invalidated by the next
     /// mutating write to the same `KeyBuf`.
-    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 
     /// Active byte length.
-    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether no bytes are active.
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -196,8 +192,6 @@ impl<'a> PathKey<'a> {
     /// # Panics
     ///
     /// Panics if `path` is empty or if `path.len()` exceeds [`MAX_KEY_SIZE`].
-    /// Use [`try_new`](Self::try_new) when the path comes from untrusted input.
-    #[must_use]
     pub const fn new(path: &'a str) -> Self {
         assert!(!path.is_empty(), "PathKey path must not be empty");
         assert!(
@@ -207,18 +201,7 @@ impl<'a> PathKey<'a> {
         Self { path }
     }
 
-    /// Fallible constructor that returns `None` when the path is empty or
-    /// exceeds [`MAX_KEY_SIZE`].
-    #[must_use]
-    pub const fn try_new(path: &'a str) -> Option<Self> {
-        if path.is_empty() || path.len() > MAX_KEY_SIZE {
-            return None;
-        }
-        Some(Self { path })
-    }
-
     /// Return a reference to the underlying UTF-8 path.
-    #[must_use]
     pub const fn as_str(self) -> &'a str {
         self.path
     }
@@ -247,19 +230,16 @@ impl ManifestRowKey {
     pub const ENCODED_LEN: usize = 16;
 
     /// Create a manifest row key.
-    #[must_use]
     pub const fn new(manifest_id: u64, row: u64) -> Self {
         Self { manifest_id, row }
     }
 
     /// Manifest identifier component.
-    #[must_use]
     pub const fn manifest_id(self) -> u64 {
         self.manifest_id
     }
 
     /// Row component.
-    #[must_use]
     pub const fn row(self) -> u64 {
         self.row
     }
@@ -282,7 +262,6 @@ impl KeyEncoding for ManifestRowKey {
 ///
 /// This function validates framing only; semantic checks (for example,
 /// monotonic row ranges) are performed by higher-level helpers.
-#[must_use]
 pub fn decode_manifest_row_key(key: &[u8]) -> Option<ManifestRowKey> {
     if key.len() != ManifestRowKey::ENCODED_LEN {
         return None;
@@ -436,7 +415,6 @@ pub fn shard_spec_from_manifest_range(
 /// prefix_successor(b"\xff", &mut buf)    => None              // top of keyspace
 /// prefix_successor(b"", &mut buf)        => None              // nothing to increment
 /// ```
-#[must_use]
 pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if prefix.len() > KeyBuf::CAPACITY {
         return None;
@@ -500,7 +478,6 @@ pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u
 ///
 /// `O(max(a.len(), b.len()))` time using stack-resident scratch buffers
 /// (bounded by [`KeyBuf::CAPACITY`]), with no heap allocation.
-#[must_use]
 pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if a >= b {
         return None;
@@ -590,7 +567,6 @@ pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a 
 /// # Complexity
 ///
 /// `O(key.len())` time, no heap allocation.
-#[must_use]
 pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if key.len() > MAX_KEY_SIZE {
         return None;

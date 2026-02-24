@@ -42,19 +42,9 @@ fn path_key_new_rejects_oversized_path() {
 }
 
 #[test]
-fn path_key_try_new_returns_none_for_empty_path() {
-    assert!(PathKey::try_new("").is_none());
-}
-
-#[test]
-fn path_key_try_new_returns_none_for_oversized_path() {
-    assert!(PathKey::try_new(&"a".repeat(MAX_KEY_SIZE + 1)).is_none());
-}
-
-#[test]
-fn path_key_try_new_accepts_path_at_max_size() {
+fn path_key_new_accepts_path_at_max_size() {
     let path = "a".repeat(MAX_KEY_SIZE);
-    let key = PathKey::try_new(&path).expect("path at MAX_KEY_SIZE should succeed");
+    let key = PathKey::new(&path);
     assert_eq!(key.as_str().len(), MAX_KEY_SIZE);
 }
 
