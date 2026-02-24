@@ -84,6 +84,12 @@ fn shard_spec_from_prefix_rejects_all_ff_prefix() {
 }
 
 #[test]
+fn shard_spec_from_prefix_rejects_empty_prefix() {
+    let err = shard_spec_from_prefix(b"", b"meta").expect_err("empty prefix should be rejected");
+    assert_eq!(err, PrefixShardError::EmptyPrefix);
+}
+
+#[test]
 fn shard_spec_from_prefix_rejects_oversized_prefix() {
     let oversized = vec![0xAB; MAX_KEY_SIZE + 1];
     let err = shard_spec_from_prefix(&oversized, b"meta")
@@ -307,6 +313,27 @@ proptest! {
     }
 
     #[test]
+    fn shard_spec_from_prefix_produces_valid_half_open_range(
+        prefix in proptest::collection::vec(any::<u8>(), 1..=32),
+    ) {
+        prop_assume!(prefix.iter().any(|&b| b != u8::MAX));
+        let spec = shard_spec_from_prefix(&prefix, b"meta");
+        let spec = match spec {
+            Ok(s) => s,
+            Err(PrefixShardError::InvalidShardSpec(_)) => return Ok(()),
+            Err(e) => return Err(proptest::test_runner::TestCaseError::Fail(
+                format!("unexpected error: {e:?}").into(),
+            )),
+        };
+        prop_assert_eq!(spec.key_range_start(), prefix.as_slice());
+        let mut buf = KeyBuf::new();
+        let expected_end = prefix_successor(&prefix, &mut buf)
+            .expect("non-all-ff prefix has a successor");
+        prop_assert_eq!(spec.key_range_end(), expected_end);
+        prop_assert_eq!(spec.metadata(), b"meta");
+    }
+
+    #[test]
     fn manifest_row_key_encoding_preserves_logical_order(
         a_manifest_id in any::<u64>(),
         a_row in any::<u64>(),
@@ -325,6 +352,35 @@ proptest! {
         prop_assert!(a_buf.as_bytes() < b_buf.as_bytes());
         prop_assert_eq!(a_buf.len(), ManifestRowKey::ENCODED_LEN);
         prop_assert_eq!(b_buf.len(), ManifestRowKey::ENCODED_LEN);
+    }
+
+    #[test]
+    fn manifest_row_key_encode_decode_roundtrip(
+        manifest_id in any::<u64>(),
+        row in any::<u64>(),
+    ) {
+        let mut buf = KeyBuf::new();
+        ManifestRowKey::new(manifest_id, row).encode_into(&mut buf);
+        prop_assert_eq!(buf.len(), ManifestRowKey::ENCODED_LEN);
+        prop_assert_eq!(
+            decode_manifest_row_key(buf.as_bytes()),
+            Some((manifest_id, row)),
+        );
+    }
+
+    #[test]
+    fn shard_spec_from_manifest_range_rejects_inverted_or_degenerate(
+        manifest_id in any::<u64>(),
+        a in any::<u64>(),
+        b in any::<u64>(),
+    ) {
+        prop_assume!(a >= b);
+        let err = shard_spec_from_manifest_range(manifest_id, a, b, b"meta")
+            .expect_err("start_row >= end_row should produce InvertedRange");
+        prop_assert!(
+            matches!(err, ShardSpecInputError::InvertedRange { .. }),
+            "expected InvertedRange, got {err:?}",
+        );
     }
 
     #[test]

@@ -4,39 +4,39 @@
 //! lexicographically ordered byte strings (the same model used by Bigtable,
 //! Spanner, and FoundationDB).
 //!
-//! This module provides five building blocks:
+//! This module provides:
 //!
-//! 1. **Ordering contract** ([`KeyEncoding`]) -- a trait that connectors
-//!    implement so their typed keys produce byte encodings whose lexicographic
-//!    order matches logical order. The coordinator itself never touches this
-//!    trait; it works with raw `&[u8]` boundaries.
+//! - **Ordering contract** ([`KeyEncoding`]) -- a trait that connectors
+//!   implement so their typed keys produce byte encodings whose lexicographic
+//!   order matches logical order. The coordinator itself never touches this
+//!   trait; it works with raw `&[u8]` boundaries.
 //!
-//! 2. **Typed key schemas** -- [`PathKey`], [`ManifestRowKey`], and
-//!    [`decode_manifest_row_key`] provide canonical encodings and decoding
-//!    for current shard-algebra consumers.
+//! - **Typed key schemas** -- [`PathKey`], [`ManifestRowKey`], and
+//!   [`decode_manifest_row_key`] provide canonical encodings and decoding
+//!   for current shard-algebra consumers.
 //!
-//! 3. **ShardSpec bridge helpers** -- fallible constructors that translate
-//!    typed key inputs into owned [`ShardSpec`] values while preserving
-//!    coordination-side validation and error semantics.
+//! - **ShardSpec bridge helpers** -- fallible constructors that translate
+//!   typed key inputs into owned [`ShardSpec`] values while preserving
+//!   coordination-side validation and error semantics.
 //!
-//! 4. **Key arithmetic** -- three pure functions for computing boundary keys
-//!    during split planning:
-//!    - [`prefix_successor`]: exclusive upper bound for a prefix scan
-//!      (analogous to FoundationDB `strinc` / CockroachDB `Key.PrefixEnd`).
-//!    - [`key_successor`]: minimal strict successor of an arbitrary key,
-//!      respecting the [`MAX_KEY_SIZE`] ceiling.
-//!    - [`byte_midpoint`]: approximate bisection point between two keys,
-//!      used by the split planner to halve a shard's range.
+//! - **Key arithmetic** -- three pure functions for computing boundary keys
+//!   during split planning:
+//!   - [`prefix_successor`]: exclusive upper bound for a prefix scan
+//!     (analogous to FoundationDB `strinc` / CockroachDB `Key.PrefixEnd`).
+//!   - [`key_successor`]: minimal strict successor of an arbitrary key,
+//!     respecting the [`MAX_KEY_SIZE`] ceiling.
+//!   - [`byte_midpoint`]: approximate bisection point between two keys,
+//!     used by the split planner to halve a shard's range.
 //!
-//!    All three return `Option` -- `None` signals that the requested successor
-//!    or midpoint does not exist within representable bounds.
+//!   All three return `Option` -- `None` signals that the requested successor
+//!   or midpoint does not exist within representable bounds.
 //!
-//! 5. **Error type** ([`PrefixShardError`]) -- models the failure modes when
-//!    converting a user-supplied prefix into a bounded key range.
+//! - **Error type** ([`PrefixShardError`]) -- models the failure modes when
+//!   converting a user-supplied prefix into a bounded key range.
 //!
-//! # Zero-allocation calling convention
+//! # Zero-allocation calling convention (key arithmetic)
 //!
-//! Arithmetic helpers take a mutable [`KeyBuf`] supplied by the caller and
+//! The key arithmetic helpers take a mutable [`KeyBuf`] supplied by the caller and
 //! return a slice borrowed from that buffer. The returned slice remains valid
 //! only until the same buffer is written again. Callers that need to retain a
 //! key across later operations must copy it.
@@ -217,7 +217,7 @@ impl<'a> PathKey<'a> {
         Some(Self { path })
     }
 
-    /// Borrow the underlying UTF-8 path.
+    /// Return a reference to the underlying UTF-8 path.
     #[must_use]
     pub const fn as_str(self) -> &'a str {
         self.path
@@ -310,10 +310,21 @@ pub fn decode_manifest_row_key(key: &[u8]) -> Option<(u64, u64)> {
 /// [`ShardSpec::try_with_range_and_metadata`]. This keeps range/metadata
 /// validation single-sourced in coordination code.
 ///
+/// # Errors
+///
+/// Returns [`ShardSpecInputError`] when coordination-level validation fails:
+///
+/// - [`KeyTooLarge`](ShardSpecInputError::KeyTooLarge) -- encoded start or
+///   end exceeds [`MAX_KEY_SIZE`].
+/// - [`InvertedRange`](ShardSpecInputError::InvertedRange) -- both keys are
+///   non-empty and encoded start >= encoded end.
+/// - [`MetadataTooLarge`](ShardSpecInputError::MetadataTooLarge) -- metadata
+///   exceeds the metadata size ceiling.
+///
 /// # Trade-offs
 ///
-/// - Allocates owned `Vec<u8>` values for both boundaries and metadata because
-///   [`ShardSpec`] stores owned bytes.
+/// - Allocates `Vec<u8>` values for both boundaries and metadata, which
+///   [`ShardSpec::try_with_range_and_metadata`] converts to `Box<[u8]>`.
 /// - Performs no local pre-validation so callers receive canonical
 ///   [`ShardSpecInputError`] variants from coordination validation.
 pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
@@ -321,12 +332,13 @@ pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
     end: &End,
     metadata: &[u8],
 ) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut encoded = KeyBuf::new();
-    start.encode_into(&mut encoded);
-    let start = encoded.as_bytes().to_vec();
+    let mut start_buf = KeyBuf::new();
+    start.encode_into(&mut start_buf);
+    let start = start_buf.as_bytes().to_vec();
 
-    end.encode_into(&mut encoded);
-    let end = encoded.as_bytes().to_vec();
+    let mut end_buf = KeyBuf::new();
+    end.encode_into(&mut end_buf);
+    let end = end_buf.as_bytes().to_vec();
 
     ShardSpec::try_with_range_and_metadata(start, end, metadata.to_vec())
 }
