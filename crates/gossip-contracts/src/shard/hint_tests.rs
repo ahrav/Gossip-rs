@@ -536,6 +536,65 @@ fn propagate_hint_on_split_manifest_rejects_empty_child_range() {
     );
 }
 
+#[test]
+fn propagate_hint_on_split_manifest_rejects_non_manifest_end_boundary() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let child_start = encode_manifest_row_key(7, 10);
+    let err = propagate_hint_on_split(&parent, &child_start, b"not-a-row")
+        .expect_err("non-manifest end boundary should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::InvalidManifestBoundary {
+            boundary: SplitBoundary::End
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_rejects_end_manifest_id_mismatch() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let child_start = encode_manifest_row_key(7, 25);
+    let child_end = encode_manifest_row_key(99, 75);
+
+    let err = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect_err("end manifest-id mismatch should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::ManifestIdMismatch {
+            parent: 7,
+            child: 99
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_rejects_end_row_beyond_parent() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 10,
+        end_row: 20,
+    };
+    let child_start = encode_manifest_row_key(7, 15);
+    let child_end = encode_manifest_row_key(7, 25);
+
+    let err = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect_err("end row beyond parent should fail");
+    assert_eq!(
+        err,
+        HintPropagationError::InvalidManifestBoundary {
+            boundary: SplitBoundary::End
+        }
+    );
+}
+
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 

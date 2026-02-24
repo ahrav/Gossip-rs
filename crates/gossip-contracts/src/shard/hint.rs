@@ -731,6 +731,12 @@ pub enum HintPropagationError {
         boundary: SplitBoundary,
     },
     /// Manifest child boundary is malformed or out of parent bounds.
+    ///
+    /// This variant covers both key-decode failures (bytes not decodable as
+    /// [`ManifestRowKey`]) and decoded-key out-of-bounds conditions (row falls
+    /// outside the parent's `[start_row, end_row)` interval).  Splitting into
+    /// separate variants is a future option if downstream callers need to
+    /// distinguish the two failure modes.
     InvalidManifestBoundary {
         /// Which boundary failed validation.
         boundary: SplitBoundary,
@@ -779,7 +785,9 @@ impl std::error::Error for HintPropagationError {}
 /// Derive a child hint from `parent_hint` and child key-range boundaries.
 ///
 /// Propagation rules:
-/// - `Range` stays `Range`.
+/// - `Range` stays `Range` unconditionally — no child-boundary validation is
+///   performed because Range hints carry no structural information to validate
+///   against.  Callers must validate child range ordering independently.
 /// - `Prefix` validates child bounds and demotes to `Range` because arbitrary
 ///   split boundaries inside one prefix shard are not representable as a single
 ///   child prefix.
@@ -865,6 +873,12 @@ fn validate_prefix_child_bounds(
     child_end: &[u8],
 ) -> Result<(), HintPropagationError> {
     let mut successor_buf = KeyBuf::new();
+    // When `prefix_successor` returns `None`, the parent prefix has no
+    // lexicographic successor (all-0xFF or empty).  `SplitBoundary::End` is
+    // reported because the successor *is* the end bound — no valid end bound
+    // exists.  This path is unreachable through the typed `prefix_shard` API,
+    // which rejects such prefixes with `PrefixShardError::NoSuccessor` at
+    // construction time.
     let successor = prefix_successor(prefix, &mut successor_buf).ok_or(
         HintPropagationError::InvalidPrefixBoundary {
             boundary: SplitBoundary::End,
