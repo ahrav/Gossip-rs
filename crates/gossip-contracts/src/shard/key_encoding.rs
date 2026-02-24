@@ -4,31 +4,40 @@
 //! lexicographically ordered byte strings (the same model used by Bigtable,
 //! Spanner, and FoundationDB).
 //!
-//! This module provides three building blocks:
+//! This module provides:
 //!
-//! 1. **Ordering contract** ([`KeyEncoding`]) -- a trait that connectors
-//!    implement so their typed keys produce byte encodings whose lexicographic
-//!    order matches logical order. The coordinator itself never touches this
-//!    trait; it works with raw `&[u8]` boundaries.
+//! - **Ordering contract and buffer** ([`KeyEncoding`], [`KeyBuf`]) -- a trait
+//!   that connectors implement so their typed keys produce byte encodings whose
+//!   lexicographic order matches logical order, plus a reusable stack buffer
+//!   that key arithmetic writes into. The coordinator itself never touches this
+//!   trait; it works with raw `&[u8]` boundaries.
 //!
-//! 2. **Key arithmetic** -- three pure functions for computing boundary keys
-//!    during split planning:
-//!    - [`prefix_successor`]: exclusive upper bound for a prefix scan
-//!      (analogous to FoundationDB `strinc` / CockroachDB `Key.PrefixEnd`).
-//!    - [`key_successor`]: minimal strict successor of an arbitrary key,
-//!      respecting the [`MAX_KEY_SIZE`] ceiling.
-//!    - [`byte_midpoint`]: approximate bisection point between two keys,
-//!      used by the split planner to halve a shard's range.
+//! - **Typed key schemas** -- [`PathKey`], [`ManifestRowKey`], and
+//!   [`decode_manifest_row_key`] provide canonical encodings and decoding
+//!   for current shard-algebra consumers.
 //!
-//!    All three return `Option` -- `None` signals that the requested successor
-//!    or midpoint does not exist within representable bounds.
+//! - **ShardSpec bridge helpers** -- fallible constructors that translate
+//!   typed key inputs into owned [`ShardSpec`] values while preserving
+//!   coordination-side validation and error semantics.
 //!
-//! 3. **Error type** ([`PrefixShardError`]) -- models the failure modes when
-//!    converting a user-supplied prefix into a bounded key range.
+//! - **Key arithmetic** -- three pure functions for computing boundary keys
+//!   during split planning:
+//!   - [`prefix_successor`]: exclusive upper bound for a prefix scan
+//!     (analogous to FoundationDB `strinc` / CockroachDB `Key.PrefixEnd`).
+//!   - [`key_successor`]: minimal strict successor of an arbitrary key,
+//!     respecting the [`MAX_KEY_SIZE`] ceiling.
+//!   - [`byte_midpoint`]: approximate bisection point between two keys,
+//!     used by the split planner to halve a shard's range.
 //!
-//! # Zero-allocation calling convention
+//!   All three return `Option` -- `None` signals that the requested successor
+//!   or midpoint does not exist within representable bounds.
 //!
-//! Arithmetic helpers take a mutable [`KeyBuf`] supplied by the caller and
+//! - **Error type** ([`PrefixShardError`]) -- models the failure modes when
+//!   converting a user-supplied prefix into a bounded key range.
+//!
+//! # Zero-allocation calling convention (key arithmetic)
+//!
+//! The key arithmetic helpers take a mutable [`KeyBuf`] supplied by the caller and
 //! return a slice borrowed from that buffer. The returned slice remains valid
 //! only until the same buffer is written again. Callers that need to retain a
 //! key across later operations must copy it.
@@ -39,7 +48,7 @@
 //! Whole-partition invariants (coverage, disjointness, child ordering across
 //! sibling shards) are validated in [`crate::coordination::shard_spec`].
 
-use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpecInputError};
+use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpec, ShardSpecInputError};
 use core::fmt;
 
 /// Reusable stack buffer for shard-key arithmetic.
@@ -60,7 +69,6 @@ impl KeyBuf {
     pub const CAPACITY: usize = MAX_KEY_SIZE + 1;
 
     /// Create an empty key buffer.
-    #[must_use]
     pub fn new() -> Self {
         Self {
             buf: [0u8; Self::CAPACITY],
@@ -72,19 +80,16 @@ impl KeyBuf {
     ///
     /// The returned slice borrows this buffer and is invalidated by the next
     /// mutating write to the same `KeyBuf`.
-    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
     }
 
     /// Active byte length.
-    #[must_use]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether no bytes are active.
-    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -163,6 +168,206 @@ pub trait KeyEncoding: Sized {
     fn encode_into(&self, buf: &mut KeyBuf);
 }
 
+/// UTF-8 path key encoded as identity bytes.
+///
+/// # Invariants
+///
+/// Encoding is exactly `path.as_bytes()`: no separator rewriting, Unicode
+/// normalization, or case folding.
+///
+/// # Trade-off
+///
+/// This keeps encoding deterministic and allocation-free, but logically
+/// equivalent filesystem paths with different textual forms compare as
+/// different keys. Callers that need canonical path semantics must normalize
+/// before constructing [`PathKey`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PathKey<'a> {
+    path: &'a str,
+}
+
+impl<'a> PathKey<'a> {
+    /// Create a path key from UTF-8 path text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path` is empty or if `path.len()` exceeds [`MAX_KEY_SIZE`].
+    pub const fn new(path: &'a str) -> Self {
+        assert!(!path.is_empty(), "PathKey path must not be empty");
+        assert!(
+            path.len() <= MAX_KEY_SIZE,
+            "PathKey path exceeds MAX_KEY_SIZE"
+        );
+        Self { path }
+    }
+
+    /// Return a reference to the underlying UTF-8 path.
+    pub const fn as_str(self) -> &'a str {
+        self.path
+    }
+}
+
+impl KeyEncoding for PathKey<'_> {
+    fn encode_into(&self, buf: &mut KeyBuf) {
+        buf.copy_from_slice(self.path.as_bytes());
+    }
+}
+
+/// Fixed-width manifest row key encoded as `(manifest_id, row)` in big-endian
+/// `u64`s.
+///
+/// Lexicographic byte ordering matches tuple ordering: compare by
+/// `manifest_id` first, then by `row`. The fixed 16-byte layout avoids
+/// delimiters/varints and keeps decode cost constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ManifestRowKey {
+    manifest_id: u64,
+    row: u64,
+}
+
+impl ManifestRowKey {
+    /// Fixed encoded width in bytes: 8-byte manifest ID + 8-byte row.
+    pub const ENCODED_LEN: usize = 16;
+
+    /// Create a manifest row key.
+    pub const fn new(manifest_id: u64, row: u64) -> Self {
+        Self { manifest_id, row }
+    }
+
+    /// Manifest identifier component.
+    pub const fn manifest_id(self) -> u64 {
+        self.manifest_id
+    }
+
+    /// Row component.
+    pub const fn row(self) -> u64 {
+        self.row
+    }
+}
+
+impl KeyEncoding for ManifestRowKey {
+    fn encode_into(&self, buf: &mut KeyBuf) {
+        let mut tmp = [0u8; Self::ENCODED_LEN];
+        tmp[..8].copy_from_slice(&self.manifest_id.to_be_bytes());
+        tmp[8..].copy_from_slice(&self.row.to_be_bytes());
+        buf.copy_from_slice(&tmp);
+    }
+}
+
+/// Decode a fixed-width [`ManifestRowKey`] byte encoding.
+///
+/// Returns a [`ManifestRowKey`] when `key` is exactly
+/// [`ManifestRowKey::ENCODED_LEN`] bytes containing two big-endian `u64`
+/// fields. Returns `None` for any other length.
+///
+/// This function validates framing only; semantic checks (for example,
+/// monotonic row ranges) are performed by higher-level helpers.
+pub fn decode_manifest_row_key(key: &[u8]) -> Option<ManifestRowKey> {
+    if key.len() != ManifestRowKey::ENCODED_LEN {
+        return None;
+    }
+    let manifest_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+    let row = u64::from_be_bytes(key[8..].try_into().unwrap());
+    Some(ManifestRowKey::new(manifest_id, row))
+}
+
+/// Construct a [`ShardSpec`] from typed start/end boundaries.
+///
+/// `start` and `end` are encoded via [`KeyEncoding`] and then validated by
+/// [`ShardSpec::try_with_range_and_metadata`]. This keeps range/metadata
+/// validation single-sourced in coordination code.
+///
+/// # Errors
+///
+/// Returns [`ShardSpecInputError`] when coordination-level validation fails:
+///
+/// - [`KeyTooLarge`](ShardSpecInputError::KeyTooLarge) -- encoded start or
+///   end exceeds [`MAX_KEY_SIZE`].
+/// - [`InvertedRange`](ShardSpecInputError::InvertedRange) -- both keys are
+///   non-empty and encoded start >= encoded end.
+/// - [`MetadataTooLarge`](ShardSpecInputError::MetadataTooLarge) -- metadata
+///   exceeds the metadata size ceiling.
+///
+/// # Trade-offs
+///
+/// - Allocates `Vec<u8>` values for both boundaries and metadata, which
+///   [`ShardSpec::try_with_range_and_metadata`] converts to `Box<[u8]>`.
+/// - Performs no local pre-validation so callers receive canonical
+///   [`ShardSpecInputError`] variants from coordination validation.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
+    start: &Start,
+    end: &End,
+    metadata: &[u8],
+) -> Result<ShardSpec, ShardSpecInputError> {
+    let mut start_buf = KeyBuf::new();
+    start.encode_into(&mut start_buf);
+    let start = start_buf.as_bytes().to_vec();
+
+    let mut end_buf = KeyBuf::new();
+    end.encode_into(&mut end_buf);
+    let end = end_buf.as_bytes().to_vec();
+
+    ShardSpec::try_with_range_and_metadata(start, end, metadata.to_vec())
+}
+
+/// Construct a prefix-bounded [`ShardSpec`] as `[prefix, prefix_successor)`.
+///
+/// The helper performs cheap prefix-specific checks first, then delegates final
+/// range/metadata validation to [`ShardSpec::try_with_range_and_metadata`].
+///
+/// # Errors
+///
+/// - [`PrefixShardError::EmptyPrefix`] if `prefix` is empty.
+/// - [`PrefixShardError::PrefixTooLarge`] if `prefix` exceeds
+///   [`MAX_KEY_SIZE`].
+/// - [`PrefixShardError::NoSuccessor`] for all-`0xFF` prefixes.
+/// - [`PrefixShardError::InvalidShardSpec`] if coordination-level shard-spec
+///   validation fails.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_prefix(
+    prefix: &[u8],
+    metadata: &[u8],
+) -> Result<ShardSpec, PrefixShardError> {
+    if prefix.is_empty() {
+        return Err(PrefixShardError::EmptyPrefix);
+    }
+    if prefix.len() > MAX_KEY_SIZE {
+        return Err(PrefixShardError::PrefixTooLarge {
+            size: prefix.len(),
+            max: MAX_KEY_SIZE,
+        });
+    }
+
+    let mut successor = KeyBuf::new();
+    let end = prefix_successor(prefix, &mut successor).ok_or(PrefixShardError::NoSuccessor)?;
+
+    ShardSpec::try_with_range_and_metadata(prefix.to_vec(), end.to_vec(), metadata.to_vec())
+        .map_err(PrefixShardError::from)
+}
+
+/// Construct a same-manifest [`ShardSpec`] from a half-open row range.
+///
+/// Both boundaries use the same `manifest_id`, so the resulting shard covers
+/// `[start_row, end_row)` within one manifest.
+///
+/// # Errors
+///
+/// Propagates [`ShardSpecInputError`] from [`shard_spec_from_keys`], including
+/// inverted/degenerate ranges (for example, `start_row >= end_row`) and
+/// metadata validation failures.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_manifest_range(
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    metadata: &[u8],
+) -> Result<ShardSpec, ShardSpecInputError> {
+    let start = ManifestRowKey::new(manifest_id, start_row);
+    let end = ManifestRowKey::new(manifest_id, end_row);
+    shard_spec_from_keys(&start, &end, metadata)
+}
+
 /// Compute the lexicographic successor of a byte prefix.
 ///
 /// Returns the smallest byte string strictly greater than `prefix` that also
@@ -180,9 +385,10 @@ pub trait KeyEncoding: Sized {
 ///    `0xFF` suffix.
 /// 3. Increment the last remaining byte by one.
 ///
-/// Truncation is essential: incrementing *after* trailing `0xFF` bytes would
-/// produce a longer string that is not a tight upper bound (it would leave a
-/// gap). Truncation + increment produces the shortest possible successor.
+/// Truncation is essential: incrementing the full key without truncating
+/// trailing `0xFF` bytes first would produce a longer string via carry
+/// propagation that is not a tight upper bound (it would leave a gap).
+/// Truncation + increment produces the shortest possible successor.
 ///
 /// # Returns `None`
 ///
@@ -209,7 +415,6 @@ pub trait KeyEncoding: Sized {
 /// prefix_successor(b"\xff", &mut buf)    => None              // top of keyspace
 /// prefix_successor(b"", &mut buf)        => None              // nothing to increment
 /// ```
-#[must_use]
 pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if prefix.len() > KeyBuf::CAPACITY {
         return None;
@@ -230,7 +435,7 @@ pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u
 
 /// Compute a midpoint key in the open interval `(a, b)`.
 ///
-/// Used by the split planner to bisect a shard's key range. The caller can
+/// Designed for split planning to bisect a shard's key range. The caller can
 /// then create two child shards covering `[parent_start, mid)` and
 /// `[mid, parent_end)`.
 ///
@@ -273,7 +478,6 @@ pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u
 ///
 /// `O(max(a.len(), b.len()))` time using stack-resident scratch buffers
 /// (bounded by [`KeyBuf::CAPACITY`]), with no heap allocation.
-#[must_use]
 pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if a >= b {
         return None;
@@ -334,7 +538,7 @@ pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a 
 
 /// Compute the smallest representable key that is strictly greater than `key`.
 ///
-/// This is the primitive the split planner uses to derive an exclusive
+/// This primitive derives an exclusive
 /// end-bound from an inclusive key, subject to the system-wide key size
 /// limit ([`MAX_KEY_SIZE`] = 4 KiB).
 ///
@@ -363,7 +567,6 @@ pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a 
 /// # Complexity
 ///
 /// `O(key.len())` time, no heap allocation.
-#[must_use]
 pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
     if key.len() > MAX_KEY_SIZE {
         return None;
@@ -396,7 +599,7 @@ pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
 ///    lexicographic successor (all `0xFF`), so the half-open range cannot be
 ///    bounded.
 /// 4. [`InvalidShardSpec`](Self::InvalidShardSpec) -- the derived range failed
-///    downstream validation in [`ShardSpec`](crate::coordination::shard_spec::ShardSpec).
+///    downstream validation in [`ShardSpec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PrefixShardError {
@@ -413,7 +616,7 @@ pub enum PrefixShardError {
     /// exclusive end-bound of the half-open range cannot be computed.
     NoSuccessor,
     /// The derived key range passed local validation but failed downstream
-    /// [`ShardSpec`](crate::coordination::shard_spec::ShardSpec) construction.
+    /// [`ShardSpec`] construction.
     InvalidShardSpec(ShardSpecInputError),
 }
 
@@ -451,297 +654,5 @@ impl From<ShardSpecInputError> for PrefixShardError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-    use rstest::rstest;
-
-    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-    struct BytesKey(Vec<u8>);
-
-    impl KeyEncoding for BytesKey {
-        fn encode_into(&self, buf: &mut KeyBuf) {
-            buf.copy_from_slice(&self.0);
-        }
-    }
-
-    #[test]
-    fn key_encoding_returns_encoded_bytes() {
-        let key = BytesKey(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        let mut buf = KeyBuf::new();
-        key.encode_into(&mut buf);
-        assert_eq!(buf.as_bytes(), [0xDE, 0xAD, 0xBE, 0xEF].as_slice());
-    }
-
-    #[test]
-    fn prefix_successor_basic() {
-        let mut buf = KeyBuf::new();
-        assert_eq!(prefix_successor(b"abc", &mut buf), Some(b"abd".as_slice()));
-        assert_eq!(
-            prefix_successor(b"ab\xff", &mut buf),
-            Some(b"ac".as_slice())
-        );
-        assert_eq!(prefix_successor(b"\xff\xff", &mut buf), None);
-        assert_eq!(prefix_successor(b"", &mut buf), None);
-    }
-
-    #[test]
-    fn key_successor_prefers_append_when_capacity_available() {
-        let mut buf = KeyBuf::new();
-        assert_eq!(key_successor(b"abc", &mut buf), Some(b"abc\0".as_slice()));
-    }
-
-    #[test]
-    fn key_successor_uses_increment_when_at_max_size() {
-        let mut key = vec![0; MAX_KEY_SIZE];
-        key[MAX_KEY_SIZE - 1] = 0x7F;
-        let mut expected = key.clone();
-        expected[MAX_KEY_SIZE - 1] = 0x80;
-
-        let mut buf = KeyBuf::new();
-        assert_eq!(key_successor(&key, &mut buf), Some(expected.as_slice()));
-    }
-
-    #[test]
-    fn key_successor_none_for_all_ff_at_max_size() {
-        let key = vec![u8::MAX; MAX_KEY_SIZE];
-        let mut buf = KeyBuf::new();
-        assert_eq!(key_successor(&key, &mut buf), None);
-    }
-
-    #[test]
-    fn byte_midpoint_rejects_oversized_inputs() {
-        let oversized_a = vec![0x40; MAX_KEY_SIZE + 1];
-        let oversized_b = vec![0xC0; MAX_KEY_SIZE + 1];
-
-        let mut buf = KeyBuf::new();
-        assert_eq!(
-            byte_midpoint(&oversized_a, &oversized_b, &mut buf),
-            None,
-            "inputs exceeding MAX_KEY_SIZE should be rejected"
-        );
-    }
-
-    #[test]
-    fn byte_midpoint_output_respects_max_key_size() {
-        let a = vec![0x40; MAX_KEY_SIZE];
-        let b = vec![0xC0; MAX_KEY_SIZE];
-
-        let mut buf = KeyBuf::new();
-        if let Some(mid) = byte_midpoint(&a, &b, &mut buf) {
-            assert!(
-                mid.len() <= MAX_KEY_SIZE,
-                "midpoint length {} exceeds MAX_KEY_SIZE {}",
-                mid.len(),
-                MAX_KEY_SIZE
-            );
-        }
-    }
-
-    #[test]
-    fn byte_midpoint_carry_regression() {
-        let mut buf = KeyBuf::new();
-        assert_eq!(
-            byte_midpoint(&[0x40], &[0xC0], &mut buf),
-            Some([0x80].as_slice())
-        );
-    }
-
-    #[test]
-    fn byte_midpoint_finds_interior_for_single_byte_gap() {
-        let mut buf = KeyBuf::new();
-        assert_eq!(
-            byte_midpoint(&[0x01], &[0x02], &mut buf),
-            Some([0x01, 0x00].as_slice())
-        );
-    }
-
-    // -- rstest parameterized: byte_midpoint edge cases with different lengths --
-
-    #[rstest]
-    #[case::both_empty(&[], &[], None)]
-    #[case::empty_vs_nonempty(&[], &[0x02], Some(vec![0x01]))]
-    #[case::full_byte_range(&[0x00], &[0xFF], Some(vec![0x7F]))]
-    #[case::shared_leading_zero_prefix(&[0x00, 0x00], &[0x00, 0x02], Some(vec![0x00, 0x01]))]
-    #[case::second_byte_gap(&[0x01, 0x00], &[0x01, 0x04], Some(vec![0x01, 0x02]))]
-    #[case::different_lengths_close(&[0x01], &[0x01, 0x00], None)]
-    #[case::high_bytes_different_lengths(&[0xFF], &[0xFF, 0x02], Some(vec![0xFF, 0x01]))]
-    #[case::wide_gap_different_lengths(&[0x10], &[0x10, 0x80], Some(vec![0x10, 0x40]))]
-    fn byte_midpoint_edge_cases(
-        #[case] a: &[u8],
-        #[case] b: &[u8],
-        #[case] expected: Option<Vec<u8>>,
-    ) {
-        let mut buf = KeyBuf::new();
-        assert_eq!(byte_midpoint(a, b, &mut buf), expected.as_deref());
-    }
-
-    // -- rstest parameterized: PrefixShardError Display formatting --
-
-    #[rstest]
-    #[case::empty_prefix(PrefixShardError::EmptyPrefix, "non-empty prefix")]
-    #[case::prefix_too_large(
-        PrefixShardError::PrefixTooLarge { size: 5000, max: 4096 },
-        "5000 bytes, max 4096",
-    )]
-    #[case::no_successor(PrefixShardError::NoSuccessor, "all bytes are 0xFF")]
-    fn prefix_shard_error_display_contains(
-        #[case] error: PrefixShardError,
-        #[case] expected_substr: &str,
-    ) {
-        let msg = error.to_string();
-        assert!(
-            msg.contains(expected_substr),
-            "expected Display output to contain {expected_substr:?}, got {msg:?}"
-        );
-    }
-
-    #[test]
-    fn prefix_shard_error_source_delegates_for_invalid_shard_spec() {
-        use std::error::Error;
-
-        let inner = ShardSpecInputError::KeyTooLarge {
-            size: 5000,
-            max: MAX_KEY_SIZE,
-        };
-        let err = PrefixShardError::InvalidShardSpec(inner.clone());
-        let source = err.source().expect("InvalidShardSpec should have a source");
-        assert_eq!(source.to_string(), inner.to_string());
-
-        // Non-delegating variants have no source.
-        assert!(PrefixShardError::EmptyPrefix.source().is_none());
-        assert!(PrefixShardError::NoSuccessor.source().is_none());
-        assert!(
-            PrefixShardError::PrefixTooLarge { size: 1, max: 4096 }
-                .source()
-                .is_none()
-        );
-    }
-
-    proptest! {
-        #![proptest_config(crate::test_util::miri_proptest_config())]
-
-        #[test]
-        fn prefix_successor_is_strictly_greater(prefix in proptest::collection::vec(any::<u8>(), 0..=32)) {
-            let mut buf = KeyBuf::new();
-            if let Some(succ) = prefix_successor(&prefix, &mut buf) {
-                prop_assert!(succ > prefix.as_slice());
-            } else {
-                let no_successor = prefix.is_empty() || prefix.iter().all(|&byte| byte == u8::MAX);
-                prop_assert!(no_successor);
-            }
-        }
-
-        #[test]
-        fn prefix_successor_is_upper_bound_for_prefixed_keys(
-            prefix in proptest::collection::vec(any::<u8>(), 1..=32),
-            suffix in proptest::collection::vec(any::<u8>(), 0..=32),
-        ) {
-            prop_assume!(prefix.iter().any(|&byte| byte != u8::MAX));
-            let mut buf = KeyBuf::new();
-            let succ = prefix_successor(&prefix, &mut buf).expect("non-all-ff prefix has successor");
-
-            let mut key = prefix.clone();
-            key.extend_from_slice(&suffix);
-
-            prop_assert!(key.as_slice() < succ);
-        }
-
-        #[test]
-        fn byte_midpoint_is_strictly_between_when_present(
-            a in proptest::collection::vec(any::<u8>(), 0..=32),
-            b in proptest::collection::vec(any::<u8>(), 0..=32),
-        ) {
-            let mut buf = KeyBuf::new();
-            if let Some(mid) = byte_midpoint(&a, &b, &mut buf) {
-                prop_assert!(a.as_slice() < mid);
-                prop_assert!(mid < b.as_slice());
-            }
-        }
-
-        // -- key_successor property tests --
-
-        /// `key_successor` result is strictly greater than the input when `Some`.
-        #[test]
-        fn key_successor_is_strictly_greater(
-            key in proptest::collection::vec(any::<u8>(), 0..=MAX_KEY_SIZE),
-        ) {
-            let mut buf = KeyBuf::new();
-            if let Some(succ) = key_successor(&key, &mut buf) {
-                prop_assert!(
-                    succ > key.as_slice(),
-                    "successor {succ:?} must be > input {key:?}"
-                );
-            }
-        }
-
-        /// `key_successor` returns `None` only when the key exceeds `MAX_KEY_SIZE`
-        /// or is all-`0xFF` at exactly `MAX_KEY_SIZE`.
-        #[test]
-        fn key_successor_none_only_when_expected(
-            key in proptest::collection::vec(any::<u8>(), 0..=(MAX_KEY_SIZE + 8)),
-        ) {
-            let mut buf = KeyBuf::new();
-            match key_successor(&key, &mut buf) {
-                Some(_) => {
-                    prop_assert!(key.len() <= MAX_KEY_SIZE);
-                }
-                None => {
-                    let oversized = key.len() > MAX_KEY_SIZE;
-                    let all_ff_at_max = key.len() == MAX_KEY_SIZE
-                        && key.iter().all(|&b| b == u8::MAX);
-                    prop_assert!(
-                        oversized || all_ff_at_max,
-                        "key_successor returned None unexpectedly for key of len {} \
-                         (oversized={oversized}, all_ff_at_max={all_ff_at_max})",
-                        key.len()
-                    );
-                }
-            }
-        }
-
-        /// Below `MAX_KEY_SIZE`, `key_successor` always appends `0x00`.
-        #[test]
-        fn key_successor_appends_zero_when_below_max(
-            key in proptest::collection::vec(any::<u8>(), 0..MAX_KEY_SIZE),
-        ) {
-            let mut buf = KeyBuf::new();
-            let succ = key_successor(&key, &mut buf).expect("below MAX_KEY_SIZE always has a successor");
-            let mut expected = key.clone();
-            expected.push(0x00);
-            prop_assert_eq!(succ, expected.as_slice());
-        }
-
-        /// At `MAX_KEY_SIZE`, `key_successor` delegates to `prefix_successor`.
-        #[test]
-        fn key_successor_delegates_to_prefix_successor_at_max(
-            key in proptest::collection::vec(any::<u8>(), MAX_KEY_SIZE..=MAX_KEY_SIZE),
-        ) {
-            let mut succ_buf = KeyBuf::new();
-            let mut prefix_buf = KeyBuf::new();
-            let succ = key_successor(&key, &mut succ_buf).map(|bytes| bytes.to_vec());
-            let prefix = prefix_successor(&key, &mut prefix_buf).map(|bytes| bytes.to_vec());
-            prop_assert_eq!(succ, prefix);
-        }
-
-        /// `byte_midpoint` with different-length inputs: the result (when `Some`)
-        /// is always strictly between `a` and `b`.
-        #[test]
-        fn byte_midpoint_different_lengths_strictly_between(
-            a in proptest::collection::vec(any::<u8>(), 0..=16),
-            extra in proptest::collection::vec(any::<u8>(), 1..=16),
-        ) {
-            // Build `b` by extending `a` so lengths differ.
-            let mut b = a.clone();
-            b.extend_from_slice(&extra);
-            // Ensure a < b (skip if not — the function returns None anyway).
-            let mut buf = KeyBuf::new();
-            if a.as_slice() < b.as_slice()
-                && let Some(mid) = byte_midpoint(&a, &b, &mut buf)
-            {
-                prop_assert!(a.as_slice() < mid);
-                prop_assert!(mid < b.as_slice());
-            }
-        }
-    }
-}
+#[path = "key_encoding_tests.rs"]
+mod tests;
