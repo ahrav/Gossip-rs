@@ -1,19 +1,19 @@
-//! Key encoding schemas, range arithmetic, and split computation.
+//! Public shard key primitives for split planning.
 //!
-//! Owns the shard algebra that governs how the scanner's keyspace is
-//! partitioned: key encoding schemas (`PathKey`, `NumericPrefixKey`, …),
-//! key-range types with intersection/union/containment operations, the split-key
-//! computation that divides oversize shards, ordering proofs, and the coverage
-//! verification logic that answers "did we scan everything?" after a run settles.
+//! This module currently exposes byte-level building blocks from
+//! [`key_encoding`]:
+//! - [`KeyEncoding`] for mapping logical keys into lexicographically sortable
+//!   bytes.
+//! - [`prefix_successor`], [`key_successor`], and [`byte_midpoint`] for
+//!   deterministic key-boundary derivation in split planning.
+//! - [`PrefixShardError`] for invalid prefix-based shard construction inputs.
 //!
-//! **Dependency direction:** May depend on `identity` and `coordination`
-//! (for ID types and shard metadata). Must not reference `connector` or
-//! `persistence`.
-//!
-//! **Key invariants:**
-//! - Split coverage — child shard key ranges must exactly partition the
-//!   parent's range with no gaps and no overlaps.
-//! - Key ordering — split keys are deterministic pure functions of their
-//!   inputs; same inputs always produce the same split point.
-//! - Range algebra correctness — intersection, union, and containment
-//!   operations are consistent with lexicographic byte ordering.
+//! It intentionally does not enforce whole-partition invariants (coverage,
+//! disjointness, child ordering). Those checks live in
+//! [`crate::coordination::shard_spec`].
+
+pub mod key_encoding;
+
+pub use key_encoding::{
+    KeyEncoding, PrefixShardError, byte_midpoint, key_successor, prefix_successor,
+};
