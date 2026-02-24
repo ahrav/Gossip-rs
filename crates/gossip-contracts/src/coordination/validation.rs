@@ -320,11 +320,7 @@ mod tests {
         old_cursor: &Cursor,
         spec: &ShardSpec,
     ) -> Result<(), CoordError> {
-        let update = match (new_cursor.last_key(), new_cursor.token()) {
-            (None, _) => CursorUpdate::initial(),
-            (Some(last_key), None) => CursorUpdate::new(last_key),
-            (Some(last_key), Some(token)) => CursorUpdate::with_token(last_key, token),
-        };
+        let update = CursorUpdate::from_cursor(new_cursor);
         validate_cursor_update_pooled(
             &update,
             old_cursor.last_key(),

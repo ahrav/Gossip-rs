@@ -1380,11 +1380,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
-        let update = CursorUpdate::new(
-            cursor
-                .last_key()
-                .expect("generate_forward_cursor always returns last_key"),
-        );
+        let update = CursorUpdate::from_cursor(&cursor);
 
         let now = self.context.now();
         match self
@@ -1417,11 +1413,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
-        let update = CursorUpdate::new(
-            cursor
-                .last_key()
-                .expect("generate_forward_cursor always returns last_key"),
-        );
+        let update = CursorUpdate::from_cursor(&cursor);
 
         let now = self.context.now();
         match self
@@ -1768,11 +1760,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let now = self.context.now();
-        let prev_update = CursorUpdate::new(
-            prev_cursor
-                .last_key()
-                .expect("stored checkpoint cursor always has last_key"),
-        );
+        let prev_update = CursorUpdate::from_cursor(&prev_cursor);
         match self
             .coordinator
             .checkpoint(now, self.tenant, &lease, &prev_update, prev_op_id)
@@ -1804,11 +1792,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
         // Generate a *different* cursor to trigger a payload hash mismatch.
         let different_cursor = self.generate_forward_cursor(worker, key);
-        let different_update = CursorUpdate::new(
-            different_cursor
-                .last_key()
-                .expect("generate_forward_cursor always returns last_key"),
-        );
+        let different_update = CursorUpdate::from_cursor(&different_cursor);
 
         let now = self.context.now();
         match self
@@ -2552,11 +2536,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             let mut checkpoints_ok: u32 = 0;
             let mut checkpoints_rejected: u32 = 0;
             for i in 0..num_checkpoints as usize {
-                let update = CursorUpdate::new(
-                    cursors[i]
-                        .last_key()
-                        .expect("session lifecycle cursor sequence always has last_key"),
-                );
+                let update = CursorUpdate::from_cursor(&cursors[i]);
                 match sess.checkpoint(now, &update, op_ids[i]) {
                     Ok(_) => checkpoints_ok += 1,
                     Err(e) => {
@@ -2589,11 +2569,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     })
                 }
                 SessionTerminalAction::Complete => {
-                    let terminal_update = CursorUpdate::new(
-                        cursors[terminal_idx]
-                            .last_key()
-                            .expect("terminal cursor always has last_key"),
-                    );
+                    let terminal_update = CursorUpdate::from_cursor(&cursors[terminal_idx]);
                     let is_terminal =
                         match sess.complete(now, &terminal_update, op_ids[terminal_idx]) {
                             Ok(_) => true,
@@ -2674,11 +2650,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         let residual_id = sess.initial_snapshot().spawned().last().copied();
                         // Complete the (now-narrowed) parent.
                         let complete_idx = terminal_idx + 1;
-                        let complete_update = CursorUpdate::new(
-                            complete_cursor
-                                .last_key()
-                                .expect("split_residual complete cursor always has last_key"),
-                        );
+                        let complete_update = CursorUpdate::from_cursor(&complete_cursor);
                         let is_terminal =
                             match sess.complete(now, &complete_update, op_ids[complete_idx]) {
                                 Ok(_) => true,

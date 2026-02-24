@@ -381,6 +381,18 @@ impl<'a> CursorUpdate<'a> {
         })
     }
 
+    /// Borrows key and token from an existing [`Cursor`].
+    ///
+    /// This is the standard way to create a `CursorUpdate` from a `Cursor`
+    /// when you need to pass owned cursor data through the borrowed API.
+    pub fn from_cursor(cursor: &'a Cursor) -> Self {
+        match (cursor.last_key(), cursor.token()) {
+            (None, _) => Self::initial(),
+            (Some(k), None) => Self::new(k),
+            (Some(k), Some(t)) => Self::with_token(k, t),
+        }
+    }
+
     /// The key of the last fully-processed item, if any.
     #[inline]
     #[must_use = "returns a reference that should be used"]

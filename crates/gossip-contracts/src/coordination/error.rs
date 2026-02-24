@@ -173,8 +173,7 @@ pub enum CoordError {
 
     /// Cursor key exceeds the maximum allowed length.
     ///
-    /// Emitted by both cursor validators (`validate_cursor_update` and
-    /// `validate_cursor_update_pooled`) before monotonicity/bounds checks.
+    /// Emitted by `validate_cursor_update_pooled` before monotonicity/bounds checks.
     CursorKeyTooLarge { size: usize, max: usize },
 
     /// Split validation failed. Wraps the detailed error from

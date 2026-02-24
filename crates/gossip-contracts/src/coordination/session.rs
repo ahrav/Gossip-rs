@@ -265,7 +265,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// The cursor at acquisition time (the last checkpoint before this session).
     ///
     /// Not updated by [`checkpoint`](Self::checkpoint) or
-    /// [`checkpoint`](Self::checkpoint) — the worker already knows
+    /// [`complete`](Self::complete) — the worker already knows
     /// the cursor it wrote. Use this to determine where to resume scanning
     /// after acquiring the shard.
     #[inline]
