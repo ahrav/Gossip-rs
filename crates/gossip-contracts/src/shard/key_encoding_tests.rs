@@ -30,9 +30,20 @@ fn path_key_uses_identity_utf8_encoding() {
 }
 
 #[test]
-#[should_panic(expected = "path length")]
+#[should_panic(expected = "PathKey path must not be empty")]
+fn path_key_new_rejects_empty_path() {
+    let _ = PathKey::new("");
+}
+
+#[test]
+#[should_panic(expected = "PathKey path exceeds MAX_KEY_SIZE")]
 fn path_key_new_rejects_oversized_path() {
     let _ = PathKey::new(&"a".repeat(MAX_KEY_SIZE + 1));
+}
+
+#[test]
+fn path_key_try_new_returns_none_for_empty_path() {
+    assert!(PathKey::try_new("").is_none());
 }
 
 #[test]
@@ -53,7 +64,9 @@ fn manifest_row_key_is_fixed_width_and_decodes() {
     let mut buf = KeyBuf::new();
     key.encode_into(&mut buf);
     assert_eq!(buf.len(), ManifestRowKey::ENCODED_LEN);
-    assert_eq!(decode_manifest_row_key(buf.as_bytes()), Some((42, 99)));
+    let decoded = decode_manifest_row_key(buf.as_bytes()).expect("valid encoding");
+    assert_eq!(decoded.manifest_id(), 42);
+    assert_eq!(decoded.row(), 99);
 }
 
 #[test]
@@ -68,11 +81,12 @@ fn shard_spec_from_manifest_range_encodes_boundaries() {
     let spec = shard_spec_from_manifest_range(7, 11, 12, b"meta")
         .expect("manifest range should encode into a valid shard spec");
 
-    assert_eq!(
-        decode_manifest_row_key(spec.key_range_start()),
-        Some((7, 11))
-    );
-    assert_eq!(decode_manifest_row_key(spec.key_range_end()), Some((7, 12)));
+    let start = decode_manifest_row_key(spec.key_range_start()).expect("valid start encoding");
+    assert_eq!(start.manifest_id(), 7);
+    assert_eq!(start.row(), 11);
+    let end = decode_manifest_row_key(spec.key_range_end()).expect("valid end encoding");
+    assert_eq!(end.manifest_id(), 7);
+    assert_eq!(end.row(), 12);
     assert_eq!(spec.metadata(), b"meta");
 }
 
@@ -297,8 +311,8 @@ proptest! {
 
     #[test]
     fn path_key_encoding_preserves_logical_order(
-        a in proptest::collection::vec(0u8..=127, 0..=64),
-        b in proptest::collection::vec(0u8..=127, 0..=64),
+        a in proptest::collection::vec(0u8..=127, 1..=64),
+        b in proptest::collection::vec(0u8..=127, 1..=64),
     ) {
         let a = String::from_utf8(a).expect("ASCII bytes should always be valid UTF-8");
         let b = String::from_utf8(b).expect("ASCII bytes should always be valid UTF-8");
@@ -362,10 +376,10 @@ proptest! {
         let mut buf = KeyBuf::new();
         ManifestRowKey::new(manifest_id, row).encode_into(&mut buf);
         prop_assert_eq!(buf.len(), ManifestRowKey::ENCODED_LEN);
-        prop_assert_eq!(
-            decode_manifest_row_key(buf.as_bytes()),
-            Some((manifest_id, row)),
-        );
+        let decoded = decode_manifest_row_key(buf.as_bytes())
+            .expect("valid encoding should roundtrip");
+        prop_assert_eq!(decoded.manifest_id(), manifest_id);
+        prop_assert_eq!(decoded.row(), row);
     }
 
     #[test]

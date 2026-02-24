@@ -6,9 +6,10 @@
 //!
 //! This module provides:
 //!
-//! - **Ordering contract** ([`KeyEncoding`]) -- a trait that connectors
-//!   implement so their typed keys produce byte encodings whose lexicographic
-//!   order matches logical order. The coordinator itself never touches this
+//! - **Ordering contract and buffer** ([`KeyEncoding`], [`KeyBuf`]) -- a trait
+//!   that connectors implement so their typed keys produce byte encodings whose
+//!   lexicographic order matches logical order, plus a reusable stack buffer
+//!   that key arithmetic writes into. The coordinator itself never touches this
 //!   trait; it works with raw `&[u8]` boundaries.
 //!
 //! - **Typed key schemas** -- [`PathKey`], [`ManifestRowKey`], and
@@ -194,24 +195,23 @@ impl<'a> PathKey<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if `path.len()` exceeds [`MAX_KEY_SIZE`]. Use [`try_new`](Self::try_new)
-    /// when the path comes from untrusted input.
+    /// Panics if `path` is empty or if `path.len()` exceeds [`MAX_KEY_SIZE`].
+    /// Use [`try_new`](Self::try_new) when the path comes from untrusted input.
     #[must_use]
-    pub fn new(path: &'a str) -> Self {
+    pub const fn new(path: &'a str) -> Self {
+        assert!(!path.is_empty(), "PathKey path must not be empty");
         assert!(
             path.len() <= MAX_KEY_SIZE,
-            "path length {} exceeds MAX_KEY_SIZE ({})",
-            path.len(),
-            MAX_KEY_SIZE
+            "PathKey path exceeds MAX_KEY_SIZE"
         );
         Self { path }
     }
 
-    /// Fallible constructor that returns `None` when the path exceeds
-    /// [`MAX_KEY_SIZE`].
+    /// Fallible constructor that returns `None` when the path is empty or
+    /// exceeds [`MAX_KEY_SIZE`].
     #[must_use]
     pub const fn try_new(path: &'a str) -> Option<Self> {
-        if path.len() > MAX_KEY_SIZE {
+        if path.is_empty() || path.len() > MAX_KEY_SIZE {
             return None;
         }
         Some(Self { path })
@@ -263,45 +263,33 @@ impl ManifestRowKey {
     pub const fn row(self) -> u64 {
         self.row
     }
-
-    fn encode_bytes(self) -> [u8; Self::ENCODED_LEN] {
-        let mut out = [0u8; Self::ENCODED_LEN];
-        out[..8].copy_from_slice(&self.manifest_id.to_be_bytes());
-        out[8..].copy_from_slice(&self.row.to_be_bytes());
-        out
-    }
 }
 
 impl KeyEncoding for ManifestRowKey {
     fn encode_into(&self, buf: &mut KeyBuf) {
-        let encoded = self.encode_bytes();
-        buf.copy_from_slice(&encoded);
+        let mut tmp = [0u8; Self::ENCODED_LEN];
+        tmp[..8].copy_from_slice(&self.manifest_id.to_be_bytes());
+        tmp[8..].copy_from_slice(&self.row.to_be_bytes());
+        buf.copy_from_slice(&tmp);
     }
 }
 
 /// Decode a fixed-width [`ManifestRowKey`] byte encoding.
 ///
-/// Returns `(manifest_id, row)` when `key` is exactly
+/// Returns a [`ManifestRowKey`] when `key` is exactly
 /// [`ManifestRowKey::ENCODED_LEN`] bytes containing two big-endian `u64`
 /// fields. Returns `None` for any other length.
 ///
 /// This function validates framing only; semantic checks (for example,
 /// monotonic row ranges) are performed by higher-level helpers.
 #[must_use]
-pub fn decode_manifest_row_key(key: &[u8]) -> Option<(u64, u64)> {
+pub fn decode_manifest_row_key(key: &[u8]) -> Option<ManifestRowKey> {
     if key.len() != ManifestRowKey::ENCODED_LEN {
         return None;
     }
-
-    let mut manifest_id_bytes = [0u8; 8];
-    manifest_id_bytes.copy_from_slice(&key[..8]);
-    let manifest_id = u64::from_be_bytes(manifest_id_bytes);
-
-    let mut row_bytes = [0u8; 8];
-    row_bytes.copy_from_slice(&key[8..]);
-    let row = u64::from_be_bytes(row_bytes);
-
-    Some((manifest_id, row))
+    let manifest_id = u64::from_be_bytes(key[..8].try_into().unwrap());
+    let row = u64::from_be_bytes(key[8..].try_into().unwrap());
+    Some(ManifestRowKey::new(manifest_id, row))
 }
 
 /// Construct a [`ShardSpec`] from typed start/end boundaries.
@@ -327,6 +315,7 @@ pub fn decode_manifest_row_key(key: &[u8]) -> Option<(u64, u64)> {
 ///   [`ShardSpec::try_with_range_and_metadata`] converts to `Box<[u8]>`.
 /// - Performs no local pre-validation so callers receive canonical
 ///   [`ShardSpecInputError`] variants from coordination validation.
+#[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
     start: &Start,
     end: &End,
@@ -356,6 +345,7 @@ pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
 /// - [`PrefixShardError::NoSuccessor`] for all-`0xFF` prefixes.
 /// - [`PrefixShardError::InvalidShardSpec`] if coordination-level shard-spec
 ///   validation fails.
+#[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_prefix(
     prefix: &[u8],
     metadata: &[u8],
@@ -387,6 +377,7 @@ pub fn shard_spec_from_prefix(
 /// Propagates [`ShardSpecInputError`] from [`shard_spec_from_keys`], including
 /// inverted/degenerate ranges (for example, `start_row >= end_row`) and
 /// metadata validation failures.
+#[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_manifest_range(
     manifest_id: u64,
     start_row: u64,
