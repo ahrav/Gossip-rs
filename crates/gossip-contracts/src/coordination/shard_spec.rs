@@ -22,12 +22,10 @@ use blake3::Hasher;
 
 use crate::identity::CanonicalBytes;
 
-/// Maximum size of a shard-spec key (start or end) in bytes (4 KiB).
-///
-/// Same ceiling as [`super::cursor::MAX_KEY_SIZE`] — both operate in the
-/// same lexicographic keyspace. Defined per-module to avoid cross-dependency
-/// on an unrelated constant.
-pub const MAX_KEY_SIZE: usize = 4_096;
+/// Re-exported from [`super::cursor`] — single source of truth for the
+/// system-wide key-size ceiling. Both cursor keys and shard-spec range
+/// boundaries operate in the same lexicographic keyspace.
+pub use super::cursor::MAX_KEY_SIZE;
 
 /// Maximum size of shard-spec opaque metadata in bytes (16 KiB).
 ///

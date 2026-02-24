@@ -58,7 +58,7 @@ use core::fmt;
 /// file paths, manifest row IDs). The coordinator never calls `encode()`
 /// directly -- it operates on raw `&[u8]` boundaries produced by the shard
 /// builder or split planner.
-pub trait KeyEncoding {
+pub trait KeyEncoding: Sized {
     /// Encode this key into bytes that preserve logical ordering under
     /// lexicographic byte comparison.
     fn encode(&self) -> Vec<u8>;
@@ -120,35 +120,34 @@ pub fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 ///
 /// # Algorithm
 ///
-/// The function interprets `a` and `b` as big-endian unsigned integers
-/// (right-padded with zeros to equal width) and computes `(a + b) / 2`:
+/// The shorter input is right-padded with `0x00` to
+/// `max_len = max(a.len(), b.len())`, then the function executes this exact
+/// sequence:
 ///
-/// 1. **Add** -- walk from LSB to MSB, accumulating carry, producing a
-///    sum of up to `(max_len + 1)` bytes.
-/// 2. **Halve** -- shift the sum right by one bit (divide by 2 from MSB to
-///    LSB, propagating the remainder).
-/// 3. **Canonicalize** -- trim leading zero bytes so the result is the
-///    shortest representation.
+/// 1. **Add** padded `a + b` from LSB to MSB with carry, yielding
+///    `max_len` or `max_len + 1` bytes.
+/// 2. **Halve** that sum by long division from MSB to LSB.
+/// 3. **Try overflow-normalized candidate**: when the quotient is
+///    `max_len + 1` bytes and begins with `0x00`, drop exactly that one
+///    leading byte and return it if `a < candidate < b`.
+/// 4. **Try fixed-width candidate**: test the unmodified quotient bytes and
+///    return them if `a < candidate < b`.
+/// 5. **Fallback successor**: if both arithmetic candidates fail, compute
+///    `key_successor(a)` and return it only if it remains `< b`.
 ///
-/// The midpoint is returned only if it falls strictly between `a` and `b`
-/// under lexicographic comparison.
+/// No other canonicalization is applied (notably, no general leading-zero
+/// trimming).
 ///
-/// # Why it can return `None` even for non-adjacent keys
-///
-/// Canonicalization (leading-zero trim) changes the byte length of the
-/// result, which can push it outside the `(a, b)` interval under lex
-/// ordering. For example, `byte_midpoint(&[0x01], &[0x02])` computes
-/// the numeric midpoint `0x01` (after `0x03 / 2`), but `[0x01]` is not
-/// strictly greater than `a = [0x01]`, so `None` is returned. This is a
-/// conservative choice: the split planner treats `None` as "this range is
-/// too narrow to bisect at this byte width."
+/// The successor fallback handles dense lexicographic ranges where the
+/// arithmetic midpoint lands on a boundary, e.g. `[0x01]..[0x02]` returns
+/// `[0x01, 0x00]`.
 ///
 /// # Returns `None`
 ///
-/// - `a >= b` (precondition violated).
-/// - Both inputs are empty.
-/// - The arithmetic midpoint, after canonicalization, does not land strictly
-///   inside `(a, b)`.
+/// - `a >= b` (precondition violated; includes both-empty inputs).
+/// - Either input exceeds [`MAX_KEY_SIZE`].
+/// - Neither arithmetic candidate is strictly inside `(a, b)`, and
+///   `key_successor(a)` is missing or `>= b`.
 ///
 /// # Complexity
 ///
@@ -160,29 +159,32 @@ pub fn byte_midpoint(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     }
 
     let max_len = a.len().max(b.len());
-    if max_len == 0 {
+    if max_len == 0 || max_len > MAX_KEY_SIZE {
         return None;
     }
 
-    // Phase 1: Big-endian addition from LSB to MSB.
+    // Phase 1: Big-endian addition from LSB to MSB with direct positional writes.
     //
     // We walk the bytes in reverse (least-significant first) so that carry
     // propagates naturally toward the most-significant byte. Shorter inputs
     // are implicitly zero-padded on the right (i.e., lower-significance
     // positions beyond their length contribute zero).
-    let mut sum_reversed = Vec::with_capacity(max_len + 1);
+    //
+    // The sum buffer is pre-allocated at `max_len + 1` to hold a possible
+    // carry into the most-significant position. Each byte is written
+    // directly at its final position (`idx + 1`), avoiding a post-loop
+    // reverse.
+    let sum_len = max_len + 1;
+    let mut sum = vec![0u8; sum_len];
     let mut carry: u16 = 0;
     for idx in (0..max_len).rev() {
         let a_byte = if idx < a.len() { u16::from(a[idx]) } else { 0 };
         let b_byte = if idx < b.len() { u16::from(b[idx]) } else { 0 };
         let total = a_byte + b_byte + carry;
-        sum_reversed.push((total & 0xFF) as u8);
+        sum[idx + 1] = (total & 0xFF) as u8;
         carry = total >> 8;
     }
-    if carry > 0 {
-        sum_reversed.push(carry as u8);
-    }
-    sum_reversed.reverse();
+    sum[0] = carry as u8;
 
     // Phase 2: Divide by 2 from MSB to LSB.
     //
@@ -190,34 +192,38 @@ pub fn byte_midpoint(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
     // next lower byte. Because the dividend is the sum of two byte strings,
     // the quotient is their arithmetic mean.
     let mut remainder: u16 = 0;
-    for byte in &mut sum_reversed {
+    for byte in &mut sum {
         let value = (remainder << 8) | u16::from(*byte);
         *byte = (value / 2) as u8;
         remainder = value % 2;
     }
 
-    // Phase 3: Canonicalize by trimming leading zeros.
+    // Phase 3: Validate arithmetic candidates.
     //
-    // Lex comparison treats shorter byte strings as "less than" longer ones
-    // that share the same prefix (since the shorter string has no byte at
-    // the divergence point). Trimming leading zeros produces the canonical
-    // shortest form, but can move the midpoint outside (a, b) -- the final
-    // bounds check below catches that.
-    let first_non_zero = sum_reversed
-        .iter()
-        .position(|&byte| byte != 0)
-        .unwrap_or(sum_reversed.len());
-    let midpoint = if first_non_zero == sum_reversed.len() {
-        Vec::new()
-    } else {
-        sum_reversed[first_non_zero..].to_vec()
-    };
-
-    // Reject if canonicalization pushed the midpoint to or past a boundary.
-    if midpoint.as_slice() <= a || midpoint.as_slice() >= b {
-        return None;
+    // If addition overflowed by one byte, halving yields a synthetic leading
+    // zero because the carried byte is at most 0x01. Drop exactly one byte and
+    // test that normalized candidate first.
+    if sum.len() == max_len + 1 && sum[0] == 0 {
+        let normalized = &sum[1..];
+        if normalized > a && normalized < b {
+            return Some(normalized.to_vec());
+        }
     }
-    Some(midpoint)
+
+    // Keep the fixed-width arithmetic candidate as-is when it lands in range.
+    // Leading zero bytes from input width are significant for lex ordering.
+    if sum.as_slice() > a && sum.as_slice() < b {
+        return Some(sum);
+    }
+
+    // Phase 4: If neither arithmetic candidate is interior, use the minimal
+    // strict successor of `a`.
+    let successor = key_successor(a)?;
+    if successor.as_slice() < b {
+        return Some(successor);
+    }
+
+    None
 }
 
 /// Compute the smallest representable key that is strictly greater than `key`.
@@ -379,13 +385,38 @@ mod tests {
     }
 
     #[test]
+    fn byte_midpoint_rejects_oversized_inputs() {
+        let oversized_a = vec![0x40; MAX_KEY_SIZE + 1];
+        let oversized_b = vec![0xC0; MAX_KEY_SIZE + 1];
+        assert_eq!(
+            byte_midpoint(&oversized_a, &oversized_b),
+            None,
+            "inputs exceeding MAX_KEY_SIZE should be rejected"
+        );
+    }
+
+    #[test]
+    fn byte_midpoint_output_respects_max_key_size() {
+        let a = vec![0x40; MAX_KEY_SIZE];
+        let b = vec![0xC0; MAX_KEY_SIZE];
+        if let Some(mid) = byte_midpoint(&a, &b) {
+            assert!(
+                mid.len() <= MAX_KEY_SIZE,
+                "midpoint length {} exceeds MAX_KEY_SIZE {}",
+                mid.len(),
+                MAX_KEY_SIZE
+            );
+        }
+    }
+
+    #[test]
     fn byte_midpoint_carry_regression() {
         assert_eq!(byte_midpoint(&[0x40], &[0xC0]), Some(vec![0x80]));
     }
 
     #[test]
-    fn byte_midpoint_may_not_find_interior_for_adjacent_inputs() {
-        assert_eq!(byte_midpoint(&[0x01], &[0x02]), None);
+    fn byte_midpoint_finds_interior_for_single_byte_gap() {
+        assert_eq!(byte_midpoint(&[0x01], &[0x02]), Some(vec![0x01, 0x00]));
     }
 
     // -- rstest parameterized: byte_midpoint edge cases with different lengths --
@@ -394,7 +425,7 @@ mod tests {
     #[case::both_empty(&[], &[], None)]
     #[case::empty_vs_nonempty(&[], &[0x02], Some(vec![0x01]))]
     #[case::full_byte_range(&[0x00], &[0xFF], Some(vec![0x7F]))]
-    #[case::canonicalization_pushes_outside(&[0x00, 0x00], &[0x00, 0x02], None)]
+    #[case::shared_leading_zero_prefix(&[0x00, 0x00], &[0x00, 0x02], Some(vec![0x00, 0x01]))]
     #[case::second_byte_gap(&[0x01, 0x00], &[0x01, 0x04], Some(vec![0x01, 0x02]))]
     #[case::different_lengths_close(&[0x01], &[0x01, 0x00], None)]
     #[case::high_bytes_different_lengths(&[0xFF], &[0xFF, 0x02], Some(vec![0xFF, 0x01]))]
