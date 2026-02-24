@@ -380,9 +380,8 @@ impl<'a> ShardMetadata<'a> {
             return Err(ShardHintDecodeError::NotShardMetadataFormat);
         }
 
-        let Some(hint_frame) = metadata.get(METADATA_HINT_LEN_PREFIX..hint_frame_end) else {
-            return Err(ShardHintDecodeError::NotShardMetadataFormat);
-        };
+        // Bounds validated: METADATA_HINT_LEN_PREFIX <= hint_frame_end <= metadata.len().
+        let hint_frame = &metadata[METADATA_HINT_LEN_PREFIX..hint_frame_end];
         let (hint, consumed) = ShardHint::decode(hint_frame)
             // Preserve a single strict-metadata failure surface for callers.
             .map_err(|_| ShardHintDecodeError::NotShardMetadataFormat)?;
@@ -448,12 +447,8 @@ fn decode_prefix<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHint
         });
     }
 
-    let Some(prefix) = data.get(PREFIX_HEADER_LEN..expected_min) else {
-        return Err(ShardHintDecodeError::TruncatedPrefix {
-            expected_min,
-            actual: data.len(),
-        });
-    };
+    // Bounds validated: PREFIX_HEADER_LEN <= expected_min <= data.len().
+    let prefix = &data[PREFIX_HEADER_LEN..expected_min];
 
     Ok((ShardHint::Prefix { prefix }, expected_min))
 }
@@ -466,24 +461,17 @@ fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHi
         });
     }
 
-    let Some(manifest_id) = read_be_u64(data, 1) else {
-        return Err(ShardHintDecodeError::TruncatedManifest {
-            expected_min: MANIFEST_LEN,
-            actual: data.len(),
-        });
-    };
-    let Some(start_row) = read_be_u64(data, 9) else {
-        return Err(ShardHintDecodeError::TruncatedManifest {
-            expected_min: MANIFEST_LEN,
-            actual: data.len(),
-        });
-    };
-    let Some(end_row) = read_be_u64(data, 17) else {
-        return Err(ShardHintDecodeError::TruncatedManifest {
-            expected_min: MANIFEST_LEN,
-            actual: data.len(),
-        });
-    };
+    // Bounds validated: data.len() >= MANIFEST_LEN (25 bytes), so all
+    // fixed-offset reads below are in-bounds.
+    let manifest_id = u64::from_be_bytes([
+        data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+    ]);
+    let start_row = u64::from_be_bytes([
+        data[9], data[10], data[11], data[12], data[13], data[14], data[15], data[16],
+    ]);
+    let end_row = u64::from_be_bytes([
+        data[17], data[18], data[19], data[20], data[21], data[22], data[23], data[24],
+    ]);
 
     if start_row >= end_row {
         return Err(ShardHintDecodeError::InvertedManifestRows { start_row, end_row });
@@ -497,11 +485,4 @@ fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHi
         },
         MANIFEST_LEN,
     ))
-}
-
-fn read_be_u64(data: &[u8], offset: usize) -> Option<u64> {
-    let bytes = data.get(offset..offset + 8)?;
-    Some(u64::from_be_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-    ]))
 }
