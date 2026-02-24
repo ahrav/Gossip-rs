@@ -44,7 +44,7 @@ The module provides six core capabilities:
 | `pooled.rs`     | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers |
 | `error.rs`      | Shared `CoordError` and `IdempotentOutcome`                           |
 | `run_errors.rs` | Run-management error types                                            |
-| `validation.rs` | `validate_lease`, `validate_cursor_update`, `check_op_idempotency`    |
+| `validation.rs` | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency` |
 | `events.rs`     | `EventCollector`, `EventKind`, `StateTransitionEvent`                 |
 | `facade.rs`     | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                   |
 | `session.rs`    | `WorkerSession` ergonomic wrapper with move/borrow lifecycle          |

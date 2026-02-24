@@ -74,7 +74,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{
     AcquireError, AcquireResult, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome,
     ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
@@ -1035,12 +1035,15 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// are validated, the cursor is advanced, and an op-log entry is
     /// recorded. Cursor/spec validation runs on borrowed pooled bytes
     /// (`validate_cursor_update_pooled`) to avoid per-call materialization.
+    ///
+    /// `new_cursor` is borrowed input only: bytes are copied into the
+    /// shard's pooled cursor storage and references are never retained.
     fn checkpoint(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        new_cursor: Cursor,
+        new_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CheckpointError> {
         let key = lease.shard_key();
@@ -1052,7 +1055,7 @@ impl CoordinationBackend for InMemoryCoordinator {
             .ok_or(CheckpointError::ShardNotFound { shard: key })?;
 
         // Idempotency before lease — replays succeed even after terminal/expiry.
-        let payload_hash = hash_checkpoint_payload(&new_cursor);
+        let payload_hash = hash_checkpoint_payload(new_cursor);
         if check_op_idempotency(record, op_id, payload_hash)?.is_some() {
             return Ok(IdempotentOutcome::Replayed(()));
         }
@@ -1060,13 +1063,13 @@ impl CoordinationBackend for InMemoryCoordinator {
         validate_lease(now, tenant, lease, record)?;
 
         validate_cursor_update_pooled(
-            &new_cursor,
+            new_cursor,
             record.cursor.last_key(&self.slab),
             record.spec.key_range_start(&self.slab),
             record.spec.key_range_end(&self.slab),
         )?;
 
-        record.cursor.update(&new_cursor, &mut self.slab)?;
+        record.cursor.update_from_ref(new_cursor, &mut self.slab)?;
         record.op_log_push(OpLogEntry::new(
             op_id,
             OpKind::Checkpoint,
@@ -1087,12 +1090,13 @@ impl CoordinationBackend for InMemoryCoordinator {
     /// The lease is cleared so no further mutations can occur under this
     /// shard. The final cursor is persisted for audit/resume purposes.
     /// Validation stays on borrowed pooled bytes to avoid extra heap work.
+    /// `final_cursor` references are not retained after the call.
     fn complete(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        final_cursor: Cursor,
+        final_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
         let key = lease.shard_key();
@@ -1103,7 +1107,7 @@ impl CoordinationBackend for InMemoryCoordinator {
             .and_then(|m| m.get_mut(&key))
             .ok_or(CompleteError::ShardNotFound { shard: key })?;
 
-        let payload_hash = hash_complete_payload(&final_cursor);
+        let payload_hash = hash_complete_payload(final_cursor);
         if check_op_idempotency(record, op_id, payload_hash)?.is_some() {
             return Ok(IdempotentOutcome::Replayed(()));
         }
@@ -1111,13 +1115,15 @@ impl CoordinationBackend for InMemoryCoordinator {
         validate_lease(now, tenant, lease, record)?;
 
         validate_cursor_update_pooled(
-            &final_cursor,
+            final_cursor,
             record.cursor.last_key(&self.slab),
             record.spec.key_range_start(&self.slab),
             record.spec.key_range_end(&self.slab),
         )?;
 
-        record.cursor.update(&final_cursor, &mut self.slab)?;
+        record
+            .cursor
+            .update_from_ref(final_cursor, &mut self.slab)?;
         record.assert_transition_legal(ShardStatus::Done);
         record.status = ShardStatus::Done;
         record.lease = None;
@@ -2162,16 +2168,20 @@ impl RunManagement for InMemoryCoordinator {
                     return Err(err.into());
                 }
             };
-            if !s.cursor().is_initial()
-                && let Err(err) = sr.cursor.update(s.cursor(), &mut self.slab)
-            {
-                // Current record + all staged records were not inserted yet;
-                // deallocate all staged slab fields before returning.
-                sr.deallocate_fields(&mut self.slab);
-                for (_, mut staged) in to_insert {
-                    staged.deallocate_fields(&mut self.slab);
+            if let Some(last_key) = s.cursor().last_key() {
+                let update = match s.cursor().token() {
+                    Some(token) => CursorUpdate::with_token(last_key, token),
+                    None => CursorUpdate::new(last_key),
+                };
+                if let Err(err) = sr.cursor.update_from_ref(&update, &mut self.slab) {
+                    // Current record + all staged records were not inserted yet;
+                    // deallocate all staged slab fields before returning.
+                    sr.deallocate_fields(&mut self.slab);
+                    for (_, mut staged) in to_insert {
+                        staged.deallocate_fields(&mut self.slab);
+                    }
+                    return Err(err.into());
                 }
-                return Err(err.into());
             }
             sr.assert_invariants();
             to_insert.push((key, sr));

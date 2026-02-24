@@ -33,7 +33,7 @@
 //! checkpoint the test verifies the cursor advanced *and* that the fence
 //! epoch did not change.
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
@@ -143,7 +143,7 @@ fn cursor_monotonicity_combined_with_split_residual() {
         now(13),
         test_tenant(),
         &lease,
-        test_cursor(b"f"),
+        &test_cursor(b"f"),
         OpId::from_raw(3),
     );
     assert!(ck_ok.is_ok(), "checkpoint at 'f' must succeed within [a,m)");
@@ -153,7 +153,7 @@ fn cursor_monotonicity_combined_with_split_residual() {
         now(14),
         test_tenant(),
         &lease,
-        test_cursor(b"n"),
+        &test_cursor(b"n"),
         OpId::from_raw(4),
     );
     assert!(
@@ -187,13 +187,19 @@ fn idempotency_before_lease_validation() {
             now(12),
             test_tenant(),
             &lease,
-            complete_cursor.clone(),
+            &complete_cursor,
             complete_op,
         )
         .unwrap();
 
     // Shard is now Done. Replay complete with the same lease, cursor, and op_id.
-    let replay = coord.complete(now(13), test_tenant(), &lease, complete_cursor, complete_op);
+    let replay = coord.complete(
+        now(13),
+        test_tenant(),
+        &lease,
+        &complete_cursor,
+        complete_op,
+    );
     assert!(
         matches!(replay, Ok(IdempotentOutcome::Replayed(()))),
         "replay on terminal shard must return Replayed, got: {replay:?}"
@@ -243,7 +249,7 @@ fn owner_divergence_with_matching_fence() {
             now(11),
             test_tenant(),
             &forged,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(1),
         )
         .unwrap_err();
@@ -397,7 +403,7 @@ fn lease_deadline_at_exact_boundary() {
         now(deadline - 1),
         test_tenant(),
         &lease,
-        test_cursor(b"d"),
+        &test_cursor(b"d"),
         OpId::from_raw(1),
     );
     assert!(ok.is_ok(), "checkpoint at deadline-1 must succeed");
@@ -407,7 +413,7 @@ fn lease_deadline_at_exact_boundary() {
         now(deadline),
         test_tenant(),
         &lease,
-        test_cursor(b"e"),
+        &test_cursor(b"e"),
         OpId::from_raw(2),
     );
     assert!(
@@ -476,12 +482,13 @@ fn oplog_eviction_then_replay() {
     // Fill the op-log with 16 checkpoints (op_ids 1..=16).
     for i in 1..=ShardRecord::OP_LOG_CAP as u64 {
         let key = vec![b'a' + i as u8]; // "b", "c", ..., "q"
+        let update = CursorUpdate::new(key.as_slice());
         let _ = coord
             .checkpoint(
                 now(10 + i),
                 test_tenant(),
                 &lease,
-                Cursor::with_last_key(key),
+                &update,
                 OpId::from_raw(i),
             )
             .unwrap();
@@ -498,7 +505,7 @@ fn oplog_eviction_then_replay() {
         now(29),
         test_tenant(),
         &lease,
-        test_cursor(b"y"),
+        &test_cursor(b"y"),
         OpId::from_raw(18),
     );
     assert!(
@@ -513,7 +520,7 @@ fn oplog_eviction_then_replay() {
         now(30),
         test_tenant(),
         &lease,
-        Cursor::with_last_key(b"b".to_vec()),
+        &CursorUpdate::new(b"b"),
         OpId::from_raw(1),
     );
     assert!(
@@ -605,7 +612,7 @@ fn same_worker_reacquire_bumps_fence() {
             now(LEASE_DURATION + 12),
             test_tenant(),
             &lease1,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(1),
         )
         .unwrap_err();
@@ -619,7 +626,7 @@ fn same_worker_reacquire_bumps_fence() {
         now(LEASE_DURATION + 12),
         test_tenant(),
         &lease2,
-        test_cursor(b"d"),
+        &test_cursor(b"d"),
         OpId::from_raw(2),
     );
     assert!(ok.is_ok(), "new lease checkpoint must succeed");

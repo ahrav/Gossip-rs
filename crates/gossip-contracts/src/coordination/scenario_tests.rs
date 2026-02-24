@@ -32,7 +32,7 @@
 
 use std::collections::HashSet;
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::CheckpointError;
 use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
@@ -106,13 +106,31 @@ fn scenario_full_run_lifecycle() {
 
     // -- Checkpoint x3 with progressively advancing cursors --
     let _ = coord
-        .checkpoint(now(4), tenant, &lease, test_cursor(b"d"), OpId::from_raw(1))
+        .checkpoint(
+            now(4),
+            tenant,
+            &lease,
+            &test_cursor(b"d"),
+            OpId::from_raw(1),
+        )
         .unwrap();
     let _ = coord
-        .checkpoint(now(5), tenant, &lease, test_cursor(b"h"), OpId::from_raw(2))
+        .checkpoint(
+            now(5),
+            tenant,
+            &lease,
+            &test_cursor(b"h"),
+            OpId::from_raw(2),
+        )
         .unwrap();
     let _ = coord
-        .checkpoint(now(6), tenant, &lease, test_cursor(b"m"), OpId::from_raw(3))
+        .checkpoint(
+            now(6),
+            tenant,
+            &lease,
+            &test_cursor(b"m"),
+            OpId::from_raw(3),
+        )
         .unwrap();
 
     // Verify cursor advanced to "m".
@@ -125,7 +143,13 @@ fn scenario_full_run_lifecycle() {
 
     // -- Complete shard --
     let _ = coord
-        .complete(now(7), tenant, &lease, test_cursor(b"y"), OpId::from_raw(4))
+        .complete(
+            now(7),
+            tenant,
+            &lease,
+            &test_cursor(b"y"),
+            OpId::from_raw(4),
+        )
         .unwrap();
     let record = coord.shard_lookup(&tenant, &key).unwrap();
     assert_eq!(
@@ -187,7 +211,7 @@ fn scenario_lease_expiry_and_reacquire() {
             now(11),
             tenant,
             &lease1,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(1),
         )
         .unwrap();
@@ -212,7 +236,7 @@ fn scenario_lease_expiry_and_reacquire() {
         now(expired_time + 1),
         tenant,
         &lease1,
-        test_cursor(b"g"),
+        &test_cursor(b"g"),
         OpId::from_raw(2),
     );
     assert!(
@@ -226,7 +250,7 @@ fn scenario_lease_expiry_and_reacquire() {
             now(expired_time + 2),
             tenant,
             &lease2,
-            test_cursor(b"y"),
+            &test_cursor(b"y"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -291,7 +315,7 @@ fn scenario_split_replace_and_children_completion() {
             now(13),
             tenant,
             &child1_lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(2),
         )
         .unwrap();
@@ -300,7 +324,7 @@ fn scenario_split_replace_and_children_completion() {
             now(14),
             tenant,
             &child1_lease,
-            test_cursor(b"l"),
+            &test_cursor(b"l"),
             OpId::from_raw(3),
         )
         .unwrap();
@@ -316,7 +340,7 @@ fn scenario_split_replace_and_children_completion() {
             now(16),
             tenant,
             &child2_lease,
-            test_cursor(b"r"),
+            &test_cursor(b"r"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -325,7 +349,7 @@ fn scenario_split_replace_and_children_completion() {
             now(17),
             tenant,
             &child2_lease,
-            test_cursor(b"y"),
+            &test_cursor(b"y"),
             OpId::from_raw(101),
         )
         .unwrap();
@@ -378,7 +402,7 @@ fn scenario_split_chain_double_residual() {
             now(11),
             tenant,
             &lease,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(1),
         )
         .unwrap();
@@ -404,7 +428,7 @@ fn scenario_split_chain_double_residual() {
             now(13),
             tenant,
             &lease,
-            test_cursor(b"g"),
+            &test_cursor(b"g"),
             OpId::from_raw(3),
         )
         .unwrap();
@@ -444,7 +468,7 @@ fn scenario_split_chain_double_residual() {
             now(15),
             tenant,
             &lease,
-            test_cursor(b"i"),
+            &test_cursor(b"i"),
             OpId::from_raw(5),
         )
         .unwrap();
@@ -465,7 +489,7 @@ fn scenario_split_chain_double_residual() {
             now(17),
             tenant,
             &r1_result.lease,
-            test_cursor(b"y"),
+            &test_cursor(b"y"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -486,7 +510,7 @@ fn scenario_split_chain_double_residual() {
             now(19),
             tenant,
             &r2_result.lease,
-            test_cursor(b"l"),
+            &test_cursor(b"l"),
             OpId::from_raw(200),
         )
         .unwrap();
@@ -529,9 +553,10 @@ fn scenario_oplog_eviction_boundary() {
     // The shard range is [a, z), so we use keys b..r (17 distinct forward values).
     for i in 1u64..=17 {
         let key_byte = b'a' + i as u8; // b, c, d, ..., r
-        let cursor = Cursor::with_last_key(vec![key_byte]);
+        let key = [key_byte];
+        let cursor = CursorUpdate::new(&key);
         let _ = coord
-            .checkpoint(now(10 + i), tenant, &lease, cursor, OpId::from_raw(i))
+            .checkpoint(now(10 + i), tenant, &lease, &cursor, OpId::from_raw(i))
             .unwrap_or_else(|e| {
                 panic!("checkpoint op_id={i} should succeed, got: {e:?}");
             });
@@ -539,9 +564,9 @@ fn scenario_oplog_eviction_boundary() {
 
     // op_id=1 has been evicted (cap=16, pushed 17). Replaying op_id=1
     // with a forward cursor should be treated as a new operation (Executed).
-    let forward_cursor = Cursor::with_last_key(vec![b's']);
+    let forward_cursor = CursorUpdate::new(b"s");
     let evicted_result = coord
-        .checkpoint(now(28), tenant, &lease, forward_cursor, OpId::from_raw(1))
+        .checkpoint(now(28), tenant, &lease, &forward_cursor, OpId::from_raw(1))
         .unwrap();
     assert!(
         evicted_result.is_executed(),
@@ -550,9 +575,14 @@ fn scenario_oplog_eviction_boundary() {
 
     // op_id=17 is still in the log. Replaying it with a different cursor
     // should produce OpIdConflict.
-    let conflict_cursor = Cursor::with_last_key(vec![b't']);
-    let conflict_result =
-        coord.checkpoint(now(29), tenant, &lease, conflict_cursor, OpId::from_raw(17));
+    let conflict_cursor = CursorUpdate::new(b"t");
+    let conflict_result = coord.checkpoint(
+        now(29),
+        tenant,
+        &lease,
+        &conflict_cursor,
+        OpId::from_raw(17),
+    );
     assert!(
         matches!(conflict_result, Err(CheckpointError::OpIdConflict { .. })),
         "op_id=17 with different cursor should produce OpIdConflict, got: {conflict_result:?}"
@@ -675,7 +705,7 @@ fn scenario_worker_self_recovery() {
             now(11),
             tenant,
             &lease1,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(1),
         )
         .unwrap();
@@ -684,7 +714,7 @@ fn scenario_worker_self_recovery() {
             now(12),
             tenant,
             &lease1,
-            test_cursor(b"h"),
+            &test_cursor(b"h"),
             OpId::from_raw(2),
         )
         .unwrap();
@@ -717,7 +747,7 @@ fn scenario_worker_self_recovery() {
             now(reacquire_time + 1),
             tenant,
             &lease2,
-            test_cursor(b"p"),
+            &test_cursor(b"p"),
             OpId::from_raw(3),
         )
         .unwrap();
@@ -726,7 +756,7 @@ fn scenario_worker_self_recovery() {
             now(reacquire_time + 2),
             tenant,
             &lease2,
-            test_cursor(b"y"),
+            &test_cursor(b"y"),
             OpId::from_raw(4),
         )
         .unwrap();

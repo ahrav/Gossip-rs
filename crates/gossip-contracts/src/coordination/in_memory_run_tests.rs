@@ -9,6 +9,7 @@
 // (children appear in list_shards and get_run_progress after split).
 
 use super::*;
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::run::{InitialShard, RunConfig, RunManagement, RunStatus, ShardFilter};
 use crate::coordination::shard_spec::{CursorSemantics, ShardLimitScope, ShardSpec};
 use crate::coordination::test_fixtures::{
@@ -73,7 +74,7 @@ fn split_residual_child_visible_in_list_shards() {
             now(4),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(b"f".to_vec()),
+            &CursorUpdate::new(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -125,7 +126,7 @@ fn checkpoint_shard_last_key(
             now(checkpoint_t),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(last_key.to_vec()),
+            &CursorUpdate::new(last_key),
             OpId::from_raw(op_id),
         )
         .unwrap();
@@ -155,7 +156,7 @@ fn complete_shard_with_key(
             now(complete_t),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(last_key.to_vec()),
+            &CursorUpdate::new(last_key),
             OpId::from_raw(op_id),
         )
         .unwrap();
@@ -191,7 +192,7 @@ fn park_shard_after_checkpoint(
             now(step.checkpoint_t),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(step.checkpoint_key.to_vec()),
+            &CursorUpdate::new(step.checkpoint_key),
             OpId::from_raw(step.checkpoint_op_id),
         )
         .unwrap();
@@ -218,7 +219,7 @@ fn coordinator_with_split_children_for_watermark()
             now(4),
             test_tenant(),
             &root_lease,
-            Cursor::with_last_key(b"b".to_vec()),
+            &CursorUpdate::new(b"b"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -317,7 +318,7 @@ fn all_shards_terminal_watermark_none() {
             now(4),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(b"f".to_vec()),
+            &CursorUpdate::new(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -326,7 +327,7 @@ fn all_shards_terminal_watermark_none() {
             now(5),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(b"y".to_vec()),
+            &CursorUpdate::new(b"y"),
             OpId::from_raw(11),
         )
         .unwrap();
@@ -407,7 +408,7 @@ fn single_active_shard_watermark_equals_its_key() {
             now(4),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(b"f".to_vec()),
+            &CursorUpdate::new(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -945,7 +946,7 @@ fn unpark_shard_cursor_preserved() {
             now(4),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(b"f".to_vec()),
+            &CursorUpdate::new(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -1033,7 +1034,7 @@ fn unpark_then_reacquire_and_checkpoint() {
             now(4),
             test_tenant(),
             &lease,
-            Cursor::with_last_key(b"d".to_vec()),
+            &CursorUpdate::new(b"d"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -1067,7 +1068,7 @@ fn unpark_then_reacquire_and_checkpoint() {
             now(8),
             test_tenant(),
             &new_lease,
-            Cursor::with_last_key(b"g".to_vec()),
+            &CursorUpdate::new(b"g"),
             OpId::from_raw(13),
         )
         .unwrap();
@@ -1118,7 +1119,7 @@ fn unpark_shard_reintroduces_cursor_into_watermark() {
             now(4),
             test_tenant(),
             &lease10,
-            Cursor::with_last_key(b"c".to_vec()),
+            &CursorUpdate::new(b"c"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -1572,7 +1573,7 @@ fn full_run_lifecycle_create_register_process_complete() {
             now(4),
             test_tenant(),
             &lease_10,
-            Cursor::with_last_key(b"f".to_vec()),
+            &CursorUpdate::new(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -1581,7 +1582,7 @@ fn full_run_lifecycle_create_register_process_complete() {
             now(5),
             test_tenant(),
             &lease_10,
-            Cursor::with_last_key(b"l".to_vec()),
+            &CursorUpdate::new(b"l"),
             OpId::from_raw(11),
         )
         .unwrap();
@@ -1597,7 +1598,7 @@ fn full_run_lifecycle_create_register_process_complete() {
             now(7),
             test_tenant(),
             &lease_11,
-            Cursor::with_last_key(b"y".to_vec()),
+            &CursorUpdate::new(b"y"),
             OpId::from_raw(12),
         )
         .unwrap();

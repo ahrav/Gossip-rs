@@ -5,7 +5,7 @@
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
-use gossip_contracts::coordination::cursor::Cursor;
+use gossip_contracts::coordination::cursor::{Cursor, CursorUpdate};
 use gossip_contracts::coordination::in_memory::InMemoryCoordinator;
 use gossip_contracts::coordination::run::{InitialShard, RunConfig, RunManagement, ShardFilter};
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
@@ -115,12 +115,12 @@ fn bench_checkpoint(c: &mut Criterion) {
 
                 b.iter(|| {
                     op_counter += 1;
-                    let cursor = Cursor::with_last_key(vec![0x42]);
+                    let cursor = CursorUpdate::new(&[0x42]);
                     let r = coord.checkpoint(
                         time,
                         tenant(),
                         &lease,
-                        cursor,
+                        &cursor,
                         OpId::from_raw(op_counter),
                     );
                     let _ = black_box(r);

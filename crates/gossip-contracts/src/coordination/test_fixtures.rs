@@ -5,7 +5,7 @@
 //! `in_memory_tests`, `conformance_tests`, `scenario_tests`, and any future
 //! coordination test modules.
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::lease::Lease;
 use crate::coordination::record::ParkReason;
@@ -60,8 +60,8 @@ pub fn other_tenant() -> TenantId {
     TenantId::from_bytes([0x02; 32])
 }
 
-pub fn test_cursor(key: &[u8]) -> Cursor {
-    Cursor::with_last_key(key.to_vec())
+pub fn test_cursor(key: &[u8]) -> CursorUpdate<'_> {
+    CursorUpdate::new(key)
 }
 
 /// Create a coordinator with a single run containing one shard `[a, z)`.
@@ -143,14 +143,9 @@ pub fn checkpoint_ok(
     cursor_key: &[u8],
     op_id: u64,
 ) {
+    let cursor = test_cursor(cursor_key);
     let _ = coord
-        .checkpoint(
-            now(t),
-            test_tenant(),
-            lease,
-            test_cursor(cursor_key),
-            OpId::from_raw(op_id),
-        )
+        .checkpoint(now(t), test_tenant(), lease, &cursor, OpId::from_raw(op_id))
         .expect("checkpoint should succeed");
 }
 
@@ -165,14 +160,9 @@ pub fn complete_ok(
     cursor_key: &[u8],
     op_id: u64,
 ) {
+    let cursor = test_cursor(cursor_key);
     let _ = coord
-        .complete(
-            now(t),
-            test_tenant(),
-            lease,
-            test_cursor(cursor_key),
-            OpId::from_raw(op_id),
-        )
+        .complete(now(t), test_tenant(), lease, &cursor, OpId::from_raw(op_id))
         .expect("complete should succeed");
 }
 

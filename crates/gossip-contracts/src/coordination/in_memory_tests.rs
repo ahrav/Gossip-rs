@@ -108,12 +108,57 @@ fn acquire_after_lease_expiry() {
 }
 
 #[test]
+fn borrowed_checkpoint_complete_path_works() {
+    // Trait-style dispatch hits the borrowed `CursorUpdate` signatures
+    // directly, mirroring the allocation-free hot path.
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let c = CursorUpdate::new(b"c");
+    let d = CursorUpdate::new(b"d");
+    let y = CursorUpdate::new(b"y");
+
+    let first = <InMemoryCoordinator as CoordinationBackend>::checkpoint(
+        &mut coord,
+        now(2),
+        test_tenant(),
+        &lease,
+        &c,
+        OpId::from_raw(1000),
+    )
+    .unwrap();
+    assert!(first.is_executed());
+
+    let second = <InMemoryCoordinator as CoordinationBackend>::checkpoint(
+        &mut coord,
+        now(3),
+        test_tenant(),
+        &lease,
+        &d,
+        OpId::from_raw(1001),
+    )
+    .unwrap();
+    assert!(second.is_executed());
+
+    let done = <InMemoryCoordinator as CoordinationBackend>::complete(
+        &mut coord,
+        now(4),
+        test_tenant(),
+        &lease,
+        &y,
+        OpId::from_raw(1002),
+    )
+    .unwrap();
+    assert!(done.is_executed());
+}
+
+#[test]
 fn acquire_terminal_rejected() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
     // Drive shard to terminal (Done) so we can test that acquire rejects it.
-    let cursor = test_cursor(b"m");
+    let cursor = &test_cursor(b"m");
     let _ = coord
         .complete(now(2), test_tenant(), &lease, cursor, OpId::from_raw(1))
         .unwrap();
@@ -173,7 +218,7 @@ fn checkpoint_basic() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
-    let cursor = test_cursor(b"b");
+    let cursor = &test_cursor(b"b");
     let result = coord
         .checkpoint(now(2), test_tenant(), &lease, cursor, OpId::from_raw(1))
         .unwrap();
@@ -187,12 +232,12 @@ fn checkpoint_op_id_conflict() {
 
     let op = OpId::from_raw(1);
     let _ = coord
-        .checkpoint(now(2), test_tenant(), &lease, test_cursor(b"b"), op)
+        .checkpoint(now(2), test_tenant(), &lease, &test_cursor(b"b"), op)
         .unwrap();
 
     // Same op_id, different payload -> OpIdConflict.
     let err = coord
-        .checkpoint(now(3), test_tenant(), &lease, test_cursor(b"c"), op)
+        .checkpoint(now(3), test_tenant(), &lease, &test_cursor(b"c"), op)
         .unwrap_err();
     assert!(matches!(err, CheckpointError::OpIdConflict { .. }));
 }
@@ -207,7 +252,7 @@ fn complete_basic() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
-    let cursor = test_cursor(b"m");
+    let cursor = &test_cursor(b"m");
     let result = coord
         .complete(now(2), test_tenant(), &lease, cursor, OpId::from_raw(1))
         .unwrap();
@@ -391,7 +436,7 @@ fn split_residual_basic() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -428,7 +473,7 @@ fn split_residual_cursor_out_of_bounds() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"r"),
+            &test_cursor(b"r"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -527,9 +572,15 @@ fn op_log_eviction_treats_old_op_as_new() {
     // Push 17 ops (cap is 16) to evict the first one.
     let mut cursor_key = b"b".to_vec();
     for i in 1..=17u64 {
-        let cursor = Cursor::with_last_key(cursor_key.clone());
+        let cursor = CursorUpdate::new(cursor_key.as_slice());
         let _ = coord
-            .checkpoint(now(i + 1), test_tenant(), &lease, cursor, OpId::from_raw(i))
+            .checkpoint(
+                now(i + 1),
+                test_tenant(),
+                &lease,
+                &cursor,
+                OpId::from_raw(i),
+            )
             .unwrap();
         cursor_key[0] = b'b' + (i as u8).min(23); // advance monotonically, clamped to stay within [a, z)
     }
@@ -537,13 +588,13 @@ fn op_log_eviction_treats_old_op_as_new() {
     // Retry the first op — it was evicted, so it's treated as a new op
     // rather than a replay. It will fail because its cursor (b"b") would
     // regress from the current position.
-    let old_cursor = Cursor::with_last_key(b"b".to_vec());
+    let old_cursor = CursorUpdate::new(b"b");
     let err = coord
         .checkpoint(
             now(20),
             test_tenant(),
             &lease,
-            old_cursor,
+            &old_cursor,
             OpId::from_raw(1),
         )
         .unwrap_err();
@@ -579,7 +630,7 @@ fn only_latest_fence_holder_can_mutate() {
             now(LEASE_DURATION + 3),
             test_tenant(),
             &old_lease,
-            test_cursor(b"b"),
+            &test_cursor(b"b"),
             OpId::from_raw(1),
         )
         .unwrap_err();
@@ -593,7 +644,7 @@ fn only_latest_fence_holder_can_mutate() {
             now(LEASE_DURATION + 3),
             test_tenant(),
             &old_lease,
-            test_cursor(b"b"),
+            &test_cursor(b"b"),
             OpId::from_raw(2),
         )
         .unwrap_err();
@@ -622,7 +673,7 @@ fn only_latest_fence_holder_can_mutate() {
             now(LEASE_DURATION + 3),
             test_tenant(),
             &new_lease,
-            test_cursor(b"b"),
+            &test_cursor(b"b"),
             OpId::from_raw(4),
         )
         .unwrap();
@@ -648,7 +699,7 @@ fn split_residual_replay_via_spawned_after_eviction() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -665,13 +716,14 @@ fn split_residual_replay_via_spawned_after_eviction() {
     // Push 16+ checkpoint ops to evict the split_residual op_log entry.
     let mut key_byte = b'e';
     for i in 1..=17u64 {
-        let cursor = Cursor::with_last_key(vec![key_byte]);
+        let key = [key_byte];
+        let cursor = CursorUpdate::new(&key);
         let _ = coord
             .checkpoint(
                 now(10 + i),
                 test_tenant(),
                 &lease,
-                cursor,
+                &cursor,
                 OpId::from_raw(300 + i),
             )
             .unwrap();
@@ -714,7 +766,7 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
         ShardStatus::Active,
         None,
         &test_spec(), // [a, z)
-        &test_cursor(b"d"),
+        &Cursor::with_last_key(b"d".to_vec()),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -788,13 +840,13 @@ fn complete_replay_after_terminal() {
     let cursor = test_cursor(b"m");
     let op = OpId::from_raw(1);
     let first = coord
-        .complete(now(2), test_tenant(), &lease, cursor.clone(), op)
+        .complete(now(2), test_tenant(), &lease, &cursor, op)
         .unwrap();
     assert!(first.is_executed());
 
     // Replay same op_id + payload after shard is terminal (Done).
     let second = coord
-        .complete(now(3), test_tenant(), &lease, cursor, op)
+        .complete(now(3), test_tenant(), &lease, &cursor, op)
         .unwrap();
     assert!(
         second.is_replay(),
@@ -874,7 +926,7 @@ fn split_residual_op_id_conflict() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -1025,7 +1077,7 @@ fn split_residual_exceeds_global_limit() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -1074,7 +1126,7 @@ fn checkpoint_wrong_tenant_returns_not_found() {
             now(2),
             other_tenant(),
             &lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(1),
         )
         .unwrap_err();
@@ -1094,7 +1146,7 @@ fn complete_wrong_tenant_returns_not_found() {
             now(2),
             other_tenant(),
             &lease,
-            test_cursor(b"m"),
+            &test_cursor(b"m"),
             OpId::from_raw(1),
         )
         .unwrap_err();
@@ -1131,7 +1183,7 @@ fn split_residual_wrong_tenant_returns_not_found() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -1165,7 +1217,7 @@ fn split_residual_replay_via_oplog_returns_replayed() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -1222,7 +1274,7 @@ fn split_residual_parent_continues_with_shrunk_range() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(100),
         )
         .unwrap();
@@ -1240,7 +1292,7 @@ fn split_residual_parent_continues_with_shrunk_range() {
             now(4),
             test_tenant(),
             &lease,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(300),
         )
         .unwrap();
@@ -1252,7 +1304,7 @@ fn split_residual_parent_continues_with_shrunk_range() {
             now(5),
             test_tenant(),
             &lease,
-            test_cursor(b"n"),
+            &test_cursor(b"n"),
             OpId::from_raw(400),
         )
         .unwrap_err();
@@ -1267,7 +1319,7 @@ fn split_residual_parent_continues_with_shrunk_range() {
             now(6),
             test_tenant(),
             &lease,
-            test_cursor(b"g"),
+            &test_cursor(b"g"),
             OpId::from_raw(500),
         )
         .unwrap();
@@ -1295,7 +1347,7 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
             now(2),
             test_tenant(),
             &lease_w1,
-            test_cursor(b"f"),
+            &test_cursor(b"f"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -1326,7 +1378,7 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
             now(LEASE_DURATION + 5),
             test_tenant(),
             &lease_w2,
-            test_cursor(b"l"), // within [a, m)
+            &test_cursor(b"l"), // within [a, m)
             OpId::from_raw(30),
         )
         .unwrap();
@@ -1359,7 +1411,7 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
             now(LEASE_DURATION + 7),
             test_tenant(),
             &child_lease,
-            test_cursor(b"p"),
+            &test_cursor(b"p"),
             OpId::from_raw(40),
         )
         .unwrap();
@@ -1370,7 +1422,7 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
             now(LEASE_DURATION + 8),
             test_tenant(),
             &child_lease,
-            test_cursor(b"y"), // within [m, z)
+            &test_cursor(b"y"), // within [m, z)
             OpId::from_raw(50),
         )
         .unwrap();
@@ -1415,7 +1467,7 @@ fn lifecycle_split_residual_twice_then_complete_children() {
             now(2),
             test_tenant(),
             &lease,
-            test_cursor(b"d"),
+            &test_cursor(b"d"),
             OpId::from_raw(10),
         )
         .unwrap();
@@ -1433,7 +1485,7 @@ fn lifecycle_split_residual_twice_then_complete_children() {
             now(4),
             test_tenant(),
             &lease,
-            test_cursor(b"g"),
+            &test_cursor(b"g"),
             OpId::from_raw(30),
         )
         .unwrap();
@@ -1455,7 +1507,7 @@ fn lifecycle_split_residual_twice_then_complete_children() {
             now(6),
             test_tenant(),
             &lease,
-            test_cursor(b"i"), // within [a, j)
+            &test_cursor(b"i"), // within [a, j)
             OpId::from_raw(50),
         )
         .unwrap();
@@ -1472,7 +1524,7 @@ fn lifecycle_split_residual_twice_then_complete_children() {
             now(8),
             test_tenant(),
             &r1_acq.lease,
-            test_cursor(b"y"),
+            &test_cursor(b"y"),
             OpId::from_raw(60),
         )
         .unwrap();
@@ -1489,7 +1541,7 @@ fn lifecycle_split_residual_twice_then_complete_children() {
             now(10),
             test_tenant(),
             &r2_acq.lease,
-            test_cursor(b"l"),
+            &test_cursor(b"l"),
             OpId::from_raw(70),
         )
         .unwrap();

@@ -11,6 +11,10 @@
 //!   or resume state. The coordinator stores and returns this verbatim
 //!   but never inspects it.
 //!
+//! The owned [`Cursor`] is used for durable snapshots and by-value APIs.
+//! [`CursorUpdate`] is the borrowed companion used on checkpoint/complete
+//! hot paths to avoid building intermediate owned cursors.
+//!
 //! Reference: Bacon et al., "Spanner: Becoming a SQL System" (2017) —
 //! query restart protocol with opaque restart tokens + ordered resume keys.
 
@@ -98,6 +102,19 @@ pub struct Cursor {
     /// It MUST NOT be interpreted, compared, or logged at the coordination
     /// layer.
     token: Option<Box<[u8]>>,
+}
+
+/// Borrowed cursor view for allocation-free checkpoint/complete updates.
+///
+/// `CursorUpdate` borrows key/token bytes from caller-owned storage so hot
+/// checkpoint paths can avoid building owned `Cursor` values first.
+///
+/// Empty tokens normalize to `None` to preserve `Cursor::from_parts` semantics
+/// and idempotency-hash compatibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorUpdate<'a> {
+    last_key: Option<&'a [u8]>,
+    token: Option<&'a [u8]>,
 }
 
 impl Cursor {
@@ -260,6 +277,155 @@ impl Cursor {
     }
 }
 
+impl<'a> CursorUpdate<'a> {
+    /// Initial update: no progress, no token.
+    #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
+    pub fn initial() -> Self {
+        Self {
+            last_key: None,
+            token: None,
+        }
+    }
+
+    /// Construct an update with a `last_key` and no token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` is empty.
+    #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
+    pub fn new(last_key: &'a [u8]) -> Self {
+        assert!(
+            !last_key.is_empty(),
+            "last_key must not be empty when present"
+        );
+        Self {
+            last_key: Some(last_key),
+            token: None,
+        }
+    }
+
+    /// Construct an update from both layers.
+    ///
+    /// Empty `token` is normalized to `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` is empty.
+    #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
+    pub fn with_token(last_key: &'a [u8], token: &'a [u8]) -> Self {
+        assert!(
+            !last_key.is_empty(),
+            "last_key must not be empty when present"
+        );
+        Self {
+            last_key: Some(last_key),
+            token: if token.is_empty() { None } else { Some(token) },
+        }
+    }
+
+    /// Fallible constructor for `last_key`-only updates.
+    ///
+    /// # Errors
+    ///
+    /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
+    /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
+    pub fn try_new(last_key: &'a [u8]) -> Result<Self, CursorInputError> {
+        if last_key.is_empty() {
+            return Err(CursorInputError::EmptyLastKey);
+        }
+        if last_key.len() > MAX_KEY_SIZE {
+            return Err(CursorInputError::KeyTooLarge {
+                size: last_key.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        Ok(Self {
+            last_key: Some(last_key),
+            token: None,
+        })
+    }
+
+    /// Fallible constructor for key+token updates.
+    ///
+    /// Empty `token` is normalized to `None`.
+    ///
+    /// # Errors
+    ///
+    /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
+    /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`CursorInputError::TokenTooLarge`] — `token` exceeds
+    ///   [`MAX_TOKEN_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
+    pub fn try_with_token(last_key: &'a [u8], token: &'a [u8]) -> Result<Self, CursorInputError> {
+        if last_key.is_empty() {
+            return Err(CursorInputError::EmptyLastKey);
+        }
+        if last_key.len() > MAX_KEY_SIZE {
+            return Err(CursorInputError::KeyTooLarge {
+                size: last_key.len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if token.len() > MAX_TOKEN_SIZE {
+            return Err(CursorInputError::TokenTooLarge {
+                size: token.len(),
+                max: MAX_TOKEN_SIZE,
+            });
+        }
+        Ok(Self {
+            last_key: Some(last_key),
+            token: if token.is_empty() { None } else { Some(token) },
+        })
+    }
+
+    /// Borrows key and token from an existing [`Cursor`].
+    ///
+    /// This is the standard way to create a `CursorUpdate` from a `Cursor`
+    /// when you need to pass owned cursor data through the borrowed API.
+    pub fn from_cursor(cursor: &'a Cursor) -> Self {
+        match (cursor.last_key(), cursor.token()) {
+            (None, _) => Self::initial(),
+            (Some(k), None) => Self::new(k),
+            (Some(k), Some(t)) => Self::with_token(k, t),
+        }
+    }
+
+    /// The key of the last fully-processed item, if any.
+    #[inline]
+    #[must_use = "returns a reference that should be used"]
+    pub fn last_key(&self) -> Option<&[u8]> {
+        self.last_key
+    }
+
+    /// The connector-opaque resume token, if any.
+    #[inline]
+    #[must_use = "returns a reference that should be used"]
+    pub fn token(&self) -> Option<&[u8]> {
+        self.token
+    }
+}
+
+#[inline]
+fn write_cursor_canonical_parts(last_key: Option<&[u8]>, token: Option<&[u8]>, h: &mut Hasher) {
+    match last_key {
+        None => 0u8.write_canonical(h),
+        Some(key) => {
+            1u8.write_canonical(h);
+            key.write_canonical(h);
+        }
+    }
+    match token {
+        None => 0u8.write_canonical(h),
+        Some(tok) => {
+            1u8.write_canonical(h);
+            tok.write_canonical(h);
+        }
+    }
+}
+
 /// `CanonicalBytes` for `Cursor`.
 ///
 /// Encoding:
@@ -276,20 +442,18 @@ impl Cursor {
 impl CanonicalBytes for Cursor {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
-        match &self.last_key {
-            None => 0u8.write_canonical(h),
-            Some(key) => {
-                1u8.write_canonical(h);
-                key.as_ref().write_canonical(h);
-            }
-        }
-        match &self.token {
-            None => 0u8.write_canonical(h),
-            Some(tok) => {
-                1u8.write_canonical(h);
-                tok.as_ref().write_canonical(h);
-            }
-        }
+        write_cursor_canonical_parts(self.last_key(), self.token(), h);
+    }
+}
+
+/// `CursorUpdate` uses the same canonical encoding as [`Cursor`].
+///
+/// This keeps op-log idempotency payload hashes stable across owned and
+/// borrowed checkpoint/complete call paths.
+impl CanonicalBytes for CursorUpdate<'_> {
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        write_cursor_canonical_parts(self.last_key(), self.token(), h);
     }
 }
 
@@ -297,7 +461,7 @@ impl CanonicalBytes for Cursor {
 // CursorInputError
 // ============================================================================
 
-/// Error returned by fallible [`Cursor`] constructors.
+/// Error returned by fallible [`Cursor`] and [`CursorUpdate`] constructors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorInputError {
     /// The `last_key` was empty. A present key must contain at least
@@ -538,6 +702,33 @@ mod tests {
     #[should_panic(expected = "must not be empty")]
     fn cursor_from_parts_empty_last_key_panics() {
         let _ = Cursor::from_parts(vec![], b"token".to_vec());
+    }
+
+    #[test]
+    fn cursor_update_with_token_empty_token_becomes_none() {
+        let u = CursorUpdate::with_token(b"key", b"");
+        assert_eq!(u.last_key(), Some(b"key".as_slice()));
+        assert!(u.token().is_none());
+    }
+
+    #[test]
+    fn cursor_update_try_with_token_over_max() {
+        let token = vec![0xCD; MAX_TOKEN_SIZE + 1];
+        let err = CursorUpdate::try_with_token(b"key", &token).unwrap_err();
+        assert_eq!(
+            err,
+            CursorInputError::TokenTooLarge {
+                size: MAX_TOKEN_SIZE + 1,
+                max: MAX_TOKEN_SIZE,
+            }
+        );
+    }
+
+    #[test]
+    fn cursor_update_views_match_inputs() {
+        let u = CursorUpdate::with_token(b"k", b"t");
+        assert_eq!(u.last_key(), Some(b"k".as_slice()));
+        assert_eq!(u.token(), Some(b"t".as_slice()));
     }
 
     // -------------------------------------------------------------------
@@ -827,6 +1018,20 @@ mod tests {
         // Bypass the panic in with_last_key by constructing via from_raw_parts.
         let c_some_empty = Cursor::from_raw_parts(Some(Box::new([])), None);
         assert_ne!(canonical_digest(&c_none), canonical_digest(&c_some_empty));
+    }
+
+    #[test]
+    fn cursor_update_canonical_bytes_matches_cursor() {
+        let c = Cursor::from_parts(b"key".to_vec(), b"token".to_vec());
+        let u = CursorUpdate::with_token(b"key", b"token");
+        assert_eq!(canonical_digest(&c), canonical_digest(&u));
+    }
+
+    #[test]
+    fn cursor_update_empty_token_hash_compatible_with_cursor() {
+        let c = Cursor::from_parts(b"key".to_vec(), vec![]);
+        let u = CursorUpdate::with_token(b"key", b"");
+        assert_eq!(canonical_digest(&c), canonical_digest(&u));
     }
 
     // -------------------------------------------------------------------

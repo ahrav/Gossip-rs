@@ -67,7 +67,7 @@
 
 use gossip_stdx::{ByteSlab, ByteSlot, SlabFull};
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::shard_spec::ShardSpec;
 
 // ============================================================================
@@ -277,38 +277,27 @@ pub(crate) struct PooledCursor {
 }
 
 impl PooledCursor {
+    #[inline]
+    fn allocate_fields(
+        last_key: Option<&[u8]>,
+        token: Option<&[u8]>,
+        slab: &mut ByteSlab,
+    ) -> Result<(Option<ByteSlot>, Option<ByteSlot>), SlabFull> {
+        let slots = allocate_with_rollback([last_key.unwrap_or(&[]), token.unwrap_or(&[])], slab)?;
+        let last_key = last_key.map(|_| slots[0]);
+        let token = token.map(|_| slots[1]);
+        Ok((last_key, token))
+    }
+
     /// Copy a `Cursor`'s byte fields into the slab, returning a pooled
     /// handle.
-    ///
-    /// Cannot reuse [`allocate_with_rollback`] because cursor fields are
-    /// `Option`-wrapped (0, 1, or 2 allocations depending on which fields
-    /// are `Some`). Rollback is handled manually: if the `token` allocation
-    /// fails, any already-allocated `last_key` slot is deallocated before
-    /// returning the error.
     ///
     /// # Errors
     ///
     /// Returns [`SlabFull`] if the slab cannot accommodate all present
     /// fields. On error, no slab space is leaked.
     pub(crate) fn from_cursor(cursor: &Cursor, slab: &mut ByteSlab) -> Result<Self, SlabFull> {
-        let last_key = match cursor.last_key() {
-            Some(k) => Some(slab.allocate(k)?),
-            None => None,
-        };
-
-        let token = match cursor.token() {
-            Some(t) => match slab.allocate(t) {
-                Ok(slot) => Some(slot),
-                Err(e) => {
-                    if let Some(slot) = last_key {
-                        slab.deallocate(slot);
-                    }
-                    return Err(e);
-                }
-            },
-            None => None,
-        };
-
+        let (last_key, token) = Self::allocate_fields(cursor.last_key(), cursor.token(), slab)?;
         Ok(Self { last_key, token })
     }
 
@@ -359,24 +348,25 @@ impl PooledCursor {
         }
     }
 
-    /// Replace all fields with data from `new_cursor`, providing a strong
-    /// exception guarantee.
+    /// Replace all fields from a borrowed [`CursorUpdate`] without requiring
+    /// an owned [`Cursor`] allocation on the caller side.
     ///
-    /// Same allocate-then-release pattern as `PooledShardSpec::update`:
-    /// new fields are fully allocated before old fields are released. On
-    /// failure, `self` is untouched.
+    /// Uses the same strong exception guarantee as `PooledShardSpec::update`:
+    /// all new slots are allocated first, then old slots are released and
+    /// swapped.
+    /// Input references are copied into slab-owned slots and are never
+    /// retained past the call boundary.
     ///
     /// # Errors
     ///
     /// Returns [`SlabFull`] if the slab cannot accommodate the new fields.
     /// On error, `self` is unchanged.
-    pub(crate) fn update(
+    pub(crate) fn update_from_ref(
         &mut self,
-        new_cursor: &Cursor,
+        update: &CursorUpdate<'_>,
         slab: &mut ByteSlab,
     ) -> Result<(), SlabFull> {
-        let PooledCursor { last_key, token } = PooledCursor::from_cursor(new_cursor, slab)?;
-        // New allocation succeeded — now safe to release old fields.
+        let (last_key, token) = Self::allocate_fields(update.last_key(), update.token(), slab)?;
         self.release_fields(slab);
         self.last_key = last_key;
         self.token = token;
@@ -441,6 +431,7 @@ impl PooledCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordination::cursor::CursorUpdate;
     use crate::test_util::{
         arb_bounded_shard_spec, arb_cursor, arb_shard_spec, miri_proptest_config,
     };
@@ -522,13 +513,13 @@ mod tests {
     }
 
     #[test]
-    fn pooled_cursor_update_strong_exception_guarantee() {
+    fn pooled_cursor_update_from_ref_strong_exception_guarantee() {
         let mut slab = ByteSlab::with_capacity(4096);
         let c1 = Cursor::with_last_key(b"aaa".to_vec());
-        let c2 = Cursor::from_parts(b"bbb".to_vec(), b"tok".to_vec());
-
         let mut pooled = PooledCursor::from_cursor(&c1, &mut slab).unwrap();
-        pooled.update(&c2, &mut slab).unwrap();
+
+        let update = CursorUpdate::with_token(b"bbb", b"tok");
+        pooled.update_from_ref(&update, &mut slab).unwrap();
         assert_eq!(pooled.last_key(&slab), Some(b"bbb".as_slice()));
         assert_eq!(pooled.token(&slab), Some(b"tok".as_slice()));
 
@@ -554,6 +545,34 @@ mod tests {
         let result = PooledCursor::from_cursor(&cursor, &mut slab);
         assert!(result.is_err(), "should fail: slab too small for 2 fields");
         assert_eq!(slab.live_count(), 0, "rollback must clean up partial alloc");
+    }
+
+    #[test]
+    fn rollback_cursor_update_from_ref_token_failure_preserves_original() {
+        // Existing cursor consumes one 16-byte slot; only one slot remains.
+        // `update_from_ref` needs two slots and must roll back partial allocs.
+        let mut slab = ByteSlab::with_capacity(32);
+        let original = Cursor::with_last_key(b"aaa".to_vec());
+        let mut pooled = PooledCursor::from_cursor(&original, &mut slab).unwrap();
+        let live_before = slab.live_count();
+
+        let update = CursorUpdate::with_token(b"bbb", b"tok");
+        let result = pooled.update_from_ref(&update, &mut slab);
+        assert!(
+            result.is_err(),
+            "should fail: slab too small for two replacement fields"
+        );
+        assert_eq!(
+            slab.live_count(),
+            live_before,
+            "rollback must preserve original live slot count"
+        );
+        assert_eq!(pooled.last_key(&slab), Some(b"aaa".as_slice()));
+        assert_eq!(pooled.token(&slab), None);
+
+        // Clean up original allocation so ByteSlab debug-drop observes no leaks.
+        pooled.release_fields(&mut slab);
+        assert_eq!(slab.live_count(), 0);
     }
 
     #[test]

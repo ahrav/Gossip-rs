@@ -7,6 +7,10 @@
 //! define how shards are assigned to workers, how progress is checkpointed, and
 //! how ownership is transferred via fencing tokens.
 //!
+//! Checkpoint/complete mutations take borrowed [`CursorUpdate`] inputs to
+//! avoid transient heap allocations. Owned [`Cursor`] values are only used
+//! for persisted snapshots and read-side materialization.
+//!
 //! **Dependency direction:** May depend on `identity` (for ID types and
 //! `CanonicalBytes`). Must not reference `shard`, `connector`, or `persistence`.
 //!
@@ -40,7 +44,7 @@ pub mod traits;
 pub mod validation;
 
 pub use cursor::{
-    Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, MAX_KEY_SIZE,
+    Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, CursorUpdate, MAX_KEY_SIZE,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
 pub use error::{
@@ -77,7 +81,7 @@ pub use split::{
     hash_split_residual_payload,
 };
 pub use traits::CoordinationBackend;
-pub use validation::{check_op_idempotency, validate_cursor_update, validate_lease};
+pub use validation::{check_op_idempotency, validate_lease};
 
 #[cfg(test)]
 mod conformance_tests;

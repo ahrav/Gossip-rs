@@ -69,22 +69,24 @@
 //!
 //! The cached [`ShardSnapshot`] reflects the shard state at acquisition
 //! time. It is **not** updated by [`checkpoint`](WorkerSession::checkpoint)
-//! because the worker already knows the cursor it just wrote, and the
-//! backend validates cursor monotonicity and bounds against the
-//! authoritative [`ShardRecord`](super::record::ShardRecord), not
-//! the session's cached snapshot. Updating the snapshot on every
-//! checkpoint would add allocation overhead for no correctness benefit.
+//! because the worker
+//! already knows the cursor it just wrote, and the backend validates cursor
+//! monotonicity and bounds against the authoritative
+//! [`ShardRecord`](super::record::ShardRecord), not the session's cached
+//! snapshot. Updating the snapshot on every checkpoint would add allocation
+//! overhead for no correctness benefit.
 //! Similarly, [`renew`](WorkerSession::renew) updates the lease
 //! deadline (via `Lease::set_deadline`) and the capacity hint, but
 //! not the snapshot.
 //!
 //! The snapshot **is** updated by [`split_residual`](WorkerSession::split_residual)
-//! because the key range narrows, and subsequent [`checkpoint`](WorkerSession::checkpoint)
-//! calls must not present cursors outside the narrowed range. While the
-//! backend would reject such cursors regardless, keeping the session's
-//! snapshot consistent avoids confusing the worker's own bounds logic.
+//! because the key range narrows, and subsequent
+//! [`checkpoint`](WorkerSession::checkpoint) calls must not present
+//! cursors outside the narrowed range. While the backend would reject such
+//! cursors regardless, keeping the session's snapshot consistent avoids
+//! confusing the worker's own bounds logic.
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{
     AcquireError, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
     RenewError, RenewResult, SplitReplaceError, SplitResidualError,
@@ -155,9 +157,10 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
     lease: Lease,
 
     /// Shard state snapshot from acquisition time. Intentionally not
-    /// updated by [`Self::checkpoint()`] (the worker already knows its
-    /// cursor). Rebuilt by [`Self::split_residual()`] to reflect the
-    /// narrowed key range so subsequent cursor-bounds checks are accurate.
+    /// updated by [`Self::checkpoint()`] or [`Self::checkpoint()`]
+    /// (the worker already knows its cursor). Rebuilt by
+    /// [`Self::split_residual()`] to reflect the narrowed key range so
+    /// subsequent cursor-bounds checks are accurate.
     snapshot: ShardSnapshot,
 
     /// Advisory capacity hint from the last acquire or renew.
@@ -261,9 +264,10 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
 
     /// The cursor at acquisition time (the last checkpoint before this session).
     ///
-    /// Not updated by [`checkpoint`](Self::checkpoint) — the worker already
-    /// knows the cursor it wrote. Use this to determine where to resume
-    /// scanning after acquiring the shard.
+    /// Not updated by [`checkpoint`](Self::checkpoint) or
+    /// [`complete`](Self::complete) — the worker already knows
+    /// the cursor it wrote. Use this to determine where to resume scanning
+    /// after acquiring the shard.
     #[inline]
     #[must_use]
     pub fn cursor(&self) -> &Cursor {
@@ -374,10 +378,13 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// Returns [`CheckpointError`] on lease validation failure, cursor
     /// monotonicity violation, out-of-bounds cursor, missing `last_key`,
     /// or `OpId` conflict.
+    ///
+    /// `new_cursor` is borrowed input only. The backend copies bytes into
+    /// pooled storage and never retains references past the call boundary.
     pub fn checkpoint(
         &mut self,
         now: LogicalTime,
-        new_cursor: Cursor,
+        new_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CheckpointError> {
         self.backend
@@ -395,10 +402,13 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// Returns [`CompleteError`] on lease validation failure, cursor
     /// constraint violation, or `OpId` conflict.
+    ///
+    /// `final_cursor` is borrowed input only. The backend copies bytes into
+    /// pooled storage and never retains references past the call boundary.
     pub fn complete(
         self,
         now: LogicalTime,
-        final_cursor: Cursor,
+        final_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError> {
         self.backend

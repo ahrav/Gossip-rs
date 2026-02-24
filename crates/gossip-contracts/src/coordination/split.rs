@@ -428,8 +428,12 @@ pub(crate) fn op_payload_hash(op_tag: &[u8], write_fields: impl FnOnce(&mut Hash
 ///
 /// Stored in the op-log alongside the [`OpId`] to detect "same OpId,
 /// different cursor" conflicts during idempotent replay.
+///
+/// Accepts any cursor representation with canonical bytes (for example,
+/// owned [`Cursor`] or borrowed
+/// [`CursorUpdate`](crate::coordination::cursor::CursorUpdate)).
 #[must_use]
-pub fn hash_checkpoint_payload(new_cursor: &Cursor) -> u64 {
+pub fn hash_checkpoint_payload(new_cursor: &impl CanonicalBytes) -> u64 {
     op_payload_hash(b"checkpoint", |h| {
         new_cursor.write_canonical(h);
     })
@@ -440,8 +444,11 @@ pub fn hash_checkpoint_payload(new_cursor: &Cursor) -> u64 {
 /// Same role as [`hash_checkpoint_payload`] but for the terminal
 /// completion event. The `b"complete"` tag ensures a completion and
 /// a checkpoint with the same cursor produce different hashes.
+///
+/// Uses the same canonical-byte requirement as [`hash_checkpoint_payload`]
+/// so owned and borrowed cursor paths remain hash-compatible.
 #[must_use]
-pub fn hash_complete_payload(final_cursor: &Cursor) -> u64 {
+pub fn hash_complete_payload(final_cursor: &impl CanonicalBytes) -> u64 {
     op_payload_hash(b"complete", |h| {
         final_cursor.write_canonical(h);
     })

@@ -26,7 +26,7 @@
 //! essential for deterministic simulation.
 //! Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021).
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::{
     AcquireError, AcquireResult, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
     RenewError, RenewResult, SplitReplaceError, SplitResidualError,
@@ -233,6 +233,10 @@ pub trait CoordinationBackend {
     /// a crash-recovery resumes from the last checkpoint, not from
     /// the beginning.
     ///
+    /// `new_cursor` is a borrowed [`CursorUpdate`]. Implementations must
+    /// treat it as call-scoped input and copy bytes into backend-owned
+    /// storage before returning.
+    ///
     /// ## Behavior
     ///
     /// 1. Check idempotency via `op_id` (see Idempotency below).
@@ -243,7 +247,7 @@ pub trait CoordinationBackend {
     /// 3. Validate `new_cursor.last_key.is_some()`.
     /// 4. Validate cursor monotonicity: `new >= old` (lexicographic).
     /// 5. Validate cursor bounds: `last_key ∈ [spec.start, spec.end)`.
-    /// 6. Update `cursor = new_cursor`.
+    /// 6. Persist `new_cursor` as the shard's latest cursor.
     /// 7. Record in op-log.
     ///
     /// ## Idempotency
@@ -263,7 +267,7 @@ pub trait CoordinationBackend {
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        new_cursor: Cursor,
+        new_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CheckpointError>;
 
@@ -275,6 +279,9 @@ pub trait CoordinationBackend {
     /// The `final_cursor` records the worker's final position. It must
     /// satisfy the same monotonicity and bounds constraints as a
     /// checkpoint cursor.
+    ///
+    /// `final_cursor` is a borrowed [`CursorUpdate`]. Implementations must
+    /// not retain references past the call boundary.
     ///
     /// ## Behavior
     ///
@@ -300,7 +307,7 @@ pub trait CoordinationBackend {
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        final_cursor: Cursor,
+        final_cursor: &CursorUpdate<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, CompleteError>;
 
