@@ -247,7 +247,7 @@ pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u
 ///    `max_len + 1` bytes and begins with `0x00`, drop exactly that one
 ///    leading byte and return it if `a < candidate < b`.
 /// 4. **Try fixed-width candidate**: test the unmodified quotient bytes and
-///    return them if `a < candidate < b`.
+///    return them if they do not exceed [`MAX_KEY_SIZE`] and `a < candidate < b`.
 /// 5. **Fallback successor**: if both arithmetic candidates fail, compute
 ///    `key_successor(a)` and return it only if it remains `< b`.
 ///
