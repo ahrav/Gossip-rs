@@ -38,7 +38,7 @@ pub mod key_encoding;
 
 pub use hint::{
     MetadataBuf, MetadataEncodingError, ShardHint, ShardHintDecodeError, ShardHintEncodeError,
-    ShardMetadata,
+    ShardMetadata, ShardMetadataDecodeError,
 };
 pub use key_encoding::{
     KeyBuf, KeyEncoding, ManifestRowKey, PathKey, PrefixShardError, byte_midpoint,

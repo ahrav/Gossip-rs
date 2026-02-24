@@ -37,9 +37,9 @@
 //! # Error semantics
 //!
 //! [`ShardHint::decode`] reports precise framing errors for standalone hint
-//! frames. [`ShardMetadata::decode`] intentionally collapses any non-empty
-//! parse failure into [`ShardHintDecodeError::NotShardMetadataFormat`] so
-//! callers can treat malformed metadata as one hard failure mode.
+//! frames. [`ShardMetadata::decode`] returns [`ShardMetadataDecodeError`],
+//! which preserves the inner [`ShardHintDecodeError`] when the envelope
+//! parsed but the hint payload did not.
 
 use crate::coordination::shard_spec::MAX_METADATA_SIZE;
 use core::fmt;
@@ -135,8 +135,8 @@ pub enum ShardHint<'a> {
     /// Wire form:
     /// `[0x02][manifest_id:u64 BE][start_row:u64 BE][end_row:u64 BE]`.
     ///
-    /// Decoding enforces `start_row < end_row`; invalid bounds are rejected.
-    /// Direct enum construction does not enforce this invariant.
+    /// Both encode and decode enforce `start_row < end_row`; invalid bounds
+    /// are rejected. Direct enum construction does not enforce this invariant.
     Manifest {
         /// Connector-defined manifest identifier.
         manifest_id: u64,
@@ -147,11 +147,10 @@ pub enum ShardHint<'a> {
     },
 }
 
-/// Decode failures for hint frames and strict metadata framing.
+/// Decode failures for [`ShardHint::decode`].
 ///
-/// `ShardHint::decode` returns the specific variant below. `ShardMetadata::decode`
-/// uses only `NotShardMetadataFormat` for any non-empty malformed metadata
-/// input, regardless of the underlying hint-level reason.
+/// Each variant describes a specific framing error in a standalone hint frame.
+/// For metadata-envelope decode failures see [`ShardMetadataDecodeError`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardHintDecodeError {
     /// Input is empty where a hint tag is required.
@@ -164,12 +163,19 @@ pub enum ShardHintDecodeError {
     TruncatedManifest { expected_min: usize, actual: usize },
     /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
     InvertedManifestRows { start_row: u64, end_row: u64 },
-    /// Metadata does not match strict shard metadata framing.
-    ///
-    /// Used by [`ShardMetadata::decode`] when non-empty metadata fails strict
-    /// envelope decoding for any reason (bad length prefix, invalid hint tag,
-    /// truncated hint payload, or manifest row invariant violation).
-    NotShardMetadataFormat,
+}
+
+/// Decode failure for the [`ShardMetadata`] envelope.
+///
+/// Any non-empty metadata that fails strict envelope decoding produces
+/// this error. When the envelope structure was valid but the inner hint
+/// payload was not, `hint_error` carries the underlying cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardMetadataDecodeError {
+    /// The hint-level error when the envelope parsed but the hint did not.
+    /// `None` for envelope-structural failures (short length prefix,
+    /// length exceeds input, or consumed bytes != declared hint length).
+    pub hint_error: Option<ShardHintDecodeError>,
 }
 
 /// Encode failures for [`ShardHint::encode_into`].
@@ -179,6 +185,8 @@ pub enum ShardHintEncodeError {
     PrefixTooLarge { size: usize, max: usize },
     /// Encoded hint exceeds metadata capacity.
     EncodedHintTooLarge { size: usize, max: usize },
+    /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
+    InvertedManifestRows { start_row: u64, end_row: u64 },
 }
 
 /// Encode failures for [`ShardMetadata::encode_into`].
@@ -188,11 +196,114 @@ pub enum MetadataEncodingError {
     MetadataTooLarge { size: usize, max: usize },
     /// Encoded hint is too large to frame in metadata.
     HintTooLarge { size: usize, max: usize },
+    /// Manifest row bounds are inverted or degenerate (`start_row >= end_row`).
+    InvalidManifestRows { start_row: u64, end_row: u64 },
 }
+
+impl fmt::Display for ShardHintDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyData => write!(f, "shard hint decode: input is empty"),
+            Self::UnknownTag(tag) => {
+                write!(f, "shard hint decode: unknown tag 0x{tag:02X}")
+            }
+            Self::TruncatedPrefix {
+                expected_min,
+                actual,
+            } => write!(
+                f,
+                "shard hint decode: prefix frame truncated (need {expected_min} bytes, got {actual})"
+            ),
+            Self::TruncatedManifest {
+                expected_min,
+                actual,
+            } => write!(
+                f,
+                "shard hint decode: manifest frame truncated (need {expected_min} bytes, got {actual})"
+            ),
+            Self::InvertedManifestRows { start_row, end_row } => write!(
+                f,
+                "shard hint decode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShardHintDecodeError {}
+
+impl fmt::Display for ShardMetadataDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.hint_error {
+            Some(ref inner) => write!(f, "shard metadata decode failed: {inner}"),
+            None => write!(
+                f,
+                "shard metadata decode: input does not conform to metadata envelope format"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShardMetadataDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.hint_error
+            .as_ref()
+            .map(|e| e as &dyn std::error::Error)
+    }
+}
+
+impl fmt::Display for ShardHintEncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PrefixTooLarge { size, max } => {
+                write!(
+                    f,
+                    "shard hint encode: prefix too large ({size} bytes, max {max})"
+                )
+            }
+            Self::EncodedHintTooLarge { size, max } => {
+                write!(
+                    f,
+                    "shard hint encode: encoded hint too large ({size} bytes, max {max})"
+                )
+            }
+            Self::InvertedManifestRows { start_row, end_row } => write!(
+                f,
+                "shard hint encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShardHintEncodeError {}
+
+impl fmt::Display for MetadataEncodingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MetadataTooLarge { size, max } => {
+                write!(
+                    f,
+                    "shard metadata encode: metadata too large ({size} bytes, max {max})"
+                )
+            }
+            Self::HintTooLarge { size, max } => {
+                write!(
+                    f,
+                    "shard metadata encode: hint too large ({size} bytes, max {max})"
+                )
+            }
+            Self::InvalidManifestRows { start_row, end_row } => write!(
+                f,
+                "shard metadata encode: manifest rows inverted (start_row={start_row} >= end_row={end_row})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MetadataEncodingError {}
 
 /// Structured shard metadata envelope.
 ///
-/// `hint` is coordination-visible and normalized by this module.
+/// `hint` is coordination-visible and validated by this module.
 /// `connector_extra` is opaque and copied through untouched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShardMetadata<'a> {
@@ -232,7 +343,17 @@ impl<'a> ShardHint<'a> {
                 }
                 Ok(size)
             }
-            Self::Manifest { .. } => Ok(MANIFEST_LEN),
+            Self::Manifest {
+                start_row, end_row, ..
+            } => {
+                if *start_row >= *end_row {
+                    return Err(ShardHintEncodeError::InvertedManifestRows {
+                        start_row: *start_row,
+                        end_row: *end_row,
+                    });
+                }
+                Ok(MANIFEST_LEN)
+            }
         }
     }
 
@@ -240,9 +361,6 @@ impl<'a> ShardHint<'a> {
     ///
     /// The returned slice borrows `buf` and is overwritten by subsequent
     /// writes into the same [`MetadataBuf`].
-    ///
-    /// This method validates framing size only. It does not enforce semantic
-    /// invariants beyond framing (for example, manifest row ordering).
     pub fn encode_into<'b>(
         &self,
         buf: &'b mut MetadataBuf,
@@ -299,7 +417,7 @@ impl<'a> ShardMetadata<'a> {
 
     /// Return encoded byte length for this metadata envelope.
     ///
-    /// This preflights `[hint_len:u32][hint_bytes][connector_extra]` and
+    /// This preflights `[hint_len:u32 BE][hint_bytes][connector_extra]` and
     /// verifies the total framed metadata size fits within
     /// [`MAX_METADATA_SIZE`].
     pub fn encoded_len(&self) -> Result<usize, MetadataEncodingError> {
@@ -352,19 +470,19 @@ impl<'a> ShardMetadata<'a> {
     /// `ShardHint::Range` with empty connector bytes.
     ///
     /// Any non-empty input that does not strictly conform to this envelope
-    /// returns [`ShardHintDecodeError::NotShardMetadataFormat`]. This includes
-    /// invalid hint tags, truncated frames, and hint payloads that decode but
-    /// leave unconsumed bytes.
+    /// returns [`ShardMetadataDecodeError`]. When the envelope structure was
+    /// valid but the inner hint payload was not, the returned error carries
+    /// the underlying [`ShardHintDecodeError`].
     ///
     /// On success, both the decoded hint prefix bytes (if any) and
     /// `connector_extra` borrow from `metadata`.
-    pub fn decode(metadata: &'a [u8]) -> Result<Self, ShardHintDecodeError> {
+    pub fn decode(metadata: &'a [u8]) -> Result<Self, ShardMetadataDecodeError> {
         if metadata.is_empty() {
             return Ok(Self::from_hint(ShardHint::Range));
         }
 
         let Some(hint_len_bytes) = metadata.get(..METADATA_HINT_LEN_PREFIX) else {
-            return Err(ShardHintDecodeError::NotShardMetadataFormat);
+            return Err(ShardMetadataDecodeError { hint_error: None });
         };
         let hint_len = u32::from_be_bytes([
             hint_len_bytes[0],
@@ -375,18 +493,19 @@ impl<'a> ShardMetadata<'a> {
 
         let hint_frame_end = METADATA_HINT_LEN_PREFIX
             .checked_add(hint_len)
-            .ok_or(ShardHintDecodeError::NotShardMetadataFormat)?;
+            .ok_or(ShardMetadataDecodeError { hint_error: None })?;
         if hint_frame_end > metadata.len() {
-            return Err(ShardHintDecodeError::NotShardMetadataFormat);
+            return Err(ShardMetadataDecodeError { hint_error: None });
         }
 
         // Bounds validated: METADATA_HINT_LEN_PREFIX <= hint_frame_end <= metadata.len().
         let hint_frame = &metadata[METADATA_HINT_LEN_PREFIX..hint_frame_end];
-        let (hint, consumed) = ShardHint::decode(hint_frame)
-            // Preserve a single strict-metadata failure surface for callers.
-            .map_err(|_| ShardHintDecodeError::NotShardMetadataFormat)?;
+        let (hint, consumed) =
+            ShardHint::decode(hint_frame).map_err(|e| ShardMetadataDecodeError {
+                hint_error: Some(e),
+            })?;
         if consumed != hint_frame.len() {
-            return Err(ShardHintDecodeError::NotShardMetadataFormat);
+            return Err(ShardMetadataDecodeError { hint_error: None });
         }
 
         Ok(Self {
@@ -402,10 +521,24 @@ fn map_hint_encode_error(err: ShardHintEncodeError) -> MetadataEncodingError {
         | ShardHintEncodeError::EncodedHintTooLarge { size, max } => {
             MetadataEncodingError::HintTooLarge { size, max }
         }
+        ShardHintEncodeError::InvertedManifestRows { start_row, end_row } => {
+            MetadataEncodingError::InvalidManifestRows { start_row, end_row }
+        }
     }
 }
 
 fn encode_hint_into_slice(hint: ShardHint<'_>, out: &mut [u8]) {
+    let required = match &hint {
+        ShardHint::Range => 1,
+        ShardHint::Prefix { prefix } => PREFIX_HEADER_LEN + prefix.len(),
+        ShardHint::Manifest { .. } => MANIFEST_LEN,
+    };
+    debug_assert!(
+        out.len() >= required,
+        "encode_hint_into_slice: output slice too small (need {required}, got {})",
+        out.len()
+    );
+
     match hint {
         ShardHint::Range => {
             out[0] = TAG_RANGE;

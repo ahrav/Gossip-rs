@@ -176,7 +176,7 @@ fn shard_hint_decode_returns_consumed_length_with_trailing_bytes() {
 fn shard_metadata_decode_empty_defaults_to_range_hint() {
     let decoded = ShardMetadata::decode(&[]).expect("empty metadata should decode");
     assert_eq!(decoded.hint, ShardHint::Range);
-    assert_eq!(decoded.connector_extra, &[]);
+    assert_eq!(decoded.connector_extra.len(), 0);
 }
 
 #[test]
@@ -190,9 +190,8 @@ fn shard_metadata_decode_rejects_non_empty_non_conforming_input() {
     ];
 
     for metadata in malformed_cases {
-        assert_eq!(
-            ShardMetadata::decode(&metadata),
-            Err(ShardHintDecodeError::NotShardMetadataFormat),
+        assert!(
+            ShardMetadata::decode(&metadata).is_err(),
             "metadata should be rejected: {metadata:?}",
         );
     }
@@ -326,6 +325,40 @@ fn ordered_rows(a: u64, b: u64) -> (u64, u64) {
     } else {
         (a, a + 1)
     }
+}
+
+#[test]
+fn shard_hint_encode_rejects_inverted_manifest_rows() {
+    let hint = ShardHint::Manifest {
+        manifest_id: 1,
+        start_row: 22,
+        end_row: 10,
+    };
+    let mut buf = MetadataBuf::new();
+    assert_eq!(
+        hint.encode_into(&mut buf),
+        Err(ShardHintEncodeError::InvertedManifestRows {
+            start_row: 22,
+            end_row: 10,
+        }),
+    );
+}
+
+#[test]
+fn shard_hint_encode_rejects_equal_manifest_rows() {
+    let hint = ShardHint::Manifest {
+        manifest_id: 1,
+        start_row: 10,
+        end_row: 10,
+    };
+    let mut buf = MetadataBuf::new();
+    assert_eq!(
+        hint.encode_into(&mut buf),
+        Err(ShardHintEncodeError::InvertedManifestRows {
+            start_row: 10,
+            end_row: 10,
+        }),
+    );
 }
 
 fn encode_raw_manifest(manifest_id: u64, start_row: u64, end_row: u64) -> Vec<u8> {
