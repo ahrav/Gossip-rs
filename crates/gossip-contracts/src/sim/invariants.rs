@@ -294,7 +294,10 @@ impl InvariantChecker {
         }
 
         if let Some(prev_claim) = self.last_claim_by_worker.get(&worker).copied() {
-            let gap = now.as_raw().saturating_sub(prev_claim.as_raw());
+            let gap = now
+                .as_raw()
+                .checked_sub(prev_claim.as_raw())
+                .expect("S9: logical time must not regress (now < prev_claim)");
             if gap < self.cooldown_interval {
                 self.cooldown_violations
                     .push(InvariantViolation::CooldownViolation {

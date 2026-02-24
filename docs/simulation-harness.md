@@ -123,7 +123,7 @@ The overload report includes:
 - `overload_goodput` (completion ratio during overload rounds).
 - D1 diagnostics (`d1_observations`) comparing reported
   `count_available_for_run` values with coordinator-derived ground truth.
-- L1 metrics (`l1_any_completed`, `l1_claim_success_rate`, `l1_passed`).
+- L1 liveness sentinel (`l1_any_completed`).
 
 ## Fault Injection Levels
 

@@ -120,13 +120,6 @@ pub struct OverloadReport {
     pub d1_observations: Vec<D1Observation>,
     /// L1 sentinel: at least one shard completed during recovery.
     pub l1_any_completed: bool,
-    /// Recovery-phase claim success ratio (`ClaimOk / ClaimNext attempts`).
-    pub l1_claim_success_rate: f64,
-    /// Overall L1 pass/fail verdict.
-    ///
-    /// Currently equivalent to `l1_any_completed`; kept separately so future
-    /// liveness criteria can evolve without changing report shape.
-    pub l1_passed: bool,
 }
 
 /// Scripted overload op burst: every worker issues `ClaimNext`.

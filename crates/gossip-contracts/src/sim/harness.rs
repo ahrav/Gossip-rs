@@ -930,6 +930,11 @@ impl CoordinationSim<InMemoryCoordinator> {
         // Phase 2: scripted overload rounds.
         for _ in 0..scenario.rounds {
             let workers: Vec<WorkerId> = self.workers.keys().copied().collect();
+            // Snapshot held shards at the start of each round. If an early
+            // `SplitReplace` succeeds within this round, later ops may
+            // reference stale keys and get rejected by the coordinator —
+            // this is intentional: the rejections exercise the coordinator's
+            // stale-key rejection path and are covered by invariant checking.
             let held_shards: Vec<(WorkerId, ShardKey)> = workers
                 .iter()
                 .flat_map(|worker| {
@@ -980,8 +985,6 @@ impl CoordinationSim<InMemoryCoordinator> {
 
         // Phase 3: bounded recovery with periodic claim injection.
         let mut l1_any_completed = false;
-        let mut l1_claim_attempts: u64 = 0;
-        let mut l1_claim_successes: u64 = 0;
 
         for i in 0..recovery_ops {
             let maybe_claim = if i % 10 == 0 {
@@ -991,28 +994,14 @@ impl CoordinationSim<InMemoryCoordinator> {
                 None
             };
             let op = maybe_claim.unwrap_or_else(|| self.generate_liveness_op());
-            if matches!(op, SimOp::ClaimNext { .. }) {
-                l1_claim_attempts += 1;
-            }
 
             let (event, violations) = self.step(op);
-            if matches!(event, SimEvent::ClaimOk { .. }) {
-                l1_claim_successes += 1;
-            }
             if matches!(event, SimEvent::CompleteOk) {
                 l1_any_completed = true;
             }
             *event_counts.entry(event.kind()).or_insert(0) += 1;
             all_violations.extend(violations);
         }
-
-        let l1_claim_success_rate = if l1_claim_attempts == 0 {
-            0.0
-        } else {
-            l1_claim_successes as f64 / l1_claim_attempts as f64
-        };
-        let l1_passed = l1_any_completed;
-
         OverloadReport {
             ops_executed: self.ops_executed,
             violations: all_violations,
@@ -1022,8 +1011,6 @@ impl CoordinationSim<InMemoryCoordinator> {
             overload_goodput: overload_goodput.rate(),
             d1_observations,
             l1_any_completed,
-            l1_claim_success_rate,
-            l1_passed,
         }
     }
 }

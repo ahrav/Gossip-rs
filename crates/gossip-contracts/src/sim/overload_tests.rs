@@ -54,7 +54,10 @@ fn test_overload_burst_claim_sunny() {
         "unexpected violations: {:?}",
         report.violations,
     );
-    assert!(report.l1_passed, "expected recovery liveness to pass");
+    assert!(
+        report.l1_any_completed,
+        "expected recovery liveness to pass"
+    );
 }
 
 #[test]
