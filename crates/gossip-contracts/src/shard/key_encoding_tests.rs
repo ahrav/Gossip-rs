@@ -30,6 +30,24 @@ fn path_key_uses_identity_utf8_encoding() {
 }
 
 #[test]
+#[should_panic(expected = "path length")]
+fn path_key_new_rejects_oversized_path() {
+    let _ = PathKey::new(&"a".repeat(MAX_KEY_SIZE + 1));
+}
+
+#[test]
+fn path_key_try_new_returns_none_for_oversized_path() {
+    assert!(PathKey::try_new(&"a".repeat(MAX_KEY_SIZE + 1)).is_none());
+}
+
+#[test]
+fn path_key_try_new_accepts_path_at_max_size() {
+    let path = "a".repeat(MAX_KEY_SIZE);
+    let key = PathKey::try_new(&path).expect("path at MAX_KEY_SIZE should succeed");
+    assert_eq!(key.as_str().len(), MAX_KEY_SIZE);
+}
+
+#[test]
 fn manifest_row_key_is_fixed_width_and_decodes() {
     let key = ManifestRowKey::new(42, 99);
     let mut buf = KeyBuf::new();

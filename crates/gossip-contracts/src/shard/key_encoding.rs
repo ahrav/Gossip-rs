@@ -11,8 +11,9 @@
 //!    order matches logical order. The coordinator itself never touches this
 //!    trait; it works with raw `&[u8]` boundaries.
 //!
-//! 2. **Typed key schemas** -- [`PathKey`] and [`ManifestRowKey`] provide
-//!    canonical encodings for current shard-algebra consumers.
+//! 2. **Typed key schemas** -- [`PathKey`], [`ManifestRowKey`], and
+//!    [`decode_manifest_row_key`] provide canonical encodings and decoding
+//!    for current shard-algebra consumers.
 //!
 //! 3. **ShardSpec bridge helpers** -- fallible constructors that translate
 //!    typed key inputs into owned [`ShardSpec`] values while preserving
@@ -190,9 +191,30 @@ pub struct PathKey<'a> {
 
 impl<'a> PathKey<'a> {
     /// Create a path key from UTF-8 path text.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path.len()` exceeds [`MAX_KEY_SIZE`]. Use [`try_new`](Self::try_new)
+    /// when the path comes from untrusted input.
     #[must_use]
-    pub const fn new(path: &'a str) -> Self {
+    pub fn new(path: &'a str) -> Self {
+        assert!(
+            path.len() <= MAX_KEY_SIZE,
+            "path length {} exceeds MAX_KEY_SIZE ({})",
+            path.len(),
+            MAX_KEY_SIZE
+        );
         Self { path }
+    }
+
+    /// Fallible constructor that returns `None` when the path exceeds
+    /// [`MAX_KEY_SIZE`].
+    #[must_use]
+    pub const fn try_new(path: &'a str) -> Option<Self> {
+        if path.len() > MAX_KEY_SIZE {
+            return None;
+        }
+        Some(Self { path })
     }
 
     /// Borrow the underlying UTF-8 path.
@@ -381,9 +403,10 @@ pub fn shard_spec_from_manifest_range(
 ///    `0xFF` suffix.
 /// 3. Increment the last remaining byte by one.
 ///
-/// Truncation is essential: incrementing *after* trailing `0xFF` bytes would
-/// produce a longer string that is not a tight upper bound (it would leave a
-/// gap). Truncation + increment produces the shortest possible successor.
+/// Truncation is essential: incrementing the full key without truncating
+/// trailing `0xFF` bytes first would produce a longer string via carry
+/// propagation that is not a tight upper bound (it would leave a gap).
+/// Truncation + increment produces the shortest possible successor.
 ///
 /// # Returns `None`
 ///
