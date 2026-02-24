@@ -4,7 +4,8 @@
 //!
 //! - [`key_encoding`]: byte-order-preserving key encoders, range arithmetic,
 //!   and typed-to-`ShardSpec` helpers.
-//! - [`hint`]: strict, versionless shard-hint metadata framing.
+//! - [`hint`]: strict, versionless shard-hint metadata framing with
+//!   borrowed decode and caller-scratch encode.
 //!
 //! Keeping these re-exports under `crate::shard` lets downstream code avoid
 //! coupling to file layout while preserving a clear layering boundary:
@@ -19,8 +20,10 @@
 //! - Typed-to-`ShardSpec` bridge helpers: [`shard_spec_from_keys`],
 //!   [`shard_spec_from_prefix`], and [`shard_spec_from_manifest_range`].
 //! - Prefix construction failures: [`PrefixShardError`].
-//! - Metadata envelope and hint decode errors: [`ShardMetadata`],
-//!   [`ShardHint`], [`ShardHintDecodeError`], and [`MetadataEncodingError`].
+//! - Metadata/hint no-allocation API: [`ShardMetadata`], [`ShardHint`], and
+//!   reusable encode scratch [`MetadataBuf`].
+//! - Metadata/hint failures: [`ShardHintDecodeError`],
+//!   [`ShardHintEncodeError`], and [`MetadataEncodingError`].
 //!
 //! Validation ownership remains single-sourced:
 //! - `key_encoding` enforces local key arithmetic contracts.
@@ -33,7 +36,10 @@
 pub mod hint;
 pub mod key_encoding;
 
-pub use hint::{MetadataEncodingError, ShardHint, ShardHintDecodeError, ShardMetadata};
+pub use hint::{
+    MetadataBuf, MetadataEncodingError, ShardHint, ShardHintDecodeError, ShardHintEncodeError,
+    ShardMetadata,
+};
 pub use key_encoding::{
     KeyBuf, KeyEncoding, ManifestRowKey, PathKey, PrefixShardError, byte_midpoint,
     decode_manifest_row_key, key_successor, prefix_successor, shard_spec_from_keys,
