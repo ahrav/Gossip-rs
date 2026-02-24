@@ -1920,7 +1920,7 @@ impl InMemoryCoordinator {
     /// See also [`get_run_progress`](Self::get_run_progress) which performs a
     /// similar iteration for run-level status reporting (different consumer,
     /// different output shape).
-    fn count_available_for_run(
+    pub(crate) fn count_available_for_run(
         &self,
         now: LogicalTime,
         tenant: TenantId,
