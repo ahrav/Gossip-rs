@@ -658,7 +658,7 @@ mod multi_tenant {
     //! The test exercises both terminal paths (`Complete` for tenant A,
     //! `Park` for tenant B) to maximize coverage of tenant-scoped behavior.
 
-    use crate::coordination::cursor::Cursor;
+    use crate::coordination::cursor::{Cursor, CursorUpdate};
     use crate::coordination::error::AcquireError;
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::record::ParkReason;
@@ -760,7 +760,7 @@ mod multi_tenant {
                 now(3),
                 tenant_a,
                 &lease_a,
-                Cursor::with_last_key(vec![0x10]),
+                &CursorUpdate::new(&[0x10]),
                 OpId::from_raw(101),
             )
             .unwrap();
@@ -770,7 +770,7 @@ mod multi_tenant {
                 now(4),
                 tenant_a,
                 &lease_a,
-                Cursor::with_last_key(vec![0x20]),
+                &CursorUpdate::new(&[0x20]),
                 OpId::from_raw(102),
             )
             .unwrap();
@@ -808,7 +808,7 @@ mod multi_tenant {
                 now(6),
                 tenant_b,
                 &lease_b,
-                Cursor::with_last_key(vec![0x10]),
+                &CursorUpdate::new(&[0x10]),
                 OpId::from_raw(201),
             )
             .unwrap();

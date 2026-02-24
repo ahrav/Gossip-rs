@@ -88,8 +88,8 @@ fn complete_consumes() {
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
     // Cursor must be within shard range [0x00, 0x40).
-    let cursor = Cursor::with_last_key(vec![0x10]);
-    let result = session.complete(now(3), cursor, OpId::from_raw(200));
+    let cursor = CursorUpdate::new(&[0x10]);
+    let result = session.complete(now(3), &cursor, OpId::from_raw(200));
     assert!(result.is_ok());
 }
 
@@ -111,8 +111,8 @@ fn split_residual_keeps_session() {
 
     // Session is still usable — checkpoint should work.
     // Cursor must be within narrowed range [0x00, 0x20).
-    let cursor = Cursor::with_last_key(vec![0x10]);
-    let cp_result = session.checkpoint(now(4), cursor, OpId::from_raw(301));
+    let cursor = CursorUpdate::new(&[0x10]);
+    let cp_result = session.checkpoint(now(4), &cursor, OpId::from_raw(301));
     assert!(cp_result.is_ok());
 
     // Snapshot spec should reflect the narrowed range.
@@ -176,8 +176,8 @@ fn checkpoint_advances_cursor_via_session() {
     let mut session =
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
-    let cursor = Cursor::with_last_key(vec![0x10]);
-    let result = session.checkpoint(now(3), cursor, OpId::from_raw(600));
+    let cursor = CursorUpdate::new(&[0x10]);
+    let result = session.checkpoint(now(3), &cursor, OpId::from_raw(600));
     assert!(result.is_ok());
     assert!(result.unwrap().is_executed());
 }
@@ -243,9 +243,10 @@ fn split_residual_replayed_after_oplog_eviction() {
     let mut t = 10u64;
     for i in 0..17u64 {
         // Cursor bytes 0x01..=0x11, all within narrowed range [0x00, 0x20).
-        let cursor = Cursor::with_last_key(vec![(i + 1) as u8]);
+        let key = [(i + 1) as u8];
+        let cursor = CursorUpdate::new(&key);
         let _ = session
-            .checkpoint(now(t), cursor, OpId::from_raw(801 + i))
+            .checkpoint(now(t), &cursor, OpId::from_raw(801 + i))
             .unwrap();
         t += 1;
     }
@@ -327,17 +328,17 @@ fn checkpoint_after_split_validates_narrowed_bounds() {
         .unwrap();
 
     // Within narrowed range — succeeds.
-    let ok_cursor = Cursor::with_last_key(vec![0x10]);
+    let ok_cursor = CursorUpdate::new(&[0x10]);
     assert!(
         session
-            .checkpoint(now(4), ok_cursor, OpId::from_raw(801))
+            .checkpoint(now(4), &ok_cursor, OpId::from_raw(801))
             .is_ok()
     );
 
     // Outside narrowed range — rejected.
-    let bad_cursor = Cursor::with_last_key(vec![0x30]);
+    let bad_cursor = CursorUpdate::new(&[0x30]);
     let err = session
-        .checkpoint(now(5), bad_cursor, OpId::from_raw(802))
+        .checkpoint(now(5), &bad_cursor, OpId::from_raw(802))
         .unwrap_err();
     assert!(
         matches!(err, CheckpointError::CursorOutOfBounds(_)),
@@ -364,11 +365,7 @@ fn expired_lease_rejected_through_session() {
 
     // Checkpoint past deadline.
     let cp_err = session
-        .checkpoint(
-            now(50),
-            Cursor::with_last_key(vec![0x10]),
-            OpId::from_raw(900),
-        )
+        .checkpoint(now(50), &CursorUpdate::new(&[0x10]), OpId::from_raw(900))
         .unwrap_err();
     assert!(
         matches!(cp_err, CheckpointError::LeaseExpired { .. }),
@@ -419,7 +416,7 @@ fn stale_fence_rejected_through_session() {
             now(51),
             test_tenant(),
             &stale_lease,
-            Cursor::with_last_key(vec![0x10]),
+            &CursorUpdate::new(&[0x10]),
             OpId::from_raw(950),
         )
         .unwrap_err();
@@ -439,8 +436,10 @@ fn crash_recovery_restores_cursor() {
     {
         let mut s1 =
             WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
-        let cursor = Cursor::with_last_key(vec![0x15]);
-        let _ = s1.checkpoint(now(3), cursor, OpId::from_raw(1000)).unwrap();
+        let cursor = CursorUpdate::new(&[0x15]);
+        let _ = s1
+            .checkpoint(now(3), &cursor, OpId::from_raw(1000))
+            .unwrap();
         // Session dropped (simulated crash) without terminal op.
     }
     // Session 2: re-acquire after lease expiry, verify restored cursor.
@@ -459,12 +458,12 @@ fn checkpoint_replayed_returns_replayed() {
     let mut session =
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
-    let cursor = Cursor::with_last_key(vec![0x10]);
+    let cursor = CursorUpdate::new(&[0x10]);
     let op = OpId::from_raw(1100);
-    let first = session.checkpoint(now(3), cursor.clone(), op).unwrap();
+    let first = session.checkpoint(now(3), &cursor, op).unwrap();
     assert!(first.is_executed());
 
-    let second = session.checkpoint(now(4), cursor, op).unwrap();
+    let second = session.checkpoint(now(4), &cursor, op).unwrap();
     assert!(second.is_replay());
 }
 
@@ -478,15 +477,15 @@ fn complete_replayed_returns_replayed() {
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
     let lease = *session.lease();
 
-    let cursor = Cursor::with_last_key(vec![0x10]);
+    let cursor = CursorUpdate::new(&[0x10]);
     let op = OpId::from_raw(1200);
-    let first = session.complete(now(3), cursor.clone(), op).unwrap();
+    let first = session.complete(now(3), &cursor, op).unwrap();
     assert!(first.is_executed());
 
     // Replay via raw backend — the shard is now Done, but the backend
     // recognizes the idempotent replay by matching the OpId.
     let second = coord
-        .complete(now(4), test_tenant(), &lease, cursor, op)
+        .complete(now(4), test_tenant(), &lease, &cursor, op)
         .unwrap();
     assert!(second.is_replay());
 }
@@ -504,8 +503,8 @@ fn checkpoint_does_not_update_cached_snapshot() {
 
     let initial_cursor = session.cursor().clone();
 
-    let checkpoint_cursor = Cursor::with_last_key(vec![0x10]);
-    let result = session.checkpoint(now(3), checkpoint_cursor.clone(), OpId::from_raw(600));
+    let checkpoint_cursor = CursorUpdate::new(&[0x10]);
+    let result = session.checkpoint(now(3), &checkpoint_cursor, OpId::from_raw(600));
     assert!(result.is_ok());
 
     // Session's cached cursor must still be the acquisition-time value.
@@ -514,10 +513,10 @@ fn checkpoint_does_not_update_cached_snapshot() {
         &initial_cursor,
         "checkpoint must not update cached snapshot cursor"
     );
-    assert_ne!(
-        session.cursor(),
-        &checkpoint_cursor,
-        "cached cursor must differ from checkpointed cursor"
+    assert_eq!(
+        checkpoint_cursor.last_key(),
+        Some(&[0x10][..]),
+        "checkpoint cursor update must preserve the requested key"
     );
 }
 
@@ -603,9 +602,9 @@ fn successive_split_residual_accumulates_spawned() {
     assert_eq!(session.initial_snapshot().spawned().len(), 2);
 
     // Checkpoint within the twice-narrowed range succeeds.
-    let cursor = Cursor::with_last_key(vec![0x10]);
+    let cursor = CursorUpdate::new(&[0x10]);
     let cp = session
-        .checkpoint(now(5), cursor, OpId::from_raw(302))
+        .checkpoint(now(5), &cursor, OpId::from_raw(302))
         .unwrap();
     assert!(cp.is_executed());
 }
@@ -690,9 +689,10 @@ proptest! {
                     {
                         continue;
                     }
-                    let cursor = Cursor::with_last_key(vec![*byte]);
+                    let key = [*byte];
+                    let cursor = CursorUpdate::new(&key);
                     let _ = session
-                        .checkpoint(now(t), cursor, OpId::from_raw(op_counter))
+                        .checkpoint(now(t), &cursor, OpId::from_raw(op_counter))
                         .map_err(|e| {
                             TestCaseError::Fail(
                                 format!("checkpoint({byte:#04x}) failed at t={t}: {e:?}")
@@ -744,8 +744,9 @@ proptest! {
         // Terminal operation — cursor must be in [range_start, range_end).
         let final_byte = last_cursor_byte.max(range_start + 1);
         if final_byte < range_end {
-            let final_cursor = Cursor::with_last_key(vec![final_byte]);
-            let _ = session.complete(now(t), final_cursor, OpId::from_raw(op_counter)).map_err(|e| {
+            let key = [final_byte];
+            let final_cursor = CursorUpdate::new(&key);
+            let _ = session.complete(now(t), &final_cursor, OpId::from_raw(op_counter)).map_err(|e| {
                 TestCaseError::Fail(format!("complete failed: {e:?}").into())
             })?;
         }

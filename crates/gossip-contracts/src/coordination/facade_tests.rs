@@ -1,5 +1,5 @@
 use super::*;
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
 use crate::coordination::shard_spec::CursorSemantics;
@@ -155,9 +155,9 @@ fn claim_skips_terminal() {
     let acquire = coord
         .acquire_and_restore(now(2), tenant, key0, test_worker(1))
         .unwrap();
-    let cursor = Cursor::with_last_key(vec![0x00]);
+    let cursor = CursorUpdate::new(&[0x00]);
     let _ = coord
-        .complete(now(3), tenant, &acquire.lease, cursor, OpId::from_raw(200))
+        .complete(now(3), tenant, &acquire.lease, &cursor, OpId::from_raw(200))
         .unwrap();
 
     // claim_next_available should skip the completed shard and get shard 1.
@@ -304,9 +304,10 @@ proptest! {
             let acq = coord
                 .acquire_and_restore(now(2), tenant, key, test_worker(200 + i as u64))
                 .unwrap();
-            let cursor = Cursor::with_last_key(vec![i as u8]);
+            let key = [i as u8];
+            let cursor = CursorUpdate::new(&key);
             let _ = coord
-                .complete(now(3), tenant, &acq.lease, cursor, OpId::from_raw(300 + i as u64))
+                .complete(now(3), tenant, &acq.lease, &cursor, OpId::from_raw(300 + i as u64))
                 .unwrap();
         }
 

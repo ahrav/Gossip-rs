@@ -63,7 +63,7 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::coordination::Lease;
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{
     AcquireError, CheckpointError, CompleteError, IdempotentOutcome, ParkError, RenewError,
     SplitError,
@@ -1380,11 +1380,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
+        let update = CursorUpdate::new(
+            cursor
+                .last_key()
+                .expect("generate_forward_cursor always returns last_key"),
+        );
 
         let now = self.context.now();
         match self
             .coordinator
-            .checkpoint(now, self.tenant, &lease, cursor.clone(), op_id)
+            .checkpoint(now, self.tenant, &lease, &update, op_id)
         {
             Ok(_) => {
                 // Track cursor progress on the worker.
@@ -1412,11 +1417,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
+        let update = CursorUpdate::new(
+            cursor
+                .last_key()
+                .expect("generate_forward_cursor always returns last_key"),
+        );
 
         let now = self.context.now();
         match self
             .coordinator
-            .complete(now, self.tenant, &lease, cursor, op_id)
+            .complete(now, self.tenant, &lease, &update, op_id)
         {
             Ok(_) => {
                 self.mark_shard_terminal(worker, key);
@@ -1758,9 +1768,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let now = self.context.now();
+        let prev_update = CursorUpdate::new(
+            prev_cursor
+                .last_key()
+                .expect("stored checkpoint cursor always has last_key"),
+        );
         match self
             .coordinator
-            .checkpoint(now, self.tenant, &lease, prev_cursor, prev_op_id)
+            .checkpoint(now, self.tenant, &lease, &prev_update, prev_op_id)
         {
             Ok(outcome) => match outcome {
                 IdempotentOutcome::Replayed(()) => SimEvent::ReplayedOk,
@@ -1789,11 +1804,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
         // Generate a *different* cursor to trigger a payload hash mismatch.
         let different_cursor = self.generate_forward_cursor(worker, key);
+        let different_update = CursorUpdate::new(
+            different_cursor
+                .last_key()
+                .expect("generate_forward_cursor always returns last_key"),
+        );
 
         let now = self.context.now();
         match self
             .coordinator
-            .checkpoint(now, self.tenant, &lease, different_cursor, prev_op_id)
+            .checkpoint(now, self.tenant, &lease, &different_update, prev_op_id)
         {
             Ok(_) => {
                 // Op-log entry was evicted -- old OpId not found, so this
@@ -1833,11 +1853,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         // Use the stale lease directly -- bypasses B1 bookkeeping.
-        let cursor = Cursor::with_last_key(vec![b'm']);
+        let update = CursorUpdate::new(b"m");
         let now = self.context.now();
         match self
             .coordinator
-            .checkpoint(now, self.tenant, &stale_lease, cursor, op_id)
+            .checkpoint(now, self.tenant, &stale_lease, &update, op_id)
         {
             Ok(_) => {
                 // A stale lease succeeding means the coordinator failed to
@@ -2532,7 +2552,12 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             let mut checkpoints_ok: u32 = 0;
             let mut checkpoints_rejected: u32 = 0;
             for i in 0..num_checkpoints as usize {
-                match sess.checkpoint(now, cursors[i].clone(), op_ids[i]) {
+                let update = CursorUpdate::new(
+                    cursors[i]
+                        .last_key()
+                        .expect("session lifecycle cursor sequence always has last_key"),
+                );
+                match sess.checkpoint(now, &update, op_ids[i]) {
                     Ok(_) => checkpoints_ok += 1,
                     Err(e) => {
                         debug_assert!(
@@ -2564,24 +2589,26 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     })
                 }
                 SessionTerminalAction::Complete => {
-                    let is_terminal = match sess.complete(
-                        now,
-                        cursors[terminal_idx].clone(),
-                        op_ids[terminal_idx],
-                    ) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            debug_assert!(
-                                !matches!(
-                                    e,
-                                    CompleteError::TenantMismatch { .. }
-                                        | CompleteError::ShardNotFound { .. }
-                                ),
-                                "session complete hit impossible error: {e:?}"
-                            );
-                            false
-                        }
-                    };
+                    let terminal_update = CursorUpdate::new(
+                        cursors[terminal_idx]
+                            .last_key()
+                            .expect("terminal cursor always has last_key"),
+                    );
+                    let is_terminal =
+                        match sess.complete(now, &terminal_update, op_ids[terminal_idx]) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                debug_assert!(
+                                    !matches!(
+                                        e,
+                                        CompleteError::TenantMismatch { .. }
+                                            | CompleteError::ShardNotFound { .. }
+                                    ),
+                                    "session complete hit impossible error: {e:?}"
+                                );
+                                false
+                            }
+                        };
                     Ok(SessionOutcome {
                         lease,
                         is_terminal,
@@ -2647,8 +2674,13 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         let residual_id = sess.initial_snapshot().spawned().last().copied();
                         // Complete the (now-narrowed) parent.
                         let complete_idx = terminal_idx + 1;
+                        let complete_update = CursorUpdate::new(
+                            complete_cursor
+                                .last_key()
+                                .expect("split_residual complete cursor always has last_key"),
+                        );
                         let is_terminal =
-                            match sess.complete(now, complete_cursor, op_ids[complete_idx]) {
+                            match sess.complete(now, &complete_update, op_ids[complete_idx]) {
                                 Ok(_) => true,
                                 Err(e) => {
                                     debug_assert!(

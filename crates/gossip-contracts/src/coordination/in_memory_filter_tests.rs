@@ -5,6 +5,7 @@
 // excludes shards based on status, lease state, and parentage.
 
 use super::*;
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::run::{InitialShard, RunManagement, ShardFilter};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::test_fixtures::{
@@ -242,7 +243,11 @@ fn apply_op(
             if let Some(lease) = last_lease.as_ref()
                 && let Ok(c) = Cursor::try_with_last_key(vec![*cursor_key])
             {
-                let _ = coord.checkpoint(now, ten, lease, c, OpId::from_raw(oc));
+                let update = CursorUpdate::new(
+                    c.last_key()
+                        .expect("try_with_last_key guarantees a non-empty key"),
+                );
+                let _ = coord.checkpoint(now, ten, lease, &update, OpId::from_raw(oc));
                 return (time, oc + 1);
             }
             (time, oc)
@@ -251,7 +256,11 @@ fn apply_op(
             if let Some(lease) = last_lease.as_ref()
                 && let Ok(c) = Cursor::try_with_last_key(vec![*cursor_key])
             {
-                let _ = coord.complete(now, ten, lease, c, OpId::from_raw(oc));
+                let update = CursorUpdate::new(
+                    c.last_key()
+                        .expect("try_with_last_key guarantees a non-empty key"),
+                );
+                let _ = coord.complete(now, ten, lease, &update, OpId::from_raw(oc));
                 return (time, oc + 1);
             }
             (time, oc)
@@ -408,26 +417,27 @@ proptest! {
             .unwrap()
             .lease;
         let op = OpId::from_raw(op_raw);
-        let cursor = Cursor::with_last_key(vec![cursor_key]);
+        let key = [cursor_key];
+        let cursor = CursorUpdate::new(&key);
 
         match op_kind {
             0 => {
                 let first = coord
-                    .checkpoint(LogicalTime::from_raw(4), ten, &lease, cursor.clone(), op)
+                    .checkpoint(LogicalTime::from_raw(4), ten, &lease, &cursor, op)
                     .unwrap();
                 prop_assert!(first.is_executed());
                 let second = coord
-                    .checkpoint(LogicalTime::from_raw(5), ten, &lease, cursor, op)
+                    .checkpoint(LogicalTime::from_raw(5), ten, &lease, &cursor, op)
                     .unwrap();
                 prop_assert!(second.is_replay());
             }
             1 => {
                 let first = coord
-                    .complete(LogicalTime::from_raw(4), ten, &lease, cursor.clone(), op)
+                    .complete(LogicalTime::from_raw(4), ten, &lease, &cursor, op)
                     .unwrap();
                 prop_assert!(first.is_executed());
                 let second = coord
-                    .complete(LogicalTime::from_raw(5), ten, &lease, cursor, op)
+                    .complete(LogicalTime::from_raw(5), ten, &lease, &cursor, op)
                     .unwrap();
                 prop_assert!(second.is_replay());
             }
@@ -484,12 +494,13 @@ proptest! {
         let mut op_counter = 3u64;
 
         for &key_byte in &keys {
-            let cursor = Cursor::with_last_key(vec![key_byte]);
+            let key = [key_byte];
+            let cursor = CursorUpdate::new(&key);
             let result = coord.checkpoint(
                 LogicalTime::from_raw(op_counter + 1),
                 test_tenant(),
                 &lease,
-                cursor,
+                &cursor,
                 OpId::from_raw(op_counter),
             );
             op_counter += 1;
@@ -690,7 +701,7 @@ fn capacity_hint_excludes_terminal_shards() {
             now(3),
             tenant,
             &r0.lease,
-            Cursor::with_last_key(vec![0]),
+            &CursorUpdate::new(&[0]),
             OpId::from_raw(200),
         )
         .unwrap();
