@@ -300,6 +300,27 @@ fn prefix_shard_roundtrip_with_decode_helpers() {
 }
 
 #[test]
+fn prefix_shard_rejects_oversized_prefix_with_prefix_too_large() {
+    // A prefix larger than MAX_KEY_SIZE should return PrefixTooLarge, not
+    // InvalidShardSpec(MetadataTooLarge), regardless of how large it is.
+    let prefix = vec![0xAB; MAX_KEY_SIZE + 1];
+    let err = prefix_shard(&prefix, b"").expect_err("oversized prefix should fail");
+    assert!(
+        matches!(err, PrefixShardError::PrefixTooLarge { .. }),
+        "expected PrefixTooLarge, got {err:?}"
+    );
+
+    // Even a prefix that exceeds the metadata capacity should still report
+    // the prefix-specific error, not a generic metadata error.
+    let huge_prefix = vec![0xAB; MAX_METADATA_SIZE + 1];
+    let err = prefix_shard(&huge_prefix, b"").expect_err("huge prefix should fail");
+    assert!(
+        matches!(err, PrefixShardError::PrefixTooLarge { .. }),
+        "expected PrefixTooLarge for huge prefix, got {err:?}"
+    );
+}
+
+#[test]
 fn prefix_shard_rejects_all_ff_prefix() {
     let prefix = vec![0xFF; 8];
     let err = prefix_shard(&prefix, b"ctx").expect_err("all-ff prefix has no successor");
@@ -410,6 +431,28 @@ fn propagate_hint_on_split_manifest_adjusts_child_rows() {
             manifest_id: 7,
             start_row: 25,
             end_row: 75,
+        }
+    );
+}
+
+#[test]
+fn propagate_hint_on_split_manifest_child_end_at_parent_end() {
+    let parent = ShardHint::Manifest {
+        manifest_id: 7,
+        start_row: 0,
+        end_row: 100,
+    };
+    let child_start = encode_manifest_row_key(7, 50);
+    let child_end = encode_manifest_row_key(7, 100);
+
+    let propagated = propagate_hint_on_split(&parent, &child_start, &child_end)
+        .expect("child_end == parent.end_row should be valid for half-open intervals");
+    assert_eq!(
+        propagated,
+        ShardHint::Manifest {
+            manifest_id: 7,
+            start_row: 50,
+            end_row: 100,
         }
     );
 }

@@ -630,6 +630,15 @@ pub fn range_shard(
 /// [`PrefixShardError::NoSuccessor`]).
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn prefix_shard(prefix: &[u8], connector_extra: &[u8]) -> Result<ShardSpec, PrefixShardError> {
+    // Validate prefix size before metadata encoding so callers always see
+    // PrefixTooLarge for oversized prefixes, not a generic MetadataTooLarge
+    // from the hint encoder hitting the metadata capacity ceiling first.
+    if prefix.len() > MAX_KEY_SIZE {
+        return Err(PrefixShardError::PrefixTooLarge {
+            size: prefix.len(),
+            max: MAX_KEY_SIZE,
+        });
+    }
     let metadata = encode_metadata_owned(ShardMetadata::new(
         ShardHint::Prefix { prefix },
         connector_extra,
