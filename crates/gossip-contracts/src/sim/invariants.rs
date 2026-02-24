@@ -77,7 +77,7 @@ use crate::sim::backend::SimIntrospection;
 
 /// Sub-classification for S7 (SplitCoverage) violations, replacing
 /// untyped string descriptions with pattern-matchable variants.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitCoverageDetail {
     /// Split shard has an empty `spawned` list — no children were created.
     EmptySpawned,
@@ -99,7 +99,7 @@ pub enum SplitCoverageDetail {
 /// or a sub-property thereof. The harness collects all violations from a
 /// simulation run into a `Vec<InvariantViolation>` for post-run analysis;
 /// an empty vec means the run passed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvariantViolation {
     /// S1: Two workers hold checker-active leases (`deadline >= now`) on the
     /// same shard simultaneously.

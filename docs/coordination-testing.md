@@ -215,7 +215,24 @@ invariant accidentally violates another.
 **Files:** `sim/sim_behavioral_tests.rs`, `sim/mega_sim_tests.rs`
 **Declared in:** `sim/mod.rs` (`#[cfg(test)]`)
 
-Six sub-tiers exercise the full simulation harness.
+Seven sub-tiers exercise the full simulation harness.
+
+### Overload Scenario Tests (`sim/overload_tests.rs`)
+
+Targeted tests for the scripted overload path (`run_overload`). Fixed-seed
+tests cover each `OverloadKind` under different fault levels, a deterministic
+replay test verifies seed stability, a D1 accuracy test validates availability
+reporting, and a proptest sweeps random seeds/kinds/rounds for safety.
+
+| Test | Config | Assertions |
+|------|--------|------------|
+| `test_overload_burst_claim_sunny` | seed=42, SunnyDay, 10 rounds | No violations, L1 liveness |
+| `test_overload_capacity_drop_stormy` | seed=77, Stormy, 8 rounds | No violations |
+| `test_overload_burst_shards_radioactive` (`#[ignore]`) | seed=9, Radioactive, 12 rounds | No violations |
+| `test_overload_deterministic_replay` | seed=123, Stormy, 12 rounds | Field-identical reports |
+| `test_d1_accuracy_sunny` | seed=7, SunnyDay, 10 rounds | D1 reported == ground truth |
+| `test_overload_zero_rounds_warmup_recovery_only` | seed=1, SunnyDay, 0 rounds | No violations, goodput == 0.0 |
+| `proptest_overload_safety` | 50 cases, Stormy, 0-6 rounds | No violations |
 
 ### Behavioral Regression Tests (`sim_behavioral_tests.rs`)
 
@@ -351,7 +368,7 @@ cargo test -p gossip-contracts proptest_state_machine -- --ignored --nocapture
 ```
 
 For simulation architecture, the invariant table (S1–S9), determinism
-model, fault injection levels, and two-phase run model, see
+model, fault injection levels, and three-stage run model, see
 [simulation-harness.md](simulation-harness.md).
 
 ---
@@ -368,6 +385,16 @@ cargo test -p gossip-contracts --lib coordination
 cargo test -p gossip-contracts --lib in_memory_tests
 cargo test -p gossip-contracts --lib conformance_tests
 cargo test -p gossip-contracts --lib scenario_tests
+```
+
+### Overload tests
+
+```bash
+# Overload scenario tests (fast, runs in default cargo test)
+cargo test -p gossip-contracts overload
+
+# Including the slow radioactive test
+cargo test -p gossip-contracts overload -- --ignored --nocapture
 ```
 
 ### Simulation tests
@@ -480,6 +507,7 @@ Full invariant definitions and the checker implementation are in
 | `sim/harness.rs`                    | Simulation driver (`run` + `run_overload`)                       |
 | `sim/invariants.rs`                 | External invariant checker (S1–S9)                               |
 | `sim/overload.rs`                   | Overload scenario/reports and scripted op generators             |
+| `sim/overload_tests.rs`            | Overload scenario tests: per-kind, replay, D1 accuracy, proptest |
 | `sim/worker.rs`                     | Simulated worker bookkeeping                                     |
 | `sim/test_util.rs`                  | Shared test helpers: record builder, proptest strategies         |
 | `sim/mod.rs`                        | SimContext (PRNG + clock), FaultConfig, FaultLevel               |

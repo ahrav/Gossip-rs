@@ -6,7 +6,7 @@ sled's simulation harness.
 
 ## Architecture
 
-The simulation is built in four layers, each composing the one below it:
+The simulation is built in five layers, each composing the one below it:
 
 ### Layer 1: SimContext (`sim/mod.rs`)
 
@@ -30,6 +30,13 @@ Per-worker bookkeeping that tracks:
 An external observer that verifies nine safety properties against coordinator
 ground truth at every simulation step. It never trusts worker-side bookkeeping.
 See the invariant table below.
+
+### Layer 3.5: Overload Scenarios (`sim/overload.rs`)
+
+Deterministic scripted stress workloads that exercise cooldown and capacity
+behavior. Defines scenario descriptors (`OverloadKind`, `OverloadScenario`),
+lightweight telemetry (`GoodputTracker`, `D1Observation`, `OverloadReport`),
+and operation burst generators consumed by `CoordinationSim::run_overload`.
 
 ### Layer 4: CoordinationSim (`sim/harness.rs`)
 
@@ -70,6 +77,13 @@ platforms and prevent invalid probability construction.
 
 All nine invariants are checked after
 every operation (both successful and rejected).
+
+**S9 push-style pattern:** Unlike S1–S8 which are validated during
+`InvariantChecker::check_all()`'s pass over coordinator state, S9 uses a
+push-style check. The harness calls `record_claim_success(worker, now)`
+when `ClaimNext` succeeds, and violations are buffered internally. The
+buffered violations are then drained and appended to the result vector at
+the end of `check_all`, keeping all invariant reporting in one place.
 
 ## Three-Stage Run Model
 
@@ -123,6 +137,10 @@ The overload report includes:
 - `overload_goodput` (completion ratio during overload rounds).
 - D1 diagnostics (`d1_observations`) comparing reported
   `count_available_for_run` values with coordinator-derived ground truth.
+  D1 samples are captured after each overload round. A mismatch between
+  `reported` and `ground_truth` indicates the coordinator's fast-path
+  availability counter drifted from the full-scan result — a bug in the
+  bookkeeping optimization, not in the protocol itself.
 - L1 liveness sentinel (`l1_any_completed`).
 
 ## Fault Injection Levels
@@ -173,6 +191,13 @@ platform.
 2. **Add the check** inside `InvariantChecker::check_all()`. Follow the
    single-pass pattern: accumulate state during the shard iteration, then
    validate after the loop if needed (like S1's post-pass duplicate check).
+
+   **Alternative: push-style checks.** If the invariant depends on
+   information not available in coordinator state (e.g., S9 depends on
+   knowing *when* a claim succeeded, which is transient), use the
+   push-style pattern: add a public method that the harness calls at the
+   relevant event, buffer violations internally, and drain them in
+   `check_all`. See `record_claim_success` (S9) as a reference.
 
 3. **Add a negative test** in `invariants::tests` that constructs a
    coordinator state violating the new invariant and asserts the checker

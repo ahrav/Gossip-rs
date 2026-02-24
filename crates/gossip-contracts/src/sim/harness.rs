@@ -948,7 +948,7 @@ impl CoordinationSim<InMemoryCoordinator> {
             let scripted_ops = match scenario.kind {
                 OverloadKind::BurstClaim => generate_burst_claim(&workers),
                 OverloadKind::CapacityDrop => generate_capacity_drop(&workers),
-                OverloadKind::BurstShards => generate_burst_shards(&workers, &held_shards),
+                OverloadKind::BurstShards => generate_burst_shards(&held_shards),
             };
 
             for op in scripted_ops {

@@ -139,15 +139,17 @@ pub(super) fn generate_capacity_drop(workers: &[WorkerId]) -> Vec<SimOp> {
     for worker in workers.iter().take(workers.len() / 2) {
         ops.push(SimOp::PauseWorker { worker: *worker });
     }
-    ops.push(SimOp::AdvanceTime { ticks: 200 });
+    // 2× DEFAULT_LEASE_DURATION — guarantees all leases from paused workers
+    // have expired by the time the surviving workers resume claiming.
+    const CAPACITY_DROP_TIME_JUMP: u64 = 200;
+    ops.push(SimOp::AdvanceTime {
+        ticks: CAPACITY_DROP_TIME_JUMP,
+    });
     ops
 }
 
 /// Scripted split burst: issue `SplitReplace` on all currently held shards.
-pub(super) fn generate_burst_shards(
-    _workers: &[WorkerId],
-    held_shards: &[(WorkerId, ShardKey)],
-) -> Vec<SimOp> {
+pub(super) fn generate_burst_shards(held_shards: &[(WorkerId, ShardKey)]) -> Vec<SimOp> {
     held_shards
         .iter()
         .map(|(worker, key)| SimOp::SplitReplace {

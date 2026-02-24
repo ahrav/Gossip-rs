@@ -100,6 +100,13 @@ fn test_overload_deterministic_replay() {
     assert_eq!(report_a.ops_executed, report_b.ops_executed);
     assert_eq!(report_a.end_time, report_b.end_time);
     assert_eq!(report_a.d1_observations, report_b.d1_observations);
+    assert_eq!(report_a.violations.len(), report_b.violations.len());
+    assert_eq!(
+        format!("{:?}", report_a.violations),
+        format!("{:?}", report_b.violations),
+    );
+    assert_eq!(report_a.overload_goodput, report_b.overload_goodput);
+    assert_eq!(report_a.l1_any_completed, report_b.l1_any_completed);
 }
 
 #[test]
@@ -123,6 +130,24 @@ fn test_d1_accuracy_sunny() {
     );
 }
 
+#[test]
+fn test_overload_zero_rounds_warmup_recovery_only() {
+    let report = overload_sim(1, FaultLevel::SunnyDay, 0).run_overload(
+        80,
+        OverloadScenario::new(OverloadKind::BurstClaim, 0),
+        120,
+    );
+    assert!(
+        report.violations.is_empty(),
+        "unexpected violations: {:?}",
+        report.violations,
+    );
+    assert_eq!(
+        report.overload_goodput, 0.0,
+        "zero rounds should produce zero overload goodput"
+    );
+}
+
 proptest! {
     #![proptest_config(sim_proptest_config())]
 
@@ -130,7 +155,7 @@ proptest! {
     fn proptest_overload_safety(
         seed in any::<u64>(),
         kind in arb_overload_kind(),
-        rounds in 1u32..=6,
+        rounds in 0u32..=6,
         cooldown in 0u64..=50,
     ) {
         let scenario = OverloadScenario::new(kind, rounds);
