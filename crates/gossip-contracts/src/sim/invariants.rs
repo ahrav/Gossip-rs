@@ -58,7 +58,7 @@
 //!   the common unchanged-cursor path.
 //! - S6 consumes borrowed cursor/spec slices from `SimIntrospection`
 //!   (`cursor_last_key` + `spec_bounds`) so bounds checks run without
-//!   materializing `Cursor`/`ShardSpec` per record.
+//!   materializing owned cursor/spec objects per record.
 //! - After each pass, permanently terminal shards (`Done`, `Split`) are
 //!   pruned from `prev_epochs` and `prev_cursors` to bound memory growth
 //!   in long-running simulations with many split cascades. `prev_terminal`
@@ -518,8 +518,8 @@ impl InvariantChecker {
 
     /// S5: cursor monotonicity.
     ///
-    /// Compares raw `Option<&[u8]>` slices rather than constructing `Cursor`
-    /// objects, avoiding a heap allocation per shard per step.
+    /// Compares raw `Option<&[u8]>` slices rather than constructing owned
+    /// cursor objects, avoiding a heap allocation per shard per step.
     fn check_cursor_monotonicity(
         &mut self,
         id: (TenantId, RunId, ShardId),

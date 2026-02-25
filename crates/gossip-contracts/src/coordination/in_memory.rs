@@ -564,10 +564,19 @@ pub struct InMemoryCoordinator {
     /// cursor keys/tokens). Shared by all records in `self.shards`.
     slab: ByteSlab,
     /// Reusable scratch for `register_shards` shard ID staging.
+    ///
+    /// Grows to the largest observed manifest and is then cleared/reused so
+    /// repeated registrations avoid fresh `Vec` allocation.
     register_shard_ids_scratch: Vec<ShardId>,
     /// Reusable scratch for `register_shards` staged record construction.
+    ///
+    /// Holds `(ShardKey, ShardRecord)` pairs during collect-then-insert, then
+    /// is returned to this field for reuse on the next call.
     register_stage_scratch: Vec<(ShardKey, ShardRecord)>,
     /// Reusable shard-id candidate buffer for claim hot path.
+    ///
+    /// Cleared and reused across calls to keep `claim_next_available`
+    /// allocation-silent after warmup.
     claim_candidates_scratch: Vec<ShardId>,
 }
 
@@ -2666,17 +2675,17 @@ impl RunManagement for InMemoryCoordinator {
     /// ordering.
     ///
     /// Applies `filter.matches_record()` *before* constructing
-    /// [`ShardSummary`], which avoids heap-allocating cloned key ranges
+    /// [`ShardSummary`], which avoids unnecessary summary-byte copies
     /// for shards that will be discarded. This matters when a run has
     /// many terminal shards and the caller only wants active ones.
     ///
     /// # Panics
     ///
-    /// Panics if the `out` buffer cannot be reserved to hold all matching
-    /// shards (defense-in-depth; callers should pre-size the buffer or
-    /// reuse one that grew to steady-state capacity).  Also panics if the
-    /// `run_shards` index references a shard ID with no corresponding record
-    /// in the primary shard map (index desynchronization — indicates a bug).
+    /// Panics if the caller-provided `out` buffer does not have enough
+    /// pre-allocated capacity to hold all run shards (allocation contract:
+    /// no growth inside this method). Also panics if the `run_shards` index
+    /// references a shard ID with no corresponding record in the primary
+    /// shard map (index desynchronization — indicates a bug).
     fn list_shards_into(
         &self,
         now: LogicalTime,
@@ -2690,19 +2699,16 @@ impl RunManagement for InMemoryCoordinator {
         let shard_ids = self.run_shards.get(&(tenant, run));
         out.clear();
         if let Some(shard_ids) = shard_ids {
-            // After `clear()`, `len = 0`, so `try_reserve(n)` ensures
-            // `capacity >= n`. Using the full shard count (not the delta
-            // from current capacity) avoids under-reserving when the
-            // existing capacity partially covers the needed size.
-            if out.capacity() < shard_ids.len() {
-                out.try_reserve(shard_ids.len()).unwrap_or_else(|_| {
-                    panic!(
-                        "list_shards_into: unable to reserve summary buffer for run {run:?} \
-                         ({}) entries",
-                        shard_ids.len()
-                    )
-                });
-            }
+            // Allocation contract: `list_shards_into` must be allocation-silent
+            // after startup. Callers are responsible for pre-sizing `out` to
+            // at least the run's shard cardinality.
+            assert!(
+                out.capacity() >= shard_ids.len(),
+                "list_shards_into: summary buffer capacity {} < required {} \
+                 for run {run:?}; pre-allocate caller buffer at startup",
+                out.capacity(),
+                shard_ids.len(),
+            );
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
                 let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
@@ -2713,8 +2719,8 @@ impl RunManagement for InMemoryCoordinator {
                         shard_id, run,
                     )
                 });
-                // Pre-filter on record fields before constructing
-                // ShardSummary (which heap-allocates key ranges).
+                // Pre-filter on record fields before constructing ShardSummary
+                // and copying spec/cursor bytes into summary storage.
                 if !filter.matches_record(record, now) {
                     continue;
                 }
@@ -3263,31 +3269,97 @@ impl InMemoryCoordinator {
 /// alone, but also available via the `test-support` feature for integration
 /// harnesses.
 ///
-/// `ShardIter` uses `Box<dyn Iterator>` because the concrete type is a
-/// nested `FlatMap` over two levels of `AHashMap` iterators — unnameable
-/// without `impl Trait` in associated type position (TAIT), which is not
-/// yet stable in trait impls. The boxing cost is negligible: this iterator
-/// is only used by the simulation checker after each step, not on any hot
-/// path.
-///
 /// This impl intentionally exposes borrowed accessors (cursor key,
 /// range bounds, cleanup hook) instead of raw slab
 /// handles so simulation code stays storage-abstraction-safe.
 #[cfg(any(test, feature = "test-support"))]
+/// Two-level shard iterator used by `SimIntrospection::shards`.
+///
+/// Traverses tenant maps in outer-hash-map iteration order, then shard maps in
+/// per-tenant hash-map iteration order. Both orders are intentionally
+/// unspecified.
+pub struct InMemoryShardIter<'a> {
+    outer: std::collections::hash_map::Iter<'a, TenantId, AHashMap<ShardKey, ShardRecord>>,
+    inner: Option<(
+        TenantId,
+        std::collections::hash_map::Iter<'a, ShardKey, ShardRecord>,
+    )>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> Iterator for InMemoryShardIter<'a> {
+    type Item = ((TenantId, ShardKey), &'a ShardRecord);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((tenant, inner)) = self.inner.as_mut()
+                && let Some((&key, record)) = inner.next()
+            {
+                return Some(((*tenant, key), record));
+            }
+
+            let (&tenant, records) = self.outer.next()?;
+            self.inner = Some((tenant, records.iter()));
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+/// Run iterator used by `SimIntrospection::runs`.
+///
+/// Order follows hash-map iteration and is intentionally unspecified.
+pub struct InMemoryRunIter<'a> {
+    inner: std::collections::hash_map::Iter<'a, (TenantId, RunId), RunRecord>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> Iterator for InMemoryRunIter<'a> {
+    type Item = ((TenantId, RunId), &'a RunRecord);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|(&(tenant, run), record)| ((tenant, run), record))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+/// Borrowed iterator over a record's spawned child IDs.
+///
+/// Wraps `PooledSpawnedIter` so simulation code does not need to reference
+/// pooled storage internals directly.
+pub struct InMemorySpawnedIter<'a> {
+    inner: crate::coordination::pooled::PooledSpawnedIter<'a>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl<'a> Iterator for InMemorySpawnedIter<'a> {
+    type Item = ShardId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
-    type ShardIter<'a> = Box<dyn Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)> + 'a>;
-    type RunIter<'a> = Box<dyn Iterator<Item = ((TenantId, RunId), &'a RunRecord)> + 'a>;
+    type ShardIter<'a> = InMemoryShardIter<'a>;
+    type RunIter<'a> = InMemoryRunIter<'a>;
+    type SpawnedIter<'a> = InMemorySpawnedIter<'a>;
 
     fn shards(&self) -> Self::ShardIter<'_> {
-        Box::new(self.shards.iter().flat_map(|(&tenant, inner)| {
-            inner
-                .iter()
-                .map(move |(&key, record)| ((tenant, key), record))
-        }))
+        // Iterator construction is allocation-free: this just captures map iterators.
+        InMemoryShardIter {
+            outer: self.shards.iter(),
+            inner: None,
+        }
     }
 
     fn runs(&self) -> Self::RunIter<'_> {
-        Box::new(self.runs.iter().map(|(&(t, r), rec)| ((t, r), rec)))
+        // Allocation-free borrowed iterator over run records.
+        InMemoryRunIter {
+            inner: self.runs.iter(),
+        }
     }
 
     fn shard_count(&self) -> usize {
@@ -3313,11 +3385,11 @@ impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
         record.validate_invariants(&self.slab)
     }
 
-    fn spawned_children<'a>(
-        &'a self,
-        record: &'a ShardRecord,
-    ) -> Box<dyn Iterator<Item = ShardId> + 'a> {
-        Box::new(record.spawned.iter(&self.slab))
+    fn spawned_children<'a>(&'a self, record: &'a ShardRecord) -> Self::SpawnedIter<'a> {
+        // Allocation-free borrowed iterator over pooled lineage storage.
+        InMemorySpawnedIter {
+            inner: record.spawned.iter(&self.slab),
+        }
     }
 
     fn release_record_fields(&mut self, record: &mut ShardRecord) {

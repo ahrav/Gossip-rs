@@ -1388,7 +1388,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Checkpoint cursor progress on a held shard.
     ///
     /// On success, records the cursor position on the worker (for forward-cursor
-    /// generation) and saves the `(OpId, Cursor)` pair for replay/conflict testing.
+    /// generation) and saves the `(OpId, last_key bytes)` pair for
+    /// replay/conflict testing.
     fn exec_checkpoint(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
             Ok(pair) => pair,

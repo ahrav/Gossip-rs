@@ -33,7 +33,8 @@
 //! The key behavioral asymmetry is intentional:
 //!
 //! - [`shards()`](FaultInjectingIntrospector::shards) returns real records
-//!   **followed by** synthetic records (via [`Iterator::chain`]).
+//!   **followed by** synthetic records (via a two-phase iterator that yields
+//!   real first, then synthetic, without allocating).
 //! - [`shard_lookup()`](FaultInjectingIntrospector::shard_lookup) delegates
 //!   to the inner backend only — synthetic records are invisible to point
 //!   lookups.
@@ -53,9 +54,13 @@
 //! inside the main `CoordinationSim::run` loop. Running it in the sim
 //! would require distinguishing expected violations (injected) from
 //! unexpected violations (real bugs), adding complexity for no safety gain.
+//!
+//! Injection itself stores records in a `Vec`, so `inject_shard` may allocate
+//! when the synthetic set grows. That is acceptable here because this helper
+//! is test-only and configured before checker execution.
 
 use crate::coordination::record::ShardRecord;
-use crate::identity::{ShardId, ShardKey, TenantId};
+use crate::identity::{ShardKey, TenantId};
 use crate::sim::backend::SimIntrospection;
 
 /// Wraps a [`SimIntrospection`] backend and injects synthetic shard records
@@ -64,6 +69,9 @@ use crate::sim::backend::SimIntrospection;
 /// Synthetic records are pre-configured before the test (not randomly
 /// injected per step), so no PRNG state is consumed and determinism
 /// is preserved.
+///
+/// Synthetic records live in a local `Vec` owned by this wrapper. Any growth
+/// allocation happens at injection time, not while iterating with `shards()`.
 ///
 /// # Iteration order contract
 ///
@@ -97,6 +105,8 @@ impl<B: SimIntrospection> FaultInjectingIntrospector<B> {
     /// to the inner backend, so injected records are not discoverable
     /// via point lookups. This matches real-world scenarios where an
     /// inconsistency is visible in a full scan but not in a targeted read.
+    ///
+    /// May grow the internal synthetic-record buffer.
     pub fn inject_shard(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
         self.synthetic_records.push((tenant, key, record));
     }
@@ -119,18 +129,46 @@ impl<B: SimIntrospection> FaultInjectingIntrospector<B> {
 
 /// Composes real and synthetic records into a unified observation stream.
 ///
-/// Uses `Box<dyn Iterator>` for `ShardIter` because the concrete chain
-/// type (`Chain<B::ShardIter<'_>, Map<...>>`) varies with `B` and cannot
-/// be named without `impl Trait` in associated types (which GATs
-/// intentionally avoid here for composability — see `backend.rs`).
+/// `next()` walks the real iterator to completion before reading from the
+/// synthetic slice iterator, preserving deterministic "real then synthetic"
+/// ordering without constructing intermediate collections.
+pub struct FaultInjectingShardIter<'a, I>
+where
+    I: Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)>,
+{
+    real: I,
+    synthetic: core::slice::Iter<'a, (TenantId, ShardKey, ShardRecord)>,
+}
+
+impl<'a, I> Iterator for FaultInjectingShardIter<'a, I>
+where
+    I: Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)>,
+{
+    type Item = ((TenantId, ShardKey), &'a ShardRecord);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(item) = self.real.next() {
+            return Some(item);
+        }
+        self.synthetic
+            .next()
+            .map(|(tenant, key, record)| ((*tenant, *key), record))
+    }
+}
+
 impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
     type ShardIter<'a>
-        = Box<dyn Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)> + 'a>
+        = FaultInjectingShardIter<'a, B::ShardIter<'a>>
     where
         Self: 'a;
 
     type RunIter<'a>
         = <B as SimIntrospection>::RunIter<'a>
+    where
+        Self: 'a;
+
+    type SpawnedIter<'a>
+        = <B as SimIntrospection>::SpawnedIter<'a>
     where
         Self: 'a;
 
@@ -141,12 +179,10 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
     /// allows them to trigger monotonicity violations (S2, S3, S5)
     /// when they carry regressed values for the same `(RunId, ShardId)`.
     fn shards(&self) -> Self::ShardIter<'_> {
-        let real = self.inner.shards();
-        let synthetic = self
-            .synthetic_records
-            .iter()
-            .map(|(tenant, key, record)| ((*tenant, *key), record));
-        Box::new(real.chain(synthetic))
+        FaultInjectingShardIter {
+            real: self.inner.shards(),
+            synthetic: self.synthetic_records.iter(),
+        }
     }
 
     /// Delegates to the inner backend — the fault injector only injects
@@ -156,6 +192,8 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
     }
 
     fn shard_count(&self) -> usize {
+        // Mirrors `shards()` output cardinality: all real records plus all
+        // configured synthetic records.
         self.inner.shard_count() + self.synthetic_records.len()
     }
 
@@ -180,10 +218,7 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
         self.inner.validate_record_invariants(record)
     }
 
-    fn spawned_children<'a>(
-        &'a self,
-        record: &'a ShardRecord,
-    ) -> Box<dyn Iterator<Item = ShardId> + 'a> {
+    fn spawned_children<'a>(&'a self, record: &'a ShardRecord) -> Self::SpawnedIter<'a> {
         self.inner.spawned_children(record)
     }
 
@@ -197,6 +232,7 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
 ///
 /// Uses the trait-level cleanup hook rather than backend-specific slab APIs,
 /// keeping fault injection compatible with any `SimIntrospection` backend.
+/// The inner backend drops through its own `Drop` path after this cleanup.
 impl<B: SimIntrospection> Drop for FaultInjectingIntrospector<B> {
     fn drop(&mut self) {
         for (_, _, record) in &mut self.synthetic_records {

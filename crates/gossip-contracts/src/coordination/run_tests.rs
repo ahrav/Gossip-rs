@@ -1023,7 +1023,6 @@ fn shard_summary_acquire_count_saturates_at_u32_max() {
         u32::MAX,
         "acquire_count must saturate at u32::MAX, not truncate"
     );
-    drop(summary);
     let mut record = record;
     record.deallocate_fields(&mut slab);
 }

@@ -14,7 +14,7 @@
 //! ├── shard_spec.rs    ShardSpec, ShardSpecRef, CursorSemantics — key ranges and split validation
 //! ├── split.rs         SplitReplacePlan, SplitResidualPlan — split types and ID derivation
 //! ├── error.rs         CoordError + per-operation error types + ShardSnapshotView
-//! ├── cursor.rs        Cursor, CursorUpdate — two-layer progress marker
+//! ├── cursor.rs        CursorUpdate — two-layer progress marker
 //! ├── lease.rs         Lease, LeaseHolder, OpLogEntry — ownership tokens and idempotency log
 //! ├── run.rs           RunRecord, RunManagement — run lifecycle and shard registration
 //! ├── validation.rs    validate_lease, check_op_idempotency — shared precondition checks

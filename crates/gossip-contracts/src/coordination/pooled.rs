@@ -69,9 +69,10 @@
 //! `PooledShardSpec` uses `ByteSlot::EMPTY` for absent range endpoints
 //! (empty `[]` in `ShardSpec`), which naturally maps to `slab.get(EMPTY)`
 //! returning `&[]`. `PooledCursor` wraps each slot in `Option` instead,
-//! because [`CursorUpdate`] semantics distinguish `None` (no progress / no token)
-//! from `Some(&[])` (present but empty). Using `ByteSlot::EMPTY` would
-//! conflate the two since `slab.get(EMPTY)` also returns `&[]`.
+//! because [`CursorUpdate`] models absence explicitly (`None` for no progress
+//! / no token). Keeping `Option<ByteSlot>` in pooled form preserves that
+//! explicit absence contract rather than encoding it implicitly via a sentinel
+//! slot value.
 //!
 //! ## Invariants
 //!
@@ -313,9 +314,8 @@ impl PooledCursor {
     /// `None` inputs are fed to `allocate_with_rollback` as `&[]`, producing
     /// `ByteSlot::EMPTY` (zero slab space). The resulting slot is then
     /// discarded by the `.map(|_| slots[i])` — only `Some` inputs produce
-    /// `Some(slot)`. This preserves the `None` vs `Some(&[])` distinction
-    /// that `PooledCursor` encodes via `Option<ByteSlot>` (see module docs
-    /// on absent-field encoding).
+    /// installed slots. This keeps staging/rollback index-aligned while
+    /// preserving explicit absence as `None`.
     #[inline]
     fn allocate_fields(
         last_key: Option<&[u8]>,
@@ -338,15 +338,6 @@ impl PooledCursor {
     ) -> Result<Self, SlabFull> {
         let (last_key, token) = Self::allocate_fields(update.last_key(), update.token(), slab)?;
         Ok(Self { last_key, token })
-    }
-
-    /// Create an initial (no-progress) cursor without any slab allocation.
-    #[cfg(test)]
-    pub(crate) fn initial() -> Self {
-        Self {
-            last_key: None,
-            token: None,
-        }
     }
 
     /// The last processed key, or `None` if no progress has been made.
@@ -389,9 +380,8 @@ impl PooledCursor {
 
     /// Deallocate all fields in-place, resetting both to `None`.
     ///
-    /// After this call, `is_initial()` returns `true`. Safe to call
-    /// multiple times: the second call is a no-op because both fields
-    /// are already `None` (`.take()` on `None` returns `None`).
+    /// Safe to call multiple times: the second call is a no-op because
+    /// both fields are already `None` (`.take()` on `None` returns `None`).
     pub(crate) fn release_fields(&mut self, slab: &mut ByteSlab) {
         if let Some(slot) = self.last_key.take() {
             slab.deallocate(slot);
@@ -586,25 +576,6 @@ impl PooledShardSpec {
     }
 }
 
-#[cfg(test)]
-impl PooledCursor {
-    /// Returns `true` if this cursor represents the initial (no-progress) state.
-    #[inline]
-    pub(crate) fn is_initial(&self) -> bool {
-        self.last_key.is_none()
-    }
-
-    /// Deallocate all fields and consume the wrapper.
-    pub(crate) fn deallocate(self, slab: &mut ByteSlab) {
-        if let Some(slot) = self.last_key {
-            slab.deallocate(slot);
-        }
-        if let Some(slot) = self.token {
-            slab.deallocate(slot);
-        }
-    }
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -644,12 +615,12 @@ mod tests {
                 (Some(last_key), None) => CursorUpdate::new(last_key),
                 (Some(last_key), Some(token)) => CursorUpdate::with_token(last_key, token),
             };
-            let pooled = PooledCursor::from_update(&update, &mut slab).unwrap();
+            let mut pooled = PooledCursor::from_update(&update, &mut slab).unwrap();
 
             prop_assert_eq!(pooled.last_key(&slab), update.last_key());
             prop_assert_eq!(pooled.token(&slab), update.token());
 
-            pooled.deallocate(&mut slab);
+            pooled.release_fields(&mut slab);
             prop_assert_eq!(slab.live_count(), 0);
         }
 
@@ -669,11 +640,13 @@ mod tests {
 
     #[test]
     fn pooled_cursor_roundtrip_initial() {
-        let slab = ByteSlab::with_capacity(4096);
-        let pooled = PooledCursor::initial();
-        assert!(pooled.is_initial());
+        let mut slab = ByteSlab::with_capacity(4096);
+        let update = CursorUpdate::initial();
+        let mut pooled = PooledCursor::from_update(&update, &mut slab).unwrap();
         assert!(pooled.last_key(&slab).is_none());
         assert!(pooled.token(&slab).is_none());
+        pooled.release_fields(&mut slab);
+        assert_eq!(slab.live_count(), 0);
     }
 
     #[test]

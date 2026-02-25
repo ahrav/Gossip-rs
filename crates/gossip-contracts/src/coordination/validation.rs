@@ -52,7 +52,7 @@
 //! cursor key and shard spec boundaries. Checks four properties in order:
 //! key presence, key size limit, monotonicity (new >= old), and bounds
 //! (`last_key` in `[spec.start, spec.end)`). Operates entirely on borrowed
-//! slices to avoid materializing owned `Cursor`/`ShardSpec` values on the
+//! slices to avoid materializing owned cursor/spec values on the
 //! checkpoint hot path.
 //!
 //! ## Invariants
@@ -178,7 +178,7 @@ pub fn validate_lease(
 ///
 /// This is the canonical cursor validator for all mutation paths (checkpoint,
 /// complete). It operates entirely on borrowed slices so callers can validate
-/// without materializing owned `Cursor` or `ShardSpec` values -- critical on
+/// without materializing owned cursor/spec values -- critical on
 /// the checkpoint hot path where the previous key and spec bounds live in the
 /// slab as `PooledCursor` / `PooledShardSpec`.
 ///

@@ -36,10 +36,10 @@
 //! | `DERIVE_SPLIT_CHILD_0_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
 //! | `DERIVE_SPLIT_CHILD_1_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
 //! | `DERIVE_SPLIT_RESIDUAL_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `HASH_CHECKPOINT_EXPECTED` | `domain::OP_PAYLOAD_V1` | Checkpoint payload encoding or `Cursor` canonical encoding changes |
-//! | `HASH_COMPLETE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Complete payload encoding or `Cursor` canonical encoding changes |
+//! | `HASH_CHECKPOINT_EXPECTED` | `domain::OP_PAYLOAD_V1` | Checkpoint payload encoding or `CursorUpdate` canonical encoding changes |
+//! | `HASH_COMPLETE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Complete payload encoding or `CursorUpdate` canonical encoding changes |
 //! | `HASH_PARK_EXPECTED` | `domain::OP_PAYLOAD_V1` | Park payload encoding or `ParkReason` discriminant changes |
-//! | `HASH_SPLIT_REPLACE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-replace payload or `ShardSpec`/`Cursor` canonical encoding changes |
+//! | `HASH_SPLIT_REPLACE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-replace payload or `ShardSpec`/`CursorUpdate` canonical encoding changes |
 //! | `HASH_SPLIT_RESIDUAL_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-residual payload or `ShardSpec` canonical encoding changes |
 //!
 //! # Adding a new vector

@@ -26,7 +26,9 @@
 //! Variable-size byte fields (spec key ranges, cursor keys) are stored in a
 //! shared [`ByteSlab`] via `PooledShardSpec` and `PooledCursor`, avoiding
 //! per-field heap allocations on hot paths. The record does not implement
-//! `Drop` — the coordinator must call `deallocate_fields()` before discarding.
+//! `Drop`. If a record is removed while the slab stays live, the coordinator
+//! must call `deallocate_fields()` to release pooled slots. Coordinator-wide
+//! teardown may instead clear/drop the slab in bulk.
 
 use std::fmt;
 
@@ -367,7 +369,8 @@ impl ShardRecord {
     ///
     /// # Errors
     ///
-    /// Returns `SlabFull` if the slab cannot allocate space for the spec.
+    /// Returns `SlabFull` if the slab cannot allocate space for spec or
+    /// cursor bytes.
     pub(crate) fn new_active_with_cursor(
         tenant: TenantId,
         run: RunId,
@@ -772,10 +775,12 @@ impl ShardRecord {
 
     /// Deallocate all slab-backed fields.
     ///
-    /// Must be called before dropping a `ShardRecord` to avoid slab leaks.
-    /// After this call, spec and cursor fields are reset to empty/initial.
-    /// Used by coordinator drop/rollback paths and by simulation wrappers
-    /// via `SimIntrospection::release_record_fields`.
+    /// Call this before discarding a `ShardRecord` while its `ByteSlab`
+    /// remains in use, otherwise pooled slots remain live and consume slab
+    /// capacity. Releases spec, cursor, and spawned-lineage storage.
+    ///
+    /// Used by coordinator rollback/drop paths (debug leak checks) and by
+    /// simulation wrappers via `SimIntrospection::release_record_fields`.
     pub(crate) fn deallocate_fields(&mut self, slab: &mut ByteSlab) {
         self.spec.release_fields(slab);
         self.cursor.release_fields(slab);

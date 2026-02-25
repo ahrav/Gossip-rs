@@ -1347,7 +1347,7 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Cursor key size check (defense-in-depth; Cursor::try_with_last_key
+    // Cursor key size check (defense-in-depth; CursorUpdate::try_with_last_key
     // also validates, but callers may use the panicking constructors).
     for shard in shards {
         if let Some(key) = shard.cursor.last_key()
@@ -1382,18 +1382,58 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
 // ShardSummary
 // ============================================================================
 
-/// Lightweight, heap-owned shard summary for listing and observability.
+/// Fixed-capacity byte storage for allocation-free [`ShardSummary`] fields.
+///
+/// `ShardSummary::from_record` writes directly into this inline buffer.
+/// The `From<Vec<u8>>` impl exists as an adapter for non-hot-path callers; any
+/// allocation implied by `Vec` construction happens at the call site, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SummaryBytes<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> SummaryBytes<N> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            bytes: [0u8; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, src: &[u8], oversize_msg: &'static str) {
+        assert!(src.len() <= N, "{oversize_msg}");
+        self.bytes[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
+    fn from(value: Vec<u8>) -> Self {
+        let mut out = Self::new();
+        out.write(&value, "summary bytes exceed fixed capacity");
+        out
+    }
+}
+
+/// Lightweight shard summary for listing and observability.
 ///
 /// Constructed from a [`ShardRecord`] via `from_record`, which copies
-/// slab-backed byte fields into owned `Box<[u8]>` allocations. This
-/// decouples the summary from the coordinator's internal slab lifetime,
-/// making it safe to return across API boundaries.
+/// slab-backed byte fields into fixed-capacity in-struct buffers (no heap
+/// allocation). This decouples the summary from the coordinator's slab
+/// lifetime while keeping repeated listing allocation-silent after caller
+/// buffer warmup.
 ///
 /// [`ShardFilter::matches_record`] provides a pre-filter that checks
-/// status/lease/root criteria on the record directly, avoiding the
-/// 2-3 heap allocations that `from_record` performs for key ranges.
-/// At 10K shards with a selective filter, this turns thousands of
-/// wasted allocations into dozens.
+/// status/lease/root criteria on the record directly, avoiding unnecessary
+/// byte copies for filtered-out shards.
 ///
 /// [`ShardRecord`]: super::record::ShardRecord
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1412,15 +1452,37 @@ pub struct ShardSummary {
     /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
     /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,
-    pub(crate) last_key: Option<Box<[u8]>>,
-    pub(crate) key_range_start: Box<[u8]>,
-    pub(crate) key_range_end: Box<[u8]>,
+    pub(crate) last_key: Option<SummaryBytes<MAX_KEY_SIZE>>,
+    pub(crate) key_range_start: SummaryBytes<MAX_KEY_SIZE>,
+    pub(crate) key_range_end: SummaryBytes<MAX_KEY_SIZE>,
     pub(crate) parent: Option<ShardId>,
     pub(crate) spawned_count: u32,
 }
 
 impl ShardSummary {
+    /// Build a summary snapshot from one record at logical time `now`.
+    ///
+    /// Copies slab-backed cursor/spec bytes into fixed-capacity inline buffers
+    /// so the returned summary no longer borrows the coordinator slab.
     pub(crate) fn from_record(record: &ShardRecord, now: LogicalTime, slab: &ByteSlab) -> Self {
+        let last_key = record.cursor.last_key(slab).map(|key| {
+            let mut bytes = SummaryBytes::new();
+            bytes.write(key, "shard summary cursor key exceeds MAX_KEY_SIZE");
+            bytes
+        });
+
+        let mut key_range_start = SummaryBytes::new();
+        key_range_start.write(
+            record.spec.key_range_start(slab),
+            "shard summary start key exceeds MAX_KEY_SIZE",
+        );
+
+        let mut key_range_end = SummaryBytes::new();
+        key_range_end.write(
+            record.spec.key_range_end(slab),
+            "shard summary end key exceeds MAX_KEY_SIZE",
+        );
+
         Self {
             shard: record.shard,
             status: record.status,
@@ -1438,9 +1500,9 @@ impl ShardSummary {
                     .saturating_sub(FenceEpoch::INITIAL.as_raw()),
             )
             .unwrap_or(u32::MAX),
-            last_key: record.cursor.last_key(slab).map(|k| k.into()),
-            key_range_start: record.spec.key_range_start(slab).into(),
-            key_range_end: record.spec.key_range_end(slab).into(),
+            last_key,
+            key_range_start,
+            key_range_end,
             parent: record.parent,
             spawned_count: u32::try_from(record.spawned.len()).unwrap_or(u32::MAX),
         }
@@ -1478,17 +1540,17 @@ impl ShardSummary {
 
     #[must_use]
     pub fn last_key(&self) -> Option<&[u8]> {
-        self.last_key.as_deref()
+        self.last_key.as_ref().map(SummaryBytes::as_slice)
     }
 
     #[must_use]
     pub fn key_range_start(&self) -> &[u8] {
-        &self.key_range_start
+        self.key_range_start.as_slice()
     }
 
     #[must_use]
     pub fn key_range_end(&self) -> &[u8] {
-        &self.key_range_end
+        self.key_range_end.as_slice()
     }
 
     #[must_use]
@@ -1585,12 +1647,10 @@ impl ShardFilter {
     }
 
     /// Pre-filter on [`ShardRecord`] fields before constructing a
-    /// [`ShardSummary`] (which heap-allocates key ranges).
+    /// [`ShardSummary`].
     ///
     /// Equivalent to `self.matches(&ShardSummary::from_record(record, now))`
-    /// but avoids the 2-3 heap allocations per record that `from_record`
-    /// performs. At 10K shards with a selective filter, this turns ~30K
-    /// wasted allocations into ~30.
+    /// but avoids unnecessary byte copies for filtered-out records.
     #[must_use]
     pub fn matches_record(&self, record: &ShardRecord, now: LogicalTime) -> bool {
         if let Some(status) = self.status
@@ -1836,10 +1896,16 @@ pub trait RunManagement {
     /// Ordered by `key_range_start` ascending.
     ///
     /// This API allows callers to reuse `out` across repeated queries and
-    /// avoid per-call heap allocations after warmup.
+    /// avoid per-call heap allocations after startup. Implementations may
+    /// require `out` to be pre-sized and refuse to grow it internally.
+    /// Ordering ties (same `key_range_start`) are backend-defined.
     ///
     /// `ShardFilter::is_leased` must be evaluated against `now`: a lease whose
     /// deadline has passed counts as unleased, not leased.
+    ///
+    /// Implementations may enforce the no-growth contract with a panic instead
+    /// of a typed error. The in-memory backend does this to keep the hot path
+    /// allocation-silent and fail fast on mis-sized caller buffers.
     fn list_shards_into(
         &self,
         now: LogicalTime,

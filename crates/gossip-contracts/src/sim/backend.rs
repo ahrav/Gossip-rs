@@ -29,11 +29,10 @@
 //!
 //! # GAT design
 //!
-//! `ShardIter` uses a Generic Associated Type (GAT) rather than RPITIT
-//! (`-> impl Iterator`) because concrete associated types enable iterator
-//! composition (e.g., `Chain<A, B>`) that opaque return types prevent.
-//! The explicit `'a` lifetime tied to `&'a self` makes borrow contracts
-//! clear for downstream wrappers.
+//! Iterator-returning methods use Generic Associated Types (GATs) rather than
+//! boxed trait objects. This keeps observation paths allocation-free while
+//! still allowing concrete composed iterators (for example `Chain<A, B>` in
+//! wrappers).
 
 use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
@@ -78,7 +77,19 @@ pub trait SimIntrospection {
         Self: 'a;
 
     /// Iterator over all run records. Order is unspecified.
+    ///
+    /// Consumers must treat this as a full-scan view, not a sorted stream.
+    /// Current checks only rely on set membership and terminal-state monotonicity,
+    /// both of which are order-independent.
     type RunIter<'a>: Iterator<Item = ((TenantId, RunId), &'a RunRecord)>
+    where
+        Self: 'a;
+
+    /// Iterator over a record's spawned child IDs.
+    ///
+    /// Returned as a borrowed view so callers can validate split lineage without
+    /// allocating an owned child list.
+    type SpawnedIter<'a>: Iterator<Item = ShardId>
     where
         Self: 'a;
 
@@ -121,7 +132,7 @@ pub trait SimIntrospection {
     ///
     /// Borrow is tied to `self` because pooled fields are slab-backed.
     /// Used by the checker/harness hot paths to avoid materializing owned
-    /// `Cursor`/`ShardSpec` values just to compare bounds/order.
+    /// cursor/spec values just to compare bounds/order.
     fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]>;
 
     /// Return the shard range bounds `[start, end)` as borrowed slices.
@@ -140,16 +151,15 @@ pub trait SimIntrospection {
     /// Iterate a record's spawned child IDs without materializing an owned list.
     ///
     /// Borrow is tied to `self` because pooled lineage storage is backend-owned.
-    fn spawned_children<'a>(
-        &'a self,
-        record: &'a ShardRecord,
-    ) -> Box<dyn Iterator<Item = ShardId> + 'a>;
+    /// Iteration order is backend-defined and must be treated as unspecified.
+    fn spawned_children<'a>(&'a self, record: &'a ShardRecord) -> Self::SpawnedIter<'a>;
 
     /// Release pooled fields for an observation-only record.
     ///
     /// This cleanup hook lets wrappers that own synthetic records
     /// (for example fault injectors) free slab-backed fields without
     /// exposing raw slab handles in the public simulation interface.
+    /// Backends without pooled fields may implement this as a no-op.
     fn release_record_fields(&mut self, record: &mut ShardRecord);
 }
 
