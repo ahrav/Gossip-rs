@@ -412,12 +412,12 @@ impl CoordinatorConfig {
     /// - `S` = `max_total_shards`, `B_s` = `per_shard_budget`
     /// - `R` = `max_runs`, `B_r` = `per_run_budget`
     /// - `W` = `max_workers`
-    /// - `SR` = [`SHARD_RECORD_PLANNING_BYTES`]
-    /// - `SO` = [`SHARD_ENTRY_OVERHEAD_BYTES`]
-    /// - `RR` = [`RUN_RECORD_PLANNING_BYTES`]
-    /// - `RO` = [`RUN_ENTRY_OVERHEAD_BYTES`]
-    /// - `WC` = [`WORKER_COOLDOWN_ENTRY_BYTES`]
-    /// - `CB` = [`COORDINATOR_BASE_BYTES`]
+    /// - `SR` = `SHARD_RECORD_PLANNING_BYTES`
+    /// - `SO` = `SHARD_ENTRY_OVERHEAD_BYTES`
+    /// - `RR` = `RUN_RECORD_PLANNING_BYTES`
+    /// - `RO` = `RUN_ENTRY_OVERHEAD_BYTES`
+    /// - `WC` = `WORKER_COOLDOWN_ENTRY_BYTES`
+    /// - `CB` = `COORDINATOR_BASE_BYTES`
     ///
     /// Assumptions:
     /// - Struct-size constants (`SR`, `RR`) match this target's layout
@@ -2744,6 +2744,66 @@ impl RunManagement for InMemoryCoordinator {
                 .then_with(|| a.shard().cmp(&b.shard()))
         });
         Ok(())
+    }
+
+    /// Single-pass candidate collection for the shard-claiming hot path.
+    ///
+    /// Iterates the run's shard set once, pushing unleased Active shard IDs
+    /// into `candidates` and tracking the earliest lease deadline among
+    /// leased Active shards.  Does **not** sort — the free function uses
+    /// modular-offset iteration and does not depend on ordering.
+    ///
+    /// Structurally identical to the filtering loop in
+    /// [`claim_next_available`](Self::claim_next_available) (lines 3069–3092),
+    /// but exposed through the [`RunManagement`] trait so the free function
+    /// [`default_claim_next_available`](super::facade::default_claim_next_available)
+    /// can avoid constructing [`ShardSummary`] objects.
+    fn collect_claim_candidates_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<LogicalTime>, GetRunError> {
+        let _ = self.lookup_run(tenant, run)?;
+        candidates.clear();
+
+        let mut earliest_deadline: Option<LogicalTime> = None;
+        if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+            assert!(
+                candidates.capacity() >= shard_ids.len(),
+                "collect_claim_candidates_into: candidate buffer capacity {} < required {} \
+                 for run {run:?}; pre-allocate caller buffer at startup",
+                candidates.capacity(),
+                shard_ids.len(),
+            );
+            for &shard_id in shard_ids {
+                let key = ShardKey::new(run, shard_id);
+                let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
+                    panic!(
+                        "run_shards index contains shard {:?} for run {:?} \
+                         but no record exists in the primary shard map — \
+                         index desynchronization",
+                        shard_id, run,
+                    )
+                });
+                if record.status != ShardStatus::Active {
+                    continue;
+                }
+                if record.is_leased_at(now) {
+                    if let Some(deadline) = record.lease_deadline() {
+                        earliest_deadline = Some(match earliest_deadline {
+                            Some(prev) => core::cmp::min(prev, deadline),
+                            None => deadline,
+                        });
+                    }
+                    continue;
+                }
+                candidates.push(shard_id);
+            }
+        }
+
+        Ok(earliest_deadline)
     }
 
     /// Transition an `Active` run to `Done` (terminal, idempotent).

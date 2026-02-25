@@ -1915,6 +1915,37 @@ pub trait RunManagement {
         out: &mut Vec<ShardSummary>,
     ) -> Result<(), GetRunError>;
 
+    /// Collect claimable shard IDs and the earliest lease deadline in a single
+    /// pass over the run's shard set.
+    ///
+    /// This is a specialized query for the shard-claiming hot path.  Unlike
+    /// [`list_shards_into`](Self::list_shards_into), it never constructs
+    /// [`ShardSummary`] objects and never copies slab-backed byte fields,
+    /// avoiding ~12 KiB of wasted memcpy per shard when only the `ShardId`
+    /// and lease deadline are needed.
+    ///
+    /// On return, `candidates` contains the IDs of all Active, unleased
+    /// shards (in backend-defined order — no sort guarantee).  The returned
+    /// `Option<LogicalTime>` is the earliest lease deadline among Active
+    /// shards that **are** leased, or `None` if no Active shard is currently
+    /// leased.  Callers use this deadline to schedule retry attempts near
+    /// the soonest expiry instead of busy-spinning.
+    ///
+    /// `candidates` is cleared before use.  The caller owns the buffer and
+    /// reuses it across calls (zero-alloc after startup per rule 4).
+    ///
+    /// # Errors
+    ///
+    /// - [`GetRunError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`GetRunError::TenantMismatch`] — tenant isolation violation.
+    fn collect_claim_candidates_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<LogicalTime>, GetRunError>;
+
     /// Mark run as Done. Precondition: Active. Idempotent via `op_id`.
     ///
     /// # Errors

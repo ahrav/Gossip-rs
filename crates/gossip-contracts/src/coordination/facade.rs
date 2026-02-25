@@ -38,10 +38,10 @@
 use std::fmt;
 
 use crate::coordination::error::{AcquireError, AcquireResultView, AcquireScratch};
-use crate::coordination::run::{RunManagement, ShardFilter, ShardSummary};
+use crate::coordination::run::RunManagement;
 use crate::coordination::run_errors::GetRunError;
 use crate::coordination::traits::CoordinationBackend;
-use crate::identity::{LogicalTime, RunId, ShardKey, TenantId, WorkerId};
+use crate::identity::{LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
 // ClaimError
@@ -138,9 +138,9 @@ impl std::error::Error for ClaimError {}
 
 /// Maps run-lookup errors into claim errors.
 ///
-/// `list_shards_into` returns `GetRunError`, which we translate 1:1 since
-/// both `RunNotFound` and `TenantMismatch` apply identically at the
-/// claim level. The match is exhaustive (no wildcard) so adding a new
+/// `collect_claim_candidates_into` returns `GetRunError`, which we translate
+/// 1:1 since both `RunNotFound` and `TenantMismatch` apply identically at
+/// the claim level. The match is exhaustive (no wildcard) so adding a new
 /// `GetRunError` variant produces a compile error here.
 impl From<GetRunError> for ClaimError {
     fn from(e: GetRunError) -> Self {
