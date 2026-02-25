@@ -114,11 +114,16 @@ use crate::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 /// `WorkerSession` and makes the refresh logic in
 /// [`WorkerSession::split_residual`] more obviously complete.
 struct SnapshotState {
-    /// Allocation-free scratch buffers from acquisition time.
+    /// Scratch buffers from acquisition time, heap-allocated to keep ~53 KiB
+    /// off the stack.
     ///
     /// Backed by fixed-capacity arrays so `split_residual` can refresh spec
-    /// bounds without owned materialization.
-    scratch: AcquireScratch,
+    /// bounds without owned materialization. Boxed because `SnapshotState`
+    /// lives for the session's lifetime and the scratch is only actively used
+    /// during `acquire_and_restore_into` and `split_residual` refreshes —
+    /// paying one heap allocation at session creation is negligible compared
+    /// to the coordination operations themselves.
+    scratch: Box<AcquireScratch>,
 
     /// Shard status at acquisition time.
     status: ShardStatus,
@@ -240,7 +245,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         key: ShardKey,
         worker: WorkerId,
     ) -> Result<Self, AcquireError> {
-        let mut snapshot_scratch = AcquireScratch::new();
+        let mut snapshot_scratch = Box::new(AcquireScratch::new());
         let result =
             backend.acquire_and_restore_into(now, tenant, key, worker, &mut snapshot_scratch)?;
         // Panic is intentional: the backend's slab only stores specs that
