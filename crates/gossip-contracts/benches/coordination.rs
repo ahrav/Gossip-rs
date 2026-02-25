@@ -231,6 +231,41 @@ fn bench_claim_next_available(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark steady-state claim with a fixed worker pool.
+///
+/// Unlike `bench_claim_next_available` (which creates a fresh `WorkerId`
+/// per iteration), this benchmark cycles 8 workers round-robin. This
+/// models production behavior where a bounded worker population
+/// repeatedly claims shards, exercising cooldown map lookups and
+/// lease re-acquisition on previously held shards.
+fn bench_claim_next_available_steady_state(c: &mut Criterion) {
+    let mut group = c.benchmark_group("claim_next_available_steady_state");
+
+    for &shard_count in &[1_000, 5_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(shard_count),
+            &shard_count,
+            |b, &n| {
+                let (mut coord, run, _ids) = coordinator_with_shards(n);
+                let mut scratch = AcquireScratch::default();
+                let mut time = LogicalTime::from_raw(100);
+                let mut iteration = 0u64;
+
+                b.iter(|| {
+                    time = LogicalTime::from_raw(time.as_raw() + 2000);
+                    iteration += 1;
+                    let worker_id = WorkerId::from_raw((iteration % 8) + 1);
+                    let result = coord
+                        .claim_next_available(time, tenant(), run, worker_id, &mut scratch)
+                        .unwrap();
+                    let _ = black_box(result.lease);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 /// Benchmark bulk shard registration at varying scale.
 ///
 /// Measures the cost of `register_shards` which inserts `n` shard records
@@ -396,6 +431,7 @@ criterion_group!(
     bench_acquire,
     bench_checkpoint,
     bench_claim_next_available,
+    bench_claim_next_available_steady_state,
     bench_register_shards,
     bench_list_shards,
     bench_collect_claim_candidates,

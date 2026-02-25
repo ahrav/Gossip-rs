@@ -133,37 +133,35 @@ use gossip_stdx::{ByteSlab, RingBuffer};
 /// (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
-// ---- Initial map/set capacity policy ----
+// ---- Initial map/set capacities ----
 //
-// These values are intentionally conservative. They reduce eager allocation
-// compared with the previous fixed-capacity (64/16) policy while keeping
-// behavior identical as structures grow. Maps grow naturally via rehashing
-// when needed; these just avoid wasteful startup allocation.
-const TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
-const TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 16;
-const TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY: usize = 8;
-const TOP_LEVEL_RUN_SHARDS_MAP_INITIAL_CAPACITY: usize = 8;
-const TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY: usize = 8;
-const TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
-const TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 32;
-const RUN_SHARD_SET_INITIAL_CAPACITY: usize = 8;
+// Conservative fixed capacities. HashMap doubling means the difference
+// between starting at 8 and 16 is one rehash at startup — negligible.
+const INITIAL_CAPACITY_SMALL: usize = 8;
+const INITIAL_CAPACITY_MEDIUM: usize = 16;
 
 // ---- Shard/tenant limit defaults ----
 const DEFAULT_MAX_SHARDS_PER_TENANT: usize = 100_000;
 const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
 
-// ---- Memory budget planning constants ----
+// ---- Memory budget planning constants (test-only) ----
 //
 // Used by `CoordinatorConfig::memory_budget()` for capacity estimation.
 // `SHARD_RECORD_PLANNING_BYTES` and `RUN_RECORD_PLANNING_BYTES` model the
 // fixed (non-slab) size of each record struct. Overhead constants model
 // per-entry HashMap bucket/key metadata. All are validated by
 // `memory_budget_constants_match_struct_sizes` in tests.
+#[cfg(any(test, feature = "test-support"))]
 const SHARD_RECORD_PLANNING_BYTES: usize = 728;
+#[cfg(any(test, feature = "test-support"))]
 const RUN_RECORD_PLANNING_BYTES: usize = 512;
+#[cfg(any(test, feature = "test-support"))]
 const SHARD_ENTRY_OVERHEAD_BYTES: usize = 72;
+#[cfg(any(test, feature = "test-support"))]
 const RUN_ENTRY_OVERHEAD_BYTES: usize = 80;
+#[cfg(any(test, feature = "test-support"))]
 const WORKER_COOLDOWN_ENTRY_BYTES: usize = 16;
+#[cfg(any(test, feature = "test-support"))]
 const COORDINATOR_BASE_BYTES: usize = 4096;
 
 /// Pre-allocated containers returned by [`InMemoryCoordinator::preflight_register_capacity`].
@@ -189,38 +187,6 @@ fn ahash_map_with_capacity<K, V>(capacity: usize) -> AHashMap<K, V> {
 #[inline]
 fn ahash_set_with_capacity<T>(capacity: usize) -> HashSet<T, ahash::RandomState> {
     HashSet::with_capacity_and_hasher(capacity, ahash::RandomState::default())
-}
-
-/// Estimate the initial capacity for the outer tenant-to-shards map.
-///
-/// Derives a tenant count estimate from shard limits and clamps it to a
-/// conservative startup range to avoid aggressive pre-allocation in small
-/// deployments.
-#[inline]
-fn top_level_shards_map_initial_capacity(
-    max_total_shards: usize,
-    max_shards_per_tenant: usize,
-) -> usize {
-    // Estimate tenant cardinality from shard limits, then clamp to a small
-    // startup range so tiny deployments do not pre-allocate aggressively.
-    let tenant_limit = max_shards_per_tenant.max(1);
-    let estimated_tenants = max_total_shards.div_ceil(tenant_limit);
-    estimated_tenants.clamp(
-        TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY,
-        TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY,
-    )
-}
-
-/// Estimate the initial capacity for a per-tenant inner shard map.
-///
-/// Clamped to a conservative range so small tenants don't over-allocate
-/// and large tenants don't start with an unreasonably large hash table.
-#[inline]
-fn tenant_shards_map_initial_capacity(max_shards_per_tenant: usize) -> usize {
-    max_shards_per_tenant.clamp(
-        TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY,
-        TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY,
-    )
 }
 
 /// Runtime constructor configuration for [`InMemoryCoordinator`].
@@ -332,8 +298,6 @@ impl CoordinatorRuntimeConfig {
             };
             if derived > DEFAULT_MAX_AUTO_SLAB_CAPACITY {
                 DEFAULT_MAX_AUTO_SLAB_CAPACITY
-            } else if derived > MAX_SLAB_CAPACITY {
-                MAX_SLAB_CAPACITY
             } else {
                 derived
             }
@@ -341,7 +305,7 @@ impl CoordinatorRuntimeConfig {
     }
 }
 
-/// Planning-only configuration for memory budget estimation.
+/// Planning-only configuration for memory budget estimation (test-only).
 ///
 /// Models expected memory needs from deployment-level parameters using a
 /// static formula. See `docs/memory-budget-audit.md`.
@@ -351,6 +315,7 @@ impl CoordinatorRuntimeConfig {
 /// [`CoordinatorRuntimeConfig`] (via
 /// [`InMemoryCoordinator::with_runtime_config`]); this type remains for
 /// capacity planning and memory-budget estimation only.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorConfig {
     /// Global shard cap.
@@ -367,6 +332,7 @@ pub struct CoordinatorConfig {
     pub per_run_budget: usize,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CoordinatorConfig {
     /// Create a config with explicit parameters.
     #[must_use]
@@ -674,22 +640,18 @@ impl InMemoryCoordinator {
              claim a second shard within one lease period"
         );
 
-        let top_level_shards_capacity =
-            top_level_shards_map_initial_capacity(max_total_shards, max_shards_per_tenant);
         Self {
-            shards: ahash_map_with_capacity(top_level_shards_capacity),
+            shards: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
             total_shard_count: 0,
-            runs: ahash_map_with_capacity(TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY),
-            run_shards: ahash_map_with_capacity(TOP_LEVEL_RUN_SHARDS_MAP_INITIAL_CAPACITY),
+            runs: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
+            run_shards: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
-            claim_cooldowns: ahash_map_with_capacity(
-                TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY,
-            ),
+            claim_cooldowns: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
             claim_cooldown_interval,
             slab: ByteSlab::with_capacity(config.effective_slab_capacity()),
-            claim_candidates_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
+            claim_candidates_scratch: Vec::with_capacity(INITIAL_CAPACITY_SMALL),
         }
     }
 
@@ -854,11 +816,10 @@ impl InMemoryCoordinator {
     /// the remove-mutate-restore pattern in split operations removes a
     /// parent, then re-inserts the mutated parent at the same key.
     fn shard_insert(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
-        let inner_initial_capacity = tenant_shards_map_initial_capacity(self.max_shards_per_tenant);
         let inner = self
             .shards
             .entry(tenant)
-            .or_insert_with(|| ahash_map_with_capacity(inner_initial_capacity));
+            .or_insert_with(|| ahash_map_with_capacity(INITIAL_CAPACITY_MEDIUM));
         if let Some(mut old) = inner.insert(key, record) {
             // Release the replaced record's slab allocations (spec key ranges,
             // cursor, metadata, spawned list) to prevent arena leaks.
@@ -984,9 +945,7 @@ impl InMemoryCoordinator {
                 })?;
             let mut inner: AHashMap<ShardKey, ShardRecord> = ahash_map_with_capacity(0);
             inner
-                .try_reserve(
-                    tenant_shards_map_initial_capacity(self.max_shards_per_tenant).max(additional),
-                )
+                .try_reserve(INITIAL_CAPACITY_MEDIUM.max(additional))
                 .map_err(|_| RegisterShardsError::ResourceExhausted {
                     resource: "tenant_shards",
                 })?;
@@ -1016,7 +975,7 @@ impl InMemoryCoordinator {
                 })?;
             let mut shard_set: HashSet<ShardId, ahash::RandomState> = ahash_set_with_capacity(0);
             shard_set
-                .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
+                .try_reserve(shard_ids.len().max(INITIAL_CAPACITY_SMALL))
                 .map_err(|_| RegisterShardsError::ResourceExhausted {
                     resource: "run_shards_set",
                 })?;
@@ -2235,7 +2194,7 @@ impl InMemoryCoordinator {
         let shard_ids = self
             .run_shards
             .entry(run_key)
-            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY));
+            .or_insert_with(|| ahash_set_with_capacity(INITIAL_CAPACITY_SMALL));
         if !shard_ids.contains(&shard) {
             shard_ids.try_reserve(1).unwrap_or_else(|_| {
                 panic!(
@@ -2610,21 +2569,20 @@ impl RunManagement for InMemoryCoordinator {
             .expect("run record must exist: verified by step 1 lookup");
         record.assert_transition_legal(RunStatus::Active);
         record.status = RunStatus::Active;
-        let executed_shard_ids = shard_ids.clone();
-        record.root_shards = executed_shard_ids.clone();
+        record.root_shards = shard_ids.clone();
         record.op_log_push(RunOpLogEntry::new(
             op_id,
             RunOpKind::RegisterShards,
             payload_hash,
             now,
             RunOpResult::RegisteredShards {
-                shard_ids: executed_shard_ids.clone().into_boxed_slice(),
+                shard_ids: shard_ids.clone().into_boxed_slice(),
             },
         ));
         record.assert_invariants();
         self.debug_assert_run_shards_consistent(tenant, run);
 
-        Ok(IdempotentOutcome::Executed(executed_shard_ids))
+        Ok(IdempotentOutcome::Executed(shard_ids))
     }
 
     /// Return a clone of the run record after validating tenant isolation.
