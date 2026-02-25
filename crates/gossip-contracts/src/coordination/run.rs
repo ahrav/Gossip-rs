@@ -1016,6 +1016,8 @@ impl RunProgress {
                 None => {
                     self.watermark = Some(WatermarkKey::from_slice(last_key));
                 }
+                // Equality or greater: watermark only advances toward
+                // smaller keys, so same-value or larger keys are no-ops.
                 _ => {}
             }
         }
@@ -1636,28 +1638,18 @@ pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
             return;
         }
 
-        // Fallback for oversized slices. Registration rejects these manifests,
-        // but hashing remains deterministic and allocation-free for callers.
-        let mut prev: Option<(u64, usize)> = None;
-        for _ in 0..shards.len() {
-            let mut next: Option<(u64, usize)> = None;
-            for (index, shard) in shards.iter().enumerate() {
-                let candidate = (shard.shard.as_raw(), index);
-                if prev.is_some_and(|p| candidate <= p) {
-                    continue;
-                }
-                if next.is_none_or(|n| candidate < n) {
-                    next = Some(candidate);
-                }
-            }
-            let (_, index) = next.expect(
-                "hash_register_shards_payload: no next shard while emitting sorted sequence",
-            );
+        // Fallback for oversized slices. Registration rejects manifests
+        // above MAX_INITIAL_SHARDS, but the hash is computed before
+        // validation so this path CAN execute for invalid input.
+        // Use a heap-allocated Vec to maintain O(N log N) sorting
+        // instead of the O(N²) selection sort that was here before.
+        let mut sorted: Vec<usize> = (0..shards.len()).collect();
+        sorted.sort_by_key(|&idx| shards[idx].shard.as_raw());
+        for &index in &sorted {
             let shard = &shards[index];
             shard.shard.write_canonical(h);
             shard.spec.write_canonical(h);
             shard.cursor.write_canonical(h);
-            prev = Some((shard.shard.as_raw(), index));
         }
     })
 }

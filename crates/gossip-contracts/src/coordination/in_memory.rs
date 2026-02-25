@@ -1707,6 +1707,15 @@ fn split_replace_replay_child_ids(
 /// Called when a mid-loop failure occurs after one or more children were
 /// already inserted (allocation failure for a later child, or a derived-ID
 /// collision discovered later in the sorted sequence).
+/// # Panic safety
+///
+/// This runs inside [`with_removed_parent`], which temporarily removes the
+/// parent from the shard map before re-inserting it. If this function panics
+/// (e.g., slab `deallocate` hits metadata exhaustion or a double-free
+/// assertion), the parent record is lost because `with_removed_parent`
+/// never reaches the re-insertion line. In practice, `deallocate_fields`
+/// only panics on slab invariant violations that indicate data corruption,
+/// at which point losing the parent is the least of our problems.
 fn split_replace_rollback_inserted_children(
     coordinator: &mut InMemoryCoordinator,
     tenant: TenantId,
@@ -2587,15 +2596,18 @@ impl RunManagement for InMemoryCoordinator {
         let shard_ids = self.run_shards.get(&(tenant, run));
         out.clear();
         if let Some(shard_ids) = shard_ids {
+            // After `clear()`, `len = 0`, so `try_reserve(n)` ensures
+            // `capacity >= n`. Using the full shard count (not the delta
+            // from current capacity) avoids under-reserving when the
+            // existing capacity partially covers the needed size.
             if out.capacity() < shard_ids.len() {
-                out.try_reserve(shard_ids.len() - out.capacity())
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "list_shards_into: unable to reserve summary buffer for run {run:?} \
+                out.try_reserve(shard_ids.len()).unwrap_or_else(|_| {
+                    panic!(
+                        "list_shards_into: unable to reserve summary buffer for run {run:?} \
                          ({}) entries",
-                            shard_ids.len()
-                        )
-                    });
+                        shard_ids.len()
+                    )
+                });
             }
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);

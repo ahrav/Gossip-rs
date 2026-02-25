@@ -610,8 +610,16 @@ impl ByteSlab {
                 if self.insert_free_block(remainder_offset, remainder) {
                     needed
                 } else {
-                    // Metadata is full; hand the whole block to the caller
-                    // rather than attempting to grow free-list storage.
+                    // Metadata is full; hand the whole block to the caller.
+                    // This can waste significant memory when best-fit finds
+                    // a much larger block (e.g., request 16 B from a 1 KiB
+                    // block → 1008 B wasted). Acceptable because metadata
+                    // exhaustion only occurs if the free-list capacity
+                    // (set at startup) is undersized relative to churn.
+                    // Deallocation panics on this condition (via
+                    // `free_list_metadata_full`), making it consistently
+                    // fatal on the return path; allocation is lenient to
+                    // avoid failing an in-progress operation.
                     block_size
                 }
             } else {
