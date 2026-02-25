@@ -246,20 +246,29 @@ fn shard_metadata_encode_rejects_oversized_payload() {
 }
 
 #[test]
-fn range_shard_ref_roundtrip_with_decode_helpers() {
+fn range_shard_roundtrip_with_decode_helpers() {
     let mut scratch = ShardSpecScratch::new();
     let spec =
         range_shard_ref(b"a", b"z", b"ctx", &mut scratch).expect("range shard should be valid");
     assert_eq!(spec.key_range_start(), b"a");
     assert_eq!(spec.key_range_end(), b"z");
 
-    let decoded = ShardMetadata::decode(spec.metadata()).expect("metadata should decode");
+    let decoded = decode_metadata(spec).expect("metadata should decode");
     assert_eq!(decoded.hint, ShardHint::Range);
     assert_eq!(decoded.connector_extra, b"ctx");
+
+    assert_eq!(
+        decode_hint(spec).expect("hint should decode"),
+        ShardHint::Range
+    );
+    assert_eq!(
+        decode_connector_extra(spec).expect("connector extra should decode"),
+        b"ctx"
+    );
 }
 
 #[test]
-fn range_shard_ref_rejects_oversized_metadata() {
+fn range_shard_rejects_oversized_metadata() {
     let extra = vec![0xAB; MAX_METADATA_SIZE - 4];
     let mut scratch = ShardSpecScratch::new();
     let err = range_shard_ref(b"a", b"z", &extra, &mut scratch)
@@ -274,7 +283,7 @@ fn range_shard_ref_rejects_oversized_metadata() {
 }
 
 #[test]
-fn prefix_shard_ref_roundtrip_with_decode_helpers() {
+fn prefix_shard_roundtrip_with_decode_helpers() {
     let prefix = b"src/";
     let mut scratch = ShardSpecScratch::new();
     let spec = prefix_shard_ref(prefix, b"bucket=prod", &mut scratch)
@@ -286,17 +295,22 @@ fn prefix_shard_ref_roundtrip_with_decode_helpers() {
         .expect("non-all-ff prefix should have successor");
     assert_eq!(spec.key_range_end(), expected_end);
 
-    let decoded = ShardMetadata::decode(spec.metadata()).expect("metadata should decode");
-    assert_eq!(decoded.hint, ShardHint::Prefix { prefix });
-    assert_eq!(decoded.connector_extra, b"bucket=prod");
+    assert_eq!(
+        decode_hint(spec).expect("hint should decode"),
+        ShardHint::Prefix { prefix }
+    );
+    assert_eq!(
+        decode_connector_extra(spec).expect("connector extra should decode"),
+        b"bucket=prod"
+    );
 }
 
 #[test]
-fn prefix_shard_ref_rejects_oversized_prefix_with_prefix_too_large() {
+fn prefix_shard_rejects_oversized_prefix_with_prefix_too_large() {
     // A prefix larger than MAX_KEY_SIZE should return PrefixTooLarge, not
     // InvalidShardSpec(MetadataTooLarge), regardless of how large it is.
-    let mut scratch = ShardSpecScratch::new();
     let prefix = vec![0xAB; MAX_KEY_SIZE + 1];
+    let mut scratch = ShardSpecScratch::new();
     let err =
         prefix_shard_ref(&prefix, b"", &mut scratch).expect_err("oversized prefix should fail");
     assert!(
@@ -316,16 +330,24 @@ fn prefix_shard_ref_rejects_oversized_prefix_with_prefix_too_large() {
 }
 
 #[test]
-fn prefix_shard_ref_rejects_all_ff_prefix() {
-    let mut scratch = ShardSpecScratch::new();
+fn prefix_shard_rejects_all_ff_prefix() {
     let prefix = vec![0xFF; 8];
+    let mut scratch = ShardSpecScratch::new();
     let err = prefix_shard_ref(&prefix, b"ctx", &mut scratch)
         .expect_err("all-ff prefix has no successor");
     assert_eq!(err, PrefixShardError::NoSuccessor);
 }
 
 #[test]
-fn manifest_shard_ref_roundtrip_with_decode_helpers() {
+fn prefix_shard_rejects_empty_prefix() {
+    let mut scratch = ShardSpecScratch::new();
+    let err =
+        prefix_shard_ref(b"", b"ctx", &mut scratch).expect_err("empty prefix should be rejected");
+    assert_eq!(err, PrefixShardError::EmptyPrefix);
+}
+
+#[test]
+fn manifest_shard_roundtrip_with_decode_helpers() {
     let mut scratch = ShardSpecScratch::new();
     let spec = manifest_shard_ref(42, 10, 20, b"blob", &mut scratch)
         .expect("manifest shard should be valid");
@@ -337,20 +359,22 @@ fn manifest_shard_ref_roundtrip_with_decode_helpers() {
     assert_eq!(start, ManifestRowKey::new(42, 10));
     assert_eq!(end, ManifestRowKey::new(42, 20));
 
-    let decoded = ShardMetadata::decode(spec.metadata()).expect("metadata should decode");
     assert_eq!(
-        decoded.hint,
+        decode_hint(spec).expect("hint should decode"),
         ShardHint::Manifest {
             manifest_id: 42,
             start_row: 10,
             end_row: 20,
         }
     );
-    assert_eq!(decoded.connector_extra, b"blob");
+    assert_eq!(
+        decode_connector_extra(spec).expect("connector extra should decode"),
+        b"blob"
+    );
 }
 
 #[test]
-fn manifest_shard_ref_rejects_inverted_rows() {
+fn manifest_shard_rejects_inverted_rows() {
     let mut scratch = ShardSpecScratch::new();
     let err =
         manifest_shard_ref(9, 99, 10, b"ctx", &mut scratch).expect_err("inverted rows should fail");
@@ -646,8 +670,7 @@ proptest! {
         key.extend_from_slice(&suffix);
 
         prop_assert!(key.starts_with(&prefix));
-        prop_assert!(key.as_slice() >= spec.key_range_start());
-        prop_assert!(key.as_slice() < spec.key_range_end());
+        prop_assert!(spec.contains_key(&key));
     }
 }
 

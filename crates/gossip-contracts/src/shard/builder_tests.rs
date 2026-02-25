@@ -1,6 +1,6 @@
 use super::{PreallocShardBuilder, PreallocShardBuilderError};
 use crate::coordination::{
-    CursorUpdate, ManifestValidationError, ShardArena, ShardSpecRef, validate_manifest_inputs,
+    CursorUpdate, ManifestValidationError, ShardArena, ShardSpecRef, validate_manifest,
 };
 
 #[test]
@@ -12,7 +12,7 @@ fn mixed_range_prefix_manifest_builds_valid_manifest() {
 
     let inputs = builder.build_inputs().unwrap();
     assert_eq!(inputs.len(), 3);
-    validate_manifest_inputs(inputs.as_slice()).unwrap();
+    validate_manifest(inputs.as_slice()).unwrap();
 }
 
 #[test]
@@ -121,7 +121,7 @@ fn stale_or_foreign_handle_is_rejected_without_panic() {
     let handle = foreign_arena
         .alloc_spec(ShardSpecRef::new(b"a", b"b", b""))
         .unwrap();
-    foreign_arena.free_spec(&handle);
+    foreign_arena.free_spec(handle);
 
     let mut builder = PreallocShardBuilder::<2>::with_capacity(2, 512).unwrap();
     let err = builder.add_spec_handle(handle).unwrap_err();
