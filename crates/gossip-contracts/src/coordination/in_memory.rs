@@ -58,6 +58,33 @@
 //! `split_residual` is special: it shrinks the parent's range and spawns a
 //! residual child, but the parent stays `Active`.
 //!
+//! # Allocation-failure policy
+//!
+//! Hot-path functions use a **two-strategy** approach to allocation failures:
+//!
+//! 1. **Pre-reservation (recoverable).**  Before entering a mutation sequence,
+//!    a dedicated `reserve_*` or `check_*` method calls `try_reserve` and
+//!    returns a typed error (e.g. `CapacityExceeded`, `SlabFull`) if the
+//!    allocator cannot satisfy the request.  Callers can propagate this error
+//!    without any state corruption because no mutation has begun.
+//!
+//! 2. **Defense-in-depth panics (unreachable after pre-reservation).**  During
+//!    the subsequent commit phase, individual insertions may still call
+//!    `try_reserve(…).unwrap_or_else(|_| panic!(…))`.  These panics exist as a
+//!    safety net: if the pre-reservation protocol was followed correctly, the
+//!    capacity is already available and the panic never fires.  If it *does*
+//!    fire, it indicates a bug in the reservation logic, and crashing is
+//!    preferable to silent data corruption.
+//!
+//! Examples:
+//! - `reserve_register_shard_capacity` + `reserve_register_index_capacity`
+//!   run before `register_shards` commits shard records and index entries.
+//! - `ensure_claim_cooldown_capacity` runs before `claim_next_available`
+//!   inserts a cooldown entry.
+//! - `index_shard` panics on `try_reserve` are defense-in-depth; callers
+//!   (`split_replace`, `split_residual`) have already passed shard-count
+//!   validation and the run's index entry exists from `register_shards`.
+//!
 //! # Split operation memory-safety pattern
 //!
 //! Both split operations temporarily **remove** the parent record from the map,
@@ -715,7 +742,7 @@ impl InMemoryCoordinator {
     /// which construct records with correct invariants by construction.
     #[cfg(any(test, feature = "test-support"))]
     pub fn seed_shard(&mut self, record: ShardRecord) {
-        record.assert_invariants();
+        record.assert_invariants(&self.slab);
         let key = ShardKey::new(record.run, record.shard);
         self.index_shard(record.tenant, record.run, record.shard);
         self.shard_insert(record.tenant, key, record);
@@ -1098,7 +1125,7 @@ impl CoordinationBackend for InMemoryCoordinator {
             record.cursor.last_key(&self.slab),
             record.cursor.token(&self.slab),
         );
-        out.write_spawned(record.spawned.as_slice());
+        out.write_spawned_iter(record.spawned.iter(&self.slab));
         let snapshot = out.view(record.status, record.cursor_semantics, record.parent);
         let capacity = self.count_available_for_run(now, tenant, key.run());
         // TODO(events): emit ShardAcquired
@@ -1126,20 +1153,24 @@ impl CoordinationBackend for InMemoryCoordinator {
     ) -> Result<RenewResult, RenewError> {
         let key = lease.shard_key();
         let lease_duration = self.default_lease_duration;
-        let record = self
-            .shard_get_mut(&tenant, &key)
-            .ok_or(RenewError::ShardNotFound { shard: key })?;
+        let deadline = {
+            let record = self
+                .shard_get_mut(&tenant, &key)
+                .ok_or(RenewError::ShardNotFound { shard: key })?;
 
-        validate_lease(now, tenant, lease, record)?;
+            validate_lease(now, tenant, lease, record)?;
 
-        // Saturate rather than panicking: a very-long lease is safe — it will
-        // still expire eventually or be superseded by a fence bump.
-        let deadline = now
-            .checked_add(lease_duration)
-            .unwrap_or(LogicalTime::from_raw(u64::MAX));
-        record.lease = Some(LeaseHolder::new(lease.owner(), deadline));
-
-        record.assert_invariants();
+            // Saturate rather than panicking: a very-long lease is safe — it will
+            // still expire eventually or be superseded by a fence bump.
+            let deadline = now
+                .checked_add(lease_duration)
+                .unwrap_or(LogicalTime::from_raw(u64::MAX));
+            record.lease = Some(LeaseHolder::new(lease.owner(), deadline));
+            deadline
+        };
+        self.shard_get(&tenant, &key)
+            .expect("renewed shard must exist")
+            .assert_invariants(&self.slab);
         let capacity = self.count_available_for_run(now, tenant, key.run());
         Ok(RenewResult {
             new_deadline: deadline,
@@ -1199,7 +1230,7 @@ impl CoordinationBackend for InMemoryCoordinator {
         ));
 
         // TODO(events): emit ShardCheckpointed
-        record.assert_invariants();
+        record.assert_invariants(&self.slab);
         Ok(IdempotentOutcome::Executed(()))
     }
 
@@ -1256,7 +1287,7 @@ impl CoordinationBackend for InMemoryCoordinator {
         ));
 
         // TODO(events): emit ShardCompleted
-        record.assert_invariants();
+        record.assert_invariants(&self.slab);
         Ok(IdempotentOutcome::Executed(()))
     }
 
@@ -1277,31 +1308,34 @@ impl CoordinationBackend for InMemoryCoordinator {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<()>, ParkError> {
         let key = lease.shard_key();
-        let record = self
-            .shard_get_mut(&tenant, &key)
-            .ok_or(ParkError::ShardNotFound { shard: key })?;
+        {
+            let record = self
+                .shard_get_mut(&tenant, &key)
+                .ok_or(ParkError::ShardNotFound { shard: key })?;
 
-        let payload_hash = hash_park_payload(reason);
-        if check_op_idempotency(record, op_id, payload_hash)?.is_some() {
-            return Ok(IdempotentOutcome::Replayed(()));
+            let payload_hash = hash_park_payload(reason);
+            if check_op_idempotency(record, op_id, payload_hash)?.is_some() {
+                return Ok(IdempotentOutcome::Replayed(()));
+            }
+
+            validate_lease(now, tenant, lease, record)?;
+
+            record.assert_transition_legal(ShardStatus::Parked);
+            record.status = ShardStatus::Parked;
+            record.park_reason = Some(reason);
+            record.lease = None;
+            record.op_log_push(OpLogEntry::new(
+                op_id,
+                OpKind::Park,
+                OpResult::Completed,
+                payload_hash,
+                now,
+            ));
         }
-
-        validate_lease(now, tenant, lease, record)?;
-
-        record.assert_transition_legal(ShardStatus::Parked);
-        record.status = ShardStatus::Parked;
-        record.park_reason = Some(reason);
-        record.lease = None;
-        record.op_log_push(OpLogEntry::new(
-            op_id,
-            OpKind::Park,
-            OpResult::Completed,
-            payload_hash,
-            now,
-        ));
-
+        self.shard_get(&tenant, &key)
+            .expect("parked shard must exist")
+            .assert_invariants(&self.slab);
         // TODO(events): emit ShardParked
-        record.assert_invariants();
         Ok(IdempotentOutcome::Executed(()))
     }
 
@@ -1421,7 +1455,9 @@ impl CoordinationBackend for InMemoryCoordinator {
                     parent.spawned.len() as u32,
                 );
 
-                if let Some(replay) = split_residual_check_replay(parent, op_id, payload_hash)? {
+                if let Some(replay) =
+                    split_residual_check_replay(parent, op_id, payload_hash, &coordinator.slab)?
+                {
                     return Ok(replay);
                 }
                 split_residual_validate_preconditions(
@@ -1821,7 +1857,8 @@ fn split_replace_apply_parent(
     op_id: OpId,
     payload_hash: u64,
     now: LogicalTime,
-) {
+    slab: &mut ByteSlab,
+) -> Result<(), SplitReplaceError> {
     assert!(!child_ids.is_empty(), "split_replace requires children");
     debug_assert!(
         parent.can_spawn(child_ids.len()),
@@ -1829,8 +1866,8 @@ fn split_replace_apply_parent(
     );
 
     parent.assert_transition_legal(ShardStatus::Split);
+    parent.spawned.install_slot(spawned_slot, spawned_len, slab);
     parent.status = ShardStatus::Split;
-    parent.spawned.extend_from_slice(child_ids);
     parent.lease = None;
     parent.op_log_push(OpLogEntry::new(
         op_id,
@@ -1839,7 +1876,8 @@ fn split_replace_apply_parent(
         payload_hash,
         now,
     ));
-    parent.assert_invariants();
+    parent.assert_invariants(slab);
+    Ok(())
 }
 
 // ============================================================================
@@ -1864,14 +1902,14 @@ fn split_replace_apply_parent(
 /// hash+compare steps and zero heap allocation.
 ///
 /// Returns `None` if no match, meaning this is genuinely a new operation.
-fn find_replayed_residual(parent: &ShardRecord, op_id: OpId) -> Option<ShardId> {
+fn find_replayed_residual(parent: &ShardRecord, op_id: OpId, slab: &ByteSlab) -> Option<ShardId> {
     assert!(
         parent.spawned.len() <= MAX_SPAWNED_PER_SHARD,
         "spawned count {} exceeds bound {}",
         parent.spawned.len(),
         MAX_SPAWNED_PER_SHARD,
     );
-    for (idx, spawned) in parent.spawned.iter().enumerate() {
+    for (idx, spawned) in parent.spawned.iter(slab).enumerate() {
         let candidate = derive_split_shard_id(
             parent.run,
             parent.shard,
@@ -1879,7 +1917,7 @@ fn find_replayed_residual(parent: &ShardRecord, op_id: OpId) -> Option<ShardId> 
             DerivedShardKind::Residual,
             idx as u32,
         );
-        if *spawned == candidate {
+        if spawned == candidate {
             return Some(candidate);
         }
     }
@@ -1908,6 +1946,7 @@ fn split_residual_check_replay(
     parent: &ShardRecord,
     op_id: OpId,
     payload_hash: u64,
+    slab: &ByteSlab,
 ) -> Result<Option<IdempotentOutcome<SplitResidualResult>>, SplitResidualError> {
     if check_op_idempotency(parent, op_id, payload_hash)?.is_some() {
         // Op-log hit. The residual is already in spawned; find it.
@@ -1915,7 +1954,7 @@ fn split_residual_check_replay(
         // residual was pushed to `parent.spawned` before the op-log entry was
         // written. If `find_replayed_residual` fails here, it indicates a
         // logic bug (spawned was mutated without recording the residual).
-        let replayed = find_replayed_residual(parent, op_id).expect(
+        let replayed = find_replayed_residual(parent, op_id, slab).expect(
             "op-log hit for split_residual implies residual exists in parent.spawned; \
              missing entry indicates a coordinator bug",
         );
@@ -1938,7 +1977,7 @@ fn split_residual_check_replay(
     // CSPRNG-generated so accidental reuse is astronomically unlikely,
     // (3) this is a reference implementation — production backends with
     // durable op-logs don't have this window.
-    if let Some(existing) = find_replayed_residual(parent, op_id) {
+    if let Some(existing) = find_replayed_residual(parent, op_id, slab) {
         return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
             residual: existing,
         })));
@@ -2076,8 +2115,14 @@ fn split_residual_apply_parent(
         "split_residual precondition violated: append would exceed spawn cap"
     );
 
-    parent.spec.update_from_ref(new_spec, slab)?;
-    parent.spawned.push(residual_id);
+    let (spawned_slot, spawned_len) = parent
+        .spawned
+        .allocate_appended_slot(core::slice::from_ref(&residual_id), slab)?;
+    if let Err(err) = parent.spec.update_from_ref(new_spec, slab) {
+        slab.deallocate(spawned_slot);
+        return Err(SplitResidualError::from(err));
+    }
+    parent.spawned.install_slot(spawned_slot, spawned_len, slab);
     parent.op_log_push(OpLogEntry::new(
         op_id,
         OpKind::SplitResidual,
@@ -2085,7 +2130,7 @@ fn split_residual_apply_parent(
         payload_hash,
         now,
     ));
-    parent.assert_invariants();
+    parent.assert_invariants(slab);
     Ok(())
 }
 
@@ -2105,6 +2150,23 @@ impl InMemoryCoordinator {
     /// a run's shards without scanning the entire tenant shard map.
     /// Idempotent — `HashSet::insert` is a no-op if the shard is already
     /// indexed, so calling this on both register and split paths is safe.
+    ///
+    /// # Pre-reservation contract
+    ///
+    /// Callers are expected to ensure the run already has an entry in
+    /// `run_shards` (created by `register_shards` during run initialization).
+    /// For `register_shards`, [`reserve_register_index_capacity`] explicitly
+    /// pre-reserves both the outer map slot and inner set capacity.  For
+    /// `split_replace` and `split_residual`, the run's index entry already
+    /// exists (the parent shard was registered earlier), so the outer map
+    /// insertion is a no-op and only inner-set growth is needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `try_reserve` fails on either the outer `run_shards` map or
+    /// the inner shard-ID set.  These are defense-in-depth: under correct
+    /// pre-reservation they are unreachable (see module-level
+    /// "Allocation-failure policy").
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
         let run_key = (tenant, run);
         if !self.run_shards.contains_key(&run_key) {
@@ -2457,7 +2519,7 @@ impl RunManagement for InMemoryCoordinator {
                     return Err(err.into());
                 }
             };
-            sr.assert_invariants();
+            sr.assert_invariants(&self.slab);
             to_insert.push((key, sr));
         }
 
@@ -2475,7 +2537,16 @@ impl RunManagement for InMemoryCoordinator {
             self.shard_insert(tenant, key, record);
         }
 
+        // Index finalization: `reserve_register_index_capacity` (step 5) already
+        // validated that `run_shards` can absorb these entries.  The panic below
+        // is defense-in-depth — it fires only if the reservation logic has a bug.
         let run_key = (tenant, run);
+        debug_assert!(
+            self.run_shards.contains_key(&run_key)
+                || self.run_shards.capacity() > self.run_shards.len(),
+            "register_shards: run_shards capacity should have been pre-reserved \
+             by reserve_register_index_capacity for run {run:?}"
+        );
         let shard_set = self.run_shards.entry(run_key).or_insert_with(|| {
             let mut shard_set = ahash_set_with_capacity(0);
             shard_set
@@ -2583,6 +2654,14 @@ impl RunManagement for InMemoryCoordinator {
     /// [`ShardSummary`], which avoids heap-allocating cloned key ranges
     /// for shards that will be discarded. This matters when a run has
     /// many terminal shards and the caller only wants active ones.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `out` buffer cannot be reserved to hold all matching
+    /// shards (defense-in-depth; callers should pre-size the buffer or
+    /// reuse one that grew to steady-state capacity).  Also panics if the
+    /// `run_shards` index references a shard ID with no corresponding record
+    /// in the primary shard map (index desynchronization — indicates a bug).
     fn list_shards_into(
         &self,
         now: LogicalTime,
@@ -2868,25 +2947,29 @@ impl RunManagement for InMemoryCoordinator {
             });
         }
 
-        let record = self
-            .shard_get_mut(&tenant, &key)
-            .expect("shard record must exist: verified by read-only check above");
+        {
+            let record = self
+                .shard_get_mut(&tenant, &key)
+                .expect("shard record must exist: verified by read-only check above");
 
-        // Bump fence first — invalidate zombie workers from prior lease.
-        record.advance_fence();
+            // Bump fence first — invalidate zombie workers from prior lease.
+            record.advance_fence();
 
-        record.park_reason = None;
-        record.status = ShardStatus::Active;
-        record.lease = None;
+            record.park_reason = None;
+            record.status = ShardStatus::Active;
+            record.lease = None;
 
-        record.op_log_push(OpLogEntry::new(
-            op_id,
-            OpKind::Unpark,
-            OpResult::Completed,
-            payload_hash,
-            now,
-        ));
-        record.assert_invariants();
+            record.op_log_push(OpLogEntry::new(
+                op_id,
+                OpKind::Unpark,
+                OpResult::Completed,
+                payload_hash,
+                now,
+            ));
+        }
+        self.shard_get(&tenant, &key)
+            .expect("unparked shard must exist")
+            .assert_invariants(&self.slab);
 
         Ok(IdempotentOutcome::Executed(()))
     }
@@ -2911,6 +2994,16 @@ impl ShardClaiming for InMemoryCoordinator {
     /// claims (no shards available, run not found) do not trigger cooldown,
     /// so a worker competing for scarce shards is never penalized for losing
     /// a race.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the candidate buffer cannot be reserved to hold all active
+    /// shards in the run (defense-in-depth; the caller-owned `AcquireScratch`
+    /// typically grows to steady-state capacity after the first call).  Also
+    /// panics if the `run_shards` index references a shard ID with no
+    /// corresponding record in the primary shard map (index desynchronization).
+    /// Panics if `ensure_claim_cooldown_capacity` was unable to pre-reserve
+    /// a cooldown entry for the worker (called before candidate selection).
     fn claim_next_available<'a>(
         &mut self,
         now: LogicalTime,
@@ -3203,6 +3296,17 @@ impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
             record.spec.key_range_start(&self.slab),
             record.spec.key_range_end(&self.slab),
         )
+    }
+
+    fn validate_record_invariants(&self, record: &ShardRecord) -> Result<(), String> {
+        record.validate_invariants(&self.slab)
+    }
+
+    fn spawned_children<'a>(
+        &'a self,
+        record: &'a ShardRecord,
+    ) -> Box<dyn Iterator<Item = ShardId> + 'a> {
+        Box::new(record.spawned.iter(&self.slab))
     }
 
     fn release_record_fields(&mut self, record: &mut ShardRecord) {

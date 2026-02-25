@@ -360,7 +360,7 @@ impl InvariantChecker {
                 record.fence_epoch,
                 &mut violations,
             );
-            Self::check_record_invariant(record, &mut violations);
+            Self::check_record_invariant(coordinator, record, &mut violations);
             let current_last_key = coordinator.cursor_last_key(record);
             let (spec_start, spec_end) = coordinator.spec_bounds(record);
             self.check_cursor_monotonicity(id, current_last_key, &mut violations);
@@ -502,8 +502,12 @@ impl InvariantChecker {
     ///
     /// Delegates to the record's non-panicking [`validate_invariants`](ShardRecord::validate_invariants),
     /// which works correctly under both `panic=unwind` and `panic=abort`.
-    fn check_record_invariant(record: &ShardRecord, violations: &mut Vec<InvariantViolation>) {
-        if let Err(message) = record.validate_invariants() {
+    fn check_record_invariant(
+        coordinator: &impl SimIntrospection,
+        record: &ShardRecord,
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        if let Err(message) = coordinator.validate_record_invariants(record) {
             violations.push(InvariantViolation::RecordInvariant {
                 run: record.run,
                 shard: record.shard,
@@ -590,7 +594,7 @@ impl InvariantChecker {
         }
         self.scratch_missing.clear();
         self.scratch_wrong_parent.clear();
-        for &child_id in &record.spawned {
+        for child_id in coordinator.spawned_children(record) {
             let child_key = ShardKey::new(record.run, child_id);
             match coordinator.shard_lookup(&tenant, &child_key) {
                 Some(child_record) => {

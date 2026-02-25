@@ -39,7 +39,7 @@ use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::run::RunRecord;
 use crate::coordination::shard_spec::ShardSpec;
-use crate::identity::{RunId, ShardKey, TenantId};
+use crate::identity::{RunId, ShardId, ShardKey, TenantId};
 
 /// Read-only observation API for simulation backends.
 ///
@@ -136,6 +136,21 @@ pub trait SimIntrospection {
     /// Borrow is tied to `self` because pooled fields are slab-backed.
     /// This keeps split and cursor-bound validation allocation-free.
     fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]);
+
+    /// Run shard-record structural validation against backend-owned storage.
+    ///
+    /// Backends with pooled storage use this hook to provide the required
+    /// storage context (`ByteSlab`) without leaking allocator internals into
+    /// simulation code.
+    fn validate_record_invariants(&self, record: &ShardRecord) -> Result<(), String>;
+
+    /// Iterate a record's spawned child IDs without materializing an owned list.
+    ///
+    /// Borrow is tied to `self` because pooled lineage storage is backend-owned.
+    fn spawned_children<'a>(
+        &'a self,
+        record: &'a ShardRecord,
+    ) -> Box<dyn Iterator<Item = ShardId> + 'a>;
 
     /// Release pooled fields for an observation-only record.
     ///

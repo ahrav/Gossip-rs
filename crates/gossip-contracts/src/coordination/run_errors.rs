@@ -237,7 +237,7 @@ impl From<SlabFull> for RegisterShardsError {
 // GetRunError
 // ============================================================================
 
-/// Error from `get_run`, `get_run_progress`, and `list_shards`.
+/// Error from `get_run`, `get_run_progress`, and `list_shards_into`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GetRunError {

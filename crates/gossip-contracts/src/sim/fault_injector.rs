@@ -56,7 +56,7 @@
 
 use crate::coordination::record::ShardRecord;
 use crate::coordination::shard_spec::ShardSpec;
-use crate::identity::{ShardKey, TenantId};
+use crate::identity::{ShardId, ShardKey, TenantId};
 use crate::sim::backend::SimIntrospection;
 
 /// Wraps a [`SimIntrospection`] backend and injects synthetic shard records
@@ -179,6 +179,17 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
 
     fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]) {
         self.inner.spec_bounds(record)
+    }
+
+    fn validate_record_invariants(&self, record: &ShardRecord) -> Result<(), String> {
+        self.inner.validate_record_invariants(record)
+    }
+
+    fn spawned_children<'a>(
+        &'a self,
+        record: &'a ShardRecord,
+    ) -> Box<dyn Iterator<Item = ShardId> + 'a> {
+        self.inner.spawned_children(record)
     }
 
     fn release_record_fields(&mut self, record: &mut ShardRecord) {

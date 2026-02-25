@@ -116,7 +116,7 @@ const _: () = assert!(CursorSemantics::Dispatched as u8 == 1);
 
 /// Borrowed shard-spec view.
 ///
-/// This is the allocation-free companion to [`ShardSpec`], used for B3 hot-path
+/// This is the allocation-free companion to [`ShardSpec`], used for hot-path
 /// APIs that must avoid per-call heap traffic. It borrows caller-owned buffers
 /// and is therefore valid only for the lifetime of those buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

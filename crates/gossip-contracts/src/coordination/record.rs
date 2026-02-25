@@ -35,7 +35,7 @@ use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
-use crate::coordination::pooled::{PooledCursor, PooledShardSpec};
+use crate::coordination::pooled::{PooledCursor, PooledShardSpec, PooledSpawned};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
@@ -43,18 +43,12 @@ use crate::identity::{
 
 use super::split::MAX_SPAWNED_PER_SHARD;
 
-/// Spawned-lineage storage for shard records.
+/// Spawned-lineage input storage used by test helpers.
 ///
-/// The inline capacity is intentionally aligned to [`MAX_SPAWNED_PER_SHARD`]
-/// so split lineage tracking remains allocation-free throughout the supported
-/// runtime envelope.
+/// Runtime shard records store lineage in slab-backed [`PooledSpawned`], but
+/// test constructors accept this inline container for ergonomics.
+#[cfg(test)]
 pub(crate) type SpawnedList = InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>;
-
-// Compile-time guard: record lineage capacity must match the protocol cap.
-const _: () = assert!(
-    core::mem::size_of::<SpawnedList>()
-        == core::mem::size_of::<InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>>()
-);
 
 /// Snapshot-facing spawned storage.
 ///
@@ -321,7 +315,7 @@ pub struct ShardRecord {
     /// Shards created by this shard via split operations.
     /// For `status == Split`: the replacement children.
     /// For `status == Active`: any residual shards spawned so far.
-    pub(crate) spawned: SpawnedList,
+    pub(crate) spawned: PooledSpawned,
 
     // -- Idempotency --
     /// Bounded operation log for idempotent replay.
@@ -406,10 +400,10 @@ impl ShardRecord {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
-            spawned: InlineVec::new(),
+            spawned: PooledSpawned::new(),
             op_log: RingBuffer::new(),
         };
-        record.assert_invariants();
+        record.assert_invariants(slab);
         Ok(record)
     }
 
@@ -452,10 +446,10 @@ impl ShardRecord {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: Some(parent),
-            spawned: InlineVec::new(),
+            spawned: PooledSpawned::new(),
             op_log: RingBuffer::new(),
         };
-        record.assert_invariants();
+        record.assert_invariants(slab);
         Ok(record)
     }
 
@@ -485,6 +479,8 @@ impl ShardRecord {
             PooledShardSpec::from_spec(spec, slab).expect("from_raw_parts: slab too small");
         let pooled_cursor =
             PooledCursor::from_cursor(cursor, slab).expect("from_raw_parts: slab too small");
+        let pooled_spawned = PooledSpawned::from_slice(spawned.as_slice(), slab)
+            .expect("from_raw_parts: slab too small");
         Self {
             tenant,
             run,
@@ -497,7 +493,7 @@ impl ShardRecord {
             lease,
             fence_epoch,
             parent,
-            spawned,
+            spawned: pooled_spawned,
             op_log,
         }
     }
@@ -532,9 +528,9 @@ impl ShardRecord {
     /// bugs. Monitor for coordinator process crashes and alert immediately.
     /// The shard's durable state is safe (the failing operation was not
     /// persisted), but the root cause must be investigated.
-    pub fn assert_invariants(&self) {
+    pub fn assert_invariants(&self, slab: &ByteSlab) {
         self.assert_lifecycle_invariants();
-        self.assert_lineage_invariants();
+        self.assert_lineage_invariants(slab);
     }
 
     /// INV-1 through INV-5: status, park_reason, lease, fence, op-log cap.
@@ -590,7 +586,7 @@ impl ShardRecord {
 
     /// INV-6 through INV-10: split/spawned, parent/derived (biconditional),
     /// op-log uniqueness, spawned cap.
-    fn assert_lineage_invariants(&self) {
+    fn assert_lineage_invariants(&self, slab: &ByteSlab) {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split {
             assert!(
@@ -617,7 +613,7 @@ impl ShardRecord {
         }
 
         // INV-8: All spawned entries must be derived.
-        for (i, spawned_id) in self.spawned.iter().enumerate() {
+        for (i, spawned_id) in self.spawned.iter(slab).enumerate() {
             assert!(
                 spawned_id.is_derived(),
                 "Shard {:?}: spawned[{i}] ({:?}) is not derived (bit 63 not set)",
@@ -659,9 +655,9 @@ impl ShardRecord {
     ///
     /// This is the non-panicking counterpart to [`assert_invariants`](Self::assert_invariants).
     /// Both check the same set of invariants (INV-1 through INV-10).
-    pub fn validate_invariants(&self) -> Result<(), String> {
+    pub fn validate_invariants(&self, slab: &ByteSlab) -> Result<(), String> {
         self.validate_lifecycle_invariants()?;
-        self.validate_lineage_invariants()
+        self.validate_lineage_invariants(slab)
     }
 
     /// INV-1 through INV-5 (non-panicking).
@@ -716,7 +712,7 @@ impl ShardRecord {
     }
 
     /// INV-6 through INV-10 (non-panicking).
-    fn validate_lineage_invariants(&self) -> Result<(), String> {
+    fn validate_lineage_invariants(&self, slab: &ByteSlab) -> Result<(), String> {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split && self.spawned.is_empty() {
             return Err(format!(
@@ -740,7 +736,7 @@ impl ShardRecord {
         }
 
         // INV-8: All spawned entries must be derived.
-        for (i, spawned_id) in self.spawned.iter().enumerate() {
+        for (i, spawned_id) in self.spawned.iter(slab).enumerate() {
             if !spawned_id.is_derived() {
                 return Err(format!(
                     "Shard {:?}: spawned[{i}] ({:?}) is not derived (bit 63 not set)",
@@ -793,14 +789,14 @@ impl ShardRecord {
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
     pub(crate) fn snapshot(&self, slab: &ByteSlab) -> ShardSnapshot {
-        self.assert_invariants();
+        self.assert_invariants(slab);
         ShardSnapshot::new(
             self.status,
             self.spec.to_spec(slab),
             self.cursor.to_cursor(slab),
             self.cursor_semantics,
             self.parent,
-            self.spawned.iter(),
+            self.spawned.iter(slab),
         )
     }
 
@@ -813,6 +809,7 @@ impl ShardRecord {
     pub(crate) fn deallocate_fields(&mut self, slab: &mut ByteSlab) {
         self.spec.release_fields(slab);
         self.cursor.release_fields(slab);
+        self.spawned.release_fields(slab);
     }
 
     /// Look up an op-log entry by [`OpId`].

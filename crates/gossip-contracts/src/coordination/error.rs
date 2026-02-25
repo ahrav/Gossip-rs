@@ -1475,12 +1475,27 @@ impl AcquireScratch {
     /// would violate split invariants and panic. This assert also guarantees
     /// `InlineVec::from_slice` stays on its inline representation (no heap
     /// spill) in steady state.
+    #[cfg(test)]
     pub(crate) fn write_spawned(&mut self, spawned: &[ShardId]) {
-        assert!(
-            spawned.len() <= MAX_SPAWNED_PER_SHARD,
-            "spawned lineage exceeds MAX_SPAWNED_PER_SHARD",
-        );
-        self.spawned = InlineVec::from_slice(spawned);
+        self.write_spawned_iter(spawned.iter().copied());
+    }
+
+    /// Copy lineage IDs from an iterator into scratch-owned inline storage.
+    ///
+    /// This keeps acquire callers allocation-free even when upstream storage
+    /// is not represented as a `&[ShardId]`.
+    pub(crate) fn write_spawned_iter<I>(&mut self, spawned: I)
+    where
+        I: IntoIterator<Item = ShardId>,
+    {
+        self.spawned = InlineVec::new();
+        for shard in spawned {
+            assert!(
+                self.spawned.len() < MAX_SPAWNED_PER_SHARD,
+                "spawned lineage exceeds MAX_SPAWNED_PER_SHARD",
+            );
+            self.spawned.push(shard);
+        }
     }
 
     /// Borrow a spec view over the currently written scratch bytes.

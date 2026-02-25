@@ -156,13 +156,13 @@ fn park_reason_from_u8_rejects_invalid(#[case] disc: u8) {
 #[test]
 fn assert_invariants_active_unleased_ok() {
     let mut slab = TestSlab::new();
-    active_record(&mut slab).assert_invariants();
+    active_record(&mut slab).assert_invariants(&slab);
 }
 
 #[test]
 fn assert_invariants_active_leased_ok() {
     let mut slab = TestSlab::new();
-    leased_record(&mut slab).assert_invariants();
+    leased_record(&mut slab).assert_invariants(&slab);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn assert_invariants_done_ok() {
     let mut slab = TestSlab::new();
     let mut r = active_record(&mut slab);
     r.status = ShardStatus::Done;
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 #[test]
@@ -179,7 +179,7 @@ fn assert_invariants_parked_ok() {
     let mut r = active_record(&mut slab);
     r.status = ShardStatus::Parked;
     r.park_reason = Some(ParkReason::TooManyErrors);
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 #[test]
@@ -187,8 +187,9 @@ fn assert_invariants_split_ok() {
     let mut slab = TestSlab::new();
     let mut r = active_record(&mut slab);
     r.status = ShardStatus::Split;
-    r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
-    r.assert_invariants();
+    r.spawned = PooledSpawned::from_slice(&[derived_shard_id(1), derived_shard_id(2)], &mut slab)
+        .expect("slab large enough for spawned lineage");
+    r.assert_invariants(&slab);
 }
 
 // ============================================================================
@@ -208,7 +209,7 @@ fn assert_invariants_parked_without_reason_panics() {
     let mut r = active_record(&mut slab);
     r.status = ShardStatus::Parked;
     // park_reason left as None.
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 /// Non-Parked statuses must not carry a `park_reason` (it would be stale).
@@ -218,7 +219,7 @@ fn assert_invariants_active_with_reason_panics() {
     let mut slab = TestSlab::new();
     let mut r = active_record(&mut slab);
     r.park_reason = Some(ParkReason::Other);
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 /// Terminal shards (Done, Parked, Split) must have their lease cleared.
@@ -255,7 +256,7 @@ fn assert_invariants_terminal_with_lease_panics(
         RingBuffer::new(),
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 // NOTE: op_log overflow test removed — RingBuffer prevents overflow at the
@@ -284,7 +285,7 @@ fn assert_invariants_parent_some_but_not_derived_panics() {
         RingBuffer::new(),
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 /// Every entry in `spawned` must be a derived ShardId. A non-derived ID in the
@@ -295,8 +296,9 @@ fn assert_invariants_spawned_contains_non_derived_panics() {
     let mut slab = TestSlab::new();
     let mut r = active_record(&mut slab);
     r.status = ShardStatus::Split;
-    r.spawned = InlineVec::from_slice(&[ShardId::from_raw(42)]); // NOT derived (bit 63 clear)
-    r.assert_invariants();
+    r.spawned = PooledSpawned::from_slice(&[ShardId::from_raw(42)], &mut slab)
+        .expect("slab large enough for spawned lineage"); // NOT derived (bit 63 clear)
+    r.assert_invariants(&slab);
 }
 
 /// `FenceEpoch::ZERO` is reserved as a sentinel. All records must start at
@@ -321,7 +323,7 @@ fn assert_invariants_fence_epoch_zero_panics() {
         RingBuffer::new(),
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 #[test]
@@ -344,7 +346,7 @@ fn assert_invariants_split_without_spawned_panics() {
         RingBuffer::new(),
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 #[test]
@@ -370,7 +372,7 @@ fn assert_invariants_duplicate_op_id_panics() {
         entries,
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 #[test]
@@ -396,7 +398,7 @@ fn assert_invariants_spawned_exceeds_cap_panics() {
         RingBuffer::new(),
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 // ============================================================================
@@ -490,7 +492,8 @@ fn snapshot_preserves_fields() {
     assert_eq!(snap.cursor(), &cursor);
     assert_eq!(snap.cursor_semantics(), r.cursor_semantics);
     assert_eq!(snap.parent(), r.parent);
-    assert_eq!(snap.spawned(), r.spawned.as_slice());
+    let expected_spawned: SpawnedList = r.spawned.iter(&slab).collect();
+    assert_eq!(snap.spawned(), expected_spawned.as_slice());
 }
 
 /// The Debug output of a snapshot must not contain TenantId, WorkerId, or
@@ -544,7 +547,7 @@ fn assert_invariants_derived_without_parent_panics() {
         RingBuffer::new(),
         &mut slab,
     );
-    r.assert_invariants();
+    r.assert_invariants(&slab);
 }
 
 // ============================================================================
@@ -589,7 +592,9 @@ fn transition_illegal_from_terminal(#[case] from: ShardStatus, #[case] to: Shard
         r.park_reason = Some(ParkReason::TooManyErrors);
     }
     if from == ShardStatus::Split {
-        r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
+        r.spawned =
+            PooledSpawned::from_slice(&[derived_shard_id(1), derived_shard_id(2)], &mut slab)
+                .expect("slab large enough for spawned lineage");
     }
     r.assert_transition_legal(to);
 }
@@ -660,9 +665,11 @@ fn can_spawn_within_cap() {
 fn can_spawn_at_cap() {
     let mut slab = TestSlab::new();
     let mut r = active_record(&mut slab);
-    r.spawned = (0..MAX_SPAWNED_PER_SHARD as u64)
+    let spawned: SpawnedList = (0..MAX_SPAWNED_PER_SHARD as u64)
         .map(|i| derived_shard_id(i + 1))
         .collect();
+    r.spawned = PooledSpawned::from_slice(spawned.as_slice(), &mut slab)
+        .expect("slab large enough for spawned lineage");
     assert!(!r.can_spawn(1));
     assert!(r.can_spawn(0));
 }

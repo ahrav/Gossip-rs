@@ -426,7 +426,7 @@ proptest! {
 
             // After every op, all records must satisfy invariants.
             for (_, record) in coord.shards() {
-                record.assert_invariants();
+                record.assert_invariants(coord.slab());
             }
         }
     }

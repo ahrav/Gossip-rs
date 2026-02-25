@@ -375,7 +375,7 @@ mod tests {
             RingBuffer::new(),
             slab,
         );
-        r.assert_invariants();
+        r.assert_invariants(slab);
         r
     }
 

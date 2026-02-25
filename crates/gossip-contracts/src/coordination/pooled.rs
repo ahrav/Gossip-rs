@@ -94,6 +94,8 @@ use crate::coordination::cursor::CursorUpdate;
 #[cfg(any(test, feature = "test-support"))]
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::shard_spec::ShardSpecRef;
+use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
+use crate::identity::ShardId;
 
 // ============================================================================
 // Staged allocation helper
@@ -481,6 +483,219 @@ impl PooledCursor {
         }
     }
 }
+
+// ============================================================================
+// PooledSpawned
+// ============================================================================
+
+const SHARD_ID_ENCODED_BYTES: usize = core::mem::size_of::<u64>();
+const MAX_SPAWNED_ENCODED_BYTES: usize = MAX_SPAWNED_PER_SHARD * SHARD_ID_ENCODED_BYTES;
+const _: () = assert!(MAX_SPAWNED_PER_SHARD <= u16::MAX as usize);
+
+/// Arena-pooled lineage storage for `ShardRecord::spawned`.
+///
+/// Stores `ShardId` values as tightly packed little-endian `u64` bytes in a
+/// single `ByteSlot`. This keeps `ShardRecord` compact while preserving the
+/// no-heap-allocation runtime contract.
+#[derive(Debug)]
+pub(crate) struct PooledSpawned {
+    slot: ByteSlot,
+    len: u16,
+}
+
+impl PooledSpawned {
+    /// Construct an empty lineage list without slab allocation.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: ByteSlot::EMPTY,
+            len: 0,
+        }
+    }
+
+    /// Construct from a `ShardId` slice by copying encoded bytes into the slab.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlabFull` if the slab cannot allocate space for the encoded list.
+    #[cfg(test)]
+    pub(crate) fn from_slice(spawned: &[ShardId], slab: &mut ByteSlab) -> Result<Self, SlabFull> {
+        assert!(
+            spawned.len() <= MAX_SPAWNED_PER_SHARD,
+            "spawned length {} exceeds cap {}",
+            spawned.len(),
+            MAX_SPAWNED_PER_SHARD,
+        );
+        if spawned.is_empty() {
+            return Ok(Self::new());
+        }
+        let mut encoded = [0u8; MAX_SPAWNED_ENCODED_BYTES];
+        let encoded_len = Self::encode_slice_into(spawned, &mut encoded);
+        let slot = slab.allocate(&encoded[..encoded_len])?;
+        Ok(Self {
+            slot,
+            len: u16::try_from(spawned.len()).expect("spawned length exceeds u16"),
+        })
+    }
+
+    #[inline]
+    fn encode_slice_into(spawned: &[ShardId], out: &mut [u8]) -> usize {
+        let needed = spawned.len() * SHARD_ID_ENCODED_BYTES;
+        assert!(out.len() >= needed, "encode buffer too small");
+        for (idx, shard) in spawned.iter().enumerate() {
+            let offset = idx * SHARD_ID_ENCODED_BYTES;
+            out[offset..offset + SHARD_ID_ENCODED_BYTES]
+                .copy_from_slice(&shard.as_raw().to_le_bytes());
+        }
+        needed
+    }
+
+    #[inline]
+    fn bytes<'a>(&self, slab: &'a ByteSlab) -> &'a [u8] {
+        let bytes = slab.get(self.slot);
+        debug_assert_eq!(bytes.len(), self.len as usize * SHARD_ID_ENCODED_BYTES);
+        bytes
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Iterate decoded `ShardId` values.
+    #[inline]
+    pub(crate) fn iter<'a>(&self, slab: &'a ByteSlab) -> PooledSpawnedIter<'a> {
+        PooledSpawnedIter {
+            chunks: self.bytes(slab).chunks_exact(SHARD_ID_ENCODED_BYTES),
+        }
+    }
+
+    /// Stage a new slot containing the current IDs plus `additional`.
+    ///
+    /// Does not mutate `self`; callers install the staged slot with
+    /// [`install_slot`](Self::install_slot) once other mutations succeed.
+    pub(crate) fn allocate_appended_slot(
+        &self,
+        additional: &[ShardId],
+        slab: &mut ByteSlab,
+    ) -> Result<(ByteSlot, u16), SlabFull> {
+        if additional.is_empty() {
+            return Ok((self.slot, self.len));
+        }
+        let current = self.len();
+        let total = current.saturating_add(additional.len());
+        assert!(
+            total <= MAX_SPAWNED_PER_SHARD,
+            "spawned length {} exceeds cap {}",
+            total,
+            MAX_SPAWNED_PER_SHARD,
+        );
+
+        let mut encoded = [0u8; MAX_SPAWNED_ENCODED_BYTES];
+        let current_bytes = current * SHARD_ID_ENCODED_BYTES;
+        if current_bytes > 0 {
+            encoded[..current_bytes].copy_from_slice(self.bytes(slab));
+        }
+        let appended_bytes = Self::encode_slice_into(
+            additional,
+            &mut encoded[current_bytes..MAX_SPAWNED_ENCODED_BYTES],
+        );
+        let total_bytes = current_bytes + appended_bytes;
+        let slot = slab.allocate(&encoded[..total_bytes])?;
+        Ok((
+            slot,
+            u16::try_from(total).expect("spawned length exceeds u16"),
+        ))
+    }
+
+    /// Install a staged slot, deallocating the previous slot in-place.
+    pub(crate) fn install_slot(&mut self, slot: ByteSlot, len: u16, slab: &mut ByteSlab) {
+        slab.deallocate(self.slot);
+        self.slot = slot;
+        self.len = len;
+    }
+
+    /// Append one lineage ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlabFull` if the slab cannot allocate a replacement slot.
+    #[cfg(test)]
+    pub(crate) fn push(&mut self, spawned: ShardId, slab: &mut ByteSlab) -> Result<(), SlabFull> {
+        let (slot, len) = self.allocate_appended_slot(core::slice::from_ref(&spawned), slab)?;
+        self.install_slot(slot, len, slab);
+        Ok(())
+    }
+
+    /// Append multiple lineage IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlabFull` if the slab cannot allocate a replacement slot.
+    #[cfg(test)]
+    pub(crate) fn extend_from_slice(
+        &mut self,
+        spawned: &[ShardId],
+        slab: &mut ByteSlab,
+    ) -> Result<(), SlabFull> {
+        let (slot, len) = self.allocate_appended_slot(spawned, slab)?;
+        if slot != self.slot || len != self.len {
+            self.install_slot(slot, len, slab);
+        }
+        Ok(())
+    }
+
+    /// Replace the lineage list with `spawned`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlabFull` if the slab cannot allocate replacement storage.
+    #[cfg(test)]
+    pub(crate) fn replace_from_slice(
+        &mut self,
+        spawned: &[ShardId],
+        slab: &mut ByteSlab,
+    ) -> Result<(), SlabFull> {
+        let replacement = Self::from_slice(spawned, slab)?;
+        self.install_slot(replacement.slot, replacement.len, slab);
+        Ok(())
+    }
+
+    /// Release slot storage and reset to empty.
+    pub(crate) fn release_fields(&mut self, slab: &mut ByteSlab) {
+        let slot = std::mem::replace(&mut self.slot, ByteSlot::EMPTY);
+        slab.deallocate(slot);
+        self.len = 0;
+    }
+}
+
+pub(crate) struct PooledSpawnedIter<'a> {
+    chunks: core::slice::ChunksExact<'a, u8>,
+}
+
+impl Iterator for PooledSpawnedIter<'_> {
+    type Item = ShardId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let chunk = self.chunks.next()?;
+        let raw = u64::from_le_bytes(chunk.try_into().expect("chunk size must be 8"));
+        Some(ShardId::from_raw(raw))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.chunks.size_hint()
+    }
+}
+
+impl ExactSizeIterator for PooledSpawnedIter<'_> {}
 
 // ============================================================================
 // Test-only helpers
