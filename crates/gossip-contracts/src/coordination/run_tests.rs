@@ -119,7 +119,7 @@ fn hash_register_shards_payload_fixtures(shards: &[InitialShardFixture]) -> u64 
 fn make_initial_shard(id: u64, start: &[u8], end: &[u8]) -> InitialShardFixture {
     InitialShardFixture {
         shard: ShardId::from_raw(id),
-        spec: ShardSpec::with_range(start.to_vec(), end.to_vec()),
+        spec: ShardSpec::with_range(start, end),
         cursor: Cursor::initial(),
     }
 }
@@ -543,13 +543,42 @@ fn progress_watermark_accessor_and_default_behavior() {
     let default_progress = RunProgress::default();
     assert_eq!(default_progress.watermark(), None);
 
-    let progress = RunProgress {
-        total: 1,
-        active: 1,
-        watermark: Some(b"abc".to_vec().into_boxed_slice()),
-        ..Default::default()
-    };
+    let mut progress = RunProgress::default();
+    progress.observe_shard(ShardStatus::Active, false, Some(b"abc"));
     assert_eq!(progress.watermark(), Some(b"abc".as_slice()));
+}
+
+#[test]
+fn progress_observe_shard_reuses_watermark_storage() {
+    let mut progress = RunProgress::default();
+    progress.observe_shard(ShardStatus::Active, false, Some(b"m"));
+
+    let watermark_ptr = progress
+        .watermark()
+        .expect("watermark must be set after observing active shard with key")
+        .as_ptr();
+
+    // Larger key should not change the tracked minimum or backing storage.
+    progress.observe_shard(ShardStatus::Active, false, Some(b"z"));
+    assert_eq!(progress.watermark(), Some(b"m".as_slice()));
+    assert_eq!(
+        progress
+            .watermark()
+            .expect("watermark must remain set after larger key")
+            .as_ptr(),
+        watermark_ptr
+    );
+
+    // Smaller key updates in place without replacing storage.
+    progress.observe_shard(ShardStatus::Active, false, Some(b"a"));
+    assert_eq!(progress.watermark(), Some(b"a".as_slice()));
+    assert_eq!(
+        progress
+            .watermark()
+            .expect("watermark must remain set after smaller key")
+            .as_ptr(),
+        watermark_ptr
+    );
 }
 
 /// Settled = no active shards. Success = settled with no parked. Failures =
@@ -688,14 +717,14 @@ fn manifest_inverted_spec() {
     // then bypass via unbounded spec manipulation. Actually, ShardSpec::with_range
     // enforces start < end at construction. Validate that validate_manifest
     // also catches this via try_with_range.
-    let result = ShardSpec::try_with_range(b"z".to_vec(), b"a".to_vec());
+    let result = ShardSpec::try_with_range(b"z", b"a");
     assert!(result.is_err(), "ShardSpec should reject inverted range");
 }
 
 #[test]
 fn manifest_cursor_out_of_bounds() {
-    let spec = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let cursor = Cursor::with_last_key(b"a".to_vec()); // before range start
+    let spec = ShardSpec::with_range(b"m", b"z");
+    let cursor = Cursor::with_last_key(b"a"); // before range start
     let shard = InitialShardInput::new(
         ShardId::from_raw(0),
         spec.as_ref(),
@@ -859,6 +888,19 @@ fn hash_register_shards_order_independent() {
     assert_ne!(h_forward, 0);
 }
 
+#[test]
+fn hash_register_shards_duplicate_ids_preserve_input_order() {
+    let a = make_initial_shard(7, b"a", b"m");
+    let b = make_initial_shard(7, b"m", b"z");
+
+    let h_ab = hash_register_shards_payload_fixtures(&[a.clone(), b.clone()]);
+    let h_ba = hash_register_shards_payload_fixtures(&[b, a]);
+    assert_ne!(
+        h_ab, h_ba,
+        "equal shard ids keep stable input order in canonical payload"
+    );
+}
+
 /// The three terminal-op hashes (complete, fail, cancel) must be non-zero
 /// and pairwise distinct so that replaying one terminal op cannot be confused
 /// with another.
@@ -981,7 +1023,7 @@ fn shard_summary_acquire_count_saturates_at_u32_max() {
         ShardId::from_raw(1),
         ShardStatus::Active,
         None,
-        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        &ShardSpec::with_range(b"a", b"z"),
         &Cursor::initial(),
         CursorSemantics::Completed,
         None,
@@ -1190,7 +1232,7 @@ mod prop_manifest {
         fn duplicate_id_always_rejected(base in arb_initial_shard(0)) {
             let dup = InitialShardFixture {
                 shard: base.shard,
-                spec: ShardSpec::with_range(b"x".to_vec(), b"y".to_vec()),
+                spec: ShardSpec::with_range(b"x", b"y"),
                 cursor: Cursor::initial(),
             };
             let result = validate_manifest_fixtures(&[base, dup]);
@@ -1208,12 +1250,12 @@ mod prop_manifest {
         ) {
             let a = InitialShardFixture {
                 shard: ShardId::from_raw(id_a),
-                spec: ShardSpec::with_range(b"a".to_vec(), b"n".to_vec()),
+                spec: ShardSpec::with_range(b"a", b"n"),
                 cursor: Cursor::initial(),
             };
             let b = InitialShardFixture {
                 shard: ShardId::from_raw(id_b),
-                spec: ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+                spec: ShardSpec::with_range(b"m", b"z"),
                 cursor: Cursor::initial(),
             };
             let result = validate_manifest_fixtures(&[a, b]);

@@ -43,13 +43,25 @@ use crate::identity::{
 
 use super::split::MAX_SPAWNED_PER_SHARD;
 
-/// Inline-first list for shard spawn tracking.
+/// Spawned-lineage storage for shard records.
 ///
-/// 8 inline slots cover the common case of a single split-replace (up to
-/// 8 children stored without heap allocation). Shards that undergo multiple
-/// residual splits or very large fan-out splits spill to heap, but these
-/// cases are rare enough that the inline optimization dominates.
-pub(crate) type SpawnedList = InlineVec<ShardId, 8>;
+/// The inline capacity is intentionally aligned to [`MAX_SPAWNED_PER_SHARD`]
+/// so split lineage tracking remains allocation-free throughout the supported
+/// runtime envelope.
+pub(crate) type SpawnedList = InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>;
+
+// Compile-time guard: record lineage capacity must match the protocol cap.
+const _: () = assert!(
+    core::mem::size_of::<SpawnedList>()
+        == core::mem::size_of::<InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>>()
+);
+
+/// Snapshot-facing spawned storage.
+///
+/// `ShardSnapshot` is the owned compatibility API. Keep its inline capacity
+/// small so `AcquireResult` remains compact; allocation-free runtime paths use
+/// `AcquireResultView` + `AcquireScratch` instead.
+type SnapshotSpawnedList = InlineVec<ShardId, 8>;
 
 // ============================================================================
 // ShardStatus
@@ -982,7 +994,7 @@ pub struct ShardSnapshot {
     cursor: Cursor,
     cursor_semantics: CursorSemantics,
     parent: Option<ShardId>,
-    spawned: SpawnedList,
+    spawned: SnapshotSpawnedList,
 }
 
 impl ShardSnapshot {
@@ -1007,7 +1019,7 @@ impl ShardSnapshot {
         I: IntoIterator<Item = S>,
         S: Borrow<ShardId>,
     {
-        let spawned = spawned.into_iter().map(|id| *id.borrow()).collect();
+        let spawned: SnapshotSpawnedList = spawned.into_iter().map(|id| *id.borrow()).collect();
         Self {
             status,
             spec,

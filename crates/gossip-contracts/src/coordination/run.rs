@@ -24,10 +24,13 @@
 //!
 //! ## Idempotency
 //!
-//! Run-level mutations (`register_shards`, `complete_run`, `fail_run`,
-//! `cancel_run`, `unpark_shard`) use a per-run op-log with the same
-//! `(OpId, payload_hash)` deduplication scheme as shard-level operations.
-//! The op-log is bounded to [`RunRecord::OP_LOG_CAP`] entries.
+//! Run lifecycle mutations (`register_shards`, `complete_run`, `fail_run`,
+//! `cancel_run`) use a per-run op-log with the same `(OpId, payload_hash)`
+//! deduplication scheme as shard-level operations. The run op-log is bounded
+//! to [`RunRecord::OP_LOG_CAP`] entries.
+//!
+//! `unpark_shard` is the exception: idempotency is recorded in the target
+//! shard's op-log (cap = 16), because unpark operations are keyed by shard.
 //!
 //! ## Manifest validation
 //!
@@ -755,6 +758,56 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 // RunProgress + RunTerminalEvaluation
 // ============================================================================
 
+/// Fixed-capacity storage for one watermark key.
+#[derive(Clone)]
+pub(crate) struct WatermarkKey {
+    bytes: [u8; MAX_KEY_SIZE],
+    len: usize,
+}
+
+impl WatermarkKey {
+    #[inline]
+    fn from_slice(key: &[u8]) -> Self {
+        debug_assert!(!key.is_empty());
+        debug_assert!(key.len() <= MAX_KEY_SIZE);
+        let mut out = Self {
+            bytes: [0u8; MAX_KEY_SIZE],
+            len: 0,
+        };
+        out.replace_from_slice(key);
+        out
+    }
+
+    #[inline]
+    fn replace_from_slice(&mut self, key: &[u8]) {
+        debug_assert!(!key.is_empty());
+        debug_assert!(key.len() <= MAX_KEY_SIZE);
+        self.bytes[..key.len()].copy_from_slice(key);
+        self.len = key.len();
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl fmt::Debug for WatermarkKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("WatermarkKey")
+            .field(&self.as_slice())
+            .finish()
+    }
+}
+
+impl PartialEq for WatermarkKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for WatermarkKey {}
+
 /// Aggregated shard status counts and in-flight watermark for a run.
 ///
 /// Constructed by iterating a run's shards once and tallying each shard's
@@ -780,7 +833,7 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// `MAX_INITIAL_SHARDS` (10K) plus spawned children, well within `u32::MAX`.
 ///
 /// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
-/// owns key bytes.
+/// stores owned key bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunProgress {
     pub(crate) total: u32,
@@ -797,7 +850,7 @@ pub struct RunProgress {
     /// if they carry cursor keys; this tracks in-flight progress only.
     /// `None` means no active shard currently has a non-initial cursor
     /// (including runs with zero active shards).
-    pub(crate) watermark: Option<Box<[u8]>>,
+    pub(crate) watermark: Option<WatermarkKey>,
 }
 
 impl RunProgress {
@@ -844,7 +897,7 @@ impl RunProgress {
     /// should maintain a running maximum externally.
     #[must_use]
     pub fn watermark(&self) -> Option<&[u8]> {
-        self.watermark.as_deref()
+        self.watermark.as_ref().map(WatermarkKey::as_slice)
     }
 
     /// Whether all active work is complete (no Active shards remain).
@@ -956,12 +1009,14 @@ impl RunProgress {
                 "RunProgress::observe_shard: last_key must be non-empty when present"
             );
 
-            if self
-                .watermark
-                .as_deref()
-                .is_none_or(|current| last_key < current)
-            {
-                self.watermark = Some(last_key.to_vec().into_boxed_slice());
+            match &mut self.watermark {
+                Some(current) if last_key < current.as_slice() => {
+                    current.replace_from_slice(last_key);
+                }
+                None => {
+                    self.watermark = Some(WatermarkKey::from_slice(last_key));
+                }
+                _ => {}
             }
         }
     }
@@ -1049,6 +1104,14 @@ pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
 pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
+
+#[inline]
+fn init_dense_indices(indices: &mut [usize], len: usize) {
+    debug_assert!(len <= indices.len());
+    for (index, slot) in indices.iter_mut().take(len).enumerate() {
+        *slot = index;
+    }
+}
 
 /// A borrowed shard registration input for a run's initial manifest.
 ///
@@ -1209,14 +1272,16 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         return Err(ManifestValidationError::Empty);
     }
 
+    let mut sorted_indices_storage = [0usize; MAX_INITIAL_SHARDS];
+    init_dense_indices(&mut sorted_indices_storage, shards.len());
+    let sorted_indices = &mut sorted_indices_storage[..shards.len()];
+
     // Check for duplicate IDs.
-    let mut ids: Vec<ShardId> = shards.iter().map(|s| s.shard).collect();
-    ids.sort_by_key(|id| id.as_raw());
-    for window in ids.windows(2) {
-        if window[0] == window[1] {
-            return Err(ManifestValidationError::DuplicateIds {
-                shard_id: window[0],
-            });
+    sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
+    for window in sorted_indices.windows(2) {
+        let current = shards[window[0]].shard;
+        if current == shards[window[1]].shard {
+            return Err(ManifestValidationError::DuplicateIds { shard_id: current });
         }
     }
 
@@ -1242,10 +1307,15 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     }
 
     // Sort by key_range_start for overlap detection.
-    let mut sorted: Vec<&InitialShardInput<'_>> = shards.iter().collect();
-    sorted.sort_by(|a, b| a.spec.key_range_start().cmp(b.spec.key_range_start()));
+    sorted_indices.sort_by(|&a, &b| {
+        shards[a]
+            .spec
+            .key_range_start()
+            .cmp(shards[b].spec.key_range_start())
+    });
 
-    for shard in &sorted {
+    for &index in sorted_indices.iter() {
+        let shard = &shards[index];
         // Validate that start < end for bounded specs.
         let start = shard.spec.key_range_start();
         let end = shard.spec.key_range_end();
@@ -1261,8 +1331,9 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     // and [b_start, b_end) overlap iff a_end > b_start, where:
     //   - empty a_end means [a_start, ∞) → always overlaps with the next shard
     //   - empty b_start means [min, b_end) → any non-empty a_end exceeds min
-    for window in sorted.windows(2) {
-        let (a, b) = (window[0], window[1]);
+    for window in sorted_indices.windows(2) {
+        let a = &shards[window[0]];
+        let b = &shards[window[1]];
         let a_end = a.spec.key_range_end();
         let b_start = b.spec.key_range_start();
         let overlaps = a_end.is_empty() || b_start.is_empty() || a_end > b_start;
@@ -1433,7 +1504,7 @@ impl ShardSummary {
 // ShardFilter
 // ============================================================================
 
-/// Filter criteria for [`RunManagement::list_shards`].
+/// Filter criteria for [`RunManagement::list_shards_into`].
 ///
 /// All fields default to "match anything" (no constraint). Named
 /// constructors compose common filter patterns:
@@ -1445,12 +1516,12 @@ impl ShardSummary {
 ///
 /// Fields are `pub(crate)` to prevent ad-hoc construction outside the
 /// crate. The `is_leased` filter is evaluated at the `now` parameter
-/// passed to `list_shards`: a lease whose deadline has passed is treated
+/// passed to `list_shards_into`: a lease whose deadline has passed is treated
 /// as unleased.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardFilter {
     pub(crate) status: Option<ShardStatus>,
-    /// Evaluated at the `now` parameter passed to [`RunManagement::list_shards`]:
+    /// Evaluated at the `now` parameter passed to [`RunManagement::list_shards_into`]:
     /// a lease whose deadline has passed is treated as unleased.
     pub(crate) is_leased: Option<bool>,
     /// When `true`, excludes split children (shards with a `parent`).
@@ -1547,15 +1618,46 @@ impl ShardFilter {
 /// shards in any order.
 #[must_use]
 pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
-    let mut sorted: Vec<&InitialShardInput<'_>> = shards.iter().collect();
-    sorted.sort_by_key(|s| s.shard.as_raw());
-
     op_payload_hash(b"register_shards", |h| {
-        (sorted.len() as u32).write_canonical(h);
-        for shard in &sorted {
+        (shards.len() as u32).write_canonical(h);
+
+        if shards.len() <= MAX_INITIAL_SHARDS {
+            let mut sorted_indices_storage = [0usize; MAX_INITIAL_SHARDS];
+            init_dense_indices(&mut sorted_indices_storage, shards.len());
+            let sorted_indices = &mut sorted_indices_storage[..shards.len()];
+            sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
+
+            for &index in sorted_indices.iter() {
+                let shard = &shards[index];
+                shard.shard.write_canonical(h);
+                shard.spec.write_canonical(h);
+                shard.cursor.write_canonical(h);
+            }
+            return;
+        }
+
+        // Fallback for oversized slices. Registration rejects these manifests,
+        // but hashing remains deterministic and allocation-free for callers.
+        let mut prev: Option<(u64, usize)> = None;
+        for _ in 0..shards.len() {
+            let mut next: Option<(u64, usize)> = None;
+            for (index, shard) in shards.iter().enumerate() {
+                let candidate = (shard.shard.as_raw(), index);
+                if prev.is_some_and(|p| candidate <= p) {
+                    continue;
+                }
+                if next.is_none_or(|n| candidate < n) {
+                    next = Some(candidate);
+                }
+            }
+            let (_, index) = next.expect(
+                "hash_register_shards_payload: no next shard while emitting sorted sequence",
+            );
+            let shard = &shards[index];
             shard.shard.write_canonical(h);
             shard.spec.write_canonical(h);
             shard.cursor.write_canonical(h);
+            prev = Some((shard.shard.as_raw(), index));
         }
     })
 }
@@ -1631,10 +1733,12 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 ///
 /// ## Idempotency
 ///
-/// All mutating methods (except `create_run`) accept an `OpId` and are
-/// idempotent via the run's bounded op-log. The op-log has capacity
-/// [`RunRecord::OP_LOG_CAP`] (8 entries). Evicted entries are treated as
-/// new operations, but status-check guards prevent re-execution on an
+/// All mutating methods (except `create_run`) accept an `OpId`.
+///
+/// `register_shards`, `complete_run`, `fail_run`, and `cancel_run` are
+/// idempotent via the run's bounded op-log (capacity
+/// [`RunRecord::OP_LOG_CAP`] = 8). Evicted entries are treated as new
+/// operations, but status-check guards prevent re-execution on an
 /// already-transitioned run.
 ///
 /// ## Cross-cutting: `unpark_shard` idempotency
@@ -1736,17 +1840,22 @@ pub trait RunManagement {
         run: RunId,
     ) -> Result<RunProgress, GetRunError>;
 
-    /// List shards for a run, filtered. Ordered by `key_range_start` ascending.
+    /// List shards for a run, filtered, into a caller-provided output buffer.
+    /// Ordered by `key_range_start` ascending.
+    ///
+    /// This API allows callers to reuse `out` across repeated queries and
+    /// avoid per-call heap allocations after warmup.
     ///
     /// `ShardFilter::is_leased` must be evaluated against `now`: a lease whose
     /// deadline has passed counts as unleased, not leased.
-    fn list_shards(
+    fn list_shards_into(
         &self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         filter: ShardFilter,
-    ) -> Result<Vec<ShardSummary>, GetRunError>;
+        out: &mut Vec<ShardSummary>,
+    ) -> Result<(), GetRunError>;
 
     /// Mark run as Done. Precondition: Active. Idempotent via `op_id`.
     ///

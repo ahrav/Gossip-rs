@@ -590,8 +590,8 @@ mod tests {
     #[test]
     fn pooled_spec_update_strong_exception_guarantee() {
         let mut slab = ByteSlab::with_capacity(4096);
-        let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-        let spec2 = ShardSpec::with_range(b"n".to_vec(), b"z".to_vec());
+        let spec1 = ShardSpec::with_range(b"a", b"m");
+        let spec2 = ShardSpec::with_range(b"n", b"z");
 
         let mut pooled = PooledShardSpec::from_spec(&spec1, &mut slab).unwrap();
         let live_before = slab.live_count();
@@ -609,7 +609,7 @@ mod tests {
     #[test]
     fn pooled_cursor_update_from_ref_strong_exception_guarantee() {
         let mut slab = ByteSlab::with_capacity(4096);
-        let c1 = Cursor::with_last_key(b"aaa".to_vec());
+        let c1 = Cursor::with_last_key(b"aaa");
         let mut pooled = PooledCursor::from_cursor(&c1, &mut slab).unwrap();
 
         let update = CursorUpdate::with_token(b"bbb", b"tok");
@@ -625,7 +625,7 @@ mod tests {
     fn rollback_on_second_field_failure() {
         // Slab large enough for one 16-byte allocation (min block) but not two.
         let mut slab = ByteSlab::with_capacity(16);
-        let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        let spec = ShardSpec::with_range(b"a", b"z");
         let result = PooledShardSpec::from_spec(&spec, &mut slab);
         assert!(result.is_err(), "should fail: slab too small for 2 fields");
         assert_eq!(slab.live_count(), 0, "rollback must clean up partial alloc");
@@ -635,7 +635,7 @@ mod tests {
     fn rollback_cursor_token_failure() {
         // Slab sized for exactly one 16-byte allocation.
         let mut slab = ByteSlab::with_capacity(16);
-        let cursor = Cursor::from_parts(b"k".to_vec(), b"t".to_vec());
+        let cursor = Cursor::from_parts(b"k", b"t");
         let result = PooledCursor::from_cursor(&cursor, &mut slab);
         assert!(result.is_err(), "should fail: slab too small for 2 fields");
         assert_eq!(slab.live_count(), 0, "rollback must clean up partial alloc");
@@ -646,7 +646,7 @@ mod tests {
         // Existing cursor consumes one 16-byte slot; only one slot remains.
         // `update_from_ref` needs two slots and must roll back partial allocs.
         let mut slab = ByteSlab::with_capacity(32);
-        let original = Cursor::with_last_key(b"aaa".to_vec());
+        let original = Cursor::with_last_key(b"aaa");
         let mut pooled = PooledCursor::from_cursor(&original, &mut slab).unwrap();
         let live_before = slab.live_count();
 
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn release_fields_is_idempotent() {
         let mut slab = ByteSlab::with_capacity(4096);
-        let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        let spec = ShardSpec::with_range(b"a", b"z");
         let mut pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
 
         pooled.release_fields(&mut slab);

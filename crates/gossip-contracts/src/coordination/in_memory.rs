@@ -13,6 +13,8 @@
 //!   concurrency concerns so invariants can be verified in-line.
 //! - **Purely in-memory** — two-level `AHashMap<TenantId, AHashMap<ShardKey, ShardRecord>>`.
 //!   No I/O, no transactions, no retries.
+//! - **No event emission wiring yet** — operation sites contain
+//!   `TODO(events)` markers where `EventCollector` hooks can be added later.
 //! - **Tiger-style invariant enforcement** — every mutation path calls
 //!   [`ShardRecord::assert_invariants()`] before returning. A violated
 //!   invariant panics immediately (crash-to-prevent-corruption).
@@ -23,10 +25,11 @@
 //!   monotonic `fence_epoch`. Stale workers are rejected by epoch comparison.
 //! - **Leases** (Gray & Cheriton 1989): time-bounded ownership via
 //!   `LeaseHolder { owner, deadline }`. Expiry makes shards re-acquirable.
-//! - **Bounded idempotency** (Stripe pattern): a 16-entry FIFO op-log caches
-//!   operation fingerprints including `(OpId, payload_hash)` for replay
-//!   detection. Replays return cached results; hash mismatches yield
-//!   `OpIdConflict`.
+//! - **Bounded idempotency** (Stripe pattern): shard-level mutations use a
+//!   16-entry FIFO op-log for `(OpId, payload_hash)` replay detection.
+//!   Run-level lifecycle operations use a separate run op-log
+//!   ([`RunRecord::OP_LOG_CAP`], currently 8 entries). Replays return cached
+//!   results; hash mismatches yield `OpIdConflict`.
 //!
 //! # Shard state machine
 //!
@@ -67,7 +70,7 @@
 //!
 //! # Performance note
 //!
-//! `claim_next_available` (via `ShardClaiming`) delegates to `list_shards`,
+//! `claim_next_available` (via `ShardClaiming`) delegates to `list_shards_into`,
 //! which sorts candidates by key range in this backend. The resulting worst
 //! case is O(S log S) where S is the run's shard count. Acceptable here;
 //! production backends need a secondary available-shards index.
@@ -79,7 +82,7 @@ use crate::coordination::error::{
     AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
     IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
-use crate::coordination::facade::{ClaimError, ShardClaiming, default_claim_next_available};
+use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run::{
@@ -93,20 +96,19 @@ use crate::coordination::run_errors::{
 };
 use crate::coordination::shard_spec::{
     ShardLimitScope, ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
-    validate_split_coverage_bounds,
 };
 use crate::coordination::split::{
-    DerivedShardKind, MAX_SPAWNED_PER_SHARD, SplitReplaceChild, SplitReplacePlan,
-    SplitReplaceResult, SplitResidualPlan, SplitResidualResult, derive_split_shard_id,
-    hash_checkpoint_payload, hash_complete_payload, hash_park_payload, hash_split_replace_payload,
-    hash_split_residual_payload,
+    DerivedShardKind, MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN, SplitReplaceChild,
+    SplitReplacePlan, SplitReplaceResult, SplitResidualPlan, SplitResidualResult,
+    derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
+    hash_split_replace_payload, hash_split_residual_payload,
 };
 use crate::coordination::traits::CoordinationBackend;
 use crate::coordination::validation::{
     check_op_idempotency, validate_cursor_update_pooled, validate_lease,
 };
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
-use gossip_stdx::{ByteSlab, RingBuffer, SlabFull};
+use gossip_stdx::{ByteSlab, RingBuffer};
 
 /// aHash-backed `HashMap` — faster hashing than the std default
 /// (`DefaultHasher`, which uses SipHash-1-3) for point lookups. aHash
@@ -323,7 +325,7 @@ impl CoordinatorConfig {
 
     /// Defaults for local development and unit tests.
     ///
-    /// ~3 MiB: 512 shards, 64 runs, 16 workers.
+    /// ~6.6 MiB: 512 shards, 64 runs, 16 workers.
     #[must_use]
     pub const fn dev_defaults() -> Self {
         Self {
@@ -338,7 +340,7 @@ impl CoordinatorConfig {
 
     /// Defaults for staging / integration tests.
     ///
-    /// ~91 MiB: 10 K shards, 1 K runs, 256 workers.
+    /// ~168 MiB: 10 K shards, 1 K runs, 256 workers.
     #[must_use]
     pub const fn staging_defaults() -> Self {
         Self {
@@ -353,7 +355,7 @@ impl CoordinatorConfig {
 
     /// Defaults for production deployments.
     ///
-    /// ~17 GiB: 1 M shards, 100 K runs, 10 K workers.
+    /// ~24.4 GiB: 1 M shards, 100 K runs, 10 K workers.
     #[must_use]
     pub const fn prod_defaults() -> Self {
         Self {
@@ -368,13 +370,13 @@ impl CoordinatorConfig {
 
     /// Estimate planning memory budget in bytes.
     ///
-    /// Formula: `M = S * (784 + B_s + 72) + R * (512 + B_r + 80) + W * 16 + 4096`
+    /// Formula: `M = S * (8912 + B_s + 72) + R * (512 + B_r + 80) + W * 16 + 4096`
     ///
     /// Where:
     /// - `S` = `max_total_shards`, `B_s` = `per_shard_budget`
     /// - `R` = `max_runs`, `B_r` = `per_run_budget`
     /// - `W` = `max_workers`
-    /// - 784 = `size_of::<ShardRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
+    /// - 8912 = `size_of::<ShardRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
     /// - 72 = per-entry HashMap overhead (key + bucket metadata)
     /// - 512 = `size_of::<RunRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
     /// - 80 = per-entry HashMap overhead for run entries
@@ -382,7 +384,7 @@ impl CoordinatorConfig {
     /// - 4096 = base coordinator struct + map headers
     ///
     /// Assumptions:
-    /// - Struct-size constants (`784`, `512`) match this target's layout
+    /// - Struct-size constants (`8912`, `512`) match this target's layout
     ///   (validated by `memory_budget_constants_match_struct_sizes`).
     /// - HashMap overhead terms (`72`, `80`, `16`) are modeling estimates
     ///   for current key/bucket metadata behavior.
@@ -399,7 +401,7 @@ impl CoordinatorConfig {
     /// overflows `usize`.
     #[must_use]
     pub const fn memory_budget(&self) -> usize {
-        let per_shard_base = match 784usize.checked_add(self.per_shard_budget) {
+        let per_shard_base = match 8912usize.checked_add(self.per_shard_budget) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: per-shard base"),
         };
@@ -494,7 +496,7 @@ pub struct InMemoryCoordinator {
     /// Secondary index: run → shard IDs (root + split children).
     ///
     /// Uses `HashSet` for O(1) dedup in `index_shard`.
-    /// Iteration order doesn't matter — `list_shards`
+    /// Iteration order doesn't matter — `list_shards_into`
     /// sorts results by `key_range_start` afterward.
     run_shards: AHashMap<(TenantId, RunId), HashSet<ShardId, ahash::RandomState>>,
     /// Duration (in logical time units) applied to every new lease.
@@ -534,6 +536,12 @@ pub struct InMemoryCoordinator {
     /// Arena allocator for pooled `ShardRecord` fields (spec key ranges,
     /// cursor keys/tokens). Shared by all records in `self.shards`.
     slab: ByteSlab,
+    /// Reusable scratch for `register_shards` shard ID staging.
+    register_shard_ids_scratch: Vec<ShardId>,
+    /// Reusable scratch for `register_shards` staged record construction.
+    register_stage_scratch: Vec<(ShardKey, ShardRecord)>,
+    /// Reusable shard-id candidate buffer for claim hot path.
+    claim_candidates_scratch: Vec<ShardId>,
 }
 
 impl std::fmt::Debug for InMemoryCoordinator {
@@ -616,6 +624,9 @@ impl InMemoryCoordinator {
             ),
             claim_cooldown_interval,
             slab: ByteSlab::with_capacity(config.effective_slab_capacity()),
+            register_shard_ids_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
+            register_stage_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
+            claim_candidates_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
         }
     }
 
@@ -690,7 +701,7 @@ impl InMemoryCoordinator {
     ///
     /// Does not enforce shard count limits — this is a test helper for
     /// constructing specific states. Also updates the `run_shards` index
-    /// so that `list_shards` can discover seeded shards (required by
+    /// so that `list_shards_into` can discover seeded shards (required by
     /// `claim_next_available`).
     ///
     /// # Panics
@@ -706,10 +717,7 @@ impl InMemoryCoordinator {
     pub fn seed_shard(&mut self, record: ShardRecord) {
         record.assert_invariants();
         let key = ShardKey::new(record.run, record.shard);
-        self.run_shards
-            .entry((record.tenant, record.run))
-            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY))
-            .insert(record.shard);
+        self.index_shard(record.tenant, record.run, record.shard);
         self.shard_insert(record.tenant, key, record);
     }
 
@@ -720,10 +728,7 @@ impl InMemoryCoordinator {
     #[cfg(test)]
     pub fn seed_shard_unchecked(&mut self, record: ShardRecord) {
         let key = ShardKey::new(record.run, record.shard);
-        self.run_shards
-            .entry((record.tenant, record.run))
-            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY))
-            .insert(record.shard);
+        self.index_shard(record.tenant, record.run, record.shard);
         self.shard_insert(record.tenant, key, record);
     }
 
@@ -875,6 +880,93 @@ impl InMemoryCoordinator {
         }
 
         Ok(())
+    }
+
+    /// Ensure tenant shard map capacity for an upcoming `register_shards` batch.
+    ///
+    /// This makes growth explicit up front so per-shard inserts in the hot
+    /// loop do not trigger implicit rehash/allocation.
+    fn reserve_register_shard_capacity(
+        &mut self,
+        tenant: TenantId,
+        additional: usize,
+    ) -> Result<(), RegisterShardsError> {
+        if additional == 0 {
+            return Ok(());
+        }
+
+        if !self.shards.contains_key(&tenant) {
+            self.shards
+                .try_reserve(1)
+                .map_err(|_| RegisterShardsError::CapacityExceeded {
+                    resource: "tenant_shards_index",
+                })?;
+            let initial =
+                tenant_shards_map_initial_capacity(self.max_shards_per_tenant).max(additional);
+            let mut inner: AHashMap<ShardKey, ShardRecord> = ahash_map_with_capacity(0);
+            inner
+                .try_reserve(initial)
+                .map_err(|_| RegisterShardsError::CapacityExceeded {
+                    resource: "tenant_shards",
+                })?;
+            return Ok(());
+        }
+
+        self.shards
+            .get_mut(&tenant)
+            .expect("tenant map must exist after contains_key check")
+            .try_reserve(additional)
+            .map_err(|_| RegisterShardsError::CapacityExceeded {
+                resource: "tenant_shards",
+            })?;
+        Ok(())
+    }
+
+    /// Ensure run-shard index map/set capacity for an upcoming `register_shards` batch.
+    fn reserve_register_index_capacity(
+        &mut self,
+        tenant: TenantId,
+        run: RunId,
+        shard_ids: &[ShardId],
+    ) -> Result<(), RegisterShardsError> {
+        let run_key = (tenant, run);
+        if let Some(existing) = self.run_shards.get_mut(&run_key) {
+            let additional_unique = shard_ids.iter().filter(|id| !existing.contains(id)).count();
+            if additional_unique > 0 {
+                existing.try_reserve(additional_unique).map_err(|_| {
+                    RegisterShardsError::CapacityExceeded {
+                        resource: "run_shards_set",
+                    }
+                })?;
+            }
+            return Ok(());
+        }
+
+        self.run_shards
+            .try_reserve(1)
+            .map_err(|_| RegisterShardsError::CapacityExceeded {
+                resource: "run_shards_index",
+            })?;
+        let mut shard_set: HashSet<ShardId, ahash::RandomState> = ahash_set_with_capacity(0);
+        shard_set
+            .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
+            .map_err(|_| RegisterShardsError::CapacityExceeded {
+                resource: "run_shards_set",
+            })?;
+        Ok(())
+    }
+
+    /// Ensure claim cooldown map can absorb a new worker entry, if needed.
+    fn ensure_claim_cooldown_capacity(&mut self, worker: WorkerId) {
+        if self.claim_cooldown_interval == 0 || self.claim_cooldowns.contains_key(&worker) {
+            return;
+        }
+        self.claim_cooldowns.try_reserve(1).unwrap_or_else(|_| {
+            panic!(
+                "claim_cooldowns capacity exhausted while preparing worker claim state \
+                 for {worker:?}"
+            )
+        });
     }
 }
 
@@ -1218,10 +1310,10 @@ impl CoordinationBackend for InMemoryCoordinator {
     ///
     /// Executes in three phases:
     ///   1. **Validate** — idempotency, lease, and full-coverage checks.
-    ///   2. **Build** — derive child shard IDs and records (pure, no
-    ///      side effects).
+    ///   2. **Build+Insert** — derive child IDs, build child records, and
+    ///      insert each child with rollback on any mid-build failure.
     ///   3. **Apply** — transition the parent to [`ShardStatus::Split`]
-    ///      (terminal), insert children into the map, and update indexes.
+    ///      (terminal) and update indexes.
     ///
     /// Uses the *remove-mutate-restore* pattern: the parent record is
     /// temporarily removed from `self.shards` so that both `&mut parent`
@@ -1259,43 +1351,23 @@ impl CoordinationBackend for InMemoryCoordinator {
                 // Shard count limit guard (temporarily_removed=1 for parent).
                 coordinator
                     .check_shard_limits(tenant, sorted.len(), 1)
-                    .map_err(|e| SplitReplaceError::SplitInvalid(Box::new(e)))?;
+                    .map_err(SplitReplaceError::SplitInvalid)?;
 
-                // Phase 2: Build children (may allocate into slab).
-                let (child_ids, children_to_insert) = split_replace_build_children(
+                // Phase 2: Build + insert children (may allocate into slab).
+                let child_ids = split_replace_insert_children(
+                    coordinator,
                     parent,
+                    &plan,
                     &sorted,
                     tenant,
                     op_id,
-                    &mut coordinator.slab,
                 )?;
 
-                // Phase 3: Apply mutations. Collision check is defense-in-depth:
-                // derive_split_shard_id uses BLAKE3 with domain separation, so
-                // collisions indicate a logic bug, not a hash weakness.
-                //
-                // Check for collisions first; if any, deallocate all children and
-                // return an error. The check and cleanup are separate loops to
-                // avoid a borrow-vs-move conflict on `children_to_insert`.
-                let collision = children_to_insert
-                    .iter()
-                    .find(|(child_key, _)| coordinator.shard_contains(&child_key.0, &child_key.1))
-                    .map(|(child_key, _)| child_key.1.shard());
-                if let Some(derived_id) = collision {
-                    for (_, mut child_record) in children_to_insert {
-                        child_record.deallocate_fields(&mut coordinator.slab);
-                    }
-                    return Err(SplitReplaceError::SplitInvalid(Box::new(
-                        SplitValidationError::DerivedIdCollision { derived_id },
-                    )));
-                }
-
+                // Phase 3: Apply parent mutation + index updates.
                 split_replace_apply_parent(parent, child_ids.as_slice(), op_id, payload_hash, now);
 
-                for (child_key, v) in children_to_insert {
-                    let child_shard = v.shard;
-                    coordinator.shard_insert(child_key.0, child_key.1, v);
-                    coordinator.index_shard(tenant, parent.run, child_shard);
+                for &child_id in &child_ids {
+                    coordinator.index_shard(tenant, parent.run, child_id);
                 }
 
                 // TODO(events): emit ShardSplit
@@ -1364,7 +1436,7 @@ impl CoordinationBackend for InMemoryCoordinator {
                 // Shard count limit guard (temporarily_removed=1 for parent).
                 coordinator
                     .check_shard_limits(tenant, 1, 1)
-                    .map_err(|e| SplitResidualError::SplitInvalid(Box::new(e)))?;
+                    .map_err(SplitResidualError::SplitInvalid)?;
 
                 // Phase 2: Build residual record (allocates into slab).
                 let mut residual_record = split_residual_build_record(
@@ -1380,11 +1452,11 @@ impl CoordinationBackend for InMemoryCoordinator {
                 if coordinator.shard_contains(&tenant, &residual_key) {
                     // Deallocate the just-built residual before returning error.
                     residual_record.deallocate_fields(&mut coordinator.slab);
-                    return Err(SplitResidualError::SplitInvalid(Box::new(
+                    return Err(SplitResidualError::SplitInvalid(
                         SplitValidationError::DerivedIdCollision {
                             derived_id: residual_id,
                         },
-                    )));
+                    ));
                 }
 
                 if let Err(e) = split_residual_apply_parent(
@@ -1431,47 +1503,158 @@ impl CoordinationBackend for InMemoryCoordinator {
 //    over their arguments.  Keeping them free of `self` makes this explicit
 //    and simplifies unit testing (no coordinator setup required).
 
+/// Fixed-capacity child-id scratch used by split-replace helpers.
+type SplitChildIds = gossip_stdx::InlineVec<ShardId, { MAX_SPLIT_CHILDREN }>;
+
+const _: () = assert!(MAX_SPLIT_CHILDREN <= u16::MAX as usize);
+
+/// Fixed-capacity sorted index scratch for `SplitReplacePlan::children()`.
+///
+/// Stores child indices sorted by `key_range_start` without allocating.
+#[derive(Clone, Copy)]
+struct SplitChildOrder {
+    len: usize,
+    indices: [u16; MAX_SPLIT_CHILDREN],
+}
+
+impl SplitChildOrder {
+    fn from_plan(plan: &SplitReplacePlan<'_>) -> Self {
+        let len = plan.children().len();
+        let mut indices = [0u16; MAX_SPLIT_CHILDREN];
+        for (i, slot) in indices.iter_mut().take(len).enumerate() {
+            *slot = u16::try_from(i).expect("split child index exceeds u16");
+        }
+        indices[..len].sort_by(|a, b| {
+            plan.children()[usize::from(*a)]
+                .spec()
+                .key_range_start()
+                .cmp(plan.children()[usize::from(*b)].spec().key_range_start())
+        });
+        // Defense-in-depth: `SplitReplacePlan::try_new` already enforces >= 2
+        // children at construction time, but this assertion guards against
+        // future refactors that might bypass the constructor.
+        assert!(len >= 2, "split_replace requires >= 2 children");
+        Self { len, indices }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn child<'a>(
+        &self,
+        plan: &'a SplitReplacePlan<'a>,
+        sorted_idx: usize,
+    ) -> &'a SplitReplaceChild<'a> {
+        &plan.children()[usize::from(self.indices[sorted_idx])]
+    }
+}
+
+fn split_replace_validate_coverage_sorted(
+    parent_start: &[u8],
+    parent_end: &[u8],
+    plan: &SplitReplacePlan<'_>,
+    sorted: &SplitChildOrder,
+) -> Result<(), SplitValidationError> {
+    if sorted.len() == 0 {
+        return Err(SplitValidationError::NoChildren);
+    }
+    if sorted.len() == 1 {
+        return Err(SplitValidationError::SingleChild);
+    }
+
+    let first = sorted.child(plan, 0).spec();
+    if first.key_range_start() != parent_start {
+        return Err(SplitValidationError::StartMismatch {
+            parent_start: parent_start.len(),
+            first_child_start: first.key_range_start().len(),
+        });
+    }
+
+    let last = sorted.child(plan, sorted.len() - 1).spec();
+    if last.key_range_end() != parent_end {
+        return Err(SplitValidationError::EndMismatch {
+            parent_end: parent_end.len(),
+            last_child_end: last.key_range_end().len(),
+        });
+    }
+
+    for i in 0..sorted.len() - 1 {
+        let child = sorted.child(plan, i).spec();
+        let next = sorted.child(plan, i + 1).spec();
+        if child.key_range_end() != next.key_range_start() {
+            return Err(SplitValidationError::BoundaryMismatch {
+                child_index: i,
+                next_child_index: i + 1,
+                child_end: child.key_range_end().len(),
+                next_child_start: next.key_range_start().len(),
+            });
+        }
+        if child.key_range_end().is_empty() {
+            return Err(SplitValidationError::OverlappingChild {
+                child_index: i,
+                next_child_index: i + 1,
+            });
+        }
+    }
+
+    for i in 0..sorted.len() {
+        let child = sorted.child(plan, i).spec();
+        if !child.key_range_start().is_empty()
+            && !child.key_range_end().is_empty()
+            && child.key_range_start() >= child.key_range_end()
+        {
+            return Err(SplitValidationError::InvertedChild { child_index: i });
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate split_replace preconditions: coverage and spawn-cap.
 ///
 /// Sorts children, validates that they partition the parent's range, and
 /// checks the spawn-cap limit. Parent bounds are borrowed directly from the
 /// pooled parent spec, avoiding `to_spec()` materialization in this hot path.
-/// Returns the sorted children on success.
+/// Returns sorted child-order scratch on success.
 fn split_replace_validate_preconditions<'a>(
     parent: &ShardRecord,
     plan: &'a SplitReplacePlan<'a>,
     slab: &ByteSlab,
-) -> Result<Vec<&'a SplitReplaceChild<'a>>, SplitReplaceError> {
+) -> Result<SplitChildOrder, SplitReplaceError> {
     let sorted = split_replace_sort_children(plan);
 
     // Validate per-spec size limits before coverage checks. ShardSpecRef is
     // intentionally unvalidated at construction; this gate prevents oversized
     // specs from reaching AcquireScratch::write_spec's panicking asserts.
-    for (i, child) in sorted.iter().enumerate() {
+    for i in 0..sorted.len() {
+        let child = sorted.child(plan, i);
         if ShardSpec::validate_ref(child.spec()).is_err() {
-            return Err(SplitReplaceError::SplitInvalid(Box::new(
+            return Err(SplitReplaceError::SplitInvalid(
                 SplitValidationError::InvalidChildSpec { child_index: i },
-            )));
+            ));
         }
     }
 
-    let child_specs: Vec<ShardSpecRef<'_>> = sorted.iter().map(|c| c.spec()).collect();
-    validate_split_coverage_bounds(
+    split_replace_validate_coverage_sorted(
         parent.spec.key_range_start(slab),
         parent.spec.key_range_end(slab),
-        &child_specs,
+        plan,
+        &sorted,
     )
-    .map_err(|e| SplitReplaceError::SplitInvalid(Box::new(e)))?;
+    .map_err(SplitReplaceError::SplitInvalid)?;
 
     // Spawn-cap guard: check BEFORE mutating parent.spawned.
     if !parent.can_spawn(sorted.len()) {
-        return Err(SplitReplaceError::SplitInvalid(Box::new(
+        return Err(SplitReplaceError::SplitInvalid(
             SplitValidationError::SpawnLimitExceeded {
                 current: parent.spawned.len(),
                 additional: sorted.len(),
                 max: MAX_SPAWNED_PER_SHARD,
             },
-        )));
+        ));
     }
     Ok(sorted)
 }
@@ -1482,16 +1665,8 @@ fn split_replace_validate_preconditions<'a>(
 /// derived child IDs (which depend on index) are stable regardless of
 /// submission order, and that `validate_split_coverage` sees children in
 /// the contiguous sequence it expects.
-fn split_replace_sort_children<'a>(
-    plan: &'a SplitReplacePlan<'a>,
-) -> Vec<&'a SplitReplaceChild<'a>> {
-    let mut sorted: Vec<&SplitReplaceChild<'a>> = plan.children().iter().collect();
-    sorted.sort_by(|a, b| a.spec().key_range_start().cmp(b.spec().key_range_start()));
-    // Defense-in-depth: `SplitReplacePlan::try_new` already enforces >= 2
-    // children at construction time, but this assertion guards against
-    // future refactors that might bypass the constructor.
-    assert!(sorted.len() >= 2, "split_replace requires >= 2 children");
-    sorted
+fn split_replace_sort_children<'a>(plan: &'a SplitReplacePlan<'a>) -> SplitChildOrder {
+    SplitChildOrder::from_plan(plan)
 }
 
 /// Recompute child IDs for an idempotent replay.
@@ -1504,7 +1679,7 @@ fn split_replace_replay_child_ids(
     parent: &ShardRecord,
     plan: &SplitReplacePlan<'_>,
     op_id: OpId,
-) -> gossip_stdx::InlineVec<ShardId, { crate::coordination::split::MAX_SPLIT_CHILDREN }> {
+) -> SplitChildIds {
     let sorted = split_replace_sort_children(plan);
     let n = sorted.len();
     // Parent is terminal (Split) after first execution, so spawned is
@@ -1514,8 +1689,8 @@ fn split_replace_replay_child_ids(
         .len()
         .checked_sub(n)
         .expect("split_replace replay: parent.spawned.len() < child count; state corruption");
-    let mut ids = gossip_stdx::InlineVec::new();
-    for (i, _) in sorted.iter().enumerate() {
+    let mut ids = SplitChildIds::new();
+    for i in 0..n {
         ids.push(derive_split_shard_id(
             parent.run,
             parent.shard,
@@ -1527,55 +1702,44 @@ fn split_replace_replay_child_ids(
     ids
 }
 
-/// A pending shard map insertion: `((tenant, shard_key), record)`.
+/// Remove and deallocate any children inserted during split-replace staging.
 ///
-/// Used by `split_replace_build_children` to batch-construct child entries
-/// before inserting them into the coordinator's two-level map.  The tuple
-/// mirrors `shard_insert`'s `(TenantId, ShardKey, ShardRecord)` signature.
-type ShardMapEntry = ((TenantId, ShardKey), ShardRecord);
-
-/// Deallocate all staged child records and clear the insertion buffer.
-fn split_replace_rollback_children(entries: &mut Vec<ShardMapEntry>, slab: &mut ByteSlab) {
-    for (_, mut prev_record) in entries.drain(..) {
-        prev_record.deallocate_fields(slab);
+/// Called when a mid-loop failure occurs after one or more children were
+/// already inserted (allocation failure for a later child, or a derived-ID
+/// collision discovered later in the sorted sequence).
+fn split_replace_rollback_inserted_children(
+    coordinator: &mut InMemoryCoordinator,
+    tenant: TenantId,
+    run: RunId,
+    inserted: &[ShardId],
+) {
+    for &child_id in inserted.iter().rev() {
+        let child_key = ShardKey::new(run, child_id);
+        if let Some(mut record) = coordinator.shard_remove(&tenant, &child_key) {
+            record.deallocate_fields(&mut coordinator.slab);
+        }
     }
 }
 
-/// Map child-build allocation failure to `SplitReplaceError` after rollback.
-fn split_replace_child_build_error(
-    entries: &mut Vec<ShardMapEntry>,
-    slab: &mut ByteSlab,
-    err: SlabFull,
-) -> SplitReplaceError {
-    split_replace_rollback_children(entries, slab);
-    SplitReplaceError::from(err)
-}
-
-/// Derive child IDs and build child `ShardRecord`s (pure — no map mutation).
+/// Derive child IDs, build child records, and insert each child with rollback.
 ///
 /// Each child ID is derived via BLAKE3 from `(run, parent_shard, op_id,
 /// kind=Child, index)`. The index starts at `parent.spawned.len()` so IDs
-/// are unique across successive splits of the same parent.
-///
-/// Returns `(child_ids, entries)` where `entries` are ready for insertion
-/// into the shard map.
-fn split_replace_build_children(
+/// are unique across successive splits of the same parent. If any child build
+/// fails, previously inserted children are removed and deallocated so the
+/// operation remains all-or-nothing before parent mutation.
+fn split_replace_insert_children(
+    coordinator: &mut InMemoryCoordinator,
     parent: &ShardRecord,
-    sorted: &[&SplitReplaceChild<'_>],
+    plan: &SplitReplacePlan<'_>,
+    sorted: &SplitChildOrder,
     tenant: TenantId,
     op_id: OpId,
-    slab: &mut ByteSlab,
-) -> Result<
-    (
-        gossip_stdx::InlineVec<ShardId, { crate::coordination::split::MAX_SPLIT_CHILDREN }>,
-        Vec<ShardMapEntry>,
-    ),
-    SplitReplaceError,
-> {
-    let mut child_ids = gossip_stdx::InlineVec::new();
-    let mut to_insert: Vec<ShardMapEntry> = Vec::with_capacity(sorted.len());
+) -> Result<SplitChildIds, SplitReplaceError> {
+    let mut child_ids = SplitChildIds::new();
 
-    for (i, child) in sorted.iter().enumerate() {
+    for i in 0..sorted.len() {
+        let child = sorted.child(plan, i);
         let idx = (parent.spawned.len() + i) as u32;
         let child_id = derive_split_shard_id(
             parent.run,
@@ -1587,7 +1751,21 @@ fn split_replace_build_children(
         assert!(child_id.is_derived(), "derived child must have bit 63 set");
 
         let child_key = ShardKey::new(parent.run, child_id);
-        let record = ShardRecord::new_split_child(
+        if coordinator.shard_contains(&tenant, &child_key) {
+            split_replace_rollback_inserted_children(
+                coordinator,
+                tenant,
+                parent.run,
+                child_ids.as_slice(),
+            );
+            return Err(SplitReplaceError::SplitInvalid(
+                SplitValidationError::DerivedIdCollision {
+                    derived_id: child_id,
+                },
+            ));
+        }
+
+        let record = match ShardRecord::new_split_child(
             tenant,
             parent.run,
             child_id,
@@ -1595,12 +1773,22 @@ fn split_replace_build_children(
             child.cursor(),
             parent.cursor_semantics,
             parent.shard,
-            slab,
-        )
-        .map_err(|err| split_replace_child_build_error(&mut to_insert, slab, err))?;
+            &mut coordinator.slab,
+        ) {
+            Ok(record) => record,
+            Err(err) => {
+                split_replace_rollback_inserted_children(
+                    coordinator,
+                    tenant,
+                    parent.run,
+                    child_ids.as_slice(),
+                );
+                return Err(SplitReplaceError::from(err));
+            }
+        };
 
+        coordinator.shard_insert(tenant, child_key, record);
         child_ids.push(child_id);
-        to_insert.push(((tenant, child_key), record));
     }
 
     assert_eq!(
@@ -1608,7 +1796,7 @@ fn split_replace_build_children(
         sorted.len(),
         "child count mismatch after build",
     );
-    Ok((child_ids, to_insert))
+    Ok(child_ids)
 }
 
 /// Transition parent to terminal `Split` status.
@@ -1626,6 +1814,10 @@ fn split_replace_apply_parent(
     now: LogicalTime,
 ) {
     assert!(!child_ids.is_empty(), "split_replace requires children");
+    debug_assert!(
+        parent.can_spawn(child_ids.len()),
+        "split_replace precondition violated: append would exceed spawn cap"
+    );
 
     parent.assert_transition_legal(ShardStatus::Split);
     parent.status = ShardStatus::Split;
@@ -1653,15 +1845,14 @@ fn split_replace_apply_parent(
 
 /// Search `parent.spawned` for a residual derived from the given `op_id`.
 ///
-/// On replay, the residual's original creation index is unknown because
-/// `spawned` may have grown since the first execution. We brute-force all
-/// possible indices `0..spawned.len()`, re-deriving the BLAKE3-based ID
-/// for each and checking membership in a `HashSet`.
+/// `spawned` is append-only: each derived split ID is pushed at the same
+/// index used in its derivation. This lets us probe replay candidates in a
+/// single pass without building a temporary set: for each current index `i`,
+/// derive `Residual(op_id, i)` and compare against `spawned[i]`.
 ///
 /// Complexity: O(S·D) where S = `spawned.len()` and D = BLAKE3 hash cost
-/// (constant). The `HashSet` construction is O(S) and each lookup is O(1)
-/// amortized. At `MAX_SPAWNED_PER_SHARD` (1024), worst case is ~1024
-/// hashes + ~1024 set lookups.
+/// (constant). At `MAX_SPAWNED_PER_SHARD` (1024), worst case is ~1024
+/// hash+compare steps and zero heap allocation.
 ///
 /// Returns `None` if no match, meaning this is genuinely a new operation.
 fn find_replayed_residual(parent: &ShardRecord, op_id: OpId) -> Option<ShardId> {
@@ -1671,16 +1862,15 @@ fn find_replayed_residual(parent: &ShardRecord, op_id: OpId) -> Option<ShardId> 
         parent.spawned.len(),
         MAX_SPAWNED_PER_SHARD,
     );
-    let spawned_set: HashSet<&ShardId> = parent.spawned.iter().collect();
-    for idx in 0..parent.spawned.len() as u32 {
+    for (idx, spawned) in parent.spawned.iter().enumerate() {
         let candidate = derive_split_shard_id(
             parent.run,
             parent.shard,
             op_id,
             DerivedShardKind::Residual,
-            idx,
+            idx as u32,
         );
-        if spawned_set.contains(&candidate) {
+        if *spawned == candidate {
             return Some(candidate);
         }
     }
@@ -1768,14 +1958,14 @@ fn split_residual_validate_preconditions(
 
     // Validate per-spec size limits for both the new parent and residual specs.
     if ShardSpec::validate_ref(plan.parent_new_spec()).is_err() {
-        return Err(SplitResidualError::SplitInvalid(Box::new(
+        return Err(SplitResidualError::SplitInvalid(
             SplitValidationError::InvalidChildSpec { child_index: 0 },
-        )));
+        ));
     }
     if ShardSpec::validate_ref(plan.residual_spec()).is_err() {
-        return Err(SplitResidualError::SplitInvalid(Box::new(
+        return Err(SplitResidualError::SplitInvalid(
             SplitValidationError::InvalidChildSpec { child_index: 1 },
-        )));
+        ));
     }
 
     validate_residual_split_bounds(
@@ -1784,18 +1974,18 @@ fn split_residual_validate_preconditions(
         plan.parent_new_spec(),
         plan.residual_spec(),
     )
-    .map_err(|e| SplitResidualError::SplitInvalid(Box::new(e)))?;
+    .map_err(SplitResidualError::SplitInvalid)?;
     // Safety: shrinking the parent must not strand its existing cursor.
     split_residual_validate_cursor_bounds(parent, plan, slab)?;
     // Spawn-cap guard: check BEFORE mutating parent.spawned.
     if !parent.can_spawn(1) {
-        return Err(SplitResidualError::SplitInvalid(Box::new(
+        return Err(SplitResidualError::SplitInvalid(
             SplitValidationError::SpawnLimitExceeded {
                 current: parent.spawned.len(),
                 additional: 1,
                 max: MAX_SPAWNED_PER_SHARD,
             },
-        )));
+        ));
     }
     Ok(())
 }
@@ -1817,21 +2007,13 @@ fn split_residual_validate_cursor_bounds(
     if let Some(k) = parent.cursor.last_key(slab)
         && !plan.parent_new_spec().contains_key(k)
     {
-        return Err(SplitResidualError::SplitInvalid(Box::new(
+        return Err(SplitResidualError::SplitInvalid(
             crate::coordination::shard_spec::SplitValidationError::ParentCursorOutOfBounds {
-                cursor: k.to_vec().into_boxed_slice(),
-                new_parent_start: plan
-                    .parent_new_spec()
-                    .key_range_start()
-                    .to_vec()
-                    .into_boxed_slice(),
-                new_parent_end: plan
-                    .parent_new_spec()
-                    .key_range_end()
-                    .to_vec()
-                    .into_boxed_slice(),
+                cursor: k.len(),
+                new_parent_start: plan.parent_new_spec().key_range_start().len(),
+                new_parent_end: plan.parent_new_spec().key_range_end().len(),
             },
-        )));
+        ));
     }
     Ok(())
 }
@@ -1880,6 +2062,10 @@ fn split_residual_apply_parent(
     slab: &mut ByteSlab,
 ) -> Result<(), SplitResidualError> {
     assert!(residual_id.is_derived(), "residual must be derived");
+    debug_assert!(
+        parent.can_spawn(1),
+        "split_residual precondition violated: append would exceed spawn cap"
+    );
 
     parent.spec.update_from_ref(new_spec, slab)?;
     parent.spawned.push(residual_id);
@@ -1906,15 +2092,33 @@ fn split_residual_apply_parent(
 impl InMemoryCoordinator {
     /// Register a shard in the run-to-shards secondary index.
     ///
-    /// This index enables `list_shards` and `get_run_progress` to enumerate
+    /// This index enables `list_shards_into` and `get_run_progress` to enumerate
     /// a run's shards without scanning the entire tenant shard map.
     /// Idempotent — `HashSet::insert` is a no-op if the shard is already
     /// indexed, so calling this on both register and split paths is safe.
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
-        self.run_shards
-            .entry((tenant, run))
-            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY))
-            .insert(shard);
+        let run_key = (tenant, run);
+        if !self.run_shards.contains_key(&run_key) {
+            self.run_shards.try_reserve(1).unwrap_or_else(|_| {
+                panic!(
+                    "run_shards index capacity exhausted while indexing run {run:?} \
+                     for tenant {tenant:?}"
+                )
+            });
+        }
+        let shard_ids = self
+            .run_shards
+            .entry(run_key)
+            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY));
+        if !shard_ids.contains(&shard) {
+            shard_ids.try_reserve(1).unwrap_or_else(|_| {
+                panic!(
+                    "run_shards set capacity exhausted while indexing shard {shard:?} \
+                     for run {run:?}"
+                )
+            });
+        }
+        shard_ids.insert(shard);
     }
 
     /// Cross-validate the `run_shards` index against the primary `shards` map.
@@ -1975,7 +2179,7 @@ impl InMemoryCoordinator {
     /// Count available shards and find the earliest lease deadline for a run.
     ///
     /// O(S) where S = shards in run.  The reference in-memory backend
-    /// accepts this cost because [`list_shards`](Self::list_shards) and the
+    /// accepts this cost because [`list_shards_into`](Self::list_shards_into) and the
     /// claiming loop already perform O(S) scans.  Production backends should
     /// maintain a secondary counter or compute this from an index.
     ///
@@ -2050,7 +2254,7 @@ impl InMemoryCoordinator {
     /// Look up a run record with tenant isolation enforcement.
     ///
     /// Shared precondition helper for read-only run queries (`get_run`,
-    /// `get_run_progress`, `list_shards`). Callers that need `&mut` must
+    /// `get_run_progress`, `list_shards_into`). Callers that need `&mut` must
     /// look up the record directly via `self.runs.get_mut`.
     fn lookup_run(&self, tenant: TenantId, run: RunId) -> Result<&RunRecord, GetRunError> {
         let record = self
@@ -2201,8 +2405,21 @@ impl RunManagement for InMemoryCoordinator {
         // are deallocated before returning so this path stays all-or-nothing.
         // Borrowed manifest inputs are copied into slab-owned record fields.
         let cursor_semantics = record.config.cursor_semantics();
-        let shard_ids: Vec<ShardId> = shards.iter().map(|s| s.shard()).collect();
-        let mut to_insert: Vec<(ShardKey, ShardRecord)> = Vec::with_capacity(shards.len());
+        let mut shard_ids = std::mem::take(&mut self.register_shard_ids_scratch);
+        shard_ids.clear();
+        shard_ids.extend(shards.iter().map(InitialShardInput::shard));
+
+        let mut to_insert = std::mem::take(&mut self.register_stage_scratch);
+        to_insert.clear();
+
+        if let Err(err) = self
+            .reserve_register_shard_capacity(tenant, shard_ids.len())
+            .and_then(|_| self.reserve_register_index_capacity(tenant, run, &shard_ids))
+        {
+            self.register_shard_ids_scratch = shard_ids;
+            self.register_stage_scratch = to_insert;
+            return Err(err);
+        }
 
         for s in shards {
             let key = ShardKey::new(run, s.shard());
@@ -2223,9 +2440,11 @@ impl RunManagement for InMemoryCoordinator {
                 Ok(record) => record,
                 Err(err) => {
                     // Roll back staged records allocated so far.
-                    for (_, mut staged) in to_insert {
+                    for (_, mut staged) in to_insert.drain(..) {
                         staged.deallocate_fields(&mut self.slab);
                     }
+                    self.register_shard_ids_scratch = shard_ids;
+                    self.register_stage_scratch = to_insert;
                     return Err(err.into());
                 }
             };
@@ -2233,14 +2452,34 @@ impl RunManagement for InMemoryCoordinator {
             to_insert.push((key, sr));
         }
 
-        for (key, record) in to_insert {
+        if !self.shards.contains_key(&tenant) {
+            self.shards.insert(
+                tenant,
+                ahash_map_with_capacity(
+                    tenant_shards_map_initial_capacity(self.max_shards_per_tenant)
+                        .max(shard_ids.len()),
+                ),
+            );
+        }
+
+        for (key, record) in to_insert.drain(..) {
             self.shard_insert(tenant, key, record);
         }
 
-        self.run_shards
-            .entry((tenant, run))
-            .or_insert_with(|| ahash_set_with_capacity(shard_ids.len()))
-            .extend(shard_ids.iter().copied());
+        let run_key = (tenant, run);
+        let shard_set = self.run_shards.entry(run_key).or_insert_with(|| {
+            let mut shard_set = ahash_set_with_capacity(0);
+            shard_set
+                .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "run_shards set capacity exhausted while finalizing register_shards \
+                         for run {run:?}"
+                    )
+                });
+            shard_set
+        });
+        shard_set.extend(shard_ids.iter().copied());
 
         // 7. Transition run → Active.
         //
@@ -2253,20 +2492,24 @@ impl RunManagement for InMemoryCoordinator {
             .expect("run record must exist: verified by step 1 lookup");
         record.assert_transition_legal(RunStatus::Active);
         record.status = RunStatus::Active;
-        record.root_shards = shard_ids.clone();
+        let executed_shard_ids = shard_ids.clone();
+        record.root_shards = executed_shard_ids.clone();
         record.op_log_push(RunOpLogEntry::new(
             op_id,
             RunOpKind::RegisterShards,
             payload_hash,
             now,
             RunOpResult::RegisteredShards {
-                shard_ids: shard_ids.clone().into_boxed_slice(),
+                shard_ids: executed_shard_ids.clone().into_boxed_slice(),
             },
         ));
         record.assert_invariants();
         self.debug_assert_run_shards_consistent(tenant, run);
 
-        Ok(IdempotentOutcome::Executed(shard_ids))
+        self.register_shard_ids_scratch = shard_ids;
+        self.register_stage_scratch = to_insert;
+
+        Ok(IdempotentOutcome::Executed(executed_shard_ids))
     }
 
     /// Return a clone of the run record after validating tenant isolation.
@@ -2319,8 +2562,8 @@ impl RunManagement for InMemoryCoordinator {
         Ok(progress)
     }
 
-    /// Return summaries for shards in a run that match `filter`, sorted
-    /// by `key_range_start` for deterministic output.
+    /// Write summaries for shards in a run that match `filter` into `out`,
+    /// sorted by `key_range_start` for deterministic output.
     ///
     /// Sort tie-breaking: when two shards share the same `key_range_start`
     /// (for example split-replace where the parent and first child start at
@@ -2331,18 +2574,29 @@ impl RunManagement for InMemoryCoordinator {
     /// [`ShardSummary`], which avoids heap-allocating cloned key ranges
     /// for shards that will be discarded. This matters when a run has
     /// many terminal shards and the caller only wants active ones.
-    fn list_shards(
+    fn list_shards_into(
         &self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         filter: ShardFilter,
-    ) -> Result<Vec<ShardSummary>, GetRunError> {
+        out: &mut Vec<ShardSummary>,
+    ) -> Result<(), GetRunError> {
         let _ = self.lookup_run(tenant, run)?;
 
         let shard_ids = self.run_shards.get(&(tenant, run));
-        let mut summaries = Vec::with_capacity(shard_ids.map_or(0, |ids| ids.len()));
+        out.clear();
         if let Some(shard_ids) = shard_ids {
+            if out.capacity() < shard_ids.len() {
+                out.try_reserve(shard_ids.len() - out.capacity())
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "list_shards_into: unable to reserve summary buffer for run {run:?} \
+                         ({}) entries",
+                            shard_ids.len()
+                        )
+                    });
+            }
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
                 let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
@@ -2359,16 +2613,16 @@ impl RunManagement for InMemoryCoordinator {
                     continue;
                 }
                 let summary = ShardSummary::from_record(record, now, &self.slab);
-                summaries.push(summary);
+                out.push(summary);
             }
         }
 
-        summaries.sort_by(|a, b| {
+        out.sort_by(|a, b| {
             a.key_range_start()
                 .cmp(b.key_range_start())
                 .then_with(|| a.shard().cmp(&b.shard()))
         });
-        Ok(summaries)
+        Ok(())
     }
 
     /// Transition an `Active` run to `Done` (terminal, idempotent).
@@ -2637,8 +2891,11 @@ impl ShardClaiming for InMemoryCoordinator {
     /// cooldown gate: if the worker's last successful claim was less than
     /// `claim_cooldown_interval` logical time units ago, the request is
     /// rejected with [`ClaimError::Throttled`] *before* invoking candidate
-    /// selection (O(S log S) in this backend because `list_shards` sorts
-    /// candidates by key range). On success, the worker's cooldown timer is reset. Failed
+    /// selection. Candidate selection scans the run index and sorts shard IDs
+    /// by `key_range_start` (O(S log S)) using a reusable caller-owned scratch
+    /// buffer to avoid per-claim summary allocations.
+    ///
+    /// On success, the worker's cooldown timer is reset. Failed
     /// claims (no shards available, run not found) do not trigger cooldown,
     /// so a worker competing for scarce shards is never penalized for losing
     /// a race.
@@ -2650,14 +2907,141 @@ impl ShardClaiming for InMemoryCoordinator {
         worker: WorkerId,
         out: &'a mut AcquireScratch,
     ) -> Result<AcquireResultView<'a>, ClaimError> {
-        // Cooldown gate: average O(1) hash lookup before candidate selection
-        // (O(S log S) in this backend due to `list_shards` sorting).
+        // Cooldown gate: average O(1) hash lookup before candidate selection.
         if let Some(retry_after) = self.check_cooldown(worker, now) {
             return Err(ClaimError::Throttled { retry_after });
         }
-        let result = default_claim_next_available(self, now, tenant, run, worker, out)?;
+        let _ = self.lookup_run(tenant, run).map_err(ClaimError::from)?;
+        self.ensure_claim_cooldown_capacity(worker);
+
+        let mut candidates = std::mem::take(&mut self.claim_candidates_scratch);
+        candidates.clear();
+
+        let claim_result = (|| {
+            let mut earliest_deadline: Option<LogicalTime> = None;
+            if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
+                if candidates.capacity() < shard_ids.len() {
+                    candidates
+                        .try_reserve(shard_ids.len() - candidates.capacity())
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "claim_next_available: unable to reserve candidate buffer \
+                                 for run {run:?} ({} entries)",
+                                shard_ids.len()
+                            )
+                        });
+                }
+                for &shard_id in shard_ids {
+                    let key = ShardKey::new(run, shard_id);
+                    let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
+                        panic!(
+                            "run_shards index contains shard {:?} for run {:?} \
+                             but no record exists in the primary shard map — \
+                             index desynchronization",
+                            shard_id, run,
+                        )
+                    });
+                    if record.status != ShardStatus::Active {
+                        continue;
+                    }
+                    if record.is_leased_at(now) {
+                        if let Some(deadline) = record.lease_deadline() {
+                            earliest_deadline = Some(match earliest_deadline {
+                                Some(prev) => core::cmp::min(prev, deadline),
+                                None => deadline,
+                            });
+                        }
+                        continue;
+                    }
+                    candidates.push(shard_id);
+                }
+            }
+
+            if candidates.is_empty() {
+                return Err(ClaimError::NoneAvailable { earliest_deadline });
+            }
+
+            candidates.sort_by(|a, b| {
+                let key_a = ShardKey::new(run, *a);
+                let key_b = ShardKey::new(run, *b);
+                let record_a = self.shard_get(&tenant, &key_a).unwrap_or_else(|| {
+                    panic!(
+                        "run_shards index contains shard {:?} for run {:?} \
+                         but no record exists in the primary shard map — \
+                         index desynchronization",
+                        a, run,
+                    )
+                });
+                let record_b = self.shard_get(&tenant, &key_b).unwrap_or_else(|| {
+                    panic!(
+                        "run_shards index contains shard {:?} for run {:?} \
+                         but no record exists in the primary shard map — \
+                         index desynchronization",
+                        b, run,
+                    )
+                });
+                record_a
+                    .spec
+                    .key_range_start(&self.slab)
+                    .cmp(record_b.spec.key_range_start(&self.slab))
+                    .then_with(|| a.cmp(b))
+            });
+
+            let len = candidates.len();
+            let offset = worker.as_raw() as usize % len;
+            let mut inconsistency_count = 0usize;
+
+            for i in 0..len {
+                let shard_id = candidates[(offset + i) % len];
+                let key = ShardKey::new(run, shard_id);
+                match self.acquire_and_restore_into(now, tenant, key, worker, out) {
+                    Ok(result) => {
+                        let snapshot = result.snapshot;
+                        return Ok((
+                            result.lease,
+                            snapshot.status(),
+                            snapshot.cursor_semantics(),
+                            snapshot.parent(),
+                            result.capacity,
+                        ));
+                    }
+                    Err(AcquireError::AlreadyLeased { lease_deadline, .. }) => {
+                        earliest_deadline = Some(match earliest_deadline {
+                            Some(prev) => core::cmp::min(prev, lease_deadline),
+                            None => lease_deadline,
+                        });
+                    }
+                    Err(AcquireError::ShardTerminal { .. }) => {}
+                    Err(AcquireError::ShardNotFound { .. }) => {
+                        debug_assert!(
+                            false,
+                            "claim_next_available: candidate shard {key:?} \
+                             disappeared between selection and acquire"
+                        );
+                        inconsistency_count += 1;
+                    }
+                    Err(AcquireError::TenantMismatch { expected }) => {
+                        return Err(ClaimError::TenantMismatch { expected });
+                    }
+                }
+            }
+
+            assert!(
+                inconsistency_count < len,
+                "all {} claim candidates returned ShardNotFound — backend index vs shard map inconsistency",
+                len,
+            );
+            Err(ClaimError::NoneAvailable { earliest_deadline })
+        })();
+
+        self.claim_candidates_scratch = candidates;
+        let (lease, status, cursor_semantics, parent, capacity) = claim_result?;
         self.record_claim(worker, now);
-        Ok(result)
+        Ok(AcquireResultView {
+            lease,
+            snapshot: out.view(status, cursor_semantics, parent),
+            capacity,
+        })
     }
 }
 

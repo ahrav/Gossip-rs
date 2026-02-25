@@ -411,9 +411,9 @@ fn split_replace_three_children() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
-    let spec_mid = ShardSpec::with_range(b"m".to_vec(), b"s".to_vec());
-    let spec_left = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec_right = ShardSpec::with_range(b"s".to_vec(), b"z".to_vec());
+    let spec_mid = ShardSpec::with_range(b"m", b"s");
+    let spec_left = ShardSpec::with_range(b"a", b"m");
+    let spec_right = ShardSpec::with_range(b"s", b"z");
     let cursor_mid = Cursor::initial();
     let cursor_left = Cursor::initial();
     let cursor_right = Cursor::initial();
@@ -447,6 +447,73 @@ fn split_replace_three_children() {
             "child {child_id:?} must be Active"
         );
     }
+}
+
+#[test]
+fn split_replace_mid_build_failure_rolls_back_inserted_children() {
+    // Capacity math with 16-byte slab blocks:
+    // - Parent spec [a,z): 2 slots => 32 bytes
+    // - Child spec  [a,m): 2 slots => 32 bytes (first child can be inserted)
+    // - Second child then fails due exhausted slab.
+    let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 100, 100);
+    runtime.slab_capacity = 64;
+    let mut coord = InMemoryCoordinator::with_runtime_config(runtime);
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+    let spec = test_spec();
+    let cursor = Cursor::initial();
+    let shards = vec![InitialShardInput::new(
+        test_shard(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
+    )];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let lease = acquire_shard(&mut coord, 3, 1);
+    let live_before = coord.slab().live_count();
+
+    let err = coord
+        .split_replace(
+            now(4),
+            test_tenant(),
+            &lease,
+            test_split_replace_plan(),
+            OpId::from_raw(22),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SplitReplaceError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got: {err:?}"
+    );
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "child fields leaked on split_replace failure"
+    );
+    assert_eq!(
+        coord.shard_count(),
+        1,
+        "failed split must not insert children"
+    );
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(parent.status, ShardStatus::Active);
+    assert!(
+        parent.spawned.is_empty(),
+        "parent spawned list must remain unchanged on failure"
+    );
 }
 
 // -- split_residual tests ----------------------------------------------
@@ -774,6 +841,56 @@ fn split_residual_replay_via_spawned_after_eviction() {
     assert_eq!(first.as_ref().residual, second.as_ref().residual);
 }
 
+#[test]
+fn split_residual_replay_via_spawned_after_additional_spawn() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    // First residual split: [a,z) -> parent [a,m), residual [m,z).
+    let plan1 = test_split_residual_plan();
+    let split_op1 = OpId::from_raw(200);
+    let first = coord
+        .split_residual(now(3), test_tenant(), &lease, plan1.clone(), split_op1)
+        .unwrap();
+    assert!(first.is_executed());
+
+    // Second residual split on the narrowed parent: [a,m) -> [a,j) + [j,m).
+    let parent2 = ShardSpec::with_range(b"a", b"j");
+    let residual2 = ShardSpec::with_range(b"j", b"m");
+    let plan2 = SplitResidualPlan::try_new(parent2.as_ref(), residual2.as_ref()).unwrap();
+    let second_exec = coord
+        .split_residual(now(4), test_tenant(), &lease, plan2, OpId::from_raw(201))
+        .unwrap();
+    assert!(second_exec.is_executed());
+
+    // Evict the first split op-log entry (cap=16) with enough checkpoints.
+    let mut key_byte = b'b';
+    for i in 1..=17u64 {
+        let key = [key_byte];
+        let cursor = CursorUpdate::new(&key);
+        let _ = coord
+            .checkpoint(
+                now(10 + i),
+                test_tenant(),
+                &lease,
+                &cursor,
+                OpId::from_raw(300 + i),
+            )
+            .unwrap();
+        if key_byte < b'i' {
+            key_byte += 1;
+        }
+    }
+
+    // Replay op1 after eviction: residual should still be found in spawned,
+    // even though it's no longer the newest spawned entry.
+    let replay = coord
+        .split_residual(now(40), test_tenant(), &lease, plan1, split_op1)
+        .unwrap();
+    assert!(replay.is_replay());
+    assert_eq!(replay.as_ref().residual, first.as_ref().residual);
+}
+
 // -- spawn-cap guard tests -----------------------------------------------
 //
 // Each shard tracks a `spawned` set of child ShardIds. When this set
@@ -799,7 +916,7 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
         ShardStatus::Active,
         None,
         &test_spec(), // [a, z)
-        &Cursor::with_last_key(b"d".to_vec()),
+        &Cursor::with_last_key(b"d"),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -856,6 +973,31 @@ fn split_residual_below_cap_succeeds() {
         .split_residual(now(2), test_tenant(), &lease, plan, OpId::from_raw(1))
         .unwrap();
     assert!(result.is_executed());
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(parent.spawned.len(), MAX_SPAWNED_PER_SHARD);
+}
+
+#[test]
+fn split_replace_fills_remaining_spawn_capacity() {
+    // Two below the cap with a 2-child split-replace should land exactly at cap.
+    let mut coord = coordinator_with_spawned_count(MAX_SPAWNED_PER_SHARD - 2);
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let result = coord
+        .split_replace(
+            now(2),
+            test_tenant(),
+            &lease,
+            test_split_replace_plan(),
+            OpId::from_raw(2),
+        )
+        .unwrap();
+    assert!(result.is_executed());
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(parent.status, ShardStatus::Split);
+    assert_eq!(parent.spawned.len(), MAX_SPAWNED_PER_SHARD);
 }
 
 // -- Idempotent replay after terminal state --------------------------------
@@ -927,8 +1069,8 @@ fn split_replace_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different plan (different split point).
-    let spec_left = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let spec_right = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+    let spec_left = ShardSpec::with_range(b"a", b"p");
+    let spec_right = ShardSpec::with_range(b"p", b"z");
     let cursor_left = Cursor::initial();
     let cursor_right = Cursor::initial();
     let plan_b = SplitReplacePlan::try_new(vec![
@@ -973,8 +1115,8 @@ fn split_residual_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different plan (different split point).
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let residual = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+    let parent_new = ShardSpec::with_range(b"a", b"p");
+    let residual = ShardSpec::with_range(b"p", b"z");
     let plan_b = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
 
     let err = coord
@@ -1039,7 +1181,7 @@ fn split_replace_exceeds_per_tenant_limit() {
     coord.seed_shard(record);
 
     // Seed two additional shards to fill tenant to limit.
-    let spec2 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec2 = ShardSpec::with_range(b"a", b"z");
     let record2 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
@@ -1050,7 +1192,7 @@ fn split_replace_exceeds_per_tenant_limit() {
     )
     .unwrap();
     coord.seed_shard(record2);
-    let spec3 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec3 = ShardSpec::with_range(b"a", b"z");
     let record3 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
@@ -1071,7 +1213,7 @@ fn split_replace_exceeds_per_tenant_limit() {
         .unwrap_err();
     assert!(
         matches!(err, SplitReplaceError::SplitInvalid(ref e)
-            if matches!(e.as_ref(),
+            if matches!(e,
                 SplitValidationError::ShardLimitExceeded { scope: ShardLimitScope::PerTenant, .. })),
         "expected ShardLimitExceeded(PerTenant), got: {err:?}",
     );
@@ -1095,7 +1237,7 @@ fn split_residual_exceeds_global_limit() {
     coord.seed_shard(record);
 
     // Seed a second shard (different tenant) to fill global limit.
-    let spec2 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec2 = ShardSpec::with_range(b"a", b"z");
     let record2 = ShardRecord::new_active(
         other_tenant(),
         test_run(),
@@ -1127,7 +1269,7 @@ fn split_residual_exceeds_global_limit() {
         .unwrap_err();
     assert!(
         matches!(err, SplitResidualError::SplitInvalid(ref e)
-            if matches!(e.as_ref(),
+            if matches!(e,
                 SplitValidationError::ShardLimitExceeded { scope: ShardLimitScope::Global, .. })),
         "expected ShardLimitExceeded(Global), got: {err:?}",
     );
@@ -1285,8 +1427,8 @@ fn split_residual_replay_via_oplog_returns_replayed() {
     assert_eq!(first.as_ref().residual, second.as_ref().residual);
 
     // Same op_id, different plan (different split point) — OpIdConflict.
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let residual = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+    let parent_new = ShardSpec::with_range(b"a", b"p");
+    let residual = ShardSpec::with_range(b"p", b"z");
     let plan_b = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
     let err = coord
         .split_residual(now(5), test_tenant(), &lease, plan_b, op)
@@ -1532,8 +1674,8 @@ fn lifecycle_split_residual_twice_then_complete_children() {
         .unwrap();
 
     // Step 4: split_residual again [a,j) + [j,m) — capture residual_2.
-    let parent_new_2 = ShardSpec::with_range(b"a".to_vec(), b"j".to_vec());
-    let residual_2_spec = ShardSpec::with_range(b"j".to_vec(), b"m".to_vec());
+    let parent_new_2 = ShardSpec::with_range(b"a", b"j");
+    let residual_2_spec = ShardSpec::with_range(b"j", b"m");
     let plan2 =
         SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2_spec.as_ref()).unwrap();
     let r2 = coord

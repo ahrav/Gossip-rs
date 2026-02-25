@@ -114,6 +114,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// from tiny allocations.
 const MIN_BLOCK: u32 = 16;
 
+/// Hard cap for free-list metadata entries.
+///
+/// Startup preallocates free-list metadata. For very large slabs, the
+/// theoretical worst-case entry count can be enormous; this cap keeps the
+/// startup metadata reservation bounded and turns overflow into an explicit
+/// runtime failure instead of silent `Vec` growth.
+const MAX_FREE_LIST_METADATA_ENTRIES: usize = 1 << 21;
+
 /// Reserved `ByteSlot` owner id used by [`ByteSlot::EMPTY`].
 const EMPTY_OWNER_ID: u32 = 0;
 
@@ -186,6 +194,30 @@ fn alloc_size(n: usize) -> Option<u32> {
     }
     let n = u32::try_from(n).ok()?;
     n.max(MIN_BLOCK).checked_next_power_of_two()
+}
+
+/// Computes startup free-list metadata capacity from slab byte capacity.
+///
+/// The structural worst case is alternating live/free minimum-size blocks.
+/// With [`MIN_BLOCK`] granularity this yields at most `ceil(blocks / 2)` free
+/// entries, where `blocks = capacity / MIN_BLOCK`. The global cap prevents
+/// pathological startup reservations for huge slabs.
+#[inline]
+fn free_list_metadata_capacity(capacity: usize) -> usize {
+    let min_blocks = capacity / MIN_BLOCK as usize;
+    let worst_case_entries = min_blocks.div_ceil(2);
+    worst_case_entries.min(MAX_FREE_LIST_METADATA_ENTRIES)
+}
+
+/// Panics on free-list metadata exhaustion.
+#[cold]
+#[inline(never)]
+fn free_list_metadata_full(capacity: usize) -> ! {
+    panic!(
+        "ByteSlab free-list metadata exhausted ({} entries); \
+         increase slab metadata budget at startup",
+        capacity
+    );
 }
 
 // ============================================================================
@@ -318,6 +350,7 @@ pub struct ByteSlab {
     /// locality. Operations are O(F) but F is typically 0-5, fitting
     /// in one cache line (40 bytes). Binary search locates neighbors
     /// for coalescing; linear scan finds best-fit for allocation.
+    /// Capacity is preallocated at startup and never grows.
     free_list: Vec<(u32, u32)>,
     /// Cached sum of all free-list bytes.
     ///
@@ -345,6 +378,14 @@ impl ByteSlab {
     ///
     /// Panics if `capacity` exceeds `u32::MAX`.
     pub fn with_capacity(capacity: usize) -> Self {
+        let free_list_capacity = free_list_metadata_capacity(capacity);
+        Self::new_with_free_list_capacity(capacity, free_list_capacity)
+    }
+
+    /// Internal constructor that fixes free-list metadata capacity at startup.
+    ///
+    /// This is used by tests to exercise metadata-capacity edge cases.
+    fn new_with_free_list_capacity(capacity: usize, free_list_capacity: usize) -> Self {
         assert!(
             capacity <= u32::MAX as usize,
             "ByteSlab capacity must fit in u32"
@@ -353,7 +394,7 @@ impl ByteSlab {
             buf: vec![0u8; capacity],
             bump: 0,
             capacity: capacity as u32,
-            free_list: Vec::new(),
+            free_list: Vec::with_capacity(free_list_capacity),
             free_bytes: 0,
             live_bytes: 0,
             live_count: 0,
@@ -382,9 +423,12 @@ impl ByteSlab {
     /// Zero-size insertions are silently ignored (no-op) to simplify
     /// callers that may produce zero remainders from block splits.
     #[inline]
-    fn insert_free_block(&mut self, offset: u32, size: u32) {
+    fn insert_free_block(&mut self, offset: u32, size: u32) -> bool {
         if size == 0 {
-            return;
+            return true;
+        }
+        if self.free_list.len() == self.free_list.capacity() {
+            return false;
         }
         let pos = self.free_list.partition_point(|&(o, _)| o < offset);
         debug_assert!(
@@ -396,6 +440,7 @@ impl ByteSlab {
             .free_bytes
             .checked_add(size)
             .expect("free_bytes overflow");
+        true
     }
 
     /// Finds and removes the smallest free block whose size is `>= needed`.
@@ -562,8 +607,13 @@ impl ByteSlab {
             let remainder = block_size - needed;
             let actual_size = if remainder >= MIN_BLOCK {
                 let remainder_offset = offset.checked_add(needed).expect("split offset overflow");
-                self.insert_free_block(remainder_offset, remainder);
-                needed
+                if self.insert_free_block(remainder_offset, remainder) {
+                    needed
+                } else {
+                    // Metadata is full; hand the whole block to the caller
+                    // rather than attempting to grow free-list storage.
+                    block_size
+                }
             } else {
                 // Remainder is too small to become a standalone free block,
                 // so the caller absorbs the extra bytes. This trades minor
@@ -715,8 +765,8 @@ impl ByteSlab {
             // inserting into the free list, recovering contiguous virgin
             // space for future bump allocations.
             self.bump = merged_offset;
-        } else {
-            self.insert_free_block(merged_offset, merged_size);
+        } else if !self.insert_free_block(merged_offset, merged_size) {
+            free_list_metadata_full(self.free_list.capacity());
         }
         self.debug_assert_invariants();
     }

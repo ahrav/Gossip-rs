@@ -68,7 +68,7 @@ pub fn test_shard() -> ShardId {
 
 /// Canonical test shard spec: half-open range `[a, z)`.
 pub fn test_spec() -> ShardSpec {
-    ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
+    ShardSpec::with_range(b"a", b"z")
 }
 
 /// Create a worker identity from a numeric ID.
@@ -156,8 +156,8 @@ fn acquire_view_to_owned(view: AcquireResultView<'_>) -> AcquireResult {
         view.snapshot.cursor().token(),
     ) {
         (None, _) => Cursor::initial(),
-        (Some(last_key), None) => Cursor::with_last_key(last_key.to_vec()),
-        (Some(last_key), Some(token)) => Cursor::from_parts(last_key.to_vec(), token.to_vec()),
+        (Some(last_key), None) => Cursor::with_last_key(last_key),
+        (Some(last_key), Some(token)) => Cursor::from_parts(last_key, token),
     };
     AcquireResult {
         lease: view.lease,
@@ -319,7 +319,7 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
-    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec = ShardSpec::with_range(b"a", b"z");
     let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),

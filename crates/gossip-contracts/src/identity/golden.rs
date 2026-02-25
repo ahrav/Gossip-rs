@@ -184,7 +184,7 @@ const HASH_SPLIT_RESIDUAL_EXPECTED: u64 = 0x4be2_bdea_6344_7e13;
 fn stable_item_id_golden_value() {
     let key = ItemKey::new(
         ConnectorTag::from_ascii(b"github"),
-        b"org/repo\0src/main.rs".to_vec(),
+        b"org/repo\0src/main.rs",
     );
     let id = key.stable_id();
     assert_eq!(
@@ -476,7 +476,7 @@ fn hash_checkpoint_golden_value() {
     use crate::coordination::cursor::Cursor;
     use crate::coordination::split::hash_checkpoint_payload;
 
-    let cursor = Cursor::with_last_key(b"golden-cursor-key".to_vec());
+    let cursor = Cursor::with_last_key(b"golden-cursor-key");
     let hash = hash_checkpoint_payload(&cursor);
     assert_eq!(
         hash, HASH_CHECKPOINT_EXPECTED,
@@ -490,7 +490,7 @@ fn hash_complete_golden_value() {
     use crate::coordination::cursor::Cursor;
     use crate::coordination::split::hash_complete_payload;
 
-    let cursor = Cursor::with_last_key(b"golden-cursor-key".to_vec());
+    let cursor = Cursor::with_last_key(b"golden-cursor-key");
     let hash = hash_complete_payload(&cursor);
     assert_eq!(
         hash, HASH_COMPLETE_EXPECTED,
@@ -520,8 +520,8 @@ fn hash_split_replace_golden_value() {
         SplitReplaceChild, SplitReplacePlan, hash_split_replace_payload,
     };
 
-    let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let spec1 = ShardSpec::with_range(b"a", b"m");
+    let spec2 = ShardSpec::with_range(b"m", b"z");
     let cursor1 = Cursor::initial();
     let cursor2 = Cursor::initial();
     let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&cursor1));
@@ -540,8 +540,8 @@ fn hash_split_residual_golden_value() {
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{SplitResidualPlan, hash_split_residual_payload};
 
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let parent_new = ShardSpec::with_range(b"a", b"m");
+    let residual = ShardSpec::with_range(b"m", b"z");
     let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
     let hash = hash_split_residual_payload(&plan);
     assert_eq!(

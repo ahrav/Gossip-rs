@@ -42,9 +42,9 @@ fn canonical_bytes_discriminant_distinct() {
 
 #[rstest]
 #[case::unbounded(ShardSpec::unbounded(), b"" as &[u8], b"" as &[u8], true, true, true)]
-#[case::bounded_a_m(ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()), b"a", b"m", false, false, false)]
-#[case::start_unbounded(ShardSpec::with_range(vec![], b"m".to_vec()), b"", b"m", true, false, false)]
-#[case::end_unbounded(ShardSpec::with_range(b"m".to_vec(), vec![]), b"m", b"", false, true, false)]
+#[case::bounded_a_m(ShardSpec::with_range(b"a", b"m"), b"a", b"m", false, false, false)]
+#[case::start_unbounded(ShardSpec::with_range(vec![], b"m"), b"", b"m", true, false, false)]
+#[case::end_unbounded(ShardSpec::with_range(b"m", vec![]), b"m", b"", false, true, false)]
 fn shard_spec_construction_truth_table(
     #[case] spec: ShardSpec,
     #[case] exp_start: &[u8],
@@ -66,15 +66,39 @@ fn shard_spec_unbounded_has_empty_metadata() {
 }
 
 #[test]
+fn shard_spec_ref_with_range_defaults_metadata_empty() {
+    let spec = ShardSpecRef::with_range(b"a", b"m");
+    assert_eq!(spec.key_range_start(), b"a");
+    assert_eq!(spec.key_range_end(), b"m");
+    assert!(spec.metadata().is_empty());
+}
+
+#[test]
+fn shard_spec_ref_with_range_and_metadata_round_trips_to_owned() {
+    let spec_ref = ShardSpecRef::with_range_and_metadata(b"a", b"z", b"meta");
+    let owned = ShardSpec::try_from_ref(spec_ref).unwrap();
+    let expected = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
+    assert_eq!(owned, expected);
+}
+
+#[test]
+fn shard_spec_ref_try_with_range_aliases_try_with_range_and_metadata() {
+    assert_eq!(
+        ShardSpecRef::try_with_range(b"a", b"m"),
+        ShardSpecRef::try_with_range_and_metadata(b"a", b"m", b""),
+    );
+}
+
+#[test]
 #[should_panic(expected = "start must be strictly less than end")]
 fn shard_spec_inverted_panics() {
-    let _ = ShardSpec::with_range(b"z".to_vec(), b"a".to_vec());
+    let _ = ShardSpec::with_range(b"z", b"a");
 }
 
 #[test]
 #[should_panic(expected = "start must be strictly less than end")]
 fn shard_spec_equal_bounds_panics() {
-    let _ = ShardSpec::with_range(b"a".to_vec(), b"a".to_vec());
+    let _ = ShardSpec::with_range(b"a", b"a");
 }
 
 #[test]
@@ -92,11 +116,7 @@ fn with_range_panics_on_oversized_end_key() {
 #[test]
 #[should_panic(expected = "metadata too large")]
 fn with_range_and_metadata_panics_on_oversized_metadata() {
-    let _ = ShardSpec::with_range_and_metadata(
-        b"a".to_vec(),
-        b"z".to_vec(),
-        vec![0xAA; MAX_METADATA_SIZE + 1],
-    );
+    let _ = ShardSpec::with_range_and_metadata(b"a", b"z", vec![0xAA; MAX_METADATA_SIZE + 1]);
 }
 
 // -------------------------------------------------------------------
@@ -105,7 +125,7 @@ fn with_range_and_metadata_panics_on_oversized_metadata() {
 
 #[test]
 fn try_with_range_inverted() {
-    let err = ShardSpec::try_with_range(b"z".to_vec(), b"a".to_vec()).unwrap_err();
+    let err = ShardSpec::try_with_range(b"z", b"a").unwrap_err();
     assert_eq!(
         err,
         ShardSpecInputError::InvertedRange {
@@ -117,18 +137,37 @@ fn try_with_range_inverted() {
 
 #[test]
 fn try_with_range_equal_bounds() {
-    let err = ShardSpec::try_with_range(b"a".to_vec(), b"a".to_vec()).unwrap_err();
+    let err = ShardSpec::try_with_range(b"a", b"a").unwrap_err();
     assert!(matches!(err, ShardSpecInputError::InvertedRange { .. }));
 }
 
 #[test]
 fn try_with_range_and_metadata_valid() {
-    let spec =
-        ShardSpec::try_with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), b"meta".to_vec())
-            .unwrap();
+    let spec = ShardSpec::try_with_range_and_metadata(b"a", b"z", b"meta").unwrap();
     assert_eq!(spec.key_range_start(), b"a");
     assert_eq!(spec.key_range_end(), b"z");
     assert_eq!(spec.metadata(), b"meta");
+}
+
+#[test]
+fn shard_spec_ref_try_with_range_and_metadata_valid() {
+    let spec = ShardSpecRef::try_with_range_and_metadata(b"a", b"z", b"meta").unwrap();
+    assert_eq!(spec.key_range_start(), b"a");
+    assert_eq!(spec.key_range_end(), b"z");
+    assert_eq!(spec.metadata(), b"meta");
+}
+
+#[test]
+fn shard_spec_ref_try_with_range_and_metadata_over_max() {
+    let metadata = vec![0xAA; MAX_METADATA_SIZE + 1];
+    let err = ShardSpecRef::try_with_range_and_metadata(b"a", b"z", &metadata).unwrap_err();
+    assert_eq!(
+        err,
+        ShardSpecInputError::MetadataTooLarge {
+            size: MAX_METADATA_SIZE + 1,
+            max: MAX_METADATA_SIZE,
+        }
+    );
 }
 
 #[rstest]
@@ -188,22 +227,21 @@ fn try_with_range_start_key_over_max() {
 #[test]
 fn try_with_range_end_key_over_max() {
     let end = vec![0xFF; MAX_KEY_SIZE + 1];
-    let err = ShardSpec::try_with_range(b"a".to_vec(), end).unwrap_err();
+    let err = ShardSpec::try_with_range(b"a", end).unwrap_err();
     assert!(matches!(err, ShardSpecInputError::KeyTooLarge { .. }));
 }
 
 #[test]
 fn try_with_range_and_metadata_at_max() {
     let meta = vec![0xAA; MAX_METADATA_SIZE];
-    let spec = ShardSpec::try_with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), meta).unwrap();
+    let spec = ShardSpec::try_with_range_and_metadata(b"a", b"z", meta).unwrap();
     assert_eq!(spec.metadata().len(), MAX_METADATA_SIZE);
 }
 
 #[test]
 fn try_with_range_and_metadata_over_max() {
     let meta = vec![0xAA; MAX_METADATA_SIZE + 1];
-    let err =
-        ShardSpec::try_with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), meta).unwrap_err();
+    let err = ShardSpec::try_with_range_and_metadata(b"a", b"z", meta).unwrap_err();
     assert_eq!(
         err,
         ShardSpecInputError::MetadataTooLarge {
@@ -219,23 +257,23 @@ fn try_with_range_and_metadata_over_max() {
 
 #[test]
 fn split_valid_two_way() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let c2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
+    let c1 = ShardSpec::with_range(b"a", b"m");
+    let c2 = ShardSpec::with_range(b"m", b"z");
     assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
 }
 
 #[test]
 fn split_valid_unbounded_parent() {
     let parent = ShardSpec::unbounded();
-    let c1 = ShardSpec::with_range(vec![], b"m".to_vec());
-    let c2 = ShardSpec::with_range(b"m".to_vec(), vec![]);
+    let c1 = ShardSpec::with_range(vec![], b"m");
+    let c2 = ShardSpec::with_range(b"m", vec![]);
     assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
 }
 
 #[test]
 fn split_no_children() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
     let empty: &[&ShardSpec] = &[];
     let result = validate_split_coverage(&parent, empty);
     assert!(matches!(result, Err(SplitValidationError::NoChildren)));
@@ -243,17 +281,17 @@ fn split_no_children() {
 
 #[test]
 fn split_single_child() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
+    let c1 = ShardSpec::with_range(b"a", b"z");
     let result = validate_split_coverage(&parent, &[&c1]);
     assert!(matches!(result, Err(SplitValidationError::SingleChild)));
 }
 
 #[test]
 fn split_start_mismatch() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"b".to_vec(), b"m".to_vec());
-    let c2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
+    let c1 = ShardSpec::with_range(b"b", b"m");
+    let c2 = ShardSpec::with_range(b"m", b"z");
     let result = validate_split_coverage(&parent, &[&c1, &c2]);
     assert!(matches!(
         result,
@@ -263,9 +301,9 @@ fn split_start_mismatch() {
 
 #[test]
 fn split_end_mismatch() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let c2 = ShardSpec::with_range(b"m".to_vec(), b"y".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
+    let c1 = ShardSpec::with_range(b"a", b"m");
+    let c2 = ShardSpec::with_range(b"m", b"y");
     let result = validate_split_coverage(&parent, &[&c1, &c2]);
     assert!(matches!(
         result,
@@ -275,9 +313,9 @@ fn split_end_mismatch() {
 
 #[test]
 fn split_boundary_mismatch_between_children() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
-    let c2 = ShardSpec::with_range(b"h".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
+    let c1 = ShardSpec::with_range(b"a", b"g");
+    let c2 = ShardSpec::with_range(b"h", b"z");
     let result = validate_split_coverage(&parent, &[&c1, &c2]);
     assert!(matches!(
         result,
@@ -287,22 +325,22 @@ fn split_boundary_mismatch_between_children() {
 
 #[test]
 fn split_children_out_of_order_still_valid() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
     // Provide children in reverse order; sorting makes it pass.
-    let c1 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let c2 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let c1 = ShardSpec::with_range(b"m", b"z");
+    let c2 = ShardSpec::with_range(b"a", b"m");
     assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
 }
 
 #[test]
 fn split_inverted_child() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
     // A zero-width child [m, m) passes contiguity but fails
     // the well-formedness check (start >= end).
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let c1 = ShardSpec::with_range(b"a", b"m");
     let c2 =
         ShardSpec::from_raw_parts(b"m".as_slice().into(), b"m".as_slice().into(), Box::new([]));
-    let c3 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let c3 = ShardSpec::with_range(b"m", b"z");
     let result = validate_split_coverage(&parent, &[&c1, &c2, &c3]);
     assert!(matches!(
         result,
@@ -312,12 +350,12 @@ fn split_inverted_child() {
 
 #[test]
 fn split_boundary_mismatch_reports_original_indices() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
     // Pass children in reverse order: index 0 is [m,z), index 1 is [a,g).
     // After sorting: [a,g) then [m,z) — gap between them.
     // The gap is between sorted[0]=original[1] and sorted[1]=original[0].
-    let c0 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+    let c0 = ShardSpec::with_range(b"m", b"z");
+    let c1 = ShardSpec::with_range(b"a", b"g");
     let result = validate_split_coverage(&parent, &[&c0, &c1]);
     match result {
         Err(SplitValidationError::BoundaryMismatch {
@@ -335,7 +373,7 @@ fn split_boundary_mismatch_reports_original_indices() {
 
 #[test]
 fn split_inverted_child_reports_original_index() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let parent = ShardSpec::with_range(b"a", b"z");
     // Degenerate [g,g) at original index 0, normal children at 1 and 2.
     // Stable sort on start key produces:
     //   sorted[0] = (orig 2, [a,g))
@@ -344,8 +382,8 @@ fn split_inverted_child_reports_original_index() {
     // The inverted child is at sorted position 1 but original index 0.
     let c0 =
         ShardSpec::from_raw_parts(b"g".as_slice().into(), b"g".as_slice().into(), Box::new([]));
-    let c1 = ShardSpec::with_range(b"g".to_vec(), b"z".to_vec());
-    let c2 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+    let c1 = ShardSpec::with_range(b"g", b"z");
+    let c2 = ShardSpec::with_range(b"a", b"g");
     let result = validate_split_coverage(&parent, &[&c0, &c1, &c2]);
     match result {
         Err(SplitValidationError::InvertedChild { child_index }) => {
@@ -361,27 +399,27 @@ fn split_inverted_child_reports_original_index() {
 
 #[test]
 fn residual_split_valid() {
-    let old_parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let new_parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let old_parent = ShardSpec::with_range(b"a", b"z");
+    let new_parent = ShardSpec::with_range(b"a", b"m");
+    let residual = ShardSpec::with_range(b"m", b"z");
     assert!(validate_residual_split(&old_parent, &new_parent, &residual).is_ok());
 }
 
 #[test]
 fn residual_split_gap() {
-    let old_parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let new_parent = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
-    let residual = ShardSpec::with_range(b"h".to_vec(), b"z".to_vec());
+    let old_parent = ShardSpec::with_range(b"a", b"z");
+    let new_parent = ShardSpec::with_range(b"a", b"g");
+    let residual = ShardSpec::with_range(b"h", b"z");
     let result = validate_residual_split(&old_parent, &new_parent, &residual);
     assert!(result.is_err());
 }
 
 #[test]
 fn residual_split_swapped_roles_rejected() {
-    let old_parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let old_parent = ShardSpec::with_range(b"a", b"z");
     // Swap: new_parent gets upper range, residual gets lower.
-    let new_parent = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let residual = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let new_parent = ShardSpec::with_range(b"m", b"z");
+    let residual = ShardSpec::with_range(b"a", b"m");
     let result = validate_residual_split(&old_parent, &new_parent, &residual);
     assert!(
         matches!(result, Err(SplitValidationError::StartMismatch { .. })),
@@ -420,8 +458,8 @@ fn split_validation_error_display() {
     let err = SplitValidationError::BoundaryMismatch {
         child_index: 0,
         next_child_index: 1,
-        child_end: b"g".as_slice().into(),
-        next_child_start: b"h".as_slice().into(),
+        child_end: 1,
+        next_child_start: 1,
     };
     let msg = err.to_string();
     assert!(msg.contains("boundary mismatch"));
@@ -435,9 +473,8 @@ fn split_validation_error_display() {
 
 #[test]
 fn with_range_and_metadata_stores_and_hashes_metadata() {
-    let spec_no_meta = ShardSpec::with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), vec![]);
-    let spec_with_meta =
-        ShardSpec::with_range_and_metadata(b"a".to_vec(), b"z".to_vec(), b"repo:org/foo".to_vec());
+    let spec_no_meta = ShardSpec::with_range_and_metadata(b"a", b"z", vec![]);
+    let spec_with_meta = ShardSpec::with_range_and_metadata(b"a", b"z", b"repo:org/foo");
 
     // Metadata is stored.
     assert_eq!(spec_with_meta.metadata(), b"repo:org/foo");
@@ -631,8 +668,8 @@ proptest! {
         spec in arb_bounded_shard_spec_with_metadata(),
     ) {
         let no_meta = ShardSpec::with_range(
-            spec.key_range_start().to_vec(),
-            spec.key_range_end().to_vec(),
+            spec.key_range_start(),
+            spec.key_range_end(),
         );
         // If the spec has non-empty metadata, digests must differ.
         if !spec.metadata().is_empty() {

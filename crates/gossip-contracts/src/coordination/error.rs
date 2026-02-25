@@ -161,17 +161,15 @@ pub enum CoordError {
     ///
     /// Cursor monotonicity is a hard safety invariant.
     CursorRegression {
-        old_key: Option<Box<[u8]>>,
-        new_key: Option<Box<[u8]>>,
+        old_key: Option<usize>,
+        new_key: Option<usize>,
     },
 
     /// Cursor bounds violation: the cursor's `last_key` falls outside
     /// the shard's key range.
     ///
-    /// Boxed to keep `CoordError` at ≤ 48 bytes (compile-time checked).
-    ///
     /// Cursor bounds checking is a hard safety invariant.
-    CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
+    CursorOutOfBounds(CursorOutOfBoundsDetail),
 
     /// Cursor key exceeds the maximum allowed length.
     ///
@@ -181,8 +179,7 @@ pub enum CoordError {
     /// Split validation failed. Wraps the detailed error from
     /// `validate_split_coverage` / `validate_residual_split`.
     ///
-    /// Boxed to keep `CoordError` at ≤ 48 bytes (compile-time checked).
-    SplitInvalid(Box<SplitValidationError>),
+    SplitInvalid(SplitValidationError),
 
     /// Checkpoint requires a `last_key` but the provided cursor has none.
     CheckpointMissingKey,
@@ -190,31 +187,39 @@ pub enum CoordError {
 
 /// Detail payload for [`CoordError::CursorOutOfBounds`].
 ///
-/// Captures the three values needed for a diagnostic message: the cursor
-/// key that violated bounds and the shard spec's `[start, end)` range.
-/// Boxed in `CoordError` to keep the enum at ~40 bytes.
+/// Captures redacted lengths for the cursor key that violated bounds and
+/// the shard spec's `[start, end)` range.
 ///
 /// `Debug` is manually implemented to show byte lengths rather than raw
 /// key bytes, matching the redaction policy for cursor data.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CursorOutOfBoundsDetail {
-    /// The cursor key that fell outside the shard's range.
-    pub last_key: Box<[u8]>,
-    /// Inclusive lower bound of the shard's key range.
-    pub spec_start: Box<[u8]>,
-    /// Exclusive upper bound of the shard's key range.
-    pub spec_end: Box<[u8]>,
+    /// Length of the cursor key that fell outside the shard's range.
+    pub last_key: usize,
+    /// Length of the inclusive lower bound of the shard's key range.
+    pub spec_start: usize,
+    /// Length of the exclusive upper bound of the shard's key range.
+    pub spec_end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct RedactedOptionalLen(Option<usize>);
+
+impl fmt::Debug for RedactedOptionalLen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(len) => write!(f, "Some([{len} bytes])"),
+            None => write!(f, "None"),
+        }
+    }
 }
 
 impl fmt::Debug for CursorOutOfBoundsDetail {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CursorOutOfBoundsDetail")
-            .field("last_key", &format_args!("[{} bytes]", self.last_key.len()))
-            .field(
-                "spec_start",
-                &format_args!("[{} bytes]", self.spec_start.len()),
-            )
-            .field("spec_end", &format_args!("[{} bytes]", self.spec_end.len()))
+            .field("last_key", &format_args!("[{} bytes]", self.last_key))
+            .field("spec_start", &format_args!("[{} bytes]", self.spec_start))
+            .field("spec_end", &format_args!("[{} bytes]", self.spec_end))
             .finish()
     }
 }
@@ -253,16 +258,11 @@ impl fmt::Debug for CoordError {
                 .field("expected_hash", &"<redacted>")
                 .field("actual_hash", &"<redacted>")
                 .finish(),
-            Self::CursorRegression { old_key, new_key } => {
-                let redact = |k: &Option<Box<[u8]>>| match k {
-                    Some(b) => format!("Some([{} bytes])", b.len()),
-                    None => "None".to_string(),
-                };
-                f.debug_struct("CursorRegression")
-                    .field("old_key", &redact(old_key))
-                    .field("new_key", &redact(new_key))
-                    .finish()
-            }
+            Self::CursorRegression { old_key, new_key } => f
+                .debug_struct("CursorRegression")
+                .field("old_key", &RedactedOptionalLen(*old_key))
+                .field("new_key", &RedactedOptionalLen(*new_key))
+                .finish(),
             Self::CursorOutOfBounds(detail) => {
                 f.debug_tuple("CursorOutOfBounds").field(detail).finish()
             }
@@ -301,7 +301,7 @@ impl fmt::Display for CoordError {
             Self::CursorOutOfBounds(detail) => write!(
                 f,
                 "cursor out of bounds: key ({} bytes) outside shard range",
-                detail.last_key.len()
+                detail.last_key
             ),
             Self::CursorKeyTooLarge { size, max } => {
                 write!(f, "cursor key too large ({size} bytes, max {max})")
@@ -315,7 +315,7 @@ impl fmt::Display for CoordError {
 impl std::error::Error for CoordError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SplitInvalid(inner) => Some(inner.as_ref()),
+            Self::SplitInvalid(inner) => Some(inner),
             _ => None,
         }
     }
@@ -500,11 +500,11 @@ pub enum CheckpointError {
     },
     /// See [`CoordError::CursorRegression`].
     CursorRegression {
-        old_key: Option<Box<[u8]>>,
-        new_key: Option<Box<[u8]>>,
+        old_key: Option<usize>,
+        new_key: Option<usize>,
     },
     /// See [`CoordError::CursorOutOfBounds`].
-    CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
+    CursorOutOfBounds(CursorOutOfBoundsDetail),
     /// See [`CoordError::CursorKeyTooLarge`].
     CursorKeyTooLarge { size: usize, max: usize },
     /// The checkpoint cursor did not contain a `last_key`, which is required
@@ -547,16 +547,11 @@ impl fmt::Debug for CheckpointError {
                 .field("expected_hash", &"<redacted>")
                 .field("actual_hash", &"<redacted>")
                 .finish(),
-            Self::CursorRegression { old_key, new_key } => {
-                let redact = |k: &Option<Box<[u8]>>| match k {
-                    Some(b) => format!("Some([{} bytes])", b.len()),
-                    None => "None".to_string(),
-                };
-                f.debug_struct("CursorRegression")
-                    .field("old_key", &redact(old_key))
-                    .field("new_key", &redact(new_key))
-                    .finish()
-            }
+            Self::CursorRegression { old_key, new_key } => f
+                .debug_struct("CursorRegression")
+                .field("old_key", &RedactedOptionalLen(*old_key))
+                .field("new_key", &RedactedOptionalLen(*new_key))
+                .finish(),
             Self::CursorOutOfBounds(detail) => {
                 f.debug_tuple("CursorOutOfBounds").field(detail).finish()
             }
@@ -595,7 +590,7 @@ impl fmt::Display for CheckpointError {
             Self::CursorOutOfBounds(detail) => write!(
                 f,
                 "cursor out of bounds: key ({} bytes) outside shard range",
-                detail.last_key.len()
+                detail.last_key
             ),
             Self::CursorKeyTooLarge { size, max } => {
                 write!(f, "cursor key too large ({size} bytes, max {max})")
@@ -653,11 +648,11 @@ pub enum CompleteError {
     },
     /// See [`CoordError::CursorRegression`].
     CursorRegression {
-        old_key: Option<Box<[u8]>>,
-        new_key: Option<Box<[u8]>>,
+        old_key: Option<usize>,
+        new_key: Option<usize>,
     },
     /// See [`CoordError::CursorOutOfBounds`].
-    CursorOutOfBounds(Box<CursorOutOfBoundsDetail>),
+    CursorOutOfBounds(CursorOutOfBoundsDetail),
     /// See [`CoordError::CursorKeyTooLarge`].
     CursorKeyTooLarge { size: usize, max: usize },
     /// Complete requires a final cursor with a `last_key` to confirm
@@ -700,16 +695,11 @@ impl fmt::Debug for CompleteError {
                 .field("expected_hash", &"<redacted>")
                 .field("actual_hash", &"<redacted>")
                 .finish(),
-            Self::CursorRegression { old_key, new_key } => {
-                let redact = |k: &Option<Box<[u8]>>| match k {
-                    Some(b) => format!("Some([{} bytes])", b.len()),
-                    None => "None".to_string(),
-                };
-                f.debug_struct("CursorRegression")
-                    .field("old_key", &redact(old_key))
-                    .field("new_key", &redact(new_key))
-                    .finish()
-            }
+            Self::CursorRegression { old_key, new_key } => f
+                .debug_struct("CursorRegression")
+                .field("old_key", &RedactedOptionalLen(*old_key))
+                .field("new_key", &RedactedOptionalLen(*new_key))
+                .finish(),
             Self::CursorOutOfBounds(detail) => {
                 f.debug_tuple("CursorOutOfBounds").field(detail).finish()
             }
@@ -748,7 +738,7 @@ impl fmt::Display for CompleteError {
             Self::CursorOutOfBounds(detail) => write!(
                 f,
                 "cursor out of bounds: key ({} bytes) outside shard range",
-                detail.last_key.len()
+                detail.last_key
             ),
             Self::CursorKeyTooLarge { size, max } => {
                 write!(f, "cursor key too large ({size} bytes, max {max})")
@@ -903,7 +893,7 @@ pub enum SplitError {
         actual_hash: u64,
     },
     /// See [`CoordError::SplitInvalid`].
-    SplitInvalid(Box<SplitValidationError>),
+    SplitInvalid(SplitValidationError),
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
@@ -988,7 +978,7 @@ impl fmt::Display for SplitError {
 impl std::error::Error for SplitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SplitInvalid(inner) => Some(inner.as_ref()),
+            Self::SplitInvalid(inner) => Some(inner),
             _ => None,
         }
     }
@@ -1310,6 +1300,45 @@ pub struct AcquireResultView<'a> {
     pub capacity: CapacityHint,
 }
 
+/// Fixed-capacity byte buffer with logical length tracking.
+#[derive(Debug)]
+struct FixedBuf<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> FixedBuf<N> {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            bytes: [0u8; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8], oversized_msg: &'static str) {
+        assert!(bytes.len() <= N, "{oversized_msg}");
+        self.bytes[..bytes.len()].copy_from_slice(bytes);
+        self.len = bytes.len();
+    }
+
+    #[inline]
+    fn read(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    #[inline]
+    fn reset(&mut self) {
+        self.len = 0;
+    }
+
+    #[inline]
+    fn has_data(&self) -> bool {
+        self.len > 0
+    }
+}
+
 /// Caller-owned scratch buffer for allocation-free acquire snapshots.
 ///
 /// `AcquireScratch` pre-allocates fixed-capacity arrays on the stack (or
@@ -1340,23 +1369,17 @@ pub struct AcquireResultView<'a> {
 ///
 /// ## Size
 ///
-/// The scratch is large (~40 KiB due to MAX_KEY_SIZE and MAX_METADATA_SIZE
-/// arrays). Prefer heap allocation (`Box::new(AcquireScratch::new())`) when
-/// stack size is a concern, and reuse the same instance across calls.
+/// The scratch is intentionally large because it stores fixed-capacity buffers
+/// for spec/cursor fields and spawned lineage IDs. Prefer heap allocation
+/// (`Box::new(AcquireScratch::new())`) when stack size is a concern, and reuse
+/// the same instance across calls.
 #[derive(Debug)]
 pub struct AcquireScratch {
-    spec_start: [u8; MAX_KEY_SIZE],
-    spec_start_len: usize,
-    spec_end: [u8; MAX_KEY_SIZE],
-    spec_end_len: usize,
-    spec_metadata: [u8; crate::coordination::shard_spec::MAX_METADATA_SIZE],
-    spec_metadata_len: usize,
-    cursor_last_key: [u8; MAX_KEY_SIZE],
-    cursor_last_key_len: usize,
-    has_cursor_last_key: bool,
-    cursor_token: [u8; MAX_TOKEN_SIZE],
-    cursor_token_len: usize,
-    has_cursor_token: bool,
+    spec_start: FixedBuf<MAX_KEY_SIZE>,
+    spec_end: FixedBuf<MAX_KEY_SIZE>,
+    spec_metadata: FixedBuf<{ crate::coordination::shard_spec::MAX_METADATA_SIZE }>,
+    cursor_last_key: FixedBuf<MAX_KEY_SIZE>,
+    cursor_token: FixedBuf<MAX_TOKEN_SIZE>,
     spawned: InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>,
 }
 
@@ -1371,33 +1394,24 @@ impl AcquireScratch {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            spec_start: [0u8; MAX_KEY_SIZE],
-            spec_start_len: 0,
-            spec_end: [0u8; MAX_KEY_SIZE],
-            spec_end_len: 0,
-            spec_metadata: [0u8; crate::coordination::shard_spec::MAX_METADATA_SIZE],
-            spec_metadata_len: 0,
-            cursor_last_key: [0u8; MAX_KEY_SIZE],
-            cursor_last_key_len: 0,
-            has_cursor_last_key: false,
-            cursor_token: [0u8; MAX_TOKEN_SIZE],
-            cursor_token_len: 0,
-            has_cursor_token: false,
+            spec_start: FixedBuf::new(),
+            spec_end: FixedBuf::new(),
+            spec_metadata: FixedBuf::new(),
+            cursor_last_key: FixedBuf::new(),
+            cursor_token: FixedBuf::new(),
             spawned: InlineVec::new(),
         }
     }
 
-    /// Reset logical lengths/flags without clearing backing bytes.
+    /// Reset logical lengths without clearing backing bytes.
     ///
     /// Existing borrowed views become stale after reset.
     pub(crate) fn reset(&mut self) {
-        self.spec_start_len = 0;
-        self.spec_end_len = 0;
-        self.spec_metadata_len = 0;
-        self.cursor_last_key_len = 0;
-        self.has_cursor_last_key = false;
-        self.cursor_token_len = 0;
-        self.has_cursor_token = false;
+        self.spec_start.reset();
+        self.spec_end.reset();
+        self.spec_metadata.reset();
+        self.cursor_last_key.reset();
+        self.cursor_token.reset();
         self.spawned = InlineVec::new();
     }
 
@@ -1414,27 +1428,19 @@ impl AcquireScratch {
     /// so a ceiling breach here indicates slab corruption. Panicking
     /// immediately is safer than writing truncated data.
     pub(crate) fn write_spec(&mut self, start: &[u8], end: &[u8], metadata: &[u8]) {
-        assert!(
-            start.len() <= MAX_KEY_SIZE,
-            "spec start exceeds MAX_KEY_SIZE"
-        );
-        assert!(end.len() <= MAX_KEY_SIZE, "spec end exceeds MAX_KEY_SIZE");
-        assert!(
-            metadata.len() <= crate::coordination::shard_spec::MAX_METADATA_SIZE,
-            "spec metadata exceeds MAX_METADATA_SIZE",
-        );
-        self.spec_start[..start.len()].copy_from_slice(start);
-        self.spec_start_len = start.len();
-        self.spec_end[..end.len()].copy_from_slice(end);
-        self.spec_end_len = end.len();
-        self.spec_metadata[..metadata.len()].copy_from_slice(metadata);
-        self.spec_metadata_len = metadata.len();
+        self.spec_start
+            .write(start, "spec start exceeds MAX_KEY_SIZE");
+        self.spec_end.write(end, "spec end exceeds MAX_KEY_SIZE");
+        self.spec_metadata
+            .write(metadata, "spec metadata exceeds MAX_METADATA_SIZE");
     }
 
     /// Copy cursor bytes into scratch-owned storage.
     ///
     /// `None` clears the corresponding field; `token` is stored only when
     /// present in input. No caller references are retained.
+    /// Empty slices are treated as absent values because presence is derived
+    /// from internal `len > 0`.
     ///
     /// # Panics
     ///
@@ -1445,64 +1451,60 @@ impl AcquireScratch {
     pub(crate) fn write_cursor(&mut self, last_key: Option<&[u8]>, token: Option<&[u8]>) {
         match last_key {
             Some(last_key) => {
-                assert!(
-                    last_key.len() <= MAX_KEY_SIZE,
-                    "cursor last_key exceeds MAX_KEY_SIZE",
-                );
-                self.cursor_last_key[..last_key.len()].copy_from_slice(last_key);
-                self.cursor_last_key_len = last_key.len();
-                self.has_cursor_last_key = true;
+                self.cursor_last_key
+                    .write(last_key, "cursor last_key exceeds MAX_KEY_SIZE");
             }
             None => {
-                self.cursor_last_key_len = 0;
-                self.has_cursor_last_key = false;
+                self.cursor_last_key.reset();
             }
         }
         match token {
             Some(token) => {
-                assert!(
-                    token.len() <= MAX_TOKEN_SIZE,
-                    "cursor token exceeds MAX_TOKEN_SIZE"
-                );
-                self.cursor_token[..token.len()].copy_from_slice(token);
-                self.cursor_token_len = token.len();
-                self.has_cursor_token = true;
+                self.cursor_token
+                    .write(token, "cursor token exceeds MAX_TOKEN_SIZE");
             }
             None => {
-                self.cursor_token_len = 0;
-                self.has_cursor_token = false;
+                self.cursor_token.reset();
             }
         }
     }
 
     /// Copy lineage IDs into scratch-owned inline storage.
+    ///
+    /// Requires `spawned.len() <= MAX_SPAWNED_PER_SHARD`; a larger slice
+    /// would violate split invariants and panic. This assert also guarantees
+    /// `InlineVec::from_slice` stays on its inline representation (no heap
+    /// spill) in steady state.
     pub(crate) fn write_spawned(&mut self, spawned: &[ShardId]) {
+        assert!(
+            spawned.len() <= MAX_SPAWNED_PER_SHARD,
+            "spawned lineage exceeds MAX_SPAWNED_PER_SHARD",
+        );
         self.spawned = InlineVec::from_slice(spawned);
     }
 
     /// Borrow a spec view over the currently written scratch bytes.
     fn spec_view(&self) -> ShardSpecRef<'_> {
         ShardSpecRef::new(
-            &self.spec_start[..self.spec_start_len],
-            &self.spec_end[..self.spec_end_len],
-            &self.spec_metadata[..self.spec_metadata_len],
+            self.spec_start.read(),
+            self.spec_end.read(),
+            self.spec_metadata.read(),
         )
     }
 
     /// Borrow a cursor view over the currently written scratch bytes.
     ///
-    /// Invariant preserved: token-only state is never produced.
+    /// Invariant preserved: token-only state is never produced. If `last_key`
+    /// is absent (including empty), this returns [`CursorUpdate::initial`]
+    /// and drops any token bytes.
     fn cursor_view(&self) -> CursorUpdate<'_> {
-        match (
-            self.has_cursor_last_key,
-            self.has_cursor_token && self.has_cursor_last_key,
-        ) {
-            (false, _) => CursorUpdate::initial(),
-            (true, false) => CursorUpdate::new(&self.cursor_last_key[..self.cursor_last_key_len]),
-            (true, true) => CursorUpdate::with_token(
-                &self.cursor_last_key[..self.cursor_last_key_len],
-                &self.cursor_token[..self.cursor_token_len],
-            ),
+        if !self.cursor_last_key.has_data() {
+            return CursorUpdate::initial();
+        }
+        if self.cursor_token.has_data() {
+            CursorUpdate::with_token(self.cursor_last_key.read(), self.cursor_token.read())
+        } else {
+            CursorUpdate::new(self.cursor_last_key.read())
         }
     }
 
@@ -1647,10 +1649,8 @@ impl<T> AsRef<T> for IdempotentOutcome<T> {
 }
 
 // Compile-time size assertion: CoordError is returned in Result<T, E>
-// on every coordination call path. The 48-byte ceiling (with ~40 bytes
-// actual) is maintained by boxing the large payloads (CursorOutOfBounds,
-// SplitInvalid). Exceeding this budget inflates every Result that wraps
-// an operation-specific error type (which embeds the same variants).
+// on every coordination call path. Keep this compact so operation-specific
+// Result types stay small in hot paths.
 #[cfg(test)]
 const _: () = {
     assert!(std::mem::size_of::<CoordError>() <= 48);

@@ -57,6 +57,51 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
 const _: () = assert!(MAX_SPAWNED_PER_SHARD == 1024);
 const _: () = assert!(LEASE_DURATION == 100);
 
+// Production-only allocation-contract guards.
+//
+// These pin the hot-path API surface to borrowed inputs and caller-owned
+// scratch/output forms in default-feature (production-like) builds.
+// `test-support` builds intentionally skip these guards so simulation paths
+// can remain allocation-friendly.
+#[cfg(not(feature = "test-support"))]
+const _: for<'a> fn(
+    &mut crate::coordination::InMemoryCoordinator,
+    crate::identity::LogicalTime,
+    crate::identity::TenantId,
+    crate::identity::ShardKey,
+    crate::identity::WorkerId,
+    &'a mut crate::coordination::AcquireScratch,
+) -> Result<
+    crate::coordination::AcquireResultView<'a>,
+    crate::coordination::AcquireError,
+> = <crate::coordination::InMemoryCoordinator as crate::coordination::CoordinationBackend>::acquire_and_restore_into;
+
+#[cfg(not(feature = "test-support"))]
+const _: fn(
+    &mut crate::coordination::InMemoryCoordinator,
+    crate::identity::LogicalTime,
+    crate::identity::TenantId,
+    &crate::coordination::Lease,
+    &crate::coordination::CursorUpdate<'_>,
+    crate::identity::OpId,
+) -> Result<
+    crate::coordination::IdempotentOutcome<()>,
+    crate::coordination::CheckpointError,
+> = <crate::coordination::InMemoryCoordinator as crate::coordination::CoordinationBackend>::checkpoint;
+
+#[cfg(not(feature = "test-support"))]
+const _: fn(
+    &mut crate::coordination::InMemoryCoordinator,
+    crate::identity::LogicalTime,
+    crate::identity::TenantId,
+    &crate::coordination::Lease,
+    &crate::coordination::CursorUpdate<'_>,
+    crate::identity::OpId,
+) -> Result<
+    crate::coordination::IdempotentOutcome<()>,
+    crate::coordination::CompleteError,
+> = <crate::coordination::InMemoryCoordinator as crate::coordination::CoordinationBackend>::complete;
+
 // ============================================================================
 // Group A: Cross-Cutting Invariant Interactions
 //
@@ -731,7 +776,7 @@ fn register_shards_on_non_initializing_rejected() {
     assert_eq!(rec.status(), RunStatus::Active);
 
     // Try to register more shards -> WrongStatus.
-    let spec = ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec());
+    let spec = ShardSpec::with_range(b"aa", b"bb");
     let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(999),

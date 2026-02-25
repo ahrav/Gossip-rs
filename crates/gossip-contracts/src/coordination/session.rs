@@ -67,24 +67,28 @@
 //!
 //! ## Snapshot Staleness
 //!
-//! The cached [`ShardSnapshot`] reflects the shard state at acquisition
-//! time. It is **not** updated by [`checkpoint`](WorkerSession::checkpoint)
-//! because the worker
-//! already knows the cursor it just wrote, and the backend validates cursor
-//! monotonicity and bounds against the authoritative
-//! [`ShardRecord`](super::record::ShardRecord), not the session's cached
-//! snapshot. Updating the snapshot on every checkpoint would add allocation
-//! overhead for no correctness benefit.
+//! The session stores snapshot bytes in [`AcquireScratch`] and materializes
+//! an owned [`ShardSnapshot`] lazily on first accessor use. The snapshot
+//! reflects shard state at acquisition time. It is **not** updated by
+//! [`checkpoint`](WorkerSession::checkpoint) because the worker already knows
+//! the cursor it just wrote, and the backend validates cursor monotonicity
+//! and bounds against the authoritative [`ShardRecord`](super::record::ShardRecord),
+//! not the session's cached view. Updating snapshot state on every checkpoint
+//! would add unnecessary work for no correctness benefit.
 //! Similarly, [`renew`](WorkerSession::renew) updates the lease
 //! deadline (via `Lease::set_deadline`) and the capacity hint, but
 //! not the snapshot.
 //!
-//! The snapshot **is** updated by [`split_residual`](WorkerSession::split_residual)
-//! because the key range narrows, and subsequent
-//! [`checkpoint`](WorkerSession::checkpoint) calls must not present
-//! cursors outside the narrowed range. While the backend would reject such
-//! cursors regardless, keeping the session's snapshot consistent avoids
-//! confusing the worker's own bounds logic.
+//! The snapshot state **is** refreshed by
+//! [`split_residual`](WorkerSession::split_residual) because the key range
+//! narrows, and subsequent [`checkpoint`](WorkerSession::checkpoint) calls
+//! must not present cursors outside the narrowed range. While the backend
+//! would reject such cursors regardless, keeping the session view consistent
+//! avoids confusing the worker's own bounds logic.
+
+use std::cell::OnceCell;
+
+use gossip_stdx::InlineVec;
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{
@@ -93,12 +97,13 @@ use crate::coordination::error::{
 };
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardSnapshot, ShardStatus};
-use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::{
-    SplitReplacePlan, SplitReplaceResult, SplitResidualPlan, SplitResidualResult,
+    MAX_SPAWNED_PER_SHARD, SplitReplacePlan, SplitReplaceResult, SplitResidualPlan,
+    SplitResidualResult,
 };
 use crate::coordination::traits::CoordinationBackend;
-use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
+use crate::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
 // WorkerSession
@@ -156,12 +161,20 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
     /// immutable after acquisition). Consumed by terminal operations.
     lease: Lease,
 
-    /// Shard state snapshot from acquisition time. Intentionally not
-    /// updated by [`Self::checkpoint()`] or [`Self::renew()`]
-    /// (the worker already knows its cursor). Rebuilt by
-    /// [`Self::split_residual()`] to reflect the narrowed key range so
-    /// subsequent cursor-bounds checks are accurate.
-    snapshot: ShardSnapshot,
+    /// Allocation-free snapshot bytes from acquisition time.
+    ///
+    /// Backed by fixed-capacity arrays so `split_residual` can refresh spec
+    /// bounds without owned materialization.
+    snapshot_scratch: AcquireScratch,
+
+    /// Snapshot metadata not stored in [`AcquireScratch`].
+    snapshot_status: ShardStatus,
+    snapshot_cursor_semantics: CursorSemantics,
+    snapshot_parent: Option<ShardId>,
+    snapshot_spawned: InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>,
+
+    /// Lazily materialized owned snapshot for compatibility accessors.
+    snapshot_cache: OnceCell<ShardSnapshot>,
 
     /// Advisory capacity hint from the last acquire or renew.
     ///
@@ -211,46 +224,92 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         key: ShardKey,
         worker: WorkerId,
     ) -> Result<Self, AcquireError> {
-        let mut scratch = AcquireScratch::new();
-        let result = backend.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?;
+        let mut snapshot_scratch = AcquireScratch::new();
+        let result =
+            backend.acquire_and_restore_into(now, tenant, key, worker, &mut snapshot_scratch)?;
         // Panic is intentional: the backend's slab only stores specs that
         // passed write_spec validation (size ceilings enforced by assert),
         // so an invalid spec here means internal slab corruption.
-        let spec = ShardSpec::try_from_ref(result.snapshot.spec())
+        ShardSpec::validate_ref(result.snapshot.spec())
             .expect("WorkerSession::new: backend returned invalid shard spec");
-        let cursor = match (
-            result.snapshot.cursor().last_key(),
-            result.snapshot.cursor().token(),
-        ) {
-            (None, _) => Cursor::initial(),
-            (Some(last_key), None) => Cursor::with_last_key(last_key.to_vec()),
-            (Some(last_key), Some(token)) => Cursor::from_parts(last_key.to_vec(), token.to_vec()),
-        };
-        let snapshot = ShardSnapshot::new(
-            result.snapshot.status(),
-            spec,
-            cursor,
-            result.snapshot.cursor_semantics(),
-            result.snapshot.parent(),
-            result.snapshot.spawned().iter(),
-        );
+        if let Some(last_key) = result.snapshot.cursor().last_key() {
+            assert!(
+                !last_key.is_empty(),
+                "WorkerSession::new: backend returned empty cursor last_key"
+            );
+        }
+        let snapshot_status = result.snapshot.status();
+        let snapshot_cursor_semantics = result.snapshot.cursor_semantics();
+        let snapshot_parent = result.snapshot.parent();
+        let snapshot_spawned = InlineVec::from_slice(result.snapshot.spawned());
+        let lease = result.lease;
+        let capacity = result.capacity;
         // Tenant is a security boundary — must hold in all builds.
-        assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
+        assert_eq!(lease.tenant(), tenant, "lease tenant mismatch");
         // The remaining assertions are correctness sanity checks: if the
         // backend returns inconsistent identity or a terminal shard, the
         // bug is in the backend, not the caller. These are debug-only to
         // avoid redundant checks on the hot path in release builds.
-        debug_assert_eq!(result.lease.shard_key(), key, "lease shard_key mismatch");
-        debug_assert_eq!(result.lease.owner(), worker, "lease owner mismatch");
-        debug_assert!(!snapshot.status().is_terminal(), "acquired terminal shard");
+        debug_assert_eq!(lease.shard_key(), key, "lease shard_key mismatch");
+        debug_assert_eq!(lease.owner(), worker, "lease owner mismatch");
+        debug_assert!(!snapshot_status.is_terminal(), "acquired terminal shard");
         Ok(Self {
             backend,
             tenant,
             worker,
-            lease: result.lease,
-            snapshot,
-            capacity: result.capacity,
+            lease,
+            snapshot_scratch,
+            snapshot_status,
+            snapshot_cursor_semantics,
+            snapshot_parent,
+            snapshot_spawned,
+            snapshot_cache: OnceCell::new(),
+            capacity,
         })
+    }
+
+    #[inline]
+    fn snapshot_view(&self) -> crate::coordination::error::ShardSnapshotView<'_> {
+        self.snapshot_scratch.view(
+            self.snapshot_status,
+            self.snapshot_cursor_semantics,
+            self.snapshot_parent,
+        )
+    }
+
+    #[inline]
+    fn owned_cursor_from_view(cursor: CursorUpdate<'_>) -> Cursor {
+        match (cursor.last_key(), cursor.token()) {
+            (None, _) => Cursor::initial(),
+            (Some(last_key), None) => Cursor::with_last_key(last_key),
+            (Some(last_key), Some(token)) => Cursor::from_parts(last_key, token),
+        }
+    }
+
+    fn materialize_snapshot(&self) -> ShardSnapshot {
+        let view = self.snapshot_view();
+        let spec = ShardSpec::try_from_ref(view.spec())
+            .expect("WorkerSession: cached snapshot spec became invalid");
+        let cursor = Self::owned_cursor_from_view(view.cursor());
+        ShardSnapshot::new(
+            view.status(),
+            spec,
+            cursor,
+            view.cursor_semantics(),
+            view.parent(),
+            self.snapshot_spawned.iter(),
+        )
+    }
+
+    #[inline]
+    fn cached_snapshot(&self) -> &ShardSnapshot {
+        self.snapshot_cache
+            .get_or_init(|| self.materialize_snapshot())
+    }
+
+    #[cfg(test)]
+    fn has_materialized_snapshot(&self) -> bool {
+        self.snapshot_cache.get().is_some()
     }
 
     /// The active lease, including fence epoch and deadline.
@@ -269,7 +328,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     #[inline]
     #[must_use]
     pub fn initial_snapshot(&self) -> &ShardSnapshot {
-        &self.snapshot
+        self.cached_snapshot()
     }
 
     /// The shard's spec (key range + metadata).
@@ -278,7 +337,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     #[inline]
     #[must_use]
     pub fn spec(&self) -> &ShardSpec {
-        self.snapshot.spec()
+        self.cached_snapshot().spec()
     }
 
     /// The cursor at acquisition time (the last checkpoint before this session).
@@ -290,7 +349,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     #[inline]
     #[must_use]
     pub fn cursor(&self) -> &Cursor {
-        self.snapshot.cursor()
+        self.cached_snapshot().cursor()
     }
 
     /// The tenant this session is scoped to.
@@ -498,17 +557,14 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// parent entirely), use [`split_replace`](Self::split_replace).
     ///
     /// When the operation executes for the first time (`Executed`, not
-    /// `Replayed`), the session's cached snapshot is rebuilt with:
-    /// - The narrowed spec from the plan
-    /// - The original status, cursor, cursor semantics, and parent (unchanged)
-    /// - The residual's `ShardId` appended to the spawned list
+    /// `Replayed`), the session refreshes allocation-free snapshot state with:
+    /// - The narrowed spec from the plan (written into scratch storage)
+    /// - The residual's `ShardId` appended to spawned lineage
+    /// - Any previously materialized owned snapshot invalidated (lazy rebuild)
     ///
-    /// The rebuild uses iterator composition instead of depending on any
-    /// specific spawned-list container representation.
-    ///
-    /// On `Replayed`, the snapshot is left unchanged — the first call in
+    /// On `Replayed`, snapshot state is left unchanged — the first call in
     /// this session already narrowed it, or (after crash-recovery) the
-    /// snapshot from `acquire_and_restore_into` already reflects the narrowed spec.
+    /// state from `acquire_and_restore_into` already reflects the narrowed spec.
     ///
     /// This rebuild is necessary because the backend validates cursor
     /// bounds against the shard record's spec (which has been narrowed).
@@ -546,39 +602,35 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             // Panic is intentional: the plan's spec passed validation at
             // construction time, so an invalid spec here means internal
             // corruption in the plan or coordinator.
-            let new_spec = ShardSpec::try_from_ref(new_spec)
-                .expect("split_residual produced invalid parent spec");
-            // Rebuild the cached snapshot so that subsequent operations
+            ShardSpec::validate_ref(new_spec).expect("split_residual produced invalid parent spec");
+            // Refresh allocation-free snapshot state so subsequent operations
             // (especially checkpoint) validate against the narrowed range.
             //
-            // Only `Executed` triggers the rebuild. `Replayed` means one of:
+            // Only `Executed` triggers refresh. `Replayed` means one of:
             // (a) Same session retried the same OpId — snapshot was already
             //     narrowed by the first call in this session.
             // (b) New session retried after crash — the backend's shard
             //     record already reflects the narrowed spec, so the snapshot
             //     from `acquire_and_restore_into` is already correct.
-            // In both cases, skipping the rebuild is safe.
-            self.snapshot = ShardSnapshot::new(
-                self.snapshot.status(),
-                new_spec,
-                self.snapshot.cursor().clone(),
-                self.snapshot.cursor_semantics(),
-                self.snapshot.parent(),
-                self.snapshot
-                    .spawned()
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(res.residual)),
+            // In both cases, skipping refresh is safe.
+            self.snapshot_scratch.write_spec(
+                new_spec.key_range_start(),
+                new_spec.key_range_end(),
+                new_spec.metadata(),
             );
+            self.snapshot_spawned.push(res.residual);
+            // Defer owned rebuild until next accessor call.
+            self.snapshot_cache.take();
             debug_assert_eq!(
-                self.snapshot.status(),
+                self.snapshot_status,
                 ShardStatus::Active,
                 "status changed after split_residual"
             );
         }
         if let IdempotentOutcome::Replayed(_) = &result {
+            let cached_spec = self.snapshot_view().spec();
             debug_assert_eq!(
-                self.snapshot.spec().key_range_end(),
+                cached_spec.key_range_end(),
                 new_spec.key_range_end(),
                 "Replayed split_residual but snapshot spec not yet narrowed"
             );

@@ -705,7 +705,7 @@ fn new_split_child_construction_and_fields() {
     let mut slab = TestSlab::new();
     let parent_id = ShardId::from_raw(10);
     let child_id = derived_shard_id(1);
-    let cursor = Cursor::with_last_key(b"middle-key".to_vec());
+    let cursor = Cursor::with_last_key(b"middle-key");
     let spec = test_spec();
 
     let record = ShardRecord::new_split_child(

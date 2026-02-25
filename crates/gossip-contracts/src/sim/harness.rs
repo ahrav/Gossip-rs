@@ -1602,8 +1602,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Err(event) => return event,
         };
 
-        let child_a_spec = ShardSpec::with_range(start.to_vec(), vec![mid]);
-        let child_b_spec = ShardSpec::with_range(vec![mid], end.to_vec());
+        let child_a_spec = ShardSpec::with_range(start, vec![mid]);
+        let child_b_spec = ShardSpec::with_range(vec![mid], end);
 
         let child_a_cursor = Cursor::initial();
         let child_b_cursor = Cursor::initial();
@@ -1700,8 +1700,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         }
         let mid = self.context.rng().random_range(lo..hi);
 
-        let new_parent_spec = ShardSpec::with_range(start.to_vec(), vec![mid]);
-        let residual_spec = ShardSpec::with_range(vec![mid], end.to_vec());
+        let new_parent_spec = ShardSpec::with_range(start, vec![mid]);
+        let residual_spec = ShardSpec::with_range(vec![mid], end);
 
         let plan =
             match SplitResidualPlan::try_new(new_parent_spec.as_ref(), residual_spec.as_ref()) {
@@ -2336,7 +2336,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             // maintain the forward-only guarantee. Without this, a single-byte
             // fallback could regress behind a multi-byte previous cursor.
             if let Some(prev) = last {
-                return Cursor::with_last_key(prev.to_vec());
+                return Cursor::with_last_key(prev);
             }
             return Cursor::with_last_key(vec![range_hi.saturating_sub(1)]);
         }

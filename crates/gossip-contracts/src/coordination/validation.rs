@@ -224,8 +224,8 @@ pub(crate) fn validate_cursor_update_pooled(
         && new_last_key < old_key
     {
         return Err(CoordError::CursorRegression {
-            old_key: Some(old_key.to_vec().into_boxed_slice()),
-            new_key: Some(new_last_key.to_vec().into_boxed_slice()),
+            old_key: Some(old_key.len()),
+            new_key: Some(new_last_key.len()),
         });
     }
 
@@ -233,13 +233,13 @@ pub(crate) fn validate_cursor_update_pooled(
     if (!spec_start.is_empty() && new_last_key < spec_start)
         || (!spec_end.is_empty() && new_last_key >= spec_end)
     {
-        return Err(CoordError::CursorOutOfBounds(Box::new(
+        return Err(CoordError::CursorOutOfBounds(
             crate::coordination::error::CursorOutOfBoundsDetail {
-                last_key: new_last_key.to_vec().into_boxed_slice(),
-                spec_start: spec_start.to_vec().into_boxed_slice(),
-                spec_end: spec_end.to_vec().into_boxed_slice(),
+                last_key: new_last_key.len(),
+                spec_start: spec_start.len(),
+                spec_end: spec_end.len(),
             },
-        )));
+        ));
     }
 
     Ok(())
@@ -642,15 +642,15 @@ mod tests {
     fn validate_cursor_update_ok_first_checkpoint() {
         let spec = test_spec();
         let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"f".to_vec());
+        let new_cursor = Cursor::with_last_key(b"f");
         assert!(validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok());
     }
 
     #[test]
     fn validate_cursor_update_ok_forward() {
         let spec = test_spec();
-        let old_cursor = Cursor::with_last_key(b"f".to_vec());
-        let new_cursor = Cursor::with_last_key(b"m".to_vec());
+        let old_cursor = Cursor::with_last_key(b"f");
+        let new_cursor = Cursor::with_last_key(b"m");
         assert!(validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok());
     }
 
@@ -682,8 +682,8 @@ mod tests {
     #[test]
     fn validate_cursor_update_regression() {
         let spec = test_spec();
-        let old_cursor = Cursor::with_last_key(b"m".to_vec());
-        let new_cursor = Cursor::with_last_key(b"f".to_vec()); // regression
+        let old_cursor = Cursor::with_last_key(b"m");
+        let new_cursor = Cursor::with_last_key(b"f"); // regression
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(matches!(result, Err(CoordError::CursorRegression { .. })));
     }
@@ -706,7 +706,7 @@ mod tests {
         // spec range is [a, z), cursor at 'z' (exclusive end).
         let spec = test_spec();
         let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"z".to_vec());
+        let new_cursor = Cursor::with_last_key(b"z");
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
@@ -719,8 +719,8 @@ mod tests {
     #[test]
     fn validate_cursor_update_idempotent_same_key() {
         let spec = test_spec();
-        let old_cursor = Cursor::with_last_key(b"f".to_vec());
-        let new_cursor = Cursor::with_last_key(b"f".to_vec()); // same key
+        let old_cursor = Cursor::with_last_key(b"f");
+        let new_cursor = Cursor::with_last_key(b"f"); // same key
         assert!(
             validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok(),
             "same key should be Forward (idempotent)"
@@ -731,7 +731,7 @@ mod tests {
     fn validate_cursor_update_key_at_spec_start() {
         let spec = test_spec(); // spec [a, z)
         let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"a".to_vec()); // at start (inclusive)
+        let new_cursor = Cursor::with_last_key(b"a"); // at start (inclusive)
         assert!(
             validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok(),
             "key at spec start should be InBounds (inclusive)"
@@ -742,7 +742,7 @@ mod tests {
     fn validate_cursor_update_key_at_spec_end() {
         let spec = test_spec(); // spec [a, z)
         let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"z".to_vec()); // at end (exclusive)
+        let new_cursor = Cursor::with_last_key(b"z"); // at end (exclusive)
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
@@ -753,18 +753,12 @@ mod tests {
     #[test]
     fn validate_cursor_update_pooled_matches_owned_validation() {
         let cases = [
-            (Cursor::initial(), Cursor::with_last_key(b"f".to_vec())),
-            (
-                Cursor::with_last_key(b"f".to_vec()),
-                Cursor::with_last_key(b"m".to_vec()),
-            ),
-            (
-                Cursor::with_last_key(b"m".to_vec()),
-                Cursor::with_last_key(b"f".to_vec()),
-            ),
+            (Cursor::initial(), Cursor::with_last_key(b"f")),
+            (Cursor::with_last_key(b"f"), Cursor::with_last_key(b"m")),
+            (Cursor::with_last_key(b"m"), Cursor::with_last_key(b"f")),
             (Cursor::initial(), Cursor::initial()),
             (Cursor::initial(), Cursor::with_last_key(vec![0x00])),
-            (Cursor::initial(), Cursor::with_last_key(b"z".to_vec())),
+            (Cursor::initial(), Cursor::with_last_key(b"z")),
             (
                 Cursor::initial(),
                 Cursor::with_last_key(vec![0xAB; MAX_KEY_SIZE + 1]),

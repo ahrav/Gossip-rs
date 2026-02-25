@@ -44,6 +44,54 @@ fn new_is_empty() {
     assert_eq!(slab.available_bytes(), 1024);
 }
 
+#[test]
+fn free_list_metadata_is_preallocated_and_stable() {
+    let mut slab = ByteSlab::with_capacity(64 * 1024);
+    let free_list_capacity = slab.free_list.capacity();
+    assert!(free_list_capacity > 0);
+    let free_list_ptr = slab.free_list.as_ptr();
+
+    // Repeatedly churn non-trailing frees to force free-list insert/remove.
+    for _ in 0..256 {
+        let a = slab.allocate(&[1u8; 17]).unwrap(); // alloc_size = 32
+        let pin1 = slab.allocate(&[0u8; 1]).unwrap(); // alloc_size = 16
+        let b = slab.allocate(&[2u8; 17]).unwrap(); // alloc_size = 32
+        let pin2 = slab.allocate(&[0u8; 1]).unwrap(); // alloc_size = 16
+        let c = slab.allocate(&[3u8; 17]).unwrap(); // alloc_size = 32
+
+        slab.deallocate(a);
+        slab.deallocate(b);
+        slab.deallocate(c);
+        slab.deallocate(pin2);
+        slab.deallocate(pin1);
+    }
+
+    assert_eq!(slab.free_list.capacity(), free_list_capacity);
+    assert_eq!(slab.free_list.as_ptr(), free_list_ptr);
+}
+
+#[test]
+fn deallocate_panics_when_free_list_metadata_is_exhausted() {
+    let mut slab = ByteSlab::new_with_free_list_capacity(128, 1);
+
+    let a = slab.allocate(&[1u8; 17]).unwrap(); // [0, 32)
+    let _pin1 = slab.allocate(&[0u8; 1]).unwrap(); // [32, 48)
+    let b = slab.allocate(&[2u8; 17]).unwrap(); // [48, 80)
+    let _pin2 = slab.allocate(&[0u8; 1]).unwrap(); // [80, 96)
+    let _tail = slab.allocate(&[3u8; 17]).unwrap(); // [96, 128), keeps bump at 128
+
+    slab.deallocate(a); // fills the single metadata slot.
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| slab.deallocate(b)));
+    assert!(
+        result.is_err(),
+        "deallocate must fail explicitly when free-list metadata is exhausted"
+    );
+
+    // Panic occurred mid-deallocate; clear restores a valid terminal state.
+    slab.clear();
+}
+
 // -----------------------------------------------------------------------
 // Allocate + get roundtrip
 // -----------------------------------------------------------------------

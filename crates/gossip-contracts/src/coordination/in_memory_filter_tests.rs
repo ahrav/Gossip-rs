@@ -1,7 +1,7 @@
 //! Tests for [`ShardFilter`] predicates applied through
-//! [`RunManagement::list_shards`].
+//! [`RunManagement::list_shards_into`].
 //!
-//! `list_shards` accepts a [`ShardFilter`] that narrows the returned set by
+//! `list_shards_into` accepts a [`ShardFilter`] that narrows the returned set by
 //! status, lease state, and parentage. Getting these predicates wrong causes
 //! workers to receive invisible shards (missed work) or stale shards
 //! (wasted retries), so each filter variant has its own focused test.
@@ -21,7 +21,7 @@
 
 use super::*;
 use crate::coordination::cursor::{Cursor, CursorUpdate};
-use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter};
+use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter, ShardSummary};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_result, acquire_shard, coordinator_with_run_and_lease,
@@ -29,6 +29,17 @@ use crate::coordination::test_fixtures::{
 };
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 use crate::sim::backend::SimIntrospection;
+
+fn list_shards_with_filter(
+    coord: &InMemoryCoordinator,
+    at: LogicalTime,
+    filter: ShardFilter,
+    out: &mut Vec<ShardSummary>,
+) {
+    coord
+        .list_shards_into(at, test_tenant(), test_run(), filter, out)
+        .unwrap();
+}
 
 // -- Deterministic filter tests -----------------------------------------------
 //
@@ -41,13 +52,12 @@ use crate::sim::backend::SimIntrospection;
 #[test]
 fn list_shards_filter_active() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
+    let mut summaries = Vec::new();
 
     // Shard is Active + leased.
-    let active_all = coord
-        .list_shards(now(4), test_tenant(), test_run(), ShardFilter::active())
-        .unwrap();
+    list_shards_with_filter(&coord, now(4), ShardFilter::active(), &mut summaries);
     assert_eq!(
-        active_all.len(),
+        summaries.len(),
         1,
         "active filter should include leased Active shard"
     );
@@ -63,11 +73,9 @@ fn list_shards_filter_active() {
         )
         .unwrap();
 
-    let active_after_park = coord
-        .list_shards(now(6), test_tenant(), test_run(), ShardFilter::active())
-        .unwrap();
+    list_shards_with_filter(&coord, now(6), ShardFilter::active(), &mut summaries);
     assert!(
-        active_after_park.is_empty(),
+        summaries.is_empty(),
         "active filter should exclude Parked shard",
     );
 }
@@ -76,27 +84,24 @@ fn list_shards_filter_active() {
 #[test]
 fn list_shards_filter_available() {
     let (coord, _lease) = coordinator_with_run_and_lease();
+    let mut summaries = Vec::new();
 
     // Shard is Active + leased -> available() requires is_leased=false.
-    let available = coord
-        .list_shards(now(4), test_tenant(), test_run(), ShardFilter::available())
-        .unwrap();
+    list_shards_with_filter(&coord, now(4), ShardFilter::available(), &mut summaries);
     assert!(
-        available.is_empty(),
+        summaries.is_empty(),
         "available filter should exclude leased Active shard",
     );
 
     // After lease expiry, shard becomes available.
-    let available_after = coord
-        .list_shards(
-            now(LEASE_DURATION + 10),
-            test_tenant(),
-            test_run(),
-            ShardFilter::available(),
-        )
-        .unwrap();
+    list_shards_with_filter(
+        &coord,
+        now(LEASE_DURATION + 10),
+        ShardFilter::available(),
+        &mut summaries,
+    );
     assert_eq!(
-        available_after.len(),
+        summaries.len(),
         1,
         "shard should be available after lease expiry"
     );
@@ -106,12 +111,11 @@ fn list_shards_filter_available() {
 #[test]
 fn list_shards_filter_parked() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
+    let mut summaries = Vec::new();
 
     // No parked shards initially.
-    let parked = coord
-        .list_shards(now(4), test_tenant(), test_run(), ShardFilter::parked())
-        .unwrap();
-    assert!(parked.is_empty());
+    list_shards_with_filter(&coord, now(4), ShardFilter::parked(), &mut summaries);
+    assert!(summaries.is_empty());
 
     // Park the shard.
     let _ = coord
@@ -124,11 +128,9 @@ fn list_shards_filter_parked() {
         )
         .unwrap();
 
-    let parked_after = coord
-        .list_shards(now(6), test_tenant(), test_run(), ShardFilter::parked())
-        .unwrap();
-    assert_eq!(parked_after.len(), 1);
-    assert_eq!(parked_after[0].status(), ShardStatus::Parked);
+    list_shards_with_filter(&coord, now(6), ShardFilter::parked(), &mut summaries);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].status(), ShardStatus::Parked);
 }
 
 /// `root_only` excludes split children (shards whose `parent` is `Some`).
@@ -140,18 +142,17 @@ fn list_shards_filter_parked() {
 fn list_shards_filter_root_only() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
     do_split_replace(&mut coord, &lease);
+    let mut summaries = Vec::new();
 
     // root_only should exclude split children.
     let root_filter = ShardFilter {
         root_only: true,
         ..ShardFilter::default()
     };
-    let roots = coord
-        .list_shards(now(5), test_tenant(), test_run(), root_filter)
-        .unwrap();
+    list_shards_with_filter(&coord, now(5), root_filter, &mut summaries);
     // The parent (root) is Split, children are derived (have parent).
     // root_only excludes shards with parent.is_some().
-    for s in &roots {
+    for s in &summaries {
         assert!(
             s.parent().is_none(),
             "root_only filter should exclude children; found shard with parent: {:?}",
@@ -160,14 +161,49 @@ fn list_shards_filter_root_only() {
     }
 
     // Without root_only, we get all (parent + children).
-    let all = coord
-        .list_shards(now(5), test_tenant(), test_run(), ShardFilter::all())
-        .unwrap();
+    let root_count = summaries.len();
+    list_shards_with_filter(&coord, now(5), ShardFilter::all(), &mut summaries);
     assert!(
-        all.len() > roots.len(),
+        summaries.len() > root_count,
         "all filter should include more shards than root_only: all={} vs roots={}",
-        all.len(),
-        roots.len(),
+        summaries.len(),
+        root_count,
+    );
+}
+
+/// `list_shards_into` should produce stable results and allow
+/// output-buffer reuse across repeated queries.
+#[test]
+fn list_shards_into_reuses_buffer_on_repeated_query() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+
+    let mut out = Vec::with_capacity(8);
+    coord
+        .list_shards_into(
+            now(4),
+            test_tenant(),
+            test_run(),
+            ShardFilter::active(),
+            &mut out,
+        )
+        .unwrap();
+    let expected = out.clone();
+
+    let capacity_after_first = out.capacity();
+    coord
+        .list_shards_into(
+            now(4),
+            test_tenant(),
+            test_run(),
+            ShardFilter::active(),
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(out, expected);
+    assert_eq!(
+        out.capacity(),
+        capacity_after_first,
+        "reused output buffer should not reallocate on identical repeated query",
     );
 }
 
@@ -320,8 +356,8 @@ fn apply_op(
         }
         Op::SplitReplace => {
             if let Some(lease) = last_lease.as_ref() {
-                let spec_a = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-                let spec_b = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+                let spec_a = ShardSpec::with_range(b"a", b"m");
+                let spec_b = ShardSpec::with_range(b"m", b"z");
                 let cursor_a = Cursor::initial();
                 let cursor_b = Cursor::initial();
                 let child_a =
@@ -337,8 +373,8 @@ fn apply_op(
         }
         Op::SplitResidual => {
             if let Some(lease) = last_lease.as_ref() {
-                let new_parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-                let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+                let new_parent = ShardSpec::with_range(b"a", b"m");
+                let residual = ShardSpec::with_range(b"m", b"z");
                 if let Ok(plan) = SplitResidualPlan::try_new(new_parent.as_ref(), residual.as_ref())
                 {
                     let _ = coord.split_residual(now, ten, lease, plan, OpId::from_raw(oc));
@@ -945,7 +981,7 @@ fn runtime_constructor_clamps_explicit_slab_capacity_to_backend_max() {
 fn coordinator_config_dev_defaults_budget() {
     let cfg = super::CoordinatorConfig::dev_defaults();
     let mb = cfg.memory_budget_mb();
-    // Dev defaults: ~3 MiB. Allow 1-100 MiB range for formula drift.
+    // Dev defaults: ~6.6 MiB. Allow 1-100 MiB range for formula drift.
     assert!(
         (1..=100).contains(&mb),
         "dev_defaults budget {mb} MB outside expected 1-100 MB range"
@@ -956,10 +992,10 @@ fn coordinator_config_dev_defaults_budget() {
 fn coordinator_config_prod_defaults_budget() {
     let cfg = super::CoordinatorConfig::prod_defaults();
     let mb = cfg.memory_budget_mb();
-    // Prod defaults: 1M shards x ~17 KiB each = ~17 GB. Allow 5-25 GB range.
+    // Prod defaults: 1M shards x ~25 KiB each = ~24.4 GiB. Allow 5-30 GB range.
     assert!(
-        (5_000..=25_000).contains(&mb),
-        "prod_defaults budget {mb} MB outside expected 5000-25000 MB range"
+        (5_000..=30_000).contains(&mb),
+        "prod_defaults budget {mb} MB outside expected 5000-30000 MB range"
     );
 }
 
@@ -1006,12 +1042,12 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The planning formula uses 784 for ShardRecord and 512 for RunRecord.
+    // The planning formula uses 8912 for ShardRecord and 512 for RunRecord.
     // These are documented in `CoordinatorConfig::memory_budget()`.
     // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
-        shard_size, 784,
-        "ShardRecord size changed from 784 to {shard_size}; \
+        shard_size, 8912,
+        "ShardRecord size changed from 8912 to {shard_size}; \
          update the constant in CoordinatorConfig::memory_budget()"
     );
     assert_eq!(

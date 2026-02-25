@@ -136,13 +136,14 @@ impl Cursor {
     /// Panics if `last_key` is empty. A present key must contain at
     /// least one byte to be meaningful in the lex-ordered keyspace.
     #[must_use = "creates a cursor that should be stored or passed to a connector"]
-    pub fn with_last_key(last_key: Vec<u8>) -> Self {
+    pub fn with_last_key(last_key: impl AsRef<[u8]>) -> Self {
+        let last_key = last_key.as_ref();
         assert!(
             !last_key.is_empty(),
             "last_key must not be empty when present"
         );
         Self {
-            last_key: Some(last_key.into_boxed_slice()),
+            last_key: Some(last_key.into()),
             token: None,
         }
     }
@@ -156,17 +157,19 @@ impl Cursor {
     ///
     /// Panics if `last_key` is empty.
     #[must_use = "creates a cursor that should be stored or passed to a connector"]
-    pub fn from_parts(last_key: Vec<u8>, token: Vec<u8>) -> Self {
+    pub fn from_parts(last_key: impl AsRef<[u8]>, token: impl AsRef<[u8]>) -> Self {
+        let last_key = last_key.as_ref();
+        let token = token.as_ref();
         assert!(
             !last_key.is_empty(),
             "last_key must not be empty when present"
         );
         Self {
-            last_key: Some(last_key.into_boxed_slice()),
+            last_key: Some(last_key.into()),
             token: if token.is_empty() {
                 None
             } else {
-                Some(token.into_boxed_slice())
+                Some(token.into())
             },
         }
     }
@@ -180,7 +183,8 @@ impl Cursor {
     /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
     ///   [`MAX_KEY_SIZE`] bytes.
     #[must_use = "returns a Result that must be checked for validation errors"]
-    pub fn try_with_last_key(last_key: Vec<u8>) -> Result<Self, CursorInputError> {
+    pub fn try_with_last_key(last_key: impl AsRef<[u8]>) -> Result<Self, CursorInputError> {
+        let last_key = last_key.as_ref();
         if last_key.is_empty() {
             return Err(CursorInputError::EmptyLastKey);
         }
@@ -191,7 +195,7 @@ impl Cursor {
             });
         }
         Ok(Self {
-            last_key: Some(last_key.into_boxed_slice()),
+            last_key: Some(last_key.into()),
             token: None,
         })
     }
@@ -210,7 +214,12 @@ impl Cursor {
     /// - [`CursorInputError::TokenTooLarge`] — `token` exceeds
     ///   [`MAX_TOKEN_SIZE`] bytes.
     #[must_use = "returns a Result that must be checked for validation errors"]
-    pub fn try_from_parts(last_key: Vec<u8>, token: Vec<u8>) -> Result<Self, CursorInputError> {
+    pub fn try_from_parts(
+        last_key: impl AsRef<[u8]>,
+        token: impl AsRef<[u8]>,
+    ) -> Result<Self, CursorInputError> {
+        let last_key = last_key.as_ref();
+        let token = token.as_ref();
         if last_key.is_empty() {
             return Err(CursorInputError::EmptyLastKey);
         }
@@ -227,11 +236,11 @@ impl Cursor {
             });
         }
         Ok(Self {
-            last_key: Some(last_key.into_boxed_slice()),
+            last_key: Some(last_key.into()),
             token: if token.is_empty() {
                 None
             } else {
-                Some(token.into_boxed_slice())
+                Some(token.into())
             },
         })
     }
@@ -304,6 +313,19 @@ impl<'a> CursorUpdate<'a> {
         }
     }
 
+    /// Construct an update with a `last_key` and no token.
+    ///
+    /// Allocation-free twin of [`Cursor::with_last_key`] for runtime paths
+    /// that already have borrowed key bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` is empty.
+    #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
+    pub fn with_last_key(last_key: &'a [u8]) -> Self {
+        Self::new(last_key)
+    }
+
     /// Construct an update from both layers.
     ///
     /// Empty `token` is normalized to `None`.
@@ -321,6 +343,21 @@ impl<'a> CursorUpdate<'a> {
             last_key: Some(last_key),
             token: if token.is_empty() { None } else { Some(token) },
         }
+    }
+
+    /// Construct an update from both layers.
+    ///
+    /// Allocation-free twin of [`Cursor::from_parts`] for runtime paths that
+    /// already hold borrowed key/token bytes.
+    ///
+    /// Empty `token` is normalized to `None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` is empty.
+    #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
+    pub fn from_parts(last_key: &'a [u8], token: &'a [u8]) -> Self {
+        Self::with_token(last_key, token)
     }
 
     /// Fallible constructor for `last_key`-only updates.
@@ -345,6 +382,21 @@ impl<'a> CursorUpdate<'a> {
             last_key: Some(last_key),
             token: None,
         })
+    }
+
+    /// Fallible constructor for `last_key`-only updates.
+    ///
+    /// Allocation-free twin of [`Cursor::try_with_last_key`] for runtime
+    /// paths that already have borrowed key bytes.
+    ///
+    /// # Errors
+    ///
+    /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
+    /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
+    pub fn try_with_last_key(last_key: &'a [u8]) -> Result<Self, CursorInputError> {
+        Self::try_new(last_key)
     }
 
     /// Fallible constructor for key+token updates.
@@ -379,6 +431,25 @@ impl<'a> CursorUpdate<'a> {
             last_key: Some(last_key),
             token: if token.is_empty() { None } else { Some(token) },
         })
+    }
+
+    /// Fallible constructor for key+token updates.
+    ///
+    /// Allocation-free twin of [`Cursor::try_from_parts`] for runtime paths
+    /// that already have borrowed key/token bytes.
+    ///
+    /// Empty `token` is normalized to `None`.
+    ///
+    /// # Errors
+    ///
+    /// - [`CursorInputError::EmptyLastKey`] — `last_key` is empty.
+    /// - [`CursorInputError::KeyTooLarge`] — `last_key` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`CursorInputError::TokenTooLarge`] — `token` exceeds
+    ///   [`MAX_TOKEN_SIZE`] bytes.
+    #[must_use = "returns a Result that must be checked for validation errors"]
+    pub fn try_from_parts(last_key: &'a [u8], token: &'a [u8]) -> Result<Self, CursorInputError> {
+        Self::try_with_token(last_key, token)
     }
 
     /// Borrows key and token from an existing [`Cursor`].
@@ -671,7 +742,7 @@ mod tests {
 
     #[test]
     fn cursor_with_last_key() {
-        let c = Cursor::with_last_key(b"org/repo\0src/main.rs".to_vec());
+        let c = Cursor::with_last_key(b"org/repo\0src/main.rs");
         assert!(!c.is_initial());
         assert_eq!(c.last_key(), Some(b"org/repo\0src/main.rs".as_slice()));
         assert!(c.token().is_none());
@@ -679,7 +750,7 @@ mod tests {
 
     #[test]
     fn cursor_from_parts() {
-        let c = Cursor::from_parts(b"key".to_vec(), b"token-data".to_vec());
+        let c = Cursor::from_parts(b"key", b"token-data");
         assert!(!c.is_initial());
         assert_eq!(c.last_key(), Some(b"key".as_slice()));
         assert_eq!(c.token(), Some(b"token-data".as_slice()));
@@ -687,7 +758,7 @@ mod tests {
 
     #[test]
     fn cursor_from_parts_empty_token_becomes_none() {
-        let c = Cursor::from_parts(b"key".to_vec(), vec![]);
+        let c = Cursor::from_parts(b"key", vec![]);
         assert_eq!(c.last_key(), Some(b"key".as_slice()));
         assert!(c.token().is_none());
     }
@@ -701,7 +772,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "must not be empty")]
     fn cursor_from_parts_empty_last_key_panics() {
-        let _ = Cursor::from_parts(vec![], b"token".to_vec());
+        let _ = Cursor::from_parts(vec![], b"token");
     }
 
     #[test]
@@ -709,6 +780,46 @@ mod tests {
         let u = CursorUpdate::with_token(b"key", b"");
         assert_eq!(u.last_key(), Some(b"key".as_slice()));
         assert!(u.token().is_none());
+    }
+
+    #[test]
+    fn cursor_update_with_last_key_matches_new() {
+        let alias = CursorUpdate::with_last_key(b"key");
+        let direct = CursorUpdate::new(b"key");
+        assert_eq!(alias, direct);
+    }
+
+    #[test]
+    fn cursor_update_from_parts_matches_with_token() {
+        let alias = CursorUpdate::from_parts(b"key", b"token-data");
+        let direct = CursorUpdate::with_token(b"key", b"token-data");
+        assert_eq!(alias, direct);
+    }
+
+    #[test]
+    fn cursor_update_try_with_last_key_matches_try_new() {
+        assert_eq!(
+            CursorUpdate::try_with_last_key(b"key"),
+            CursorUpdate::try_new(b"key")
+        );
+        let over = vec![0xAA; MAX_KEY_SIZE + 1];
+        assert_eq!(
+            CursorUpdate::try_with_last_key(&over),
+            CursorUpdate::try_new(&over)
+        );
+    }
+
+    #[test]
+    fn cursor_update_try_from_parts_matches_try_with_token() {
+        assert_eq!(
+            CursorUpdate::try_from_parts(b"key", b"token"),
+            CursorUpdate::try_with_token(b"key", b"token")
+        );
+        let over = vec![0xCD; MAX_TOKEN_SIZE + 1];
+        assert_eq!(
+            CursorUpdate::try_from_parts(b"key", &over),
+            CursorUpdate::try_with_token(b"key", &over)
+        );
     }
 
     #[test]
@@ -737,7 +848,7 @@ mod tests {
 
     #[test]
     fn try_with_last_key_valid() {
-        let c = Cursor::try_with_last_key(b"key".to_vec()).unwrap();
+        let c = Cursor::try_with_last_key(b"key").unwrap();
         assert_eq!(c.last_key(), Some(b"key".as_slice()));
         assert!(c.token().is_none());
     }
@@ -750,20 +861,20 @@ mod tests {
 
     #[test]
     fn try_from_parts_valid() {
-        let c = Cursor::try_from_parts(b"key".to_vec(), b"tok".to_vec()).unwrap();
+        let c = Cursor::try_from_parts(b"key", b"tok").unwrap();
         assert_eq!(c.last_key(), Some(b"key".as_slice()));
         assert_eq!(c.token(), Some(b"tok".as_slice()));
     }
 
     #[test]
     fn try_from_parts_empty_key() {
-        let err = Cursor::try_from_parts(vec![], b"tok".to_vec()).unwrap_err();
+        let err = Cursor::try_from_parts(vec![], b"tok").unwrap_err();
         assert_eq!(err, CursorInputError::EmptyLastKey);
     }
 
     #[test]
     fn try_from_parts_empty_token_normalized() {
-        let c = Cursor::try_from_parts(b"key".to_vec(), vec![]).unwrap();
+        let c = Cursor::try_from_parts(b"key", vec![]).unwrap();
         assert!(c.token().is_none());
     }
 
@@ -801,21 +912,21 @@ mod tests {
     #[test]
     fn try_from_parts_key_over_max() {
         let key = vec![0xAB; MAX_KEY_SIZE + 1];
-        let err = Cursor::try_from_parts(key, b"tok".to_vec()).unwrap_err();
+        let err = Cursor::try_from_parts(key, b"tok").unwrap_err();
         assert!(matches!(err, CursorInputError::KeyTooLarge { .. }));
     }
 
     #[test]
     fn try_from_parts_token_at_max_size() {
         let token = vec![0xCD; MAX_TOKEN_SIZE];
-        let c = Cursor::try_from_parts(b"key".to_vec(), token).unwrap();
+        let c = Cursor::try_from_parts(b"key", token).unwrap();
         assert_eq!(c.token().unwrap().len(), MAX_TOKEN_SIZE);
     }
 
     #[test]
     fn try_from_parts_token_over_max() {
         let token = vec![0xCD; MAX_TOKEN_SIZE + 1];
-        let err = Cursor::try_from_parts(b"key".to_vec(), token).unwrap_err();
+        let err = Cursor::try_from_parts(b"key", token).unwrap_err();
         assert_eq!(
             err,
             CursorInputError::TokenTooLarge {
@@ -891,11 +1002,11 @@ mod tests {
 
         for (label, old_key, new_key, expected) in cases {
             let old = match old_key {
-                Some(k) => Cursor::with_last_key(k.to_vec()),
+                Some(k) => Cursor::with_last_key(k),
                 None => Cursor::initial(),
             };
             let new = match new_key {
-                Some(k) => Cursor::with_last_key(k.to_vec()),
+                Some(k) => Cursor::with_last_key(k),
                 None => Cursor::initial(),
             };
             assert_eq!(check_cursor_advance(&old, &new), *expected, "case: {label}");
@@ -984,13 +1095,13 @@ mod tests {
 
         for (label, key, start, end, expected) in cases {
             let cursor = match key {
-                Some(k) => Cursor::with_last_key(k.to_vec()),
+                Some(k) => Cursor::with_last_key(k),
                 None => Cursor::initial(),
             };
             let spec = if start.is_empty() && end.is_empty() {
                 ShardSpec::unbounded()
             } else {
-                ShardSpec::with_range(start.to_vec(), end.to_vec())
+                ShardSpec::with_range(start, end)
             };
             assert_eq!(
                 check_cursor_bounds(&cursor, &spec),
@@ -1006,7 +1117,7 @@ mod tests {
 
     #[test]
     fn cursor_canonical_bytes_deterministic() {
-        let c = Cursor::with_last_key(b"key".to_vec());
+        let c = Cursor::with_last_key(b"key");
         let d1 = canonical_digest(&c);
         let d2 = canonical_digest(&c);
         assert_eq!(d1, d2);
@@ -1022,14 +1133,14 @@ mod tests {
 
     #[test]
     fn cursor_update_canonical_bytes_matches_cursor() {
-        let c = Cursor::from_parts(b"key".to_vec(), b"token".to_vec());
+        let c = Cursor::from_parts(b"key", b"token");
         let u = CursorUpdate::with_token(b"key", b"token");
         assert_eq!(canonical_digest(&c), canonical_digest(&u));
     }
 
     #[test]
     fn cursor_update_empty_token_hash_compatible_with_cursor() {
-        let c = Cursor::from_parts(b"key".to_vec(), vec![]);
+        let c = Cursor::from_parts(b"key", vec![]);
         let u = CursorUpdate::with_token(b"key", b"");
         assert_eq!(canonical_digest(&c), canonical_digest(&u));
     }

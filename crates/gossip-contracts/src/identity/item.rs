@@ -7,6 +7,8 @@
 //! |------|-------|-------------|---------|
 //! | [`ConnectorTag`] | 8 B | `from_ascii` / `from_bytes` | Source-system discriminator |
 //! | [`ItemKey`] | variable | `new(connector, path)` | Human-meaningful item identity |
+//! | [`ItemKeyRef`] | variable | `new(connector, path)` | Allocation-free borrowed item-key view |
+//! | [`ItemKeyScratch`] | const-capacity | `from_path(connector, path)` | Scratch-backed runtime path builder |
 //! | [`StableItemId`] | 32 B | derived via `ItemKey::stable_id` | Fixed-width item identity for derivation |
 //! | [`ObjectVersionId`] | 32 B | `from_version_bytes` | Version-specific content identity |
 //!
@@ -43,7 +45,7 @@ use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
 /// These are returned by the `try_*` constructors on [`ConnectorTag`],
 /// [`ItemKey`], and [`ObjectVersionId`]. The panicking constructors
 /// (`from_ascii`, `new`, `from_version_bytes`) remain available for
-/// const contexts and trusted internal code.
+/// trusted internal code; only [`ConnectorTag::from_ascii`] is `const`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityInputError {
     /// Connector tag is empty.
@@ -303,7 +305,7 @@ impl ItemKey {
     /// use gossip_contracts::identity::{ConnectorTag, ItemKey};
     ///
     /// let github = ConnectorTag::from_ascii(b"github");
-    /// let key = ItemKey::new(github, b"org/repo\0src/main.rs".to_vec());
+    /// let key = ItemKey::new(github, b"org/repo\0src/main.rs");
     ///
     /// assert_eq!(key.connector(), github);
     /// assert_eq!(key.path(), b"org/repo\0src/main.rs");
@@ -315,11 +317,12 @@ impl ItemKey {
     /// the connector — every scannable item has a non-empty location.  This
     /// is not a user-input validation boundary; connectors are trusted
     /// internal code, so a panic (rather than `Result`) is appropriate.
-    pub fn new(connector: ConnectorTag, path: Vec<u8>) -> Self {
+    pub fn new(connector: ConnectorTag, path: impl AsRef<[u8]>) -> Self {
+        let path = path.as_ref();
         assert!(!path.is_empty(), "ItemKey path must not be empty");
         Self {
             connector,
-            path: path.into_boxed_slice(),
+            path: path.into(),
         }
     }
 
@@ -327,13 +330,17 @@ impl ItemKey {
     ///
     /// Returns an error instead of panicking when the path is empty.
     /// Use this at system boundaries where the path comes from external input.
-    pub fn try_new(connector: ConnectorTag, path: Vec<u8>) -> Result<Self, IdentityInputError> {
+    pub fn try_new(
+        connector: ConnectorTag,
+        path: impl AsRef<[u8]>,
+    ) -> Result<Self, IdentityInputError> {
+        let path = path.as_ref();
         if path.is_empty() {
             return Err(IdentityInputError::EmptyPath);
         }
         Ok(Self {
             connector,
-            path: path.into_boxed_slice(),
+            path: path.into(),
         })
     }
 
@@ -349,23 +356,270 @@ impl ItemKey {
         &self.path
     }
 
+    /// Borrow this key as an allocation-free [`ItemKeyRef`] view.
+    #[inline]
+    pub fn as_ref(&self) -> ItemKeyRef<'_> {
+        ItemKeyRef::new(self.connector, &self.path)
+    }
+
+    /// Allocate a new owned key from a borrowed view.
+    #[inline]
+    pub fn from_ref(key: ItemKeyRef<'_>) -> Self {
+        Self {
+            connector: key.connector(),
+            path: key.path().into(),
+        }
+    }
+
     /// Derive the fixed-width [`StableItemId`] for this key.
     ///
     /// This is a pure, infallible function: same `ItemKey` always produces
     /// the same `StableItemId`.
     pub fn stable_id(&self) -> StableItemId {
-        let mut h = ITEM_ID_HASHER.clone();
-        self.write_canonical(&mut h);
-        StableItemId::from_bytes(finalize_32(&h))
+        self.as_ref().stable_id()
     }
 }
 
 impl CanonicalBytes for ItemKey {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
+        self.as_ref().write_canonical(h);
+    }
+}
+
+impl<'a> From<&'a ItemKey> for ItemKeyRef<'a> {
+    #[inline]
+    fn from(value: &'a ItemKey) -> Self {
+        value.as_ref()
+    }
+}
+
+impl<'a> From<ItemKeyRef<'a>> for ItemKey {
+    #[inline]
+    fn from(value: ItemKeyRef<'a>) -> Self {
+        value.to_owned()
+    }
+}
+
+impl<'a> PartialEq<ItemKeyRef<'a>> for ItemKey {
+    #[inline]
+    fn eq(&self, other: &ItemKeyRef<'a>) -> bool {
+        self.connector == other.connector() && self.path() == other.path()
+    }
+}
+
+impl<'a> PartialEq<ItemKey> for ItemKeyRef<'a> {
+    #[inline]
+    fn eq(&self, other: &ItemKey) -> bool {
+        other == self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ItemKeyRef — borrowed item-key view for allocation-free hot paths
+// ---------------------------------------------------------------------------
+
+/// Borrowed item identity view.
+///
+/// `ItemKeyRef` is the allocation-free companion to [`ItemKey`]. It borrows
+/// path bytes from caller-owned storage (or from an existing [`ItemKey`]) and
+/// can derive [`StableItemId`] without materializing owned path memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ItemKeyRef<'a> {
+    connector: ConnectorTag,
+    path: &'a [u8],
+}
+
+impl<'a> ItemKeyRef<'a> {
+    /// Construct a borrowed key view from connector and path bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `path` is empty.
+    #[inline]
+    pub fn new(connector: ConnectorTag, path: &'a [u8]) -> Self {
+        assert!(!path.is_empty(), "ItemKey path must not be empty");
+        Self { connector, path }
+    }
+
+    /// Fallible constructor for borrowed key views.
+    #[inline]
+    pub fn try_new(connector: ConnectorTag, path: &'a [u8]) -> Result<Self, IdentityInputError> {
+        if path.is_empty() {
+            return Err(IdentityInputError::EmptyPath);
+        }
+        Ok(Self { connector, path })
+    }
+
+    /// Borrow from an owned [`ItemKey`].
+    #[inline]
+    pub fn from_item_key(key: &'a ItemKey) -> Self {
+        key.as_ref()
+    }
+
+    /// The connector tag for this item.
+    #[inline]
+    pub fn connector(self) -> ConnectorTag {
+        self.connector
+    }
+
+    /// The opaque connector-defined path bytes.
+    #[inline]
+    pub fn path(self) -> &'a [u8] {
+        self.path
+    }
+
+    /// Convert into an owned [`ItemKey`], allocating path storage once.
+    #[inline]
+    pub fn to_owned(self) -> ItemKey {
+        ItemKey::from_ref(self)
+    }
+
+    /// Derive the fixed-width [`StableItemId`] from this borrowed key.
+    pub fn stable_id(self) -> StableItemId {
+        let mut h = ITEM_ID_HASHER.clone();
+        self.write_canonical(&mut h);
+        StableItemId::from_bytes(finalize_32(&h))
+    }
+}
+
+impl CanonicalBytes for ItemKeyRef<'_> {
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
         self.connector.write_canonical(h);
         // Path is variable-length → length-prefixed.
-        self.path.as_ref().write_canonical(h);
+        self.path.write_canonical(h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ItemKeyScratch — fixed-capacity scratch for runtime path reuse
+// ---------------------------------------------------------------------------
+
+/// Errors from [`ItemKeyScratch`] path staging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ItemKeyScratchError {
+    /// Provided path was empty.
+    EmptyPath,
+    /// Provided path exceeded this scratch's fixed capacity.
+    PathTooLong {
+        /// Input path length.
+        len: usize,
+        /// Scratch capacity.
+        capacity: usize,
+    },
+}
+
+impl fmt::Display for ItemKeyScratchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyPath => write!(f, "ItemKey path must not be empty"),
+            Self::PathTooLong { len, capacity } => {
+                write!(
+                    f,
+                    "ItemKey path length {len} exceeds scratch capacity {capacity}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ItemKeyScratchError {}
+
+/// Reusable fixed-capacity scratch buffer for runtime item paths.
+///
+/// This is intended for hot loops where paths are generated repeatedly and a
+/// borrowed key view is sufficient. `ItemKeyScratch` stores path bytes in a
+/// caller-owned array and returns an [`ItemKeyRef`] borrowing that array.
+///
+/// Any subsequent write invalidates previously returned `ItemKeyRef` values.
+#[derive(Clone)]
+pub struct ItemKeyScratch<const CAP: usize> {
+    buf: [u8; CAP],
+    len: usize,
+}
+
+impl<const CAP: usize> ItemKeyScratch<CAP> {
+    /// Maximum number of path bytes this scratch can hold.
+    pub const CAPACITY: usize = CAP;
+
+    /// Create an empty scratch buffer.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; CAP],
+            len: 0,
+        }
+    }
+
+    /// Active path bytes currently staged in this scratch.
+    #[inline]
+    pub fn path(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    /// Number of active path bytes.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` when no path is currently staged.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Clear the staged path without touching backing storage.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Copy path bytes into this scratch and return a borrowed key view.
+    ///
+    /// The returned [`ItemKeyRef`] borrows this scratch and stays valid until
+    /// the next mutation of the same scratch value.
+    pub fn from_path<'a>(
+        &'a mut self,
+        connector: ConnectorTag,
+        path: &[u8],
+    ) -> Result<ItemKeyRef<'a>, ItemKeyScratchError> {
+        if path.is_empty() {
+            return Err(ItemKeyScratchError::EmptyPath);
+        }
+        if path.len() > CAP {
+            return Err(ItemKeyScratchError::PathTooLong {
+                len: path.len(),
+                capacity: CAP,
+            });
+        }
+        self.buf[..path.len()].copy_from_slice(path);
+        self.len = path.len();
+        Ok(ItemKeyRef::new(connector, self.path()))
+    }
+
+    /// View the currently staged path as an [`ItemKeyRef`].
+    ///
+    /// Returns [`IdentityInputError::EmptyPath`] if scratch is empty.
+    pub fn try_view(&self, connector: ConnectorTag) -> Result<ItemKeyRef<'_>, IdentityInputError> {
+        ItemKeyRef::try_new(connector, self.path())
+    }
+}
+
+impl<const CAP: usize> Default for ItemKeyScratch<CAP> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const CAP: usize> fmt::Debug for ItemKeyScratch<CAP> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ItemKeyScratch")
+            .field("capacity", &CAP)
+            .field("len", &self.len)
+            .field("path", &self.path())
+            .finish()
     }
 }
 
@@ -491,6 +745,7 @@ impl ObjectVersionId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hash::{Hash, Hasher as StdHasher};
 
     // -- ConnectorTag --
 
@@ -551,6 +806,136 @@ mod tests {
         ItemKey::new(ConnectorTag::from_ascii(b"github"), vec![]);
     }
 
+    #[test]
+    #[should_panic(expected = "must not be empty")]
+    fn item_key_ref_empty_path_panics() {
+        let _ = ItemKeyRef::new(ConnectorTag::from_ascii(b"github"), b"");
+    }
+
+    #[test]
+    fn item_key_ref_try_new_rejects_empty_path() {
+        let err = ItemKeyRef::try_new(ConnectorTag::from_ascii(b"github"), b"")
+            .expect_err("empty path should fail");
+        assert_eq!(err, IdentityInputError::EmptyPath);
+    }
+
+    #[test]
+    fn item_key_ref_matches_owned_semantics() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let owned = ItemKey::new(connector, b"org/repo\0src/main.rs");
+        let borrowed = owned.as_ref();
+
+        assert_eq!(borrowed.connector(), connector);
+        assert_eq!(borrowed.path(), owned.path());
+        assert_eq!(borrowed.stable_id(), owned.stable_id());
+        assert_eq!(borrowed.to_owned(), owned);
+        assert_eq!(borrowed, owned);
+        assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn item_key_ref_hash_matches_owned() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let owned = ItemKey::new(connector, b"org/repo\0src/main.rs");
+        let borrowed = owned.as_ref();
+
+        let mut owned_hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut borrowed_hasher = std::collections::hash_map::DefaultHasher::new();
+        owned.hash(&mut owned_hasher);
+        borrowed.hash(&mut borrowed_hasher);
+        assert_eq!(owned_hasher.finish(), borrowed_hasher.finish());
+    }
+
+    #[test]
+    fn item_key_canonical_bytes_match_borrowed_view() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let owned = ItemKey::new(connector, b"org/repo\0src/main.rs");
+        let borrowed = owned.as_ref();
+        let mut owned_hasher = Hasher::new();
+        let mut borrowed_hasher = Hasher::new();
+        owned.write_canonical(&mut owned_hasher);
+        borrowed.write_canonical(&mut borrowed_hasher);
+        assert_eq!(owned_hasher.finalize(), borrowed_hasher.finalize());
+    }
+
+    #[test]
+    fn item_key_scratch_from_path_builds_borrowed_view() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let mut scratch = ItemKeyScratch::<64>::new();
+        let key = scratch
+            .from_path(connector, b"org/repo\0src/main.rs")
+            .expect("path should fit scratch");
+        let owned = ItemKey::new(connector, b"org/repo\0src/main.rs");
+        assert_eq!(key.path(), b"org/repo\0src/main.rs");
+        assert_eq!(key.stable_id(), owned.stable_id());
+    }
+
+    #[test]
+    fn item_key_scratch_try_view_uses_staged_path() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let mut scratch = ItemKeyScratch::<16>::new();
+        scratch
+            .from_path(connector, b"abc")
+            .expect("staging path should succeed");
+        let view = scratch
+            .try_view(connector)
+            .expect("existing path should produce a view");
+        assert_eq!(view.path(), b"abc");
+    }
+
+    #[test]
+    fn item_key_scratch_rejects_empty_path() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let mut scratch = ItemKeyScratch::<16>::new();
+        let err = scratch
+            .from_path(connector, b"")
+            .expect_err("empty path should be rejected");
+        assert_eq!(err, ItemKeyScratchError::EmptyPath);
+    }
+
+    #[test]
+    fn item_key_scratch_rejects_oversized_path() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let mut scratch = ItemKeyScratch::<4>::new();
+        let err = scratch
+            .from_path(connector, b"12345")
+            .expect_err("oversized path should fail");
+        assert_eq!(
+            err,
+            ItemKeyScratchError::PathTooLong {
+                len: 5,
+                capacity: 4
+            }
+        );
+    }
+
+    #[test]
+    fn item_key_scratch_try_view_rejects_empty_state() {
+        let scratch = ItemKeyScratch::<8>::new();
+        let err = scratch
+            .try_view(ConnectorTag::from_ascii(b"github"))
+            .expect_err("empty scratch should not produce a key");
+        assert_eq!(err, IdentityInputError::EmptyPath);
+    }
+
+    #[test]
+    fn item_key_scratch_can_be_reused_across_iterations() {
+        let connector = ConnectorTag::from_ascii(b"github");
+        let mut scratch = ItemKeyScratch::<32>::new();
+
+        for path in [
+            b"first/path".as_slice(),
+            b"second/path".as_slice(),
+            b"third/path".as_slice(),
+        ] {
+            let key = scratch
+                .from_path(connector, path)
+                .expect("path should fit scratch");
+            let owned = ItemKey::new(connector, path);
+            assert_eq!(key.stable_id(), owned.stable_id());
+        }
+    }
+
     // -- ItemKey CanonicalBytes --
 
     #[test]
@@ -558,8 +943,8 @@ mod tests {
         // Connector tag + path must not collide with different splits.
         // ConnectorTag is fixed-width and path is length-prefixed,
         // so this is structurally impossible. Verify anyway:
-        let a = ItemKey::new(ConnectorTag::from_bytes(*b"ab\0\0\0\0\0\0"), b"cd".to_vec());
-        let b = ItemKey::new(ConnectorTag::from_bytes(*b"abcd\0\0\0\0"), b"ef".to_vec());
+        let a = ItemKey::new(ConnectorTag::from_bytes(*b"ab\0\0\0\0\0\0"), b"cd");
+        let b = ItemKey::new(ConnectorTag::from_bytes(*b"abcd\0\0\0\0"), b"ef");
         let mut ha = Hasher::new();
         let mut hb = Hasher::new();
         a.write_canonical(&mut ha);
@@ -608,6 +993,17 @@ mod tests {
             let id1 = key.stable_id();
             let id2 = key.stable_id();
             proptest::prop_assert_eq!(id1, id2);
+        }
+
+        #[test]
+        fn item_key_ref_stable_id_matches_owned(
+            tag_bytes in proptest::array::uniform8(proptest::num::u8::ANY),
+            path in proptest::collection::vec(proptest::num::u8::ANY, 1..256),
+        ) {
+            let connector = ConnectorTag::from_bytes(tag_bytes);
+            let owned = ItemKey::new(connector, path.clone());
+            let borrowed = ItemKeyRef::new(connector, &path);
+            proptest::prop_assert_eq!(owned.stable_id(), borrowed.stable_id());
         }
 
         #[test]

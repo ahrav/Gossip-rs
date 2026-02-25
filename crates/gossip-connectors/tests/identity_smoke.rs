@@ -19,7 +19,7 @@ fn connector_tag_from_ascii_works() {
 #[test]
 fn item_key_derives_non_zero_stable_id() {
     let tag = ConnectorTag::from_ascii(b"github");
-    let key = ItemKey::new(tag, b"org/repo\0src/main.rs".to_vec());
+    let key = ItemKey::new(tag, b"org/repo\0src/main.rs");
 
     let id = key.stable_id();
     assert_ne!(id, StableItemId::ZERO);

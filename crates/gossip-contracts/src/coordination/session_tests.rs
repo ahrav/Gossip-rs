@@ -1,10 +1,11 @@
 //! Tests for [`WorkerSession`], the RAII handle that binds a worker to a shard.
 //!
-//! `WorkerSession` wraps an acquired lease and a cached `ShardSnapshot`, then
-//! delegates every operation (checkpoint, complete, park, split, renew) to the
-//! backend while keeping the cached snapshot consistent. This module verifies
-//! that the session wrapper faithfully threads operations through to the backend
-//! and maintains its internal state correctly, including after errors.
+//! `WorkerSession` wraps an acquired lease and a lazily materialized
+//! `ShardSnapshot`, then delegates every operation (checkpoint, complete, park,
+//! split, renew) to the backend while keeping snapshot state consistent. This
+//! module verifies that the session wrapper faithfully threads operations
+//! through to the backend and maintains its internal state correctly, including
+//! after errors.
 //!
 //! # Coverage Areas
 //!
@@ -577,6 +578,60 @@ fn complete_replayed_returns_replayed() {
 }
 
 // -- Snapshot staleness tests ----------------------------------------
+
+/// Session creation should keep snapshot bytes in scratch and defer owned
+/// `ShardSnapshot` materialization until the first snapshot accessor call.
+#[test]
+fn new_defers_snapshot_materialization_until_first_read() {
+    let (mut coord, keys) = setup_coordinator(1);
+    let session =
+        WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+    assert!(
+        !session.has_materialized_snapshot(),
+        "new should not eagerly materialize owned snapshot"
+    );
+
+    let _ = session.spec();
+    assert!(
+        session.has_materialized_snapshot(),
+        "first snapshot accessor should materialize owned snapshot"
+    );
+}
+
+/// `split_residual` refreshes allocation-free snapshot state and invalidates
+/// owned cache instead of eagerly rebuilding it.
+#[test]
+fn split_residual_invalidates_owned_snapshot_cache() {
+    let (mut coord, keys) = setup_coordinator(1);
+    let mut session =
+        WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+    // Force first materialization.
+    let _ = session.initial_snapshot();
+    assert!(session.has_materialized_snapshot());
+
+    let parent_new_spec =
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
+    let residual_spec =
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
+    let plan =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let outcome = session
+        .split_residual(now(3), plan, OpId::from_raw(705))
+        .unwrap();
+    assert!(outcome.is_executed());
+    assert!(
+        !session.has_materialized_snapshot(),
+        "split_residual should invalidate owned cache and defer rebuild"
+    );
+
+    assert_eq!(session.spec().key_range_end(), &[0x20]);
+    assert!(
+        session.has_materialized_snapshot(),
+        "snapshot should rematerialize on next accessor call"
+    );
+}
 
 /// Checkpoint does NOT update the session's cached snapshot.
 /// The cursor returned by `session.cursor()` should still reflect

@@ -634,8 +634,8 @@ mod tests {
 
     #[test]
     fn split_residual_plan_valid() {
-        let parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-        let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let parent = ShardSpec::with_range(b"a", b"m");
+        let residual = ShardSpec::with_range(b"m", b"z");
         let plan = SplitResidualPlan::try_new(parent.as_ref(), residual.as_ref()).unwrap();
         assert_eq!(plan.parent_new_spec(), parent.as_ref());
         assert_eq!(plan.residual_spec(), residual.as_ref());
@@ -643,7 +643,7 @@ mod tests {
 
     #[test]
     fn split_residual_plan_identical_specs_returns_error() {
-        let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+        let spec = ShardSpec::with_range(b"a", b"z");
         assert_eq!(
             SplitResidualPlan::try_new(spec.as_ref(), spec.as_ref()),
             Err(SplitResidualPlanError::IdenticalSpecs),
@@ -654,8 +654,8 @@ mod tests {
 
     #[test]
     fn split_replace_plan_canonical_deterministic() {
-        let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-        let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let spec1 = ShardSpec::with_range(b"a", b"m");
+        let spec2 = ShardSpec::with_range(b"m", b"z");
         let c1 = Cursor::initial();
         let c2 = Cursor::initial();
         let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&c1));

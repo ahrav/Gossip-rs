@@ -1,10 +1,15 @@
 //! State transition events and event collection.
 //!
-//! Every coordination operation (acquire, checkpoint, complete, park,
-//! split, unpark, run lifecycle) can produce one or more
-//! [`StateTransitionEvent`] values describing what happened. Events are
-//! pure data — the coordination layer never acts on them. Side effects
-//! (metrics, notifications, dashboards) are the caller's responsibility.
+//! This module defines the event vocabulary for coordination operations
+//! (acquire, checkpoint, complete, park, split, unpark, run lifecycle).
+//! Events are pure data — the coordination layer never acts on them.
+//! Side effects (metrics, notifications, dashboards) are the caller's
+//! responsibility.
+//!
+//! The event types are available now, but backend emission hooks are not
+//! wired yet in this crate. Existing backends include TODO markers at
+//! mutation sites where emission should happen once `_with_events` adapters
+//! are introduced.
 //!
 //! ## Design
 //!
@@ -36,7 +41,7 @@
 //! The types are defined here; wiring into `CoordinationBackend` is
 //! tracked separately.
 //!
-//! ## Event / Operation Correspondence
+//! ## Planned Event / Operation Correspondence
 //!
 //! | Backend operation   | Event(s) emitted                             |
 //! |---------------------|----------------------------------------------|
@@ -404,6 +409,8 @@ impl EventCollector {
     /// Create an event collector that silently drops events after
     /// `max_events` have been collected.
     ///
+    /// Uses fixed preallocation (`Vec::with_capacity(max_events)`) so
+    /// accepted events do not trigger implicit growth after warmup.
     /// Use this as a safety valve in production to prevent unbounded
     /// memory growth if a backend produces unexpectedly many events.
     /// Dropped events are silently discarded — the caller can detect
@@ -411,7 +418,7 @@ impl EventCollector {
     #[must_use]
     pub fn with_max_capacity(max_events: usize) -> Self {
         Self {
-            events: Vec::new(),
+            events: Vec::with_capacity(max_events),
             max_capacity: Some(max_events),
         }
     }
@@ -776,8 +783,8 @@ mod tests {
     #[test]
     fn collector_with_max_capacity_drops_excess() {
         let mut c = EventCollector::with_max_capacity(3);
-        for i in 0..5u64 {
-            c.emit(StateTransitionEvent {
+        for i in 0..3u64 {
+            let accepted = c.emit(StateTransitionEvent {
                 tenant: test_tenant(),
                 run: test_run(),
                 at: LogicalTime::from_raw(i),
@@ -785,9 +792,65 @@ mod tests {
                     shard: ShardId::from_raw(i),
                 },
             });
+            assert!(accepted, "events up to max_capacity must be accepted");
         }
-        // Only 3 accepted, 2 dropped.
+        let overflow_accepted = c.emit(StateTransitionEvent {
+            tenant: test_tenant(),
+            run: test_run(),
+            at: LogicalTime::from_raw(99),
+            kind: EventKind::RunCreated,
+        });
+        assert!(
+            !overflow_accepted,
+            "overflow behavior must be explicit via emit=false"
+        );
+        // Only 3 accepted; overflow events are dropped.
         assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn collector_with_max_capacity_preallocates() {
+        let c = EventCollector::with_max_capacity(7);
+        assert_eq!(c.events.capacity(), 7);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn collector_with_max_capacity_is_allocation_stable_after_warmup() {
+        let max = 4usize;
+        let mut c = EventCollector::with_max_capacity(max);
+        assert_eq!(c.events.capacity(), max);
+
+        for round in 0..64u64 {
+            for offset in 0..max as u64 {
+                let accepted = c.emit(StateTransitionEvent {
+                    tenant: test_tenant(),
+                    run: test_run(),
+                    at: LogicalTime::from_raw(round * 10 + offset),
+                    kind: EventKind::ShardCompleted {
+                        shard: ShardId::from_raw(offset),
+                    },
+                });
+                assert!(accepted, "round={round} offset={offset}");
+            }
+
+            let overflow_accepted = c.emit(StateTransitionEvent {
+                tenant: test_tenant(),
+                run: test_run(),
+                at: LogicalTime::from_raw(round * 10 + 9),
+                kind: EventKind::RunCreated,
+            });
+            assert!(
+                !overflow_accepted,
+                "collector must not grow past max_capacity"
+            );
+
+            let cap_before_drain = c.events.capacity();
+            c.drain_with(|_| {});
+            assert!(c.is_empty());
+            assert_eq!(c.events.capacity(), cap_before_drain);
+            assert_eq!(c.events.capacity(), max);
+        }
     }
 
     #[test]
