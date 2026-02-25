@@ -2625,7 +2625,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             lease: Lease,
             is_terminal: bool,
             checkpoints_ok: u32,
+            /// Number of failed checkpoint operations (e.g., lease expired mid-session).
             checkpoints_rejected: u32,
+            /// Child shard IDs created by split operations (empty if no split occurred).
             split_children: Vec<ShardId>,
         }
 

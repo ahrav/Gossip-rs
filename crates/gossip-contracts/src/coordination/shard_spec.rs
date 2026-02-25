@@ -773,8 +773,12 @@ impl std::error::Error for ShardSpecInputError {}
 /// (cheap to pass around) but the underlying bytes live in the arena's slab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShardSpecHandle {
+    /// Index into the arena's slot array.
     slot: u32,
+    /// Generation counter at allocation time. Must match the slot's current
+    /// generation for the handle to be valid.
     generation: u32,
+    /// Unique arena identity. Prevents cross-arena handle misuse.
     arena_id: u32,
 }
 
@@ -827,6 +831,11 @@ fn next_arena_id() -> u32 {
 
 impl ShardArena {
     /// Create a new arena with fixed slot and byte capacity.
+    ///
+    /// All slots and the slab are allocated at construction time so that
+    /// runtime operations (alloc/free/view) never touch the global allocator.
+    /// `spec_slots` determines the maximum number of live specs; `byte_capacity`
+    /// determines the total slab bytes available for spec key ranges and metadata.
     #[must_use]
     pub fn with_capacity(spec_slots: usize, byte_capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(spec_slots);

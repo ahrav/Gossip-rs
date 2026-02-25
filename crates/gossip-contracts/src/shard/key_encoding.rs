@@ -318,8 +318,7 @@ impl<E: std::error::Error + 'static> std::error::Error for ShardIntoError<E> {
 /// # Errors
 ///
 /// Returns [`ShardSpecInputError`] when the encoded range fails validation:
-/// inverted bounds, keys exceeding [`MAX_KEY_SIZE`], or metadata exceeding
-/// [`MAX_METADATA_SIZE`].
+/// inverted bounds, keys exceeding [`MAX_KEY_SIZE`], or oversized metadata.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_keys_ref<'a, Start: KeyEncoding, End: KeyEncoding>(
     start: &Start,
