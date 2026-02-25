@@ -65,13 +65,8 @@ const U32_MAX_USIZE: usize = u32::MAX as usize;
 
 /// Reusable fixed-capacity metadata scratch buffer.
 ///
-/// Sized to hold any valid metadata envelope ([`MAX_METADATA_SIZE`] bytes).
-/// Allocate one at startup or per-thread and reuse it across repeated
-/// `encode_into` calls to avoid per-encode heap allocation.
-///
-/// The returned slice from `encode_into` borrows this buffer. Any
-/// subsequent write overwrites the previous content; callers must
-/// consume or copy the slice before the next encode.
+/// This buffer is intended to be allocated once (for example at startup) and
+/// reused across repeated metadata/hint encodes without heap allocation.
 pub struct MetadataBuf {
     buf: [u8; Self::CAPACITY],
     len: usize,
@@ -874,47 +869,26 @@ pub fn manifest_shard_into(
         .map_err(ManifestShardIntoError::SlabFull)
 }
 
-/// Convenience wrapper: build a manifest shard then allocate it in arena.
-pub fn manifest_shard_into(
-    arena: &mut ShardArena,
-    manifest_id: u64,
-    start_row: u64,
-    end_row: u64,
-    connector_extra: &[u8],
-    scratch: &mut ShardSpecScratch,
-) -> Result<ShardSpecHandle, ShardIntoError<ShardSpecInputError>> {
-    let spec = manifest_shard_ref(manifest_id, start_row, end_row, connector_extra, scratch)
-        .map_err(ShardIntoError::Build)?;
-    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
-}
-
-/// Decode typed shard metadata from a borrowed shard spec view.
+/// Decode typed shard metadata from a [`ShardSpec`].
 ///
 /// This applies strict envelope validation. Empty metadata is interpreted as
 /// absent hint bytes and maps to [`ShardHint::Range`] with empty
 /// `connector_extra`.
 #[must_use = "returns a Result that must be checked for metadata decode errors"]
-pub fn decode_metadata<'a, S>(spec: S) -> Result<ShardMetadata<'a>, ShardMetadataDecodeError>
-where
-    S: IntoShardSpecRef<'a>,
-{
-    let spec = spec.into_spec_ref();
+pub fn decode_metadata(spec: &ShardSpec) -> Result<ShardMetadata<'_>, ShardMetadataDecodeError> {
     ShardMetadata::decode(spec.metadata())
 }
 
-/// Decode only the hint portion from a shard metadata envelope.
+/// Decode only the hint portion from a [`ShardSpec`] metadata envelope.
 ///
 /// This still validates the full envelope first; malformed length prefixes or
 /// hint frames are surfaced as decode errors.
 #[must_use = "returns a Result that must be checked for metadata decode errors"]
-pub fn decode_hint<'a, S>(spec: S) -> Result<ShardHint<'a>, ShardMetadataDecodeError>
-where
-    S: IntoShardSpecRef<'a>,
-{
+pub fn decode_hint(spec: &ShardSpec) -> Result<ShardHint<'_>, ShardMetadataDecodeError> {
     decode_metadata(spec).map(|metadata| metadata.hint)
 }
 
-/// Decode only connector-opaque trailing bytes from a shard metadata
+/// Decode only connector-opaque trailing bytes from a [`ShardSpec`] metadata
 /// envelope.
 ///
 /// This still validates the hint frame and envelope length prefix; it is not a
@@ -922,10 +896,7 @@ where
 ///
 /// The returned slice borrows from `spec` and performs no allocation.
 #[must_use = "returns a Result that must be checked for metadata decode errors"]
-pub fn decode_connector_extra<'a, S>(spec: S) -> Result<&'a [u8], ShardMetadataDecodeError>
-where
-    S: IntoShardSpecRef<'a>,
-{
+pub fn decode_connector_extra(spec: &ShardSpec) -> Result<&[u8], ShardMetadataDecodeError> {
     decode_metadata(spec).map(|metadata| metadata.connector_extra)
 }
 
@@ -1016,10 +987,7 @@ impl std::error::Error for HintPropagationError {}
 ///   against.  Callers must validate child range ordering independently.
 /// - `Prefix` validates child bounds and demotes to `Range` because arbitrary
 ///   split boundaries inside one prefix shard are not representable as a single
-///   child prefix. Connectors should treat `[child_start, child_end)` as a
-///   sub-range of the original prefix scan; the parent-prefix context is
-///   recoverable from shard lineage (`ShardSnapshot::parent`) rather than from
-///   the child hint itself.
+///   child prefix.
 /// - `Manifest` validates row-key boundaries and returns a narrowed
 ///   `Manifest` hint.
 ///
@@ -1094,12 +1062,8 @@ pub fn propagate_hint_on_split(
 
 /// Validate child bounds for a split of a prefix shard.
 ///
-/// The child interval `[child_start, child_end)` must satisfy:
-/// 1. `prefix <= child_start < prefix_successor(prefix)` -- start is inside
-///    the parent prefix range.
-/// 2. `prefix < child_end <= prefix_successor(prefix)` -- end does not
-///    exceed the parent boundary.
-/// 3. `child_start < child_end` -- the interval is non-empty.
+/// The child interval must remain within `[prefix, prefix_successor(prefix)]`
+/// and be non-empty (`child_start < child_end`).
 fn validate_prefix_child_bounds(
     prefix: &[u8],
     child_start: &[u8],
@@ -1154,8 +1118,6 @@ fn map_encode_to_spec_input_error(err: ShardEncodeError) -> ShardSpecInputError 
     }
 }
 
-/// Map a [`ShardEncodeError`] to the [`PrefixShardError`] vocabulary
-/// expected by callers of prefix shard constructors.
 fn map_encode_to_prefix_error(err: ShardEncodeError) -> PrefixShardError {
     match err {
         ShardEncodeError::PrefixTooLarge { size, .. } => PrefixShardError::PrefixTooLarge {

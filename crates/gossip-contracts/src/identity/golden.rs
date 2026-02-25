@@ -514,18 +514,20 @@ fn hash_park_golden_value() {
 
 #[test]
 fn hash_split_replace_golden_value() {
-    use crate::coordination::cursor::{Cursor, CursorUpdate};
+    use crate::coordination::cursor::Cursor;
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{
         SplitReplaceChild, SplitReplacePlan, hash_split_replace_payload,
     };
 
-    let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let cursor1 = Cursor::initial();
-    let cursor2 = Cursor::initial();
-    let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&cursor1));
-    let c2 = SplitReplaceChild::new(spec2.as_ref(), CursorUpdate::from_cursor(&cursor2));
+    let c1 = SplitReplaceChild::new(
+        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        Cursor::initial(),
+    );
+    let c2 = SplitReplaceChild::new(
+        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        Cursor::initial(),
+    );
     let plan = SplitReplacePlan::try_new(vec![c1, c2]).unwrap();
     let hash = hash_split_replace_payload(&plan);
     assert_eq!(
@@ -540,9 +542,11 @@ fn hash_split_residual_golden_value() {
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{SplitResidualPlan, hash_split_residual_payload};
 
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
+    let plan = SplitResidualPlan::try_new(
+        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+    )
+    .unwrap();
     let hash = hash_split_residual_payload(&plan);
     assert_eq!(
         hash, HASH_SPLIT_RESIDUAL_EXPECTED,

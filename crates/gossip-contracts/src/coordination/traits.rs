@@ -9,7 +9,7 @@
 //!
 //! Lease-gated operations take `(TenantId, Lease)` — the backend extracts
 //! the `ShardKey` from the lease via `lease.shard_key()`.
-//! `acquire_and_restore_into` is the exception: it takes
+//! `acquire_and_restore` is the exception: it takes
 //! `(TenantId, ShardKey, WorkerId)` since no lease exists yet.
 //! The backend validates:
 //! 1. Tenant isolation (`record.tenant == tenant`)
@@ -28,8 +28,8 @@
 
 use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::{
-    AcquireError, AcquireResultView, AcquireScratch, CheckpointError, CompleteError,
-    IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireResult, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
+    RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::lease::Lease;
 use crate::coordination::record::ParkReason;
@@ -63,7 +63,7 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 /// tenant isolation on every call.
 ///
 /// **Lease-gated mutations**: All mutating operations (except
-/// `acquire_and_restore_into`) require a valid `Lease`. The backend
+/// `acquire_and_restore`) require a valid `Lease`. The backend
 /// validates the lease's fence epoch and deadline before executing.
 ///
 /// ## Invariants (must hold across ALL backends)
@@ -143,9 +143,6 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 /// expression, so the target store rejects writes from superseded workers.
 pub trait CoordinationBackend {
     // —— Shard lifecycle operations ——————————————————————————————
-    //
-    // Allocation-sensitive methods use caller-owned scratch/output buffers to
-    // avoid per-call heap allocation on hot paths.
 
     /// Acquire a shard for processing and restore its last checkpoint.
     ///
@@ -169,7 +166,7 @@ pub trait CoordinationBackend {
     ///
     /// ## Idempotency
     ///
-    /// `acquire_and_restore_into` is NOT idempotent via OpId. It is
+    /// `acquire_and_restore` is NOT idempotent via OpId. It is
     /// inherently non-idempotent: each call that succeeds increments
     /// the fence epoch. A worker that calls acquire twice gets two
     /// different leases (the first is immediately invalidated by the
@@ -186,17 +183,13 @@ pub trait CoordinationBackend {
     /// acquisition time (after epoch bump, before any worker mutations).
     /// **Capacity**: The `capacity` field in the result reflects the run's
     /// available-shard count computed *after* this operation completes.
-    ///
-    /// `out` is caller-owned scratch reused across calls. Implementations may
-    /// overwrite it fully and must not retain references into it after return.
-    fn acquire_and_restore_into<'a>(
+    fn acquire_and_restore(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         key: ShardKey,
         worker: WorkerId,
-        out: &'a mut AcquireScratch,
-    ) -> Result<AcquireResultView<'a>, AcquireError>;
+    ) -> Result<AcquireResult, AcquireError>;
 
     /// Renew an existing lease, extending the deadline.
     ///
@@ -407,7 +400,7 @@ pub trait CoordinationBackend {
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        plan: SplitReplacePlan<'_>,
+        plan: SplitReplacePlan,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError>;
 
@@ -458,7 +451,7 @@ pub trait CoordinationBackend {
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        plan: SplitResidualPlan<'_>,
+        plan: SplitResidualPlan,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError>;
 }

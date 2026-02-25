@@ -1,66 +1,42 @@
-//! Shared validation helpers for lease-gated coordination operations.
+//! Validation helpers for coordination operations.
 //!
-//! These are pure, side-effect-free functions that extract precondition
-//! checks shared across [`CoordinationBackend`] implementations. Keeping
-//! them as free functions (rather than methods on a backend type) ensures
-//! that validation logic is identical across all backends and is
-//! independently testable without coordinator setup.
+//! These pure, side-effect-free functions extract shared precondition checks
+//! from the coordinator backend. Each returns `Result<(), CoordError>` (or
+//! `Result<Option<&OpLogEntry>, CoordError>` for idempotency) so callers
+//! can convert into operation-specific error types via `From<CoordError>`.
 //!
-//! Each function returns `Result<_, CoordError>` so callers can convert
-//! into operation-specific error types via the `From<CoordError>` impls
-//! defined in [`super::error`].
+//! ## Composition
 //!
-//! [`CoordinationBackend`]: super::traits::CoordinationBackend
+//! A lease-gated mutation (e.g. checkpoint, complete) typically chains:
 //!
-//! ## Composition pattern
+//! 1. **[`check_op_idempotency`]** — replay detection first, so replays
+//!    succeed even after lease expiry or terminal status.
+//! 2. **[`validate_lease`]** — tenant, terminal, fence, expiry checks.
+//! 3. **Operation-specific validation** (e.g.
+//!    `validate_cursor_update_pooled` for checkpoint/complete).
 //!
-//! Every lease-gated mutation (checkpoint, complete, park, split) follows
-//! the same three-step validation pipeline:
+//! Step 1 is checked first on every idempotent path so that a successful
+//! replay is never blocked by an expired lease or terminal status.
+//! Step 2 is mandatory for every lease-gated path.
 //!
-//! 1. **[`check_op_idempotency`]** — replay detection. Checked first so
-//!    that replays succeed even after the lease expires or the shard
-//!    reaches a terminal state. This ordering is critical: without it,
-//!    a worker that successfully completed an operation but failed to
-//!    receive the response would be unable to retry.
+//! ## Check ordering
 //!
-//! 2. **[`validate_lease`]** — tenant isolation, terminal status, fence
-//!    epoch, lease expiry, and owner identity. These checks are ordered
-//!    by security priority (see below).
+//! `validate_lease` checks in priority order:
+//! 1. **Tenant isolation** — security-first; never leak cross-tenant info
+//! 2. **Terminal status** — fast rejection of dead shards
+//! 3. **Fence epoch** — zombie fencing
+//! 4. **Lease expiry** — time-based rejection
+//! 5. **Owner divergence** — catches identity mismatches when fence epochs agree
 //!
-//! 3. **Operation-specific validation** — e.g.,
-//!    `validate_cursor_update_pooled` for checkpoint/complete, or
-//!    split coverage validation for split operations.
-//!
-//! ## `validate_lease` check ordering
-//!
-//! The five checks in `validate_lease` are deliberately ordered by
-//! information-security priority:
-//!
-//! 1. **Tenant isolation** — security-first; a tenant-mismatch error
-//!    never reveals whether the shard is terminal, has a stale fence,
-//!    or has an expired lease.
-//! 2. **Terminal status** — fast rejection of dead shards before more
-//!    expensive checks.
-//! 3. **Fence epoch** — zombie worker fencing (Kleppmann protocol).
-//! 4. **Lease expiry** — time-based rejection.
-//! 5. **Owner divergence** — catches identity mismatches when fence
-//!    epochs agree (defense-in-depth against state reconstruction bugs).
-//!
-//! ## `validate_cursor_update_pooled`
-//!
-//! Validates a [`CursorUpdate`] against pooled/slice views of the previous
-//! cursor key and shard spec boundaries. Checks four properties in order:
-//! key presence, key size limit, monotonicity (new >= old), and bounds
-//! (`last_key` in `[spec.start, spec.end)`). Operates entirely on borrowed
-//! slices to avoid materializing owned `Cursor`/`ShardSpec` values on the
-//! checkpoint hot path.
+//! This order ensures that a tenant-mismatch error never reveals whether
+//! the shard is terminal, has a stale fence, or has an expired lease.
 //!
 //! ## Invariants
 //!
 //! - **Lease deadline existence:** When a caller's fence epoch matches the
-//!   record's current epoch, the record's lease deadline MUST be `Some`.
-//!   If it is `None`, the record is in an inconsistent state and
-//!   `validate_lease` returns `StaleFence` to force re-acquisition.
+//!   record's current fence epoch, the record's lease deadline MUST be `Some`.
+//!   If it is `None`, the record is in an inconsistent state and `validate_lease`
+//!   returns `StaleFence` to force re-acquisition (see check 4).
 
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::error::CoordError;
@@ -70,41 +46,22 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId};
 
 /// Validate lease preconditions for a lease-gated operation.
 ///
-/// Checks (in priority order -- see module docs for rationale):
+/// Checks (in priority order):
+/// 1. Tenant isolation — the provided `tenant` must match the record's tenant.
+/// 2. Terminal status — terminal shards reject all mutations.
+/// 3. Fence epoch — the lease's epoch must match the record's current epoch.
+/// 4. Lease expiry — `now` must be before the record's lease deadline.
+/// 5. Owner divergence — the lease's owner must match the record's current lease holder.
 ///
-/// 1. **Tenant isolation** — `record.tenant == tenant`. Checked first so
-///    that a mismatch never reveals whether the shard is terminal, has a
-///    stale fence, or has an expired lease.
-/// 2. **Terminal status** — `!record.status.is_terminal()`. Terminal shards
-///    reject all mutations. Checked before fence/lease to avoid confusing
-///    "stale fence" errors on shards that are simply dead.
-/// 3. **Fence epoch** — `lease.fence() == record.fence_epoch`. A mismatch
-///    means another worker has since acquired the shard (Kleppmann fencing).
-/// 4. **Lease expiry** — `now < record.lease_deadline()`. If the fence check
-///    passes but the record has no lease holder (`deadline == None`), the
-///    record is in an inconsistent state and `StaleFence` is returned to
-///    force re-acquisition.
-/// 5. **Owner divergence** — `record.lease_owner() == Some(lease.owner())`.
-///    Defense-in-depth: catches identity mismatches when fence epochs agree
-///    (e.g., state reconstruction bugs).
+/// # Preconditions
 ///
-/// ## Postconditions (on `Ok(())`)
-///
-/// - `record.tenant == tenant`
-/// - `record.status` is non-terminal
-/// - `lease.fence() == record.fence_epoch`
-/// - `record.is_leased_at(now)` is `true`
-///
-/// ## Preconditions
-///
-/// - `now > LogicalTime::ZERO` (asserted at runtime).
-/// - The caller MUST have looked up the shard record by `ShardKey` before
-///   calling this function. If the shard is not found, return
-///   `CoordError::ShardNotFound` directly (this function cannot check that).
+/// The caller MUST have looked up the shard record by `ShardKey` before
+/// calling this function. If the shard is not found, return
+/// `CoordError::ShardNotFound` directly (this function cannot check that).
 ///
 /// # Errors
 ///
-/// Returns the first violated check as a [`CoordError`].
+/// Returns the first violated check as a `CoordError`.
 pub fn validate_lease(
     now: LogicalTime,
     tenant: TenantId,
@@ -173,33 +130,14 @@ pub fn validate_lease(
     Ok(())
 }
 
-/// Validate a cursor update against borrowed slices of the previous cursor
-/// key and shard-spec boundaries.
+/// Validate a cursor update using pooled/slice views for the previous cursor
+/// key and shard bounds.
 ///
-/// This is the canonical cursor validator for all mutation paths (checkpoint,
-/// complete). It operates entirely on borrowed slices so callers can validate
-/// without materializing owned `Cursor` or `ShardSpec` values -- critical on
-/// the checkpoint hot path where the previous key and spec bounds live in the
-/// slab as `PooledCursor` / `PooledShardSpec`.
+/// This is the canonical cursor validator for mutation paths. It operates on
+/// borrowed slices so callers can validate without materializing owned
+/// `Cursor` / `ShardSpec` values.
 ///
-/// ## Check order
-///
-/// 1. **Key presence** -- `new_cursor.last_key()` must be `Some`. A
-///    checkpoint with no key represents no progress, which is meaningless.
-/// 2. **Key size** -- `last_key.len() <= MAX_KEY_SIZE`. Defense-in-depth
-///    against oversized keys that could bloat slab storage.
-/// 3. **Monotonicity** -- `new_last_key >= old_last_key` (lexicographic).
-///    Prevents cursor regression within a lease epoch.
-/// 4. **Bounds** -- `last_key` must fall within `[spec_start, spec_end)`.
-///    Empty `spec_start` / `spec_end` are treated as unbounded on that side.
-///
-/// The ordering matters: a missing key is reported before monotonicity, and
-/// monotonicity is reported before bounds. This gives the caller the most
-/// actionable error first.
-///
-/// # Errors
-///
-/// Returns the first violated check as a [`CoordError`].
+/// Used by borrowed checkpoint/complete paths that pass [`CursorUpdate`].
 pub(crate) fn validate_cursor_update_pooled(
     new_cursor: &CursorUpdate<'_>,
     old_last_key: Option<&[u8]>,
@@ -246,47 +184,34 @@ pub(crate) fn validate_cursor_update_pooled(
 }
 
 /// Check whether an operation is a replay (idempotent retry) or a new
-/// operation by looking up `op_id` in the shard's bounded op-log.
+/// operation.
 ///
-/// ## Three-way return
+/// - Returns `Ok(None)` if the `OpId` is not in the op-log (new operation).
+/// - Returns `Ok(Some(entry))` if the `OpId` is found and the payload hash
+///   matches (idempotent replay — return the cached result).
+/// - Returns `Err(CoordError::OpIdConflict)` if the `OpId` is found but
+///   the payload hash differs (mutation conflict — reject).
 ///
-/// | Condition | Return | Caller action |
-/// |-----------|--------|---------------|
-/// | `op_id` not in log | `Ok(None)` | Proceed with fresh execution |
-/// | `op_id` found, hash matches | `Ok(Some(entry))` | Return cached result (replay) |
-/// | `op_id` found, hash differs | `Err(OpIdConflict)` | Reject -- caller reused an OpId with different parameters |
+/// # Preconditions
 ///
-/// ## Call ordering
+/// On idempotent paths this function is called BEFORE [`validate_lease`],
+/// so that a successful replay is never blocked by an expired lease or
+/// terminal shard status. This function does not check lease validity.
 ///
-/// On every idempotent path this function is called **before**
-/// [`validate_lease`], so that a successful replay is never blocked by
-/// an expired lease or terminal shard status. This ordering is critical:
-/// a worker that successfully completed an operation but crashed before
-/// receiving the response must be able to retry and get the cached result,
-/// even if the lease has since expired or the shard has transitioned.
+/// `payload_hash` must be non-zero; a zero hash indicates the caller
+/// failed to compute a hash (see `OpLogEntry::new` assertion).
 ///
-/// ## Op-log capacity and eviction
+/// # Op-log capacity
 ///
-/// The op-log is bounded to [`ShardRecord::OP_LOG_CAP`] (16) entries.
-/// If an `OpId` has been evicted, this function returns `Ok(None)` and
-/// the caller treats it as a new operation. This is safe because:
-///
-/// - For terminal operations (complete, park, split_replace): the shard
-///   is terminal after first execution, so no further ops can push entries
-///   and the terminal op's entry is never evicted.
-/// - For non-terminal operations (checkpoint, split_residual): eviction
-///   requires 16+ intervening ops within the same lease epoch. The fence
-///   epoch is the primary deduplication guard; the op-log is a secondary
-///   defense for in-lease retries only.
-///
-/// ## Preconditions
-///
-/// `payload_hash` must be non-zero (asserted at runtime). A zero hash
-/// indicates the caller failed to compute a hash.
+/// The op-log is bounded to [`ShardRecord::OP_LOG_CAP`] entries. If an
+/// `OpId` has been evicted from the log, this function returns `Ok(None)`
+/// (treats it as new). Callers rely on the fence epoch as the primary
+/// deduplication guard; the op-log is a secondary defense for in-lease
+/// retries only.
 ///
 /// # Errors
 ///
-/// Returns [`CoordError::OpIdConflict`] if the `OpId` was previously used
+/// Returns `CoordError::OpIdConflict` if the `OpId` was previously used
 /// with a different payload hash.
 pub fn check_op_idempotency(
     record: &ShardRecord,
@@ -342,12 +267,11 @@ mod tests {
 
     /// Active record, no lease, fence=INITIAL.
     fn active_unleased_record(slab: &mut ByteSlab) -> ShardRecord {
-        let spec = test_spec();
         ShardRecord::new_active(
             test_tenant(),
             test_run(),
             test_shard(),
-            spec.as_ref(),
+            &test_spec(),
             CursorSemantics::Completed,
             slab,
         )

@@ -359,15 +359,8 @@ fn terminal_clears_lease() {
 fn cursor_semantics_dispatched_through_coordinator() {
     let mut coord = seeded_coordinator_with_semantics(CursorSemantics::Dispatched);
 
-    let mut scratch = crate::coordination::AcquireScratch::new();
     let result = coord
-        .acquire_and_restore_into(
-            now(10),
-            test_tenant(),
-            test_key(),
-            test_worker(1),
-            &mut scratch,
-        )
+        .acquire_and_restore(now(10), test_tenant(), test_key(), test_worker(1))
         .unwrap();
     assert_eq!(
         result.snapshot.cursor_semantics(),
@@ -446,13 +439,10 @@ fn split_coverage_key_range_partition() {
         .unwrap();
     let children = result.into_inner().children;
     assert_eq!(children.len(), 2, "must produce exactly 2 children");
-    let children = children.as_slice();
-    let child_a = children[0];
-    let child_b = children[1];
 
     // Look up each child and verify key ranges.
-    let key_a = ShardKey::new(test_run(), child_a);
-    let key_b = ShardKey::new(test_run(), child_b);
+    let key_a = ShardKey::new(test_run(), children[0]);
+    let key_b = ShardKey::new(test_run(), children[1]);
 
     let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
     let rec_b = coord.shard_lookup(&test_tenant(), &key_b).unwrap();

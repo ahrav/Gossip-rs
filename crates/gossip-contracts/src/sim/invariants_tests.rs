@@ -10,34 +10,11 @@
 //! `seed_shard_unchecked` to construct states production code would reject,
 //! because the goal here is validating checker detection logic, not backend
 //! mutation-path legality.
-//!
-//! # Coverage by invariant
-//!
-//! | Invariant | Tests |
-//! |---|---|
-//! | S1 (MutualExclusion) | Not testable with in-memory backend (structurally impossible) |
-//! | S2 (FenceMonotonicity) | `detects_fence_epoch_regression`, `fence_regression_during_unpark_does_not_double_report` |
-//! | S3 (TerminalIrreversibility) | `detects_terminal_state_reversion`, `detects_split_to_active_reversion`, `parked_to_active_not_flagged_as_terminal_reversion`, `detects_unpark_without_fence_bump` |
-//! | S4 (RecordInvariant) | `detects_record_invariant_violation` |
-//! | S5 (CursorMonotonicity) | `detects_cursor_regression`, `detects_cursor_reset_to_initial` |
-//! | S6 (CursorBounds) | `detects_cursor_above_range`, `detects_cursor_below_range` |
-//! | S7 (SplitCoverage) | `detects_split_no_children`, `detects_split_missing_child`, `detects_split_wrong_parent_ref` |
-//! | S8 (RunTerminalIrreversibility) | Covered by harness-level run-terminal tests |
-//! | S9 (CooldownViolation) | `s9_detects_cooldown_violation`, `s9_vacuously_true_when_disabled`, `s9_allows_claims_beyond_interval`, `s9_independent_per_worker`, `s9_set_cooldown_interval_activates_checking` |
-//! | Cross-cutting | `cross_tenant_isolation_in_temporal_checks`, `prunes_permanently_terminal_shards_from_history` |
-//!
-//! # Test strategy
-//!
-//! Each negative test follows the same pattern: (1) seed a coordinator with
-//! a valid state, (2) run `check_all` to establish checker history, (3)
-//! re-seed with a state that violates the target invariant, (4) assert the
-//! checker detects exactly the expected violation type. This two-pass
-//! approach is necessary because temporal invariants (S2, S3, S5) require
-//! comparing the current state against a previously observed state.
 
 use super::*;
 use crate::coordination::cursor::Cursor;
 use crate::coordination::in_memory::InMemoryCoordinator;
+use crate::coordination::record::ShardRecord;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::derived_shard_id;
 use crate::identity::{LogicalTime, RunId, ShardId, ShardKey, WorkerId};
@@ -49,12 +26,11 @@ use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder};
 fn make_coordinator_with_shard(shard_raw: u64) -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
     let key = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(shard_raw));
-    let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
-    let record = crate::coordination::record::ShardRecord::new_active(
+    let record = ShardRecord::new_active(
         TENANT,
         key.run(),
         key.shard(),
-        spec.as_ref(),
+        &ShardSpec::with_range(vec![b'a'], vec![b'z']),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -414,11 +390,6 @@ fn detects_split_to_active_reversion() {
 }
 
 /// S3: Parked->Active is a legitimate unpark transition, not an S3 violation.
-///
-/// This is the positive complement to `detects_unpark_without_fence_bump`:
-/// when the fence epoch IS bumped (as `unpark_shard` always does), the
-/// Parked->Active transition is the allowed S3 exception and must not
-/// produce any violation.
 #[test]
 fn parked_to_active_not_flagged_as_terminal_reversion() {
     let run = RunId::from_raw(1);
@@ -534,15 +505,9 @@ fn fence_regression_during_unpark_does_not_double_report() {
 }
 
 // -- Pruning: prev_* maps shrink for permanently terminal shards ----------
-//
-// Without pruning, the checker's per-shard history maps would grow
-// unboundedly in simulations with many split cascades. Done and Split
-// shards are permanently terminal (no valid future mutation), so their
-// S2/S5 histories can be discarded. Parked shards are NOT pruned because
-// the Parked->Active unpark path requires continued S3 monitoring.
 
 /// Permanently terminal shards (Done, Split) have their epoch and cursor
-/// history pruned after `check_all`. `prev_terminal` is retained so S3 can
+/// history pruned after check_all. `prev_terminal` is retained so S3 can
 /// still catch illegal reversions. Parked shards are never pruned.
 #[test]
 fn prunes_permanently_terminal_shards_from_history() {
@@ -630,11 +595,6 @@ fn prunes_permanently_terminal_shards_from_history() {
 }
 
 // -- Cross-tenant isolation -----------------------------------------------
-//
-// The checker keys its history maps by (TenantId, RunId, ShardId). If it
-// keyed by (RunId, ShardId) alone, two tenants with the same run/shard
-// IDs would share temporal history, causing false S2 violations when one
-// tenant's fence epoch is lower than the other's.
 
 /// Two tenants sharing the same (RunId, ShardId) must not have their
 /// fence histories cross-contaminate. Advancing tenant A's epoch must
@@ -693,13 +653,7 @@ fn cross_tenant_isolation_in_temporal_checks() {
 }
 
 // -- S9 cooldown spacing ---------------------------------------------------
-//
-// S9 is a push-based check: the harness calls `record_claim_success` on
-// each successful claim, and violations are buffered until the next
-// `check_all`. These tests validate the cooldown interval math, the
-// per-worker independence property, and the disabled-interval shortcut.
 
-/// Gap of 5 ticks < interval of 10 ticks triggers S9.
 #[test]
 fn s9_detects_cooldown_violation() {
     let mut checker = InvariantChecker::with_cooldown_interval(10);
@@ -725,7 +679,6 @@ fn s9_detects_cooldown_violation() {
     ));
 }
 
-/// Cooldown interval of 0 disables S9 entirely (vacuously true).
 #[test]
 fn s9_vacuously_true_when_disabled() {
     let mut checker = InvariantChecker::new();
@@ -741,7 +694,6 @@ fn s9_vacuously_true_when_disabled() {
     );
 }
 
-/// Gap of exactly 10 ticks == interval of 10 ticks: boundary case passes.
 #[test]
 fn s9_allows_claims_beyond_interval() {
     let mut checker = InvariantChecker::with_cooldown_interval(10);
@@ -757,8 +709,6 @@ fn s9_allows_claims_beyond_interval() {
     );
 }
 
-/// Worker 2's claim at t=101 must not affect worker 1's cooldown window.
-/// Only worker 1's rapid re-claim at t=105 (gap=5 < interval=10) violates.
 #[test]
 fn s9_independent_per_worker() {
     let mut checker = InvariantChecker::with_cooldown_interval(10);
@@ -778,9 +728,6 @@ fn s9_independent_per_worker() {
     ));
 }
 
-/// Calling `set_cooldown_interval` mid-flight activates S9 checking.
-/// Claims recorded before activation are not retroactively checked,
-/// but subsequent rapid claims trigger violations.
 #[test]
 fn s9_set_cooldown_interval_activates_checking() {
     let mut checker = InvariantChecker::new();

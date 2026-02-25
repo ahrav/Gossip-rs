@@ -26,28 +26,28 @@
 //! Deterministic unit tests are grouped by the operation they exercise:
 //! acquire, renew, checkpoint, complete, park, split (replace and residual),
 //! fencing, op-log eviction, idempotent replay, tenant isolation, shard
-//! count limits, spawn-cap guards, lease deadline saturation, capacity hints,
-//! constructor equivalence, and memory budget. Two integration tests
-//! (`full_lifecycle_*`, `lifecycle_*`) chain multiple operations to verify
-//! end-to-end shard progression.
+//! count limits, run lifecycle, unpark, and list_shards filtering. Two
+//! integration tests (`full_lifecycle_*`) chain multiple operations to
+//! verify end-to-end shard progression.
 //!
-//! A property-based section fuzzes random operation sequences against the
-//! coordinator, asserting structural invariants (record consistency, fence
-//! monotonicity, cursor monotonicity, idempotent replay) after every step.
+//! The final section contains property-based tests that fuzz random
+//! operation sequences against the coordinator, asserting structural
+//! invariants (record consistency, fence monotonicity, cursor monotonicity,
+//! idempotent replay) after every step.
 
 use super::*;
 use crate::coordination::run::InitialShardInput;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, acquire_result, acquire_shard, derived_shard_id, now, other_tenant,
-    seeded_coordinator, test_cursor, test_key, test_run, test_shard, test_spec,
-    test_split_replace_plan, test_split_residual_plan, test_tenant, test_worker,
+    LEASE_DURATION, acquire_shard, derived_shard_id, now, other_tenant, seeded_coordinator,
+    test_cursor, test_key, test_run, test_shard, test_spec, test_split_replace_plan,
+    test_split_residual_plan, test_tenant, test_worker,
 };
 use crate::identity::FenceEpoch;
 use crate::sim::backend::SimIntrospection;
 use gossip_stdx::RingBuffer;
 
-// -- acquire_and_restore_into tests ------------------------------------
+// -- acquire_and_restore tests ----------------------------------------
 //
 // Validates the shard acquisition contract: successful acquire returns a
 // valid lease (correct owner, fence bumped from INITIAL, deadline =
@@ -58,14 +58,9 @@ use gossip_stdx::RingBuffer;
 #[test]
 fn acquire_basic() {
     let mut coord = seeded_coordinator();
-    let result = acquire_result(
-        &mut coord,
-        now(1),
-        test_tenant(),
-        test_key(),
-        test_worker(1),
-    )
-    .unwrap();
+    let result = coord
+        .acquire_and_restore(now(1), test_tenant(), test_key(), test_worker(1))
+        .unwrap();
 
     assert_eq!(result.lease.owner(), test_worker(1));
     assert_eq!(result.lease.fence(), FenceEpoch::INITIAL.increment());
@@ -79,14 +74,9 @@ fn acquire_basic() {
 #[test]
 fn acquire_not_found() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let err = acquire_result(
-        &mut coord,
-        now(1),
-        test_tenant(),
-        test_key(),
-        test_worker(1),
-    )
-    .unwrap_err();
+    let err = coord
+        .acquire_and_restore(now(1), test_tenant(), test_key(), test_worker(1))
+        .unwrap_err();
     assert!(matches!(err, AcquireError::ShardNotFound { .. }));
 }
 
@@ -95,14 +85,9 @@ fn acquire_already_leased() {
     let mut coord = seeded_coordinator();
     let _lease = acquire_shard(&mut coord, 1, 1);
 
-    let err = acquire_result(
-        &mut coord,
-        now(2),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap_err();
+    let err = coord
+        .acquire_and_restore(now(2), test_tenant(), test_key(), test_worker(2))
+        .unwrap_err();
     assert!(matches!(err, AcquireError::AlreadyLeased { .. }));
 }
 
@@ -112,14 +97,14 @@ fn acquire_after_lease_expiry() {
     let _lease = acquire_shard(&mut coord, 1, 1);
 
     // Advance past lease deadline.
-    let result = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 2),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap();
+    let result = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 2),
+            test_tenant(),
+            test_key(),
+            test_worker(2),
+        )
+        .unwrap();
     assert_eq!(result.lease.owner(), test_worker(2));
 }
 
@@ -179,14 +164,9 @@ fn acquire_terminal_rejected() {
         .complete(now(2), test_tenant(), &lease, cursor, OpId::from_raw(1))
         .unwrap();
 
-    let err = acquire_result(
-        &mut coord,
-        now(3),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap_err();
+    let err = coord
+        .acquire_and_restore(now(3), test_tenant(), test_key(), test_worker(2))
+        .unwrap_err();
     assert!(matches!(err, AcquireError::ShardTerminal { .. }));
 }
 
@@ -213,14 +193,14 @@ fn renew_stale_fence() {
     let old_lease = acquire_shard(&mut coord, 1, 1);
 
     // Another worker acquires, bumping the fence.
-    let _new_lease = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 2),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap();
+    let _new_lease = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 2),
+            test_tenant(),
+            test_key(),
+            test_worker(2),
+        )
+        .unwrap();
 
     let err = coord
         .renew(now(LEASE_DURATION + 3), test_tenant(), &old_lease)
@@ -280,14 +260,9 @@ fn complete_basic() {
     assert!(result.is_executed());
 
     // Shard is now terminal.
-    let err = acquire_result(
-        &mut coord,
-        now(3),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap_err();
+    let err = coord
+        .acquire_and_restore(now(3), test_tenant(), test_key(), test_worker(2))
+        .unwrap_err();
     assert!(matches!(err, AcquireError::ShardTerminal { .. }));
 }
 
@@ -339,14 +314,9 @@ fn split_replace_basic() {
     }
 
     // Parent should be terminal.
-    let err = acquire_result(
-        &mut coord,
-        now(3),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap_err();
+    let err = coord
+        .acquire_and_restore(now(3), test_tenant(), test_key(), test_worker(2))
+        .unwrap_err();
     assert!(matches!(err, AcquireError::ShardTerminal { .. }));
 }
 
@@ -411,18 +381,18 @@ fn split_replace_three_children() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
-    let spec_mid = ShardSpec::with_range(b"m".to_vec(), b"s".to_vec());
-    let spec_left = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec_right = ShardSpec::with_range(b"s".to_vec(), b"z".to_vec());
-    let cursor_mid = Cursor::initial();
-    let cursor_left = Cursor::initial();
-    let cursor_right = Cursor::initial();
     let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(spec_mid.as_ref(), CursorUpdate::from_cursor(&cursor_mid)),
-        SplitReplaceChild::new(spec_left.as_ref(), CursorUpdate::from_cursor(&cursor_left)),
         SplitReplaceChild::new(
-            spec_right.as_ref(),
-            CursorUpdate::from_cursor(&cursor_right),
+            ShardSpec::with_range(b"m".to_vec(), b"s".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"s".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
         ),
     ])
     .unwrap();
@@ -482,14 +452,14 @@ fn split_residual_basic() {
 
     // Parent should still be acquirable (not terminal).
     // But current lease is still active, so we must wait for expiry.
-    let new_result = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 4),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap();
+    let new_result = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 4),
+            test_tenant(),
+            test_key(),
+            test_worker(2),
+        )
+        .unwrap();
     assert_eq!(new_result.snapshot.status(), ShardStatus::Active);
 }
 
@@ -646,15 +616,15 @@ fn only_latest_fence_holder_can_mutate() {
     let old_lease = acquire_shard(&mut coord, 1, 1);
 
     // New worker acquires.
-    let new_lease = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 2),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap()
-    .lease;
+    let new_lease = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 2),
+            test_tenant(),
+            test_key(),
+            test_worker(2),
+        )
+        .unwrap()
+        .lease;
 
     // Old lease: all mutations rejected with StaleFence.
     let err = coord
@@ -926,15 +896,14 @@ fn split_replace_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different plan (different split point).
-    let spec_left = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let spec_right = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
-    let cursor_left = Cursor::initial();
-    let cursor_right = Cursor::initial();
     let plan_b = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(spec_left.as_ref(), CursorUpdate::from_cursor(&cursor_left)),
         SplitReplaceChild::new(
-            spec_right.as_ref(),
-            CursorUpdate::from_cursor(&cursor_right),
+            ShardSpec::with_range(b"a".to_vec(), b"p".to_vec()),
+            Cursor::initial(),
+        ),
+        SplitReplaceChild::new(
+            ShardSpec::with_range(b"p".to_vec(), b"z".to_vec()),
+            Cursor::initial(),
         ),
     ])
     .unwrap();
@@ -972,9 +941,11 @@ fn split_residual_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different plan (different split point).
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let residual = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
-    let plan_b = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
+    let plan_b = SplitResidualPlan::try_new(
+        ShardSpec::with_range(b"a".to_vec(), b"p".to_vec()),
+        ShardSpec::with_range(b"p".to_vec(), b"z".to_vec()),
+    )
+    .unwrap();
 
     let err = coord
         .split_residual(now(4), test_tenant(), &lease, plan_b, op)
@@ -994,8 +965,7 @@ fn split_residual_op_id_conflict() {
 #[test]
 fn acquire_saturates_on_lease_deadline_overflow() {
     let mut coord = seeded_coordinator();
-    let result = acquire_result(
-        &mut coord,
+    let result = coord.acquire_and_restore(
         LogicalTime::from_raw(u64::MAX),
         test_tenant(),
         test_key(),
@@ -1025,12 +995,11 @@ fn split_replace_exceeds_per_tenant_limit() {
     let mut coord = InMemoryCoordinator::with_limits(LEASE_DURATION, 3, 100);
 
     // Seed the target shard.
-    let spec = test_spec();
     let record = ShardRecord::new_active(
         test_tenant(),
         test_run(),
         test_shard(),
-        spec.as_ref(),
+        &test_spec(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1038,23 +1007,21 @@ fn split_replace_exceeds_per_tenant_limit() {
     coord.seed_shard(record);
 
     // Seed two additional shards to fill tenant to limit.
-    let spec2 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
     let record2 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        spec2.as_ref(),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
     .unwrap();
     coord.seed_shard(record2);
-    let spec3 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
     let record3 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
         ShardId::from_raw(30),
-        spec3.as_ref(),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1081,12 +1048,11 @@ fn split_residual_exceeds_global_limit() {
     // Global limit of 2: seed 2 shards, then split_residual wants to add 1 more.
     let mut coord = InMemoryCoordinator::with_limits(LEASE_DURATION, 100, 2);
 
-    let spec = test_spec();
     let record = ShardRecord::new_active(
         test_tenant(),
         test_run(),
         test_shard(),
-        spec.as_ref(),
+        &test_spec(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1094,12 +1060,11 @@ fn split_residual_exceeds_global_limit() {
     coord.seed_shard(record);
 
     // Seed a second shard (different tenant) to fill global limit.
-    let spec2 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
     let record2 = ShardRecord::new_active(
         other_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        spec2.as_ref(),
+        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1144,14 +1109,9 @@ fn split_residual_exceeds_global_limit() {
 #[test]
 fn acquire_wrong_tenant_returns_not_found() {
     let mut coord = seeded_coordinator();
-    let err = acquire_result(
-        &mut coord,
-        now(1),
-        other_tenant(),
-        test_key(),
-        test_worker(1),
-    )
-    .unwrap_err();
+    let err = coord
+        .acquire_and_restore(now(1), other_tenant(), test_key(), test_worker(1))
+        .unwrap_err();
     assert!(
         matches!(err, AcquireError::ShardNotFound { .. }),
         "wrong tenant should see ShardNotFound, got: {err:?}",
@@ -1284,9 +1244,11 @@ fn split_residual_replay_via_oplog_returns_replayed() {
     assert_eq!(first.as_ref().residual, second.as_ref().residual);
 
     // Same op_id, different plan (different split point) — OpIdConflict.
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let residual = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
-    let plan_b = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
+    let plan_b = SplitResidualPlan::try_new(
+        ShardSpec::with_range(b"a".to_vec(), b"p".to_vec()),
+        ShardSpec::with_range(b"p".to_vec(), b"z".to_vec()),
+    )
+    .unwrap();
     let err = coord
         .split_residual(now(5), test_tenant(), &lease, plan_b, op)
         .unwrap_err();
@@ -1402,15 +1364,15 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
     let residual_id = split_result.into_inner().residual;
 
     // Step 4: Parent still Active — re-acquire after lease expiry (worker 2).
-    let lease_w2 = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 4),
-        test_tenant(),
-        test_key(),
-        test_worker(2),
-    )
-    .unwrap()
-    .lease;
+    let lease_w2 = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 4),
+            test_tenant(),
+            test_key(),
+            test_worker(2),
+        )
+        .unwrap()
+        .lease;
 
     // Step 5: Complete parent (t=LEASE_DURATION+5, op_id=30).
     let complete_result = coord
@@ -1426,14 +1388,14 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
 
     // Step 6: Acquire residual child (worker 3).
     let residual_key = ShardKey::new(test_run(), residual_id);
-    let child_result = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 6),
-        test_tenant(),
-        residual_key,
-        test_worker(3),
-    )
-    .unwrap();
+    let child_result = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 6),
+            test_tenant(),
+            residual_key,
+            test_worker(3),
+        )
+        .unwrap();
     // Verify snapshot has the residual range [m, z).
     assert_eq!(
         child_result.snapshot.spec().key_range_start(),
@@ -1469,27 +1431,27 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
     assert!(child_complete.is_executed());
 
     // Step 9: Verify both parent and child are terminal.
-    let parent_err = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 9),
-        test_tenant(),
-        test_key(),
-        test_worker(4),
-    )
-    .unwrap_err();
+    let parent_err = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 9),
+            test_tenant(),
+            test_key(),
+            test_worker(4),
+        )
+        .unwrap_err();
     assert!(
         matches!(parent_err, AcquireError::ShardTerminal { .. }),
         "parent should be terminal, got: {parent_err:?}",
     );
 
-    let child_err = acquire_result(
-        &mut coord,
-        now(LEASE_DURATION + 10),
-        test_tenant(),
-        residual_key,
-        test_worker(4),
-    )
-    .unwrap_err();
+    let child_err = coord
+        .acquire_and_restore(
+            now(LEASE_DURATION + 10),
+            test_tenant(),
+            residual_key,
+            test_worker(4),
+        )
+        .unwrap_err();
     assert!(
         matches!(child_err, AcquireError::ShardTerminal { .. }),
         "child should be terminal, got: {child_err:?}",
@@ -1531,10 +1493,11 @@ fn lifecycle_split_residual_twice_then_complete_children() {
         .unwrap();
 
     // Step 4: split_residual again [a,j) + [j,m) — capture residual_2.
-    let parent_new_2 = ShardSpec::with_range(b"a".to_vec(), b"j".to_vec());
-    let residual_2_spec = ShardSpec::with_range(b"j".to_vec(), b"m".to_vec());
-    let plan2 =
-        SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2_spec.as_ref()).unwrap();
+    let plan2 = SplitResidualPlan::try_new(
+        ShardSpec::with_range(b"a".to_vec(), b"j".to_vec()),
+        ShardSpec::with_range(b"j".to_vec(), b"m".to_vec()),
+    )
+    .unwrap();
     let r2 = coord
         .split_residual(now(5), test_tenant(), &lease, plan2, OpId::from_raw(40))
         .unwrap();
@@ -1553,7 +1516,9 @@ fn lifecycle_split_residual_twice_then_complete_children() {
 
     // Step 6: Acquire + complete residual_1 [m, z).
     let r1_key = ShardKey::new(test_run(), residual_1);
-    let r1_acq = acquire_result(&mut coord, now(7), test_tenant(), r1_key, test_worker(2)).unwrap();
+    let r1_acq = coord
+        .acquire_and_restore(now(7), test_tenant(), r1_key, test_worker(2))
+        .unwrap();
     assert_eq!(r1_acq.snapshot.spec().key_range_start(), b"m".as_slice());
     assert_eq!(r1_acq.snapshot.spec().key_range_end(), b"z".as_slice());
     let _ = coord
@@ -1568,7 +1533,9 @@ fn lifecycle_split_residual_twice_then_complete_children() {
 
     // Step 7: Acquire + complete residual_2 [j, m).
     let r2_key = ShardKey::new(test_run(), residual_2);
-    let r2_acq = acquire_result(&mut coord, now(9), test_tenant(), r2_key, test_worker(3)).unwrap();
+    let r2_acq = coord
+        .acquire_and_restore(now(9), test_tenant(), r2_key, test_worker(3))
+        .unwrap();
     assert_eq!(r2_acq.snapshot.spec().key_range_start(), b"j".as_slice());
     assert_eq!(r2_acq.snapshot.spec().key_range_end(), b"m".as_slice());
     let _ = coord
@@ -1582,21 +1549,18 @@ fn lifecycle_split_residual_twice_then_complete_children() {
         .unwrap();
 
     // Step 8: All three are terminal.
-    let parent_err = acquire_result(
-        &mut coord,
-        now(11),
-        test_tenant(),
-        test_key(),
-        test_worker(4),
-    )
-    .unwrap_err();
+    let parent_err = coord
+        .acquire_and_restore(now(11), test_tenant(), test_key(), test_worker(4))
+        .unwrap_err();
     assert!(matches!(parent_err, AcquireError::ShardTerminal { .. }));
 
-    let r1_err =
-        acquire_result(&mut coord, now(12), test_tenant(), r1_key, test_worker(4)).unwrap_err();
+    let r1_err = coord
+        .acquire_and_restore(now(12), test_tenant(), r1_key, test_worker(4))
+        .unwrap_err();
     assert!(matches!(r1_err, AcquireError::ShardTerminal { .. }));
 
-    let r2_err =
-        acquire_result(&mut coord, now(13), test_tenant(), r2_key, test_worker(4)).unwrap_err();
+    let r2_err = coord
+        .acquire_and_restore(now(13), test_tenant(), r2_key, test_worker(4))
+        .unwrap_err();
     assert!(matches!(r2_err, AcquireError::ShardTerminal { .. }));
 }

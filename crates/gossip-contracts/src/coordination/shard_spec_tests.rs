@@ -131,31 +131,16 @@ fn try_with_range_and_metadata_valid() {
     assert_eq!(spec.metadata(), b"meta");
 }
 
-#[rstest]
-#[case::inverted_range(
-    ShardSpecInputError::InvertedRange { start_len: 3, end_len: 1 },
-    "start must be strictly less than end", "3 bytes", "1 bytes",
-)]
-#[case::key_too_large(
-    ShardSpecInputError::KeyTooLarge { size: 5000, max: 4096 },
-    "5000", "4096", "",
-)]
-#[case::metadata_too_large(
-    ShardSpecInputError::MetadataTooLarge { size: 20000, max: 16384 },
-    "20000", "16384", "",
-)]
-fn shard_spec_input_error_display(
-    #[case] err: ShardSpecInputError,
-    #[case] expected1: &str,
-    #[case] expected2: &str,
-    #[case] expected3: &str,
-) {
+#[test]
+fn shard_spec_input_error_display() {
+    let err = ShardSpecInputError::InvertedRange {
+        start_len: 3,
+        end_len: 1,
+    };
     let msg = err.to_string();
-    assert!(msg.contains(expected1), "expected '{expected1}' in '{msg}'");
-    assert!(msg.contains(expected2), "expected '{expected2}' in '{msg}'");
-    if !expected3.is_empty() {
-        assert!(msg.contains(expected3), "expected '{expected3}' in '{msg}'");
-    }
+    assert!(msg.contains("start must be strictly less than end"));
+    assert!(msg.contains("3 bytes"));
+    assert!(msg.contains("1 bytes"));
 }
 
 // -------------------------------------------------------------------
@@ -213,6 +198,28 @@ fn try_with_range_and_metadata_over_max() {
     );
 }
 
+#[test]
+fn shard_spec_input_error_display_key_too_large() {
+    let err = ShardSpecInputError::KeyTooLarge {
+        size: 5000,
+        max: 4096,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("5000"));
+    assert!(msg.contains("4096"));
+}
+
+#[test]
+fn shard_spec_input_error_display_metadata_too_large() {
+    let err = ShardSpecInputError::MetadataTooLarge {
+        size: 20000,
+        max: 16384,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("20000"));
+    assert!(msg.contains("16384"));
+}
+
 // -------------------------------------------------------------------
 // Split validation
 // -------------------------------------------------------------------
@@ -223,6 +230,15 @@ fn split_valid_two_way() {
     let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
     let c2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
     assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
+}
+
+#[test]
+fn split_valid_three_way() {
+    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
+    let c2 = ShardSpec::with_range(b"g".to_vec(), b"p".to_vec());
+    let c3 = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+    assert!(validate_split_coverage(&parent, &[&c1, &c2, &c3]).is_ok());
 }
 
 #[test]
@@ -596,34 +612,6 @@ proptest! {
         prop_assert_eq!(try_result, Ok(direct));
     }
 
-    // -- Canonical hash consistency: ShardSpec and ShardSpecRef produce
-    //    the same digest for the same logical value.
-
-    #[test]
-    fn shard_spec_and_ref_canonical_hash_consistent(
-        spec in arb_shard_spec(),
-    ) {
-        let owned_digest = canonical_digest(&spec);
-        let ref_digest = canonical_digest(&spec.as_ref());
-        prop_assert_eq!(
-            owned_digest, ref_digest,
-            "ShardSpec and ShardSpecRef must produce identical canonical digests"
-        );
-    }
-
-    // -- Round-trip: try_from_ref(spec.as_ref()) recovers the original.
-
-    #[test]
-    fn try_from_ref_round_trip(
-        spec in arb_shard_spec(),
-    ) {
-        let reconstructed = ShardSpec::try_from_ref(spec.as_ref()).unwrap();
-        prop_assert_eq!(
-            spec, reconstructed,
-            "ShardSpec::try_from_ref must round-trip through as_ref"
-        );
-    }
-
     // -- Metadata distinction: different metadata → different digest -----
 
     #[test]
@@ -643,183 +631,4 @@ proptest! {
             );
         }
     }
-}
-
-// -------------------------------------------------------------------
-// Split coverage rejects oversized child specs
-// -------------------------------------------------------------------
-
-// -------------------------------------------------------------------
-// ShardArena
-// -------------------------------------------------------------------
-
-/// Helper: create a small arena suitable for unit tests.
-fn test_arena(slots: usize, bytes: usize) -> ShardArena {
-    ShardArena::with_capacity(slots, bytes)
-}
-
-#[test]
-fn arena_basic_alloc_view_free_cycle() {
-    let mut arena = test_arena(4, 4096);
-    let spec = ShardSpecRef::new(b"a", b"z", b"meta");
-    let handle = arena.alloc_spec(spec).unwrap();
-    let view = arena.view_spec(&handle);
-    assert_eq!(view.key_range_start(), b"a");
-    assert_eq!(view.key_range_end(), b"z");
-    assert_eq!(view.metadata(), b"meta");
-    arena.free_spec(handle);
-}
-
-#[test]
-fn arena_slot_exhaustion_returns_slab_full() {
-    let mut arena = test_arena(2, 4096);
-    let spec = ShardSpecRef::new(b"a", b"z", &[]);
-    let h1 = arena.alloc_spec(spec).unwrap();
-    let h2 = arena.alloc_spec(spec).unwrap();
-    let err = arena.alloc_spec(spec).unwrap_err();
-    assert_eq!(
-        err,
-        SlabFull {
-            requested: 1,
-            available: 0
-        }
-    );
-    // Free all specs before drop to satisfy ByteSlab leak detector.
-    arena.free_spec(h1);
-    arena.free_spec(h2);
-}
-
-#[test]
-fn arena_byte_capacity_exhaustion_returns_slab_full() {
-    // Very small byte capacity: not enough for even one spec.
-    let mut arena = test_arena(4, 1);
-    let spec = ShardSpecRef::new(b"a", b"z", b"metadata_payload");
-    assert!(arena.alloc_spec(spec).is_err());
-}
-
-#[test]
-#[should_panic(expected = "stale handle generation")]
-fn arena_stale_handle_view_spec_panics() {
-    let mut arena = test_arena(4, 4096);
-    let spec = ShardSpecRef::new(b"a", b"z", &[]);
-    let handle = arena.alloc_spec(spec).unwrap();
-    arena.free_spec(handle);
-    // handle is now stale (generation incremented)
-    let _ = arena.view_spec(&handle);
-}
-
-#[test]
-fn arena_stale_handle_free_spec_is_silent() {
-    let mut arena = test_arena(4, 4096);
-    let spec = ShardSpecRef::new(b"a", b"z", &[]);
-    let handle = arena.alloc_spec(spec).unwrap();
-    arena.free_spec(handle);
-    // Double-free with stale handle should be silently ignored.
-    arena.free_spec(handle);
-}
-
-#[test]
-fn arena_slot_reuse_after_free() {
-    let mut arena = test_arena(1, 4096);
-    let spec1 = ShardSpecRef::new(b"a", b"m", &[]);
-    let h1 = arena.alloc_spec(spec1).unwrap();
-    arena.free_spec(h1);
-
-    // The single slot is free again — a new alloc should succeed.
-    let spec2 = ShardSpecRef::new(b"m", b"z", b"different");
-    let h2 = arena.alloc_spec(spec2).unwrap();
-    let view = arena.view_spec(&h2);
-    assert_eq!(view.key_range_start(), b"m");
-    assert_eq!(view.key_range_end(), b"z");
-    assert_eq!(view.metadata(), b"different");
-    arena.free_spec(h2);
-}
-
-#[test]
-#[should_panic(expected = "invalid slot")]
-fn arena_invalid_slot_index_panics() {
-    let arena = test_arena(2, 4096);
-    let bogus = ShardSpecHandle {
-        slot: 999,
-        generation: 0,
-    };
-    let _ = arena.view_spec(&bogus);
-}
-
-#[test]
-fn arena_rollback_on_slab_byte_exhaustion() {
-    // 2 slots, but only enough bytes for one spec.
-    let mut arena = test_arena(2, 64);
-    let small = ShardSpecRef::new(b"a", b"b", &[]);
-    let h1 = arena.alloc_spec(small).unwrap();
-
-    // Second alloc exceeds byte capacity — should fail and
-    // return the slot to the free list.
-    let large = ShardSpecRef::new(b"a", b"z", &[0xAA; 200]);
-    assert!(arena.alloc_spec(large).is_err());
-
-    // The slot should have been returned, so a small alloc succeeds.
-    let h2 = arena.alloc_spec(small).unwrap();
-
-    // Free all specs before drop to satisfy ByteSlab leak detector.
-    arena.free_spec(h1);
-    arena.free_spec(h2);
-}
-
-// -------------------------------------------------------------------
-// validate_ref error paths
-// -------------------------------------------------------------------
-
-#[rstest]
-#[case::oversized_start_key(
-    vec![0x01; MAX_KEY_SIZE + 1], b"z".to_vec(), vec![],
-    ShardSpecInputError::KeyTooLarge { size: MAX_KEY_SIZE + 1, max: MAX_KEY_SIZE },
-)]
-#[case::oversized_end_key(
-    b"a".to_vec(), vec![0xFF; MAX_KEY_SIZE + 1], vec![],
-    ShardSpecInputError::KeyTooLarge { size: MAX_KEY_SIZE + 1, max: MAX_KEY_SIZE },
-)]
-#[case::oversized_metadata(
-    b"a".to_vec(), b"z".to_vec(), vec![0xAA; MAX_METADATA_SIZE + 1],
-    ShardSpecInputError::MetadataTooLarge { size: MAX_METADATA_SIZE + 1, max: MAX_METADATA_SIZE },
-)]
-#[case::inverted_range(
-    b"z".to_vec(), b"a".to_vec(), vec![],
-    ShardSpecInputError::InvertedRange { start_len: 1, end_len: 1 },
-)]
-fn validate_ref_rejects_invalid_spec(
-    #[case] start: Vec<u8>,
-    #[case] end: Vec<u8>,
-    #[case] metadata: Vec<u8>,
-    #[case] expected: ShardSpecInputError,
-) {
-    let spec = ShardSpecRef::new(&start, &end, &metadata);
-    let err = ShardSpec::validate_ref(spec).unwrap_err();
-    assert_eq!(err, expected);
-}
-
-#[test]
-fn validate_ref_accepts_valid_spec() {
-    let spec = ShardSpecRef::new(b"a", b"z", b"meta");
-    assert!(ShardSpec::validate_ref(spec).is_ok());
-}
-
-// -------------------------------------------------------------------
-// Split coverage rejects oversized child specs
-// -------------------------------------------------------------------
-
-#[test]
-fn split_coverage_rejects_child_with_oversized_metadata() {
-    // Children with valid key ranges but oversized metadata should be
-    // rejected by split coverage validation to prevent downstream
-    // panics in AcquireScratch::write_spec.
-    let oversized_meta = vec![0xAA; MAX_METADATA_SIZE + 1];
-    let child1 = ShardSpecRef::new(b"a", b"m", &oversized_meta);
-    let child2 = ShardSpecRef::new(b"m", b"z", &[]);
-    let result = validate_split_coverage_bounds(b"a", b"z", &[child1, child2]);
-    assert!(
-        result.is_err(),
-        "validate_split_coverage_bounds should reject children with metadata \
-         exceeding MAX_METADATA_SIZE",
-    );
 }

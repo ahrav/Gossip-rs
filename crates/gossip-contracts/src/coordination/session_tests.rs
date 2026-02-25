@@ -1,47 +1,3 @@
-//! Tests for [`WorkerSession`], the RAII handle that binds a worker to a shard.
-//!
-//! `WorkerSession` wraps an acquired lease and a cached `ShardSnapshot`, then
-//! delegates every operation (checkpoint, complete, park, split, renew) to the
-//! backend while keeping the cached snapshot consistent. This module verifies
-//! that the session wrapper faithfully threads operations through to the backend
-//! and maintains its internal state correctly, including after errors.
-//!
-//! # Coverage Areas
-//!
-//! - **Happy-path operations**: session creation, checkpoint, complete, park,
-//!   split_replace, split_residual, renew. Each verifies the operation succeeds
-//!   and that the session's observable state (lease, spec, cursor, capacity) is
-//!   consistent afterward.
-//!
-//! - **Ownership semantics**: `complete`, `park`, and `split_replace` consume
-//!   the session (move semantics), while `split_residual`, `checkpoint`, and
-//!   `renew` borrow mutably and keep the session usable.
-//!
-//! - **Error propagation**: `LeaseExpired`, `AlreadyLeased`, and `StaleFence`
-//!   errors from the backend surface through the session API without wrapping.
-//!
-//! - **Snapshot integrity**: checkpoint does not update the cached snapshot;
-//!   failed `split_residual` does not corrupt it; replayed `split_residual`
-//!   does not double-rebuild it; successive splits accumulate spawned entries
-//!   correctly.
-//!
-//! - **Idempotency**: replayed checkpoint returns `Replayed`; replayed
-//!   complete returns `Replayed` (tested via raw backend after consume).
-//!   Op-log eviction fallback for split_residual also returns `Replayed`.
-//!
-//! - **Crash recovery**: dropping a session without a terminal op, then
-//!   re-acquiring after lease expiry, restores the checkpointed cursor.
-//!
-//! - **Lease renewal invariants**: renew advances the deadline without changing
-//!   the fence epoch; duplicate same-tick renewals are harmless.
-//!
-//! - **Capacity hints**: session reports correct available/saturated counts
-//!   after acquisition and after renewal.
-//!
-//! - **Property test**: random Renew/Checkpoint/SplitResidual sequences
-//!   preserve identity invariants (tenant, worker, shard_key never change)
-//!   and terminate cleanly with complete.
-
 use super::*;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
@@ -103,12 +59,6 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
             )
         })
         .collect();
-    let shards: Vec<InitialShardInput<'_>> = shard_entries
-        .iter()
-        .map(|(shard, spec, cursor)| {
-            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-        })
-        .collect();
 
     let _ = coord
         .register_shards(now(1), tenant, run, &inputs, OpId::from_raw(100))
@@ -121,15 +71,6 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
     (coord, keys)
 }
 
-// ============================================================================
-// Happy-path operations
-//
-// Each test exercises one session method and verifies success plus the
-// session's observable state afterward.
-// ============================================================================
-
-/// Session creation acquires the shard and populates identity fields
-/// (tenant, worker, shard_key) and the initial snapshot (spec, cursor).
 #[test]
 fn new_ok() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -146,9 +87,6 @@ fn new_ok() {
     );
 }
 
-/// `complete` consumes the session by move; the shard transitions to Done.
-/// After this call, the session variable is no longer usable (enforced by
-/// Rust's ownership system).
 #[test]
 fn complete_consumes() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -161,9 +99,6 @@ fn complete_consumes() {
     assert!(result.is_ok());
 }
 
-/// `split_residual` borrows the session mutably and keeps it usable.
-/// After the split, the session's spec reflects the narrowed parent range,
-/// and further operations (checkpoint) work within the new bounds.
 #[test]
 fn split_residual_keeps_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -175,8 +110,7 @@ fn split_residual_keeps_session() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan = SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec).unwrap();
 
     let result = session.split_residual(now(3), plan, OpId::from_raw(300));
     assert!(result.is_ok());
@@ -191,9 +125,6 @@ fn split_residual_keeps_session() {
     assert_eq!(session.spec().key_range_end(), &[0x20]);
 }
 
-/// `renew` extends the lease deadline without creating a new session.
-/// The internal lease handle is updated so subsequent operations see the
-/// new deadline.
 #[test]
 fn renew_updates_internal_deadline() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -208,7 +139,6 @@ fn renew_updates_internal_deadline() {
     assert!(new_deadline > old_deadline);
 }
 
-/// `park` consumes the session by move, transitioning the shard to Parked.
 #[test]
 fn park_consumes_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -219,8 +149,6 @@ fn park_consumes_session() {
     assert!(result.is_ok());
 }
 
-/// `split_replace` consumes the session by move. The parent transitions to
-/// Split, and the returned outcome contains the newly created child shard IDs.
 #[test]
 fn split_replace_consumes_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -232,18 +160,11 @@ fn split_replace_consumes_session() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let child2_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let child1_cursor = Cursor::initial();
-    let child2_cursor = Cursor::initial();
 
+    use crate::coordination::split::SplitReplaceChild;
     let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(
-            child1_spec.as_ref(),
-            CursorUpdate::from_cursor(&child1_cursor),
-        ),
-        SplitReplaceChild::new(
-            child2_spec.as_ref(),
-            CursorUpdate::from_cursor(&child2_cursor),
-        ),
+        SplitReplaceChild::new(child1_spec, Cursor::initial()),
+        SplitReplaceChild::new(child2_spec, Cursor::initial()),
     ])
     .unwrap();
 
@@ -255,8 +176,6 @@ fn split_replace_consumes_session() {
     }
 }
 
-/// Checkpoint through the session returns `Executed` on first call and
-/// delegates successfully to the backend.
 #[test]
 fn checkpoint_advances_cursor_via_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -287,8 +206,7 @@ fn split_residual_replayed_does_not_rebuild_snapshot() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
 
     // First call: Executed — snapshot is rebuilt with narrowed range.
-    let plan1 =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan1 = SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec.clone()).unwrap();
     let op = OpId::from_raw(700);
     let r1 = session.split_residual(now(3), plan1, op).unwrap();
     assert!(r1.is_executed());
@@ -298,8 +216,7 @@ fn split_residual_replayed_does_not_rebuild_snapshot() {
     assert_eq!(spawned_after_first.len(), 1);
 
     // Second call with same OpId: Replayed — snapshot must NOT change.
-    let plan2 =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan2 = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
     let r2 = session.split_residual(now(4), plan2, op).unwrap();
     assert!(r2.is_replay());
 
@@ -323,8 +240,7 @@ fn split_residual_replayed_after_oplog_eviction() {
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
     let split_op = OpId::from_raw(700);
-    let plan =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan = SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec.clone()).unwrap();
     let r = session.split_residual(now(3), plan, split_op).unwrap();
     assert!(r.is_executed(), "first call must be Executed");
 
@@ -343,8 +259,7 @@ fn split_residual_replayed_after_oplog_eviction() {
 
     // Retry split_residual with the same OpId — op-log entry is
     // evicted, but the spawned-probe fallback detects the residual.
-    let plan2 =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan2 = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
     let r2 = session.split_residual(now(t), plan2, split_op).unwrap();
     assert!(
         r2.is_replay(),
@@ -413,8 +328,7 @@ fn checkpoint_after_split_validates_narrowed_bounds() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
     let _ = session
         .split_residual(now(3), plan, OpId::from_raw(800))
         .unwrap();
@@ -472,7 +386,9 @@ fn already_leased_rejected_through_session() {
     let (mut coord, keys) = setup_coordinator(1);
 
     // Worker 1 acquires via raw backend call (borrow released on return).
-    let _w1 = acquire_result(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+    let _w1 = coord
+        .acquire_and_restore(now(2), test_tenant(), keys[0], test_worker(1))
+        .unwrap();
 
     // Worker 2 tries to create a session on the same shard.
     match WorkerSession::new(&mut coord, now(3), test_tenant(), keys[0], test_worker(2)) {
@@ -628,8 +544,7 @@ fn split_residual_error_does_not_corrupt_snapshot() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan =
-        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+    let plan = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
     let err = session.split_residual(now(50), plan, OpId::from_raw(900));
     assert!(
         err.is_err(),
@@ -672,10 +587,11 @@ fn successive_split_residual_accumulates_spawned() {
     let mut session = WorkerSession::new(&mut coord, now(2), tenant, key, test_worker(1)).unwrap();
 
     // First split: [0x00, 0x60) -> [0x00, 0x40) + residual [0x40, 0x60).
-    let parent_new_1 =
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x40]);
-    let residual_1 = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x40], vec![0x60]);
-    let plan1 = SplitResidualPlan::try_new(parent_new_1.as_ref(), residual_1.as_ref()).unwrap();
+    let plan1 = SplitResidualPlan::try_new(
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x40]),
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x40], vec![0x60]),
+    )
+    .unwrap();
     let r1 = session
         .split_residual(now(3), plan1, OpId::from_raw(300))
         .unwrap();
@@ -684,10 +600,11 @@ fn successive_split_residual_accumulates_spawned() {
     assert_eq!(session.initial_snapshot().spawned().len(), 1);
 
     // Second split: [0x00, 0x40) -> [0x00, 0x20) + residual [0x20, 0x40).
-    let parent_new_2 =
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
-    let residual_2 = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan2 = SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2.as_ref()).unwrap();
+    let plan2 = SplitResidualPlan::try_new(
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]),
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]),
+    )
+    .unwrap();
     let r2 = session
         .split_residual(now(4), plan2, OpId::from_raw(301))
         .unwrap();
@@ -817,7 +734,8 @@ proptest! {
                             vec![mid],
                             vec![range_end],
                         );
-                    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
+                    let plan =
+                        SplitResidualPlan::try_new(parent_new, residual).unwrap();
                     let result = session
                         .split_residual(now(t), plan, OpId::from_raw(op_counter))
                         .map_err(|e| {
@@ -847,10 +765,7 @@ proptest! {
     }
 }
 
-// -- Capacity hint tests -----------------------------------------------
-//
-// The capacity hint tells a worker how many shards remain available in the
-// run, enabling back-pressure and scheduling decisions.
+// -- capacity hint tests --
 
 /// After acquiring one of two shards, the session's capacity hint
 /// shows the remaining shard as available.
