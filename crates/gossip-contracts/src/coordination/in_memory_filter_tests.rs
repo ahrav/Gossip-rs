@@ -36,6 +36,13 @@ fn list_shards_with_filter(
     filter: ShardFilter,
     out: &mut Vec<ShardSummary>,
 ) {
+    let required = coord
+        .run_shards
+        .get(&(test_tenant(), test_run()))
+        .map_or(0, |ids| ids.len());
+    if out.capacity() < required {
+        out.reserve(required - out.capacity());
+    }
     coord
         .list_shards_into(at, test_tenant(), test_run(), filter, out)
         .unwrap();
@@ -1030,17 +1037,21 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The planning formula uses 8912 for ShardRecord and 512 for RunRecord.
-    // These are documented in `CoordinatorConfig::memory_budget()`.
+    // The planning formula uses constants from in_memory.rs; keep them in
+    // lockstep with the actual target layout.
     // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
-        shard_size, 8912,
-        "ShardRecord size changed from 8912 to {shard_size}; \
-         update the constant in CoordinatorConfig::memory_budget()"
+        shard_size,
+        super::SHARD_RECORD_PLANNING_BYTES,
+        "ShardRecord size changed from {} to {shard_size}; \
+         update SHARD_RECORD_PLANNING_BYTES in CoordinatorConfig::memory_budget()",
+        super::SHARD_RECORD_PLANNING_BYTES,
     );
     assert_eq!(
-        run_size, 512,
-        "RunRecord size changed from 512 to {run_size}; \
-         update the constant in CoordinatorConfig::memory_budget()"
+        run_size,
+        super::RUN_RECORD_PLANNING_BYTES,
+        "RunRecord size changed from {} to {run_size}; \
+         update RUN_RECORD_PLANNING_BYTES in CoordinatorConfig::memory_budget()",
+        super::RUN_RECORD_PLANNING_BYTES,
     );
 }

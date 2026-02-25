@@ -600,6 +600,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
                 new_spec.metadata(),
             );
             self.snapshot.spawned.push(res.residual);
+            self.snapshot
+                .scratch
+                .write_spawned_iter(self.snapshot.spawned.iter().copied());
             debug_assert_eq!(
                 self.snapshot.status,
                 ShardStatus::Active,

@@ -160,6 +160,12 @@ const TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 32;
 const RUN_SHARD_SET_INITIAL_CAPACITY: usize = 8;
 const DEFAULT_MAX_SHARDS_PER_TENANT: usize = 100_000;
 const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
+const SHARD_RECORD_PLANNING_BYTES: usize = 728;
+const RUN_RECORD_PLANNING_BYTES: usize = 512;
+const SHARD_ENTRY_OVERHEAD_BYTES: usize = 72;
+const RUN_ENTRY_OVERHEAD_BYTES: usize = 80;
+const WORKER_COOLDOWN_ENTRY_BYTES: usize = 16;
+const COORDINATOR_BASE_BYTES: usize = 4096;
 
 #[inline]
 fn ahash_map_with_capacity<K, V>(capacity: usize) -> AHashMap<K, V> {
@@ -399,21 +405,22 @@ impl CoordinatorConfig {
 
     /// Estimate planning memory budget in bytes.
     ///
-    /// Formula: `M = S * (8912 + B_s + 72) + R * (512 + B_r + 80) + W * 16 + 4096`
+    /// Formula:
+    /// `M = S * (SR + B_s + SO) + R * (RR + B_r + RO) + W * WC + CB`
     ///
     /// Where:
     /// - `S` = `max_total_shards`, `B_s` = `per_shard_budget`
     /// - `R` = `max_runs`, `B_r` = `per_run_budget`
     /// - `W` = `max_workers`
-    /// - 8912 = `size_of::<ShardRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
-    /// - 72 = per-entry HashMap overhead (key + bucket metadata)
-    /// - 512 = `size_of::<RunRecord>()` (validated by `memory_budget_constants_match_struct_sizes`)
-    /// - 80 = per-entry HashMap overhead for run entries
-    /// - 16 = per-entry in claim_cooldowns
-    /// - 4096 = base coordinator struct + map headers
+    /// - `SR` = [`SHARD_RECORD_PLANNING_BYTES`]
+    /// - `SO` = [`SHARD_ENTRY_OVERHEAD_BYTES`]
+    /// - `RR` = [`RUN_RECORD_PLANNING_BYTES`]
+    /// - `RO` = [`RUN_ENTRY_OVERHEAD_BYTES`]
+    /// - `WC` = [`WORKER_COOLDOWN_ENTRY_BYTES`]
+    /// - `CB` = [`COORDINATOR_BASE_BYTES`]
     ///
     /// Assumptions:
-    /// - Struct-size constants (`8912`, `512`) match this target's layout
+    /// - Struct-size constants (`SR`, `RR`) match this target's layout
     ///   (validated by `memory_budget_constants_match_struct_sizes`).
     /// - HashMap overhead terms (`72`, `80`, `16`) are modeling estimates
     ///   for current key/bucket metadata behavior.
@@ -430,20 +437,21 @@ impl CoordinatorConfig {
     /// overflows `usize`.
     #[must_use]
     pub const fn memory_budget(&self) -> usize {
-        let per_shard_base = match 8912usize.checked_add(self.per_shard_budget) {
+        let per_shard_base = match SHARD_RECORD_PLANNING_BYTES.checked_add(self.per_shard_budget)
+        {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: per-shard base"),
         };
-        let per_shard = match per_shard_base.checked_add(72) {
+        let per_shard = match per_shard_base.checked_add(SHARD_ENTRY_OVERHEAD_BYTES) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: per-shard overhead"),
         };
 
-        let per_run_base = match 512usize.checked_add(self.per_run_budget) {
+        let per_run_base = match RUN_RECORD_PLANNING_BYTES.checked_add(self.per_run_budget) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: per-run base"),
         };
-        let per_run = match per_run_base.checked_add(80) {
+        let per_run = match per_run_base.checked_add(RUN_ENTRY_OVERHEAD_BYTES) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: per-run overhead"),
         };
@@ -456,7 +464,10 @@ impl CoordinatorConfig {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: run contribution"),
         };
-        let worker_bytes = match self.max_workers.checked_mul(16) {
+        let worker_bytes = match self
+            .max_workers
+            .checked_mul(WORKER_COOLDOWN_ENTRY_BYTES)
+        {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: worker contribution"),
         };
@@ -469,7 +480,7 @@ impl CoordinatorConfig {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: shard+run+worker total"),
         };
-        match with_workers.checked_add(4096) {
+        match with_workers.checked_add(COORDINATOR_BASE_BYTES) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: final total"),
         }

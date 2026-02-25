@@ -37,7 +37,7 @@
 use super::*;
 use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::run::{
-    InitialShardInput, RunConfig, RunManagement, RunStatus, ShardFilter,
+    InitialShardInput, RunConfig, RunManagement, RunStatus, ShardFilter, ShardSummary,
 };
 use crate::coordination::shard_spec::{CursorSemantics, ShardLimitScope, ShardSpec};
 use crate::coordination::test_fixtures::{
@@ -47,6 +47,24 @@ use crate::coordination::test_fixtures::{
 use crate::identity::{FenceEpoch, OpId, RunId, ShardId, ShardKey};
 use crate::sim::backend::SimIntrospection;
 use rstest::rstest;
+
+fn list_shards_for_run(
+    coord: &InMemoryCoordinator,
+    at: LogicalTime,
+    filter: ShardFilter,
+    out: &mut Vec<ShardSummary>,
+) {
+    let required = coord
+        .run_shards
+        .get(&(test_tenant(), test_run()))
+        .map_or(0, |ids| ids.len());
+    if out.capacity() < required {
+        out.reserve(required - out.capacity());
+    }
+    coord
+        .list_shards_into(at, test_tenant(), test_run(), filter, out)
+        .unwrap();
+}
 
 // -- Split index consistency tests --
 //
@@ -77,15 +95,7 @@ fn split_replace_children_visible_in_list_shards() {
     do_split_replace(&mut coord, &lease);
 
     let mut all = Vec::new();
-    coord
-        .list_shards_into(
-            now(5),
-            test_tenant(),
-            test_run(),
-            ShardFilter::all(),
-            &mut all,
-        )
-        .unwrap();
+    list_shards_for_run(&coord, now(5), ShardFilter::all(), &mut all);
     assert!(
         all.len() == 3,
         "expected 3 shards in listing (parent + 2 children), got {}",
@@ -121,15 +131,7 @@ fn split_residual_child_visible_in_list_shards() {
         .unwrap();
 
     let mut all = Vec::new();
-    coord
-        .list_shards_into(
-            now(6),
-            test_tenant(),
-            test_run(),
-            ShardFilter::all(),
-            &mut all,
-        )
-        .unwrap();
+    list_shards_for_run(&coord, now(6), ShardFilter::all(), &mut all);
     assert!(
         all.len() == 2,
         "expected 2 shards (parent + residual), got {}",
@@ -308,15 +310,7 @@ fn coordinator_with_split_children_for_watermark()
         .unwrap();
 
     let mut active_children = Vec::new();
-    coord
-        .list_shards_into(
-            now(6),
-            test_tenant(),
-            test_run(),
-            ShardFilter::active(),
-            &mut active_children,
-        )
-        .unwrap();
+    list_shards_for_run(&coord, now(6), ShardFilter::active(), &mut active_children);
     assert_eq!(active_children.len(), 3);
 
     let child_done = active_children
@@ -1460,15 +1454,7 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
 
     // No shards should have been inserted.
     let mut summaries = Vec::new();
-    coord
-        .list_shards_into(
-            now(3),
-            test_tenant(),
-            test_run(),
-            ShardFilter::all(),
-            &mut summaries,
-        )
-        .unwrap();
+    list_shards_for_run(&coord, now(3), ShardFilter::all(), &mut summaries);
     assert!(summaries.is_empty(), "failed registration inserted shards");
     assert_eq!(
         coord.shard_count(),
