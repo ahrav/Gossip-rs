@@ -698,7 +698,7 @@ fn arena_byte_capacity_exhaustion_returns_slab_full() {
 }
 
 #[test]
-#[should_panic(expected = "stale handle generation")]
+#[should_panic(expected = "invalid, stale, or freed handle")]
 fn arena_stale_handle_view_spec_panics() {
     let mut arena = test_arena(4, 4096);
     let spec = ShardSpecRef::new(b"a", b"z", &[]);
@@ -736,7 +736,7 @@ fn arena_slot_reuse_after_free() {
 }
 
 #[test]
-#[should_panic(expected = "invalid slot")]
+#[should_panic(expected = "invalid, stale, or freed handle")]
 fn arena_invalid_slot_index_panics() {
     let arena = test_arena(2, 4096);
     let bogus = ShardSpecHandle {
