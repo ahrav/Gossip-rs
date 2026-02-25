@@ -119,15 +119,12 @@ impl From<GetRunError> for CreateRunError {
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegisterShardsError {
+    /// The specified run does not exist for this tenant.
     RunNotFound,
     /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
-    TenantMismatch {
-        expected: TenantId,
-    },
+    TenantMismatch { expected: TenantId },
     /// Run is not in `Initializing` status.
-    WrongStatus {
-        status: RunStatus,
-    },
+    WrongStatus { status: RunStatus },
     /// Manifest validation failed.
     ManifestInvalid(ManifestValidationError),
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
@@ -145,9 +142,7 @@ pub enum RegisterShardsError {
     ResourceExhausted(SlabFull),
     /// Coordinator index/map capacity could not be expanded for this request.
     /// Recoverable: retry with a larger runtime capacity budget.
-    CapacityExceeded {
-        resource: &'static str,
-    },
+    CapacityExceeded { resource: &'static str },
 }
 
 impl fmt::Debug for RegisterShardsError {
@@ -241,11 +236,10 @@ impl From<SlabFull> for RegisterShardsError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GetRunError {
+    /// The specified run does not exist for this tenant.
     RunNotFound,
     /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
-    TenantMismatch {
-        expected: TenantId,
-    },
+    TenantMismatch { expected: TenantId },
 }
 
 impl fmt::Display for GetRunError {
@@ -275,15 +269,12 @@ impl std::error::Error for GetRunError {}
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RunTransitionError {
+    /// The specified run does not exist for this tenant.
     RunNotFound,
     /// Tenant isolation violation. Only `expected` is exposed (tenant isolation).
-    TenantMismatch {
-        expected: TenantId,
-    },
+    TenantMismatch { expected: TenantId },
     /// Run is already in a terminal state.
-    RunTerminal {
-        status: RunStatus,
-    },
+    RunTerminal { status: RunStatus },
     /// Run is not in the required status for this transition.
     ///
     /// `target` is the terminal status the caller attempted to transition to,

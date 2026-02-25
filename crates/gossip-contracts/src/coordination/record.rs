@@ -534,7 +534,8 @@ impl ShardRecord {
         self.assert_lineage_invariants(slab);
     }
 
-    /// INV-1 through INV-5: status, park_reason, lease, fence, op-log cap.
+    /// Assert INV-1 through INV-5: status/park_reason consistency, terminal
+    /// shards unleased, fence epoch minimum, and op-log capacity bound.
     fn assert_lifecycle_invariants(&self) {
         // INV-1: park_reason consistency.
         match self.status {
@@ -585,8 +586,9 @@ impl ShardRecord {
         );
     }
 
-    /// INV-6 through INV-10: split/spawned, parent/derived (biconditional),
-    /// op-log uniqueness, spawned cap.
+    /// Assert INV-6 through INV-10: split implies spawned non-empty,
+    /// parent/derived biconditional, all spawned are derived, op-log
+    /// `OpId` uniqueness, and spawned count cap.
     fn assert_lineage_invariants(&self, slab: &ByteSlab) {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split {
