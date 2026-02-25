@@ -211,20 +211,21 @@ fn build_inputs_on_empty_builder_returns_manifest_empty() {
 #[test]
 fn config_rejects_zero_entry_limit() {
     let mut arena = ShardArena::with_capacity(4, 4_096);
-    let err = PreallocShardBuilder::<4>::new(&mut arena, 0).unwrap_err();
-    assert_eq!(err, PreallocShardBuilderError::EntryLimitZero);
+    assert!(matches!(
+        PreallocShardBuilder::<4>::new(&mut arena, 0),
+        Err(PreallocShardBuilderError::EntryLimitZero)
+    ));
 }
 
 #[test]
 fn config_rejects_entry_limit_exceeding_cap() {
     let mut arena = ShardArena::with_capacity(4, 4_096);
-    let err = PreallocShardBuilder::<2>::new(&mut arena, 4).unwrap_err();
     assert!(matches!(
-        err,
-        PreallocShardBuilderError::CapMismatch {
+        PreallocShardBuilder::<2>::new(&mut arena, 4),
+        Err(PreallocShardBuilderError::CapMismatch {
             entry_limit: 4,
             cap: 2
-        }
+        })
     ));
 }
 
@@ -290,13 +291,14 @@ fn add_manifest_with_cursor_preserves_initial_cursor() {
 
 #[test]
 fn add_manifest_with_cursor_preserves_explicit_cursor() {
-    let mut arena = ShardArena::with_capacity(4, 2_048);
-    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     // Manifest key encoding: BE(manifest_id) ++ BE(row), 16 bytes total.
     // For manifest_id=7, row range [0, 10), a cursor at row=5 is in-bounds.
+    // Declared before arena/builder so it outlives the borrowed CursorUpdate.
     let mut cursor_key = [0u8; 16];
     cursor_key[..8].copy_from_slice(&7u64.to_be_bytes());
     cursor_key[8..].copy_from_slice(&5u64.to_be_bytes());
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     builder
         .add_manifest_with_cursor(7, 0, 10, b"", CursorUpdate::new(&cursor_key))
         .unwrap();
