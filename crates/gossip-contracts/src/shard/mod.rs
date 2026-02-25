@@ -37,9 +37,7 @@ pub mod builder;
 pub mod hint;
 pub mod key_encoding;
 
-pub use builder::{
-    PreallocShardBuilder, PreallocShardBuilderConfigError, PreallocShardBuilderError,
-};
+pub use builder::{PreallocShardBuilder, PreallocShardBuilderError};
 pub use hint::{
     HintPropagationError, MetadataBuf, ShardEncodeError, ShardHint, ShardHintDecodeError,
     ShardMetadata, ShardMetadataDecodeError, ShardSpecScratch, SplitBoundary,

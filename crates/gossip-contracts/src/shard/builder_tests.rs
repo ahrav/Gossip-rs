@@ -5,7 +5,8 @@ use crate::coordination::{
 
 #[test]
 fn mixed_range_prefix_manifest_builds_valid_manifest() {
-    let mut builder = PreallocShardBuilder::<8>::with_capacity(8, 4_096).unwrap();
+    let mut arena = ShardArena::with_capacity(8, 4_096);
+    let mut builder = PreallocShardBuilder::<8>::new(&mut arena, 8).unwrap();
     builder.add_range(b"a", b"f", b"").unwrap();
     builder.add_prefix(b"m/", b"").unwrap();
     builder.add_manifest(7, 0, 10, b"").unwrap();
@@ -17,7 +18,8 @@ fn mixed_range_prefix_manifest_builds_valid_manifest() {
 
 #[test]
 fn ids_are_assigned_in_insertion_order() {
-    let mut builder = PreallocShardBuilder::<8>::with_capacity(8, 4_096).unwrap();
+    let mut arena = ShardArena::with_capacity(8, 4_096);
+    let mut builder = PreallocShardBuilder::<8>::new(&mut arena, 8).unwrap();
     builder.add_range(b"a", b"f", b"").unwrap();
     builder.add_prefix(b"m/", b"").unwrap();
     builder.add_manifest(7, 0, 10, b"").unwrap();
@@ -29,7 +31,8 @@ fn ids_are_assigned_in_insertion_order() {
 
 #[test]
 fn default_add_methods_use_initial_cursor() {
-    let mut builder = PreallocShardBuilder::<4>::with_capacity(4, 2_048).unwrap();
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     builder.add_range(b"a", b"b", b"").unwrap();
 
     let inputs = builder.build_inputs().unwrap();
@@ -41,7 +44,8 @@ fn default_add_methods_use_initial_cursor() {
 
 #[test]
 fn with_cursor_methods_preserve_non_initial_cursor() {
-    let mut builder = PreallocShardBuilder::<4>::with_capacity(4, 2_048).unwrap();
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     let cursor = CursorUpdate::with_token(b"a1", b"tok");
     builder
         .add_range_with_cursor(b"a", b"b", b"", cursor)
@@ -68,7 +72,8 @@ fn with_cursor_methods_preserve_non_initial_cursor() {
 
 #[test]
 fn overlapping_ranges_fail_on_build_validation() {
-    let mut builder = PreallocShardBuilder::<4>::with_capacity(4, 2_048).unwrap();
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     builder.add_range(b"a", b"m", b"").unwrap();
     builder.add_range(b"f", b"z", b"").unwrap();
 
@@ -83,7 +88,8 @@ fn overlapping_ranges_fail_on_build_validation() {
 
 #[test]
 fn entry_limit_exhaustion_returns_capacity_exceeded() {
-    let mut builder = PreallocShardBuilder::<2>::with_capacity(1, 2_048).unwrap();
+    let mut arena = ShardArena::with_capacity(2, 2_048);
+    let mut builder = PreallocShardBuilder::<2>::new(&mut arena, 1).unwrap();
     builder.add_range(b"a", b"b", b"").unwrap();
     let err = builder.add_range(b"b", b"c", b"").unwrap_err();
 
@@ -99,7 +105,8 @@ fn entry_limit_exhaustion_returns_capacity_exceeded() {
 
 #[test]
 fn arena_slot_exhaustion_returns_slab_full() {
-    let mut builder = PreallocShardBuilder::<4>::try_with_limits(4, 1, 4_096).unwrap();
+    let mut arena = ShardArena::with_capacity(1, 4_096);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     builder.add_range(b"a", b"b", b"").unwrap();
     let err = builder.add_range(b"b", b"c", b"").unwrap_err();
 
@@ -108,7 +115,8 @@ fn arena_slot_exhaustion_returns_slab_full() {
 
 #[test]
 fn arena_byte_exhaustion_returns_slab_full() {
-    let mut builder = PreallocShardBuilder::<4>::try_with_limits(4, 4, 64).unwrap();
+    let mut arena = ShardArena::with_capacity(4, 64);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     builder.add_range(b"a", b"b", b"").unwrap();
     let err = builder.add_range(b"c", b"d", b"").unwrap_err();
 
@@ -123,14 +131,16 @@ fn stale_or_foreign_handle_is_rejected_without_panic() {
         .unwrap();
     foreign_arena.free_spec(handle);
 
-    let mut builder = PreallocShardBuilder::<2>::with_capacity(2, 512).unwrap();
+    let mut arena = ShardArena::with_capacity(2, 512);
+    let mut builder = PreallocShardBuilder::<2>::new(&mut arena, 2).unwrap();
     let err = builder.add_spec_handle(handle).unwrap_err();
     assert!(matches!(err, PreallocShardBuilderError::InvalidSpecHandle));
 }
 
 #[test]
 fn reset_allows_fresh_reuse_and_resets_ids() {
-    let mut builder = PreallocShardBuilder::<4>::with_capacity(4, 2_048).unwrap();
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
     builder.add_range(b"a", b"b", b"").unwrap();
     builder.add_range(b"b", b"c", b"").unwrap();
     assert_eq!(builder.len(), 2);

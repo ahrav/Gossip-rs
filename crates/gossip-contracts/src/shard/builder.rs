@@ -1,8 +1,9 @@
 //! Startup-preallocated shard builder with borrowed-first add paths.
 //!
-//! The builder stores shard specs in a [`ShardArena`] and tracks entries in a
+//! The builder borrows a caller-provided [`ShardArena`] and tracks entries in a
 //! bounded [`InlineVec`], exposing allocation-silent add operations after
-//! startup preallocation.
+//! startup preallocation. Arena slot/byte sizing is the caller's responsibility;
+//! the builder only validates logical entry limits.
 //!
 //! Two-phase workflow:
 //! - `add_*` methods validate and stage shard specs plus optional borrowed
@@ -12,8 +13,9 @@
 //!   handoff to run registration.
 //!
 //! Error reporting is intentionally split by phase:
-//! - add-time errors isolate constructor/arena capacity failures and reject
-//!   invalid external handles passed to [`PreallocShardBuilder::add_spec_handle`].
+//! - add-time errors isolate entry-limit violations, arena capacity failures,
+//!   and rejection of invalid external handles passed to
+//!   [`PreallocShardBuilder::add_spec_handle`].
 //! - build-time errors surface manifest-shape violations and defensively report
 //!   invalid staged handles if they are observed.
 
@@ -38,43 +40,18 @@ struct BuilderEntry<'a> {
     cursor: CursorUpdate<'a>,
 }
 
-/// Configuration error for [`PreallocShardBuilder`].
+/// Error for [`PreallocShardBuilder`] construction and add/build operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PreallocShardBuilderConfigError {
+pub enum PreallocShardBuilderError {
+    // -- Configuration (returned from `new`) --
     /// `entry_limit` was zero.
     EntryLimitZero,
-    /// `arena_slots` was zero.
-    ArenaSlotsZero,
-    /// `arena_bytes` was zero.
-    ArenaBytesZero,
     /// `entry_limit` exceeded const generic `CAP`.
     CapMismatch { entry_limit: usize, cap: usize },
     /// `entry_limit` exceeded [`MAX_INITIAL_SHARDS`].
     EntryLimitExceedsManifestMax { entry_limit: usize, max: usize },
-}
 
-impl fmt::Display for PreallocShardBuilderConfigError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EntryLimitZero => write!(f, "entry_limit must be > 0"),
-            Self::ArenaSlotsZero => write!(f, "arena_slots must be > 0"),
-            Self::ArenaBytesZero => write!(f, "arena_bytes must be > 0"),
-            Self::CapMismatch { entry_limit, cap } => {
-                write!(f, "entry_limit ({entry_limit}) exceeds builder CAP ({cap})")
-            }
-            Self::EntryLimitExceedsManifestMax { entry_limit, max } => write!(
-                f,
-                "entry_limit ({entry_limit}) exceeds MAX_INITIAL_SHARDS ({max})"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PreallocShardBuilderConfigError {}
-
-/// Runtime error for [`PreallocShardBuilder`] add/build operations.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PreallocShardBuilderError {
+    // -- Add/build --
     /// Requested append would exceed configured entry budget.
     CapacityExceeded {
         limit: usize,
@@ -100,6 +77,14 @@ pub enum PreallocShardBuilderError {
 impl fmt::Display for PreallocShardBuilderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EntryLimitZero => write!(f, "entry_limit must be > 0"),
+            Self::CapMismatch { entry_limit, cap } => {
+                write!(f, "entry_limit ({entry_limit}) exceeds builder CAP ({cap})")
+            }
+            Self::EntryLimitExceedsManifestMax { entry_limit, max } => write!(
+                f,
+                "entry_limit ({entry_limit}) exceeds MAX_INITIAL_SHARDS ({max})"
+            ),
             Self::CapacityExceeded {
                 limit,
                 current,
@@ -128,16 +113,24 @@ impl std::error::Error for PreallocShardBuilderError {
             Self::ManifestCtorInvalid(err) => Some(err),
             Self::SpecInvalid(err) => Some(err),
             Self::ManifestInvalid(err) => Some(err),
-            Self::CapacityExceeded { .. } | Self::InvalidSpecHandle => None,
+            Self::EntryLimitZero
+            | Self::CapMismatch { .. }
+            | Self::EntryLimitExceedsManifestMax { .. }
+            | Self::CapacityExceeded { .. }
+            | Self::InvalidSpecHandle => None,
         }
     }
 }
 
-/// Startup-preallocated shard builder.
+/// Startup-preallocated shard builder backed by a borrowed arena.
 ///
-/// - Specs are stored in [`ShardArena`] handles.
+/// - Specs are stored in a caller-provided [`ShardArena`] via mutable borrow.
 /// - Entries are tracked in fixed-capacity [`InlineVec`].
 /// - Public add paths accept borrowed/spec-handle inputs only.
+///
+/// `CAP` controls the inline entry buffer size. Each entry is ~32 bytes,
+/// so `CAP = 1024` places ~32 KiB on the stack. A compile-time assertion
+/// rejects `CAP > 1024`.
 ///
 /// The builder does not own cursor key bytes in staged entries:
 /// [`CursorUpdate`] payloads are borrowed for lifetime `'a`. This keeps
@@ -145,7 +138,7 @@ impl std::error::Error for PreallocShardBuilderError {
 /// cursor data outlives the [`InitialShardInput`] slice produced by
 /// [`Self::build_inputs`].
 pub struct PreallocShardBuilder<'a, const CAP: usize> {
-    arena: ShardArena,
+    arena: &'a mut ShardArena,
     scratch: ShardSpecScratch,
     entries: InlineVec<BuilderEntry<'a>, CAP>,
     entry_limit: usize,
@@ -153,64 +146,50 @@ pub struct PreallocShardBuilder<'a, const CAP: usize> {
 }
 
 impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
-    /// Construct with explicit entry and arena limits.
+    /// Construct a builder borrowing the given arena.
     ///
-    /// `entry_limit` caps logical manifest cardinality; `arena_slots` and
-    /// `arena_bytes` cap backing storage. Choosing larger arena budgets than
-    /// `entry_limit` is valid when callers expect larger key/metadata payloads
-    /// per entry.
+    /// `entry_limit` caps logical manifest cardinality. Arena slot/byte sizing
+    /// is the caller's responsibility — create the [`ShardArena`] with
+    /// sufficient capacity before passing it here.
     ///
     /// # Errors
     ///
-    /// Returns [`PreallocShardBuilderConfigError`] when any limit is zero or
-    /// incompatible with `CAP`/[`MAX_INITIAL_SHARDS`].
-    pub fn try_with_limits(
+    /// Returns [`PreallocShardBuilderError`] when `entry_limit` is zero,
+    /// exceeds `CAP`, or exceeds [`MAX_INITIAL_SHARDS`].
+    pub fn new(
+        arena: &'a mut ShardArena,
         entry_limit: usize,
-        arena_slots: usize,
-        arena_bytes: usize,
-    ) -> Result<Self, PreallocShardBuilderConfigError> {
+    ) -> Result<Self, PreallocShardBuilderError> {
+        const {
+            assert!(
+                CAP <= 1024,
+                "PreallocShardBuilder: CAP > 1024 risks >32 KiB stack usage"
+            )
+        };
+
         if entry_limit == 0 {
-            return Err(PreallocShardBuilderConfigError::EntryLimitZero);
-        }
-        if arena_slots == 0 {
-            return Err(PreallocShardBuilderConfigError::ArenaSlotsZero);
-        }
-        if arena_bytes == 0 {
-            return Err(PreallocShardBuilderConfigError::ArenaBytesZero);
+            return Err(PreallocShardBuilderError::EntryLimitZero);
         }
         if entry_limit > CAP {
-            return Err(PreallocShardBuilderConfigError::CapMismatch {
+            return Err(PreallocShardBuilderError::CapMismatch {
                 entry_limit,
                 cap: CAP,
             });
         }
         if entry_limit > MAX_INITIAL_SHARDS {
-            return Err(
-                PreallocShardBuilderConfigError::EntryLimitExceedsManifestMax {
-                    entry_limit,
-                    max: MAX_INITIAL_SHARDS,
-                },
-            );
+            return Err(PreallocShardBuilderError::EntryLimitExceedsManifestMax {
+                entry_limit,
+                max: MAX_INITIAL_SHARDS,
+            });
         }
 
         Ok(Self {
-            arena: ShardArena::with_capacity(arena_slots, arena_bytes),
+            arena,
             scratch: ShardSpecScratch::new(),
             entries: InlineVec::new(),
             entry_limit,
             next_shard_raw: 0,
         })
-    }
-
-    /// Convenience constructor where slot capacity matches `entry_limit`.
-    ///
-    /// Use [`Self::try_with_limits`] when you need extra arena slots for
-    /// churn patterns that allocate/free specs before final build.
-    pub fn with_capacity(
-        entry_limit: usize,
-        arena_bytes: usize,
-    ) -> Result<Self, PreallocShardBuilderConfigError> {
-        Self::try_with_limits(entry_limit, entry_limit, arena_bytes)
     }
 
     #[must_use]
@@ -235,14 +214,17 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
 
     /// Reset all builder state for reuse.
     ///
-    /// Frees arena-backed specs, clears entries, and restarts shard IDs at 0.
+    /// Frees arena-backed specs for all tracked entries, clears the entry
+    /// buffer, and restarts shard IDs at 0.
     ///
     /// This invalidates all previously returned [`ShardSpecHandle`] values and
     /// any [`InitialShardInput`] slices built from earlier state.
     pub fn reset(&mut self) {
-        self.arena.clear();
+        let old = std::mem::replace(&mut self.entries, InlineVec::new());
+        for entry in old.as_slice() {
+            self.arena.free_spec(entry.spec_handle);
+        }
         self.scratch = ShardSpecScratch::new();
-        self.entries = InlineVec::new();
         self.next_shard_raw = 0;
     }
 
@@ -268,6 +250,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     }
 
     fn push_entry(&mut self, spec_handle: ShardSpecHandle, cursor: CursorUpdate<'a>) -> ShardId {
+        debug_assert!(
+            self.entries.len() < self.entry_limit,
+            "push_entry: capacity invariant violated"
+        );
         let shard = self.next_shard_id();
         self.entries.push(BuilderEntry {
             shard,
@@ -307,14 +293,8 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         cursor: CursorUpdate<'a>,
     ) -> Result<ShardId, PreallocShardBuilderError> {
         self.ensure_entry_capacity(1)?;
-        let handle = range_shard_into(
-            &mut self.arena,
-            start,
-            end,
-            connector_extra,
-            &mut self.scratch,
-        )
-        .map_err(|err| match err {
+        let handle = range_shard_into(self.arena, start, end, connector_extra, &mut self.scratch)
+            .map_err(|err| match err {
             ShardIntoError::Build(err) => PreallocShardBuilderError::RangeInvalid(err),
             ShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
         })?;
@@ -349,7 +329,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         cursor: CursorUpdate<'a>,
     ) -> Result<ShardId, PreallocShardBuilderError> {
         self.ensure_entry_capacity(1)?;
-        let handle = prefix_shard_into(&mut self.arena, prefix, connector_extra, &mut self.scratch)
+        let handle = prefix_shard_into(self.arena, prefix, connector_extra, &mut self.scratch)
             .map_err(|err| match err {
                 ShardIntoError::Build(err) => PreallocShardBuilderError::PrefixInvalid(err),
                 ShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
@@ -396,7 +376,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ) -> Result<ShardId, PreallocShardBuilderError> {
         self.ensure_entry_capacity(1)?;
         let handle = manifest_shard_into(
-            &mut self.arena,
+            self.arena,
             manifest_id,
             start_row,
             end_row,
@@ -435,7 +415,11 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// Add an existing arena-backed spec handle with an initial cursor.
     ///
     /// This is a zero-copy path: no spec bytes are re-allocated. The handle
-    /// must reference a live spec in this builder's internal arena.
+    /// must reference a live spec in the borrowed arena. Handles from a
+    /// different [`ShardArena`] instance will be rejected — generation-based
+    /// slot validation catches most cross-arena confusion, though handles from
+    /// arenas with coincidentally matching slot/generation state are not
+    /// detected.
     ///
     /// # Errors
     ///
@@ -456,9 +440,14 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
 
     /// Materialize borrowed manifest rows for registration.
     ///
-    /// Re-validates that every stored handle is still live and then runs
-    /// [`validate_manifest`] on the final slice so callers see
-    /// registration-time manifest errors before touching coordinator state.
+    /// Re-validates that every stored handle is still live. Although the builder
+    /// exclusively controls its borrowed arena (no external code can free handles
+    /// between add and build), this check defends against future refactors that
+    /// might introduce non-obvious invalidation paths.
+    ///
+    /// After handle validation, runs [`validate_manifest`] on the final slice
+    /// so callers see registration-time manifest errors before touching
+    /// coordinator state.
     ///
     /// # Errors
     ///
