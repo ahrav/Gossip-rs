@@ -1,27 +1,27 @@
-//! Arena-pooled wrappers for
-//! [`crate::coordination::shard_spec::ShardSpec`] and [`CursorUpdate`] byte fields.
+//! Arena-pooled wrappers for shard-spec, cursor, and spawned-lineage byte fields.
 //!
 //! ## Problem
 //!
-//! Each [`ShardRecord`](super::record::ShardRecord) stores 3-5 variable-size
-//! byte fields (key range start/end, metadata, cursor last-key, cursor
-//! token). Without pooling, every field is a separate `Box<[u8]>` heap
-//! allocation, making per-field allocation the dominant cost on the
-//! `checkpoint` and `acquire_and_restore_into` hot paths.
+//! Each [`ShardRecord`](super::record::ShardRecord) stores 4-6 variable-size
+//! byte fields (key range start/end, metadata, cursor last-key, cursor token,
+//! and spawned lineage). Without pooling, every field is a separate
+//! `Box<[u8]>` heap allocation, making per-field allocation the dominant cost
+//! on the `checkpoint` and `acquire_and_restore_into` hot paths.
 //!
 //! ## Solution
 //!
-//! [`PooledShardSpec`] and [`PooledCursor`] replace `Box<[u8]>` fields
-//! with [`ByteSlot`] handles into a shared [`ByteSlab`]. The slab
-//! pre-allocates a single contiguous buffer and carves out variable-size
-//! regions via bump-pointer + free-list, turning N heap allocations per
-//! shard into N slab operations and removing per-field `malloc`/`free`
-//! on hot paths.
+//! [`PooledShardSpec`], [`PooledCursor`], and [`PooledSpawned`] replace
+//! `Box<[u8]>` fields with [`ByteSlot`] handles into a shared [`ByteSlab`].
+//! The slab pre-allocates a single contiguous buffer and carves out
+//! variable-size regions via bump-pointer + free-list, turning N heap
+//! allocations per shard into N slab operations and removing per-field
+//! `malloc`/`free` on hot paths.
 //!
 //! ## Multi-field atomicity
 //!
-//! Both types need 2-3 slab allocations to construct. If the k-th
-//! allocation fails, the preceding allocations must be rolled back.
+//! `PooledShardSpec` and `PooledCursor` need 2-3 slab allocations to
+//! construct. If the k-th allocation fails, the preceding allocations must
+//! be rolled back.
 //! [`allocate_with_rollback`] provides this guarantee: it attempts all
 //! allocations, and on failure deallocates fields 0..k-1 in reverse
 //! order before returning `SlabFull`. This strong exception guarantee
@@ -84,7 +84,7 @@
 //! - **SLAB-3 (Balance)**: `release_fields` decreases `live_count` by
 //!   exactly the number of non-empty fields.
 //! - **SLAB-4 (Conservation)**: `slab.live_count()` equals the total
-//!   non-empty fields across all records (harness-level assertion).
+//!   non-empty fields across all records (validated in pooled/coordinator tests).
 //! - **SLAB-5 (Leak freedom)**: `slab.live_count() == 0` when the
 //!   coordinator is dropped.
 

@@ -23,12 +23,13 @@
 //!
 //! ## Arena Pooling
 //!
-//! Variable-size byte fields (spec key ranges, cursor keys) are stored in a
-//! shared [`ByteSlab`] via `PooledShardSpec` and `PooledCursor`, avoiding
-//! per-field heap allocations on hot paths. The record does not implement
-//! `Drop`. If a record is removed while the slab stays live, the coordinator
-//! must call `deallocate_fields()` to release pooled slots. Coordinator-wide
-//! teardown may instead clear/drop the slab in bulk.
+//! Variable-size byte fields (spec key ranges, cursor keys, and spawned
+//! lineage) are stored in a shared [`ByteSlab`] via `PooledShardSpec`,
+//! `PooledCursor`, and `PooledSpawned`, avoiding per-field heap allocations
+//! on hot paths. The record does not implement `Drop`. If a record is removed
+//! while the slab stays live, the coordinator must call `deallocate_fields()`
+//! to release pooled slots. Coordinator-wide teardown may instead clear/drop
+//! the slab in bulk.
 
 use std::fmt;
 
