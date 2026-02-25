@@ -22,7 +22,7 @@
 use proptest::prelude::*;
 use std::borrow::Borrow;
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::lease::LeaseHolder;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::record::ShardStatus;
@@ -146,7 +146,7 @@ pub(crate) fn make_key(run: u64, shard: u64) -> ShardKey {
 /// | `status` | `ShardStatus::Active` |
 /// | `park_reason` | `None` |
 /// | `spec` | Range `[b'a', b'z']` |
-/// | `cursor` | `Cursor::initial()` |
+/// | `cursor` | `CursorUpdate::initial()` |
 /// | `cursor_semantics` | `CursorSemantics::Completed` |
 /// | `lease` | `None` (unleased) |
 /// | `fence_epoch` | `FenceEpoch::INITIAL` |
@@ -174,7 +174,8 @@ pub(crate) struct TestRecordBuilder {
     status: ShardStatus,
     park_reason: Option<crate::coordination::record::ParkReason>,
     spec: ShardSpec,
-    cursor: Cursor,
+    cursor_last_key: Option<Vec<u8>>,
+    cursor_token: Option<Vec<u8>>,
     cursor_semantics: CursorSemantics,
     lease: Option<LeaseHolder>,
     fence_epoch: FenceEpoch,
@@ -193,7 +194,8 @@ impl TestRecordBuilder {
             status: ShardStatus::Active,
             park_reason: None,
             spec: ShardSpec::with_range(vec![b'a'], vec![b'z']),
-            cursor: Cursor::initial(),
+            cursor_last_key: None,
+            cursor_token: None,
             cursor_semantics: CursorSemantics::Completed,
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
@@ -224,9 +226,10 @@ impl TestRecordBuilder {
         self
     }
 
-    /// Override the cursor position (default: `Cursor::initial()`).
-    pub fn cursor(mut self, cursor: Cursor) -> Self {
-        self.cursor = cursor;
+    /// Override the cursor position (default: `CursorUpdate::initial()`).
+    pub fn cursor(mut self, cursor: CursorUpdate<'_>) -> Self {
+        self.cursor_last_key = cursor.last_key().map(ToOwned::to_owned);
+        self.cursor_token = cursor.token().map(ToOwned::to_owned);
         self
     }
 
@@ -269,6 +272,14 @@ impl TestRecordBuilder {
     /// Delegates to `from_raw_parts`, bypassing invariant validation so
     /// tests can construct intentionally invalid records.
     pub fn build(self, slab: &mut ByteSlab) -> ShardRecord {
+        let cursor = match (
+            self.cursor_last_key.as_deref(),
+            self.cursor_token.as_deref(),
+        ) {
+            (None, _) => CursorUpdate::initial(),
+            (Some(last_key), None) => CursorUpdate::with_last_key(last_key),
+            (Some(last_key), Some(token)) => CursorUpdate::with_token(last_key, token),
+        };
         ShardRecord::from_raw_parts(
             self.tenant,
             self.run,
@@ -276,7 +287,7 @@ impl TestRecordBuilder {
             self.status,
             self.park_reason,
             &self.spec,
-            &self.cursor,
+            cursor,
             self.cursor_semantics,
             self.lease,
             self.fence_epoch,

@@ -28,12 +28,12 @@
 //!   `park_ok`): advance state without inspecting the return value. They
 //!   panic on failure, suitable only for setup steps.
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
-use crate::coordination::error::{AcquireError, AcquireResult, AcquireResultView, AcquireScratch};
+use crate::coordination::cursor::CursorUpdate;
+use crate::coordination::error::{AcquireError, AcquireScratch, CapacityHint, ShardSnapshotView};
 use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::lease::Lease;
-use crate::coordination::record::{ParkReason, ShardSnapshot};
+use crate::coordination::record::{ParkReason, ShardStatus};
 use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
@@ -125,11 +125,10 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
     let spec = test_spec();
-    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         test_shard(),
         spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
+        CursorUpdate::initial(),
     )];
     let _ = coord
         .register_shards(
@@ -148,57 +147,83 @@ pub fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap()
 }
 
-fn acquire_view_to_owned(view: AcquireResultView<'_>) -> AcquireResult {
-    let spec = ShardSpec::try_from_ref(view.snapshot.spec())
-        .expect("acquire view must carry a valid spec");
-    let cursor = match (
-        view.snapshot.cursor().last_key(),
-        view.snapshot.cursor().token(),
-    ) {
-        (None, _) => Cursor::initial(),
-        (Some(last_key), None) => Cursor::with_last_key(last_key),
-        (Some(last_key), Some(token)) => Cursor::from_parts(last_key, token),
-    };
-    AcquireResult {
-        lease: view.lease,
-        snapshot: ShardSnapshot::new(
-            view.snapshot.status(),
-            spec,
-            cursor,
-            view.snapshot.cursor_semantics(),
-            view.snapshot.parent(),
-            view.snapshot.spawned().iter(),
-        ),
-        capacity: view.capacity,
+/// Allocation-free test acquire result wrapper that owns scratch storage.
+///
+/// This keeps borrowed snapshot views usable after helper return without any
+/// heap-backed cursor/spec materialization.
+#[derive(Debug)]
+pub struct AcquireFixture {
+    pub lease: Lease,
+    pub capacity: CapacityHint,
+    status: ShardStatus,
+    cursor_semantics: CursorSemantics,
+    parent: Option<ShardId>,
+    scratch: AcquireScratch,
+}
+
+impl AcquireFixture {
+    pub fn snapshot(&self) -> ShardSnapshotView<'_> {
+        self.scratch
+            .view(self.status, self.cursor_semantics, self.parent)
     }
 }
 
-/// Acquire + restore and materialize a fully-owned test result.
+/// Acquire + restore using allocation-free snapshot storage.
 pub fn acquire_result<B: CoordinationBackend>(
     backend: &mut B,
     now: LogicalTime,
     tenant: TenantId,
     key: ShardKey,
     worker: WorkerId,
-) -> Result<AcquireResult, AcquireError> {
+) -> Result<AcquireFixture, AcquireError> {
     let mut scratch = AcquireScratch::new();
-    backend
-        .acquire_and_restore_into(now, tenant, key, worker, &mut scratch)
-        .map(acquire_view_to_owned)
+    let (lease, capacity, status, cursor_semantics, parent) = {
+        let view = backend.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?;
+        (
+            view.lease,
+            view.capacity,
+            view.snapshot.status(),
+            view.snapshot.cursor_semantics(),
+            view.snapshot.parent(),
+        )
+    };
+    Ok(AcquireFixture {
+        lease,
+        capacity,
+        status,
+        cursor_semantics,
+        parent,
+        scratch,
+    })
 }
 
-/// Claim next available and materialize a fully-owned test result.
+/// Claim next available using allocation-free snapshot storage.
 pub fn claim_result<B: ShardClaiming + Sized>(
     backend: &mut B,
     now: LogicalTime,
     tenant: TenantId,
     run: RunId,
     worker: WorkerId,
-) -> Result<AcquireResult, ClaimError> {
+) -> Result<AcquireFixture, ClaimError> {
     let mut scratch = AcquireScratch::new();
-    backend
-        .claim_next_available(now, tenant, run, worker, &mut scratch)
-        .map(acquire_view_to_owned)
+    let (lease, capacity, status, cursor_semantics, parent) = {
+        let view = backend.claim_next_available(now, tenant, run, worker, &mut scratch)?;
+        (
+            view.lease,
+            view.capacity,
+            view.snapshot.status(),
+            view.snapshot.cursor_semantics(),
+            view.snapshot.parent(),
+        )
+    };
+    Ok(AcquireFixture {
+        lease,
+        capacity,
+        status,
+        cursor_semantics,
+        parent,
+        scratch,
+    })
 }
 
 // ============================================================================
@@ -320,11 +345,11 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
     let spec = ShardSpec::with_range(b"a", b"z");
-    let cursor = Cursor::initial();
+    let cursor = CursorUpdate::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
+        cursor,
     )];
     let _ = coord
         .register_shards(

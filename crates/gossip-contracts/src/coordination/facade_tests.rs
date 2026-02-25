@@ -26,7 +26,7 @@
 //!   satisfies `CoordinationFacade`.
 
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
 use crate::coordination::shard_spec::CursorSemantics;
@@ -84,15 +84,13 @@ fn populate_run(coord: &mut InMemoryCoordinator, shard_count: usize) {
             (
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                CursorUpdate::initial(),
             )
         })
         .collect();
     let shards: Vec<InitialShardInput<'_>> = shard_entries
         .iter()
-        .map(|(shard, spec, cursor)| {
-            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-        })
+        .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
         .collect();
 
     let _ = coord
@@ -582,11 +580,11 @@ fn claim_cooldown_spans_runs() {
     // Create run A with one shard.
     coord.create_run(now(1), tenant, run_a, config).unwrap();
     let spec_a = crate::coordination::shard_spec::ShardSpec::with_range(vec![0], vec![1]);
-    let cursor_a = Cursor::initial();
+    let cursor_a = CursorUpdate::initial();
     let shards_a = vec![InitialShardInput::new(
         ShardId::from_raw(0),
         spec_a.as_ref(),
-        CursorUpdate::from_cursor(&cursor_a),
+        cursor_a,
     )];
     let _ = coord
         .register_shards(now(1), tenant, run_a, &shards_a, OpId::from_raw(100))
@@ -595,11 +593,11 @@ fn claim_cooldown_spans_runs() {
     // Create run B with one shard (different shard ID).
     coord.create_run(now(1), tenant, run_b, config).unwrap();
     let spec_b = crate::coordination::shard_spec::ShardSpec::with_range(vec![10], vec![11]);
-    let cursor_b = Cursor::initial();
+    let cursor_b = CursorUpdate::initial();
     let shards_b = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         spec_b.as_ref(),
-        CursorUpdate::from_cursor(&cursor_b),
+        cursor_b,
     )];
     let _ = coord
         .register_shards(now(1), tenant, run_b, &shards_b, OpId::from_raw(101))
@@ -761,15 +759,13 @@ fn claim_cooldown_overflow_saturates_to_permanent() {
             (
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                CursorUpdate::initial(),
             )
         })
         .collect();
     let shards: Vec<InitialShardInput<'_>> = shard_entries
         .iter()
-        .map(|(shard, spec, cursor)| {
-            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-        })
+        .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
         .collect();
 
     let _ = coord

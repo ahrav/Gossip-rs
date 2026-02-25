@@ -38,7 +38,6 @@
 use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::run::RunRecord;
-use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{RunId, ShardId, ShardKey, TenantId};
 
 /// Read-only observation API for simulation backends.
@@ -46,7 +45,7 @@ use crate::identity::{RunId, ShardId, ShardKey, TenantId};
 /// Provides the shard-level introspection that the invariant checker
 /// and simulation harness need to verify protocol correctness.
 /// The trait intentionally hides allocator internals (`ByteSlab` and
-/// `ByteSlot`): callers observe through borrowed/owned accessors so
+/// `ByteSlot`): callers observe through borrowed accessors so
 /// simulation logic stays storage-backend agnostic.
 ///
 /// # Consistency contract
@@ -107,8 +106,9 @@ pub trait SimIntrospection {
     ///
     /// Used by the S7 (split-coverage) check to verify that a
     /// split-parent's spawned children exist and reference the correct
-    /// parent. Also used by the simulation harness to read shard specs
-    /// for cursor generation and split-point computation.
+    /// parent. Also used by the simulation harness to read borrowed
+    /// shard bounds for cursor generation and split planning without
+    /// materializing owned specs.
     ///
     /// Note: [`FaultInjectingIntrospector`](super::fault_injector::FaultInjectingIntrospector)
     /// delegates this to the inner backend only — synthetic records
@@ -117,18 +117,11 @@ pub trait SimIntrospection {
     /// discussion on the trait.
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord>;
 
-    /// Materialize an owned shard spec for API boundaries that require
-    /// detached data (for example split-plan construction in the harness).
-    ///
-    /// Prefer [`spec_bounds`](Self::spec_bounds) when only range checks are
-    /// needed: that path stays borrowed and avoids per-record heap copies.
-    fn materialize_spec(&self, record: &ShardRecord) -> ShardSpec;
-
     /// Return the record cursor's last-key view without allocation.
     ///
     /// Borrow is tied to `self` because pooled fields are slab-backed.
     /// Used by the checker/harness hot paths to avoid materializing owned
-    /// `Cursor` values just to compare bounds/order.
+    /// `Cursor`/`ShardSpec` values just to compare bounds/order.
     fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]>;
 
     /// Return the shard range bounds `[start, end)` as borrowed slices.

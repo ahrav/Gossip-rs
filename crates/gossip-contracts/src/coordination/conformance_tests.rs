@@ -33,7 +33,7 @@
 //! checkpoint the test verifies the cursor advanced *and* that the fence
 //! epoch did not change.
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
@@ -777,11 +777,11 @@ fn register_shards_on_non_initializing_rejected() {
 
     // Try to register more shards -> WrongStatus.
     let spec = ShardSpec::with_range(b"aa", b"bb");
-    let cursor = Cursor::initial();
+    let cursor = CursorUpdate::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(999),
         spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
+        cursor,
     )];
     let err = coord
         .register_shards(

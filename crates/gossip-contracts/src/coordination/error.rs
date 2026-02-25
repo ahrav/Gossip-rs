@@ -77,7 +77,7 @@ use gossip_stdx::{InlineVec, SlabFull};
 
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
 use crate::coordination::lease::Lease;
-use crate::coordination::record::{ShardSnapshot, ShardStatus};
+use crate::coordination::record::ShardStatus;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef, SplitValidationError};
 use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
@@ -1220,7 +1220,7 @@ const _: () = assert!(core::mem::size_of::<CapacityHint>() <= 24);
 
 /// Borrowed view of shard state returned by `acquire_and_restore_into`.
 ///
-/// This is the allocation-free counterpart to [`ShardSnapshot`]. Instead
+/// This is the allocation-free shard snapshot form. Instead
 /// of heap-backed `Box<[u8]>` fields, all byte data borrows from the
 /// caller-owned [`AcquireScratch`]. The view is valid only until that
 /// scratch is reused or dropped.
@@ -1228,13 +1228,8 @@ const _: () = assert!(core::mem::size_of::<CapacityHint>() <= 24);
 /// Consumers that need owned data must copy fields out explicitly before the
 /// scratch buffer is reused.
 ///
-/// ## Why Both `ShardSnapshotView` and `ShardSnapshot` Exist
-///
-/// The hot acquire path in production must avoid per-call allocation.
-/// `ShardSnapshotView` borrows from stack-allocated scratch, keeping
-/// the fast path allocation-free. `ShardSnapshot` is the owned form
-/// used in tests, by `WorkerSession` (which caches the snapshot), and
-/// at API boundaries where the caller cannot guarantee scratch lifetime.
+/// `ShardSnapshotView` keeps the hot acquire path allocation-free by
+/// borrowing from stack-allocated scratch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "snapshot view should be consumed before scratch is reused"]
 pub struct ShardSnapshotView<'a> {
@@ -1533,22 +1528,6 @@ impl AcquireScratch {
     }
 }
 
-/// Result of a successful `acquire_and_restore_into` operation.
-///
-/// Contains everything a worker needs to start or resume scanning:
-/// - `lease`: proof of ownership with fencing token
-/// - `snapshot`: shard state (status, spec, cursor, cursor_semantics, lineage)
-///
-/// The worker uses `lease` for all subsequent operations and `snapshot`
-/// to determine where to resume scanning.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "acquire result contains a lease that must be used"]
-pub struct AcquireResult {
-    pub lease: Lease,
-    pub snapshot: ShardSnapshot,
-    pub capacity: CapacityHint,
-}
-
 /// Result of a successful `renew` operation.
 ///
 /// Returns the new deadline. The fence epoch does not change on
@@ -1560,12 +1539,8 @@ pub struct RenewResult {
     pub capacity: CapacityHint,
 }
 
-// Compile-time size assertions: these types live on hot-path return types.
-// RenewResult is Copy (two scalars + CapacityHint), so should stay compact.
-// AcquireResult contains ShardSnapshot with inline SpawnedList, so its size
-// is larger than a pure-pointer layout but still bounded.
+// Compile-time size assertion: this type lives on hot-path return values.
 const _: () = assert!(core::mem::size_of::<RenewResult>() <= 32);
-const _: () = assert!(core::mem::size_of::<AcquireResult>() <= 288);
 
 // Checkpoint, Complete, and Park return `IdempotentOutcome<()>` on
 // success (the operation either executed or was replayed, with no

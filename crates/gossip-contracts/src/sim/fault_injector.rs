@@ -55,7 +55,6 @@
 //! unexpected violations (real bugs), adding complexity for no safety gain.
 
 use crate::coordination::record::ShardRecord;
-use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{ShardId, ShardKey, TenantId};
 use crate::sim::backend::SimIntrospection;
 
@@ -169,10 +168,6 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
         self.inner.shard_lookup(tenant, key)
     }
 
-    fn materialize_spec(&self, record: &ShardRecord) -> ShardSpec {
-        self.inner.materialize_spec(record)
-    }
-
     fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]> {
         self.inner.cursor_last_key(record)
     }
@@ -213,7 +208,7 @@ impl<B: SimIntrospection> Drop for FaultInjectingIntrospector<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordination::cursor::Cursor;
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::lease::LeaseHolder;
     use crate::coordination::record::{ShardRecord, ShardStatus};
@@ -472,7 +467,7 @@ mod tests {
         // Seed with cursor at 'h'.
         let key = make_key(1, 1);
         let record = TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'h']))
+            .cursor(CursorUpdate::with_last_key(b"h"))
             .build(coord.slab_mut());
         coord.seed_shard(record);
 
@@ -486,7 +481,7 @@ mod tests {
         // Inject a synthetic record with cursor regressed to 'c'.
         let mut injector = FaultInjectingIntrospector::new(coord);
         let regressed = TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'c']))
+            .cursor(CursorUpdate::with_last_key(b"c"))
             .build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, regressed);
 
@@ -516,7 +511,7 @@ mod tests {
         let mut injector = FaultInjectingIntrospector::new(coord);
         let key = make_key(1, 1);
         let out_of_bounds = TestRecordBuilder::new(TENANT, run, shard)
-            .cursor(Cursor::with_last_key(vec![b'{']))
+            .cursor(CursorUpdate::with_last_key(b"{"))
             .build(injector.inner_mut().slab_mut());
         injector.inject_shard(TENANT, key, out_of_bounds);
 

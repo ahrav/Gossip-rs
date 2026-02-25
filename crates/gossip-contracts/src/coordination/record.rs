@@ -10,7 +10,8 @@
 //! - [`ShardStatus`] — lifecycle state machine (`Active -> Done | Parked | Split`)
 //! - [`ParkReason`] — coordination-level categories for why a shard was halted
 //! - [`ShardRecord`] — the full record with 10 runtime invariant assertions
-//! - [`ShardSnapshot`] — worker-visible read-only view returned on acquisition
+//! - [`crate::coordination::error::ShardSnapshotView`] — worker-visible
+//!   read-only view returned on acquisition
 //!
 //! ## Ownership Model
 //!
@@ -27,16 +28,19 @@
 //! per-field heap allocations on hot paths. The record does not implement
 //! `Drop` — the coordinator must call `deallocate_fields()` before discarding.
 
-use std::borrow::Borrow;
 use std::fmt;
 
 use blake3::Hasher;
-use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
+#[cfg(test)]
+use gossip_stdx::InlineVec;
+use gossip_stdx::{ByteSlab, RingBuffer};
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
 use crate::coordination::pooled::{PooledCursor, PooledShardSpec, PooledSpawned};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
+#[cfg(test)]
+use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
 };
@@ -49,13 +53,6 @@ use super::split::MAX_SPAWNED_PER_SHARD;
 /// test constructors accept this inline container for ergonomics.
 #[cfg(test)]
 pub(crate) type SpawnedList = InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>;
-
-/// Snapshot-facing spawned storage.
-///
-/// `ShardSnapshot` is the owned compatibility API. Keep its inline capacity
-/// small so `AcquireResult` remains compact; allocation-free runtime paths use
-/// `AcquireResultView` + `AcquireScratch` instead.
-type SnapshotSpawnedList = InlineVec<ShardId, 8>;
 
 // ============================================================================
 // ShardStatus
@@ -466,7 +463,7 @@ impl ShardRecord {
         status: ShardStatus,
         park_reason: Option<ParkReason>,
         spec: &ShardSpec,
-        cursor: &Cursor,
+        cursor: CursorUpdate<'_>,
         cursor_semantics: CursorSemantics,
         lease: Option<LeaseHolder>,
         fence_epoch: FenceEpoch,
@@ -475,10 +472,10 @@ impl ShardRecord {
         op_log: RingBuffer<OpLogEntry, { ShardRecord::OP_LOG_CAP }>,
         slab: &mut ByteSlab,
     ) -> Self {
-        let pooled_spec =
-            PooledShardSpec::from_spec(spec, slab).expect("from_raw_parts: slab too small");
+        let pooled_spec = PooledShardSpec::from_spec_ref(spec.as_ref(), slab)
+            .expect("from_raw_parts: slab too small");
         let pooled_cursor =
-            PooledCursor::from_cursor(cursor, slab).expect("from_raw_parts: slab too small");
+            PooledCursor::from_update(&cursor, slab).expect("from_raw_parts: slab too small");
         let pooled_spawned = PooledSpawned::from_slice(spawned.as_slice(), slab)
             .expect("from_raw_parts: slab too small");
         Self {
@@ -773,33 +770,6 @@ impl ShardRecord {
         Ok(())
     }
 
-    /// Create a [`ShardSnapshot`] for returning to a worker on acquisition.
-    ///
-    /// Contains only the information a worker needs to resume scanning.
-    /// Excludes lease, fence, op_log, tenant, park_reason, and identity
-    /// fields (run, shard). The worker gets lease info from the Lease
-    /// return value and already knows its tenant and shard identity. Spawned
-    /// children are copied by ID without exposing the internal container type.
-    ///
-    /// Materializes owned `ShardSpec` and `Cursor` from the slab (heap
-    /// allocations), since the snapshot crosses the API boundary.
-    /// Simulation hot paths should prefer `SimIntrospection` borrowed
-    /// accessors (`spec_bounds`, `cursor_last_key`) to avoid this copy.
-    #[must_use]
-    #[cfg(any(test, feature = "test-support"))]
-    #[allow(dead_code)]
-    pub(crate) fn snapshot(&self, slab: &ByteSlab) -> ShardSnapshot {
-        self.assert_invariants(slab);
-        ShardSnapshot::new(
-            self.status,
-            self.spec.to_spec(slab),
-            self.cursor.to_cursor(slab),
-            self.cursor_semantics,
-            self.parent,
-            self.spawned.iter(slab),
-        )
-    }
-
     /// Deallocate all slab-backed fields.
     ///
     /// Must be called before dropping a `ShardRecord` to avoid slab leaks.
@@ -964,111 +934,6 @@ impl ShardRecord {
 // Compile-time binding: OP_LOG_CAP matches the RingBuffer's const capacity.
 // RingBuffer's own compile-time checks enforce N > 0 and power-of-2.
 const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
-
-// ============================================================================
-// ShardSnapshot
-// ============================================================================
-
-/// Read-only snapshot of shard state returned to a worker on acquisition.
-///
-/// Contains everything a worker needs to resume scanning:
-/// - Current lifecycle state (`status`)
-/// - What to scan (`spec` — the key range and connector metadata)
-/// - Where to resume (`cursor` — the two-layer progress marker)
-/// - How to interpret the cursor (`cursor_semantics`)
-/// - Lineage context (`parent`, `spawned`)
-///
-/// Excludes coordination-internal state:
-/// - `run`, `shard` — the worker already knows its identity from the acquire call
-/// - `tenant` — the worker already knows its tenant
-/// - `lease`, `fence_epoch` — the worker gets these from the Lease
-/// - `op_log` — internal to the coordinator
-/// - `park_reason` — only relevant for parked shards, which aren't acquired
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShardSnapshot {
-    status: ShardStatus,
-    spec: ShardSpec,
-    cursor: Cursor,
-    cursor_semantics: CursorSemantics,
-    parent: Option<ShardId>,
-    spawned: SnapshotSpawnedList,
-}
-
-impl ShardSnapshot {
-    /// Construct a new snapshot from individual fields.
-    ///
-    /// Prefer [`ShardRecord::snapshot()`] which validates invariants
-    /// before constructing.
-    ///
-    /// Accepts any iterator of borrowed [`ShardId`] values so callers can pass
-    /// slices, iterators, or concrete spawned-list containers without coupling
-    /// this API to one storage representation.
-    #[must_use]
-    pub(crate) fn new<I, S>(
-        status: ShardStatus,
-        spec: ShardSpec,
-        cursor: Cursor,
-        cursor_semantics: CursorSemantics,
-        parent: Option<ShardId>,
-        spawned: I,
-    ) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Borrow<ShardId>,
-    {
-        let spawned: SnapshotSpawnedList = spawned.into_iter().map(|id| *id.borrow()).collect();
-        Self {
-            status,
-            spec,
-            cursor,
-            cursor_semantics,
-            parent,
-            spawned,
-        }
-    }
-
-    /// The shard's lifecycle status.
-    #[inline]
-    #[must_use]
-    pub fn status(&self) -> ShardStatus {
-        self.status
-    }
-
-    /// The shard specification (key range and metadata).
-    #[inline]
-    #[must_use]
-    pub fn spec(&self) -> &ShardSpec {
-        &self.spec
-    }
-
-    /// The current cursor position.
-    #[inline]
-    #[must_use]
-    pub fn cursor(&self) -> &Cursor {
-        &self.cursor
-    }
-
-    /// The cursor semantics (Completed vs Dispatched).
-    #[inline]
-    #[must_use]
-    pub fn cursor_semantics(&self) -> CursorSemantics {
-        self.cursor_semantics
-    }
-
-    /// The parent shard, if this shard was created by a split.
-    #[inline]
-    #[must_use]
-    pub fn parent(&self) -> Option<ShardId> {
-        self.parent
-    }
-
-    /// Shards spawned by this shard.
-    #[inline]
-    #[must_use]
-    pub fn spawned(&self) -> &[ShardId] {
-        self.spawned.as_slice()
-    }
-}
 
 #[cfg(test)]
 #[path = "record_tests.rs"]

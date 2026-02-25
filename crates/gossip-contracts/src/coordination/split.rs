@@ -31,8 +31,6 @@ use std::fmt;
 use blake3::Hasher;
 use gossip_stdx::InlineVec;
 
-#[cfg(test)]
-use crate::coordination::cursor::Cursor;
 use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::record::ParkReason;
 #[cfg(test)]
@@ -305,7 +303,7 @@ impl CanonicalBytes for SplitReplacePlan<'_> {
 /// The parent keeps `parent_new_spec` (the prefix it has already partially
 /// scanned) and continues processing with its existing lease. The residual
 /// shard gets `residual_spec` (the unprocessed suffix) and starts from
-/// `Cursor::initial()` (enforced by the coordinator, not by this type).
+/// `CursorUpdate::initial()` (enforced by the coordinator, not by this type).
 ///
 /// ## Key Difference from Split-Replace
 ///
@@ -496,8 +494,7 @@ pub(crate) fn op_payload_hash(op_tag: &[u8], write_fields: impl FnOnce(&mut Hash
 /// different cursor" conflicts during idempotent replay.
 ///
 /// Accepts any cursor representation with canonical bytes (for example,
-/// owned [`crate::coordination::cursor::Cursor`] or borrowed
-/// [`CursorUpdate`]).
+/// borrowed [`CursorUpdate`] or any equivalent canonical representation).
 #[must_use]
 pub fn hash_checkpoint_payload(new_cursor: &impl CanonicalBytes) -> u64 {
     op_payload_hash(b"checkpoint", |h| {
@@ -512,7 +509,7 @@ pub fn hash_checkpoint_payload(new_cursor: &impl CanonicalBytes) -> u64 {
 /// a checkpoint with the same cursor produce different hashes.
 ///
 /// Uses the same canonical-byte requirement as [`hash_checkpoint_payload`]
-/// so owned and borrowed cursor paths remain hash-compatible.
+/// so all cursor encodings with equivalent canonical bytes hash identically.
 #[must_use]
 pub fn hash_complete_payload(final_cursor: &impl CanonicalBytes) -> u64 {
     op_payload_hash(b"complete", |h| {
@@ -613,14 +610,9 @@ mod tests {
                     ShardSpec::with_range(start, end)
                 })
                 .collect();
-            let cursors: Vec<_> = (0..count).map(|_| Cursor::initial()).collect();
+            let cursors: Vec<_> = (0..count).map(|_| CursorUpdate::initial()).collect();
             let children: Vec<SplitReplaceChild> = (0..count)
-                .map(|i| {
-                    SplitReplaceChild::new(
-                        specs[i].as_ref(),
-                        CursorUpdate::from_cursor(&cursors[i]),
-                    )
-                })
+                .map(|i| SplitReplaceChild::new(specs[i].as_ref(), cursors[i]))
                 .collect();
             let result = SplitReplacePlan::try_new(children);
             match expected {
@@ -656,10 +648,10 @@ mod tests {
     fn split_replace_plan_canonical_deterministic() {
         let spec1 = ShardSpec::with_range(b"a", b"m");
         let spec2 = ShardSpec::with_range(b"m", b"z");
-        let c1 = Cursor::initial();
-        let c2 = Cursor::initial();
-        let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&c1));
-        let c2 = SplitReplaceChild::new(spec2.as_ref(), CursorUpdate::from_cursor(&c2));
+        let c1 = CursorUpdate::initial();
+        let c2 = CursorUpdate::initial();
+        let c1 = SplitReplaceChild::new(spec1.as_ref(), c1);
+        let c2 = SplitReplaceChild::new(spec2.as_ref(), c2);
         let plan = SplitReplacePlan::try_new(vec![c1, c2]).unwrap();
         assert_eq!(canonical_digest(&plan), canonical_digest(&plan));
     }
@@ -712,8 +704,8 @@ mod tests {
             k2 in proptest::collection::vec(any::<u8>(), 1..64),
         ) {
             prop_assume!(k1 != k2);
-            let c1 = Cursor::with_last_key(k1);
-            let c2 = Cursor::with_last_key(k2);
+            let c1 = CursorUpdate::with_last_key(&k1);
+            let c2 = CursorUpdate::with_last_key(&k2);
             prop_assert_ne!(hash_checkpoint_payload(&c1), hash_checkpoint_payload(&c2));
             prop_assert_ne!(hash_complete_payload(&c1), hash_complete_payload(&c2));
         }
@@ -723,7 +715,7 @@ mod tests {
         fn cursor_hash_functions_are_pure(
             k in proptest::collection::vec(any::<u8>(), 1..64),
         ) {
-            let c = Cursor::with_last_key(k);
+            let c = CursorUpdate::with_last_key(&k);
             prop_assert_eq!(hash_checkpoint_payload(&c), hash_checkpoint_payload(&c));
             prop_assert_eq!(hash_complete_payload(&c), hash_complete_payload(&c));
         }
@@ -734,7 +726,7 @@ mod tests {
         fn checkpoint_and_complete_hashes_differ(
             k in proptest::collection::vec(any::<u8>(), 1..64),
         ) {
-            let c = Cursor::with_last_key(k);
+            let c = CursorUpdate::with_last_key(&k);
             prop_assert_ne!(hash_checkpoint_payload(&c), hash_complete_payload(&c));
         }
 
@@ -766,17 +758,17 @@ mod tests {
             let spec1_b = ShardSpec::with_range(e1, vec![0xFF; 32]);
             let spec2_a = ShardSpec::with_range(s2.clone(), e2.clone());
             let spec2_b = ShardSpec::with_range(e2, vec![0xFF; 32]);
-            let c1_a = Cursor::initial();
-            let c1_b = Cursor::initial();
-            let c2_a = Cursor::initial();
-            let c2_b = Cursor::initial();
+            let c1_a = CursorUpdate::initial();
+            let c1_b = CursorUpdate::initial();
+            let c2_a = CursorUpdate::initial();
+            let c2_b = CursorUpdate::initial();
             let plan1 = SplitReplacePlan::try_new(vec![
-                SplitReplaceChild::new(spec1_a.as_ref(), CursorUpdate::from_cursor(&c1_a)),
-                SplitReplaceChild::new(spec1_b.as_ref(), CursorUpdate::from_cursor(&c1_b)),
+                SplitReplaceChild::new(spec1_a.as_ref(), c1_a),
+                SplitReplaceChild::new(spec1_b.as_ref(), c1_b),
             ]).unwrap();
             let plan2 = SplitReplacePlan::try_new(vec![
-                SplitReplaceChild::new(spec2_a.as_ref(), CursorUpdate::from_cursor(&c2_a)),
-                SplitReplaceChild::new(spec2_b.as_ref(), CursorUpdate::from_cursor(&c2_b)),
+                SplitReplaceChild::new(spec2_a.as_ref(), c2_a),
+                SplitReplaceChild::new(spec2_b.as_ref(), c2_b),
             ]).unwrap();
             prop_assume!(plan1 != plan2);
             prop_assert_ne!(hash_split_replace_payload(&plan1), hash_split_replace_payload(&plan2));

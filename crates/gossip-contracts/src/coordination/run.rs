@@ -887,7 +887,7 @@ impl RunProgress {
     /// Lexicographic minimum last-key among active, non-initial shards.
     ///
     /// Returns `None` if there are no active shards with a non-initial cursor.
-    /// This can happen when all active shards are still at `Cursor::initial()`
+    /// This can happen when all active shards are still at `CursorUpdate::initial()`
     /// or when the run has no active shards.
     ///
     /// **Non-monotonicity**: This is a point-in-time snapshot, not a monotonic
@@ -1818,7 +1818,7 @@ pub trait RunManagement {
     ///   checkpoint cursors are both eligible while shard status is `Active`).
     ///
     /// `watermark` intentionally ignores `Done`/`Split`/`Parked` shards and
-    /// active shards still at `Cursor::initial()`. It is a snapshot, not a
+    /// active shards still at `CursorUpdate::initial()`. It is a snapshot, not a
     /// monotonic stream, and may move backward between calls as shard
     /// membership changes.
     ///

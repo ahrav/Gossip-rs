@@ -658,7 +658,7 @@ mod multi_tenant {
     //! The test exercises both terminal paths (`Complete` for tenant A,
     //! `Park` for tenant B) to maximize coverage of tenant-scoped behavior.
 
-    use crate::coordination::cursor::{Cursor, CursorUpdate};
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::error::AcquireError;
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::record::ParkReason;
@@ -712,15 +712,13 @@ mod multi_tenant {
                 (
                     ShardId::from_raw(i),
                     ShardSpec::with_range(vec![(i as u8) * 0x30], vec![((i + 1) as u8) * 0x30]),
-                    Cursor::initial(),
+                    CursorUpdate::initial(),
                 )
             })
             .collect();
         let shards_a: Vec<InitialShardInput<'_>> = shard_entries_a
             .iter()
-            .map(|(shard, spec, cursor)| {
-                InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-            })
+            .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
             .collect();
         let _ = coord
             .register_shards(now(1), tenant_a, run_a, &shards_a, OpId::from_raw(100))
@@ -732,15 +730,13 @@ mod multi_tenant {
                 (
                     ShardId::from_raw(i),
                     ShardSpec::with_range(vec![(i as u8) * 0x40], vec![((i + 1) as u8) * 0x40]),
-                    Cursor::initial(),
+                    CursorUpdate::initial(),
                 )
             })
             .collect();
         let shards_b: Vec<InitialShardInput<'_>> = shard_entries_b
             .iter()
-            .map(|(shard, spec, cursor)| {
-                InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-            })
+            .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
             .collect();
         let _ = coord
             .register_shards(now(1), tenant_b, run_b, &shards_b, OpId::from_raw(200))

@@ -1713,8 +1713,8 @@ fn split_replace_validate_preconditions<'a>(
 ///
 /// Callers may submit children in any order. Sorting ensures that the
 /// derived child IDs (which depend on index) are stable regardless of
-/// submission order, and that `validate_split_coverage` sees children in
-/// the contiguous sequence it expects.
+/// submission order, and that `split_replace_validate_coverage_sorted`
+/// sees children in the contiguous sequence it expects.
 fn split_replace_sort_children<'a>(plan: &'a SplitReplacePlan<'a>) -> SplitChildOrder {
     SplitChildOrder::from_plan(plan)
 }
@@ -2083,7 +2083,7 @@ fn split_residual_validate_cursor_bounds(
 
 /// Build the residual shard record (pure — no map mutation).
 ///
-/// The residual starts with `Cursor::initial()` because no work has been
+/// The residual starts with `CursorUpdate::initial()` because no work has been
 /// done in the residual's key range yet. It inherits `cursor_semantics`
 /// from the parent (run-level property) and records `parent.shard` as its
 /// lineage parent.
@@ -3270,8 +3270,8 @@ impl InMemoryCoordinator {
 /// is only used by the simulation checker after each step, not on any hot
 /// path.
 ///
-/// This impl intentionally exposes borrowed/owned accessors (cursor key,
-/// range bounds, materialize spec, cleanup hook) instead of raw slab
+/// This impl intentionally exposes borrowed accessors (cursor key,
+/// range bounds, cleanup hook) instead of raw slab
 /// handles so simulation code stays storage-abstraction-safe.
 #[cfg(any(test, feature = "test-support"))]
 impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
@@ -3296,10 +3296,6 @@ impl crate::sim::backend::SimIntrospection for InMemoryCoordinator {
 
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
         self.shard_get(tenant, key)
-    }
-
-    fn materialize_spec(&self, record: &ShardRecord) -> crate::coordination::shard_spec::ShardSpec {
-        record.spec.to_spec(&self.slab)
     }
 
     fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]> {

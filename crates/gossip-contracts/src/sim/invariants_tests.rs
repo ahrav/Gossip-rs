@@ -36,7 +36,7 @@
 //! comparing the current state against a previously observed state.
 
 use super::*;
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::derived_shard_id;
@@ -178,7 +178,7 @@ fn detects_cursor_regression() {
 
     // Seed with cursor at 'h'.
     let record = TestRecordBuilder::new(TENANT, run, shard)
-        .cursor(Cursor::with_last_key(vec![b'h']))
+        .cursor(CursorUpdate::with_last_key(b"h"))
         .build(coord.slab_mut());
     coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
@@ -186,7 +186,7 @@ fn detects_cursor_regression() {
 
     // Re-seed with cursor regressed to 'd' — S5 violation.
     let record = TestRecordBuilder::new(TENANT, run, shard)
-        .cursor(Cursor::with_last_key(vec![b'd']))
+        .cursor(CursorUpdate::with_last_key(b"d"))
         .build(coord.slab_mut());
     coord.seed_shard(record);
 
@@ -208,7 +208,7 @@ fn detects_cursor_reset_to_initial() {
 
     // Seed with cursor at 'h'.
     let record = TestRecordBuilder::new(TENANT, run, shard)
-        .cursor(Cursor::with_last_key(vec![b'h']))
+        .cursor(CursorUpdate::with_last_key(b"h"))
         .build(coord.slab_mut());
     coord.seed_shard(record);
     let mut checker = InvariantChecker::new();
@@ -236,7 +236,7 @@ fn detects_cursor_above_range() {
 
     // Cursor at '{' (ASCII 123) is above spec range [a=97, z=122).
     let record = TestRecordBuilder::new(TENANT, run, shard)
-        .cursor(Cursor::with_last_key(vec![b'{']))
+        .cursor(CursorUpdate::with_last_key(b"{"))
         .build(coord.slab_mut());
     coord.seed_shard(record);
 
@@ -259,7 +259,7 @@ fn detects_cursor_below_range() {
 
     // Cursor at 0x01 is below spec range [a=97, z=122).
     let record = TestRecordBuilder::new(TENANT, run, shard)
-        .cursor(Cursor::with_last_key(vec![0x01]))
+        .cursor(CursorUpdate::with_last_key(&[0x01]))
         .build(coord.slab_mut());
     coord.seed_shard(record);
 

@@ -20,7 +20,7 @@
 //! filter/capacity-hint contracts.
 
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter, ShardSummary};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::test_fixtures::{
@@ -311,12 +311,8 @@ fn apply_op(
         }
         Op::Checkpoint { cursor_key } => {
             if let Some(lease) = last_lease.as_ref()
-                && let Ok(c) = Cursor::try_with_last_key(vec![*cursor_key])
+                && let Ok(update) = CursorUpdate::try_with_last_key(&[*cursor_key])
             {
-                let update = CursorUpdate::new(
-                    c.last_key()
-                        .expect("try_with_last_key guarantees a non-empty key"),
-                );
                 let _ = coord.checkpoint(now, ten, lease, &update, OpId::from_raw(oc));
                 return (time, oc + 1);
             }
@@ -324,12 +320,8 @@ fn apply_op(
         }
         Op::Complete { cursor_key } => {
             if let Some(lease) = last_lease.as_ref()
-                && let Ok(c) = Cursor::try_with_last_key(vec![*cursor_key])
+                && let Ok(update) = CursorUpdate::try_with_last_key(&[*cursor_key])
             {
-                let update = CursorUpdate::new(
-                    c.last_key()
-                        .expect("try_with_last_key guarantees a non-empty key"),
-                );
                 let _ = coord.complete(now, ten, lease, &update, OpId::from_raw(oc));
                 return (time, oc + 1);
             }
@@ -358,12 +350,10 @@ fn apply_op(
             if let Some(lease) = last_lease.as_ref() {
                 let spec_a = ShardSpec::with_range(b"a", b"m");
                 let spec_b = ShardSpec::with_range(b"m", b"z");
-                let cursor_a = Cursor::initial();
-                let cursor_b = Cursor::initial();
-                let child_a =
-                    SplitReplaceChild::new(spec_a.as_ref(), CursorUpdate::from_cursor(&cursor_a));
-                let child_b =
-                    SplitReplaceChild::new(spec_b.as_ref(), CursorUpdate::from_cursor(&cursor_b));
+                let cursor_a = CursorUpdate::initial();
+                let cursor_b = CursorUpdate::initial();
+                let child_a = SplitReplaceChild::new(spec_a.as_ref(), cursor_a);
+                let child_b = SplitReplaceChild::new(spec_b.as_ref(), cursor_b);
                 if let Ok(plan) = SplitReplacePlan::try_new(vec![child_a, child_b]) {
                     let _ = coord.split_replace(now, ten, lease, plan, OpId::from_raw(oc));
                     return (time, oc + 1);
@@ -626,15 +616,13 @@ fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
             (
                 ShardId::from_raw(i as u64),
                 ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                CursorUpdate::initial(),
             )
         })
         .collect();
     let shards: Vec<InitialShardInput<'_>> = shard_entries
         .iter()
-        .map(|(shard, spec, cursor)| {
-            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-        })
+        .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
         .collect();
     let _ = coord
         .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))

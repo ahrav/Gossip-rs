@@ -615,11 +615,10 @@ impl ShardSpec {
 
     /// Construct a `ShardSpec` from pre-built parts, bypassing validation.
     ///
-    /// Used by [`PooledShardSpec::to_spec`] to reconstruct an owned spec
-    /// from slab-backed bytes (which were originally validated on creation).
-    /// Also available in test builds for constructing intentionally invalid
-    /// specs.
+    /// Test-support helper for constructing specs from pre-built parts
+    /// without re-running validation.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_raw_parts(
         key_range_start: Box<[u8]>,
         key_range_end: Box<[u8]>,
@@ -1036,23 +1035,25 @@ pub enum SplitValidationError {
     },
     /// Boundary mismatch (gap or overlap) between adjacent children.
     BoundaryMismatch {
-        /// Index in the caller's input order, not the internal sorted order.
+        /// Index in the coordinator's internal start-sorted child order.
         child_index: usize,
-        /// Index in the caller's input order, not the internal sorted order.
+        /// Index in the coordinator's internal start-sorted child order.
         next_child_index: usize,
         child_end: usize,
         next_child_start: usize,
     },
     /// Child has inverted key range (start >= end).
     InvertedChild {
-        /// Index in the caller's input order, not the internal sorted order.
+        /// Index in the coordinator's internal start-sorted child order.
         child_index: usize,
     },
 
     /// A non-last child has an unbounded end, causing it to overlap with
     /// subsequent children.
     OverlappingChild {
+        /// Index in the coordinator's internal start-sorted child order.
         child_index: usize,
+        /// Index in the coordinator's internal start-sorted child order.
         next_child_index: usize,
     },
 

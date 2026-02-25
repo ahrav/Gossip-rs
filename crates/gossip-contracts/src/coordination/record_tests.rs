@@ -43,6 +43,7 @@
 //!   parent, status, cursor, and fence, and rejects non-derived IDs.
 
 use super::*;
+use crate::coordination::error::AcquireScratch;
 use crate::coordination::lease::{OpKind, OpResult};
 use crate::coordination::test_fixtures::{derived_shard_id, test_run, test_spec, test_tenant};
 use crate::test_util::{TestSlab, canonical_digest};
@@ -247,7 +248,7 @@ fn assert_invariants_terminal_with_lease_panics(
         status,
         park_reason,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         lease,
         FenceEpoch::INITIAL,
@@ -276,7 +277,7 @@ fn assert_invariants_parent_some_but_not_derived_panics() {
         ShardStatus::Active,
         None,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -314,7 +315,7 @@ fn assert_invariants_fence_epoch_zero_panics() {
         ShardStatus::Active,
         None,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::ZERO,
@@ -337,7 +338,7 @@ fn assert_invariants_split_without_spawned_panics() {
         ShardStatus::Split,
         None,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -363,7 +364,7 @@ fn assert_invariants_duplicate_op_id_panics() {
         ShardStatus::Active,
         None,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -389,7 +390,7 @@ fn assert_invariants_spawned_exceeds_cap_panics() {
         ShardStatus::Split,
         None,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -481,15 +482,20 @@ fn op_log_lookup_reverse_finds_recent_first() {
 fn snapshot_preserves_fields() {
     let mut slab = TestSlab::new();
     let r = active_record(&mut slab);
-    let snap = r.snapshot(&slab);
-
-    // Materialize pooled fields for comparison.
-    let spec = r.spec.to_spec(&slab);
-    let cursor = r.cursor.to_cursor(&slab);
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(
+        r.spec.key_range_start(&slab),
+        r.spec.key_range_end(&slab),
+        r.spec.metadata(&slab),
+    );
+    scratch.write_cursor(r.cursor.last_key(&slab), r.cursor.token(&slab));
+    scratch.write_spawned_iter(r.spawned.iter(&slab));
+    let snap = scratch.view(r.status, r.cursor_semantics, r.parent);
 
     assert_eq!(snap.status(), r.status);
-    assert_eq!(snap.spec(), &spec);
-    assert_eq!(snap.cursor(), &cursor);
+    assert_eq!(snap.spec(), r.spec.as_spec_ref(&slab));
+    assert_eq!(snap.cursor().last_key(), r.cursor.last_key(&slab));
+    assert_eq!(snap.cursor().token(), r.cursor.token(&slab));
     assert_eq!(snap.cursor_semantics(), r.cursor_semantics);
     assert_eq!(snap.parent(), r.parent);
     let expected_spawned: SpawnedList = r.spawned.iter(&slab).collect();
@@ -503,7 +509,15 @@ fn snapshot_preserves_fields() {
 fn snapshot_does_not_leak_coordination_state() {
     let mut slab = TestSlab::new();
     let r = leased_record(&mut slab);
-    let snap = r.snapshot(&slab);
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(
+        r.spec.key_range_start(&slab),
+        r.spec.key_range_end(&slab),
+        r.spec.metadata(&slab),
+    );
+    scratch.write_cursor(r.cursor.last_key(&slab), r.cursor.token(&slab));
+    scratch.write_spawned_iter(r.spawned.iter(&slab));
+    let snap = scratch.view(r.status, r.cursor_semantics, r.parent);
     let debug = format!("{snap:?}");
     assert!(
         !debug.contains("TenantId"),
@@ -538,7 +552,7 @@ fn assert_invariants_derived_without_parent_panics() {
         ShardStatus::Active,
         None,
         &test_spec(),
-        &Cursor::initial(),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -712,7 +726,7 @@ fn new_split_child_construction_and_fields() {
     let mut slab = TestSlab::new();
     let parent_id = ShardId::from_raw(10);
     let child_id = derived_shard_id(1);
-    let cursor = Cursor::with_last_key(b"middle-key");
+    let cursor = CursorUpdate::with_last_key(b"middle-key");
     let spec = test_spec();
 
     let record = ShardRecord::new_split_child(
@@ -720,7 +734,7 @@ fn new_split_child_construction_and_fields() {
         test_run(),
         child_id,
         spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
+        cursor,
         CursorSemantics::Dispatched,
         parent_id,
         &mut slab,
@@ -730,9 +744,8 @@ fn new_split_child_construction_and_fields() {
     assert_eq!(record.status, ShardStatus::Active);
     assert_eq!(record.parent, Some(parent_id));
 
-    // Materialize pooled cursor for comparison.
-    let materialized_cursor = record.cursor.to_cursor(&slab);
-    assert_eq!(materialized_cursor, cursor);
+    assert_eq!(record.cursor.last_key(&slab), cursor.last_key());
+    assert_eq!(record.cursor.token(&slab), cursor.token());
 
     assert_eq!(record.cursor_semantics, CursorSemantics::Dispatched);
     assert_eq!(record.shard, child_id);
@@ -747,13 +760,13 @@ fn new_split_child_construction_and_fields() {
 fn new_split_child_non_derived_shard_panics() {
     let mut slab = TestSlab::new();
     let spec = test_spec();
-    let cursor = Cursor::initial();
+    let cursor = CursorUpdate::initial();
     let _ = ShardRecord::new_split_child(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10), // NOT derived
         spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
+        cursor,
         CursorSemantics::Completed,
         ShardId::from_raw(5),
         &mut slab,

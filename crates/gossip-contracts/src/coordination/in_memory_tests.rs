@@ -36,7 +36,7 @@
 //! monotonicity, cursor monotonicity, idempotent replay) after every step.
 
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_result, acquire_shard, derived_shard_id, now, other_tenant,
@@ -73,7 +73,7 @@ fn acquire_basic() {
         result.lease.deadline(),
         now(1).checked_add(LEASE_DURATION).unwrap(),
     );
-    assert_eq!(result.snapshot.status(), ShardStatus::Active);
+    assert_eq!(result.snapshot().status(), ShardStatus::Active);
 }
 
 #[test]
@@ -414,16 +414,13 @@ fn split_replace_three_children() {
     let spec_mid = ShardSpec::with_range(b"m", b"s");
     let spec_left = ShardSpec::with_range(b"a", b"m");
     let spec_right = ShardSpec::with_range(b"s", b"z");
-    let cursor_mid = Cursor::initial();
-    let cursor_left = Cursor::initial();
-    let cursor_right = Cursor::initial();
+    let cursor_mid = CursorUpdate::initial();
+    let cursor_left = CursorUpdate::initial();
+    let cursor_right = CursorUpdate::initial();
     let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(spec_mid.as_ref(), CursorUpdate::from_cursor(&cursor_mid)),
-        SplitReplaceChild::new(spec_left.as_ref(), CursorUpdate::from_cursor(&cursor_left)),
-        SplitReplaceChild::new(
-            spec_right.as_ref(),
-            CursorUpdate::from_cursor(&cursor_right),
-        ),
+        SplitReplaceChild::new(spec_mid.as_ref(), cursor_mid),
+        SplitReplaceChild::new(spec_left.as_ref(), cursor_left),
+        SplitReplaceChild::new(spec_right.as_ref(), cursor_right),
     ])
     .unwrap();
 
@@ -464,12 +461,8 @@ fn split_replace_mid_build_failure_rolls_back_inserted_children() {
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
     let spec = test_spec();
-    let cursor = Cursor::initial();
-    let shards = vec![InitialShardInput::new(
-        test_shard(),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    )];
+    let cursor = CursorUpdate::initial();
+    let shards = vec![InitialShardInput::new(test_shard(), spec.as_ref(), cursor)];
     let _ = coord
         .register_shards(
             now(2),
@@ -557,7 +550,7 @@ fn split_residual_basic() {
         test_worker(2),
     )
     .unwrap();
-    assert_eq!(new_result.snapshot.status(), ShardStatus::Active);
+    assert_eq!(new_result.snapshot().status(), ShardStatus::Active);
 }
 
 #[test]
@@ -601,12 +594,8 @@ fn split_residual_parent_update_failure_deallocates_residual_fields() {
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
     let spec = test_spec();
-    let cursor = Cursor::initial();
-    let shards = vec![InitialShardInput::new(
-        test_shard(),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    )];
+    let cursor = CursorUpdate::initial();
+    let shards = vec![InitialShardInput::new(test_shard(), spec.as_ref(), cursor)];
     let _ = coord
         .register_shards(
             now(2),
@@ -916,7 +905,7 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
         ShardStatus::Active,
         None,
         &test_spec(), // [a, z)
-        &Cursor::with_last_key(b"d"),
+        CursorUpdate::with_last_key(b"d"),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -1071,14 +1060,11 @@ fn split_replace_op_id_conflict() {
     // Same op_id, different plan (different split point).
     let spec_left = ShardSpec::with_range(b"a", b"p");
     let spec_right = ShardSpec::with_range(b"p", b"z");
-    let cursor_left = Cursor::initial();
-    let cursor_right = Cursor::initial();
+    let cursor_left = CursorUpdate::initial();
+    let cursor_right = CursorUpdate::initial();
     let plan_b = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(spec_left.as_ref(), CursorUpdate::from_cursor(&cursor_left)),
-        SplitReplaceChild::new(
-            spec_right.as_ref(),
-            CursorUpdate::from_cursor(&cursor_right),
-        ),
+        SplitReplaceChild::new(spec_left.as_ref(), cursor_left),
+        SplitReplaceChild::new(spec_right.as_ref(), cursor_right),
     ])
     .unwrap();
 
@@ -1579,11 +1565,11 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
     .unwrap();
     // Verify snapshot has the residual range [m, z).
     assert_eq!(
-        child_result.snapshot.spec().key_range_start(),
+        child_result.snapshot().spec().key_range_start(),
         b"m".as_slice(),
     );
     assert_eq!(
-        child_result.snapshot.spec().key_range_end(),
+        child_result.snapshot().spec().key_range_end(),
         b"z".as_slice(),
     );
     let child_lease = child_result.lease;
@@ -1697,8 +1683,8 @@ fn lifecycle_split_residual_twice_then_complete_children() {
     // Step 6: Acquire + complete residual_1 [m, z).
     let r1_key = ShardKey::new(test_run(), residual_1);
     let r1_acq = acquire_result(&mut coord, now(7), test_tenant(), r1_key, test_worker(2)).unwrap();
-    assert_eq!(r1_acq.snapshot.spec().key_range_start(), b"m".as_slice());
-    assert_eq!(r1_acq.snapshot.spec().key_range_end(), b"z".as_slice());
+    assert_eq!(r1_acq.snapshot().spec().key_range_start(), b"m".as_slice());
+    assert_eq!(r1_acq.snapshot().spec().key_range_end(), b"z".as_slice());
     let _ = coord
         .complete(
             now(8),
@@ -1712,8 +1698,8 @@ fn lifecycle_split_residual_twice_then_complete_children() {
     // Step 7: Acquire + complete residual_2 [j, m).
     let r2_key = ShardKey::new(test_run(), residual_2);
     let r2_acq = acquire_result(&mut coord, now(9), test_tenant(), r2_key, test_worker(3)).unwrap();
-    assert_eq!(r2_acq.snapshot.spec().key_range_start(), b"j".as_slice());
-    assert_eq!(r2_acq.snapshot.spec().key_range_end(), b"m".as_slice());
+    assert_eq!(r2_acq.snapshot().spec().key_range_start(), b"j".as_slice());
+    assert_eq!(r2_acq.snapshot().spec().key_range_end(), b"m".as_slice());
     let _ = coord
         .complete(
             now(10),
@@ -1763,19 +1749,11 @@ fn acquire_scratch_reuse_does_not_grow_buffers() {
     let shard_b = ShardId::from_raw(20);
     let spec_a = ShardSpec::with_range(b"a", b"m");
     let spec_b = ShardSpec::with_range(b"m", b"z");
-    let cursor_a = Cursor::initial();
-    let cursor_b = Cursor::initial();
+    let cursor_a = CursorUpdate::initial();
+    let cursor_b = CursorUpdate::initial();
     let shards = vec![
-        InitialShardInput::new(
-            shard_a,
-            spec_a.as_ref(),
-            CursorUpdate::from_cursor(&cursor_a),
-        ),
-        InitialShardInput::new(
-            shard_b,
-            spec_b.as_ref(),
-            CursorUpdate::from_cursor(&cursor_b),
-        ),
+        InitialShardInput::new(shard_a, spec_a.as_ref(), cursor_a),
+        InitialShardInput::new(shard_b, spec_b.as_ref(), cursor_b),
     ];
     let _ = coord
         .register_shards(

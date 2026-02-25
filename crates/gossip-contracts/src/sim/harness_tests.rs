@@ -27,6 +27,7 @@
 //! | **Terminate-run generator** | `try_gen_terminate_run` samples all seeded runs uniformly |
 
 use super::*;
+use crate::coordination::shard_spec::ShardSpec;
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
 
@@ -195,7 +196,7 @@ fn forward_cursor_no_regression_at_range_boundary() {
 
     // Generate a forward cursor -- must be >= previous.
     let cursor = sim.generate_forward_cursor(worker, key);
-    let cursor_key = cursor.last_key().expect("cursor should have a key");
+    let cursor_key = cursor.as_slice();
 
     assert!(
         cursor_key >= prev_cursor.as_slice(),
@@ -314,7 +315,7 @@ fn generate_forward_cursor_no_prior() {
 
     // No prior cursor recorded — generate a fresh one.
     let cursor = sim.generate_forward_cursor(worker, key);
-    let cursor_key = cursor.last_key().expect("cursor should have a key");
+    let cursor_key = cursor.as_slice();
 
     // Spec range is [b'a', b'z'). First byte must be in [b'a', b'z').
     let first_byte = cursor_key[0];
@@ -349,7 +350,7 @@ fn generate_forward_cursor_forward_progress() {
         .record_cursor(key.run(), key.shard(), vec![b'c']);
 
     let cursor = sim.generate_forward_cursor(worker, key);
-    let cursor_key = cursor.last_key().expect("cursor should have a key");
+    let cursor_key = cursor.as_slice();
 
     assert!(
         cursor_key[0] >= b'd',
@@ -381,7 +382,7 @@ fn generate_forward_cursor_range_exhausted() {
     );
 
     let cursor = sim.generate_forward_cursor(worker, key);
-    let cursor_key = cursor.last_key().expect("cursor should have a key");
+    let cursor_key = cursor.as_slice();
 
     // Must return the previous cursor since range is exhausted.
     assert_eq!(
@@ -433,7 +434,7 @@ fn generate_forward_cursor_single_byte_range() {
         .record_cursor(run, shard, vec![b'a']);
 
     let cursor = sim.generate_forward_cursor(worker, key);
-    let cursor_key = cursor.last_key().expect("cursor should have a key");
+    let cursor_key = cursor.as_slice();
 
     // First byte must be >= b'b' (forward from b'a') and < b'c' (range end).
     // With spec [b'a', b'c'), the only valid first byte is b'b'.

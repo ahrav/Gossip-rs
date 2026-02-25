@@ -92,7 +92,7 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::coordination::Lease;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::error::{
     AcquireError, AcquireScratch, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
     RenewError, SplitError,
@@ -102,7 +102,7 @@ use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{RunTransitionError, UnparkError};
 use crate::coordination::session::WorkerSession;
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
@@ -624,7 +624,7 @@ const MAX_STALE_LEASES: usize = 64;
 ///
 /// Keyed by `(worker_raw, run_raw, shard_raw)` because `ShardKey` intentionally
 /// omits `Ord` (it is an opaque identity, not an ordered quantity). Each entry
-/// stores the `(OpId, Cursor, WorkerId, ShardKey)` from the last successful
+/// stores the `(OpId, last_key, WorkerId, ShardKey)` from the last successful
 /// checkpoint, enabling:
 ///
 /// - [`SimOp::ReplayCheckpoint`]: resubmit the same OpId + same payload to
@@ -635,7 +635,9 @@ const MAX_STALE_LEASES: usize = 64;
 /// Only the most recent checkpoint per `(worker, run, shard)` is retained.
 /// Earlier entries are overwritten, which is correct because the op-log's
 /// dedup window is bounded and older ops may already be evicted.
-type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Cursor, WorkerId, ShardKey)>;
+type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Vec<u8>, WorkerId, ShardKey)>;
+type SplitBoundsBuf = ([u8; MAX_KEY_SIZE], usize, [u8; MAX_KEY_SIZE], usize);
+type SplitInputCopy = (SplitBoundsBuf, Option<u8>);
 
 /// Validate worker preconditions and consume the next op-ID in one shot.
 ///
@@ -838,12 +840,12 @@ impl CoordinationSim<InMemoryCoordinator> {
     /// `active_shard_keys` -- call [`with_workers_and_shards`](Self::with_workers_and_shards)
     /// or set `active_shard_keys` manually after registration.
     pub fn register_shard(&mut self, run: RunId, shard: ShardId) {
-        let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+        let spec = ShardSpecRef::with_range(b"a", b"z");
         let record = ShardRecord::new_active(
             self.tenant,
             run,
             shard,
-            spec.as_ref(),
+            spec,
             CursorSemantics::Completed,
             self.coordinator.slab_mut(),
         )
@@ -1394,7 +1396,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
-        let update = CursorUpdate::from_cursor(&cursor);
+        let update = CursorUpdate::with_last_key(&cursor);
 
         let now = self.context.now();
         match self
@@ -1403,10 +1405,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         {
             Ok(_) => {
                 // Track cursor progress on the worker.
-                if let Some(last_key) = cursor.last_key()
-                    && let Some(w) = self.workers.get_mut(&worker)
-                {
-                    w.record_cursor(key.run(), key.shard(), last_key.to_vec());
+                if let Some(w) = self.workers.get_mut(&worker) {
+                    w.record_cursor(key.run(), key.shard(), cursor.clone());
                 }
                 // Save for OpId replay/conflict testing.
                 let ck = (worker.as_raw(), key.run().as_raw(), key.shard().as_raw());
@@ -1427,7 +1427,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let cursor = self.generate_forward_cursor(worker, key);
-        let update = CursorUpdate::from_cursor(&cursor);
+        let update = CursorUpdate::with_last_key(&cursor);
 
         let now = self.context.now();
         match self
@@ -1535,19 +1535,39 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     // Split helpers
     // -----------------------------------------------------------------------
 
-    /// Look up a shard's spec from the coordinator, returning a rejection
-    /// event if the shard does not exist.
+    /// Copy split-relevant shard inputs into stack-owned buffers.
     ///
-    /// This helper intentionally materializes an owned spec because split-plan
-    /// builders own their `ShardSpec`s. Other harness paths prefer borrowed
-    /// accessors (`spec_bounds`, `cursor_last_key`) to avoid extra copies.
-    fn lookup_shard_spec(&self, key: ShardKey) -> Result<ShardSpec, SimEvent> {
-        match self.coordinator.shard_lookup(&self.tenant, &key) {
-            Some(record) => Ok(self.coordinator.materialize_spec(record)),
-            None => Err(SimEvent::Rejected {
-                kind: RejectionKind::ShardNotFound,
-            }),
-        }
+    /// Returns `(start_buf, start_len, end_buf, end_len)` plus the optional
+    /// first cursor byte. Copying into fixed-capacity stack buffers allows the
+    /// harness to build `ShardSpecRef` split plans without holding immutable
+    /// borrows into the coordinator while mutating it, and without materializing
+    /// owned specs on the runtime simulation path.
+    fn copy_shard_split_inputs(&self, key: ShardKey) -> Result<SplitInputCopy, SimEvent> {
+        let record =
+            self.coordinator
+                .shard_lookup(&self.tenant, &key)
+                .ok_or(SimEvent::Rejected {
+                    kind: RejectionKind::ShardNotFound,
+                })?;
+
+        let (start, end) = self.coordinator.spec_bounds(record);
+        debug_assert!(start.len() <= MAX_KEY_SIZE);
+        debug_assert!(end.len() <= MAX_KEY_SIZE);
+
+        let mut start_buf = [0u8; MAX_KEY_SIZE];
+        let mut end_buf = [0u8; MAX_KEY_SIZE];
+        start_buf[..start.len()].copy_from_slice(start);
+        end_buf[..end.len()].copy_from_slice(end);
+
+        let cursor_first_byte = self
+            .coordinator
+            .cursor_last_key(record)
+            .and_then(|k| k.first().copied());
+
+        Ok((
+            (start_buf, start.len(), end_buf, end.len()),
+            cursor_first_byte,
+        ))
     }
 
     /// Compute a random single-byte split point strictly within `(start[0], end[0])`.
@@ -1580,7 +1600,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     ///
     /// On success, releases the parent from the worker, registers both child
     /// shard keys in `shard_keys` and `active_shard_keys`, and removes the
-    /// parent from the active set. The children start with `Cursor::initial()`
+    /// parent from the active set. The children start with `CursorUpdate::initial()`
     /// (no progress) and are available for future acquire operations.
     fn exec_split_replace(&mut self, worker: WorkerId, key: ShardKey) -> SimEvent {
         let (lease, op_id) = match require_lease_and_op(&mut self.workers, worker, &key) {
@@ -1588,34 +1608,29 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Err(event) => return event,
         };
 
-        // Look up parent's spec to compute a valid split point.
-        let parent_spec = match self.lookup_shard_spec(key) {
-            Ok(spec) => spec,
+        // Look up parent bounds to compute a valid split point.
+        let ((start_buf, start_len, end_buf, end_len), _) = match self.copy_shard_split_inputs(key)
+        {
+            Ok(inputs) => inputs,
             Err(event) => return event,
         };
-
-        let start = parent_spec.key_range_start();
-        let end = parent_spec.key_range_end();
+        let start = &start_buf[..start_len];
+        let end = &end_buf[..end_len];
 
         let mid = match self.compute_split_byte(start, end) {
             Ok(m) => m,
             Err(event) => return event,
         };
 
-        let child_a_spec = ShardSpec::with_range(start, vec![mid]);
-        let child_b_spec = ShardSpec::with_range(vec![mid], end);
+        let mid_key = [mid];
+        let child_a_spec = ShardSpecRef::with_range(start, &mid_key);
+        let child_b_spec = ShardSpecRef::with_range(&mid_key, end);
 
-        let child_a_cursor = Cursor::initial();
-        let child_b_cursor = Cursor::initial();
-        let plan = match SplitReplacePlan::try_new(vec![
-            SplitReplaceChild::new(
-                child_a_spec.as_ref(),
-                CursorUpdate::from_cursor(&child_a_cursor),
-            ),
-            SplitReplaceChild::new(
-                child_b_spec.as_ref(),
-                CursorUpdate::from_cursor(&child_b_cursor),
-            ),
+        let child_a_cursor = CursorUpdate::initial();
+        let child_b_cursor = CursorUpdate::initial();
+        let plan = match SplitReplacePlan::try_new([
+            SplitReplaceChild::new(child_a_spec, child_a_cursor),
+            SplitReplaceChild::new(child_b_spec, child_b_cursor),
         ]) {
             Ok(p) => p,
             Err(_e) => {
@@ -1664,18 +1679,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             Err(event) => return event,
         };
 
-        // Look up parent's current spec and cursor to compute a valid split.
-        let parent_spec = match self.lookup_shard_spec(key) {
-            Ok(spec) => spec,
-            Err(event) => return event,
-        };
-        let parent_cursor_key = self
-            .coordinator
-            .shard_lookup(&self.tenant, &key)
-            .and_then(|r| self.coordinator.cursor_last_key(r).map(|k| k.to_vec()));
-
-        let start = parent_spec.key_range_start();
-        let end = parent_spec.key_range_end();
+        // Look up parent bounds and cursor to compute a valid split.
+        let ((start_buf, start_len, end_buf, end_len), parent_cursor_first_byte) =
+            match self.copy_shard_split_inputs(key) {
+                Ok(inputs) => inputs,
+                Err(event) => return event,
+            };
+        let start = &start_buf[..start_len];
+        let end = &end_buf[..end_len];
 
         // Basic range validation (reuse helper logic).
         if start.is_empty() || end.is_empty() || start >= end || end[0] - start[0] < 2 {
@@ -1686,10 +1697,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
         // Split point must be after the current cursor (parent keeps the
         // prefix it already scanned). If no cursor yet, split anywhere.
-        let cursor_byte = parent_cursor_key
-            .as_ref()
-            .and_then(|k| k.first().copied())
-            .unwrap_or(start[0]);
+        let cursor_byte = parent_cursor_first_byte.unwrap_or(start[0]);
 
         let lo = cursor_byte.saturating_add(1).max(start[0] + 1);
         let hi = end[0];
@@ -1700,19 +1708,19 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         }
         let mid = self.context.rng().random_range(lo..hi);
 
-        let new_parent_spec = ShardSpec::with_range(start, vec![mid]);
-        let residual_spec = ShardSpec::with_range(vec![mid], end);
+        let mid_key = [mid];
+        let new_parent_spec = ShardSpecRef::with_range(start, &mid_key);
+        let residual_spec = ShardSpecRef::with_range(&mid_key, end);
 
-        let plan =
-            match SplitResidualPlan::try_new(new_parent_spec.as_ref(), residual_spec.as_ref()) {
-                Ok(p) => p,
-                Err(_e) => {
-                    debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
-                    return SimEvent::Rejected {
-                        kind: RejectionKind::SplitValidation,
-                    };
-                }
-            };
+        let plan = match SplitResidualPlan::try_new(new_parent_spec, residual_spec) {
+            Ok(p) => p,
+            Err(_e) => {
+                debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
+                return SimEvent::Rejected {
+                    kind: RejectionKind::SplitValidation,
+                };
+            }
+        };
 
         let now = self.context.now();
         match self
@@ -1745,7 +1753,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         &self,
         worker: WorkerId,
         key: ShardKey,
-    ) -> Result<(OpId, Cursor, Lease), SimEvent> {
+    ) -> Result<(OpId, Vec<u8>, Lease), SimEvent> {
         if self.workers.get(&worker).is_none_or(|w| w.is_paused()) {
             return Err(SimEvent::Rejected {
                 kind: RejectionKind::WorkerPaused,
@@ -1787,7 +1795,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let now = self.context.now();
-        let prev_update = CursorUpdate::from_cursor(&prev_cursor);
+        let prev_update = CursorUpdate::with_last_key(&prev_cursor);
         match self
             .coordinator
             .checkpoint(now, self.tenant, &lease, &prev_update, prev_op_id)
@@ -1819,7 +1827,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
 
         // Generate a *different* cursor to trigger a payload hash mismatch.
         let different_cursor = self.generate_forward_cursor(worker, key);
-        let different_update = CursorUpdate::from_cursor(&different_cursor);
+        let different_update = CursorUpdate::with_last_key(&different_cursor);
 
         let now = self.context.now();
         match self
@@ -2302,7 +2310,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     ///
     /// Generates variable-length keys (1–3 bytes) to exercise multi-byte
     /// lexicographic comparison paths in the coordinator.
-    fn generate_forward_cursor(&mut self, worker: WorkerId, key: ShardKey) -> Cursor {
+    fn generate_forward_cursor(&mut self, worker: WorkerId, key: ShardKey) -> Vec<u8> {
         let last = self
             .workers
             .get(&worker)
@@ -2336,9 +2344,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             // maintain the forward-only guarantee. Without this, a single-byte
             // fallback could regress behind a multi-byte previous cursor.
             if let Some(prev) = last {
-                return Cursor::with_last_key(prev);
+                return prev.to_vec();
             }
-            return Cursor::with_last_key(vec![range_hi.saturating_sub(1)]);
+            return vec![range_hi.saturating_sub(1)];
         }
 
         let first_byte = self.context.rng().random_range(start..range_hi);
@@ -2352,7 +2360,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             cursor_key.push(self.context.rng().random_range(0u8..=255));
         }
 
-        Cursor::with_last_key(cursor_key)
+        cursor_key
     }
 
     // -----------------------------------------------------------------------
@@ -2522,18 +2530,18 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             _ => 1,
         };
         let total_cursors = num_checkpoints as usize + extra_ops;
-        let mut cursors: Vec<Cursor> = Vec::with_capacity(total_cursors);
+        let mut cursors: Vec<Vec<u8>> = Vec::with_capacity(total_cursors);
         let mut lo = range_lo;
         for _ in 0..total_cursors {
             if lo >= range_hi {
                 let byte = cursors
                     .last()
-                    .and_then(|c| c.last_key().and_then(|k| k.first().copied()))
+                    .and_then(|c| c.first().copied())
                     .unwrap_or(range_hi.saturating_sub(1));
-                cursors.push(Cursor::with_last_key(vec![byte]));
+                cursors.push(vec![byte]);
             } else {
                 let byte = self.context.rng().random_range(lo..range_hi);
-                cursors.push(Cursor::with_last_key(vec![byte]));
+                cursors.push(vec![byte]);
                 lo = byte.saturating_add(1);
             }
         }
@@ -2552,7 +2560,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         ) {
             let last_cp_byte = cursors
                 .get(num_checkpoints.saturating_sub(1) as usize)
-                .and_then(|c| c.last_key().and_then(|k| k.first().copied()))
+                .and_then(|c| c.first().copied())
                 .unwrap_or(range_lo);
             precompute_split_residual_plan(self.context.rng(), range_lo, range_hi, last_cp_byte)
         } else {
@@ -2608,7 +2616,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             let mut checkpoints_ok: u32 = 0;
             let mut checkpoints_rejected: u32 = 0;
             for i in 0..num_checkpoints as usize {
-                let update = CursorUpdate::from_cursor(&cursors[i]);
+                let update = CursorUpdate::with_last_key(&cursors[i]);
                 match sess.checkpoint(now, &update, op_ids[i]) {
                     Ok(_) => checkpoints_ok += 1,
                     Err(e) => {
@@ -2641,7 +2649,7 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     })
                 }
                 SessionTerminalAction::Complete => {
-                    let terminal_update = CursorUpdate::from_cursor(&cursors[terminal_idx]);
+                    let terminal_update = CursorUpdate::with_last_key(&cursors[terminal_idx]);
                     let is_terminal =
                         match sess.complete(now, &terminal_update, op_ids[terminal_idx]) {
                             Ok(_) => true,
@@ -2668,19 +2676,16 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                 SessionTerminalAction::SplitReplace => {
                     let mid = split_replace_plan
                         .expect("terminal_action normalized away SplitReplace without midpoint");
-                    let child_a_spec = ShardSpec::with_range(vec![range_lo], vec![mid]);
-                    let child_b_spec = ShardSpec::with_range(vec![mid], vec![range_hi]);
-                    let child_a_cursor = Cursor::initial();
-                    let child_b_cursor = Cursor::initial();
-                    let plan = match SplitReplacePlan::try_new(vec![
-                        SplitReplaceChild::new(
-                            child_a_spec.as_ref(),
-                            CursorUpdate::from_cursor(&child_a_cursor),
-                        ),
-                        SplitReplaceChild::new(
-                            child_b_spec.as_ref(),
-                            CursorUpdate::from_cursor(&child_b_cursor),
-                        ),
+                    let range_lo_key = [range_lo];
+                    let mid_key = [mid];
+                    let range_hi_key = [range_hi];
+                    let child_a_spec = ShardSpecRef::with_range(&range_lo_key, &mid_key);
+                    let child_b_spec = ShardSpecRef::with_range(&mid_key, &range_hi_key);
+                    let child_a_cursor = CursorUpdate::initial();
+                    let child_b_cursor = CursorUpdate::initial();
+                    let plan = match SplitReplacePlan::try_new([
+                        SplitReplaceChild::new(child_a_spec, child_a_cursor),
+                        SplitReplaceChild::new(child_b_spec, child_b_cursor),
                     ]) {
                         Ok(plan) => plan,
                         Err(_e) => {
@@ -2728,12 +2733,12 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     let (mid, complete_byte) = split_residual_plan.expect(
                         "terminal_action normalized away SplitResidualThenComplete without bytes",
                     );
-                    let new_parent_spec = ShardSpec::with_range(vec![range_lo], vec![mid]);
-                    let residual_spec = ShardSpec::with_range(vec![mid], vec![range_hi]);
-                    let plan = match SplitResidualPlan::try_new(
-                        new_parent_spec.as_ref(),
-                        residual_spec.as_ref(),
-                    ) {
+                    let range_lo_key = [range_lo];
+                    let mid_key = [mid];
+                    let range_hi_key = [range_hi];
+                    let new_parent_spec = ShardSpecRef::with_range(&range_lo_key, &mid_key);
+                    let residual_spec = ShardSpecRef::with_range(&mid_key, &range_hi_key);
+                    let plan = match SplitResidualPlan::try_new(new_parent_spec, residual_spec) {
                         Ok(plan) => plan,
                         Err(_e) => {
                             debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
@@ -2766,8 +2771,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         let residual_id = sess.initial_snapshot().spawned().last().copied();
                         // Complete the (now-narrowed) parent.
                         let complete_idx = terminal_idx + 1;
-                        let complete_cursor = Cursor::with_last_key(vec![complete_byte]);
-                        let complete_update = CursorUpdate::from_cursor(&complete_cursor);
+                        let complete_key = [complete_byte];
+                        let complete_cursor = CursorUpdate::with_last_key(&complete_key);
+                        let complete_update = complete_cursor;
                         let is_terminal =
                             match sess.complete(now, &complete_update, op_ids[complete_idx]) {
                                 Ok(_) => true,

@@ -1,4 +1,5 @@
-//! Arena-pooled wrappers for [`ShardSpec`] and [`Cursor`] byte fields.
+//! Arena-pooled wrappers for
+//! [`crate::coordination::shard_spec::ShardSpec`] and [`CursorUpdate`] byte fields.
 //!
 //! ## Problem
 //!
@@ -68,7 +69,7 @@
 //! `PooledShardSpec` uses `ByteSlot::EMPTY` for absent range endpoints
 //! (empty `[]` in `ShardSpec`), which naturally maps to `slab.get(EMPTY)`
 //! returning `&[]`. `PooledCursor` wraps each slot in `Option` instead,
-//! because `Cursor` semantics distinguish `None` (no progress / no token)
+//! because [`CursorUpdate`] semantics distinguish `None` (no progress / no token)
 //! from `Some(&[])` (present but empty). Using `ByteSlot::EMPTY` would
 //! conflate the two since `slab.get(EMPTY)` also returns `&[]`.
 //!
@@ -88,10 +89,8 @@
 
 use gossip_stdx::{ByteSlab, ByteSlot, SlabFull};
 
-#[cfg(any(test, feature = "test-support"))]
-use crate::coordination::cursor::Cursor;
 use crate::coordination::cursor::CursorUpdate;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::shard_spec::ShardSpecRef;
 use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
@@ -145,7 +144,8 @@ fn allocate_with_rollback<const N: usize>(
 // PooledShardSpec
 // ============================================================================
 
-/// Arena-pooled mirror of [`ShardSpec`], backed by [`ByteSlot`] handles.
+/// Arena-pooled mirror of [`crate::coordination::shard_spec::ShardSpec`],
+/// backed by [`ByteSlot`] handles.
 ///
 /// Holds exactly 3 `ByteSlot` handles corresponding to `ShardSpec`'s 3
 /// byte fields: `key_range_start`, `key_range_end`, and `metadata`.
@@ -189,21 +189,6 @@ impl PooledShardSpec {
         })
     }
 
-    /// Copy a `ShardSpec`'s byte fields into the slab, returning a pooled
-    /// handle.
-    ///
-    /// All 3 fields are allocated atomically via [`allocate_with_rollback`]:
-    /// if the slab runs out of space mid-way, earlier allocations are rolled
-    /// back and no slab space is leaked.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SlabFull`] if the slab cannot accommodate all 3 fields.
-    #[cfg(test)]
-    pub(crate) fn from_spec(spec: &ShardSpec, slab: &mut ByteSlab) -> Result<Self, SlabFull> {
-        Self::from_spec_ref(spec.as_ref(), slab)
-    }
-
     /// Inclusive lower bound of the key range.
     #[inline]
     pub(crate) fn key_range_start<'a>(&self, slab: &'a ByteSlab) -> &'a [u8] {
@@ -232,25 +217,6 @@ impl PooledShardSpec {
         )
     }
 
-    /// Materialize an owned `ShardSpec` by copying bytes out of the slab
-    /// into fresh `Box<[u8]>` allocations.
-    ///
-    /// Used when crossing API boundaries (e.g., `ShardRecord::snapshot`)
-    /// that require heap-owned types. The pooled handle remains valid
-    /// afterward — this is a read, not a move.
-    ///
-    /// Bypasses `ShardSpec` validation via [`ShardSpec::from_raw_parts`]
-    /// because the data was validated when the original spec was created.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn to_spec(&self, slab: &ByteSlab) -> ShardSpec {
-        let spec = self.as_spec_ref(slab);
-        ShardSpec::from_raw_parts(
-            spec.key_range_start().into(),
-            spec.key_range_end().into(),
-            spec.metadata().into(),
-        )
-    }
-
     /// Replace all fields with data from `new_spec`, providing a strong
     /// exception guarantee.
     ///
@@ -260,21 +226,14 @@ impl PooledShardSpec {
     /// and `SlabFull` is returned. This avoids a window where the spec
     /// is in a partially-updated state.
     ///
+    /// Replace all fields from a borrowed spec view.
+    ///
+    /// Uses the same allocate-then-release ordering described above. If
+    /// allocation fails, old slots remain installed and `self` is unchanged.
+    ///
     /// # Errors
     ///
     /// Returns [`SlabFull`] if the slab cannot accommodate the new fields.
-    /// On error, `self` is unchanged.
-    #[cfg(test)]
-    pub(crate) fn update(
-        &mut self,
-        new_spec: &ShardSpec,
-        slab: &mut ByteSlab,
-    ) -> Result<(), SlabFull> {
-        self.update_from_ref(new_spec.as_ref(), slab)
-    }
-
-    /// Replace all fields from a borrowed spec view, preserving the same
-    /// strong exception guarantee as [`Self::update`].
     pub(crate) fn update_from_ref(
         &mut self,
         new_spec: ShardSpecRef<'_>,
@@ -323,16 +282,16 @@ impl PooledShardSpec {
 // PooledCursor
 // ============================================================================
 
-/// Arena-pooled mirror of [`Cursor`], backed by [`ByteSlot`] handles.
+/// Arena-pooled mirror of [`CursorUpdate`], backed by [`ByteSlot`] handles.
 ///
-/// Holds 0-2 `ByteSlot` handles corresponding to `Cursor`'s two optional
-/// byte fields.
+/// Holds 0-2 `ByteSlot` handles corresponding to `CursorUpdate`'s two
+/// optional byte fields.
 ///
 /// ## `Option<ByteSlot>` vs bare `ByteSlot`
 ///
 /// Unlike `PooledShardSpec` (which uses `ByteSlot::EMPTY` for absent
 /// range endpoints), `PooledCursor` wraps each slot in `Option`. This
-/// preserves the semantic distinction from `Cursor`: `None` means "no
+/// preserves the semantic distinction from [`CursorUpdate`]: `None` means "no
 /// progress" / "no token", which is different from "present but empty."
 /// `ByteSlot::EMPTY` would conflate the two because `slab.get(EMPTY)`
 /// returns `&[]`.
@@ -369,23 +328,10 @@ impl PooledCursor {
         Ok((last_key, token))
     }
 
-    /// Copy a `Cursor`'s byte fields into the slab, returning a pooled
-    /// handle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SlabFull`] if the slab cannot accommodate all present
-    /// fields. On error, no slab space is leaked.
-    #[cfg(test)]
-    pub(crate) fn from_cursor(cursor: &Cursor, slab: &mut ByteSlab) -> Result<Self, SlabFull> {
-        let (last_key, token) = Self::allocate_fields(cursor.last_key(), cursor.token(), slab)?;
-        Ok(Self { last_key, token })
-    }
-
     /// Copy a borrowed cursor update into the slab.
     ///
-    /// This is the borrowed-input companion to [`Self::from_cursor`], used by
-    /// hot paths that avoid materializing owned cursor values.
+    /// This is the only cursor-construction path: runtime and tests both pass
+    /// borrowed cursor bytes via [`CursorUpdate`].
     pub(crate) fn from_update(
         update: &CursorUpdate<'_>,
         slab: &mut ByteSlab,
@@ -415,39 +361,11 @@ impl PooledCursor {
         self.token.map(|slot| slab.get(slot))
     }
 
-    /// Materialize an owned `Cursor` by copying bytes out of the slab
-    /// into heap allocations.
-    ///
-    /// Used when crossing API boundaries (e.g., `ShardRecord::snapshot`).
-    /// The pooled handle remains valid afterward.
-    ///
-    /// The `(None, Some(_))` state is theoretically impossible: `Cursor`
-    /// does not support token-without-last-key. Keep an explicit arm so
-    /// debug builds surface invariant drift early; release builds degrade to
-    /// `Cursor::initial()` to keep conversion total even under corruption.
-    #[cfg(any(test, feature = "test-support"))]
-    #[allow(dead_code)]
-    pub(crate) fn to_cursor(&self, slab: &ByteSlab) -> Cursor {
-        let last_key = self.last_key(slab).map(|k| k.to_vec());
-        let token = self.token(slab).map(|t| t.to_vec());
-        match (last_key, token) {
-            (None, None) => Cursor::initial(),
-            (None, Some(_)) => {
-                debug_assert!(
-                    false,
-                    "pooled cursor invariant violated: token present without last_key",
-                );
-                Cursor::initial()
-            }
-            (Some(k), None) => Cursor::with_last_key(k),
-            (Some(k), Some(t)) => Cursor::from_parts(k, t),
-        }
-    }
-
     /// Replace all fields from a borrowed [`CursorUpdate`] without requiring
-    /// an owned [`Cursor`] allocation on the caller side.
+    /// any owned cursor allocation.
     ///
-    /// Uses the same strong exception guarantee as `PooledShardSpec::update`:
+    /// Uses the same strong exception guarantee as
+    /// [`PooledShardSpec::update_from_ref`]:
     /// all new slots are allocated first, then old slots are released and
     /// swapped.
     /// Input references are copied into slab-owned slots and are never
@@ -695,9 +613,7 @@ impl PooledCursor {
 mod tests {
     use super::*;
     use crate::coordination::cursor::CursorUpdate;
-    use crate::test_util::{
-        arb_bounded_shard_spec, arb_cursor, arb_shard_spec, miri_proptest_config,
-    };
+    use crate::test_util::{arb_bounded_shard_spec, arb_shard_spec, miri_proptest_config};
     use proptest::prelude::*;
 
     proptest! {
@@ -706,8 +622,8 @@ mod tests {
         #[test]
         fn spec_roundtrip_property(spec in arb_shard_spec()) {
             let mut slab = ByteSlab::with_capacity(4096);
-            let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
-            let reconstructed = pooled.to_spec(&slab);
+            let pooled = PooledShardSpec::from_spec_ref(spec.as_ref(), &mut slab).unwrap();
+            let reconstructed = pooled.as_spec_ref(&slab);
 
             prop_assert_eq!(reconstructed.key_range_start(), spec.key_range_start());
             prop_assert_eq!(reconstructed.key_range_end(), spec.key_range_end());
@@ -718,13 +634,20 @@ mod tests {
         }
 
         #[test]
-        fn cursor_roundtrip_property(cursor in arb_cursor()) {
+        fn cursor_roundtrip_property(
+            last_key in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)),
+            token in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..64)),
+        ) {
             let mut slab = ByteSlab::with_capacity(4096);
-            let pooled = PooledCursor::from_cursor(&cursor, &mut slab).unwrap();
-            let reconstructed = pooled.to_cursor(&slab);
+            let update = match (last_key.as_deref(), token.as_deref()) {
+                (None, _) => CursorUpdate::initial(),
+                (Some(last_key), None) => CursorUpdate::new(last_key),
+                (Some(last_key), Some(token)) => CursorUpdate::with_token(last_key, token),
+            };
+            let pooled = PooledCursor::from_update(&update, &mut slab).unwrap();
 
-            prop_assert_eq!(reconstructed.last_key(), cursor.last_key());
-            prop_assert_eq!(reconstructed.token(), cursor.token());
+            prop_assert_eq!(pooled.last_key(&slab), update.last_key());
+            prop_assert_eq!(pooled.token(&slab), update.token());
 
             pooled.deallocate(&mut slab);
             prop_assert_eq!(slab.live_count(), 0);
@@ -736,7 +659,7 @@ mod tests {
             key in proptest::collection::vec(any::<u8>(), 0..128),
         ) {
             let mut slab = ByteSlab::with_capacity(4096);
-            let pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
+            let pooled = PooledShardSpec::from_spec_ref(spec.as_ref(), &mut slab).unwrap();
 
             prop_assert_eq!(pooled.contains_key(&key, &slab), spec.contains_key(&key));
 
@@ -751,9 +674,6 @@ mod tests {
         assert!(pooled.is_initial());
         assert!(pooled.last_key(&slab).is_none());
         assert!(pooled.token(&slab).is_none());
-
-        let cursor = pooled.to_cursor(&slab);
-        assert!(cursor.is_initial());
     }
 
     #[test]
@@ -762,10 +682,10 @@ mod tests {
         let spec1 = ShardSpec::with_range(b"a", b"m");
         let spec2 = ShardSpec::with_range(b"n", b"z");
 
-        let mut pooled = PooledShardSpec::from_spec(&spec1, &mut slab).unwrap();
+        let mut pooled = PooledShardSpec::from_spec_ref(spec1.as_ref(), &mut slab).unwrap();
         let live_before = slab.live_count();
 
-        pooled.update(&spec2, &mut slab).unwrap();
+        pooled.update_from_ref(spec2.as_ref(), &mut slab).unwrap();
         assert_eq!(pooled.key_range_start(&slab), b"n");
         assert_eq!(pooled.key_range_end(&slab), b"z");
         // Same number of live slots (old deallocated, new allocated).
@@ -778,8 +698,8 @@ mod tests {
     #[test]
     fn pooled_cursor_update_from_ref_strong_exception_guarantee() {
         let mut slab = ByteSlab::with_capacity(4096);
-        let c1 = Cursor::with_last_key(b"aaa");
-        let mut pooled = PooledCursor::from_cursor(&c1, &mut slab).unwrap();
+        let c1 = CursorUpdate::with_last_key(b"aaa");
+        let mut pooled = PooledCursor::from_update(&c1, &mut slab).unwrap();
 
         let update = CursorUpdate::with_token(b"bbb", b"tok");
         pooled.update_from_ref(&update, &mut slab).unwrap();
@@ -795,7 +715,7 @@ mod tests {
         // Slab large enough for one 16-byte allocation (min block) but not two.
         let mut slab = ByteSlab::with_capacity(16);
         let spec = ShardSpec::with_range(b"a", b"z");
-        let result = PooledShardSpec::from_spec(&spec, &mut slab);
+        let result = PooledShardSpec::from_spec_ref(spec.as_ref(), &mut slab);
         assert!(result.is_err(), "should fail: slab too small for 2 fields");
         assert_eq!(slab.live_count(), 0, "rollback must clean up partial alloc");
     }
@@ -804,8 +724,8 @@ mod tests {
     fn rollback_cursor_token_failure() {
         // Slab sized for exactly one 16-byte allocation.
         let mut slab = ByteSlab::with_capacity(16);
-        let cursor = Cursor::from_parts(b"k", b"t");
-        let result = PooledCursor::from_cursor(&cursor, &mut slab);
+        let cursor = CursorUpdate::from_parts(b"k", b"t");
+        let result = PooledCursor::from_update(&cursor, &mut slab);
         assert!(result.is_err(), "should fail: slab too small for 2 fields");
         assert_eq!(slab.live_count(), 0, "rollback must clean up partial alloc");
     }
@@ -815,8 +735,8 @@ mod tests {
         // Existing cursor consumes one 16-byte slot; only one slot remains.
         // `update_from_ref` needs two slots and must roll back partial allocs.
         let mut slab = ByteSlab::with_capacity(32);
-        let original = Cursor::with_last_key(b"aaa");
-        let mut pooled = PooledCursor::from_cursor(&original, &mut slab).unwrap();
+        let original = CursorUpdate::with_last_key(b"aaa");
+        let mut pooled = PooledCursor::from_update(&original, &mut slab).unwrap();
         let live_before = slab.live_count();
 
         let update = CursorUpdate::with_token(b"bbb", b"tok");
@@ -842,7 +762,7 @@ mod tests {
     fn release_fields_is_idempotent() {
         let mut slab = ByteSlab::with_capacity(4096);
         let spec = ShardSpec::with_range(b"a", b"z");
-        let mut pooled = PooledShardSpec::from_spec(&spec, &mut slab).unwrap();
+        let mut pooled = PooledShardSpec::from_spec_ref(spec.as_ref(), &mut slab).unwrap();
 
         pooled.release_fields(&mut slab);
         assert_eq!(slab.live_count(), 0);

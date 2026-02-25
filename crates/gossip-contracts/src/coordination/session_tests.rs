@@ -96,15 +96,13 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
             (
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                CursorUpdate::initial(),
             )
         })
         .collect();
     let shards: Vec<InitialShardInput<'_>> = shard_entries
         .iter()
-        .map(|(shard, spec, cursor)| {
-            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-        })
+        .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
         .collect();
 
     let _ = coord
@@ -229,18 +227,12 @@ fn split_replace_consumes_session() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let child2_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let child1_cursor = Cursor::initial();
-    let child2_cursor = Cursor::initial();
+    let child1_cursor = CursorUpdate::initial();
+    let child2_cursor = CursorUpdate::initial();
 
     let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(
-            child1_spec.as_ref(),
-            CursorUpdate::from_cursor(&child1_cursor),
-        ),
-        SplitReplaceChild::new(
-            child2_spec.as_ref(),
-            CursorUpdate::from_cursor(&child2_cursor),
-        ),
+        SplitReplaceChild::new(child1_spec.as_ref(), child1_cursor),
+        SplitReplaceChild::new(child2_spec.as_ref(), child2_cursor),
     ])
     .unwrap();
 
@@ -290,7 +282,9 @@ fn split_residual_replayed_does_not_rebuild_snapshot() {
     let r1 = session.split_residual(now(3), plan1, op).unwrap();
     assert!(r1.is_executed());
 
-    let spec_after_first = session.spec().clone();
+    let spec_after_first_start = session.spec().key_range_start().to_vec();
+    let spec_after_first_end = session.spec().key_range_end().to_vec();
+    let spec_after_first_meta = session.spec().metadata().to_vec();
     let spawned_after_first: Vec<_> = session.initial_snapshot().spawned().to_vec();
     assert_eq!(spawned_after_first.len(), 1);
 
@@ -300,7 +294,15 @@ fn split_residual_replayed_does_not_rebuild_snapshot() {
     let r2 = session.split_residual(now(4), plan2, op).unwrap();
     assert!(r2.is_replay());
 
-    assert_eq!(session.spec(), &spec_after_first);
+    assert_eq!(
+        session.spec().key_range_start(),
+        spec_after_first_start.as_slice()
+    );
+    assert_eq!(
+        session.spec().key_range_end(),
+        spec_after_first_end.as_slice()
+    );
+    assert_eq!(session.spec().metadata(), spec_after_first_meta.as_slice());
     assert_eq!(session.initial_snapshot().spawned(), &spawned_after_first);
 }
 
@@ -579,37 +581,23 @@ fn complete_replayed_returns_replayed() {
 
 // -- Snapshot staleness tests ----------------------------------------
 
-/// Session creation should keep snapshot bytes in scratch and defer owned
-/// `ShardSnapshot` materialization until the first snapshot accessor call.
+/// Session creation should expose allocation-free snapshot views immediately.
 #[test]
-fn new_defers_snapshot_materialization_until_first_read() {
+fn new_exposes_snapshot_views() {
     let (mut coord, keys) = setup_coordinator(1);
     let session =
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
-    assert!(
-        !session.has_materialized_snapshot(),
-        "new should not eagerly materialize owned snapshot"
-    );
-
-    let _ = session.spec();
-    assert!(
-        session.has_materialized_snapshot(),
-        "first snapshot accessor should materialize owned snapshot"
-    );
+    assert_eq!(session.spec().key_range_start(), &[0x00]);
+    assert!(session.cursor().last_key().is_none());
 }
 
-/// `split_residual` refreshes allocation-free snapshot state and invalidates
-/// owned cache instead of eagerly rebuilding it.
+/// `split_residual` refreshes allocation-free snapshot state.
 #[test]
-fn split_residual_invalidates_owned_snapshot_cache() {
+fn split_residual_refreshes_snapshot_views() {
     let (mut coord, keys) = setup_coordinator(1);
     let mut session =
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
-
-    // Force first materialization.
-    let _ = session.initial_snapshot();
-    assert!(session.has_materialized_snapshot());
 
     let parent_new_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
@@ -621,16 +609,9 @@ fn split_residual_invalidates_owned_snapshot_cache() {
         .split_residual(now(3), plan, OpId::from_raw(705))
         .unwrap();
     assert!(outcome.is_executed());
-    assert!(
-        !session.has_materialized_snapshot(),
-        "split_residual should invalidate owned cache and defer rebuild"
-    );
 
     assert_eq!(session.spec().key_range_end(), &[0x20]);
-    assert!(
-        session.has_materialized_snapshot(),
-        "snapshot should rematerialize on next accessor call"
-    );
+    assert_eq!(session.initial_snapshot().spawned().len(), 1);
 }
 
 /// Checkpoint does NOT update the session's cached snapshot.
@@ -642,7 +623,8 @@ fn checkpoint_does_not_update_cached_snapshot() {
     let mut session =
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
-    let initial_cursor = session.cursor().clone();
+    let initial_last_key = session.cursor().last_key().map(ToOwned::to_owned);
+    let initial_token = session.cursor().token().map(ToOwned::to_owned);
 
     let checkpoint_cursor = CursorUpdate::new(&[0x10]);
     let result = session.checkpoint(now(3), &checkpoint_cursor, OpId::from_raw(600));
@@ -650,10 +632,11 @@ fn checkpoint_does_not_update_cached_snapshot() {
 
     // Session's cached cursor must still be the acquisition-time value.
     assert_eq!(
-        session.cursor(),
-        &initial_cursor,
+        session.cursor().last_key(),
+        initial_last_key.as_deref(),
         "checkpoint must not update cached snapshot cursor"
     );
+    assert_eq!(session.cursor().token(), initial_token.as_deref());
     assert_eq!(
         checkpoint_cursor.last_key(),
         Some(&[0x10][..]),
@@ -670,8 +653,11 @@ fn split_residual_error_does_not_corrupt_snapshot() {
     let mut session =
         WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
-    let spec_before = session.spec().clone();
-    let cursor_before = session.cursor().clone();
+    let spec_before_start = session.spec().key_range_start().to_vec();
+    let spec_before_end = session.spec().key_range_end().to_vec();
+    let spec_before_meta = session.spec().metadata().to_vec();
+    let cursor_before_last = session.cursor().last_key().map(ToOwned::to_owned);
+    let cursor_before_token = session.cursor().token().map(ToOwned::to_owned);
     let spawned_before: Vec<_> = session.initial_snapshot().spawned().to_vec();
 
     // Attempt split_residual with expired lease (deadline=32, now=50).
@@ -688,8 +674,14 @@ fn split_residual_error_does_not_corrupt_snapshot() {
     );
 
     // Snapshot must be unchanged after the error.
-    assert_eq!(session.spec(), &spec_before);
-    assert_eq!(session.cursor(), &cursor_before);
+    assert_eq!(
+        session.spec().key_range_start(),
+        spec_before_start.as_slice()
+    );
+    assert_eq!(session.spec().key_range_end(), spec_before_end.as_slice());
+    assert_eq!(session.spec().metadata(), spec_before_meta.as_slice());
+    assert_eq!(session.cursor().last_key(), cursor_before_last.as_deref());
+    assert_eq!(session.cursor().token(), cursor_before_token.as_deref());
     assert_eq!(session.initial_snapshot().spawned(), &spawned_before);
 }
 
@@ -709,12 +701,8 @@ fn successive_split_residual_accumulates_spawned() {
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x60]);
-    let shard_cursor = Cursor::initial();
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        shard_spec.as_ref(),
-        CursorUpdate::from_cursor(&shard_cursor),
-    );
+    let shard_cursor = CursorUpdate::initial();
+    let shard = InitialShardInput::new(ShardId::from_raw(0), shard_spec.as_ref(), shard_cursor);
     let _ = coord
         .register_shards(now(1), tenant, run, &[shard], OpId::from_raw(100))
         .unwrap();

@@ -473,10 +473,10 @@ const _: () = assert!(DERIVE_SPLIT_RESIDUAL_EXPECTED & (1u64 << 63) != 0);
 
 #[test]
 fn hash_checkpoint_golden_value() {
-    use crate::coordination::cursor::Cursor;
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::split::hash_checkpoint_payload;
 
-    let cursor = Cursor::with_last_key(b"golden-cursor-key");
+    let cursor = CursorUpdate::with_last_key(b"golden-cursor-key");
     let hash = hash_checkpoint_payload(&cursor);
     assert_eq!(
         hash, HASH_CHECKPOINT_EXPECTED,
@@ -487,10 +487,10 @@ fn hash_checkpoint_golden_value() {
 
 #[test]
 fn hash_complete_golden_value() {
-    use crate::coordination::cursor::Cursor;
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::split::hash_complete_payload;
 
-    let cursor = Cursor::with_last_key(b"golden-cursor-key");
+    let cursor = CursorUpdate::with_last_key(b"golden-cursor-key");
     let hash = hash_complete_payload(&cursor);
     assert_eq!(
         hash, HASH_COMPLETE_EXPECTED,
@@ -514,7 +514,7 @@ fn hash_park_golden_value() {
 
 #[test]
 fn hash_split_replace_golden_value() {
-    use crate::coordination::cursor::{Cursor, CursorUpdate};
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{
         SplitReplaceChild, SplitReplacePlan, hash_split_replace_payload,
@@ -522,10 +522,10 @@ fn hash_split_replace_golden_value() {
 
     let spec1 = ShardSpec::with_range(b"a", b"m");
     let spec2 = ShardSpec::with_range(b"m", b"z");
-    let cursor1 = Cursor::initial();
-    let cursor2 = Cursor::initial();
-    let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&cursor1));
-    let c2 = SplitReplaceChild::new(spec2.as_ref(), CursorUpdate::from_cursor(&cursor2));
+    let cursor1 = CursorUpdate::initial();
+    let cursor2 = CursorUpdate::initial();
+    let c1 = SplitReplaceChild::new(spec1.as_ref(), cursor1);
+    let c2 = SplitReplaceChild::new(spec2.as_ref(), cursor2);
     let plan = SplitReplacePlan::try_new(vec![c1, c2]).unwrap();
     let hash = hash_split_replace_payload(&plan);
     assert_eq!(

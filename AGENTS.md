@@ -19,6 +19,70 @@ After modifying Rust code, ALWAYS run these steps:
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
 3. If adding new components, update relevant docs: `docs/coordination-testing.md`, `docs/simulation-harness.md`, `docs/boundary-2-coordination.md`
 
+<!-- zero-alloc-hot-path-v1 -->
+
+## Zero Allocation After Startup — MANDATORY
+
+Hot paths must never allocate heap memory. All variable-size data in
+steady-state operations must use the project's pooled/slab infrastructure.
+The only allocations permitted are during coordinator construction and
+initial shard registration.
+
+### Rules
+
+1. **No `Vec::new()`, `Box::new()`, `String::new()`, or `.to_vec()` in hot paths.**
+   Use pre-allocated scratch buffers, `ByteSlab` slots, `InlineVec`, or
+   `RingBuffer` instead.
+2. **All byte fields in `ShardRecord` must be slab-backed.** Use `PooledShardSpec`,
+   `PooledCursor`, and `PooledSpawned` — never raw `Vec<u8>` or `Box<[u8]>`.
+3. **Scratch buffers must be caller-owned and reused.** Functions like
+   `acquire_and_restore_into` take `&mut AcquireScratch`; callers create the
+   scratch once and pass it on every call.
+4. **Coordinator-level scratch Vecs are cleared and reused, never reallocated.**
+   Use `std::mem::take()` + `clear()` + push pattern. The Vec grows to
+   steady-state capacity once and stays there.
+5. **`InlineVec<T, N>` for small collections.** When the common case is 0–N
+   elements and N is small (≤ 8), use `InlineVec` to keep data on the stack.
+6. **`RingBuffer<T, N>` for bounded logs.** Fixed-capacity, zero-allocation
+   circular buffer for op-logs and similar bounded histories.
+
+### Existing Infrastructure (use these, don't reinvent)
+
+| Type | Location | Purpose |
+|------|----------|---------|
+| `ByteSlab` / `ByteSlot` | `gossip-stdx/src/byte_slab.rs` | Core pre-allocated byte pool |
+| `PooledShardSpec` | `coordination/pooled.rs` | Slab-backed shard spec fields |
+| `PooledCursor` | `coordination/pooled.rs` | Slab-backed cursor fields |
+| `PooledSpawned` | `coordination/pooled.rs` | Slab-backed lineage storage |
+| `AcquireScratch` / `FixedBuf` | `coordination/error.rs` | Reusable fixed-capacity scratch |
+| `InlineVec<T, N>` | `gossip-stdx/src/inline_vec.rs` | Stack-first small collection |
+| `RingBuffer<T, N>` | `gossip-stdx/src/ring_buffer.rs` | Fixed-capacity circular queue |
+
+### When Allocation Is Acceptable
+
+Allocation is permitted **only** when all of these are true:
+- It happens during **startup or teardown** (coordinator construction, session
+  creation, initial registration), not in the steady-state loop.
+- There is **no existing pooled alternative** that covers the use case.
+- The justification is documented in a code comment explaining why pooled
+  memory cannot be used.
+
+### What Counts as a Hot Path
+
+Any function called per-shard, per-tick, or per-checkpoint in steady state:
+- `acquire_and_restore_into`, `checkpoint`, `claim_next_available`
+- `split`, `merge`, `register_shards` (after initial setup)
+- Any method on `ShardRecord`, `PooledShardSpec`, `PooledCursor`, `PooledSpawned`
+
+### Enforcement
+
+Any PR that introduces heap allocation in a hot path without documented
+justification will be rejected. When in doubt, add a benchmark that confirms
+zero allocations using the `#[global_allocator]` counting pattern or
+`dhat`.
+
+<!-- end-zero-alloc-hot-path -->
+
 <!-- bv-agent-instructions-v1 -->
 
 ### Using bv as an AI sidecar
