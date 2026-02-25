@@ -53,13 +53,20 @@ use crate::coordination::shard_spec::{
 };
 use core::fmt;
 
+/// Wire tag for [`ShardHint::Range`].
 const TAG_RANGE: u8 = 0x00;
+/// Wire tag for [`ShardHint::Prefix`].
 const TAG_PREFIX: u8 = 0x01;
+/// Wire tag for [`ShardHint::Manifest`].
 const TAG_MANIFEST: u8 = 0x02;
 
+/// Prefix hint header: 1-byte tag + 4-byte big-endian length.
 const PREFIX_HEADER_LEN: usize = 1 + 4;
+/// Manifest hint total size: 1-byte tag + three 8-byte big-endian u64 fields.
 const MANIFEST_LEN: usize = 1 + 8 + 8 + 8;
+/// Metadata envelope hint-length prefix size (4-byte big-endian u32).
 const METADATA_HINT_LEN_PREFIX: usize = 4;
+/// `u32::MAX` as `usize`, used as the framing width ceiling for prefix length.
 const U32_MAX_USIZE: usize = u32::MAX as usize;
 
 /// Reusable fixed-capacity metadata scratch buffer.

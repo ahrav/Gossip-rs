@@ -2,7 +2,7 @@
 //!
 //! ## Problem
 //!
-//! Each [`ShardRecord`](super::record::ShardRecord) stores 4-6 variable-size
+//! Each [`ShardRecord`](super::record::ShardRecord) stores 3-6 variable-size
 //! byte fields (key range start/end, metadata, cursor last-key, cursor token,
 //! and spawned lineage). Without pooling, every field is a separate
 //! `Box<[u8]>` heap allocation, making per-field allocation the dominant cost
@@ -25,7 +25,7 @@
 //! [`allocate_with_rollback`] provides this guarantee: it attempts all
 //! allocations, and on failure deallocates fields 0..k-1 in reverse
 //! order before returning `SlabFull`. This strong exception guarantee
-//! also applies to `update`/`update_from_ref` methods, which allocate
+//! also applies to `update_from_ref` methods, which allocate
 //! new fields before releasing old ones (allocate-then-release ordering).
 //!
 //! ## Accessor lifetime pattern
@@ -218,7 +218,7 @@ impl PooledShardSpec {
         )
     }
 
-    /// Replace all fields with data from `new_spec`, providing a strong
+    /// Replace all fields from a borrowed spec view, providing a strong
     /// exception guarantee.
     ///
     /// The update follows allocate-then-release ordering: the new fields
@@ -226,11 +226,6 @@ impl PooledShardSpec {
     /// the slab is too full for the new data, the old data is untouched
     /// and `SlabFull` is returned. This avoids a window where the spec
     /// is in a partially-updated state.
-    ///
-    /// Replace all fields from a borrowed spec view.
-    ///
-    /// Uses the same allocate-then-release ordering described above. If
-    /// allocation fails, old slots remain installed and `self` is unchanged.
     ///
     /// # Errors
     ///

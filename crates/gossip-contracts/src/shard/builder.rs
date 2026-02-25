@@ -33,6 +33,7 @@ use crate::shard::hint::{
 };
 use crate::shard::key_encoding::{ManifestRowKey, PrefixShardError, ShardIntoError};
 
+/// A staged shard registration: shard ID, arena-backed spec, and borrowed cursor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BuilderEntry<'a> {
     shard: ShardId,
@@ -149,6 +150,7 @@ pub struct PreallocShardBuilder<'a, const CAP: usize> {
 }
 
 impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
+    /// Sentinel error for invalid manifest split bounds.
     const fn manifest_split_invalid_bounds() -> PreallocShardBuilderError {
         PreallocShardBuilderError::ManifestCtorInvalid(ShardSpecInputError::InvertedRange {
             start_len: ManifestRowKey::ENCODED_LEN,
@@ -156,6 +158,11 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         })
     }
 
+    /// Compute the number of fixed-width row chunks in `[start_row, end_row)`.
+    ///
+    /// Returns the ceiling division `(end_row - start_row) / rows_per_shard`,
+    /// clamped to `usize::MAX` on overflow. Rejects empty ranges and zero
+    /// chunk width.
     fn manifest_split_count(
         start_row: u64,
         end_row: u64,
@@ -218,21 +225,28 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         })
     }
 
+    /// Number of shard entries currently staged.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether no entries have been staged yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Maximum number of entries this builder will accept.
+    ///
+    /// Set at construction and cannot be changed. Always `<= CAP` and
+    /// `<= MAX_INITIAL_SHARDS`.
     #[must_use]
     pub const fn entry_limit(&self) -> usize {
         self.entry_limit
     }
 
+    /// Number of entries that can still be added before hitting `entry_limit`.
     #[must_use]
     pub fn remaining_entries(&self) -> usize {
         self.entry_limit.saturating_sub(self.entries.len())
@@ -254,6 +268,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         self.next_shard_raw = 0;
     }
 
+    /// Check that `additional` more entries fit within `entry_limit`.
     fn ensure_entry_capacity(&self, additional: usize) -> Result<(), PreallocShardBuilderError> {
         let current = self.entries.len();
         if current.saturating_add(additional) > self.entry_limit {
@@ -266,6 +281,12 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         Ok(())
     }
 
+    /// Allocate the next sequential shard ID (monotonically increasing from 0).
+    ///
+    /// # Panics
+    ///
+    /// Panics on `u64` overflow, which cannot happen for any `entry_limit`
+    /// within `MAX_INITIAL_SHARDS`.
     fn next_shard_id(&mut self) -> ShardId {
         let shard = ShardId::from_raw(self.next_shard_raw);
         self.next_shard_raw = self
@@ -275,6 +296,8 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         shard
     }
 
+    /// Append a validated entry. Caller must have already called
+    /// `ensure_entry_capacity` to guarantee room.
     fn push_entry(&mut self, spec_handle: ShardSpecHandle, cursor: CursorUpdate<'a>) -> ShardId {
         debug_assert!(
             self.entries.len() < self.entry_limit,
@@ -292,7 +315,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// Add a range shard with an initial cursor.
     ///
     /// Equivalent to [`Self::add_range_with_cursor`] with
-    /// [`CursorUpdate::initial`].
+    /// [`CursorUpdate::initial`]. See that method for error conditions.
     pub fn add_range(
         &mut self,
         start: &[u8],
@@ -327,10 +350,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         Ok(self.push_entry(handle, cursor))
     }
 
-    /// Add a prefix shard with an initial cursor.
+    /// Add a prefix shard covering all keys starting with `prefix`.
     ///
     /// Equivalent to [`Self::add_prefix_with_cursor`] with
-    /// [`CursorUpdate::initial`].
+    /// [`CursorUpdate::initial`]. See that method for error conditions.
     pub fn add_prefix(
         &mut self,
         prefix: &[u8],
@@ -363,10 +386,11 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         Ok(self.push_entry(handle, cursor))
     }
 
-    /// Add a manifest-row shard with an initial cursor.
+    /// Add a manifest-row shard for the half-open row range
+    /// `[start_row, end_row)` within the given manifest.
     ///
     /// Equivalent to [`Self::add_manifest_with_cursor`] with
-    /// [`CursorUpdate::initial`].
+    /// [`CursorUpdate::initial`]. See that method for error conditions.
     pub fn add_manifest(
         &mut self,
         manifest_id: u64,
@@ -643,6 +667,11 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     }
 }
 
+/// Clears the borrowed arena on drop to release all slab-backed specs.
+///
+/// This ensures arena resources are reclaimed even if the builder is
+/// dropped without an explicit [`PreallocShardBuilder::reset`] call.
+/// Any [`ShardSpecHandle`] values obtained from the arena become invalid.
 impl<'a, const CAP: usize> Drop for PreallocShardBuilder<'a, CAP> {
     fn drop(&mut self) {
         self.arena.clear();

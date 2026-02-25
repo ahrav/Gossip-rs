@@ -48,6 +48,7 @@ pub trait CanonicalBytes {
     fn write_canonical(&self, hasher: &mut Hasher);
 }
 
+/// Single-byte encoding: no length prefix needed (fixed 1-byte width).
 impl CanonicalBytes for u8 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -55,6 +56,7 @@ impl CanonicalBytes for u8 {
     }
 }
 
+/// 4-byte little-endian encoding: no length prefix needed (fixed width).
 impl CanonicalBytes for u32 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -62,6 +64,7 @@ impl CanonicalBytes for u32 {
     }
 }
 
+/// 8-byte little-endian encoding: no length prefix needed (fixed width).
 impl CanonicalBytes for u64 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {

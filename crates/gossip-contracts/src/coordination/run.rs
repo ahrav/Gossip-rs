@@ -81,10 +81,23 @@ use gossip_stdx::{ByteSlab, RingBuffer};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunStatus {
+    /// Run is being set up. `register_shards` has not yet been called.
+    /// No shards exist in this state (INV-4).
     Initializing = 0,
+
+    /// Run is active and its shards are being processed by workers.
+    /// Reached after `register_shards` succeeds. At least one root shard
+    /// must exist (INV-1).
     Active = 1,
+
+    /// All shards completed successfully. Terminal.
     Done = 2,
+
+    /// Run failed (some shards parked). Terminal.
     Failed = 3,
+
+    /// Run was administratively cancelled. Terminal.
+    /// Reachable from both `Initializing` and `Active`.
     Cancelled = 4,
 }
 
@@ -214,22 +227,34 @@ impl RunConfig {
     /// Panicking validator for coordinator-internal paths.
     ///
     /// Use [`try_new`](Self::try_new) for external input.
+    ///
+    /// # Panics
+    ///
+    /// Currently a no-op because `NonZeroU64` structurally prevents the
+    /// only invariant (`lease_duration > 0`). Retained as a hook for
+    /// future constraints.
     pub(crate) fn assert_valid(&self) {
         // lease_duration > 0 is guaranteed by NonZeroU64.
         let _ = self.lease_duration;
     }
 
+    /// When cursor advancement counts as committed progress.
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
         self.cursor_semantics
     }
 
-    /// Lease duration in [`LogicalTime`] ticks.
+    /// Lease duration in [`LogicalTime`] ticks. Always positive.
     #[must_use]
     pub fn lease_duration(&self) -> u64 {
         self.lease_duration.get()
     }
 
+    /// Optional per-shard retry budget. `None` means unlimited retries.
+    ///
+    /// The coordination layer does not enforce this limit directly; the
+    /// orchestrator inspects `ShardSummary::acquire_count` and calls
+    /// `park_shard` when the budget is exhausted.
     #[must_use]
     pub fn max_shard_retries(&self) -> Option<u32> {
         self.max_shard_retries
@@ -249,13 +274,20 @@ impl RunConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunOpKind {
+    /// Initial shard manifest registration.
     RegisterShards = 0,
+    /// Terminal transition: run completed successfully.
     CompleteRun = 1,
+    /// Terminal transition: run failed (some shards parked).
     FailRun = 2,
+    /// Terminal transition: run administratively cancelled.
     CancelRun = 3,
 }
 
 impl RunOpKind {
+    /// Parse a `u8` discriminant to the corresponding variant.
+    ///
+    /// Returns `None` for unrecognized values -- forward compatibility.
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -267,6 +299,7 @@ impl RunOpKind {
         }
     }
 
+    /// The persisted `u8` discriminant value.
     #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
@@ -364,26 +397,32 @@ impl RunOpLogEntry {
         }
     }
 
+    /// The caller-provided idempotency key for this operation.
     #[must_use]
     pub fn op_id(&self) -> OpId {
         self.op_id
     }
 
+    /// Which run-level operation this entry records.
     #[must_use]
     pub fn kind(&self) -> RunOpKind {
         self.kind
     }
 
+    /// BLAKE3-derived hash of the operation's payload, used for
+    /// idempotency conflict detection. Always non-zero.
     #[must_use]
     pub fn payload_hash(&self) -> u64 {
         self.payload_hash
     }
 
+    /// Logical time at which this operation was first executed.
     #[must_use]
     pub fn executed_at(&self) -> LogicalTime {
         self.executed_at
     }
 
+    /// The cached result payload, returned on idempotent replay.
     #[must_use]
     pub fn result(&self) -> &RunOpResult {
         &self.result
@@ -482,10 +521,17 @@ impl RunRecord {
     /// the status check.
     pub const OP_LOG_CAP: usize = 8;
 
-    /// Assert all structural invariants.
+    /// Assert all structural invariants (INV-1 through INV-11).
     ///
-    /// Call after every state transition, before persisting. Panics on
-    /// violation — crash-to-prevent-corruption philosophy.
+    /// Call after every state transition, before persisting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the 11 invariants documented on [`RunRecord`] are
+    /// violated. This is the crash-to-prevent-corruption philosophy: an
+    /// invariant violation means in-memory state is inconsistent, and
+    /// panicking before persistence ensures crash-recovery returns to the
+    /// last valid state.
     pub fn assert_invariants(&self) {
         self.assert_lifecycle_invariants();
         self.assert_oplog_invariants();

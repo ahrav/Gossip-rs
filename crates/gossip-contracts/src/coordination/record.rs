@@ -661,7 +661,8 @@ impl ShardRecord {
         self.validate_lineage_invariants(slab)
     }
 
-    /// INV-1 through INV-5 (non-panicking).
+    /// Validate INV-1 through INV-5 without panicking.
+    /// Returns `Err` with a diagnostic message on the first violation.
     fn validate_lifecycle_invariants(&self) -> Result<(), String> {
         // INV-1: park_reason consistency.
         match self.status {
@@ -712,7 +713,8 @@ impl ShardRecord {
         Ok(())
     }
 
-    /// INV-6 through INV-10 (non-panicking).
+    /// Validate INV-6 through INV-10 without panicking.
+    /// Returns `Err` with a diagnostic message on the first violation.
     fn validate_lineage_invariants(&self, slab: &ByteSlab) -> Result<(), String> {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split && self.spawned.is_empty() {

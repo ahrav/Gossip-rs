@@ -22,6 +22,17 @@ pub const MAX_KEY_SIZE: usize = 4_096;
 pub const MAX_TOKEN_SIZE: usize = 16_384;
 
 /// Borrowed cursor view for allocation-free checkpoint/complete updates.
+///
+/// ## Invariants
+///
+/// - When `last_key` is `Some`, the slice is guaranteed non-empty. All
+///   constructors enforce this: panicking (`new`, `with_token`) or
+///   returning `Err` (`try_new`, `try_with_token`).
+/// - `token` without `last_key` is not representable. A token only has
+///   meaning as a continuation marker for an established position.
+/// - Size limits ([`MAX_KEY_SIZE`], [`MAX_TOKEN_SIZE`]) are enforced
+///   by the `try_*` constructors but not by the panicking constructors.
+///   Use the `try_*` variants when accepting untrusted input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorUpdate<'a> {
     last_key: Option<&'a [u8]>,
@@ -168,6 +179,13 @@ impl<'a> CursorUpdate<'a> {
     }
 }
 
+/// Encode cursor fields into a BLAKE3 hasher using a tagged-option format.
+///
+/// Each optional field is prefixed with a discriminant byte (`0` for `None`,
+/// `1` for `Some`) followed by the canonical encoding of the inner value.
+/// This prevents ambiguity between `None` and an empty slice, and ensures
+/// identical cursors always produce identical digests regardless of
+/// construction path.
 #[inline]
 fn write_cursor_canonical_parts(last_key: Option<&[u8]>, token: Option<&[u8]>, h: &mut Hasher) {
     match last_key {
@@ -233,19 +251,33 @@ impl fmt::Display for CursorInputError {
 impl std::error::Error for CursorInputError {}
 
 /// Result of comparing two cursor updates for monotonic forward progress.
+///
+/// Used by the coordination layer to reject checkpoint and complete
+/// operations that would move a shard's scan position backwards.
+/// `Forward` covers both strict advancement and idempotent replays
+/// at the same position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "advance check result must be inspected to enforce monotonicity"]
 #[non_exhaustive]
 pub enum CursorAdvance {
     /// New cursor represents forward progress (or idempotent same-position).
     Forward,
-    /// New cursor has a `last_key` that is strictly less than the old one.
+    /// New cursor has a `last_key` that is strictly less than the old one
+    /// (lexicographic byte comparison).
     Regression,
-    /// New cursor has `last_key = None` when old cursor had `Some`.
+    /// New cursor has `last_key = None` when old cursor had `Some`,
+    /// indicating an attempt to erase established progress.
     ResetToNone,
 }
 
-/// Compare two cursor updates for monotonicity.
+/// Compare two cursor updates for monotonic forward progress.
+///
+/// Comparison uses lexicographic byte ordering on `last_key`. The token
+/// field is ignored because it is connector-opaque and has no defined
+/// ordering.
+///
+/// Returns [`CursorAdvance::Forward`] for any transition that does not
+/// move backwards, including same-position idempotent replays.
 #[inline]
 #[must_use = "ignoring the advance check defeats the monotonicity safety invariant"]
 pub fn check_cursor_advance(old: CursorUpdate<'_>, new: CursorUpdate<'_>) -> CursorAdvance {
@@ -268,7 +300,13 @@ pub fn check_cursor_advance(old: CursorUpdate<'_>, new: CursorUpdate<'_>) -> Cur
     }
 }
 
-/// Result of checking a cursor update against a half-open key range.
+/// Result of checking a cursor update against a shard's half-open key range
+/// `[start, end)`.
+///
+/// Empty `start` or `end` in the shard spec means that boundary is
+/// unbounded (negative or positive infinity, respectively). A fully
+/// unbounded spec (`start = []`, `end = []`) always yields [`InBounds`](Self::InBounds)
+/// for any non-`None` key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "bounds check result must be inspected to enforce range safety"]
 #[non_exhaustive]
@@ -283,7 +321,11 @@ pub enum CursorBoundsCheck {
     AboveRange,
 }
 
-/// Check whether a cursor update's `last_key` falls within a shard range.
+/// Check whether a cursor update's `last_key` falls within a shard's
+/// half-open key range `[start, end)`.
+///
+/// An empty `start` or `end` in `spec` is treated as unbounded on that
+/// side, so bounds checking is skipped for that boundary.
 #[inline]
 #[must_use = "ignoring the bounds check defeats the range safety invariant"]
 pub fn check_cursor_bounds(cursor: CursorUpdate<'_>, spec: ShardSpecRef<'_>) -> CursorBoundsCheck {

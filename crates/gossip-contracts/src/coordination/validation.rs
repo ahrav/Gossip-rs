@@ -102,6 +102,12 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId};
 ///   calling this function. If the shard is not found, return
 ///   `CoordError::ShardNotFound` directly (this function cannot check that).
 ///
+/// # Panics
+///
+/// Panics if `now == LogicalTime::ZERO`. A zero timestamp indicates a broken
+/// clock or uninitialized time source -- this is a caller bug, not a protocol
+/// error.
+///
 /// # Errors
 ///
 /// Returns the first violated check as a [`CoordError`].
@@ -293,6 +299,11 @@ pub(crate) fn validate_cursor_update_pooled(
 ///
 /// `payload_hash` must be non-zero (asserted at runtime). A zero hash
 /// indicates the caller failed to compute a hash.
+///
+/// # Panics
+///
+/// Panics if `payload_hash == 0`. A zero hash indicates the caller failed to
+/// compute a payload hash -- this is a caller bug, not a protocol error.
 ///
 /// # Errors
 ///

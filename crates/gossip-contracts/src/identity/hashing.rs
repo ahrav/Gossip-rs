@@ -53,24 +53,31 @@ use super::domain;
 // hasher, avoiding redundant key-schedule computation on each call.
 // ---------------------------------------------------------------------------
 
+/// Cached derive-key hasher for [`FindingId`](super::FindingId) derivation.
 pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::FINDING_ID_V1));
 
+/// Cached derive-key hasher for [`OccurrenceId`](super::OccurrenceId) derivation.
 pub(crate) static OCCURRENCE_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OCCURRENCE_ID_V1));
 
+/// Cached derive-key hasher for [`StableItemId`](super::StableItemId) derivation.
 pub(crate) static ITEM_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::ITEM_ID_V1));
 
+/// Cached derive-key hasher for [`ObjectVersionId`](super::ObjectVersionId) derivation.
 pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OBJECT_VERSION_V1));
 
+/// Cached derive-key hasher for [`PolicyHash`](super::PolicyHash) derivation.
 pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
 
+/// Cached derive-key hasher for split shard-ID derivation in the coordination layer.
 pub(crate) static SPLIT_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::SPLIT_ID_V1));
 
+/// Cached derive-key hasher for op-log payload hashing in the coordination layer.
 pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OP_PAYLOAD_V1));
 

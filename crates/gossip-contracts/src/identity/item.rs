@@ -44,6 +44,9 @@ use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
 /// [`ItemKey`], and [`ObjectVersionId`]. The panicking constructors
 /// (`from_ascii`, `new`, `from_version_bytes`) remain available for
 /// trusted internal code; only [`ConnectorTag::from_ascii`] is `const`.
+///
+/// All variants carry enough context to produce a useful error message
+/// without re-inspecting the original input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityInputError {
     /// Connector tag is empty.
@@ -197,6 +200,13 @@ impl ConnectorTag {
     ///
     /// Returns an error instead of panicking when the input is invalid.
     /// Use this at system boundaries where the tag comes from external input.
+    ///
+    /// # Errors
+    ///
+    /// - [`IdentityInputError::EmptyTag`] if `tag` is empty.
+    /// - [`IdentityInputError::TagTooLong`] if `tag` exceeds 8 bytes.
+    /// - [`IdentityInputError::NonGraphicByte`] if any byte is outside
+    ///   the ASCII graphic range (`0x21..=0x7E`).
     pub fn try_from_ascii(tag: &[u8]) -> Result<Self, IdentityInputError> {
         if tag.is_empty() {
             return Err(IdentityInputError::EmptyTag);
@@ -234,9 +244,11 @@ impl ConnectorTag {
 }
 
 impl CanonicalBytes for ConnectorTag {
+    /// Writes the full 8-byte array (including null padding) with no length
+    /// prefix. Fixed-width encoding ensures unambiguous framing when
+    /// concatenated with subsequent fields in composite types like [`ItemKey`].
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
-        // Fixed-width: no length prefix.
         h.update(&self.0);
     }
 }
@@ -328,6 +340,10 @@ impl ItemKey {
     ///
     /// Returns an error instead of panicking when the path is empty.
     /// Use this at system boundaries where the path comes from external input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityInputError::EmptyPath`] if the path is empty.
     pub fn try_new(
         connector: ConnectorTag,
         path: impl AsRef<[u8]>,
@@ -366,6 +382,10 @@ impl ItemKey {
 }
 
 impl CanonicalBytes for ItemKey {
+    /// Writes `ConnectorTag` (8 bytes, fixed-width) followed by `path`
+    /// (4-byte LE length prefix + variable-length body). The length prefix
+    /// on the path prevents concatenation ambiguity between connector tag
+    /// padding and path content.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.connector.write_canonical(h);
@@ -478,6 +498,11 @@ impl ObjectVersionId {
     /// Returns an error instead of panicking when `version_bytes` is empty.
     /// Use this at system boundaries where the version token comes from
     /// external input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityInputError::EmptyVersionBytes`] if `version_bytes`
+    /// is empty.
     pub fn try_from_version_bytes(version_bytes: &[u8]) -> Result<Self, IdentityInputError> {
         if version_bytes.is_empty() {
             return Err(IdentityInputError::EmptyVersionBytes);
