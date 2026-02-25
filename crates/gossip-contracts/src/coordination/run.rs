@@ -4,17 +4,22 @@
 //! collectively cover the target data source. The coordinator tracks run
 //! status, validates shard manifests, and provides progress aggregation.
 //!
+//! Startup registration supports both owned ([`InitialShard`]) and borrowed
+//! ([`InitialShardInput`]) manifest rows. Borrowed inputs enable preallocated
+//! startup paths to validate and register shards without first materializing
+//! owned `ShardSpec`/`Cursor` values.
+//!
 
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::coordination::cursor::{Cursor, MAX_KEY_SIZE};
+use crate::coordination::cursor::{Cursor, CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::op_payload_hash;
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
