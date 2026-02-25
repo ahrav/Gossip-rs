@@ -5,8 +5,21 @@
 //! - `last_key`: coordinator-visible ordered progress key.
 //! - `token`: connector-opaque pagination/resume state.
 //!
-//! This module intentionally uses borrowed views (`CursorUpdate`) so runtime
-//! paths can remain allocation-free.
+//! This module intentionally uses borrowed views ([`CursorUpdate`]) so
+//! runtime paths can remain allocation-free.
+//!
+//! ## Constructor Families
+//!
+//! [`CursorUpdate`] provides two parallel constructor sets:
+//!
+//! - **Panicking** ([`CursorUpdate::new`], [`CursorUpdate::with_token`]):
+//!   for internal code paths where inputs are already validated by the
+//!   slab layer. These enforce non-empty `last_key` via `assert!` but do
+//!   not check size limits.
+//! - **Fallible** ([`CursorUpdate::try_new`], [`CursorUpdate::try_with_token`]):
+//!   for boundaries accepting untrusted input. These validate both
+//!   emptiness and size limits, returning [`CursorInputError`] on
+//!   violations.
 
 use std::fmt;
 
@@ -67,6 +80,10 @@ impl<'a> CursorUpdate<'a> {
     }
 
     /// Alias for [`Self::new`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` is empty (delegates to [`Self::new`]).
     #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
     pub fn with_last_key(last_key: &'a [u8]) -> Self {
         Self::new(last_key)
@@ -92,6 +109,10 @@ impl<'a> CursorUpdate<'a> {
     }
 
     /// Alias for [`Self::with_token`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` is empty (delegates to [`Self::with_token`]).
     #[must_use = "creates a cursor update that should be stored or passed to a coordinator"]
     pub fn from_parts(last_key: &'a [u8], token: &'a [u8]) -> Self {
         Self::with_token(last_key, token)
@@ -121,6 +142,10 @@ impl<'a> CursorUpdate<'a> {
     }
 
     /// Alias for [`Self::try_new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::try_new`].
     #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_with_last_key(last_key: &'a [u8]) -> Result<Self, CursorInputError> {
         Self::try_new(last_key)
@@ -159,6 +184,10 @@ impl<'a> CursorUpdate<'a> {
     }
 
     /// Alias for [`Self::try_with_token`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::try_with_token`].
     #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_from_parts(last_key: &'a [u8], token: &'a [u8]) -> Result<Self, CursorInputError> {
         Self::try_with_token(last_key, token)
@@ -204,6 +233,10 @@ fn write_cursor_canonical_parts(last_key: Option<&[u8]>, token: Option<&[u8]>, h
     }
 }
 
+/// Feeds the cursor's `last_key` and `token` into a BLAKE3 hasher using
+/// the tagged-option encoding: each optional field is prefixed with a
+/// discriminant byte (`0` for `None`, `1` for `Some`) followed by the
+/// canonical encoding of the inner value.
 impl CanonicalBytes for CursorUpdate<'_> {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {

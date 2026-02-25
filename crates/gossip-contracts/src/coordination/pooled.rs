@@ -391,8 +391,12 @@ impl PooledCursor {
 // PooledSpawned
 // ============================================================================
 
+/// Byte width of a single `ShardId` in the packed encoding (8 bytes, little-endian `u64`).
 const SHARD_ID_ENCODED_BYTES: usize = core::mem::size_of::<u64>();
+
+/// Maximum byte length of a fully populated spawned list in packed encoding.
 const MAX_SPAWNED_ENCODED_BYTES: usize = MAX_SPAWNED_PER_SHARD * SHARD_ID_ENCODED_BYTES;
+
 const _: () = assert!(MAX_SPAWNED_PER_SHARD <= u16::MAX as usize);
 
 /// Arena-pooled lineage storage for `ShardRecord::spawned`.
@@ -442,6 +446,13 @@ impl PooledSpawned {
         })
     }
 
+    /// Encode `spawned` IDs as packed little-endian `u64` bytes into `out`.
+    ///
+    /// Returns the number of bytes written (`spawned.len() * 8`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` is too small to hold all encoded IDs.
     #[inline]
     fn encode_slice_into(spawned: &[ShardId], out: &mut [u8]) -> usize {
         let needed = spawned.len() * SHARD_ID_ENCODED_BYTES;
@@ -454,6 +465,11 @@ impl PooledSpawned {
         needed
     }
 
+    /// Borrow the raw packed byte representation from the slab.
+    ///
+    /// The returned slice has length `self.len * SHARD_ID_ENCODED_BYTES`
+    /// and borrows from the slab, not from `self` (see module-level
+    /// accessor lifetime pattern docs).
     #[inline]
     fn bytes<'a>(&self, slab: &'a ByteSlab) -> &'a [u8] {
         let bytes = slab.get(self.slot);
@@ -461,12 +477,14 @@ impl PooledSpawned {
         bytes
     }
 
+    /// Number of `ShardId` entries stored.
     #[inline]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.len as usize
     }
 
+    /// Returns `true` when no child IDs have been recorded.
     #[inline]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
@@ -539,6 +557,11 @@ impl PooledSpawned {
     }
 }
 
+/// Iterator that decodes packed little-endian `u64` bytes back into
+/// [`ShardId`] values.
+///
+/// Yields exactly [`PooledSpawned::len`] items. Implements
+/// [`ExactSizeIterator`] because chunk count is known at construction.
 pub(crate) struct PooledSpawnedIter<'a> {
     chunks: core::slice::ChunksExact<'a, u8>,
 }

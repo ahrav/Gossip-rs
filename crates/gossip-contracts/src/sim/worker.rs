@@ -35,9 +35,21 @@ pub struct SimWorker {
     /// order (matching the natural `(RunId, ShardId)` tuple ordering)
     /// without requiring `Ord` on `ShardKey`.
     held_shards: BTreeMap<(u64, u64), (ShardKey, Lease)>,
+    /// Next op-ID to hand out within this worker's partition.
+    /// Incremented monotonically; must stay below `op_ceiling`.
     next_op: u64,
+    /// Exclusive upper bound of this worker's op-ID partition.
+    /// Reached when `next_op == op_ceiling`, at which point
+    /// [`next_op_id`](Self::next_op_id) panics.
     op_ceiling: u64,
+    /// Whether this worker is paused (simulating a stall or hang).
+    /// Paused workers skip operations in the simulation harness,
+    /// which can trigger lease expiration and ownership transfer.
     paused: bool,
+    /// Last checkpoint cursor recorded per `(RunId, ShardId)`.
+    /// Used by the simulation to verify cursor restore-after-acquire.
+    /// Heap-allocated per entry; acceptable because this is simulation
+    /// bookkeeping, not a hot-path data structure.
     last_cursors: BTreeMap<(RunId, ShardId), Vec<u8>>,
 }
 

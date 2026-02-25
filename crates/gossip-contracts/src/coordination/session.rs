@@ -285,6 +285,12 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         })
     }
 
+    /// Build a borrowed snapshot view combining the scratch buffers with
+    /// scalar snapshot metadata.
+    ///
+    /// The returned view borrows `self` and is invalidated by any
+    /// `&mut self` operation (notably `split_residual` which rewrites
+    /// the scratch buffers).
     #[inline]
     fn snapshot_view(&self) -> ShardSnapshotView<'_> {
         self.snapshot.scratch.view(

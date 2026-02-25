@@ -58,12 +58,17 @@
 //!   `Parked` shards may be resumed via `unpark_shard` (admin `RunManagement`
 //!   operation).
 
+// ---- Sub-modules (alphabetical) ----
+
 pub mod cursor;
 pub mod error;
 pub mod events;
 pub mod facade;
 pub mod in_memory;
 pub mod lease;
+/// Arena-pooled wrappers for shard byte fields (spec, cursor, spawned).
+/// Crate-internal -- callers interact through [`ShardRecord`] and
+/// [`AcquireScratch`] rather than pooled types directly.
 pub(crate) mod pooled;
 pub mod record;
 pub mod run;

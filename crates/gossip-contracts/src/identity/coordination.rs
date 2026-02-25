@@ -151,6 +151,7 @@ impl FenceEpoch {
 }
 
 impl CanonicalBytes for FenceEpoch {
+    /// 8-byte little-endian encoding, no length prefix (fixed width).
     #[inline]
     fn write_canonical(&self, h: &mut blake3::Hasher) {
         h.update(&self.0.to_le_bytes());
@@ -210,6 +211,7 @@ impl LogicalTime {
 }
 
 impl CanonicalBytes for LogicalTime {
+    /// 8-byte little-endian encoding, no length prefix (fixed width).
     #[inline]
     fn write_canonical(&self, h: &mut blake3::Hasher) {
         h.update(&self.0.to_le_bytes());
@@ -266,10 +268,11 @@ impl ShardKey {
 }
 
 impl CanonicalBytes for ShardKey {
+    /// Encodes `run || shard` in field order (16 bytes total). Both fields
+    /// are fixed-width (8 bytes each), so no length prefix is needed and
+    /// the boundary is unambiguous.
     #[inline]
     fn write_canonical(&self, h: &mut blake3::Hasher) {
-        // Order matters: run-then-shard. Both fields are fixed-width (8 bytes),
-        // so no length prefix is needed and the boundary is unambiguous.
         self.run.write_canonical(h);
         self.shard.write_canonical(h);
     }

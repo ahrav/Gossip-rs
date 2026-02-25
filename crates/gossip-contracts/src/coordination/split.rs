@@ -105,6 +105,7 @@ impl DerivedShardKind {
 }
 
 impl CanonicalBytes for DerivedShardKind {
+    /// Delegates to the `u8` discriminant -- single-byte, fixed-width encoding.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.as_u8().write_canonical(h);
@@ -167,6 +168,9 @@ impl<'a> SplitReplaceChild<'a> {
 }
 
 impl CanonicalBytes for SplitReplaceChild<'_> {
+    /// Encodes `spec || cursor` in field order. Both fields are
+    /// self-framing (length-prefixed internally), so the boundary
+    /// between them is unambiguous.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.spec.write_canonical(h);

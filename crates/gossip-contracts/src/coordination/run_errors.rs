@@ -36,6 +36,11 @@ use crate::identity::{RunId, TenantId};
 
 /// Generates the `From<RunOpIdConflict>` impl for error types with an
 /// `OpIdConflict(RunOpIdConflict)` tuple variant.
+///
+/// Applied to [`RegisterShardsError`], [`RunTransitionError`], and
+/// [`UnparkError`] -- every error type that carries an `OpIdConflict` variant.
+/// `CreateRunError` is intentionally excluded because `create_run` is not
+/// idempotent (no `OpId`).
 macro_rules! impl_from_run_op_id_conflict {
     ($ty:ident) => {
         impl From<RunOpIdConflict> for $ty {
@@ -50,9 +55,12 @@ macro_rules! impl_from_run_op_id_conflict {
 // CreateRunError
 // ============================================================================
 
-/// Error from `create_run`.
+/// Error from [`RunManagement::create_run`](super::run::RunManagement::create_run)
+/// and [`RunManagement::create_run_with_shards`](super::run::RunManagement::create_run_with_shards).
 ///
-/// `create_run` is NOT idempotent — no `OpIdConflict` variant.
+/// `create_run` is NOT idempotent -- no `OpIdConflict` variant.
+/// `create_run_with_shards` may produce `RegisterShardsFailed` or
+/// `GetRunFailed` if the shard registration step fails after run creation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CreateRunError {
@@ -115,7 +123,10 @@ impl From<GetRunError> for CreateRunError {
 // RegisterShardsError
 // ============================================================================
 
-/// Error from `register_shards`.
+/// Error from [`RunManagement::register_shards`](super::run::RunManagement::register_shards).
+///
+/// Custom `Debug` impl: redacts hash values in `OpIdConflict` and omits the
+/// `actual` tenant in `TenantMismatch` (tenant isolation boundary).
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegisterShardsError {
@@ -232,7 +243,10 @@ impl From<SlabFull> for RegisterShardsError {
 // GetRunError
 // ============================================================================
 
-/// Error from `get_run`, `get_run_progress`, and `list_shards_into`.
+/// Error from read-only run queries: [`get_run`](super::run::RunManagement::get_run),
+/// [`get_run_progress`](super::run::RunManagement::get_run_progress),
+/// [`list_shards_into`](super::run::RunManagement::list_shards_into), and
+/// [`collect_claim_candidates_into`](super::run::RunManagement::collect_claim_candidates_into).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GetRunError {

@@ -224,6 +224,8 @@ impl ParkReason {
     }
 }
 
+/// Hashes as a single `u8` discriminant -- deterministic and stable across
+/// builds because of the `#[repr(u8)]` guarantee.
 impl CanonicalBytes for ParkReason {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -287,18 +289,30 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 #[derive(Debug)]
 pub struct ShardRecord {
     // -- Identity --
+    /// Owning tenant. All operations on this record must present this tenant.
     pub(crate) tenant: TenantId,
+    /// The run this shard belongs to.
     pub(crate) run: RunId,
+    /// Unique shard identifier within the run. Root shards have bit 63 clear;
+    /// split-derived shards have bit 63 set (see `ShardId::is_derived`).
     pub(crate) shard: ShardId,
 
     // -- Lifecycle --
+    /// Current lifecycle state. Transitions are validated by
+    /// [`assert_transition_legal`](Self::assert_transition_legal).
     pub(crate) status: ShardStatus,
     /// Set when `status == Parked`, `None` otherwise.
     pub(crate) park_reason: Option<ParkReason>,
 
     // -- Coverage and progress (arena-pooled) --
+    /// Slab-backed shard specification (key range bounds + metadata).
+    /// Modified only by `split_residual` (narrowing the range).
     pub(crate) spec: PooledShardSpec,
+    /// Slab-backed cursor tracking the worker's scan progress.
+    /// Advanced by `checkpoint` and terminal operations.
     pub(crate) cursor: PooledCursor,
+    /// Per-run cursor semantics governing when cursor advancement
+    /// counts as committed progress. Immutable after creation.
     pub(crate) cursor_semantics: CursorSemantics,
 
     // -- Lease / ownership --

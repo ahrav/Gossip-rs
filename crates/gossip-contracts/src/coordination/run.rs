@@ -488,13 +488,22 @@ impl std::error::Error for RunOpIdConflict {}
 ///     result; all other ops have `Ack` result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunRecord {
+    /// Owning tenant. All operations must present this tenant for isolation.
     pub(crate) tenant: TenantId,
+    /// Unique run identifier within the tenant.
     pub(crate) run: RunId,
+    /// Immutable per-run configuration set at creation time.
     pub(crate) config: RunConfig,
+    /// Current lifecycle status. Transitions validated by
+    /// [`assert_transition_legal`](Self::assert_transition_legal).
     pub(crate) status: RunStatus,
+    /// Logical time at which the run was created. Always > `LogicalTime::ZERO` (INV-3).
     pub(crate) created_at: LogicalTime,
+    /// Logical time at which the run reached a terminal state.
+    /// `Some` iff `status.is_terminal()` (INV-2).
     pub(crate) completed_at: Option<LogicalTime>,
     /// Root shard IDs registered at creation. Does not include split children.
+    /// Empty while `status == Initializing` (INV-4); non-empty when `Active` (INV-1).
     pub(crate) root_shards: Vec<ShardId>,
     /// Bounded op-log for idempotent replay of run-level ops.
     pub(crate) op_log: RingBuffer<RunOpLogEntry, { RunRecord::OP_LOG_CAP }>,
@@ -841,10 +850,15 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// stores owned key bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunProgress {
+    /// Total shard count: always `active + done + split + parked`.
     pub(crate) total: u32,
+    /// Shards in `Active` status (both leased and unleased).
     pub(crate) active: u32,
+    /// Shards that completed successfully (`Done` status).
     pub(crate) done: u32,
+    /// Shards retired by split (replaced by children, `Split` status).
     pub(crate) split: u32,
+    /// Shards halted due to errors (`Parked` status).
     pub(crate) parked: u32,
     /// Subset of `active`: shards currently held by a worker lease.
     pub(crate) leased: u32,
@@ -1126,6 +1140,11 @@ pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
 
+/// Fill the first `len` elements of `indices` with `0..len`.
+///
+/// Used to build a sortable index array over manifest shards without
+/// heap allocation. The caller provides a stack-allocated array of
+/// [`MAX_INITIAL_SHARDS`] elements and passes the actual shard count as `len`.
 #[inline]
 fn init_dense_indices(indices: &mut [usize], len: usize) {
     debug_assert!(len <= indices.len());
@@ -1142,8 +1161,12 @@ fn init_dense_indices(indices: &mut [usize], len: usize) {
 /// their bytes into owned storage before returning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitialShardInput<'a> {
+    /// Unique shard identifier within the run.
     pub(crate) shard: ShardId,
+    /// Key range and metadata specification for this shard.
     pub(crate) spec: ShardSpecRef<'a>,
+    /// Initial cursor position. Typically [`CursorUpdate::initial()`] for
+    /// fresh scans; a non-initial value resumes from a prior checkpoint.
     pub(crate) cursor: CursorUpdate<'a>,
 }
 
@@ -1408,16 +1431,23 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
 
 /// Fixed-capacity byte storage for allocation-free [`ShardSummary`] fields.
 ///
+/// Stores up to `N` bytes inline (on the stack or within the parent struct)
+/// with a `len` field tracking the occupied prefix. This avoids heap
+/// allocation when constructing summaries from slab-backed shard records.
+///
 /// `ShardSummary::from_record` writes directly into this inline buffer.
 /// The `From<Vec<u8>>` impl exists as an adapter for non-hot-path callers; any
 /// allocation implied by `Vec` construction happens at the call site, not here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SummaryBytes<const N: usize> {
+    /// Fixed-size backing array. Only `bytes[..len]` contains valid data.
     bytes: [u8; N],
+    /// Number of valid bytes in the `bytes` array.
     len: usize,
 }
 
 impl<const N: usize> SummaryBytes<N> {
+    /// Create an empty buffer (zero-length, zeroed backing array).
     #[inline]
     fn new() -> Self {
         Self {
@@ -1426,6 +1456,11 @@ impl<const N: usize> SummaryBytes<N> {
         }
     }
 
+    /// Copy `src` into the buffer, replacing any previous content.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `oversize_msg` if `src.len() > N`.
     #[inline]
     fn write(&mut self, src: &[u8], oversize_msg: &'static str) {
         assert!(src.len() <= N, "{oversize_msg}");
@@ -1433,12 +1468,20 @@ impl<const N: usize> SummaryBytes<N> {
         self.len = src.len();
     }
 
+    /// Borrow the occupied portion of the buffer.
     #[inline]
     fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
 
+/// Adapter for non-hot-path callers. Any heap allocation is the caller's
+/// responsibility; the conversion itself only copies bytes into the
+/// fixed-capacity inline buffer.
+///
+/// # Panics
+///
+/// Panics if `value.len() > N`.
 impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
     fn from(value: Vec<u8>) -> Self {
         let mut out = Self::new();
@@ -1462,9 +1505,13 @@ impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
 /// [`ShardRecord`]: super::record::ShardRecord
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardSummary {
+    /// Shard identifier (unique within the run).
     pub(crate) shard: ShardId,
+    /// Lifecycle status at snapshot time.
     pub(crate) status: ShardStatus,
+    /// Park reason, set only when `status == Parked`.
     pub(crate) park_reason: Option<ParkReason>,
+    /// Whether the shard has an active (non-expired) lease at snapshot time.
     pub(crate) is_leased: bool,
     /// Deadline of the current lease, if any.  `Some` only when
     /// `is_leased` is `true`.  Callers use this to schedule retry
@@ -1476,10 +1523,17 @@ pub struct ShardSummary {
     /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
     /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,
+    /// Cursor's `last_key` at snapshot time, or `None` if the cursor
+    /// is at its initial (no-progress) position.
     pub(crate) last_key: Option<SummaryBytes<MAX_KEY_SIZE>>,
+    /// Inclusive lower bound of this shard's key range (copied from spec).
     pub(crate) key_range_start: SummaryBytes<MAX_KEY_SIZE>,
+    /// Exclusive upper bound of this shard's key range (copied from spec).
     pub(crate) key_range_end: SummaryBytes<MAX_KEY_SIZE>,
+    /// Parent shard ID if this shard was created by a split, `None` for root shards.
     pub(crate) parent: Option<ShardId>,
+    /// Number of child shards spawned by this shard via split operations.
+    /// Saturates at `u32::MAX` (astronomically unlikely in practice).
     pub(crate) spawned_count: u32,
 }
 
@@ -1754,13 +1808,17 @@ pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
     })
 }
 
-/// Shared implementation for terminal run operations.
+/// Shared implementation for terminal run operation payload hashes.
 ///
 /// Terminal ops (complete, fail, cancel) carry no per-invocation parameters
 /// beyond the `RunId` (implicit in the call site), so the payload is just
 /// the domain-separated tag. Each tag produces a distinct hash (non-zero
 /// with overwhelming probability ~1-2^{-64}; verified by
 /// `hash_terminal_ops_distinct` test).
+///
+/// Not `pub` because callers use the typed wrappers ([`hash_complete_run_payload`],
+/// [`hash_fail_run_payload`], [`hash_cancel_run_payload`]) which encode the
+/// correct domain tag for each operation.
 fn hash_run_terminal_payload(tag: &[u8]) -> u64 {
     op_payload_hash(tag, |_h| {})
 }

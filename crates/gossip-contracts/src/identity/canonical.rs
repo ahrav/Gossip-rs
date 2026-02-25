@@ -22,7 +22,10 @@ use blake3::Hasher;
 /// **Determinism**: output must be identical across platforms, byte orders, and
 /// Rust versions. Use fixed-endian encoding (little-endian by convention).
 ///
-/// **No allocation**: implementations must feed directly into the hasher.
+/// **No allocation**: implementations must feed bytes directly into the hasher
+/// without intermediate heap allocation. Identity derivation runs on hot paths
+/// (per-finding, per-shard, per-checkpoint), so any allocation here would
+/// violate the zero-allocation-after-startup invariant.
 ///
 /// # Implementing for composite types
 ///

@@ -67,6 +67,8 @@ pub enum IdentityInputError {
 }
 
 impl fmt::Display for IdentityInputError {
+    /// Formats the error with a human-readable message that includes the
+    /// offending value (e.g., byte index, length) when applicable.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyTag => write!(f, "ConnectorTag must not be empty"),
@@ -85,6 +87,7 @@ impl fmt::Display for IdentityInputError {
     }
 }
 
+/// All variants are self-describing leaf errors with no inner `source`.
 impl std::error::Error for IdentityInputError {}
 
 // ---------------------------------------------------------------------------
@@ -236,7 +239,7 @@ impl ConnectorTag {
         Self(bytes)
     }
 
-    /// Borrow the inner 8-byte array.
+    /// Borrow the inner 8-byte array, including any null padding.
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; 8] {
         &self.0
@@ -358,13 +361,16 @@ impl ItemKey {
         })
     }
 
-    /// The connector tag for this item.
+    /// The connector tag for this item (e.g., `b"github\0\0"`).
     #[inline]
     pub fn connector(&self) -> ConnectorTag {
         self.connector
     }
 
-    /// The opaque path bytes for this item.
+    /// The opaque, connector-defined path bytes for this item.
+    ///
+    /// The encoding is connector-specific; see [`ItemKey`] struct docs for
+    /// examples. The returned slice never includes the connector tag.
     #[inline]
     pub fn path(&self) -> &[u8] {
         &self.path
@@ -372,8 +378,9 @@ impl ItemKey {
 
     /// Derive the fixed-width [`StableItemId`] for this key.
     ///
-    /// This is a pure, infallible function: same `ItemKey` always produces
-    /// the same `StableItemId`.
+    /// Uses BLAKE3 derive-key mode with [`domain::ITEM_ID_V1`](super::domain::ITEM_ID_V1)
+    /// via a cached hasher clone. This is a pure, infallible function: same
+    /// `ItemKey` always produces the same `StableItemId`.
     pub fn stable_id(&self) -> StableItemId {
         let mut h = ITEM_ID_HASHER.clone();
         self.write_canonical(&mut h);

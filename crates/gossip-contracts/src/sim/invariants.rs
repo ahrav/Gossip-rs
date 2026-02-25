@@ -77,6 +77,9 @@ use crate::sim::backend::SimIntrospection;
 
 /// Sub-classification for S7 (SplitCoverage) violations, replacing
 /// untyped string descriptions with pattern-matchable variants.
+///
+/// Each variant carries enough context (the offending child IDs) for
+/// diagnostic output without requiring a second coordinator scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitCoverageDetail {
     /// Split shard has an empty `spawned` list — no children were created.
@@ -563,6 +566,12 @@ impl InvariantChecker {
 
     /// S6: cursor bounds.
     ///
+    /// The shard spec defines a half-open range `[start, end)`. A cursor
+    /// is out-of-bounds if its `last_key` is lexicographically before
+    /// `start` or at-or-after `end`. Empty bounds (zero-length slices)
+    /// are treated as unbounded in that direction, which disables the
+    /// corresponding check -- this handles open-ended shards.
+    ///
     /// Accepts borrowed slices from `SimIntrospection` accessors so the
     /// checker can validate bounds directly on slab-backed data without
     /// allocating temporary owned cursor/spec objects.
@@ -689,6 +698,7 @@ impl InvariantChecker {
     }
 }
 
+/// Default-constructs with no history and S9 cooldown checking disabled.
 impl Default for InvariantChecker {
     fn default() -> Self {
         Self::new()

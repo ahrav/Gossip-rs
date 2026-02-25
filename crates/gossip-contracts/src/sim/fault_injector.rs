@@ -84,7 +84,12 @@ use crate::sim::backend::SimIntrospection;
 /// fence epoch, earlier cursor, reverted status) that the checker detects
 /// as violations of S2, S3, or S5.
 pub struct FaultInjectingIntrospector<B: SimIntrospection> {
+    /// The real backend being wrapped. All point-lookup and run-iteration
+    /// methods delegate to this backend unchanged.
     inner: B,
+    /// Synthetic records injected before checker execution. These appear
+    /// in `shards()` iteration but are invisible to `shard_lookup()`.
+    /// Growth allocation happens at injection time, not during iteration.
     synthetic_records: Vec<(TenantId, ShardKey, ShardRecord)>,
 }
 
@@ -136,7 +141,11 @@ pub struct FaultInjectingShardIter<'a, I>
 where
     I: Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)>,
 {
+    /// Inner backend's shard iterator, consumed first. Once exhausted,
+    /// `next()` switches to the synthetic slice iterator.
     real: I,
+    /// Slice iterator over the injector's synthetic record buffer.
+    /// Only consumed after `real` is fully drained.
     synthetic: core::slice::Iter<'a, (TenantId, ShardKey, ShardRecord)>,
 }
 

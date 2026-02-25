@@ -145,11 +145,12 @@ use gossip_stdx::{ByteSlab, RingBuffer};
 /// (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
-// Initial map/set capacity policy.
+// ---- Initial map/set capacity policy ----
 //
 // These values are intentionally conservative. They reduce eager allocation
 // compared with the previous fixed-capacity (64/16) policy while keeping
-// behavior identical as structures grow.
+// behavior identical as structures grow. Maps grow naturally via rehashing
+// when needed; these just avoid wasteful startup allocation.
 const TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
 const TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 16;
 const TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY: usize = 8;
@@ -158,8 +159,18 @@ const TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY: usize = 8;
 const TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
 const TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 32;
 const RUN_SHARD_SET_INITIAL_CAPACITY: usize = 8;
+
+// ---- Shard/tenant limit defaults ----
 const DEFAULT_MAX_SHARDS_PER_TENANT: usize = 100_000;
 const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
+
+// ---- Memory budget planning constants ----
+//
+// Used by `CoordinatorConfig::memory_budget()` for capacity estimation.
+// `SHARD_RECORD_PLANNING_BYTES` and `RUN_RECORD_PLANNING_BYTES` model the
+// fixed (non-slab) size of each record struct. Overhead constants model
+// per-entry HashMap bucket/key metadata. All are validated by
+// `memory_budget_constants_match_struct_sizes` in tests.
 const SHARD_RECORD_PLANNING_BYTES: usize = 728;
 const RUN_RECORD_PLANNING_BYTES: usize = 512;
 const SHARD_ENTRY_OVERHEAD_BYTES: usize = 72;
@@ -167,16 +178,23 @@ const RUN_ENTRY_OVERHEAD_BYTES: usize = 80;
 const WORKER_COOLDOWN_ENTRY_BYTES: usize = 16;
 const COORDINATOR_BASE_BYTES: usize = 4096;
 
+/// Create a new `AHashMap` with the given pre-allocated capacity.
 #[inline]
 fn ahash_map_with_capacity<K, V>(capacity: usize) -> AHashMap<K, V> {
     AHashMap::with_capacity_and_hasher(capacity, ahash::RandomState::default())
 }
 
+/// Create a new `HashSet` with aHash and the given pre-allocated capacity.
 #[inline]
 fn ahash_set_with_capacity<T>(capacity: usize) -> HashSet<T, ahash::RandomState> {
     HashSet::with_capacity_and_hasher(capacity, ahash::RandomState::default())
 }
 
+/// Estimate the initial capacity for the outer tenant-to-shards map.
+///
+/// Derives a tenant count estimate from shard limits and clamps it to a
+/// conservative startup range to avoid aggressive pre-allocation in small
+/// deployments.
 #[inline]
 fn top_level_shards_map_initial_capacity(
     max_total_shards: usize,
@@ -192,6 +210,10 @@ fn top_level_shards_map_initial_capacity(
     )
 }
 
+/// Estimate the initial capacity for a per-tenant inner shard map.
+///
+/// Clamped to a conservative range so small tenants don't over-allocate
+/// and large tenants don't start with an unreasonably large hash table.
 #[inline]
 fn tenant_shards_map_initial_capacity(max_shards_per_tenant: usize) -> usize {
     max_shards_per_tenant.clamp(
@@ -247,6 +269,10 @@ const MAX_SLAB_CAPACITY: usize = u32::MAX as usize;
 
 impl CoordinatorRuntimeConfig {
     /// Create a runtime config with explicit parameters.
+    ///
+    /// `slab_capacity` defaults to 0 (auto-sized from `max_total_shards`).
+    /// Use struct update syntax to override:
+    /// `CoordinatorRuntimeConfig { slab_capacity: 1 << 20, ..base }`.
     #[must_use]
     pub const fn new(
         default_lease_duration: u64,
@@ -281,9 +307,12 @@ impl CoordinatorRuntimeConfig {
     /// Derive slab capacity from config, using the explicit value if set
     /// or computing the capped default formula from `max_total_shards`.
     ///
-    /// Explicit capacities are clamped to [`MAX_SLAB_CAPACITY`]. Auto-sized
-    /// capacities are clamped to both startup budget
-    /// ([`DEFAULT_MAX_AUTO_SLAB_CAPACITY`]) and backend addressability.
+    /// - **Explicit (`slab_capacity > 0`)**: clamped to [`MAX_SLAB_CAPACITY`]
+    ///   (`u32::MAX`) to stay within `ByteSlab`'s addressable range.
+    /// - **Auto-sized (`slab_capacity == 0`)**: computed as
+    ///   `max_total_shards * DEFAULT_PER_SHARD_SLAB_BUDGET`, clamped to
+    ///   [`DEFAULT_MAX_AUTO_SLAB_CAPACITY`] (64 MiB) to prevent pathological
+    ///   eager allocation at startup.
     const fn effective_slab_capacity(&self) -> usize {
         if self.slab_capacity > 0 {
             if self.slab_capacity > MAX_SLAB_CAPACITY {

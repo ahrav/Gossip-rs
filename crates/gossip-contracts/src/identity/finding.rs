@@ -266,6 +266,14 @@ impl CanonicalBytes for OccurrenceIdInputs {
 /// derive-key mode. The tenant's secret key prevents cross-tenant
 /// correlation of normalized secret values.
 ///
+/// # Hash construction
+///
+/// The domain tag ([`domain::SECRET_HASH_V1`]) is fed as *data* inside the
+/// keyed hasher, not as a derive-key context, because BLAKE3 does not
+/// support both keyed mode and derive-key mode simultaneously. The domain
+/// tag acts as an internal context prefix that separates this derivation
+/// from any other use of the same tenant key.
+///
 /// # Examples
 ///
 /// ```

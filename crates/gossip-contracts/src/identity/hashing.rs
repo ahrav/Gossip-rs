@@ -92,6 +92,10 @@ pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
 ///
 /// `base` is expected to be one of this module's `LazyLock<Hasher>` statics
 /// (e.g., [`FINDING_HASHER`]); deref coercion provides `&Hasher` transparently.
+///
+/// The `T: CanonicalBytes` bound guarantees that `inputs` produces a
+/// collision-free, deterministic byte encoding, so the resulting 32-byte
+/// digest is a pure function of `(domain, inputs)`.
 #[inline]
 pub(crate) fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
     let mut h = base.clone();
@@ -141,6 +145,12 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
 /// entries per epoch) where cardinality is bounded by system design.  For
 /// globally-unique content-addressed identifiers with unbounded cardinality,
 /// use [`finalize_32`] instead.
+///
+/// # Panics
+///
+/// Contains an internal `.expect()` on the 8-byte slice conversion. This
+/// is unreachable in practice because BLAKE3 always produces at least 32
+/// bytes of output.
 #[inline]
 pub fn finalize_64(hasher: &Hasher) -> u64 {
     let bytes = hasher.finalize();
