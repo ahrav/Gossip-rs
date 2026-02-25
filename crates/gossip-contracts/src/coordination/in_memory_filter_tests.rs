@@ -1055,3 +1055,180 @@ fn memory_budget_constants_match_struct_sizes() {
         super::RUN_RECORD_PLANNING_BYTES,
     );
 }
+
+// ============================================================================
+// collect_claim_candidates_into tests
+//
+// These tests exercise the lightweight candidate collection method that the
+// default claim path uses instead of list_shards_into.  It returns only
+// ShardId values and the earliest lease deadline, avoiding ShardSummary
+// construction and slab byte copies.
+// ============================================================================
+
+/// Empty run returns empty candidates and no deadline.
+#[test]
+fn collect_candidates_empty_run() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    // Create a second run with zero shards.
+    let mut coord = coord;
+    let empty_run = crate::identity::RunId::from_raw(999);
+    let config = crate::coordination::run::RunConfig::try_new(
+        ShardSpec::default_cursor_semantics(),
+        30,
+        None,
+    )
+    .unwrap();
+    coord
+        .create_run(now(1), test_tenant(), empty_run, config)
+        .unwrap();
+    // Register zero shards to transition to Active.
+    let _ = coord
+        .register_shards(now(1), test_tenant(), empty_run, &[], OpId::from_raw(500))
+        .unwrap();
+
+    let mut candidates = Vec::new();
+    let deadline = coord
+        .collect_claim_candidates_into(now(2), test_tenant(), empty_run, &mut candidates)
+        .unwrap();
+    assert!(candidates.is_empty());
+    assert_eq!(deadline, None);
+}
+
+/// Mixed states: available + leased + terminal. Only available IDs appear
+/// in candidates; the earliest lease deadline is from the leased shard.
+#[test]
+fn collect_candidates_mixed_states() {
+    let (coord, lease) = coordinator_with_run_and_lease();
+    let mut coord = coord;
+    let tenant = test_tenant();
+    let run = test_run();
+
+    // Shard 0 is Active + leased (from the fixture).
+    // Split shard 0 to create children shards 1 and 2. This gives us
+    // terminal (shard 0 after split) and new Active shards.
+    let (child_a, child_b) = do_split_replace(&mut coord, &lease, now(5));
+
+    // child_a and child_b are Active + unleased.
+    // Lease child_a to make it Active + leased.
+    let child_a_key = ShardKey::new(run, child_a);
+    let child_a_lease = acquire_shard(&mut coord, now(6), child_a_key);
+
+    // child_b stays Active + unleased.
+    let shard_count = coord
+        .run_shards
+        .get(&(tenant, run))
+        .map_or(0, |ids| ids.len());
+    let mut candidates = Vec::with_capacity(shard_count);
+    let deadline = coord
+        .collect_claim_candidates_into(now(7), tenant, run, &mut candidates)
+        .unwrap();
+
+    // Only child_b should be a candidate (Active + unleased).
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0], child_b);
+
+    // Deadline should reflect child_a's lease (acquired at now(6), duration=30 → deadline=36).
+    assert_eq!(deadline, Some(now(36)));
+
+    // Original shard 0 is terminal (Split) — must not appear.
+    assert!(!candidates.contains(&ShardId::from_raw(0)));
+    // child_a is Active + leased — must not appear as candidate.
+    assert!(!candidates.contains(&child_a));
+}
+
+/// All shards leased: empty candidates, earliest deadline populated.
+#[test]
+fn collect_candidates_all_leased() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let tenant = test_tenant();
+    let run = test_run();
+
+    // The fixture has shard 0, Active + leased at now(3) with duration=30 → deadline=33.
+    let shard_count = coord
+        .run_shards
+        .get(&(tenant, run))
+        .map_or(0, |ids| ids.len());
+    let mut candidates = Vec::with_capacity(shard_count);
+    let deadline = coord
+        .collect_claim_candidates_into(now(4), tenant, run, &mut candidates)
+        .unwrap();
+
+    assert!(candidates.is_empty(), "all leased → no candidates");
+    assert_eq!(
+        deadline,
+        Some(now(3 + LEASE_DURATION)),
+        "should report the lease deadline"
+    );
+}
+
+/// Buffer reuse: capacity is preserved across calls.
+#[test]
+fn collect_candidates_buffer_reuse() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let tenant = test_tenant();
+    let run = test_run();
+
+    let shard_count = coord
+        .run_shards
+        .get(&(tenant, run))
+        .map_or(0, |ids| ids.len());
+    let mut candidates = Vec::with_capacity(shard_count + 10);
+    let initial_capacity = candidates.capacity();
+
+    // Call once (all leased at now(4)).
+    let _ = coord
+        .collect_claim_candidates_into(now(4), tenant, run, &mut candidates)
+        .unwrap();
+    assert_eq!(
+        candidates.capacity(),
+        initial_capacity,
+        "capacity must not change"
+    );
+
+    // Call again after lease expiry (now(34) > deadline(33)).
+    let _ = coord
+        .collect_claim_candidates_into(now(34), tenant, run, &mut candidates)
+        .unwrap();
+    assert_eq!(
+        candidates.capacity(),
+        initial_capacity,
+        "capacity must not change on second call"
+    );
+    assert_eq!(
+        candidates.len(),
+        1,
+        "shard should be available after expiry"
+    );
+}
+
+/// RunNotFound error for nonexistent run.
+#[test]
+fn collect_candidates_run_not_found() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let mut candidates = Vec::new();
+    let result = coord.collect_claim_candidates_into(
+        now(2),
+        test_tenant(),
+        crate::identity::RunId::from_raw(999),
+        &mut candidates,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::coordination::run_errors::GetRunError::RunNotFound)
+    ));
+}
+
+/// TenantMismatch error for wrong tenant.
+#[test]
+fn collect_candidates_tenant_mismatch() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let wrong_tenant = crate::identity::TenantId::from_bytes([0xFF; 32]);
+    let mut candidates = Vec::new();
+    let result =
+        coord.collect_claim_candidates_into(now(2), wrong_tenant, test_run(), &mut candidates);
+    // InMemoryCoordinator keys by (tenant, run), so wrong tenant → RunNotFound.
+    assert!(matches!(
+        result,
+        Err(crate::coordination::run_errors::GetRunError::RunNotFound)
+    ));
+}

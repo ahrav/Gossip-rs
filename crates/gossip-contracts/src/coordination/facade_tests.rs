@@ -1,11 +1,11 @@
 //! Tests for the [`CoordinationFacade`] super-trait, the [`ShardClaiming`]
 //! trait, and the [`default_claim_next_available`] free function.
 //!
-//! The claim algorithm uses a two-step list-then-acquire pattern: it queries
-//! the backend for available (active, unleased) shards, then tries to acquire
-//! each candidate sequentially. Because the fencing protocol in
+//! The claim algorithm uses a two-step scan-then-acquire pattern: it collects
+//! available (active, unleased) shard IDs from the backend, then tries to
+//! acquire each candidate sequentially. Because the fencing protocol in
 //! `acquire_and_restore_into` guarantees at-most-one winner per shard, the TOCTOU
-//! gap between list and acquire is safe --- losers advance to the next
+//! gap between scan and acquire is safe — losers advance to the next
 //! candidate.
 //!
 //! # Coverage Areas
