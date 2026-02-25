@@ -2752,6 +2752,8 @@ impl RunManagement for InMemoryCoordinator {
             }
         }
 
+        // Deterministic ordering by ShardId — cheaper than key_range_start
+        // (avoids slab reads per comparison) while preserving stable assignment.
         candidates.sort_unstable();
 
         Ok(earliest_deadline)
