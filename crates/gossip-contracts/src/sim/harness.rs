@@ -128,8 +128,11 @@ use super::{FaultConfig, FaultLevel, SimContext};
 /// so a single `SimOp::TerminateRun { run, kind }` variant covers all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunTerminalKind {
+    /// Mark the run as successfully completed.
     Complete,
+    /// Mark the run as failed.
     Fail,
+    /// Cancel the run.
     Cancel,
 }
 
@@ -641,8 +644,23 @@ const MAX_STALE_LEASES: usize = 64;
 /// Only the most recent checkpoint per `(worker, run, shard)` is retained.
 /// Earlier entries are overwritten, which is correct because the op-log's
 /// dedup window is bounded and older ops may already be evicted.
+/// Per-(worker, run, shard) checkpoint history for replay/conflict testing.
+///
+/// Key is `(worker_raw, run_raw, shard_raw)` using raw `u64` identifiers
+/// because `ShardKey` omits `Ord`. Value stores the last successful
+/// checkpoint's `(OpId, last_key_bytes, WorkerId, ShardKey)`.
 type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Vec<u8>, WorkerId, ShardKey)>;
+
+/// Stack-owned copy of a shard's spec bounds: `(start_buf, start_len, end_buf, end_len)`.
+///
+/// Fixed-capacity arrays avoid holding immutable borrows into the coordinator
+/// while building split plans that require mutable coordinator access.
 type SplitBoundsBuf = ([u8; MAX_KEY_SIZE], usize, [u8; MAX_KEY_SIZE], usize);
+
+/// Split input snapshot: spec bounds plus the optional first cursor byte.
+///
+/// The cursor byte is used by split-residual to place the split point after
+/// already-scanned data.
 type SplitInputCopy = (SplitBoundsBuf, Option<u8>);
 
 /// Validate worker preconditions and consume the next op-ID in one shot.
@@ -2142,14 +2160,17 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         Some(f(worker, held[idx]))
     }
 
+    /// Pick an active worker holding a shard and generate a renew op.
     fn try_gen_renew(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Renew { worker, key })
     }
 
+    /// Pick an active worker holding a shard and generate a checkpoint op.
     fn try_gen_checkpoint(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Checkpoint { worker, key })
     }
 
+    /// Pick an active worker holding a shard and generate a complete op.
     fn try_gen_complete(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Complete { worker, key })
     }

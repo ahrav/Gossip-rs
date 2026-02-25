@@ -52,9 +52,16 @@ impl OverloadScenario {
 }
 
 /// Tracks completion goodput during scripted overload rounds.
+///
+/// Goodput is the ratio of successful completions (`CompleteOk`) to total
+/// operations fed into [`record`](Self::record). The harness feeds only
+/// scripted overload events (not warmup/recovery) to keep the metric focused
+/// on pressure behavior.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GoodputTracker {
+    /// Number of `SimEvent::CompleteOk` events recorded.
     completions: u64,
+    /// Total number of events recorded (completions + all other outcomes).
     total_ops: u64,
 }
 
@@ -78,6 +85,8 @@ impl GoodputTracker {
     }
 
     /// Completion ratio in `[0.0, 1.0]`.
+    ///
+    /// Returns `0.0` when no events have been recorded (avoids division by zero).
     #[must_use]
     pub fn rate(&self) -> f64 {
         if self.total_ops == 0 {
@@ -123,6 +132,9 @@ pub struct OverloadReport {
 }
 
 /// Scripted overload op burst: every worker issues `ClaimNext`.
+///
+/// Returns one `SimOp::ClaimNext` per worker, modeling a thundering-herd
+/// scenario where all workers attempt to claim simultaneously.
 pub(super) fn generate_burst_claim(workers: &[WorkerId]) -> Vec<SimOp> {
     workers
         .iter()
@@ -132,6 +144,13 @@ pub(super) fn generate_burst_claim(workers: &[WorkerId]) -> Vec<SimOp> {
 }
 
 /// Scripted capacity-drop burst: pause half the workers, then jump time.
+///
+/// Models partial infrastructure failure (e.g., losing an availability zone).
+/// The time jump (`2 * DEFAULT_LEASE_DURATION`) guarantees all leases from
+/// paused workers expire before surviving workers resume claiming.
+///
+/// With odd worker counts, integer division rounds down, keeping one extra
+/// worker active (partial, not total, capacity loss).
 pub(super) fn generate_capacity_drop(workers: &[WorkerId]) -> Vec<SimOp> {
     let mut ops = Vec::new();
     // Integer division intentionally rounds down: with odd worker counts we
@@ -149,6 +168,11 @@ pub(super) fn generate_capacity_drop(workers: &[WorkerId]) -> Vec<SimOp> {
 }
 
 /// Scripted split burst: issue `SplitReplace` on all currently held shards.
+///
+/// Models rapid shard proliferation (e.g., auto-scaling triggered by a
+/// workload spike). Returns one `SimOp::SplitReplace` per held shard;
+/// the caller snapshots held shards before the round, so early splits
+/// within the round may cause later entries to hit stale-key rejections.
 pub(super) fn generate_burst_shards(held_shards: &[(WorkerId, ShardKey)]) -> Vec<SimOp> {
     held_shards
         .iter()

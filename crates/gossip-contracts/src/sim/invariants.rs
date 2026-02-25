@@ -197,8 +197,12 @@ pub enum InvariantViolation {
 // InvariantChecker
 // ---------------------------------------------------------------------------
 
-/// Composite key for per-shard temporal history, scoped by tenant to prevent
-/// cross-contamination when a single checker validates multiple tenants.
+/// Composite key for per-shard temporal history.
+///
+/// Scoped by `TenantId` so a single [`InvariantChecker`] can validate
+/// multiple tenants without cross-contamination. Uses a tuple rather than
+/// `ShardKey` because `ShardKey` intentionally omits `Ord` (it is an opaque
+/// identity, not an ordered quantity), and `BTreeMap` requires `Ord` keys.
 type HistoryKey = (TenantId, RunId, ShardId);
 
 /// Stateful external observer that tracks per-shard history across
@@ -254,12 +258,18 @@ pub struct InvariantChecker {
 }
 
 impl InvariantChecker {
-    /// Create a fresh checker with no history.
+    /// Create a fresh checker with no history and S9 cooldown checking disabled.
+    ///
+    /// Equivalent to `InvariantChecker::with_cooldown_interval(0)`.
     pub fn new() -> Self {
         Self::with_cooldown_interval(0)
     }
 
     /// Create a checker with an explicit S9 cooldown interval.
+    ///
+    /// A `cooldown_interval` of 0 disables S9 checking (vacuously satisfied).
+    /// Positive values enforce that the same worker cannot claim twice within
+    /// `cooldown_interval` logical ticks.
     pub fn with_cooldown_interval(cooldown_interval: u64) -> Self {
         Self {
             prev_epochs: BTreeMap::new(),
@@ -288,6 +298,11 @@ impl InvariantChecker {
     /// This is a push-style check invoked by the harness when `ClaimNext`
     /// succeeds. Violations are buffered and appended by `check_all` so the
     /// caller sees a unified violation vector per simulation step.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `now` is less than a previously recorded claim time for
+    /// the same worker (logical time must not regress).
     pub fn record_claim_success(&mut self, worker: WorkerId, now: LogicalTime) {
         if self.cooldown_interval == 0 {
             return;

@@ -127,6 +127,12 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
 /// Takes the first 8 bytes of the BLAKE3 output as a little-endian `u64`.
 /// Used for op-log payload hashes and split shard ID derivation.
 ///
+/// # Byte ordering
+///
+/// The first 8 bytes of the BLAKE3 output are interpreted as a **little-endian**
+/// `u64`. This matches the `CanonicalBytes` convention used throughout the
+/// identity module and ensures consistent cross-platform behavior.
+///
 /// # Cardinality bounds
 ///
 /// A 64-bit truncated hash has a birthday collision bound of approximately
