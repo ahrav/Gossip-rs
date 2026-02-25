@@ -1469,17 +1469,6 @@ impl AcquireScratch {
         }
     }
 
-    /// Copy lineage IDs into scratch-owned inline storage.
-    ///
-    /// Requires `spawned.len() <= MAX_SPAWNED_PER_SHARD`; a larger slice
-    /// would violate split invariants and panic. This assert also guarantees
-    /// `InlineVec::from_slice` stays on its inline representation (no heap
-    /// spill) in steady state.
-    #[cfg(test)]
-    pub(crate) fn write_spawned(&mut self, spawned: &[ShardId]) {
-        self.write_spawned_iter(spawned.iter().copied());
-    }
-
     /// Copy lineage IDs from an iterator into scratch-owned inline storage.
     ///
     /// This keeps acquire callers allocation-free even when upstream storage

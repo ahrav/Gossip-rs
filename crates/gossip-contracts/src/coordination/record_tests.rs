@@ -376,7 +376,7 @@ fn assert_invariants_duplicate_op_id_panics() {
 }
 
 #[test]
-#[should_panic(expected = "spawned count")]
+#[should_panic(expected = "exceeds cap")]
 fn assert_invariants_spawned_exceeds_cap_panics() {
     let mut slab = TestSlab::new();
     let spawned: SpawnedList = (0..=MAX_SPAWNED_PER_SHARD as u64)

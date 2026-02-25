@@ -623,52 +623,6 @@ impl PooledSpawned {
         self.len = len;
     }
 
-    /// Append one lineage ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SlabFull` if the slab cannot allocate a replacement slot.
-    #[cfg(test)]
-    pub(crate) fn push(&mut self, spawned: ShardId, slab: &mut ByteSlab) -> Result<(), SlabFull> {
-        let (slot, len) = self.allocate_appended_slot(core::slice::from_ref(&spawned), slab)?;
-        self.install_slot(slot, len, slab);
-        Ok(())
-    }
-
-    /// Append multiple lineage IDs.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SlabFull` if the slab cannot allocate a replacement slot.
-    #[cfg(test)]
-    pub(crate) fn extend_from_slice(
-        &mut self,
-        spawned: &[ShardId],
-        slab: &mut ByteSlab,
-    ) -> Result<(), SlabFull> {
-        let (slot, len) = self.allocate_appended_slot(spawned, slab)?;
-        if slot != self.slot || len != self.len {
-            self.install_slot(slot, len, slab);
-        }
-        Ok(())
-    }
-
-    /// Replace the lineage list with `spawned`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SlabFull` if the slab cannot allocate replacement storage.
-    #[cfg(test)]
-    pub(crate) fn replace_from_slice(
-        &mut self,
-        spawned: &[ShardId],
-        slab: &mut ByteSlab,
-    ) -> Result<(), SlabFull> {
-        let replacement = Self::from_slice(spawned, slab)?;
-        self.install_slot(replacement.slot, replacement.len, slab);
-        Ok(())
-    }
-
     /// Release slot storage and reset to empty.
     pub(crate) fn release_fields(&mut self, slab: &mut ByteSlab) {
         let slot = std::mem::replace(&mut self.slot, ByteSlot::EMPTY);

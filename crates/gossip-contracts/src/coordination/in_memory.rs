@@ -1001,11 +1001,11 @@ impl InMemoryCoordinator {
 ///
 /// Two strategies, chosen by build profile:
 ///
-/// - **Debug builds**: iterate every record and call `release_fields` on
-///   its `spec` and `cursor`. This decrements `live_count` for each slot
-///   individually, so `ByteSlab::Drop` can assert `live_count == 0` -- a
-///   leak detector that catches bugs where a record is removed from the
-///   map but its slab slots are never released.
+/// - **Debug builds**: iterate every record and call `deallocate_fields`
+///   (`spec`, `cursor`, and spawned lineage storage). This decrements
+///   `live_count` for each slot individually, so `ByteSlab::Drop` can assert
+///   `live_count == 0` -- a leak detector that catches bugs where a record
+///   is removed from the map but its slab slots are never released.
 ///
 /// - **Release builds**: call `slab.clear()` for O(1) bulk reset. This
 ///   skips the per-record iteration (irrelevant in production where the
@@ -1016,8 +1016,7 @@ impl Drop for InMemoryCoordinator {
         {
             for (_tenant, tenant_map) in self.shards.drain() {
                 for (_key, mut record) in tenant_map {
-                    record.spec.release_fields(&mut self.slab);
-                    record.cursor.release_fields(&mut self.slab);
+                    record.deallocate_fields(&mut self.slab);
                 }
             }
             // ByteSlab::Drop will assert live_count == 0
@@ -1398,7 +1397,22 @@ impl CoordinationBackend for InMemoryCoordinator {
                 )?;
 
                 // Phase 3: Apply parent mutation + index updates.
-                split_replace_apply_parent(parent, child_ids.as_slice(), op_id, payload_hash, now);
+                if let Err(e) = split_replace_apply_parent(
+                    parent,
+                    child_ids.as_slice(),
+                    op_id,
+                    payload_hash,
+                    now,
+                    &mut coordinator.slab,
+                ) {
+                    split_replace_rollback_inserted_children(
+                        coordinator,
+                        tenant,
+                        parent.run,
+                        child_ids.as_slice(),
+                    );
+                    return Err(e);
+                }
 
                 for &child_id in &child_ids {
                     coordinator.index_shard(tenant, parent.run, child_id);
@@ -1865,6 +1879,7 @@ fn split_replace_apply_parent(
         "split_replace precondition violated: append would exceed spawn cap"
     );
 
+    let (spawned_slot, spawned_len) = parent.spawned.allocate_appended_slot(child_ids, slab)?;
     parent.assert_transition_legal(ShardStatus::Split);
     parent.spawned.install_slot(spawned_slot, spawned_len, slab);
     parent.status = ShardStatus::Split;
