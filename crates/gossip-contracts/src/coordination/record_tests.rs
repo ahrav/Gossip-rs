@@ -1,3 +1,47 @@
+//! Tests for [`ShardRecord`] and its supporting types (`ShardStatus`,
+//! `ParkReason`, `OpLogEntry`, `ShardSnapshot`).
+//!
+//! `ShardRecord` is the single source of truth for a shard's state in the
+//! coordinator. Every field on it has invariants that are enforced by
+//! `assert_invariants()`, and the record's op-log provides bounded
+//! idempotency detection. This module tests those invariants exhaustively.
+//!
+//! # Coverage Areas
+//!
+//! - **Enum discriminant stability**: `ShardStatus` and `ParkReason`
+//!   roundtrip through `as_u8`/`from_u8` and produce the expected
+//!   `Display` output. These are persisted values; discriminant drift
+//!   is a data-corruption bug.
+//!
+//! - **`assert_invariants` truth table**: every valid record configuration
+//!   passes, and every illegal configuration (Parked without reason,
+//!   Active with reason, terminal with lease, derived without parent,
+//!   parent without derived bit, zero fence epoch, Split without
+//!   spawned, duplicate op-log entries, spawned exceeding cap) panics
+//!   with a specific message.
+//!
+//! - **Op-log mechanics**: lookup (found/not-found), reverse-scan bias
+//!   toward recent entries, FIFO eviction at capacity, and duplicate
+//!   rejection.
+//!
+//! - **Snapshot fidelity**: all record fields are faithfully projected
+//!   into `ShardSnapshot`, and coordination-internal state (tenant,
+//!   worker, fence) is excluded from the snapshot's `Debug` output.
+//!
+//! - **State-transition legality**: the `assert_transition_legal`
+//!   guard allows Active-to-{Done,Parked,Split} and idempotent
+//!   terminal-to-same, but panics on terminal-to-different.
+//!
+//! - **Fence monotonicity**: `advance_fence` increments strictly.
+//!
+//! - **Lease boundary**: `is_leased_at` uses a half-open interval.
+//!
+//! - **Spawned capacity**: `can_spawn` respects the per-shard cap and
+//!   handles overflow.
+//!
+//! - **Split child construction**: `new_split_child` sets the correct
+//!   parent, status, cursor, and fence, and rejects non-derived IDs.
+
 use super::*;
 use crate::coordination::lease::{OpKind, OpResult};
 use crate::coordination::test_fixtures::{derived_shard_id, test_run, test_spec, test_tenant};
@@ -12,7 +56,7 @@ fn active_record(slab: &mut ByteSlab) -> ShardRecord {
         test_tenant(),
         test_run(),
         ShardId::from_raw(10),
-        &test_spec(),
+        test_spec(),
         CursorSemantics::Completed,
         slab,
     )
@@ -38,8 +82,15 @@ fn make_entry(op_raw: u64) -> OpLogEntry {
     )
 }
 
-// -- ShardStatus -----------------------------------------------------
+// ============================================================================
+// ShardStatus discriminant stability and terminal classification
+//
+// ShardStatus is persisted as `#[repr(u8)]`. These tests pin the exact
+// discriminant-to-variant mapping and the terminal/non-terminal partition.
+// ============================================================================
 
+/// Active is the only non-terminal status; Done, Split, and Parked are
+/// all terminal (no further shard-level operations except idempotent replay).
 #[test]
 fn shard_status_terminal_truth_table() {
     assert!(!ShardStatus::Active.is_terminal());
@@ -48,6 +99,8 @@ fn shard_status_terminal_truth_table() {
     assert!(ShardStatus::Parked.is_terminal());
 }
 
+/// Exhaustive roundtrip: every valid discriminant survives `as_u8`/`from_u8`,
+/// out-of-range values return `None`, and `Display` matches expectations.
 #[test]
 fn shard_status_roundtrip_table() {
     let cases: &[(u8, Option<ShardStatus>, Option<&str>)] = &[
@@ -75,8 +128,12 @@ fn shard_status_roundtrip_table() {
     }
 }
 
-// -- ParkReason ------------------------------------------------------
+// ============================================================================
+// ParkReason discriminant stability
+// ============================================================================
 
+/// Same roundtrip + display test as `ShardStatus`, but for `ParkReason`.
+/// All five variants (PermissionDenied..Other) roundtrip; values 5+ are invalid.
 #[test]
 fn park_reason_roundtrip_table() {
     let cases: &[(u8, Option<ParkReason>, Option<&str>)] = &[
@@ -109,8 +166,14 @@ fn park_reason_roundtrip_table() {
     }
 }
 
-// -- assert_invariants (success) -------------------------------------
+// ============================================================================
+// assert_invariants — valid configurations
+//
+// Each test constructs one valid record state and verifies assert_invariants
+// does not panic. Together these cover every ShardStatus variant.
+// ============================================================================
 
+/// Active with no lease is the initial post-registration state.
 #[test]
 fn assert_invariants_active_unleased_ok() {
     let mut slab = TestSlab::new();
@@ -149,8 +212,16 @@ fn assert_invariants_split_ok() {
     r.assert_invariants();
 }
 
-// -- assert_invariants (panics) --------------------------------------
+// ============================================================================
+// assert_invariants — illegal configurations (must panic)
+//
+// Each test constructs exactly one invariant violation and verifies the
+// panic message. The expected-string in `#[should_panic]` pins the exact
+// invariant being violated, so regressions that silently accept bad state
+// are caught.
+// ============================================================================
 
+/// Parked status requires a `park_reason` explaining why the shard was parked.
 #[test]
 #[should_panic(expected = "must have park_reason")]
 fn assert_invariants_parked_without_reason_panics() {
@@ -161,6 +232,7 @@ fn assert_invariants_parked_without_reason_panics() {
     r.assert_invariants();
 }
 
+/// Non-Parked statuses must not carry a `park_reason` (it would be stale).
 #[test]
 #[should_panic(expected = "must not have park_reason")]
 fn assert_invariants_active_with_reason_panics() {
@@ -170,6 +242,9 @@ fn assert_invariants_active_with_reason_panics() {
     r.assert_invariants();
 }
 
+/// Terminal shards (Done, Parked, Split) must have their lease cleared.
+/// A lingering lease would block future admin operations and violate the
+/// "terminal = no owner" invariant.
 #[test]
 fn assert_invariants_terminal_with_lease_panics() {
     let mut slab = TestSlab::new();
@@ -258,6 +333,8 @@ fn assert_invariants_terminal_with_lease_panics() {
 // NOTE: op_log overflow test removed — RingBuffer prevents overflow at the
 // type level, making the scenario unrepresentable.
 
+/// A shard with a `parent` field set must have its derived bit (bit 63) set
+/// on its `ShardId`. A non-derived ID claiming a parent is a construction bug.
 #[test]
 #[should_panic(expected = "not derived")]
 fn assert_invariants_parent_some_but_not_derived_panics() {
@@ -282,6 +359,8 @@ fn assert_invariants_parent_some_but_not_derived_panics() {
     r.assert_invariants();
 }
 
+/// Every entry in `spawned` must be a derived ShardId. A non-derived ID in the
+/// spawned list means a split operation generated an ID incorrectly.
 #[test]
 #[should_panic(expected = "not derived")]
 fn assert_invariants_spawned_contains_non_derived_panics() {
@@ -292,6 +371,8 @@ fn assert_invariants_spawned_contains_non_derived_panics() {
     r.assert_invariants();
 }
 
+/// `FenceEpoch::ZERO` is reserved as a sentinel. All records must start at
+/// `INITIAL` (which is 1) and only increase from there.
 #[test]
 #[should_panic(expected = "fence_epoch must be >= INITIAL")]
 fn assert_invariants_fence_epoch_zero_panics() {
@@ -390,8 +471,16 @@ fn assert_invariants_spawned_exceeds_cap_panics() {
     r.assert_invariants();
 }
 
-// -- Op-log ----------------------------------------------------------
+// ============================================================================
+// Op-log mechanics
+//
+// The shard op-log is a bounded ring buffer (OP_LOG_CAP = 16) used for
+// idempotency detection. Lookup is reverse-biased (most recent first) since
+// replays typically hit the last few entries. Eviction is FIFO: when full,
+// push evicts the oldest entry. Duplicate op_ids are rejected at push time.
+// ============================================================================
 
+/// Lookup finds an entry that was just pushed.
 #[test]
 fn op_log_lookup_found() {
     let mut slab = TestSlab::new();
@@ -404,6 +493,7 @@ fn op_log_lookup_found() {
     );
 }
 
+/// Lookup on an empty op-log returns `None`.
 #[test]
 fn op_log_lookup_not_found() {
     let mut slab = TestSlab::new();
@@ -411,6 +501,8 @@ fn op_log_lookup_not_found() {
     assert!(r.op_log_lookup(OpId::from_raw(999)).is_none());
 }
 
+/// At capacity, the oldest entry (op_id=0) is evicted; the newest and
+/// second-oldest survive. This is the FIFO ring-buffer contract.
 #[test]
 fn op_log_push_evicts_oldest() {
     let mut slab = TestSlab::new();
@@ -430,6 +522,8 @@ fn op_log_push_evicts_oldest() {
     assert!(r.op_log_lookup(OpId::from_raw(1)).is_some());
 }
 
+/// Reverse scan finds the most recent entry first, optimizing for the
+/// common case where replays target the latest operation.
 #[test]
 fn op_log_lookup_reverse_finds_recent_first() {
     let mut slab = TestSlab::new();
@@ -444,8 +538,15 @@ fn op_log_lookup_reverse_finds_recent_first() {
     );
 }
 
-// -- Snapshot --------------------------------------------------------
+// ============================================================================
+// Snapshot fidelity and information hiding
+//
+// ShardSnapshot is the worker-visible projection of a ShardRecord. It must
+// contain all fields a worker needs (spec, cursor, status, lineage) but must
+// NOT expose coordination-internal state (tenant, worker, fence).
+// ============================================================================
 
+/// All domain-relevant fields survive the record-to-snapshot projection.
 #[test]
 fn snapshot_preserves_fields() {
     let mut slab = TestSlab::new();
@@ -464,6 +565,9 @@ fn snapshot_preserves_fields() {
     assert_eq!(snap.spawned(), r.spawned.as_slice());
 }
 
+/// The Debug output of a snapshot must not contain TenantId, WorkerId, or
+/// FenceEpoch. Leaking these into worker-visible output would violate the
+/// information-hiding boundary between coordination and processing.
 #[test]
 fn snapshot_does_not_leak_coordination_state() {
     let mut slab = TestSlab::new();
@@ -484,8 +588,14 @@ fn snapshot_does_not_leak_coordination_state() {
     );
 }
 
-// -- INV-7b: derived without parent -----------------------------------
+// ============================================================================
+// INV-7b: derived-bit / parent biconditional
+//
+// A derived ShardId (bit 63 set) must always have a parent, and vice versa.
+// This is the inverse of the parent-without-derived test above.
+// ============================================================================
 
+/// A derived ShardId without a parent violates INV-7b.
 #[test]
 #[should_panic(expected = "derived (bit 63 set) but has no parent")]
 fn assert_invariants_derived_without_parent_panics() {
@@ -509,8 +619,15 @@ fn assert_invariants_derived_without_parent_panics() {
     r.assert_invariants();
 }
 
-// -- assert_transition_legal -----------------------------------------
+// ============================================================================
+// State-transition legality
+//
+// The shard state machine allows Active -> {Done, Parked, Split} and
+// idempotent terminal -> same-terminal. All other transitions (e.g.
+// Done -> Active, Parked -> Active, Split -> Done) are illegal.
+// ============================================================================
 
+/// Active -> Done is the normal completion path.
 #[test]
 fn assert_transition_legal_active_to_done_ok() {
     let mut slab = TestSlab::new();
@@ -532,6 +649,7 @@ fn assert_transition_legal_active_to_split_ok() {
     r.assert_transition_legal(ShardStatus::Split);
 }
 
+/// Done -> Done is allowed (idempotent terminal replay).
 #[test]
 fn assert_transition_legal_done_to_done_ok() {
     let mut slab = TestSlab::new();
@@ -540,6 +658,7 @@ fn assert_transition_legal_done_to_done_ok() {
     r.assert_transition_legal(ShardStatus::Done);
 }
 
+/// Done -> Active is illegal (terminal irreversibility).
 #[test]
 #[should_panic(expected = "illegal transition from terminal")]
 fn assert_transition_legal_done_to_active_panics() {
@@ -569,8 +688,14 @@ fn assert_transition_legal_split_to_done_panics() {
     r.assert_transition_legal(ShardStatus::Done);
 }
 
-// -- advance_fence ---------------------------------------------------
+// ============================================================================
+// Fence monotonicity
+//
+// advance_fence is called on every acquire. It must strictly increment the
+// epoch on every call, never repeat a value, and never decrease.
+// ============================================================================
 
+/// First advance moves from INITIAL to INITIAL+1.
 #[test]
 fn advance_fence_increments() {
     let mut slab = TestSlab::new();
@@ -580,6 +705,7 @@ fn advance_fence_increments() {
     assert_eq!(new, FenceEpoch::INITIAL.increment());
 }
 
+/// Three successive advances produce a strictly increasing sequence.
 #[test]
 fn advance_fence_monotonic() {
     let mut slab = TestSlab::new();
@@ -591,8 +717,14 @@ fn advance_fence_monotonic() {
     assert!(f2 < f3);
 }
 
-// -- is_leased_at ----------------------------------------------------
+// ============================================================================
+// Lease boundary (is_leased_at)
+//
+// A shard is leased at time `now` iff it has a lease and `now < deadline`
+// (half-open interval). No lease means never leased.
+// ============================================================================
 
+/// A record with no lease is never leased, regardless of the time argument.
 #[test]
 fn is_leased_at_no_lease() {
     let mut slab = TestSlab::new();
@@ -600,8 +732,15 @@ fn is_leased_at_no_lease() {
     assert!(!r.is_leased_at(LogicalTime::from_raw(0)));
 }
 
-// -- can_spawn -------------------------------------------------------
+// ============================================================================
+// Spawned capacity (can_spawn)
+//
+// Each shard has a maximum number of children it can spawn
+// (MAX_SPAWNED_PER_SHARD). can_spawn checks whether `current + requested`
+// fits within the cap, handling overflow safely.
+// ============================================================================
 
+/// A fresh record can spawn 1 or up to MAX_SPAWNED_PER_SHARD children.
 #[test]
 fn can_spawn_within_cap() {
     let mut slab = TestSlab::new();
@@ -610,6 +749,7 @@ fn can_spawn_within_cap() {
     assert!(r.can_spawn(MAX_SPAWNED_PER_SHARD));
 }
 
+/// At exactly MAX_SPAWNED_PER_SHARD, spawning 1 more fails; spawning 0 succeeds.
 #[test]
 fn can_spawn_at_cap() {
     let mut slab = TestSlab::new();
@@ -621,6 +761,7 @@ fn can_spawn_at_cap() {
     assert!(r.can_spawn(0));
 }
 
+/// usize::MAX as the requested count must not panic or wrap; it returns false.
 #[test]
 fn can_spawn_overflow() {
     let mut slab = TestSlab::new();
@@ -628,8 +769,12 @@ fn can_spawn_overflow() {
     assert!(!r.can_spawn(usize::MAX));
 }
 
-// -- op_log_push duplicate rejection ----------------------------------
+// ============================================================================
+// Op-log duplicate rejection
+// ============================================================================
 
+/// Pushing the same OpId twice panics. This is a programming error (callers
+/// must check idempotency before pushing), not a runtime condition.
 #[test]
 #[should_panic(expected = "duplicate OpId")]
 fn op_log_push_rejects_duplicate() {
@@ -639,8 +784,16 @@ fn op_log_push_rejects_duplicate() {
     r.op_log_push(make_entry(42)); // same OpId — should panic
 }
 
-// -- new_split_child construction ------------------------------------
+// ============================================================================
+// new_split_child construction
+//
+// Split children are created with a derived ShardId (bit 63 set), a parent
+// reference, an inherited cursor, and a fresh fence epoch. The constructor
+// rejects non-derived IDs.
+// ============================================================================
 
+/// A split child has Active status, the correct parent, inherited cursor and
+/// semantics, an empty spawned list and op-log, and INITIAL fence epoch.
 #[test]
 fn new_split_child_construction_and_fields() {
     let mut slab = TestSlab::new();
@@ -652,8 +805,8 @@ fn new_split_child_construction_and_fields() {
         test_tenant(),
         test_run(),
         child_id,
-        &test_spec(),
-        &cursor,
+        test_spec(),
+        cursor.clone(),
         CursorSemantics::Dispatched,
         parent_id,
         &mut slab,
@@ -674,6 +827,7 @@ fn new_split_child_construction_and_fields() {
     assert_eq!(record.fence_epoch, FenceEpoch::INITIAL);
 }
 
+/// Passing a non-derived ShardId (bit 63 clear) to `new_split_child` panics.
 #[test]
 #[should_panic(expected = "not derived")]
 fn new_split_child_non_derived_shard_panics() {
@@ -682,19 +836,27 @@ fn new_split_child_non_derived_shard_panics() {
         test_tenant(),
         test_run(),
         ShardId::from_raw(10), // NOT derived
-        &test_spec(),
-        &Cursor::initial(),
+        test_spec(),
+        Cursor::initial(),
         CursorSemantics::Completed,
         ShardId::from_raw(5),
         &mut slab,
     );
 }
 
-// -- Property tests --------------------------------------------------
+// ============================================================================
+// Property tests
+//
+// Randomized invariant checks: op-log remains bounded regardless of push
+// count, ParkReason canonical encoding is stable and collision-free,
+// is_leased_at matches the half-open `now < deadline` predicate for all
+// (deadline, now) pairs.
+// ============================================================================
 
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
+    /// Regardless of how many ops are pushed, the op-log never exceeds OP_LOG_CAP.
     #[test]
     fn op_log_push_bounded(ops in proptest::collection::vec(1u64..10000, 0..64)) {
         let mut slab = TestSlab::new();

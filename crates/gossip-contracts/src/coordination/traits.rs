@@ -27,9 +27,11 @@
 //! Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021).
 
 use crate::coordination::cursor::CursorUpdate;
+#[cfg(any(test, feature = "test-support"))]
+use crate::coordination::error::AcquireResult;
 use crate::coordination::error::{
-    AcquireError, AcquireResult, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
-    RenewError, RenewResult, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireResultView, AcquireScratch, CheckpointError, CompleteError,
+    IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::lease::Lease;
 use crate::coordination::record::ParkReason;
@@ -143,6 +145,15 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 /// expression, so the target store rejects writes from superseded workers.
 pub trait CoordinationBackend {
     // —— Shard lifecycle operations ——————————————————————————————
+    //
+    // Two naming conventions appear here:
+    //
+    // - `*_into` methods (e.g., `acquire_and_restore_into`): write output
+    //   into caller-owned scratch to avoid per-call allocation. These are
+    //   the primary production entry points.
+    //
+    // - Non-`_into` methods (e.g., `acquire_and_restore`): return owned
+    //   results with heap allocation. Available in test builds only.
 
     /// Acquire a shard for processing and restore its last checkpoint.
     ///
@@ -183,13 +194,34 @@ pub trait CoordinationBackend {
     /// acquisition time (after epoch bump, before any worker mutations).
     /// **Capacity**: The `capacity` field in the result reflects the run's
     /// available-shard count computed *after* this operation completes.
+    ///
+    /// `out` is caller-owned scratch reused across calls. Implementations may
+    /// overwrite it fully and must not retain references into it after return.
+    fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, AcquireError>;
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Owned convenience wrapper around [`Self::acquire_and_restore_into`].
+    ///
+    /// This exists for tests and compatibility paths. Hot production paths
+    /// should prefer the borrowed variant to avoid per-call allocation.
     fn acquire_and_restore(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         key: ShardKey,
         worker: WorkerId,
-    ) -> Result<AcquireResult, AcquireError>;
+    ) -> Result<AcquireResult, AcquireError> {
+        let mut scratch = AcquireScratch::default();
+        self.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)
+            .map(|result| result.to_owned())
+    }
 
     /// Renew an existing lease, extending the deadline.
     ///
@@ -400,7 +432,7 @@ pub trait CoordinationBackend {
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        plan: SplitReplacePlan,
+        plan: SplitReplacePlan<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError>;
 
@@ -451,7 +483,7 @@ pub trait CoordinationBackend {
         now: LogicalTime,
         tenant: TenantId,
         lease: &Lease,
-        plan: SplitResidualPlan,
+        plan: SplitResidualPlan<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError>;
 }

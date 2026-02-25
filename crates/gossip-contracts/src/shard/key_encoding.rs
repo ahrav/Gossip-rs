@@ -48,8 +48,11 @@
 //! Whole-partition invariants (coverage, disjointness, child ordering across
 //! sibling shards) are validated in [`crate::coordination::shard_spec`].
 
-use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpec, ShardSpecInputError};
+use crate::coordination::shard_spec::{
+    MAX_KEY_SIZE, ShardArena, ShardSpec, ShardSpecHandle, ShardSpecInputError, ShardSpecRef,
+};
 use core::fmt;
+use gossip_stdx::SlabFull;
 
 /// Reusable stack buffer for shard-key arithmetic.
 ///
@@ -271,64 +274,84 @@ pub fn decode_manifest_row_key(key: &[u8]) -> Option<ManifestRowKey> {
     Some(ManifestRowKey::new(manifest_id, row))
 }
 
-/// Construct a [`ShardSpec`] from typed start/end boundaries.
+/// Error returned by `*_into` helpers when build or arena allocation fails.
 ///
-/// `start` and `end` are encoded via [`KeyEncoding`] and then validated by
-/// [`ShardSpec::try_with_range_and_metadata`]. This keeps range/metadata
-/// validation single-sourced in coordination code.
+/// The two-phase `*_into` helpers first build a borrowed `ShardSpecRef`,
+/// then allocate it in a [`ShardArena`]. This enum distinguishes between
+/// build-time validation failures (`Build`) and arena capacity exhaustion
+/// (`SlabFull`). The generic parameter `E` is the build error type, which
+/// varies by constructor (e.g., [`ShardSpecInputError`] for range/manifest,
+/// [`PrefixShardError`] for prefix).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardIntoError<E> {
+    /// The spec failed validation before allocation was attempted.
+    Build(E),
+    /// The arena has no remaining capacity for this spec.
+    SlabFull(SlabFull),
+}
+
+impl<E: fmt::Display> fmt::Display for ShardIntoError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Build(err) => write!(f, "{err}"),
+            Self::SlabFull(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ShardIntoError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Build(err) => Some(err),
+            Self::SlabFull(err) => Some(err),
+        }
+    }
+}
+
+/// Construct a borrowed [`ShardSpecRef`] from typed start/end boundaries.
 ///
-/// # Errors
-///
-/// Returns [`ShardSpecInputError`] when coordination-level validation fails:
-///
-/// - [`KeyTooLarge`](ShardSpecInputError::KeyTooLarge) -- encoded start or
-///   end exceeds [`MAX_KEY_SIZE`].
-/// - [`InvertedRange`](ShardSpecInputError::InvertedRange) -- both keys are
-///   non-empty and encoded start >= encoded end.
-/// - [`MetadataTooLarge`](ShardSpecInputError::MetadataTooLarge) -- metadata
-///   exceeds the metadata size ceiling.
-///
-/// # Trade-offs
-///
-/// - Allocates `Vec<u8>` values for both boundaries and metadata, which
-///   [`ShardSpec::try_with_range_and_metadata`] converts to `Box<[u8]>`.
-/// - Performs no local pre-validation so callers receive canonical
-///   [`ShardSpecInputError`] variants from coordination validation.
+/// `start` and `end` are encoded into caller-provided scratch buffers, and
+/// validation is delegated to [`ShardSpec::validate_ref`].
+/// Returned range bytes borrow from `start_buf`/`end_buf`; reusing either
+/// buffer invalidates those views.
 #[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
+pub fn shard_spec_from_keys_ref<'a, Start: KeyEncoding, End: KeyEncoding>(
+    start: &Start,
+    end: &End,
+    metadata: &'a [u8],
+    start_buf: &'a mut KeyBuf,
+    end_buf: &'a mut KeyBuf,
+) -> Result<ShardSpecRef<'a>, ShardSpecInputError> {
+    start.encode_into(start_buf);
+    end.encode_into(end_buf);
+    let spec = ShardSpecRef::new(start_buf.as_bytes(), end_buf.as_bytes(), metadata);
+    ShardSpec::validate_ref(spec)?;
+    Ok(spec)
+}
+
+/// Convenience wrapper: build a borrowed spec then allocate it in [`ShardArena`].
+pub fn shard_spec_from_keys_into<Start: KeyEncoding, End: KeyEncoding>(
+    arena: &mut ShardArena,
     start: &Start,
     end: &End,
     metadata: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut start_buf = KeyBuf::new();
-    start.encode_into(&mut start_buf);
-    let start = start_buf.as_bytes().to_vec();
-
-    let mut end_buf = KeyBuf::new();
-    end.encode_into(&mut end_buf);
-    let end = end_buf.as_bytes().to_vec();
-
-    ShardSpec::try_with_range_and_metadata(start, end, metadata.to_vec())
+    start_buf: &mut KeyBuf,
+    end_buf: &mut KeyBuf,
+) -> Result<ShardSpecHandle, ShardIntoError<ShardSpecInputError>> {
+    let spec = shard_spec_from_keys_ref(start, end, metadata, start_buf, end_buf)
+        .map_err(ShardIntoError::Build)?;
+    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
 }
 
-/// Construct a prefix-bounded [`ShardSpec`] as `[prefix, prefix_successor)`.
+/// Construct a prefix-bounded [`ShardSpecRef`] as `[prefix, prefix_successor)`.
 ///
-/// The helper performs cheap prefix-specific checks first, then delegates final
-/// range/metadata validation to [`ShardSpec::try_with_range_and_metadata`].
-///
-/// # Errors
-///
-/// - [`PrefixShardError::EmptyPrefix`] if `prefix` is empty.
-/// - [`PrefixShardError::PrefixTooLarge`] if `prefix` exceeds
-///   [`MAX_KEY_SIZE`].
-/// - [`PrefixShardError::NoSuccessor`] for all-`0xFF` prefixes.
-/// - [`PrefixShardError::InvalidShardSpec`] if coordination-level shard-spec
-///   validation fails.
+/// The returned end bound borrows from `successor_buf`.
 #[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_prefix(
-    prefix: &[u8],
-    metadata: &[u8],
-) -> Result<ShardSpec, PrefixShardError> {
+pub fn shard_spec_from_prefix_ref<'a>(
+    prefix: &'a [u8],
+    metadata: &'a [u8],
+    successor_buf: &'a mut KeyBuf,
+) -> Result<ShardSpecRef<'a>, PrefixShardError> {
     if prefix.is_empty() {
         return Err(PrefixShardError::EmptyPrefix);
     }
@@ -339,23 +362,100 @@ pub fn shard_spec_from_prefix(
         });
     }
 
-    let mut successor = KeyBuf::new();
-    let end = prefix_successor(prefix, &mut successor).ok_or(PrefixShardError::NoSuccessor)?;
-
-    ShardSpec::try_with_range_and_metadata(prefix.to_vec(), end.to_vec(), metadata.to_vec())
-        .map_err(PrefixShardError::from)
+    let end = prefix_successor(prefix, successor_buf).ok_or(PrefixShardError::NoSuccessor)?;
+    let spec = ShardSpecRef::new(prefix, end, metadata);
+    ShardSpec::validate_ref(spec).map_err(PrefixShardError::from)?;
+    Ok(spec)
 }
 
-/// Construct a same-manifest [`ShardSpec`] from a half-open row range.
+/// Convenience wrapper: build a prefix spec then allocate it in [`ShardArena`].
+pub fn shard_spec_from_prefix_into(
+    arena: &mut ShardArena,
+    prefix: &[u8],
+    metadata: &[u8],
+    successor_buf: &mut KeyBuf,
+) -> Result<ShardSpecHandle, ShardIntoError<PrefixShardError>> {
+    let spec = shard_spec_from_prefix_ref(prefix, metadata, successor_buf)
+        .map_err(ShardIntoError::Build)?;
+    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
+}
+
+/// Construct a same-manifest [`ShardSpecRef`] from a half-open row range.
 ///
-/// Both boundaries use the same `manifest_id`, so the resulting shard covers
-/// `[start_row, end_row)` within one manifest.
+/// Returned start/end bounds borrow from `start_buf` and `end_buf`.
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_manifest_range_ref<'a>(
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    metadata: &'a [u8],
+    start_buf: &'a mut KeyBuf,
+    end_buf: &'a mut KeyBuf,
+) -> Result<ShardSpecRef<'a>, ShardSpecInputError> {
+    let start = ManifestRowKey::new(manifest_id, start_row);
+    let end = ManifestRowKey::new(manifest_id, end_row);
+    shard_spec_from_keys_ref(&start, &end, metadata, start_buf, end_buf)
+}
+
+/// Convenience wrapper: build a manifest-range spec then allocate in arena.
+pub fn shard_spec_from_manifest_range_into(
+    arena: &mut ShardArena,
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    metadata: &[u8],
+    start_buf: &mut KeyBuf,
+    end_buf: &mut KeyBuf,
+) -> Result<ShardSpecHandle, ShardIntoError<ShardSpecInputError>> {
+    let spec = shard_spec_from_manifest_range_ref(
+        manifest_id,
+        start_row,
+        end_row,
+        metadata,
+        start_buf,
+        end_buf,
+    )
+    .map_err(ShardIntoError::Build)?;
+    arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
+}
+
+/// Test convenience: allocating key-pair shard constructor.
 ///
-/// # Errors
+/// Creates temporary `KeyBuf` scratch on each call. Prefer
+/// [`shard_spec_from_keys_ref`] with reusable buffers in hot paths.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
+    start: &Start,
+    end: &End,
+    metadata: &[u8],
+) -> Result<ShardSpec, ShardSpecInputError> {
+    let mut start_buf = KeyBuf::new();
+    let mut end_buf = KeyBuf::new();
+    let spec = shard_spec_from_keys_ref(start, end, metadata, &mut start_buf, &mut end_buf)?;
+    ShardSpec::try_from_ref(spec)
+}
+
+/// Test convenience: allocating prefix shard constructor.
 ///
-/// Propagates [`ShardSpecInputError`] from [`shard_spec_from_keys`], including
-/// inverted/degenerate ranges (for example, `start_row >= end_row`) and
-/// metadata validation failures.
+/// Creates temporary scratch on each call. Prefer
+/// [`shard_spec_from_prefix_ref`] with a reusable `KeyBuf` in hot paths.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use = "returns a Result that must be checked for validation errors"]
+pub fn shard_spec_from_prefix(
+    prefix: &[u8],
+    metadata: &[u8],
+) -> Result<ShardSpec, PrefixShardError> {
+    let mut successor_buf = KeyBuf::new();
+    let spec = shard_spec_from_prefix_ref(prefix, metadata, &mut successor_buf)?;
+    ShardSpec::try_from_ref(spec).map_err(PrefixShardError::from)
+}
+
+/// Test convenience: allocating manifest-range shard constructor.
+///
+/// Creates temporary scratch on each call. Prefer
+/// [`shard_spec_from_manifest_range_ref`] with reusable `KeyBuf`s in hot paths.
+#[cfg(any(test, feature = "test-support"))]
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_manifest_range(
     manifest_id: u64,
@@ -363,9 +463,17 @@ pub fn shard_spec_from_manifest_range(
     end_row: u64,
     metadata: &[u8],
 ) -> Result<ShardSpec, ShardSpecInputError> {
-    let start = ManifestRowKey::new(manifest_id, start_row);
-    let end = ManifestRowKey::new(manifest_id, end_row);
-    shard_spec_from_keys(&start, &end, metadata)
+    let mut start_buf = KeyBuf::new();
+    let mut end_buf = KeyBuf::new();
+    let spec = shard_spec_from_manifest_range_ref(
+        manifest_id,
+        start_row,
+        end_row,
+        metadata,
+        &mut start_buf,
+        &mut end_buf,
+    )?;
+    ShardSpec::try_from_ref(spec)
 }
 
 /// Compute the lexicographic successor of a byte prefix.

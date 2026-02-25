@@ -1,6 +1,61 @@
+//! Tests for run-level types, validation, and the run lifecycle state machine.
+//!
+//! A "run" is a single scan invocation that groups shards covering a target data
+//! source. This module tests the types that model runs (`RunStatus`, `RunConfig`,
+//! `RunRecord`, `RunProgress`) and the validation logic that gates shard
+//! registration (`validate_manifest`).
+//!
+//! # Coverage Areas
+//!
+//! - **Enum discriminant stability**: `RunStatus` and `RunOpKind` round-trip
+//!   through `as_u8`/`from_u8` and produce the expected `Display` output.
+//!   These are persisted values; discriminant drift is a data-corruption bug.
+//!
+//! - **RunConfig construction**: valid configs succeed, zero-lease-duration is
+//!   rejected.
+//!
+//! - **RunOpLogEntry construction guards**: zero payload hash and zero timestamp
+//!   are rejected at construction time. Kind-result consistency (INV-11) is
+//!   enforced: `RegisterShards` requires `RegisteredShards` result, terminal
+//!   ops require `Ack`.
+//!
+//! - **RunOpIdConflict security**: `Debug` and `Display` redact payload hashes
+//!   to prevent leaking internal state into logs.
+//!
+//! - **RunRecord invariants**: `assert_invariants` rejects every illegal
+//!   configuration (Done without `completed_at`, Active with `completed_at`,
+//!   Initializing with shards, Active without shards, zero `created_at`,
+//!   `completed_at` before `created_at`, duplicate root shards, non-monotonic
+//!   op-log timestamps).
+//!
+//! - **RunRecord op-log**: push/lookup, reverse-scan bias, bounded eviction,
+//!   duplicate rejection.
+//!
+//! - **Idempotency detection**: `check_op_idempotency` returns `None` for new
+//!   ops, `Some` for replays with matching hash, and `Err` for hash conflicts.
+//!
+//! - **RunProgress**: `count_shard` accumulates correctly, `is_settled` /
+//!   `is_success` / `has_failures` predicates, overflow protection, watermark
+//!   accessor.
+//!
+//! - **evaluate_run_terminal**: maps progress to the three terminal evaluation
+//!   outcomes.
+//!
+//! - **validate_manifest**: accepts valid manifests (adjacent, gapped, unordered,
+//!   single-shard); rejects empty, too-many, duplicate-IDs, overlapping ranges,
+//!   inverted specs, out-of-bounds cursors, oversized cursor keys, and unbounded
+//!   ranges. Property tests verify these conditions hold across random inputs.
+//!
+//! - **ShardFilter**: `all()`, `active()`, `available()`, and `root_only`
+//!   predicates match/reject the expected shard summaries.
+//!
+//! - **Payload hashes**: register-shards hash is order-independent, terminal-op
+//!   hashes are distinct and non-zero, unpark hashes vary by shard key.
+
 use super::*;
 use crate::coordination::cursor::Cursor;
 use crate::coordination::shard_spec::CursorSemantics;
+use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{OpId, RunId, ShardId};
 use gossip_stdx::{ByteSlab, RingBuffer};
 use rstest::rstest;
@@ -32,8 +87,8 @@ fn test_run_record() -> RunRecord {
     }
 }
 
-fn make_initial_shard(id: u64, start: &[u8], end: &[u8]) -> InitialShard {
-    InitialShard::new(
+fn make_initial_shard(id: u64, start: &[u8], end: &[u8]) -> InitialShardInput<'static> {
+    InitialShardInput::new(
         ShardId::from_raw(id),
         ShardSpec::with_range(start.to_vec(), end.to_vec()),
         Cursor::initial(),
@@ -56,8 +111,15 @@ fn make_op_log_entry(op_id: u64, kind: RunOpKind) -> RunOpLogEntry {
     )
 }
 
-// -- RunStatus --
+// ============================================================================
+// RunStatus discriminant stability
+//
+// RunStatus is persisted as `#[repr(u8)]`. These tests pin every variant's
+// discriminant, terminal flag, and Display string.
+// ============================================================================
 
+/// Exhaustive roundtrip for all five RunStatus variants plus out-of-range
+/// rejection. Terminal variants are Done, Failed, Cancelled.
 #[rstest]
 #[case::initializing(RunStatus::Initializing, 0, false, "Initializing")]
 #[case::active(RunStatus::Active, 1, false, "Active")]
@@ -82,8 +144,11 @@ fn run_status_from_u8_out_of_range() {
     assert_eq!(RunStatus::from_u8(u8::MAX), None);
 }
 
-// -- RunConfig --
+// ============================================================================
+// RunConfig construction and validation
+// ============================================================================
 
+/// Valid config preserves all fields through accessors.
 #[test]
 fn run_config_try_new_ok() {
     let cfg = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
@@ -92,6 +157,7 @@ fn run_config_try_new_ok() {
     assert_eq!(cfg.max_shard_retries(), Some(5));
 }
 
+/// Zero lease duration is rejected at construction time.
 #[test]
 fn run_config_try_new_zero_lease() {
     let err = RunConfig::try_new(CursorSemantics::Completed, 0, None).unwrap_err();
@@ -106,8 +172,11 @@ fn run_config_assert_valid_ok() {
 // Zero-lease-duration panicking test removed — `NonZeroU64` enforces
 // this invariant at the type level; you can't construct the invalid state.
 
-// -- RunOpKind --
+// ============================================================================
+// RunOpKind discriminant stability
+// ============================================================================
 
+/// All four RunOpKind variants roundtrip; values 4+ are invalid.
 #[rstest]
 #[case::register_shards(RunOpKind::RegisterShards, 0, "RegisterShards")]
 #[case::complete_run(RunOpKind::CompleteRun, 1, "CompleteRun")]
@@ -124,8 +193,14 @@ fn run_op_kind_from_u8_out_of_range() {
     assert_eq!(RunOpKind::from_u8(4), None);
 }
 
-// -- RunOpLogEntry --
+// ============================================================================
+// RunOpLogEntry construction and guards
+//
+// RunOpLogEntry enforces preconditions at construction: non-zero payload hash,
+// non-zero timestamp, and kind-result consistency (INV-11).
+// ============================================================================
 
+/// All accessor methods return the values passed to the constructor.
 #[test]
 fn run_op_log_entry_accessors() {
     let entry = RunOpLogEntry::new(
@@ -142,6 +217,8 @@ fn run_op_log_entry_accessors() {
     assert_eq!(entry.result(), &RunOpResult::Ack);
 }
 
+/// Zero payload hash would make idempotency detection unsound (every op
+/// would appear to match), so it is rejected at construction.
 #[test]
 #[should_panic(expected = "payload_hash must not be zero")]
 fn run_op_log_entry_zero_hash_panics() {
@@ -166,8 +243,16 @@ fn run_op_log_entry_zero_time_panics() {
     );
 }
 
-// -- RunOpIdConflict security --
+// ============================================================================
+// RunOpIdConflict security
+//
+// Payload hashes are internal integrity tokens. Leaking them in logs could
+// help an attacker forge idempotent replays, so both Debug and Display
+// must redact the actual hash values.
+// ============================================================================
 
+/// `Debug` output replaces hash values with `<redacted>` and does not
+/// leak hex or decimal representations.
 #[test]
 fn run_op_id_conflict_debug_redacts_hashes() {
     let c = RunOpIdConflict {
@@ -185,8 +270,18 @@ fn run_op_id_conflict_debug_redacts_hashes() {
     );
 }
 
-// -- RunRecord invariants --
+// ============================================================================
+// RunRecord invariants
+//
+// RunRecord::assert_invariants enforces the biconditional between status and
+// field values: terminal status requires completed_at, non-terminal forbids
+// it; Active requires root_shards, Initializing forbids them; created_at
+// must be non-zero; completed_at >= created_at; root_shards are unique;
+// op-log timestamps are non-decreasing.
+// ============================================================================
 
+/// Active, Done, Initializing, and Cancelled are all valid when their
+/// field invariants are satisfied.
 #[test]
 fn run_record_valid_states_pass_invariants() {
     test_run_record().assert_invariants();
@@ -213,6 +308,7 @@ fn run_record_valid_states_pass_invariants() {
     .assert_invariants();
 }
 
+/// Done status without completed_at violates the "terminal implies timestamp" invariant.
 #[test]
 #[should_panic(expected = "completed_at must be Some")]
 fn rr_done_no_completed_at() {
@@ -224,6 +320,7 @@ fn rr_done_no_completed_at() {
     .assert_invariants();
 }
 
+/// Active status with completed_at violates the "non-terminal implies no timestamp" invariant.
 #[test]
 #[should_panic(expected = "completed_at must be Some")]
 fn rr_active_has_completed_at() {
@@ -277,7 +374,13 @@ fn rr_completed_before_created() {
     .assert_invariants();
 }
 
-// -- RunRecord op-log --
+// ============================================================================
+// RunRecord op-log
+//
+// The run op-log is a bounded ring buffer for idempotency detection. Same
+// mechanics as the shard op-log: push/lookup, reverse-scan, FIFO eviction,
+// duplicate rejection.
+// ============================================================================
 
 #[test]
 fn run_op_log_push_and_lookup() {
@@ -320,8 +423,14 @@ fn run_op_log_push_duplicate_panics() {
     r.op_log_push(make_op_log_entry(1, RunOpKind::FailRun));
 }
 
-// -- check_op_idempotency --
+// ============================================================================
+// check_op_idempotency
+//
+// Three outcomes: new op (None), replay with matching hash (Some), or
+// hash conflict (Err). Zero hash is rejected as a precondition.
+// ============================================================================
 
+/// An op_id not in the log returns `None` (new operation).
 #[test]
 fn run_idem_new_op() {
     assert!(
@@ -332,6 +441,7 @@ fn run_idem_new_op() {
     );
 }
 
+/// An op_id in the log with matching hash returns `Some` (idempotent replay).
 #[test]
 fn run_idem_replay() {
     let mut r = test_run_record();
@@ -349,6 +459,7 @@ fn run_idem_replay() {
     );
 }
 
+/// An op_id in the log with a different hash returns `Err(RunOpIdConflict)`.
 #[test]
 fn run_idem_conflict() {
     let mut r = test_run_record();
@@ -372,8 +483,16 @@ fn run_idem_zero_hash_panics() {
         .unwrap();
 }
 
-// -- RunProgress --
+// ============================================================================
+// RunProgress
+//
+// RunProgress accumulates shard counts by status and leased flag. The
+// predicates (is_settled, is_success, has_failures) drive the orchestrator's
+// decision to complete or fail the run.
+// ============================================================================
 
+/// Counting one of each status produces the expected totals and per-status
+/// counts. Leased count only tracks Active shards.
 #[test]
 fn progress_count_shard() {
     let mut p = RunProgress::default();
@@ -404,6 +523,8 @@ fn progress_watermark_accessor_and_default_behavior() {
     assert_eq!(progress.watermark(), Some(b"abc".as_slice()));
 }
 
+/// Settled = no active shards. Success = settled with no parked. Failures =
+/// settled with at least one parked. Still-active = not settled.
 #[test]
 fn progress_predicates() {
     let settled_success = RunProgress {
@@ -435,7 +556,12 @@ fn progress_predicates() {
     assert!(!still_active.is_settled());
 }
 
-// -- evaluate_run_terminal --
+// ============================================================================
+// evaluate_run_terminal
+//
+// Maps RunProgress to one of three outcomes: StillActive (has active shards),
+// AllDone (settled with no parked), HasFailures (settled with parked).
+// ============================================================================
 
 #[rstest]
 #[case::still_active(
@@ -457,8 +583,17 @@ fn evaluate_run_terminal_cases(
     assert_eq!(evaluate_run_terminal(&progress), expected);
 }
 
-// -- validate_manifest --
+// ============================================================================
+// validate_manifest
+//
+// The manifest is the initial shard layout for a run. Validation enforces:
+// non-empty, within max count, unique IDs, non-overlapping ranges, valid
+// specs, bounded key ranges, and cursor-in-bounds. These tests cover both
+// the happy path and each rejection reason.
+// ============================================================================
 
+/// Valid manifests: adjacent shards, gapped shards, unordered input (sorted
+/// internally), and single shard.
 #[rstest]
 #[case::two_adjacent(
     vec![make_initial_shard(0, b"a", b"m"), make_initial_shard(1, b"m", b"z")]
@@ -470,7 +605,7 @@ fn evaluate_run_terminal_cases(
     vec![make_initial_shard(1, b"m", b"z"), make_initial_shard(0, b"a", b"m")]
 )]
 #[case::single_shard(vec![make_initial_shard(0, b"a", b"z")])]
-fn manifest_valid_cases(#[case] shards: Vec<InitialShard>) {
+fn manifest_valid_cases(#[case] shards: Vec<InitialShardInput>) {
     assert!(validate_manifest(&shards).is_ok());
 }
 
@@ -528,7 +663,7 @@ fn manifest_inverted_spec() {
 
 #[test]
 fn manifest_cursor_out_of_bounds() {
-    let shard = InitialShard::new(
+    let shard = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
         Cursor::with_last_key(b"a".to_vec()), // before range start
@@ -544,7 +679,7 @@ fn manifest_cursor_key_too_large() {
     use crate::coordination::cursor::MAX_KEY_SIZE;
 
     let oversized_key = vec![0xAA; MAX_KEY_SIZE + 1];
-    let shard = InitialShard::new(
+    let shard = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::with_range(vec![0x00], vec![0xFF]),
         Cursor::with_last_key(oversized_key),
@@ -565,7 +700,7 @@ fn manifest_cursor_key_at_exact_max_succeeds() {
     use crate::coordination::cursor::MAX_KEY_SIZE;
 
     let exact_key = vec![0xBB; MAX_KEY_SIZE];
-    let shard = InitialShard::new(
+    let shard = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::with_range(vec![0x00], vec![0xFF]),
         Cursor::with_last_key(exact_key),
@@ -585,7 +720,13 @@ fn manifest_cursor_key_too_large_display() {
     assert!(msg.contains("4096"), "display must include max size");
 }
 
-// -- ShardFilter --
+// ============================================================================
+// ShardFilter
+//
+// Predicate-based filtering over shard summaries. Used by list_shards to
+// scope queries (all shards, active only, available = active + unleased,
+// root-only = no parent).
+// ============================================================================
 
 fn make_shard_summary(status: ShardStatus, leased: bool, parent: Option<ShardId>) -> ShardSummary {
     ShardSummary {
@@ -632,18 +773,29 @@ fn shard_filter_matching(
     assert_eq!(filter.matches(&summary), expected);
 }
 
-// -- Payload hashes --
+// ============================================================================
+// Payload hashes
+//
+// Payload hashes are used for idempotency detection: same op_id + same hash
+// = replay, same op_id + different hash = conflict. These tests verify the
+// hash functions produce non-zero, distinct, and order-independent values.
+// ============================================================================
 
+/// Register-shards hash must be order-independent so that the same set of
+/// shards produces the same hash regardless of iteration order.
 #[test]
 fn hash_register_shards_order_independent() {
     let s1 = make_initial_shard(0, b"a", b"m");
     let s2 = make_initial_shard(1, b"m", b"z");
-    let h_forward = hash_register_shards_payload(&[s1.clone(), s2.clone()]);
+    let h_forward = hash_register_shards_payload(&[s1, s2]);
     let h_reverse = hash_register_shards_payload(&[s2, s1]);
     assert_eq!(h_forward, h_reverse);
     assert_ne!(h_forward, 0);
 }
 
+/// The three terminal-op hashes (complete, fail, cancel) must be non-zero
+/// and pairwise distinct so that replaying one terminal op cannot be confused
+/// with another.
 #[test]
 fn hash_terminal_ops_distinct() {
     let hc = hash_complete_run_payload();
@@ -668,8 +820,15 @@ fn hash_unpark_different_shards_differ() {
     assert_ne!(h2, 0);
 }
 
-// -- INV-11: Kind-result consistency --
+// ============================================================================
+// INV-11: Kind-result consistency
+//
+// RunOpLogEntry::new enforces that RegisterShards ops carry a
+// RegisteredShards result, and terminal ops carry Ack. Mismatches panic
+// at construction, preventing malformed entries from entering the op-log.
+// ============================================================================
 
+/// RegisterShards kind paired with Ack result violates INV-11.
 #[test]
 #[should_panic(expected = "RegisterShards must have RegisteredShards result")]
 fn construction_rejects_register_shards_with_ack() {
@@ -683,6 +842,7 @@ fn construction_rejects_register_shards_with_ack() {
     );
 }
 
+/// Terminal op kind (CompleteRun) paired with RegisteredShards result violates INV-11.
 #[test]
 #[should_panic(expected = "must have Ack result, not RegisteredShards")]
 fn construction_rejects_terminal_op_with_registered_shards() {
@@ -734,8 +894,15 @@ fn rr_oplog_timestamps_non_decreasing_panics() {
     r.assert_invariants();
 }
 
-// -- Finding 3: ShardSummary acquire_count saturation --
+// ============================================================================
+// ShardSummary acquire_count saturation
+//
+// acquire_count is derived from FenceEpoch (u64) but exposed as u32 in the
+// summary. Values exceeding u32::MAX must saturate rather than truncate.
+// ============================================================================
 
+/// A FenceEpoch exceeding u32::MAX saturates acquire_count to u32::MAX
+/// rather than wrapping or truncating, preventing misleading metrics.
 #[test]
 fn shard_summary_acquire_count_saturates_at_u32_max() {
     use crate::coordination::record::ShardRecord;
@@ -769,8 +936,16 @@ fn shard_summary_acquire_count_saturates_at_u32_max() {
     record.deallocate_fields(&mut slab);
 }
 
-// -- Finding 2: validate_manifest InvalidSpec path --
+// ============================================================================
+// validate_manifest: inverted spec detection
+//
+// ShardSpec::with_range rejects inverted ranges at construction, but
+// from_raw_parts bypasses the check. validate_manifest must catch inverted
+// specs that slip through raw construction.
+// ============================================================================
 
+/// An inverted spec (start > end) constructed via `from_raw_parts` is
+/// caught by `validate_manifest` as `InvalidSpec`.
 #[test]
 fn manifest_inverted_spec_detected_by_validate_manifest() {
     let inverted_spec = ShardSpec::from_raw_parts(
@@ -778,7 +953,7 @@ fn manifest_inverted_spec_detected_by_validate_manifest() {
         b"a".to_vec().into_boxed_slice(),
         Box::new([]),
     );
-    let shard = InitialShard::new(ShardId::from_raw(0), inverted_spec, Cursor::initial());
+    let shard = InitialShardInput::new(ShardId::from_raw(0), inverted_spec, Cursor::initial());
     let result = validate_manifest(&[shard]);
     assert!(
         matches!(result, Err(ManifestValidationError::InvalidSpec { .. })),
@@ -823,8 +998,14 @@ fn run_op_id_conflict_display_no_hash_leak() {
     );
 }
 
-// -- Exact boundary tests --
+// ============================================================================
+// Exact boundary tests
+//
+// Tests at the exact limits of capacity constants: MAX_INITIAL_SHARDS for
+// manifests, OP_LOG_CAP for op-logs, u32::MAX for progress counters.
+// ============================================================================
 
+/// A manifest with exactly MAX_INITIAL_SHARDS succeeds (off-by-one guard).
 #[test]
 fn manifest_exactly_max_initial_shards_succeeds() {
     let shards: Vec<_> = (0..MAX_INITIAL_SHARDS)
@@ -837,6 +1018,8 @@ fn manifest_exactly_max_initial_shards_succeeds() {
     assert!(validate_manifest(&shards).is_ok());
 }
 
+/// Op-log at exactly OP_LOG_CAP entries passes invariants; one more evicts
+/// the oldest without breaking invariants.
 #[test]
 fn op_log_exactly_at_cap_maintains_invariants() {
     let mut r = test_run_record();
@@ -887,12 +1070,12 @@ mod prop_manifest {
         (1u64..10_000).prop_map(ShardId::from_raw)
     }
 
-    /// Strategy for a valid InitialShard with non-overlapping key range.
-    fn arb_initial_shard(idx: usize) -> impl Strategy<Value = InitialShard> {
+    /// Strategy for a valid InitialShardInput with non-overlapping key range.
+    fn arb_initial_shard(idx: usize) -> impl Strategy<Value = InitialShardInput<'static>> {
         arb_shard_id().prop_map(move |id| {
             let start = format!("{:06}", idx);
             let end = format!("{:06}", idx + 1);
-            InitialShard::new(
+            InitialShardInput::new(
                 id,
                 ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
                 Cursor::initial(),
@@ -902,7 +1085,7 @@ mod prop_manifest {
 
     /// Generate a vec of `n` initial shards with unique, non-overlapping
     /// key ranges (indexed by position).
-    fn arb_manifest(max_len: usize) -> impl Strategy<Value = Vec<InitialShard>> {
+    fn arb_manifest(max_len: usize) -> impl Strategy<Value = Vec<InitialShardInput<'static>>> {
         (1..=max_len).prop_flat_map(|n| {
             // Generate n unique shard IDs.
             proptest::collection::hash_set(1u64..100_000, n).prop_map(move |ids| {
@@ -911,7 +1094,7 @@ mod prop_manifest {
                     .map(|(idx, raw)| {
                         let start = format!("{:06}", idx);
                         let end = format!("{:06}", idx + 1);
-                        InitialShard::new(
+                        InitialShardInput::new(
                             ShardId::from_raw(raw),
                             ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
                             Cursor::initial(),
@@ -934,7 +1117,7 @@ mod prop_manifest {
         /// Manifests with a duplicate ID always fail.
         #[test]
         fn duplicate_id_always_rejected(base in arb_initial_shard(0)) {
-            let dup = InitialShard::new(
+            let dup = InitialShardInput::new(
                 base.shard(),
                 ShardSpec::with_range(b"x".to_vec(), b"y".to_vec()),
                 Cursor::initial(),
@@ -952,12 +1135,12 @@ mod prop_manifest {
             id_a in 1u64..50_000,
             id_b in 50_000u64..100_000,
         ) {
-            let a = InitialShard::new(
+            let a = InitialShardInput::new(
                 ShardId::from_raw(id_a),
                 ShardSpec::with_range(b"a".to_vec(), b"n".to_vec()),
                 Cursor::initial(),
             );
-            let b = InitialShard::new(
+            let b = InitialShardInput::new(
                 ShardId::from_raw(id_b),
                 ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
                 Cursor::initial(),
@@ -971,12 +1154,18 @@ mod prop_manifest {
     }
 }
 
-// -- Unbounded range rejection tests --
+// ============================================================================
+// Unbounded range rejection
+//
+// Production manifests must have bounded key ranges on both ends. Unbounded
+// ranges (empty start or empty end) are rejected before overlap detection.
+// ============================================================================
 
+/// Unbounded end (`[a, inf)`) is rejected as `UnboundedRange`, not as overlap.
 #[test]
 fn manifest_detects_overlap_with_unbounded_end() {
     // Unbounded end is now rejected before overlap detection.
-    let shard_a = InitialShard::new(
+    let shard_a = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::from_raw_parts(
             b"a".to_vec().into_boxed_slice(),
@@ -996,7 +1185,7 @@ fn manifest_detects_overlap_with_unbounded_end() {
 #[test]
 fn manifest_detects_overlap_with_both_starts_empty() {
     // Unbounded start is now rejected before overlap detection.
-    let shard_a = InitialShard::new(
+    let shard_a = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::from_raw_parts(
             Box::new([]), // unbounded start
@@ -1005,7 +1194,7 @@ fn manifest_detects_overlap_with_both_starts_empty() {
         ),
         Cursor::initial(),
     );
-    let shard_b = InitialShard::new(
+    let shard_b = InitialShardInput::new(
         ShardId::from_raw(1),
         ShardSpec::from_raw_parts(
             Box::new([]), // unbounded start
@@ -1024,7 +1213,7 @@ fn manifest_detects_overlap_with_both_starts_empty() {
 #[test]
 fn manifest_unbounded_start_rejected() {
     // Unbounded start is no longer accepted in production manifests.
-    let shard_a = InitialShard::new(
+    let shard_a = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::from_raw_parts(
             Box::new([]), // unbounded start
@@ -1043,7 +1232,7 @@ fn manifest_unbounded_start_rejected() {
 
 #[test]
 fn manifest_unbounded_end_rejected() {
-    let shard = InitialShard::new(
+    let shard = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::from_raw_parts(b"a".to_vec().into_boxed_slice(), Box::new([]), Box::new([])),
         Cursor::initial(),
@@ -1059,7 +1248,7 @@ fn manifest_unbounded_end_rejected() {
 
 #[test]
 fn manifest_fully_unbounded_rejected() {
-    let shard = InitialShard::new(
+    let shard = InitialShardInput::new(
         ShardId::from_raw(0),
         ShardSpec::unbounded(),
         Cursor::initial(),

@@ -4,44 +4,82 @@
 //! seeded coordinator setup) to a single `pub(crate)` location. Consumed by
 //! `in_memory_tests`, `conformance_tests`, `scenario_tests`, and any future
 //! coordination test modules.
+//!
+//! # Design rationale
+//!
+//! Every coordination test needs the same boilerplate: a `TenantId`, a
+//! `RunId`, a `ShardId`, and a coordinator seeded with at least one run and
+//! shard. Duplicating that setup per test module invites copy-paste drift
+//! (different tenant bytes, inconsistent shard ranges). Centralizing here
+//! keeps the canonical identities stable and lets test modules focus on the
+//! behavior under test.
+//!
+//! # Conventions
+//!
+//! - **Time**: `now(t)` wraps `LogicalTime::from_raw(t)`. Tests advance
+//!   time manually; no background clock.
+//! - **Identity factories** (`test_tenant`, `test_run`, `test_shard`,
+//!   `test_worker`): return deterministic, visually recognizable values.
+//! - **Seeded coordinators** (`seeded_coordinator`,
+//!   `coordinator_with_run_and_lease`): pre-populate a single run with one
+//!   shard and optionally acquire a lease, so tests start from a known
+//!   baseline.
+//! - **Fire-and-forget helpers** (`checkpoint_ok`, `complete_ok`,
+//!   `park_ok`): advance state without inspecting the return value. They
+//!   panic on failure, suitable only for setup steps.
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::lease::Lease;
 use crate::coordination::record::ParkReason;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
+use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
+// ============================================================================
+// Constants and identity factories
+// ============================================================================
+
 /// Default lease duration in logical time ticks.
+///
+/// 100 ticks provides enough headroom that most test operations complete
+/// within a single lease, while still allowing lease-expiry tests to
+/// advance time past the deadline with small offsets.
 pub const LEASE_DURATION: u64 = 100;
 
+/// Canonical test tenant (`[0x01; 32]`).
 pub fn test_tenant() -> TenantId {
     TenantId::from_bytes([0x01; 32])
 }
 
+/// Canonical test run (ID = 1).
 pub fn test_run() -> RunId {
     RunId::from_raw(1)
 }
 
+/// Canonical test shard (ID = 10).
 pub fn test_shard() -> ShardId {
     ShardId::from_raw(10)
 }
 
+/// Canonical test shard spec: half-open range `[a, z)`.
 pub fn test_spec() -> ShardSpec {
     ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
 }
 
+/// Create a worker identity from a numeric ID.
 pub fn test_worker(id: u64) -> WorkerId {
     WorkerId::from_raw(id)
 }
 
+/// Wrap a raw tick count into [`LogicalTime`].
 pub fn now(t: u64) -> LogicalTime {
     LogicalTime::from_raw(t)
 }
 
+/// Canonical shard key combining [`test_run()`] and [`test_shard()`].
 pub fn test_key() -> ShardKey {
     ShardKey::new(test_run(), test_shard())
 }
@@ -60,9 +98,14 @@ pub fn other_tenant() -> TenantId {
     TenantId::from_bytes([0x02; 32])
 }
 
+/// Wrap a byte slice in a [`CursorUpdate`].
 pub fn test_cursor(key: &[u8]) -> CursorUpdate<'_> {
     CursorUpdate::new(key)
 }
+
+// ============================================================================
+// Seeded coordinator factories
+// ============================================================================
 
 /// Create a coordinator with a single run containing one shard `[a, z)`.
 ///
@@ -79,7 +122,7 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
     coord
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         test_shard(),
         test_spec(),
         Cursor::initial(),
@@ -96,12 +139,17 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
     coord
 }
 
+/// Standard [`RunConfig`] with default lease duration (100 ticks).
 pub fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap()
 }
 
+// ============================================================================
+// Split plan factories
+// ============================================================================
+
 /// The canonical `[a,m) + [m,z)` replace plan used by most split tests.
-pub fn test_split_replace_plan() -> SplitReplacePlan {
+pub fn test_split_replace_plan() -> SplitReplacePlan<'static> {
     SplitReplacePlan::try_new(vec![
         SplitReplaceChild::new(
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
@@ -116,13 +164,22 @@ pub fn test_split_replace_plan() -> SplitReplacePlan {
 }
 
 /// The canonical `[a,m)` parent + `[m,z)` residual plan.
-pub fn test_split_residual_plan() -> SplitResidualPlan {
+pub fn test_split_residual_plan() -> SplitResidualPlan<'static> {
     SplitResidualPlan::try_new(
         ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
         ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
     )
     .unwrap()
 }
+
+// ============================================================================
+// Fire-and-forget operation helpers
+// ============================================================================
+//
+// Each helper performs one coordinator operation and panics on failure.
+// Use these only for *setup* steps where the return value is not the
+// subject of the test's assertions. For assertions on outcomes, call
+// the coordinator method directly.
 
 /// Acquire the default test shard with the given worker at the given time.
 pub fn acquire_shard(coord: &mut InMemoryCoordinator, t: u64, worker_id: u64) -> Lease {
@@ -204,7 +261,7 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),

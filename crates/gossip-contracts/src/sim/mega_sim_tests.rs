@@ -4,7 +4,7 @@
 //! of PRNG seeds to surface timing-dependent invariant violations that a single
 //! deterministic run might miss. Each seed produces a completely different
 //! operation sequence, fault injection pattern, and timing profile while the
-//! invariant checker (S1-S7) validates every step.
+//! invariant checker (S1-S9) validates every step.
 //!
 //! # Test structure
 //!
@@ -406,7 +406,7 @@ fn stress_200_shards_stormy() {
 ///    or split-plan construction are broken.
 /// 2. **Referential integrity (S7)**: child shards created by splits
 ///    exist in the coordinator and point back to their parent.
-/// 3. **Safety under cascades**: invariants S1--S7 hold even when the
+/// 3. **Safety under cascades**: invariants S1--S9 hold even when the
 ///    shard set grows dynamically from splits.
 ///
 /// 10 seeds are run to give the probabilistic split path enough chances
@@ -461,7 +461,7 @@ fn stress_split_cascade() {
 /// and produces child shards without invariant violations.
 ///
 /// The session lifecycle terminal action is chosen uniformly in `[0, 10)`:
-/// `SplitResidualThenComplete` fires on roll == 2 (10% probability). With
+/// `SplitResidualThenComplete` fires on roll == 4 (10% probability). With
 /// ~80+ session lifecycle calls per 1K-op run, the probability of exercising
 /// this path at least once is approximately `1 - 0.9^80 ≈ 99.97%`.
 ///
@@ -539,7 +539,7 @@ mod proptest_mega {
 mod proptest_convergence {
     //! Convergence (bounded liveness) property tests.
     //!
-    //! The mega-sim sweep checks **safety** (S1--S7) across many seeds but
+    //! The mega-sim sweep checks **safety** (S1--S9) across many seeds but
     //! never asserts **convergence** -- that every shard eventually reaches a
     //! terminal state. These tests close that gap.
     //!
@@ -574,7 +574,7 @@ mod proptest_convergence {
     //! **Radioactive omission.** Radioactive fault pressure (~20% lease-expiry
     //! rate, 100–500 tick time jumps) makes bounded convergence unreliable
     //! within practical op budgets. Safety under Radioactive faults is covered
-    //! by `stress_split_cascade` (invariants S1–S7 verified); convergence
+    //! by `stress_split_cascade` (invariants S1–S9 verified); convergence
     //! testing is limited to SunnyDay and Stormy, where liveness budgets are
     //! tractable.
 
@@ -662,7 +662,7 @@ mod multi_tenant {
     use crate::coordination::error::AcquireError;
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::record::ParkReason;
-    use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
+    use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
     use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use crate::coordination::traits::CoordinationBackend;
     use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
@@ -707,9 +707,9 @@ mod multi_tenant {
         // only iterates tenant-scoped records.
 
         coord.create_run(now(1), tenant_a, run_a, config).unwrap();
-        let shards_a: Vec<InitialShard> = (0..3)
+        let shards_a: Vec<InitialShardInput> = (0..3)
             .map(|i| {
-                InitialShard::new(
+                InitialShardInput::new(
                     ShardId::from_raw(i),
                     ShardSpec::with_range(vec![(i as u8) * 0x30], vec![((i + 1) as u8) * 0x30]),
                     Cursor::initial(),
@@ -721,9 +721,9 @@ mod multi_tenant {
             .unwrap();
 
         coord.create_run(now(1), tenant_b, run_b, config).unwrap();
-        let shards_b: Vec<InitialShard> = (0..2)
+        let shards_b: Vec<InitialShardInput> = (0..2)
             .map(|i| {
-                InitialShard::new(
+                InitialShardInput::new(
                     ShardId::from_raw(i),
                     ShardSpec::with_range(vec![(i as u8) * 0x40], vec![((i + 1) as u8) * 0x40]),
                     Cursor::initial(),

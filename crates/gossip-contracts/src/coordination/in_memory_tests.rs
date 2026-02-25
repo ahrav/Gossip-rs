@@ -26,16 +26,17 @@
 //! Deterministic unit tests are grouped by the operation they exercise:
 //! acquire, renew, checkpoint, complete, park, split (replace and residual),
 //! fencing, op-log eviction, idempotent replay, tenant isolation, shard
-//! count limits, run lifecycle, unpark, and list_shards filtering. Two
-//! integration tests (`full_lifecycle_*`) chain multiple operations to
-//! verify end-to-end shard progression.
+//! count limits, spawn-cap guards, lease deadline saturation, capacity hints,
+//! constructor equivalence, and memory budget. Two integration tests
+//! (`full_lifecycle_*`, `lifecycle_*`) chain multiple operations to verify
+//! end-to-end shard progression.
 //!
-//! The final section contains property-based tests that fuzz random
-//! operation sequences against the coordinator, asserting structural
-//! invariants (record consistency, fence monotonicity, cursor monotonicity,
-//! idempotent replay) after every step.
+//! A property-based section fuzzes random operation sequences against the
+//! coordinator, asserting structural invariants (record consistency, fence
+//! monotonicity, cursor monotonicity, idempotent replay) after every step.
 
 use super::*;
+use crate::coordination::cursor::Cursor;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_shard, derived_shard_id, now, other_tenant, seeded_coordinator,
@@ -502,7 +503,7 @@ fn split_residual_parent_update_failure_deallocates_residual_fields() {
     coord
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         test_shard(),
         test_spec(),
         Cursor::initial(),
@@ -997,7 +998,7 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         test_shard(),
-        &test_spec(),
+        test_spec(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1009,7 +1010,7 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1019,7 +1020,7 @@ fn split_replace_exceeds_per_tenant_limit() {
         test_tenant(),
         test_run(),
         ShardId::from_raw(30),
-        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1050,7 +1051,7 @@ fn split_residual_exceeds_global_limit() {
         test_tenant(),
         test_run(),
         test_shard(),
-        &test_spec(),
+        test_spec(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -1062,7 +1063,7 @@ fn split_residual_exceeds_global_limit() {
         other_tenant(),
         test_run(),
         ShardId::from_raw(20),
-        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
+        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )

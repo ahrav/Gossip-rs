@@ -1,12 +1,27 @@
-// -- list_shards filter correctness tests -------------------------------------
-//
-// list_shards supports predicate-based filtering (active, available,
-// parked, root_only). Tests verify each filter correctly includes or
-// excludes shards based on status, lease state, and parentage.
+//! Tests for [`ShardFilter`] predicates applied through
+//! [`RunManagement::list_shards`].
+//!
+//! `list_shards` accepts a [`ShardFilter`] that narrows the returned set by
+//! status, lease state, and parentage. Getting these predicates wrong causes
+//! workers to receive invisible shards (missed work) or stale shards
+//! (wasted retries), so each filter variant has its own focused test.
+//!
+//! # Coverage
+//!
+//! | Filter | What the test proves |
+//! |--------|----------------------|
+//! | `active()` | Includes leased Active shards, excludes Parked |
+//! | `available()` | Excludes leased shards, includes expired-lease shards |
+//! | `parked()` | Excludes Active, includes Parked |
+//! | `root_only` | Excludes split children (shards with a parent) |
+//!
+//! A property-based section follows the deterministic tests: random
+//! operation sequences must preserve shard-record invariants and the
+//! filter/capacity-hint contracts.
 
 use super::*;
-use crate::coordination::cursor::CursorUpdate;
-use crate::coordination::run::{InitialShard, RunManagement, ShardFilter};
+use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_shard, coordinator_with_run_and_lease, do_split_replace, now, test_run,
@@ -15,6 +30,14 @@ use crate::coordination::test_fixtures::{
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 use crate::sim::backend::SimIntrospection;
 
+// -- Deterministic filter tests -----------------------------------------------
+//
+// Each test sets up a coordinator with one shard in a known state, applies a
+// single filter predicate, and asserts exact inclusion/exclusion. The fixture
+// `coordinator_with_run_and_lease` provides an Active+leased shard; tests
+// transition it to Parked or Split as needed.
+
+/// Active filter includes leased Active shards and excludes Parked ones.
 #[test]
 fn list_shards_filter_active() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -49,6 +72,7 @@ fn list_shards_filter_active() {
     );
 }
 
+/// Available filter excludes leased shards but includes them once the lease expires.
 #[test]
 fn list_shards_filter_available() {
     let (coord, _lease) = coordinator_with_run_and_lease();
@@ -78,6 +102,7 @@ fn list_shards_filter_available() {
     );
 }
 
+/// Parked filter returns only Parked shards, empty when none are parked.
 #[test]
 fn list_shards_filter_parked() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -106,6 +131,11 @@ fn list_shards_filter_parked() {
     assert_eq!(parked_after[0].status(), ShardStatus::Parked);
 }
 
+/// `root_only` excludes split children (shards whose `parent` is `Some`).
+///
+/// After a split-replace, the parent becomes Split (root) and two children
+/// are created with `parent.is_some()`. The root_only filter must return
+/// only the parent; the `all()` filter returns parent + children.
 #[test]
 fn list_shards_filter_root_only() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -533,6 +563,15 @@ proptest! {
 // ============================================================================
 // Capacity hint tests
 // ============================================================================
+//
+// CapacityHint is returned by acquire and renew to inform callers how many
+// shards remain available in the run. These tests verify:
+//
+// - `available_count` decrements with each successful acquisition.
+// - `earliest_deadline` tracks the minimum lease deadline across all
+//   leased shards, giving callers a backoff target when saturated.
+// - Terminal shards (Done, Parked) are excluded from the count.
+// - The half-open deadline boundary (`now < deadline`) is respected.
 
 /// Helper: create a coordinator with `n` shards in a single run.
 fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
@@ -541,11 +580,11 @@ fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
     let tenant = test_tenant();
     let run = test_run();
     coord.create_run(now(1), tenant, run, run_config()).unwrap();
-    let shards: Vec<InitialShard> = (0..n)
+    let shards: Vec<InitialShardInput> = (0..n)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
-            InitialShard::new(
+            InitialShardInput::new(
                 ShardId::from_raw(i as u64),
                 ShardSpec::with_range(start, end),
                 Cursor::initial(),
@@ -785,6 +824,16 @@ fn capacity_hint_helpers() {
     assert!(CapacityHint::ZERO.is_saturated());
 }
 
+// ============================================================================
+// Constructor equivalence tests
+// ============================================================================
+//
+// `InMemoryCoordinator` offers multiple constructor entry points
+// (`new`, `with_limits`, `with_cooldown`, `with_runtime_config`).
+// These tests verify that constructors producing the same logical
+// configuration yield bit-identical internal state so callers can
+// migrate between constructors without behavioral drift.
+
 /// Asserts constructor wrappers are behaviorally equivalent at initialization.
 ///
 /// This guards the runtime-config migration: legacy constructor entry points
@@ -872,6 +921,14 @@ fn runtime_constructor_clamps_explicit_slab_capacity_to_backend_max() {
 }
 
 // -- CoordinatorConfig memory budget smoke tests ------------------------------
+//
+// `CoordinatorConfig::memory_budget()` estimates heap consumption to let
+// operators right-size container memory limits. These tests pin the
+// estimate within a plausible range for dev and prod profiles, verify
+// rounding behavior, and confirm that the planning constants embedded in
+// the formula match actual `size_of::<ShardRecord>()` / `size_of::<RunRecord>()`
+// on this platform. If struct layouts change, the constant-match test
+// fails and the formula must be updated in lockstep.
 
 #[test]
 fn coordinator_config_dev_defaults_budget() {

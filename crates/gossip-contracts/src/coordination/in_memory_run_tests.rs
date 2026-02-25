@@ -1,16 +1,44 @@
-// -- RunManagement tests --------------------------------------------------
-//
-// Tests for the RunManagement trait: create_run, register_shards,
-// complete_run, fail_run, cancel_run, unpark_shard, list_shards, and
-// create_run_with_shards. Covers the run state machine
-// (Initializing -> Active -> Done|Failed|Cancelled), idempotent replay,
-// OpIdConflict, wrong-status rejections, terminal irreversibility,
-// shard count limits on register_shards, and split-index visibility
-// (children appear in list_shards and get_run_progress after split).
+//! Tests for the [`RunManagement`] trait as implemented by
+//! [`InMemoryCoordinator`].
+//!
+//! # Scope
+//!
+//! This module exercises run-level operations: `create_run`,
+//! `register_shards`, `complete_run`, `fail_run`, `cancel_run`,
+//! `unpark_shard`, `list_shards`, `get_run_progress`, and the
+//! convenience combo `create_run_with_shards`. It does **not** test
+//! shard-level operations (acquire, checkpoint, etc.) except as setup
+//! steps for run-level assertions.
+//!
+//! # Key invariants verified
+//!
+//! - **Run state machine**: Initializing -> Active (via register_shards)
+//!   -> Done | Failed | Cancelled. Transitions out of terminal states are
+//!   rejected.
+//! - **Split-index consistency**: Child shards created by split operations
+//!   appear in `list_shards` and `get_run_progress` immediately.
+//! - **Watermark correctness**: `get_run_progress().watermark()` equals
+//!   the lexicographic minimum of cursor keys across *Active* shards
+//!   only, excluding Done/Split/Parked.
+//! - **Shard-count limits**: `register_shards` rejects the entire batch
+//!   when per-tenant or global limits would be exceeded.
+//! - **Idempotent replay**: Same `(OpId, payload)` returns `Replayed`;
+//!   same `OpId` with different payload returns `OpIdConflict`.
+//! - **Unpark lifecycle**: Parked -> Active with fence bump, cursor
+//!   preservation, and rejection when the run is terminal.
+//!
+//! # Section organization
+//!
+//! Tests are grouped by the operation or contract they exercise. Each
+//! group starts with a section comment naming the operation and
+//! summarizing what it covers. Parameterized tests use `rstest` to
+//! avoid repeating identical structure for complete/fail/cancel.
 
 use super::*;
-use crate::coordination::cursor::CursorUpdate;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement, RunStatus, ShardFilter};
+use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::run::{
+    InitialShardInput, RunConfig, RunManagement, RunStatus, ShardFilter,
+};
 use crate::coordination::shard_spec::{CursorSemantics, ShardLimitScope, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, coordinator_with_run_and_lease, do_split_replace, now, short_lease_run_config,
@@ -100,7 +128,18 @@ fn split_residual_child_visible_in_list_shards() {
     assert!(has_residual, "residual [m,z) should be in listing");
 }
 
-// -- get_run_progress watermark tests ---------------------------------------
+// -- get_run_progress watermark tests -----------------------------------------
+//
+// The watermark is the lexicographic minimum of `cursor.last_key` across all
+// Active shards in a run. It approximates "how far has the run processed?"
+// and is used for progress reporting and backpressure decisions.
+//
+// Correctness requirements:
+// - Only Active shards contribute; Done, Split, and Parked are excluded.
+// - `None` when no Active shard has a non-initial cursor.
+// - The watermark advances when the lagging shard's cursor advances.
+// - Shards registered with non-initial cursors (resume) are included.
+// - Unpark reintroduces the shard's cursor into the watermark pool.
 
 /// Acquire `shard` and write a checkpoint key at a controlled logical time.
 fn checkpoint_shard_last_key(
@@ -162,7 +201,11 @@ fn complete_shard_with_key(
         .unwrap();
 }
 
-/// Acquire, checkpoint, then park `shard` while preserving explicit timestamps.
+/// Parameters for the acquire-checkpoint-park helper.
+///
+/// Bundles the logical timestamps, operation IDs, and cursor key needed
+/// to drive a shard through acquire -> checkpoint -> park in a single
+/// call to [`park_shard_after_checkpoint`].
 struct ParkAfterCheckpointStep<'a> {
     worker_id: u64,
     acquire_t: u64,
@@ -173,6 +216,10 @@ struct ParkAfterCheckpointStep<'a> {
     park_op_id: u64,
 }
 
+/// Drive a shard through acquire -> checkpoint -> park in one call.
+///
+/// Used by watermark tests that need a shard in Parked state with a known
+/// cursor position.
 fn park_shard_after_checkpoint(
     coord: &mut InMemoryCoordinator,
     shard: ShardId,
@@ -273,6 +320,9 @@ fn coordinator_with_split_children_for_watermark()
     (coord, child_done, child_parked, child_active)
 }
 
+/// After a 3-way split, completing one child, parking another, and
+/// checkpointing the third must leave the watermark at the active child's
+/// cursor key. Done, Split, and Parked shards are excluded.
 #[test]
 fn done_split_parked_excluded_from_watermark() {
     let (mut coord, child_done, child_parked, child_active) =
@@ -308,6 +358,8 @@ fn done_split_parked_excluded_from_watermark() {
     );
 }
 
+/// When every shard is terminal (no Active shards remain), the watermark
+/// must be `None` regardless of cursor positions.
 #[test]
 fn all_shards_terminal_watermark_none() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -343,6 +395,8 @@ fn all_shards_terminal_watermark_none() {
     );
 }
 
+/// The watermark tracks the *minimum* active cursor key and advances when
+/// the lagging shard checkpoints forward.
 #[test]
 fn watermark_advances_when_min_shard_checkpoints() {
     // Setup: 2-shard run with ranges [a,m) and [m,z).
@@ -351,12 +405,12 @@ fn watermark_advances_when_min_shard_checkpoints() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -398,6 +452,7 @@ fn watermark_advances_when_min_shard_checkpoints() {
     );
 }
 
+/// With a single active shard, the watermark equals that shard's cursor key.
 #[test]
 fn single_active_shard_watermark_equals_its_key() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -424,6 +479,8 @@ fn single_active_shard_watermark_equals_its_key() {
     );
 }
 
+/// Shards registered with a non-initial cursor (resume case) contribute
+/// to the watermark immediately, without needing a checkpoint first.
 #[test]
 fn watermark_includes_shards_registered_with_non_initial_cursors() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
@@ -433,12 +490,12 @@ fn watermark_includes_shards_registered_with_non_initial_cursors() {
 
     // Register two shards: one with a resume cursor, one with initial.
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::with_last_key(b"d".to_vec()),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -479,11 +536,11 @@ fn register_shards_exceeds_per_tenant_limit() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let shards: Vec<InitialShard> = (0..4)
+    let shards: Vec<InitialShardInput> = (0..4)
         .map(|i| {
             let start = vec![b'a' + (i * 5) as u8];
             let end = vec![b'a' + (i * 5 + 4) as u8];
-            InitialShard::new(
+            InitialShardInput::new(
                 ShardId::from_raw(i),
                 ShardSpec::with_range(start, end),
                 Cursor::initial(),
@@ -522,7 +579,7 @@ fn register_shards_exceeds_global_limit() {
         other,
         RunId::from_raw(99),
         ShardId::from_raw(90),
-        &ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -532,7 +589,7 @@ fn register_shards_exceeds_global_limit() {
         other,
         RunId::from_raw(99),
         ShardId::from_raw(91),
-        &ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -544,12 +601,12 @@ fn register_shards_exceeds_global_limit() {
         .unwrap();
 
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -585,12 +642,12 @@ fn register_shards_within_limits_succeeds() {
         .unwrap();
 
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -622,7 +679,7 @@ fn register_shards_preserves_non_initial_cursors() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::with_last_key(b"f".to_vec()),
@@ -668,7 +725,7 @@ fn active_run_coordinator() -> InMemoryCoordinator {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -685,6 +742,8 @@ fn active_run_coordinator() -> InMemoryCoordinator {
     coord
 }
 
+/// Discriminant for the three run-terminal operations so parameterized
+/// tests can dispatch without repeating the match logic.
 #[derive(Debug, Clone, Copy)]
 enum TerminalOp {
     Complete,
@@ -702,6 +761,10 @@ impl TerminalOp {
     }
 }
 
+/// Dispatch a terminal run operation by discriminant.
+///
+/// Centralizes the `match` so parameterized tests only need to pass
+/// `TerminalOp` without knowing the underlying method signatures.
 fn apply_terminal_op(
     coord: &mut InMemoryCoordinator,
     op: TerminalOp,
@@ -1075,6 +1138,10 @@ fn unpark_then_reacquire_and_checkpoint() {
     assert!(cp.is_executed());
 }
 
+/// Unparking a shard reintroduces its old cursor into the watermark pool.
+///
+/// Demonstrates that the watermark can move *backward* after unpark if the
+/// unparked shard's cursor is behind the remaining active shards.
 #[test]
 fn unpark_shard_reintroduces_cursor_into_watermark() {
     // Setup: 2-shard run with ranges [a,m) and [m,z).
@@ -1083,12 +1150,12 @@ fn unpark_shard_reintroduces_cursor_into_watermark() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -1234,7 +1301,7 @@ fn register_shards_idempotent_replay() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1261,7 +1328,7 @@ fn register_shards_op_id_conflict() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let shards_a = vec![InitialShard::new(
+    let shards_a = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1272,7 +1339,7 @@ fn register_shards_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different payload (different shard IDs).
-    let shards_b = vec![InitialShard::new(
+    let shards_b = vec![InitialShardInput::new(
         ShardId::from_raw(20),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1290,7 +1357,7 @@ fn register_shards_op_id_conflict() {
 fn register_shards_wrong_status_active() {
     let mut coord = active_run_coordinator();
     // Run is already Active.
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(20),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1318,7 +1385,7 @@ fn register_shards_wrong_status_active() {
 #[test]
 fn register_shards_run_not_found() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1350,12 +1417,12 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
         .unwrap();
 
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -1402,7 +1469,7 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
 #[test]
 fn create_run_with_shards_fresh() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1425,7 +1492,7 @@ fn create_run_with_shards_fresh() {
 #[test]
 fn create_run_with_shards_retry_same_config() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1461,7 +1528,7 @@ fn create_run_with_shards_retry_same_config() {
 #[test]
 fn create_run_with_shards_config_mismatch() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -1537,12 +1604,12 @@ fn full_run_lifecycle_create_register_process_complete() {
 
     // Step 2: Register two shards [a,m) and [m,z).
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(10),
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             ShardId::from_raw(11),
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),
@@ -1622,7 +1689,21 @@ fn full_run_lifecycle_create_register_process_complete() {
     assert_eq!(record.completed_at(), Some(now(9)));
 }
 
-// Property-based tests verifying watermark correctness across arbitrary shard configurations.
+// ============================================================================
+// Property-based watermark tests
+// ============================================================================
+//
+// Fuzz-generates arbitrary shard configurations (random statuses and cursor
+// keys) and verifies three properties:
+//
+// 1. `watermark == min(key | status == Active && key.is_some())`
+// 2. `watermark <= every Active cursor key` (lower bound)
+// 3. `watermark == None` when no Active shard has a cursor key
+//
+// These properties are hard to violate with hand-picked cases but easy to
+// violate when the implementation accidentally includes a terminal shard's
+// cursor or uses the wrong comparison direction.
+
 mod prop_progress_watermark {
     use super::*;
     use crate::test_util::miri_proptest_config;

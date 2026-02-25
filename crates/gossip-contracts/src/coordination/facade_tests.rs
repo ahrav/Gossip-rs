@@ -1,7 +1,34 @@
+//! Tests for the [`CoordinationFacade`] super-trait, the [`ShardClaiming`]
+//! trait, and the [`default_claim_next_available`] free function.
+//!
+//! The claim algorithm uses a two-step list-then-acquire pattern: it queries
+//! the backend for available (active, unleased) shards, then tries to acquire
+//! each candidate sequentially. Because the fencing protocol in
+//! `acquire_and_restore` guarantees at-most-one winner per shard, the TOCTOU
+//! gap between list and acquire is safe --- losers advance to the next
+//! candidate.
+//!
+//! # Coverage Areas
+//!
+//! - **Happy path**: single claim, sequential exhaustion, claim after lease
+//!   expiry, skipping terminal and already-leased shards.
+//! - **Error mapping**: `ClaimError::from(GetRunError)` conversions,
+//!   `RunNotFound`, `TenantMismatch`, `NoneAvailable` with
+//!   `earliest_deadline` reporting.
+//! - **Cooldown enforcement**: per-worker throttling across runs, boundary
+//!   timing, isolation between workers, priority over downstream errors,
+//!   overflow saturation, and the deliberate bypass on direct
+//!   `acquire_and_restore`.
+//! - **Property tests**: random shard/lease mixes, mixed terminal/leased
+//!   states, expired lease reclamation, and cooldown invariant validation
+//!   across random timestamp sequences.
+//! - **Trait wiring**: compile-time proof that `InMemoryCoordinator`
+//!   satisfies `CoordinationFacade`.
+
 use super::*;
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::in_memory::InMemoryCoordinator;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
+use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
 use crate::coordination::shard_spec::CursorSemantics;
 use crate::coordination::test_fixtures::{now, test_run, test_tenant, test_worker};
 use crate::identity::{OpId, ShardId};
@@ -14,6 +41,9 @@ fn test_run_config() -> RunConfig {
 }
 
 /// Populate the coordinator with a run and `shard_count` shards.
+///
+/// Each shard covers a single-byte range `[i, i+1)`. The run uses a 30-tick
+/// lease duration and `CursorSemantics::Completed`.
 fn populate_run(coord: &mut InMemoryCoordinator, shard_count: usize) {
     let tenant = test_tenant();
     let run = test_run();
@@ -21,11 +51,11 @@ fn populate_run(coord: &mut InMemoryCoordinator, shard_count: usize) {
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShard> = (0..shard_count)
+    let shards: Vec<InitialShardInput> = (0..shard_count)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
-            InitialShard::new(
+            InitialShardInput::new(
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
                 Cursor::initial(),
@@ -39,12 +69,25 @@ fn populate_run(coord: &mut InMemoryCoordinator, shard_count: usize) {
 }
 
 /// Set up a coordinator with a run containing `shard_count` shards.
+///
+/// Returns the coordinator ready for claim operations. Shards are registered
+/// at `now(1)`, so claim operations should use `now(2)` or later.
 fn setup_coordinator(shard_count: usize) -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(30);
     populate_run(&mut coord, shard_count);
     coord
 }
 
+// ============================================================================
+// Basic claim operations
+//
+// Each test verifies one aspect of the claim algorithm: success, exhaustion,
+// skipping occupied shards, nonexistent runs, sequential claiming, and
+// reclamation after lease expiry.
+// ============================================================================
+
+/// Claiming on a run with available shards succeeds and returns a lease
+/// scoped to the correct run.
 #[test]
 fn claim_next_available_ok() {
     let mut coord = setup_coordinator(2);
@@ -54,6 +97,8 @@ fn claim_next_available_ok() {
     assert_eq!(acquire.lease.run(), test_run());
 }
 
+/// When the only shard is already leased, `claim_next_available` returns
+/// `NoneAvailable` rather than blocking or returning a stale result.
 #[test]
 fn claim_none_available() {
     let mut coord = setup_coordinator(1);
@@ -67,6 +112,9 @@ fn claim_none_available() {
     assert!(matches!(result, Err(ClaimError::NoneAvailable { .. })));
 }
 
+/// The claim algorithm iterates candidates sequentially; if shard 0 is
+/// already leased, shard 1 is returned instead. This verifies the
+/// list-then-acquire loop correctly advances past occupied shards.
 #[test]
 fn claim_skips_already_leased() {
     let mut coord = setup_coordinator(2);
@@ -83,6 +131,8 @@ fn claim_skips_already_leased() {
     assert_eq!(acquire.lease.shard(), ShardId::from_raw(1));
 }
 
+/// Claiming against a nonexistent run surfaces `RunNotFound` immediately
+/// rather than attempting any shard-level operations.
 #[test]
 fn claim_run_not_found() {
     let mut coord = InMemoryCoordinator::new(30);
@@ -91,6 +141,9 @@ fn claim_run_not_found() {
     assert_eq!(result, Err(ClaimError::RunNotFound));
 }
 
+/// Three sequential claims on a 3-shard run produce three distinct leases;
+/// a fourth claim returns `NoneAvailable`. Verifies the claim algorithm
+/// tracks which shards have been assigned and exhausts them correctly.
 #[test]
 fn claim_all_sequential() {
     let mut coord = setup_coordinator(3);
@@ -118,6 +171,8 @@ fn claim_all_sequential() {
     assert!(matches!(r4, Err(ClaimError::NoneAvailable { .. })));
 }
 
+/// Compile-time proof that `InMemoryCoordinator` satisfies the
+/// `CoordinationFacade` super-trait bound (backend + run mgmt + claiming).
 #[test]
 fn facade_trait_compiles() {
     fn requires_facade<B: CoordinationFacade>(_: &mut B) {}
@@ -125,6 +180,10 @@ fn facade_trait_compiles() {
     requires_facade(&mut coord);
 }
 
+/// After a lease expires, the shard becomes available again. A new worker
+/// can claim it and receives a fresh lease with its own identity. This is
+/// the fundamental liveness property: stalled workers do not permanently
+/// block shards.
 #[test]
 fn claim_after_lease_expiry() {
     let mut coord = setup_coordinator(1);
@@ -144,6 +203,9 @@ fn claim_after_lease_expiry() {
     assert_eq!(acquire.lease.owner(), test_worker(2));
 }
 
+/// Completed (Done) shards are terminal and must not be returned by the
+/// claim algorithm. After completing shard 0, claiming should skip it
+/// and return shard 1.
 #[test]
 fn claim_skips_terminal() {
     let mut coord = setup_coordinator(2);
@@ -366,9 +428,15 @@ proptest! {
     }
 }
 
-// ========================================================================
+// ============================================================================
 // Claim cooldown tests
-// ========================================================================
+//
+// Cooldown is a per-worker rate limiter on `claim_next_available`. After a
+// successful claim, the same worker is blocked from claiming again until
+// `now >= last_success + cooldown_interval`. The gate fires before run
+// lookup or candidate scanning, giving `Throttled` priority over
+// `RunNotFound` and `NoneAvailable`. Failed claims do not trigger cooldown.
+// ============================================================================
 
 /// Helper: set up a coordinator with cooldown enabled and `shard_count` shards.
 fn setup_coordinator_with_cooldown(
@@ -421,6 +489,9 @@ fn claim_cooldown_single_worker(
     }
 }
 
+/// Failed claims (NoneAvailable) must not start a cooldown timer. Worker 2
+/// gets NoneAvailable twice in a row without being throttled, proving that
+/// only *successful* claims trigger cooldown.
 #[test]
 fn claim_cooldown_not_triggered_on_failure() {
     let mut coord = setup_coordinator_with_cooldown(1, 5);
@@ -449,6 +520,9 @@ fn claim_cooldown_not_triggered_on_failure() {
     );
 }
 
+/// Cooldown timers are per-worker: worker 2 can claim immediately after
+/// worker 1, even though worker 1 is in cooldown. Worker 1's subsequent
+/// attempt is correctly throttled while worker 2 is unaffected.
 #[test]
 fn claim_cooldown_per_worker_isolation() {
     let mut coord = setup_coordinator_with_cooldown(3, 5);
@@ -477,6 +551,9 @@ fn claim_cooldown_per_worker_isolation() {
     );
 }
 
+/// Cooldown spans across runs: a successful claim in run A puts the worker
+/// in cooldown for run B too. This prevents a worker from flooding the
+/// coordinator by rapidly cycling through runs.
 #[test]
 fn claim_cooldown_spans_runs() {
     // Cooldown is per-worker, not per-run: a successful claim in run A
@@ -489,7 +566,7 @@ fn claim_cooldown_spans_runs() {
 
     // Create run A with one shard.
     coord.create_run(now(1), tenant, run_a, config).unwrap();
-    let shards_a = vec![InitialShard::new(
+    let shards_a = vec![InitialShardInput::new(
         ShardId::from_raw(0),
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0], vec![1]),
         Cursor::initial(),
@@ -500,7 +577,7 @@ fn claim_cooldown_spans_runs() {
 
     // Create run B with one shard (different shard ID).
     coord.create_run(now(1), tenant, run_b, config).unwrap();
-    let shards_b = vec![InitialShard::new(
+    let shards_b = vec![InitialShardInput::new(
         ShardId::from_raw(10),
         crate::coordination::shard_spec::ShardSpec::with_range(vec![10], vec![11]),
         Cursor::initial(),
@@ -532,6 +609,8 @@ fn claim_cooldown_spans_runs() {
     );
 }
 
+/// The `Display` impl for `Throttled` includes both the "throttled" keyword
+/// and the numeric retry-after value, so log messages are actionable.
 #[test]
 fn claim_error_throttled_display() {
     let err = ClaimError::Throttled {
@@ -666,11 +745,11 @@ fn claim_cooldown_overflow_saturates_to_permanent() {
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShard> = (0..3)
+    let shards: Vec<InitialShardInput> = (0..3)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
-            InitialShard::new(
+            InitialShardInput::new(
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
                 Cursor::initial(),

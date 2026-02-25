@@ -37,7 +37,7 @@ use crate::coordination::error::CheckpointError;
 use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardStatus;
-use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
+use crate::coordination::run::{InitialShardInput, RunManagement, RunStatus};
 use crate::coordination::run_errors::{RegisterShardsError, RunTransitionError};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::split::SplitResidualPlan;
@@ -74,7 +74,7 @@ fn scenario_full_run_lifecycle() {
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     // -- Register one shard [a, z) --
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         test_shard(),
         test_spec(),
         Cursor::initial(),
@@ -295,6 +295,9 @@ fn scenario_split_replace_and_children_completion() {
         .into_inner();
     let children = split_result.children;
     assert_eq!(children.len(), 2, "split should produce exactly 2 children");
+    let children = children.as_slice();
+    let child1 = children[0];
+    let child2 = children[1];
 
     // Verify parent is now Split.
     let parent_record = coord.shard_lookup(&tenant, &key).unwrap();
@@ -305,7 +308,7 @@ fn scenario_split_replace_and_children_completion() {
     );
 
     // -- Acquire and complete child 1 [a,m) --
-    let child1_key = ShardKey::new(test_run(), children[0]);
+    let child1_key = ShardKey::new(test_run(), child1);
     let child1_result = coord
         .acquire_and_restore(now(12), tenant, child1_key, test_worker(1))
         .unwrap();
@@ -330,7 +333,7 @@ fn scenario_split_replace_and_children_completion() {
         .unwrap();
 
     // -- Acquire and complete child 2 [m,z) --
-    let child2_key = ShardKey::new(test_run(), children[1]);
+    let child2_key = ShardKey::new(test_run(), child2);
     let child2_result = coord
         .acquire_and_restore(now(15), tenant, child2_key, test_worker(2))
         .unwrap();
@@ -642,7 +645,7 @@ fn scenario_cancel_from_initializing() {
     );
 
     // -- register_shards on cancelled run should fail --
-    let shards = vec![InitialShard::new(
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(1),
         ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
         Cursor::initial(),
@@ -800,12 +803,12 @@ fn scenario_claim_contention() {
     let shard1 = ShardId::from_raw(1);
     let shard2 = ShardId::from_raw(2);
     let shards = vec![
-        InitialShard::new(
+        InitialShardInput::new(
             shard1,
             ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
             Cursor::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             shard2,
             ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
             Cursor::initial(),

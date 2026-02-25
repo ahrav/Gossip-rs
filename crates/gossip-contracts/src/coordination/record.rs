@@ -1,8 +1,31 @@
 //! ShardRecord: the coordinator's authoritative state for a single shard.
 //!
-//! Contains the lifecycle state machine ([`ShardStatus`]), park reasons
-//! ([`ParkReason`]), the full [`ShardRecord`] with runtime invariant
-//! assertions, and the worker-visible [`ShardSnapshot`].
+//! Every shard in the system has exactly one `ShardRecord` that tracks its
+//! lifecycle, ownership, progress, and lineage. The coordinator mutates this
+//! record during state transitions (acquire, checkpoint, complete, park, split)
+//! and validates invariants after every mutation.
+//!
+//! ## Contents
+//!
+//! - [`ShardStatus`] — lifecycle state machine (`Active -> Done | Parked | Split`)
+//! - [`ParkReason`] — coordination-level categories for why a shard was halted
+//! - [`ShardRecord`] — the full record with 10 runtime invariant assertions
+//! - [`ShardSnapshot`] — worker-visible read-only view returned on acquisition
+//!
+//! ## Ownership Model
+//!
+//! `ShardRecord` fields are `pub(crate)` rather than private because the
+//! coordinator backend directly mutates them during state transitions. Safety
+//! comes from `assert_invariants()` called after every transition, not from
+//! accessor-gated mutation. This is the "Tiger-style" invariant enforcement
+//! pattern: allow direct field access, panic immediately on violation.
+//!
+//! ## Arena Pooling
+//!
+//! Variable-size byte fields (spec key ranges, cursor keys) are stored in a
+//! shared [`ByteSlab`] via `PooledShardSpec` and `PooledCursor`, avoiding
+//! per-field heap allocations on hot paths. The record does not implement
+//! `Drop` — the coordinator must call `deallocate_fields()` before discarding.
 
 use std::borrow::Borrow;
 use std::fmt;
@@ -10,19 +33,87 @@ use std::fmt;
 use blake3::Hasher;
 use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
 
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
 use crate::coordination::pooled::{PooledCursor, PooledShardSpec};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
 };
 
 use super::split::MAX_SPAWNED_PER_SHARD;
 
-/// Inline-first list for shard spawn tracking. 8 inline slots cover 99%+
-/// of shards; only long split chains spill to heap.
+/// Inline-first list for shard spawn tracking.
+///
+/// 8 inline slots cover the common case of a single split-replace (up to
+/// 8 children stored without heap allocation). Shards that undergo multiple
+/// residual splits or very large fan-out splits spill to heap, but these
+/// cases are rare enough that the inline optimization dominates.
 pub(crate) type SpawnedList = InlineVec<ShardId, 8>;
+
+/// Adapter trait for record constructors that accept owned specs or borrowed
+/// [`ShardSpecRef`] values.
+///
+/// This trait eliminates forced heap allocation at call sites: callers with
+/// borrowed slab-backed bytes pass `ShardSpecRef` directly, while callers
+/// with owned `ShardSpec` values convert on the fly. The constructor then
+/// copies bytes into the slab regardless of input form.
+///
+/// The produced view is call-scoped — constructors copy bytes into
+/// slab-owned storage before returning and do not retain the reference.
+pub(crate) trait IntoRecordSpec<'a> {
+    /// Produce a borrowed spec view for the duration of the constructor call.
+    fn into_record_spec(self) -> ShardSpecRef<'a>;
+}
+
+impl<'a> IntoRecordSpec<'a> for ShardSpecRef<'a> {
+    fn into_record_spec(self) -> ShardSpecRef<'a> {
+        self
+    }
+}
+
+impl<'a> IntoRecordSpec<'a> for &'a ShardSpec {
+    fn into_record_spec(self) -> ShardSpecRef<'a> {
+        self.as_ref()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl IntoRecordSpec<'static> for ShardSpec {
+    fn into_record_spec(self) -> ShardSpecRef<'static> {
+        Box::leak(Box::new(self)).as_ref()
+    }
+}
+
+/// Adapter trait for record constructors that accept owned cursors or borrowed
+/// [`CursorUpdate`] values.
+///
+/// Same rationale as [`IntoRecordSpec`]: avoids forcing callers to materialize
+/// owned `Cursor` values when they already have borrowed bytes. The produced
+/// view is call-scoped input copied into slab storage by the constructor.
+pub(crate) trait IntoRecordCursor<'a> {
+    /// Produce a borrowed cursor update view for the duration of the constructor call.
+    fn into_record_cursor(self) -> CursorUpdate<'a>;
+}
+
+impl<'a> IntoRecordCursor<'a> for CursorUpdate<'a> {
+    fn into_record_cursor(self) -> CursorUpdate<'a> {
+        self
+    }
+}
+
+impl<'a> IntoRecordCursor<'a> for &'a Cursor {
+    fn into_record_cursor(self) -> CursorUpdate<'a> {
+        CursorUpdate::from_cursor(self)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl IntoRecordCursor<'static> for Cursor {
+    fn into_record_cursor(self) -> CursorUpdate<'static> {
+        CursorUpdate::from_cursor(Box::leak(Box::new(self)))
+    }
+}
 
 // ============================================================================
 // ShardStatus
@@ -303,18 +394,60 @@ impl ShardRecord {
 
     /// Construct a new active shard record (root shard).
     ///
+    /// The cursor initializes to [`CursorUpdate::initial()`]. Borrowed inputs
+    /// are copied into slab-owned storage; constructor callers do not need to
+    /// keep source buffers alive after return.
+    ///
     /// # Errors
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec.
-    pub(crate) fn new_active(
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn new_active<'a, S: IntoRecordSpec<'a>>(
         tenant: TenantId,
         run: RunId,
         shard: ShardId,
-        spec: &ShardSpec,
+        spec: S,
         cursor_semantics: CursorSemantics,
         slab: &mut ByteSlab,
     ) -> Result<Self, gossip_stdx::SlabFull> {
-        let pooled_spec = PooledShardSpec::from_spec(spec, slab)?;
+        Self::new_active_with_cursor(
+            tenant,
+            run,
+            shard,
+            spec,
+            CursorUpdate::initial(),
+            cursor_semantics,
+            slab,
+        )
+    }
+
+    /// Construct a new active shard record (root shard) with explicit cursor.
+    ///
+    /// `spec`/`initial_cursor` may be borrowed views; bytes are copied into the
+    /// coordinator slab before the record is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlabFull` if the slab cannot allocate space for the spec.
+    pub(crate) fn new_active_with_cursor<'a, S: IntoRecordSpec<'a>, C: IntoRecordCursor<'a>>(
+        tenant: TenantId,
+        run: RunId,
+        shard: ShardId,
+        spec: S,
+        initial_cursor: C,
+        cursor_semantics: CursorSemantics,
+        slab: &mut ByteSlab,
+    ) -> Result<Self, gossip_stdx::SlabFull> {
+        let spec = spec.into_record_spec();
+        let initial_cursor = initial_cursor.into_record_cursor();
+        let pooled_spec = PooledShardSpec::from_spec_ref(spec, slab)?;
+        let pooled_cursor = match PooledCursor::from_update(&initial_cursor, slab) {
+            Ok(cursor) => cursor,
+            Err(err) => {
+                pooled_spec.deallocate(slab);
+                return Err(err);
+            }
+        };
         let record = Self {
             tenant,
             run,
@@ -322,7 +455,7 @@ impl ShardRecord {
             status: ShardStatus::Active,
             park_reason: None,
             spec: pooled_spec,
-            cursor: PooledCursor::initial(),
+            cursor: pooled_cursor,
             cursor_semantics,
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
@@ -336,22 +469,27 @@ impl ShardRecord {
 
     /// Construct a new active shard record created by a split.
     ///
+    /// As with root constructors, borrowed `spec`/`cursor` inputs are copied
+    /// into slab-owned storage.
+    ///
     /// # Errors
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec/cursor.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_split_child(
+    pub(crate) fn new_split_child<'a, S: IntoRecordSpec<'a>, C: IntoRecordCursor<'a>>(
         tenant: TenantId,
         run: RunId,
         shard: ShardId,
-        spec: &ShardSpec,
-        cursor: &Cursor,
+        spec: S,
+        cursor: C,
         cursor_semantics: CursorSemantics,
         parent: ShardId,
         slab: &mut ByteSlab,
     ) -> Result<Self, gossip_stdx::SlabFull> {
-        let pooled_spec = PooledShardSpec::from_spec(spec, slab)?;
-        let pooled_cursor = match PooledCursor::from_cursor(cursor, slab) {
+        let spec = spec.into_record_spec();
+        let cursor = cursor.into_record_cursor();
+        let pooled_spec = PooledShardSpec::from_spec_ref(spec, slab)?;
+        let pooled_cursor = match PooledCursor::from_update(&cursor, slab) {
             Ok(c) => c,
             Err(e) => {
                 pooled_spec.deallocate(slab);
@@ -708,6 +846,8 @@ impl ShardRecord {
     /// Simulation hot paths should prefer `SimIntrospection` borrowed
     /// accessors (`spec_bounds`, `cursor_last_key`) to avoid this copy.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    #[allow(dead_code)]
     pub(crate) fn snapshot(&self, slab: &ByteSlab) -> ShardSnapshot {
         self.assert_invariants();
         ShardSnapshot::new(

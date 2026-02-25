@@ -45,7 +45,7 @@
 
 use std::fmt;
 
-use crate::coordination::error::{AcquireError, AcquireResult};
+use crate::coordination::error::{AcquireError, AcquireResult, AcquireScratch};
 use crate::coordination::run::{RunManagement, ShardFilter};
 use crate::coordination::run_errors::GetRunError;
 use crate::coordination::traits::CoordinationBackend;
@@ -232,6 +232,7 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
     run: RunId,
     worker: WorkerId,
 ) -> Result<AcquireResult, ClaimError> {
+    let mut acquire_scratch = AcquireScratch::new();
     let summaries = backend
         .list_shards(now, tenant, run, ShardFilter::available())
         .map_err(ClaimError::from)?;
@@ -256,8 +257,8 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
     for i in 0..len {
         let summary = &summaries[(offset + i) % len];
         let key = ShardKey::new(run, summary.shard());
-        match backend.acquire_and_restore(now, tenant, key, worker) {
-            Ok(result) => return Ok(result),
+        match backend.acquire_and_restore_into(now, tenant, key, worker, &mut acquire_scratch) {
+            Ok(result) => return Ok(result.to_owned()),
             Err(AcquireError::AlreadyLeased { lease_deadline, .. }) => {
                 // Race -- another worker claimed it.  Track the deadline
                 // so callers can schedule their next attempt near the

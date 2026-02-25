@@ -1,11 +1,44 @@
+//! Unit and property tests for the simulation harness ([`CoordinationSim`]).
+//!
+//! These tests validate the harness's own correctness -- its bookkeeping,
+//! op generation, and integration with the coordinator and invariant checker.
+//! They complement the large-scale mega-sim sweep (which treats the harness
+//! as a black box and only checks for invariant violations) by testing
+//! internal mechanisms with deterministic, hand-crafted scenarios.
+//!
+//! # Coverage map
+//!
+//! | Test cluster | What it validates |
+//! |---|---|
+//! | **No-violations property** | S1-S9 hold across random seeds and all fault levels |
+//! | **Report properties** | `SimReport` fields are populated and rejections occur under faults |
+//! | **Deterministic replay** | Same seed produces identical event counts, op count, and end time |
+//! | **Convergence** | Liveness phase drives all shards to terminal (SunnyDay) |
+//! | **Zombie scenario** | B1 bookkeeping cleanup rejects stale worker checkpoint |
+//! | **Forward cursor** | `generate_forward_cursor` never regresses, handles edge cases |
+//! | **Renew bookkeeping** | Worker's local lease deadline matches coordinator after renew |
+//! | **Multi-run isolation** | Interleaved ops on two runs produce no cross-run violations |
+//! | **Op-type coverage** | All exotic op types fire across 20 seeds (split, replay, claim, session, run-terminal) |
+//! | **step() API** | Public `step()` returns correct events, increments counter, rejects paused workers |
+//! | **Cooldown** | `with_cooldown` throttles rapid claims and allows post-cooldown claims |
+//! | **Unpark** | Park->Unpark cycle, rejection on non-parked, S3 exemption, active-set bookkeeping |
+//! | **Admin op-ID partitioning** | Admin partition 0 does not collide with worker partition 1+ |
+//! | **Run-terminal** | Unpark blocked after run cancel, shard ops continue, terminal irreversibility |
+//! | **Terminate-run generator** | `try_gen_terminate_run` samples all seeded runs uniformly |
+
 use super::*;
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
 
+/// Standard 3-worker, 5-shard simulation for property tests.
+///
+/// The 3:5 ratio ensures contention (fewer workers than shards) while
+/// keeping runs fast enough for proptest's 50-case default.
 fn default_sim(seed: u64, level: FaultLevel) -> CoordinationSim {
     CoordinationSim::new(seed, level).with_workers_and_shards(3, 5)
 }
 
+/// Proptest config with 50 cases (1 under Miri for speed).
 fn sim_proptest_config() -> proptest::test_runner::Config {
     let mut cfg = miri_proptest_config();
     if !cfg!(miri) {
@@ -14,6 +47,12 @@ fn sim_proptest_config() -> proptest::test_runner::Config {
     cfg
 }
 
+/// Scale safety and liveness op budgets by fault severity.
+///
+/// Higher fault levels need more ops because fault-induced rejections
+/// (expired leases, paused workers) waste a larger fraction of the budget.
+/// Radioactive gets 5x the SunnyDay budget to compensate for its ~20%
+/// rejection rate.
 fn ops_for_level(level: FaultLevel) -> (usize, usize) {
     match level {
         FaultLevel::SunnyDay => (200, 100),
@@ -25,6 +64,10 @@ fn ops_for_level(level: FaultLevel) -> (usize, usize) {
 use crate::sim::test_util::arb_fault_level;
 
 // -- Cluster 1: no-violations property (replaces 5 tests) ----------------
+//
+// The core safety property: invariants S1-S9 hold for any seed under any
+// fault level. This single proptest replaces five former per-level tests
+// by parameterizing over both seed and level.
 
 proptest! {
     #![proptest_config(sim_proptest_config())]
@@ -45,6 +88,10 @@ proptest! {
 }
 
 // -- Cluster 2: report properties (merges 2 tests) -----------------------
+//
+// Validates that SimReport fields are populated correctly and that
+// Stormy fault injection produces at least some rejections (a zero
+// rejection count would indicate fault injection is silently disabled).
 
 #[test]
 fn report_properties() {
@@ -63,8 +110,15 @@ fn report_properties() {
     );
 }
 
-// -- Unique tests (unchanged) --------------------------------------------
+// -- Determinism and convergence ------------------------------------------
+//
+// These test the two foundational simulation guarantees: (1) same seed
+// always produces identical results (ChaCha8Rng reproducibility), and
+// (2) the liveness phase can drive all shards to terminal state.
 
+/// Two runs with the same seed must produce byte-identical results.
+/// This is the reproducibility contract that makes seed-based failure
+/// investigation possible -- if this fails, bisecting by seed is broken.
 #[test]
 fn deterministic_replay() {
     let seed = 99;
@@ -75,6 +129,9 @@ fn deterministic_replay() {
     assert_eq!(report_a.end_time, report_b.end_time);
 }
 
+/// With a generous liveness budget (500 ops), all shards must reach
+/// terminal state under zero faults. Failure here means the liveness
+/// phase's acquire+complete bias is insufficient or broken.
 #[test]
 fn two_phase_converges() {
     let report = default_sim(42, FaultLevel::SunnyDay).run(50, 500);
@@ -85,6 +142,11 @@ fn two_phase_converges() {
     );
 }
 
+/// The zombie preamble (injected before random ops) must produce at
+/// least one rejection without any invariant violations. This confirms
+/// the B1 bookkeeping cleanup path works: Worker A's stale lease is
+/// cleared when Worker B acquires, so Worker A's subsequent checkpoint
+/// is rejected with NotLeased.
 #[test]
 fn zombie_worker_rejected() {
     let report = default_sim(42, FaultLevel::SunnyDay).run(10, 10);
@@ -227,6 +289,13 @@ fn multi_run_isolation() {
 }
 
 // -- generate_forward_cursor edge cases ------------------------------------
+//
+// These test the monotonicity guarantee of cursor generation. The harness
+// must never generate a cursor that lexicographically precedes the worker's
+// last cursor -- doing so would cause the coordinator to correctly reject
+// the operation, masking real bugs behind expected CursorRegression noise.
+// Edge cases covered: no prior cursor, forward progress, range exhaustion,
+// narrow spec, and multi-byte boundary regression.
 
 /// Worker with no prior cursor generates a cursor within spec bounds.
 #[test]
@@ -341,7 +410,7 @@ fn generate_forward_cursor_single_byte_range() {
         sim.tenant,
         run,
         shard,
-        &ShardSpec::with_range(vec![b'a'], vec![b'c']),
+        ShardSpec::with_range(vec![b'a'], vec![b'c']),
         CursorSemantics::Completed,
         sim.coordinator.slab_mut(),
     )
@@ -374,9 +443,13 @@ fn generate_forward_cursor_single_byte_range() {
     );
 }
 
-/// Verify the new operation types (split, replay, conflict) are exercised
-/// across multiple seeds. This catches regressions where op generation
-/// weights produce zero coverage.
+/// Verify all exotic operation types are exercised across 20 seeds.
+///
+/// Each op type has a small weight in `generate_random_op` (2-8%), so any
+/// single seed may not trigger all of them. Scanning 20 seeds with 1000
+/// safety ops each gives each path thousands of chances. A zero count for
+/// any op type across all 20 seeds indicates broken op-generation weights
+/// or a precondition that is never satisfied.
 #[test]
 fn new_op_types_exercised() {
     let mut split_replace_seen = false;
@@ -559,7 +632,13 @@ fn with_cooldown_throttles_and_then_allows() {
     );
 }
 
-// -- Unpark behavioral tests --
+// -- Unpark behavioral tests ------------------------------------------------
+//
+// Unpark is the only allowed terminal->non-terminal transition (Parked->Active).
+// The coordinator must bump fence_epoch during unpark so stale pre-park
+// leases are invalidated (S3 exemption). These tests verify the harness
+// correctly tracks active-set membership, the coordinator bumps fences, and
+// the invariant checker's S3 exemption fires without false positives.
 
 #[test]
 fn unpark_reverses_park_and_allows_reacquire() {
@@ -761,6 +840,13 @@ fn admin_unpark_no_op_id_collision_with_workers() {
 }
 
 // -- Run-terminal behavioral tests ------------------------------------------
+//
+// Run-level terminal transitions (complete/fail/cancel) are admin
+// operations that affect the run record, not individual shard records.
+// After a run is terminated, admin ops like unpark must be rejected
+// (the run is frozen), but shard-level ops (acquire, checkpoint,
+// complete) continue working on already-registered shards. These tests
+// verify this asymmetry and the S8 terminal irreversibility invariant.
 
 /// Validates the coordinator contract around run termination:
 /// - Unpark is blocked after run terminal (`TerminalState` rejection).

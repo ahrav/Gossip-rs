@@ -1,6 +1,50 @@
+//! Tests for [`WorkerSession`], the RAII handle that binds a worker to a shard.
+//!
+//! `WorkerSession` wraps an acquired lease and a cached `ShardSnapshot`, then
+//! delegates every operation (checkpoint, complete, park, split, renew) to the
+//! backend while keeping the cached snapshot consistent. This module verifies
+//! that the session wrapper faithfully threads operations through to the backend
+//! and maintains its internal state correctly, including after errors.
+//!
+//! # Coverage Areas
+//!
+//! - **Happy-path operations**: session creation, checkpoint, complete, park,
+//!   split_replace, split_residual, renew. Each verifies the operation succeeds
+//!   and that the session's observable state (lease, spec, cursor, capacity) is
+//!   consistent afterward.
+//!
+//! - **Ownership semantics**: `complete`, `park`, and `split_replace` consume
+//!   the session (move semantics), while `split_residual`, `checkpoint`, and
+//!   `renew` borrow mutably and keep the session usable.
+//!
+//! - **Error propagation**: `LeaseExpired`, `AlreadyLeased`, and `StaleFence`
+//!   errors from the backend surface through the session API without wrapping.
+//!
+//! - **Snapshot integrity**: checkpoint does not update the cached snapshot;
+//!   failed `split_residual` does not corrupt it; replayed `split_residual`
+//!   does not double-rebuild it; successive splits accumulate spawned entries
+//!   correctly.
+//!
+//! - **Idempotency**: replayed checkpoint returns `Replayed`; replayed
+//!   complete returns `Replayed` (tested via raw backend after consume).
+//!   Op-log eviction fallback for split_residual also returns `Replayed`.
+//!
+//! - **Crash recovery**: dropping a session without a terminal op, then
+//!   re-acquiring after lease expiry, restores the checkpointed cursor.
+//!
+//! - **Lease renewal invariants**: renew advances the deadline without changing
+//!   the fence epoch; duplicate same-tick renewals are harmless.
+//!
+//! - **Capacity hints**: session reports correct available/saturated counts
+//!   after acquisition and after renewal.
+//!
+//! - **Property test**: random Renew/Checkpoint/SplitResidual sequences
+//!   preserve identity invariants (tenant, worker, shard_key never change)
+//!   and terminate cleanly with complete.
+
 use super::*;
 use crate::coordination::in_memory::InMemoryCoordinator;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
+use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
 use crate::coordination::shard_spec::CursorSemantics;
 use crate::identity::{RunId, ShardId};
 use crate::test_util::miri_proptest_config;
@@ -42,11 +86,11 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShard> = (0..shard_count)
+    let shards: Vec<InitialShardInput> = (0..shard_count)
         .map(|i| {
             let start = vec![(i as u8) * 0x40];
             let end = vec![((i + 1) as u8) * 0x40];
-            InitialShard::new(
+            InitialShardInput::new(
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
                 Cursor::initial(),
@@ -65,6 +109,15 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
     (coord, keys)
 }
 
+// ============================================================================
+// Happy-path operations
+//
+// Each test exercises one session method and verifies success plus the
+// session's observable state afterward.
+// ============================================================================
+
+/// Session creation acquires the shard and populates identity fields
+/// (tenant, worker, shard_key) and the initial snapshot (spec, cursor).
 #[test]
 fn new_ok() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -81,6 +134,9 @@ fn new_ok() {
     );
 }
 
+/// `complete` consumes the session by move; the shard transitions to Done.
+/// After this call, the session variable is no longer usable (enforced by
+/// Rust's ownership system).
 #[test]
 fn complete_consumes() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -93,6 +149,9 @@ fn complete_consumes() {
     assert!(result.is_ok());
 }
 
+/// `split_residual` borrows the session mutably and keeps it usable.
+/// After the split, the session's spec reflects the narrowed parent range,
+/// and further operations (checkpoint) work within the new bounds.
 #[test]
 fn split_residual_keeps_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -119,6 +178,9 @@ fn split_residual_keeps_session() {
     assert_eq!(session.spec().key_range_end(), &[0x20]);
 }
 
+/// `renew` extends the lease deadline without creating a new session.
+/// The internal lease handle is updated so subsequent operations see the
+/// new deadline.
 #[test]
 fn renew_updates_internal_deadline() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -133,6 +195,7 @@ fn renew_updates_internal_deadline() {
     assert!(new_deadline > old_deadline);
 }
 
+/// `park` consumes the session by move, transitioning the shard to Parked.
 #[test]
 fn park_consumes_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -143,6 +206,8 @@ fn park_consumes_session() {
     assert!(result.is_ok());
 }
 
+/// `split_replace` consumes the session by move. The parent transitions to
+/// Split, and the returned outcome contains the newly created child shard IDs.
 #[test]
 fn split_replace_consumes_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -170,6 +235,8 @@ fn split_replace_consumes_session() {
     }
 }
 
+/// Checkpoint through the session returns `Executed` on first call and
+/// delegates successfully to the backend.
 #[test]
 fn checkpoint_advances_cursor_via_session() {
     let (mut coord, keys) = setup_coordinator(1);
@@ -567,7 +634,7 @@ fn successive_split_residual_accumulates_spawned() {
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x60]);
-    let shard = InitialShard::new(ShardId::from_raw(0), shard_spec, Cursor::initial());
+    let shard = InitialShardInput::new(ShardId::from_raw(0), shard_spec, Cursor::initial());
     let _ = coord
         .register_shards(now(1), tenant, run, &[shard], OpId::from_raw(100))
         .unwrap();
@@ -754,7 +821,10 @@ proptest! {
     }
 }
 
-// -- capacity hint tests --
+// -- Capacity hint tests -----------------------------------------------
+//
+// The capacity hint tells a worker how many shards remain available in the
+// run, enabling back-pressure and scheduling decisions.
 
 /// After acquiring one of two shards, the session's capacity hint
 /// shows the remaining shard as available.
