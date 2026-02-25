@@ -37,7 +37,7 @@ use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
-use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
+use crate::coordination::run::{InitialShardInput, RunManagement, RunStatus};
 use crate::coordination::run_errors::{RunTransitionError, UnparkError};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
@@ -359,8 +359,15 @@ fn terminal_clears_lease() {
 fn cursor_semantics_dispatched_through_coordinator() {
     let mut coord = seeded_coordinator_with_semantics(CursorSemantics::Dispatched);
 
+    let mut scratch = crate::coordination::AcquireScratch::new();
     let result = coord
-        .acquire_and_restore(now(10), test_tenant(), test_key(), test_worker(1))
+        .acquire_and_restore_into(
+            now(10),
+            test_tenant(),
+            test_key(),
+            test_worker(1),
+            &mut scratch,
+        )
         .unwrap();
     assert_eq!(
         result.snapshot.cursor_semantics(),
@@ -439,10 +446,13 @@ fn split_coverage_key_range_partition() {
         .unwrap();
     let children = result.into_inner().children;
     assert_eq!(children.len(), 2, "must produce exactly 2 children");
+    let children = children.as_slice();
+    let child_a = children[0];
+    let child_b = children[1];
 
     // Look up each child and verify key ranges.
-    let key_a = ShardKey::new(test_run(), children[0]);
-    let key_b = ShardKey::new(test_run(), children[1]);
+    let key_a = ShardKey::new(test_run(), child_a);
+    let key_b = ShardKey::new(test_run(), child_b);
 
     let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
     let rec_b = coord.shard_lookup(&test_tenant(), &key_b).unwrap();
@@ -721,10 +731,12 @@ fn register_shards_on_non_initializing_rejected() {
     assert_eq!(rec.status(), RunStatus::Active);
 
     // Try to register more shards -> WrongStatus.
-    let shards = vec![InitialShard::new(
+    let spec = ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec());
+    let cursor = Cursor::initial();
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(999),
-        ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let err = coord
         .register_shards(

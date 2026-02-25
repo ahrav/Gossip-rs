@@ -73,12 +73,14 @@
 
 use std::fmt;
 
-use gossip_stdx::SlabFull;
+use gossip_stdx::{InlineVec, SlabFull};
 
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ShardSnapshot, ShardStatus};
-use crate::coordination::shard_spec::SplitValidationError;
-use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardKey, TenantId, WorkerId};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef, SplitValidationError};
+use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
+use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
 // CoordError -- shared error building blocks
@@ -323,7 +325,7 @@ impl std::error::Error for CoordError {
 // Operation-specific error types
 // ============================================================================
 
-/// Error from `acquire_and_restore`.
+/// Error from `acquire_and_restore_into`.
 ///
 /// Acquire is special: it does NOT require a pre-existing lease, so
 /// it cannot produce `StaleFence` or `LeaseExpired`. It can fail if
@@ -1002,13 +1004,16 @@ impl From<SlabFull> for SplitError {
 // From<CoordError> impls -- explicit rejection arms
 // ============================================================================
 
-// These allow the validation helpers to return `CoordError` which callers
-// map into operation-specific errors via `?`. Only variants valid for each
-// operation type are converted; invalid conversions hit `unreachable!()`.
+// These impls are the routing layer between the shared `CoordError` (returned
+// by `validate_lease`, `check_op_idempotency`, etc.) and the per-operation
+// error types (returned to callers). The `?` operator in backend methods
+// uses these conversions automatically.
 //
-// Every impl explicitly enumerates rejected variants so that adding a new
-// `CoordError` variant triggers a compile error here, forcing a conscious
-// routing decision.
+// Every impl explicitly enumerates rejected variants (mapped to
+// `unreachable!()`) rather than using a wildcard `_` arm. This is the
+// compile-time exhaustiveness strategy documented in the module-level docs:
+// adding a new `CoordError` variant triggers a compile error in every impl,
+// forcing a conscious routing decision for the new variant.
 
 impl From<CoordError> for CheckpointError {
     fn from(e: CoordError) -> Self {
@@ -1169,13 +1174,18 @@ impl From<CoordError> for RenewError {
 /// Advisory capacity information piggybacked on acquire/renew results.
 ///
 /// Represents the post-operation state: how many shards are available
-/// for acquisition in the run after the operation completed.  Workers
-/// may use this to inform backoff decisions (e.g., backing off when
-/// `available_count` is zero, scheduling retry near `earliest_deadline`).
+/// for acquisition in the run after the operation completed. Workers
+/// may use this to inform backoff decisions:
+///
+/// - `available_count == 0` with `earliest_deadline.is_some()`: all shards
+///   are claimed — back off until at least `earliest_deadline`.
+/// - `available_count == 0` with `earliest_deadline.is_none()`: all shards
+///   are terminal or the run has none — stop trying.
+/// - `available_count > 0`: shards are available — acquire immediately.
 ///
 /// This is fail-open advisory metadata — it does not affect correctness.
 /// The hint is a point-in-time snapshot that may be stale by the time
-/// the caller reads it.  Workers MUST NOT rely on these values for
+/// the caller reads it. Workers MUST NOT rely on these values for
 /// safety-critical decisions.
 ///
 /// Reference: Breakwater (Cho et al., OSDI 2020) — credit piggybacking.
@@ -1218,7 +1228,306 @@ const _: () = assert!(core::mem::size_of::<CapacityHint>() <= 24);
 // Operation result types
 // ============================================================================
 
-/// Result of a successful `acquire_and_restore` operation.
+/// Borrowed view of shard state returned by `acquire_and_restore_into`.
+///
+/// This is the allocation-free counterpart to [`ShardSnapshot`]. Instead
+/// of heap-backed `Box<[u8]>` fields, all byte data borrows from the
+/// caller-owned [`AcquireScratch`]. The view is valid only until that
+/// scratch is reused or dropped.
+///
+/// Consumers that need owned data must copy fields out explicitly before the
+/// scratch buffer is reused.
+///
+/// ## Why Both `ShardSnapshotView` and `ShardSnapshot` Exist
+///
+/// The hot acquire path in production must avoid per-call allocation.
+/// `ShardSnapshotView` borrows from stack-allocated scratch, keeping
+/// the fast path allocation-free. `ShardSnapshot` is the owned form
+/// used in tests, by `WorkerSession` (which caches the snapshot), and
+/// at API boundaries where the caller cannot guarantee scratch lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "snapshot view should be consumed before scratch is reused"]
+pub struct ShardSnapshotView<'a> {
+    status: ShardStatus,
+    spec: ShardSpecRef<'a>,
+    cursor: CursorUpdate<'a>,
+    cursor_semantics: CursorSemantics,
+    parent: Option<ShardId>,
+    spawned: &'a [ShardId],
+}
+
+impl<'a> ShardSnapshotView<'a> {
+    /// Lifecycle status at acquisition time.
+    #[must_use]
+    pub fn status(&self) -> ShardStatus {
+        self.status
+    }
+
+    /// Borrowed shard spec view (range + metadata).
+    #[must_use]
+    pub fn spec(&self) -> ShardSpecRef<'a> {
+        self.spec
+    }
+
+    /// Borrowed cursor view captured at acquisition time.
+    #[must_use]
+    pub fn cursor(&self) -> CursorUpdate<'a> {
+        self.cursor
+    }
+
+    /// Cursor semantics configured for the run.
+    #[must_use]
+    pub fn cursor_semantics(&self) -> CursorSemantics {
+        self.cursor_semantics
+    }
+
+    /// Parent shard ID when this shard was split from another.
+    #[must_use]
+    pub fn parent(&self) -> Option<ShardId> {
+        self.parent
+    }
+
+    /// Borrowed list of spawned child shard IDs.
+    #[must_use]
+    pub fn spawned(&self) -> &'a [ShardId] {
+        self.spawned
+    }
+}
+
+/// Borrowed acquire result that references caller-owned [`AcquireScratch`].
+///
+/// This is the allocation-free return type from `acquire_and_restore_into`.
+/// The lease is `Copy` (small fixed-size struct), but the snapshot borrows
+/// variable-size byte fields from the scratch buffer.
+///
+/// The `capacity` field is advisory metadata for backoff decisions; see
+/// [`CapacityHint`] for usage guidance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "contains a lease and borrowed snapshot view"]
+pub struct AcquireResultView<'a> {
+    pub lease: Lease,
+    pub snapshot: ShardSnapshotView<'a>,
+    pub capacity: CapacityHint,
+}
+
+/// Caller-owned scratch buffer for allocation-free acquire snapshots.
+///
+/// `AcquireScratch` pre-allocates fixed-capacity arrays on the stack (or
+/// wherever the caller places it) for every variable-size field in a shard
+/// snapshot: spec start/end, metadata, cursor last_key, cursor token, and
+/// spawned shard IDs. The coordinator writes into these arrays during
+/// `acquire_and_restore_into`, and the caller reads from them via the
+/// returned [`AcquireResultView`].
+///
+/// ## Usage Pattern
+///
+/// ```text
+/// let mut scratch = AcquireScratch::new();  // once per session
+/// loop {
+///     let view = backend.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?;
+///     // use view.snapshot.spec(), view.snapshot.cursor(), etc.
+///     // scratch is overwritten on next call — view is invalidated
+/// }
+/// ```
+///
+/// ## Invalidation
+///
+/// Methods on this type overwrite internal storage; any previously returned
+/// [`ShardSnapshotView`] must be treated as invalid after the next write/reset.
+/// The Rust borrow checker enforces this: `acquire_and_restore_into` takes
+/// `&'a mut AcquireScratch` and returns `AcquireResultView<'a>`, preventing
+/// the caller from calling it again while the view is still live.
+///
+/// ## Size
+///
+/// The scratch is large (~40 KiB due to MAX_KEY_SIZE and MAX_METADATA_SIZE
+/// arrays). Prefer heap allocation (`Box::new(AcquireScratch::new())`) when
+/// stack size is a concern, and reuse the same instance across calls.
+#[derive(Debug)]
+pub struct AcquireScratch {
+    spec_start: [u8; MAX_KEY_SIZE],
+    spec_start_len: usize,
+    spec_end: [u8; MAX_KEY_SIZE],
+    spec_end_len: usize,
+    spec_metadata: [u8; crate::coordination::shard_spec::MAX_METADATA_SIZE],
+    spec_metadata_len: usize,
+    cursor_last_key: [u8; MAX_KEY_SIZE],
+    cursor_last_key_len: usize,
+    has_cursor_last_key: bool,
+    cursor_token: [u8; MAX_TOKEN_SIZE],
+    cursor_token_len: usize,
+    has_cursor_token: bool,
+    spawned: InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>,
+}
+
+impl Default for AcquireScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AcquireScratch {
+    /// Create empty reusable scratch with fixed-capacity internal buffers.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            spec_start: [0u8; MAX_KEY_SIZE],
+            spec_start_len: 0,
+            spec_end: [0u8; MAX_KEY_SIZE],
+            spec_end_len: 0,
+            spec_metadata: [0u8; crate::coordination::shard_spec::MAX_METADATA_SIZE],
+            spec_metadata_len: 0,
+            cursor_last_key: [0u8; MAX_KEY_SIZE],
+            cursor_last_key_len: 0,
+            has_cursor_last_key: false,
+            cursor_token: [0u8; MAX_TOKEN_SIZE],
+            cursor_token_len: 0,
+            has_cursor_token: false,
+            spawned: InlineVec::new(),
+        }
+    }
+
+    /// Reset logical lengths/flags without clearing backing bytes.
+    ///
+    /// Existing borrowed views become stale after reset.
+    pub(crate) fn reset(&mut self) {
+        self.spec_start_len = 0;
+        self.spec_end_len = 0;
+        self.spec_metadata_len = 0;
+        self.cursor_last_key_len = 0;
+        self.has_cursor_last_key = false;
+        self.cursor_token_len = 0;
+        self.has_cursor_token = false;
+        self.spawned = InlineVec::new();
+    }
+
+    /// Copy spec bytes into scratch-owned storage.
+    ///
+    /// Inputs are validated against shard/key metadata size ceilings and then
+    /// copied. No caller references are retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start`, `end`, or `metadata` exceed their respective size
+    /// ceilings. These asserts are defense-in-depth: callers read spec data
+    /// from a `PooledShardSpec` slab that only stores pre-validated specs,
+    /// so a ceiling breach here indicates slab corruption. Panicking
+    /// immediately is safer than writing truncated data.
+    pub(crate) fn write_spec(&mut self, start: &[u8], end: &[u8], metadata: &[u8]) {
+        assert!(
+            start.len() <= MAX_KEY_SIZE,
+            "spec start exceeds MAX_KEY_SIZE"
+        );
+        assert!(end.len() <= MAX_KEY_SIZE, "spec end exceeds MAX_KEY_SIZE");
+        assert!(
+            metadata.len() <= crate::coordination::shard_spec::MAX_METADATA_SIZE,
+            "spec metadata exceeds MAX_METADATA_SIZE",
+        );
+        self.spec_start[..start.len()].copy_from_slice(start);
+        self.spec_start_len = start.len();
+        self.spec_end[..end.len()].copy_from_slice(end);
+        self.spec_end_len = end.len();
+        self.spec_metadata[..metadata.len()].copy_from_slice(metadata);
+        self.spec_metadata_len = metadata.len();
+    }
+
+    /// Copy cursor bytes into scratch-owned storage.
+    ///
+    /// `None` clears the corresponding field; `token` is stored only when
+    /// present in input. No caller references are retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` or `token` exceed their respective size ceilings.
+    /// Same defense-in-depth rationale as [`write_spec`](Self::write_spec):
+    /// cursor bytes originate from pooled slab storage that enforces size
+    /// limits at write time, so a breach here is internal corruption.
+    pub(crate) fn write_cursor(&mut self, last_key: Option<&[u8]>, token: Option<&[u8]>) {
+        match last_key {
+            Some(last_key) => {
+                assert!(
+                    last_key.len() <= MAX_KEY_SIZE,
+                    "cursor last_key exceeds MAX_KEY_SIZE",
+                );
+                self.cursor_last_key[..last_key.len()].copy_from_slice(last_key);
+                self.cursor_last_key_len = last_key.len();
+                self.has_cursor_last_key = true;
+            }
+            None => {
+                self.cursor_last_key_len = 0;
+                self.has_cursor_last_key = false;
+            }
+        }
+        match token {
+            Some(token) => {
+                assert!(
+                    token.len() <= MAX_TOKEN_SIZE,
+                    "cursor token exceeds MAX_TOKEN_SIZE"
+                );
+                self.cursor_token[..token.len()].copy_from_slice(token);
+                self.cursor_token_len = token.len();
+                self.has_cursor_token = true;
+            }
+            None => {
+                self.cursor_token_len = 0;
+                self.has_cursor_token = false;
+            }
+        }
+    }
+
+    /// Copy lineage IDs into scratch-owned inline storage.
+    pub(crate) fn write_spawned(&mut self, spawned: &[ShardId]) {
+        self.spawned = InlineVec::from_slice(spawned);
+    }
+
+    /// Borrow a spec view over the currently written scratch bytes.
+    fn spec_view(&self) -> ShardSpecRef<'_> {
+        ShardSpecRef::new(
+            &self.spec_start[..self.spec_start_len],
+            &self.spec_end[..self.spec_end_len],
+            &self.spec_metadata[..self.spec_metadata_len],
+        )
+    }
+
+    /// Borrow a cursor view over the currently written scratch bytes.
+    ///
+    /// Invariant preserved: token-only state is never produced.
+    fn cursor_view(&self) -> CursorUpdate<'_> {
+        match (
+            self.has_cursor_last_key,
+            self.has_cursor_token && self.has_cursor_last_key,
+        ) {
+            (false, _) => CursorUpdate::initial(),
+            (true, false) => CursorUpdate::new(&self.cursor_last_key[..self.cursor_last_key_len]),
+            (true, true) => CursorUpdate::with_token(
+                &self.cursor_last_key[..self.cursor_last_key_len],
+                &self.cursor_token[..self.cursor_token_len],
+            ),
+        }
+    }
+
+    /// Build a borrowed snapshot view backed by this scratch buffer.
+    ///
+    /// Returned references remain valid only until this scratch is next
+    /// mutated or dropped.
+    pub(crate) fn view(
+        &self,
+        status: ShardStatus,
+        cursor_semantics: CursorSemantics,
+        parent: Option<ShardId>,
+    ) -> ShardSnapshotView<'_> {
+        ShardSnapshotView {
+            status,
+            spec: self.spec_view(),
+            cursor: self.cursor_view(),
+            cursor_semantics,
+            parent,
+            spawned: self.spawned.as_slice(),
+        }
+    }
+}
+
+/// Result of a successful `acquire_and_restore_into` operation.
 ///
 /// Contains everything a worker needs to start or resume scanning:
 /// - `lease`: proof of ownership with fencing token
@@ -1266,11 +1575,26 @@ const _: () = assert!(core::mem::size_of::<AcquireResult>() <= 288);
 /// The outcome of an idempotent operation: either freshly executed or
 /// replayed from the op-log.
 ///
-/// Callers generally don't need to distinguish -- the result is the same
-/// either way. Use [`into_inner`](Self::into_inner) to discard the
-/// execution-path metadata. The `Executed` vs `Replayed` distinction
-/// exists for observability: metrics can track retry rates, and logging
-/// can flag unexpected replay storms.
+/// ## Design Rationale
+///
+/// Most callers do not need to distinguish `Executed` from `Replayed` — the
+/// result `T` is the same either way. Use [`into_inner`](Self::into_inner)
+/// to discard the execution-path metadata. The distinction exists for two
+/// observability use cases:
+///
+/// 1. **Retry rate tracking**: production metrics can count `is_replay()`
+///    results to detect client-side retry storms or network instability.
+/// 2. **Correctness auditing**: simulation tests can assert that a
+///    deliberately-repeated operation returns `Replayed` (confirming the
+///    op-log detected the duplicate) rather than silently re-executing.
+///
+/// ## Generic over `T`
+///
+/// - Checkpoint and complete return `IdempotentOutcome<()>` (the operation
+///   either succeeded or was replayed, with no additional data).
+/// - `split_replace` returns `IdempotentOutcome<SplitReplaceResult>` (carrying
+///   the child shard IDs).
+/// - `split_residual` returns `IdempotentOutcome<SplitResidualResult>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 #[must_use = "idempotent outcome should be inspected"]

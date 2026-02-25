@@ -19,7 +19,9 @@
 use std::fmt;
 
 use blake3::Hasher;
+use gossip_stdx::{ByteSlab, SlabFull};
 
+use crate::coordination::pooled::PooledShardSpec;
 use crate::identity::CanonicalBytes;
 
 /// Re-exported from [`super::cursor`] — single source of truth for the
@@ -108,6 +110,136 @@ const _: () = assert!(CursorSemantics::Completed as u8 == 0);
 const _: () = assert!(CursorSemantics::Dispatched as u8 == 1);
 
 // ============================================================================
+// ShardSpecRef
+// ============================================================================
+
+/// Borrowed shard-spec view.
+///
+/// This is the allocation-free companion to [`ShardSpec`], used for B3 hot-path
+/// APIs that must avoid per-call heap traffic. It borrows caller-owned buffers
+/// and is therefore valid only for the lifetime of those buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardSpecRef<'a> {
+    key_range_start: &'a [u8],
+    key_range_end: &'a [u8],
+    metadata: &'a [u8],
+}
+
+impl<'a> ShardSpecRef<'a> {
+    /// Construct a borrowed shard-spec view from raw slices.
+    ///
+    /// This constructor is intentionally lightweight and performs no
+    /// validation. Call [`ShardSpec::validate_ref`] (or
+    /// [`ShardSpec::try_from_ref`]) before persisting or trusting external
+    /// input.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        key_range_start: &'a [u8],
+        key_range_end: &'a [u8],
+        metadata: &'a [u8],
+    ) -> Self {
+        Self {
+            key_range_start,
+            key_range_end,
+            metadata,
+        }
+    }
+
+    /// Unbounded key range with empty metadata.
+    #[inline]
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self::new(&[], &[], &[])
+    }
+
+    /// Inclusive lower bound of the key range.
+    #[inline]
+    #[must_use]
+    pub fn key_range_start(self) -> &'a [u8] {
+        self.key_range_start
+    }
+
+    /// Exclusive upper bound of the key range.
+    #[inline]
+    #[must_use]
+    pub fn key_range_end(self) -> &'a [u8] {
+        self.key_range_end
+    }
+
+    /// Connector-opaque metadata.
+    #[inline]
+    #[must_use]
+    pub fn metadata(self) -> &'a [u8] {
+        self.metadata
+    }
+
+    /// Returns `true` if the key range has no lower bound.
+    #[inline]
+    #[must_use]
+    pub fn is_start_unbounded(self) -> bool {
+        self.key_range_start.is_empty()
+    }
+
+    /// Returns `true` if the key range has no upper bound.
+    #[inline]
+    #[must_use]
+    pub fn is_end_unbounded(self) -> bool {
+        self.key_range_end.is_empty()
+    }
+
+    /// Returns `true` if the shard covers the entire keyspace.
+    #[inline]
+    #[must_use]
+    pub fn is_unbounded(self) -> bool {
+        self.is_start_unbounded() && self.is_end_unbounded()
+    }
+
+    /// Check whether a key falls within this shard's key range.
+    #[inline]
+    #[must_use]
+    pub fn contains_key(self, key: &[u8]) -> bool {
+        let above_start = self.is_start_unbounded() || key >= self.key_range_start;
+        let below_end = self.is_end_unbounded() || key < self.key_range_end;
+        above_start && below_end
+    }
+}
+
+impl CanonicalBytes for ShardSpecRef<'_> {
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.key_range_start.write_canonical(h);
+        self.key_range_end.write_canonical(h);
+        self.metadata.write_canonical(h);
+    }
+}
+
+/// Conversion trait for APIs that accept borrowed spec views.
+///
+/// This allows callers to pass either a direct [`ShardSpecRef`] or a borrowed
+/// [`&ShardSpec`](ShardSpec) view without allocation.
+///
+/// Implementations must produce a [`ShardSpecRef`] whose lifetime reflects the
+/// true ownership of the underlying bytes. The result is call-scoped input:
+/// consuming APIs copy bytes into their own storage before returning.
+pub trait IntoShardSpecRef<'a> {
+    /// Produce a borrowed shard-spec view for call-scoped validation/encoding.
+    fn into_spec_ref(self) -> ShardSpecRef<'a>;
+}
+
+impl<'a> IntoShardSpecRef<'a> for ShardSpecRef<'a> {
+    fn into_spec_ref(self) -> ShardSpecRef<'a> {
+        self
+    }
+}
+
+impl<'a> IntoShardSpecRef<'a> for &'a ShardSpec {
+    fn into_spec_ref(self) -> ShardSpecRef<'a> {
+        self.as_ref()
+    }
+}
+
+// ============================================================================
 // ShardSpec
 // ============================================================================
 
@@ -187,6 +319,72 @@ pub struct ShardSpec {
 }
 
 impl ShardSpec {
+    /// Borrow this spec as a [`ShardSpecRef`].
+    #[inline]
+    #[must_use]
+    pub fn as_ref(&self) -> ShardSpecRef<'_> {
+        ShardSpecRef::new(
+            self.key_range_start(),
+            self.key_range_end(),
+            self.metadata(),
+        )
+    }
+
+    /// Validate a borrowed spec view.
+    ///
+    /// # Errors
+    ///
+    /// - [`ShardSpecInputError::KeyTooLarge`] when `start` or `end` exceeds
+    ///   [`MAX_KEY_SIZE`].
+    /// - [`ShardSpecInputError::MetadataTooLarge`] when `metadata` exceeds
+    ///   [`MAX_METADATA_SIZE`].
+    /// - [`ShardSpecInputError::InvertedRange`] when both bounds are non-empty
+    ///   and `start >= end`.
+    pub fn validate_ref(spec: ShardSpecRef<'_>) -> Result<(), ShardSpecInputError> {
+        if spec.key_range_start().len() > MAX_KEY_SIZE {
+            return Err(ShardSpecInputError::KeyTooLarge {
+                size: spec.key_range_start().len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if spec.key_range_end().len() > MAX_KEY_SIZE {
+            return Err(ShardSpecInputError::KeyTooLarge {
+                size: spec.key_range_end().len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if spec.metadata().len() > MAX_METADATA_SIZE {
+            return Err(ShardSpecInputError::MetadataTooLarge {
+                size: spec.metadata().len(),
+                max: MAX_METADATA_SIZE,
+            });
+        }
+        if !spec.key_range_start().is_empty()
+            && !spec.key_range_end().is_empty()
+            && spec.key_range_start() >= spec.key_range_end()
+        {
+            return Err(ShardSpecInputError::InvertedRange {
+                start_len: spec.key_range_start().len(),
+                end_len: spec.key_range_end().len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Materialize an owned [`ShardSpec`] from a borrowed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::validate_ref`].
+    pub fn try_from_ref(spec: ShardSpecRef<'_>) -> Result<Self, ShardSpecInputError> {
+        Self::validate_ref(spec)?;
+        Ok(Self {
+            key_range_start: spec.key_range_start().into(),
+            key_range_end: spec.key_range_end().into(),
+            metadata: spec.metadata().into(),
+        })
+    }
+
     /// Unbounded shard covering the entire keyspace, no metadata.
     #[must_use = "creates a shard spec that should be stored or used"]
     pub fn unbounded() -> Self {
@@ -318,6 +516,7 @@ impl ShardSpec {
     /// from slab-backed bytes (which were originally validated on creation).
     /// Also available in test builds for constructing intentionally invalid
     /// specs.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_raw_parts(
         key_range_start: Box<[u8]>,
         key_range_end: Box<[u8]>,
@@ -461,10 +660,178 @@ impl fmt::Display for ShardSpecInputError {
 impl std::error::Error for ShardSpecInputError {}
 
 // ============================================================================
+// ShardArena
+// ============================================================================
+
+/// Opaque handle for a spec allocated in [`ShardArena`].
+///
+/// Handles are slot + generation pairs. The generation prevents use-after-free:
+/// freeing a slot increments the generation, so stale handles pointing to the
+/// same slot index are detected and rejected by `view_spec`. Handles are `Copy`
+/// (cheap to pass around) but the underlying bytes live in the arena's slab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShardSpecHandle {
+    slot: u32,
+    generation: u32,
+}
+
+#[derive(Debug)]
+struct ArenaSlot {
+    generation: u32,
+    spec: Option<PooledShardSpec>,
+}
+
+/// Startup-preallocated arena for persistent shard specs.
+///
+/// `ShardArena` stores spec bytes in a shared [`ByteSlab`] and tracks live
+/// entries with generational slot handles ([`ShardSpecHandle`]). Allocation is
+/// bounded by both byte capacity and slot capacity; runtime calls never touch
+/// the global allocator once the arena itself is provisioned.
+///
+/// ## When to Use
+///
+/// Use `ShardArena` when specs are long-lived and frequently accessed by
+/// reference (e.g., the run-level manifest that maps shard IDs to their
+/// specs). For short-lived, per-operation spec views, prefer borrowing
+/// directly via [`ShardSpecRef`].
+///
+/// ## Generational Slots
+///
+/// Each slot carries a `generation` counter. Freeing a slot increments the
+/// generation so that stale [`ShardSpecHandle`] values (pointing to the same
+/// slot index but an earlier generation) are detected by `view_spec` and
+/// cause a panic rather than silently returning unrelated data. The generation
+/// wraps at `u32::MAX`; in practice, a single slot would need 4 billion
+/// alloc/free cycles to wrap, which is not a realistic concern.
+///
+/// ## Cleanup
+///
+/// `ShardArena` does not implement `Drop` for individual specs. Callers
+/// must call [`free_spec`](Self::free_spec) to release slab bytes. Dropping
+/// the arena drops the slab, reclaiming all memory at once.
+pub struct ShardArena {
+    slab: ByteSlab,
+    slots: Vec<ArenaSlot>,
+    free_slots: Vec<u32>,
+}
+
+impl ShardArena {
+    /// Create a new arena with fixed slot and byte capacity.
+    #[must_use]
+    pub fn with_capacity(spec_slots: usize, byte_capacity: usize) -> Self {
+        let mut slots = Vec::with_capacity(spec_slots);
+        let mut free_slots = Vec::with_capacity(spec_slots);
+        for i in 0..spec_slots {
+            slots.push(ArenaSlot {
+                generation: 0,
+                spec: None,
+            });
+            free_slots.push((spec_slots - 1 - i) as u32);
+        }
+        Self {
+            slab: ByteSlab::with_capacity(byte_capacity),
+            slots,
+            free_slots,
+        }
+    }
+
+    /// Allocate a spec in the arena and return a stable slot handle.
+    ///
+    /// The spec bytes are copied into arena-owned storage. The returned handle
+    /// is independent of the caller's input buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlabFull`] when either:
+    /// - the slab lacks byte capacity for this spec, or
+    /// - no free slots remain.
+    pub fn alloc_spec(&mut self, spec: ShardSpecRef<'_>) -> Result<ShardSpecHandle, SlabFull> {
+        assert!(
+            ShardSpec::validate_ref(spec).is_ok(),
+            "alloc_spec called with invalid ShardSpecRef; callers must validate first"
+        );
+        let Some(slot_index) = self.free_slots.pop() else {
+            return Err(SlabFull {
+                requested: 1,
+                available: 0,
+            });
+        };
+
+        let pooled = match PooledShardSpec::from_spec_ref(spec, &mut self.slab) {
+            Ok(pooled) => pooled,
+            Err(err) => {
+                self.free_slots.push(slot_index);
+                return Err(err);
+            }
+        };
+
+        let slot = &mut self.slots[slot_index as usize];
+        assert!(slot.spec.is_none(), "free slot unexpectedly occupied");
+        slot.spec = Some(pooled);
+
+        Ok(ShardSpecHandle {
+            slot: slot_index,
+            generation: slot.generation,
+        })
+    }
+
+    /// Borrow a spec view from a previously allocated handle.
+    ///
+    /// The returned view borrows arena-owned bytes and stays valid while the
+    /// handle remains allocated. Once the handle is freed, any previously
+    /// returned view must be considered invalid for future use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` is stale or invalid.
+    #[must_use]
+    pub fn view_spec(&self, handle: &ShardSpecHandle) -> ShardSpecRef<'_> {
+        let slot = self
+            .slots
+            .get(handle.slot as usize)
+            .expect("ShardArena::view_spec: invalid slot");
+        assert_eq!(
+            slot.generation, handle.generation,
+            "ShardArena::view_spec: stale handle generation",
+        );
+        slot.spec
+            .as_ref()
+            .expect("ShardArena::view_spec: handle points to a freed slot")
+            .as_spec_ref(&self.slab)
+    }
+
+    /// Free a previously allocated handle.
+    ///
+    /// Stale or already-freed handles are ignored (returns silently).
+    /// In debug builds, an invalid slot index triggers a debug_assert
+    /// to catch corrupted handles early.
+    pub fn free_spec(&mut self, handle: ShardSpecHandle) {
+        let Some(slot) = self.slots.get_mut(handle.slot as usize) else {
+            debug_assert!(false, "free_spec: invalid slot index {}", handle.slot);
+            return;
+        };
+        if slot.generation != handle.generation {
+            return;
+        }
+        let Some(spec) = slot.spec.take() else {
+            return;
+        };
+        spec.deallocate(&mut self.slab);
+        slot.generation = slot.generation.wrapping_add(1);
+        self.free_slots.push(handle.slot);
+    }
+}
+
+// ============================================================================
 // Split Validation
 // ============================================================================
 
 /// Whether a shard limit breach is per-tenant or global.
+///
+/// Split operations check both per-tenant and global shard count ceilings
+/// before creating new children. This enum distinguishes which ceiling was
+/// hit, enabling callers to produce targeted error messages (e.g., "tenant
+/// X is at the limit" vs "system-wide limit reached").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardLimitScope {
     /// Per-tenant shard count limit.
@@ -486,6 +853,19 @@ impl fmt::Display for ShardLimitScope {
 /// [`validate_split_coverage`], [`validate_residual_split`], and the
 /// coordinator's cursor-bounds check — when proposed child shards do
 /// not form a valid partition of the parent's key range.
+///
+/// ## Security-Sensitive Variants
+///
+/// `SpawnLimitExceeded` and `ShardLimitExceeded` are resource exhaustion
+/// guards that prevent a malicious or buggy worker from creating unbounded
+/// shards via repeated splits. `DerivedIdCollision` is an astronomically
+/// unlikely BLAKE3 collision that the system handles gracefully rather
+/// than panicking on external input.
+///
+/// ## Display Redaction
+///
+/// Byte field lengths are shown instead of raw content in `Display` output,
+/// consistent with the cursor redaction policy in [`CoordError`](super::error::CoordError).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SplitValidationError {
@@ -564,6 +944,13 @@ pub enum SplitValidationError {
     DerivedIdCollision {
         derived_id: crate::identity::ShardId,
     },
+
+    /// A child spec exceeds size limits (`MAX_KEY_SIZE` or `MAX_METADATA_SIZE`).
+    ///
+    /// `ShardSpecRef` is intentionally unvalidated at construction time;
+    /// this variant surfaces when the coordinator's precondition check
+    /// detects oversized fields before they reach `AcquireScratch::write_spec`.
+    InvalidChildSpec { child_index: usize },
 }
 
 impl fmt::Display for SplitValidationError {
@@ -646,6 +1033,13 @@ impl fmt::Display for SplitValidationError {
             Self::DerivedIdCollision { derived_id } => {
                 write!(f, "derived shard id collision: {derived_id:?}")
             }
+            Self::InvalidChildSpec { child_index } => {
+                write!(
+                    f,
+                    "child {child_index} spec exceeds size limits \
+                     (MAX_KEY_SIZE or MAX_METADATA_SIZE)",
+                )
+            }
         }
     }
 }
@@ -688,24 +1082,48 @@ impl std::error::Error for SplitValidationError {}
 /// Reference: CockroachDB range split/merge validation; Spanner tablet
 /// split with key-range continuity check.
 #[must_use = "returns a Result that must be checked for validation errors"]
-pub fn validate_split_coverage(
-    parent: &ShardSpec,
-    children: &[&ShardSpec],
-) -> Result<(), SplitValidationError> {
-    validate_split_coverage_bounds(parent.key_range_start(), parent.key_range_end(), children)
+pub fn validate_split_coverage<'a, P, C>(
+    parent: P,
+    children: &[C],
+) -> Result<(), SplitValidationError>
+where
+    P: IntoShardSpecRef<'a>,
+    C: Copy + IntoShardSpecRef<'a>,
+{
+    let parent = parent.into_spec_ref();
+    let children: Vec<ShardSpecRef<'a>> = children
+        .iter()
+        .copied()
+        .map(IntoShardSpecRef::into_spec_ref)
+        .collect();
+    validate_split_coverage_bounds(parent.key_range_start(), parent.key_range_end(), &children)
 }
 
-/// Validate split coverage using borrowed parent bounds.
+/// Validate split coverage using borrowed parent bounds (slab-friendly variant).
 ///
-/// Equivalent to [`validate_split_coverage`] but avoids requiring an owned
-/// parent `ShardSpec` when callers already have borrowed range bounds.
-/// This is the preferred entry point for pooled-record hot paths where
-/// parent bounds are already available as slab-backed slices.
+/// Equivalent to [`validate_split_coverage`] but takes `parent_start` and
+/// `parent_end` as raw slices rather than requiring a `ShardSpec` or
+/// `ShardSpecRef`. This is the preferred entry point for the coordinator's
+/// pooled-record hot paths where parent bounds are already available as
+/// slab-backed `&[u8]` slices — no temporary `ShardSpec` materialization needed.
+///
+/// ## Algorithm
+///
+/// 1. Sort children by `key_range_start` (preserving original indices for errors).
+/// 2. Assert first child's start matches parent's start.
+/// 3. Assert last child's end matches parent's end.
+/// 4. Walk adjacent pairs, checking contiguity (`child[i].end == child[i+1].start`).
+/// 5. Reject any child with an inverted range (`start >= end`).
+///
+/// ## Complexity
+///
+/// O(N log N) for the sort, O(N) for the linear contiguity scan,
+/// where N is the number of children.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_split_coverage_bounds(
     parent_start: &[u8],
     parent_end: &[u8],
-    children: &[&ShardSpec],
+    children: &[ShardSpecRef<'_>],
 ) -> Result<(), SplitValidationError> {
     if children.is_empty() {
         return Err(SplitValidationError::NoChildren);
@@ -717,7 +1135,8 @@ pub fn validate_split_coverage_bounds(
 
     // Pair each child with its original index, then sort by start key.
     // This lets us report the caller's input indices in errors.
-    let mut indexed: Vec<(usize, &ShardSpec)> = children.iter().copied().enumerate().collect();
+    let mut indexed: Vec<(usize, ShardSpecRef<'_>)> =
+        children.iter().copied().enumerate().collect();
     indexed.sort_by(|a, b| a.1.key_range_start().cmp(b.1.key_range_start()));
 
     // First child start == parent start.
@@ -776,18 +1195,16 @@ pub fn validate_split_coverage_bounds(
         }
     }
 
-    // Defense-in-depth: child keys derive from parent range boundaries.
-    // If parent was validated, children cannot exceed MAX_KEY_SIZE.
-    // This assert catches logic bugs where specs are constructed without validation.
-    for &(_, child) in &indexed {
-        assert!(
-            child.key_range_start().len() <= MAX_KEY_SIZE,
-            "child start key exceeds MAX_KEY_SIZE"
-        );
-        assert!(
-            child.key_range_end().len() <= MAX_KEY_SIZE || child.key_range_end().is_empty(),
-            "child end key exceeds MAX_KEY_SIZE"
-        );
+    // Validate per-spec size limits. ShardSpecRef is intentionally
+    // unvalidated at construction; this gate prevents oversized fields
+    // (keys or metadata) from reaching AcquireScratch::write_spec's
+    // panicking asserts.
+    for &(orig_idx, child) in &indexed {
+        if ShardSpec::validate_ref(child).is_err() {
+            return Err(SplitValidationError::InvalidChildSpec {
+                child_index: orig_idx,
+            });
+        }
     }
 
     debug_assert!(indexed.first().unwrap().1.key_range_start() == parent_start);
@@ -826,11 +1243,19 @@ pub fn validate_split_coverage_bounds(
 /// - Any error from [`validate_split_coverage`] when the two children
 ///   don't form a valid partition.
 #[must_use = "returns a Result that must be checked for validation errors"]
-pub fn validate_residual_split(
-    old_parent: &ShardSpec,
-    new_parent: &ShardSpec,
-    residual: &ShardSpec,
-) -> Result<(), SplitValidationError> {
+pub fn validate_residual_split<'a, O, N, R>(
+    old_parent: O,
+    new_parent: N,
+    residual: R,
+) -> Result<(), SplitValidationError>
+where
+    O: IntoShardSpecRef<'a>,
+    N: IntoShardSpecRef<'a>,
+    R: IntoShardSpecRef<'a>,
+{
+    let old_parent = old_parent.into_spec_ref();
+    let new_parent = new_parent.into_spec_ref();
+    let residual = residual.into_spec_ref();
     validate_residual_split_bounds(
         old_parent.key_range_start(),
         old_parent.key_range_end(),
@@ -839,18 +1264,18 @@ pub fn validate_residual_split(
     )
 }
 
-/// Validate residual split using borrowed old-parent bounds.
+/// Validate residual split using borrowed old-parent bounds (slab-friendly variant).
 ///
-/// Equivalent to [`validate_residual_split`] but avoids requiring an owned
-/// old-parent `ShardSpec` when callers already have borrowed bounds.
-/// Used by coordinator split precondition checks to avoid materializing
-/// temporary parent specs from pooled storage.
+/// Same semantics as [`validate_residual_split`] but takes raw `&[u8]`
+/// slices for the old parent's range bounds rather than a full spec.
+/// Used by the coordinator's split precondition checks to avoid
+/// materializing a temporary `ShardSpec` from pooled slab storage.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn validate_residual_split_bounds(
     old_parent_start: &[u8],
     old_parent_end: &[u8],
-    new_parent: &ShardSpec,
-    residual: &ShardSpec,
+    new_parent: ShardSpecRef<'_>,
+    residual: ShardSpecRef<'_>,
 ) -> Result<(), SplitValidationError> {
     // The parent must keep the left (lower) portion of the range.
     if new_parent.key_range_start() != old_parent_start {

@@ -68,7 +68,9 @@ fn decode_manifest_row_key_rejects_non_fixed_width_inputs() {
 
 #[test]
 fn shard_spec_from_manifest_range_encodes_boundaries() {
-    let spec = shard_spec_from_manifest_range(7, 11, 12, b"meta")
+    let mut start_buf = KeyBuf::new();
+    let mut end_buf = KeyBuf::new();
+    let spec = shard_spec_from_manifest_range_ref(7, 11, 12, b"meta", &mut start_buf, &mut end_buf)
         .expect("manifest range should encode into a valid shard spec");
 
     let start = decode_manifest_row_key(spec.key_range_start()).expect("valid start encoding");
@@ -82,21 +84,25 @@ fn shard_spec_from_manifest_range_encodes_boundaries() {
 
 #[test]
 fn shard_spec_from_prefix_rejects_all_ff_prefix() {
-    let err = shard_spec_from_prefix(&[u8::MAX, u8::MAX], b"meta")
+    let mut successor_buf = KeyBuf::new();
+    let err = shard_spec_from_prefix_ref(&[u8::MAX, u8::MAX], b"meta", &mut successor_buf)
         .expect_err("all-ff prefix should not have a lexicographic successor");
     assert_eq!(err, PrefixShardError::NoSuccessor);
 }
 
 #[test]
 fn shard_spec_from_prefix_rejects_empty_prefix() {
-    let err = shard_spec_from_prefix(b"", b"meta").expect_err("empty prefix should be rejected");
+    let mut successor_buf = KeyBuf::new();
+    let err = shard_spec_from_prefix_ref(b"", b"meta", &mut successor_buf)
+        .expect_err("empty prefix should be rejected");
     assert_eq!(err, PrefixShardError::EmptyPrefix);
 }
 
 #[test]
 fn shard_spec_from_prefix_rejects_oversized_prefix() {
     let oversized = vec![0xAB; MAX_KEY_SIZE + 1];
-    let err = shard_spec_from_prefix(&oversized, b"meta")
+    let mut successor_buf = KeyBuf::new();
+    let err = shard_spec_from_prefix_ref(&oversized, b"meta", &mut successor_buf)
         .expect_err("oversized prefix should fail early");
     assert_eq!(
         err,
@@ -118,8 +124,16 @@ fn shard_spec_from_keys_surfaces_oversized_encoded_boundary() {
         }
     }
 
-    let err = shard_spec_from_keys(&OversizedKey, &ManifestRowKey::new(1, 1), b"meta")
-        .expect_err("oversized encoded key should be rejected by ShardSpec validation");
+    let mut start_buf = KeyBuf::new();
+    let mut end_buf = KeyBuf::new();
+    let err = shard_spec_from_keys_ref(
+        &OversizedKey,
+        &ManifestRowKey::new(1, 1),
+        b"meta",
+        &mut start_buf,
+        &mut end_buf,
+    )
+    .expect_err("oversized encoded key should be rejected by ShardSpec validation");
     assert_eq!(
         err,
         ShardSpecInputError::KeyTooLarge {
@@ -321,7 +335,8 @@ proptest! {
         prefix in proptest::collection::vec(any::<u8>(), 1..=32),
     ) {
         prop_assume!(prefix.iter().any(|&b| b != u8::MAX));
-        let spec = shard_spec_from_prefix(&prefix, b"meta");
+        let mut successor_buf = KeyBuf::new();
+        let spec = shard_spec_from_prefix_ref(&prefix, b"meta", &mut successor_buf);
         let spec = match spec {
             Ok(s) => s,
             Err(PrefixShardError::InvalidShardSpec(_)) => return Ok(()),
@@ -379,7 +394,16 @@ proptest! {
         b in any::<u64>(),
     ) {
         prop_assume!(a >= b);
-        let err = shard_spec_from_manifest_range(manifest_id, a, b, b"meta")
+        let mut start_buf = KeyBuf::new();
+        let mut end_buf = KeyBuf::new();
+        let err = shard_spec_from_manifest_range_ref(
+            manifest_id,
+            a,
+            b,
+            b"meta",
+            &mut start_buf,
+            &mut end_buf,
+        )
             .expect_err("start_row >= end_row should produce InvertedRange");
         prop_assert!(
             matches!(err, ShardSpecInputError::InvertedRange { .. }),

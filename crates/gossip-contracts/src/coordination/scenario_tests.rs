@@ -34,10 +34,10 @@ use std::collections::HashSet;
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::CheckpointError;
-use crate::coordination::facade::{ClaimError, ShardClaiming};
+use crate::coordination::facade::ClaimError;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardStatus;
-use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
+use crate::coordination::run::{InitialShardInput, RunManagement, RunStatus};
 use crate::coordination::run_errors::{RegisterShardsError, RunTransitionError};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::split::SplitResidualPlan;
@@ -57,7 +57,7 @@ use crate::sim::backend::SimIntrospection;
 ///
 /// Manually constructs the coordinator (no `seeded_coordinator`) to exercise
 /// the full setup sequence: `create_run` -> `register_shards` ->
-/// `acquire_and_restore` -> three checkpoints with advancing cursors ->
+/// `acquire_and_restore_into` -> three checkpoints with advancing cursors ->
 /// `complete` (shard) -> `complete_run`.
 ///
 /// Verifies: shard starts Active after registration, cursor advances
@@ -74,10 +74,12 @@ fn scenario_full_run_lifecycle() {
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     // -- Register one shard [a, z) --
-    let shards = vec![InitialShard::new(
+    let spec = test_spec();
+    let cursor = Cursor::initial();
+    let shards = vec![InitialShardInput::new(
         test_shard(),
-        test_spec(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let reg_outcome = coord
         .register_shards(now(2), tenant, run, &shards, OpId::from_raw(u64::MAX))
@@ -99,9 +101,7 @@ fn scenario_full_run_lifecycle() {
     );
 
     // -- Acquire shard --
-    let result = coord
-        .acquire_and_restore(now(3), tenant, key, test_worker(1))
-        .unwrap();
+    let result = acquire_result(&mut coord, now(3), tenant, key, test_worker(1)).unwrap();
     let lease = result.lease;
 
     // -- Checkpoint x3 with progressively advancing cursors --
@@ -218,9 +218,8 @@ fn scenario_lease_expiry_and_reacquire() {
 
     // -- W2 acquires after lease expiry --
     let expired_time = 10 + LEASE_DURATION + 1;
-    let result2 = coord
-        .acquire_and_restore(now(expired_time), tenant, key, test_worker(2))
-        .unwrap();
+    let result2 =
+        acquire_result(&mut coord, now(expired_time), tenant, key, test_worker(2)).unwrap();
     let lease2 = result2.lease;
 
     // Verify the snapshot restores cursor "f".
@@ -295,6 +294,9 @@ fn scenario_split_replace_and_children_completion() {
         .into_inner();
     let children = split_result.children;
     assert_eq!(children.len(), 2, "split should produce exactly 2 children");
+    let children = children.as_slice();
+    let child1 = children[0];
+    let child2 = children[1];
 
     // Verify parent is now Split.
     let parent_record = coord.shard_lookup(&tenant, &key).unwrap();
@@ -305,10 +307,9 @@ fn scenario_split_replace_and_children_completion() {
     );
 
     // -- Acquire and complete child 1 [a,m) --
-    let child1_key = ShardKey::new(test_run(), children[0]);
-    let child1_result = coord
-        .acquire_and_restore(now(12), tenant, child1_key, test_worker(1))
-        .unwrap();
+    let child1_key = ShardKey::new(test_run(), child1);
+    let child1_result =
+        acquire_result(&mut coord, now(12), tenant, child1_key, test_worker(1)).unwrap();
     let child1_lease = child1_result.lease;
     let _ = coord
         .checkpoint(
@@ -330,10 +331,9 @@ fn scenario_split_replace_and_children_completion() {
         .unwrap();
 
     // -- Acquire and complete child 2 [m,z) --
-    let child2_key = ShardKey::new(test_run(), children[1]);
-    let child2_result = coord
-        .acquire_and_restore(now(15), tenant, child2_key, test_worker(2))
-        .unwrap();
+    let child2_key = ShardKey::new(test_run(), child2);
+    let child2_result =
+        acquire_result(&mut coord, now(15), tenant, child2_key, test_worker(2)).unwrap();
     let child2_lease = child2_result.lease;
     let _ = coord
         .checkpoint(
@@ -434,11 +434,9 @@ fn scenario_split_chain_double_residual() {
         .unwrap();
 
     // -- Second residual split: [a,m) -> parent=[a,j), residual=[j,m) --
-    let plan2 = SplitResidualPlan::try_new(
-        ShardSpec::with_range(b"a".to_vec(), b"j".to_vec()),
-        ShardSpec::with_range(b"j".to_vec(), b"m".to_vec()),
-    )
-    .unwrap();
+    let parent_new_2 = ShardSpec::with_range(b"a".to_vec(), b"j".to_vec());
+    let residual_2 = ShardSpec::with_range(b"j".to_vec(), b"m".to_vec());
+    let plan2 = SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2.as_ref()).unwrap();
     let result2 = coord
         .split_residual(now(14), tenant, &lease, plan2, OpId::from_raw(4))
         .unwrap()
@@ -481,9 +479,7 @@ fn scenario_split_chain_double_residual() {
 
     // -- Acquire + complete residual 1 [m,z) --
     let r1_key = ShardKey::new(test_run(), residual1);
-    let r1_result = coord
-        .acquire_and_restore(now(16), tenant, r1_key, test_worker(2))
-        .unwrap();
+    let r1_result = acquire_result(&mut coord, now(16), tenant, r1_key, test_worker(2)).unwrap();
     let _ = coord
         .complete(
             now(17),
@@ -502,9 +498,7 @@ fn scenario_split_chain_double_residual() {
 
     // -- Acquire + complete residual 2 [j,m) --
     let r2_key = ShardKey::new(test_run(), residual2);
-    let r2_result = coord
-        .acquire_and_restore(now(18), tenant, r2_key, test_worker(2))
-        .unwrap();
+    let r2_result = acquire_result(&mut coord, now(18), tenant, r2_key, test_worker(2)).unwrap();
     let _ = coord
         .complete(
             now(19),
@@ -642,10 +636,12 @@ fn scenario_cancel_from_initializing() {
     );
 
     // -- register_shards on cancelled run should fail --
-    let shards = vec![InitialShard::new(
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(1),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let reg_result = coord.register_shards(now(3), tenant, run, &shards, OpId::from_raw(2));
     assert!(
@@ -721,9 +717,8 @@ fn scenario_worker_self_recovery() {
 
     // -- Time advances past lease deadline --
     let reacquire_time = 10 + LEASE_DURATION + 1;
-    let result2 = coord
-        .acquire_and_restore(now(reacquire_time), tenant, key, test_worker(1))
-        .unwrap();
+    let result2 =
+        acquire_result(&mut coord, now(reacquire_time), tenant, key, test_worker(1)).unwrap();
     let lease2 = result2.lease;
 
     // Fence must have advanced.
@@ -799,17 +794,13 @@ fn scenario_claim_contention() {
 
     let shard1 = ShardId::from_raw(1);
     let shard2 = ShardId::from_raw(2);
+    let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor1 = Cursor::initial();
+    let cursor2 = Cursor::initial();
     let shards = vec![
-        InitialShard::new(
-            shard1,
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
-        ),
-        InitialShard::new(
-            shard2,
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
+        InitialShardInput::new(shard1, spec1.as_ref(), CursorUpdate::from_cursor(&cursor1)),
+        InitialShardInput::new(shard2, spec2.as_ref(), CursorUpdate::from_cursor(&cursor2)),
     ];
     let _ = coord
         .register_shards(now(2), tenant, run, &shards, OpId::from_raw(u64::MAX))
@@ -820,7 +811,7 @@ fn scenario_claim_contention() {
     let mut failures = 0;
 
     for worker_id in 1..=3u64 {
-        match coord.claim_next_available(now(3), tenant, run, test_worker(worker_id)) {
+        match claim_result(&mut coord, now(3), tenant, run, test_worker(worker_id)) {
             Ok(result) => successes.push(result),
             Err(ClaimError::NoneAvailable { .. }) => failures += 1,
             Err(e) => panic!("worker {worker_id}: unexpected claim error: {e:?}"),

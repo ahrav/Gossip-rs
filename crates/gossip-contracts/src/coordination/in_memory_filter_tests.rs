@@ -1,20 +1,43 @@
-// -- list_shards filter correctness tests -------------------------------------
-//
-// list_shards supports predicate-based filtering (active, available,
-// parked, root_only). Tests verify each filter correctly includes or
-// excludes shards based on status, lease state, and parentage.
+//! Tests for [`ShardFilter`] predicates applied through
+//! [`RunManagement::list_shards`].
+//!
+//! `list_shards` accepts a [`ShardFilter`] that narrows the returned set by
+//! status, lease state, and parentage. Getting these predicates wrong causes
+//! workers to receive invisible shards (missed work) or stale shards
+//! (wasted retries), so each filter variant has its own focused test.
+//!
+//! # Coverage
+//!
+//! | Filter | What the test proves |
+//! |--------|----------------------|
+//! | `active()` | Includes leased Active shards, excludes Parked |
+//! | `available()` | Excludes leased shards, includes expired-lease shards |
+//! | `parked()` | Excludes Active, includes Parked |
+//! | `root_only` | Excludes split children (shards with a parent) |
+//!
+//! A property-based section follows the deterministic tests: random
+//! operation sequences must preserve shard-record invariants and the
+//! filter/capacity-hint contracts.
 
 use super::*;
-use crate::coordination::cursor::CursorUpdate;
-use crate::coordination::run::{InitialShard, RunManagement, ShardFilter};
+use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter};
 use crate::coordination::shard_spec::ShardSpec;
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, acquire_shard, coordinator_with_run_and_lease, do_split_replace, now, test_run,
-    test_tenant, test_worker,
+    LEASE_DURATION, acquire_result, acquire_shard, coordinator_with_run_and_lease,
+    do_split_replace, now, test_run, test_tenant, test_worker,
 };
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 use crate::sim::backend::SimIntrospection;
 
+// -- Deterministic filter tests -----------------------------------------------
+//
+// Each test sets up a coordinator with one shard in a known state, applies a
+// single filter predicate, and asserts exact inclusion/exclusion. The fixture
+// `coordinator_with_run_and_lease` provides an Active+leased shard; tests
+// transition it to Parked or Split as needed.
+
+/// Active filter includes leased Active shards and excludes Parked ones.
 #[test]
 fn list_shards_filter_active() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -49,6 +72,7 @@ fn list_shards_filter_active() {
     );
 }
 
+/// Available filter excludes leased shards but includes them once the lease expires.
 #[test]
 fn list_shards_filter_available() {
     let (coord, _lease) = coordinator_with_run_and_lease();
@@ -78,6 +102,7 @@ fn list_shards_filter_available() {
     );
 }
 
+/// Parked filter returns only Parked shards, empty when none are parked.
 #[test]
 fn list_shards_filter_parked() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -106,6 +131,11 @@ fn list_shards_filter_parked() {
     assert_eq!(parked_after[0].status(), ShardStatus::Parked);
 }
 
+/// `root_only` excludes split children (shards whose `parent` is `Some`).
+///
+/// After a split-replace, the parent becomes Split (root) and two children
+/// are created with `parent.is_some()`. The root_only filter must return
+/// only the parent; the `all()` filter returns parent + children.
 #[test]
 fn list_shards_filter_root_only() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
@@ -150,7 +180,7 @@ fn list_shards_filter_root_only() {
 // deterministic unit tests above by exploring operation orderings and
 // parameter combinations that a human would not enumerate by hand.
 
-use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
+use crate::coordination::split::SplitReplacePlan;
 use crate::coordination::test_fixtures::{seeded_coordinator, test_key};
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
@@ -232,9 +262,13 @@ fn apply_op(
     let ten = test_tenant();
     match op {
         Op::Acquire { worker } => {
-            if let Ok(r) =
-                coord.acquire_and_restore(now, ten, test_key(), WorkerId::from_raw(*worker as u64))
-            {
+            if let Ok(r) = acquire_result(
+                coord,
+                now,
+                ten,
+                test_key(),
+                WorkerId::from_raw(*worker as u64),
+            ) {
                 *last_lease = Some(r.lease);
             }
             (time, oc)
@@ -286,14 +320,14 @@ fn apply_op(
         }
         Op::SplitReplace => {
             if let Some(lease) = last_lease.as_ref() {
-                let child_a = SplitReplaceChild::new(
-                    ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-                    Cursor::initial(),
-                );
-                let child_b = SplitReplaceChild::new(
-                    ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-                    Cursor::initial(),
-                );
+                let spec_a = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+                let spec_b = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+                let cursor_a = Cursor::initial();
+                let cursor_b = Cursor::initial();
+                let child_a =
+                    SplitReplaceChild::new(spec_a.as_ref(), CursorUpdate::from_cursor(&cursor_a));
+                let child_b =
+                    SplitReplaceChild::new(spec_b.as_ref(), CursorUpdate::from_cursor(&cursor_b));
                 if let Ok(plan) = SplitReplacePlan::try_new(vec![child_a, child_b]) {
                     let _ = coord.split_replace(now, ten, lease, plan, OpId::from_raw(oc));
                     return (time, oc + 1);
@@ -305,7 +339,8 @@ fn apply_op(
             if let Some(lease) = last_lease.as_ref() {
                 let new_parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
                 let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-                if let Ok(plan) = SplitResidualPlan::try_new(new_parent, residual) {
+                if let Ok(plan) = SplitResidualPlan::try_new(new_parent.as_ref(), residual.as_ref())
+                {
                     let _ = coord.split_residual(now, ten, lease, plan, OpId::from_raw(oc));
                     return (time, oc + 1);
                 }
@@ -375,7 +410,7 @@ proptest! {
 
         for worker in worker_ids {
             time += LEASE_DURATION + 1; // ensure lease expired
-            if let Ok(result) = coord.acquire_and_restore(
+            if let Ok(result) = acquire_result(&mut coord,
                 LogicalTime::from_raw(time),
                 test_tenant(),
                 test_key(),
@@ -407,8 +442,7 @@ proptest! {
         let ten = test_tenant();
         // seeded_coordinator() consumes t=1 (create_run) and t=2 (register_shards),
         // so user operations must start at t=3 to preserve logical time ordering.
-        let lease = coord
-            .acquire_and_restore(
+        let lease = acquire_result(&mut coord,
                 LogicalTime::from_raw(3),
                 ten,
                 test_key(),
@@ -480,8 +514,7 @@ proptest! {
         let mut coord = seeded_coordinator();
         // seeded_coordinator() consumes t=1 (create_run) and t=2 (register_shards),
         // so user operations must start at t=3 to preserve logical time ordering.
-        let lease = coord
-            .acquire_and_restore(
+        let lease = acquire_result(&mut coord,
                 LogicalTime::from_raw(3),
                 test_tenant(),
                 test_key(),
@@ -533,6 +566,15 @@ proptest! {
 // ============================================================================
 // Capacity hint tests
 // ============================================================================
+//
+// CapacityHint is returned by acquire and renew to inform callers how many
+// shards remain available in the run. These tests verify:
+//
+// - `available_count` decrements with each successful acquisition.
+// - `earliest_deadline` tracks the minimum lease deadline across all
+//   leased shards, giving callers a backoff target when saturated.
+// - Terminal shards (Done, Parked) are excluded from the count.
+// - The half-open deadline boundary (`now < deadline`) is respected.
 
 /// Helper: create a coordinator with `n` shards in a single run.
 fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
@@ -541,15 +583,21 @@ fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
     let tenant = test_tenant();
     let run = test_run();
     coord.create_run(now(1), tenant, run, run_config()).unwrap();
-    let shards: Vec<InitialShard> = (0..n)
+    let shard_entries: Vec<_> = (0..n)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
-            InitialShard::new(
+            (
                 ShardId::from_raw(i as u64),
                 ShardSpec::with_range(start, end),
                 Cursor::initial(),
             )
+        })
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = shard_entries
+        .iter()
+        .map(|(shard, spec, cursor)| {
+            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
         })
         .collect();
     let _ = coord
@@ -565,36 +613,36 @@ fn acquire_capacity_hint_reflects_remaining() {
     let tenant = test_tenant();
     let run = test_run();
 
-    let r0 = coord
-        .acquire_and_restore(
-            now(2),
-            tenant,
-            ShardKey::new(run, ShardId::from_raw(0)),
-            test_worker(1),
-        )
-        .unwrap();
+    let r0 = acquire_result(
+        &mut coord,
+        now(2),
+        tenant,
+        ShardKey::new(run, ShardId::from_raw(0)),
+        test_worker(1),
+    )
+    .unwrap();
     assert_eq!(r0.capacity.available_count, 2);
     assert!(!r0.capacity.is_saturated());
     assert!(r0.capacity.earliest_deadline.is_some());
 
-    let r1 = coord
-        .acquire_and_restore(
-            now(2),
-            tenant,
-            ShardKey::new(run, ShardId::from_raw(1)),
-            test_worker(2),
-        )
-        .unwrap();
+    let r1 = acquire_result(
+        &mut coord,
+        now(2),
+        tenant,
+        ShardKey::new(run, ShardId::from_raw(1)),
+        test_worker(2),
+    )
+    .unwrap();
     assert_eq!(r1.capacity.available_count, 1);
 
-    let r2 = coord
-        .acquire_and_restore(
-            now(2),
-            tenant,
-            ShardKey::new(run, ShardId::from_raw(2)),
-            test_worker(3),
-        )
-        .unwrap();
+    let r2 = acquire_result(
+        &mut coord,
+        now(2),
+        tenant,
+        ShardKey::new(run, ShardId::from_raw(2)),
+        test_worker(3),
+    )
+    .unwrap();
     assert_eq!(r2.capacity.available_count, 0);
     assert!(r2.capacity.is_saturated());
     // All leases granted at now(2) with LEASE_DURATION -- earliest deadline
@@ -610,27 +658,27 @@ fn capacity_hint_earliest_deadline_is_minimum() {
     let run = test_run();
 
     // Acquire shard 0 at now(5) -> deadline = 5 + LEASE_DURATION.
-    let r0 = coord
-        .acquire_and_restore(
-            now(5),
-            tenant,
-            ShardKey::new(run, ShardId::from_raw(0)),
-            test_worker(1),
-        )
-        .unwrap();
+    let r0 = acquire_result(
+        &mut coord,
+        now(5),
+        tenant,
+        ShardKey::new(run, ShardId::from_raw(0)),
+        test_worker(1),
+    )
+    .unwrap();
     // Only shard 0 is leased; its deadline is the earliest (and only).
     assert_eq!(r0.capacity.earliest_deadline, Some(now(5 + LEASE_DURATION)),);
 
     // Acquire shard 1 at now(10) -> deadline = 10 + LEASE_DURATION.
     // Shard 0's deadline (105) < shard 1's deadline (110) -- min is 105.
-    let r1 = coord
-        .acquire_and_restore(
-            now(10),
-            tenant,
-            ShardKey::new(run, ShardId::from_raw(1)),
-            test_worker(2),
-        )
-        .unwrap();
+    let r1 = acquire_result(
+        &mut coord,
+        now(10),
+        tenant,
+        ShardKey::new(run, ShardId::from_raw(1)),
+        test_worker(2),
+    )
+    .unwrap();
     assert_eq!(
         r1.capacity.earliest_deadline,
         Some(now(5 + LEASE_DURATION)),
@@ -639,14 +687,14 @@ fn capacity_hint_earliest_deadline_is_minimum() {
 
     // Acquire shard 2 at now(2) -> deadline = 2 + LEASE_DURATION.
     // Now shard 2's deadline (102) < shard 0's (105) < shard 1's (110).
-    let r2 = coord
-        .acquire_and_restore(
-            now(2),
-            tenant,
-            ShardKey::new(run, ShardId::from_raw(2)),
-            test_worker(3),
-        )
-        .unwrap();
+    let r2 = acquire_result(
+        &mut coord,
+        now(2),
+        tenant,
+        ShardKey::new(run, ShardId::from_raw(2)),
+        test_worker(3),
+    )
+    .unwrap();
     assert_eq!(
         r2.capacity.earliest_deadline,
         Some(now(2 + LEASE_DURATION)),
@@ -677,9 +725,14 @@ fn capacity_hint_after_lease_expiry() {
     let _lease = acquire_shard(&mut coord, 3, 1);
 
     // Lease deadline = 3 + 100 = 103. At now(104), lease expired.
-    let r = coord
-        .acquire_and_restore(now(104), test_tenant(), test_key(), test_worker(2))
-        .unwrap();
+    let r = acquire_result(
+        &mut coord,
+        now(104),
+        test_tenant(),
+        test_key(),
+        test_worker(2),
+    )
+    .unwrap();
     // Just acquired the only shard -- 0 available remain.
     assert_eq!(r.capacity.available_count, 0);
 }
@@ -693,9 +746,7 @@ fn capacity_hint_excludes_terminal_shards() {
 
     // Acquire shard 0 and complete it.
     let key0 = ShardKey::new(run, ShardId::from_raw(0));
-    let r0 = coord
-        .acquire_and_restore(now(2), tenant, key0, test_worker(1))
-        .unwrap();
+    let r0 = acquire_result(&mut coord, now(2), tenant, key0, test_worker(1)).unwrap();
     let _ = coord
         .complete(
             now(3),
@@ -708,9 +759,7 @@ fn capacity_hint_excludes_terminal_shards() {
 
     // Acquire shard 1 -- shard 0 is terminal and not counted.
     let key1 = ShardKey::new(run, ShardId::from_raw(1));
-    let r1 = coord
-        .acquire_and_restore(now(4), tenant, key1, test_worker(2))
-        .unwrap();
+    let r1 = acquire_result(&mut coord, now(4), tenant, key1, test_worker(2)).unwrap();
     assert_eq!(r1.capacity.available_count, 0);
     assert!(r1.capacity.earliest_deadline.is_some());
 }
@@ -724,9 +773,7 @@ fn capacity_hint_excludes_parked_shards() {
 
     // Acquire shard 0 and park it.
     let key0 = ShardKey::new(run, ShardId::from_raw(0));
-    let r0 = coord
-        .acquire_and_restore(now(2), tenant, key0, test_worker(1))
-        .unwrap();
+    let r0 = acquire_result(&mut coord, now(2), tenant, key0, test_worker(1)).unwrap();
     let _ = coord
         .park_shard(
             now(3),
@@ -740,9 +787,7 @@ fn capacity_hint_excludes_parked_shards() {
     // Acquire shard 1 -- shard 0 is Parked (terminal), so the only active
     // shard is shard 1 which we just acquired. Available count = 0.
     let key1 = ShardKey::new(run, ShardId::from_raw(1));
-    let r1 = coord
-        .acquire_and_restore(now(4), tenant, key1, test_worker(2))
-        .unwrap();
+    let r1 = acquire_result(&mut coord, now(4), tenant, key1, test_worker(2)).unwrap();
     assert_eq!(r1.capacity.available_count, 0);
     assert!(r1.capacity.is_saturated());
     // Shard 0 is parked, shard 1 is leased -- earliest deadline reflects shard 1.
@@ -757,9 +802,14 @@ fn capacity_hint_at_deadline_boundary() {
 
     // Lease deadline = 3 + 100 = 103.
     // At now(103): now < deadline is false => lease expired.
-    let r = coord
-        .acquire_and_restore(now(103), test_tenant(), test_key(), test_worker(2))
-        .unwrap();
+    let r = acquire_result(
+        &mut coord,
+        now(103),
+        test_tenant(),
+        test_key(),
+        test_worker(2),
+    )
+    .unwrap();
     assert_eq!(r.capacity.available_count, 0);
 }
 
@@ -784,6 +834,16 @@ fn capacity_hint_helpers() {
     assert_eq!(CapacityHint::ZERO.earliest_deadline, None);
     assert!(CapacityHint::ZERO.is_saturated());
 }
+
+// ============================================================================
+// Constructor equivalence tests
+// ============================================================================
+//
+// `InMemoryCoordinator` offers multiple constructor entry points
+// (`new`, `with_limits`, `with_cooldown`, `with_runtime_config`).
+// These tests verify that constructors producing the same logical
+// configuration yield bit-identical internal state so callers can
+// migrate between constructors without behavioral drift.
 
 /// Asserts constructor wrappers are behaviorally equivalent at initialization.
 ///
@@ -872,6 +932,14 @@ fn runtime_constructor_clamps_explicit_slab_capacity_to_backend_max() {
 }
 
 // -- CoordinatorConfig memory budget smoke tests ------------------------------
+//
+// `CoordinatorConfig::memory_budget()` estimates heap consumption to let
+// operators right-size container memory limits. These tests pin the
+// estimate within a plausible range for dev and prod profiles, verify
+// rounding behavior, and confirm that the planning constants embedded in
+// the formula match actual `size_of::<ShardRecord>()` / `size_of::<RunRecord>()`
+// on this platform. If struct layouts change, the constant-match test
+// fails and the formula must be updated in lockstep.
 
 #[test]
 fn coordinator_config_dev_defaults_budget() {
