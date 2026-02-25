@@ -437,8 +437,7 @@ impl CoordinatorConfig {
     /// overflows `usize`.
     #[must_use]
     pub const fn memory_budget(&self) -> usize {
-        let per_shard_base = match SHARD_RECORD_PLANNING_BYTES.checked_add(self.per_shard_budget)
-        {
+        let per_shard_base = match SHARD_RECORD_PLANNING_BYTES.checked_add(self.per_shard_budget) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: per-shard base"),
         };
@@ -464,10 +463,7 @@ impl CoordinatorConfig {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: run contribution"),
         };
-        let worker_bytes = match self
-            .max_workers
-            .checked_mul(WORKER_COOLDOWN_ENTRY_BYTES)
-        {
+        let worker_bytes = match self.max_workers.checked_mul(WORKER_COOLDOWN_ENTRY_BYTES) {
             Some(value) => value,
             None => panic!("CoordinatorConfig::memory_budget overflow: worker contribution"),
         };

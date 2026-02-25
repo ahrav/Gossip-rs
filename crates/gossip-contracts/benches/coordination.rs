@@ -273,7 +273,9 @@ fn bench_list_shards(c: &mut Criterion) {
 
     // Filter: all (no pre-filter benefit)
     group.bench_function("all_10k", |b| {
-        let mut summaries = Vec::new();
+        // `list_shards_into` requires caller-owned output capacity to be
+        // provisioned up front (no internal growth on hot path).
+        let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
             coord
                 .list_shards_into(
@@ -290,7 +292,7 @@ fn bench_list_shards(c: &mut Criterion) {
 
     // Filter: available (Active + unleased) — all match since none are leased
     group.bench_function("available_10k", |b| {
-        let mut summaries = Vec::new();
+        let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
             coord
                 .list_shards_into(
@@ -307,7 +309,7 @@ fn bench_list_shards(c: &mut Criterion) {
 
     // Filter: parked — matches 0, maximum pre-filter benefit
     group.bench_function("parked_10k", |b| {
-        let mut summaries = Vec::new();
+        let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
             coord
                 .list_shards_into(
