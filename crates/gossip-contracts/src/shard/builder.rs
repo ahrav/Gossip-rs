@@ -481,8 +481,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
                 .ok_or(PreallocShardBuilderError::InvalidSpecHandle)?;
             out.push(InitialShardInput::new(entry.shard, spec, entry.cursor));
         }
-        validate_manifest_no_alloc(out.as_slice())
-            .map_err(PreallocShardBuilderError::ManifestInvalid)?;
+        validate_manifest(out.as_slice()).map_err(PreallocShardBuilderError::ManifestInvalid)?;
         Ok(out)
     }
 }
