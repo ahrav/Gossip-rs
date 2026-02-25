@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use rstest::rstest;
+
 use super::*;
 use crate::identity::{FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId};
 
@@ -61,6 +63,10 @@ fn cursor_variants() -> Vec<CoordError> {
             spec_start: b"a".as_slice().into(),
             spec_end: b"z".as_slice().into(),
         })),
+        CoordError::CursorKeyTooLarge {
+            size: MAX_KEY_SIZE + 1,
+            max: MAX_KEY_SIZE,
+        },
     ]
 }
 
@@ -72,7 +78,7 @@ fn checkpoint_missing_key_variant() -> CoordError {
     CoordError::CheckpointMissingKey
 }
 
-/// All 10 `CoordError` variants. Used by the display-determinism test.
+/// All 11 `CoordError` variants. Used by the display-determinism test.
 fn all_coord_error_variants() -> Vec<CoordError> {
     let mut v = common_precondition_variants();
     v.push(op_id_conflict_variant());
@@ -148,76 +154,51 @@ fn idempotent_outcome_as_ref() {
 
 // -- From<CoordError> exhaustiveness tests ---------------------------
 //
-// Each test composes variant groups and converts them, verifying every
-// valid conversion succeeds. The explicit rejection arms in the From
-// impls (not wildcard `_`) guarantee that adding a new CoordError
+// Each invocation composes variant groups and converts them, verifying
+// every valid conversion succeeds. The explicit rejection arms in the
+// From impls (not wildcard `_`) guarantee that adding a new CoordError
 // variant triggers a compile error.
 
-#[test]
-fn checkpoint_error_from_coord_error_exhaustive() {
-    let mut v = common_precondition_variants();
-    v.push(op_id_conflict_variant());
-    v.extend(cursor_variants());
-    v.push(checkpoint_missing_key_variant());
-    assert_from_coord_error_accepted::<CheckpointError>(v);
-
-    // Rejected: SplitInvalid
-    assert_from_coord_error_rejected::<CheckpointError>(vec![split_invalid_variant()]);
+macro_rules! from_coord_error_exhaustive {
+    ($name:ident, $ty:ty,
+     accepted: [$($acc:expr),* $(,)?],
+     rejected: [$($rej:expr),* $(,)?]) => {
+        #[test]
+        fn $name() {
+            let mut accepted = Vec::new();
+            $(accepted.extend($acc);)*
+            assert_from_coord_error_accepted::<$ty>(accepted);
+            let mut rejected = Vec::new();
+            $(rejected.extend($rej);)*
+            assert_from_coord_error_rejected::<$ty>(rejected);
+        }
+    };
 }
 
-#[test]
-fn complete_error_from_coord_error_exhaustive() {
-    let mut v = common_precondition_variants();
-    v.push(op_id_conflict_variant());
-    v.extend(cursor_variants());
-    v.push(checkpoint_missing_key_variant());
-    assert_from_coord_error_accepted::<CompleteError>(v);
+from_coord_error_exhaustive!(checkpoint_error_from_coord_error_exhaustive, CheckpointError,
+    accepted: [common_precondition_variants(), vec![op_id_conflict_variant()],
+               cursor_variants(), vec![checkpoint_missing_key_variant()]],
+    rejected: [vec![split_invalid_variant()]]);
 
-    // Rejected: SplitInvalid
-    assert_from_coord_error_rejected::<CompleteError>(vec![split_invalid_variant()]);
-}
+from_coord_error_exhaustive!(complete_error_from_coord_error_exhaustive, CompleteError,
+    accepted: [common_precondition_variants(), vec![op_id_conflict_variant()],
+               cursor_variants(), vec![checkpoint_missing_key_variant()]],
+    rejected: [vec![split_invalid_variant()]]);
 
-#[test]
-fn park_error_from_coord_error_exhaustive() {
-    let mut v = common_precondition_variants();
-    v.push(op_id_conflict_variant());
-    assert_from_coord_error_accepted::<ParkError>(v);
+from_coord_error_exhaustive!(park_error_from_coord_error_exhaustive, ParkError,
+    accepted: [common_precondition_variants(), vec![op_id_conflict_variant()]],
+    rejected: [cursor_variants(), vec![split_invalid_variant()],
+               vec![checkpoint_missing_key_variant()]]);
 
-    // Rejected: CursorRegression, CursorOutOfBounds,
-    //           SplitInvalid, CheckpointMissingKey
-    let mut rejected = cursor_variants();
-    rejected.push(split_invalid_variant());
-    rejected.push(checkpoint_missing_key_variant());
-    assert_from_coord_error_rejected::<ParkError>(rejected);
-}
+from_coord_error_exhaustive!(split_error_from_coord_error_exhaustive, SplitError,
+    accepted: [common_precondition_variants(), vec![op_id_conflict_variant()],
+               vec![split_invalid_variant()]],
+    rejected: [cursor_variants(), vec![checkpoint_missing_key_variant()]]);
 
-#[test]
-fn split_error_from_coord_error_exhaustive() {
-    let mut v = common_precondition_variants();
-    v.push(op_id_conflict_variant());
-    v.push(split_invalid_variant());
-    assert_from_coord_error_accepted::<SplitError>(v);
-
-    // Rejected: CursorRegression, CursorOutOfBounds,
-    //           CheckpointMissingKey
-    let mut rejected = cursor_variants();
-    rejected.push(checkpoint_missing_key_variant());
-    assert_from_coord_error_rejected::<SplitError>(rejected);
-}
-
-#[test]
-fn renew_error_from_coord_error_exhaustive() {
-    let v = common_precondition_variants();
-    assert_from_coord_error_accepted::<RenewError>(v);
-
-    // Rejected: OpIdConflict, CursorRegression,
-    //           CursorOutOfBounds, SplitInvalid, CheckpointMissingKey
-    let mut rejected = vec![op_id_conflict_variant()];
-    rejected.extend(cursor_variants());
-    rejected.push(split_invalid_variant());
-    rejected.push(checkpoint_missing_key_variant());
-    assert_from_coord_error_rejected::<RenewError>(rejected);
-}
+from_coord_error_exhaustive!(renew_error_from_coord_error_exhaustive, RenewError,
+    accepted: [common_precondition_variants()],
+    rejected: [vec![op_id_conflict_variant()], cursor_variants(),
+               vec![split_invalid_variant()], vec![checkpoint_missing_key_variant()]]);
 
 // -- Display + Security tests ----------------------------------------
 
@@ -418,72 +399,102 @@ fn already_leased_debug_no_owner_leak() {
     assert!(debug.contains("999"), "debug should contain deadline");
 }
 
-#[test]
-fn cursor_out_of_bounds_display_no_key_leak() {
-    let err = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
+fn oob_error() -> CoordError {
+    CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
         last_key: b"SECRET_KEY_DATA".to_vec().into_boxed_slice(),
         spec_start: b"SPEC_START_BYTES".to_vec().into_boxed_slice(),
         spec_end: b"SPEC_END_BYTES".to_vec().into_boxed_slice(),
-    }));
-    let display = err.to_string();
-    assert!(
-        !display.contains("SECRET") && !display.contains("SPEC_"),
-        "display must not leak raw key bytes: {display}"
-    );
-    assert!(
-        display.contains("15"),
-        "display should contain key byte length: {display}"
-    );
+    }))
 }
 
-#[test]
-fn cursor_regression_display_no_key_leak() {
-    let err = CoordError::CursorRegression {
+fn regression_error() -> CoordError {
+    CoordError::CursorRegression {
         old_key: Some(b"OLD_SECRET_KEY".to_vec().into_boxed_slice()),
         new_key: Some(b"NEW_SECRET_KEY".to_vec().into_boxed_slice()),
+    }
+}
+
+#[rstest]
+#[case::oob_display(oob_error(), false, &["SECRET", "SPEC_"], &["15"])]
+#[case::oob_debug(oob_error(), true, &["SECRET", "SPEC_"], &["15 bytes", "16 bytes", "14 bytes"])]
+#[case::regression_display(regression_error(), false, &["OLD_SECRET", "NEW_SECRET"], &[])]
+#[case::regression_debug(regression_error(), true, &["OLD_SECRET", "NEW_SECRET"], &["14 bytes"])]
+fn cursor_data_redaction(
+    #[case] err: CoordError,
+    #[case] use_debug: bool,
+    #[case] forbidden: &[&str],
+    #[case] required: &[&str],
+) {
+    let output = if use_debug {
+        format!("{err:?}")
+    } else {
+        err.to_string()
     };
-    let display = err.to_string();
-    assert!(
-        !display.contains("OLD_SECRET") && !display.contains("NEW_SECRET"),
-        "display must not leak raw key bytes: {display}"
-    );
+    let mode = if use_debug { "Debug" } else { "Display" };
+    for needle in forbidden {
+        assert!(
+            !output.contains(needle),
+            "{mode} must not leak raw key bytes (found {needle:?}): {output}"
+        );
+    }
+    for needle in required {
+        assert!(
+            output.contains(needle),
+            "{mode} should contain {needle:?}: {output}"
+        );
+    }
+}
+
+// -- AcquireScratch edge cases (F8) ----------------------------------
+
+#[test]
+#[should_panic(expected = "spec start exceeds MAX_KEY_SIZE")]
+fn acquire_scratch_write_spec_panics_on_oversized_start() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(&[0x01; MAX_KEY_SIZE + 1], b"z", &[]);
 }
 
 #[test]
-fn cursor_out_of_bounds_debug_no_key_leak() {
-    let err = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
-        last_key: b"SECRET_KEY_DATA".to_vec().into_boxed_slice(),
-        spec_start: b"SPEC_START_BYTES".to_vec().into_boxed_slice(),
-        spec_end: b"SPEC_END_BYTES".to_vec().into_boxed_slice(),
-    }));
-    let debug = format!("{err:?}");
-    assert!(
-        !debug.contains("SECRET") && !debug.contains("SPEC_"),
-        "debug must not leak raw key bytes: {debug}"
-    );
-    // Verify byte lengths are shown.
-    assert!(
-        debug.contains("15 bytes") && debug.contains("16 bytes") && debug.contains("14 bytes"),
-        "debug should contain byte lengths: {debug}"
-    );
+#[should_panic(expected = "spec end exceeds MAX_KEY_SIZE")]
+fn acquire_scratch_write_spec_panics_on_oversized_end() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(b"a", &[0xFF; MAX_KEY_SIZE + 1], &[]);
 }
 
 #[test]
-fn cursor_regression_debug_no_key_leak() {
-    let err = CoordError::CursorRegression {
-        old_key: Some(b"OLD_SECRET_KEY".to_vec().into_boxed_slice()),
-        new_key: Some(b"NEW_SECRET_KEY".to_vec().into_boxed_slice()),
-    };
-    let debug = format!("{err:?}");
-    assert!(
-        !debug.contains("OLD_SECRET") && !debug.contains("NEW_SECRET"),
-        "debug must not leak raw key bytes: {debug}"
-    );
-    // Verify byte lengths are shown.
-    assert!(
-        debug.contains("14 bytes"),
-        "debug should contain byte lengths: {debug}"
-    );
+#[should_panic(expected = "spec metadata exceeds MAX_METADATA_SIZE")]
+fn acquire_scratch_write_spec_panics_on_oversized_metadata() {
+    let mut scratch = AcquireScratch::new();
+    let meta = vec![0xAA; crate::coordination::shard_spec::MAX_METADATA_SIZE + 1];
+    scratch.write_spec(b"a", b"z", &meta);
+}
+
+#[test]
+fn acquire_scratch_cursor_view_with_token_but_no_last_key_returns_initial() {
+    let mut scratch = AcquireScratch::new();
+    // Write a cursor with no last_key but with token.
+    // CursorUpdate::initial() should be returned because
+    // cursor_view gates token on has_cursor_last_key.
+    scratch.write_cursor(None, Some(b"some_token"));
+    let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
+    let cursor = view.cursor();
+    assert!(cursor.last_key().is_none());
+    assert!(cursor.token().is_none());
+}
+
+#[test]
+fn acquire_scratch_reset_then_view_returns_empty_state() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(b"start", b"end", b"meta");
+    scratch.write_cursor(Some(b"key"), Some(b"token"));
+    scratch.reset();
+
+    let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
+    assert!(view.spec().key_range_start().is_empty());
+    assert!(view.spec().key_range_end().is_empty());
+    assert!(view.spec().metadata().is_empty());
+    assert!(view.cursor().last_key().is_none());
+    assert!(view.cursor().token().is_none());
 }
 
 // -- Size regression test --------------------------------------------
