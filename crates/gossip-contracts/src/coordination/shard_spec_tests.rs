@@ -597,7 +597,7 @@ proptest! {
     }
 
     // -- Canonical hash consistency: ShardSpec and ShardSpecRef produce
-    //    the same digest for the same logical value (F2).
+    //    the same digest for the same logical value.
 
     #[test]
     fn shard_spec_and_ref_canonical_hash_consistent(
@@ -611,7 +611,7 @@ proptest! {
         );
     }
 
-    // -- Round-trip: try_from_ref(spec.as_ref()) recovers the original (F13).
+    // -- Round-trip: try_from_ref(spec.as_ref()) recovers the original.
 
     #[test]
     fn try_from_ref_round_trip(
@@ -767,7 +767,7 @@ fn arena_rollback_on_slab_byte_exhaustion() {
 }
 
 // -------------------------------------------------------------------
-// validate_ref error paths (F7)
+// validate_ref error paths
 // -------------------------------------------------------------------
 
 #[rstest]

@@ -746,6 +746,10 @@ impl ShardArena {
     /// - the slab lacks byte capacity for this spec, or
     /// - no free slots remain.
     pub fn alloc_spec(&mut self, spec: ShardSpecRef<'_>) -> Result<ShardSpecHandle, SlabFull> {
+        assert!(
+            ShardSpec::validate_ref(spec).is_ok(),
+            "alloc_spec called with invalid ShardSpecRef; callers must validate first"
+        );
         let Some(slot_index) = self.free_slots.pop() else {
             return Err(SlabFull {
                 requested: 1,
