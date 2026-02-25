@@ -25,8 +25,6 @@
 
 use std::fmt;
 
-use gossip_stdx::SlabFull;
-
 use crate::coordination::record::ShardStatus;
 use crate::coordination::run::{
     ManifestValidationError, RunConfigError, RunOpIdConflict, RunStatus,
@@ -127,6 +125,9 @@ impl From<GetRunError> for CreateRunError {
 ///
 /// Custom `Debug` impl: redacts hash values in `OpIdConflict` and omits the
 /// `actual` tenant in `TenantMismatch` (tenant isolation boundary).
+/// Allocation failures are reported only through
+/// [`RegisterShardsError::ResourceExhausted`], with `resource` identifying
+/// which coordinator structure failed to grow.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegisterShardsError {
@@ -148,12 +149,9 @@ pub enum RegisterShardsError {
         max: usize,
         scope: ShardLimitScope,
     },
-    /// The byte slab could not satisfy an allocation request.
-    /// Recoverable: the caller may retry after freeing slab space.
-    ResourceExhausted(SlabFull),
-    /// Coordinator index/map capacity could not be expanded for this request.
-    /// Recoverable: retry with a larger runtime capacity budget.
-    CapacityExceeded { resource: &'static str },
+    /// Coordinator memory resources could not satisfy an allocation request.
+    /// Recoverable: retry with a larger runtime memory budget.
+    ResourceExhausted { resource: &'static str },
 }
 
 impl fmt::Debug for RegisterShardsError {
@@ -182,9 +180,8 @@ impl fmt::Debug for RegisterShardsError {
                 .field("max", max)
                 .field("scope", scope)
                 .finish(),
-            Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
-            Self::CapacityExceeded { resource } => f
-                .debug_struct("CapacityExceeded")
+            Self::ResourceExhausted { resource } => f
+                .debug_struct("ResourceExhausted")
                 .field("resource", resource)
                 .finish(),
         }
@@ -214,9 +211,8 @@ impl fmt::Display for RegisterShardsError {
                     "shard limit exceeded ({scope:?}): {current} + {additional} > {max}"
                 )
             }
-            Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
-            Self::CapacityExceeded { resource } => {
-                write!(f, "coordinator capacity exceeded for {resource}")
+            Self::ResourceExhausted { resource } => {
+                write!(f, "coordinator resource exhausted: {resource}")
             }
         }
     }
@@ -232,12 +228,6 @@ impl std::error::Error for RegisterShardsError {
 }
 
 impl_from_run_op_id_conflict!(RegisterShardsError);
-
-impl From<SlabFull> for RegisterShardsError {
-    fn from(e: SlabFull) -> Self {
-        Self::ResourceExhausted(e)
-    }
-}
 
 // ============================================================================
 // GetRunError
@@ -529,6 +519,7 @@ mod tests {
     #[case::create_get_run_failed(Box::new(CreateRunError::GetRunFailed(GetRunError::RunNotFound)) as Box<dyn std::error::Error>)]
     #[case::register_shards_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>)]
     #[case::register_shard_limit(Box::new(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }) as Box<dyn std::error::Error>)]
+    #[case::register_resource_exhausted(Box::new(RegisterShardsError::ResourceExhausted { resource: "shard_slab" }) as Box<dyn std::error::Error>)]
     #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>)]
     #[case::transition_terminal(Box::new(RunTransitionError::RunTerminal { status: RunStatus::Done }) as Box<dyn std::error::Error>)]
     #[case::transition_wrong_status_done(Box::new(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }) as Box<dyn std::error::Error>)]
@@ -553,6 +544,7 @@ mod tests {
     #[case::register_manifest_unbounded(Box::new(RegisterShardsError::ManifestInvalid(ManifestValidationError::UnboundedRange { shard_id: ShardId::from_raw(0) })) as Box<dyn std::error::Error>, true)]
     #[case::register_not_found(Box::new(RegisterShardsError::RunNotFound) as Box<dyn std::error::Error>, false)]
     #[case::register_shard_limit(Box::new(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }) as Box<dyn std::error::Error>, false)]
+    #[case::register_resource_exhausted(Box::new(RegisterShardsError::ResourceExhausted { resource: "shard_slab" }) as Box<dyn std::error::Error>, false)]
     #[case::get_run_not_found(Box::new(GetRunError::RunNotFound) as Box<dyn std::error::Error>, false)]
     #[case::transition_terminal(Box::new(RunTransitionError::RunTerminal { status: RunStatus::Done }) as Box<dyn std::error::Error>, false)]
     #[case::transition_wrong_status(Box::new(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }) as Box<dyn std::error::Error>, false)]
@@ -579,6 +571,7 @@ mod tests {
     #[case::register_manifest_unbounded(RegisterShardsError::ManifestInvalid(ManifestValidationError::UnboundedRange { shard_id: ShardId::from_raw(0) }).to_string())]
     #[case::register_op_id_conflict(RegisterShardsError::OpIdConflict(test_conflict()).to_string())]
     #[case::register_shard_limit_exceeded(RegisterShardsError::ShardLimitExceeded { current: 5, additional: 3, max: 6, scope: ShardLimitScope::PerTenant }.to_string())]
+    #[case::register_resource_exhausted(RegisterShardsError::ResourceExhausted { resource: "shard_slab" }.to_string())]
     // GetRunError
     #[case::get_not_found(GetRunError::RunNotFound.to_string())]
     #[case::get_tenant_mismatch(GetRunError::TenantMismatch { expected: test_tenant() }.to_string())]

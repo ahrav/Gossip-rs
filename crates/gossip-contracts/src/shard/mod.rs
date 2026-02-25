@@ -2,8 +2,8 @@
 //!
 //! This module is the bridge between connectors (which think in typed keys
 //! like file paths or manifest rows) and the coordination layer (which
-//! operates on opaque `&[u8]` range boundaries). It provides two
-//! complementary submodules:
+//! operates on opaque `&[u8]` range boundaries). It provides three
+//! submodules:
 //!
 //! - [`key_encoding`] -- byte-order-preserving key encoders
 //!   ([`KeyEncoding`], [`PathKey`], [`ManifestRowKey`]), range arithmetic
@@ -16,9 +16,8 @@
 //!   decode helpers, and split-propagation logic
 //!   ([`propagate_hint_on_split`]).
 //!
-//! - [`builder`] -- startup-preallocated borrowed shard-manifest builder
-//!   ([`PreallocShardBuilder`]) for bounded, allocation-silent
-//!   `register_shards` inputs.
+//! - [`builder`] -- startup-preallocated shard builder with
+//!   borrowed-first add paths and bounded-capacity manifests.
 //!
 //! # Zero-allocation design
 //!
@@ -37,7 +36,6 @@ pub mod builder;
 pub mod hint;
 pub mod key_encoding;
 
-pub use builder::{PreallocShardBuilder, PreallocShardBuilderError};
 pub use hint::{
     HintPropagationError, MetadataBuf, ShardEncodeError, ShardHint, ShardHintDecodeError,
     ShardMetadata, ShardMetadataDecodeError, ShardSpecScratch, SplitBoundary,

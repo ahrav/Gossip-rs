@@ -1,7 +1,8 @@
 //! Criterion benchmarks for `InMemoryCoordinator` hot-path operations.
 //!
 //! Validates that the two-level shard map, aHash hasher, O(1) shard counting,
-//! and `list_shards_into` pre-filter deliver the expected performance characteristics.
+//! and `list_shards_into` pre-filtering deliver the expected performance
+//! characteristics.
 //! Acquire/checkpoint benchmarks intentionally use borrowed APIs plus reusable
 //! scratch so measurements reflect steady-state (allocation-free) hot paths.
 //!
@@ -11,8 +12,10 @@
 //! |---|---|---|
 //! | `acquire` | `acquire_and_restore_into` | Lease acquisition is the entry point for every worker session. Must scale O(1) with shard count via the two-level hash map. |
 //! | `checkpoint` | `checkpoint` | The most frequent hot-path call in production (called once per batch of scanned rows). Exercises op-log insert + cursor update. |
+//! | `claim_next_available` | `claim_next_available` | Worker-facing claim loop. Validates candidate collection + modular-offset acquire under realistic run sizes. |
+//! | `collect_claim_candidates` | `collect_claim_candidates_into` | Scan-only claim prepass. Measures candidate extraction + deterministic ordering cost without acquire side effects. |
 //! | `register_shards` | `register_shards` | Bulk shard registration at run creation. Measures per-shard insertion cost into the two-level map and byte slab. |
-//! | `list_shards` | `list_shards_into` with filters | Validates that `ShardFilter` pre-filtering avoids full shard scans. Three filter profiles: `all` (baseline), `available` (common), `parked` (zero-match best case). |
+//! | `list_shards` | `list_shards_into` with filters | Validates that `ShardFilter` pre-filtering avoids constructing summaries for filtered-out records during full scans. Three filter profiles: `all` (baseline), `available` (common), `parked` (zero-match best case). |
 //!
 //! # Shard count parameters
 //!
@@ -32,6 +35,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, c
 
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::error::AcquireScratch;
+use gossip_contracts::coordination::facade::ShardClaiming;
 use gossip_contracts::coordination::in_memory::InMemoryCoordinator;
 use gossip_contracts::coordination::run::{
     InitialShardInput, RunConfig, RunManagement, ShardFilter,
@@ -190,6 +194,78 @@ fn bench_checkpoint(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark claim_next_available at different shard counts.
+///
+/// Uses one long-lived coordinator and advances logical time by > lease
+/// duration each iteration so previously claimed shards are available again.
+fn bench_claim_next_available(c: &mut Criterion) {
+    let mut group = c.benchmark_group("claim_next_available");
+
+    for &shard_count in &[1_000, 5_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(shard_count),
+            &shard_count,
+            |b, &n| {
+                let (mut coord, run, _ids) = coordinator_with_shards(n);
+                let mut scratch = AcquireScratch::default();
+                let mut time = LogicalTime::from_raw(100);
+                let mut worker_raw = 1u64;
+
+                b.iter(|| {
+                    time = LogicalTime::from_raw(time.as_raw() + 2000);
+                    worker_raw = worker_raw.saturating_add(1);
+                    let result = coord
+                        .claim_next_available(
+                            time,
+                            tenant(),
+                            run,
+                            WorkerId::from_raw(worker_raw),
+                            &mut scratch,
+                        )
+                        .unwrap();
+                    let _ = black_box(result.lease);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Benchmark steady-state claim with a fixed worker pool.
+///
+/// Unlike `bench_claim_next_available` (which creates a fresh `WorkerId`
+/// per iteration), this benchmark cycles 8 workers round-robin. This
+/// models production behavior where a bounded worker population
+/// repeatedly claims shards, exercising cooldown map lookups and
+/// lease re-acquisition on previously held shards.
+fn bench_claim_next_available_steady_state(c: &mut Criterion) {
+    let mut group = c.benchmark_group("claim_next_available_steady_state");
+
+    for &shard_count in &[1_000, 5_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(shard_count),
+            &shard_count,
+            |b, &n| {
+                let (mut coord, run, _ids) = coordinator_with_shards(n);
+                let mut scratch = AcquireScratch::default();
+                let mut time = LogicalTime::from_raw(100);
+                let mut iteration = 0u64;
+
+                b.iter(|| {
+                    time = LogicalTime::from_raw(time.as_raw() + 2000);
+                    iteration += 1;
+                    let worker_id = WorkerId::from_raw((iteration % 8) + 1);
+                    let result = coord
+                        .claim_next_available(time, tenant(), run, worker_id, &mut scratch)
+                        .unwrap();
+                    let _ = black_box(result.lease);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 /// Benchmark bulk shard registration at varying scale.
 ///
 /// Measures the cost of `register_shards` which inserts `n` shard records
@@ -263,9 +339,9 @@ fn bench_register_shards(c: &mut Criterion) {
 ///   shards are Active and unleased, so all 10K match. Measures the
 ///   per-record filter evaluation overhead on top of the full scan.
 /// - **`parked`**: zero matches. If the pre-filter uses status-indexed
-///   counters or early termination, this should be significantly faster
-///   than the `all` case. A similar runtime indicates the pre-filter
-///   is not effective.
+///   checks to skip summary construction effectively, this should be
+///   faster than the `all` case. A similar runtime means most cost still
+///   comes from scanning and sorting.
 fn bench_list_shards(c: &mut Criterion) {
     let mut group = c.benchmark_group("list_shards");
 
@@ -273,8 +349,8 @@ fn bench_list_shards(c: &mut Criterion) {
 
     // Filter: all (no pre-filter benefit)
     group.bench_function("all_10k", |b| {
-        // `list_shards_into` requires caller-owned output capacity to be
-        // provisioned up front (no internal growth on hot path).
+        // Pre-size the buffer so benchmark noise does not include repeated
+        // allocator growth.
         let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
             coord
@@ -327,11 +403,37 @@ fn bench_list_shards(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark scan-only claim candidate collection at 10K shards.
+fn bench_collect_claim_candidates(c: &mut Criterion) {
+    let mut group = c.benchmark_group("collect_claim_candidates");
+    let (coord, run, _ids) = coordinator_with_shards(10_000);
+
+    group.bench_function("all_available_10k", |b| {
+        let mut candidates = Vec::with_capacity(10_000);
+        b.iter(|| {
+            let earliest = coord
+                .collect_claim_candidates_into(
+                    LogicalTime::from_raw(50),
+                    tenant(),
+                    run,
+                    &mut candidates,
+                )
+                .unwrap();
+            black_box((candidates.len(), earliest));
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     coordination_benches,
     bench_acquire,
     bench_checkpoint,
+    bench_claim_next_available,
+    bench_claim_next_available_steady_state,
     bench_register_shards,
     bench_list_shards,
+    bench_collect_claim_candidates,
 );
 criterion_main!(coordination_benches);

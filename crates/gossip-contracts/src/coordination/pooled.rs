@@ -395,6 +395,7 @@ impl PooledCursor {
 const SHARD_ID_ENCODED_BYTES: usize = core::mem::size_of::<u64>();
 
 /// Maximum byte length of a fully populated spawned list in packed encoding.
+#[cfg(test)]
 const MAX_SPAWNED_ENCODED_BYTES: usize = MAX_SPAWNED_PER_SHARD * SHARD_ID_ENCODED_BYTES;
 
 const _: () = assert!(MAX_SPAWNED_PER_SHARD <= u16::MAX as usize);
@@ -525,17 +526,14 @@ impl PooledSpawned {
             MAX_SPAWNED_PER_SHARD,
         );
 
-        let mut encoded = [0u8; MAX_SPAWNED_ENCODED_BYTES];
+        let total_bytes = total * SHARD_ID_ENCODED_BYTES;
+        let mut encoded = vec![0u8; total_bytes];
         let current_bytes = current * SHARD_ID_ENCODED_BYTES;
         if current_bytes > 0 {
             encoded[..current_bytes].copy_from_slice(self.bytes(slab));
         }
-        let appended_bytes = Self::encode_slice_into(
-            additional,
-            &mut encoded[current_bytes..MAX_SPAWNED_ENCODED_BYTES],
-        );
-        let total_bytes = current_bytes + appended_bytes;
-        let slot = slab.allocate(&encoded[..total_bytes])?;
+        Self::encode_slice_into(additional, &mut encoded[current_bytes..]);
+        let slot = slab.allocate(&encoded)?;
         Ok((
             slot,
             u16::try_from(total).expect("spawned length exceeds u16"),

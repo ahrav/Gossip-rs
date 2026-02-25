@@ -444,7 +444,7 @@ fn cursor_data_redaction(
     }
 }
 
-// -- AcquireScratch edge cases (F8) ----------------------------------
+// -- AcquireScratch edge cases ----------------------------------
 
 #[test]
 #[should_panic(expected = "spec start exceeds MAX_KEY_SIZE")]

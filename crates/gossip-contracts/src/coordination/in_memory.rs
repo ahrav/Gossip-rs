@@ -62,30 +62,18 @@
 //!
 //! # Allocation-failure policy
 //!
-//! Hot-path functions use a **two-strategy** approach to allocation failures:
+//! Allocation behavior is tiered:
 //!
-//! 1. **Pre-reservation (recoverable).**  Before entering a mutation sequence,
-//!    a dedicated `reserve_*` or `check_*` method calls `try_reserve` and
-//!    returns a typed error (e.g. `CapacityExceeded`, `SlabFull`) if the
-//!    allocator cannot satisfy the request.  Callers can propagate this error
-//!    without any state corruption because no mutation has begun.
-//!
-//! 2. **Defense-in-depth panics (unreachable after pre-reservation).**  During
-//!    the subsequent commit phase, individual insertions may still call
-//!    `try_reserve(…).unwrap_or_else(|_| panic!(…))`.  These panics exist as a
-//!    safety net: if the pre-reservation protocol was followed correctly, the
-//!    capacity is already available and the panic never fires.  If it *does*
-//!    fire, it indicates a bug in the reservation logic, and crashing is
-//!    preferable to silent data corruption.
-//!
-//! Examples:
-//! - `reserve_register_shard_capacity` + `reserve_register_index_capacity`
-//!   run before `register_shards` commits shard records and index entries.
-//! - `ensure_claim_cooldown_capacity` runs before `claim_next_available`
-//!   inserts a cooldown entry.
-//! - `index_shard` panics on `try_reserve` are defense-in-depth; callers
-//!   (`split_replace`, `split_residual`) have already passed shard-count
-//!   validation and the run's index entry exists from `register_shards`.
+//! - `register_shards` performs a single fallible preflight
+//!   (`preflight_register_capacity`) before shard-map mutation and returns
+//!   `RegisterShardsError::ResourceExhausted { resource }` on failure.
+//! - shard records are still staged first and rolled back on slab failure, so
+//!   registration remains all-or-nothing.
+//! - read/query helpers (`list_shards_into`, `collect_claim_candidates_into`)
+//!   may grow caller-provided vectors instead of panicking on undersized
+//!   capacity.
+//! - core shard lifecycle paths keep slab-backed storage and borrowed/scratch
+//!   interfaces for steady-state execution.
 //!
 //! # Split operation memory-safety pattern
 //!
@@ -100,9 +88,9 @@
 //! # Performance note
 //!
 //! `claim_next_available` (via `ShardClaiming`) scans the run index and sorts
-//! available candidates by key range in-place. The resulting worst case is
-//! O(S log S) where S is the run's shard count. Acceptable here; production
-//! backends need a secondary available-shards index.
+//! available candidates by `ShardId` for deterministic ordering. The resulting
+//! worst case is O(S log S) where S is the run's shard count. Acceptable here;
+//! production backends need a secondary available-shards index.
 
 use std::collections::{HashMap, HashSet};
 
@@ -111,7 +99,7 @@ use crate::coordination::error::{
     AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
     IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
-use crate::coordination::facade::{ClaimError, ShardClaiming};
+use crate::coordination::facade::{ClaimError, ShardClaiming, default_claim_next_available};
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run::{
@@ -145,38 +133,49 @@ use gossip_stdx::{ByteSlab, RingBuffer};
 /// (uses AES-NI where available).
 type AHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 
-// ---- Initial map/set capacity policy ----
+// ---- Initial map/set capacities ----
 //
-// These values are intentionally conservative. They reduce eager allocation
-// compared with the previous fixed-capacity (64/16) policy while keeping
-// behavior identical as structures grow. Maps grow naturally via rehashing
-// when needed; these just avoid wasteful startup allocation.
-const TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
-const TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 16;
-const TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY: usize = 8;
-const TOP_LEVEL_RUN_SHARDS_MAP_INITIAL_CAPACITY: usize = 8;
-const TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY: usize = 8;
-const TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY: usize = 4;
-const TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY: usize = 32;
-const RUN_SHARD_SET_INITIAL_CAPACITY: usize = 8;
+// Conservative fixed capacities. HashMap doubling means the difference
+// between starting at 8 and 16 is one rehash at startup — negligible.
+const INITIAL_CAPACITY_SMALL: usize = 8;
+const INITIAL_CAPACITY_MEDIUM: usize = 16;
 
 // ---- Shard/tenant limit defaults ----
 const DEFAULT_MAX_SHARDS_PER_TENANT: usize = 100_000;
 const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
 
-// ---- Memory budget planning constants ----
+// ---- Memory budget planning constants (test-only) ----
 //
 // Used by `CoordinatorConfig::memory_budget()` for capacity estimation.
 // `SHARD_RECORD_PLANNING_BYTES` and `RUN_RECORD_PLANNING_BYTES` model the
 // fixed (non-slab) size of each record struct. Overhead constants model
 // per-entry HashMap bucket/key metadata. All are validated by
 // `memory_budget_constants_match_struct_sizes` in tests.
+#[cfg(any(test, feature = "test-support"))]
 const SHARD_RECORD_PLANNING_BYTES: usize = 728;
+#[cfg(any(test, feature = "test-support"))]
 const RUN_RECORD_PLANNING_BYTES: usize = 512;
+#[cfg(any(test, feature = "test-support"))]
 const SHARD_ENTRY_OVERHEAD_BYTES: usize = 72;
+#[cfg(any(test, feature = "test-support"))]
 const RUN_ENTRY_OVERHEAD_BYTES: usize = 80;
+#[cfg(any(test, feature = "test-support"))]
 const WORKER_COOLDOWN_ENTRY_BYTES: usize = 16;
+#[cfg(any(test, feature = "test-support"))]
 const COORDINATOR_BASE_BYTES: usize = 4096;
+
+/// Pre-allocated containers returned by [`InMemoryCoordinator::preflight_register_capacity`].
+///
+/// When a new tenant or run is being registered for the first time, the
+/// preflight builds the inner map/set with fallible allocation and hands
+/// it back so the caller can insert it directly — no second allocation.
+#[derive(Default)]
+struct PreflightMaps {
+    /// Inner shard map for a new tenant (None if tenant already existed).
+    tenant_map: Option<AHashMap<ShardKey, ShardRecord>>,
+    /// Shard-ID set for a new run (None if run index already existed).
+    run_shard_set: Option<HashSet<ShardId, ahash::RandomState>>,
+}
 
 /// Create a new `AHashMap` with the given pre-allocated capacity.
 #[inline]
@@ -190,44 +189,12 @@ fn ahash_set_with_capacity<T>(capacity: usize) -> HashSet<T, ahash::RandomState>
     HashSet::with_capacity_and_hasher(capacity, ahash::RandomState::default())
 }
 
-/// Estimate the initial capacity for the outer tenant-to-shards map.
-///
-/// Derives a tenant count estimate from shard limits and clamps it to a
-/// conservative startup range to avoid aggressive pre-allocation in small
-/// deployments.
-#[inline]
-fn top_level_shards_map_initial_capacity(
-    max_total_shards: usize,
-    max_shards_per_tenant: usize,
-) -> usize {
-    // Estimate tenant cardinality from shard limits, then clamp to a small
-    // startup range so tiny deployments do not pre-allocate aggressively.
-    let tenant_limit = max_shards_per_tenant.max(1);
-    let estimated_tenants = max_total_shards.div_ceil(tenant_limit);
-    estimated_tenants.clamp(
-        TOP_LEVEL_SHARDS_MAP_MIN_INITIAL_CAPACITY,
-        TOP_LEVEL_SHARDS_MAP_MAX_INITIAL_CAPACITY,
-    )
-}
-
-/// Estimate the initial capacity for a per-tenant inner shard map.
-///
-/// Clamped to a conservative range so small tenants don't over-allocate
-/// and large tenants don't start with an unreasonably large hash table.
-#[inline]
-fn tenant_shards_map_initial_capacity(max_shards_per_tenant: usize) -> usize {
-    max_shards_per_tenant.clamp(
-        TENANT_SHARDS_MAP_MIN_INITIAL_CAPACITY,
-        TENANT_SHARDS_MAP_MAX_INITIAL_CAPACITY,
-    )
-}
-
 /// Runtime constructor configuration for [`InMemoryCoordinator`].
 ///
 /// This type drives operational constructor behavior:
 /// lease duration, shard limits, and optional claim cooldown.
-/// It intentionally excludes planning-only budget knobs from
-/// [`CoordinatorConfig`] so runtime enforcement and capacity estimation can
+/// It intentionally excludes planning-only budget knobs (see the test-only
+/// `CoordinatorConfig`) so runtime enforcement and capacity estimation can
 /// evolve independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorRuntimeConfig {
@@ -331,8 +298,6 @@ impl CoordinatorRuntimeConfig {
             };
             if derived > DEFAULT_MAX_AUTO_SLAB_CAPACITY {
                 DEFAULT_MAX_AUTO_SLAB_CAPACITY
-            } else if derived > MAX_SLAB_CAPACITY {
-                MAX_SLAB_CAPACITY
             } else {
                 derived
             }
@@ -340,7 +305,7 @@ impl CoordinatorRuntimeConfig {
     }
 }
 
-/// Planning-only configuration for memory budget estimation.
+/// Planning-only configuration for memory budget estimation (test-only).
 ///
 /// Models expected memory needs from deployment-level parameters using a
 /// static formula. See `docs/memory-budget-audit.md`.
@@ -350,6 +315,7 @@ impl CoordinatorRuntimeConfig {
 /// [`CoordinatorRuntimeConfig`] (via
 /// [`InMemoryCoordinator::with_runtime_config`]); this type remains for
 /// capacity planning and memory-budget estimation only.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorConfig {
     /// Global shard cap.
@@ -366,6 +332,7 @@ pub struct CoordinatorConfig {
     pub per_run_budget: usize,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl CoordinatorConfig {
     /// Create a config with explicit parameters.
     #[must_use]
@@ -601,16 +568,6 @@ pub struct InMemoryCoordinator {
     /// Arena allocator for pooled `ShardRecord` fields (spec key ranges,
     /// cursor keys/tokens). Shared by all records in `self.shards`.
     slab: ByteSlab,
-    /// Reusable scratch for `register_shards` shard ID staging.
-    ///
-    /// Grows to the largest observed manifest and is then cleared/reused so
-    /// repeated registrations avoid fresh `Vec` allocation.
-    register_shard_ids_scratch: Vec<ShardId>,
-    /// Reusable scratch for `register_shards` staged record construction.
-    ///
-    /// Holds `(ShardKey, ShardRecord)` pairs during collect-then-insert, then
-    /// is returned to this field for reuse on the next call.
-    register_stage_scratch: Vec<(ShardKey, ShardRecord)>,
     /// Reusable shard-id candidate buffer for claim hot path.
     ///
     /// Cleared and reused across calls to keep `claim_next_available`
@@ -683,24 +640,18 @@ impl InMemoryCoordinator {
              claim a second shard within one lease period"
         );
 
-        let top_level_shards_capacity =
-            top_level_shards_map_initial_capacity(max_total_shards, max_shards_per_tenant);
         Self {
-            shards: ahash_map_with_capacity(top_level_shards_capacity),
+            shards: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
             total_shard_count: 0,
-            runs: ahash_map_with_capacity(TOP_LEVEL_RUNS_MAP_INITIAL_CAPACITY),
-            run_shards: ahash_map_with_capacity(TOP_LEVEL_RUN_SHARDS_MAP_INITIAL_CAPACITY),
+            runs: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
+            run_shards: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
             default_lease_duration,
             max_shards_per_tenant,
             max_total_shards,
-            claim_cooldowns: ahash_map_with_capacity(
-                TOP_LEVEL_CLAIM_COOLDOWNS_MAP_INITIAL_CAPACITY,
-            ),
+            claim_cooldowns: ahash_map_with_capacity(INITIAL_CAPACITY_SMALL),
             claim_cooldown_interval,
             slab: ByteSlab::with_capacity(config.effective_slab_capacity()),
-            register_shard_ids_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
-            register_stage_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
-            claim_candidates_scratch: Vec::with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY),
+            claim_candidates_scratch: Vec::with_capacity(INITIAL_CAPACITY_SMALL),
         }
     }
 
@@ -865,12 +816,13 @@ impl InMemoryCoordinator {
     /// the remove-mutate-restore pattern in split operations removes a
     /// parent, then re-inserts the mutated parent at the same key.
     fn shard_insert(&mut self, tenant: TenantId, key: ShardKey, record: ShardRecord) {
-        let inner_initial_capacity = tenant_shards_map_initial_capacity(self.max_shards_per_tenant);
         let inner = self
             .shards
             .entry(tenant)
-            .or_insert_with(|| ahash_map_with_capacity(inner_initial_capacity));
+            .or_insert_with(|| ahash_map_with_capacity(INITIAL_CAPACITY_MEDIUM));
         if let Some(mut old) = inner.insert(key, record) {
+            // Release the replaced record's slab allocations (spec key ranges,
+            // cursor, metadata, spawned list) to prevent arena leaks.
             old.deallocate_fields(&mut self.slab);
         } else {
             self.total_shard_count += 1;
@@ -956,91 +908,84 @@ impl InMemoryCoordinator {
         Ok(())
     }
 
-    /// Ensure tenant shard map capacity for an upcoming `register_shards` batch.
+    /// Fallible preflight for `register_shards` memory growth.
     ///
-    /// This makes growth explicit up front so per-shard inserts in the hot
-    /// loop do not trigger implicit rehash/allocation.
-    fn reserve_register_shard_capacity(
-        &mut self,
-        tenant: TenantId,
-        additional: usize,
-    ) -> Result<(), RegisterShardsError> {
-        if additional == 0 {
-            return Ok(());
-        }
-
-        if !self.shards.contains_key(&tenant) {
-            self.shards
-                .try_reserve(1)
-                .map_err(|_| RegisterShardsError::CapacityExceeded {
-                    resource: "tenant_shards_index",
-                })?;
-            let initial =
-                tenant_shards_map_initial_capacity(self.max_shards_per_tenant).max(additional);
-            let mut inner: AHashMap<ShardKey, ShardRecord> = ahash_map_with_capacity(0);
-            inner
-                .try_reserve(initial)
-                .map_err(|_| RegisterShardsError::CapacityExceeded {
-                    resource: "tenant_shards",
-                })?;
-            return Ok(());
-        }
-
-        self.shards
-            .get_mut(&tenant)
-            .expect("tenant map must exist after contains_key check")
-            .try_reserve(additional)
-            .map_err(|_| RegisterShardsError::CapacityExceeded {
-                resource: "tenant_shards",
-            })?;
-        Ok(())
-    }
-
-    /// Ensure run-shard index map/set capacity for an upcoming `register_shards` batch.
-    fn reserve_register_index_capacity(
+    /// Checks all affected structures before any shard-map mutation begins.
+    /// When new containers are needed (new tenant or new run), they are
+    /// allocated here and returned so the caller can insert them directly,
+    /// avoiding a probe-and-drop pattern where the preflight allocation is
+    /// discarded and the caller re-allocates infallibly.
+    fn preflight_register_capacity(
         &mut self,
         tenant: TenantId,
         run: RunId,
         shard_ids: &[ShardId],
-    ) -> Result<(), RegisterShardsError> {
+    ) -> Result<PreflightMaps, RegisterShardsError> {
+        if shard_ids.is_empty() {
+            return Ok(PreflightMaps::default());
+        }
+
+        // -- Phase 1: ensure the per-tenant inner shard map can absorb new entries --
+        let additional = shard_ids.len();
+        let tenant_map = if let Some(tenant_map) = self.shards.get_mut(&tenant) {
+            // Tenant already exists: reserve space in the existing inner map.
+            tenant_map.try_reserve(additional).map_err(|_| {
+                RegisterShardsError::ResourceExhausted {
+                    resource: "tenant_shards",
+                }
+            })?;
+            None
+        } else {
+            // First registration for this tenant: build the inner map here
+            // so allocation is fallible; the caller inserts it directly.
+            self.shards
+                .try_reserve(1)
+                .map_err(|_| RegisterShardsError::ResourceExhausted {
+                    resource: "tenant_shards_index",
+                })?;
+            let mut inner: AHashMap<ShardKey, ShardRecord> = ahash_map_with_capacity(0);
+            inner
+                .try_reserve(INITIAL_CAPACITY_MEDIUM.max(additional))
+                .map_err(|_| RegisterShardsError::ResourceExhausted {
+                    resource: "tenant_shards",
+                })?;
+            Some(inner)
+        };
+
+        // -- Phase 2: ensure the run→shard secondary index can absorb new entries --
         let run_key = (tenant, run);
-        if let Some(existing) = self.run_shards.get_mut(&run_key) {
+        let run_shard_set = if let Some(existing) = self.run_shards.get_mut(&run_key) {
+            // Run index exists (idempotent retry): only reserve for genuinely new IDs.
             let additional_unique = shard_ids.iter().filter(|id| !existing.contains(id)).count();
             if additional_unique > 0 {
                 existing.try_reserve(additional_unique).map_err(|_| {
-                    RegisterShardsError::CapacityExceeded {
+                    RegisterShardsError::ResourceExhausted {
                         resource: "run_shards_set",
                     }
                 })?;
             }
-            return Ok(());
-        }
+            None
+        } else {
+            // First registration for this run: build the inner set here
+            // so allocation is fallible; the caller inserts it directly.
+            self.run_shards
+                .try_reserve(1)
+                .map_err(|_| RegisterShardsError::ResourceExhausted {
+                    resource: "run_shards_index",
+                })?;
+            let mut shard_set: HashSet<ShardId, ahash::RandomState> = ahash_set_with_capacity(0);
+            shard_set
+                .try_reserve(shard_ids.len().max(INITIAL_CAPACITY_SMALL))
+                .map_err(|_| RegisterShardsError::ResourceExhausted {
+                    resource: "run_shards_set",
+                })?;
+            Some(shard_set)
+        };
 
-        self.run_shards
-            .try_reserve(1)
-            .map_err(|_| RegisterShardsError::CapacityExceeded {
-                resource: "run_shards_index",
-            })?;
-        let mut shard_set: HashSet<ShardId, ahash::RandomState> = ahash_set_with_capacity(0);
-        shard_set
-            .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
-            .map_err(|_| RegisterShardsError::CapacityExceeded {
-                resource: "run_shards_set",
-            })?;
-        Ok(())
-    }
-
-    /// Ensure claim cooldown map can absorb a new worker entry, if needed.
-    fn ensure_claim_cooldown_capacity(&mut self, worker: WorkerId) {
-        if self.claim_cooldown_interval == 0 || self.claim_cooldowns.contains_key(&worker) {
-            return;
-        }
-        self.claim_cooldowns.try_reserve(1).unwrap_or_else(|_| {
-            panic!(
-                "claim_cooldowns capacity exhausted while preparing worker claim state \
-                 for {worker:?}"
-            )
-        });
+        Ok(PreflightMaps {
+            tenant_map,
+            run_shard_set,
+        })
     }
 }
 
@@ -1608,6 +1553,9 @@ const _: () = assert!(MAX_SPLIT_CHILDREN <= u16::MAX as usize);
 /// Fixed-capacity sorted index scratch for `SplitReplacePlan::children()`.
 ///
 /// Stores child indices sorted by `key_range_start` without allocating.
+/// The indirection (storing sorted indices rather than sorted children)
+/// avoids copying `SplitReplaceChild` values while still enabling
+/// contiguous-boundary validation in `key_range_start` order.
 #[derive(Clone, Copy)]
 struct SplitChildOrder {
     len: usize,
@@ -1649,6 +1597,15 @@ impl SplitChildOrder {
     }
 }
 
+/// Verify that the sorted children form a contiguous, non-overlapping
+/// partition of the parent's key range `[parent_start, parent_end)`.
+///
+/// Checks (all on pre-sorted children):
+///   1. At least 2 children exist.
+///   2. First child starts at `parent_start`.
+///   3. Last child ends at `parent_end`.
+///   4. Adjacent children share an exact boundary (no gaps, no overlaps).
+///   5. No child has an inverted range (`start >= end` for bounded ranges).
 fn split_replace_validate_coverage_sorted(
     parent_start: &[u8],
     parent_end: &[u8],
@@ -2213,22 +2170,17 @@ impl InMemoryCoordinator {
     /// Idempotent — `HashSet::insert` is a no-op if the shard is already
     /// indexed, so calling this on both register and split paths is safe.
     ///
-    /// # Pre-reservation contract
+    /// # Capacity behavior
     ///
-    /// Callers are expected to ensure the run already has an entry in
-    /// `run_shards` (created by `register_shards` during run initialization).
-    /// For `register_shards`, [`reserve_register_index_capacity`] explicitly
-    /// pre-reserves both the outer map slot and inner set capacity.  For
-    /// `split_replace` and `split_residual`, the run's index entry already
-    /// exists (the parent shard was registered earlier), so the outer map
-    /// insertion is a no-op and only inner-set growth is needed.
+    /// `register_shards` preflights index growth with
+    /// `preflight_register_capacity` before mutating shard maps.
+    /// Split paths (`split_replace`, `split_residual`) reuse an existing
+    /// run index entry and may still need inner-set growth.
     ///
     /// # Panics
     ///
     /// Panics if `try_reserve` fails on either the outer `run_shards` map or
-    /// the inner shard-ID set.  These are defense-in-depth: under correct
-    /// pre-reservation they are unreachable (see module-level
-    /// "Allocation-failure policy").
+    /// the inner shard-ID set.
     fn index_shard(&mut self, tenant: TenantId, run: RunId, shard: ShardId) {
         let run_key = (tenant, run);
         if !self.run_shards.contains_key(&run_key) {
@@ -2242,7 +2194,7 @@ impl InMemoryCoordinator {
         let shard_ids = self
             .run_shards
             .entry(run_key)
-            .or_insert_with(|| ahash_set_with_capacity(RUN_SHARD_SET_INITIAL_CAPACITY));
+            .or_insert_with(|| ahash_set_with_capacity(INITIAL_CAPACITY_SMALL));
         if !shard_ids.contains(&shard) {
             shard_ids.try_reserve(1).unwrap_or_else(|_| {
                 panic!(
@@ -2466,16 +2418,10 @@ impl RunManagement for InMemoryCoordinator {
     ///
     /// # Panic safety
     ///
-    /// Step 6 rolls back partially-allocated shard records via
-    /// `deallocate_fields` on `SlabFull`. If `deallocate_fields` itself
-    /// panics (slab metadata exhaustion or double-free assertion), the
-    /// scratch buffers (`register_shard_ids_scratch`, `register_stage_scratch`)
-    /// are lost because the restore lines never execute. Subsequent
-    /// `register_shards` calls would allocate fresh Vecs. In practice,
-    /// `deallocate_fields` only panics on slab invariant violations that
-    /// indicate data corruption — at that point losing scratch buffers is
-    /// the least of the problems. Same reasoning as
-    /// `split_replace_rollback_inserted_children`.
+    /// Step 6 rolls back partially-allocated staged shard records via
+    /// `deallocate_fields` when slab allocation fails. If `deallocate_fields`
+    /// itself panics (slab metadata corruption or double-free), this method
+    /// the panic propagates immediately; that indicates irrecoverable internal corruption.
     fn register_shards(
         &mut self,
         now: LogicalTime,
@@ -2546,26 +2492,16 @@ impl RunManagement for InMemoryCoordinator {
 
         // 6. Build shard records, then insert.
         //
-        // Build first so recoverable allocation failures (`SlabFull`) return
+        // Build first so recoverable allocation failures return
         // an error without partially mutating shard maps. Any staged records
         // are deallocated before returning so this path stays all-or-nothing.
         // Borrowed manifest inputs are copied into slab-owned record fields.
         let cursor_semantics = record.config.cursor_semantics();
-        let mut shard_ids = std::mem::take(&mut self.register_shard_ids_scratch);
-        shard_ids.clear();
-        shard_ids.extend(shards.iter().map(InitialShardInput::shard));
-
-        let mut to_insert = std::mem::take(&mut self.register_stage_scratch);
-        to_insert.clear();
-
-        if let Err(err) = self
-            .reserve_register_shard_capacity(tenant, shard_ids.len())
-            .and_then(|_| self.reserve_register_index_capacity(tenant, run, &shard_ids))
-        {
-            self.register_shard_ids_scratch = shard_ids;
-            self.register_stage_scratch = to_insert;
-            return Err(err);
-        }
+        let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
+        let preflight = self.preflight_register_capacity(tenant, run, &shard_ids)?;
+        // Infallible allocation; preflight_register_capacity already verified
+        // that the surrounding maps can absorb this many entries.
+        let mut to_insert: Vec<(ShardKey, ShardRecord)> = Vec::with_capacity(shards.len());
 
         for s in shards {
             let key = ShardKey::new(run, s.shard());
@@ -2584,56 +2520,42 @@ impl RunManagement for InMemoryCoordinator {
                 &mut self.slab,
             ) {
                 Ok(record) => record,
-                Err(err) => {
-                    // Roll back staged records allocated so far.
+                Err(_slab_err) => {
+                    // SlabFull diagnostic intentionally discarded — the
+                    // ResourceExhausted variant carries the resource name,
+                    // which is sufficient for callers.
                     for (_, mut staged) in to_insert.drain(..) {
                         staged.deallocate_fields(&mut self.slab);
                     }
-                    self.register_shard_ids_scratch = shard_ids;
-                    self.register_stage_scratch = to_insert;
-                    return Err(err.into());
+                    return Err(RegisterShardsError::ResourceExhausted {
+                        resource: "shard_slab",
+                    });
                 }
             };
             sr.assert_invariants(&self.slab);
             to_insert.push((key, sr));
         }
 
-        if !self.shards.contains_key(&tenant) {
-            self.shards.insert(
-                tenant,
-                ahash_map_with_capacity(
-                    tenant_shards_map_initial_capacity(self.max_shards_per_tenant)
-                        .max(shard_ids.len()),
-                ),
-            );
+        // Insert the pre-built tenant map from preflight (if this is a new
+        // tenant), or use the existing one. All allocations happened fallibly
+        // in `preflight_register_capacity`; no infallible allocation here.
+        if let Some(inner) = preflight.tenant_map {
+            self.shards.insert(tenant, inner);
         }
 
         for (key, record) in to_insert.drain(..) {
             self.shard_insert(tenant, key, record);
         }
 
-        // Index finalization: `reserve_register_index_capacity` (step 5) already
-        // validated that `run_shards` can absorb these entries.  The panic below
-        // is defense-in-depth — it fires only if the reservation logic has a bug.
+        // Insert the pre-built run shard set from preflight (if this is a
+        // new run), then extend with the registered shard IDs.
         let run_key = (tenant, run);
-        debug_assert!(
-            self.run_shards.contains_key(&run_key)
-                || self.run_shards.capacity() > self.run_shards.len(),
-            "register_shards: run_shards capacity should have been pre-reserved \
-             by reserve_register_index_capacity for run {run:?}"
+        if let Some(set) = preflight.run_shard_set {
+            self.run_shards.insert(run_key, set);
+        }
+        let shard_set = self.run_shards.get_mut(&run_key).expect(
+            "run_shards entry must exist: either pre-existing or just inserted from preflight",
         );
-        let shard_set = self.run_shards.entry(run_key).or_insert_with(|| {
-            let mut shard_set = ahash_set_with_capacity(0);
-            shard_set
-                .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
-                .unwrap_or_else(|_| {
-                    panic!(
-                        "run_shards set capacity exhausted while finalizing register_shards \
-                         for run {run:?}"
-                    )
-                });
-            shard_set
-        });
         shard_set.extend(shard_ids.iter().copied());
 
         // 7. Transition run → Active.
@@ -2647,24 +2569,20 @@ impl RunManagement for InMemoryCoordinator {
             .expect("run record must exist: verified by step 1 lookup");
         record.assert_transition_legal(RunStatus::Active);
         record.status = RunStatus::Active;
-        let executed_shard_ids = shard_ids.clone();
-        record.root_shards = executed_shard_ids.clone();
+        record.root_shards = shard_ids.clone();
         record.op_log_push(RunOpLogEntry::new(
             op_id,
             RunOpKind::RegisterShards,
             payload_hash,
             now,
             RunOpResult::RegisteredShards {
-                shard_ids: executed_shard_ids.clone().into_boxed_slice(),
+                shard_ids: shard_ids.clone().into_boxed_slice(),
             },
         ));
         record.assert_invariants();
         self.debug_assert_run_shards_consistent(tenant, run);
 
-        self.register_shard_ids_scratch = shard_ids;
-        self.register_stage_scratch = to_insert;
-
-        Ok(IdempotentOutcome::Executed(executed_shard_ids))
+        Ok(IdempotentOutcome::Executed(shard_ids))
     }
 
     /// Return a clone of the run record after validating tenant isolation.
@@ -2730,13 +2648,14 @@ impl RunManagement for InMemoryCoordinator {
     /// for shards that will be discarded. This matters when a run has
     /// many terminal shards and the caller only wants active ones.
     ///
+    /// `out` is cleared before population and may grow if undersized.
+    /// Callers can pre-size it to reduce reallocations across repeated queries.
+    ///
     /// # Panics
     ///
-    /// Panics if the caller-provided `out` buffer does not have enough
-    /// pre-allocated capacity to hold all run shards (allocation contract:
-    /// no growth inside this method). Also panics if the `run_shards` index
-    /// references a shard ID with no corresponding record in the primary
-    /// shard map (index desynchronization — indicates a bug).
+    /// Panics if the `run_shards` index references a shard ID with no
+    /// corresponding record in the primary shard map (index desynchronization
+    /// — indicates a bug).
     fn list_shards_into(
         &self,
         now: LogicalTime,
@@ -2750,16 +2669,6 @@ impl RunManagement for InMemoryCoordinator {
         let shard_ids = self.run_shards.get(&(tenant, run));
         out.clear();
         if let Some(shard_ids) = shard_ids {
-            // Allocation contract: `list_shards_into` must be allocation-silent
-            // after startup. Callers are responsible for pre-sizing `out` to
-            // at least the run's shard cardinality.
-            assert!(
-                out.capacity() >= shard_ids.len(),
-                "list_shards_into: summary buffer capacity {} < required {} \
-                 for run {run:?}; pre-allocate caller buffer at startup",
-                out.capacity(),
-                shard_ids.len(),
-            );
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
                 let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
@@ -2792,24 +2701,18 @@ impl RunManagement for InMemoryCoordinator {
     ///
     /// Iterates the run's shard set once, pushing unleased Active shard IDs
     /// into `candidates` and tracking the earliest lease deadline among
-    /// leased Active shards.  Does **not** sort — the free function
-    /// [`default_claim_next_available`](super::facade::default_claim_next_available)
-    /// uses modular-offset iteration and does not depend on ordering.
+    /// leased Active shards. Candidates are then sorted by `ShardId` to
+    /// preserve deterministic claim ordering without extra map lookups.
     ///
-    /// The filtering logic (status check, lease check, deadline tracking)
-    /// is identical to the inline candidate loop in
-    /// [`claim_next_available`](Self::claim_next_available), but capacity
-    /// handling differs: this method panics on undersized buffers to enforce
-    /// the zero-allocation contract, whereas the inline loop uses
-    /// `try_reserve` to grow.  Exposed through the [`RunManagement`] trait
-    /// so the free function can avoid constructing [`ShardSummary`] objects.
+    /// Exposed through the [`RunManagement`] trait so the free function
+    /// [`default_claim_next_available`]
+    /// can avoid constructing [`ShardSummary`] objects.
+    ///
+    /// `candidates` is cleared before use and may grow if undersized.
     ///
     /// # Panics
     ///
-    /// - If `candidates.capacity()` is smaller than the run's shard count.
-    ///   The buffer must be pre-allocated at startup; panicking on undersized
-    ///   capacity enforces the zero-allocation contract on the hot path.
-    /// - If a shard ID in the `run_shards` index has no corresponding record
+    /// If a shard ID in the `run_shards` index has no corresponding record
     ///   in the primary shard map (index desynchronization — data corruption).
     fn collect_claim_candidates_into(
         &self,
@@ -2823,13 +2726,6 @@ impl RunManagement for InMemoryCoordinator {
 
         let mut earliest_deadline: Option<LogicalTime> = None;
         if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
-            assert!(
-                candidates.capacity() >= shard_ids.len(),
-                "collect_claim_candidates_into: candidate buffer capacity {} < required {} \
-                 for run {run:?}; pre-allocate caller buffer at startup",
-                candidates.capacity(),
-                shard_ids.len(),
-            );
             for &shard_id in shard_ids {
                 let key = ShardKey::new(run, shard_id);
                 let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
@@ -2855,6 +2751,10 @@ impl RunManagement for InMemoryCoordinator {
                 candidates.push(shard_id);
             }
         }
+
+        // Deterministic ordering by ShardId — cheaper than key_range_start
+        // (avoids slab reads per comparison) while preserving stable assignment.
+        candidates.sort_unstable();
 
         Ok(earliest_deadline)
     }
@@ -3092,6 +2992,9 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         {
+            // Re-borrow mutably for the actual mutation. The preceding read-only
+            // checks used `shard_get` (shared ref) which also took `&self.runs`;
+            // switching to `shard_get_mut` here keeps the two borrow phases separate.
             let record = self
                 .shard_get_mut(&tenant, &key)
                 .expect("shard record must exist: verified by read-only check above");
@@ -3126,28 +3029,11 @@ impl RunManagement for InMemoryCoordinator {
 impl ShardClaiming for InMemoryCoordinator {
     /// Claim the next available shard with per-worker cooldown enforcement.
     ///
-    /// Overrides the default [`ShardClaiming`] implementation to add a
-    /// cooldown gate: if the worker's last successful claim was less than
-    /// `claim_cooldown_interval` logical time units ago, the request is
-    /// rejected with [`ClaimError::Throttled`] *before* invoking candidate
-    /// selection. Candidate selection scans the run index and sorts shard IDs
-    /// by `key_range_start` (O(S log S)) using a reusable caller-owned scratch
-    /// buffer to avoid per-claim summary allocations.
+    /// Uses [`default_claim_next_available`] as the canonical claim path while
+    /// preserving coordinator-specific cooldown semantics.
     ///
-    /// On success, the worker's cooldown timer is reset. Failed
-    /// claims (no shards available, run not found) do not trigger cooldown,
-    /// so a worker competing for scarce shards is never penalized for losing
-    /// a race.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the candidate buffer cannot be reserved to hold all active
-    /// shards in the run (defense-in-depth; the caller-owned `AcquireScratch`
-    /// typically grows to steady-state capacity after the first call).  Also
-    /// panics if the `run_shards` index references a shard ID with no
-    /// corresponding record in the primary shard map (index desynchronization).
-    /// Panics if `ensure_claim_cooldown_capacity` was unable to pre-reserve
-    /// a cooldown entry for the worker (called before candidate selection).
+    /// On success, the worker's cooldown timer is reset. Failed claims do not
+    /// trigger cooldown.
     fn claim_next_available<'a>(
         &mut self,
         now: LogicalTime,
@@ -3160,137 +3046,19 @@ impl ShardClaiming for InMemoryCoordinator {
         if let Some(retry_after) = self.check_cooldown(worker, now) {
             return Err(ClaimError::Throttled { retry_after });
         }
-        let _ = self.lookup_run(tenant, run).map_err(ClaimError::from)?;
-        self.ensure_claim_cooldown_capacity(worker);
 
+        // Extract the scratch buffer via `mem::take` to avoid a simultaneous
+        // `&mut self` (for `default_claim_next_available`) and borrow of
+        // `self.claim_candidates_scratch`. Restored unconditionally after the call.
         let mut candidates = std::mem::take(&mut self.claim_candidates_scratch);
         candidates.clear();
-
-        let claim_result = (|| {
-            let mut earliest_deadline: Option<LogicalTime> = None;
-            if let Some(shard_ids) = self.run_shards.get(&(tenant, run)) {
-                if candidates.capacity() < shard_ids.len() {
-                    candidates
-                        .try_reserve(shard_ids.len() - candidates.capacity())
-                        .unwrap_or_else(|_| {
-                            panic!(
-                                "claim_next_available: unable to reserve candidate buffer \
-                                 for run {run:?} ({} entries)",
-                                shard_ids.len()
-                            )
-                        });
-                }
-                for &shard_id in shard_ids {
-                    let key = ShardKey::new(run, shard_id);
-                    let record = self.shard_get(&tenant, &key).unwrap_or_else(|| {
-                        panic!(
-                            "run_shards index contains shard {:?} for run {:?} \
-                             but no record exists in the primary shard map — \
-                             index desynchronization",
-                            shard_id, run,
-                        )
-                    });
-                    if record.status != ShardStatus::Active {
-                        continue;
-                    }
-                    if record.is_leased_at(now) {
-                        if let Some(deadline) = record.lease_deadline() {
-                            earliest_deadline = Some(match earliest_deadline {
-                                Some(prev) => core::cmp::min(prev, deadline),
-                                None => deadline,
-                            });
-                        }
-                        continue;
-                    }
-                    candidates.push(shard_id);
-                }
-            }
-
-            if candidates.is_empty() {
-                return Err(ClaimError::NoneAvailable { earliest_deadline });
-            }
-
-            candidates.sort_by(|a, b| {
-                let key_a = ShardKey::new(run, *a);
-                let key_b = ShardKey::new(run, *b);
-                let record_a = self.shard_get(&tenant, &key_a).unwrap_or_else(|| {
-                    panic!(
-                        "run_shards index contains shard {:?} for run {:?} \
-                         but no record exists in the primary shard map — \
-                         index desynchronization",
-                        a, run,
-                    )
-                });
-                let record_b = self.shard_get(&tenant, &key_b).unwrap_or_else(|| {
-                    panic!(
-                        "run_shards index contains shard {:?} for run {:?} \
-                         but no record exists in the primary shard map — \
-                         index desynchronization",
-                        b, run,
-                    )
-                });
-                record_a
-                    .spec
-                    .key_range_start(&self.slab)
-                    .cmp(record_b.spec.key_range_start(&self.slab))
-                    .then_with(|| a.cmp(b))
-            });
-
-            let len = candidates.len();
-            let offset = worker.as_raw() as usize % len;
-            let mut inconsistency_count = 0usize;
-
-            for i in 0..len {
-                let shard_id = candidates[(offset + i) % len];
-                let key = ShardKey::new(run, shard_id);
-                match self.acquire_and_restore_into(now, tenant, key, worker, out) {
-                    Ok(result) => {
-                        let snapshot = result.snapshot;
-                        return Ok((
-                            result.lease,
-                            snapshot.status(),
-                            snapshot.cursor_semantics(),
-                            snapshot.parent(),
-                            result.capacity,
-                        ));
-                    }
-                    Err(AcquireError::AlreadyLeased { lease_deadline, .. }) => {
-                        earliest_deadline = Some(match earliest_deadline {
-                            Some(prev) => core::cmp::min(prev, lease_deadline),
-                            None => lease_deadline,
-                        });
-                    }
-                    Err(AcquireError::ShardTerminal { .. }) => {}
-                    Err(AcquireError::ShardNotFound { .. }) => {
-                        debug_assert!(
-                            false,
-                            "claim_next_available: candidate shard {key:?} \
-                             disappeared between selection and acquire"
-                        );
-                        inconsistency_count += 1;
-                    }
-                    Err(AcquireError::TenantMismatch { expected }) => {
-                        return Err(ClaimError::TenantMismatch { expected });
-                    }
-                }
-            }
-
-            assert!(
-                inconsistency_count < len,
-                "all {} claim candidates returned ShardNotFound — backend index vs shard map inconsistency",
-                len,
-            );
-            Err(ClaimError::NoneAvailable { earliest_deadline })
-        })();
-
+        let claim_result =
+            default_claim_next_available(self, now, tenant, run, worker, out, &mut candidates);
         self.claim_candidates_scratch = candidates;
-        let (lease, status, cursor_semantics, parent, capacity) = claim_result?;
-        self.record_claim(worker, now);
-        Ok(AcquireResultView {
-            lease,
-            snapshot: out.view(status, cursor_semantics, parent),
-            capacity,
-        })
+        if claim_result.is_ok() {
+            self.record_claim(worker, now);
+        }
+        claim_result
     }
 }
 
@@ -3338,6 +3106,8 @@ impl InMemoryCoordinator {
                  now={now:?}, previous={:?}",
                 self.claim_cooldowns.get(&worker),
             );
+            // Infallible insert: implicit growth on OOM produces a generic
+            // allocator abort, acceptable for WARM-path cooldown tracking.
             self.claim_cooldowns.insert(worker, now);
         }
     }

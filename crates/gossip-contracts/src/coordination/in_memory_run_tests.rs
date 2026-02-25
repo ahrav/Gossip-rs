@@ -54,6 +54,8 @@ fn list_shards_for_run(
     filter: ShardFilter,
     out: &mut Vec<ShardSummary>,
 ) {
+    // Optional pre-sizing for deterministic test allocations.
+    // `list_shards_into` itself can grow `out` if needed.
     let required = coord
         .run_shards
         .get(&(test_tenant(), test_run()))
@@ -1415,8 +1417,9 @@ fn register_shards_run_not_found() {
 fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
     // Two shards with bounded ranges need 4 non-empty spec slots total.
     // With 16-byte minimum block size, that is 64 bytes. A 32-byte slab can
-    // allocate at most one shard spec before returning SlabFull. The
-    // coordinator stages record builds, so this should roll back to zero
+    // allocate at most one shard spec before surfacing
+    // `RegisterShardsError::ResourceExhausted { resource: "shard_slab" }`.
+    // The coordinator stages record builds, so this should roll back to zero
     // inserted shards instead of leaving a partially registered run.
     let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 10, 10);
     runtime.slab_capacity = 32;
@@ -1443,7 +1446,12 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, RegisterShardsError::ResourceExhausted(_)),
+        matches!(
+            err,
+            RegisterShardsError::ResourceExhausted {
+                resource: "shard_slab"
+            }
+        ),
         "expected ResourceExhausted, got: {err:?}"
     );
 
@@ -1460,6 +1468,22 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
         coord.shard_count(),
         0,
         "failed registration changed shard count"
+    );
+}
+
+#[test]
+fn register_shards_resource_exhausted_display_includes_resource_name() {
+    let err = RegisterShardsError::ResourceExhausted {
+        resource: "shard_slab",
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("shard_slab"),
+        "Display output should include the resource name: {msg}"
+    );
+    assert!(
+        msg.contains("exhausted"),
+        "Display output should mention exhaustion: {msg}"
     );
 }
 

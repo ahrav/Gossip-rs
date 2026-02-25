@@ -8,26 +8,27 @@ validation.
 For protocol details see [boundary-2-coordination.md](boundary-2-coordination.md).
 For simulation architecture see [simulation-harness.md](simulation-harness.md).
 
-## Allocation Contract Scope (Production vs Sim)
+## Allocation Policy Scope (Tiered)
 
-The no-allocation contract applies to **production runtime paths** in
-coordination code, not to simulation infrastructure.
+Coordination follows a HOT/WARM/COLD allocation policy:
 
-- Production path expectation: hot operations use borrowed inputs and
-  caller-owned scratch buffers (`acquire_and_restore_into`,
-  `checkpoint`, `complete`) so post-startup calls do not depend on
-  allocation-friendly helper APIs.
-- Sim/test-support expectation: `sim/` is intentionally free to allocate
-  for readability, randomized workloads, and invariant diagnostics.
+- **HOT** paths keep allocation-silent behavior where practical
+  (`acquire_and_restore_into`, `checkpoint`, `complete`, claim internals).
+- **WARM** query/admin paths prioritize simpler contracts and may grow
+  caller buffers (`list_shards_into`, `collect_claim_candidates_into`).
+- **COLD** lifecycle/setup paths optimize for clarity and atomicity over
+  preallocation plumbing (`register_shards` preflight + staged rollback).
 
-Enforcement is feature-aware:
+Simulation/test-support code (`sim/`) remains free to allocate for
+readability, workload generation, and diagnostics.
+
+Feature-aware enforcement remains in place for production-facing signatures:
 
 - `#[cfg(not(feature = "test-support"))]` compile-time guards in
-  `coordination/conformance_tests.rs` lock production hot-path signatures
-  to borrowed/scratch forms.
-- The same guards are intentionally absent when `test-support` is enabled,
-  so simulation code can evolve without production no-allocation false
-  positives.
+  `coordination/conformance_tests.rs` preserve borrowed/scratch hot-path
+  forms.
+- The same guards are intentionally absent with `test-support` enabled, so
+  simulation infrastructure can evolve without hot-path false positives.
 
 ---
 

@@ -174,9 +174,10 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// 1. Collect candidates via
 ///    [`collect_claim_candidates_into`](RunManagement::collect_claim_candidates_into)
 ///    — a single pass over the run's shard set that returns Active, unleased
-///    shard IDs and the earliest lease deadline among Active-but-leased shards.
+///    shard IDs plus the earliest lease deadline among Active-but-leased
+///    shards. Backends may sort candidates for deterministic ordering.
 ///    No [`ShardSummary`](crate::coordination::run::ShardSummary) objects are
-///    constructed and no slab-backed byte fields are copied.
+///    constructed.
 /// 2. If the candidate list is empty, return `NoneAvailable` with the
 ///    earliest deadline from the scan (so callers can schedule a retry
 ///    near the soonest lease expiry instead of busy-spinning).
@@ -186,7 +187,7 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///    (no RNG) — for a given candidate list length, the same worker
 ///    always starts at the same position.
 ///    For each candidate, attempt `acquire_and_restore_into`.
-/// 4. On success, return the `AcquireResult` (lease, snapshot, capacity hint).
+/// 4. On success, return the `AcquireResultView` (lease, snapshot, capacity hint).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
 ///    `ShardNotFound`), skip that candidate and try the next.
 /// 6. On `TenantMismatch`, fail immediately — this indicates a
@@ -220,12 +221,12 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// - `out`: caller-owned scratch space for the shard snapshot returned on
 ///   success. Reused across calls — no allocation in steady state.
 /// - `candidates`: caller-owned buffer for shard IDs. Cleared and reused
-///   per call — no allocation in steady state.
+///   per call; implementations may grow it when needed.
 ///
 /// ## Complexity
 ///
-/// O(S) where S is the number of shards in the run. The candidate scan
-/// is a single linear pass — no sort, no slab reads, no byte copies.
+/// O(S + C log C) where S is the number of shards in the run and C is the
+/// number of claimable candidates (if the backend sorts candidates).
 ///
 /// ## Errors
 ///
@@ -255,6 +256,8 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     let len = candidates.len();
     let offset = worker.as_raw() as usize % len;
     let mut inconsistency_count = 0usize;
+    // Merge the scan-phase earliest deadline with any tighter deadlines
+    // discovered during per-shard acquire attempts (AlreadyLeased errors).
     let mut earliest_deadline: Option<LogicalTime> = scan_deadline;
     let mut i = 0usize;
     let acquired = loop {
@@ -265,6 +268,10 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
         let key = ShardKey::new(run, shard_id);
         match backend.acquire_and_restore_into(now, tenant, key, worker, out) {
             Ok(result) => {
+                // Destructure into owned values before breaking out of the loop.
+                // `result.snapshot` borrows `out`, and the loop needs to yield
+                // ownership back to the caller — extracting the fields here
+                // drops the borrow so `out.view()` can be called after the loop.
                 let snapshot = result.snapshot;
                 break Some((
                     result.lease,
@@ -367,15 +374,14 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
 ///         worker: WorkerId,
 ///         out: &'a mut AcquireScratch,
 ///     ) -> Result<AcquireResultView<'a>, ClaimError> {
-///         default_claim_next_available(
-///             self,
-///             now,
-///             tenant,
-///             run,
-///             worker,
-///             out,
-///             &mut self.claim_candidates_scratch,
-///         )
+///         // Temporarily take the scratch buffer to avoid simultaneous
+///         // `&mut self` and `&mut self.claim_candidates_scratch`.
+///         let mut candidates = std::mem::take(&mut self.claim_candidates_scratch);
+///         let result = default_claim_next_available(
+///             self, now, tenant, run, worker, out, &mut candidates,
+///         );
+///         self.claim_candidates_scratch = candidates;
+///         result
 ///     }
 /// }
 /// ```
