@@ -49,33 +49,36 @@ use crate::identity::CanonicalBytes;
 // =========================================================================
 
 define_id_64! {
-    /// Unique run identifier.
+    /// Unique run identifier scoping all shards within a single pipeline execution.
     RunId
 }
 
 define_id_64! {
-    /// Unique shard ID within a run.  By convention, derived shards have bit 63 set.
+    /// Shard identity within a run; derived (split) shards have bit 63 set.
     ShardId
 }
 
 define_id_64! {
-    /// Worker process identity.
+    /// Worker (scanner) process identity for lease ownership and owner-divergence checks.
     WorkerId
 }
 
 define_id_64! {
-    /// Caller-generated idempotency key (SHOULD use CSPRNG).
+    /// Caller-generated idempotency key for replay detection (SHOULD use CSPRNG).
     OpId
 }
 
 define_id_64! {
-    /// Higher-level job grouping.
+    /// Higher-level job grouping for multi-run lifecycle management.
     JobId
 }
 
 impl ShardId {
-    /// Whether this shard was derived (split). By convention, derived shards
-    /// have bit 63 set.
+    /// Returns `true` if bit 63 is set, marking this as a split-derived shard.
+    ///
+    /// Root shards (externally assigned) have bit 63 clear. Derived shards are
+    /// produced by [`derive_split_shard_id`](crate::coordination::split::derive_split_shard_id)
+    /// which forces bit 63 high.
     #[inline]
     pub const fn is_derived(&self) -> bool {
         self.0 >> 63 != 0
@@ -106,9 +109,9 @@ impl ::core::fmt::Debug for FenceEpoch {
 }
 
 impl FenceEpoch {
-    /// The zero sentinel — represents "no epoch assigned".
+    /// The zero sentinel -- "no epoch assigned" (pre-registration state).
     pub const ZERO: Self = Self(0);
-    /// The first valid epoch after initialization.
+    /// The first valid epoch (value=1); shard records start here after creation.
     pub const INITIAL: Self = Self(1);
 
     /// Construct from a raw `u64`.
@@ -148,6 +151,7 @@ impl FenceEpoch {
 }
 
 impl CanonicalBytes for FenceEpoch {
+    /// 8-byte little-endian encoding, no length prefix (fixed width).
     #[inline]
     fn write_canonical(&self, h: &mut blake3::Hasher) {
         h.update(&self.0.to_le_bytes());
@@ -181,7 +185,7 @@ impl ::core::fmt::Debug for LogicalTime {
 }
 
 impl LogicalTime {
-    /// The zero sentinel — represents the origin of time.
+    /// The zero sentinel -- origin of time; operations require `now > ZERO`.
     pub const ZERO: Self = Self(0);
 
     /// Construct from a raw `u64`.
@@ -207,6 +211,7 @@ impl LogicalTime {
 }
 
 impl CanonicalBytes for LogicalTime {
+    /// 8-byte little-endian encoding, no length prefix (fixed width).
     #[inline]
     fn write_canonical(&self, h: &mut blake3::Hasher) {
         h.update(&self.0.to_le_bytes());
@@ -217,12 +222,16 @@ impl CanonicalBytes for LogicalTime {
 // ShardKey — compound lookup type
 // =========================================================================
 
-/// HashMap lookup key for the coordinator.
+/// Compound HashMap lookup key for the coordinator shard map.
 ///
-/// Combines a [`RunId`] and [`ShardId`] into a single key for shard-state
-/// lookups.  Fields are private with accessors (codebase convention).
+/// Combines a [`RunId`] and [`ShardId`] into a single 16-byte key for
+/// shard-state lookups. Two shards in different runs may share the same
+/// `ShardId`, so the `RunId` component is essential for disambiguation.
 ///
-/// No `Ord` — this is a lookup key, not an ordered value.
+/// Fields are private with accessors (codebase convention).
+///
+/// No `Ord` -- this is a lookup key, not an ordered value. Ordering shards
+/// by their key range is done via `ShardSpec`, not `ShardKey`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShardKey {
     run: RunId,
@@ -259,10 +268,11 @@ impl ShardKey {
 }
 
 impl CanonicalBytes for ShardKey {
+    /// Encodes `run || shard` in field order (16 bytes total). Both fields
+    /// are fixed-width (8 bytes each), so no length prefix is needed and
+    /// the boundary is unambiguous.
     #[inline]
     fn write_canonical(&self, h: &mut blake3::Hasher) {
-        // Order matters: run-then-shard. Both fields are fixed-width (8 bytes),
-        // so no length prefix is needed and the boundary is unambiguous.
         self.run.write_canonical(h);
         self.shard.write_canonical(h);
     }

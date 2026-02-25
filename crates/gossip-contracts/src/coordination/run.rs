@@ -81,10 +81,23 @@ use gossip_stdx::{ByteSlab, RingBuffer};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunStatus {
+    /// Run is being set up. `register_shards` has not yet been called.
+    /// No shards exist in this state (INV-4).
     Initializing = 0,
+
+    /// Run is active and its shards are being processed by workers.
+    /// Reached after `register_shards` succeeds. At least one root shard
+    /// must exist (INV-1).
     Active = 1,
+
+    /// All shards completed successfully. Terminal.
     Done = 2,
+
+    /// Run failed (some shards parked). Terminal.
     Failed = 3,
+
+    /// Run was administratively cancelled. Terminal.
+    /// Reachable from both `Initializing` and `Active`.
     Cancelled = 4,
 }
 
@@ -214,22 +227,34 @@ impl RunConfig {
     /// Panicking validator for coordinator-internal paths.
     ///
     /// Use [`try_new`](Self::try_new) for external input.
+    ///
+    /// # Panics
+    ///
+    /// Currently a no-op because `NonZeroU64` structurally prevents the
+    /// only invariant (`lease_duration > 0`). Retained as a hook for
+    /// future constraints.
     pub(crate) fn assert_valid(&self) {
         // lease_duration > 0 is guaranteed by NonZeroU64.
         let _ = self.lease_duration;
     }
 
+    /// When cursor advancement counts as committed progress.
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
         self.cursor_semantics
     }
 
-    /// Lease duration in [`LogicalTime`] ticks.
+    /// Lease duration in [`LogicalTime`] ticks. Always positive.
     #[must_use]
     pub fn lease_duration(&self) -> u64 {
         self.lease_duration.get()
     }
 
+    /// Optional per-shard retry budget. `None` means unlimited retries.
+    ///
+    /// The coordination layer does not enforce this limit directly; the
+    /// orchestrator inspects `ShardSummary::acquire_count` and calls
+    /// `park_shard` when the budget is exhausted.
     #[must_use]
     pub fn max_shard_retries(&self) -> Option<u32> {
         self.max_shard_retries
@@ -249,13 +274,20 @@ impl RunConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum RunOpKind {
+    /// Initial shard manifest registration.
     RegisterShards = 0,
+    /// Terminal transition: run completed successfully.
     CompleteRun = 1,
+    /// Terminal transition: run failed (some shards parked).
     FailRun = 2,
+    /// Terminal transition: run administratively cancelled.
     CancelRun = 3,
 }
 
 impl RunOpKind {
+    /// Parse a `u8` discriminant to the corresponding variant.
+    ///
+    /// Returns `None` for unrecognized values -- forward compatibility.
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -267,6 +299,7 @@ impl RunOpKind {
         }
     }
 
+    /// The persisted `u8` discriminant value.
     #[inline]
     #[must_use]
     pub const fn as_u8(self) -> u8 {
@@ -364,26 +397,32 @@ impl RunOpLogEntry {
         }
     }
 
+    /// The caller-provided idempotency key for this operation.
     #[must_use]
     pub fn op_id(&self) -> OpId {
         self.op_id
     }
 
+    /// Which run-level operation this entry records.
     #[must_use]
     pub fn kind(&self) -> RunOpKind {
         self.kind
     }
 
+    /// BLAKE3-derived hash of the operation's payload, used for
+    /// idempotency conflict detection. Always non-zero.
     #[must_use]
     pub fn payload_hash(&self) -> u64 {
         self.payload_hash
     }
 
+    /// Logical time at which this operation was first executed.
     #[must_use]
     pub fn executed_at(&self) -> LogicalTime {
         self.executed_at
     }
 
+    /// The cached result payload, returned on idempotent replay.
     #[must_use]
     pub fn result(&self) -> &RunOpResult {
         &self.result
@@ -449,13 +488,22 @@ impl std::error::Error for RunOpIdConflict {}
 ///     result; all other ops have `Ack` result.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunRecord {
+    /// Owning tenant. All operations must present this tenant for isolation.
     pub(crate) tenant: TenantId,
+    /// Unique run identifier within the tenant.
     pub(crate) run: RunId,
+    /// Immutable per-run configuration set at creation time.
     pub(crate) config: RunConfig,
+    /// Current lifecycle status. Transitions validated by
+    /// [`assert_transition_legal`](Self::assert_transition_legal).
     pub(crate) status: RunStatus,
+    /// Logical time at which the run was created. Always > `LogicalTime::ZERO` (INV-3).
     pub(crate) created_at: LogicalTime,
+    /// Logical time at which the run reached a terminal state.
+    /// `Some` iff `status.is_terminal()` (INV-2).
     pub(crate) completed_at: Option<LogicalTime>,
     /// Root shard IDs registered at creation. Does not include split children.
+    /// Empty while `status == Initializing` (INV-4); non-empty when `Active` (INV-1).
     pub(crate) root_shards: Vec<ShardId>,
     /// Bounded op-log for idempotent replay of run-level ops.
     pub(crate) op_log: RingBuffer<RunOpLogEntry, { RunRecord::OP_LOG_CAP }>,
@@ -482,10 +530,17 @@ impl RunRecord {
     /// the status check.
     pub const OP_LOG_CAP: usize = 8;
 
-    /// Assert all structural invariants.
+    /// Assert all structural invariants (INV-1 through INV-11).
     ///
-    /// Call after every state transition, before persisting. Panics on
-    /// violation — crash-to-prevent-corruption philosophy.
+    /// Call after every state transition, before persisting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the 11 invariants documented on [`RunRecord`] are
+    /// violated. This is the crash-to-prevent-corruption philosophy: an
+    /// invariant violation means in-memory state is inconsistent, and
+    /// panicking before persistence ensures crash-recovery returns to the
+    /// last valid state.
     pub fn assert_invariants(&self) {
         self.assert_lifecycle_invariants();
         self.assert_oplog_invariants();
@@ -714,36 +769,45 @@ impl RunRecord {
 
     // -- Public accessors --
 
+    /// The tenant that owns this run.
     #[must_use]
     pub fn tenant(&self) -> TenantId {
         self.tenant
     }
 
+    /// Unique identifier for this run within the tenant.
     #[must_use]
     pub fn run(&self) -> RunId {
         self.run
     }
 
+    /// Immutable per-run configuration (cursor semantics, lease duration, retry budget).
     #[must_use]
     pub fn config(&self) -> &RunConfig {
         &self.config
     }
 
+    /// Current lifecycle status. See [`RunStatus`] for the state machine.
     #[must_use]
     pub fn status(&self) -> RunStatus {
         self.status
     }
 
+    /// Logical time at which this run was created. Always > `LogicalTime::ZERO`.
     #[must_use]
     pub fn created_at(&self) -> LogicalTime {
         self.created_at
     }
 
+    /// Logical time at which this run reached a terminal state.
+    /// `Some` iff `status().is_terminal()` (INV-2).
     #[must_use]
     pub fn completed_at(&self) -> Option<LogicalTime> {
         self.completed_at
     }
 
+    /// Root shard IDs registered at creation time. Does not include
+    /// split-spawned children.
     #[must_use]
     pub fn root_shards(&self) -> &[ShardId] {
         &self.root_shards
@@ -786,10 +850,15 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// stores owned key bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunProgress {
+    /// Total shard count: always `active + done + split + parked`.
     pub(crate) total: u32,
+    /// Shards in `Active` status (both leased and unleased).
     pub(crate) active: u32,
+    /// Shards that completed successfully (`Done` status).
     pub(crate) done: u32,
+    /// Shards retired by split (replaced by children, `Split` status).
     pub(crate) split: u32,
+    /// Shards halted due to errors (`Parked` status).
     pub(crate) parked: u32,
     /// Subset of `active`: shards currently held by a worker lease.
     pub(crate) leased: u32,
@@ -804,31 +873,37 @@ pub struct RunProgress {
 }
 
 impl RunProgress {
+    /// Total shard count: `active + done + split + parked`.
     #[must_use]
     pub fn total(&self) -> u32 {
         self.total
     }
 
+    /// Shards in `Active` status (leased or unleased).
     #[must_use]
     pub fn active(&self) -> u32 {
         self.active
     }
 
+    /// Shards that completed successfully.
     #[must_use]
     pub fn done(&self) -> u32 {
         self.done
     }
 
+    /// Shards retired by split (replaced by children).
     #[must_use]
     pub fn split(&self) -> u32 {
         self.split
     }
 
+    /// Shards halted due to errors (candidates for unpark).
     #[must_use]
     pub fn parked(&self) -> u32 {
         self.parked
     }
 
+    /// Active shards currently held by a worker lease. Always `<= active()`.
     #[must_use]
     pub fn leased(&self) -> u32 {
         self.leased
@@ -1033,6 +1108,11 @@ pub enum RunTerminalEvaluation {
 /// This function is intentionally external to `RunRecord` -- the coordinator
 /// decides *when* and *whether* to act on the evaluation. The function only
 /// provides the recommendation; it does not mutate any state.
+///
+/// # Panics
+///
+/// Panics if `progress.total == 0`. A run with no shards cannot be evaluated
+/// for terminal status (it should not exist in `Active` state).
 #[must_use]
 pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
     assert!(
@@ -1060,6 +1140,11 @@ pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
 
+/// Fill the first `len` elements of `indices` with `0..len`.
+///
+/// Used to build a sortable index array over manifest shards without
+/// heap allocation. The caller provides a stack-allocated array of
+/// [`MAX_INITIAL_SHARDS`] elements and passes the actual shard count as `len`.
 #[inline]
 fn init_dense_indices(indices: &mut [usize], len: usize) {
     debug_assert!(len <= indices.len());
@@ -1076,8 +1161,12 @@ fn init_dense_indices(indices: &mut [usize], len: usize) {
 /// their bytes into owned storage before returning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitialShardInput<'a> {
+    /// Unique shard identifier within the run.
     pub(crate) shard: ShardId,
+    /// Key range and metadata specification for this shard.
     pub(crate) spec: ShardSpecRef<'a>,
+    /// Initial cursor position. Typically [`CursorUpdate::initial()`] for
+    /// fresh scans; a non-initial value resumes from a prior checkpoint.
     pub(crate) cursor: CursorUpdate<'a>,
 }
 
@@ -1095,16 +1184,21 @@ impl<'a> InitialShardInput<'a> {
         }
     }
 
+    /// The shard's unique identifier within the run.
     #[must_use]
     pub fn shard(&self) -> ShardId {
         self.shard
     }
 
+    /// The shard's key range and metadata specification.
     #[must_use]
     pub fn spec(&self) -> ShardSpecRef<'a> {
         self.spec
     }
 
+    /// Initial cursor position for this shard. Typically
+    /// [`CursorUpdate::initial()`] for fresh scans, or a resume point
+    /// for partially-completed shards.
     #[must_use]
     pub fn cursor(&self) -> CursorUpdate<'a> {
         self.cursor
@@ -1337,16 +1431,23 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
 
 /// Fixed-capacity byte storage for allocation-free [`ShardSummary`] fields.
 ///
+/// Stores up to `N` bytes inline (on the stack or within the parent struct)
+/// with a `len` field tracking the occupied prefix. This avoids heap
+/// allocation when constructing summaries from slab-backed shard records.
+///
 /// `ShardSummary::from_record` writes directly into this inline buffer.
 /// The `From<Vec<u8>>` impl exists as an adapter for non-hot-path callers; any
 /// allocation implied by `Vec` construction happens at the call site, not here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SummaryBytes<const N: usize> {
+    /// Fixed-size backing array. Only `bytes[..len]` contains valid data.
     bytes: [u8; N],
+    /// Number of valid bytes in the `bytes` array.
     len: usize,
 }
 
 impl<const N: usize> SummaryBytes<N> {
+    /// Create an empty buffer (zero-length, zeroed backing array).
     #[inline]
     fn new() -> Self {
         Self {
@@ -1355,6 +1456,11 @@ impl<const N: usize> SummaryBytes<N> {
         }
     }
 
+    /// Copy `src` into the buffer, replacing any previous content.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `oversize_msg` if `src.len() > N`.
     #[inline]
     fn write(&mut self, src: &[u8], oversize_msg: &'static str) {
         assert!(src.len() <= N, "{oversize_msg}");
@@ -1362,12 +1468,20 @@ impl<const N: usize> SummaryBytes<N> {
         self.len = src.len();
     }
 
+    /// Borrow the occupied portion of the buffer.
     #[inline]
     fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
 
+/// Adapter for non-hot-path callers. Any heap allocation is the caller's
+/// responsibility; the conversion itself only copies bytes into the
+/// fixed-capacity inline buffer.
+///
+/// # Panics
+///
+/// Panics if `value.len() > N`.
 impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
     fn from(value: Vec<u8>) -> Self {
         let mut out = Self::new();
@@ -1391,9 +1505,13 @@ impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
 /// [`ShardRecord`]: super::record::ShardRecord
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardSummary {
+    /// Shard identifier (unique within the run).
     pub(crate) shard: ShardId,
+    /// Lifecycle status at snapshot time.
     pub(crate) status: ShardStatus,
+    /// Park reason, set only when `status == Parked`.
     pub(crate) park_reason: Option<ParkReason>,
+    /// Whether the shard has an active (non-expired) lease at snapshot time.
     pub(crate) is_leased: bool,
     /// Deadline of the current lease, if any.  `Some` only when
     /// `is_leased` is `true`.  Callers use this to schedule retry
@@ -1405,18 +1523,27 @@ pub struct ShardSummary {
     /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
     /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,
+    /// Cursor's `last_key` at snapshot time, or `None` if the cursor
+    /// is at its initial (no-progress) position.
     pub(crate) last_key: Option<SummaryBytes<MAX_KEY_SIZE>>,
+    /// Inclusive lower bound of this shard's key range (copied from spec).
     pub(crate) key_range_start: SummaryBytes<MAX_KEY_SIZE>,
+    /// Exclusive upper bound of this shard's key range (copied from spec).
     pub(crate) key_range_end: SummaryBytes<MAX_KEY_SIZE>,
+    /// Parent shard ID if this shard was created by a split, `None` for root shards.
     pub(crate) parent: Option<ShardId>,
+    /// Number of child shards spawned by this shard via split operations.
+    /// Saturates at `u32::MAX` (astronomically unlikely in practice).
     pub(crate) spawned_count: u32,
 }
 
 impl ShardSummary {
-    /// Build a summary snapshot from one record at logical time `now`.
+    /// Build a summary snapshot from a [`ShardRecord`] at logical time `now`.
     ///
     /// Copies slab-backed cursor/spec bytes into fixed-capacity inline buffers
-    /// so the returned summary no longer borrows the coordinator slab.
+    /// so the returned summary no longer borrows the coordinator slab. Lease
+    /// status is evaluated against `now` (a lease past its deadline is treated
+    /// as expired).
     pub(crate) fn from_record(record: &ShardRecord, now: LogicalTime, slab: &ByteSlab) -> Self {
         let last_key = record.cursor.last_key(slab).map(|key| {
             let mut bytes = SummaryBytes::new();
@@ -1461,56 +1588,70 @@ impl ShardSummary {
         }
     }
 
+    /// The shard's unique identifier.
     #[must_use]
     pub fn shard(&self) -> ShardId {
         self.shard
     }
 
+    /// Current lifecycle status of this shard.
     #[must_use]
     pub fn status(&self) -> ShardStatus {
         self.status
     }
 
+    /// Why this shard was parked, if `status() == Parked`.
     #[must_use]
     pub fn park_reason(&self) -> Option<ParkReason> {
         self.park_reason
     }
 
+    /// Whether a worker holds an active (non-expired) lease at snapshot time.
     #[must_use]
     pub fn is_leased(&self) -> bool {
         self.is_leased
     }
 
+    /// Deadline of the current lease, if leased. Callers can use this to
+    /// schedule retry attempts near the soonest expiry.
     #[must_use]
     pub fn lease_deadline(&self) -> Option<LogicalTime> {
         self.lease_deadline
     }
 
+    /// Number of times this shard has been acquired (derived from fence epoch).
+    /// Useful for enforcing per-shard retry budgets.
     #[must_use]
     pub fn acquire_count(&self) -> u32 {
         self.acquire_count
     }
 
+    /// The cursor's `last_key` at snapshot time, or `None` if the cursor
+    /// is at its initial (no-progress) position.
     #[must_use]
     pub fn last_key(&self) -> Option<&[u8]> {
         self.last_key.as_ref().map(SummaryBytes::as_slice)
     }
 
+    /// Inclusive lower bound of this shard's key range.
     #[must_use]
     pub fn key_range_start(&self) -> &[u8] {
         self.key_range_start.as_slice()
     }
 
+    /// Exclusive upper bound of this shard's key range.
     #[must_use]
     pub fn key_range_end(&self) -> &[u8] {
         self.key_range_end.as_slice()
     }
 
+    /// Parent shard ID if this shard was created by a split, `None` for root shards.
     #[must_use]
     pub fn parent(&self) -> Option<ShardId> {
         self.parent
     }
 
+    /// Number of child shards spawned by this shard via split operations.
     #[must_use]
     pub fn spawned_count(&self) -> u32 {
         self.spawned_count
@@ -1667,13 +1808,17 @@ pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
     })
 }
 
-/// Shared implementation for terminal run operations.
+/// Shared implementation for terminal run operation payload hashes.
 ///
 /// Terminal ops (complete, fail, cancel) carry no per-invocation parameters
 /// beyond the `RunId` (implicit in the call site), so the payload is just
 /// the domain-separated tag. Each tag produces a distinct hash (non-zero
 /// with overwhelming probability ~1-2^{-64}; verified by
 /// `hash_terminal_ops_distinct` test).
+///
+/// Not `pub` because callers use the typed wrappers ([`hash_complete_run_payload`],
+/// [`hash_fail_run_payload`], [`hash_cancel_run_payload`]) which encode the
+/// correct domain tag for each operation.
 fn hash_run_terminal_payload(tag: &[u8]) -> u64 {
     op_payload_hash(tag, |_h| {})
 }
@@ -1819,6 +1964,12 @@ pub trait RunManagement {
         Ok(outcome.map(|_| record))
     }
 
+    /// Retrieve the run record for a given tenant and run ID.
+    ///
+    /// # Errors
+    ///
+    /// - [`GetRunError::RunNotFound`] -- no run with this ID for the tenant.
+    /// - [`GetRunError::TenantMismatch`] -- tenant isolation violation.
     fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError>;
 
     /// Return a point-in-time progress snapshot for `run`.

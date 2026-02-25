@@ -53,13 +53,20 @@ use crate::coordination::shard_spec::{
 };
 use core::fmt;
 
+/// Wire tag for [`ShardHint::Range`].
 const TAG_RANGE: u8 = 0x00;
+/// Wire tag for [`ShardHint::Prefix`].
 const TAG_PREFIX: u8 = 0x01;
+/// Wire tag for [`ShardHint::Manifest`].
 const TAG_MANIFEST: u8 = 0x02;
 
+/// Prefix hint header: 1-byte tag + 4-byte big-endian length.
 const PREFIX_HEADER_LEN: usize = 1 + 4;
+/// Manifest hint total size: 1-byte tag + three 8-byte big-endian u64 fields.
 const MANIFEST_LEN: usize = 1 + 8 + 8 + 8;
+/// Metadata envelope hint-length prefix size (4-byte big-endian u32).
 const METADATA_HINT_LEN_PREFIX: usize = 4;
+/// `u32::MAX` as `usize`, used as the framing width ceiling for prefix length.
 const U32_MAX_USIZE: usize = u32::MAX as usize;
 
 /// Reusable fixed-capacity metadata scratch buffer.
@@ -665,7 +672,16 @@ pub fn range_shard_ref<'a>(
     Ok(spec)
 }
 
-/// Convenience wrapper: build a range shard then allocate it in arena.
+/// Build a range shard spec and allocate it in the given arena.
+///
+/// Combines [`range_shard_ref`] validation with arena allocation. On
+/// success, returns a handle to the arena-backed spec. The handle remains
+/// valid until the arena is cleared or the spec is explicitly freed.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- range bounds or metadata fail validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
 pub fn range_shard_into(
     arena: &mut ShardArena,
     start: &[u8],
@@ -721,7 +737,16 @@ pub fn prefix_shard_ref<'a>(
     Ok(spec)
 }
 
-/// Convenience wrapper: build a prefix shard then allocate it in arena.
+/// Build a prefix shard spec and allocate it in the given arena.
+///
+/// Combines [`prefix_shard_ref`] validation with arena allocation. On
+/// success, returns a handle to the arena-backed spec.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- prefix is empty, too large, all-`0xFF`,
+///   or derived spec fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
 pub fn prefix_shard_into(
     arena: &mut ShardArena,
     prefix: &[u8],
@@ -772,7 +797,16 @@ pub fn manifest_shard_ref<'a>(
     Ok(spec)
 }
 
-/// Convenience wrapper: build a manifest shard then allocate it in arena.
+/// Build a manifest-row shard spec and allocate it in the given arena.
+///
+/// Combines [`manifest_shard_ref`] validation with arena allocation. On
+/// success, returns a handle to the arena-backed spec.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- row range is inverted or metadata fails
+///   validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
 pub fn manifest_shard_into(
     arena: &mut ShardArena,
     manifest_id: u64,

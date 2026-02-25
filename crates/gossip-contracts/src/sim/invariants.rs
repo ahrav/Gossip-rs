@@ -77,6 +77,9 @@ use crate::sim::backend::SimIntrospection;
 
 /// Sub-classification for S7 (SplitCoverage) violations, replacing
 /// untyped string descriptions with pattern-matchable variants.
+///
+/// Each variant carries enough context (the offending child IDs) for
+/// diagnostic output without requiring a second coordinator scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SplitCoverageDetail {
     /// Split shard has an empty `spawned` list — no children were created.
@@ -197,8 +200,12 @@ pub enum InvariantViolation {
 // InvariantChecker
 // ---------------------------------------------------------------------------
 
-/// Composite key for per-shard temporal history, scoped by tenant to prevent
-/// cross-contamination when a single checker validates multiple tenants.
+/// Composite key for per-shard temporal history.
+///
+/// Scoped by `TenantId` so a single [`InvariantChecker`] can validate
+/// multiple tenants without cross-contamination. Uses a tuple rather than
+/// `ShardKey` because `ShardKey` intentionally omits `Ord` (it is an opaque
+/// identity, not an ordered quantity), and `BTreeMap` requires `Ord` keys.
 type HistoryKey = (TenantId, RunId, ShardId);
 
 /// Stateful external observer that tracks per-shard history across
@@ -254,12 +261,18 @@ pub struct InvariantChecker {
 }
 
 impl InvariantChecker {
-    /// Create a fresh checker with no history.
+    /// Create a fresh checker with no history and S9 cooldown checking disabled.
+    ///
+    /// Equivalent to `InvariantChecker::with_cooldown_interval(0)`.
     pub fn new() -> Self {
         Self::with_cooldown_interval(0)
     }
 
     /// Create a checker with an explicit S9 cooldown interval.
+    ///
+    /// A `cooldown_interval` of 0 disables S9 checking (vacuously satisfied).
+    /// Positive values enforce that the same worker cannot claim twice within
+    /// `cooldown_interval` logical ticks.
     pub fn with_cooldown_interval(cooldown_interval: u64) -> Self {
         Self {
             prev_epochs: BTreeMap::new(),
@@ -288,6 +301,11 @@ impl InvariantChecker {
     /// This is a push-style check invoked by the harness when `ClaimNext`
     /// succeeds. Violations are buffered and appended by `check_all` so the
     /// caller sees a unified violation vector per simulation step.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `now` is less than a previously recorded claim time for
+    /// the same worker (logical time must not regress).
     pub fn record_claim_success(&mut self, worker: WorkerId, now: LogicalTime) {
         if self.cooldown_interval == 0 {
             return;
@@ -548,6 +566,12 @@ impl InvariantChecker {
 
     /// S6: cursor bounds.
     ///
+    /// The shard spec defines a half-open range `[start, end)`. A cursor
+    /// is out-of-bounds if its `last_key` is lexicographically before
+    /// `start` or at-or-after `end`. Empty bounds (zero-length slices)
+    /// are treated as unbounded in that direction, which disables the
+    /// corresponding check -- this handles open-ended shards.
+    ///
     /// Accepts borrowed slices from `SimIntrospection` accessors so the
     /// checker can validate bounds directly on slab-backed data without
     /// allocating temporary owned cursor/spec objects.
@@ -674,6 +698,7 @@ impl InvariantChecker {
     }
 }
 
+/// Default-constructs with no history and S9 cooldown checking disabled.
 impl Default for InvariantChecker {
     fn default() -> Self {
         Self::new()

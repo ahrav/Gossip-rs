@@ -314,6 +314,11 @@ impl<E: std::error::Error + 'static> std::error::Error for ShardIntoError<E> {
 /// validation is delegated to [`ShardSpec::validate_ref`].
 /// Returned range bytes borrow from `start_buf`/`end_buf`; reusing either
 /// buffer invalidates those views.
+///
+/// # Errors
+///
+/// Returns [`ShardSpecInputError`] when the encoded range fails validation:
+/// inverted bounds, keys exceeding [`MAX_KEY_SIZE`], or oversized metadata.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_keys_ref<'a, Start: KeyEncoding, End: KeyEncoding>(
     start: &Start,
@@ -329,7 +334,14 @@ pub fn shard_spec_from_keys_ref<'a, Start: KeyEncoding, End: KeyEncoding>(
     Ok(spec)
 }
 
-/// Convenience wrapper: build a borrowed spec then allocate it in [`ShardArena`].
+/// Build a spec from typed keys then allocate it in [`ShardArena`].
+///
+/// Combines [`shard_spec_from_keys_ref`] validation with arena allocation.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- encoded range fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
 pub fn shard_spec_from_keys_into<Start: KeyEncoding, End: KeyEncoding>(
     arena: &mut ShardArena,
     start: &Start,
@@ -346,6 +358,12 @@ pub fn shard_spec_from_keys_into<Start: KeyEncoding, End: KeyEncoding>(
 /// Construct a prefix-bounded [`ShardSpecRef`] as `[prefix, prefix_successor)`.
 ///
 /// The returned end bound borrows from `successor_buf`.
+///
+/// # Errors
+///
+/// Returns [`PrefixShardError`] when the prefix is empty, exceeds
+/// [`MAX_KEY_SIZE`], has no lexicographic successor (all `0xFF`), or when
+/// the derived spec fails downstream validation.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_prefix_ref<'a>(
     prefix: &'a [u8],
@@ -368,7 +386,14 @@ pub fn shard_spec_from_prefix_ref<'a>(
     Ok(spec)
 }
 
-/// Convenience wrapper: build a prefix spec then allocate it in [`ShardArena`].
+/// Build a prefix spec then allocate it in [`ShardArena`].
+///
+/// Combines [`shard_spec_from_prefix_ref`] validation with arena allocation.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- prefix fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
 pub fn shard_spec_from_prefix_into(
     arena: &mut ShardArena,
     prefix: &[u8],
@@ -382,7 +407,14 @@ pub fn shard_spec_from_prefix_into(
 
 /// Construct a same-manifest [`ShardSpecRef`] from a half-open row range.
 ///
-/// Returned start/end bounds borrow from `start_buf` and `end_buf`.
+/// Encodes `(manifest_id, start_row)` and `(manifest_id, end_row)` as
+/// [`ManifestRowKey`] boundaries. Returned start/end bounds borrow from
+/// `start_buf` and `end_buf`.
+///
+/// # Errors
+///
+/// Returns [`ShardSpecInputError`] when `start_row >= end_row` (inverted
+/// range) or the encoded keys fail downstream spec validation.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn shard_spec_from_manifest_range_ref<'a>(
     manifest_id: u64,
@@ -397,7 +429,15 @@ pub fn shard_spec_from_manifest_range_ref<'a>(
     shard_spec_from_keys_ref(&start, &end, metadata, start_buf, end_buf)
 }
 
-/// Convenience wrapper: build a manifest-range spec then allocate in arena.
+/// Build a manifest-range spec then allocate it in [`ShardArena`].
+///
+/// Combines [`shard_spec_from_manifest_range_ref`] validation with arena
+/// allocation.
+///
+/// # Errors
+///
+/// - [`ShardIntoError::Build`] -- row range fails validation.
+/// - [`ShardIntoError::SlabFull`] -- arena cannot allocate another spec.
 pub fn shard_spec_from_manifest_range_into(
     arena: &mut ShardArena,
     manifest_id: u64,

@@ -84,7 +84,12 @@ use crate::sim::backend::SimIntrospection;
 /// fence epoch, earlier cursor, reverted status) that the checker detects
 /// as violations of S2, S3, or S5.
 pub struct FaultInjectingIntrospector<B: SimIntrospection> {
+    /// The real backend being wrapped. All point-lookup and run-iteration
+    /// methods delegate to this backend unchanged.
     inner: B,
+    /// Synthetic records injected before checker execution. These appear
+    /// in `shards()` iteration but are invisible to `shard_lookup()`.
+    /// Growth allocation happens at injection time, not during iteration.
     synthetic_records: Vec<(TenantId, ShardKey, ShardRecord)>,
 }
 
@@ -136,7 +141,11 @@ pub struct FaultInjectingShardIter<'a, I>
 where
     I: Iterator<Item = ((TenantId, ShardKey), &'a ShardRecord)>,
 {
+    /// Inner backend's shard iterator, consumed first. Once exhausted,
+    /// `next()` switches to the synthetic slice iterator.
     real: I,
+    /// Slice iterator over the injector's synthetic record buffer.
+    /// Only consumed after `real` is fully drained.
     synthetic: core::slice::Iter<'a, (TenantId, ShardKey, ShardRecord)>,
 }
 
@@ -156,17 +165,24 @@ where
     }
 }
 
+/// [`SimIntrospection`] implementation that composes the inner backend's
+/// iterators with synthetic record injection. Run and spawned iterators
+/// pass through unchanged; only the shard iterator is wrapped.
 impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
+    /// Two-phase iterator: real records from `B`, then synthetic records
+    /// from `self.synthetic_records`.
     type ShardIter<'a>
         = FaultInjectingShardIter<'a, B::ShardIter<'a>>
     where
         Self: 'a;
 
+    /// Passthrough — no synthetic run records are injected.
     type RunIter<'a>
         = <B as SimIntrospection>::RunIter<'a>
     where
         Self: 'a;
 
+    /// Passthrough — spawned children come from the inner backend.
     type SpawnedIter<'a>
         = <B as SimIntrospection>::SpawnedIter<'a>
     where
@@ -191,37 +207,46 @@ impl<B: SimIntrospection> SimIntrospection for FaultInjectingIntrospector<B> {
         self.inner.runs()
     }
 
+    /// Returns the sum of real and synthetic record counts.
+    ///
+    /// Consistent with [`shards()`](Self::shards) output cardinality,
+    /// but intentionally inconsistent with [`shard_lookup()`](Self::shard_lookup)
+    /// (which cannot find synthetic records). See the
+    /// [consistency contract](SimIntrospection#consistency-contract).
     fn shard_count(&self) -> usize {
-        // Mirrors `shards()` output cardinality: all real records plus all
-        // configured synthetic records.
         self.inner.shard_count() + self.synthetic_records.len()
     }
 
+    /// Delegates to the inner backend only — synthetic records are invisible.
+    ///
+    /// This asymmetry is intentional: S7 (SplitCoverage) uses `shard_lookup`
+    /// to verify child existence, so synthetic split-parents with
+    /// missing children correctly fail the lookup.
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord> {
-        // Delegates to real backend only — synthetic records are
-        // visible through full iteration but not point lookups.
-        // This is intentional: S7 (SplitCoverage) uses shard_lookup
-        // to verify child existence, so synthetic split-parents with
-        // missing children correctly fail the lookup.
         self.inner.shard_lookup(tenant, key)
     }
 
+    /// Delegates to the inner backend's cursor accessor.
     fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]> {
         self.inner.cursor_last_key(record)
     }
 
+    /// Delegates to the inner backend's spec accessor.
     fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]) {
         self.inner.spec_bounds(record)
     }
 
+    /// Delegates to the inner backend's structural validation.
     fn validate_record_invariants(&self, record: &ShardRecord) -> Result<(), String> {
         self.inner.validate_record_invariants(record)
     }
 
+    /// Delegates to the inner backend's spawned-children iterator.
     fn spawned_children<'a>(&'a self, record: &'a ShardRecord) -> Self::SpawnedIter<'a> {
         self.inner.spawned_children(record)
     }
 
+    /// Delegates to the inner backend's pooled-field cleanup.
     fn release_record_fields(&mut self, record: &mut ShardRecord) {
         self.inner.release_record_fields(record);
     }

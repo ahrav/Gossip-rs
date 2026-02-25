@@ -162,7 +162,12 @@ pub enum CoordError {
     ///
     /// Cursor monotonicity is a hard safety invariant.
     CursorRegression {
+        /// Byte length of the old cursor's `last_key`, or `None` if the
+        /// old cursor had no key. Raw key bytes are redacted to prevent
+        /// data exfiltration via error messages.
         old_key: Option<usize>,
+        /// Byte length of the new (rejected) cursor's `last_key`, or
+        /// `None` if absent. Redacted for the same reason as `old_key`.
         new_key: Option<usize>,
     },
 
@@ -208,6 +213,8 @@ pub struct CursorOutOfBoundsDetail {
     pub spec_end: usize,
 }
 
+/// Helper for `Debug` impls that shows `Some([N bytes])` instead of
+/// raw key data. Used by `CursorRegression` redaction.
 #[derive(Clone, Copy)]
 struct RedactedOptionalLen(Option<usize>);
 
@@ -1286,36 +1293,55 @@ pub struct ShardSnapshotView<'a> {
 
 impl<'a> ShardSnapshotView<'a> {
     /// Lifecycle status at acquisition time.
+    ///
+    /// Typically [`ShardStatus::Active`] because only active shards can
+    /// be acquired, but the snapshot captures the raw stored value.
     #[must_use]
     pub fn status(&self) -> ShardStatus {
         self.status
     }
 
-    /// Borrowed shard spec view (range + metadata).
+    /// Borrowed shard spec view (key range boundaries and metadata).
+    ///
+    /// The returned reference borrows from the [`AcquireScratch`] that
+    /// backs this snapshot.
     #[must_use]
     pub fn spec(&self) -> ShardSpecRef<'a> {
         self.spec
     }
 
-    /// Borrowed cursor view captured at acquisition time.
+    /// Borrowed cursor view representing the shard's scan progress at
+    /// acquisition time.
+    ///
+    /// Workers should resume processing from this cursor position.
     #[must_use]
     pub fn cursor(&self) -> CursorUpdate<'a> {
         self.cursor
     }
 
-    /// Cursor semantics configured for the run.
+    /// Cursor semantics configured for the run (e.g., lexicographic
+    /// vs. opaque ordering).
+    ///
+    /// Determines how the coordination layer validates cursor
+    /// monotonicity and bounds for subsequent checkpoint/complete calls.
     #[must_use]
     pub fn cursor_semantics(&self) -> CursorSemantics {
         self.cursor_semantics
     }
 
-    /// Parent shard ID when this shard was split from another.
+    /// Parent shard ID if this shard was created by a split operation.
+    ///
+    /// `None` for original (non-split) shards registered during
+    /// `register_shards`.
     #[must_use]
     pub fn parent(&self) -> Option<ShardId> {
         self.parent
     }
 
-    /// Borrowed list of spawned child shard IDs.
+    /// Child shard IDs spawned from this shard via split operations.
+    ///
+    /// Empty for shards that have never been split. The slice borrows
+    /// from the [`AcquireScratch`]'s inline storage.
     #[must_use]
     pub fn spawned(&self) -> &'a [ShardId] {
         self.spawned
@@ -1333,8 +1359,14 @@ impl<'a> ShardSnapshotView<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "contains a lease and borrowed snapshot view"]
 pub struct AcquireResultView<'a> {
+    /// The newly granted lease for the acquired shard. Contains the
+    /// shard key, fence epoch, and deadline the worker must renew before.
     pub lease: Lease,
+    /// Borrowed view of the shard's state at acquisition time.
+    /// References data stored in the caller-owned [`AcquireScratch`].
     pub snapshot: ShardSnapshotView<'a>,
+    /// Advisory snapshot of run-level shard availability for backoff
+    /// decisions. See [`CapacityHint`] for usage guidance.
     pub capacity: CapacityHint,
 }
 
@@ -1348,6 +1380,7 @@ pub(crate) struct FixedBuf<const N: usize> {
 }
 
 impl<const N: usize> FixedBuf<N> {
+    /// Create an empty buffer (logical length zero, backing bytes zeroed).
     #[inline]
     pub(crate) const fn new() -> Self {
         Self {
@@ -1369,6 +1402,10 @@ impl<const N: usize> FixedBuf<N> {
     }
 
     /// Convenience constructor: create and immediately write.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes.len() > N` with `oversized_msg`.
     #[inline]
     pub(crate) fn from_slice(bytes: &[u8], oversized_msg: &'static str) -> Self {
         let mut buf = Self::new();
@@ -1376,16 +1413,22 @@ impl<const N: usize> FixedBuf<N> {
         buf
     }
 
+    /// Borrow the written portion of the buffer (`&bytes[..len]`).
     #[inline]
     pub(crate) fn read(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 
+    /// Set logical length to zero without zeroing backing bytes.
+    ///
+    /// After reset, [`read`](Self::read) returns an empty slice and
+    /// [`has_data`](Self::has_data) returns `false`.
     #[inline]
     pub(crate) fn reset(&mut self) {
         self.len = 0;
     }
 
+    /// Returns `true` if the buffer contains at least one written byte.
     #[inline]
     pub(crate) fn has_data(&self) -> bool {
         self.len > 0
@@ -1563,6 +1606,11 @@ impl AcquireScratch {
     ///
     /// This keeps acquire callers allocation-free even when upstream storage
     /// is not represented as a `&[ShardId]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the iterator yields more than [`MAX_SPAWNED_PER_SHARD`]
+    /// items, indicating shard record corruption.
     pub(crate) fn write_spawned_iter<I>(&mut self, spawned: I)
     where
         I: IntoIterator<Item = ShardId>,
@@ -1630,7 +1678,10 @@ impl AcquireScratch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use = "renew result contains the new deadline"]
 pub struct RenewResult {
+    /// The extended lease deadline after successful renewal.
     pub new_deadline: LogicalTime,
+    /// Advisory snapshot of how many shards remain available in the run.
+    /// See [`CapacityHint`] for backoff guidance.
     pub capacity: CapacityHint,
 }
 

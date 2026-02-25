@@ -22,6 +22,10 @@ use super::harness::{SimEvent, SimEventKind, SimOp};
 use super::invariants::InvariantViolation;
 
 /// Scripted overload workload kind.
+///
+/// Each variant produces a deterministic burst of [`SimOp`]s via its
+/// corresponding generator function (`generate_burst_claim`,
+/// `generate_capacity_drop`, `generate_burst_shards`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverloadKind {
     /// All workers attempt to claim in a burst.
@@ -33,6 +37,9 @@ pub enum OverloadKind {
 }
 
 /// Scenario configuration for overload runs.
+///
+/// Consumed by [`CoordinationSim::run_overload`](super::harness::CoordinationSim::run_overload)
+/// to configure the scripted pressure phase between warmup and recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverloadScenario {
     /// Which scripted pressure pattern to execute each round.
@@ -52,9 +59,16 @@ impl OverloadScenario {
 }
 
 /// Tracks completion goodput during scripted overload rounds.
+///
+/// Goodput is the ratio of successful completions (`CompleteOk`) to total
+/// operations fed into [`record`](Self::record). The harness feeds only
+/// scripted overload events (not warmup/recovery) to keep the metric focused
+/// on pressure behavior.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GoodputTracker {
+    /// Number of `SimEvent::CompleteOk` events recorded.
     completions: u64,
+    /// Total number of events recorded (completions + all other outcomes).
     total_ops: u64,
 }
 
@@ -64,6 +78,15 @@ impl GoodputTracker {
     /// This counter is phase-agnostic; callers decide which events to feed in.
     /// `run_overload` records only scripted overload events to keep the
     /// goodput metric focused on pressure behavior rather than warmup/recovery.
+    ///
+    /// Only [`SimEvent::CompleteOk`] increments the completion counter;
+    /// all other event variants (including other success types like
+    /// `AcquireOk`) contribute only to `total_ops`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `u64` overflow of `total_ops` or `completions` (unreachable
+    /// in practice for simulation-scale workloads).
     pub fn record(&mut self, event: &SimEvent) {
         self.total_ops = self
             .total_ops
@@ -78,6 +101,8 @@ impl GoodputTracker {
     }
 
     /// Completion ratio in `[0.0, 1.0]`.
+    ///
+    /// Returns `0.0` when no events have been recorded (avoids division by zero).
     #[must_use]
     pub fn rate(&self) -> f64 {
         if self.total_ops == 0 {
@@ -89,6 +114,11 @@ impl GoodputTracker {
 }
 
 /// D1 diagnostic sample at a point in simulated time.
+///
+/// Captures the gap between the coordinator's fast-path availability
+/// count (`count_available_for_run`) and the ground-truth count from a
+/// full shard scan. A discrepancy indicates a bookkeeping bug in the
+/// coordinator's availability tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct D1Observation {
     /// Logical time at which the sample was captured.
@@ -99,7 +129,11 @@ pub struct D1Observation {
     pub ground_truth: u32,
 }
 
-/// Report returned by `CoordinationSim::run_overload`.
+/// Report returned by [`CoordinationSim::run_overload`](super::harness::CoordinationSim::run_overload).
+///
+/// Extends the standard [`SimReport`](super::harness::SimReport) with
+/// overload-specific diagnostics: goodput during the pressure phase,
+/// D1 availability-accuracy samples, and an L1 recovery sentinel.
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct OverloadReport {
@@ -114,15 +148,22 @@ pub struct OverloadReport {
     pub seed: u64,
     /// Logical time at run completion.
     pub end_time: LogicalTime,
-    /// Completion ratio during scripted overload rounds.
+    /// Completion ratio during scripted overload rounds (0.0--1.0).
+    /// Computed from `GoodputTracker` which only records scripted-phase events.
     pub overload_goodput: f64,
     /// D1 samples comparing reported availability to full-scan truth.
+    /// Captured after each successful acquire/claim during overload rounds.
     pub d1_observations: Vec<D1Observation>,
     /// L1 sentinel: at least one shard completed during recovery.
+    /// `false` indicates the system did not make forward progress after
+    /// the overload phase, which may signal a liveness regression.
     pub l1_any_completed: bool,
 }
 
 /// Scripted overload op burst: every worker issues `ClaimNext`.
+///
+/// Returns one `SimOp::ClaimNext` per worker, modeling a thundering-herd
+/// scenario where all workers attempt to claim simultaneously.
 pub(super) fn generate_burst_claim(workers: &[WorkerId]) -> Vec<SimOp> {
     workers
         .iter()
@@ -132,6 +173,13 @@ pub(super) fn generate_burst_claim(workers: &[WorkerId]) -> Vec<SimOp> {
 }
 
 /// Scripted capacity-drop burst: pause half the workers, then jump time.
+///
+/// Models partial infrastructure failure (e.g., losing an availability zone).
+/// The time jump (`2 * DEFAULT_LEASE_DURATION`) guarantees all leases from
+/// paused workers expire before surviving workers resume claiming.
+///
+/// With odd worker counts, integer division rounds down, keeping one extra
+/// worker active (partial, not total, capacity loss).
 pub(super) fn generate_capacity_drop(workers: &[WorkerId]) -> Vec<SimOp> {
     let mut ops = Vec::new();
     // Integer division intentionally rounds down: with odd worker counts we
@@ -149,6 +197,11 @@ pub(super) fn generate_capacity_drop(workers: &[WorkerId]) -> Vec<SimOp> {
 }
 
 /// Scripted split burst: issue `SplitReplace` on all currently held shards.
+///
+/// Models rapid shard proliferation (e.g., auto-scaling triggered by a
+/// workload spike). Returns one `SimOp::SplitReplace` per held shard;
+/// the caller snapshots held shards before the round, so early splits
+/// within the round may cause later entries to hit stale-key rejections.
 pub(super) fn generate_burst_shards(held_shards: &[(WorkerId, ShardKey)]) -> Vec<SimOp> {
     held_shards
         .iter()

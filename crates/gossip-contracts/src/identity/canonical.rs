@@ -22,7 +22,10 @@ use blake3::Hasher;
 /// **Determinism**: output must be identical across platforms, byte orders, and
 /// Rust versions. Use fixed-endian encoding (little-endian by convention).
 ///
-/// **No allocation**: implementations must feed directly into the hasher.
+/// **No allocation**: implementations must feed bytes directly into the hasher
+/// without intermediate heap allocation. Identity derivation runs on hot paths
+/// (per-finding, per-shard, per-checkpoint), so any allocation here would
+/// violate the zero-allocation-after-startup invariant.
 ///
 /// # Implementing for composite types
 ///
@@ -48,6 +51,7 @@ pub trait CanonicalBytes {
     fn write_canonical(&self, hasher: &mut Hasher);
 }
 
+/// Single-byte encoding: no length prefix needed (fixed 1-byte width).
 impl CanonicalBytes for u8 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -55,6 +59,7 @@ impl CanonicalBytes for u8 {
     }
 }
 
+/// 4-byte little-endian encoding: no length prefix needed (fixed width).
 impl CanonicalBytes for u32 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -62,6 +67,7 @@ impl CanonicalBytes for u32 {
     }
 }
 
+/// 8-byte little-endian encoding: no length prefix needed (fixed width).
 impl CanonicalBytes for u64 {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {

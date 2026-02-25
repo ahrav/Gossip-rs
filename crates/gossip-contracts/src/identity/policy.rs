@@ -46,7 +46,9 @@ pub enum IdHashMode {
 
 impl IdHashMode {
     /// Convert from a raw `u8` discriminant, returning `None` for unknown
-    /// values.
+    /// values.  Currently only `0` ([`Unkeyed`](Self::Unkeyed)) and `1`
+    /// ([`KeyedV1`](Self::KeyedV1)) are recognized; all other values
+    /// return `None`.
     #[inline]
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
@@ -64,6 +66,8 @@ impl IdHashMode {
 }
 
 impl CanonicalBytes for IdHashMode {
+    /// Encodes as a single byte (the `#[repr(u8)]` discriminant), which is
+    /// self-framing and needs no length prefix.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.as_u8().write_canonical(h);
@@ -72,13 +76,19 @@ impl CanonicalBytes for IdHashMode {
 
 /// Current schema version for [`PolicyHashInputs`].
 ///
-/// Bump this to force a rescan when the derivation scheme changes.
+/// Bumping this value changes every derived `PolicyHash`, which in turn
+/// invalidates all existing skip/dedupe decisions and forces a full rescan
+/// across all tenants.  Only bump when the derivation algorithm itself
+/// changes (not when individual rules change -- that is captured by
+/// `rules_digest`).
 pub const CURRENT_VERSION: u32 = 1;
 
 /// Current evidence-hash version.
 ///
 /// Bump this when the normalization or input pipeline changes in a way
-/// that affects hash output.
+/// that affects hash output (e.g., changing how whitespace is
+/// canonicalized before hashing).  Like [`CURRENT_VERSION`], bumping
+/// this invalidates all derived `PolicyHash` values and forces rescans.
 pub const CURRENT_EVIDENCE_VERSION: u32 = 1;
 
 /// Structured inputs to [`compute_policy_hash`].
@@ -120,6 +130,8 @@ impl CanonicalBytes for PolicyHashInputs {
 /// Derive a [`PolicyHash`] from its structured inputs.
 ///
 /// Uses BLAKE3 derive-key mode with [`super::domain::POLICY_HASH_V2`].
+/// Internally clones a cached hasher (`hashing::POLICY_HASH_HASHER`)
+/// to avoid re-running the BLAKE3 key-schedule setup on every call.
 ///
 /// # Invariants
 ///

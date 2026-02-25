@@ -126,10 +126,17 @@ use super::{FaultConfig, FaultLevel, SimContext};
 /// All three share identical coordinator signatures
 /// `(now, tenant, run, op_id) -> Result<IdempotentOutcome<()>, RunTransitionError>`
 /// so a single `SimOp::TerminateRun { run, kind }` variant covers all three.
+///
+/// Unlike shard terminal states, run terminal transitions have no "unpark"
+/// exception -- once a run reaches `Done`, `Failed`, or `Cancelled`, any
+/// further transition attempt is rejected by the coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunTerminalKind {
+    /// Mark the run as successfully completed.
     Complete,
+    /// Mark the run as failed.
     Fail,
+    /// Cancel the run.
     Cancel,
 }
 
@@ -214,6 +221,9 @@ pub enum SimOp {
 /// their result payloads (e.g., the new fence epoch from an acquire); rejected
 /// operations carry a [`RejectionKind`] that categorizes the failure without
 /// heap allocation.
+///
+/// The `kind()` method maps each variant to a payload-free
+/// [`SimEventKind`] discriminant for histogram counting in [`SimReport`].
 #[derive(Debug, Clone)]
 pub enum SimEvent {
     /// Lease acquired; `fence` is the new fence epoch for the shard.
@@ -641,8 +651,23 @@ const MAX_STALE_LEASES: usize = 64;
 /// Only the most recent checkpoint per `(worker, run, shard)` is retained.
 /// Earlier entries are overwritten, which is correct because the op-log's
 /// dedup window is bounded and older ops may already be evicted.
+/// Per-(worker, run, shard) checkpoint history for replay/conflict testing.
+///
+/// Key is `(worker_raw, run_raw, shard_raw)` using raw `u64` identifiers
+/// because `ShardKey` omits `Ord`. Value stores the last successful
+/// checkpoint's `(OpId, last_key_bytes, WorkerId, ShardKey)`.
 type CheckpointOpMap = BTreeMap<(u64, u64, u64), (OpId, Vec<u8>, WorkerId, ShardKey)>;
+
+/// Stack-owned copy of a shard's spec bounds: `(start_buf, start_len, end_buf, end_len)`.
+///
+/// Fixed-capacity arrays avoid holding immutable borrows into the coordinator
+/// while building split plans that require mutable coordinator access.
 type SplitBoundsBuf = ([u8; MAX_KEY_SIZE], usize, [u8; MAX_KEY_SIZE], usize);
+
+/// Split input snapshot: spec bounds plus the optional first cursor byte.
+///
+/// The cursor byte is used by split-residual to place the split point after
+/// already-scanned data.
 type SplitInputCopy = (SplitBoundsBuf, Option<u8>);
 
 /// Validate worker preconditions and consume the next op-ID in one shot.
@@ -771,17 +796,26 @@ fn precompute_split_residual_plan(
 /// | `last_checkpoint_ops` | Per-(worker, run, shard) checkpoint history for replay/conflict testing. |
 /// | `run_shard_ids` | Shard IDs per run, seeded into the coordinator for `claim_next_available`. |
 pub struct CoordinationSim<B: SimulationBackend = InMemoryCoordinator> {
+    /// PRNG + logical clock for deterministic simulation.
     context: SimContext,
+    /// The backend under test (ground truth for all shard/lease/fence state).
     coordinator: B,
+    /// Per-worker local bookkeeping. Intentionally diverges from coordinator
+    /// truth after faults (e.g., silent lease expiry).
     workers: BTreeMap<WorkerId, SimWorker>,
+    /// Fault injection rates for the current run.
     fault_config: FaultConfig,
+    /// External invariant observer, called after every operation.
     checker: InvariantChecker,
+    /// All registered shard keys (grows on splits, never shrinks).
     shard_keys: Vec<ShardKey>,
     /// Subset of `shard_keys` containing only non-terminal shards.
     /// Used by `pick_random_shard_key` to avoid selecting terminal shards
     /// that would always be rejected.
     active_shard_keys: Vec<ShardKey>,
+    /// Fixed tenant ID for the simulation (`[0x01; 32]`).
     tenant: TenantId,
+    /// Running count of operations executed (zombie + safety + liveness).
     ops_executed: usize,
     /// Stale leases saved when B1 cleanup supersedes them, used for
     /// zombie checkpoint injection to exercise the `StaleFence` path.
@@ -882,7 +916,12 @@ impl CoordinationSim<InMemoryCoordinator> {
         self
     }
 
-    /// Create run records for all registered runs.
+    /// Create run records for all registered runs in the coordinator.
+    ///
+    /// Must be called after all shards are registered via
+    /// [`register_shard`](Self::register_shard) so the run records contain
+    /// the correct shard ID lists. Called automatically by
+    /// [`with_workers_and_shards`](Self::with_workers_and_shards).
     pub fn seed_all_runs(&mut self) {
         for (run, shard_ids) in &self.run_shard_ids {
             self.coordinator
@@ -1475,6 +1514,12 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Worker IDs start at 1, so partition 0 `[0, OP_ID_PARTITION)` is unused
     /// by workers. Admin operations (`Unpark`, `TerminateRun`) draw from this
     /// partition so they cannot collide with worker-generated op-IDs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the admin partition is exhausted (more than `OP_ID_PARTITION`
+    /// admin operations in a single run). In practice this is unreachable for
+    /// simulation sizes under millions of admin ops.
     fn next_admin_op_id(&mut self) -> OpId {
         assert!(
             self.admin_next_op < super::worker::OP_ID_PARTITION,
@@ -1857,6 +1902,12 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     /// Execute a checkpoint using a stale lease saved when another worker
     /// acquired the same shard. Exercises the coordinator's fence-based
     /// `StaleFence` rejection path that bookkeeping cleanup otherwise shadows.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the coordinator *accepts* a checkpoint with a stale lease.
+    /// A successful stale-lease write means the fencing protocol is
+    /// fundamentally broken -- this is not a recoverable simulation event.
     fn exec_zombie_checkpoint(&mut self) -> SimEvent {
         if self.stale_leases.is_empty() {
             return SimEvent::Rejected {
@@ -2142,18 +2193,22 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         Some(f(worker, held[idx]))
     }
 
+    /// Pick an active worker holding a shard and generate a renew op.
     fn try_gen_renew(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Renew { worker, key })
     }
 
+    /// Pick an active worker holding a shard and generate a checkpoint op.
     fn try_gen_checkpoint(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Checkpoint { worker, key })
     }
 
+    /// Pick an active worker holding a shard and generate a complete op.
     fn try_gen_complete(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Complete { worker, key })
     }
 
+    /// Pick an active worker holding a shard and generate a park op.
     fn try_gen_park(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::Park { worker, key })
     }
@@ -2238,10 +2293,12 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         Some(SimOp::ResumeWorker { worker })
     }
 
+    /// Pick an active worker holding a shard and generate a split-replace op.
     fn try_gen_split_replace(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::SplitReplace { worker, key })
     }
 
+    /// Pick an active worker holding a shard and generate a split-residual op.
     fn try_gen_split_residual(&mut self) -> Option<SimOp> {
         self.try_gen_held_shard_op(|worker, key| SimOp::SplitResidual { worker, key })
     }
@@ -2604,7 +2661,9 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             lease: Lease,
             is_terminal: bool,
             checkpoints_ok: u32,
+            /// Number of failed checkpoint operations (e.g., lease expired mid-session).
             checkpoints_rejected: u32,
+            /// Child shard IDs created by split operations (empty if no split occurred).
             split_children: Vec<ShardId>,
         }
 

@@ -93,10 +93,13 @@ macro_rules! define_id_32 {
         }
 
         impl $name {
-            /// The all-zeros sentinel value.
+            /// The all-zeros sentinel value, used as a default/placeholder in
+            /// contexts where an ID is structurally required but not yet known
+            /// (e.g., uninitialized shard records).
             pub const ZERO: Self = Self([0u8; 32]);
 
-            /// Construct from raw bytes.
+            /// Construct from raw bytes.  No validation is performed --
+            /// any 32-byte value is a valid ID.
             #[inline]
             pub const fn from_bytes(bytes: [u8; 32]) -> Self {
                 Self(bytes)
@@ -170,8 +173,11 @@ macro_rules! define_id_32_restricted {
         impl $name {
             /// Construct from raw bytes.
             ///
-            /// `pub(crate)` — only derivation functions within this crate may
-            /// construct this type.
+            /// `pub(crate)` visibility ensures that only derivation functions
+            /// within this crate may construct this type.  External callers
+            /// cannot forge values by supplying arbitrary bytes; they must go
+            /// through the designated derivation function (e.g., `key_secret_hash`
+            /// for `SecretHash`).
             #[inline]
             pub(crate) const fn from_bytes_internal(bytes: [u8; 32]) -> Self {
                 Self(bytes)
@@ -301,10 +307,13 @@ macro_rules! define_id_64 {
         }
 
         impl $name {
-            /// The zero sentinel value.
+            /// The zero sentinel value, used as a default/placeholder in
+            /// contexts where an ID is structurally required but not yet
+            /// assigned (e.g., newly created coordination records).
             pub const ZERO: Self = Self(0);
 
-            /// Construct from a raw `u64`.
+            /// Construct from a raw `u64`.  No validation is performed --
+            /// any `u64` value is a valid ID.
             #[inline]
             pub const fn from_raw(raw: u64) -> Self { Self(raw) }
 

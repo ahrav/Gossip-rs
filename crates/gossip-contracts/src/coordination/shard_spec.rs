@@ -773,14 +773,29 @@ impl std::error::Error for ShardSpecInputError {}
 /// (cheap to pass around) but the underlying bytes live in the arena's slab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShardSpecHandle {
+    /// Index into the arena's slot array.
     slot: u32,
+    /// Generation counter at allocation time. Must match the slot's current
+    /// generation for the handle to be valid.
     generation: u32,
+    /// Unique arena identity. Prevents cross-arena handle misuse.
     arena_id: u32,
 }
 
+/// Internal slot in a [`ShardArena`] that pairs a generation counter with
+/// an optional pooled spec.
+///
+/// When `spec` is `Some`, the slot is occupied and the `generation` matches
+/// the generation stored in the corresponding [`ShardSpecHandle`]. When
+/// the slot is freed, `spec` is set to `None` and `generation` is
+/// incremented to invalidate any outstanding handles.
 #[derive(Debug)]
 struct ArenaSlot {
+    /// Generation counter, incremented on each free. Stale handles carry
+    /// the generation from allocation time and will fail the match check
+    /// in [`ShardArena::try_view_spec`].
     generation: u32,
+    /// The pooled spec occupying this slot, or `None` if the slot is free.
     spec: Option<PooledShardSpec>,
 }
 
@@ -813,20 +828,43 @@ struct ArenaSlot {
 /// must call [`free_spec`](Self::free_spec) to release slab bytes. Dropping
 /// the arena drops the slab, reclaiming all memory at once.
 pub struct ShardArena {
+    /// Shared byte pool backing all spec key ranges and metadata.
     slab: ByteSlab,
+    /// Fixed-size slot array. Indices are reused via `free_slots`;
+    /// generations prevent stale-handle access.
     slots: Vec<ArenaSlot>,
+    /// LIFO stack of free slot indices. Popped on alloc, pushed on free.
+    /// Reverse order (highest index at bottom) gives deterministic
+    /// allocation order after [`clear`](Self::clear).
     free_slots: Vec<u32>,
+    /// Unique identifier for this arena instance. Prevents cross-arena
+    /// handle misuse (a handle from arena A is rejected by arena B).
     arena_id: u32,
 }
 
+/// Global counter for assigning unique arena identifiers.
+///
+/// Each [`ShardArena`] gets a distinct `arena_id` to prevent cross-arena
+/// handle misuse. Starts at 1 (0 is reserved as an invalid sentinel).
+/// `Relaxed` ordering is sufficient because uniqueness only requires
+/// atomicity, not ordering relative to other memory operations.
 static NEXT_ARENA_ID: AtomicU32 = AtomicU32::new(1);
 
+/// Allocate the next unique arena ID.
+///
+/// Wraps at `u32::MAX`; in practice a process would need to create
+/// 4 billion arenas before collision, which is not a realistic concern.
 fn next_arena_id() -> u32 {
     NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl ShardArena {
     /// Create a new arena with fixed slot and byte capacity.
+    ///
+    /// All slots and the slab are allocated at construction time so that
+    /// runtime operations (alloc/free/view) never touch the global allocator.
+    /// `spec_slots` determines the maximum number of live specs; `byte_capacity`
+    /// determines the total slab bytes available for spec key ranges and metadata.
     #[must_use]
     pub fn with_capacity(spec_slots: usize, byte_capacity: usize) -> Self {
         let mut slots = Vec::with_capacity(spec_slots);
@@ -1025,12 +1063,16 @@ pub enum SplitValidationError {
     SingleChild,
     /// First child's start doesn't match parent's start.
     StartMismatch {
+        /// Length of the parent's start key in bytes.
         parent_start: usize,
+        /// Length of the first child's start key in bytes.
         first_child_start: usize,
     },
     /// Last child's end doesn't match parent's end.
     EndMismatch {
+        /// Length of the parent's end key in bytes.
         parent_end: usize,
+        /// Length of the last child's end key in bytes.
         last_child_end: usize,
     },
     /// Boundary mismatch (gap or overlap) between adjacent children.
@@ -1039,7 +1081,9 @@ pub enum SplitValidationError {
         child_index: usize,
         /// Index in the coordinator's internal start-sorted child order.
         next_child_index: usize,
+        /// Length of `child_index`'s end key in bytes.
         child_end: usize,
+        /// Length of `next_child_index`'s start key in bytes.
         next_child_start: usize,
     },
     /// Child has inverted key range (start >= end).
@@ -1062,8 +1106,11 @@ pub enum SplitValidationError {
     /// strand the cursor outside the parent's key range, violating
     /// cursor bounds (D2.4).
     ParentCursorOutOfBounds {
+        /// Length of the parent's cursor `last_key` in bytes.
         cursor: usize,
+        /// Length of the proposed new parent start key in bytes.
         new_parent_start: usize,
+        /// Length of the proposed new parent end key in bytes.
         new_parent_end: usize,
     },
 
@@ -1074,8 +1121,11 @@ pub enum SplitValidationError {
     /// the in-memory reference spec matches by returning this error
     /// instead of panicking at `assert_invariants`.
     SpawnLimitExceeded {
+        /// Number of children already spawned by the parent.
         current: usize,
+        /// Number of new children this split would add.
         additional: usize,
+        /// Maximum allowed spawned children per shard.
         max: usize,
     },
 
@@ -1083,9 +1133,13 @@ pub enum SplitValidationError {
     ///
     /// Prevents unbounded resource growth from split-flooding (CWE-400).
     ShardLimitExceeded {
+        /// Current number of shards in the scope.
         current: usize,
+        /// Number of new shards this split would add.
         additional: usize,
+        /// Maximum allowed shards in the scope.
         max: usize,
+        /// Whether the limit is per-tenant or global.
         scope: ShardLimitScope,
     },
 

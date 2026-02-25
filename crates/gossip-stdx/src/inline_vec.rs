@@ -56,7 +56,12 @@ const _: () = assert!(
 );
 
 impl<T, const N: usize> InlineVec<T, N> {
-    /// Compile-time capacity validation.
+    /// Validated inline capacity as a `u32`, computed at compile time.
+    ///
+    /// Asserts `N > 0` and `N <= u32::MAX / 2`. The half-u32 upper bound
+    /// prevents `len + 1` from overflowing during push. Constructors evaluate
+    /// this constant via `let _ = Self::VALIDATED_CAP` to force the assertions
+    /// even when the constant is not otherwise used.
     const VALIDATED_CAP: u32 = {
         assert!(N > 0, "InlineVec capacity must be > 0");
         assert!(
@@ -192,6 +197,10 @@ impl<T, const N: usize> InlineVec<T, N> {
         self.repr = Repr::Heap(vec);
     }
 
+    /// Cold path: spills the inline buffer to heap and pushes one element.
+    ///
+    /// Separated from `push` so the compiler places this code out-of-line,
+    /// keeping the fast inline path compact in the instruction cache.
     #[cold]
     #[inline(never)]
     fn spill_and_push(&mut self, value: T) {
@@ -341,7 +350,12 @@ impl<T, const N: usize> InlineVec<T, N> {
     }
 }
 
-/// Create an uninitialized `[MaybeUninit<T>; N]` without running any constructors.
+/// Creates an uninitialized `[MaybeUninit<T>; N]` without running any constructors.
+///
+/// # Safety (internal)
+///
+/// Sound because `MaybeUninit<T>` is explicitly designed to hold uninitialized
+/// data. An array of `MaybeUninit<T>` requires no initialization for validity.
 fn uninit_array<T, const N: usize>() -> [MaybeUninit<T>; N] {
     // SAFETY: An uninitialized MaybeUninit<T> is valid by definition.
     unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
@@ -419,6 +433,8 @@ impl<T: PartialEq, const N: usize> PartialEq for InlineVec<T, N> {
     }
 }
 
+/// Reflexive equality. Safe because `PartialEq` delegates to slice comparison,
+/// which is reflexive when `T: Eq`.
 impl<T: Eq, const N: usize> Eq for InlineVec<T, N> {}
 
 impl<T, const N: usize> From<Vec<T>> for InlineVec<T, N> {

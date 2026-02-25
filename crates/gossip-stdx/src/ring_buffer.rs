@@ -19,6 +19,11 @@ const _: () = assert!(
     "Platform must have at least 32-bit addressing"
 );
 
+/// Converts a `u32` slot index to `usize` for array indexing.
+///
+/// This is always lossless because the compile-time assertion above guarantees
+/// `usize >= u32`. Exists as a named function to document the truncation-free
+/// cast at each call site.
 #[inline(always)]
 fn index(i: u32) -> usize {
     i as usize
@@ -51,13 +56,22 @@ pub struct RingBuffer<T, const N: usize> {
     len: u32,
 }
 
-/// Create an uninitialized `[MaybeUninit<T>; N]` without running any constructors.
+/// Creates an uninitialized `[MaybeUninit<T>; N]` without running any constructors.
+///
+/// Sound because `MaybeUninit<T>` is explicitly designed to hold uninitialized
+/// data. An array of `MaybeUninit<T>` requires no initialization for validity.
 fn uninit_array<T, const N: usize>() -> [MaybeUninit<T>; N] {
     // SAFETY: An uninitialized MaybeUninit<T> is valid.
     unsafe { MaybeUninit::<[MaybeUninit<T>; N]>::uninit().assume_init() }
 }
 
 impl<T, const N: usize> RingBuffer<T, N> {
+    /// Compile-time validated capacity as `u32`.
+    ///
+    /// Asserts three properties:
+    /// - `N > 0` (an empty ring buffer is nonsensical).
+    /// - `N` is a power of 2 (enables bitwise AND for wrapping instead of modulo).
+    /// - `N <= u32::MAX / 2` (prevents `head + len` from overflowing `u32`).
     const CAPACITY: u32 = {
         assert!(N > 0, "RingBuffer capacity must be > 0");
         assert!(N & (N - 1) == 0, "RingBuffer capacity must be power of 2");
@@ -68,7 +82,8 @@ impl<T, const N: usize> RingBuffer<T, N> {
         N as u32
     };
 
-    /// Bitmask for power-of-2 modulo: (head + len) & MASK == (head + len) % CAPACITY
+    /// Bitmask for power-of-2 wrapping: `(head + offset) & MASK` is equivalent
+    /// to `(head + offset) % CAPACITY` but compiles to a single AND instruction.
     const MASK: u32 = Self::CAPACITY - 1;
 
     /// Constructs an empty ring buffer with capacity `N` without heap allocation.
@@ -303,6 +318,11 @@ impl<T, const N: usize> Default for RingBuffer<T, N> {
 }
 
 impl<T, const N: usize> Drop for RingBuffer<T, N> {
+    /// Drops all remaining elements via [`clear`](RingBuffer::clear).
+    ///
+    /// Delegates to `clear()` rather than a separate loop so that panic-safety
+    /// is handled in one place: `clear` pops elements one at a time, keeping
+    /// `head` and `len` consistent even if `T::drop()` panics.
     fn drop(&mut self) {
         self.clear();
         debug_assert!(self.len == 0);
@@ -310,6 +330,18 @@ impl<T, const N: usize> Drop for RingBuffer<T, N> {
 }
 
 impl<T: Clone, const N: usize> Clone for RingBuffer<T, N> {
+    /// Clones all elements into a fresh ring buffer.
+    ///
+    /// The clone always starts with `head = 0`, so physical layout may differ
+    /// from the source even though logical element order is preserved. This is
+    /// semantically correct because `PartialEq` compares by logical order, not
+    /// physical slot positions.
+    ///
+    /// # Panic safety
+    ///
+    /// Uses `push_back_assume_capacity` which updates `len` after each write.
+    /// If `T::clone()` panics mid-iteration, `RingBuffer::drop` on the
+    /// partially-built clone drops only the already-written elements.
     fn clone(&self) -> Self {
         let mut new = Self::new();
         for i in 0..self.len as usize {
@@ -331,6 +363,10 @@ impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for RingBuffer<T, N> {
 }
 
 impl<T: PartialEq, const N: usize> PartialEq for RingBuffer<T, N> {
+    /// Compares by logical element order, not physical slot positions.
+    ///
+    /// Two ring buffers are equal iff they contain the same elements in the
+    /// same FIFO order, regardless of where `head` happens to point in each.
     fn eq(&self, other: &Self) -> bool {
         if self.len != other.len {
             return false;
@@ -378,6 +414,11 @@ impl<'a, T, const N: usize> IntoIterator for &'a RingBuffer<T, N> {
 // ============================================================================
 
 /// Iterator over references to elements in a [`RingBuffer`], in FIFO order.
+///
+/// Supports both forward and reverse traversal via [`DoubleEndedIterator`].
+/// `front` and `back` are logical offsets into the ring's initialized range,
+/// not physical buffer indices. The physical index is computed on each access
+/// via `(head + logical) & MASK`.
 pub struct Iter<'a, T, const N: usize> {
     ring: &'a RingBuffer<T, N>,
     /// Logical offset from the front (0 = oldest element).
@@ -448,6 +489,10 @@ impl<T, const N: usize> std::iter::FusedIterator for Iter<'_, T, N> {}
 // ============================================================================
 
 /// Consuming iterator over a [`RingBuffer`], yielding owned elements in FIFO order.
+///
+/// Created by [`RingBuffer::into_iter`]. When dropped before exhaustion,
+/// any remaining elements are dropped via `RingBuffer::drop` (which calls
+/// `clear`), so no elements are leaked.
 pub struct IntoIter<T, const N: usize> {
     ring: RingBuffer<T, N>,
 }

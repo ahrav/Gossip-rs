@@ -100,6 +100,9 @@ crate::define_id_32! {
 #[derive(Clone, Copy)]
 pub struct TenantSecretKey([u8; 32]);
 
+/// Constant-time equality to prevent timing side-channel leakage of key
+/// material.  Uses `subtle::ConstantTimeEq` so the comparison takes the
+/// same amount of time regardless of how many bytes match.
 impl PartialEq for TenantSecretKey {
     fn eq(&self, other: &Self) -> bool {
         use subtle::ConstantTimeEq;
@@ -109,6 +112,8 @@ impl PartialEq for TenantSecretKey {
 
 impl Eq for TenantSecretKey {}
 
+/// Redacted output to prevent key material from appearing in logs or
+/// debug-formatted error messages.
 impl ::core::fmt::Debug for TenantSecretKey {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
         write!(f, "TenantSecretKey([redacted])")
@@ -117,6 +122,10 @@ impl ::core::fmt::Debug for TenantSecretKey {
 
 impl TenantSecretKey {
     /// Construct from raw bytes.
+    ///
+    /// No validation is performed at construction time because this is a
+    /// `const fn`.  Callers at provisioning boundaries should call
+    /// [`is_valid`](Self::is_valid) immediately after to reject all-zero keys.
     #[inline]
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -132,7 +141,9 @@ impl TenantSecretKey {
     ///
     /// Returns `true` if the key is not all-zeros.  An all-zero key
     /// provides no tenant isolation and should be rejected during
-    /// provisioning.
+    /// provisioning.  This is a necessary but not sufficient entropy
+    /// check; production provisioning should use cryptographically
+    /// random key material.
     ///
     /// Note: `from_bytes` is `const fn` and cannot perform this check
     /// automatically, so callers at the provisioning boundary should

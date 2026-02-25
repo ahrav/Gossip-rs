@@ -53,24 +53,31 @@ use super::domain;
 // hasher, avoiding redundant key-schedule computation on each call.
 // ---------------------------------------------------------------------------
 
+/// Cached derive-key hasher for [`FindingId`](super::FindingId) derivation.
 pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::FINDING_ID_V1));
 
+/// Cached derive-key hasher for [`OccurrenceId`](super::OccurrenceId) derivation.
 pub(crate) static OCCURRENCE_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OCCURRENCE_ID_V1));
 
+/// Cached derive-key hasher for [`StableItemId`](super::StableItemId) derivation.
 pub(crate) static ITEM_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::ITEM_ID_V1));
 
+/// Cached derive-key hasher for [`ObjectVersionId`](super::ObjectVersionId) derivation.
 pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OBJECT_VERSION_V1));
 
+/// Cached derive-key hasher for [`PolicyHash`](super::PolicyHash) derivation.
 pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
 
+/// Cached derive-key hasher for split shard-ID derivation in the coordination layer.
 pub(crate) static SPLIT_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::SPLIT_ID_V1));
 
+/// Cached derive-key hasher for op-log payload hashing in the coordination layer.
 pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OP_PAYLOAD_V1));
 
@@ -85,6 +92,10 @@ pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
 ///
 /// `base` is expected to be one of this module's `LazyLock<Hasher>` statics
 /// (e.g., [`FINDING_HASHER`]); deref coercion provides `&Hasher` transparently.
+///
+/// The `T: CanonicalBytes` bound guarantees that `inputs` produces a
+/// collision-free, deterministic byte encoding, so the resulting 32-byte
+/// digest is a pure function of `(domain, inputs)`.
 #[inline]
 pub(crate) fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
     let mut h = base.clone();
@@ -120,6 +131,12 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
 /// Takes the first 8 bytes of the BLAKE3 output as a little-endian `u64`.
 /// Used for op-log payload hashes and split shard ID derivation.
 ///
+/// # Byte ordering
+///
+/// The first 8 bytes of the BLAKE3 output are interpreted as a **little-endian**
+/// `u64`. This matches the `CanonicalBytes` convention used throughout the
+/// identity module and ensures consistent cross-platform behavior.
+///
 /// # Cardinality bounds
 ///
 /// A 64-bit truncated hash has a birthday collision bound of approximately
@@ -128,6 +145,12 @@ pub fn finalize_32(hasher: &Hasher) -> [u8; 32] {
 /// entries per epoch) where cardinality is bounded by system design.  For
 /// globally-unique content-addressed identifiers with unbounded cardinality,
 /// use [`finalize_32`] instead.
+///
+/// # Panics
+///
+/// Contains an internal `.expect()` on the 8-byte slice conversion. This
+/// is unreachable in practice because BLAKE3 always produces at least 32
+/// bytes of output.
 #[inline]
 pub fn finalize_64(hasher: &Hasher) -> u64 {
     let bytes = hasher.finalize();

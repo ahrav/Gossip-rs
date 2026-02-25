@@ -224,6 +224,8 @@ impl ParkReason {
     }
 }
 
+/// Hashes as a single `u8` discriminant -- deterministic and stable across
+/// builds because of the `#[repr(u8)]` guarantee.
 impl CanonicalBytes for ParkReason {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
@@ -287,18 +289,30 @@ const _: () = assert!(core::mem::size_of::<ParkReason>() == 1);
 #[derive(Debug)]
 pub struct ShardRecord {
     // -- Identity --
+    /// Owning tenant. All operations on this record must present this tenant.
     pub(crate) tenant: TenantId,
+    /// The run this shard belongs to.
     pub(crate) run: RunId,
+    /// Unique shard identifier within the run. Root shards have bit 63 clear;
+    /// split-derived shards have bit 63 set (see `ShardId::is_derived`).
     pub(crate) shard: ShardId,
 
     // -- Lifecycle --
+    /// Current lifecycle state. Transitions are validated by
+    /// [`assert_transition_legal`](Self::assert_transition_legal).
     pub(crate) status: ShardStatus,
     /// Set when `status == Parked`, `None` otherwise.
     pub(crate) park_reason: Option<ParkReason>,
 
     // -- Coverage and progress (arena-pooled) --
+    /// Slab-backed shard specification (key range bounds + metadata).
+    /// Modified only by `split_residual` (narrowing the range).
     pub(crate) spec: PooledShardSpec,
+    /// Slab-backed cursor tracking the worker's scan progress.
+    /// Advanced by `checkpoint` and terminal operations.
     pub(crate) cursor: PooledCursor,
+    /// Per-run cursor semantics governing when cursor advancement
+    /// counts as committed progress. Immutable after creation.
     pub(crate) cursor_semantics: CursorSemantics,
 
     // -- Lease / ownership --
@@ -534,7 +548,8 @@ impl ShardRecord {
         self.assert_lineage_invariants(slab);
     }
 
-    /// INV-1 through INV-5: status, park_reason, lease, fence, op-log cap.
+    /// Assert INV-1 through INV-5: status/park_reason consistency, terminal
+    /// shards unleased, fence epoch minimum, and op-log capacity bound.
     fn assert_lifecycle_invariants(&self) {
         // INV-1: park_reason consistency.
         match self.status {
@@ -585,8 +600,9 @@ impl ShardRecord {
         );
     }
 
-    /// INV-6 through INV-10: split/spawned, parent/derived (biconditional),
-    /// op-log uniqueness, spawned cap.
+    /// Assert INV-6 through INV-10: split implies spawned non-empty,
+    /// parent/derived biconditional, all spawned are derived, op-log
+    /// `OpId` uniqueness, and spawned count cap.
     fn assert_lineage_invariants(&self, slab: &ByteSlab) {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split {
@@ -661,7 +677,8 @@ impl ShardRecord {
         self.validate_lineage_invariants(slab)
     }
 
-    /// INV-1 through INV-5 (non-panicking).
+    /// Validate INV-1 through INV-5 without panicking.
+    /// Returns `Err` with a diagnostic message on the first violation.
     fn validate_lifecycle_invariants(&self) -> Result<(), String> {
         // INV-1: park_reason consistency.
         match self.status {
@@ -712,7 +729,8 @@ impl ShardRecord {
         Ok(())
     }
 
-    /// INV-6 through INV-10 (non-panicking).
+    /// Validate INV-6 through INV-10 without panicking.
+    /// Returns `Err` with a diagnostic message on the first violation.
     fn validate_lineage_invariants(&self, slab: &ByteSlab) -> Result<(), String> {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split && self.spawned.is_empty() {

@@ -108,6 +108,11 @@ pub enum ClaimError {
     Throttled { retry_after: LogicalTime },
 }
 
+/// Human-readable formatting for logging and error display chains.
+///
+/// Includes the `earliest_deadline` for `NoneAvailable` and the
+/// `retry_after` for `Throttled` so operators can diagnose scheduling
+/// delays without inspecting the error value programmatically.
 impl fmt::Display for ClaimError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

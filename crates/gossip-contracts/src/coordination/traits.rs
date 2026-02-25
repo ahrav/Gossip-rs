@@ -187,6 +187,15 @@ pub trait CoordinationBackend {
     /// **Capacity**: The `capacity` field in the result reflects the run's
     /// available-shard count computed *after* this operation completes.
     ///
+    /// ## Errors
+    ///
+    /// Returns [`AcquireError`] on failure:
+    /// - `ShardNotFound` -- no record exists for `(tenant, key)`.
+    /// - `TenantMismatch` -- the record belongs to a different tenant.
+    /// - `ShardTerminal` -- the shard is in a terminal state (Done/Split/Parked).
+    /// - `AlreadyLeased` -- the shard has a live lease held by another worker.
+    /// - `SlabFull` -- the backend's byte slab lacks capacity for the snapshot.
+    ///
     /// `out` is caller-owned scratch reused across calls. Implementations may
     /// overwrite it fully and must not retain references into it after return.
     fn acquire_and_restore_into<'a>(
@@ -226,6 +235,15 @@ pub trait CoordinationBackend {
     /// **Liveness**: The new deadline is strictly after `now`.
     /// **Capacity**: The `capacity` field in the result reflects the run's
     /// available-shard count computed *after* this operation completes.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`RenewError`] on failure:
+    /// - `ShardNotFound` -- no record exists for the lease's shard key.
+    /// - `TenantMismatch` -- the record belongs to a different tenant.
+    /// - `ShardTerminal` -- the shard has reached a terminal state.
+    /// - `StaleFence` -- the lease's fence epoch does not match the record's.
+    /// - `LeaseExpired` -- the lease has already expired at `now`.
     fn renew(
         &mut self,
         now: LogicalTime,
@@ -263,6 +281,18 @@ pub trait CoordinationBackend {
     /// - Same `(op_id, hash_checkpoint_payload(new_cursor))` → `Replayed(())`
     /// - Same `op_id`, different hash → `OpIdConflict`
     /// - New `op_id` → execute, record in op-log, `Executed(())`
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`CheckpointError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was previously used with a different payload.
+    /// - `ShardNotFound` -- no record exists for the lease's shard key.
+    /// - `TenantMismatch` / `ShardTerminal` / `StaleFence` / `LeaseExpired` -- lease
+    ///   validation failures (see [`validate_lease`](super::validation::validate_lease)).
+    /// - `CheckpointMissingKey` -- `new_cursor` has no `last_key`.
+    /// - `CursorRegression` -- the new key is lexicographically before the old.
+    /// - `CursorOutOfBounds` -- the key falls outside the shard's `[start, end)`.
+    /// - `CursorKeyTooLarge` / `CursorTokenTooLarge` -- field exceeds size limit.
     ///
     /// ## Production note
     ///
@@ -304,6 +334,12 @@ pub trait CoordinationBackend {
     ///
     /// Idempotent via `op_id` + `hash_complete_payload(final_cursor)`.
     ///
+    /// ## Errors
+    ///
+    /// Returns [`CompleteError`] on failure. Error conditions are the same as
+    /// [`checkpoint`](Self::checkpoint) (OpId conflict, lease validation, cursor
+    /// constraints) since completion carries a final cursor update.
+    ///
     /// ## Production note
     ///
     /// Backends with external storage must execute lease validation (step 2)
@@ -337,6 +373,13 @@ pub trait CoordinationBackend {
     /// ## Idempotency
     ///
     /// Idempotent via `op_id` + `hash_park_payload(reason)`.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`ParkError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
+    /// - Lease validation failures (same as [`checkpoint`](Self::checkpoint),
+    ///   minus cursor errors since park carries no cursor update).
     ///
     /// ## Production note
     ///
@@ -397,6 +440,15 @@ pub trait CoordinationBackend {
     /// mutation). Networked backends must use multi-key transactions or
     /// batch conditional writes.
     ///
+    /// ## Errors
+    ///
+    /// Returns [`SplitReplaceError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
+    /// - Lease validation failures (same as other lease-gated operations).
+    /// - `SplitCoverage` -- children do not exactly partition the parent's range.
+    /// - `SpawnLimitExceeded` -- total spawned children would exceed
+    ///   [`MAX_SPAWNED_PER_SHARD`](super::split::MAX_SPAWNED_PER_SHARD).
+    ///
     /// ## Production note
     ///
     /// Backends with external storage must execute lease validation (step 2)
@@ -447,6 +499,16 @@ pub trait CoordinationBackend {
     /// Same transactional pattern as `split_replace`: read the parent
     /// revision, write all changes in one transaction, fail on concurrent
     /// modification.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`SplitResidualError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
+    /// - Lease validation failures (same as other lease-gated operations).
+    /// - `ResidualSplitInvalid` -- `parent_new_spec union residual_spec` does
+    ///   not exactly cover the parent's original range.
+    /// - `SpawnLimitExceeded` -- total spawned shards would exceed
+    ///   [`MAX_SPAWNED_PER_SHARD`](super::split::MAX_SPAWNED_PER_SHARD).
     ///
     /// ## Production note
     ///

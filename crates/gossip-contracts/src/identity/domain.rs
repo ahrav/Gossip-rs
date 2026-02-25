@@ -149,7 +149,11 @@ pub const ALL: [&str; 13] = [
 
 /// Returns every domain constant in the registry as a `(name, value)` pair.
 ///
-/// Used by the uniqueness and coverage tests in this module.
+/// Used by the uniqueness, coverage, and format-validation tests in this
+/// module.  The first element of each tuple is the Rust constant name
+/// (e.g., `"FINDING_ID_V1"`), the second is the domain string value
+/// (e.g., `"gossip/finding/v1"`).
+///
 /// When adding a new domain constant, you **must** add it to [`ALL`] *and*
 /// here, then bump the `ALL` array length.
 #[cfg(test)]

@@ -105,6 +105,7 @@ impl DerivedShardKind {
 }
 
 impl CanonicalBytes for DerivedShardKind {
+    /// Delegates to the `u8` discriminant -- single-byte, fixed-width encoding.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.as_u8().write_canonical(h);
@@ -167,6 +168,9 @@ impl<'a> SplitReplaceChild<'a> {
 }
 
 impl CanonicalBytes for SplitReplaceChild<'_> {
+    /// Encodes `spec || cursor` in field order. Both fields are
+    /// self-framing (length-prefixed internally), so the boundary
+    /// between them is unambiguous.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.spec.write_canonical(h);
@@ -386,6 +390,10 @@ impl<'a> SplitResidualPlan<'a> {
 }
 
 impl CanonicalBytes for SplitResidualPlan<'_> {
+    /// Encodes `parent_new_spec || residual_spec` in that order.
+    ///
+    /// No length prefix is needed because a residual plan always has exactly
+    /// two fixed-position fields, so the boundary is unambiguous.
     fn write_canonical(&self, h: &mut Hasher) {
         self.parent_new_spec.write_canonical(h);
         self.residual_spec.write_canonical(h);
@@ -408,6 +416,8 @@ impl CanonicalBytes for SplitResidualPlan<'_> {
 /// executed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitReplaceResult {
+    /// Deterministically-derived child shard IDs, ordered by `key_range_start`
+    /// for reproducibility (same inputs always produce the same order).
     pub children: InlineVec<ShardId, MAX_SPLIT_CHILDREN>,
 }
 
@@ -420,6 +430,8 @@ pub struct SplitReplaceResult {
 /// without creating a duplicate shard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitResidualResult {
+    /// Deterministically-derived residual shard ID covering the unprocessed
+    /// upper portion of the parent's original key range.
     pub residual: ShardId,
 }
 

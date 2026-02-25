@@ -196,8 +196,12 @@ pub struct FindingIdInputs {
 }
 
 impl CanonicalBytes for FindingIdInputs {
+    /// Feeds all four 32-byte fields sequentially (128 bytes total, no length
+    /// prefixes).
+    ///
     /// Field order must match struct declaration order — reordering fields
-    /// without updating this impl silently changes all derived IDs.
+    /// without updating this impl silently changes all derived IDs and breaks
+    /// the golden vectors in `golden.rs`.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.tenant.write_canonical(h);
@@ -236,8 +240,12 @@ pub struct OccurrenceIdInputs {
 }
 
 impl CanonicalBytes for OccurrenceIdInputs {
+    /// Feeds two 32-byte fields and two 8-byte LE integers (80 bytes total,
+    /// no length prefixes).
+    ///
     /// Field order must match struct declaration order — reordering fields
-    /// without updating this impl silently changes all derived IDs.
+    /// without updating this impl silently changes all derived IDs and breaks
+    /// the golden vectors in `golden.rs`.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.finding.write_canonical(h);
@@ -257,6 +265,14 @@ impl CanonicalBytes for OccurrenceIdInputs {
 /// This is the only derivation that uses keyed mode rather than
 /// derive-key mode. The tenant's secret key prevents cross-tenant
 /// correlation of normalized secret values.
+///
+/// # Hash construction
+///
+/// The domain tag ([`domain::SECRET_HASH_V1`]) is fed as *data* inside the
+/// keyed hasher, not as a derive-key context, because BLAKE3 does not
+/// support both keyed mode and derive-key mode simultaneously. The domain
+/// tag acts as an internal context prefix that separates this derivation
+/// from any other use of the same tenant key.
 ///
 /// # Examples
 ///

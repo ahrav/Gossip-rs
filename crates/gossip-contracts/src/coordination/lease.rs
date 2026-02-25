@@ -105,9 +105,15 @@ pub struct LeaseHolder {
 impl LeaseHolder {
     /// Create a new lease-holder binding.
     ///
-    /// No validation is performed here — the coordinator is responsible
-    /// for ensuring `deadline` is in the future relative to the current
-    /// logical time.
+    /// Only minimal structural validation is performed (non-zero deadline).
+    /// The coordinator is responsible for ensuring `deadline` is actually
+    /// in the future relative to the current logical time — this constructor
+    /// does not enforce that temporal invariant.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `deadline` is [`LogicalTime::ZERO`] — a zero deadline
+    /// would make the lease instantly expired at any positive time.
     #[must_use]
     pub fn new(owner: WorkerId, deadline: LogicalTime) -> Self {
         assert!(

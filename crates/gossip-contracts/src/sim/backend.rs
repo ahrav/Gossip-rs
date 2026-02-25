@@ -162,6 +162,11 @@ pub trait SimIntrospection {
     /// (for example fault injectors) free slab-backed fields without
     /// exposing raw slab handles in the public simulation interface.
     /// Backends without pooled fields may implement this as a no-op.
+    ///
+    /// Must be called before the backend's slab is dropped; otherwise
+    /// the slab slots referenced by the record's pooled fields become
+    /// dangling. See [`FaultInjectingIntrospector::drop`](super::fault_injector::FaultInjectingIntrospector)
+    /// for the canonical cleanup pattern.
     fn release_record_fields(&mut self, record: &mut ShardRecord);
 }
 

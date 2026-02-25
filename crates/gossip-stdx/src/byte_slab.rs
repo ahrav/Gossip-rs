@@ -114,12 +114,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// from tiny allocations.
 const MIN_BLOCK: u32 = 16;
 
-/// Hard cap for free-list metadata entries.
+/// Hard cap for free-list metadata entries (2^21 = ~2M entries).
 ///
 /// Startup preallocates free-list metadata. For very large slabs, the
 /// theoretical worst-case entry count can be enormous; this cap keeps the
-/// startup metadata reservation bounded and turns overflow into an explicit
-/// runtime failure instead of silent `Vec` growth.
+/// startup metadata reservation bounded (2M entries x 8 bytes = 16 MiB)
+/// and turns overflow into an explicit runtime failure instead of silent
+/// `Vec` growth on the hot path.
 const MAX_FREE_LIST_METADATA_ENTRIES: usize = 1 << 21;
 
 /// Reserved `ByteSlot` owner id used by [`ByteSlot::EMPTY`].
@@ -134,7 +135,10 @@ static NEXT_SLAB_ID: AtomicU32 = AtomicU32::new(1);
 /// Returns the next non-zero slab owner id.
 ///
 /// Owner ids are process-local provenance tags, not durable capabilities.
-/// They may wrap and be reused after enough slab creations.
+/// They may wrap and be reused after ~2^32 slab creations. The loop
+/// skips zero (reserved for [`ByteSlot::EMPTY`]) so that non-empty
+/// slots always carry a non-zero owner id, making the provenance check
+/// in [`ByteSlab::assert_slot_owner`] reliable.
 #[inline]
 fn next_slab_id() -> u32 {
     loop {
@@ -210,6 +214,11 @@ fn free_list_metadata_capacity(capacity: usize) -> usize {
 }
 
 /// Panics on free-list metadata exhaustion.
+///
+/// This is a fatal condition: the free-list `Vec` was pre-allocated at
+/// startup and is not permitted to grow (to uphold the zero-allocation
+/// hot-path guarantee). If churn exceeds the metadata budget, the slab
+/// cannot track freed blocks, so it aborts rather than silently leaking.
 #[cold]
 #[inline(never)]
 fn free_list_metadata_full(capacity: usize) -> ! {
@@ -384,7 +393,13 @@ impl ByteSlab {
 
     /// Internal constructor that fixes free-list metadata capacity at startup.
     ///
-    /// This is used by tests to exercise metadata-capacity edge cases.
+    /// Separated from [`with_capacity`](Self::with_capacity) so that tests can
+    /// exercise metadata-capacity edge cases (e.g., what happens when the
+    /// free-list metadata fills up during heavy churn).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` exceeds `u32::MAX`.
     fn new_with_free_list_capacity(capacity: usize, free_list_capacity: usize) -> Self {
         assert!(
             capacity <= u32::MAX as usize,
@@ -422,6 +437,10 @@ impl ByteSlab {
     ///
     /// Zero-size insertions are silently ignored (no-op) to simplify
     /// callers that may produce zero remainders from block splits.
+    ///
+    /// Returns `true` if the block was inserted (or was zero-size),
+    /// `false` if the free-list metadata is at capacity and the block
+    /// could not be recorded.
     #[inline]
     fn insert_free_block(&mut self, offset: u32, size: u32) -> bool {
         if size == 0 {
@@ -698,6 +717,16 @@ impl ByteSlab {
     /// Deallocating [`ByteSlot::EMPTY`] is a no-op. The `slot` must not
     /// be used after deallocation; debug builds poison the freed bytes
     /// and will detect use-after-free via the poison check on reallocation.
+    ///
+    /// # Panics
+    ///
+    /// - Panics if the slot belongs to a different slab (owner id mismatch).
+    /// - Panics if `slot.len > slot.alloc_size` (corrupt slot metadata).
+    /// - Panics if the slot region exceeds the bump pointer (corrupt or
+    ///   forged slot).
+    /// - Panics if free-list metadata capacity is exhausted during
+    ///   insertion (fatal — indicates the startup metadata budget was
+    ///   undersized for the workload's churn rate).
     ///
     /// # Coalescing strategy
     ///

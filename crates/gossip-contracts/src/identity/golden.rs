@@ -467,6 +467,10 @@ fn derive_split_shard_id_golden_values() {
 }
 
 // Compile-time assertion: all derived shard ID golden values have bit 63 set.
+// `derive_split_shard_id` forces bit 63 high so that hash-derived shard IDs
+// are always distinguishable from sequentially-allocated IDs (which start at
+// small values and grow upward). If a golden value has bit 63 clear, the
+// derivation logic has regressed.
 const _: () = assert!(DERIVE_SPLIT_CHILD_0_EXPECTED & (1u64 << 63) != 0);
 const _: () = assert!(DERIVE_SPLIT_CHILD_1_EXPECTED & (1u64 << 63) != 0);
 const _: () = assert!(DERIVE_SPLIT_RESIDUAL_EXPECTED & (1u64 << 63) != 0);

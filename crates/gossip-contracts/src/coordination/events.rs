@@ -318,10 +318,13 @@ const _: () = assert!(std::mem::size_of::<EventKind>() <= 40);
 /// `Serialize` derive would leak raw key bytes.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StateTransitionEvent {
+    /// Tenant that owns the run this event belongs to.
     pub tenant: TenantId,
+    /// Run within which this state transition occurred.
     pub run: RunId,
     /// Coordinator logical clock at the time this event was produced.
     pub at: LogicalTime,
+    /// Variant-specific payload describing what transitioned.
     pub kind: EventKind,
 }
 

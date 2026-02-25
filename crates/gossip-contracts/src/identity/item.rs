@@ -44,6 +44,9 @@ use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
 /// [`ItemKey`], and [`ObjectVersionId`]. The panicking constructors
 /// (`from_ascii`, `new`, `from_version_bytes`) remain available for
 /// trusted internal code; only [`ConnectorTag::from_ascii`] is `const`.
+///
+/// All variants carry enough context to produce a useful error message
+/// without re-inspecting the original input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityInputError {
     /// Connector tag is empty.
@@ -64,6 +67,8 @@ pub enum IdentityInputError {
 }
 
 impl fmt::Display for IdentityInputError {
+    /// Formats the error with a human-readable message that includes the
+    /// offending value (e.g., byte index, length) when applicable.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyTag => write!(f, "ConnectorTag must not be empty"),
@@ -82,6 +87,7 @@ impl fmt::Display for IdentityInputError {
     }
 }
 
+/// All variants are self-describing leaf errors with no inner `source`.
 impl std::error::Error for IdentityInputError {}
 
 // ---------------------------------------------------------------------------
@@ -197,6 +203,13 @@ impl ConnectorTag {
     ///
     /// Returns an error instead of panicking when the input is invalid.
     /// Use this at system boundaries where the tag comes from external input.
+    ///
+    /// # Errors
+    ///
+    /// - [`IdentityInputError::EmptyTag`] if `tag` is empty.
+    /// - [`IdentityInputError::TagTooLong`] if `tag` exceeds 8 bytes.
+    /// - [`IdentityInputError::NonGraphicByte`] if any byte is outside
+    ///   the ASCII graphic range (`0x21..=0x7E`).
     pub fn try_from_ascii(tag: &[u8]) -> Result<Self, IdentityInputError> {
         if tag.is_empty() {
             return Err(IdentityInputError::EmptyTag);
@@ -226,7 +239,7 @@ impl ConnectorTag {
         Self(bytes)
     }
 
-    /// Borrow the inner 8-byte array.
+    /// Borrow the inner 8-byte array, including any null padding.
     #[inline]
     pub const fn as_bytes(&self) -> &[u8; 8] {
         &self.0
@@ -234,9 +247,11 @@ impl ConnectorTag {
 }
 
 impl CanonicalBytes for ConnectorTag {
+    /// Writes the full 8-byte array (including null padding) with no length
+    /// prefix. Fixed-width encoding ensures unambiguous framing when
+    /// concatenated with subsequent fields in composite types like [`ItemKey`].
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
-        // Fixed-width: no length prefix.
         h.update(&self.0);
     }
 }
@@ -328,6 +343,10 @@ impl ItemKey {
     ///
     /// Returns an error instead of panicking when the path is empty.
     /// Use this at system boundaries where the path comes from external input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityInputError::EmptyPath`] if the path is empty.
     pub fn try_new(
         connector: ConnectorTag,
         path: impl AsRef<[u8]>,
@@ -342,13 +361,16 @@ impl ItemKey {
         })
     }
 
-    /// The connector tag for this item.
+    /// The connector tag for this item (e.g., `b"github\0\0"`).
     #[inline]
     pub fn connector(&self) -> ConnectorTag {
         self.connector
     }
 
-    /// The opaque path bytes for this item.
+    /// The opaque, connector-defined path bytes for this item.
+    ///
+    /// The encoding is connector-specific; see [`ItemKey`] struct docs for
+    /// examples. The returned slice never includes the connector tag.
     #[inline]
     pub fn path(&self) -> &[u8] {
         &self.path
@@ -356,8 +378,9 @@ impl ItemKey {
 
     /// Derive the fixed-width [`StableItemId`] for this key.
     ///
-    /// This is a pure, infallible function: same `ItemKey` always produces
-    /// the same `StableItemId`.
+    /// Uses BLAKE3 derive-key mode with [`domain::ITEM_ID_V1`](super::domain::ITEM_ID_V1)
+    /// via a cached hasher clone. This is a pure, infallible function: same
+    /// `ItemKey` always produces the same `StableItemId`.
     pub fn stable_id(&self) -> StableItemId {
         let mut h = ITEM_ID_HASHER.clone();
         self.write_canonical(&mut h);
@@ -366,6 +389,10 @@ impl ItemKey {
 }
 
 impl CanonicalBytes for ItemKey {
+    /// Writes `ConnectorTag` (8 bytes, fixed-width) followed by `path`
+    /// (4-byte LE length prefix + variable-length body). The length prefix
+    /// on the path prevents concatenation ambiguity between connector tag
+    /// padding and path content.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.connector.write_canonical(h);
@@ -478,6 +505,11 @@ impl ObjectVersionId {
     /// Returns an error instead of panicking when `version_bytes` is empty.
     /// Use this at system boundaries where the version token comes from
     /// external input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityInputError::EmptyVersionBytes`] if `version_bytes`
+    /// is empty.
     pub fn try_from_version_bytes(version_bytes: &[u8]) -> Result<Self, IdentityInputError> {
         if version_bytes.is_empty() {
             return Err(IdentityInputError::EmptyVersionBytes);

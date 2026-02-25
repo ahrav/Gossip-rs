@@ -181,11 +181,14 @@ impl SimContext {
 
 /// Fault injection severity level.
 ///
-/// Discriminants are stable.
+/// Ordered by increasing fault intensity (`SunnyDay < Stormy < Radioactive`),
+/// with stable `#[repr(u8)]` discriminants validated by a const assertion
+/// below. The `Ord` derive follows discriminant order, so comparing levels
+/// directly reflects severity ranking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum FaultLevel {
-    /// No faults injected.
+    /// No faults injected. All PPM rates are zero.
     SunnyDay = 1,
     /// Moderate fault rate -- ~10% time jump, ~10% lease expiry, ~5% pause.
     Stormy = 2,
@@ -204,7 +207,10 @@ const _: () = {
 // FaultConfig
 // ---------------------------------------------------------------------------
 
-/// Maximum value for PPM rates (parts-per-million).
+/// Maximum value for PPM rates (parts-per-million): `1_000_000`.
+///
+/// PPM rates must be in `[0, PPM_MAX]`. A rate of `PPM_MAX` means
+/// "always inject"; a rate of 0 means "never inject".
 const PPM_MAX: u32 = 1_000_000;
 
 /// Fault injection configuration using integer PPM rates.
@@ -294,6 +300,8 @@ impl FaultConfig {
     }
 
     /// Random pause duration within the configured range.
+    ///
+    /// Returns 0 when the pause range is empty (i.e., [`FaultLevel::SunnyDay`]).
     pub fn pause_ticks(&self, rng: &mut ChaCha8Rng) -> u64 {
         if self.pause_range.is_empty() {
             return 0;
@@ -307,6 +315,8 @@ impl FaultConfig {
     }
 
     /// Random time-jump duration within the configured range.
+    ///
+    /// Returns 0 when the time-jump range is empty (i.e., [`FaultLevel::SunnyDay`]).
     pub fn time_jump_ticks(&self, rng: &mut ChaCha8Rng) -> u64 {
         if self.time_jump_range.is_empty() {
             return 0;
@@ -321,6 +331,10 @@ impl FaultConfig {
 /// `ppm = 0` never fires and `ppm = 1_000_000` always fires. The
 /// `assert` rejects out-of-range values that would silently skew
 /// injection rates.
+///
+/// # Panics
+///
+/// Panics if `ppm > 1_000_000`.
 fn should_inject(rng: &mut ChaCha8Rng, ppm: u32) -> bool {
     if ppm == 0 {
         return false;
