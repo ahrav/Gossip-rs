@@ -45,7 +45,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
-use crate::coordination::error::IdempotentOutcome;
+use crate::coordination::error::{FixedBuf, IdempotentOutcome};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
@@ -758,56 +758,6 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 // RunProgress + RunTerminalEvaluation
 // ============================================================================
 
-/// Fixed-capacity storage for one watermark key.
-#[derive(Clone)]
-pub(crate) struct WatermarkKey {
-    bytes: [u8; MAX_KEY_SIZE],
-    len: usize,
-}
-
-impl WatermarkKey {
-    #[inline]
-    fn from_slice(key: &[u8]) -> Self {
-        debug_assert!(!key.is_empty());
-        debug_assert!(key.len() <= MAX_KEY_SIZE);
-        let mut out = Self {
-            bytes: [0u8; MAX_KEY_SIZE],
-            len: 0,
-        };
-        out.replace_from_slice(key);
-        out
-    }
-
-    #[inline]
-    fn replace_from_slice(&mut self, key: &[u8]) {
-        debug_assert!(!key.is_empty());
-        debug_assert!(key.len() <= MAX_KEY_SIZE);
-        self.bytes[..key.len()].copy_from_slice(key);
-        self.len = key.len();
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl fmt::Debug for WatermarkKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("WatermarkKey")
-            .field(&self.as_slice())
-            .finish()
-    }
-}
-
-impl PartialEq for WatermarkKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_slice() == other.as_slice()
-    }
-}
-
-impl Eq for WatermarkKey {}
-
 /// Aggregated shard status counts and in-flight watermark for a run.
 ///
 /// Constructed by iterating a run's shards once and tallying each shard's
@@ -850,7 +800,7 @@ pub struct RunProgress {
     /// if they carry cursor keys; this tracks in-flight progress only.
     /// `None` means no active shard currently has a non-initial cursor
     /// (including runs with zero active shards).
-    pub(crate) watermark: Option<WatermarkKey>,
+    pub(crate) watermark: Option<FixedBuf<MAX_KEY_SIZE>>,
 }
 
 impl RunProgress {
@@ -897,7 +847,7 @@ impl RunProgress {
     /// should maintain a running maximum externally.
     #[must_use]
     pub fn watermark(&self) -> Option<&[u8]> {
-        self.watermark.as_ref().map(WatermarkKey::as_slice)
+        self.watermark.as_ref().map(|wm| wm.read())
     }
 
     /// Whether all active work is complete (no Active shards remain).
@@ -1010,11 +960,14 @@ impl RunProgress {
             );
 
             match &mut self.watermark {
-                Some(current) if last_key < current.as_slice() => {
-                    current.replace_from_slice(last_key);
+                Some(current) if last_key < current.read() => {
+                    current.write(last_key, "watermark key exceeds MAX_KEY_SIZE");
                 }
                 None => {
-                    self.watermark = Some(WatermarkKey::from_slice(last_key));
+                    self.watermark = Some(FixedBuf::from_slice(
+                        last_key,
+                        "watermark key exceeds MAX_KEY_SIZE",
+                    ));
                 }
                 // Equality or greater: watermark only advances toward
                 // smaller keys, so same-value or larger keys are no-ops.

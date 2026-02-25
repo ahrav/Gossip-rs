@@ -1339,41 +1339,93 @@ pub struct AcquireResultView<'a> {
 }
 
 /// Fixed-capacity byte buffer with logical length tracking.
-#[derive(Debug)]
-struct FixedBuf<const N: usize> {
+///
+/// Used for inline storage of small variable-length fields (watermark keys,
+/// scratch buffers in `AcquireScratch`) without heap allocation.
+pub(crate) struct FixedBuf<const N: usize> {
     bytes: [u8; N],
     len: usize,
 }
 
 impl<const N: usize> FixedBuf<N> {
     #[inline]
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             bytes: [0u8; N],
             len: 0,
         }
     }
 
+    /// Write `bytes` into the buffer, replacing any previous content.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes.len() > N` with `oversized_msg`.
     #[inline]
-    fn write(&mut self, bytes: &[u8], oversized_msg: &'static str) {
+    pub(crate) fn write(&mut self, bytes: &[u8], oversized_msg: &'static str) {
         assert!(bytes.len() <= N, "{oversized_msg}");
         self.bytes[..bytes.len()].copy_from_slice(bytes);
         self.len = bytes.len();
     }
 
+    /// Convenience constructor: create and immediately write.
     #[inline]
-    fn read(&self) -> &[u8] {
+    pub(crate) fn from_slice(bytes: &[u8], oversized_msg: &'static str) -> Self {
+        let mut buf = Self::new();
+        buf.write(bytes, oversized_msg);
+        buf
+    }
+
+    #[inline]
+    pub(crate) fn read(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 
     #[inline]
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.len = 0;
     }
 
     #[inline]
-    fn has_data(&self) -> bool {
+    pub(crate) fn has_data(&self) -> bool {
         self.len > 0
+    }
+}
+
+impl<const N: usize> Clone for FixedBuf<N> {
+    fn clone(&self) -> Self {
+        let mut buf = Self::new();
+        buf.bytes[..self.len].copy_from_slice(&self.bytes[..self.len]);
+        buf.len = self.len;
+        buf
+    }
+}
+
+impl<const N: usize> PartialEq for FixedBuf<N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.read() == other.read()
+    }
+}
+
+impl<const N: usize> Eq for FixedBuf<N> {}
+
+impl<const N: usize> fmt::Debug for FixedBuf<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let data = self.read();
+        if data.is_empty() {
+            return write!(f, "FixedBuf<{N}>(empty)");
+        }
+        let show = data.len().min(8);
+        write!(
+            f,
+            "FixedBuf<{N}>([{} bytes] {:02x?}",
+            data.len(),
+            &data[..show]
+        )?;
+        if data.len() > 8 {
+            write!(f, "...")?;
+        }
+        write!(f, ")")
     }
 }
 

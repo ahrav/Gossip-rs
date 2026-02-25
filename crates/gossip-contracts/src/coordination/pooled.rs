@@ -495,6 +495,11 @@ impl PooledSpawned {
         additional: &[ShardId],
         slab: &mut ByteSlab,
     ) -> Result<(ByteSlot, u16), SlabFull> {
+        debug_assert!(
+            !additional.is_empty(),
+            "allocate_appended_slot: additional must not be empty \
+             (empty input aliases the current slot, causing use-after-free in install_slot)"
+        );
         if additional.is_empty() {
             return Ok((self.slot, self.len));
         }

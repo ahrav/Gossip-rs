@@ -541,3 +541,72 @@ fn coord_error_size_regression() {
         std::mem::size_of::<CoordError>()
     );
 }
+
+// -- FixedBuf ---------------------------------------------------------------
+
+#[test]
+fn fixed_buf_write_and_read_roundtrip() {
+    let mut buf = FixedBuf::<64>::new();
+    buf.write(b"hello world", "test");
+    assert_eq!(buf.read(), b"hello world");
+    assert!(buf.has_data());
+}
+
+#[test]
+fn fixed_buf_write_at_max_capacity() {
+    let mut buf = FixedBuf::<4>::new();
+    buf.write(b"abcd", "test");
+    assert_eq!(buf.read(), b"abcd");
+}
+
+#[test]
+#[should_panic(expected = "oversized")]
+fn fixed_buf_write_oversized_panics() {
+    let mut buf = FixedBuf::<4>::new();
+    buf.write(b"abcde", "oversized");
+}
+
+#[test]
+fn fixed_buf_reset_clears_logically() {
+    let mut buf = FixedBuf::<16>::new();
+    buf.write(b"data", "test");
+    assert!(buf.has_data());
+    buf.reset();
+    assert!(!buf.has_data());
+    assert!(buf.read().is_empty());
+}
+
+#[test]
+fn fixed_buf_replace_shorter_preserves_only_new() {
+    let mut buf = FixedBuf::<16>::new();
+    buf.write(b"12345678", "test");
+    assert_eq!(buf.read().len(), 8);
+    buf.write(b"abcd", "test");
+    assert_eq!(buf.read(), b"abcd");
+    assert_eq!(buf.read().len(), 4);
+}
+
+#[test]
+fn fixed_buf_equality_same_content() {
+    let a = FixedBuf::<16>::from_slice(b"test", "test");
+    let b = FixedBuf::<16>::from_slice(b"test", "test");
+    assert_eq!(a, b);
+}
+
+#[test]
+fn fixed_buf_equality_different_content() {
+    let a = FixedBuf::<16>::from_slice(b"aaa", "test");
+    let b = FixedBuf::<16>::from_slice(b"bbb", "test");
+    assert_ne!(a, b);
+}
+
+#[test]
+fn fixed_buf_debug_output_safe() {
+    let buf = FixedBuf::<16>::from_slice(b"abcdef", "test");
+    let dbg = format!("{buf:?}");
+    assert!(dbg.contains("6 bytes"), "should contain byte count: {dbg}");
+
+    let empty = FixedBuf::<8>::new();
+    let dbg_empty = format!("{empty:?}");
+    assert!(dbg_empty.contains("empty"), "should say empty: {dbg_empty}");
+}
