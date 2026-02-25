@@ -35,8 +35,8 @@
 //! ## Manifest validation
 //!
 //! [`validate_manifest`] enforces that the initial shard set is non-empty,
-//! contains no duplicate IDs, uses bounded key ranges, and has no derived
-//! (split-child) shard IDs. This prevents invalid initial states from
+//! contains no duplicate IDs, uses bounded key ranges, and has cursor values
+//! within declared shard bounds. This prevents invalid initial states from
 //! entering the coordination layer.
 //!
 //! [`ShardRecord`]: super::record::ShardRecord

@@ -15,9 +15,11 @@
 //!   No I/O, no transactions, no retries.
 //! - **No event emission wiring yet** — operation sites contain
 //!   `TODO(events)` markers where `EventCollector` hooks can be added later.
-//! - **Tiger-style invariant enforcement** — every mutation path calls
-//!   [`ShardRecord::assert_invariants()`] before returning. A violated
-//!   invariant panics immediately (crash-to-prevent-corruption).
+//! - **Tiger-style invariant enforcement** — mutation paths that can affect
+//!   multi-field shard invariants call [`ShardRecord::assert_invariants()`]
+//!   before returning. Simpler paths (for example lease refresh/acquire
+//!   updates) mutate a constrained field subset and rely on targeted guards.
+//!   A violated invariant panics immediately (crash-to-prevent-corruption).
 //!
 //! # Protocol foundations
 //!
@@ -97,10 +99,10 @@
 //!
 //! # Performance note
 //!
-//! `claim_next_available` (via `ShardClaiming`) delegates to `list_shards_into`,
-//! which sorts candidates by key range in this backend. The resulting worst
-//! case is O(S log S) where S is the run's shard count. Acceptable here;
-//! production backends need a secondary available-shards index.
+//! `claim_next_available` (via `ShardClaiming`) scans the run index and sorts
+//! available candidates by key range in-place. The resulting worst case is
+//! O(S log S) where S is the run's shard count. Acceptable here; production
+//! backends need a secondary available-shards index.
 
 use std::collections::{HashMap, HashSet};
 

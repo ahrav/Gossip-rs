@@ -63,8 +63,10 @@ use crate::identity::{RunId, ShardId, ShardKey, TenantId};
 /// # Ordering
 ///
 /// Iteration order of [`shards()`](Self::shards) is unspecified — callers
-/// must not depend on any particular ordering. All current shard-level
-/// invariant checks (S1–S7) are order-independent.
+/// must not depend on storage-map order from real backends. Wrapper
+/// implementations may impose deterministic ordering for targeted checks
+/// (for example, yielding real observations before synthetic regressions in
+/// fault-injection tests).
 pub trait SimIntrospection {
     /// Iterator over all shard records. Order is unspecified.
     ///
