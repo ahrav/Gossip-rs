@@ -193,6 +193,12 @@ fn claim_run_not_found() {
 /// Three sequential claims on a 3-shard run produce three distinct leases;
 /// a fourth claim returns `NoneAvailable`. Verifies the claim algorithm
 /// tracks which shards have been assigned and exhausts them correctly.
+///
+/// Note: shard IDs in this test are monotonic with key ranges, so the
+/// sorted order (by `ShardId`) happens to match the registration order.
+/// The `default_claim_next_available` algorithm sorts candidates by
+/// `ShardId` for deterministic worker-offset selection; correctness does
+/// not depend on this ordering.
 #[test]
 fn claim_all_sequential() {
     let mut coord = setup_coordinator(3);

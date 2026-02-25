@@ -374,15 +374,14 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
 ///         worker: WorkerId,
 ///         out: &'a mut AcquireScratch,
 ///     ) -> Result<AcquireResultView<'a>, ClaimError> {
-///         default_claim_next_available(
-///             self,
-///             now,
-///             tenant,
-///             run,
-///             worker,
-///             out,
-///             &mut self.claim_candidates_scratch,
-///         )
+///         // Temporarily take the scratch buffer to avoid simultaneous
+///         // `&mut self` and `&mut self.claim_candidates_scratch`.
+///         let mut candidates = std::mem::take(&mut self.claim_candidates_scratch);
+///         let result = default_claim_next_available(
+///             self, now, tenant, run, worker, out, &mut candidates,
+///         );
+///         self.claim_candidates_scratch = candidates;
+///         result
 ///     }
 /// }
 /// ```

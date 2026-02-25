@@ -2000,7 +2000,9 @@ pub trait RunManagement {
     /// and lease deadline are needed.
     ///
     /// On return, `candidates` contains the IDs of all Active, unleased
-    /// shards (in backend-defined order — no sort guarantee).  The returned
+    /// shards in implementation-defined order. Backends using
+    /// [`default_claim_next_available`](super::default_claim_next_available)
+    /// should sort for deterministic worker-offset behavior.  The returned
     /// `Option<LogicalTime>` is the earliest lease deadline among Active
     /// shards that **are** leased, or `None` if no Active shard is currently
     /// leased.  Callers use this deadline to schedule retry attempts near

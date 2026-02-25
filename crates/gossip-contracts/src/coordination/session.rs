@@ -109,7 +109,7 @@ use crate::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
 /// Grouped snapshot state for a `WorkerSession`.
 ///
-/// Bundles the allocation-free scratch buffers, scalar metadata, spawned
+/// Bundles the fixed-capacity scratch buffers, scalar metadata, spawned
 /// lineage into a single struct. This reduces the field count on
 /// `WorkerSession` and makes the refresh logic in
 /// [`WorkerSession::split_residual`] more obviously complete.

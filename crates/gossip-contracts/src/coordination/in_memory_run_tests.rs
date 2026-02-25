@@ -1471,6 +1471,22 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
     );
 }
 
+#[test]
+fn register_shards_resource_exhausted_display_includes_resource_name() {
+    let err = RegisterShardsError::ResourceExhausted {
+        resource: "shard_slab",
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("shard_slab"),
+        "Display output should include the resource name: {msg}"
+    );
+    assert!(
+        msg.contains("exhausted"),
+        "Display output should mention exhaustion: {msg}"
+    );
+}
+
 // -- create_run_with_shards tests ---------------------------------------------
 //
 // Atomic create+register convenience method. Covers: fresh creation

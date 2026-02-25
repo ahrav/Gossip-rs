@@ -166,6 +166,19 @@ const RUN_ENTRY_OVERHEAD_BYTES: usize = 80;
 const WORKER_COOLDOWN_ENTRY_BYTES: usize = 16;
 const COORDINATOR_BASE_BYTES: usize = 4096;
 
+/// Pre-allocated containers returned by [`InMemoryCoordinator::preflight_register_capacity`].
+///
+/// When a new tenant or run is being registered for the first time, the
+/// preflight builds the inner map/set with fallible allocation and hands
+/// it back so the caller can insert it directly — no second allocation.
+#[derive(Default)]
+struct PreflightMaps {
+    /// Inner shard map for a new tenant (None if tenant already existed).
+    tenant_map: Option<AHashMap<ShardKey, ShardRecord>>,
+    /// Shard-ID set for a new run (None if run index already existed).
+    run_shard_set: Option<HashSet<ShardId, ahash::RandomState>>,
+}
+
 /// Create a new `AHashMap` with the given pre-allocated capacity.
 #[inline]
 fn ahash_map_with_capacity<K, V>(capacity: usize) -> AHashMap<K, V> {
@@ -936,30 +949,34 @@ impl InMemoryCoordinator {
 
     /// Fallible preflight for `register_shards` memory growth.
     ///
-    /// This is intentionally a single path that checks all affected structures
-    /// before any shard-map mutation begins.
+    /// Checks all affected structures before any shard-map mutation begins.
+    /// When new containers are needed (new tenant or new run), they are
+    /// allocated here and returned so the caller can insert them directly,
+    /// avoiding a probe-and-drop pattern where the preflight allocation is
+    /// discarded and the caller re-allocates infallibly.
     fn preflight_register_capacity(
         &mut self,
         tenant: TenantId,
         run: RunId,
         shard_ids: &[ShardId],
-    ) -> Result<(), RegisterShardsError> {
+    ) -> Result<PreflightMaps, RegisterShardsError> {
         if shard_ids.is_empty() {
-            return Ok(());
+            return Ok(PreflightMaps::default());
         }
 
         // -- Phase 1: ensure the per-tenant inner shard map can absorb new entries --
         let additional = shard_ids.len();
-        if let Some(tenant_map) = self.shards.get_mut(&tenant) {
+        let tenant_map = if let Some(tenant_map) = self.shards.get_mut(&tenant) {
             // Tenant already exists: reserve space in the existing inner map.
             tenant_map.try_reserve(additional).map_err(|_| {
                 RegisterShardsError::ResourceExhausted {
                     resource: "tenant_shards",
                 }
             })?;
+            None
         } else {
-            // First registration for this tenant: reserve one slot in the
-            // outer map and probe-allocate the inner map to confirm it fits.
+            // First registration for this tenant: build the inner map here
+            // so allocation is fallible; the caller inserts it directly.
             self.shards
                 .try_reserve(1)
                 .map_err(|_| RegisterShardsError::ResourceExhausted {
@@ -973,11 +990,12 @@ impl InMemoryCoordinator {
                 .map_err(|_| RegisterShardsError::ResourceExhausted {
                     resource: "tenant_shards",
                 })?;
-        }
+            Some(inner)
+        };
 
         // -- Phase 2: ensure the run→shard secondary index can absorb new entries --
         let run_key = (tenant, run);
-        if let Some(existing) = self.run_shards.get_mut(&run_key) {
+        let run_shard_set = if let Some(existing) = self.run_shards.get_mut(&run_key) {
             // Run index exists (idempotent retry): only reserve for genuinely new IDs.
             let additional_unique = shard_ids.iter().filter(|id| !existing.contains(id)).count();
             if additional_unique > 0 {
@@ -987,22 +1005,28 @@ impl InMemoryCoordinator {
                     }
                 })?;
             }
-            return Ok(());
-        }
+            None
+        } else {
+            // First registration for this run: build the inner set here
+            // so allocation is fallible; the caller inserts it directly.
+            self.run_shards
+                .try_reserve(1)
+                .map_err(|_| RegisterShardsError::ResourceExhausted {
+                    resource: "run_shards_index",
+                })?;
+            let mut shard_set: HashSet<ShardId, ahash::RandomState> = ahash_set_with_capacity(0);
+            shard_set
+                .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
+                .map_err(|_| RegisterShardsError::ResourceExhausted {
+                    resource: "run_shards_set",
+                })?;
+            Some(shard_set)
+        };
 
-        // First registration for this run: reserve in outer index + inner set.
-        self.run_shards
-            .try_reserve(1)
-            .map_err(|_| RegisterShardsError::ResourceExhausted {
-                resource: "run_shards_index",
-            })?;
-        let mut shard_set: HashSet<ShardId, ahash::RandomState> = ahash_set_with_capacity(0);
-        shard_set
-            .try_reserve(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
-            .map_err(|_| RegisterShardsError::ResourceExhausted {
-                resource: "run_shards_set",
-            })?;
-        Ok(())
+        Ok(PreflightMaps {
+            tenant_map,
+            run_shard_set,
+        })
     }
 }
 
@@ -2438,7 +2462,7 @@ impl RunManagement for InMemoryCoordinator {
     /// Step 6 rolls back partially-allocated staged shard records via
     /// `deallocate_fields` when slab allocation fails. If `deallocate_fields`
     /// itself panics (slab metadata corruption or double-free), this method
-    /// aborts immediately; that indicates irrecoverable internal corruption.
+    /// the panic propagates immediately; that indicates irrecoverable internal corruption.
     fn register_shards(
         &mut self,
         now: LogicalTime,
@@ -2515,7 +2539,9 @@ impl RunManagement for InMemoryCoordinator {
         // Borrowed manifest inputs are copied into slab-owned record fields.
         let cursor_semantics = record.config.cursor_semantics();
         let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
-        self.preflight_register_capacity(tenant, run, &shard_ids)?;
+        let preflight = self.preflight_register_capacity(tenant, run, &shard_ids)?;
+        // Infallible allocation; preflight_register_capacity already verified
+        // that the surrounding maps can absorb this many entries.
         let mut to_insert: Vec<(ShardKey, ShardRecord)> = Vec::with_capacity(shards.len());
 
         for s in shards {
@@ -2535,8 +2561,10 @@ impl RunManagement for InMemoryCoordinator {
                 &mut self.slab,
             ) {
                 Ok(record) => record,
-                Err(_) => {
-                    // Roll back staged records allocated so far.
+                Err(_slab_err) => {
+                    // SlabFull diagnostic intentionally discarded — the
+                    // ResourceExhausted variant carries the resource name,
+                    // which is sufficient for callers.
                     for (_, mut staged) in to_insert.drain(..) {
                         staged.deallocate_fields(&mut self.slab);
                     }
@@ -2549,24 +2577,26 @@ impl RunManagement for InMemoryCoordinator {
             to_insert.push((key, sr));
         }
 
-        if !self.shards.contains_key(&tenant) {
-            self.shards.insert(
-                tenant,
-                ahash_map_with_capacity(
-                    tenant_shards_map_initial_capacity(self.max_shards_per_tenant)
-                        .max(shard_ids.len()),
-                ),
-            );
+        // Insert the pre-built tenant map from preflight (if this is a new
+        // tenant), or use the existing one. All allocations happened fallibly
+        // in `preflight_register_capacity`; no infallible allocation here.
+        if let Some(inner) = preflight.tenant_map {
+            self.shards.insert(tenant, inner);
         }
 
         for (key, record) in to_insert.drain(..) {
             self.shard_insert(tenant, key, record);
         }
 
+        // Insert the pre-built run shard set from preflight (if this is a
+        // new run), then extend with the registered shard IDs.
         let run_key = (tenant, run);
-        let shard_set = self.run_shards.entry(run_key).or_insert_with(|| {
-            ahash_set_with_capacity(shard_ids.len().max(RUN_SHARD_SET_INITIAL_CAPACITY))
-        });
+        if let Some(set) = preflight.run_shard_set {
+            self.run_shards.insert(run_key, set);
+        }
+        let shard_set = self.run_shards.get_mut(&run_key).expect(
+            "run_shards entry must exist: either pre-existing or just inserted from preflight",
+        );
         shard_set.extend(shard_ids.iter().copied());
 
         // 7. Transition run → Active.
@@ -3116,6 +3146,8 @@ impl InMemoryCoordinator {
                  now={now:?}, previous={:?}",
                 self.claim_cooldowns.get(&worker),
             );
+            // Infallible insert: implicit growth on OOM produces a generic
+            // allocator abort, acceptable for WARM-path cooldown tracking.
             self.claim_cooldowns.insert(worker, now);
         }
     }
