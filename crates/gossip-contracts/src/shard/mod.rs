@@ -16,6 +16,10 @@
 //!   decode helpers, and split-propagation logic
 //!   ([`propagate_hint_on_split`]).
 //!
+//! - [`builder`] -- startup-preallocated borrowed shard-manifest builder
+//!   ([`PreallocShardBuilder`]) for bounded, allocation-silent
+//!   `register_shards` inputs.
+//!
 //! # Zero-allocation design
 //!
 //! Both submodules follow the same caller-owned-buffer pattern: callers
@@ -29,9 +33,11 @@
 //! May depend on `identity` and `coordination::shard_spec`. Must not
 //! reference `connector` or `persistence`.
 
+pub mod builder;
 pub mod hint;
 pub mod key_encoding;
 
+pub use builder::{PreallocShardBuilder, PreallocShardBuilderError};
 pub use hint::{
     HintPropagationError, MetadataBuf, ShardEncodeError, ShardHint, ShardHintDecodeError,
     ShardMetadata, ShardMetadataDecodeError, ShardSpecScratch, SplitBoundary,
