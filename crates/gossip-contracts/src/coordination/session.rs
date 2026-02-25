@@ -106,6 +106,40 @@ use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
+// SnapshotState
+// ============================================================================
+
+/// Grouped snapshot state for a `WorkerSession`.
+///
+/// Bundles the allocation-free scratch buffers, scalar metadata, spawned
+/// lineage, and the lazy owned-snapshot cache into a single struct. This
+/// reduces the field count on `WorkerSession` and makes the refresh logic
+/// in [`WorkerSession::split_residual`] more obviously complete — all
+/// snapshot-related state lives in one place.
+struct SnapshotState {
+    /// Allocation-free scratch buffers from acquisition time.
+    ///
+    /// Backed by fixed-capacity arrays so `split_residual` can refresh spec
+    /// bounds without owned materialization.
+    scratch: AcquireScratch,
+
+    /// Shard status at acquisition time.
+    status: ShardStatus,
+
+    /// Cursor semantics for the shard.
+    cursor_semantics: CursorSemantics,
+
+    /// Parent shard ID (if this shard was created by a split).
+    parent: Option<ShardId>,
+
+    /// Lineage of spawned child shards, appended to on each `split_residual`.
+    spawned: InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>,
+
+    /// Lazily materialized owned snapshot for compatibility accessors.
+    cache: OnceCell<ShardSnapshot>,
+}
+
+// ============================================================================
 // WorkerSession
 // ============================================================================
 
@@ -161,20 +195,8 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
     /// immutable after acquisition). Consumed by terminal operations.
     lease: Lease,
 
-    /// Allocation-free snapshot bytes from acquisition time.
-    ///
-    /// Backed by fixed-capacity arrays so `split_residual` can refresh spec
-    /// bounds without owned materialization.
-    snapshot_scratch: AcquireScratch,
-
-    /// Snapshot metadata not stored in [`AcquireScratch`].
-    snapshot_status: ShardStatus,
-    snapshot_cursor_semantics: CursorSemantics,
-    snapshot_parent: Option<ShardId>,
-    snapshot_spawned: InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>,
-
-    /// Lazily materialized owned snapshot for compatibility accessors.
-    snapshot_cache: OnceCell<ShardSnapshot>,
+    /// Snapshot state from acquisition time, refreshed by `split_residual`.
+    snapshot: SnapshotState,
 
     /// Advisory capacity hint from the last acquire or renew.
     ///
@@ -238,10 +260,10 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
                 "WorkerSession::new: backend returned empty cursor last_key"
             );
         }
-        let snapshot_status = result.snapshot.status();
-        let snapshot_cursor_semantics = result.snapshot.cursor_semantics();
-        let snapshot_parent = result.snapshot.parent();
-        let snapshot_spawned = InlineVec::from_slice(result.snapshot.spawned());
+        let status = result.snapshot.status();
+        let cursor_semantics = result.snapshot.cursor_semantics();
+        let parent = result.snapshot.parent();
+        let spawned = InlineVec::from_slice(result.snapshot.spawned());
         let lease = result.lease;
         let capacity = result.capacity;
         // Tenant is a security boundary — must hold in all builds.
@@ -252,28 +274,30 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         // avoid redundant checks on the hot path in release builds.
         debug_assert_eq!(lease.shard_key(), key, "lease shard_key mismatch");
         debug_assert_eq!(lease.owner(), worker, "lease owner mismatch");
-        debug_assert!(!snapshot_status.is_terminal(), "acquired terminal shard");
+        debug_assert!(!status.is_terminal(), "acquired terminal shard");
         Ok(Self {
             backend,
             tenant,
             worker,
             lease,
-            snapshot_scratch,
-            snapshot_status,
-            snapshot_cursor_semantics,
-            snapshot_parent,
-            snapshot_spawned,
-            snapshot_cache: OnceCell::new(),
+            snapshot: SnapshotState {
+                scratch: snapshot_scratch,
+                status,
+                cursor_semantics,
+                parent,
+                spawned,
+                cache: OnceCell::new(),
+            },
             capacity,
         })
     }
 
     #[inline]
     fn snapshot_view(&self) -> crate::coordination::error::ShardSnapshotView<'_> {
-        self.snapshot_scratch.view(
-            self.snapshot_status,
-            self.snapshot_cursor_semantics,
-            self.snapshot_parent,
+        self.snapshot.scratch.view(
+            self.snapshot.status,
+            self.snapshot.cursor_semantics,
+            self.snapshot.parent,
         )
     }
 
@@ -297,19 +321,20 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             cursor,
             view.cursor_semantics(),
             view.parent(),
-            self.snapshot_spawned.iter(),
+            self.snapshot.spawned.iter(),
         )
     }
 
     #[inline]
     fn cached_snapshot(&self) -> &ShardSnapshot {
-        self.snapshot_cache
+        self.snapshot
+            .cache
             .get_or_init(|| self.materialize_snapshot())
     }
 
     #[cfg(test)]
     fn has_materialized_snapshot(&self) -> bool {
-        self.snapshot_cache.get().is_some()
+        self.snapshot.cache.get().is_some()
     }
 
     /// The active lease, including fence epoch and deadline.
@@ -613,16 +638,16 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             //     record already reflects the narrowed spec, so the snapshot
             //     from `acquire_and_restore_into` is already correct.
             // In both cases, skipping refresh is safe.
-            self.snapshot_scratch.write_spec(
+            self.snapshot.scratch.write_spec(
                 new_spec.key_range_start(),
                 new_spec.key_range_end(),
                 new_spec.metadata(),
             );
-            self.snapshot_spawned.push(res.residual);
+            self.snapshot.spawned.push(res.residual);
             // Defer owned rebuild until next accessor call.
-            self.snapshot_cache.take();
+            self.snapshot.cache.take();
             debug_assert_eq!(
-                self.snapshot_status,
+                self.snapshot.status,
                 ShardStatus::Active,
                 "status changed after split_residual"
             );
