@@ -1405,6 +1405,14 @@ impl AcquireScratch {
     ///
     /// Inputs are validated against shard/key metadata size ceilings and then
     /// copied. No caller references are retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `start`, `end`, or `metadata` exceed their respective size
+    /// ceilings. These asserts are defense-in-depth: callers read spec data
+    /// from a `PooledShardSpec` slab that only stores pre-validated specs,
+    /// so a ceiling breach here indicates slab corruption. Panicking
+    /// immediately is safer than writing truncated data.
     pub(crate) fn write_spec(&mut self, start: &[u8], end: &[u8], metadata: &[u8]) {
         assert!(
             start.len() <= MAX_KEY_SIZE,
@@ -1427,6 +1435,13 @@ impl AcquireScratch {
     ///
     /// `None` clears the corresponding field; `token` is stored only when
     /// present in input. No caller references are retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_key` or `token` exceed their respective size ceilings.
+    /// Same defense-in-depth rationale as [`write_spec`](Self::write_spec):
+    /// cursor bytes originate from pooled slab storage that enforces size
+    /// limits at write time, so a breach here is internal corruption.
     pub(crate) fn write_cursor(&mut self, last_key: Option<&[u8]>, token: Option<&[u8]>) {
         match last_key {
             Some(last_key) => {

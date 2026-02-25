@@ -762,7 +762,7 @@ impl ShardArena {
         };
 
         let slot = &mut self.slots[slot_index as usize];
-        debug_assert!(slot.spec.is_none(), "free slot unexpectedly occupied");
+        assert!(slot.spec.is_none(), "free slot unexpectedly occupied");
         slot.spec = Some(pooled);
 
         Ok(ShardSpecHandle {
@@ -798,9 +798,12 @@ impl ShardArena {
 
     /// Free a previously allocated handle.
     ///
-    /// Stale or already-freed handles are ignored.
+    /// Stale or already-freed handles are ignored (returns silently).
+    /// In debug builds, an invalid slot index triggers a debug_assert
+    /// to catch corrupted handles early.
     pub fn free_spec(&mut self, handle: ShardSpecHandle) {
         let Some(slot) = self.slots.get_mut(handle.slot as usize) else {
+            debug_assert!(false, "free_spec: invalid slot index {}", handle.slot);
             return;
         };
         if slot.generation != handle.generation {

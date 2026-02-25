@@ -213,6 +213,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ) -> Result<Self, AcquireError> {
         let mut scratch = AcquireScratch::new();
         let result = backend.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?;
+        // Panic is intentional: the backend's slab only stores specs that
+        // passed write_spec validation (size ceilings enforced by assert),
+        // so an invalid spec here means internal slab corruption.
         let spec = ShardSpec::try_from_ref(result.snapshot.spec())
             .expect("WorkerSession::new: backend returned invalid shard spec");
         let cursor = match (
@@ -540,6 +543,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             .backend
             .split_residual(now, self.tenant, &self.lease, plan, op_id)?;
         if let IdempotentOutcome::Executed(ref res) = result {
+            // Panic is intentional: the plan's spec passed validation at
+            // construction time, so an invalid spec here means internal
+            // corruption in the plan or coordinator.
             let new_spec = ShardSpec::try_from_ref(new_spec)
                 .expect("split_residual produced invalid parent spec");
             // Rebuild the cached snapshot so that subsequent operations

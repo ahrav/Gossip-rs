@@ -486,6 +486,58 @@ fn cursor_regression_debug_no_key_leak() {
     );
 }
 
+// -- AcquireScratch edge cases (F8) ----------------------------------
+
+#[test]
+#[should_panic(expected = "spec start exceeds MAX_KEY_SIZE")]
+fn acquire_scratch_write_spec_panics_on_oversized_start() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(&[0x01; MAX_KEY_SIZE + 1], b"z", &[]);
+}
+
+#[test]
+#[should_panic(expected = "spec end exceeds MAX_KEY_SIZE")]
+fn acquire_scratch_write_spec_panics_on_oversized_end() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(b"a", &[0xFF; MAX_KEY_SIZE + 1], &[]);
+}
+
+#[test]
+#[should_panic(expected = "spec metadata exceeds MAX_METADATA_SIZE")]
+fn acquire_scratch_write_spec_panics_on_oversized_metadata() {
+    let mut scratch = AcquireScratch::new();
+    let meta = vec![0xAA; crate::coordination::shard_spec::MAX_METADATA_SIZE + 1];
+    scratch.write_spec(b"a", b"z", &meta);
+}
+
+#[test]
+fn acquire_scratch_cursor_view_with_token_but_no_last_key_returns_initial() {
+    let mut scratch = AcquireScratch::new();
+    // Write a cursor with no last_key but with token.
+    // CursorUpdate::initial() should be returned because
+    // cursor_view gates token on has_cursor_last_key.
+    scratch.write_cursor(None, Some(b"some_token"));
+    let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
+    let cursor = view.cursor();
+    assert!(cursor.last_key().is_none());
+    assert!(cursor.token().is_none());
+}
+
+#[test]
+fn acquire_scratch_reset_then_view_returns_empty_state() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_spec(b"start", b"end", b"meta");
+    scratch.write_cursor(Some(b"key"), Some(b"token"));
+    scratch.reset();
+
+    let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
+    assert!(view.spec().key_range_start().is_empty());
+    assert!(view.spec().key_range_end().is_empty());
+    assert!(view.spec().metadata().is_empty());
+    assert!(view.cursor().last_key().is_none());
+    assert!(view.cursor().token().is_none());
+}
+
 // -- Size regression test --------------------------------------------
 
 #[test]

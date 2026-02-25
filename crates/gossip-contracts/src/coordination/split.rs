@@ -210,6 +210,9 @@ pub enum SplitReplacePlanError {
     /// Fewer than 2 children — not a split.
     TooFewChildren { count: usize },
     /// More than [`MAX_SPLIT_CHILDREN`] children.
+    ///
+    /// `count` is a lower bound: the iterator is not fully consumed once
+    /// the limit is exceeded, so the actual count may be higher.
     TooManyChildren { count: usize },
 }
 

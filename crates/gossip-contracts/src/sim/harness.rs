@@ -1618,7 +1618,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
             ),
         ]) {
             Ok(p) => p,
-            Err(_) => {
+            Err(_e) => {
+                debug_assert!(false, "unexpected split-replace plan failure: {_e:?}");
                 return SimEvent::Rejected {
                     kind: RejectionKind::SplitValidation,
                 };
@@ -1705,7 +1706,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let plan =
             match SplitResidualPlan::try_new(new_parent_spec.as_ref(), residual_spec.as_ref()) {
                 Ok(p) => p,
-                Err(_) => {
+                Err(_e) => {
+                    debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
                     return SimEvent::Rejected {
                         kind: RejectionKind::SplitValidation,
                     };
@@ -2681,7 +2683,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         ),
                     ]) {
                         Ok(plan) => plan,
-                        Err(_) => {
+                        Err(_e) => {
+                            debug_assert!(false, "unexpected split-replace plan failure: {_e:?}");
                             return Ok(SessionOutcome {
                                 lease,
                                 is_terminal: false,
@@ -2732,7 +2735,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                         residual_spec.as_ref(),
                     ) {
                         Ok(plan) => plan,
-                        Err(_) => {
+                        Err(_e) => {
+                            debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
                             return Ok(SessionOutcome {
                                 lease,
                                 is_terminal: false,
