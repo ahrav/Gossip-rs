@@ -690,7 +690,8 @@ pub fn range_shard_into(
 /// # Errors
 ///
 /// - [`PrefixShardError::PrefixTooLarge`] if `prefix.len() > MAX_KEY_SIZE`.
-/// - [`PrefixShardError::NoSuccessor`] if `prefix` is empty or all `0xFF`.
+/// - [`PrefixShardError::EmptyPrefix`] if `prefix` is empty.
+/// - [`PrefixShardError::NoSuccessor`] if `prefix` is all `0xFF`.
 /// - [`PrefixShardError::InvalidShardSpec`] if downstream validation fails.
 #[must_use = "returns a Result that must be checked for validation errors"]
 pub fn prefix_shard_ref<'a>(
@@ -698,6 +699,9 @@ pub fn prefix_shard_ref<'a>(
     connector_extra: &[u8],
     scratch: &'a mut ShardSpecScratch,
 ) -> Result<ShardSpecRef<'a>, PrefixShardError> {
+    if prefix.is_empty() {
+        return Err(PrefixShardError::EmptyPrefix);
+    }
     // Validate prefix size before metadata encoding so callers always see
     // PrefixTooLarge for oversized prefixes, not a generic MetadataTooLarge
     // from the hint encoder hitting the metadata capacity ceiling first.
@@ -910,7 +914,10 @@ impl std::error::Error for HintPropagationError {}
 ///   against.  Callers must validate child range ordering independently.
 /// - `Prefix` validates child bounds and demotes to `Range` because arbitrary
 ///   split boundaries inside one prefix shard are not representable as a single
-///   child prefix.
+///   child prefix. Connectors should treat `[child_start, child_end)` as a
+///   sub-range of the original prefix scan; the parent-prefix context is
+///   recoverable from shard lineage (`ShardSnapshot::parent`) rather than from
+///   the child hint itself.
 /// - `Manifest` validates row-key boundaries and returns a narrowed
 ///   `Manifest` hint.
 ///
@@ -997,12 +1004,14 @@ fn validate_prefix_child_bounds(
     child_end: &[u8],
 ) -> Result<(), HintPropagationError> {
     let mut successor_buf = KeyBuf::new();
-    // When `prefix_successor` returns `None`, the parent prefix has no
-    // lexicographic successor (all-0xFF or empty).  `SplitBoundary::End` is
-    // reported because the successor *is* the end bound — no valid end bound
-    // exists.  This path is unreachable through the typed `prefix_shard` API,
-    // which rejects such prefixes with `PrefixShardError::NoSuccessor` at
-    // construction time.
+    // When `prefix_successor` returns `None`, the parent prefix either has no
+    // lexicographic successor (all-0xFF or empty) or exceeds `KeyBuf` capacity.
+    // `SplitBoundary::End` is reported because the successor *is* the end bound
+    // and therefore cannot be formed. This path is unreachable through the
+    // typed prefix helpers: empty prefixes are rejected as
+    // `PrefixShardError::EmptyPrefix`, oversized prefixes as
+    // `PrefixShardError::PrefixTooLarge`, and all-0xFF prefixes as
+    // `PrefixShardError::NoSuccessor`.
     let successor = prefix_successor(prefix, &mut successor_buf).ok_or(
         HintPropagationError::InvalidPrefixBoundary {
             boundary: SplitBoundary::End,

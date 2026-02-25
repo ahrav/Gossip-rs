@@ -63,6 +63,9 @@ use crate::identity::{LogicalTime, RunId, ShardKey, TenantId, WorkerId};
 /// when *every* candidate has been exhausted. This keeps callers from
 /// needing to distinguish between "no shards exist" and "all shards
 /// were grabbed by other workers" -- both mean "try again later."
+/// The default implementation panics instead of returning `NoneAvailable`
+/// when *every* candidate yields `ShardNotFound`, because that indicates
+/// backend index corruption rather than normal contention.
 ///
 /// The enum is `#[non_exhaustive]` so that future claim strategies can
 /// introduce additional error variants without requiring callers to
@@ -254,30 +257,23 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     let offset = worker.as_raw() as usize % len;
     let mut inconsistency_count = 0usize;
     let mut earliest_deadline: Option<LogicalTime> = None;
-    let mut attempt_scratch = AcquireScratch::new();
-    for i in 0..len {
+    let mut i = 0usize;
+    let acquired = loop {
+        if i == len {
+            break None;
+        }
         let summary = &summaries[(offset + i) % len];
         let key = ShardKey::new(run, summary.shard());
-        match backend.acquire_and_restore_into(now, tenant, key, worker, &mut attempt_scratch) {
+        match backend.acquire_and_restore_into(now, tenant, key, worker, out) {
             Ok(result) => {
-                out.reset();
                 let snapshot = result.snapshot;
-                out.write_spec(
-                    snapshot.spec().key_range_start(),
-                    snapshot.spec().key_range_end(),
-                    snapshot.spec().metadata(),
-                );
-                out.write_cursor(snapshot.cursor().last_key(), snapshot.cursor().token());
-                out.write_spawned(snapshot.spawned());
-                return Ok(AcquireResultView {
-                    lease: result.lease,
-                    snapshot: out.view(
-                        snapshot.status(),
-                        snapshot.cursor_semantics(),
-                        snapshot.parent(),
-                    ),
-                    capacity: result.capacity,
-                });
+                break Some((
+                    result.lease,
+                    snapshot.status(),
+                    snapshot.cursor_semantics(),
+                    snapshot.parent(),
+                    result.capacity,
+                ));
             }
             Err(AcquireError::AlreadyLeased { lease_deadline, .. }) => {
                 // Race -- another worker claimed it.  Track the deadline
@@ -288,10 +284,12 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                     Some(prev) => core::cmp::min(prev, lease_deadline),
                     None => lease_deadline,
                 });
+                i += 1;
                 continue;
             }
             Err(AcquireError::ShardTerminal { .. }) => {
                 // Shard became terminal between list and acquire.
+                i += 1;
                 continue;
             }
             Err(AcquireError::ShardNotFound { .. }) => {
@@ -308,6 +306,7 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                      but acquire_and_restore reports ShardNotFound"
                 );
                 inconsistency_count += 1;
+                i += 1;
                 continue;
             }
             Err(AcquireError::TenantMismatch { expected }) => {
@@ -317,6 +316,14 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 return Err(ClaimError::TenantMismatch { expected });
             }
         }
+    };
+
+    if let Some((lease, status, cursor_semantics, parent, capacity)) = acquired {
+        return Ok(AcquireResultView {
+            lease,
+            snapshot: out.view(status, cursor_semantics, parent),
+            capacity,
+        });
     }
 
     // Partial ShardNotFound is tolerable (concurrent mutations).

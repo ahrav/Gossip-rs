@@ -757,6 +757,35 @@ fn manifest_cursor_key_too_large_display() {
     assert!(msg.contains("4096"), "display must include max size");
 }
 
+#[test]
+fn manifest_rejects_oversized_spec_key() {
+    use crate::coordination::shard_spec::MAX_KEY_SIZE;
+
+    // Construct a ShardSpecRef with an oversized start key directly,
+    // bypassing ShardSpec's validating constructor.
+    let oversized_start = vec![0x01; MAX_KEY_SIZE + 1];
+    let end = vec![0xFF];
+    let spec = ShardSpecRef::new(&oversized_start, &end, &[]);
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec, CursorUpdate::initial());
+    assert!(
+        validate_manifest(&[shard]).is_err(),
+        "validate_manifest should reject specs with keys exceeding MAX_KEY_SIZE",
+    );
+}
+
+#[test]
+fn manifest_rejects_oversized_spec_metadata() {
+    use crate::coordination::shard_spec::MAX_METADATA_SIZE;
+
+    let oversized_meta = vec![0xAA; MAX_METADATA_SIZE + 1];
+    let spec = ShardSpecRef::new(b"a", b"z", &oversized_meta);
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec, CursorUpdate::initial());
+    assert!(
+        validate_manifest(&[shard]).is_err(),
+        "validate_manifest should reject specs with metadata exceeding MAX_METADATA_SIZE",
+    );
+}
+
 // ============================================================================
 // ShardFilter
 //

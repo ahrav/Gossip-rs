@@ -632,3 +632,23 @@ proptest! {
         }
     }
 }
+
+// -------------------------------------------------------------------
+// Split coverage rejects oversized child specs
+// -------------------------------------------------------------------
+
+#[test]
+fn split_coverage_rejects_child_with_oversized_metadata() {
+    // Children with valid key ranges but oversized metadata should be
+    // rejected by split coverage validation to prevent downstream
+    // panics in AcquireScratch::write_spec.
+    let oversized_meta = vec![0xAA; MAX_METADATA_SIZE + 1];
+    let child1 = ShardSpecRef::new(b"a", b"m", &oversized_meta);
+    let child2 = ShardSpecRef::new(b"m", b"z", &[]);
+    let result = validate_split_coverage_bounds(b"a", b"z", &[child1, child2]);
+    assert!(
+        result.is_err(),
+        "validate_split_coverage_bounds should reject children with metadata \
+         exceeding MAX_METADATA_SIZE",
+    );
+}

@@ -339,6 +339,14 @@ fn prefix_shard_rejects_all_ff_prefix() {
 }
 
 #[test]
+fn prefix_shard_rejects_empty_prefix() {
+    let mut scratch = ShardSpecScratch::new();
+    let err =
+        prefix_shard_ref(b"", b"ctx", &mut scratch).expect_err("empty prefix should be rejected");
+    assert_eq!(err, PrefixShardError::EmptyPrefix);
+}
+
+#[test]
 fn manifest_shard_roundtrip_with_decode_helpers() {
     let mut scratch = ShardSpecScratch::new();
     let spec = manifest_shard_ref(42, 10, 20, b"blob", &mut scratch)

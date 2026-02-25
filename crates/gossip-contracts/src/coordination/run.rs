@@ -47,7 +47,7 @@ use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::op_payload_hash;
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
@@ -1224,6 +1224,18 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     for shard in shards {
         if shard.spec.key_range_start().is_empty() || shard.spec.key_range_end().is_empty() {
             return Err(ManifestValidationError::UnboundedRange {
+                shard_id: shard.shard,
+            });
+        }
+    }
+
+    // Validate per-spec size limits (key sizes, metadata size, range ordering).
+    // ShardSpecRef is intentionally unvalidated at construction time; this is the
+    // gate that prevents oversized specs from reaching AcquireScratch::write_spec,
+    // which uses panicking asserts on the same size ceilings.
+    for shard in shards {
+        if ShardSpec::validate_ref(shard.spec).is_err() {
+            return Err(ManifestValidationError::InvalidSpec {
                 shard_id: shard.shard,
             });
         }

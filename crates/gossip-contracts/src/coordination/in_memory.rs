@@ -92,7 +92,7 @@ use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 use crate::coordination::shard_spec::{
-    ShardLimitScope, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
+    ShardLimitScope, ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
     validate_split_coverage_bounds,
 };
 use crate::coordination::split::{
@@ -1443,6 +1443,18 @@ fn split_replace_validate_preconditions<'a>(
     slab: &ByteSlab,
 ) -> Result<Vec<&'a SplitReplaceChild<'a>>, SplitReplaceError> {
     let sorted = split_replace_sort_children(plan);
+
+    // Validate per-spec size limits before coverage checks. ShardSpecRef is
+    // intentionally unvalidated at construction; this gate prevents oversized
+    // specs from reaching AcquireScratch::write_spec's panicking asserts.
+    for (i, child) in sorted.iter().enumerate() {
+        if ShardSpec::validate_ref(child.spec()).is_err() {
+            return Err(SplitReplaceError::SplitInvalid(Box::new(
+                SplitValidationError::InvalidChildSpec { child_index: i },
+            )));
+        }
+    }
+
     let child_specs: Vec<ShardSpecRef<'_>> = sorted.iter().map(|c| c.spec()).collect();
     validate_split_coverage_bounds(
         parent.spec.key_range_start(slab),
@@ -1753,6 +1765,19 @@ fn split_residual_validate_preconditions(
     slab: &ByteSlab,
 ) -> Result<(), SplitResidualError> {
     validate_lease(now, tenant, lease, parent)?;
+
+    // Validate per-spec size limits for both the new parent and residual specs.
+    if ShardSpec::validate_ref(plan.parent_new_spec()).is_err() {
+        return Err(SplitResidualError::SplitInvalid(Box::new(
+            SplitValidationError::InvalidChildSpec { child_index: 0 },
+        )));
+    }
+    if ShardSpec::validate_ref(plan.residual_spec()).is_err() {
+        return Err(SplitResidualError::SplitInvalid(Box::new(
+            SplitValidationError::InvalidChildSpec { child_index: 1 },
+        )));
+    }
+
     validate_residual_split_bounds(
         parent.spec.key_range_start(slab),
         parent.spec.key_range_end(slab),

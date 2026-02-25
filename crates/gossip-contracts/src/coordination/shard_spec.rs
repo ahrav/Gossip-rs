@@ -937,6 +937,13 @@ pub enum SplitValidationError {
     DerivedIdCollision {
         derived_id: crate::identity::ShardId,
     },
+
+    /// A child spec exceeds size limits (`MAX_KEY_SIZE` or `MAX_METADATA_SIZE`).
+    ///
+    /// `ShardSpecRef` is intentionally unvalidated at construction time;
+    /// this variant surfaces when the coordinator's precondition check
+    /// detects oversized fields before they reach `AcquireScratch::write_spec`.
+    InvalidChildSpec { child_index: usize },
 }
 
 impl fmt::Display for SplitValidationError {
@@ -1018,6 +1025,13 @@ impl fmt::Display for SplitValidationError {
             ),
             Self::DerivedIdCollision { derived_id } => {
                 write!(f, "derived shard id collision: {derived_id:?}")
+            }
+            Self::InvalidChildSpec { child_index } => {
+                write!(
+                    f,
+                    "child {child_index} spec exceeds size limits \
+                     (MAX_KEY_SIZE or MAX_METADATA_SIZE)",
+                )
             }
         }
     }
@@ -1174,18 +1188,16 @@ pub fn validate_split_coverage_bounds(
         }
     }
 
-    // Defense-in-depth: child keys derive from parent range boundaries.
-    // If parent was validated, children cannot exceed MAX_KEY_SIZE.
-    // This assert catches logic bugs where specs are constructed without validation.
-    for &(_, child) in &indexed {
-        assert!(
-            child.key_range_start().len() <= MAX_KEY_SIZE,
-            "child start key exceeds MAX_KEY_SIZE"
-        );
-        assert!(
-            child.key_range_end().len() <= MAX_KEY_SIZE || child.key_range_end().is_empty(),
-            "child end key exceeds MAX_KEY_SIZE"
-        );
+    // Validate per-spec size limits. ShardSpecRef is intentionally
+    // unvalidated at construction; this gate prevents oversized fields
+    // (keys or metadata) from reaching AcquireScratch::write_spec's
+    // panicking asserts.
+    for &(orig_idx, child) in &indexed {
+        if ShardSpec::validate_ref(child).is_err() {
+            return Err(SplitValidationError::InvalidChildSpec {
+                child_index: orig_idx,
+            });
+        }
     }
 
     debug_assert!(indexed.first().unwrap().1.key_range_start() == parent_start);
