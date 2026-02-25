@@ -35,14 +35,13 @@
 //!
 //! # Allocation Contract Boundary
 //!
-//! Production runtime paths in this crate are designed to keep hot operations
-//! allocation-free after startup (for example, coordination acquire/checkpoint/
-//! complete flows that use borrowed inputs and caller-owned scratch buffers).
+//! Runtime allocation policy is tiered:
+//! - HOT paths prioritize allocation-silent execution (borrowed/scratch/slab).
+//! - WARM/COLD paths prioritize simpler API contracts and may allocate.
 //!
-//! This guarantee is intentionally **production-scoped**. The `sim` module is
-//! deterministic verification infrastructure exposed only for `#[cfg(test)]` or
-//! `test-support` builds, and it may allocate freely for ergonomics and richer
-//! diagnostics.
+//! The `sim` module remains deterministic verification infrastructure exposed
+//! only for `#[cfg(test)]` or `test-support` builds, and may allocate freely
+//! for ergonomics and diagnostics.
 
 #![forbid(unsafe_code)]
 

@@ -174,9 +174,10 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// 1. Collect candidates via
 ///    [`collect_claim_candidates_into`](RunManagement::collect_claim_candidates_into)
 ///    — a single pass over the run's shard set that returns Active, unleased
-///    shard IDs and the earliest lease deadline among Active-but-leased shards.
+///    shard IDs plus the earliest lease deadline among Active-but-leased
+///    shards. Backends may sort candidates for deterministic ordering.
 ///    No [`ShardSummary`](crate::coordination::run::ShardSummary) objects are
-///    constructed and no slab-backed byte fields are copied.
+///    constructed.
 /// 2. If the candidate list is empty, return `NoneAvailable` with the
 ///    earliest deadline from the scan (so callers can schedule a retry
 ///    near the soonest lease expiry instead of busy-spinning).
@@ -220,12 +221,12 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// - `out`: caller-owned scratch space for the shard snapshot returned on
 ///   success. Reused across calls — no allocation in steady state.
 /// - `candidates`: caller-owned buffer for shard IDs. Cleared and reused
-///   per call — no allocation in steady state.
+///   per call; implementations may grow it when needed.
 ///
 /// ## Complexity
 ///
-/// O(S) where S is the number of shards in the run. The candidate scan
-/// is a single linear pass — no sort, no slab reads, no byte copies.
+/// O(S + C log C) where S is the number of shards in the run and C is the
+/// number of claimable candidates (if the backend sorts candidates).
 ///
 /// ## Errors
 ///

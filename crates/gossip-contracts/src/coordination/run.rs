@@ -1999,17 +1999,14 @@ pub trait RunManagement {
     /// List shards for a run, filtered, into a caller-provided output buffer.
     /// Ordered by `key_range_start` ascending.
     ///
-    /// This API allows callers to reuse `out` across repeated queries and
-    /// avoid per-call heap allocations after startup. Implementations may
-    /// require `out` to be pre-sized and refuse to grow it internally.
+    /// This API allows callers to reuse `out` across repeated queries.
+    /// Implementations may grow `out` when needed; callers may still pre-size
+    /// it to avoid repeated reallocations.
     /// Ordering ties (same `key_range_start`) are backend-defined.
     ///
     /// `ShardFilter::is_leased` must be evaluated against `now`: a lease whose
     /// deadline has passed counts as unleased, not leased.
     ///
-    /// Implementations may enforce the no-growth contract with a panic instead
-    /// of a typed error. The in-memory backend does this to keep the hot path
-    /// allocation-silent and fail fast on mis-sized caller buffers.
     fn list_shards_into(
         &self,
         now: LogicalTime,
@@ -2036,16 +2033,7 @@ pub trait RunManagement {
     /// the soonest expiry instead of busy-spinning.
     ///
     /// `candidates` is cleared before use.  The caller owns the buffer and
-    /// reuses it across calls — no allocation in steady state.
-    ///
-    /// # Panics
-    ///
-    /// Implementations may panic if `candidates.capacity()` is smaller than
-    /// the run's shard count.  This enforces the zero-allocation contract:
-    /// the caller must pre-allocate the buffer at startup so the hot path
-    /// never grows it.  The in-memory backend panics on this condition and
-    /// also panics if its internal shard index references a shard ID with
-    /// no corresponding record (index desynchronization — data corruption).
+    /// reuses it across calls; implementations may grow it if needed.
     ///
     /// # Errors
     ///

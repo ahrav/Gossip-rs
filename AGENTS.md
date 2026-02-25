@@ -21,30 +21,36 @@ After modifying Rust code, ALWAYS run these steps:
 
 <!-- zero-alloc-hot-path-v1 -->
 
-## Zero Allocation After Startup — MANDATORY
+## Allocation Policy (Tiered) — MANDATORY
 
-Hot paths must never allocate heap memory. All variable-size data in
-steady-state operations must use the project's pooled/slab infrastructure.
-The only allocations permitted are during coordinator construction and
-initial shard registration.
+Use an operationally tiered policy instead of blanket no-allocation rules.
+
+### Tiers
+
+- **HOT**: per-shard/per-claim/per-tick steady-state loops.
+- **WARM**: frequent read/query/admin operations outside inner mutation loops.
+- **COLD**: startup, registration, setup/teardown, and test-support helpers.
 
 ### Rules
 
-1. **No `Vec::new()`, `Box::new()`, `String::new()`, or `.to_vec()` in hot paths.**
-   Use pre-allocated scratch buffers, `ByteSlab` slots, `InlineVec`, or
-   `RingBuffer` instead.
-2. **All byte fields in `ShardRecord` must be slab-backed.** Use `PooledShardSpec`,
-   `PooledCursor`, and `PooledSpawned` — never raw `Vec<u8>` or `Box<[u8]>`.
-3. **Scratch buffers must be caller-owned and reused.** Functions like
-   `acquire_and_restore_into` take `&mut AcquireScratch`; callers create the
-   scratch once and pass it on every call.
-4. **Coordinator-level scratch Vecs are cleared and reused, never reallocated.**
-   Use `std::mem::take()` + `clear()` + push pattern. The Vec grows to
-   steady-state capacity once and stays there.
-5. **`InlineVec<T, N>` for small collections.** When the common case is 0–N
-   elements and N is small (≤ 8), use `InlineVec` to keep data on the stack.
-6. **`RingBuffer<T, N>` for bounded logs.** Fixed-capacity, zero-allocation
-   circular buffer for op-logs and similar bounded histories.
+1. **HOT paths remain allocation-silent where practical.**
+   Keep pooled/slab-backed data and caller-owned reusable scratch on true
+   steady-state paths (`acquire_and_restore_into`, `checkpoint`, `complete`,
+   claim loop internals).
+2. **WARM/COLD paths optimize for simplicity first.**
+   Prefer straightforward local allocation over preallocation-only API contracts
+   when complexity tax is high and measurable regressions are absent.
+3. **No panic-on-undersized-caller-buffer contracts for query APIs.**
+   `list_shards_into` and `collect_claim_candidates_into` may grow caller
+   vectors as needed.
+4. **Registration keeps atomicity, not scratch plumbing.**
+   `register_shards` must perform fallible preflight before shard-map mutation
+   and must roll back staged records on allocation failure.
+5. **Single allocation-failure shape for register_shards.**
+   Use `RegisterShardsError::ResourceExhausted { resource }` everywhere.
+6. **No parallel legacy/new surfaces.**
+   Breaking changes are applied in one pass; remove superseded allocation
+   behavior instead of preserving compatibility layers.
 
 ### Existing Infrastructure (use these, don't reinvent)
 
@@ -58,28 +64,12 @@ initial shard registration.
 | `InlineVec<T, N>` | `gossip-stdx/src/inline_vec.rs` | Stack-first small collection |
 | `RingBuffer<T, N>` | `gossip-stdx/src/ring_buffer.rs` | Fixed-capacity circular queue |
 
-### When Allocation Is Acceptable
-
-Allocation is permitted **only** when all of these are true:
-- It happens during **startup or teardown** (coordinator construction, session
-  creation, initial registration), not in the steady-state loop.
-- There is **no existing pooled alternative** that covers the use case.
-- The justification is documented in a code comment explaining why pooled
-  memory cannot be used.
-
-### What Counts as a Hot Path
-
-Any function called per-shard, per-tick, or per-checkpoint in steady state:
-- `acquire_and_restore_into`, `checkpoint`, `claim_next_available`
-- `split`, `merge`, `register_shards` (after initial setup)
-- Any method on `ShardRecord`, `PooledShardSpec`, `PooledCursor`, `PooledSpawned`
-
 ### Enforcement
 
-Any PR that introduces heap allocation in a hot path without documented
-justification will be rejected. When in doubt, add a benchmark that confirms
-zero allocations using the `#[global_allocator]` counting pattern or
-`dhat`.
+- Hot-path regressions are benchmark-gated: no >5% median regression without
+  explicit documented justification.
+- PRs that introduce avoidable hot-path heap allocation or legacy dual-path
+  allocation behavior will be rejected.
 
 <!-- end-zero-alloc-hot-path -->
 

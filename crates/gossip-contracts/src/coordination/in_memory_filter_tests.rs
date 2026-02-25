@@ -36,13 +36,6 @@ fn list_shards_with_filter(
     filter: ShardFilter,
     out: &mut Vec<ShardSummary>,
 ) {
-    let required = coord
-        .run_shards
-        .get(&(test_tenant(), test_run()))
-        .map_or(0, |ids| ids.len());
-    if out.capacity() < required {
-        out.reserve(required - out.capacity());
-    }
     coord
         .list_shards_into(at, test_tenant(), test_run(), filter, out)
         .unwrap();
@@ -175,6 +168,30 @@ fn list_shards_filter_root_only() {
         "all filter should include more shards than root_only: all={} vs roots={}",
         summaries.len(),
         root_count,
+    );
+}
+
+/// list_shards_into grows an undersized caller buffer instead of panicking.
+#[test]
+fn list_shards_grows_undersized_output_buffer() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let mut out = Vec::new();
+    assert_eq!(out.capacity(), 0, "test precondition");
+
+    coord
+        .list_shards_into(
+            now(4),
+            test_tenant(),
+            test_run(),
+            ShardFilter::all(),
+            &mut out,
+        )
+        .unwrap();
+
+    assert_eq!(out.len(), 1);
+    assert!(
+        out.capacity() >= 1,
+        "buffer should grow to hold at least one summary"
     );
 }
 
@@ -1232,6 +1249,27 @@ fn collect_candidates_buffer_reuse() {
         candidates.len(),
         1,
         "shard should be available after expiry"
+    );
+}
+
+/// collect_claim_candidates_into grows an undersized caller buffer instead of panicking.
+#[test]
+fn collect_candidates_grow_undersized_buffer() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let tenant = test_tenant();
+    let run = test_run();
+
+    let mut candidates = Vec::new();
+    assert_eq!(candidates.capacity(), 0, "test precondition");
+
+    let _deadline = coord
+        .collect_claim_candidates_into(now(LEASE_DURATION + 10), tenant, run, &mut candidates)
+        .unwrap();
+
+    assert_eq!(candidates.len(), 1);
+    assert!(
+        candidates.capacity() >= 1,
+        "buffer should grow to hold at least one candidate"
     );
 }
 
