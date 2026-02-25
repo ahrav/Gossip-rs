@@ -25,7 +25,7 @@
 //!
 //! - [`LeaseHolder`] — stored *in* the [`ShardRecord`](super::record::ShardRecord)
 //!   to track who currently owns the shard and when the lease expires.
-//! - [`Lease`] — the capability *returned to the worker* by `acquire_and_restore`.
+//! - [`Lease`] — the capability *returned to the worker* by `acquire_and_restore_into`.
 //!   Workers present this token on every subsequent mutation. The coordinator
 //!   validates the embedded [`FenceEpoch`] against the record's current epoch.
 //! - [`OpKind`], [`OpResult`], [`OpLogEntry`] — the vocabulary and storage for
@@ -36,7 +36,7 @@
 //! The [`FenceEpoch`] is the primary defense against zombie workers — workers
 //! that hold an expired lease but continue issuing mutations due to GC pauses,
 //! network partitions, or slow processing. Every ownership transfer
-//! (`acquire_and_restore`) increments the epoch; mutations carrying a stale
+//! (`acquire_and_restore_into`) increments the epoch; mutations carrying a stale
 //! epoch are rejected before any state change.
 //!
 //! Reference: Kleppmann, "How to do distributed locking" (2016);
@@ -44,7 +44,7 @@
 //!
 //! ## Idempotency window
 //!
-//! Mutating operations (except `acquire_and_restore` and `renew`, which are
+//! Mutating operations (except `acquire_and_restore_into` and `renew`, which are
 //! coordinator-level and do not appear in the op-log) carry an [`OpId`]. The
 //! shard record caches the last 16 operation fingerprints in a ring buffer so
 //! the coordinator can detect retries and return cached results instead of
@@ -141,14 +141,14 @@ impl LeaseHolder {
 
 /// A capability token granting exclusive, temporary rights to mutate a shard.
 ///
-/// Returned by `acquire_and_restore` and required by every lease-gated
+/// Returned by `acquire_and_restore_into` and required by every lease-gated
 /// op-log mutation (`checkpoint`, `complete`, `park_shard`, `split_replace`,
 /// `split_residual`). The coordinator validates two properties on each call:
 ///
 /// 1. **Fence epoch** — `lease.fence == record.fence_epoch`. A mismatch means
 ///    the lease was superseded by a newer acquisition and the caller is a
 ///    zombie. The epoch is monotonically increasing: it increments on every
-///    `acquire_and_restore` and on administrative unpark.
+///    `acquire_and_restore_into` and on administrative unpark.
 ///
 /// 2. **Deadline** — `now < lease.deadline`. An expired lease does not
 ///    authorize mutations; the worker must re-acquire.

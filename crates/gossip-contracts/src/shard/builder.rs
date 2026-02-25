@@ -23,14 +23,13 @@ use gossip_stdx::{InlineVec, SlabFull};
 
 use crate::coordination::{
     CursorUpdate, InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, ShardArena,
-    ShardSpec, ShardSpecHandle, ShardSpecInputError, ShardSpecRef, validate_manifest_inputs,
+    ShardSpec, ShardSpecHandle, ShardSpecInputError, ShardSpecRef, validate_manifest,
 };
 use crate::identity::ShardId;
 use crate::shard::hint::{
-    ManifestShardIntoError, PrefixShardIntoError, RangeShardIntoError, ShardSpecScratch,
-    manifest_shard_into, prefix_shard_into, range_shard_into,
+    ShardSpecScratch, manifest_shard_into, prefix_shard_into, range_shard_into,
 };
-use crate::shard::key_encoding::PrefixShardError;
+use crate::shard::key_encoding::{PrefixShardError, ShardIntoError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BuilderEntry<'a> {
@@ -241,8 +240,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// This invalidates all previously returned [`ShardSpecHandle`] values and
     /// any [`InitialShardInput`] slices built from earlier state.
     pub fn reset(&mut self) {
-        self.arena.clear();
-        self.scratch.clear();
+        for entry in self.entries.as_slice() {
+            self.arena.free_spec(entry.spec_handle);
+        }
+        self.scratch = ShardSpecScratch::new();
         self.entries = InlineVec::new();
         self.next_shard_raw = 0;
     }
@@ -309,15 +310,15 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ) -> Result<ShardId, PreallocShardBuilderError> {
         self.ensure_entry_capacity(1)?;
         let handle = range_shard_into(
+            &mut self.arena,
             start,
             end,
             connector_extra,
             &mut self.scratch,
-            &mut self.arena,
         )
         .map_err(|err| match err {
-            RangeShardIntoError::InvalidSpec(err) => PreallocShardBuilderError::RangeInvalid(err),
-            RangeShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
+            ShardIntoError::Build(err) => PreallocShardBuilderError::RangeInvalid(err),
+            ShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
         })?;
         Ok(self.push_entry(handle, cursor))
     }
@@ -350,12 +351,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         cursor: CursorUpdate<'a>,
     ) -> Result<ShardId, PreallocShardBuilderError> {
         self.ensure_entry_capacity(1)?;
-        let handle = prefix_shard_into(prefix, connector_extra, &mut self.scratch, &mut self.arena)
+        let handle = prefix_shard_into(&mut self.arena, prefix, connector_extra, &mut self.scratch)
             .map_err(|err| match err {
-                PrefixShardIntoError::InvalidPrefix(err) => {
-                    PreallocShardBuilderError::PrefixInvalid(err)
-                }
-                PrefixShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
+                ShardIntoError::Build(err) => PreallocShardBuilderError::PrefixInvalid(err),
+                ShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
             })?;
         Ok(self.push_entry(handle, cursor))
     }
@@ -399,18 +398,16 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ) -> Result<ShardId, PreallocShardBuilderError> {
         self.ensure_entry_capacity(1)?;
         let handle = manifest_shard_into(
+            &mut self.arena,
             manifest_id,
             start_row,
             end_row,
             connector_extra,
             &mut self.scratch,
-            &mut self.arena,
         )
         .map_err(|err| match err {
-            ManifestShardIntoError::InvalidSpec(err) => {
-                PreallocShardBuilderError::ManifestCtorInvalid(err)
-            }
-            ManifestShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
+            ShardIntoError::Build(err) => PreallocShardBuilderError::ManifestCtorInvalid(err),
+            ShardIntoError::SlabFull(err) => PreallocShardBuilderError::SlabFull(err),
         })?;
         Ok(self.push_entry(handle, cursor))
     }
@@ -462,7 +459,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// Materialize borrowed manifest rows for registration.
     ///
     /// Re-validates that every stored handle is still live and then runs
-    /// [`validate_manifest_inputs`] on the final slice so callers see
+    /// [`validate_manifest`] on the final slice so callers see
     /// registration-time manifest errors before touching coordinator state.
     ///
     /// # Errors
@@ -486,9 +483,16 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
                 .ok_or(PreallocShardBuilderError::InvalidSpecHandle)?;
             out.push(InitialShardInput::new(entry.shard, spec, entry.cursor));
         }
-        validate_manifest_inputs(out.as_slice())
-            .map_err(PreallocShardBuilderError::ManifestInvalid)?;
+        validate_manifest(out.as_slice()).map_err(PreallocShardBuilderError::ManifestInvalid)?;
         Ok(out)
+    }
+}
+
+impl<'a, const CAP: usize> Drop for PreallocShardBuilder<'a, CAP> {
+    fn drop(&mut self) {
+        for entry in self.entries.as_slice() {
+            self.arena.free_spec(entry.spec_handle);
+        }
     }
 }
 

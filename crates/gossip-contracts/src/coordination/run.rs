@@ -1,15 +1,42 @@
-//! Run-level types, validation, payload hashing, and the `RunManagement` trait.
+//! Run lifecycle: configuration, status, shard manifests, progress, and the
+//! [`RunManagement`] admin trait.
 //!
-//! A "run" is a single scan invocation — it groups a set of shards that
-//! collectively cover the target data source. The coordinator tracks run
-//! status, validates shard manifests, and provides progress aggregation.
+//! A **run** is a single scan invocation that groups a set of shards
+//! collectively covering a target data source. The run lifecycle proceeds
+//! through two phases:
 //!
-//! Startup registration uses borrowed [`InitialShardInput`] manifest rows.
-//! This keeps registration allocation-light by borrowing shard range and
-//! cursor bytes from caller-managed storage.
-//! Typed shard-spec construction is handled upstream in [`crate::shard`];
-//! this module validates and registers already-constructed manifest rows.
+//! 1. **Setup** — `create_run` (Initializing) followed by `register_shards`
+//!    which validates the shard manifest and transitions the run to Active.
+//! 2. **Execution** — workers claim, checkpoint, and complete shards.
+//!    Once all shards are Done, `complete_run` marks the run terminal.
+//!    `fail_run` and `cancel_run` provide early termination paths.
 //!
+//! ## Key types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`RunConfig`] | Immutable per-run settings (cursor semantics, lease duration, retry budget) |
+//! | [`RunRecord`] | Coordinator-authoritative run state, similar to [`ShardRecord`] for shards |
+//! | [`RunStatus`] | Lifecycle state machine: Initializing -> Active -> Done/Failed/Cancelled |
+//! | [`RunProgress`] | Aggregated shard status counts for observability |
+//! | [`ShardFilter`] / [`ShardSummary`] | Querying and summarizing shard state within a run |
+//! | [`RunManagement`] | Admin trait for run lifecycle + shard unparking |
+//!
+//! ## Idempotency
+//!
+//! Run-level mutations (`register_shards`, `complete_run`, `fail_run`,
+//! `cancel_run`, `unpark_shard`) use a per-run op-log with the same
+//! `(OpId, payload_hash)` deduplication scheme as shard-level operations.
+//! The op-log is bounded to [`RunRecord::OP_LOG_CAP`] entries.
+//!
+//! ## Manifest validation
+//!
+//! [`validate_manifest`] enforces that the initial shard set is non-empty,
+//! contains no duplicate IDs, uses bounded key ranges, and has no derived
+//! (split-child) shard IDs. This prevents invalid initial states from
+//! entering the coordination layer.
+//!
+//! [`ShardRecord`]: super::record::ShardRecord
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -20,7 +47,7 @@ use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::op_payload_hash;
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
@@ -129,14 +156,35 @@ impl std::error::Error for RunConfigError {}
 
 /// Per-run configuration, immutable after creation.
 ///
+/// Captures the three knobs that vary between runs:
+///
+/// - **Cursor semantics** — governs when cursor advancement counts as
+///   committed progress. `Completed` means progress is durable only on
+///   `complete`; `Checkpointed` means every checkpoint advances the
+///   durable position. The choice affects the strength of the progress
+///   guarantee and interacts with retry logic.
+///
+/// - **Lease duration** — how long (in logical time ticks) a worker holds
+///   exclusive ownership of a shard before the lease expires and the
+///   shard becomes re-acquirable. Stored as [`NonZeroU64`] so the
+///   zero-duration invariant is structurally unrepresentable.
+///
+/// - **Max shard retries** — optional cap on the number of times a
+///   shard may be re-acquired before the orchestrator should park it.
+///   `None` means unlimited retries. Enforcement is external to the
+///   coordination layer (the orchestrator inspects `ShardSummary::acquire_count`
+///   and calls `park_shard` when the budget is exhausted).
+///
 /// Fields are `pub(crate)` to allow coordinator-internal mutation during
 /// record construction, with public accessor methods for external callers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunConfig {
+    /// Controls when cursor advancement counts as durable progress.
     pub(crate) cursor_semantics: CursorSemantics,
     /// Lease duration in [`LogicalTime`] ticks. `NonZeroU64` makes the
     /// zero-duration invariant unrepresentable — no runtime check needed.
     pub(crate) lease_duration: NonZeroU64,
+    /// Optional retry budget per shard. `None` = unlimited.
     pub(crate) max_shard_retries: Option<u32>,
 }
 
@@ -709,10 +757,27 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 
 /// Aggregated shard status counts and in-flight watermark for a run.
 ///
-/// Fields are `pub(crate)` with public accessors. Uses `u32` (not `u64`)
-/// for compact storage. Counter updates use checked arithmetic and panic on
-/// overflow, so backend shard-limit configuration must remain within practical
-/// `u32` bounds.
+/// Constructed by iterating a run's shards once and tallying each shard's
+/// status and lease state via [`observe_shard`](Self::observe_shard). The
+/// result is a point-in-time snapshot -- not a monotonic stream.
+///
+/// ## Status counters
+///
+/// `total == active + done + split + parked` (asserted after every update).
+/// `leased <= active` (only Active shards can hold a lease).
+///
+/// ## Watermark
+///
+/// The `watermark` tracks the lexicographic minimum `cursor.last_key` among
+/// Active shards with non-initial cursors. Terminal shards are intentionally
+/// excluded even if they carry cursor keys -- this tracks in-flight progress
+/// only. The watermark is **not monotonic**: splits, unparks, and new shard
+/// activations can introduce Active shards with earlier cursor positions.
+///
+/// ## Field sizes
+///
+/// Uses `u32` (not `u64`) because the maximum shard count is bounded by
+/// `MAX_INITIAL_SHARDS` (10K) plus spawned children, well within `u32::MAX`.
 ///
 /// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
 /// owns key bytes.
@@ -942,14 +1007,22 @@ pub enum RunTerminalEvaluation {
     HasFailures,
 }
 
-/// Pure function: evaluate whether a run should transition to terminal.
+/// Pure function: evaluate whether a run should transition to a terminal
+/// state based on its shard progress counts.
 ///
-/// Priority order: `active > 0` → [`StillActive`](RunTerminalEvaluation::StillActive),
-/// then `parked > 0` → [`HasFailures`](RunTerminalEvaluation::HasFailures),
-/// otherwise → [`AllDone`](RunTerminalEvaluation::AllDone).
+/// Decision tree (checked in priority order):
 ///
-/// This is intentionally external to `RunRecord` — the coordinator decides
-/// when and whether to auto-transition (D2.19: external terminal evaluation).
+/// 1. `active > 0` --> [`StillActive`](RunTerminalEvaluation::StillActive):
+///    at least one shard is still being processed. The run cannot terminate.
+/// 2. `parked > 0` --> [`HasFailures`](RunTerminalEvaluation::HasFailures):
+///    all shards settled but some parked. The orchestrator should call
+///    `fail_run` (or decide to unpark and retry).
+/// 3. Otherwise --> [`AllDone`](RunTerminalEvaluation::AllDone): every shard
+///    is Done or Split. The orchestrator should call `complete_run`.
+///
+/// This function is intentionally external to `RunRecord` -- the coordinator
+/// decides *when* and *whether* to act on the evaluation. The function only
+/// provides the recommendation; it does not mutate any state.
 #[must_use]
 pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
     assert!(
@@ -966,40 +1039,37 @@ pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
 }
 
 // ============================================================================
-// Initial Manifest Validation
+// InitialShardInput + Manifest Validation
 // ============================================================================
 
 /// Maximum number of shards in a single `register_shards` call (SEC-3).
 ///
 /// Prevents resource exhaustion from a single API call creating unbounded
-/// shard records. Checked as the FIRST validation step in
-/// [`validate_manifest_inputs`].
+/// shard records. Checked as the FIRST validation step in `validate_manifest`.
 pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
 
-/// Borrowed manifest row for run registration inputs.
+/// A borrowed shard registration input for a run's initial manifest.
 ///
-/// Key ranges and cursor bytes borrow from caller-owned storage (`ShardArena`,
-/// scratch buffers, or stack data), while shard identity is still an owned
-/// value type.
-///
-/// The coordinator consumes these as read-only snapshots during registration;
-/// callers must keep borrowed bytes alive for the duration of that call.
+/// Used in the second phase of two-phase run creation (D2.20):
+/// `create_run` → `register_shards(&[InitialShardInput])`.
+/// `spec` and `cursor` are call-scoped borrowed views; backends must copy
+/// their bytes into owned storage before returning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InitialShardInput<'a> {
-    shard: ShardId,
-    spec: ShardSpecRef<'a>,
-    cursor: CursorUpdate<'a>,
+    pub(crate) shard: ShardId,
+    pub(crate) spec: ShardSpecRef<'a>,
+    pub(crate) cursor: CursorUpdate<'a>,
 }
 
 impl<'a> InitialShardInput<'a> {
-    /// Build one borrowed manifest row.
+    /// Construct one borrowed initial-shard manifest entry.
     ///
-    /// This constructor is intentionally infallible; structural checks happen in
-    /// [`validate_manifest_inputs`] so callers can batch-report manifest errors.
+    /// Inputs are not retained; registration paths copy bytes into backend-owned
+    /// storage.
     #[must_use]
-    pub const fn new(shard: ShardId, spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
+    pub fn new(shard: ShardId, spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
         Self {
             shard,
             spec,
@@ -1008,22 +1078,22 @@ impl<'a> InitialShardInput<'a> {
     }
 
     #[must_use]
-    pub const fn shard(&self) -> ShardId {
+    pub fn shard(&self) -> ShardId {
         self.shard
     }
 
     #[must_use]
-    pub const fn spec(&self) -> ShardSpecRef<'a> {
+    pub fn spec(&self) -> ShardSpecRef<'a> {
         self.spec
     }
 
     #[must_use]
-    pub const fn cursor(&self) -> CursorUpdate<'a> {
+    pub fn cursor(&self) -> CursorUpdate<'a> {
         self.cursor
     }
 }
 
-/// Error from [`validate_manifest_inputs`].
+/// Error from `validate_manifest`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ManifestValidationError {
@@ -1096,9 +1166,37 @@ impl fmt::Display for ManifestValidationError {
 
 impl std::error::Error for ManifestValidationError {}
 
-fn validate_manifest_common(
-    shards: &[InitialShardInput<'_>],
-) -> Result<(), ManifestValidationError> {
+/// Validate a manifest of initial shards before registration.
+///
+/// This is the gatekeeper for all shard data entering the coordination
+/// layer through `register_shards`. Every property that could cause
+/// invariant violations downstream is checked here, before any records
+/// are created.
+///
+/// ## Check order (fail-fast, cheapest first)
+///
+/// 1. **Count limit** -- `shards.len() <= MAX_INITIAL_SHARDS`. Checked
+///    FIRST (before any allocation) to prevent resource exhaustion from
+///    a single oversized API call.
+/// 2. **Non-empty** -- at least one shard required.
+/// 3. **No duplicate IDs** -- sort + adjacent-pair scan, O(N log N).
+/// 4. **No unbounded ranges** -- production manifests must have finite
+///    `[start, end)` intervals. Unbounded specs are test-only constructs.
+/// 5. **Spec validity** -- `start < end` for bounded ranges.
+/// 6. **No overlapping key ranges** -- sort by `key_range_start`, then
+///    check that each `key_range_end` does not exceed the next shard's
+///    `key_range_start`. Gaps between shards are allowed (sparse coverage).
+/// 7. **Cursor key size** -- `last_key.len() <= MAX_KEY_SIZE` for
+///    non-initial cursors. Defense-in-depth against oversized keys.
+/// 8. **Cursor bounds** -- non-initial cursors must fall within
+///    `[spec.start, spec.end)`.
+///
+/// ## Design note
+///
+/// Overlap detection uses sorted-adjacency comparison, not pairwise
+/// comparison. This is O(N log N) (dominated by the sort) rather than
+/// O(N^2), which matters at `MAX_INITIAL_SHARDS` (10K).
+pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
         return Err(ManifestValidationError::TooManyShards {
@@ -1112,7 +1210,7 @@ fn validate_manifest_common(
     }
 
     // Check for duplicate IDs.
-    let mut ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
+    let mut ids: Vec<ShardId> = shards.iter().map(|s| s.shard).collect();
     ids.sort_by_key(|id| id.as_raw());
     for window in ids.windows(2) {
         if window[0] == window[1] {
@@ -1124,27 +1222,37 @@ fn validate_manifest_common(
 
     // Reject unbounded ranges: production manifests must have finite bounds.
     for shard in shards {
-        let spec = shard.spec();
-        if spec.key_range_start().is_empty() || spec.key_range_end().is_empty() {
+        if shard.spec.key_range_start().is_empty() || shard.spec.key_range_end().is_empty() {
             return Err(ManifestValidationError::UnboundedRange {
-                shard_id: shard.shard(),
+                shard_id: shard.shard,
+            });
+        }
+    }
+
+    // Validate per-spec size limits (key sizes, metadata size, range ordering).
+    // ShardSpecRef is intentionally unvalidated at construction time; this is the
+    // gate that prevents oversized specs from reaching AcquireScratch::write_spec,
+    // which uses panicking asserts on the same size ceilings.
+    for shard in shards {
+        if ShardSpec::validate_ref(shard.spec).is_err() {
+            return Err(ManifestValidationError::InvalidSpec {
+                shard_id: shard.shard,
             });
         }
     }
 
     // Sort by key_range_start for overlap detection.
-    let mut sorted: Vec<(ShardId, ShardSpecRef<'_>)> = shards
-        .iter()
-        .map(|shard| (shard.shard(), shard.spec()))
-        .collect();
-    sorted.sort_by(|a, b| a.1.key_range_start().cmp(b.1.key_range_start()));
+    let mut sorted: Vec<&InitialShardInput<'_>> = shards.iter().collect();
+    sorted.sort_by(|a, b| a.spec.key_range_start().cmp(b.spec.key_range_start()));
 
     for shard in &sorted {
         // Validate that start < end for bounded specs.
-        let start = shard.1.key_range_start();
-        let end = shard.1.key_range_end();
+        let start = shard.spec.key_range_start();
+        let end = shard.spec.key_range_end();
         if !start.is_empty() && !end.is_empty() && start >= end {
-            return Err(ManifestValidationError::InvalidSpec { shard_id: shard.0 });
+            return Err(ManifestValidationError::InvalidSpec {
+                shard_id: shard.shard,
+            });
         }
     }
 
@@ -1155,13 +1263,13 @@ fn validate_manifest_common(
     //   - empty b_start means [min, b_end) → any non-empty a_end exceeds min
     for window in sorted.windows(2) {
         let (a, b) = (window[0], window[1]);
-        let a_end = a.1.key_range_end();
-        let b_start = b.1.key_range_start();
+        let a_end = a.spec.key_range_end();
+        let b_start = b.spec.key_range_start();
         let overlaps = a_end.is_empty() || b_start.is_empty() || a_end > b_start;
         if overlaps {
             return Err(ManifestValidationError::OverlappingRanges {
-                shard_a: a.0,
-                shard_b: b.0,
+                shard_a: a.shard,
+                shard_b: b.shard,
             });
         }
     }
@@ -1169,12 +1277,11 @@ fn validate_manifest_common(
     // Cursor key size check (defense-in-depth; Cursor::try_with_last_key
     // also validates, but callers may use the panicking constructors).
     for shard in shards {
-        let cursor = shard.cursor();
-        if let Some(key) = cursor.last_key()
+        if let Some(key) = shard.cursor.last_key()
             && key.len() > MAX_KEY_SIZE
         {
             return Err(ManifestValidationError::CursorKeyTooLarge {
-                shard_id: shard.shard(),
+                shard_id: shard.shard,
                 size: key.len(),
                 max: MAX_KEY_SIZE,
             });
@@ -1183,15 +1290,13 @@ fn validate_manifest_common(
 
     // Cursor bounds check for non-initial cursors.
     for shard in shards {
-        let cursor = shard.cursor();
-        if let Some(key) = cursor.last_key() {
-            let spec = shard.spec();
-            let start = spec.key_range_start();
-            let end = spec.key_range_end();
+        if let Some(key) = shard.cursor.last_key() {
+            let start = shard.spec.key_range_start();
+            let end = shard.spec.key_range_end();
             let in_bounds = (start.is_empty() || key >= start) && (end.is_empty() || key < end);
             if !in_bounds {
                 return Err(ManifestValidationError::CursorOutOfBounds {
-                    shard_id: shard.shard(),
+                    shard_id: shard.shard,
                 });
             }
         }
@@ -1200,37 +1305,24 @@ fn validate_manifest_common(
     Ok(())
 }
 
-/// Validate a manifest of borrowed initial-shard inputs.
-///
-/// Checks (in order):
-/// 1. SEC-3: count <= `MAX_INITIAL_SHARDS` (FIRST check, before allocation).
-/// 2. Non-empty.
-/// 3. No duplicate IDs.
-/// 4. No unbounded ranges (empty start or end).
-/// 5. Spec validity: `start < end` for bounded key ranges.
-/// 6. No overlapping key ranges (gaps are allowed).
-/// 7. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
-/// 8. Cursor bounds for non-initial cursors.
-///
-/// # Errors
-///
-/// Returns [`ManifestValidationError`] variants for:
-/// empty manifests, duplicate IDs, invalid specs, unbounded ranges,
-/// overlapping ranges, cursor key-size violations, cursor-bounds violations,
-/// and SEC-3 shard-count violations.
-pub fn validate_manifest_inputs(
-    shards: &[InitialShardInput<'_>],
-) -> Result<(), ManifestValidationError> {
-    validate_manifest_common(shards)
-}
-
 // ============================================================================
 // ShardSummary
 // ============================================================================
 
-/// Lightweight shard summary for listing and observability.
+/// Lightweight, heap-owned shard summary for listing and observability.
 ///
-/// Constructed from a `ShardRecord` via `from_record`, using accessor methods.
+/// Constructed from a [`ShardRecord`] via `from_record`, which copies
+/// slab-backed byte fields into owned `Box<[u8]>` allocations. This
+/// decouples the summary from the coordinator's internal slab lifetime,
+/// making it safe to return across API boundaries.
+///
+/// [`ShardFilter::matches_record`] provides a pre-filter that checks
+/// status/lease/root criteria on the record directly, avoiding the
+/// 2-3 heap allocations that `from_record` performs for key ranges.
+/// At 10K shards with a selective filter, this turns thousands of
+/// wasted allocations into dozens.
+///
+/// [`ShardRecord`]: super::record::ShardRecord
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardSummary {
     pub(crate) shard: ShardId,
@@ -1241,12 +1333,11 @@ pub struct ShardSummary {
     /// `is_leased` is `true`.  Callers use this to schedule retry
     /// attempts near the soonest expiry without a separate query.
     pub(crate) lease_deadline: Option<LogicalTime>,
-    /// Number of ownership-epoch bumps since shard initialization.
+    /// Number of times this shard has been acquired.
     ///
-    /// Derived as `fence_epoch - INITIAL`. This includes successful
-    /// `acquire_and_restore` operations and any admin transitions that bump
-    /// the fence (for example `unpark_shard`). Saturates at `u32::MAX` if the
-    /// epoch difference exceeds 32-bit range (astronomically unlikely).
+    /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore_into`
+    /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
+    /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,
     pub(crate) last_key: Option<Box<[u8]>>,
     pub(crate) key_range_start: Box<[u8]>,
@@ -1308,9 +1399,6 @@ impl ShardSummary {
     }
 
     #[must_use]
-    /// Ownership-epoch bump count (`fence_epoch - INITIAL`).
-    ///
-    /// Includes acquires plus admin fence-bump transitions such as unpark.
     pub fn acquire_count(&self) -> u32 {
         self.acquire_count
     }
@@ -1347,9 +1435,18 @@ impl ShardSummary {
 
 /// Filter criteria for [`RunManagement::list_shards`].
 ///
-/// All fields default to "match anything". Named constructors compose
-/// common filter patterns; fields are `pub(crate)` to prevent ad-hoc
-/// construction outside the crate.
+/// All fields default to "match anything" (no constraint). Named
+/// constructors compose common filter patterns:
+///
+/// - [`ShardFilter::all()`] -- every shard (no filter)
+/// - [`ShardFilter::active()`] -- Active shards (leased or unleased)
+/// - [`ShardFilter::available()`] -- Active AND unleased (candidates for claiming)
+/// - [`ShardFilter::parked()`] -- Parked shards (candidates for unpark)
+///
+/// Fields are `pub(crate)` to prevent ad-hoc construction outside the
+/// crate. The `is_leased` filter is evaluated at the `now` parameter
+/// passed to `list_shards`: a lease whose deadline has passed is treated
+/// as unleased.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardFilter {
     pub(crate) status: Option<ShardStatus>,
@@ -1450,17 +1547,15 @@ impl ShardFilter {
 /// shards in any order.
 #[must_use]
 pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
-    let mut sorted: Vec<InitialShardInput<'_>> = shards.to_vec();
-    sorted.sort_by_key(|s| s.shard().as_raw());
+    let mut sorted: Vec<&InitialShardInput<'_>> = shards.iter().collect();
+    sorted.sort_by_key(|s| s.shard.as_raw());
 
     op_payload_hash(b"register_shards", |h| {
         (sorted.len() as u32).write_canonical(h);
         for shard in &sorted {
-            shard.shard().write_canonical(h);
-            shard.spec().key_range_start().write_canonical(h);
-            shard.spec().key_range_end().write_canonical(h);
-            shard.spec().metadata().write_canonical(h);
-            shard.cursor().write_canonical(h);
+            shard.shard.write_canonical(h);
+            shard.spec.write_canonical(h);
+            shard.cursor.write_canonical(h);
         }
     })
 }
@@ -1510,11 +1605,37 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 // RunManagement trait
 // ============================================================================
 
-/// Run-level management operations.
+/// Run-level management operations: setup, terminal transitions, listing,
+/// progress, and shard unparking.
 ///
-/// Separated from `CoordinationBackend` (D2.22) because:
-/// - Different authorization model (admin/scheduler vs worker)
-/// - Independent testability
+/// Separated from [`CoordinationBackend`](super::traits::CoordinationBackend)
+/// because the two trait surfaces serve different callers with different
+/// authorization models:
+///
+/// - **`CoordinationBackend`** — called by *workers* during shard processing.
+///   Every mutation requires a valid lease (worker proof-of-ownership).
+/// - **`RunManagement`** — called by the *orchestrator/scheduler* or an
+///   *admin operator*. No lease required; authorization is out-of-band.
+///
+/// Keeping them separate also enables independent testability: a run
+/// management test does not need to set up shard leases, and a shard
+/// lifecycle test does not need run creation boilerplate.
+///
+/// ## Lifecycle
+///
+/// ```text
+/// create_run(Initializing) --> register_shards(Active) --> complete_run(Done)
+///                          \-> cancel_run(Cancelled)       fail_run(Failed)
+///                                                          cancel_run(Cancelled)
+/// ```
+///
+/// ## Idempotency
+///
+/// All mutating methods (except `create_run`) accept an `OpId` and are
+/// idempotent via the run's bounded op-log. The op-log has capacity
+/// [`RunRecord::OP_LOG_CAP`] (8 entries). Evicted entries are treated as
+/// new operations, but status-check guards prevent re-execution on an
+/// already-transitioned run.
 ///
 /// ## Cross-cutting: `unpark_shard` idempotency
 ///
@@ -1522,7 +1643,6 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 /// entries in the **shard** op-log (cap=16), not the run op-log. This is
 /// because unpark targets a specific shard, and the run op-log would need
 /// a keying scheme to distinguish `unpark(shard_A)` from `unpark(shard_B)`.
-/// See also: `CoordinationBackend` shard op-log documentation.
 pub trait RunManagement {
     /// Create a new run in `Initializing` status. **NOT** idempotent.
     ///
@@ -1541,12 +1661,12 @@ pub trait RunManagement {
     ///
     /// Idempotent via `op_id`. Uses collect-then-insert internally:
     /// all shards are validated first, then inserted atomically.
-    fn register_shards<'a>(
+    fn register_shards(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
-        shards: &[InitialShardInput<'a>],
+        shards: &[InitialShardInput<'_>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError>;
 
@@ -1563,13 +1683,13 @@ pub trait RunManagement {
     /// serializes via `&mut self`, but production backends should override
     /// this with a transactional implementation to avoid partial-creation
     /// races under concurrent callers.
-    fn create_run_with_shards<'a>(
+    fn create_run_with_shards(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         config: RunConfig,
-        shards: &[InitialShardInput<'a>],
+        shards: &[InitialShardInput<'_>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<RunRecord>, CreateRunError> {
         match self.create_run(now, tenant, run, config) {

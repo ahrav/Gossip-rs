@@ -33,7 +33,7 @@
 //! checkpoint the test verifies the cursor advanced *and* that the fence
 //! epoch did not change.
 
-use crate::coordination::cursor::CursorUpdate;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
@@ -359,8 +359,15 @@ fn terminal_clears_lease() {
 fn cursor_semantics_dispatched_through_coordinator() {
     let mut coord = seeded_coordinator_with_semantics(CursorSemantics::Dispatched);
 
+    let mut scratch = crate::coordination::AcquireScratch::new();
     let result = coord
-        .acquire_and_restore(now(10), test_tenant(), test_key(), test_worker(1))
+        .acquire_and_restore_into(
+            now(10),
+            test_tenant(),
+            test_key(),
+            test_worker(1),
+            &mut scratch,
+        )
         .unwrap();
     assert_eq!(
         result.snapshot.cursor_semantics(),
@@ -439,10 +446,13 @@ fn split_coverage_key_range_partition() {
         .unwrap();
     let children = result.into_inner().children;
     assert_eq!(children.len(), 2, "must produce exactly 2 children");
+    let children = children.as_slice();
+    let child_a = children[0];
+    let child_b = children[1];
 
     // Look up each child and verify key ranges.
-    let key_a = ShardKey::new(test_run(), children[0]);
-    let key_b = ShardKey::new(test_run(), children[1]);
+    let key_a = ShardKey::new(test_run(), child_a);
+    let key_b = ShardKey::new(test_run(), child_b);
 
     let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
     let rec_b = coord.shard_lookup(&test_tenant(), &key_b).unwrap();
@@ -722,17 +732,18 @@ fn register_shards_on_non_initializing_rejected() {
 
     // Try to register more shards -> WrongStatus.
     let spec = ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec());
-    let inputs = [InitialShardInput::new(
+    let cursor = Cursor::initial();
+    let shards = vec![InitialShardInput::new(
         ShardId::from_raw(999),
         spec.as_ref(),
-        CursorUpdate::initial(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let err = coord
         .register_shards(
             now(10),
             test_tenant(),
             test_run(),
-            &inputs,
+            &shards,
             OpId::from_raw(200),
         )
         .unwrap_err();
