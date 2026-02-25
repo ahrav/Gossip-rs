@@ -64,11 +64,11 @@ pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};
 pub use run::RunManagement;
 pub use run::{
-    InitialShard, InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, RunConfig,
-    RunConfigError, RunOpIdConflict, RunOpKind, RunOpLogEntry, RunOpResult, RunProgress, RunRecord,
-    RunStatus, RunTerminalEvaluation, ShardFilter, ShardSummary, evaluate_run_terminal,
+    InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, RunConfig, RunConfigError,
+    RunOpIdConflict, RunOpKind, RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus,
+    RunTerminalEvaluation, ShardFilter, ShardSummary, evaluate_run_terminal,
     hash_cancel_run_payload, hash_complete_run_payload, hash_fail_run_payload,
-    hash_register_shards_payload, hash_unpark_payload, validate_manifest, validate_manifest_inputs,
+    hash_register_shards_payload, hash_unpark_payload, validate_manifest_inputs,
 };
 pub use run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,

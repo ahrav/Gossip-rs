@@ -10,9 +10,8 @@
 //! steady-state paths:
 //! - Decode returns borrowed views into caller-provided input bytes.
 //! - Encode writes into a caller-owned reusable [`MetadataBuf`].
-//! - Convenience constructors ([`range_shard`], [`prefix_shard`],
-//!   [`manifest_shard`]) return owned [`ShardSpec`] values and therefore
-//!   allocate for owned key/metadata storage.
+//! - Typed shard constructors use caller-owned scratch and emit borrowed
+//!   [`ShardSpecRef`] values or arena-backed handles.
 //!
 //! Decode outputs are lifetime-bound to the provided input slice. In
 //! particular, [`ShardHint::Prefix`] and [`ShardMetadata::connector_extra`]
@@ -45,13 +44,15 @@
 //! parsed but the hint payload did not.
 
 use super::key_encoding::{
-    KeyBuf, ManifestRowKey, PrefixShardError, decode_manifest_row_key, prefix_successor,
-    shard_spec_from_manifest_range, shard_spec_from_prefix,
+    KeyBuf, KeyEncoding, ManifestRowKey, PrefixShardError, decode_manifest_row_key,
+    prefix_successor,
 };
 use crate::coordination::shard_spec::{
-    MAX_KEY_SIZE, MAX_METADATA_SIZE, ShardSpec, ShardSpecInputError,
+    MAX_KEY_SIZE, MAX_METADATA_SIZE, ShardArena, ShardSpec, ShardSpecHandle, ShardSpecInputError,
+    ShardSpecRef,
 };
 use core::fmt;
+use gossip_stdx::SlabFull;
 
 const TAG_RANGE: u8 = 0x00;
 const TAG_PREFIX: u8 = 0x01;
@@ -117,6 +118,46 @@ impl fmt::Debug for MetadataBuf {
             .field("len", &self.len)
             .field("bytes", &self.as_bytes())
             .finish()
+    }
+}
+
+/// Reusable scratch buffers for borrowed shard-spec constructors.
+///
+/// This is intended to be allocated once (for example inside a startup
+/// preallocated builder) and reused across repeated `*_shard_ref` calls.
+///
+/// Returned [`ShardSpecRef`] values alias this scratch memory. A subsequent
+/// constructor call overwrites those bytes, so callers should consume/copy the
+/// borrowed spec before reusing the scratch.
+pub struct ShardSpecScratch {
+    metadata: MetadataBuf,
+    start: KeyBuf,
+    end: KeyBuf,
+}
+
+impl ShardSpecScratch {
+    /// Create an empty scratch set.
+    #[must_use = "creates scratch buffers that should be reused by callers"]
+    pub fn new() -> Self {
+        Self {
+            metadata: MetadataBuf::new(),
+            start: KeyBuf::new(),
+            end: KeyBuf::new(),
+        }
+    }
+
+    /// Reset tracked metadata bytes; key buffers are overwritten on next use.
+    ///
+    /// This does not zero prior key bytes; it only drops the active metadata
+    /// length so future encodes can reuse capacity without extra writes.
+    pub fn clear(&mut self) {
+        self.metadata.clear();
+    }
+}
+
+impl Default for ShardSpecScratch {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -601,75 +642,231 @@ fn decode_manifest<'a>(data: &'a [u8]) -> Result<(ShardHint<'a>, usize), ShardHi
     ))
 }
 
-/// Construct a range shard with encoded metadata.
+/// Error returned by [`range_shard_into`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RangeShardIntoError {
+    /// Borrowed range constructor rejected bounds/metadata shape.
+    InvalidSpec(ShardSpecInputError),
+    /// Arena storage lacked slots/bytes for one more spec.
+    SlabFull(SlabFull),
+}
+
+impl fmt::Display for RangeShardIntoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSpec(err) => write!(f, "{err}"),
+            Self::SlabFull(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for RangeShardIntoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSpec(err) => Some(err),
+            Self::SlabFull(err) => Some(err),
+        }
+    }
+}
+
+/// Error returned by [`prefix_shard_into`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PrefixShardIntoError {
+    /// Prefix validation or derived-spec validation failed.
+    InvalidPrefix(PrefixShardError),
+    /// Arena storage lacked slots/bytes for one more spec.
+    SlabFull(SlabFull),
+}
+
+impl fmt::Display for PrefixShardIntoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPrefix(err) => write!(f, "{err}"),
+            Self::SlabFull(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for PrefixShardIntoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPrefix(err) => Some(err),
+            Self::SlabFull(err) => Some(err),
+        }
+    }
+}
+
+/// Error returned by [`manifest_shard_into`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManifestShardIntoError {
+    /// Borrowed manifest constructor rejected row bounds/metadata shape.
+    InvalidSpec(ShardSpecInputError),
+    /// Arena storage lacked slots/bytes for one more spec.
+    SlabFull(SlabFull),
+}
+
+impl fmt::Display for ManifestShardIntoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSpec(err) => write!(f, "{err}"),
+            Self::SlabFull(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ManifestShardIntoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSpec(err) => Some(err),
+            Self::SlabFull(err) => Some(err),
+        }
+    }
+}
+
+/// Construct a borrowed range shard reference with encoded metadata.
 ///
-/// The returned [`ShardSpec`] covers `[start, end)` and carries
-/// [`ShardHint::Range`] plus `connector_extra` in the metadata envelope.
+/// The returned [`ShardSpecRef`] borrows from `scratch`.
 ///
-/// This helper produces an owned [`ShardSpec`], so it copies `start`, `end`,
-/// and encoded metadata into owned `Vec<u8>` fields.
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn range_shard(
+/// # Errors
+///
+/// Returns the same validation errors as [`ShardSpec::validate_ref`], including
+/// key-size, metadata-size, and inverted-range failures.
+pub fn range_shard_ref<'s>(
     start: &[u8],
     end: &[u8],
     connector_extra: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let metadata = encode_metadata_owned(ShardMetadata::new(ShardHint::Range, connector_extra))
+    scratch: &'s mut ShardSpecScratch,
+) -> Result<ShardSpecRef<'s>, ShardSpecInputError> {
+    scratch.start.copy_from_slice(start);
+    scratch.end.copy_from_slice(end);
+    let metadata = ShardMetadata::new(ShardHint::Range, connector_extra)
+        .encode_into(&mut scratch.metadata)
         .map_err(map_encode_to_spec_input_error)?;
-    ShardSpec::try_with_range_and_metadata(start.to_vec(), end.to_vec(), metadata)
+    let spec = ShardSpecRef::new(scratch.start.as_bytes(), scratch.end.as_bytes(), metadata);
+    ShardSpec::validate_ref(spec)?;
+    Ok(spec)
 }
 
-/// Construct a prefix shard `[prefix, prefix_successor(prefix))` with encoded
-/// metadata.
+/// Construct + allocate a range shard directly into a [`ShardArena`].
 ///
-/// On success, the metadata hint is [`ShardHint::Prefix`] and
-/// `connector_extra` is preserved as opaque bytes.
+/// This is the borrowed fast path used by preallocated builders: validation
+/// happens before allocation, and only arena-resident bytes are retained.
+pub fn range_shard_into(
+    start: &[u8],
+    end: &[u8],
+    connector_extra: &[u8],
+    scratch: &mut ShardSpecScratch,
+    arena: &mut ShardArena,
+) -> Result<ShardSpecHandle, RangeShardIntoError> {
+    let spec = range_shard_ref(start, end, connector_extra, scratch)
+        .map_err(RangeShardIntoError::InvalidSpec)?;
+    arena
+        .alloc_spec(spec)
+        .map_err(RangeShardIntoError::SlabFull)
+}
+
+/// Construct a borrowed prefix shard reference with encoded metadata.
 ///
-/// This uses [`shard_spec_from_prefix`] for range derivation and validation, so
-/// it inherits prefix constraints (for example, all-`0xFF` prefixes fail with
-/// [`PrefixShardError::NoSuccessor`]).
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn prefix_shard(prefix: &[u8], connector_extra: &[u8]) -> Result<ShardSpec, PrefixShardError> {
-    // Validate prefix size before metadata encoding so callers always see
-    // PrefixTooLarge for oversized prefixes, not a generic MetadataTooLarge
-    // from the hint encoder hitting the metadata capacity ceiling first.
+/// The returned [`ShardSpecRef`] borrows from `scratch`.
+///
+/// # Errors
+///
+/// - [`PrefixShardError::EmptyPrefix`] for empty prefixes.
+/// - [`PrefixShardError::NoSuccessor`] when prefix has no lexical successor
+///   (for example all-`0xFF` bytes).
+/// - [`PrefixShardError::PrefixTooLarge`] / `InvalidShardSpec` for size and
+///   derived-range validation failures.
+pub fn prefix_shard_ref<'s>(
+    prefix: &[u8],
+    connector_extra: &[u8],
+    scratch: &'s mut ShardSpecScratch,
+) -> Result<ShardSpecRef<'s>, PrefixShardError> {
+    if prefix.is_empty() {
+        return Err(PrefixShardError::EmptyPrefix);
+    }
     if prefix.len() > MAX_KEY_SIZE {
         return Err(PrefixShardError::PrefixTooLarge {
             size: prefix.len(),
             max: MAX_KEY_SIZE,
         });
     }
-    let metadata = encode_metadata_owned(ShardMetadata::new(
-        ShardHint::Prefix { prefix },
-        connector_extra,
-    ))
-    .map_err(map_encode_to_prefix_error)?;
-    shard_spec_from_prefix(prefix, &metadata)
+
+    scratch.start.copy_from_slice(prefix);
+    let end = prefix_successor(prefix, &mut scratch.end).ok_or(PrefixShardError::NoSuccessor)?;
+    let metadata = ShardMetadata::new(ShardHint::Prefix { prefix }, connector_extra)
+        .encode_into(&mut scratch.metadata)
+        .map_err(map_encode_to_prefix_error)?;
+    let spec = ShardSpecRef::new(scratch.start.as_bytes(), end, metadata);
+    ShardSpec::validate_ref(spec).map_err(PrefixShardError::InvalidShardSpec)?;
+    Ok(spec)
 }
 
-/// Construct a same-manifest shard `[start_row, end_row)` with encoded
-/// metadata.
+/// Construct + allocate a prefix shard directly into a [`ShardArena`].
 ///
-/// On success, key bounds are encoded as [`ManifestRowKey`] and metadata carries
-/// [`ShardHint::Manifest`] plus connector-opaque bytes.
-/// `start_row < end_row` is required.
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn manifest_shard(
+/// Encodes metadata into caller scratch, validates the derived `[start, end)`
+/// range, then stores bytes in arena-backed slots.
+pub fn prefix_shard_into(
+    prefix: &[u8],
+    connector_extra: &[u8],
+    scratch: &mut ShardSpecScratch,
+    arena: &mut ShardArena,
+) -> Result<ShardSpecHandle, PrefixShardIntoError> {
+    let spec = prefix_shard_ref(prefix, connector_extra, scratch)
+        .map_err(PrefixShardIntoError::InvalidPrefix)?;
+    arena
+        .alloc_spec(spec)
+        .map_err(PrefixShardIntoError::SlabFull)
+}
+
+/// Construct a borrowed same-manifest shard reference with encoded metadata.
+///
+/// The returned [`ShardSpecRef`] borrows from `scratch`.
+///
+/// # Errors
+///
+/// Returns the same validation errors as [`ShardSpec::validate_ref`], plus
+/// manifest-row inversion errors surfaced through encoded metadata validation.
+pub fn manifest_shard_ref<'s>(
     manifest_id: u64,
     start_row: u64,
     end_row: u64,
     connector_extra: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let metadata = encode_metadata_owned(ShardMetadata::new(
+    scratch: &'s mut ShardSpecScratch,
+) -> Result<ShardSpecRef<'s>, ShardSpecInputError> {
+    ManifestRowKey::new(manifest_id, start_row).encode_into(&mut scratch.start);
+    ManifestRowKey::new(manifest_id, end_row).encode_into(&mut scratch.end);
+    let metadata = ShardMetadata::new(
         ShardHint::Manifest {
             manifest_id,
             start_row,
             end_row,
         },
         connector_extra,
-    ))
+    )
+    .encode_into(&mut scratch.metadata)
     .map_err(map_encode_to_spec_input_error)?;
-    shard_spec_from_manifest_range(manifest_id, start_row, end_row, &metadata)
+    let spec = ShardSpecRef::new(scratch.start.as_bytes(), scratch.end.as_bytes(), metadata);
+    ShardSpec::validate_ref(spec)?;
+    Ok(spec)
+}
+
+/// Construct + allocate a manifest shard directly into a [`ShardArena`].
+///
+/// Uses the same borrowed construction path as [`manifest_shard_ref`] and only
+/// copies bytes once into arena storage.
+pub fn manifest_shard_into(
+    manifest_id: u64,
+    start_row: u64,
+    end_row: u64,
+    connector_extra: &[u8],
+    scratch: &mut ShardSpecScratch,
+    arena: &mut ShardArena,
+) -> Result<ShardSpecHandle, ManifestShardIntoError> {
+    let spec = manifest_shard_ref(manifest_id, start_row, end_row, connector_extra, scratch)
+        .map_err(ManifestShardIntoError::InvalidSpec)?;
+    arena
+        .alloc_spec(spec)
+        .map_err(ManifestShardIntoError::SlabFull)
 }
 
 /// Decode typed shard metadata from a [`ShardSpec`].
@@ -876,8 +1073,8 @@ fn validate_prefix_child_bounds(
     // When `prefix_successor` returns `None`, the parent prefix has no
     // lexicographic successor (all-0xFF or empty).  `SplitBoundary::End` is
     // reported because the successor *is* the end bound — no valid end bound
-    // exists.  This path is unreachable through the typed `prefix_shard` API,
-    // which rejects such prefixes with `PrefixShardError::NoSuccessor` at
+    // exists. This path is unreachable through typed prefix constructors,
+    // which reject such prefixes with `PrefixShardError::NoSuccessor` at
     // construction time.
     let successor = prefix_successor(prefix, &mut successor_buf).ok_or(
         HintPropagationError::InvalidPrefixBoundary {
@@ -902,11 +1099,6 @@ fn validate_prefix_child_bounds(
     }
 
     Ok(())
-}
-
-fn encode_metadata_owned(metadata: ShardMetadata<'_>) -> Result<Vec<u8>, ShardEncodeError> {
-    let mut buf = MetadataBuf::new();
-    metadata.encode_into(&mut buf).map(|bytes| bytes.to_vec())
 }
 
 fn map_encode_to_spec_input_error(err: ShardEncodeError) -> ShardSpecInputError {

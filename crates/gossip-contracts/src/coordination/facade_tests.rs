@@ -1,9 +1,11 @@
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::in_memory::InMemoryCoordinator;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
-use crate::coordination::shard_spec::CursorSemantics;
-use crate::coordination::test_fixtures::{now, test_run, test_tenant, test_worker};
+use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
+use crate::coordination::test_fixtures::{
+    InitialShard, manifest_inputs, now, test_run, test_tenant, test_worker,
+};
 use crate::identity::{OpId, ShardId};
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
@@ -21,20 +23,26 @@ fn populate_run(coord: &mut InMemoryCoordinator, shard_count: usize) {
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShard> = (0..shard_count)
+    let specs: Vec<(ShardId, Vec<u8>, Vec<u8>)> = (0..shard_count)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
-            InitialShard::new(
-                ShardId::from_raw(i as u64),
-                crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                Cursor::initial(),
+            (ShardId::from_raw(i as u64), start, end)
+        })
+        .collect();
+    let inputs: Vec<_> = specs
+        .iter()
+        .map(|(shard, start, end)| {
+            InitialShardInput::new(
+                *shard,
+                ShardSpecRef::new(start.as_slice(), end.as_slice(), b""),
+                CursorUpdate::initial(),
             )
         })
         .collect();
 
     let _ = coord
-        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+        .register_shards(now(1), tenant, run, &inputs, OpId::from_raw(100))
         .unwrap();
 }
 
@@ -489,24 +497,30 @@ fn claim_cooldown_spans_runs() {
 
     // Create run A with one shard.
     coord.create_run(now(1), tenant, run_a, config).unwrap();
+    let run_a_start = [0u8];
+    let run_a_end = [1u8];
     let shards_a = vec![InitialShard::new(
         ShardId::from_raw(0),
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0], vec![1]),
-        Cursor::initial(),
+        ShardSpecRef::new(&run_a_start, &run_a_end, b""),
+        CursorUpdate::initial(),
     )];
+    let inputs_a = manifest_inputs(&shards_a);
     let _ = coord
-        .register_shards(now(1), tenant, run_a, &shards_a, OpId::from_raw(100))
+        .register_shards(now(1), tenant, run_a, &inputs_a, OpId::from_raw(100))
         .unwrap();
 
     // Create run B with one shard (different shard ID).
     coord.create_run(now(1), tenant, run_b, config).unwrap();
+    let run_b_start = [10u8];
+    let run_b_end = [11u8];
     let shards_b = vec![InitialShard::new(
         ShardId::from_raw(10),
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![10], vec![11]),
-        Cursor::initial(),
+        ShardSpecRef::new(&run_b_start, &run_b_end, b""),
+        CursorUpdate::initial(),
     )];
+    let inputs_b = manifest_inputs(&shards_b);
     let _ = coord
-        .register_shards(now(1), tenant, run_b, &shards_b, OpId::from_raw(101))
+        .register_shards(now(1), tenant, run_b, &inputs_b, OpId::from_raw(101))
         .unwrap();
 
     // Worker claims in run A at t=10.
@@ -666,20 +680,27 @@ fn claim_cooldown_overflow_saturates_to_permanent() {
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShard> = (0..3)
+    let specs: Vec<_> = (0..3)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
+            (ShardId::from_raw(i as u64), start, end)
+        })
+        .collect();
+    let shards: Vec<_> = specs
+        .iter()
+        .map(|(shard, start, end)| {
             InitialShard::new(
-                ShardId::from_raw(i as u64),
-                crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                *shard,
+                ShardSpecRef::new(start.as_slice(), end.as_slice(), b""),
+                CursorUpdate::initial(),
             )
         })
         .collect();
+    let inputs = manifest_inputs(&shards);
 
     let _ = coord
-        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+        .register_shards(now(1), tenant, run, &inputs, OpId::from_raw(100))
         .unwrap();
 
     // First claim succeeds at t=10.

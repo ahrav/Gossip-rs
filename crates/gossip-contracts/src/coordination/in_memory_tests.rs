@@ -36,6 +36,7 @@
 //! idempotent replay) after every step.
 
 use super::*;
+use crate::coordination::run::InitialShardInput;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_shard, derived_shard_id, now, other_tenant, seeded_coordinator,
@@ -502,17 +503,18 @@ fn split_residual_parent_update_failure_deallocates_residual_fields() {
     coord
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let spec = test_spec();
+    let inputs = [InitialShardInput::new(
         test_shard(),
-        test_spec(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::initial(),
     )];
     let _ = coord
         .register_shards(
             now(2),
             test_tenant(),
             test_run(),
-            &shards,
+            &inputs,
             OpId::from_raw(11),
         )
         .unwrap();

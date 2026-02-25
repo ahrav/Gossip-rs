@@ -1,7 +1,7 @@
 use super::*;
 use crate::coordination::in_memory::InMemoryCoordinator;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
-use crate::coordination::shard_spec::CursorSemantics;
+use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use crate::identity::{RunId, ShardId};
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
@@ -42,20 +42,26 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShard> = (0..shard_count)
+    let specs: Vec<(ShardId, Vec<u8>, Vec<u8>)> = (0..shard_count)
         .map(|i| {
             let start = vec![(i as u8) * 0x40];
             let end = vec![((i + 1) as u8) * 0x40];
-            InitialShard::new(
-                ShardId::from_raw(i as u64),
-                crate::coordination::shard_spec::ShardSpec::with_range(start, end),
-                Cursor::initial(),
+            (ShardId::from_raw(i as u64), start, end)
+        })
+        .collect();
+    let inputs: Vec<_> = specs
+        .iter()
+        .map(|(shard, start, end)| {
+            InitialShardInput::new(
+                *shard,
+                ShardSpecRef::new(start.as_slice(), end.as_slice(), b""),
+                CursorUpdate::initial(),
             )
         })
         .collect();
 
     let _ = coord
-        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+        .register_shards(now(1), tenant, run, &inputs, OpId::from_raw(100))
         .unwrap();
 
     let keys: Vec<ShardKey> = (0..shard_count)
@@ -566,10 +572,15 @@ fn successive_split_residual_accumulates_spawned() {
     let config = test_run_config();
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shard_spec = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x60]);
-    let shard = InitialShard::new(ShardId::from_raw(0), shard_spec, Cursor::initial());
+    let shard_start = [0x00u8];
+    let shard_end = [0x60u8];
+    let inputs = [InitialShardInput::new(
+        ShardId::from_raw(0),
+        ShardSpecRef::new(&shard_start, &shard_end, b""),
+        CursorUpdate::initial(),
+    )];
     let _ = coord
-        .register_shards(now(1), tenant, run, &[shard], OpId::from_raw(100))
+        .register_shards(now(1), tenant, run, &inputs, OpId::from_raw(100))
         .unwrap();
     let key = ShardKey::new(run, ShardId::from_raw(0));
 

@@ -83,10 +83,10 @@ use crate::coordination::facade::{ClaimError, ShardClaiming, default_claim_next_
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run::{
-    InitialShard, RunConfig, RunManagement, RunOpKind, RunOpLogEntry, RunOpResult, RunProgress,
-    RunRecord, RunStatus, ShardFilter, ShardSummary, hash_cancel_run_payload,
+    InitialShardInput, RunConfig, RunManagement, RunOpKind, RunOpLogEntry, RunOpResult,
+    RunProgress, RunRecord, RunStatus, ShardFilter, ShardSummary, hash_cancel_run_payload,
     hash_complete_run_payload, hash_fail_run_payload, hash_register_shards_payload,
-    hash_unpark_payload, validate_manifest,
+    hash_unpark_payload, validate_manifest_inputs,
 };
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
@@ -2067,12 +2067,12 @@ impl RunManagement for InMemoryCoordinator {
     ///   5. Shard-count limit guard.
     ///   6. Stage shard record creation with rollback on allocation failure.
     ///   7. Insert staged records, update index, transition run to `Active`.
-    fn register_shards(
+    fn register_shards<'a>(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
-        shards: &[InitialShard],
+        shards: &[InitialShardInput<'a>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
         let payload_hash = hash_register_shards_payload(shards);
@@ -2116,7 +2116,7 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         // 4. Manifest validation.
-        validate_manifest(shards).map_err(RegisterShardsError::ManifestInvalid)?;
+        validate_manifest_inputs(shards).map_err(RegisterShardsError::ManifestInvalid)?;
 
         // 5. Shard count limit.
         self.check_shard_limits(tenant, shards.len(), 0)
@@ -2151,7 +2151,7 @@ impl RunManagement for InMemoryCoordinator {
                 "register_shards: ShardKey collision for {key:?} — \
                  manifest validation should prevent this"
             );
-            let mut sr = match ShardRecord::new_active(
+            let mut sr = match ShardRecord::new_active_ref(
                 tenant,
                 run,
                 s.shard(),
@@ -2168,20 +2168,16 @@ impl RunManagement for InMemoryCoordinator {
                     return Err(err.into());
                 }
             };
-            if let Some(last_key) = s.cursor().last_key() {
-                let update = match s.cursor().token() {
-                    Some(token) => CursorUpdate::with_token(last_key, token),
-                    None => CursorUpdate::new(last_key),
-                };
-                if let Err(err) = sr.cursor.update_from_ref(&update, &mut self.slab) {
-                    // Current record + all staged records were not inserted yet;
-                    // deallocate all staged slab fields before returning.
-                    sr.deallocate_fields(&mut self.slab);
-                    for (_, mut staged) in to_insert {
-                        staged.deallocate_fields(&mut self.slab);
-                    }
-                    return Err(err.into());
+            if s.cursor().last_key().is_some()
+                && let Err(err) = sr.cursor.update_from_ref(&s.cursor(), &mut self.slab)
+            {
+                // Current record + all staged records were not inserted yet;
+                // deallocate all staged slab fields before returning.
+                sr.deallocate_fields(&mut self.slab);
+                for (_, mut staged) in to_insert {
+                    staged.deallocate_fields(&mut self.slab);
                 }
+                return Err(err.into());
             }
             sr.assert_invariants();
             to_insert.push((key, sr));

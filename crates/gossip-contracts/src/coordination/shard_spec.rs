@@ -17,8 +17,10 @@
 //! strings.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use blake3::Hasher;
+use gossip_stdx::{ByteSlab, ByteSlot, SlabFull};
 
 use crate::identity::CanonicalBytes;
 
@@ -33,6 +35,344 @@ pub use super::cursor::MAX_KEY_SIZE;
 /// TruffleHog (200-500 B), JWT (2-4 KB), config drift (~8 KB).
 /// 16 KiB provides 2x headroom over worst observed.
 pub const MAX_METADATA_SIZE: usize = 16_384;
+
+// ============================================================================
+// ShardSpecRef + ShardArena
+// ============================================================================
+
+/// Borrowed shard specification view.
+///
+/// This mirrors [`ShardSpec`] without owning allocations and is intended for
+/// startup/preallocated construction paths. All fields borrow from caller
+/// memory and must remain valid for the lifetime `'a`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardSpecRef<'a> {
+    key_range_start: &'a [u8],
+    key_range_end: &'a [u8],
+    metadata: &'a [u8],
+}
+
+impl<'a> ShardSpecRef<'a> {
+    /// Construct a borrowed shard-spec view.
+    ///
+    /// This performs no validation; use [`ShardSpec::validate_ref`] when
+    /// accepting external or untrusted boundaries.
+    #[must_use = "creates a borrowed view that should be validated or stored"]
+    pub const fn new(
+        key_range_start: &'a [u8],
+        key_range_end: &'a [u8],
+        metadata: &'a [u8],
+    ) -> Self {
+        Self {
+            key_range_start,
+            key_range_end,
+            metadata,
+        }
+    }
+
+    /// Inclusive lower bound of the key range.
+    #[must_use = "returns a borrowed boundary that should be used"]
+    pub const fn key_range_start(self) -> &'a [u8] {
+        self.key_range_start
+    }
+
+    /// Exclusive upper bound of the key range.
+    #[must_use = "returns a borrowed boundary that should be used"]
+    pub const fn key_range_end(self) -> &'a [u8] {
+        self.key_range_end
+    }
+
+    /// Connector-opaque metadata bytes.
+    #[must_use = "returns borrowed metadata that should be used"]
+    pub const fn metadata(self) -> &'a [u8] {
+        self.metadata
+    }
+}
+
+/// Opaque handle for one shard spec stored in a [`ShardArena`].
+///
+/// Handles are arena-local and generation-tagged. Reusing a slot after
+/// `free_spec`/`clear` bumps generation so stale handles fail lookup instead of
+/// aliasing newer specs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ShardSpecHandle {
+    slot: u32,
+    generation: u32,
+    arena_id: u32,
+}
+
+#[derive(Debug)]
+struct ArenaSpec {
+    key_range_start: ByteSlot,
+    key_range_end: ByteSlot,
+    metadata: ByteSlot,
+}
+
+impl ArenaSpec {
+    fn alloc(spec: ShardSpecRef<'_>, slab: &mut ByteSlab) -> Result<Self, SlabFull> {
+        let slots = allocate_with_rollback(
+            [
+                spec.key_range_start(),
+                spec.key_range_end(),
+                spec.metadata(),
+            ],
+            slab,
+        )?;
+        Ok(Self {
+            key_range_start: slots[0],
+            key_range_end: slots[1],
+            metadata: slots[2],
+        })
+    }
+
+    fn view<'a>(&self, slab: &'a ByteSlab) -> ShardSpecRef<'a> {
+        ShardSpecRef::new(
+            slab.get(self.key_range_start),
+            slab.get(self.key_range_end),
+            slab.get(self.metadata),
+        )
+    }
+
+    fn deallocate(self, slab: &mut ByteSlab) {
+        slab.deallocate(self.key_range_start);
+        slab.deallocate(self.key_range_end);
+        slab.deallocate(self.metadata);
+    }
+}
+
+#[derive(Debug)]
+struct ArenaSlot {
+    generation: u32,
+    spec: Option<ArenaSpec>,
+}
+
+const EMPTY_OWNER_ID: u32 = 0;
+static NEXT_ARENA_ID: AtomicU32 = AtomicU32::new(1);
+
+#[inline]
+fn next_arena_id() -> u32 {
+    loop {
+        let id = NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed);
+        if id != EMPTY_OWNER_ID {
+            return id;
+        }
+    }
+}
+
+/// Allocate multiple byte slices into the slab atomically: all succeed or none.
+fn allocate_with_rollback<const N: usize>(
+    fields: [&[u8]; N],
+    slab: &mut ByteSlab,
+) -> Result<[ByteSlot; N], SlabFull> {
+    let mut slots = [ByteSlot::EMPTY; N];
+    for (i, &data) in fields.iter().enumerate() {
+        match slab.allocate(data) {
+            Ok(slot) => slots[i] = slot,
+            Err(err) => {
+                for slot in slots[..i].iter().rev() {
+                    slab.deallocate(*slot);
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// Startup-preallocated storage for borrowed shard specs.
+///
+/// `ShardArena` owns a fixed-size handle table (`slot_capacity`) plus a
+/// preallocated [`ByteSlab`] for the shard-spec byte fields.
+///
+/// Trade-off: this avoids per-shard heap churn on startup paths, but handle
+/// validity is tied to arena lifetime/generation. Callers that persist handles
+/// across `clear` or between arenas must expect lookup failure.
+pub struct ShardArena {
+    slab: ByteSlab,
+    slots: Vec<ArenaSlot>,
+    free_slots: Vec<u32>,
+    arena_id: u32,
+}
+
+impl ShardArena {
+    /// Construct a preallocated arena with explicit slot and byte limits.
+    ///
+    /// # Panics
+    ///
+    /// - `slot_capacity == 0`
+    /// - `slot_capacity > u32::MAX`
+    pub fn with_capacity(slot_capacity: usize, byte_capacity: usize) -> Self {
+        assert!(slot_capacity > 0, "ShardArena: slot_capacity must be > 0");
+        assert!(
+            slot_capacity <= u32::MAX as usize,
+            "ShardArena: slot_capacity must fit in u32"
+        );
+
+        let mut free_slots = Vec::with_capacity(slot_capacity);
+        // Use descending order so first allocation gets slot 0.
+        for slot in (0..slot_capacity).rev() {
+            free_slots.push(u32::try_from(slot).expect("slot index must fit in u32"));
+        }
+
+        let mut slots = Vec::with_capacity(slot_capacity);
+        for _ in 0..slot_capacity {
+            slots.push(ArenaSlot {
+                generation: 0,
+                spec: None,
+            });
+        }
+
+        Self {
+            slab: ByteSlab::with_capacity(byte_capacity),
+            slots,
+            free_slots,
+            arena_id: next_arena_id(),
+        }
+    }
+
+    /// Total handle slots configured at construction.
+    #[must_use]
+    pub fn slot_capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Number of currently free handle slots.
+    #[must_use]
+    pub fn available_slots(&self) -> usize {
+        self.free_slots.len()
+    }
+
+    /// Allocate one shard spec and return its handle.
+    ///
+    /// `alloc_spec` does not call [`ShardSpec::validate_ref`]; callers are
+    /// expected to pass already-validated specs (for example from typed
+    /// constructors in `shard::hint`).
+    ///
+    /// Returns [`SlabFull`] for both slot exhaustion and byte-slab exhaustion.
+    pub fn alloc_spec(&mut self, spec: ShardSpecRef<'_>) -> Result<ShardSpecHandle, SlabFull> {
+        let slot = match self.free_slots.pop() {
+            Some(slot) => slot,
+            None => {
+                return Err(SlabFull {
+                    requested: 1,
+                    available: 0,
+                });
+            }
+        };
+
+        let pooled = match ArenaSpec::alloc(spec, &mut self.slab) {
+            Ok(pooled) => pooled,
+            Err(err) => {
+                self.free_slots.push(slot);
+                return Err(err);
+            }
+        };
+
+        let slot_entry = &mut self.slots[slot as usize];
+        debug_assert!(slot_entry.spec.is_none());
+        slot_entry.spec = Some(pooled);
+
+        Ok(ShardSpecHandle {
+            slot,
+            generation: slot_entry.generation,
+            arena_id: self.arena_id,
+        })
+    }
+
+    /// Borrow a stored shard spec, panicking on invalid or stale handles.
+    ///
+    /// Use [`try_view_spec`](Self::try_view_spec) for non-panicking lookups.
+    #[must_use]
+    pub fn view_spec(&self, handle: &ShardSpecHandle) -> ShardSpecRef<'_> {
+        self.try_view_spec(handle)
+            .expect("ShardArena::view_spec: invalid, stale, or foreign handle")
+    }
+
+    /// Borrow a stored shard spec. Returns `None` for invalid/stale/foreign handles.
+    ///
+    /// This is the non-panicking boundary for generation and arena ownership
+    /// checks; use it when stale handles are expected outcomes.
+    #[must_use]
+    pub fn try_view_spec(&self, handle: &ShardSpecHandle) -> Option<ShardSpecRef<'_>> {
+        if handle.arena_id != self.arena_id {
+            return None;
+        }
+        let slot = self.slots.get(handle.slot as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let spec = slot.spec.as_ref()?;
+        Some(spec.view(&self.slab))
+    }
+
+    /// Free one handle and return its slot to the arena.
+    ///
+    /// Frees slab bytes immediately and bumps slot generation, making `handle`
+    /// permanently stale even if the same slot is later reused.
+    ///
+    /// # Panics
+    ///
+    /// Panics on invalid/stale/foreign handles.
+    pub fn free_spec(&mut self, handle: &ShardSpecHandle) {
+        assert_eq!(
+            handle.arena_id, self.arena_id,
+            "ShardArena::free_spec: foreign handle",
+        );
+        let slot = self
+            .slots
+            .get_mut(handle.slot as usize)
+            .expect("ShardArena::free_spec: slot out of range");
+        assert_eq!(
+            slot.generation, handle.generation,
+            "ShardArena::free_spec: stale handle generation",
+        );
+        let spec = slot
+            .spec
+            .take()
+            .expect("ShardArena::free_spec: handle does not reference a live spec");
+        spec.deallocate(&mut self.slab);
+        slot.generation = slot.generation.wrapping_add(1);
+        self.free_slots.push(handle.slot);
+    }
+
+    /// Clear all handles and reset slab state while preserving allocations.
+    ///
+    /// All previously issued handles become invalid.
+    ///
+    /// This is optimized for startup-build reuse: backing vectors/slab
+    /// capacity stay allocated, but all live specs are dropped in one pass.
+    pub fn clear(&mut self) {
+        self.slab.clear();
+        self.free_slots.clear();
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            slot.spec = None;
+            slot.generation = slot.generation.wrapping_add(1);
+            self.free_slots
+                .push(u32::try_from(idx).expect("slot index must fit in u32"));
+        }
+        // Re-establish deterministic allocation order (slot 0 first).
+        self.free_slots.reverse();
+    }
+}
+
+impl fmt::Debug for ShardArena {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardArena")
+            .field("slot_capacity", &self.slot_capacity())
+            .field("available_slots", &self.available_slots())
+            .field("slab_capacity", &self.slab.capacity())
+            .field("slab_live_bytes", &self.slab.live_bytes())
+            .field("slab_live_count", &self.slab.live_count())
+            .finish()
+    }
+}
+
+impl Drop for ShardArena {
+    fn drop(&mut self) {
+        // Ensure ByteSlab debug-drop observes no live allocations.
+        self.clear();
+    }
+}
 
 // ============================================================================
 // CursorSemantics
@@ -309,6 +649,69 @@ impl ShardSpec {
             key_range_start: start.into_boxed_slice(),
             key_range_end: end.into_boxed_slice(),
             metadata: metadata.into_boxed_slice(),
+        })
+    }
+
+    /// Borrow this spec as a [`ShardSpecRef`] without allocation.
+    #[must_use = "returns a borrowed view that should be used"]
+    pub fn as_ref(&self) -> ShardSpecRef<'_> {
+        ShardSpecRef::new(
+            self.key_range_start(),
+            self.key_range_end(),
+            self.metadata(),
+        )
+    }
+
+    /// Validate a borrowed shard-spec view.
+    ///
+    /// # Errors
+    ///
+    /// - [`ShardSpecInputError::KeyTooLarge`] for oversized start/end keys.
+    /// - [`ShardSpecInputError::MetadataTooLarge`] for oversized metadata.
+    /// - [`ShardSpecInputError::InvertedRange`] when both bounds are non-empty
+    ///   and `start >= end`.
+    pub fn validate_ref(spec: ShardSpecRef<'_>) -> Result<(), ShardSpecInputError> {
+        if spec.key_range_start().len() > MAX_KEY_SIZE {
+            return Err(ShardSpecInputError::KeyTooLarge {
+                size: spec.key_range_start().len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if spec.key_range_end().len() > MAX_KEY_SIZE {
+            return Err(ShardSpecInputError::KeyTooLarge {
+                size: spec.key_range_end().len(),
+                max: MAX_KEY_SIZE,
+            });
+        }
+        if spec.metadata().len() > MAX_METADATA_SIZE {
+            return Err(ShardSpecInputError::MetadataTooLarge {
+                size: spec.metadata().len(),
+                max: MAX_METADATA_SIZE,
+            });
+        }
+        if !spec.key_range_start().is_empty()
+            && !spec.key_range_end().is_empty()
+            && spec.key_range_start() >= spec.key_range_end()
+        {
+            return Err(ShardSpecInputError::InvertedRange {
+                start_len: spec.key_range_start().len(),
+                end_len: spec.key_range_end().len(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Materialize an owned [`ShardSpec`] from a borrowed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::validate_ref`].
+    pub fn try_from_ref(spec: ShardSpecRef<'_>) -> Result<Self, ShardSpecInputError> {
+        Self::validate_ref(spec)?;
+        Ok(Self {
+            key_range_start: spec.key_range_start().into(),
+            key_range_end: spec.key_range_end().into(),
+            metadata: spec.metadata().into(),
         })
     }
 

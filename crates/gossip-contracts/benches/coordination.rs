@@ -5,10 +5,12 @@
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
-use gossip_contracts::coordination::cursor::{Cursor, CursorUpdate};
+use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::in_memory::InMemoryCoordinator;
-use gossip_contracts::coordination::run::{InitialShard, RunConfig, RunManagement, ShardFilter};
-use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use gossip_contracts::coordination::run::{
+    InitialShardInput, RunConfig, RunManagement, ShardFilter,
+};
+use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use gossip_contracts::coordination::traits::CoordinationBackend;
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
@@ -36,13 +38,18 @@ fn coordinator_with_shards(n: usize) -> (InMemoryCoordinator, RunId, Vec<ShardId
 
     // Use 4-byte big-endian ranges to support >256 shards without overlap.
     // Shard i covers [i_be4, (i+1)_be4) where i_be4 is i as 4-byte big-endian.
-    let shards: Vec<InitialShard> = (0..n)
-        .map(|i| {
-            let shard = ShardId::from_raw(i as u64 + 1);
-            let lo = (i as u32).to_be_bytes().to_vec();
-            let hi = ((i as u32) + 1).to_be_bytes().to_vec();
-            let spec = ShardSpec::with_range(lo, hi);
-            InitialShard::new(shard, spec, Cursor::initial())
+    let ranges: Vec<([u8; 4], [u8; 4])> = (0..n)
+        .map(|i| ((i as u32).to_be_bytes(), ((i as u32) + 1).to_be_bytes()))
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = ranges
+        .iter()
+        .enumerate()
+        .map(|(i, (lo, hi))| {
+            InitialShardInput::new(
+                ShardId::from_raw(i as u64 + 1),
+                ShardSpecRef::new(lo.as_slice(), hi.as_slice(), b""),
+                CursorUpdate::initial(),
+            )
         })
         .collect();
 
@@ -139,13 +146,18 @@ fn bench_register_shards(c: &mut Criterion) {
             BenchmarkId::from_parameter(shard_count),
             &shard_count,
             |b, &n| {
-                let shards: Vec<InitialShard> = (0..n)
-                    .map(|i| {
-                        let shard = ShardId::from_raw(i as u64 + 1);
-                        let lo = (i as u32).to_be_bytes().to_vec();
-                        let hi = ((i as u32) + 1).to_be_bytes().to_vec();
-                        let spec = ShardSpec::with_range(lo, hi);
-                        InitialShard::new(shard, spec, Cursor::initial())
+                let ranges: Vec<([u8; 4], [u8; 4])> = (0..n)
+                    .map(|i| ((i as u32).to_be_bytes(), ((i as u32) + 1).to_be_bytes()))
+                    .collect();
+                let shards: Vec<InitialShardInput<'_>> = ranges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (lo, hi))| {
+                        InitialShardInput::new(
+                            ShardId::from_raw(i as u64 + 1),
+                            ShardSpecRef::new(lo.as_slice(), hi.as_slice(), b""),
+                            CursorUpdate::initial(),
+                        )
                     })
                     .collect();
 

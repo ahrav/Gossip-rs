@@ -13,7 +13,7 @@ use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
 use crate::coordination::cursor::Cursor;
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
 use crate::coordination::pooled::{PooledCursor, PooledShardSpec};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
 };
@@ -306,6 +306,7 @@ impl ShardRecord {
     /// # Errors
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec.
+    #[cfg(test)]
     pub(crate) fn new_active(
         tenant: TenantId,
         run: RunId,
@@ -314,7 +315,23 @@ impl ShardRecord {
         cursor_semantics: CursorSemantics,
         slab: &mut ByteSlab,
     ) -> Result<Self, gossip_stdx::SlabFull> {
-        let pooled_spec = PooledShardSpec::from_spec(spec, slab)?;
+        Self::new_active_ref(tenant, run, shard, spec.as_ref(), cursor_semantics, slab)
+    }
+
+    /// Construct a new active shard record (root shard) from a borrowed spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlabFull` if the slab cannot allocate space for the spec.
+    pub(crate) fn new_active_ref(
+        tenant: TenantId,
+        run: RunId,
+        shard: ShardId,
+        spec: ShardSpecRef<'_>,
+        cursor_semantics: CursorSemantics,
+        slab: &mut ByteSlab,
+    ) -> Result<Self, gossip_stdx::SlabFull> {
+        let pooled_spec = PooledShardSpec::from_spec_ref(spec, slab)?;
         let record = Self {
             tenant,
             run,

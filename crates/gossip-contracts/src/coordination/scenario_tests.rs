@@ -32,14 +32,14 @@
 
 use std::collections::HashSet;
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::CheckpointError;
 use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::ShardStatus;
-use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
+use crate::coordination::run::{InitialShardInput, RunManagement, RunStatus};
 use crate::coordination::run_errors::{RegisterShardsError, RunTransitionError};
-use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::{ShardSpec, ShardSpecRef};
 use crate::coordination::split::SplitResidualPlan;
 use crate::coordination::test_fixtures::*;
 use crate::coordination::traits::CoordinationBackend;
@@ -74,13 +74,14 @@ fn scenario_full_run_lifecycle() {
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     // -- Register one shard [a, z) --
-    let shards = vec![InitialShard::new(
+    let spec = test_spec();
+    let inputs = [InitialShardInput::new(
         test_shard(),
-        test_spec(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::initial(),
     )];
     let reg_outcome = coord
-        .register_shards(now(2), tenant, run, &shards, OpId::from_raw(u64::MAX))
+        .register_shards(now(2), tenant, run, &inputs, OpId::from_raw(u64::MAX))
         .unwrap();
     assert!(
         reg_outcome.is_executed(),
@@ -642,12 +643,14 @@ fn scenario_cancel_from_initializing() {
     );
 
     // -- register_shards on cancelled run should fail --
-    let shards = vec![InitialShard::new(
+    let start = b"a";
+    let end = b"z";
+    let inputs = [InitialShardInput::new(
         ShardId::from_raw(1),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        ShardSpecRef::new(start, end, b""),
+        CursorUpdate::initial(),
     )];
-    let reg_result = coord.register_shards(now(3), tenant, run, &shards, OpId::from_raw(2));
+    let reg_result = coord.register_shards(now(3), tenant, run, &inputs, OpId::from_raw(2));
     assert!(
         matches!(reg_result, Err(RegisterShardsError::WrongStatus { .. })),
         "register_shards on cancelled run should fail with WrongStatus, got: {reg_result:?}"
@@ -799,20 +802,24 @@ fn scenario_claim_contention() {
 
     let shard1 = ShardId::from_raw(1);
     let shard2 = ShardId::from_raw(2);
-    let shards = vec![
-        InitialShard::new(
+    let start1 = b"a";
+    let end1 = b"m";
+    let start2 = b"m";
+    let end2 = b"z";
+    let inputs = [
+        InitialShardInput::new(
             shard1,
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            ShardSpecRef::new(start1, end1, b""),
+            CursorUpdate::initial(),
         ),
-        InitialShard::new(
+        InitialShardInput::new(
             shard2,
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            ShardSpecRef::new(start2, end2, b""),
+            CursorUpdate::initial(),
         ),
     ];
     let _ = coord
-        .register_shards(now(2), tenant, run, &shards, OpId::from_raw(u64::MAX))
+        .register_shards(now(2), tenant, run, &inputs, OpId::from_raw(u64::MAX))
         .unwrap();
 
     // -- 3 workers attempt to claim --

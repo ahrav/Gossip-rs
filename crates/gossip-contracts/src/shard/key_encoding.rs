@@ -16,9 +16,9 @@
 //!   [`decode_manifest_row_key`] provide canonical encodings and decoding
 //!   for current shard-algebra consumers.
 //!
-//! - **ShardSpec bridge helpers** -- fallible constructors that translate
-//!   typed key inputs into owned [`ShardSpec`] values while preserving
-//!   coordination-side validation and error semantics.
+//!   Typed shard-spec constructors are intentionally not in this module.
+//!   Use [`crate::shard`] helpers (`*_shard_ref` / `*_shard_into`) when you
+//!   need validated shard-spec construction from typed inputs.
 //!
 //! - **Key arithmetic** -- three pure functions for computing boundary keys
 //!   during split planning:
@@ -48,7 +48,7 @@
 //! Whole-partition invariants (coverage, disjointness, child ordering across
 //! sibling shards) are validated in [`crate::coordination::shard_spec`].
 
-use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpec, ShardSpecInputError};
+use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpecInputError};
 use core::fmt;
 
 /// Reusable stack buffer for shard-key arithmetic.
@@ -269,103 +269,6 @@ pub fn decode_manifest_row_key(key: &[u8]) -> Option<ManifestRowKey> {
     let manifest_id = u64::from_be_bytes(key[..8].try_into().unwrap());
     let row = u64::from_be_bytes(key[8..].try_into().unwrap());
     Some(ManifestRowKey::new(manifest_id, row))
-}
-
-/// Construct a [`ShardSpec`] from typed start/end boundaries.
-///
-/// `start` and `end` are encoded via [`KeyEncoding`] and then validated by
-/// [`ShardSpec::try_with_range_and_metadata`]. This keeps range/metadata
-/// validation single-sourced in coordination code.
-///
-/// # Errors
-///
-/// Returns [`ShardSpecInputError`] when coordination-level validation fails:
-///
-/// - [`KeyTooLarge`](ShardSpecInputError::KeyTooLarge) -- encoded start or
-///   end exceeds [`MAX_KEY_SIZE`].
-/// - [`InvertedRange`](ShardSpecInputError::InvertedRange) -- both keys are
-///   non-empty and encoded start >= encoded end.
-/// - [`MetadataTooLarge`](ShardSpecInputError::MetadataTooLarge) -- metadata
-///   exceeds the metadata size ceiling.
-///
-/// # Trade-offs
-///
-/// - Allocates `Vec<u8>` values for both boundaries and metadata, which
-///   [`ShardSpec::try_with_range_and_metadata`] converts to `Box<[u8]>`.
-/// - Performs no local pre-validation so callers receive canonical
-///   [`ShardSpecInputError`] variants from coordination validation.
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
-    start: &Start,
-    end: &End,
-    metadata: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut start_buf = KeyBuf::new();
-    start.encode_into(&mut start_buf);
-    let start = start_buf.as_bytes().to_vec();
-
-    let mut end_buf = KeyBuf::new();
-    end.encode_into(&mut end_buf);
-    let end = end_buf.as_bytes().to_vec();
-
-    ShardSpec::try_with_range_and_metadata(start, end, metadata.to_vec())
-}
-
-/// Construct a prefix-bounded [`ShardSpec`] as `[prefix, prefix_successor)`.
-///
-/// The helper performs cheap prefix-specific checks first, then delegates final
-/// range/metadata validation to [`ShardSpec::try_with_range_and_metadata`].
-///
-/// # Errors
-///
-/// - [`PrefixShardError::EmptyPrefix`] if `prefix` is empty.
-/// - [`PrefixShardError::PrefixTooLarge`] if `prefix` exceeds
-///   [`MAX_KEY_SIZE`].
-/// - [`PrefixShardError::NoSuccessor`] for all-`0xFF` prefixes.
-/// - [`PrefixShardError::InvalidShardSpec`] if coordination-level shard-spec
-///   validation fails.
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_prefix(
-    prefix: &[u8],
-    metadata: &[u8],
-) -> Result<ShardSpec, PrefixShardError> {
-    if prefix.is_empty() {
-        return Err(PrefixShardError::EmptyPrefix);
-    }
-    if prefix.len() > MAX_KEY_SIZE {
-        return Err(PrefixShardError::PrefixTooLarge {
-            size: prefix.len(),
-            max: MAX_KEY_SIZE,
-        });
-    }
-
-    let mut successor = KeyBuf::new();
-    let end = prefix_successor(prefix, &mut successor).ok_or(PrefixShardError::NoSuccessor)?;
-
-    ShardSpec::try_with_range_and_metadata(prefix.to_vec(), end.to_vec(), metadata.to_vec())
-        .map_err(PrefixShardError::from)
-}
-
-/// Construct a same-manifest [`ShardSpec`] from a half-open row range.
-///
-/// Both boundaries use the same `manifest_id`, so the resulting shard covers
-/// `[start_row, end_row)` within one manifest.
-///
-/// # Errors
-///
-/// Propagates [`ShardSpecInputError`] from [`shard_spec_from_keys`], including
-/// inverted/degenerate ranges (for example, `start_row >= end_row`) and
-/// metadata validation failures.
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_manifest_range(
-    manifest_id: u64,
-    start_row: u64,
-    end_row: u64,
-    metadata: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let start = ManifestRowKey::new(manifest_id, start_row);
-    let end = ManifestRowKey::new(manifest_id, end_row);
-    shard_spec_from_keys(&start, &end, metadata)
 }
 
 /// Compute the lexicographic successor of a byte prefix.
@@ -599,7 +502,7 @@ pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
 ///    lexicographic successor (all `0xFF`), so the half-open range cannot be
 ///    bounded.
 /// 4. [`InvalidShardSpec`](Self::InvalidShardSpec) -- the derived range failed
-///    downstream validation in [`ShardSpec`].
+///    downstream validation in [`crate::coordination::ShardSpec`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PrefixShardError {
@@ -616,7 +519,7 @@ pub enum PrefixShardError {
     /// exclusive end-bound of the half-open range cannot be computed.
     NoSuccessor,
     /// The derived key range passed local validation but failed downstream
-    /// [`ShardSpec`] construction.
+    /// [`crate::coordination::ShardSpec`] construction.
     InvalidShardSpec(ShardSpecInputError),
 }
 

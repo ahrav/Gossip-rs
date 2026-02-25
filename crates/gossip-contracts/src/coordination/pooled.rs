@@ -68,7 +68,7 @@
 use gossip_stdx::{ByteSlab, ByteSlot, SlabFull};
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
-use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::{ShardSpec, ShardSpecRef};
 
 // ============================================================================
 // Staged allocation helper
@@ -144,6 +144,23 @@ impl PooledShardSpec {
     ///
     /// Returns [`SlabFull`] if the slab cannot accommodate all 3 fields.
     pub(crate) fn from_spec(spec: &ShardSpec, slab: &mut ByteSlab) -> Result<Self, SlabFull> {
+        Self::from_spec_ref(spec.as_ref(), slab)
+    }
+
+    /// Copy a borrowed `ShardSpecRef`'s byte fields into the slab, returning
+    /// a pooled handle.
+    ///
+    /// All 3 fields are allocated atomically via [`allocate_with_rollback`]:
+    /// if the slab runs out of space mid-way, earlier allocations are rolled
+    /// back and no slab space is leaked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlabFull`] if the slab cannot accommodate all 3 fields.
+    pub(crate) fn from_spec_ref(
+        spec: ShardSpecRef<'_>,
+        slab: &mut ByteSlab,
+    ) -> Result<Self, SlabFull> {
         let slots = allocate_with_rollback(
             [
                 spec.key_range_start(),

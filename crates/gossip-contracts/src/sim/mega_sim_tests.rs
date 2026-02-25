@@ -658,12 +658,13 @@ mod multi_tenant {
     //! The test exercises both terminal paths (`Complete` for tenant A,
     //! `Park` for tenant B) to maximize coverage of tenant-scoped behavior.
 
-    use crate::coordination::cursor::{Cursor, CursorUpdate};
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::error::AcquireError;
     use crate::coordination::in_memory::InMemoryCoordinator;
     use crate::coordination::record::ParkReason;
-    use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
-    use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+    use crate::coordination::run::{RunConfig, RunManagement};
+    use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
+    use crate::coordination::test_fixtures::{InitialShard, manifest_inputs};
     use crate::coordination::traits::CoordinationBackend;
     use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
     use crate::sim::invariants::InvariantChecker;
@@ -707,31 +708,49 @@ mod multi_tenant {
         // only iterates tenant-scoped records.
 
         coord.create_run(now(1), tenant_a, run_a, config).unwrap();
-        let shards_a: Vec<InitialShard> = (0..3)
+        let specs_a: Vec<_> = (0..3)
             .map(|i| {
+                let start = vec![(i as u8) * 0x30];
+                let end = vec![((i + 1) as u8) * 0x30];
+                (ShardId::from_raw(i), start, end)
+            })
+            .collect();
+        let shards_a: Vec<_> = specs_a
+            .iter()
+            .map(|(shard, start, end)| {
                 InitialShard::new(
-                    ShardId::from_raw(i),
-                    ShardSpec::with_range(vec![(i as u8) * 0x30], vec![((i + 1) as u8) * 0x30]),
-                    Cursor::initial(),
+                    *shard,
+                    ShardSpecRef::new(start.as_slice(), end.as_slice(), b""),
+                    CursorUpdate::initial(),
                 )
             })
             .collect();
+        let inputs_a = manifest_inputs(&shards_a);
         let _ = coord
-            .register_shards(now(1), tenant_a, run_a, &shards_a, OpId::from_raw(100))
+            .register_shards(now(1), tenant_a, run_a, &inputs_a, OpId::from_raw(100))
             .unwrap();
 
         coord.create_run(now(1), tenant_b, run_b, config).unwrap();
-        let shards_b: Vec<InitialShard> = (0..2)
+        let specs_b: Vec<_> = (0..2)
             .map(|i| {
+                let start = vec![(i as u8) * 0x40];
+                let end = vec![((i + 1) as u8) * 0x40];
+                (ShardId::from_raw(i), start, end)
+            })
+            .collect();
+        let shards_b: Vec<_> = specs_b
+            .iter()
+            .map(|(shard, start, end)| {
                 InitialShard::new(
-                    ShardId::from_raw(i),
-                    ShardSpec::with_range(vec![(i as u8) * 0x40], vec![((i + 1) as u8) * 0x40]),
-                    Cursor::initial(),
+                    *shard,
+                    ShardSpecRef::new(start.as_slice(), end.as_slice(), b""),
+                    CursorUpdate::initial(),
                 )
             })
             .collect();
+        let inputs_b = manifest_inputs(&shards_b);
         let _ = coord
-            .register_shards(now(1), tenant_b, run_b, &shards_b, OpId::from_raw(200))
+            .register_shards(now(1), tenant_b, run_b, &inputs_b, OpId::from_raw(200))
             .unwrap();
 
         let key_a0 = ShardKey::new(run_a, ShardId::from_raw(0));

@@ -9,8 +9,8 @@ use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::lease::Lease;
 use crate::coordination::record::ParkReason;
-use crate::coordination::run::{InitialShard, RunConfig, RunManagement};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
@@ -32,6 +32,30 @@ pub fn test_shard() -> ShardId {
 
 pub fn test_spec() -> ShardSpec {
     ShardSpec::with_range(b"a".to_vec(), b"z".to_vec())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialShard<'a> {
+    shard: ShardId,
+    spec: ShardSpecRef<'a>,
+    cursor: CursorUpdate<'a>,
+}
+
+impl<'a> InitialShard<'a> {
+    pub fn new(shard: ShardId, spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
+        Self {
+            shard,
+            spec,
+            cursor,
+        }
+    }
+}
+
+pub fn manifest_inputs<'a>(shards: &[InitialShard<'a>]) -> Vec<InitialShardInput<'a>> {
+    shards
+        .iter()
+        .map(|shard| InitialShardInput::new(shard.shard, shard.spec, shard.cursor))
+        .collect()
 }
 
 pub fn test_worker(id: u64) -> WorkerId {
@@ -79,17 +103,18 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
     coord
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let spec = test_spec();
+    let inputs = [InitialShardInput::new(
         test_shard(),
-        test_spec(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::initial(),
     )];
     let _ = coord
         .register_shards(
             now(2),
             test_tenant(),
             test_run(),
-            &shards,
+            &inputs,
             OpId::from_raw(u64::MAX),
         )
         .unwrap();
@@ -204,17 +229,18 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
-    let shards = vec![InitialShard::new(
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let inputs = [InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::initial(),
     )];
     let _ = coord
         .register_shards(
             now(2),
             test_tenant(),
             test_run(),
-            &shards,
+            &inputs,
             OpId::from_raw(1),
         )
         .unwrap();

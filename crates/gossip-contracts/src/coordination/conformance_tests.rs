@@ -33,11 +33,11 @@
 //! checkpoint the test verifies the cursor advanced *and* that the fence
 //! epoch did not change.
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::{CheckpointError, IdempotentOutcome};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
-use crate::coordination::run::{InitialShard, RunManagement, RunStatus};
+use crate::coordination::run::{InitialShardInput, RunManagement, RunStatus};
 use crate::coordination::run_errors::{RunTransitionError, UnparkError};
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
@@ -721,17 +721,18 @@ fn register_shards_on_non_initializing_rejected() {
     assert_eq!(rec.status(), RunStatus::Active);
 
     // Try to register more shards -> WrongStatus.
-    let shards = vec![InitialShard::new(
+    let spec = ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec());
+    let inputs = [InitialShardInput::new(
         ShardId::from_raw(999),
-        ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::initial(),
     )];
     let err = coord
         .register_shards(
             now(10),
             test_tenant(),
             test_run(),
-            &shards,
+            &inputs,
             OpId::from_raw(200),
         )
         .unwrap_err();

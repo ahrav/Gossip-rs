@@ -6,11 +6,11 @@
 
 use super::*;
 use crate::coordination::cursor::CursorUpdate;
-use crate::coordination::run::{InitialShard, RunManagement, ShardFilter};
-use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::run::{RunManagement, ShardFilter};
+use crate::coordination::shard_spec::{ShardSpec, ShardSpecRef};
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, acquire_shard, coordinator_with_run_and_lease, do_split_replace, now, test_run,
-    test_tenant, test_worker,
+    InitialShard, LEASE_DURATION, acquire_shard, coordinator_with_run_and_lease, do_split_replace,
+    manifest_inputs, now, test_run, test_tenant, test_worker,
 };
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 use crate::sim::backend::SimIntrospection;
@@ -541,19 +541,26 @@ fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
     let tenant = test_tenant();
     let run = test_run();
     coord.create_run(now(1), tenant, run, run_config()).unwrap();
-    let shards: Vec<InitialShard> = (0..n)
+    let specs: Vec<_> = (0..n)
         .map(|i| {
             let start = vec![i as u8];
             let end = vec![(i + 1) as u8];
+            (ShardId::from_raw(i as u64), start, end)
+        })
+        .collect();
+    let shards: Vec<_> = specs
+        .iter()
+        .map(|(shard, start, end)| {
             InitialShard::new(
-                ShardId::from_raw(i as u64),
-                ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                *shard,
+                ShardSpecRef::new(start.as_slice(), end.as_slice(), b""),
+                CursorUpdate::initial(),
             )
         })
         .collect();
+    let inputs = manifest_inputs(&shards);
     let _ = coord
-        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
+        .register_shards(now(1), tenant, run, &inputs, OpId::from_raw(100))
         .unwrap();
     coord
 }

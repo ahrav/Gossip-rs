@@ -4,22 +4,23 @@
 //! collectively cover the target data source. The coordinator tracks run
 //! status, validates shard manifests, and provides progress aggregation.
 //!
-//! Startup registration supports both owned ([`InitialShard`]) and borrowed
-//! ([`InitialShardInput`]) manifest rows. Borrowed inputs enable preallocated
-//! startup paths to validate and register shards without first materializing
-//! owned `ShardSpec`/`Cursor` values.
+//! Startup registration uses borrowed [`InitialShardInput`] manifest rows.
+//! This keeps registration allocation-light by borrowing shard range and
+//! cursor bytes from caller-managed storage.
+//! Typed shard-spec construction is handled upstream in [`crate::shard`];
+//! this module validates and registers already-constructed manifest rows.
 //!
 
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::coordination::cursor::{Cursor, CursorUpdate, MAX_KEY_SIZE};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use crate::coordination::split::op_payload_hash;
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
@@ -709,8 +710,9 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// Aggregated shard status counts and in-flight watermark for a run.
 ///
 /// Fields are `pub(crate)` with public accessors. Uses `u32` (not `u64`)
-/// because the maximum shard count is bounded by `MAX_INITIAL_SHARDS` plus
-/// spawned children, well within `u32::MAX`.
+/// for compact storage. Counter updates use checked arithmetic and panic on
+/// overflow, so backend shard-limit configuration must remain within practical
+/// `u32` bounds.
 ///
 /// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
 /// owns key bytes.
@@ -964,35 +966,40 @@ pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
 }
 
 // ============================================================================
-// InitialShard + Manifest Validation
+// Initial Manifest Validation
 // ============================================================================
 
 /// Maximum number of shards in a single `register_shards` call (SEC-3).
 ///
 /// Prevents resource exhaustion from a single API call creating unbounded
-/// shard records. Checked as the FIRST validation step in `validate_manifest`.
+/// shard records. Checked as the FIRST validation step in
+/// [`validate_manifest_inputs`].
 pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
 
-/// A shard to be registered as part of a run's initial manifest.
+/// Borrowed manifest row for run registration inputs.
 ///
-/// Used in the second phase of two-phase run creation (D2.20):
-/// `create_run` → `register_shards(&[InitialShard])`. Each entry pairs
-/// a [`ShardSpec`] (key range) with an optional resume [`Cursor`].
-/// Initial cursors (`Cursor::initial()`) start processing from the range
-/// beginning; non-initial cursors resume from a previously checkpointed
-/// position (e.g., after a failed run restart).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InitialShard {
-    pub(crate) shard: ShardId,
-    pub(crate) spec: ShardSpec,
-    pub(crate) cursor: Cursor,
+/// Key ranges and cursor bytes borrow from caller-owned storage (`ShardArena`,
+/// scratch buffers, or stack data), while shard identity is still an owned
+/// value type.
+///
+/// The coordinator consumes these as read-only snapshots during registration;
+/// callers must keep borrowed bytes alive for the duration of that call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialShardInput<'a> {
+    shard: ShardId,
+    spec: ShardSpecRef<'a>,
+    cursor: CursorUpdate<'a>,
 }
 
-impl InitialShard {
+impl<'a> InitialShardInput<'a> {
+    /// Build one borrowed manifest row.
+    ///
+    /// This constructor is intentionally infallible; structural checks happen in
+    /// [`validate_manifest_inputs`] so callers can batch-report manifest errors.
     #[must_use]
-    pub fn new(shard: ShardId, spec: ShardSpec, cursor: Cursor) -> Self {
+    pub const fn new(shard: ShardId, spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
         Self {
             shard,
             spec,
@@ -1001,22 +1008,22 @@ impl InitialShard {
     }
 
     #[must_use]
-    pub fn shard(&self) -> ShardId {
+    pub const fn shard(&self) -> ShardId {
         self.shard
     }
 
     #[must_use]
-    pub fn spec(&self) -> &ShardSpec {
-        &self.spec
+    pub const fn spec(&self) -> ShardSpecRef<'a> {
+        self.spec
     }
 
     #[must_use]
-    pub fn cursor(&self) -> &Cursor {
-        &self.cursor
+    pub const fn cursor(&self) -> CursorUpdate<'a> {
+        self.cursor
     }
 }
 
-/// Error from `validate_manifest`.
+/// Error from [`validate_manifest_inputs`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ManifestValidationError {
@@ -1089,18 +1096,9 @@ impl fmt::Display for ManifestValidationError {
 
 impl std::error::Error for ManifestValidationError {}
 
-/// Validate a manifest of initial shards.
-///
-/// Checks (in order):
-/// 1. SEC-3: count <= `MAX_INITIAL_SHARDS` (FIRST check, before allocation).
-/// 2. Non-empty.
-/// 3. No duplicate IDs.
-/// 4. No unbounded ranges (empty start or end).
-/// 5. Spec validity: `start < end` for bounded key ranges.
-/// 6. No overlapping key ranges (gaps are allowed).
-/// 7. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
-/// 8. Cursor bounds for non-initial cursors.
-pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidationError> {
+fn validate_manifest_common(
+    shards: &[InitialShardInput<'_>],
+) -> Result<(), ManifestValidationError> {
     // SEC-3: Bound check FIRST, before any allocation.
     if shards.len() > MAX_INITIAL_SHARDS {
         return Err(ManifestValidationError::TooManyShards {
@@ -1114,7 +1112,7 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
     }
 
     // Check for duplicate IDs.
-    let mut ids: Vec<ShardId> = shards.iter().map(|s| s.shard).collect();
+    let mut ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
     ids.sort_by_key(|id| id.as_raw());
     for window in ids.windows(2) {
         if window[0] == window[1] {
@@ -1126,25 +1124,27 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
 
     // Reject unbounded ranges: production manifests must have finite bounds.
     for shard in shards {
-        if shard.spec.key_range_start().is_empty() || shard.spec.key_range_end().is_empty() {
+        let spec = shard.spec();
+        if spec.key_range_start().is_empty() || spec.key_range_end().is_empty() {
             return Err(ManifestValidationError::UnboundedRange {
-                shard_id: shard.shard,
+                shard_id: shard.shard(),
             });
         }
     }
 
     // Sort by key_range_start for overlap detection.
-    let mut sorted: Vec<&InitialShard> = shards.iter().collect();
-    sorted.sort_by(|a, b| a.spec.key_range_start().cmp(b.spec.key_range_start()));
+    let mut sorted: Vec<(ShardId, ShardSpecRef<'_>)> = shards
+        .iter()
+        .map(|shard| (shard.shard(), shard.spec()))
+        .collect();
+    sorted.sort_by(|a, b| a.1.key_range_start().cmp(b.1.key_range_start()));
 
     for shard in &sorted {
         // Validate that start < end for bounded specs.
-        let start = shard.spec.key_range_start();
-        let end = shard.spec.key_range_end();
+        let start = shard.1.key_range_start();
+        let end = shard.1.key_range_end();
         if !start.is_empty() && !end.is_empty() && start >= end {
-            return Err(ManifestValidationError::InvalidSpec {
-                shard_id: shard.shard,
-            });
+            return Err(ManifestValidationError::InvalidSpec { shard_id: shard.0 });
         }
     }
 
@@ -1155,13 +1155,13 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
     //   - empty b_start means [min, b_end) → any non-empty a_end exceeds min
     for window in sorted.windows(2) {
         let (a, b) = (window[0], window[1]);
-        let a_end = a.spec.key_range_end();
-        let b_start = b.spec.key_range_start();
+        let a_end = a.1.key_range_end();
+        let b_start = b.1.key_range_start();
         let overlaps = a_end.is_empty() || b_start.is_empty() || a_end > b_start;
         if overlaps {
             return Err(ManifestValidationError::OverlappingRanges {
-                shard_a: a.shard,
-                shard_b: b.shard,
+                shard_a: a.0,
+                shard_b: b.0,
             });
         }
     }
@@ -1169,11 +1169,12 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
     // Cursor key size check (defense-in-depth; Cursor::try_with_last_key
     // also validates, but callers may use the panicking constructors).
     for shard in shards {
-        if let Some(key) = shard.cursor.last_key()
+        let cursor = shard.cursor();
+        if let Some(key) = cursor.last_key()
             && key.len() > MAX_KEY_SIZE
         {
             return Err(ManifestValidationError::CursorKeyTooLarge {
-                shard_id: shard.shard,
+                shard_id: shard.shard(),
                 size: key.len(),
                 max: MAX_KEY_SIZE,
             });
@@ -1182,19 +1183,45 @@ pub fn validate_manifest(shards: &[InitialShard]) -> Result<(), ManifestValidati
 
     // Cursor bounds check for non-initial cursors.
     for shard in shards {
-        if let Some(key) = shard.cursor.last_key() {
-            let start = shard.spec.key_range_start();
-            let end = shard.spec.key_range_end();
+        let cursor = shard.cursor();
+        if let Some(key) = cursor.last_key() {
+            let spec = shard.spec();
+            let start = spec.key_range_start();
+            let end = spec.key_range_end();
             let in_bounds = (start.is_empty() || key >= start) && (end.is_empty() || key < end);
             if !in_bounds {
                 return Err(ManifestValidationError::CursorOutOfBounds {
-                    shard_id: shard.shard,
+                    shard_id: shard.shard(),
                 });
             }
         }
     }
 
     Ok(())
+}
+
+/// Validate a manifest of borrowed initial-shard inputs.
+///
+/// Checks (in order):
+/// 1. SEC-3: count <= `MAX_INITIAL_SHARDS` (FIRST check, before allocation).
+/// 2. Non-empty.
+/// 3. No duplicate IDs.
+/// 4. No unbounded ranges (empty start or end).
+/// 5. Spec validity: `start < end` for bounded key ranges.
+/// 6. No overlapping key ranges (gaps are allowed).
+/// 7. Cursor key size <= [`MAX_KEY_SIZE`] for non-initial cursors.
+/// 8. Cursor bounds for non-initial cursors.
+///
+/// # Errors
+///
+/// Returns [`ManifestValidationError`] variants for:
+/// empty manifests, duplicate IDs, invalid specs, unbounded ranges,
+/// overlapping ranges, cursor key-size violations, cursor-bounds violations,
+/// and SEC-3 shard-count violations.
+pub fn validate_manifest_inputs(
+    shards: &[InitialShardInput<'_>],
+) -> Result<(), ManifestValidationError> {
+    validate_manifest_common(shards)
 }
 
 // ============================================================================
@@ -1214,11 +1241,12 @@ pub struct ShardSummary {
     /// `is_leased` is `true`.  Callers use this to schedule retry
     /// attempts near the soonest expiry without a separate query.
     pub(crate) lease_deadline: Option<LogicalTime>,
-    /// Number of times this shard has been acquired.
+    /// Number of ownership-epoch bumps since shard initialization.
     ///
-    /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore`
-    /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
-    /// exceeds 32-bit range (astronomically unlikely in practice).
+    /// Derived as `fence_epoch - INITIAL`. This includes successful
+    /// `acquire_and_restore` operations and any admin transitions that bump
+    /// the fence (for example `unpark_shard`). Saturates at `u32::MAX` if the
+    /// epoch difference exceeds 32-bit range (astronomically unlikely).
     pub(crate) acquire_count: u32,
     pub(crate) last_key: Option<Box<[u8]>>,
     pub(crate) key_range_start: Box<[u8]>,
@@ -1280,6 +1308,9 @@ impl ShardSummary {
     }
 
     #[must_use]
+    /// Ownership-epoch bump count (`fence_epoch - INITIAL`).
+    ///
+    /// Includes acquires plus admin fence-bump transitions such as unpark.
     pub fn acquire_count(&self) -> u32 {
         self.acquire_count
     }
@@ -1418,16 +1449,18 @@ impl ShardFilter {
 /// Sort by `shard.as_raw()` for order-independence — callers may provide
 /// shards in any order.
 #[must_use]
-pub fn hash_register_shards_payload(shards: &[InitialShard]) -> u64 {
-    let mut sorted: Vec<&InitialShard> = shards.iter().collect();
-    sorted.sort_by_key(|s| s.shard.as_raw());
+pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
+    let mut sorted: Vec<InitialShardInput<'_>> = shards.to_vec();
+    sorted.sort_by_key(|s| s.shard().as_raw());
 
     op_payload_hash(b"register_shards", |h| {
         (sorted.len() as u32).write_canonical(h);
         for shard in &sorted {
-            shard.shard.write_canonical(h);
-            shard.spec.write_canonical(h);
-            shard.cursor.write_canonical(h);
+            shard.shard().write_canonical(h);
+            shard.spec().key_range_start().write_canonical(h);
+            shard.spec().key_range_end().write_canonical(h);
+            shard.spec().metadata().write_canonical(h);
+            shard.cursor().write_canonical(h);
         }
     })
 }
@@ -1508,12 +1541,12 @@ pub trait RunManagement {
     ///
     /// Idempotent via `op_id`. Uses collect-then-insert internally:
     /// all shards are validated first, then inserted atomically.
-    fn register_shards(
+    fn register_shards<'a>(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
-        shards: &[InitialShard],
+        shards: &[InitialShardInput<'a>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError>;
 
@@ -1530,13 +1563,13 @@ pub trait RunManagement {
     /// serializes via `&mut self`, but production backends should override
     /// this with a transactional implementation to avoid partial-creation
     /// races under concurrent callers.
-    fn create_run_with_shards(
+    fn create_run_with_shards<'a>(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         config: RunConfig,
-        shards: &[InitialShard],
+        shards: &[InitialShardInput<'a>],
         op_id: OpId,
     ) -> Result<IdempotentOutcome<RunRecord>, CreateRunError> {
         match self.create_run(now, tenant, run, config) {

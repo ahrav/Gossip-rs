@@ -73,7 +73,7 @@ use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{RunTransitionError, UnparkError};
 use crate::coordination::session::WorkerSession;
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
@@ -842,11 +842,11 @@ impl CoordinationSim<InMemoryCoordinator> {
     /// `active_shard_keys` -- call [`with_workers_and_shards`](Self::with_workers_and_shards)
     /// or set `active_shard_keys` manually after registration.
     pub fn register_shard(&mut self, run: RunId, shard: ShardId) {
-        let record = ShardRecord::new_active(
+        let record = ShardRecord::new_active_ref(
             self.tenant,
             run,
             shard,
-            &ShardSpec::with_range(vec![b'a'], vec![b'z']),
+            ShardSpecRef::new(b"a", b"z", b""),
             CursorSemantics::Completed,
             self.coordinator.slab_mut(),
         )
