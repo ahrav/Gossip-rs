@@ -187,7 +187,7 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///    (no RNG) — for a given candidate list length, the same worker
 ///    always starts at the same position.
 ///    For each candidate, attempt `acquire_and_restore_into`.
-/// 4. On success, return the `AcquireResult` (lease, snapshot, capacity hint).
+/// 4. On success, return the `AcquireResultView` (lease, snapshot, capacity hint).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
 ///    `ShardNotFound`), skip that candidate and try the next.
 /// 6. On `TenantMismatch`, fail immediately — this indicates a
