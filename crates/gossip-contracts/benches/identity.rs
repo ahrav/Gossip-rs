@@ -61,7 +61,7 @@ fn bench_compute_policy_hash(c: &mut Criterion) {
 fn bench_item_key_stable_id(c: &mut Criterion) {
     let key = ItemKey::new(
         ConnectorTag::from_ascii(b"github"),
-        b"org/repo\0src/main.rs".to_vec(),
+        b"org/repo\0src/main.rs",
     );
 
     c.bench_function("item_key_stable_id", |b| {

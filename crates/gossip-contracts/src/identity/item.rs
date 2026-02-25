@@ -43,7 +43,7 @@ use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
 /// These are returned by the `try_*` constructors on [`ConnectorTag`],
 /// [`ItemKey`], and [`ObjectVersionId`]. The panicking constructors
 /// (`from_ascii`, `new`, `from_version_bytes`) remain available for
-/// const contexts and trusted internal code.
+/// trusted internal code; only [`ConnectorTag::from_ascii`] is `const`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentityInputError {
     /// Connector tag is empty.
@@ -303,7 +303,7 @@ impl ItemKey {
     /// use gossip_contracts::identity::{ConnectorTag, ItemKey};
     ///
     /// let github = ConnectorTag::from_ascii(b"github");
-    /// let key = ItemKey::new(github, b"org/repo\0src/main.rs".to_vec());
+    /// let key = ItemKey::new(github, b"org/repo\0src/main.rs");
     ///
     /// assert_eq!(key.connector(), github);
     /// assert_eq!(key.path(), b"org/repo\0src/main.rs");
@@ -315,11 +315,12 @@ impl ItemKey {
     /// the connector — every scannable item has a non-empty location.  This
     /// is not a user-input validation boundary; connectors are trusted
     /// internal code, so a panic (rather than `Result`) is appropriate.
-    pub fn new(connector: ConnectorTag, path: Vec<u8>) -> Self {
+    pub fn new(connector: ConnectorTag, path: impl AsRef<[u8]>) -> Self {
+        let path = path.as_ref();
         assert!(!path.is_empty(), "ItemKey path must not be empty");
         Self {
             connector,
-            path: path.into_boxed_slice(),
+            path: path.into(),
         }
     }
 
@@ -327,13 +328,17 @@ impl ItemKey {
     ///
     /// Returns an error instead of panicking when the path is empty.
     /// Use this at system boundaries where the path comes from external input.
-    pub fn try_new(connector: ConnectorTag, path: Vec<u8>) -> Result<Self, IdentityInputError> {
+    pub fn try_new(
+        connector: ConnectorTag,
+        path: impl AsRef<[u8]>,
+    ) -> Result<Self, IdentityInputError> {
+        let path = path.as_ref();
         if path.is_empty() {
             return Err(IdentityInputError::EmptyPath);
         }
         Ok(Self {
             connector,
-            path: path.into_boxed_slice(),
+            path: path.into(),
         })
     }
 
@@ -364,8 +369,7 @@ impl CanonicalBytes for ItemKey {
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.connector.write_canonical(h);
-        // Path is variable-length → length-prefixed.
-        self.path.as_ref().write_canonical(h);
+        self.path.write_canonical(h);
     }
 }
 
@@ -558,8 +562,8 @@ mod tests {
         // Connector tag + path must not collide with different splits.
         // ConnectorTag is fixed-width and path is length-prefixed,
         // so this is structurally impossible. Verify anyway:
-        let a = ItemKey::new(ConnectorTag::from_bytes(*b"ab\0\0\0\0\0\0"), b"cd".to_vec());
-        let b = ItemKey::new(ConnectorTag::from_bytes(*b"abcd\0\0\0\0"), b"ef".to_vec());
+        let a = ItemKey::new(ConnectorTag::from_bytes(*b"ab\0\0\0\0\0\0"), b"cd");
+        let b = ItemKey::new(ConnectorTag::from_bytes(*b"abcd\0\0\0\0"), b"ef");
         let mut ha = Hasher::new();
         let mut hb = Hasher::new();
         a.write_canonical(&mut ha);

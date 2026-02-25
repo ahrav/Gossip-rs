@@ -24,16 +24,19 @@
 //!
 //! ## Idempotency
 //!
-//! Run-level mutations (`register_shards`, `complete_run`, `fail_run`,
-//! `cancel_run`, `unpark_shard`) use a per-run op-log with the same
-//! `(OpId, payload_hash)` deduplication scheme as shard-level operations.
-//! The op-log is bounded to [`RunRecord::OP_LOG_CAP`] entries.
+//! Run lifecycle mutations (`register_shards`, `complete_run`, `fail_run`,
+//! `cancel_run`) use a per-run op-log with the same `(OpId, payload_hash)`
+//! deduplication scheme as shard-level operations. The run op-log is bounded
+//! to [`RunRecord::OP_LOG_CAP`] entries.
+//!
+//! `unpark_shard` is the exception: idempotency is recorded in the target
+//! shard's op-log (cap = 16), because unpark operations are keyed by shard.
 //!
 //! ## Manifest validation
 //!
 //! [`validate_manifest`] enforces that the initial shard set is non-empty,
-//! contains no duplicate IDs, uses bounded key ranges, and has no derived
-//! (split-child) shard IDs. This prevents invalid initial states from
+//! contains no duplicate IDs, uses bounded key ranges, and has cursor values
+//! within declared shard bounds. This prevents invalid initial states from
 //! entering the coordination layer.
 //!
 //! [`ShardRecord`]: super::record::ShardRecord
@@ -42,7 +45,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
-use crate::coordination::error::IdempotentOutcome;
+use crate::coordination::error::{FixedBuf, IdempotentOutcome};
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
@@ -780,7 +783,7 @@ const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
 /// `MAX_INITIAL_SHARDS` (10K) plus spawned children, well within `u32::MAX`.
 ///
 /// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
-/// owns key bytes.
+/// stores owned key bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RunProgress {
     pub(crate) total: u32,
@@ -797,7 +800,7 @@ pub struct RunProgress {
     /// if they carry cursor keys; this tracks in-flight progress only.
     /// `None` means no active shard currently has a non-initial cursor
     /// (including runs with zero active shards).
-    pub(crate) watermark: Option<Box<[u8]>>,
+    pub(crate) watermark: Option<FixedBuf<MAX_KEY_SIZE>>,
 }
 
 impl RunProgress {
@@ -834,7 +837,7 @@ impl RunProgress {
     /// Lexicographic minimum last-key among active, non-initial shards.
     ///
     /// Returns `None` if there are no active shards with a non-initial cursor.
-    /// This can happen when all active shards are still at `Cursor::initial()`
+    /// This can happen when all active shards are still at `CursorUpdate::initial()`
     /// or when the run has no active shards.
     ///
     /// **Non-monotonicity**: This is a point-in-time snapshot, not a monotonic
@@ -844,7 +847,7 @@ impl RunProgress {
     /// should maintain a running maximum externally.
     #[must_use]
     pub fn watermark(&self) -> Option<&[u8]> {
-        self.watermark.as_deref()
+        self.watermark.as_ref().map(|wm| wm.read())
     }
 
     /// Whether all active work is complete (no Active shards remain).
@@ -956,12 +959,19 @@ impl RunProgress {
                 "RunProgress::observe_shard: last_key must be non-empty when present"
             );
 
-            if self
-                .watermark
-                .as_deref()
-                .is_none_or(|current| last_key < current)
-            {
-                self.watermark = Some(last_key.to_vec().into_boxed_slice());
+            match &mut self.watermark {
+                Some(current) if last_key < current.read() => {
+                    current.write(last_key, "watermark key exceeds MAX_KEY_SIZE");
+                }
+                None => {
+                    self.watermark = Some(FixedBuf::from_slice(
+                        last_key,
+                        "watermark key exceeds MAX_KEY_SIZE",
+                    ));
+                }
+                // Equality or greater: watermark only advances toward
+                // smaller keys, so same-value or larger keys are no-ops.
+                _ => {}
             }
         }
     }
@@ -1049,6 +1059,14 @@ pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
 pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
+
+#[inline]
+fn init_dense_indices(indices: &mut [usize], len: usize) {
+    debug_assert!(len <= indices.len());
+    for (index, slot) in indices.iter_mut().take(len).enumerate() {
+        *slot = index;
+    }
+}
 
 /// A borrowed shard registration input for a run's initial manifest.
 ///
@@ -1209,14 +1227,16 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         return Err(ManifestValidationError::Empty);
     }
 
+    let mut sorted_indices_storage = [0usize; MAX_INITIAL_SHARDS];
+    init_dense_indices(&mut sorted_indices_storage, shards.len());
+    let sorted_indices = &mut sorted_indices_storage[..shards.len()];
+
     // Check for duplicate IDs.
-    let mut ids: Vec<ShardId> = shards.iter().map(|s| s.shard).collect();
-    ids.sort_by_key(|id| id.as_raw());
-    for window in ids.windows(2) {
-        if window[0] == window[1] {
-            return Err(ManifestValidationError::DuplicateIds {
-                shard_id: window[0],
-            });
+    sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
+    for window in sorted_indices.windows(2) {
+        let current = shards[window[0]].shard;
+        if current == shards[window[1]].shard {
+            return Err(ManifestValidationError::DuplicateIds { shard_id: current });
         }
     }
 
@@ -1242,10 +1262,15 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     }
 
     // Sort by key_range_start for overlap detection.
-    let mut sorted: Vec<&InitialShardInput<'_>> = shards.iter().collect();
-    sorted.sort_by(|a, b| a.spec.key_range_start().cmp(b.spec.key_range_start()));
+    sorted_indices.sort_by(|&a, &b| {
+        shards[a]
+            .spec
+            .key_range_start()
+            .cmp(shards[b].spec.key_range_start())
+    });
 
-    for shard in &sorted {
+    for &index in sorted_indices.iter() {
+        let shard = &shards[index];
         // Validate that start < end for bounded specs.
         let start = shard.spec.key_range_start();
         let end = shard.spec.key_range_end();
@@ -1261,8 +1286,9 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     // and [b_start, b_end) overlap iff a_end > b_start, where:
     //   - empty a_end means [a_start, ∞) → always overlaps with the next shard
     //   - empty b_start means [min, b_end) → any non-empty a_end exceeds min
-    for window in sorted.windows(2) {
-        let (a, b) = (window[0], window[1]);
+    for window in sorted_indices.windows(2) {
+        let a = &shards[window[0]];
+        let b = &shards[window[1]];
         let a_end = a.spec.key_range_end();
         let b_start = b.spec.key_range_start();
         let overlaps = a_end.is_empty() || b_start.is_empty() || a_end > b_start;
@@ -1274,7 +1300,7 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         }
     }
 
-    // Cursor key size check (defense-in-depth; Cursor::try_with_last_key
+    // Cursor key size check (defense-in-depth; CursorUpdate::try_with_last_key
     // also validates, but callers may use the panicking constructors).
     for shard in shards {
         if let Some(key) = shard.cursor.last_key()
@@ -1309,18 +1335,58 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
 // ShardSummary
 // ============================================================================
 
-/// Lightweight, heap-owned shard summary for listing and observability.
+/// Fixed-capacity byte storage for allocation-free [`ShardSummary`] fields.
+///
+/// `ShardSummary::from_record` writes directly into this inline buffer.
+/// The `From<Vec<u8>>` impl exists as an adapter for non-hot-path callers; any
+/// allocation implied by `Vec` construction happens at the call site, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SummaryBytes<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> SummaryBytes<N> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            bytes: [0u8; N],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, src: &[u8], oversize_msg: &'static str) {
+        assert!(src.len() <= N, "{oversize_msg}");
+        self.bytes[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
+    fn from(value: Vec<u8>) -> Self {
+        let mut out = Self::new();
+        out.write(&value, "summary bytes exceed fixed capacity");
+        out
+    }
+}
+
+/// Lightweight shard summary for listing and observability.
 ///
 /// Constructed from a [`ShardRecord`] via `from_record`, which copies
-/// slab-backed byte fields into owned `Box<[u8]>` allocations. This
-/// decouples the summary from the coordinator's internal slab lifetime,
-/// making it safe to return across API boundaries.
+/// slab-backed byte fields into fixed-capacity in-struct buffers (no heap
+/// allocation). This decouples the summary from the coordinator's slab
+/// lifetime while keeping repeated listing allocation-silent after caller
+/// buffer warmup.
 ///
 /// [`ShardFilter::matches_record`] provides a pre-filter that checks
-/// status/lease/root criteria on the record directly, avoiding the
-/// 2-3 heap allocations that `from_record` performs for key ranges.
-/// At 10K shards with a selective filter, this turns thousands of
-/// wasted allocations into dozens.
+/// status/lease/root criteria on the record directly, avoiding unnecessary
+/// byte copies for filtered-out shards.
 ///
 /// [`ShardRecord`]: super::record::ShardRecord
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1339,15 +1405,37 @@ pub struct ShardSummary {
     /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
     /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,
-    pub(crate) last_key: Option<Box<[u8]>>,
-    pub(crate) key_range_start: Box<[u8]>,
-    pub(crate) key_range_end: Box<[u8]>,
+    pub(crate) last_key: Option<SummaryBytes<MAX_KEY_SIZE>>,
+    pub(crate) key_range_start: SummaryBytes<MAX_KEY_SIZE>,
+    pub(crate) key_range_end: SummaryBytes<MAX_KEY_SIZE>,
     pub(crate) parent: Option<ShardId>,
     pub(crate) spawned_count: u32,
 }
 
 impl ShardSummary {
+    /// Build a summary snapshot from one record at logical time `now`.
+    ///
+    /// Copies slab-backed cursor/spec bytes into fixed-capacity inline buffers
+    /// so the returned summary no longer borrows the coordinator slab.
     pub(crate) fn from_record(record: &ShardRecord, now: LogicalTime, slab: &ByteSlab) -> Self {
+        let last_key = record.cursor.last_key(slab).map(|key| {
+            let mut bytes = SummaryBytes::new();
+            bytes.write(key, "shard summary cursor key exceeds MAX_KEY_SIZE");
+            bytes
+        });
+
+        let mut key_range_start = SummaryBytes::new();
+        key_range_start.write(
+            record.spec.key_range_start(slab),
+            "shard summary start key exceeds MAX_KEY_SIZE",
+        );
+
+        let mut key_range_end = SummaryBytes::new();
+        key_range_end.write(
+            record.spec.key_range_end(slab),
+            "shard summary end key exceeds MAX_KEY_SIZE",
+        );
+
         Self {
             shard: record.shard,
             status: record.status,
@@ -1365,9 +1453,9 @@ impl ShardSummary {
                     .saturating_sub(FenceEpoch::INITIAL.as_raw()),
             )
             .unwrap_or(u32::MAX),
-            last_key: record.cursor.last_key(slab).map(|k| k.into()),
-            key_range_start: record.spec.key_range_start(slab).into(),
-            key_range_end: record.spec.key_range_end(slab).into(),
+            last_key,
+            key_range_start,
+            key_range_end,
             parent: record.parent,
             spawned_count: u32::try_from(record.spawned.len()).unwrap_or(u32::MAX),
         }
@@ -1405,17 +1493,17 @@ impl ShardSummary {
 
     #[must_use]
     pub fn last_key(&self) -> Option<&[u8]> {
-        self.last_key.as_deref()
+        self.last_key.as_ref().map(SummaryBytes::as_slice)
     }
 
     #[must_use]
     pub fn key_range_start(&self) -> &[u8] {
-        &self.key_range_start
+        self.key_range_start.as_slice()
     }
 
     #[must_use]
     pub fn key_range_end(&self) -> &[u8] {
-        &self.key_range_end
+        self.key_range_end.as_slice()
     }
 
     #[must_use]
@@ -1433,7 +1521,7 @@ impl ShardSummary {
 // ShardFilter
 // ============================================================================
 
-/// Filter criteria for [`RunManagement::list_shards`].
+/// Filter criteria for [`RunManagement::list_shards_into`].
 ///
 /// All fields default to "match anything" (no constraint). Named
 /// constructors compose common filter patterns:
@@ -1445,12 +1533,12 @@ impl ShardSummary {
 ///
 /// Fields are `pub(crate)` to prevent ad-hoc construction outside the
 /// crate. The `is_leased` filter is evaluated at the `now` parameter
-/// passed to `list_shards`: a lease whose deadline has passed is treated
+/// passed to `list_shards_into`: a lease whose deadline has passed is treated
 /// as unleased.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardFilter {
     pub(crate) status: Option<ShardStatus>,
-    /// Evaluated at the `now` parameter passed to [`RunManagement::list_shards`]:
+    /// Evaluated at the `now` parameter passed to [`RunManagement::list_shards_into`]:
     /// a lease whose deadline has passed is treated as unleased.
     pub(crate) is_leased: Option<bool>,
     /// When `true`, excludes split children (shards with a `parent`).
@@ -1512,12 +1600,10 @@ impl ShardFilter {
     }
 
     /// Pre-filter on [`ShardRecord`] fields before constructing a
-    /// [`ShardSummary`] (which heap-allocates key ranges).
+    /// [`ShardSummary`].
     ///
     /// Equivalent to `self.matches(&ShardSummary::from_record(record, now))`
-    /// but avoids the 2-3 heap allocations per record that `from_record`
-    /// performs. At 10K shards with a selective filter, this turns ~30K
-    /// wasted allocations into ~30.
+    /// but avoids unnecessary byte copies for filtered-out records.
     #[must_use]
     pub fn matches_record(&self, record: &ShardRecord, now: LogicalTime) -> bool {
         if let Some(status) = self.status
@@ -1547,12 +1633,33 @@ impl ShardFilter {
 /// shards in any order.
 #[must_use]
 pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
-    let mut sorted: Vec<&InitialShardInput<'_>> = shards.iter().collect();
-    sorted.sort_by_key(|s| s.shard.as_raw());
-
     op_payload_hash(b"register_shards", |h| {
-        (sorted.len() as u32).write_canonical(h);
-        for shard in &sorted {
+        (shards.len() as u32).write_canonical(h);
+
+        if shards.len() <= MAX_INITIAL_SHARDS {
+            let mut sorted_indices_storage = [0usize; MAX_INITIAL_SHARDS];
+            init_dense_indices(&mut sorted_indices_storage, shards.len());
+            let sorted_indices = &mut sorted_indices_storage[..shards.len()];
+            sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
+
+            for &index in sorted_indices.iter() {
+                let shard = &shards[index];
+                shard.shard.write_canonical(h);
+                shard.spec.write_canonical(h);
+                shard.cursor.write_canonical(h);
+            }
+            return;
+        }
+
+        // Fallback for oversized slices. Registration rejects manifests
+        // above MAX_INITIAL_SHARDS, but the hash is computed before
+        // validation so this path CAN execute for invalid input.
+        // Use a heap-allocated Vec to maintain O(N log N) sorting
+        // instead of the O(N²) selection sort that was here before.
+        let mut sorted: Vec<usize> = (0..shards.len()).collect();
+        sorted.sort_by_key(|&idx| shards[idx].shard.as_raw());
+        for &index in &sorted {
+            let shard = &shards[index];
             shard.shard.write_canonical(h);
             shard.spec.write_canonical(h);
             shard.cursor.write_canonical(h);
@@ -1631,10 +1738,12 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 ///
 /// ## Idempotency
 ///
-/// All mutating methods (except `create_run`) accept an `OpId` and are
-/// idempotent via the run's bounded op-log. The op-log has capacity
-/// [`RunRecord::OP_LOG_CAP`] (8 entries). Evicted entries are treated as
-/// new operations, but status-check guards prevent re-execution on an
+/// All mutating methods (except `create_run`) accept an `OpId`.
+///
+/// `register_shards`, `complete_run`, `fail_run`, and `cancel_run` are
+/// idempotent via the run's bounded op-log (capacity
+/// [`RunRecord::OP_LOG_CAP`] = 8). Evicted entries are treated as new
+/// operations, but status-check guards prevent re-execution on an
 /// already-transitioned run.
 ///
 /// ## Cross-cutting: `unpark_shard` idempotency
@@ -1722,7 +1831,7 @@ pub trait RunManagement {
     ///   checkpoint cursors are both eligible while shard status is `Active`).
     ///
     /// `watermark` intentionally ignores `Done`/`Split`/`Parked` shards and
-    /// active shards still at `Cursor::initial()`. It is a snapshot, not a
+    /// active shards still at `CursorUpdate::initial()`. It is a snapshot, not a
     /// monotonic stream, and may move backward between calls as shard
     /// membership changes.
     ///
@@ -1736,17 +1845,68 @@ pub trait RunManagement {
         run: RunId,
     ) -> Result<RunProgress, GetRunError>;
 
-    /// List shards for a run, filtered. Ordered by `key_range_start` ascending.
+    /// List shards for a run, filtered, into a caller-provided output buffer.
+    /// Ordered by `key_range_start` ascending.
+    ///
+    /// This API allows callers to reuse `out` across repeated queries and
+    /// avoid per-call heap allocations after startup. Implementations may
+    /// require `out` to be pre-sized and refuse to grow it internally.
+    /// Ordering ties (same `key_range_start`) are backend-defined.
     ///
     /// `ShardFilter::is_leased` must be evaluated against `now`: a lease whose
     /// deadline has passed counts as unleased, not leased.
-    fn list_shards(
+    ///
+    /// Implementations may enforce the no-growth contract with a panic instead
+    /// of a typed error. The in-memory backend does this to keep the hot path
+    /// allocation-silent and fail fast on mis-sized caller buffers.
+    fn list_shards_into(
         &self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         filter: ShardFilter,
-    ) -> Result<Vec<ShardSummary>, GetRunError>;
+        out: &mut Vec<ShardSummary>,
+    ) -> Result<(), GetRunError>;
+
+    /// Collect claimable shard IDs and the earliest lease deadline in a single
+    /// pass over the run's shard set.
+    ///
+    /// This is a specialized query for the shard-claiming hot path.  Unlike
+    /// [`list_shards_into`](Self::list_shards_into), it never constructs
+    /// [`ShardSummary`] objects and never copies slab-backed byte fields,
+    /// avoiding ~12 KiB of wasted memcpy per shard when only the `ShardId`
+    /// and lease deadline are needed.
+    ///
+    /// On return, `candidates` contains the IDs of all Active, unleased
+    /// shards (in backend-defined order — no sort guarantee).  The returned
+    /// `Option<LogicalTime>` is the earliest lease deadline among Active
+    /// shards that **are** leased, or `None` if no Active shard is currently
+    /// leased.  Callers use this deadline to schedule retry attempts near
+    /// the soonest expiry instead of busy-spinning.
+    ///
+    /// `candidates` is cleared before use.  The caller owns the buffer and
+    /// reuses it across calls — no allocation in steady state.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if `candidates.capacity()` is smaller than
+    /// the run's shard count.  This enforces the zero-allocation contract:
+    /// the caller must pre-allocate the buffer at startup so the hot path
+    /// never grows it.  The in-memory backend panics on this condition and
+    /// also panics if its internal shard index references a shard ID with
+    /// no corresponding record (index desynchronization — data corruption).
+    ///
+    /// # Errors
+    ///
+    /// - [`GetRunError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`GetRunError::TenantMismatch`] — tenant isolation violation.
+    fn collect_claim_candidates_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<LogicalTime>, GetRunError>;
 
     /// Mark run as Done. Precondition: Active. Idempotent via `op_id`.
     ///

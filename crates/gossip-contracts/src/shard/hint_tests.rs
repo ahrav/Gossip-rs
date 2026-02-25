@@ -389,7 +389,7 @@ fn manifest_shard_rejects_inverted_rows() {
 
 #[test]
 fn decode_helpers_propagate_malformed_metadata_errors() {
-    let spec = ShardSpec::with_range_and_metadata(b"a".to_vec(), b"b".to_vec(), vec![0x00]);
+    let spec = ShardSpec::with_range_and_metadata(b"a", b"b", vec![0x00]);
     assert!(decode_metadata(&spec).is_err());
     assert!(decode_hint(&spec).is_err());
     assert!(decode_connector_extra(&spec).is_err());

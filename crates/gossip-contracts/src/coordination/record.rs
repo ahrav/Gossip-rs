@@ -10,7 +10,8 @@
 //! - [`ShardStatus`] — lifecycle state machine (`Active -> Done | Parked | Split`)
 //! - [`ParkReason`] — coordination-level categories for why a shard was halted
 //! - [`ShardRecord`] — the full record with 10 runtime invariant assertions
-//! - [`ShardSnapshot`] — worker-visible read-only view returned on acquisition
+//! - [`crate::coordination::error::ShardSnapshotView`] — worker-visible
+//!   read-only view returned on acquisition
 //!
 //! ## Ownership Model
 //!
@@ -22,34 +23,39 @@
 //!
 //! ## Arena Pooling
 //!
-//! Variable-size byte fields (spec key ranges, cursor keys) are stored in a
-//! shared [`ByteSlab`] via `PooledShardSpec` and `PooledCursor`, avoiding
-//! per-field heap allocations on hot paths. The record does not implement
-//! `Drop` — the coordinator must call `deallocate_fields()` before discarding.
+//! Variable-size byte fields (spec key ranges, cursor keys, and spawned
+//! lineage) are stored in a shared [`ByteSlab`] via `PooledShardSpec`,
+//! `PooledCursor`, and `PooledSpawned`, avoiding per-field heap allocations
+//! on hot paths. The record does not implement `Drop`. If a record is removed
+//! while the slab stays live, the coordinator must call `deallocate_fields()`
+//! to release pooled slots. Coordinator-wide teardown may instead clear/drop
+//! the slab in bulk.
 
-use std::borrow::Borrow;
 use std::fmt;
 
 use blake3::Hasher;
-use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
+#[cfg(test)]
+use gossip_stdx::InlineVec;
+use gossip_stdx::{ByteSlab, RingBuffer};
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::lease::{LeaseHolder, OpLogEntry};
-use crate::coordination::pooled::{PooledCursor, PooledShardSpec};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
+use crate::coordination::pooled::{PooledCursor, PooledShardSpec, PooledSpawned};
+#[cfg(test)]
+use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use crate::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
 };
 
 use super::split::MAX_SPAWNED_PER_SHARD;
 
-/// Inline-first list for shard spawn tracking.
+/// Spawned-lineage input storage used by test helpers.
 ///
-/// 8 inline slots cover the common case of a single split-replace (up to
-/// 8 children stored without heap allocation). Shards that undergo multiple
-/// residual splits or very large fan-out splits spill to heap, but these
-/// cases are rare enough that the inline optimization dominates.
-pub(crate) type SpawnedList = InlineVec<ShardId, 8>;
+/// Runtime shard records store lineage in slab-backed [`PooledSpawned`], but
+/// test constructors accept this inline container for ergonomics.
+#[cfg(test)]
+pub(crate) type SpawnedList = InlineVec<ShardId, MAX_SPAWNED_PER_SHARD>;
 
 // ============================================================================
 // ShardStatus
@@ -309,7 +315,7 @@ pub struct ShardRecord {
     /// Shards created by this shard via split operations.
     /// For `status == Split`: the replacement children.
     /// For `status == Active`: any residual shards spawned so far.
-    pub(crate) spawned: SpawnedList,
+    pub(crate) spawned: PooledSpawned,
 
     // -- Idempotency --
     /// Bounded operation log for idempotent replay.
@@ -364,7 +370,8 @@ impl ShardRecord {
     ///
     /// # Errors
     ///
-    /// Returns `SlabFull` if the slab cannot allocate space for the spec.
+    /// Returns `SlabFull` if the slab cannot allocate space for spec or
+    /// cursor bytes.
     pub(crate) fn new_active_with_cursor(
         tenant: TenantId,
         run: RunId,
@@ -394,10 +401,10 @@ impl ShardRecord {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: None,
-            spawned: InlineVec::new(),
+            spawned: PooledSpawned::new(),
             op_log: RingBuffer::new(),
         };
-        record.assert_invariants();
+        record.assert_invariants(slab);
         Ok(record)
     }
 
@@ -440,10 +447,10 @@ impl ShardRecord {
             lease: None,
             fence_epoch: FenceEpoch::INITIAL,
             parent: Some(parent),
-            spawned: InlineVec::new(),
+            spawned: PooledSpawned::new(),
             op_log: RingBuffer::new(),
         };
-        record.assert_invariants();
+        record.assert_invariants(slab);
         Ok(record)
     }
 
@@ -460,7 +467,7 @@ impl ShardRecord {
         status: ShardStatus,
         park_reason: Option<ParkReason>,
         spec: &ShardSpec,
-        cursor: &Cursor,
+        cursor: CursorUpdate<'_>,
         cursor_semantics: CursorSemantics,
         lease: Option<LeaseHolder>,
         fence_epoch: FenceEpoch,
@@ -469,10 +476,12 @@ impl ShardRecord {
         op_log: RingBuffer<OpLogEntry, { ShardRecord::OP_LOG_CAP }>,
         slab: &mut ByteSlab,
     ) -> Self {
-        let pooled_spec =
-            PooledShardSpec::from_spec(spec, slab).expect("from_raw_parts: slab too small");
+        let pooled_spec = PooledShardSpec::from_spec_ref(spec.as_ref(), slab)
+            .expect("from_raw_parts: slab too small");
         let pooled_cursor =
-            PooledCursor::from_cursor(cursor, slab).expect("from_raw_parts: slab too small");
+            PooledCursor::from_update(&cursor, slab).expect("from_raw_parts: slab too small");
+        let pooled_spawned = PooledSpawned::from_slice(spawned.as_slice(), slab)
+            .expect("from_raw_parts: slab too small");
         Self {
             tenant,
             run,
@@ -485,7 +494,7 @@ impl ShardRecord {
             lease,
             fence_epoch,
             parent,
-            spawned,
+            spawned: pooled_spawned,
             op_log,
         }
     }
@@ -520,9 +529,9 @@ impl ShardRecord {
     /// bugs. Monitor for coordinator process crashes and alert immediately.
     /// The shard's durable state is safe (the failing operation was not
     /// persisted), but the root cause must be investigated.
-    pub fn assert_invariants(&self) {
+    pub fn assert_invariants(&self, slab: &ByteSlab) {
         self.assert_lifecycle_invariants();
-        self.assert_lineage_invariants();
+        self.assert_lineage_invariants(slab);
     }
 
     /// INV-1 through INV-5: status, park_reason, lease, fence, op-log cap.
@@ -578,7 +587,7 @@ impl ShardRecord {
 
     /// INV-6 through INV-10: split/spawned, parent/derived (biconditional),
     /// op-log uniqueness, spawned cap.
-    fn assert_lineage_invariants(&self) {
+    fn assert_lineage_invariants(&self, slab: &ByteSlab) {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split {
             assert!(
@@ -605,7 +614,7 @@ impl ShardRecord {
         }
 
         // INV-8: All spawned entries must be derived.
-        for (i, spawned_id) in self.spawned.iter().enumerate() {
+        for (i, spawned_id) in self.spawned.iter(slab).enumerate() {
             assert!(
                 spawned_id.is_derived(),
                 "Shard {:?}: spawned[{i}] ({:?}) is not derived (bit 63 not set)",
@@ -647,9 +656,9 @@ impl ShardRecord {
     ///
     /// This is the non-panicking counterpart to [`assert_invariants`](Self::assert_invariants).
     /// Both check the same set of invariants (INV-1 through INV-10).
-    pub fn validate_invariants(&self) -> Result<(), String> {
+    pub fn validate_invariants(&self, slab: &ByteSlab) -> Result<(), String> {
         self.validate_lifecycle_invariants()?;
-        self.validate_lineage_invariants()
+        self.validate_lineage_invariants(slab)
     }
 
     /// INV-1 through INV-5 (non-panicking).
@@ -704,7 +713,7 @@ impl ShardRecord {
     }
 
     /// INV-6 through INV-10 (non-panicking).
-    fn validate_lineage_invariants(&self) -> Result<(), String> {
+    fn validate_lineage_invariants(&self, slab: &ByteSlab) -> Result<(), String> {
         // INV-6: Split implies spawned is non-empty.
         if self.status == ShardStatus::Split && self.spawned.is_empty() {
             return Err(format!(
@@ -728,7 +737,7 @@ impl ShardRecord {
         }
 
         // INV-8: All spawned entries must be derived.
-        for (i, spawned_id) in self.spawned.iter().enumerate() {
+        for (i, spawned_id) in self.spawned.iter(slab).enumerate() {
             if !spawned_id.is_derived() {
                 return Err(format!(
                     "Shard {:?}: spawned[{i}] ({:?}) is not derived (bit 63 not set)",
@@ -765,42 +774,18 @@ impl ShardRecord {
         Ok(())
     }
 
-    /// Create a [`ShardSnapshot`] for returning to a worker on acquisition.
-    ///
-    /// Contains only the information a worker needs to resume scanning.
-    /// Excludes lease, fence, op_log, tenant, park_reason, and identity
-    /// fields (run, shard). The worker gets lease info from the Lease
-    /// return value and already knows its tenant and shard identity. Spawned
-    /// children are copied by ID without exposing the internal container type.
-    ///
-    /// Materializes owned `ShardSpec` and `Cursor` from the slab (heap
-    /// allocations), since the snapshot crosses the API boundary.
-    /// Simulation hot paths should prefer `SimIntrospection` borrowed
-    /// accessors (`spec_bounds`, `cursor_last_key`) to avoid this copy.
-    #[must_use]
-    #[cfg(any(test, feature = "test-support"))]
-    #[allow(dead_code)]
-    pub(crate) fn snapshot(&self, slab: &ByteSlab) -> ShardSnapshot {
-        self.assert_invariants();
-        ShardSnapshot::new(
-            self.status,
-            self.spec.to_spec(slab),
-            self.cursor.to_cursor(slab),
-            self.cursor_semantics,
-            self.parent,
-            self.spawned.iter(),
-        )
-    }
-
     /// Deallocate all slab-backed fields.
     ///
-    /// Must be called before dropping a `ShardRecord` to avoid slab leaks.
-    /// After this call, spec and cursor fields are reset to empty/initial.
-    /// Used by coordinator drop/rollback paths and by simulation wrappers
-    /// via `SimIntrospection::release_record_fields`.
+    /// Call this before discarding a `ShardRecord` while its `ByteSlab`
+    /// remains in use, otherwise pooled slots remain live and consume slab
+    /// capacity. Releases spec, cursor, and spawned-lineage storage.
+    ///
+    /// Used by coordinator rollback/drop paths (debug leak checks) and by
+    /// simulation wrappers via `SimIntrospection::release_record_fields`.
     pub(crate) fn deallocate_fields(&mut self, slab: &mut ByteSlab) {
         self.spec.release_fields(slab);
         self.cursor.release_fields(slab);
+        self.spawned.release_fields(slab);
     }
 
     /// Look up an op-log entry by [`OpId`].
@@ -955,111 +940,6 @@ impl ShardRecord {
 // Compile-time binding: OP_LOG_CAP matches the RingBuffer's const capacity.
 // RingBuffer's own compile-time checks enforce N > 0 and power-of-2.
 const _: () = assert!(ShardRecord::OP_LOG_CAP == 16);
-
-// ============================================================================
-// ShardSnapshot
-// ============================================================================
-
-/// Read-only snapshot of shard state returned to a worker on acquisition.
-///
-/// Contains everything a worker needs to resume scanning:
-/// - Current lifecycle state (`status`)
-/// - What to scan (`spec` — the key range and connector metadata)
-/// - Where to resume (`cursor` — the two-layer progress marker)
-/// - How to interpret the cursor (`cursor_semantics`)
-/// - Lineage context (`parent`, `spawned`)
-///
-/// Excludes coordination-internal state:
-/// - `run`, `shard` — the worker already knows its identity from the acquire call
-/// - `tenant` — the worker already knows its tenant
-/// - `lease`, `fence_epoch` — the worker gets these from the Lease
-/// - `op_log` — internal to the coordinator
-/// - `park_reason` — only relevant for parked shards, which aren't acquired
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShardSnapshot {
-    status: ShardStatus,
-    spec: ShardSpec,
-    cursor: Cursor,
-    cursor_semantics: CursorSemantics,
-    parent: Option<ShardId>,
-    spawned: SpawnedList,
-}
-
-impl ShardSnapshot {
-    /// Construct a new snapshot from individual fields.
-    ///
-    /// Prefer [`ShardRecord::snapshot()`] which validates invariants
-    /// before constructing.
-    ///
-    /// Accepts any iterator of borrowed [`ShardId`] values so callers can pass
-    /// slices, iterators, or concrete spawned-list containers without coupling
-    /// this API to one storage representation.
-    #[must_use]
-    pub(crate) fn new<I, S>(
-        status: ShardStatus,
-        spec: ShardSpec,
-        cursor: Cursor,
-        cursor_semantics: CursorSemantics,
-        parent: Option<ShardId>,
-        spawned: I,
-    ) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Borrow<ShardId>,
-    {
-        let spawned = spawned.into_iter().map(|id| *id.borrow()).collect();
-        Self {
-            status,
-            spec,
-            cursor,
-            cursor_semantics,
-            parent,
-            spawned,
-        }
-    }
-
-    /// The shard's lifecycle status.
-    #[inline]
-    #[must_use]
-    pub fn status(&self) -> ShardStatus {
-        self.status
-    }
-
-    /// The shard specification (key range and metadata).
-    #[inline]
-    #[must_use]
-    pub fn spec(&self) -> &ShardSpec {
-        &self.spec
-    }
-
-    /// The current cursor position.
-    #[inline]
-    #[must_use]
-    pub fn cursor(&self) -> &Cursor {
-        &self.cursor
-    }
-
-    /// The cursor semantics (Completed vs Dispatched).
-    #[inline]
-    #[must_use]
-    pub fn cursor_semantics(&self) -> CursorSemantics {
-        self.cursor_semantics
-    }
-
-    /// The parent shard, if this shard was created by a split.
-    #[inline]
-    #[must_use]
-    pub fn parent(&self) -> Option<ShardId> {
-        self.parent
-    }
-
-    /// Shards spawned by this shard.
-    #[inline]
-    #[must_use]
-    pub fn spawned(&self) -> &[ShardId] {
-        self.spawned.as_slice()
-    }
-}
 
 #[cfg(test)]
 #[path = "record_tests.rs"]

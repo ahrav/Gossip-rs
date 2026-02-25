@@ -58,7 +58,7 @@
 //!   the common unchanged-cursor path.
 //! - S6 consumes borrowed cursor/spec slices from `SimIntrospection`
 //!   (`cursor_last_key` + `spec_bounds`) so bounds checks run without
-//!   materializing `Cursor`/`ShardSpec` per record.
+//!   materializing owned cursor/spec objects per record.
 //! - After each pass, permanently terminal shards (`Done`, `Split`) are
 //!   pruned from `prev_epochs` and `prev_cursors` to bound memory growth
 //!   in long-running simulations with many split cascades. `prev_terminal`
@@ -360,7 +360,7 @@ impl InvariantChecker {
                 record.fence_epoch,
                 &mut violations,
             );
-            Self::check_record_invariant(record, &mut violations);
+            Self::check_record_invariant(coordinator, record, &mut violations);
             let current_last_key = coordinator.cursor_last_key(record);
             let (spec_start, spec_end) = coordinator.spec_bounds(record);
             self.check_cursor_monotonicity(id, current_last_key, &mut violations);
@@ -502,8 +502,12 @@ impl InvariantChecker {
     ///
     /// Delegates to the record's non-panicking [`validate_invariants`](ShardRecord::validate_invariants),
     /// which works correctly under both `panic=unwind` and `panic=abort`.
-    fn check_record_invariant(record: &ShardRecord, violations: &mut Vec<InvariantViolation>) {
-        if let Err(message) = record.validate_invariants() {
+    fn check_record_invariant(
+        coordinator: &impl SimIntrospection,
+        record: &ShardRecord,
+        violations: &mut Vec<InvariantViolation>,
+    ) {
+        if let Err(message) = coordinator.validate_record_invariants(record) {
             violations.push(InvariantViolation::RecordInvariant {
                 run: record.run,
                 shard: record.shard,
@@ -514,8 +518,8 @@ impl InvariantChecker {
 
     /// S5: cursor monotonicity.
     ///
-    /// Compares raw `Option<&[u8]>` slices rather than constructing `Cursor`
-    /// objects, avoiding a heap allocation per shard per step.
+    /// Compares raw `Option<&[u8]>` slices rather than constructing owned
+    /// cursor objects, avoiding a heap allocation per shard per step.
     fn check_cursor_monotonicity(
         &mut self,
         id: (TenantId, RunId, ShardId),
@@ -590,7 +594,7 @@ impl InvariantChecker {
         }
         self.scratch_missing.clear();
         self.scratch_wrong_parent.clear();
-        for &child_id in &record.spawned {
+        for child_id in coordinator.spawned_children(record) {
             let child_key = ShardKey::new(record.run, child_id);
             match coordinator.shard_lookup(&tenant, &child_key) {
                 Some(child_record) => {

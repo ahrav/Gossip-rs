@@ -36,10 +36,10 @@
 //! | `DERIVE_SPLIT_CHILD_0_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
 //! | `DERIVE_SPLIT_CHILD_1_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
 //! | `DERIVE_SPLIT_RESIDUAL_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `HASH_CHECKPOINT_EXPECTED` | `domain::OP_PAYLOAD_V1` | Checkpoint payload encoding or `Cursor` canonical encoding changes |
-//! | `HASH_COMPLETE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Complete payload encoding or `Cursor` canonical encoding changes |
+//! | `HASH_CHECKPOINT_EXPECTED` | `domain::OP_PAYLOAD_V1` | Checkpoint payload encoding or `CursorUpdate` canonical encoding changes |
+//! | `HASH_COMPLETE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Complete payload encoding or `CursorUpdate` canonical encoding changes |
 //! | `HASH_PARK_EXPECTED` | `domain::OP_PAYLOAD_V1` | Park payload encoding or `ParkReason` discriminant changes |
-//! | `HASH_SPLIT_REPLACE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-replace payload or `ShardSpec`/`Cursor` canonical encoding changes |
+//! | `HASH_SPLIT_REPLACE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-replace payload or `ShardSpec`/`CursorUpdate` canonical encoding changes |
 //! | `HASH_SPLIT_RESIDUAL_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-residual payload or `ShardSpec` canonical encoding changes |
 //!
 //! # Adding a new vector
@@ -184,7 +184,7 @@ const HASH_SPLIT_RESIDUAL_EXPECTED: u64 = 0x4be2_bdea_6344_7e13;
 fn stable_item_id_golden_value() {
     let key = ItemKey::new(
         ConnectorTag::from_ascii(b"github"),
-        b"org/repo\0src/main.rs".to_vec(),
+        b"org/repo\0src/main.rs",
     );
     let id = key.stable_id();
     assert_eq!(
@@ -473,10 +473,10 @@ const _: () = assert!(DERIVE_SPLIT_RESIDUAL_EXPECTED & (1u64 << 63) != 0);
 
 #[test]
 fn hash_checkpoint_golden_value() {
-    use crate::coordination::cursor::Cursor;
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::split::hash_checkpoint_payload;
 
-    let cursor = Cursor::with_last_key(b"golden-cursor-key".to_vec());
+    let cursor = CursorUpdate::with_last_key(b"golden-cursor-key");
     let hash = hash_checkpoint_payload(&cursor);
     assert_eq!(
         hash, HASH_CHECKPOINT_EXPECTED,
@@ -487,10 +487,10 @@ fn hash_checkpoint_golden_value() {
 
 #[test]
 fn hash_complete_golden_value() {
-    use crate::coordination::cursor::Cursor;
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::split::hash_complete_payload;
 
-    let cursor = Cursor::with_last_key(b"golden-cursor-key".to_vec());
+    let cursor = CursorUpdate::with_last_key(b"golden-cursor-key");
     let hash = hash_complete_payload(&cursor);
     assert_eq!(
         hash, HASH_COMPLETE_EXPECTED,
@@ -514,18 +514,18 @@ fn hash_park_golden_value() {
 
 #[test]
 fn hash_split_replace_golden_value() {
-    use crate::coordination::cursor::{Cursor, CursorUpdate};
+    use crate::coordination::cursor::CursorUpdate;
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{
         SplitReplaceChild, SplitReplacePlan, hash_split_replace_payload,
     };
 
-    let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let cursor1 = Cursor::initial();
-    let cursor2 = Cursor::initial();
-    let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&cursor1));
-    let c2 = SplitReplaceChild::new(spec2.as_ref(), CursorUpdate::from_cursor(&cursor2));
+    let spec1 = ShardSpec::with_range(b"a", b"m");
+    let spec2 = ShardSpec::with_range(b"m", b"z");
+    let cursor1 = CursorUpdate::initial();
+    let cursor2 = CursorUpdate::initial();
+    let c1 = SplitReplaceChild::new(spec1.as_ref(), cursor1);
+    let c2 = SplitReplaceChild::new(spec2.as_ref(), cursor2);
     let plan = SplitReplacePlan::try_new(vec![c1, c2]).unwrap();
     let hash = hash_split_replace_payload(&plan);
     assert_eq!(
@@ -540,8 +540,8 @@ fn hash_split_residual_golden_value() {
     use crate::coordination::shard_spec::ShardSpec;
     use crate::coordination::split::{SplitResidualPlan, hash_split_residual_payload};
 
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let parent_new = ShardSpec::with_range(b"a", b"m");
+    let residual = ShardSpec::with_range(b"m", b"z");
     let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
     let hash = hash_split_residual_payload(&plan);
     assert_eq!(

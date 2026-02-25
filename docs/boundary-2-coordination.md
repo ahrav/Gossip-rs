@@ -355,7 +355,7 @@ irrecoverable corruption.
 
 ### Lease structure
 
-A `Lease` is the capability returned by `acquire_and_restore` and required by
+A `Lease` is the capability returned by `acquire_and_restore_into` and required by
 all lease-gated mutations. It contains:
 
 - `tenant: TenantId` -- tenant isolation scope
@@ -369,7 +369,7 @@ via accessors.
 
 ### Fencing token protocol
 
-Every `acquire_and_restore` increments the shard's `fence_epoch`. Subsequent
+Every `acquire_and_restore_into` increments the shard's `fence_epoch`. Subsequent
 mutations must present a lease whose `fence` matches the record's current
 epoch. If the epoch does not match, the operation is rejected with
 `StaleFence` -- the worker is a zombie from a prior ownership period.
@@ -447,7 +447,7 @@ PostgreSQL, deterministic simulator) must implement:
 
 | Operation             | Signature                                          | Terminal?    | Idempotent? | Lease-gated? |
 |-----------------------|----------------------------------------------------|:------------:|:-----------:|:------------:|
-| `acquire_and_restore` | `(now, tenant, key, worker) -> (Lease, Snapshot)`  | No           | No          | No           |
+| `acquire_and_restore_into` | `(now, tenant, key, worker) -> (Lease, Snapshot)`  | No           | No          | No           |
 | `renew`               | `(now, tenant, lease) -> new_deadline`             | No           | No          | Yes          |
 | `checkpoint`          | `(now, tenant, lease, cursor, op_id) -> ()`        | No           | Yes (OpId)  | Yes          |
 | `complete`            | `(now, tenant, lease, cursor, op_id) -> ()`        | Yes (Done)   | Yes (OpId)  | Yes          |
@@ -457,7 +457,7 @@ PostgreSQL, deterministic simulator) must implement:
 
 ### Operation semantics
 
-**`acquire_and_restore`** -- the entry point for a worker to start or resume
+**`acquire_and_restore_into`** -- the entry point for a worker to start or resume
 scanning. Verifies the shard is Active and unleased (or lease expired),
 increments `fence_epoch`, grants a new lease, and returns a `ShardSnapshot`
 with the shard's last checkpointed cursor. NOT idempotent: each successful
@@ -584,7 +584,7 @@ half-open `[start, end)` byte-key ranges.
 | D2.12 | ShardSnapshot excludes lease, fence, op_log, tenant, park_reason                  |
 | D2.13 | Trait is synchronous (returns `Result`, not futures)                              |
 | D2.14 | Lease-gated operations take `(TenantId, Lease)`                                   |
-| D2.15 | `acquire_and_restore` is the only non-lease operation                             |
+| D2.15 | `acquire_and_restore_into` is the only non-lease operation                             |
 | D2.16 | Error types are operation-specific enums via `From<CoordError>`                   |
 | D2.17 | `now: LogicalTime` passed explicitly (deterministic simulation)                   |
 | D2.18 | `RunRecord` is the authoritative run record                                       |
@@ -618,7 +618,7 @@ decision.
 
 | Operation             | Error Type           | OpIdConflict? | Cursor Variants? | Split Variants? |
 |-----------------------|----------------------|:-------------:|:----------------:|:---------------:|
-| `acquire_and_restore` | `AcquireError`       | No            | No               | No              |
+| `acquire_and_restore_into` | `AcquireError`       | No            | No               | No              |
 | `renew`               | `RenewError`         | No            | No               | No              |
 | `checkpoint`          | `CheckpointError`    | Yes           | Yes              | No              |
 | `complete`            | `CompleteError`      | Yes           | Yes              | No              |
@@ -668,7 +668,7 @@ coordination protocol. It implements both `CoordinationBackend` and
   cursor token). `ShardRecord` fields hold `PooledShardSpec` and
   `PooledCursor` wrappers whose `ByteSlot` handles index into the slab.
   This replaces per-field `Box<[u8]>` heap allocations with slab operations
-  on the `checkpoint` and `acquire_and_restore` hot paths (D2.26).
+  on the `checkpoint` and `acquire_and_restore_into` hot paths (D2.26).
 - **Tiger-style invariant enforcement** -- every mutation path calls
   `ShardRecord::assert_invariants()` before returning.
 

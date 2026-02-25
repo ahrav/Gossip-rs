@@ -10,11 +10,11 @@
 //! ```text
 //! coordination/
 //! ├── traits.rs        CoordinationBackend — the semantic contract all backends implement
-//! ├── record.rs        ShardRecord, ShardStatus, ShardSnapshot — authoritative shard state
+//! ├── record.rs        ShardRecord, ShardStatus — authoritative shard state
 //! ├── shard_spec.rs    ShardSpec, ShardSpecRef, CursorSemantics — key ranges and split validation
 //! ├── split.rs         SplitReplacePlan, SplitResidualPlan — split types and ID derivation
-//! ├── error.rs         CoordError + per-operation error types — type-safe error routing
-//! ├── cursor.rs        Cursor, CursorUpdate — two-layer progress marker
+//! ├── error.rs         CoordError + per-operation error types + ShardSnapshotView
+//! ├── cursor.rs        CursorUpdate — two-layer progress marker
 //! ├── lease.rs         Lease, LeaseHolder, OpLogEntry — ownership tokens and idempotency log
 //! ├── run.rs           RunRecord, RunManagement — run lifecycle and shard registration
 //! ├── validation.rs    validate_lease, check_op_idempotency — shared precondition checks
@@ -33,11 +33,11 @@
 //!
 //! ## Allocation Strategy
 //!
-//! Checkpoint/complete mutations take borrowed [`CursorUpdate`] inputs to
-//! avoid transient heap allocations. Owned [`Cursor`] values are only used
-//! for persisted snapshots and read-side materialization. The same owned-vs-borrowed
-//! split applies to [`ShardSpec`] (owned, heap-backed) vs
-//! [`ShardSpecRef`] (borrowed, zero-copy).
+//! Checkpoint/complete mutations take borrowed [`CursorUpdate`] inputs, and
+//! acquire restores write into caller-owned [`AcquireScratch`] buffers. Runtime
+//! coordination paths stay borrowed/slab-backed and avoid heap materialization
+//! of cursor/spec payload bytes. Simulation split planning follows the same
+//! pattern by building `ShardSpecRef` plans from stack-copied bounds.
 //!
 //! ## Dependency Direction
 //!
@@ -76,15 +76,15 @@ pub mod validation;
 
 // -- Progress tracking --
 pub use cursor::{
-    Cursor, CursorAdvance, CursorBoundsCheck, CursorInputError, CursorUpdate, MAX_KEY_SIZE,
+    CursorAdvance, CursorBoundsCheck, CursorInputError, CursorUpdate, MAX_KEY_SIZE,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
 };
 
 // -- Error types and result wrappers --
 pub use error::{
-    AcquireError, AcquireResult, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError,
-    CompleteError, CoordError, CursorOutOfBoundsDetail, IdempotentOutcome, ParkError, RenewError,
-    RenewResult, ShardSnapshotView, SplitError, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
+    CoordError, CursorOutOfBoundsDetail, IdempotentOutcome, ParkError, RenewError, RenewResult,
+    ShardSnapshotView, SplitError, SplitReplaceError, SplitResidualError,
 };
 
 // -- Observability --
@@ -100,7 +100,7 @@ pub use in_memory::InMemoryCoordinator;
 pub use lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 
 // -- Shard state --
-pub use record::{ParkReason, ShardRecord, ShardSnapshot, ShardStatus};
+pub use record::{ParkReason, ShardRecord, ShardStatus};
 
 // -- Run lifecycle --
 pub use run::RunManagement;

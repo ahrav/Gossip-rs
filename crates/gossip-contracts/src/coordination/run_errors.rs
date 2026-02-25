@@ -143,6 +143,11 @@ pub enum RegisterShardsError {
     /// The byte slab could not satisfy an allocation request.
     /// Recoverable: the caller may retry after freeing slab space.
     ResourceExhausted(SlabFull),
+    /// Coordinator index/map capacity could not be expanded for this request.
+    /// Recoverable: retry with a larger runtime capacity budget.
+    CapacityExceeded {
+        resource: &'static str,
+    },
 }
 
 impl fmt::Debug for RegisterShardsError {
@@ -172,6 +177,10 @@ impl fmt::Debug for RegisterShardsError {
                 .field("scope", scope)
                 .finish(),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
+            Self::CapacityExceeded { resource } => f
+                .debug_struct("CapacityExceeded")
+                .field("resource", resource)
+                .finish(),
         }
     }
 }
@@ -200,6 +209,9 @@ impl fmt::Display for RegisterShardsError {
                 )
             }
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
+            Self::CapacityExceeded { resource } => {
+                write!(f, "coordinator capacity exceeded for {resource}")
+            }
         }
     }
 }
@@ -225,7 +237,7 @@ impl From<SlabFull> for RegisterShardsError {
 // GetRunError
 // ============================================================================
 
-/// Error from `get_run`, `get_run_progress`, and `list_shards`.
+/// Error from `get_run`, `get_run_progress`, and `list_shards_into`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GetRunError {

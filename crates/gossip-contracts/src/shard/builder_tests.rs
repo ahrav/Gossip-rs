@@ -2,6 +2,7 @@ use super::{PreallocShardBuilder, PreallocShardBuilderError};
 use crate::coordination::{
     CursorUpdate, ManifestValidationError, ShardArena, ShardSpecRef, validate_manifest,
 };
+use crate::shard::key_encoding::decode_manifest_row_key;
 
 #[test]
 fn mixed_range_prefix_manifest_builds_valid_manifest() {
@@ -324,4 +325,112 @@ fn build_inputs_is_idempotent() {
         assert_eq!(a.shard().as_raw(), b.shard().as_raw());
         assert_eq!(a.spec().key_range_start(), b.spec().key_range_start());
     }
+}
+
+#[test]
+fn split_range_by_boundaries_exact_capacity_preserves_ordering() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let split_points: [&[u8]; 3] = [b"f", b"m", b"t"];
+    builder
+        .split_range_by_boundaries(b"a", &split_points, b"z", b"")
+        .unwrap();
+
+    assert_eq!(builder.len(), 4);
+    let inputs = builder.build_inputs().unwrap();
+    let starts: Vec<&[u8]> = inputs
+        .iter()
+        .map(|entry| entry.spec().key_range_start())
+        .collect();
+    let ends: Vec<&[u8]> = inputs
+        .iter()
+        .map(|entry| entry.spec().key_range_end())
+        .collect();
+    let ids: Vec<u64> = inputs.iter().map(|entry| entry.shard().as_raw()).collect();
+    assert_eq!(starts, vec![b"a".as_slice(), b"f", b"m", b"t"]);
+    assert_eq!(ends, vec![b"f".as_slice(), b"m", b"t", b"z"]);
+    assert_eq!(ids, vec![0, 1, 2, 3]);
+}
+
+#[test]
+fn split_range_by_boundaries_over_capacity_has_no_partial_writes() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 3).unwrap();
+    let split_points: [&[u8]; 3] = [b"f", b"m", b"t"];
+    let err = builder
+        .split_range_by_boundaries(b"a", &split_points, b"z", b"")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::CapacityExceeded {
+            limit: 3,
+            current: 0,
+            additional: 4
+        }
+    ));
+    assert!(builder.is_empty());
+}
+
+#[test]
+fn split_manifest_by_rows_exact_capacity_tiles_manifest_rows() {
+    let mut arena = ShardArena::with_capacity(3, 4_096);
+    let mut builder = PreallocShardBuilder::<3>::new(&mut arena, 3).unwrap();
+    builder.split_manifest_by_rows(7, 0, 10, 4, b"").unwrap();
+
+    let inputs = builder.build_inputs().unwrap();
+    assert_eq!(inputs.len(), 3);
+    let rows: Vec<(u64, u64, u64)> = inputs
+        .iter()
+        .map(|entry| {
+            let start = decode_manifest_row_key(entry.spec().key_range_start()).unwrap();
+            let end = decode_manifest_row_key(entry.spec().key_range_end()).unwrap();
+            (start.manifest_id(), start.row(), end.row())
+        })
+        .collect();
+    assert_eq!(rows, vec![(7, 0, 4), (7, 4, 8), (7, 8, 10)]);
+}
+
+#[test]
+fn split_manifest_by_rows_over_capacity_has_no_partial_writes() {
+    let mut arena = ShardArena::with_capacity(3, 4_096);
+    let mut builder = PreallocShardBuilder::<3>::new(&mut arena, 2).unwrap();
+    let err = builder
+        .split_manifest_by_rows(7, 0, 10, 4, b"")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::CapacityExceeded {
+            limit: 2,
+            current: 0,
+            additional: 3
+        }
+    ));
+    assert!(builder.is_empty());
+}
+
+#[test]
+fn split_manifest_by_rows_handles_u64_boundary_without_wrap() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let start_row = u64::MAX - 5;
+    let end_row = u64::MAX;
+    builder
+        .split_manifest_by_rows(99, start_row, end_row, 4, b"")
+        .unwrap();
+
+    let inputs = builder.build_inputs().unwrap();
+    assert_eq!(inputs.len(), 2);
+    let first_start =
+        decode_manifest_row_key(inputs.as_slice()[0].spec().key_range_start()).unwrap();
+    let first_end = decode_manifest_row_key(inputs.as_slice()[0].spec().key_range_end()).unwrap();
+    let second_start =
+        decode_manifest_row_key(inputs.as_slice()[1].spec().key_range_start()).unwrap();
+    let second_end = decode_manifest_row_key(inputs.as_slice()[1].spec().key_range_end()).unwrap();
+
+    assert_eq!(first_start.row(), start_row);
+    assert_eq!(first_end.row(), start_row + 4);
+    assert_eq!(second_start.row(), start_row + 4);
+    assert_eq!(second_end.row(), end_row);
 }

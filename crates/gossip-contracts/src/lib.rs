@@ -32,6 +32,17 @@
 //! | Flag | Default | Purpose |
 //! |------|---------|---------|
 //! | `test-support` | off | Enables test doubles and helpers for downstream crate tests. |
+//!
+//! # Allocation Contract Boundary
+//!
+//! Production runtime paths in this crate are designed to keep hot operations
+//! allocation-free after startup (for example, coordination acquire/checkpoint/
+//! complete flows that use borrowed inputs and caller-owned scratch buffers).
+//!
+//! This guarantee is intentionally **production-scoped**. The `sim` module is
+//! deterministic verification infrastructure exposed only for `#[cfg(test)]` or
+//! `test-support` builds, and it may allocate freely for ergonomics and richer
+//! diagnostics.
 
 #![forbid(unsafe_code)]
 

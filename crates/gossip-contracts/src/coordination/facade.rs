@@ -15,28 +15,20 @@
 //!   └── ShardClaiming        (this file: shard assignment)
 //! ```
 //!
-//! Backends must implement `ShardClaiming` explicitly. The trait
-//! provides a default method body that delegates to the free function
-//! [`default_claim_next_available`], so a one-line empty impl is
-//! sufficient for backends that need no custom claim logic:
-//!
-//! ```rust,ignore
-//! impl ShardClaiming for MyBackend {}
-//! ```
-//!
-//! Backends that need custom behavior (e.g., per-worker claim
-//! cooldown) override `claim_next_available` and may delegate to
-//! `default_claim_next_available` internally.
+//! Backends implement `ShardClaiming` explicitly. Implementations that
+//! want the shared scan-then-acquire behavior can delegate to
+//! [`default_claim_next_available`] while reusing a caller-owned
+//! candidate buffer (`Vec<ShardId>`).
 //!
 //! ## Design Rationale
 //!
 //! The default claim algorithm deliberately uses a two-step
-//! list-then-acquire pattern rather than requiring an atomic
+//! scan-then-acquire pattern rather than requiring an atomic
 //! "claim next" primitive from every backend. This keeps the
 //! `CoordinationBackend` trait minimal (no claim-specific method)
-//! while still being correct under concurrency -- the fencing
+//! while still being correct under concurrency — the fencing
 //! protocol in `acquire_and_restore_into` ensures at most one worker
-//! succeeds for any given shard, so the TOCTOU gap between list
+//! succeeds for any given shard, so the TOCTOU gap between scan
 //! and acquire is safe (losers simply retry the next candidate).
 //!
 //! The default logic is also exposed as the free function
@@ -46,10 +38,10 @@
 use std::fmt;
 
 use crate::coordination::error::{AcquireError, AcquireResultView, AcquireScratch};
-use crate::coordination::run::{RunManagement, ShardFilter};
+use crate::coordination::run::RunManagement;
 use crate::coordination::run_errors::GetRunError;
 use crate::coordination::traits::CoordinationBackend;
-use crate::identity::{LogicalTime, RunId, ShardKey, TenantId, WorkerId};
+use crate::identity::{LogicalTime, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
 // ClaimError
@@ -146,9 +138,9 @@ impl std::error::Error for ClaimError {}
 
 /// Maps run-lookup errors into claim errors.
 ///
-/// `list_shards` returns `GetRunError`, which we translate 1:1 since
-/// both `RunNotFound` and `TenantMismatch` apply identically at the
-/// claim level. The match is exhaustive (no wildcard) so adding a new
+/// `collect_claim_candidates_into` returns `GetRunError`, which we translate
+/// 1:1 since both `RunNotFound` and `TenantMismatch` apply identically at
+/// the claim level. The match is exhaustive (no wildcard) so adding a new
 /// `GetRunError` variant produces a compile error here.
 impl From<GetRunError> for ClaimError {
     fn from(e: GetRunError) -> Self {
@@ -174,10 +166,15 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///
 /// ## Algorithm
 ///
-/// 1. Fetch the candidate list via
-///    `list_shards(ShardFilter::available())` -- active, unleased shards.
-/// 2. If the list is empty, query `active()` shards to find the earliest
-///    lease deadline, then return `NoneAvailable` with that deadline.
+/// 1. Collect candidates via
+///    [`collect_claim_candidates_into`](RunManagement::collect_claim_candidates_into)
+///    — a single pass over the run's shard set that returns Active, unleased
+///    shard IDs and the earliest lease deadline among Active-but-leased shards.
+///    No [`ShardSummary`](crate::coordination::run::ShardSummary) objects are
+///    constructed and no slab-backed byte fields are copied.
+/// 2. If the candidate list is empty, return `NoneAvailable` with the
+///    earliest deadline from the scan (so callers can schedule a retry
+///    near the soonest lease expiry instead of busy-spinning).
 /// 3. Start iteration at offset `worker.as_raw() % len` so that
 ///    different workers begin at different candidates, reducing
 ///    contention on the first shard. The offset is deterministic
@@ -187,7 +184,7 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// 4. On success, return the `AcquireResult` (lease, snapshot, capacity hint).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
 ///    `ShardNotFound`), skip that candidate and try the next.
-/// 6. On `TenantMismatch`, fail immediately -- this indicates a
+/// 6. On `TenantMismatch`, fail immediately — this indicates a
 ///    logic bug, not a race.
 /// 7. If all candidates fail, return `NoneAvailable`. (If every
 ///    candidate returned `ShardNotFound`, this indicates index
@@ -195,39 +192,42 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///
 /// ## Concurrency
 ///
-/// There is an intentional TOCTOU gap between the `list_shards`
-/// snapshot and the per-shard `acquire_and_restore_into` calls. This is
-/// safe because the fencing protocol in `acquire_and_restore_into`
-/// guarantees at-most-one winner per shard. Workers that lose the
-/// race simply advance to the next candidate. The worst case for a
-/// single worker is O(S) failed acquire attempts where S is the
-/// number of available shards, since it tries each candidate at
-/// most once.
+/// There is an intentional TOCTOU gap between the candidate scan and the
+/// per-shard `acquire_and_restore_into` calls. This is safe because the
+/// fencing protocol in `acquire_and_restore_into` guarantees at-most-one
+/// winner per shard. Workers that lose the race simply advance to the next
+/// candidate. The worst case for a single worker is O(C) failed acquire
+/// attempts where C is the number of candidates, since it tries each
+/// candidate at most once.
 ///
 /// ## Parameters
 ///
 /// - `backend`: mutable reference to the coordination backend. The
 ///   `&mut B` bound means exactly one claim attempt is in flight per
-///   backend instance at a time -- concurrent claiming requires
+///   backend instance at a time — concurrent claiming requires
 ///   separate backend instances (one per worker thread/task).
-/// - `now`: logical timestamp threaded into both `list_shards` and
-///   `acquire_and_restore_into`. The coordinator never reads a wall clock;
-///   passing time explicitly is required for deterministic simulation.
+/// - `now`: logical timestamp threaded into both
+///   `collect_claim_candidates_into` and `acquire_and_restore_into`.
+///   The coordinator never reads a wall clock; passing time explicitly
+///   is required for deterministic simulation.
 /// - `tenant` / `run`: scope the candidate set and enforce isolation.
 /// - `worker`: identity recorded on the new lease if acquire succeeds.
+/// - `out`: caller-owned scratch space for the shard snapshot returned on
+///   success. Reused across calls — no allocation in steady state.
+/// - `candidates`: caller-owned buffer for shard IDs. Cleared and reused
+///   per call — no allocation in steady state.
 ///
 /// ## Complexity
 ///
-/// O(S) where S is the number of available shards. Each shard is
-/// attempted at most once. The `list_shards` call is O(S log S) in the
-/// in-memory backend (linear scan + sort over the run's shard map).
+/// O(S) where S is the number of shards in the run. The candidate scan
+/// is a single linear pass — no sort, no slab reads, no byte copies.
 ///
 /// ## Errors
 ///
-/// - [`ClaimError::NoneAvailable`] -- no shards to claim (empty list
+/// - [`ClaimError::NoneAvailable`] — no shards to claim (empty list
 ///   or all candidates lost to races).
-/// - [`ClaimError::RunNotFound`] -- the run does not exist.
-/// - [`ClaimError::TenantMismatch`] -- tenant isolation violation.
+/// - [`ClaimError::RunNotFound`] — the run does not exist.
+/// - [`ClaimError::TenantMismatch`] — tenant isolation violation.
 pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     backend: &mut B,
     now: LogicalTime,
@@ -235,35 +235,29 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     run: RunId,
     worker: WorkerId,
     out: &'a mut AcquireScratch,
+    candidates: &mut Vec<ShardId>,
 ) -> Result<AcquireResultView<'a>, ClaimError> {
-    let summaries = backend
-        .list_shards(now, tenant, run, ShardFilter::available())
+    let scan_deadline = backend
+        .collect_claim_candidates_into(now, tenant, run, candidates)
         .map_err(ClaimError::from)?;
 
-    if summaries.is_empty() {
-        // No unleased shards.  Query active shards (including leased) to
-        // surface the earliest lease deadline so callers can schedule a
-        // retry near the soonest expiry instead of busy-spinning.
-        let earliest_deadline = backend
-            .list_shards(now, tenant, run, ShardFilter::active())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|s| s.lease_deadline())
-            .min();
-        return Err(ClaimError::NoneAvailable { earliest_deadline });
+    if candidates.is_empty() {
+        return Err(ClaimError::NoneAvailable {
+            earliest_deadline: scan_deadline,
+        });
     }
 
-    let len = summaries.len();
+    let len = candidates.len();
     let offset = worker.as_raw() as usize % len;
     let mut inconsistency_count = 0usize;
-    let mut earliest_deadline: Option<LogicalTime> = None;
+    let mut earliest_deadline: Option<LogicalTime> = scan_deadline;
     let mut i = 0usize;
     let acquired = loop {
         if i == len {
             break None;
         }
-        let summary = &summaries[(offset + i) % len];
-        let key = ShardKey::new(run, summary.shard());
+        let shard_id = candidates[(offset + i) % len];
+        let key = ShardKey::new(run, shard_id);
         match backend.acquire_and_restore_into(now, tenant, key, worker, out) {
             Ok(result) => {
                 let snapshot = result.snapshot;
@@ -276,7 +270,7 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 ));
             }
             Err(AcquireError::AlreadyLeased { lease_deadline, .. }) => {
-                // Race -- another worker claimed it.  Track the deadline
+                // Race — another worker claimed it.  Track the deadline
                 // so callers can schedule their next attempt near the
                 // soonest lease expiry.  Only AlreadyLeased carries a
                 // deadline; terminal and not-found shards have none.
@@ -288,29 +282,27 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 continue;
             }
             Err(AcquireError::ShardTerminal { .. }) => {
-                // Shard became terminal between list and acquire.
+                // Shard became terminal between scan and acquire.
                 i += 1;
                 continue;
             }
             Err(AcquireError::ShardNotFound { .. }) => {
-                // list_shards returned this shard but acquire_and_restore
-                // says it doesn't exist.  This is a backend data
-                // inconsistency (the index disagrees with the shard map).
-                // Isolated occurrences are tolerable in release builds
-                // (a concurrent split_replace could theoretically cause
-                // a transient gap); all-not-found is data corruption and
-                // is caught by the post-loop assert.
+                // collect_claim_candidates_into returned this shard but
+                // acquire_and_restore says it doesn't exist.  Isolated
+                // occurrences are tolerable (a concurrent split_replace
+                // could cause a transient gap); all-not-found is data
+                // corruption and is caught by the post-loop assert.
                 debug_assert!(
                     false,
-                    "claim_next_available: list_shards returned shard {key:?} \
-                     but acquire_and_restore_into reports ShardNotFound"
+                    "claim_next_available: candidate shard {key:?} \
+                     not found during acquire_and_restore_into"
                 );
                 inconsistency_count += 1;
                 i += 1;
                 continue;
             }
             Err(AcquireError::TenantMismatch { expected }) => {
-                // Not a race -- this is a logic bug (wrong tenant
+                // Not a race — this is a logic bug (wrong tenant
                 // threaded into the call). Fail immediately; retrying
                 // other candidates would hit the same mismatch.
                 return Err(ClaimError::TenantMismatch { expected });
@@ -330,9 +322,9 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     // All-not-found means the backend's shard index is fundamentally
     // inconsistent with the shard map — unconditional panic (data corruption).
     assert!(
-        inconsistency_count < summaries.len(),
+        inconsistency_count < candidates.len(),
         "all {} candidates returned ShardNotFound — backend index vs shard map inconsistency",
-        summaries.len(),
+        candidates.len(),
     );
 
     // All candidates were claimed by other workers, became terminal,
@@ -356,29 +348,36 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
 ///
 /// ## Implementation
 ///
-/// Backends must implement this trait explicitly. The default method
-/// body delegates to [`default_claim_next_available`], so a minimal
-/// impl needs no method bodies:
+/// Backends implement [`claim_next_available`](Self::claim_next_available)
+/// explicitly. Implementations can delegate to
+/// [`default_claim_next_available`] as a building block:
 ///
 /// ```rust,ignore
-/// impl ShardClaiming for MyBackend {}
+/// impl ShardClaiming for MyBackend {
+///     fn claim_next_available<'a>(
+///         &mut self,
+///         now: LogicalTime,
+///         tenant: TenantId,
+///         run: RunId,
+///         worker: WorkerId,
+///         out: &'a mut AcquireScratch,
+///     ) -> Result<AcquireResultView<'a>, ClaimError> {
+///         default_claim_next_available(
+///             self,
+///             now,
+///             tenant,
+///             run,
+///             worker,
+///             out,
+///             &mut self.claim_candidates_scratch,
+///         )
+///     }
+/// }
 /// ```
 ///
 /// Backends that need custom claim behavior (e.g., per-worker cooldown,
-/// SQL `SKIP LOCKED`, locality-aware selection) override
-/// [`claim_next_available`](Self::claim_next_available) and may
-/// delegate to [`default_claim_next_available`] internally.
-///
-/// ## Default Algorithm
-///
-/// The default [`claim_next_available`](Self::claim_next_available)
-/// calls `list_shards(available)` then tries `acquire_and_restore_into` on
-/// each candidate sequentially. This is correct but not optimal under
-/// high contention -- it may attempt O(N) acquires before succeeding
-/// or giving up.
-///
-/// The default already spreads contention by starting iteration at
-/// `worker.as_raw() % len` (deterministic per-worker offset).
+/// SQL `SKIP LOCKED`, locality-aware selection) can implement their own
+/// candidate selection/acquire loop.
 pub trait ShardClaiming: CoordinationBackend + RunManagement {
     /// Attempt to claim the next available shard for `run`.
     ///
@@ -396,19 +395,9 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
     /// - [`ClaimError::Throttled`] -- the worker's claim cooldown has
     ///   not elapsed. Only returned by backends with per-worker rate
     ///   limiting (e.g., [`InMemoryCoordinator`] with a non-zero
-    ///   cooldown interval). The default implementation never returns
-    ///   `Throttled`; backends that add rate limiting must override
-    ///   this method to enforce it before delegating.
+    ///   cooldown interval).
     ///
     /// [`InMemoryCoordinator`]: crate::coordination::in_memory::InMemoryCoordinator
-    ///
-    /// ## `Self: Sized` bound
-    ///
-    /// Required because the default body passes `self` to the free
-    /// function [`default_claim_next_available`], which takes `&mut B`
-    /// by generic parameter. This means `claim_next_available` is
-    /// excluded from the vtable and cannot be called on `dyn
-    /// ShardClaiming`.
     fn claim_next_available<'a>(
         &mut self,
         now: LogicalTime,
@@ -416,19 +405,10 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
         run: RunId,
         worker: WorkerId,
         out: &'a mut AcquireScratch,
-    ) -> Result<AcquireResultView<'a>, ClaimError>
-    where
-        Self: Sized,
-    {
-        default_claim_next_available(self, now, tenant, run, worker, out)
-    }
+    ) -> Result<AcquireResultView<'a>, ClaimError>;
 }
 
 // No blanket impl: backends must implement `ShardClaiming` explicitly.
-// The trait provides a default method body that delegates to
-// `default_claim_next_available`, so a one-line empty impl suffices
-// for backends with no custom claim logic. Backends that need custom
-// behavior (e.g., per-worker cooldown) override the method directly.
 
 // ============================================================================
 // CoordinationFacade — combined super-trait
@@ -442,16 +422,6 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
 /// instead of listing three separate bounds. `CoordinationFacade`
 /// has a blanket impl, so any backend that implements all three
 /// component traits automatically satisfies it.
-///
-/// ## Object safety
-///
-/// `CoordinationFacade` is technically object-safe, but `dyn
-/// CoordinationFacade` loses access to
-/// [`ShardClaiming::claim_next_available`] because it carries a
-/// `where Self: Sized` bound (excluded from the vtable). Since
-/// claiming is the primary value of the facade, prefer
-/// `B: CoordinationFacade` as a generic bound over `dyn
-/// CoordinationFacade`.
 ///
 /// ## Typical lifecycle
 ///

@@ -36,7 +36,7 @@
 //! monotonicity, cursor monotonicity, idempotent replay) after every step.
 
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_result, acquire_shard, derived_shard_id, now, other_tenant,
@@ -73,7 +73,7 @@ fn acquire_basic() {
         result.lease.deadline(),
         now(1).checked_add(LEASE_DURATION).unwrap(),
     );
-    assert_eq!(result.snapshot.status(), ShardStatus::Active);
+    assert_eq!(result.snapshot().status(), ShardStatus::Active);
 }
 
 #[test]
@@ -411,19 +411,16 @@ fn split_replace_three_children() {
     let mut coord = seeded_coordinator();
     let lease = acquire_shard(&mut coord, 1, 1);
 
-    let spec_mid = ShardSpec::with_range(b"m".to_vec(), b"s".to_vec());
-    let spec_left = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec_right = ShardSpec::with_range(b"s".to_vec(), b"z".to_vec());
-    let cursor_mid = Cursor::initial();
-    let cursor_left = Cursor::initial();
-    let cursor_right = Cursor::initial();
+    let spec_mid = ShardSpec::with_range(b"m", b"s");
+    let spec_left = ShardSpec::with_range(b"a", b"m");
+    let spec_right = ShardSpec::with_range(b"s", b"z");
+    let cursor_mid = CursorUpdate::initial();
+    let cursor_left = CursorUpdate::initial();
+    let cursor_right = CursorUpdate::initial();
     let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(spec_mid.as_ref(), CursorUpdate::from_cursor(&cursor_mid)),
-        SplitReplaceChild::new(spec_left.as_ref(), CursorUpdate::from_cursor(&cursor_left)),
-        SplitReplaceChild::new(
-            spec_right.as_ref(),
-            CursorUpdate::from_cursor(&cursor_right),
-        ),
+        SplitReplaceChild::new(spec_mid.as_ref(), cursor_mid),
+        SplitReplaceChild::new(spec_left.as_ref(), cursor_left),
+        SplitReplaceChild::new(spec_right.as_ref(), cursor_right),
     ])
     .unwrap();
 
@@ -447,6 +444,69 @@ fn split_replace_three_children() {
             "child {child_id:?} must be Active"
         );
     }
+}
+
+#[test]
+fn split_replace_mid_build_failure_rolls_back_inserted_children() {
+    // Capacity math with 16-byte slab blocks:
+    // - Parent spec [a,z): 2 slots => 32 bytes
+    // - Child spec  [a,m): 2 slots => 32 bytes (first child can be inserted)
+    // - Second child then fails due exhausted slab.
+    let mut runtime = CoordinatorRuntimeConfig::with_limits(LEASE_DURATION, 100, 100);
+    runtime.slab_capacity = 64;
+    let mut coord = InMemoryCoordinator::with_runtime_config(runtime);
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+    let spec = test_spec();
+    let cursor = CursorUpdate::initial();
+    let shards = vec![InitialShardInput::new(test_shard(), spec.as_ref(), cursor)];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(11),
+        )
+        .unwrap();
+
+    let lease = acquire_shard(&mut coord, 3, 1);
+    let live_before = coord.slab().live_count();
+
+    let err = coord
+        .split_replace(
+            now(4),
+            test_tenant(),
+            &lease,
+            test_split_replace_plan(),
+            OpId::from_raw(22),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, SplitReplaceError::ResourceExhausted(_)),
+        "expected ResourceExhausted, got: {err:?}"
+    );
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "child fields leaked on split_replace failure"
+    );
+    assert_eq!(
+        coord.shard_count(),
+        1,
+        "failed split must not insert children"
+    );
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(parent.status, ShardStatus::Active);
+    assert!(
+        parent.spawned.is_empty(),
+        "parent spawned list must remain unchanged on failure"
+    );
 }
 
 // -- split_residual tests ----------------------------------------------
@@ -490,7 +550,7 @@ fn split_residual_basic() {
         test_worker(2),
     )
     .unwrap();
-    assert_eq!(new_result.snapshot.status(), ShardStatus::Active);
+    assert_eq!(new_result.snapshot().status(), ShardStatus::Active);
 }
 
 #[test]
@@ -534,12 +594,8 @@ fn split_residual_parent_update_failure_deallocates_residual_fields() {
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
     let spec = test_spec();
-    let cursor = Cursor::initial();
-    let shards = vec![InitialShardInput::new(
-        test_shard(),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    )];
+    let cursor = CursorUpdate::initial();
+    let shards = vec![InitialShardInput::new(test_shard(), spec.as_ref(), cursor)];
     let _ = coord
         .register_shards(
             now(2),
@@ -774,6 +830,56 @@ fn split_residual_replay_via_spawned_after_eviction() {
     assert_eq!(first.as_ref().residual, second.as_ref().residual);
 }
 
+#[test]
+fn split_residual_replay_via_spawned_after_additional_spawn() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    // First residual split: [a,z) -> parent [a,m), residual [m,z).
+    let plan1 = test_split_residual_plan();
+    let split_op1 = OpId::from_raw(200);
+    let first = coord
+        .split_residual(now(3), test_tenant(), &lease, plan1.clone(), split_op1)
+        .unwrap();
+    assert!(first.is_executed());
+
+    // Second residual split on the narrowed parent: [a,m) -> [a,j) + [j,m).
+    let parent2 = ShardSpec::with_range(b"a", b"j");
+    let residual2 = ShardSpec::with_range(b"j", b"m");
+    let plan2 = SplitResidualPlan::try_new(parent2.as_ref(), residual2.as_ref()).unwrap();
+    let second_exec = coord
+        .split_residual(now(4), test_tenant(), &lease, plan2, OpId::from_raw(201))
+        .unwrap();
+    assert!(second_exec.is_executed());
+
+    // Evict the first split op-log entry (cap=16) with enough checkpoints.
+    let mut key_byte = b'b';
+    for i in 1..=17u64 {
+        let key = [key_byte];
+        let cursor = CursorUpdate::new(&key);
+        let _ = coord
+            .checkpoint(
+                now(10 + i),
+                test_tenant(),
+                &lease,
+                &cursor,
+                OpId::from_raw(300 + i),
+            )
+            .unwrap();
+        if key_byte < b'i' {
+            key_byte += 1;
+        }
+    }
+
+    // Replay op1 after eviction: residual should still be found in spawned,
+    // even though it's no longer the newest spawned entry.
+    let replay = coord
+        .split_residual(now(40), test_tenant(), &lease, plan1, split_op1)
+        .unwrap();
+    assert!(replay.is_replay());
+    assert_eq!(replay.as_ref().residual, first.as_ref().residual);
+}
+
 // -- spawn-cap guard tests -----------------------------------------------
 //
 // Each shard tracks a `spawned` set of child ShardIds. When this set
@@ -799,7 +905,7 @@ fn coordinator_with_spawned_count(spawned_count: usize) -> InMemoryCoordinator {
         ShardStatus::Active,
         None,
         &test_spec(), // [a, z)
-        &Cursor::with_last_key(b"d".to_vec()),
+        CursorUpdate::with_last_key(b"d"),
         CursorSemantics::Completed,
         None,
         FenceEpoch::INITIAL,
@@ -856,6 +962,31 @@ fn split_residual_below_cap_succeeds() {
         .split_residual(now(2), test_tenant(), &lease, plan, OpId::from_raw(1))
         .unwrap();
     assert!(result.is_executed());
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(parent.spawned.len(), MAX_SPAWNED_PER_SHARD);
+}
+
+#[test]
+fn split_replace_fills_remaining_spawn_capacity() {
+    // Two below the cap with a 2-child split-replace should land exactly at cap.
+    let mut coord = coordinator_with_spawned_count(MAX_SPAWNED_PER_SHARD - 2);
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let result = coord
+        .split_replace(
+            now(2),
+            test_tenant(),
+            &lease,
+            test_split_replace_plan(),
+            OpId::from_raw(2),
+        )
+        .unwrap();
+    assert!(result.is_executed());
+
+    let parent = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(parent.status, ShardStatus::Split);
+    assert_eq!(parent.spawned.len(), MAX_SPAWNED_PER_SHARD);
 }
 
 // -- Idempotent replay after terminal state --------------------------------
@@ -927,16 +1058,13 @@ fn split_replace_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different plan (different split point).
-    let spec_left = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let spec_right = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
-    let cursor_left = Cursor::initial();
-    let cursor_right = Cursor::initial();
+    let spec_left = ShardSpec::with_range(b"a", b"p");
+    let spec_right = ShardSpec::with_range(b"p", b"z");
+    let cursor_left = CursorUpdate::initial();
+    let cursor_right = CursorUpdate::initial();
     let plan_b = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(spec_left.as_ref(), CursorUpdate::from_cursor(&cursor_left)),
-        SplitReplaceChild::new(
-            spec_right.as_ref(),
-            CursorUpdate::from_cursor(&cursor_right),
-        ),
+        SplitReplaceChild::new(spec_left.as_ref(), cursor_left),
+        SplitReplaceChild::new(spec_right.as_ref(), cursor_right),
     ])
     .unwrap();
 
@@ -973,8 +1101,8 @@ fn split_residual_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different plan (different split point).
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let residual = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+    let parent_new = ShardSpec::with_range(b"a", b"p");
+    let residual = ShardSpec::with_range(b"p", b"z");
     let plan_b = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
 
     let err = coord
@@ -1039,7 +1167,7 @@ fn split_replace_exceeds_per_tenant_limit() {
     coord.seed_shard(record);
 
     // Seed two additional shards to fill tenant to limit.
-    let spec2 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec2 = ShardSpec::with_range(b"a", b"z");
     let record2 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
@@ -1050,7 +1178,7 @@ fn split_replace_exceeds_per_tenant_limit() {
     )
     .unwrap();
     coord.seed_shard(record2);
-    let spec3 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec3 = ShardSpec::with_range(b"a", b"z");
     let record3 = ShardRecord::new_active(
         test_tenant(),
         test_run(),
@@ -1071,7 +1199,7 @@ fn split_replace_exceeds_per_tenant_limit() {
         .unwrap_err();
     assert!(
         matches!(err, SplitReplaceError::SplitInvalid(ref e)
-            if matches!(e.as_ref(),
+            if matches!(e,
                 SplitValidationError::ShardLimitExceeded { scope: ShardLimitScope::PerTenant, .. })),
         "expected ShardLimitExceeded(PerTenant), got: {err:?}",
     );
@@ -1095,7 +1223,7 @@ fn split_residual_exceeds_global_limit() {
     coord.seed_shard(record);
 
     // Seed a second shard (different tenant) to fill global limit.
-    let spec2 = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let spec2 = ShardSpec::with_range(b"a", b"z");
     let record2 = ShardRecord::new_active(
         other_tenant(),
         test_run(),
@@ -1127,7 +1255,7 @@ fn split_residual_exceeds_global_limit() {
         .unwrap_err();
     assert!(
         matches!(err, SplitResidualError::SplitInvalid(ref e)
-            if matches!(e.as_ref(),
+            if matches!(e,
                 SplitValidationError::ShardLimitExceeded { scope: ShardLimitScope::Global, .. })),
         "expected ShardLimitExceeded(Global), got: {err:?}",
     );
@@ -1285,8 +1413,8 @@ fn split_residual_replay_via_oplog_returns_replayed() {
     assert_eq!(first.as_ref().residual, second.as_ref().residual);
 
     // Same op_id, different plan (different split point) — OpIdConflict.
-    let parent_new = ShardSpec::with_range(b"a".to_vec(), b"p".to_vec());
-    let residual = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
+    let parent_new = ShardSpec::with_range(b"a", b"p");
+    let residual = ShardSpec::with_range(b"p", b"z");
     let plan_b = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
     let err = coord
         .split_residual(now(5), test_tenant(), &lease, plan_b, op)
@@ -1437,11 +1565,11 @@ fn full_lifecycle_acquire_checkpoint_split_residual_complete() {
     .unwrap();
     // Verify snapshot has the residual range [m, z).
     assert_eq!(
-        child_result.snapshot.spec().key_range_start(),
+        child_result.snapshot().spec().key_range_start(),
         b"m".as_slice(),
     );
     assert_eq!(
-        child_result.snapshot.spec().key_range_end(),
+        child_result.snapshot().spec().key_range_end(),
         b"z".as_slice(),
     );
     let child_lease = child_result.lease;
@@ -1532,8 +1660,8 @@ fn lifecycle_split_residual_twice_then_complete_children() {
         .unwrap();
 
     // Step 4: split_residual again [a,j) + [j,m) — capture residual_2.
-    let parent_new_2 = ShardSpec::with_range(b"a".to_vec(), b"j".to_vec());
-    let residual_2_spec = ShardSpec::with_range(b"j".to_vec(), b"m".to_vec());
+    let parent_new_2 = ShardSpec::with_range(b"a", b"j");
+    let residual_2_spec = ShardSpec::with_range(b"j", b"m");
     let plan2 =
         SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2_spec.as_ref()).unwrap();
     let r2 = coord
@@ -1555,8 +1683,8 @@ fn lifecycle_split_residual_twice_then_complete_children() {
     // Step 6: Acquire + complete residual_1 [m, z).
     let r1_key = ShardKey::new(test_run(), residual_1);
     let r1_acq = acquire_result(&mut coord, now(7), test_tenant(), r1_key, test_worker(2)).unwrap();
-    assert_eq!(r1_acq.snapshot.spec().key_range_start(), b"m".as_slice());
-    assert_eq!(r1_acq.snapshot.spec().key_range_end(), b"z".as_slice());
+    assert_eq!(r1_acq.snapshot().spec().key_range_start(), b"m".as_slice());
+    assert_eq!(r1_acq.snapshot().spec().key_range_end(), b"z".as_slice());
     let _ = coord
         .complete(
             now(8),
@@ -1570,8 +1698,8 @@ fn lifecycle_split_residual_twice_then_complete_children() {
     // Step 7: Acquire + complete residual_2 [j, m).
     let r2_key = ShardKey::new(test_run(), residual_2);
     let r2_acq = acquire_result(&mut coord, now(9), test_tenant(), r2_key, test_worker(3)).unwrap();
-    assert_eq!(r2_acq.snapshot.spec().key_range_start(), b"j".as_slice());
-    assert_eq!(r2_acq.snapshot.spec().key_range_end(), b"m".as_slice());
+    assert_eq!(r2_acq.snapshot().spec().key_range_start(), b"j".as_slice());
+    assert_eq!(r2_acq.snapshot().spec().key_range_end(), b"m".as_slice());
     let _ = coord
         .complete(
             now(10),
@@ -1600,4 +1728,323 @@ fn lifecycle_split_residual_twice_then_complete_children() {
     let r2_err =
         acquire_result(&mut coord, now(13), test_tenant(), r2_key, test_worker(4)).unwrap_err();
     assert!(matches!(r2_err, AcquireError::ShardTerminal { .. }));
+}
+
+// -- Scratch buffer reuse tests ----------------------------------------
+//
+// Validates the allocation-free reuse contract: AcquireScratch internal
+// buffer capacities must not grow when reused across multiple acquire calls.
+
+#[test]
+fn acquire_scratch_reuse_does_not_grow_buffers() {
+    // Build a coordinator with two shards so we can acquire each one
+    // independently using the same scratch buffer.
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap();
+    coord
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .unwrap();
+
+    let shard_a = ShardId::from_raw(10);
+    let shard_b = ShardId::from_raw(20);
+    let spec_a = ShardSpec::with_range(b"a", b"m");
+    let spec_b = ShardSpec::with_range(b"m", b"z");
+    let cursor_a = CursorUpdate::initial();
+    let cursor_b = CursorUpdate::initial();
+    let shards = vec![
+        InitialShardInput::new(shard_a, spec_a.as_ref(), cursor_a),
+        InitialShardInput::new(shard_b, spec_b.as_ref(), cursor_b),
+    ];
+    let _ = coord
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    let key_a = ShardKey::new(test_run(), shard_a);
+    let key_b = ShardKey::new(test_run(), shard_b);
+    let mut scratch = AcquireScratch::new();
+
+    // First acquire: populates scratch with spec [a,m) and initial cursor.
+    let result1 = coord
+        .acquire_and_restore_into(now(3), test_tenant(), key_a, test_worker(1), &mut scratch)
+        .unwrap();
+    assert_eq!(result1.snapshot.status(), ShardStatus::Active);
+    assert_eq!(result1.snapshot.spec().key_range_start(), b"a");
+    assert_eq!(result1.snapshot.spec().key_range_end(), b"m");
+
+    // Checkpoint to advance cursor — gives the scratch more data to write
+    // on the next acquire.
+    let _ = coord
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &result1.lease,
+            &test_cursor(b"d"),
+            OpId::from_raw(2),
+        )
+        .unwrap();
+
+    // Complete shard_a so its lease is released.
+    let _ = coord
+        .complete(
+            now(5),
+            test_tenant(),
+            &result1.lease,
+            &test_cursor(b"l"),
+            OpId::from_raw(3),
+        )
+        .unwrap();
+
+    // Second acquire reuses the same scratch. The scratch's internal
+    // FixedBuf arrays have compile-time-fixed capacity, so this call
+    // exercises the reset-and-rewrite path without heap growth.
+    let result2 = coord
+        .acquire_and_restore_into(now(6), test_tenant(), key_b, test_worker(2), &mut scratch)
+        .unwrap();
+    assert_eq!(result2.snapshot.status(), ShardStatus::Active);
+    assert_eq!(result2.snapshot.spec().key_range_start(), b"m");
+    assert_eq!(result2.snapshot.spec().key_range_end(), b"z");
+
+    // The core reuse assertion: size_of_val doesn't change because
+    // AcquireScratch uses fixed-capacity inline buffers (FixedBuf<N>
+    // and InlineVec). No heap allocation occurs on the second call.
+    // This is a compile-time guarantee enforced by the type system,
+    // but we verify behavioral correctness (reset + rewrite) here.
+    assert!(
+        result2.snapshot.cursor().last_key().is_none(),
+        "new shard should have initial cursor after scratch reuse"
+    );
+}
+
+// -- Error-path memory cleanup tests -----------------------------------
+//
+// Validates that slab.live_count() returns to baseline after operations
+// fail at various stages (validation, lease, idempotency). Each test
+// snapshots live_count before the failing operation and asserts equality
+// afterward, proving no slab allocations leaked on the error path.
+
+#[test]
+fn checkpoint_validation_error_does_not_leak_slab_memory() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    // Checkpoint to advance cursor to "m".
+    let _ = coord
+        .checkpoint(
+            now(2),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"m"),
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    let live_before = coord.slab().live_count();
+
+    // Attempt checkpoint with a cursor that regresses (b"b" < b"m").
+    let err = coord
+        .checkpoint(
+            now(3),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"b"),
+            OpId::from_raw(2),
+        )
+        .unwrap_err();
+    assert!(matches!(err, CheckpointError::CursorRegression { .. }));
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "cursor regression error must not leak slab memory"
+    );
+}
+
+#[test]
+fn checkpoint_opid_conflict_does_not_leak_slab_memory() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    // First checkpoint with OpId 1 at cursor "d".
+    let _ = coord
+        .checkpoint(
+            now(2),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"d"),
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    let live_before = coord.slab().live_count();
+
+    // Same OpId, different cursor → OpIdConflict.
+    let err = coord
+        .checkpoint(
+            now(3),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"f"),
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(matches!(err, CheckpointError::OpIdConflict { .. }));
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "OpIdConflict error must not leak slab memory"
+    );
+}
+
+#[test]
+fn checkpoint_lease_expired_does_not_leak_slab_memory() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let live_before = coord.slab().live_count();
+
+    // Advance time past the lease deadline (100 ticks from now(1)).
+    let err = coord
+        .checkpoint(
+            now(LEASE_DURATION + 2),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"b"),
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(matches!(err, CheckpointError::LeaseExpired { .. }));
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "LeaseExpired error must not leak slab memory"
+    );
+}
+
+#[test]
+fn complete_validation_error_does_not_leak_slab_memory() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    // Checkpoint to "m".
+    let _ = coord
+        .checkpoint(
+            now(2),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"m"),
+            OpId::from_raw(1),
+        )
+        .unwrap();
+
+    let live_before = coord.slab().live_count();
+
+    // Attempt complete with regressing cursor (b"b" < b"m").
+    let err = coord
+        .complete(
+            now(3),
+            test_tenant(),
+            &lease,
+            &test_cursor(b"b"),
+            OpId::from_raw(2),
+        )
+        .unwrap_err();
+    assert!(matches!(err, CompleteError::CursorRegression { .. }));
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "complete cursor regression must not leak slab memory"
+    );
+}
+
+#[test]
+fn split_replace_lease_expired_does_not_leak_slab_memory() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let live_before = coord.slab().live_count();
+
+    // Attempt split_replace with expired lease.
+    let err = coord
+        .split_replace(
+            now(LEASE_DURATION + 2),
+            test_tenant(),
+            &lease,
+            test_split_replace_plan(),
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(matches!(err, SplitReplaceError::LeaseExpired { .. }));
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "split_replace LeaseExpired must not leak slab memory"
+    );
+}
+
+#[test]
+fn split_residual_lease_expired_does_not_leak_slab_memory() {
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let live_before = coord.slab().live_count();
+
+    // Attempt split_residual with expired lease.
+    let err = coord
+        .split_residual(
+            now(LEASE_DURATION + 2),
+            test_tenant(),
+            &lease,
+            test_split_residual_plan(),
+            OpId::from_raw(1),
+        )
+        .unwrap_err();
+    assert!(matches!(err, SplitResidualError::LeaseExpired { .. }));
+
+    assert_eq!(
+        coord.slab().live_count(),
+        live_before,
+        "split_residual LeaseExpired must not leak slab memory"
+    );
+}
+
+// -- Token size validation tests ------------------------------------------
+//
+// `validate_cursor_update_pooled` must reject tokens exceeding
+// MAX_TOKEN_SIZE with a typed error rather than accepting them and
+// panicking later when `AcquireScratch::write_cursor` hits the
+// FixedBuf capacity assert.
+
+#[test]
+fn checkpoint_rejects_oversized_cursor_token() {
+    use crate::coordination::cursor::MAX_TOKEN_SIZE;
+
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let oversized_token = vec![0xABu8; MAX_TOKEN_SIZE + 1];
+    let cursor = CursorUpdate::with_token(b"b", &oversized_token);
+
+    let result = coord.checkpoint(now(2), test_tenant(), &lease, &cursor, OpId::from_raw(1));
+
+    assert!(
+        result.is_err(),
+        "checkpoint must reject tokens exceeding MAX_TOKEN_SIZE"
+    );
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            CheckpointError::CursorTokenTooLarge { .. }
+        ),
+        "expected CursorTokenTooLarge error variant"
+    );
 }

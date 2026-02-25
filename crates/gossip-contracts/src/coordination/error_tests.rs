@@ -58,11 +58,11 @@ fn cursor_variants() -> Vec<CoordError> {
             old_key: None,
             new_key: None,
         },
-        CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
-            last_key: b"k".as_slice().into(),
-            spec_start: b"a".as_slice().into(),
-            spec_end: b"z".as_slice().into(),
-        })),
+        CoordError::CursorOutOfBounds(CursorOutOfBoundsDetail {
+            last_key: 1,
+            spec_start: 1,
+            spec_end: 1,
+        }),
         CoordError::CursorKeyTooLarge {
             size: MAX_KEY_SIZE + 1,
             max: MAX_KEY_SIZE,
@@ -71,7 +71,7 @@ fn cursor_variants() -> Vec<CoordError> {
 }
 
 fn split_invalid_variant() -> CoordError {
-    CoordError::SplitInvalid(Box::new(SplitValidationError::NoChildren))
+    CoordError::SplitInvalid(SplitValidationError::NoChildren)
 }
 
 fn checkpoint_missing_key_variant() -> CoordError {
@@ -318,7 +318,7 @@ fn op_id_conflict_no_hash_leak_all_types() {
 #[test]
 fn coord_error_split_invalid_source_returns_inner() {
     let inner = SplitValidationError::NoChildren;
-    let err = CoordError::SplitInvalid(Box::new(inner.clone()));
+    let err = CoordError::SplitInvalid(inner.clone());
     let src = err.source().expect("SplitInvalid should return source");
     assert_eq!(src.to_string(), inner.to_string());
 }
@@ -332,7 +332,7 @@ fn coord_error_non_split_source_returns_none() {
 #[test]
 fn split_error_source_propagates() {
     let inner = SplitValidationError::NoChildren;
-    let err = SplitError::SplitInvalid(Box::new(inner.clone()));
+    let err = SplitError::SplitInvalid(inner.clone());
     let src = err.source().expect("SplitInvalid should return source");
     assert_eq!(src.to_string(), inner.to_string());
 
@@ -344,37 +344,36 @@ fn split_error_source_propagates() {
 // -- PartialEq value-equality tests ----------------------------------
 
 #[test]
-fn coord_error_eq_compares_box_bytes_by_value() {
-    let a = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
-        last_key: b"key".to_vec().into_boxed_slice(),
-        spec_start: b"a".to_vec().into_boxed_slice(),
-        spec_end: b"z".to_vec().into_boxed_slice(),
-    }));
-    let b = CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
-        last_key: b"key".to_vec().into_boxed_slice(),
-        spec_start: b"a".to_vec().into_boxed_slice(),
-        spec_end: b"z".to_vec().into_boxed_slice(),
-    }));
-    // Different allocations, same content -- should be equal.
+fn coord_error_eq_compares_cursor_oob_lengths_by_value() {
+    let a = CoordError::CursorOutOfBounds(CursorOutOfBoundsDetail {
+        last_key: 3,
+        spec_start: 1,
+        spec_end: 1,
+    });
+    let b = CoordError::CursorOutOfBounds(CursorOutOfBoundsDetail {
+        last_key: 3,
+        spec_start: 1,
+        spec_end: 1,
+    });
     assert_eq!(a, b);
 }
 
 #[test]
-fn cursor_regression_eq_compares_option_box_by_value() {
+fn cursor_regression_eq_compares_option_lengths_by_value() {
     let a = CoordError::CursorRegression {
-        old_key: Some(b"old".to_vec().into_boxed_slice()),
-        new_key: Some(b"new".to_vec().into_boxed_slice()),
+        old_key: Some(3),
+        new_key: Some(3),
     };
     let b = CoordError::CursorRegression {
-        old_key: Some(b"old".to_vec().into_boxed_slice()),
-        new_key: Some(b"new".to_vec().into_boxed_slice()),
+        old_key: Some(3),
+        new_key: Some(3),
     };
     assert_eq!(a, b);
 
     // None vs Some should not be equal.
     let c = CoordError::CursorRegression {
         old_key: None,
-        new_key: Some(b"new".to_vec().into_boxed_slice()),
+        new_key: Some(3),
     };
     assert_ne!(a, c);
 }
@@ -400,17 +399,17 @@ fn already_leased_debug_no_owner_leak() {
 }
 
 fn oob_error() -> CoordError {
-    CoordError::CursorOutOfBounds(Box::new(CursorOutOfBoundsDetail {
-        last_key: b"SECRET_KEY_DATA".to_vec().into_boxed_slice(),
-        spec_start: b"SPEC_START_BYTES".to_vec().into_boxed_slice(),
-        spec_end: b"SPEC_END_BYTES".to_vec().into_boxed_slice(),
-    }))
+    CoordError::CursorOutOfBounds(CursorOutOfBoundsDetail {
+        last_key: b"SECRET_KEY_DATA".len(),
+        spec_start: b"SPEC_START_BYTES".len(),
+        spec_end: b"SPEC_END_BYTES".len(),
+    })
 }
 
 fn regression_error() -> CoordError {
     CoordError::CursorRegression {
-        old_key: Some(b"OLD_SECRET_KEY".to_vec().into_boxed_slice()),
-        new_key: Some(b"NEW_SECRET_KEY".to_vec().into_boxed_slice()),
+        old_key: Some(b"OLD_SECRET_KEY".len()),
+        new_key: Some(b"NEW_SECRET_KEY".len()),
     }
 }
 
@@ -470,15 +469,50 @@ fn acquire_scratch_write_spec_panics_on_oversized_metadata() {
 }
 
 #[test]
+#[should_panic(expected = "cursor last_key exceeds MAX_KEY_SIZE")]
+fn acquire_scratch_write_cursor_panics_on_oversized_last_key() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_cursor(Some(&[0x01; MAX_KEY_SIZE + 1]), None);
+}
+
+#[test]
+#[should_panic(expected = "cursor token exceeds MAX_TOKEN_SIZE")]
+fn acquire_scratch_write_cursor_panics_on_oversized_token() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_cursor(Some(b"k"), Some(&[0x02; MAX_TOKEN_SIZE + 1]));
+}
+
+#[test]
 fn acquire_scratch_cursor_view_with_token_but_no_last_key_returns_initial() {
     let mut scratch = AcquireScratch::new();
     // Write a cursor with no last_key but with token.
     // CursorUpdate::initial() should be returned because
-    // cursor_view gates token on has_cursor_last_key.
+    // cursor_view derives presence from len > 0.
     scratch.write_cursor(None, Some(b"some_token"));
     let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
     let cursor = view.cursor();
     assert!(cursor.last_key().is_none());
+    assert!(cursor.token().is_none());
+}
+
+#[test]
+fn acquire_scratch_cursor_view_with_empty_last_key_returns_initial() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_cursor(Some(b"key"), Some(b"token"));
+    scratch.write_cursor(Some(&[]), Some(b"updated_token"));
+    let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
+    let cursor = view.cursor();
+    assert!(cursor.last_key().is_none());
+    assert!(cursor.token().is_none());
+}
+
+#[test]
+fn acquire_scratch_cursor_view_with_empty_token_returns_last_key_only() {
+    let mut scratch = AcquireScratch::new();
+    scratch.write_cursor(Some(b"key"), Some(&[]));
+    let view = scratch.view(ShardStatus::Active, CursorSemantics::Completed, None);
+    let cursor = view.cursor();
+    assert_eq!(cursor.last_key(), Some(&b"key"[..]));
     assert!(cursor.token().is_none());
 }
 
@@ -506,4 +540,72 @@ fn coord_error_size_regression() {
         "CoordError is {} bytes, expected <= 48",
         std::mem::size_of::<CoordError>()
     );
+}
+
+// -- FixedBuf ---------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "oversized")]
+fn fixed_buf_write_oversized_panics() {
+    let mut buf = FixedBuf::<4>::new();
+    buf.write(b"abcde", "oversized");
+}
+
+#[test]
+fn fixed_buf_reset_clears_logically() {
+    let mut buf = FixedBuf::<16>::new();
+    buf.write(b"data", "test");
+    assert!(buf.has_data());
+    buf.reset();
+    assert!(!buf.has_data());
+    assert!(buf.read().is_empty());
+}
+
+#[test]
+fn fixed_buf_debug_output_format() {
+    let buf = FixedBuf::<16>::from_slice(b"abcdef", "test");
+    let dbg = format!("{buf:?}");
+    assert!(dbg.contains("6 bytes"), "should contain byte count: {dbg}");
+
+    let empty = FixedBuf::<8>::new();
+    let dbg_empty = format!("{empty:?}");
+    assert!(dbg_empty.contains("empty"), "should say empty: {dbg_empty}");
+}
+
+proptest::proptest! {
+    #![proptest_config(crate::test_util::miri_proptest_config())]
+
+    /// write→read roundtrip: any slice that fits is returned verbatim.
+    /// Subsumes individual roundtrip, at-capacity, and replace-shorter tests.
+    #[test]
+    fn fixed_buf_write_read_roundtrip(
+        first in proptest::collection::vec(proptest::num::u8::ANY, 0..=64),
+        second in proptest::collection::vec(proptest::num::u8::ANY, 0..=64),
+    ) {
+        let mut buf = FixedBuf::<64>::new();
+
+        buf.write(&first, "test");
+        proptest::prop_assert_eq!(buf.read(), first.as_slice());
+        proptest::prop_assert_eq!(buf.has_data(), !first.is_empty());
+
+        // Overwrite with second value — only new content survives.
+        buf.write(&second, "test");
+        proptest::prop_assert_eq!(buf.read(), second.as_slice());
+    }
+
+    /// Equality tracks logical content, not backing-array padding bytes.
+    #[test]
+    fn fixed_buf_equality_matches_content(
+        a in proptest::collection::vec(proptest::num::u8::ANY, 0..=32),
+        b in proptest::collection::vec(proptest::num::u8::ANY, 0..=32),
+    ) {
+        let fa = FixedBuf::<32>::from_slice(&a, "test");
+        let fb = FixedBuf::<32>::from_slice(&b, "test");
+
+        if a == b {
+            proptest::prop_assert_eq!(&fa, &fb);
+        } else {
+            proptest::prop_assert_ne!(&fa, &fb);
+        }
+    }
 }

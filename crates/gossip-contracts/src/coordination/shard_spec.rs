@@ -116,7 +116,7 @@ const _: () = assert!(CursorSemantics::Dispatched as u8 == 1);
 
 /// Borrowed shard-spec view.
 ///
-/// This is the allocation-free companion to [`ShardSpec`], used for B3 hot-path
+/// This is the allocation-free companion to [`ShardSpec`], used for hot-path
 /// APIs that must avoid per-call heap traffic. It borrows caller-owned buffers
 /// and is therefore valid only for the lifetime of those buffers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +152,95 @@ impl<'a> ShardSpecRef<'a> {
     #[must_use]
     pub const fn unbounded() -> Self {
         Self::new(&[], &[], &[])
+    }
+
+    /// Construct a borrowed shard-spec view with explicit key range bounds.
+    ///
+    /// Allocation-free twin of [`ShardSpec::with_range`] for runtime paths that
+    /// already hold borrowed key bytes.
+    ///
+    /// # Panics
+    ///
+    /// - `start` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `end` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `start` and `end` are both non-empty and `start >= end`.
+    #[must_use]
+    pub fn with_range(start: &'a [u8], end: &'a [u8]) -> Self {
+        Self::with_range_and_metadata(start, end, &[])
+    }
+
+    /// Construct a borrowed shard-spec view with key range bounds and metadata.
+    ///
+    /// Allocation-free twin of [`ShardSpec::with_range_and_metadata`] for
+    /// runtime paths that already hold borrowed slices.
+    ///
+    /// # Panics
+    ///
+    /// - `start` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `end` exceeds [`MAX_KEY_SIZE`] bytes.
+    /// - `metadata` exceeds [`MAX_METADATA_SIZE`] bytes.
+    /// - `start` and `end` are both non-empty and `start >= end`.
+    #[must_use]
+    pub fn with_range_and_metadata(start: &'a [u8], end: &'a [u8], metadata: &'a [u8]) -> Self {
+        assert!(
+            start.len() <= MAX_KEY_SIZE,
+            "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
+            start.len(),
+        );
+        assert!(
+            end.len() <= MAX_KEY_SIZE,
+            "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
+            end.len(),
+        );
+        assert!(
+            metadata.len() <= MAX_METADATA_SIZE,
+            "ShardSpec: metadata too large ({} bytes, max {MAX_METADATA_SIZE})",
+            metadata.len(),
+        );
+        if !start.is_empty() && !end.is_empty() {
+            assert!(
+                start < end,
+                "ShardSpec: start must be strictly less than end \
+                 (start: {} bytes, end: {} bytes)",
+                start.len(),
+                end.len(),
+            );
+        }
+        Self::new(start, end, metadata)
+    }
+
+    /// Fallible constructor: returns `Err` if range is inverted or keys exceed
+    /// [`MAX_KEY_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ShardSpecInputError::KeyTooLarge`] — `start` or `end` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`ShardSpecInputError::InvertedRange`] — both `start` and `end` are
+    ///   non-empty and `start >= end`.
+    pub fn try_with_range(start: &'a [u8], end: &'a [u8]) -> Result<Self, ShardSpecInputError> {
+        Self::try_with_range_and_metadata(start, end, &[])
+    }
+
+    /// Fallible constructor: returns `Err` if range is inverted, keys exceed
+    /// [`MAX_KEY_SIZE`], or metadata exceeds [`MAX_METADATA_SIZE`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ShardSpecInputError::KeyTooLarge`] — `start` or `end` exceeds
+    ///   [`MAX_KEY_SIZE`] bytes.
+    /// - [`ShardSpecInputError::InvertedRange`] — both `start` and `end` are
+    ///   non-empty and `start >= end`.
+    /// - [`ShardSpecInputError::MetadataTooLarge`] — `metadata` exceeds
+    ///   [`MAX_METADATA_SIZE`] bytes.
+    pub fn try_with_range_and_metadata(
+        start: &'a [u8],
+        end: &'a [u8],
+        metadata: &'a [u8],
+    ) -> Result<Self, ShardSpecInputError> {
+        let spec = Self::new(start, end, metadata);
+        ShardSpec::validate_ref(spec)?;
+        Ok(spec)
     }
 
     /// Inclusive lower bound of the key range.
@@ -404,8 +493,8 @@ impl ShardSpec {
     /// - `end` exceeds [`MAX_KEY_SIZE`] bytes.
     /// - `start` and `end` are both non-empty and `start >= end`.
     #[must_use = "creates a shard spec that should be stored or used"]
-    pub fn with_range(start: Vec<u8>, end: Vec<u8>) -> Self {
-        Self::with_range_and_metadata(start, end, vec![])
+    pub fn with_range(start: impl AsRef<[u8]>, end: impl AsRef<[u8]>) -> Self {
+        Self::with_range_and_metadata(start, end, [])
     }
 
     /// Construct a shard spec with key range bounds and metadata.
@@ -417,7 +506,14 @@ impl ShardSpec {
     /// - `metadata` exceeds [`MAX_METADATA_SIZE`] bytes.
     /// - `start` and `end` are both non-empty and `start >= end`.
     #[must_use = "creates a shard spec that should be stored or used"]
-    pub fn with_range_and_metadata(start: Vec<u8>, end: Vec<u8>, metadata: Vec<u8>) -> Self {
+    pub fn with_range_and_metadata(
+        start: impl AsRef<[u8]>,
+        end: impl AsRef<[u8]>,
+        metadata: impl AsRef<[u8]>,
+    ) -> Self {
+        let start = start.as_ref();
+        let end = end.as_ref();
+        let metadata = metadata.as_ref();
         assert!(
             start.len() <= MAX_KEY_SIZE,
             "ShardSpec: key too large ({} bytes, max {MAX_KEY_SIZE})",
@@ -435,7 +531,7 @@ impl ShardSpec {
         );
         if !start.is_empty() && !end.is_empty() {
             assert!(
-                start.as_slice() < end.as_slice(),
+                start < end,
                 "ShardSpec: start must be strictly less than end \
                  (start: {} bytes, end: {} bytes)",
                 start.len(),
@@ -443,9 +539,9 @@ impl ShardSpec {
             );
         }
         Self {
-            key_range_start: start.into_boxed_slice(),
-            key_range_end: end.into_boxed_slice(),
-            metadata: metadata.into_boxed_slice(),
+            key_range_start: start.into(),
+            key_range_end: end.into(),
+            metadata: metadata.into(),
         }
     }
 
@@ -459,8 +555,11 @@ impl ShardSpec {
     /// - [`ShardSpecInputError::InvertedRange`] — both `start` and `end`
     ///   are non-empty and `start >= end`.
     #[must_use = "returns a Result that must be checked for validation errors"]
-    pub fn try_with_range(start: Vec<u8>, end: Vec<u8>) -> Result<Self, ShardSpecInputError> {
-        Self::try_with_range_and_metadata(start, end, vec![])
+    pub fn try_with_range(
+        start: impl AsRef<[u8]>,
+        end: impl AsRef<[u8]>,
+    ) -> Result<Self, ShardSpecInputError> {
+        Self::try_with_range_and_metadata(start, end, [])
     }
 
     /// Fallible constructor: returns `Err` if range is inverted, keys
@@ -476,10 +575,13 @@ impl ShardSpec {
     ///   [`MAX_METADATA_SIZE`] bytes.
     #[must_use = "returns a Result that must be checked for validation errors"]
     pub fn try_with_range_and_metadata(
-        start: Vec<u8>,
-        end: Vec<u8>,
-        metadata: Vec<u8>,
+        start: impl AsRef<[u8]>,
+        end: impl AsRef<[u8]>,
+        metadata: impl AsRef<[u8]>,
     ) -> Result<Self, ShardSpecInputError> {
+        let start = start.as_ref();
+        let end = end.as_ref();
+        let metadata = metadata.as_ref();
         if start.len() > MAX_KEY_SIZE {
             return Err(ShardSpecInputError::KeyTooLarge {
                 size: start.len(),
@@ -498,26 +600,25 @@ impl ShardSpec {
                 max: MAX_METADATA_SIZE,
             });
         }
-        if !start.is_empty() && !end.is_empty() && start.as_slice() >= end.as_slice() {
+        if !start.is_empty() && !end.is_empty() && start >= end {
             return Err(ShardSpecInputError::InvertedRange {
                 start_len: start.len(),
                 end_len: end.len(),
             });
         }
         Ok(Self {
-            key_range_start: start.into_boxed_slice(),
-            key_range_end: end.into_boxed_slice(),
-            metadata: metadata.into_boxed_slice(),
+            key_range_start: start.into(),
+            key_range_end: end.into(),
+            metadata: metadata.into(),
         })
     }
 
     /// Construct a `ShardSpec` from pre-built parts, bypassing validation.
     ///
-    /// Used by [`PooledShardSpec::to_spec`] to reconstruct an owned spec
-    /// from slab-backed bytes (which were originally validated on creation).
-    /// Also available in test builds for constructing intentionally invalid
-    /// specs.
+    /// Test-support helper for constructing specs from pre-built parts
+    /// without re-running validation.
     #[cfg(any(test, feature = "test-support"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_raw_parts(
         key_range_start: Box<[u8]>,
         key_range_end: Box<[u8]>,
@@ -924,33 +1025,35 @@ pub enum SplitValidationError {
     SingleChild,
     /// First child's start doesn't match parent's start.
     StartMismatch {
-        parent_start: Box<[u8]>,
-        first_child_start: Box<[u8]>,
+        parent_start: usize,
+        first_child_start: usize,
     },
     /// Last child's end doesn't match parent's end.
     EndMismatch {
-        parent_end: Box<[u8]>,
-        last_child_end: Box<[u8]>,
+        parent_end: usize,
+        last_child_end: usize,
     },
     /// Boundary mismatch (gap or overlap) between adjacent children.
     BoundaryMismatch {
-        /// Index in the caller's input order, not the internal sorted order.
+        /// Index in the coordinator's internal start-sorted child order.
         child_index: usize,
-        /// Index in the caller's input order, not the internal sorted order.
+        /// Index in the coordinator's internal start-sorted child order.
         next_child_index: usize,
-        child_end: Box<[u8]>,
-        next_child_start: Box<[u8]>,
+        child_end: usize,
+        next_child_start: usize,
     },
     /// Child has inverted key range (start >= end).
     InvertedChild {
-        /// Index in the caller's input order, not the internal sorted order.
+        /// Index in the coordinator's internal start-sorted child order.
         child_index: usize,
     },
 
     /// A non-last child has an unbounded end, causing it to overlap with
     /// subsequent children.
     OverlappingChild {
+        /// Index in the coordinator's internal start-sorted child order.
         child_index: usize,
+        /// Index in the coordinator's internal start-sorted child order.
         next_child_index: usize,
     },
 
@@ -959,9 +1062,9 @@ pub enum SplitValidationError {
     /// strand the cursor outside the parent's key range, violating
     /// cursor bounds (D2.4).
     ParentCursorOutOfBounds {
-        cursor: Box<[u8]>,
-        new_parent_start: Box<[u8]>,
-        new_parent_end: Box<[u8]>,
+        cursor: usize,
+        new_parent_start: usize,
+        new_parent_end: usize,
     },
 
     /// The split would exceed the parent's spawn capacity
@@ -1013,8 +1116,7 @@ impl fmt::Display for SplitValidationError {
             } => write!(
                 f,
                 "first child start ({} bytes) does not match parent start ({} bytes)",
-                first_child_start.len(),
-                parent_start.len(),
+                first_child_start, parent_start,
             ),
             Self::EndMismatch {
                 parent_end,
@@ -1022,8 +1124,7 @@ impl fmt::Display for SplitValidationError {
             } => write!(
                 f,
                 "last child end ({} bytes) does not match parent end ({} bytes)",
-                last_child_end.len(),
-                parent_end.len(),
+                last_child_end, parent_end,
             ),
             Self::BoundaryMismatch {
                 child_index,
@@ -1034,8 +1135,7 @@ impl fmt::Display for SplitValidationError {
                 f,
                 "boundary mismatch between child {child_index} end ({} bytes) \
                  and child {next_child_index} start ({} bytes)",
-                child_end.len(),
-                next_child_start.len(),
+                child_end, next_child_start,
             ),
             Self::InvertedChild { child_index } => {
                 write!(
@@ -1058,9 +1158,7 @@ impl fmt::Display for SplitValidationError {
                 f,
                 "parent cursor ({} bytes) falls outside new parent range \
                  (start: {} bytes, end: {} bytes)",
-                cursor.len(),
-                new_parent_start.len(),
-                new_parent_end.len(),
+                cursor, new_parent_start, new_parent_end,
             ),
             Self::SpawnLimitExceeded {
                 current,
@@ -1191,8 +1289,8 @@ pub fn validate_split_coverage_bounds(
     // First child start == parent start.
     if indexed[0].1.key_range_start() != parent_start {
         return Err(SplitValidationError::StartMismatch {
-            parent_start: parent_start.to_vec().into_boxed_slice(),
-            first_child_start: indexed[0].1.key_range_start().to_vec().into_boxed_slice(),
+            parent_start: parent_start.len(),
+            first_child_start: indexed[0].1.key_range_start().len(),
         });
     }
 
@@ -1200,8 +1298,8 @@ pub fn validate_split_coverage_bounds(
     let last = indexed[indexed.len() - 1];
     if last.1.key_range_end() != parent_end {
         return Err(SplitValidationError::EndMismatch {
-            parent_end: parent_end.to_vec().into_boxed_slice(),
-            last_child_end: last.1.key_range_end().to_vec().into_boxed_slice(),
+            parent_end: parent_end.len(),
+            last_child_end: last.1.key_range_end().len(),
         });
     }
 
@@ -1216,12 +1314,8 @@ pub fn validate_split_coverage_bounds(
             return Err(SplitValidationError::BoundaryMismatch {
                 child_index: indexed[i].0,
                 next_child_index: indexed[i + 1].0,
-                child_end: indexed[i].1.key_range_end().to_vec().into_boxed_slice(),
-                next_child_start: indexed[i + 1]
-                    .1
-                    .key_range_start()
-                    .to_vec()
-                    .into_boxed_slice(),
+                child_end: indexed[i].1.key_range_end().len(),
+                next_child_start: indexed[i + 1].1.key_range_start().len(),
             });
         }
         if indexed[i].1.key_range_end().is_empty() {
@@ -1329,15 +1423,15 @@ pub fn validate_residual_split_bounds(
     // The parent must keep the left (lower) portion of the range.
     if new_parent.key_range_start() != old_parent_start {
         return Err(SplitValidationError::StartMismatch {
-            parent_start: old_parent_start.to_vec().into_boxed_slice(),
-            first_child_start: new_parent.key_range_start().to_vec().into_boxed_slice(),
+            parent_start: old_parent_start.len(),
+            first_child_start: new_parent.key_range_start().len(),
         });
     }
     // The residual must cover the right (upper) portion.
     if residual.key_range_end() != old_parent_end {
         return Err(SplitValidationError::EndMismatch {
-            parent_end: old_parent_end.to_vec().into_boxed_slice(),
-            last_child_end: residual.key_range_end().to_vec().into_boxed_slice(),
+            parent_end: old_parent_end.len(),
+            last_child_end: residual.key_range_end().len(),
         });
     }
     validate_split_coverage_bounds(old_parent_start, old_parent_end, &[new_parent, residual])

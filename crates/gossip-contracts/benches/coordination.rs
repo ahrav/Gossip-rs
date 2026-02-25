@@ -1,7 +1,7 @@
 //! Criterion benchmarks for `InMemoryCoordinator` hot-path operations.
 //!
 //! Validates that the two-level shard map, aHash hasher, O(1) shard counting,
-//! and `list_shards` pre-filter deliver the expected performance characteristics.
+//! and `list_shards_into` pre-filter deliver the expected performance characteristics.
 //! Acquire/checkpoint benchmarks intentionally use borrowed APIs plus reusable
 //! scratch so measurements reflect steady-state (allocation-free) hot paths.
 //!
@@ -12,7 +12,7 @@
 //! | `acquire` | `acquire_and_restore_into` | Lease acquisition is the entry point for every worker session. Must scale O(1) with shard count via the two-level hash map. |
 //! | `checkpoint` | `checkpoint` | The most frequent hot-path call in production (called once per batch of scanned rows). Exercises op-log insert + cursor update. |
 //! | `register_shards` | `register_shards` | Bulk shard registration at run creation. Measures per-shard insertion cost into the two-level map and byte slab. |
-//! | `list_shards` | `list_shards` with filters | Validates that `ShardFilter` pre-filtering avoids full shard scans. Three filter profiles: `all` (baseline), `available` (common), `parked` (zero-match best case). |
+//! | `list_shards` | `list_shards_into` with filters | Validates that `ShardFilter` pre-filtering avoids full shard scans. Three filter profiles: `all` (baseline), `available` (common), `parked` (zero-match best case). |
 //!
 //! # Shard count parameters
 //!
@@ -252,7 +252,7 @@ fn bench_register_shards(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark `list_shards` with three filter profiles at 10K shards.
+/// Benchmark `list_shards_into` with three filter profiles at 10K shards.
 ///
 /// Validates that `ShardFilter` pre-filtering provides meaningful
 /// performance differentiation:
@@ -273,41 +273,54 @@ fn bench_list_shards(c: &mut Criterion) {
 
     // Filter: all (no pre-filter benefit)
     group.bench_function("all_10k", |b| {
+        // `list_shards_into` requires caller-owned output capacity to be
+        // provisioned up front (no internal growth on hot path).
+        let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
-            let result = coord
-                .list_shards(LogicalTime::from_raw(50), tenant(), run, ShardFilter::all())
+            coord
+                .list_shards_into(
+                    LogicalTime::from_raw(50),
+                    tenant(),
+                    run,
+                    ShardFilter::all(),
+                    &mut summaries,
+                )
                 .unwrap();
-            black_box(result.len());
+            black_box(summaries.len());
         });
     });
 
     // Filter: available (Active + unleased) — all match since none are leased
     group.bench_function("available_10k", |b| {
+        let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
-            let result = coord
-                .list_shards(
+            coord
+                .list_shards_into(
                     LogicalTime::from_raw(50),
                     tenant(),
                     run,
                     ShardFilter::available(),
+                    &mut summaries,
                 )
                 .unwrap();
-            black_box(result.len());
+            black_box(summaries.len());
         });
     });
 
     // Filter: parked — matches 0, maximum pre-filter benefit
     group.bench_function("parked_10k", |b| {
+        let mut summaries = Vec::with_capacity(10_000);
         b.iter(|| {
-            let result = coord
-                .list_shards(
+            coord
+                .list_shards_into(
                     LogicalTime::from_raw(50),
                     tenant(),
                     run,
                     ShardFilter::parked(),
+                    &mut summaries,
                 )
                 .unwrap();
-            black_box(result.len());
+            black_box(summaries.len());
         });
     });
 

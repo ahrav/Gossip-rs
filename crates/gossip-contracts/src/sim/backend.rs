@@ -29,24 +29,22 @@
 //!
 //! # GAT design
 //!
-//! `ShardIter` uses a Generic Associated Type (GAT) rather than RPITIT
-//! (`-> impl Iterator`) because concrete associated types enable iterator
-//! composition (e.g., `Chain<A, B>`) that opaque return types prevent.
-//! The explicit `'a` lifetime tied to `&'a self` makes borrow contracts
-//! clear for downstream wrappers.
+//! Iterator-returning methods use Generic Associated Types (GATs) rather than
+//! boxed trait objects. This keeps observation paths allocation-free while
+//! still allowing concrete composed iterators (for example `Chain<A, B>` in
+//! wrappers).
 
 use crate::coordination::facade::CoordinationFacade;
 use crate::coordination::record::ShardRecord;
 use crate::coordination::run::RunRecord;
-use crate::coordination::shard_spec::ShardSpec;
-use crate::identity::{RunId, ShardKey, TenantId};
+use crate::identity::{RunId, ShardId, ShardKey, TenantId};
 
 /// Read-only observation API for simulation backends.
 ///
 /// Provides the shard-level introspection that the invariant checker
 /// and simulation harness need to verify protocol correctness.
 /// The trait intentionally hides allocator internals (`ByteSlab` and
-/// `ByteSlot`): callers observe through borrowed/owned accessors so
+/// `ByteSlot`): callers observe through borrowed accessors so
 /// simulation logic stays storage-backend agnostic.
 ///
 /// # Consistency contract
@@ -65,8 +63,10 @@ use crate::identity::{RunId, ShardKey, TenantId};
 /// # Ordering
 ///
 /// Iteration order of [`shards()`](Self::shards) is unspecified — callers
-/// must not depend on any particular ordering. All current shard-level
-/// invariant checks (S1–S7) are order-independent.
+/// must not depend on storage-map order from real backends. Wrapper
+/// implementations may impose deterministic ordering for targeted checks
+/// (for example, yielding real observations before synthetic regressions in
+/// fault-injection tests).
 pub trait SimIntrospection {
     /// Iterator over all shard records. Order is unspecified.
     ///
@@ -79,7 +79,19 @@ pub trait SimIntrospection {
         Self: 'a;
 
     /// Iterator over all run records. Order is unspecified.
+    ///
+    /// Consumers must treat this as a full-scan view, not a sorted stream.
+    /// Current checks only rely on set membership and terminal-state monotonicity,
+    /// both of which are order-independent.
     type RunIter<'a>: Iterator<Item = ((TenantId, RunId), &'a RunRecord)>
+    where
+        Self: 'a;
+
+    /// Iterator over a record's spawned child IDs.
+    ///
+    /// Returned as a borrowed view so callers can validate split lineage without
+    /// allocating an owned child list.
+    type SpawnedIter<'a>: Iterator<Item = ShardId>
     where
         Self: 'a;
 
@@ -107,8 +119,9 @@ pub trait SimIntrospection {
     ///
     /// Used by the S7 (split-coverage) check to verify that a
     /// split-parent's spawned children exist and reference the correct
-    /// parent. Also used by the simulation harness to read shard specs
-    /// for cursor generation and split-point computation.
+    /// parent. Also used by the simulation harness to read borrowed
+    /// shard bounds for cursor generation and split planning without
+    /// materializing owned specs.
     ///
     /// Note: [`FaultInjectingIntrospector`](super::fault_injector::FaultInjectingIntrospector)
     /// delegates this to the inner backend only — synthetic records
@@ -117,18 +130,11 @@ pub trait SimIntrospection {
     /// discussion on the trait.
     fn shard_lookup(&self, tenant: &TenantId, key: &ShardKey) -> Option<&ShardRecord>;
 
-    /// Materialize an owned shard spec for API boundaries that require
-    /// detached data (for example split-plan construction in the harness).
-    ///
-    /// Prefer [`spec_bounds`](Self::spec_bounds) when only range checks are
-    /// needed: that path stays borrowed and avoids per-record heap copies.
-    fn materialize_spec(&self, record: &ShardRecord) -> ShardSpec;
-
     /// Return the record cursor's last-key view without allocation.
     ///
     /// Borrow is tied to `self` because pooled fields are slab-backed.
     /// Used by the checker/harness hot paths to avoid materializing owned
-    /// `Cursor` values just to compare bounds/order.
+    /// cursor/spec values just to compare bounds/order.
     fn cursor_last_key<'a>(&'a self, record: &'a ShardRecord) -> Option<&'a [u8]>;
 
     /// Return the shard range bounds `[start, end)` as borrowed slices.
@@ -137,11 +143,25 @@ pub trait SimIntrospection {
     /// This keeps split and cursor-bound validation allocation-free.
     fn spec_bounds<'a>(&'a self, record: &'a ShardRecord) -> (&'a [u8], &'a [u8]);
 
+    /// Run shard-record structural validation against backend-owned storage.
+    ///
+    /// Backends with pooled storage use this hook to provide the required
+    /// storage context (`ByteSlab`) without leaking allocator internals into
+    /// simulation code.
+    fn validate_record_invariants(&self, record: &ShardRecord) -> Result<(), String>;
+
+    /// Iterate a record's spawned child IDs without materializing an owned list.
+    ///
+    /// Borrow is tied to `self` because pooled lineage storage is backend-owned.
+    /// Iteration order is backend-defined and must be treated as unspecified.
+    fn spawned_children<'a>(&'a self, record: &'a ShardRecord) -> Self::SpawnedIter<'a>;
+
     /// Release pooled fields for an observation-only record.
     ///
     /// This cleanup hook lets wrappers that own synthetic records
     /// (for example fault injectors) free slab-backed fields without
     /// exposing raw slab handles in the public simulation interface.
+    /// Backends without pooled fields may implement this as a no-op.
     fn release_record_fields(&mut self, record: &mut ShardRecord);
 }
 

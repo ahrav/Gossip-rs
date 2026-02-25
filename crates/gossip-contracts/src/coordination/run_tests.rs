@@ -53,7 +53,7 @@
 //!   hashes are distinct and non-zero, unpark hashes vary by shard key.
 
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::shard_spec::CursorSemantics;
 use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{OpId, RunId, ShardId};
@@ -91,16 +91,12 @@ fn test_run_record() -> RunRecord {
 struct InitialShardFixture {
     shard: ShardId,
     spec: ShardSpec,
-    cursor: Cursor,
+    cursor: CursorUpdate<'static>,
 }
 
 impl InitialShardFixture {
     fn as_input(&self) -> InitialShardInput<'_> {
-        InitialShardInput::new(
-            self.shard,
-            self.spec.as_ref(),
-            CursorUpdate::from_cursor(&self.cursor),
-        )
+        InitialShardInput::new(self.shard, self.spec.as_ref(), self.cursor)
     }
 }
 
@@ -119,8 +115,8 @@ fn hash_register_shards_payload_fixtures(shards: &[InitialShardFixture]) -> u64 
 fn make_initial_shard(id: u64, start: &[u8], end: &[u8]) -> InitialShardFixture {
     InitialShardFixture {
         shard: ShardId::from_raw(id),
-        spec: ShardSpec::with_range(start.to_vec(), end.to_vec()),
-        cursor: Cursor::initial(),
+        spec: ShardSpec::with_range(start, end),
+        cursor: CursorUpdate::initial(),
     }
 }
 
@@ -543,13 +539,42 @@ fn progress_watermark_accessor_and_default_behavior() {
     let default_progress = RunProgress::default();
     assert_eq!(default_progress.watermark(), None);
 
-    let progress = RunProgress {
-        total: 1,
-        active: 1,
-        watermark: Some(b"abc".to_vec().into_boxed_slice()),
-        ..Default::default()
-    };
+    let mut progress = RunProgress::default();
+    progress.observe_shard(ShardStatus::Active, false, Some(b"abc"));
     assert_eq!(progress.watermark(), Some(b"abc".as_slice()));
+}
+
+#[test]
+fn progress_observe_shard_reuses_watermark_storage() {
+    let mut progress = RunProgress::default();
+    progress.observe_shard(ShardStatus::Active, false, Some(b"m"));
+
+    let watermark_ptr = progress
+        .watermark()
+        .expect("watermark must be set after observing active shard with key")
+        .as_ptr();
+
+    // Larger key should not change the tracked minimum or backing storage.
+    progress.observe_shard(ShardStatus::Active, false, Some(b"z"));
+    assert_eq!(progress.watermark(), Some(b"m".as_slice()));
+    assert_eq!(
+        progress
+            .watermark()
+            .expect("watermark must remain set after larger key")
+            .as_ptr(),
+        watermark_ptr
+    );
+
+    // Smaller key updates in place without replacing storage.
+    progress.observe_shard(ShardStatus::Active, false, Some(b"a"));
+    assert_eq!(progress.watermark(), Some(b"a".as_slice()));
+    assert_eq!(
+        progress
+            .watermark()
+            .expect("watermark must remain set after smaller key")
+            .as_ptr(),
+        watermark_ptr
+    );
 }
 
 /// Settled = no active shards. Success = settled with no parked. Failures =
@@ -688,19 +713,15 @@ fn manifest_inverted_spec() {
     // then bypass via unbounded spec manipulation. Actually, ShardSpec::with_range
     // enforces start < end at construction. Validate that validate_manifest
     // also catches this via try_with_range.
-    let result = ShardSpec::try_with_range(b"z".to_vec(), b"a".to_vec());
+    let result = ShardSpec::try_with_range(b"z", b"a");
     assert!(result.is_err(), "ShardSpec should reject inverted range");
 }
 
 #[test]
 fn manifest_cursor_out_of_bounds() {
-    let spec = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let cursor = Cursor::with_last_key(b"a".to_vec()); // before range start
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    );
+    let spec = ShardSpec::with_range(b"m", b"z");
+    let cursor = CursorUpdate::with_last_key(b"a"); // before range start
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec.as_ref(), cursor);
     assert!(matches!(
         validate_manifest(&[shard]),
         Err(ManifestValidationError::CursorOutOfBounds { .. })
@@ -713,12 +734,8 @@ fn manifest_cursor_key_too_large() {
 
     let oversized_key = vec![0xAA; MAX_KEY_SIZE + 1];
     let spec = ShardSpec::with_range(vec![0x00], vec![0xFF]);
-    let cursor = Cursor::with_last_key(oversized_key);
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    );
+    let cursor = CursorUpdate::with_last_key(&oversized_key);
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec.as_ref(), cursor);
     let result = validate_manifest(&[shard]);
     assert!(
         matches!(
@@ -736,12 +753,8 @@ fn manifest_cursor_key_at_exact_max_succeeds() {
 
     let exact_key = vec![0xBB; MAX_KEY_SIZE];
     let spec = ShardSpec::with_range(vec![0x00], vec![0xFF]);
-    let cursor = Cursor::with_last_key(exact_key);
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    );
+    let cursor = CursorUpdate::with_last_key(&exact_key);
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec.as_ref(), cursor);
     assert!(validate_manifest(&[shard]).is_ok());
 }
 
@@ -857,6 +870,19 @@ fn hash_register_shards_order_independent() {
     let h_reverse = hash_register_shards_payload_fixtures(&[s2, s1]);
     assert_eq!(h_forward, h_reverse);
     assert_ne!(h_forward, 0);
+}
+
+#[test]
+fn hash_register_shards_duplicate_ids_preserve_input_order() {
+    let a = make_initial_shard(7, b"a", b"m");
+    let b = make_initial_shard(7, b"m", b"z");
+
+    let h_ab = hash_register_shards_payload_fixtures(&[a.clone(), b.clone()]);
+    let h_ba = hash_register_shards_payload_fixtures(&[b, a]);
+    assert_ne!(
+        h_ab, h_ba,
+        "equal shard ids keep stable input order in canonical payload"
+    );
 }
 
 /// The three terminal-op hashes (complete, fail, cancel) must be non-zero
@@ -981,8 +1007,8 @@ fn shard_summary_acquire_count_saturates_at_u32_max() {
         ShardId::from_raw(1),
         ShardStatus::Active,
         None,
-        &ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        &Cursor::initial(),
+        &ShardSpec::with_range(b"a", b"z"),
+        CursorUpdate::initial(),
         CursorSemantics::Completed,
         None,
         large_epoch,
@@ -997,7 +1023,6 @@ fn shard_summary_acquire_count_saturates_at_u32_max() {
         u32::MAX,
         "acquire_count must saturate at u32::MAX, not truncate"
     );
-    drop(summary);
     let mut record = record;
     record.deallocate_fields(&mut slab);
 }
@@ -1019,12 +1044,8 @@ fn manifest_inverted_spec_detected_by_validate_manifest() {
         b"a".to_vec().into_boxed_slice(),
         Box::new([]),
     );
-    let cursor = Cursor::initial();
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        inverted_spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    );
+    let cursor = CursorUpdate::initial();
+    let shard = InitialShardInput::new(ShardId::from_raw(0), inverted_spec.as_ref(), cursor);
     let result = validate_manifest(&[shard]);
     assert!(
         matches!(result, Err(ManifestValidationError::InvalidSpec { .. })),
@@ -1149,7 +1170,7 @@ mod prop_manifest {
             InitialShardFixture {
                 shard: id,
                 spec: ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
-                cursor: Cursor::initial(),
+                cursor: CursorUpdate::initial(),
             }
         })
     }
@@ -1168,7 +1189,7 @@ mod prop_manifest {
                         InitialShardFixture {
                             shard: ShardId::from_raw(raw),
                             spec: ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
-                            cursor: Cursor::initial(),
+                            cursor: CursorUpdate::initial(),
                         }
                     })
                     .collect()
@@ -1190,8 +1211,8 @@ mod prop_manifest {
         fn duplicate_id_always_rejected(base in arb_initial_shard(0)) {
             let dup = InitialShardFixture {
                 shard: base.shard,
-                spec: ShardSpec::with_range(b"x".to_vec(), b"y".to_vec()),
-                cursor: Cursor::initial(),
+                spec: ShardSpec::with_range(b"x", b"y"),
+                cursor: CursorUpdate::initial(),
             };
             let result = validate_manifest_fixtures(&[base, dup]);
             prop_assert!(
@@ -1208,13 +1229,13 @@ mod prop_manifest {
         ) {
             let a = InitialShardFixture {
                 shard: ShardId::from_raw(id_a),
-                spec: ShardSpec::with_range(b"a".to_vec(), b"n".to_vec()),
-                cursor: Cursor::initial(),
+                spec: ShardSpec::with_range(b"a", b"n"),
+                cursor: CursorUpdate::initial(),
             };
             let b = InitialShardFixture {
                 shard: ShardId::from_raw(id_b),
-                spec: ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-                cursor: Cursor::initial(),
+                spec: ShardSpec::with_range(b"m", b"z"),
+                cursor: CursorUpdate::initial(),
             };
             let result = validate_manifest_fixtures(&[a, b]);
             prop_assert!(
@@ -1241,12 +1262,8 @@ fn manifest_detects_overlap_with_unbounded_end() {
         Box::new([]), // unbounded end = [a, ∞)
         Box::new([]),
     );
-    let cursor_a = Cursor::initial();
-    let shard_a = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec_a.as_ref(),
-        CursorUpdate::from_cursor(&cursor_a),
-    );
+    let cursor_a = CursorUpdate::initial();
+    let shard_a = InitialShardInput::new(ShardId::from_raw(0), spec_a.as_ref(), cursor_a);
     let shard_b = make_initial_shard(1, b"m", b"z");
     let shard_b_input = shard_b.as_input();
     let result = validate_manifest(&[shard_a, shard_b_input]);
@@ -1269,18 +1286,10 @@ fn manifest_detects_overlap_with_both_starts_empty() {
         b"z".to_vec().into_boxed_slice(),
         Box::new([]),
     );
-    let cursor_a = Cursor::initial();
-    let cursor_b = Cursor::initial();
-    let shard_a = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec_a.as_ref(),
-        CursorUpdate::from_cursor(&cursor_a),
-    );
-    let shard_b = InitialShardInput::new(
-        ShardId::from_raw(1),
-        spec_b.as_ref(),
-        CursorUpdate::from_cursor(&cursor_b),
-    );
+    let cursor_a = CursorUpdate::initial();
+    let cursor_b = CursorUpdate::initial();
+    let shard_a = InitialShardInput::new(ShardId::from_raw(0), spec_a.as_ref(), cursor_a);
+    let shard_b = InitialShardInput::new(ShardId::from_raw(1), spec_b.as_ref(), cursor_b);
     let result = validate_manifest(&[shard_a, shard_b]);
     assert!(
         matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
@@ -1296,12 +1305,8 @@ fn manifest_unbounded_start_rejected() {
         b"m".to_vec().into_boxed_slice(),
         Box::new([]),
     );
-    let cursor_a = Cursor::initial();
-    let shard_a = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec_a.as_ref(),
-        CursorUpdate::from_cursor(&cursor_a),
-    );
+    let cursor_a = CursorUpdate::initial();
+    let shard_a = InitialShardInput::new(ShardId::from_raw(0), spec_a.as_ref(), cursor_a);
     let shard_b = make_initial_shard(1, b"m", b"z");
     let shard_b_input = shard_b.as_input();
     let result = validate_manifest(&[shard_a, shard_b_input]);
@@ -1315,12 +1320,8 @@ fn manifest_unbounded_start_rejected() {
 fn manifest_unbounded_end_rejected() {
     let spec =
         ShardSpec::from_raw_parts(b"a".to_vec().into_boxed_slice(), Box::new([]), Box::new([]));
-    let cursor = Cursor::initial();
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    );
+    let cursor = CursorUpdate::initial();
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec.as_ref(), cursor);
     assert!(
         matches!(
             validate_manifest(&[shard]),
@@ -1333,12 +1334,8 @@ fn manifest_unbounded_end_rejected() {
 #[test]
 fn manifest_fully_unbounded_rejected() {
     let spec = ShardSpec::unbounded();
-    let cursor = Cursor::initial();
-    let shard = InitialShardInput::new(
-        ShardId::from_raw(0),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    );
+    let cursor = CursorUpdate::initial();
+    let shard = InitialShardInput::new(ShardId::from_raw(0), spec.as_ref(), cursor);
     assert!(
         matches!(
             validate_manifest(&[shard]),

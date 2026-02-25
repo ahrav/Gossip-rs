@@ -52,7 +52,7 @@
 //! cursor key and shard spec boundaries. Checks four properties in order:
 //! key presence, key size limit, monotonicity (new >= old), and bounds
 //! (`last_key` in `[spec.start, spec.end)`). Operates entirely on borrowed
-//! slices to avoid materializing owned `Cursor`/`ShardSpec` values on the
+//! slices to avoid materializing owned cursor/spec values on the
 //! checkpoint hot path.
 //!
 //! ## Invariants
@@ -62,7 +62,7 @@
 //!   If it is `None`, the record is in an inconsistent state and
 //!   `validate_lease` returns `StaleFence` to force re-acquisition.
 
-use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
 use crate::coordination::error::CoordError;
 use crate::coordination::lease::{Lease, OpLogEntry};
 use crate::coordination::record::ShardRecord;
@@ -178,7 +178,7 @@ pub fn validate_lease(
 ///
 /// This is the canonical cursor validator for all mutation paths (checkpoint,
 /// complete). It operates entirely on borrowed slices so callers can validate
-/// without materializing owned `Cursor` or `ShardSpec` values -- critical on
+/// without materializing owned cursor/spec values -- critical on
 /// the checkpoint hot path where the previous key and spec bounds live in the
 /// slab as `PooledCursor` / `PooledShardSpec`.
 ///
@@ -219,13 +219,23 @@ pub(crate) fn validate_cursor_update_pooled(
         });
     }
 
+    // 2b. Token size.
+    if let Some(token) = new_cursor.token()
+        && token.len() > MAX_TOKEN_SIZE
+    {
+        return Err(CoordError::CursorTokenTooLarge {
+            size: token.len(),
+            max: MAX_TOKEN_SIZE,
+        });
+    }
+
     // 3. Monotonicity.
     if let Some(old_key) = old_last_key
         && new_last_key < old_key
     {
         return Err(CoordError::CursorRegression {
-            old_key: Some(old_key.to_vec().into_boxed_slice()),
-            new_key: Some(new_last_key.to_vec().into_boxed_slice()),
+            old_key: Some(old_key.len()),
+            new_key: Some(new_last_key.len()),
         });
     }
 
@@ -233,13 +243,13 @@ pub(crate) fn validate_cursor_update_pooled(
     if (!spec_start.is_empty() && new_last_key < spec_start)
         || (!spec_end.is_empty() && new_last_key >= spec_end)
     {
-        return Err(CoordError::CursorOutOfBounds(Box::new(
+        return Err(CoordError::CursorOutOfBounds(
             crate::coordination::error::CursorOutOfBoundsDetail {
-                last_key: new_last_key.to_vec().into_boxed_slice(),
-                spec_start: spec_start.to_vec().into_boxed_slice(),
-                spec_end: spec_end.to_vec().into_boxed_slice(),
+                last_key: new_last_key.len(),
+                spec_start: spec_start.len(),
+                spec_end: spec_end.len(),
             },
-        )));
+        ));
     }
 
     Ok(())
@@ -325,8 +335,7 @@ mod tests {
 
     use super::*;
     use crate::coordination::cursor::{
-        Cursor, CursorAdvance, CursorBoundsCheck, CursorUpdate, check_cursor_advance,
-        check_cursor_bounds,
+        CursorAdvance, CursorBoundsCheck, CursorUpdate, check_cursor_advance, check_cursor_bounds,
     };
     use crate::coordination::lease::{LeaseHolder, OpKind, OpResult};
     use crate::coordination::record::ShardRecord;
@@ -363,7 +372,7 @@ mod tests {
             crate::coordination::record::ShardStatus::Active,
             None,
             &test_spec(),
-            &Cursor::initial(),
+            CursorUpdate::initial(),
             CursorSemantics::Completed,
             Some(LeaseHolder::new(
                 WorkerId::from_raw(99),
@@ -375,7 +384,7 @@ mod tests {
             RingBuffer::new(),
             slab,
         );
-        r.assert_invariants();
+        r.assert_invariants(slab);
         r
     }
 
@@ -392,13 +401,12 @@ mod tests {
     }
 
     fn validate_cursor_update_for_tests(
-        new_cursor: &Cursor,
-        old_cursor: &Cursor,
+        new_cursor: &CursorUpdate<'_>,
+        old_cursor: &CursorUpdate<'_>,
         spec: &ShardSpec,
     ) -> Result<(), CoordError> {
-        let update = CursorUpdate::from_cursor(new_cursor);
         validate_cursor_update_pooled(
-            &update,
+            new_cursor,
             old_cursor.last_key(),
             spec.key_range_start(),
             spec.key_range_end(),
@@ -641,24 +649,24 @@ mod tests {
     #[test]
     fn validate_cursor_update_ok_first_checkpoint() {
         let spec = test_spec();
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"f".to_vec());
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::with_last_key(b"f");
         assert!(validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok());
     }
 
     #[test]
     fn validate_cursor_update_ok_forward() {
         let spec = test_spec();
-        let old_cursor = Cursor::with_last_key(b"f".to_vec());
-        let new_cursor = Cursor::with_last_key(b"m".to_vec());
+        let old_cursor = CursorUpdate::with_last_key(b"f");
+        let new_cursor = CursorUpdate::with_last_key(b"m");
         assert!(validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok());
     }
 
     #[test]
     fn validate_cursor_update_missing_key() {
         let spec = test_spec();
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::initial(); // no last_key
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::initial(); // no last_key
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(matches!(result, Err(CoordError::CheckpointMissingKey)));
     }
@@ -666,8 +674,8 @@ mod tests {
     #[test]
     fn validate_cursor_update_rejects_oversized_key() {
         let spec = test_spec();
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(vec![0xAB; MAX_KEY_SIZE + 1]);
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::with_last_key(&[0xAB; MAX_KEY_SIZE + 1]);
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(
@@ -680,10 +688,29 @@ mod tests {
     }
 
     #[test]
+    fn validate_cursor_update_rejects_oversized_token() {
+        use crate::coordination::cursor::MAX_TOKEN_SIZE;
+
+        let spec = test_spec();
+        let old_cursor = CursorUpdate::initial();
+        let oversized_token = vec![0xCD; MAX_TOKEN_SIZE + 1];
+        let new_cursor = CursorUpdate::with_token(b"b", &oversized_token);
+        let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
+        assert!(
+            matches!(
+                result,
+                Err(CoordError::CursorTokenTooLarge { size, max })
+                    if size == MAX_TOKEN_SIZE + 1 && max == MAX_TOKEN_SIZE
+            ),
+            "expected CursorTokenTooLarge, got {result:?}",
+        );
+    }
+
+    #[test]
     fn validate_cursor_update_regression() {
         let spec = test_spec();
-        let old_cursor = Cursor::with_last_key(b"m".to_vec());
-        let new_cursor = Cursor::with_last_key(b"f".to_vec()); // regression
+        let old_cursor = CursorUpdate::with_last_key(b"m");
+        let new_cursor = CursorUpdate::with_last_key(b"f"); // regression
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(matches!(result, Err(CoordError::CursorRegression { .. })));
     }
@@ -692,8 +719,8 @@ mod tests {
     fn validate_cursor_update_below_range() {
         // spec range is [a, z), cursor at byte 0x00 which is below 'a'.
         let spec = test_spec();
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(vec![0x00]);
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::with_last_key(&[0x00]);
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
@@ -705,8 +732,8 @@ mod tests {
     fn validate_cursor_update_above_range() {
         // spec range is [a, z), cursor at 'z' (exclusive end).
         let spec = test_spec();
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"z".to_vec());
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::with_last_key(b"z");
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
@@ -719,8 +746,8 @@ mod tests {
     #[test]
     fn validate_cursor_update_idempotent_same_key() {
         let spec = test_spec();
-        let old_cursor = Cursor::with_last_key(b"f".to_vec());
-        let new_cursor = Cursor::with_last_key(b"f".to_vec()); // same key
+        let old_cursor = CursorUpdate::with_last_key(b"f");
+        let new_cursor = CursorUpdate::with_last_key(b"f"); // same key
         assert!(
             validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok(),
             "same key should be Forward (idempotent)"
@@ -730,8 +757,8 @@ mod tests {
     #[test]
     fn validate_cursor_update_key_at_spec_start() {
         let spec = test_spec(); // spec [a, z)
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"a".to_vec()); // at start (inclusive)
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::with_last_key(b"a"); // at start (inclusive)
         assert!(
             validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec).is_ok(),
             "key at spec start should be InBounds (inclusive)"
@@ -741,8 +768,8 @@ mod tests {
     #[test]
     fn validate_cursor_update_key_at_spec_end() {
         let spec = test_spec(); // spec [a, z)
-        let old_cursor = Cursor::initial();
-        let new_cursor = Cursor::with_last_key(b"z".to_vec()); // at end (exclusive)
+        let old_cursor = CursorUpdate::initial();
+        let new_cursor = CursorUpdate::with_last_key(b"z"); // at end (exclusive)
         let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
         assert!(
             matches!(result, Err(CoordError::CursorOutOfBounds(_))),
@@ -753,21 +780,24 @@ mod tests {
     #[test]
     fn validate_cursor_update_pooled_matches_owned_validation() {
         let cases = [
-            (Cursor::initial(), Cursor::with_last_key(b"f".to_vec())),
+            (CursorUpdate::initial(), CursorUpdate::with_last_key(b"f")),
             (
-                Cursor::with_last_key(b"f".to_vec()),
-                Cursor::with_last_key(b"m".to_vec()),
+                CursorUpdate::with_last_key(b"f"),
+                CursorUpdate::with_last_key(b"m"),
             ),
             (
-                Cursor::with_last_key(b"m".to_vec()),
-                Cursor::with_last_key(b"f".to_vec()),
+                CursorUpdate::with_last_key(b"m"),
+                CursorUpdate::with_last_key(b"f"),
             ),
-            (Cursor::initial(), Cursor::initial()),
-            (Cursor::initial(), Cursor::with_last_key(vec![0x00])),
-            (Cursor::initial(), Cursor::with_last_key(b"z".to_vec())),
+            (CursorUpdate::initial(), CursorUpdate::initial()),
             (
-                Cursor::initial(),
-                Cursor::with_last_key(vec![0xAB; MAX_KEY_SIZE + 1]),
+                CursorUpdate::initial(),
+                CursorUpdate::with_last_key(&[0x00]),
+            ),
+            (CursorUpdate::initial(), CursorUpdate::with_last_key(b"z")),
+            (
+                CursorUpdate::initial(),
+                CursorUpdate::with_last_key(&[0xAB; MAX_KEY_SIZE + 1]),
             ),
         ];
         let spec = test_spec();
@@ -919,14 +949,14 @@ mod tests {
             new_key in proptest::option::of(proptest::collection::vec(any::<u8>(), 1..32)),
             spec in crate::test_util::arb_bounded_shard_spec(),
         ) {
-            let old_cursor = match old_key {
-                Some(k) => Cursor::with_last_key(k),
-                None => Cursor::initial(),
+            let old_cursor = match old_key.as_deref() {
+                Some(k) => CursorUpdate::with_last_key(k),
+                None => CursorUpdate::initial(),
             };
 
-            let new_cursor = match new_key {
-                Some(k) => Cursor::with_last_key(k),
-                None => Cursor::initial(),
+            let new_cursor = match new_key.as_deref() {
+                Some(k) => CursorUpdate::with_last_key(k),
+                None => CursorUpdate::initial(),
             };
 
             let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
@@ -938,12 +968,12 @@ mod tests {
                     prop_assert!(new_cursor.last_key().is_some());
                     // Must be forward.
                     prop_assert_eq!(
-                        check_cursor_advance(&old_cursor, &new_cursor),
+                        check_cursor_advance(old_cursor, new_cursor),
                         CursorAdvance::Forward,
                     );
                     // Must be in bounds.
                     prop_assert_eq!(
-                        check_cursor_bounds(&new_cursor, &spec),
+                        check_cursor_bounds(new_cursor, spec.as_ref()),
                         CursorBoundsCheck::InBounds,
                     );
                 }
@@ -951,13 +981,13 @@ mod tests {
                     prop_assert!(new_cursor.last_key().is_none());
                 }
                 Err(CoordError::CursorRegression { .. }) => {
-                    let adv = check_cursor_advance(&old_cursor, &new_cursor);
+                    let adv = check_cursor_advance(old_cursor, new_cursor);
                     prop_assert!(
                         adv == CursorAdvance::Regression || adv == CursorAdvance::ResetToNone,
                     );
                 }
                 Err(CoordError::CursorOutOfBounds(_)) => {
-                    let bounds = check_cursor_bounds(&new_cursor, &spec);
+                    let bounds = check_cursor_bounds(new_cursor, spec.as_ref());
                     prop_assert!(
                         bounds == CursorBoundsCheck::BelowRange
                             || bounds == CursorBoundsCheck::AboveRange,

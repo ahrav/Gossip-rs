@@ -32,7 +32,7 @@
 
 use std::collections::HashSet;
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::CheckpointError;
 use crate::coordination::facade::ClaimError;
 use crate::coordination::in_memory::InMemoryCoordinator;
@@ -75,12 +75,8 @@ fn scenario_full_run_lifecycle() {
 
     // -- Register one shard [a, z) --
     let spec = test_spec();
-    let cursor = Cursor::initial();
-    let shards = vec![InitialShardInput::new(
-        test_shard(),
-        spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
-    )];
+    let cursor = CursorUpdate::initial();
+    let shards = vec![InitialShardInput::new(test_shard(), spec.as_ref(), cursor)];
     let reg_outcome = coord
         .register_shards(now(2), tenant, run, &shards, OpId::from_raw(u64::MAX))
         .unwrap();
@@ -434,8 +430,8 @@ fn scenario_split_chain_double_residual() {
         .unwrap();
 
     // -- Second residual split: [a,m) -> parent=[a,j), residual=[j,m) --
-    let parent_new_2 = ShardSpec::with_range(b"a".to_vec(), b"j".to_vec());
-    let residual_2 = ShardSpec::with_range(b"j".to_vec(), b"m".to_vec());
+    let parent_new_2 = ShardSpec::with_range(b"a", b"j");
+    let residual_2 = ShardSpec::with_range(b"j", b"m");
     let plan2 = SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2.as_ref()).unwrap();
     let result2 = coord
         .split_residual(now(14), tenant, &lease, plan2, OpId::from_raw(4))
@@ -636,12 +632,12 @@ fn scenario_cancel_from_initializing() {
     );
 
     // -- register_shards on cancelled run should fail --
-    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let cursor = Cursor::initial();
+    let spec = ShardSpec::with_range(b"a", b"z");
+    let cursor = CursorUpdate::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(1),
         spec.as_ref(),
-        CursorUpdate::from_cursor(&cursor),
+        cursor,
     )];
     let reg_result = coord.register_shards(now(3), tenant, run, &shards, OpId::from_raw(2));
     assert!(
@@ -794,13 +790,13 @@ fn scenario_claim_contention() {
 
     let shard1 = ShardId::from_raw(1);
     let shard2 = ShardId::from_raw(2);
-    let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-    let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-    let cursor1 = Cursor::initial();
-    let cursor2 = Cursor::initial();
+    let spec1 = ShardSpec::with_range(b"a", b"m");
+    let spec2 = ShardSpec::with_range(b"m", b"z");
+    let cursor1 = CursorUpdate::initial();
+    let cursor2 = CursorUpdate::initial();
     let shards = vec![
-        InitialShardInput::new(shard1, spec1.as_ref(), CursorUpdate::from_cursor(&cursor1)),
-        InitialShardInput::new(shard2, spec2.as_ref(), CursorUpdate::from_cursor(&cursor2)),
+        InitialShardInput::new(shard1, spec1.as_ref(), cursor1),
+        InitialShardInput::new(shard2, spec2.as_ref(), cursor2),
     ];
     let _ = coord
         .register_shards(now(2), tenant, run, &shards, OpId::from_raw(u64::MAX))

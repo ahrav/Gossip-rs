@@ -1,7 +1,7 @@
 //! Tests for [`ShardFilter`] predicates applied through
-//! [`RunManagement::list_shards`].
+//! [`RunManagement::list_shards_into`].
 //!
-//! `list_shards` accepts a [`ShardFilter`] that narrows the returned set by
+//! `list_shards_into` accepts a [`ShardFilter`] that narrows the returned set by
 //! status, lease state, and parentage. Getting these predicates wrong causes
 //! workers to receive invisible shards (missed work) or stale shards
 //! (wasted retries), so each filter variant has its own focused test.
@@ -20,15 +20,33 @@
 //! filter/capacity-hint contracts.
 
 use super::*;
-use crate::coordination::cursor::{Cursor, CursorUpdate};
-use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter};
-use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::cursor::CursorUpdate;
+use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter, ShardSummary};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_result, acquire_shard, coordinator_with_run_and_lease,
     do_split_replace, now, test_run, test_tenant, test_worker,
 };
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 use crate::sim::backend::SimIntrospection;
+
+fn list_shards_with_filter(
+    coord: &InMemoryCoordinator,
+    at: LogicalTime,
+    filter: ShardFilter,
+    out: &mut Vec<ShardSummary>,
+) {
+    let required = coord
+        .run_shards
+        .get(&(test_tenant(), test_run()))
+        .map_or(0, |ids| ids.len());
+    if out.capacity() < required {
+        out.reserve(required - out.capacity());
+    }
+    coord
+        .list_shards_into(at, test_tenant(), test_run(), filter, out)
+        .unwrap();
+}
 
 // -- Deterministic filter tests -----------------------------------------------
 //
@@ -41,13 +59,12 @@ use crate::sim::backend::SimIntrospection;
 #[test]
 fn list_shards_filter_active() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
+    let mut summaries = Vec::new();
 
     // Shard is Active + leased.
-    let active_all = coord
-        .list_shards(now(4), test_tenant(), test_run(), ShardFilter::active())
-        .unwrap();
+    list_shards_with_filter(&coord, now(4), ShardFilter::active(), &mut summaries);
     assert_eq!(
-        active_all.len(),
+        summaries.len(),
         1,
         "active filter should include leased Active shard"
     );
@@ -63,11 +80,9 @@ fn list_shards_filter_active() {
         )
         .unwrap();
 
-    let active_after_park = coord
-        .list_shards(now(6), test_tenant(), test_run(), ShardFilter::active())
-        .unwrap();
+    list_shards_with_filter(&coord, now(6), ShardFilter::active(), &mut summaries);
     assert!(
-        active_after_park.is_empty(),
+        summaries.is_empty(),
         "active filter should exclude Parked shard",
     );
 }
@@ -76,27 +91,24 @@ fn list_shards_filter_active() {
 #[test]
 fn list_shards_filter_available() {
     let (coord, _lease) = coordinator_with_run_and_lease();
+    let mut summaries = Vec::new();
 
     // Shard is Active + leased -> available() requires is_leased=false.
-    let available = coord
-        .list_shards(now(4), test_tenant(), test_run(), ShardFilter::available())
-        .unwrap();
+    list_shards_with_filter(&coord, now(4), ShardFilter::available(), &mut summaries);
     assert!(
-        available.is_empty(),
+        summaries.is_empty(),
         "available filter should exclude leased Active shard",
     );
 
     // After lease expiry, shard becomes available.
-    let available_after = coord
-        .list_shards(
-            now(LEASE_DURATION + 10),
-            test_tenant(),
-            test_run(),
-            ShardFilter::available(),
-        )
-        .unwrap();
+    list_shards_with_filter(
+        &coord,
+        now(LEASE_DURATION + 10),
+        ShardFilter::available(),
+        &mut summaries,
+    );
     assert_eq!(
-        available_after.len(),
+        summaries.len(),
         1,
         "shard should be available after lease expiry"
     );
@@ -106,12 +118,11 @@ fn list_shards_filter_available() {
 #[test]
 fn list_shards_filter_parked() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
+    let mut summaries = Vec::new();
 
     // No parked shards initially.
-    let parked = coord
-        .list_shards(now(4), test_tenant(), test_run(), ShardFilter::parked())
-        .unwrap();
-    assert!(parked.is_empty());
+    list_shards_with_filter(&coord, now(4), ShardFilter::parked(), &mut summaries);
+    assert!(summaries.is_empty());
 
     // Park the shard.
     let _ = coord
@@ -124,11 +135,9 @@ fn list_shards_filter_parked() {
         )
         .unwrap();
 
-    let parked_after = coord
-        .list_shards(now(6), test_tenant(), test_run(), ShardFilter::parked())
-        .unwrap();
-    assert_eq!(parked_after.len(), 1);
-    assert_eq!(parked_after[0].status(), ShardStatus::Parked);
+    list_shards_with_filter(&coord, now(6), ShardFilter::parked(), &mut summaries);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].status(), ShardStatus::Parked);
 }
 
 /// `root_only` excludes split children (shards whose `parent` is `Some`).
@@ -140,18 +149,17 @@ fn list_shards_filter_parked() {
 fn list_shards_filter_root_only() {
     let (mut coord, lease) = coordinator_with_run_and_lease();
     do_split_replace(&mut coord, &lease);
+    let mut summaries = Vec::new();
 
     // root_only should exclude split children.
     let root_filter = ShardFilter {
         root_only: true,
         ..ShardFilter::default()
     };
-    let roots = coord
-        .list_shards(now(5), test_tenant(), test_run(), root_filter)
-        .unwrap();
+    list_shards_with_filter(&coord, now(5), root_filter, &mut summaries);
     // The parent (root) is Split, children are derived (have parent).
     // root_only excludes shards with parent.is_some().
-    for s in &roots {
+    for s in &summaries {
         assert!(
             s.parent().is_none(),
             "root_only filter should exclude children; found shard with parent: {:?}",
@@ -160,14 +168,49 @@ fn list_shards_filter_root_only() {
     }
 
     // Without root_only, we get all (parent + children).
-    let all = coord
-        .list_shards(now(5), test_tenant(), test_run(), ShardFilter::all())
-        .unwrap();
+    let root_count = summaries.len();
+    list_shards_with_filter(&coord, now(5), ShardFilter::all(), &mut summaries);
     assert!(
-        all.len() > roots.len(),
+        summaries.len() > root_count,
         "all filter should include more shards than root_only: all={} vs roots={}",
-        all.len(),
-        roots.len(),
+        summaries.len(),
+        root_count,
+    );
+}
+
+/// `list_shards_into` should produce stable results and allow
+/// output-buffer reuse across repeated queries.
+#[test]
+fn list_shards_into_reuses_buffer_on_repeated_query() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+
+    let mut out = Vec::with_capacity(8);
+    coord
+        .list_shards_into(
+            now(4),
+            test_tenant(),
+            test_run(),
+            ShardFilter::active(),
+            &mut out,
+        )
+        .unwrap();
+    let expected = out.clone();
+
+    let capacity_after_first = out.capacity();
+    coord
+        .list_shards_into(
+            now(4),
+            test_tenant(),
+            test_run(),
+            ShardFilter::active(),
+            &mut out,
+        )
+        .unwrap();
+    assert_eq!(out, expected);
+    assert_eq!(
+        out.capacity(),
+        capacity_after_first,
+        "reused output buffer should not reallocate on identical repeated query",
     );
 }
 
@@ -275,12 +318,8 @@ fn apply_op(
         }
         Op::Checkpoint { cursor_key } => {
             if let Some(lease) = last_lease.as_ref()
-                && let Ok(c) = Cursor::try_with_last_key(vec![*cursor_key])
+                && let Ok(update) = CursorUpdate::try_with_last_key(&[*cursor_key])
             {
-                let update = CursorUpdate::new(
-                    c.last_key()
-                        .expect("try_with_last_key guarantees a non-empty key"),
-                );
                 let _ = coord.checkpoint(now, ten, lease, &update, OpId::from_raw(oc));
                 return (time, oc + 1);
             }
@@ -288,12 +327,8 @@ fn apply_op(
         }
         Op::Complete { cursor_key } => {
             if let Some(lease) = last_lease.as_ref()
-                && let Ok(c) = Cursor::try_with_last_key(vec![*cursor_key])
+                && let Ok(update) = CursorUpdate::try_with_last_key(&[*cursor_key])
             {
-                let update = CursorUpdate::new(
-                    c.last_key()
-                        .expect("try_with_last_key guarantees a non-empty key"),
-                );
                 let _ = coord.complete(now, ten, lease, &update, OpId::from_raw(oc));
                 return (time, oc + 1);
             }
@@ -320,14 +355,12 @@ fn apply_op(
         }
         Op::SplitReplace => {
             if let Some(lease) = last_lease.as_ref() {
-                let spec_a = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-                let spec_b = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-                let cursor_a = Cursor::initial();
-                let cursor_b = Cursor::initial();
-                let child_a =
-                    SplitReplaceChild::new(spec_a.as_ref(), CursorUpdate::from_cursor(&cursor_a));
-                let child_b =
-                    SplitReplaceChild::new(spec_b.as_ref(), CursorUpdate::from_cursor(&cursor_b));
+                let spec_a = ShardSpec::with_range(b"a", b"m");
+                let spec_b = ShardSpec::with_range(b"m", b"z");
+                let cursor_a = CursorUpdate::initial();
+                let cursor_b = CursorUpdate::initial();
+                let child_a = SplitReplaceChild::new(spec_a.as_ref(), cursor_a);
+                let child_b = SplitReplaceChild::new(spec_b.as_ref(), cursor_b);
                 if let Ok(plan) = SplitReplacePlan::try_new(vec![child_a, child_b]) {
                     let _ = coord.split_replace(now, ten, lease, plan, OpId::from_raw(oc));
                     return (time, oc + 1);
@@ -337,8 +370,8 @@ fn apply_op(
         }
         Op::SplitResidual => {
             if let Some(lease) = last_lease.as_ref() {
-                let new_parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
-                let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+                let new_parent = ShardSpec::with_range(b"a", b"m");
+                let residual = ShardSpec::with_range(b"m", b"z");
                 if let Ok(plan) = SplitResidualPlan::try_new(new_parent.as_ref(), residual.as_ref())
                 {
                     let _ = coord.split_residual(now, ten, lease, plan, OpId::from_raw(oc));
@@ -390,7 +423,7 @@ proptest! {
 
             // After every op, all records must satisfy invariants.
             for (_, record) in coord.shards() {
-                record.assert_invariants();
+                record.assert_invariants(coord.slab());
             }
         }
     }
@@ -590,15 +623,13 @@ fn multi_shard_coordinator(n: usize) -> InMemoryCoordinator {
             (
                 ShardId::from_raw(i as u64),
                 ShardSpec::with_range(start, end),
-                Cursor::initial(),
+                CursorUpdate::initial(),
             )
         })
         .collect();
     let shards: Vec<InitialShardInput<'_>> = shard_entries
         .iter()
-        .map(|(shard, spec, cursor)| {
-            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
-        })
+        .map(|(shard, spec, cursor)| InitialShardInput::new(*shard, spec.as_ref(), *cursor))
         .collect();
     let _ = coord
         .register_shards(now(1), tenant, run, &shards, OpId::from_raw(100))
@@ -945,7 +976,7 @@ fn runtime_constructor_clamps_explicit_slab_capacity_to_backend_max() {
 fn coordinator_config_dev_defaults_budget() {
     let cfg = super::CoordinatorConfig::dev_defaults();
     let mb = cfg.memory_budget_mb();
-    // Dev defaults: ~3 MiB. Allow 1-100 MiB range for formula drift.
+    // Dev defaults: ~6.6 MiB. Allow 1-100 MiB range for formula drift.
     assert!(
         (1..=100).contains(&mb),
         "dev_defaults budget {mb} MB outside expected 1-100 MB range"
@@ -956,10 +987,10 @@ fn coordinator_config_dev_defaults_budget() {
 fn coordinator_config_prod_defaults_budget() {
     let cfg = super::CoordinatorConfig::prod_defaults();
     let mb = cfg.memory_budget_mb();
-    // Prod defaults: 1M shards x ~17 KiB each = ~17 GB. Allow 5-25 GB range.
+    // Prod defaults: 1M shards x ~25 KiB each = ~24.4 GiB. Allow 5-30 GB range.
     assert!(
-        (5_000..=25_000).contains(&mb),
-        "prod_defaults budget {mb} MB outside expected 5000-25000 MB range"
+        (5_000..=30_000).contains(&mb),
+        "prod_defaults budget {mb} MB outside expected 5000-30000 MB range"
     );
 }
 
@@ -1006,17 +1037,232 @@ fn memory_budget_constants_match_struct_sizes() {
     let shard_size = size_of::<ShardRecord>();
     let run_size = size_of::<RunRecord>();
 
-    // The planning formula uses 784 for ShardRecord and 512 for RunRecord.
-    // These are documented in `CoordinatorConfig::memory_budget()`.
+    // The planning formula uses constants from in_memory.rs; keep them in
+    // lockstep with the actual target layout.
     // Keep this test in lockstep with the implementation and docs.
     assert_eq!(
-        shard_size, 784,
-        "ShardRecord size changed from 784 to {shard_size}; \
-         update the constant in CoordinatorConfig::memory_budget()"
+        shard_size,
+        super::SHARD_RECORD_PLANNING_BYTES,
+        "ShardRecord size changed from {} to {shard_size}; \
+         update SHARD_RECORD_PLANNING_BYTES in CoordinatorConfig::memory_budget()",
+        super::SHARD_RECORD_PLANNING_BYTES,
     );
     assert_eq!(
-        run_size, 512,
-        "RunRecord size changed from 512 to {run_size}; \
-         update the constant in CoordinatorConfig::memory_budget()"
+        run_size,
+        super::RUN_RECORD_PLANNING_BYTES,
+        "RunRecord size changed from {} to {run_size}; \
+         update RUN_RECORD_PLANNING_BYTES in CoordinatorConfig::memory_budget()",
+        super::RUN_RECORD_PLANNING_BYTES,
     );
+}
+
+// ============================================================================
+// collect_claim_candidates_into tests
+//
+// These tests exercise the lightweight candidate collection method that the
+// default claim path uses instead of list_shards_into.  It returns only
+// ShardId values and the earliest lease deadline, avoiding ShardSummary
+// construction and slab byte copies.
+// ============================================================================
+
+/// An Initializing run (no shards registered yet) returns empty candidates
+/// and no deadline.
+#[test]
+fn collect_candidates_no_shards_registered() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let tenant = test_tenant();
+    let run = test_run();
+    let config = crate::coordination::run::RunConfig::try_new(
+        CursorSemantics::Completed,
+        LEASE_DURATION,
+        None,
+    )
+    .unwrap();
+    coord.create_run(now(1), tenant, run, config).unwrap();
+
+    // Run exists but has zero shards (still Initializing).
+    let mut candidates = Vec::new();
+    let deadline = coord
+        .collect_claim_candidates_into(now(2), tenant, run, &mut candidates)
+        .unwrap();
+    assert!(candidates.is_empty());
+    assert_eq!(deadline, None);
+}
+
+/// Mixed states: available + leased + terminal. Only available IDs appear
+/// in candidates; the earliest lease deadline is from the leased shard.
+#[test]
+fn collect_candidates_mixed_states() {
+    use crate::coordination::run::{InitialShardInput, RunConfig};
+
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let tenant = test_tenant();
+    let run = test_run();
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, None).unwrap();
+    coord.create_run(now(1), tenant, run, config).unwrap();
+
+    // Register 3 shards.
+    let specs: Vec<_> = (0u8..3)
+        .map(|i| {
+            (
+                ShardId::from_raw(i as u64),
+                crate::coordination::shard_spec::ShardSpec::with_range(
+                    vec![i * 10],
+                    vec![i * 10 + 9],
+                ),
+                CursorUpdate::initial(),
+            )
+        })
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = specs
+        .iter()
+        .map(|(id, spec, cursor)| InitialShardInput::new(*id, spec.as_ref(), *cursor))
+        .collect();
+    let _ = coord
+        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(1))
+        .unwrap();
+
+    // Shard 0: acquire and complete (terminal Done).
+    let key0 = ShardKey::new(run, ShardId::from_raw(0));
+    let mut scratch = crate::coordination::error::AcquireScratch::new();
+    let lease0 = coord
+        .acquire_and_restore_into(now(2), tenant, key0, test_worker(1), &mut scratch)
+        .unwrap()
+        .lease;
+    let _ = coord
+        .complete(
+            now(3),
+            tenant,
+            &lease0,
+            &CursorUpdate::new(&[0x00]),
+            OpId::from_raw(10),
+        )
+        .unwrap();
+
+    // Shard 1: acquire (Active + leased at now(4), deadline = 4 + LEASE_DURATION).
+    let key1 = ShardKey::new(run, ShardId::from_raw(1));
+    let _ = coord
+        .acquire_and_restore_into(now(4), tenant, key1, test_worker(2), &mut scratch)
+        .unwrap();
+
+    // Shard 2: remains Active + unleased.
+
+    let shard_count = coord
+        .run_shards
+        .get(&(tenant, run))
+        .map_or(0, |ids| ids.len());
+    let mut candidates = Vec::with_capacity(shard_count);
+    let deadline = coord
+        .collect_claim_candidates_into(now(5), tenant, run, &mut candidates)
+        .unwrap();
+
+    // Only shard 2 should appear (Active + unleased).
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0], ShardId::from_raw(2));
+
+    // Deadline should reflect shard 1's lease.
+    assert_eq!(deadline, Some(now(4 + LEASE_DURATION)));
+
+    // Terminal shard 0 must not appear.
+    assert!(!candidates.contains(&ShardId::from_raw(0)));
+    // Leased shard 1 must not appear as candidate.
+    assert!(!candidates.contains(&ShardId::from_raw(1)));
+}
+
+/// All shards leased: empty candidates, earliest deadline populated.
+#[test]
+fn collect_candidates_all_leased() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let tenant = test_tenant();
+    let run = test_run();
+
+    // The fixture has shard 0, Active + leased at now(3) with duration=30 → deadline=33.
+    let shard_count = coord
+        .run_shards
+        .get(&(tenant, run))
+        .map_or(0, |ids| ids.len());
+    let mut candidates = Vec::with_capacity(shard_count);
+    let deadline = coord
+        .collect_claim_candidates_into(now(4), tenant, run, &mut candidates)
+        .unwrap();
+
+    assert!(candidates.is_empty(), "all leased → no candidates");
+    assert_eq!(
+        deadline,
+        Some(now(3 + LEASE_DURATION)),
+        "should report the lease deadline"
+    );
+}
+
+/// Buffer reuse: capacity is preserved across calls.
+#[test]
+fn collect_candidates_buffer_reuse() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let tenant = test_tenant();
+    let run = test_run();
+
+    let shard_count = coord
+        .run_shards
+        .get(&(tenant, run))
+        .map_or(0, |ids| ids.len());
+    let mut candidates = Vec::with_capacity(shard_count + 10);
+    let initial_capacity = candidates.capacity();
+
+    // Call once (all leased at now(4), deadline = 3 + LEASE_DURATION).
+    let _ = coord
+        .collect_claim_candidates_into(now(4), tenant, run, &mut candidates)
+        .unwrap();
+    assert_eq!(
+        candidates.capacity(),
+        initial_capacity,
+        "capacity must not change"
+    );
+
+    // Call again after lease expiry.
+    let after_expiry = 3 + LEASE_DURATION + 1;
+    let _ = coord
+        .collect_claim_candidates_into(now(after_expiry), tenant, run, &mut candidates)
+        .unwrap();
+    assert_eq!(
+        candidates.capacity(),
+        initial_capacity,
+        "capacity must not change on second call"
+    );
+    assert_eq!(
+        candidates.len(),
+        1,
+        "shard should be available after expiry"
+    );
+}
+
+/// RunNotFound error for nonexistent run.
+#[test]
+fn collect_candidates_run_not_found() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let mut candidates = Vec::new();
+    let result = coord.collect_claim_candidates_into(
+        now(2),
+        test_tenant(),
+        crate::identity::RunId::from_raw(999),
+        &mut candidates,
+    );
+    assert!(matches!(
+        result,
+        Err(crate::coordination::run_errors::GetRunError::RunNotFound)
+    ));
+}
+
+/// TenantMismatch error for wrong tenant.
+#[test]
+fn collect_candidates_tenant_mismatch() {
+    let (coord, _lease) = coordinator_with_run_and_lease();
+    let wrong_tenant = crate::identity::TenantId::from_bytes([0xFF; 32]);
+    let mut candidates = Vec::new();
+    let result =
+        coord.collect_claim_candidates_into(now(2), wrong_tenant, test_run(), &mut candidates);
+    // InMemoryCoordinator keys by (tenant, run), so wrong tenant → RunNotFound.
+    assert!(matches!(
+        result,
+        Err(crate::coordination::run_errors::GetRunError::RunNotFound)
+    ));
 }
