@@ -17,6 +17,7 @@
 //! strings.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use blake3::Hasher;
 use gossip_stdx::{ByteSlab, SlabFull};
@@ -673,6 +674,7 @@ impl std::error::Error for ShardSpecInputError {}
 pub struct ShardSpecHandle {
     slot: u32,
     generation: u32,
+    arena_id: u32,
 }
 
 #[derive(Debug)]
@@ -713,6 +715,13 @@ pub struct ShardArena {
     slab: ByteSlab,
     slots: Vec<ArenaSlot>,
     free_slots: Vec<u32>,
+    arena_id: u32,
+}
+
+static NEXT_ARENA_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_arena_id() -> u32 {
+    NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl ShardArena {
@@ -732,6 +741,7 @@ impl ShardArena {
             slab: ByteSlab::with_capacity(byte_capacity),
             slots,
             free_slots,
+            arena_id: next_arena_id(),
         }
     }
 
@@ -772,6 +782,7 @@ impl ShardArena {
         Ok(ShardSpecHandle {
             slot: slot_index,
             generation: slot.generation,
+            arena_id: self.arena_id,
         })
     }
 
@@ -799,6 +810,9 @@ impl ShardArena {
     /// are an expected runtime outcome.
     #[must_use]
     pub fn try_view_spec(&self, handle: &ShardSpecHandle) -> Option<ShardSpecRef<'_>> {
+        if handle.arena_id != self.arena_id {
+            return None;
+        }
         let slot = self.slots.get(handle.slot as usize)?;
         if slot.generation != handle.generation {
             return None;
@@ -813,6 +827,9 @@ impl ShardArena {
     /// In debug builds, an invalid slot index triggers a debug_assert
     /// to catch corrupted handles early.
     pub fn free_spec(&mut self, handle: ShardSpecHandle) {
+        if handle.arena_id != self.arena_id {
+            return;
+        }
         let Some(slot) = self.slots.get_mut(handle.slot as usize) else {
             debug_assert!(false, "free_spec: invalid slot index {}", handle.slot);
             return;
@@ -826,6 +843,31 @@ impl ShardArena {
         spec.deallocate(&mut self.slab);
         slot.generation = slot.generation.wrapping_add(1);
         self.free_slots.push(handle.slot);
+    }
+
+    /// Clear all arena-backed specs while preserving startup allocations.
+    ///
+    /// This is an allocation-free reset path:
+    /// - resets the slab in O(1) without resizing backing buffers,
+    /// - invalidates all existing handles by bumping slot generations,
+    /// - rebuilds the free-slot stack in deterministic order (slot 0 first).
+    pub fn clear(&mut self) {
+        self.slab.clear();
+        self.free_slots.clear();
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            slot.spec = None;
+            slot.generation = slot.generation.wrapping_add(1);
+            self.free_slots
+                .push(u32::try_from(idx).expect("slot index must fit in u32"));
+        }
+        self.free_slots.reverse();
+    }
+}
+
+impl Drop for ShardArena {
+    fn drop(&mut self) {
+        // Ensures ByteSlab debug-drop sees zero live allocations.
+        self.clear();
     }
 }
 

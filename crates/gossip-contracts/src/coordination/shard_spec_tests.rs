@@ -742,6 +742,7 @@ fn arena_invalid_slot_index_panics() {
     let bogus = ShardSpecHandle {
         slot: 999,
         generation: 0,
+        arena_id: arena.arena_id,
     };
     let _ = arena.view_spec(&bogus);
 }

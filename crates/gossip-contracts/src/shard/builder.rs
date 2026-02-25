@@ -240,9 +240,7 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// This invalidates all previously returned [`ShardSpecHandle`] values and
     /// any [`InitialShardInput`] slices built from earlier state.
     pub fn reset(&mut self) {
-        for entry in self.entries.as_slice() {
-            self.arena.free_spec(entry.spec_handle);
-        }
+        self.arena.clear();
         self.scratch = ShardSpecScratch::new();
         self.entries = InlineVec::new();
         self.next_shard_raw = 0;
@@ -483,16 +481,15 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
                 .ok_or(PreallocShardBuilderError::InvalidSpecHandle)?;
             out.push(InitialShardInput::new(entry.shard, spec, entry.cursor));
         }
-        validate_manifest(out.as_slice()).map_err(PreallocShardBuilderError::ManifestInvalid)?;
+        validate_manifest_no_alloc(out.as_slice())
+            .map_err(PreallocShardBuilderError::ManifestInvalid)?;
         Ok(out)
     }
 }
 
 impl<'a, const CAP: usize> Drop for PreallocShardBuilder<'a, CAP> {
     fn drop(&mut self) {
-        for entry in self.entries.as_slice() {
-            self.arena.free_spec(entry.spec_handle);
-        }
+        self.arena.clear();
     }
 }
 
