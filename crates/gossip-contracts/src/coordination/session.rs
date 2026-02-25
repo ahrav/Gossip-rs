@@ -175,7 +175,7 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
 impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// Acquire a shard and create a new session.
     ///
-    /// Delegates to [`CoordinationBackend::acquire_and_restore`], which
+    /// Delegates to [`CoordinationBackend::acquire_and_restore_into`], which
     /// increments the shard's fence epoch and grants a new lease. The
     /// returned session caches the lease, tenant, worker, and the
     /// shard's snapshot (cursor + spec at acquisition time).
@@ -212,9 +212,25 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         worker: WorkerId,
     ) -> Result<Self, AcquireError> {
         let mut scratch = AcquireScratch::new();
-        let result = backend
-            .acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?
-            .to_owned();
+        let result = backend.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?;
+        let spec = ShardSpec::try_from_ref(result.snapshot.spec())
+            .expect("WorkerSession::new: backend returned invalid shard spec");
+        let cursor = match (
+            result.snapshot.cursor().last_key(),
+            result.snapshot.cursor().token(),
+        ) {
+            (None, _) => Cursor::initial(),
+            (Some(last_key), None) => Cursor::with_last_key(last_key.to_vec()),
+            (Some(last_key), Some(token)) => Cursor::from_parts(last_key.to_vec(), token.to_vec()),
+        };
+        let snapshot = ShardSnapshot::new(
+            result.snapshot.status(),
+            spec,
+            cursor,
+            result.snapshot.cursor_semantics(),
+            result.snapshot.parent(),
+            result.snapshot.spawned().iter(),
+        );
         // Tenant is a security boundary — must hold in all builds.
         assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
         // The remaining assertions are correctness sanity checks: if the
@@ -223,16 +239,13 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         // avoid redundant checks on the hot path in release builds.
         debug_assert_eq!(result.lease.shard_key(), key, "lease shard_key mismatch");
         debug_assert_eq!(result.lease.owner(), worker, "lease owner mismatch");
-        debug_assert!(
-            !result.snapshot.status().is_terminal(),
-            "acquired terminal shard"
-        );
+        debug_assert!(!snapshot.status().is_terminal(), "acquired terminal shard");
         Ok(Self {
             backend,
             tenant,
             worker,
             lease: result.lease,
-            snapshot: result.snapshot,
+            snapshot,
             capacity: result.capacity,
         })
     }

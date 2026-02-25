@@ -29,11 +29,13 @@
 //!   panic on failure, suitable only for setup steps.
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
+use crate::coordination::error::{AcquireError, AcquireResult, AcquireResultView, AcquireScratch};
+use crate::coordination::facade::{ClaimError, ShardClaiming};
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::lease::Lease;
-use crate::coordination::record::ParkReason;
+use crate::coordination::record::{ParkReason, ShardSnapshot};
 use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
-use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use crate::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
 use crate::coordination::traits::CoordinationBackend;
 use crate::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
@@ -122,10 +124,12 @@ pub fn seeded_coordinator_with_semantics(semantics: CursorSemantics) -> InMemory
     coord
         .create_run(now(1), test_tenant(), test_run(), config)
         .unwrap();
+    let spec = test_spec();
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         test_shard(),
-        test_spec(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let _ = coord
         .register_shards(
@@ -144,6 +148,59 @@ pub fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, Some(5)).unwrap()
 }
 
+fn acquire_view_to_owned(view: AcquireResultView<'_>) -> AcquireResult {
+    let spec = ShardSpec::try_from_ref(view.snapshot.spec())
+        .expect("acquire view must carry a valid spec");
+    let cursor = match (
+        view.snapshot.cursor().last_key(),
+        view.snapshot.cursor().token(),
+    ) {
+        (None, _) => Cursor::initial(),
+        (Some(last_key), None) => Cursor::with_last_key(last_key.to_vec()),
+        (Some(last_key), Some(token)) => Cursor::from_parts(last_key.to_vec(), token.to_vec()),
+    };
+    AcquireResult {
+        lease: view.lease,
+        snapshot: ShardSnapshot::new(
+            view.snapshot.status(),
+            spec,
+            cursor,
+            view.snapshot.cursor_semantics(),
+            view.snapshot.parent(),
+            view.snapshot.spawned().iter(),
+        ),
+        capacity: view.capacity,
+    }
+}
+
+/// Acquire + restore and materialize a fully-owned test result.
+pub fn acquire_result<B: CoordinationBackend>(
+    backend: &mut B,
+    now: LogicalTime,
+    tenant: TenantId,
+    key: ShardKey,
+    worker: WorkerId,
+) -> Result<AcquireResult, AcquireError> {
+    let mut scratch = AcquireScratch::new();
+    backend
+        .acquire_and_restore_into(now, tenant, key, worker, &mut scratch)
+        .map(acquire_view_to_owned)
+}
+
+/// Claim next available and materialize a fully-owned test result.
+pub fn claim_result<B: ShardClaiming + Sized>(
+    backend: &mut B,
+    now: LogicalTime,
+    tenant: TenantId,
+    run: RunId,
+    worker: WorkerId,
+) -> Result<AcquireResult, ClaimError> {
+    let mut scratch = AcquireScratch::new();
+    backend
+        .claim_next_available(now, tenant, run, worker, &mut scratch)
+        .map(acquire_view_to_owned)
+}
+
 // ============================================================================
 // Split plan factories
 // ============================================================================
@@ -151,14 +208,8 @@ pub fn test_run_config() -> RunConfig {
 /// The canonical `[a,m) + [m,z)` replace plan used by most split tests.
 pub fn test_split_replace_plan() -> SplitReplacePlan<'static> {
     SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
-        ),
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
+        SplitReplaceChild::new(ShardSpecRef::new(b"a", b"m", b""), CursorUpdate::initial()),
+        SplitReplaceChild::new(ShardSpecRef::new(b"m", b"z", b""), CursorUpdate::initial()),
     ])
     .unwrap()
 }
@@ -166,8 +217,8 @@ pub fn test_split_replace_plan() -> SplitReplacePlan<'static> {
 /// The canonical `[a,m)` parent + `[m,z)` residual plan.
 pub fn test_split_residual_plan() -> SplitResidualPlan<'static> {
     SplitResidualPlan::try_new(
-        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        ShardSpecRef::new(b"a", b"m", b""),
+        ShardSpecRef::new(b"m", b"z", b""),
     )
     .unwrap()
 }
@@ -183,8 +234,15 @@ pub fn test_split_residual_plan() -> SplitResidualPlan<'static> {
 
 /// Acquire the default test shard with the given worker at the given time.
 pub fn acquire_shard(coord: &mut InMemoryCoordinator, t: u64, worker_id: u64) -> Lease {
+    let mut scratch = crate::coordination::error::AcquireScratch::new();
     let result = coord
-        .acquire_and_restore(now(t), test_tenant(), test_key(), test_worker(worker_id))
+        .acquire_and_restore_into(
+            now(t),
+            test_tenant(),
+            test_key(),
+            test_worker(worker_id),
+            &mut scratch,
+        )
         .expect("acquire should succeed");
     result.lease
 }
@@ -261,10 +319,12 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let _ = coord
         .register_shards(
@@ -276,8 +336,9 @@ pub fn coordinator_with_run_and_lease() -> (InMemoryCoordinator, Lease) {
         )
         .unwrap();
     let key = ShardKey::new(test_run(), ShardId::from_raw(10));
+    let mut scratch = crate::coordination::error::AcquireScratch::new();
     let lease = coord
-        .acquire_and_restore(now(3), test_tenant(), key, test_worker(1))
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch)
         .unwrap()
         .lease;
     (coord, lease)

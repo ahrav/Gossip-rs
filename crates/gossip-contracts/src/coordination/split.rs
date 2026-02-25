@@ -31,9 +31,13 @@ use std::fmt;
 use blake3::Hasher;
 use gossip_stdx::InlineVec;
 
-use crate::coordination::cursor::{Cursor, CursorUpdate};
+#[cfg(test)]
+use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::record::ParkReason;
-use crate::coordination::shard_spec::{ShardSpec, ShardSpecRef};
+#[cfg(test)]
+use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::ShardSpecRef;
 use crate::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
 use crate::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
 
@@ -118,72 +122,6 @@ const _: () = assert!(core::mem::size_of::<DerivedShardKind>() == 1);
 // SplitReplaceChild
 // ============================================================================
 
-/// Adapter trait for split APIs that accept either owned specs or borrowed
-/// [`ShardSpecRef`] views.
-///
-/// This is the split module's entry point for the same owned-vs-borrowed
-/// pattern used by `IntoRecordSpec` (record constructors) and
-/// `IntoShardSpecRef` (validation functions). The resulting view is
-/// call-scoped input: split planning/execution must copy bytes into
-/// backend-owned storage before returning.
-///
-/// The `#[cfg(test)]` impl for owned `ShardSpec` leaks the value via
-/// `Box::leak` to produce a `'static` reference, which is acceptable in
-/// tests but intentionally unavailable in production builds.
-pub trait IntoSplitSpec<'a> {
-    /// Produce a borrowed spec view for the duration of the split operation.
-    fn into_split_spec(self) -> ShardSpecRef<'a>;
-}
-
-impl<'a> IntoSplitSpec<'a> for ShardSpecRef<'a> {
-    fn into_split_spec(self) -> ShardSpecRef<'a> {
-        self
-    }
-}
-
-impl<'a> IntoSplitSpec<'a> for &'a ShardSpec {
-    fn into_split_spec(self) -> ShardSpecRef<'a> {
-        self.as_ref()
-    }
-}
-
-#[cfg(test)]
-impl IntoSplitSpec<'static> for ShardSpec {
-    fn into_split_spec(self) -> ShardSpecRef<'static> {
-        Box::leak(Box::new(self)).as_ref()
-    }
-}
-
-/// Adapter trait for split APIs that accept owned or borrowed cursor forms.
-///
-/// Same owned-vs-borrowed pattern as [`IntoSplitSpec`] but for cursor
-/// inputs. The produced [`CursorUpdate`] is an input view only.
-/// Implementations of split operations must not retain references after
-/// the call boundary.
-pub trait IntoSplitCursor<'a> {
-    /// Produce a borrowed cursor update view for the duration of the split operation.
-    fn into_split_cursor(self) -> CursorUpdate<'a>;
-}
-
-impl<'a> IntoSplitCursor<'a> for CursorUpdate<'a> {
-    fn into_split_cursor(self) -> CursorUpdate<'a> {
-        self
-    }
-}
-
-impl<'a> IntoSplitCursor<'a> for &'a Cursor {
-    fn into_split_cursor(self) -> CursorUpdate<'a> {
-        CursorUpdate::from_cursor(self)
-    }
-}
-
-#[cfg(test)]
-impl IntoSplitCursor<'static> for Cursor {
-    fn into_split_cursor(self) -> CursorUpdate<'static> {
-        CursorUpdate::from_cursor(Box::leak(Box::new(self)))
-    }
-}
-
 /// A single child in a [`SplitReplacePlan`].
 ///
 /// Each child carries its own [`ShardSpecRef`] (the key sub-range it covers)
@@ -211,15 +149,8 @@ pub struct SplitReplaceChild<'a> {
 impl<'a> SplitReplaceChild<'a> {
     /// Construct a new child entry.
     #[must_use]
-    pub fn new<S, C>(spec: S, cursor: C) -> Self
-    where
-        S: IntoSplitSpec<'a>,
-        C: IntoSplitCursor<'a>,
-    {
-        Self {
-            spec: spec.into_split_spec(),
-            cursor: cursor.into_split_cursor(),
-        }
+    pub fn new(spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
+        Self { spec, cursor }
     }
 
     /// The child's shard specification (key sub-range).
@@ -425,16 +356,10 @@ impl<'a> SplitResidualPlan<'a> {
     /// `parent_new_spec == residual_spec`. Full coverage validation
     /// (parent_new ∪ residual == old_parent, no overlap) is performed
     /// by the coordinator at execution time via `validate_residual_split`.
-    pub fn try_new<P, R>(
-        parent_new_spec: P,
-        residual_spec: R,
-    ) -> Result<Self, SplitResidualPlanError>
-    where
-        P: IntoSplitSpec<'a>,
-        R: IntoSplitSpec<'a>,
-    {
-        let parent_new_spec = parent_new_spec.into_split_spec();
-        let residual_spec = residual_spec.into_split_spec();
+    pub fn try_new(
+        parent_new_spec: ShardSpecRef<'a>,
+        residual_spec: ShardSpecRef<'a>,
+    ) -> Result<Self, SplitResidualPlanError> {
         if parent_new_spec == residual_spec {
             return Err(SplitResidualPlanError::IdenticalSpecs);
         }
@@ -568,7 +493,7 @@ pub(crate) fn op_payload_hash(op_tag: &[u8], write_fields: impl FnOnce(&mut Hash
 /// different cursor" conflicts during idempotent replay.
 ///
 /// Accepts any cursor representation with canonical bytes (for example,
-/// owned [`Cursor`] or borrowed
+/// owned [`crate::coordination::cursor::Cursor`] or borrowed
 /// [`CursorUpdate`]).
 #[must_use]
 pub fn hash_checkpoint_payload(new_cursor: &impl CanonicalBytes) -> u64 {
@@ -678,11 +603,20 @@ mod tests {
         ];
 
         for &(count, ref expected) in cases {
-            let children: Vec<SplitReplaceChild> = (0..count)
+            let specs: Vec<_> = (0..count)
                 .map(|i| {
                     let start = (i as u16).to_be_bytes().to_vec();
                     let end = ((i + 1) as u16).to_be_bytes().to_vec();
-                    SplitReplaceChild::new(ShardSpec::with_range(start, end), Cursor::initial())
+                    ShardSpec::with_range(start, end)
+                })
+                .collect();
+            let cursors: Vec<_> = (0..count).map(|_| Cursor::initial()).collect();
+            let children: Vec<SplitReplaceChild> = (0..count)
+                .map(|i| {
+                    SplitReplaceChild::new(
+                        specs[i].as_ref(),
+                        CursorUpdate::from_cursor(&cursors[i]),
+                    )
                 })
                 .collect();
             let result = SplitReplacePlan::try_new(children);
@@ -699,7 +633,7 @@ mod tests {
     fn split_residual_plan_valid() {
         let parent = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
         let residual = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
-        let plan = SplitResidualPlan::try_new(parent.clone(), residual.clone()).unwrap();
+        let plan = SplitResidualPlan::try_new(parent.as_ref(), residual.as_ref()).unwrap();
         assert_eq!(plan.parent_new_spec(), parent.as_ref());
         assert_eq!(plan.residual_spec(), residual.as_ref());
     }
@@ -708,7 +642,7 @@ mod tests {
     fn split_residual_plan_identical_specs_returns_error() {
         let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
         assert_eq!(
-            SplitResidualPlan::try_new(spec.clone(), spec),
+            SplitResidualPlan::try_new(spec.as_ref(), spec.as_ref()),
             Err(SplitResidualPlanError::IdenticalSpecs),
         );
     }
@@ -717,14 +651,12 @@ mod tests {
 
     #[test]
     fn split_replace_plan_canonical_deterministic() {
-        let c1 = SplitReplaceChild::new(
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
-        );
-        let c2 = SplitReplaceChild::new(
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        );
+        let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+        let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+        let c1 = Cursor::initial();
+        let c2 = Cursor::initial();
+        let c1 = SplitReplaceChild::new(spec1.as_ref(), CursorUpdate::from_cursor(&c1));
+        let c2 = SplitReplaceChild::new(spec2.as_ref(), CursorUpdate::from_cursor(&c2));
         let plan = SplitReplacePlan::try_new(vec![c1, c2]).unwrap();
         assert_eq!(canonical_digest(&plan), canonical_digest(&plan));
     }
@@ -827,13 +759,21 @@ mod tests {
 
             prop_assume!((s1.clone(), e1.clone()) != (s2.clone(), e2.clone()));
 
+            let spec1_a = ShardSpec::with_range(s1.clone(), e1.clone());
+            let spec1_b = ShardSpec::with_range(e1, vec![0xFF; 32]);
+            let spec2_a = ShardSpec::with_range(s2.clone(), e2.clone());
+            let spec2_b = ShardSpec::with_range(e2, vec![0xFF; 32]);
+            let c1_a = Cursor::initial();
+            let c1_b = Cursor::initial();
+            let c2_a = Cursor::initial();
+            let c2_b = Cursor::initial();
             let plan1 = SplitReplacePlan::try_new(vec![
-                SplitReplaceChild::new(ShardSpec::with_range(s1.clone(), e1.clone()), Cursor::initial()),
-                SplitReplaceChild::new(ShardSpec::with_range(e1, vec![0xFF; 32]), Cursor::initial()),
+                SplitReplaceChild::new(spec1_a.as_ref(), CursorUpdate::from_cursor(&c1_a)),
+                SplitReplaceChild::new(spec1_b.as_ref(), CursorUpdate::from_cursor(&c1_b)),
             ]).unwrap();
             let plan2 = SplitReplacePlan::try_new(vec![
-                SplitReplaceChild::new(ShardSpec::with_range(s2.clone(), e2.clone()), Cursor::initial()),
-                SplitReplaceChild::new(ShardSpec::with_range(e2, vec![0xFF; 32]), Cursor::initial()),
+                SplitReplaceChild::new(spec2_a.as_ref(), CursorUpdate::from_cursor(&c2_a)),
+                SplitReplaceChild::new(spec2_b.as_ref(), CursorUpdate::from_cursor(&c2_b)),
             ]).unwrap();
             prop_assume!(plan1 != plan2);
             prop_assert_ne!(hash_split_replace_payload(&plan1), hash_split_replace_payload(&plan2));
@@ -852,13 +792,17 @@ mod tests {
             let mut e2 = s2.clone();
             e2.extend_from_slice(&s2_suffix);
 
+            let plan1_parent = ShardSpec::with_range(s1.clone(), e1.clone());
+            let plan1_residual = ShardSpec::with_range(e1, vec![0xFF; 32]);
             let plan1 = SplitResidualPlan::try_new(
-                ShardSpec::with_range(s1.clone(), e1.clone()),
-                ShardSpec::with_range(e1, vec![0xFF; 32]),
+                plan1_parent.as_ref(),
+                plan1_residual.as_ref(),
             ).unwrap();
+            let plan2_parent = ShardSpec::with_range(s2.clone(), e2.clone());
+            let plan2_residual = ShardSpec::with_range(e2, vec![0xFF; 32]);
             let plan2 = SplitResidualPlan::try_new(
-                ShardSpec::with_range(s2.clone(), e2.clone()),
-                ShardSpec::with_range(e2, vec![0xFF; 32]),
+                plan2_parent.as_ref(),
+                plan2_residual.as_ref(),
             ).unwrap();
             prop_assume!(plan1 != plan2);
             prop_assert_ne!(hash_split_residual_payload(&plan1), hash_split_residual_payload(&plan2));

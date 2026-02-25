@@ -51,70 +51,6 @@ use super::split::MAX_SPAWNED_PER_SHARD;
 /// cases are rare enough that the inline optimization dominates.
 pub(crate) type SpawnedList = InlineVec<ShardId, 8>;
 
-/// Adapter trait for record constructors that accept owned specs or borrowed
-/// [`ShardSpecRef`] values.
-///
-/// This trait eliminates forced heap allocation at call sites: callers with
-/// borrowed slab-backed bytes pass `ShardSpecRef` directly, while callers
-/// with owned `ShardSpec` values convert on the fly. The constructor then
-/// copies bytes into the slab regardless of input form.
-///
-/// The produced view is call-scoped — constructors copy bytes into
-/// slab-owned storage before returning and do not retain the reference.
-pub(crate) trait IntoRecordSpec<'a> {
-    /// Produce a borrowed spec view for the duration of the constructor call.
-    fn into_record_spec(self) -> ShardSpecRef<'a>;
-}
-
-impl<'a> IntoRecordSpec<'a> for ShardSpecRef<'a> {
-    fn into_record_spec(self) -> ShardSpecRef<'a> {
-        self
-    }
-}
-
-impl<'a> IntoRecordSpec<'a> for &'a ShardSpec {
-    fn into_record_spec(self) -> ShardSpecRef<'a> {
-        self.as_ref()
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl IntoRecordSpec<'static> for ShardSpec {
-    fn into_record_spec(self) -> ShardSpecRef<'static> {
-        Box::leak(Box::new(self)).as_ref()
-    }
-}
-
-/// Adapter trait for record constructors that accept owned cursors or borrowed
-/// [`CursorUpdate`] values.
-///
-/// Same rationale as [`IntoRecordSpec`]: avoids forcing callers to materialize
-/// owned `Cursor` values when they already have borrowed bytes. The produced
-/// view is call-scoped input copied into slab storage by the constructor.
-pub(crate) trait IntoRecordCursor<'a> {
-    /// Produce a borrowed cursor update view for the duration of the constructor call.
-    fn into_record_cursor(self) -> CursorUpdate<'a>;
-}
-
-impl<'a> IntoRecordCursor<'a> for CursorUpdate<'a> {
-    fn into_record_cursor(self) -> CursorUpdate<'a> {
-        self
-    }
-}
-
-impl<'a> IntoRecordCursor<'a> for &'a Cursor {
-    fn into_record_cursor(self) -> CursorUpdate<'a> {
-        CursorUpdate::from_cursor(self)
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl IntoRecordCursor<'static> for Cursor {
-    fn into_record_cursor(self) -> CursorUpdate<'static> {
-        CursorUpdate::from_cursor(Box::leak(Box::new(self)))
-    }
-}
-
 // ============================================================================
 // ShardStatus
 // ============================================================================
@@ -402,11 +338,11 @@ impl ShardRecord {
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn new_active<'a, S: IntoRecordSpec<'a>>(
+    pub(crate) fn new_active(
         tenant: TenantId,
         run: RunId,
         shard: ShardId,
-        spec: S,
+        spec: ShardSpecRef<'_>,
         cursor_semantics: CursorSemantics,
         slab: &mut ByteSlab,
     ) -> Result<Self, gossip_stdx::SlabFull> {
@@ -429,17 +365,15 @@ impl ShardRecord {
     /// # Errors
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec.
-    pub(crate) fn new_active_with_cursor<'a, S: IntoRecordSpec<'a>, C: IntoRecordCursor<'a>>(
+    pub(crate) fn new_active_with_cursor(
         tenant: TenantId,
         run: RunId,
         shard: ShardId,
-        spec: S,
-        initial_cursor: C,
+        spec: ShardSpecRef<'_>,
+        initial_cursor: CursorUpdate<'_>,
         cursor_semantics: CursorSemantics,
         slab: &mut ByteSlab,
     ) -> Result<Self, gossip_stdx::SlabFull> {
-        let spec = spec.into_record_spec();
-        let initial_cursor = initial_cursor.into_record_cursor();
         let pooled_spec = PooledShardSpec::from_spec_ref(spec, slab)?;
         let pooled_cursor = match PooledCursor::from_update(&initial_cursor, slab) {
             Ok(cursor) => cursor,
@@ -476,18 +410,16 @@ impl ShardRecord {
     ///
     /// Returns `SlabFull` if the slab cannot allocate space for the spec/cursor.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_split_child<'a, S: IntoRecordSpec<'a>, C: IntoRecordCursor<'a>>(
+    pub(crate) fn new_split_child(
         tenant: TenantId,
         run: RunId,
         shard: ShardId,
-        spec: S,
-        cursor: C,
+        spec: ShardSpecRef<'_>,
+        cursor: CursorUpdate<'_>,
         cursor_semantics: CursorSemantics,
         parent: ShardId,
         slab: &mut ByteSlab,
     ) -> Result<Self, gossip_stdx::SlabFull> {
-        let spec = spec.into_record_spec();
-        let cursor = cursor.into_record_cursor();
         let pooled_spec = PooledShardSpec::from_spec_ref(spec, slab)?;
         let pooled_cursor = match PooledCursor::from_update(&cursor, slab) {
             Ok(c) => c,

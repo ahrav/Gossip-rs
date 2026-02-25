@@ -76,9 +76,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::error::{
-    AcquireError, AcquireResult, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError,
-    CompleteError, IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError,
-    SplitResidualError,
+    AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
+    IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::facade::{ClaimError, ShardClaiming, default_claim_next_available};
 use crate::coordination::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
@@ -2618,19 +2617,20 @@ impl ShardClaiming for InMemoryCoordinator {
     /// claims (no shards available, run not found) do not trigger cooldown,
     /// so a worker competing for scarce shards is never penalized for losing
     /// a race.
-    fn claim_next_available(
+    fn claim_next_available<'a>(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         worker: WorkerId,
-    ) -> Result<AcquireResult, ClaimError> {
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, ClaimError> {
         // Cooldown gate: average O(1) hash lookup before candidate selection
         // (O(S log S) in this backend due to `list_shards` sorting).
         if let Some(retry_after) = self.check_cooldown(worker, now) {
             return Err(ClaimError::Throttled { retry_after });
         }
-        let result = default_claim_next_available(self, now, tenant, run, worker)?;
+        let result = default_claim_next_available(self, now, tenant, run, worker, out)?;
         self.record_claim(worker, now);
         Ok(result)
     }

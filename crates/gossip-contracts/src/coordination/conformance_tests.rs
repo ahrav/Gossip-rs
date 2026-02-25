@@ -359,8 +359,15 @@ fn terminal_clears_lease() {
 fn cursor_semantics_dispatched_through_coordinator() {
     let mut coord = seeded_coordinator_with_semantics(CursorSemantics::Dispatched);
 
+    let mut scratch = crate::coordination::AcquireScratch::new();
     let result = coord
-        .acquire_and_restore(now(10), test_tenant(), test_key(), test_worker(1))
+        .acquire_and_restore_into(
+            now(10),
+            test_tenant(),
+            test_key(),
+            test_worker(1),
+            &mut scratch,
+        )
         .unwrap();
     assert_eq!(
         result.snapshot.cursor_semantics(),
@@ -724,10 +731,12 @@ fn register_shards_on_non_initializing_rejected() {
     assert_eq!(rec.status(), RunStatus::Active);
 
     // Try to register more shards -> WrongStatus.
+    let spec = ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(999),
-        ShardSpec::with_range(b"aa".to_vec(), b"bb".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let err = coord
         .register_shards(

@@ -214,12 +214,10 @@ impl CanonicalBytes for ShardSpecRef<'_> {
     }
 }
 
-/// Conversion trait for APIs that accept either owned specs or borrowed views.
+/// Conversion trait for APIs that accept borrowed spec views.
 ///
-/// This is the public counterpart to the `crate`-internal `IntoRecordSpec` and
-/// `IntoSplitSpec` adapter traits. All three follow the same pattern: allow
-/// callers to pass `&ShardSpec`, `ShardSpecRef`, or (in tests) owned `ShardSpec`
-/// without forcing allocation at the call site.
+/// This allows callers to pass either a direct [`ShardSpecRef`] or a borrowed
+/// [`&ShardSpec`](ShardSpec) view without allocation.
 ///
 /// Implementations must produce a [`ShardSpecRef`] whose lifetime reflects the
 /// true ownership of the underlying bytes. The result is call-scoped input:
@@ -238,13 +236,6 @@ impl<'a> IntoShardSpecRef<'a> for ShardSpecRef<'a> {
 impl<'a> IntoShardSpecRef<'a> for &'a ShardSpec {
     fn into_spec_ref(self) -> ShardSpecRef<'a> {
         self.as_ref()
-    }
-}
-
-#[cfg(test)]
-impl IntoShardSpecRef<'static> for ShardSpec {
-    fn into_spec_ref(self) -> ShardSpecRef<'static> {
-        Box::leak(Box::new(self)).as_ref()
     }
 }
 

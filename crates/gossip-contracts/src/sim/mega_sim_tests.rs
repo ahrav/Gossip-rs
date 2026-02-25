@@ -707,13 +707,19 @@ mod multi_tenant {
         // only iterates tenant-scoped records.
 
         coord.create_run(now(1), tenant_a, run_a, config).unwrap();
-        let shards_a: Vec<InitialShardInput> = (0..3)
+        let shard_entries_a: Vec<_> = (0..3)
             .map(|i| {
-                InitialShardInput::new(
+                (
                     ShardId::from_raw(i),
                     ShardSpec::with_range(vec![(i as u8) * 0x30], vec![((i + 1) as u8) * 0x30]),
                     Cursor::initial(),
                 )
+            })
+            .collect();
+        let shards_a: Vec<InitialShardInput<'_>> = shard_entries_a
+            .iter()
+            .map(|(shard, spec, cursor)| {
+                InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
             })
             .collect();
         let _ = coord
@@ -721,13 +727,19 @@ mod multi_tenant {
             .unwrap();
 
         coord.create_run(now(1), tenant_b, run_b, config).unwrap();
-        let shards_b: Vec<InitialShardInput> = (0..2)
+        let shard_entries_b: Vec<_> = (0..2)
             .map(|i| {
-                InitialShardInput::new(
+                (
                     ShardId::from_raw(i),
                     ShardSpec::with_range(vec![(i as u8) * 0x40], vec![((i + 1) as u8) * 0x40]),
                     Cursor::initial(),
                 )
+            })
+            .collect();
+        let shards_b: Vec<InitialShardInput<'_>> = shard_entries_b
+            .iter()
+            .map(|(shard, spec, cursor)| {
+                InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
             })
             .collect();
         let _ = coord
@@ -750,8 +762,9 @@ mod multi_tenant {
 
         // --- Tenant A: acquire → checkpoint → complete on shard 0 ---
 
+        let mut scratch_a = crate::coordination::AcquireScratch::new();
         let result_a = coord
-            .acquire_and_restore(now(2), tenant_a, key_a0, worker_a)
+            .acquire_and_restore_into(now(2), tenant_a, key_a0, worker_a, &mut scratch_a)
             .unwrap();
         let lease_a = result_a.lease;
 
@@ -784,7 +797,9 @@ mod multi_tenant {
         // The shard exists under tenant A's run, so tenant B should get ShardNotFound
         // (tenant-scoped lookup) or TenantMismatch.
 
-        let cross_result = coord.acquire_and_restore(now(5), tenant_b, key_a0, worker_b);
+        let mut cross_scratch = crate::coordination::AcquireScratch::new();
+        let cross_result =
+            coord.acquire_and_restore_into(now(5), tenant_b, key_a0, worker_b, &mut cross_scratch);
         match cross_result {
             Err(AcquireError::ShardNotFound { .. } | AcquireError::TenantMismatch { .. }) => {
                 // Tenant-scoped lookup correctly rejects cross-tenant access.
@@ -798,8 +813,9 @@ mod multi_tenant {
 
         // --- Tenant B: independent lifecycle on its own shard ---
 
+        let mut scratch_b = crate::coordination::AcquireScratch::new();
         let result_b = coord
-            .acquire_and_restore(now(5), tenant_b, key_b0, worker_b)
+            .acquire_and_restore_into(now(5), tenant_b, key_b0, worker_b, &mut scratch_b)
             .unwrap();
         let lease_b = result_b.lease;
 

@@ -94,8 +94,8 @@ use rand_chacha::ChaCha8Rng;
 use crate::coordination::Lease;
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{
-    AcquireError, CheckpointError, CompleteError, IdempotentOutcome, ParkError, RenewError,
-    SplitError,
+    AcquireError, AcquireScratch, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
+    RenewError, SplitError,
 };
 use crate::coordination::facade::ClaimError;
 use crate::coordination::in_memory::InMemoryCoordinator;
@@ -838,11 +838,12 @@ impl CoordinationSim<InMemoryCoordinator> {
     /// `active_shard_keys` -- call [`with_workers_and_shards`](Self::with_workers_and_shards)
     /// or set `active_shard_keys` manually after registration.
     pub fn register_shard(&mut self, run: RunId, shard: ShardId) {
+        let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
         let record = ShardRecord::new_active(
             self.tenant,
             run,
             shard,
-            ShardSpec::with_range(vec![b'a'], vec![b'z']),
+            spec.as_ref(),
             CursorSemantics::Completed,
             self.coordinator.slab_mut(),
         )
@@ -1322,9 +1323,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         }
 
         let now = self.context.now();
+        let mut scratch = AcquireScratch::new();
         match self
             .coordinator
-            .acquire_and_restore(now, self.tenant, key, worker)
+            .acquire_and_restore_into(now, self.tenant, key, worker, &mut scratch)
         {
             Ok(result) => {
                 let fence = result.lease.fence();
@@ -1606,8 +1608,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let child_a_cursor = Cursor::initial();
         let child_b_cursor = Cursor::initial();
         let plan = match SplitReplacePlan::try_new(vec![
-            SplitReplaceChild::new(&child_a_spec, &child_a_cursor),
-            SplitReplaceChild::new(&child_b_spec, &child_b_cursor),
+            SplitReplaceChild::new(
+                child_a_spec.as_ref(),
+                CursorUpdate::from_cursor(&child_a_cursor),
+            ),
+            SplitReplaceChild::new(
+                child_b_spec.as_ref(),
+                CursorUpdate::from_cursor(&child_b_cursor),
+            ),
         ]) {
             Ok(p) => p,
             Err(_) => {
@@ -1694,14 +1702,15 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let new_parent_spec = ShardSpec::with_range(start.to_vec(), vec![mid]);
         let residual_spec = ShardSpec::with_range(vec![mid], end.to_vec());
 
-        let plan = match SplitResidualPlan::try_new(&new_parent_spec, &residual_spec) {
-            Ok(p) => p,
-            Err(_) => {
-                return SimEvent::Rejected {
-                    kind: RejectionKind::SplitValidation,
-                };
-            }
-        };
+        let plan =
+            match SplitResidualPlan::try_new(new_parent_spec.as_ref(), residual_spec.as_ref()) {
+                Ok(p) => p,
+                Err(_) => {
+                    return SimEvent::Rejected {
+                        kind: RejectionKind::SplitValidation,
+                    };
+                }
+            };
 
         let now = self.context.now();
         match self
@@ -1901,9 +1910,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let run = runs[idx];
 
         let now = self.context.now();
+        let mut scratch = AcquireScratch::new();
         match self
             .coordinator
-            .claim_next_available(now, self.tenant, run, worker)
+            .claim_next_available(now, self.tenant, run, worker, &mut scratch)
         {
             Ok(result) => {
                 let shard = result.lease.shard();
@@ -2661,8 +2671,14 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     let child_a_cursor = Cursor::initial();
                     let child_b_cursor = Cursor::initial();
                     let plan = match SplitReplacePlan::try_new(vec![
-                        SplitReplaceChild::new(&child_a_spec, &child_a_cursor),
-                        SplitReplaceChild::new(&child_b_spec, &child_b_cursor),
+                        SplitReplaceChild::new(
+                            child_a_spec.as_ref(),
+                            CursorUpdate::from_cursor(&child_a_cursor),
+                        ),
+                        SplitReplaceChild::new(
+                            child_b_spec.as_ref(),
+                            CursorUpdate::from_cursor(&child_b_cursor),
+                        ),
                     ]) {
                         Ok(plan) => plan,
                         Err(_) => {
@@ -2711,7 +2727,10 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     );
                     let new_parent_spec = ShardSpec::with_range(vec![range_lo], vec![mid]);
                     let residual_spec = ShardSpec::with_range(vec![mid], vec![range_hi]);
-                    let plan = match SplitResidualPlan::try_new(&new_parent_spec, &residual_spec) {
+                    let plan = match SplitResidualPlan::try_new(
+                        new_parent_spec.as_ref(),
+                        residual_spec.as_ref(),
+                    ) {
                         Ok(plan) => plan,
                         Err(_) => {
                             return Ok(SessionOutcome {

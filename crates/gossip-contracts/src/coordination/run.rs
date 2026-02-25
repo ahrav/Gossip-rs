@@ -41,7 +41,7 @@
 use std::fmt;
 use std::num::NonZeroU64;
 
-use crate::coordination::cursor::{Cursor, CursorUpdate, MAX_KEY_SIZE};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::error::IdempotentOutcome;
 use crate::coordination::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::coordination::run_errors::{
@@ -1063,73 +1063,17 @@ pub struct InitialShardInput<'a> {
     pub(crate) cursor: CursorUpdate<'a>,
 }
 
-/// Adapter trait for initial-manifest APIs that accept owned specs or borrowed
-/// [`ShardSpecRef`] values.
-pub trait IntoInitialShardSpec<'a> {
-    /// Convert into a borrowed spec view for manifest validation/registration.
-    fn into_initial_spec(self) -> ShardSpecRef<'a>;
-}
-
-impl<'a> IntoInitialShardSpec<'a> for ShardSpecRef<'a> {
-    fn into_initial_spec(self) -> ShardSpecRef<'a> {
-        self
-    }
-}
-
-impl<'a> IntoInitialShardSpec<'a> for &'a crate::coordination::shard_spec::ShardSpec {
-    fn into_initial_spec(self) -> ShardSpecRef<'a> {
-        self.as_ref()
-    }
-}
-
-#[cfg(test)]
-impl IntoInitialShardSpec<'static> for crate::coordination::shard_spec::ShardSpec {
-    fn into_initial_spec(self) -> ShardSpecRef<'static> {
-        Box::leak(Box::new(self)).as_ref()
-    }
-}
-
-/// Adapter trait for initial-manifest APIs that accept owned cursors or
-/// borrowed [`CursorUpdate`] values.
-pub trait IntoInitialCursor<'a> {
-    /// Convert into a borrowed cursor update view.
-    fn into_initial_cursor(self) -> CursorUpdate<'a>;
-}
-
-impl<'a> IntoInitialCursor<'a> for CursorUpdate<'a> {
-    fn into_initial_cursor(self) -> CursorUpdate<'a> {
-        self
-    }
-}
-
-impl<'a> IntoInitialCursor<'a> for &'a Cursor {
-    fn into_initial_cursor(self) -> CursorUpdate<'a> {
-        CursorUpdate::from_cursor(self)
-    }
-}
-
-#[cfg(test)]
-impl IntoInitialCursor<'static> for Cursor {
-    fn into_initial_cursor(self) -> CursorUpdate<'static> {
-        CursorUpdate::from_cursor(Box::leak(Box::new(self)))
-    }
-}
-
 impl<'a> InitialShardInput<'a> {
     /// Construct one borrowed initial-shard manifest entry.
     ///
     /// Inputs are not retained; registration paths copy bytes into backend-owned
     /// storage.
     #[must_use]
-    pub fn new<S, C>(shard: ShardId, spec: S, cursor: C) -> Self
-    where
-        S: IntoInitialShardSpec<'a>,
-        C: IntoInitialCursor<'a>,
-    {
+    pub fn new(shard: ShardId, spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
         Self {
             shard,
-            spec: spec.into_initial_spec(),
-            cursor: cursor.into_initial_cursor(),
+            spec,
+            cursor,
         }
     }
 

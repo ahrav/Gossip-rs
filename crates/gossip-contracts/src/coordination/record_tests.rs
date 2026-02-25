@@ -52,11 +52,12 @@ use proptest::prelude::*;
 // -- Test fixtures ---------------------------------------------------
 
 fn active_record(slab: &mut ByteSlab) -> ShardRecord {
+    let spec = test_spec();
     ShardRecord::new_active(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10),
-        test_spec(),
+        spec.as_ref(),
         CursorSemantics::Completed,
         slab,
     )
@@ -800,13 +801,14 @@ fn new_split_child_construction_and_fields() {
     let parent_id = ShardId::from_raw(10);
     let child_id = derived_shard_id(1);
     let cursor = Cursor::with_last_key(b"middle-key".to_vec());
+    let spec = test_spec();
 
     let record = ShardRecord::new_split_child(
         test_tenant(),
         test_run(),
         child_id,
-        test_spec(),
-        cursor.clone(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
         CursorSemantics::Dispatched,
         parent_id,
         &mut slab,
@@ -832,12 +834,14 @@ fn new_split_child_construction_and_fields() {
 #[should_panic(expected = "not derived")]
 fn new_split_child_non_derived_shard_panics() {
     let mut slab = TestSlab::new();
+    let spec = test_spec();
+    let cursor = Cursor::initial();
     let _ = ShardRecord::new_split_child(
         test_tenant(),
         test_run(),
         ShardId::from_raw(10), // NOT derived
-        test_spec(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
         CursorSemantics::Completed,
         ShardId::from_raw(5),
         &mut slab,

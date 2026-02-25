@@ -342,11 +342,12 @@ mod tests {
 
     /// Active record, no lease, fence=INITIAL.
     fn active_unleased_record(slab: &mut ByteSlab) -> ShardRecord {
+        let spec = test_spec();
         ShardRecord::new_active(
             test_tenant(),
             test_run(),
             test_shard(),
-            test_spec(),
+            spec.as_ref(),
             CursorSemantics::Completed,
             slab,
         )

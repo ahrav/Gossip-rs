@@ -41,8 +41,8 @@ use crate::coordination::run::{
 };
 use crate::coordination::shard_spec::{CursorSemantics, ShardLimitScope, ShardSpec};
 use crate::coordination::test_fixtures::{
-    LEASE_DURATION, coordinator_with_run_and_lease, do_split_replace, now, short_lease_run_config,
-    test_run, test_split_residual_plan, test_tenant, test_worker,
+    LEASE_DURATION, acquire_result, coordinator_with_run_and_lease, do_split_replace, now,
+    short_lease_run_config, test_run, test_split_residual_plan, test_tenant, test_worker,
 };
 use crate::identity::{FenceEpoch, OpId, RunId, ShardId, ShardKey};
 use crate::sim::backend::SimIntrospection;
@@ -151,15 +151,15 @@ fn checkpoint_shard_last_key(
     op_id: u64,
     last_key: &[u8],
 ) {
-    let lease = coord
-        .acquire_and_restore(
-            now(acquire_t),
-            test_tenant(),
-            ShardKey::new(test_run(), shard),
-            test_worker(worker_id),
-        )
-        .unwrap()
-        .lease;
+    let lease = acquire_result(
+        coord,
+        now(acquire_t),
+        test_tenant(),
+        ShardKey::new(test_run(), shard),
+        test_worker(worker_id),
+    )
+    .unwrap()
+    .lease;
     let _ = coord
         .checkpoint(
             now(checkpoint_t),
@@ -181,15 +181,15 @@ fn complete_shard_with_key(
     op_id: u64,
     last_key: &[u8],
 ) {
-    let lease = coord
-        .acquire_and_restore(
-            now(acquire_t),
-            test_tenant(),
-            ShardKey::new(test_run(), shard),
-            test_worker(worker_id),
-        )
-        .unwrap()
-        .lease;
+    let lease = acquire_result(
+        coord,
+        now(acquire_t),
+        test_tenant(),
+        ShardKey::new(test_run(), shard),
+        test_worker(worker_id),
+    )
+    .unwrap()
+    .lease;
     let _ = coord
         .complete(
             now(complete_t),
@@ -225,15 +225,15 @@ fn park_shard_after_checkpoint(
     shard: ShardId,
     step: ParkAfterCheckpointStep<'_>,
 ) {
-    let lease = coord
-        .acquire_and_restore(
-            now(step.acquire_t),
-            test_tenant(),
-            ShardKey::new(test_run(), shard),
-            test_worker(step.worker_id),
-        )
-        .unwrap()
-        .lease;
+    let lease = acquire_result(
+        coord,
+        now(step.acquire_t),
+        test_tenant(),
+        ShardKey::new(test_run(), shard),
+        test_worker(step.worker_id),
+    )
+    .unwrap()
+    .lease;
     let _ = coord
         .checkpoint(
             now(step.checkpoint_t),
@@ -271,19 +271,16 @@ fn coordinator_with_split_children_for_watermark()
         )
         .unwrap();
 
+    let spec_a = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_b = ShardSpec::with_range(b"m".to_vec(), b"t".to_vec());
+    let spec_c = ShardSpec::with_range(b"t".to_vec(), b"z".to_vec());
+    let cursor_a = Cursor::initial();
+    let cursor_b = Cursor::initial();
+    let cursor_c = Cursor::initial();
     let split_plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
-        ),
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"m".to_vec(), b"t".to_vec()),
-            Cursor::initial(),
-        ),
-        SplitReplaceChild::new(
-            ShardSpec::with_range(b"t".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
-        ),
+        SplitReplaceChild::new(spec_a.as_ref(), CursorUpdate::from_cursor(&cursor_a)),
+        SplitReplaceChild::new(spec_b.as_ref(), CursorUpdate::from_cursor(&cursor_b)),
+        SplitReplaceChild::new(spec_c.as_ref(), CursorUpdate::from_cursor(&cursor_c)),
     ])
     .unwrap();
     let _ = coord
@@ -404,16 +401,20 @@ fn watermark_advances_when_min_shard_checkpoints() {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::initial();
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
     let _ = coord
@@ -489,16 +490,20 @@ fn watermark_includes_shards_registered_with_non_initial_cursors() {
         .unwrap();
 
     // Register two shards: one with a resume cursor, one with initial.
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::with_last_key(b"d".to_vec());
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::with_last_key(b"d".to_vec()),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
     let _ = coord
@@ -536,15 +541,21 @@ fn register_shards_exceeds_per_tenant_limit() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
-    let shards: Vec<InitialShardInput> = (0..4)
+    let shard_entries: Vec<_> = (0..4)
         .map(|i| {
             let start = vec![b'a' + (i * 5) as u8];
             let end = vec![b'a' + (i * 5 + 4) as u8];
-            InitialShardInput::new(
+            (
                 ShardId::from_raw(i),
                 ShardSpec::with_range(start, end),
                 Cursor::initial(),
             )
+        })
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = shard_entries
+        .iter()
+        .map(|(shard, spec, cursor)| {
+            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
         })
         .collect();
 
@@ -575,21 +586,23 @@ fn register_shards_exceeds_global_limit() {
 
     // Seed 2 existing shards from a different tenant.
     let other = TenantId::from_bytes([0x02; 32]);
+    let spec1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
     let sr1 = ShardRecord::new_active(
         other,
         RunId::from_raw(99),
         ShardId::from_raw(90),
-        ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
+        spec1.as_ref(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
     .unwrap();
     coord.seed_shard(sr1);
+    let spec2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
     let sr2 = ShardRecord::new_active(
         other,
         RunId::from_raw(99),
         ShardId::from_raw(91),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+        spec2.as_ref(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )
@@ -600,16 +613,20 @@ fn register_shards_exceeds_global_limit() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::initial();
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
 
@@ -641,16 +658,20 @@ fn register_shards_within_limits_succeeds() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::initial();
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
 
@@ -679,10 +700,12 @@ fn register_shards_preserves_non_initial_cursors() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::with_last_key(b"f".to_vec());
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::with_last_key(b"f".to_vec()),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let _ = coord
         .register_shards(
@@ -695,9 +718,7 @@ fn register_shards_preserves_non_initial_cursors() {
         .unwrap();
 
     let key = ShardKey::new(test_run(), ShardId::from_raw(10));
-    let result = coord
-        .acquire_and_restore(now(3), test_tenant(), key, test_worker(1))
-        .unwrap();
+    let result = acquire_result(&mut coord, now(3), test_tenant(), key, test_worker(1)).unwrap();
     assert_eq!(
         result.snapshot.cursor().last_key(),
         Some(b"f".as_slice()),
@@ -725,10 +746,12 @@ fn active_run_coordinator() -> InMemoryCoordinator {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let _ = coord
         .register_shards(
@@ -1115,9 +1138,8 @@ fn unpark_then_reacquire_and_checkpoint() {
         .unwrap();
 
     // Re-acquire with a new worker.
-    let new_result = coord
-        .acquire_and_restore(now(7), test_tenant(), key, test_worker(2))
-        .unwrap();
+    let new_result =
+        acquire_result(&mut coord, now(7), test_tenant(), key, test_worker(2)).unwrap();
     let new_lease = new_result.lease;
     assert_eq!(
         new_result.snapshot.cursor().last_key(),
@@ -1149,16 +1171,20 @@ fn unpark_shard_reintroduces_cursor_into_watermark() {
     coord
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::initial();
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
     let _ = coord
@@ -1172,15 +1198,15 @@ fn unpark_shard_reintroduces_cursor_into_watermark() {
         .unwrap();
 
     // Acquire shard 10, checkpoint at "c", keep the lease for parking.
-    let lease10 = coord
-        .acquire_and_restore(
-            now(3),
-            test_tenant(),
-            ShardKey::new(test_run(), ShardId::from_raw(10)),
-            test_worker(1),
-        )
-        .unwrap()
-        .lease;
+    let lease10 = acquire_result(
+        &mut coord,
+        now(3),
+        test_tenant(),
+        ShardKey::new(test_run(), ShardId::from_raw(10)),
+        test_worker(1),
+    )
+    .unwrap()
+    .lease;
     let _ = coord
         .checkpoint(
             now(4),
@@ -1301,10 +1327,12 @@ fn register_shards_idempotent_replay() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let op = OpId::from_raw(1);
 
@@ -1328,10 +1356,12 @@ fn register_shards_op_id_conflict() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
+    let spec_a = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor_a = Cursor::initial();
     let shards_a = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec_a.as_ref(),
+        CursorUpdate::from_cursor(&cursor_a),
     )];
     let op = OpId::from_raw(1);
     let _ = coord
@@ -1339,10 +1369,12 @@ fn register_shards_op_id_conflict() {
         .unwrap();
 
     // Same op_id, different payload (different shard IDs).
+    let spec_b = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor_b = Cursor::initial();
     let shards_b = vec![InitialShardInput::new(
         ShardId::from_raw(20),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec_b.as_ref(),
+        CursorUpdate::from_cursor(&cursor_b),
     )];
     let err = coord
         .register_shards(now(3), test_tenant(), test_run(), &shards_b, op)
@@ -1357,10 +1389,12 @@ fn register_shards_op_id_conflict() {
 fn register_shards_wrong_status_active() {
     let mut coord = active_run_coordinator();
     // Run is already Active.
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(20),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let err = coord
         .register_shards(
@@ -1385,10 +1419,12 @@ fn register_shards_wrong_status_active() {
 #[test]
 fn register_shards_run_not_found() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let err = coord
         .register_shards(
@@ -1416,16 +1452,20 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
         .create_run(now(1), test_tenant(), test_run(), short_lease_run_config())
         .unwrap();
 
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::initial();
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
     let err = coord
@@ -1469,10 +1509,12 @@ fn register_shards_resource_exhausted_returns_error_without_partial_inserts() {
 #[test]
 fn create_run_with_shards_fresh() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let result = coord
         .create_run_with_shards(
@@ -1492,10 +1534,12 @@ fn create_run_with_shards_fresh() {
 #[test]
 fn create_run_with_shards_retry_same_config() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
     let op = OpId::from_raw(1);
 
@@ -1528,10 +1572,12 @@ fn create_run_with_shards_retry_same_config() {
 #[test]
 fn create_run_with_shards_config_mismatch() {
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let spec = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
+    let cursor = Cursor::initial();
     let shards = vec![InitialShardInput::new(
         ShardId::from_raw(10),
-        ShardSpec::with_range(b"a".to_vec(), b"z".to_vec()),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     )];
 
     let _ = coord
@@ -1603,16 +1649,20 @@ fn full_run_lifecycle_create_register_process_complete() {
     assert_eq!(record.status(), RunStatus::Initializing);
 
     // Step 2: Register two shards [a,m) and [m,z).
+    let spec_10 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
+    let spec_11 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor_10 = Cursor::initial();
+    let cursor_11 = Cursor::initial();
     let shards = vec![
         InitialShardInput::new(
             ShardId::from_raw(10),
-            ShardSpec::with_range(b"a".to_vec(), b"m".to_vec()),
-            Cursor::initial(),
+            spec_10.as_ref(),
+            CursorUpdate::from_cursor(&cursor_10),
         ),
         InitialShardInput::new(
             ShardId::from_raw(11),
-            ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-            Cursor::initial(),
+            spec_11.as_ref(),
+            CursorUpdate::from_cursor(&cursor_11),
         ),
     ];
     let reg_result = coord
@@ -1631,8 +1681,7 @@ fn full_run_lifecycle_create_register_process_complete() {
 
     // Step 3: Acquire + checkpoint + complete shard 10.
     let key_10 = ShardKey::new(test_run(), ShardId::from_raw(10));
-    let lease_10 = coord
-        .acquire_and_restore(now(3), test_tenant(), key_10, test_worker(1))
+    let lease_10 = acquire_result(&mut coord, now(3), test_tenant(), key_10, test_worker(1))
         .unwrap()
         .lease;
     let _ = coord
@@ -1656,8 +1705,7 @@ fn full_run_lifecycle_create_register_process_complete() {
 
     // Step 4: Acquire + complete shard 11.
     let key_11 = ShardKey::new(test_run(), ShardId::from_raw(11));
-    let lease_11 = coord
-        .acquire_and_restore(now(6), test_tenant(), key_11, test_worker(2))
+    let lease_11 = acquire_result(&mut coord, now(6), test_tenant(), key_11, test_worker(2))
         .unwrap()
         .lease;
     let _ = coord

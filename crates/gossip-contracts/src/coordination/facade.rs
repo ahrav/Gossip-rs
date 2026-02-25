@@ -45,7 +45,7 @@
 
 use std::fmt;
 
-use crate::coordination::error::{AcquireError, AcquireResult, AcquireScratch};
+use crate::coordination::error::{AcquireError, AcquireResultView, AcquireScratch};
 use crate::coordination::run::{RunManagement, ShardFilter};
 use crate::coordination::run_errors::GetRunError;
 use crate::coordination::traits::CoordinationBackend;
@@ -225,14 +225,14 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///   or all candidates lost to races).
 /// - [`ClaimError::RunNotFound`] -- the run does not exist.
 /// - [`ClaimError::TenantMismatch`] -- tenant isolation violation.
-pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
+pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     backend: &mut B,
     now: LogicalTime,
     tenant: TenantId,
     run: RunId,
     worker: WorkerId,
-) -> Result<AcquireResult, ClaimError> {
-    let mut acquire_scratch = AcquireScratch::new();
+    out: &'a mut AcquireScratch,
+) -> Result<AcquireResultView<'a>, ClaimError> {
     let summaries = backend
         .list_shards(now, tenant, run, ShardFilter::available())
         .map_err(ClaimError::from)?;
@@ -254,11 +254,31 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
     let offset = worker.as_raw() as usize % len;
     let mut inconsistency_count = 0usize;
     let mut earliest_deadline: Option<LogicalTime> = None;
+    let mut attempt_scratch = AcquireScratch::new();
     for i in 0..len {
         let summary = &summaries[(offset + i) % len];
         let key = ShardKey::new(run, summary.shard());
-        match backend.acquire_and_restore_into(now, tenant, key, worker, &mut acquire_scratch) {
-            Ok(result) => return Ok(result.to_owned()),
+        match backend.acquire_and_restore_into(now, tenant, key, worker, &mut attempt_scratch) {
+            Ok(result) => {
+                out.reset();
+                let snapshot = result.snapshot;
+                out.write_spec(
+                    snapshot.spec().key_range_start(),
+                    snapshot.spec().key_range_end(),
+                    snapshot.spec().metadata(),
+                );
+                out.write_cursor(snapshot.cursor().last_key(), snapshot.cursor().token());
+                out.write_spawned(snapshot.spawned());
+                return Ok(AcquireResultView {
+                    lease: result.lease,
+                    snapshot: out.view(
+                        snapshot.status(),
+                        snapshot.cursor_semantics(),
+                        snapshot.parent(),
+                    ),
+                    capacity: result.capacity,
+                });
+            }
             Err(AcquireError::AlreadyLeased { lease_deadline, .. }) => {
                 // Race -- another worker claimed it.  Track the deadline
                 // so callers can schedule their next attempt near the
@@ -345,7 +365,7 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
 /// ## Default Algorithm
 ///
 /// The default [`claim_next_available`](Self::claim_next_available)
-/// calls `list_shards(available)` then tries `acquire_and_restore` on
+/// calls `list_shards(available)` then tries `acquire_and_restore_into` on
 /// each candidate sequentially. This is correct but not optimal under
 /// high contention -- it may attempt O(N) acquires before succeeding
 /// or giving up.
@@ -355,7 +375,7 @@ pub fn default_claim_next_available<B: CoordinationBackend + RunManagement>(
 pub trait ShardClaiming: CoordinationBackend + RunManagement {
     /// Attempt to claim the next available shard for `run`.
     ///
-    /// On success, returns an [`AcquireResult`] containing the lease
+    /// On success, returns an [`AcquireResultView`] containing the lease
     /// (proof of ownership with fencing token), the shard snapshot
     /// (status, spec, cursor, cursor_semantics, lineage), and a
     /// [`CapacityHint`](crate::coordination::error::CapacityHint)
@@ -382,17 +402,18 @@ pub trait ShardClaiming: CoordinationBackend + RunManagement {
     /// by generic parameter. This means `claim_next_available` is
     /// excluded from the vtable and cannot be called on `dyn
     /// ShardClaiming`.
-    fn claim_next_available(
+    fn claim_next_available<'a>(
         &mut self,
         now: LogicalTime,
         tenant: TenantId,
         run: RunId,
         worker: WorkerId,
-    ) -> Result<AcquireResult, ClaimError>
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, ClaimError>
     where
         Self: Sized,
     {
-        default_claim_next_available(self, now, tenant, run, worker)
+        default_claim_next_available(self, now, tenant, run, worker, out)
     }
 }
 

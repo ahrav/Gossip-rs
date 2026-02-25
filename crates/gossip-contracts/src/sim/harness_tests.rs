@@ -406,11 +406,12 @@ fn generate_forward_cursor_single_byte_range() {
     // Manually seed a shard with narrow spec [b'a', b'c').
     let run = RunId::from_raw(1);
     let shard = ShardId::from_raw(1);
-    let record = ShardRecord::new_active(
+    let spec = ShardSpec::with_range(vec![b'a'], vec![b'c']);
+    let record = crate::coordination::record::ShardRecord::new_active(
         sim.tenant,
         run,
         shard,
-        ShardSpec::with_range(vec![b'a'], vec![b'c']),
+        spec.as_ref(),
         CursorSemantics::Completed,
         sim.coordinator.slab_mut(),
     )

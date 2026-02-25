@@ -38,7 +38,6 @@
 use super::*;
 use crate::coordination::cursor::Cursor;
 use crate::coordination::in_memory::InMemoryCoordinator;
-use crate::coordination::record::ShardRecord;
 use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::derived_shard_id;
 use crate::identity::{LogicalTime, RunId, ShardId, ShardKey, WorkerId};
@@ -50,11 +49,12 @@ use crate::sim::test_util::{LEASE_DUR, TENANT, TestRecordBuilder};
 fn make_coordinator_with_shard(shard_raw: u64) -> InMemoryCoordinator {
     let mut coord = InMemoryCoordinator::new(LEASE_DUR);
     let key = ShardKey::new(RunId::from_raw(1), ShardId::from_raw(shard_raw));
-    let record = ShardRecord::new_active(
+    let spec = ShardSpec::with_range(vec![b'a'], vec![b'z']);
+    let record = crate::coordination::record::ShardRecord::new_active(
         TENANT,
         key.run(),
         key.shard(),
-        ShardSpec::with_range(vec![b'a'], vec![b'z']),
+        spec.as_ref(),
         CursorSemantics::Completed,
         coord.slab_mut(),
     )

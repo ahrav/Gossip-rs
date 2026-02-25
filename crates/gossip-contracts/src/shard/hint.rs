@@ -782,57 +782,6 @@ pub fn manifest_shard_into(
     arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
 }
 
-/// Test convenience: allocating range-shard constructor.
-///
-/// Allocates internal scratch on each call. Prefer [`range_shard_ref`]
-/// with a reusable [`ShardSpecScratch`] in hot paths.
-#[cfg(any(test, feature = "test-support"))]
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn range_shard(
-    start: &[u8],
-    end: &[u8],
-    connector_extra: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut scratch = ShardSpecScratch::default();
-    let spec = range_shard_ref(start, end, connector_extra, &mut scratch)?;
-    ShardSpec::try_from_ref(spec)
-}
-
-/// Test convenience: allocating prefix-shard constructor.
-///
-/// Allocates internal scratch on each call. Prefer [`prefix_shard_ref`]
-/// with a reusable [`ShardSpecScratch`] in hot paths.
-#[cfg(any(test, feature = "test-support"))]
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn prefix_shard(prefix: &[u8], connector_extra: &[u8]) -> Result<ShardSpec, PrefixShardError> {
-    let mut scratch = ShardSpecScratch::default();
-    let spec = prefix_shard_ref(prefix, connector_extra, &mut scratch)?;
-    ShardSpec::try_from_ref(spec).map_err(PrefixShardError::from)
-}
-
-/// Test convenience: allocating manifest-shard constructor.
-///
-/// Allocates internal scratch on each call. Prefer [`manifest_shard_ref`]
-/// with a reusable [`ShardSpecScratch`] in hot paths.
-#[cfg(any(test, feature = "test-support"))]
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn manifest_shard(
-    manifest_id: u64,
-    start_row: u64,
-    end_row: u64,
-    connector_extra: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut scratch = ShardSpecScratch::default();
-    let spec = manifest_shard_ref(
-        manifest_id,
-        start_row,
-        end_row,
-        connector_extra,
-        &mut scratch,
-    )?;
-    ShardSpec::try_from_ref(spec)
-}
-
 /// Decode typed shard metadata from a borrowed shard spec view.
 ///
 /// This applies strict envelope validation. Empty metadata is interpreted as

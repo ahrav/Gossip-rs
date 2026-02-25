@@ -53,7 +53,7 @@
 //!   hashes are distinct and non-zero, unpark hashes vary by shard key.
 
 use super::*;
-use crate::coordination::cursor::Cursor;
+use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::shard_spec::CursorSemantics;
 use crate::coordination::shard_spec::ShardSpec;
 use crate::identity::{OpId, RunId, ShardId};
@@ -87,12 +87,41 @@ fn test_run_record() -> RunRecord {
     }
 }
 
-fn make_initial_shard(id: u64, start: &[u8], end: &[u8]) -> InitialShardInput<'static> {
-    InitialShardInput::new(
-        ShardId::from_raw(id),
-        ShardSpec::with_range(start.to_vec(), end.to_vec()),
-        Cursor::initial(),
-    )
+#[derive(Clone, Debug)]
+struct InitialShardFixture {
+    shard: ShardId,
+    spec: ShardSpec,
+    cursor: Cursor,
+}
+
+impl InitialShardFixture {
+    fn as_input(&self) -> InitialShardInput<'_> {
+        InitialShardInput::new(
+            self.shard,
+            self.spec.as_ref(),
+            CursorUpdate::from_cursor(&self.cursor),
+        )
+    }
+}
+
+fn validate_manifest_fixtures(
+    shards: &[InitialShardFixture],
+) -> Result<(), ManifestValidationError> {
+    let inputs: Vec<_> = shards.iter().map(InitialShardFixture::as_input).collect();
+    validate_manifest(&inputs)
+}
+
+fn hash_register_shards_payload_fixtures(shards: &[InitialShardFixture]) -> u64 {
+    let inputs: Vec<_> = shards.iter().map(InitialShardFixture::as_input).collect();
+    hash_register_shards_payload(&inputs)
+}
+
+fn make_initial_shard(id: u64, start: &[u8], end: &[u8]) -> InitialShardFixture {
+    InitialShardFixture {
+        shard: ShardId::from_raw(id),
+        spec: ShardSpec::with_range(start.to_vec(), end.to_vec()),
+        cursor: Cursor::initial(),
+    }
 }
 
 fn make_op_log_entry(op_id: u64, kind: RunOpKind) -> RunOpLogEntry {
@@ -605,8 +634,8 @@ fn evaluate_run_terminal_cases(
     vec![make_initial_shard(1, b"m", b"z"), make_initial_shard(0, b"a", b"m")]
 )]
 #[case::single_shard(vec![make_initial_shard(0, b"a", b"z")])]
-fn manifest_valid_cases(#[case] shards: Vec<InitialShardInput>) {
-    assert!(validate_manifest(&shards).is_ok());
+fn manifest_valid_cases(#[case] shards: Vec<InitialShardFixture>) {
+    assert!(validate_manifest_fixtures(&shards).is_ok());
 }
 
 #[test]
@@ -624,29 +653,31 @@ fn manifest_too_many() {
         })
         .collect();
     assert!(matches!(
-        validate_manifest(&shards),
+        validate_manifest_fixtures(&shards),
         Err(ManifestValidationError::TooManyShards { .. })
     ));
 }
 
 #[test]
 fn manifest_dup_id() {
+    let shards = vec![
+        make_initial_shard(0, b"a", b"m"),
+        make_initial_shard(0, b"m", b"z"),
+    ];
     assert!(matches!(
-        validate_manifest(&[
-            make_initial_shard(0, b"a", b"m"),
-            make_initial_shard(0, b"m", b"z"),
-        ]),
+        validate_manifest_fixtures(&shards),
         Err(ManifestValidationError::DuplicateIds { .. })
     ));
 }
 
 #[test]
 fn manifest_overlap() {
+    let shards = vec![
+        make_initial_shard(0, b"a", b"n"),
+        make_initial_shard(1, b"m", b"z"),
+    ];
     assert!(matches!(
-        validate_manifest(&[
-            make_initial_shard(0, b"a", b"n"),
-            make_initial_shard(1, b"m", b"z"),
-        ]),
+        validate_manifest_fixtures(&shards),
         Err(ManifestValidationError::OverlappingRanges { .. })
     ));
 }
@@ -663,10 +694,12 @@ fn manifest_inverted_spec() {
 
 #[test]
 fn manifest_cursor_out_of_bounds() {
+    let spec = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
+    let cursor = Cursor::with_last_key(b"a".to_vec()); // before range start
     let shard = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-        Cursor::with_last_key(b"a".to_vec()), // before range start
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     );
     assert!(matches!(
         validate_manifest(&[shard]),
@@ -679,10 +712,12 @@ fn manifest_cursor_key_too_large() {
     use crate::coordination::cursor::MAX_KEY_SIZE;
 
     let oversized_key = vec![0xAA; MAX_KEY_SIZE + 1];
+    let spec = ShardSpec::with_range(vec![0x00], vec![0xFF]);
+    let cursor = Cursor::with_last_key(oversized_key);
     let shard = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::with_range(vec![0x00], vec![0xFF]),
-        Cursor::with_last_key(oversized_key),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     );
     let result = validate_manifest(&[shard]);
     assert!(
@@ -700,10 +735,12 @@ fn manifest_cursor_key_at_exact_max_succeeds() {
     use crate::coordination::cursor::MAX_KEY_SIZE;
 
     let exact_key = vec![0xBB; MAX_KEY_SIZE];
+    let spec = ShardSpec::with_range(vec![0x00], vec![0xFF]);
+    let cursor = Cursor::with_last_key(exact_key);
     let shard = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::with_range(vec![0x00], vec![0xFF]),
-        Cursor::with_last_key(exact_key),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     );
     assert!(validate_manifest(&[shard]).is_ok());
 }
@@ -787,8 +824,8 @@ fn shard_filter_matching(
 fn hash_register_shards_order_independent() {
     let s1 = make_initial_shard(0, b"a", b"m");
     let s2 = make_initial_shard(1, b"m", b"z");
-    let h_forward = hash_register_shards_payload(&[s1, s2]);
-    let h_reverse = hash_register_shards_payload(&[s2, s1]);
+    let h_forward = hash_register_shards_payload_fixtures(&[s1.clone(), s2.clone()]);
+    let h_reverse = hash_register_shards_payload_fixtures(&[s2, s1]);
     assert_eq!(h_forward, h_reverse);
     assert_ne!(h_forward, 0);
 }
@@ -953,7 +990,12 @@ fn manifest_inverted_spec_detected_by_validate_manifest() {
         b"a".to_vec().into_boxed_slice(),
         Box::new([]),
     );
-    let shard = InitialShardInput::new(ShardId::from_raw(0), inverted_spec, Cursor::initial());
+    let cursor = Cursor::initial();
+    let shard = InitialShardInput::new(
+        ShardId::from_raw(0),
+        inverted_spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
+    );
     let result = validate_manifest(&[shard]);
     assert!(
         matches!(result, Err(ManifestValidationError::InvalidSpec { .. })),
@@ -1015,7 +1057,7 @@ fn manifest_exactly_max_initial_shards_succeeds() {
             make_initial_shard(i as u64, start.as_bytes(), end.as_bytes())
         })
         .collect();
-    assert!(validate_manifest(&shards).is_ok());
+    assert!(validate_manifest_fixtures(&shards).is_ok());
 }
 
 /// Op-log at exactly OP_LOG_CAP entries passes invariants; one more evicts
@@ -1071,21 +1113,21 @@ mod prop_manifest {
     }
 
     /// Strategy for a valid InitialShardInput with non-overlapping key range.
-    fn arb_initial_shard(idx: usize) -> impl Strategy<Value = InitialShardInput<'static>> {
+    fn arb_initial_shard(idx: usize) -> impl Strategy<Value = InitialShardFixture> {
         arb_shard_id().prop_map(move |id| {
             let start = format!("{:06}", idx);
             let end = format!("{:06}", idx + 1);
-            InitialShardInput::new(
-                id,
-                ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
-                Cursor::initial(),
-            )
+            InitialShardFixture {
+                shard: id,
+                spec: ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
+                cursor: Cursor::initial(),
+            }
         })
     }
 
     /// Generate a vec of `n` initial shards with unique, non-overlapping
     /// key ranges (indexed by position).
-    fn arb_manifest(max_len: usize) -> impl Strategy<Value = Vec<InitialShardInput<'static>>> {
+    fn arb_manifest(max_len: usize) -> impl Strategy<Value = Vec<InitialShardFixture>> {
         (1..=max_len).prop_flat_map(|n| {
             // Generate n unique shard IDs.
             proptest::collection::hash_set(1u64..100_000, n).prop_map(move |ids| {
@@ -1094,11 +1136,11 @@ mod prop_manifest {
                     .map(|(idx, raw)| {
                         let start = format!("{:06}", idx);
                         let end = format!("{:06}", idx + 1);
-                        InitialShardInput::new(
-                            ShardId::from_raw(raw),
-                            ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
-                            Cursor::initial(),
-                        )
+                        InitialShardFixture {
+                            shard: ShardId::from_raw(raw),
+                            spec: ShardSpec::with_range(start.into_bytes(), end.into_bytes()),
+                            cursor: Cursor::initial(),
+                        }
                     })
                     .collect()
             })
@@ -1111,18 +1153,18 @@ mod prop_manifest {
         /// Well-formed manifests always pass validation.
         #[test]
         fn valid_manifests_accepted(shards in arb_manifest(50)) {
-            prop_assert!(validate_manifest(&shards).is_ok());
+            prop_assert!(validate_manifest_fixtures(&shards).is_ok());
         }
 
         /// Manifests with a duplicate ID always fail.
         #[test]
         fn duplicate_id_always_rejected(base in arb_initial_shard(0)) {
-            let dup = InitialShardInput::new(
-                base.shard(),
-                ShardSpec::with_range(b"x".to_vec(), b"y".to_vec()),
-                Cursor::initial(),
-            );
-            let result = validate_manifest(&[base, dup]);
+            let dup = InitialShardFixture {
+                shard: base.shard,
+                spec: ShardSpec::with_range(b"x".to_vec(), b"y".to_vec()),
+                cursor: Cursor::initial(),
+            };
+            let result = validate_manifest_fixtures(&[base, dup]);
             prop_assert!(
                 matches!(result, Err(ManifestValidationError::DuplicateIds { .. })),
                 "expected DuplicateIds, got: {result:?}",
@@ -1135,17 +1177,17 @@ mod prop_manifest {
             id_a in 1u64..50_000,
             id_b in 50_000u64..100_000,
         ) {
-            let a = InitialShardInput::new(
-                ShardId::from_raw(id_a),
-                ShardSpec::with_range(b"a".to_vec(), b"n".to_vec()),
-                Cursor::initial(),
-            );
-            let b = InitialShardInput::new(
-                ShardId::from_raw(id_b),
-                ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
-                Cursor::initial(),
-            );
-            let result = validate_manifest(&[a, b]);
+            let a = InitialShardFixture {
+                shard: ShardId::from_raw(id_a),
+                spec: ShardSpec::with_range(b"a".to_vec(), b"n".to_vec()),
+                cursor: Cursor::initial(),
+            };
+            let b = InitialShardFixture {
+                shard: ShardId::from_raw(id_b),
+                spec: ShardSpec::with_range(b"m".to_vec(), b"z".to_vec()),
+                cursor: Cursor::initial(),
+            };
+            let result = validate_manifest_fixtures(&[a, b]);
             prop_assert!(
                 matches!(result, Err(ManifestValidationError::OverlappingRanges { .. })),
                 "expected OverlappingRanges, got: {result:?}",
@@ -1165,17 +1207,20 @@ mod prop_manifest {
 #[test]
 fn manifest_detects_overlap_with_unbounded_end() {
     // Unbounded end is now rejected before overlap detection.
+    let spec_a = ShardSpec::from_raw_parts(
+        b"a".to_vec().into_boxed_slice(),
+        Box::new([]), // unbounded end = [a, ∞)
+        Box::new([]),
+    );
+    let cursor_a = Cursor::initial();
     let shard_a = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::from_raw_parts(
-            b"a".to_vec().into_boxed_slice(),
-            Box::new([]), // unbounded end = [a, ∞)
-            Box::new([]),
-        ),
-        Cursor::initial(),
+        spec_a.as_ref(),
+        CursorUpdate::from_cursor(&cursor_a),
     );
     let shard_b = make_initial_shard(1, b"m", b"z");
-    let result = validate_manifest(&[shard_a, shard_b]);
+    let shard_b_input = shard_b.as_input();
+    let result = validate_manifest(&[shard_a, shard_b_input]);
     assert!(
         matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
         "unbounded end must be rejected: {result:?}"
@@ -1185,23 +1230,27 @@ fn manifest_detects_overlap_with_unbounded_end() {
 #[test]
 fn manifest_detects_overlap_with_both_starts_empty() {
     // Unbounded start is now rejected before overlap detection.
+    let spec_a = ShardSpec::from_raw_parts(
+        Box::new([]), // unbounded start
+        b"m".to_vec().into_boxed_slice(),
+        Box::new([]),
+    );
+    let spec_b = ShardSpec::from_raw_parts(
+        Box::new([]), // unbounded start
+        b"z".to_vec().into_boxed_slice(),
+        Box::new([]),
+    );
+    let cursor_a = Cursor::initial();
+    let cursor_b = Cursor::initial();
     let shard_a = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::from_raw_parts(
-            Box::new([]), // unbounded start
-            b"m".to_vec().into_boxed_slice(),
-            Box::new([]),
-        ),
-        Cursor::initial(),
+        spec_a.as_ref(),
+        CursorUpdate::from_cursor(&cursor_a),
     );
     let shard_b = InitialShardInput::new(
         ShardId::from_raw(1),
-        ShardSpec::from_raw_parts(
-            Box::new([]), // unbounded start
-            b"z".to_vec().into_boxed_slice(),
-            Box::new([]),
-        ),
-        Cursor::initial(),
+        spec_b.as_ref(),
+        CursorUpdate::from_cursor(&cursor_b),
     );
     let result = validate_manifest(&[shard_a, shard_b]);
     assert!(
@@ -1213,17 +1262,20 @@ fn manifest_detects_overlap_with_both_starts_empty() {
 #[test]
 fn manifest_unbounded_start_rejected() {
     // Unbounded start is no longer accepted in production manifests.
+    let spec_a = ShardSpec::from_raw_parts(
+        Box::new([]), // unbounded start
+        b"m".to_vec().into_boxed_slice(),
+        Box::new([]),
+    );
+    let cursor_a = Cursor::initial();
     let shard_a = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::from_raw_parts(
-            Box::new([]), // unbounded start
-            b"m".to_vec().into_boxed_slice(),
-            Box::new([]),
-        ),
-        Cursor::initial(),
+        spec_a.as_ref(),
+        CursorUpdate::from_cursor(&cursor_a),
     );
     let shard_b = make_initial_shard(1, b"m", b"z");
-    let result = validate_manifest(&[shard_a, shard_b]);
+    let shard_b_input = shard_b.as_input();
+    let result = validate_manifest(&[shard_a, shard_b_input]);
     assert!(
         matches!(result, Err(ManifestValidationError::UnboundedRange { .. })),
         "unbounded start must be rejected: {result:?}"
@@ -1232,10 +1284,13 @@ fn manifest_unbounded_start_rejected() {
 
 #[test]
 fn manifest_unbounded_end_rejected() {
+    let spec =
+        ShardSpec::from_raw_parts(b"a".to_vec().into_boxed_slice(), Box::new([]), Box::new([]));
+    let cursor = Cursor::initial();
     let shard = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::from_raw_parts(b"a".to_vec().into_boxed_slice(), Box::new([]), Box::new([])),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     );
     assert!(
         matches!(
@@ -1248,10 +1303,12 @@ fn manifest_unbounded_end_rejected() {
 
 #[test]
 fn manifest_fully_unbounded_rejected() {
+    let spec = ShardSpec::unbounded();
+    let cursor = Cursor::initial();
     let shard = InitialShardInput::new(
         ShardId::from_raw(0),
-        ShardSpec::unbounded(),
-        Cursor::initial(),
+        spec.as_ref(),
+        CursorUpdate::from_cursor(&cursor),
     );
     assert!(
         matches!(

@@ -75,12 +75,10 @@ use std::fmt;
 
 use gossip_stdx::{InlineVec, SlabFull};
 
-use crate::coordination::cursor::{Cursor, CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ShardSnapshot, ShardStatus};
-use crate::coordination::shard_spec::{
-    CursorSemantics, ShardSpec, ShardSpecRef, SplitValidationError,
-};
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpecRef, SplitValidationError};
 use crate::coordination::split::MAX_SPAWNED_PER_SHARD;
 use crate::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
@@ -1237,9 +1235,8 @@ const _: () = assert!(core::mem::size_of::<CapacityHint>() <= 24);
 /// caller-owned [`AcquireScratch`]. The view is valid only until that
 /// scratch is reused or dropped.
 ///
-/// Use [`AcquireResultView::to_owned`] to materialize an [`AcquireResult`]
-/// when the snapshot must outlive the scratch buffer (e.g., crossing an
-/// API boundary or caching for later use).
+/// Consumers that need owned data must copy fields out explicitly before the
+/// scratch buffer is reused.
 ///
 /// ## Why Both `ShardSnapshotView` and `ShardSnapshot` Exist
 ///
@@ -1301,8 +1298,7 @@ impl<'a> ShardSnapshotView<'a> {
 ///
 /// This is the allocation-free return type from `acquire_and_restore_into`.
 /// The lease is `Copy` (small fixed-size struct), but the snapshot borrows
-/// variable-size byte fields from the scratch buffer. Use [`Self::to_owned`]
-/// at API boundaries that require heap-backed, lifetime-independent data.
+/// variable-size byte fields from the scratch buffer.
 ///
 /// The `capacity` field is advisory metadata for backoff decisions; see
 /// [`CapacityHint`] for usage guidance.
@@ -1312,37 +1308,6 @@ pub struct AcquireResultView<'a> {
     pub lease: Lease,
     pub snapshot: ShardSnapshotView<'a>,
     pub capacity: CapacityHint,
-}
-
-impl AcquireResultView<'_> {
-    /// Explicit non-hot-path adapter to the legacy owned acquire result.
-    ///
-    /// Performs heap allocation and byte copies; prefer borrowed accessors on
-    /// this type when ownership transfer is not required.
-    pub fn to_owned(&self) -> AcquireResult {
-        let spec = ShardSpec::try_from_ref(self.snapshot.spec())
-            .expect("AcquireResultView::to_owned: invalid spec view");
-        let cursor = match (
-            self.snapshot.cursor().last_key(),
-            self.snapshot.cursor().token(),
-        ) {
-            (None, _) => Cursor::initial(),
-            (Some(last_key), None) => Cursor::with_last_key(last_key.to_vec()),
-            (Some(last_key), Some(token)) => Cursor::from_parts(last_key.to_vec(), token.to_vec()),
-        };
-        AcquireResult {
-            lease: self.lease,
-            snapshot: ShardSnapshot::new(
-                self.snapshot.status(),
-                spec,
-                cursor,
-                self.snapshot.cursor_semantics(),
-                self.snapshot.parent(),
-                self.snapshot.spawned().iter(),
-            ),
-            capacity: self.capacity,
-        }
-    }
 }
 
 /// Caller-owned scratch buffer for allocation-free acquire snapshots.

@@ -9,7 +9,7 @@
 //!
 //! Lease-gated operations take `(TenantId, Lease)` — the backend extracts
 //! the `ShardKey` from the lease via `lease.shard_key()`.
-//! `acquire_and_restore` is the exception: it takes
+//! `acquire_and_restore_into` is the exception: it takes
 //! `(TenantId, ShardKey, WorkerId)` since no lease exists yet.
 //! The backend validates:
 //! 1. Tenant isolation (`record.tenant == tenant`)
@@ -27,8 +27,6 @@
 //! Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021).
 
 use crate::coordination::cursor::CursorUpdate;
-#[cfg(any(test, feature = "test-support"))]
-use crate::coordination::error::AcquireResult;
 use crate::coordination::error::{
     AcquireError, AcquireResultView, AcquireScratch, CheckpointError, CompleteError,
     IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
@@ -65,7 +63,7 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 /// tenant isolation on every call.
 ///
 /// **Lease-gated mutations**: All mutating operations (except
-/// `acquire_and_restore`) require a valid `Lease`. The backend
+/// `acquire_and_restore_into`) require a valid `Lease`. The backend
 /// validates the lease's fence epoch and deadline before executing.
 ///
 /// ## Invariants (must hold across ALL backends)
@@ -146,14 +144,8 @@ use crate::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 pub trait CoordinationBackend {
     // —— Shard lifecycle operations ——————————————————————————————
     //
-    // Two naming conventions appear here:
-    //
-    // - `*_into` methods (e.g., `acquire_and_restore_into`): write output
-    //   into caller-owned scratch to avoid per-call allocation. These are
-    //   the primary production entry points.
-    //
-    // - Non-`_into` methods (e.g., `acquire_and_restore`): return owned
-    //   results with heap allocation. Available in test builds only.
+    // Allocation-sensitive methods use caller-owned scratch/output buffers to
+    // avoid per-call heap allocation on hot paths.
 
     /// Acquire a shard for processing and restore its last checkpoint.
     ///
@@ -177,7 +169,7 @@ pub trait CoordinationBackend {
     ///
     /// ## Idempotency
     ///
-    /// `acquire_and_restore` is NOT idempotent via OpId. It is
+    /// `acquire_and_restore_into` is NOT idempotent via OpId. It is
     /// inherently non-idempotent: each call that succeeds increments
     /// the fence epoch. A worker that calls acquire twice gets two
     /// different leases (the first is immediately invalidated by the
@@ -205,23 +197,6 @@ pub trait CoordinationBackend {
         worker: WorkerId,
         out: &'a mut AcquireScratch,
     ) -> Result<AcquireResultView<'a>, AcquireError>;
-
-    #[cfg(any(test, feature = "test-support"))]
-    /// Owned convenience wrapper around [`Self::acquire_and_restore_into`].
-    ///
-    /// This exists for tests and compatibility paths. Hot production paths
-    /// should prefer the borrowed variant to avoid per-call allocation.
-    fn acquire_and_restore(
-        &mut self,
-        now: LogicalTime,
-        tenant: TenantId,
-        key: ShardKey,
-        worker: WorkerId,
-    ) -> Result<AcquireResult, AcquireError> {
-        let mut scratch = AcquireScratch::default();
-        self.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)
-            .map(|result| result.to_owned())
-    }
 
     /// Renew an existing lease, extending the deadline.
     ///

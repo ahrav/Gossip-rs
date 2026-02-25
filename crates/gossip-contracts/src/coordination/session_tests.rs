@@ -46,6 +46,8 @@ use super::*;
 use crate::coordination::in_memory::InMemoryCoordinator;
 use crate::coordination::run::{InitialShardInput, RunConfig, RunManagement};
 use crate::coordination::shard_spec::CursorSemantics;
+use crate::coordination::split::SplitReplaceChild;
+use crate::coordination::test_fixtures::acquire_result;
 use crate::identity::{RunId, ShardId};
 use crate::test_util::miri_proptest_config;
 use proptest::prelude::*;
@@ -86,15 +88,21 @@ fn setup_coordinator(shard_count: usize) -> (InMemoryCoordinator, Vec<ShardKey>)
 
     coord.create_run(now(1), tenant, run, config).unwrap();
 
-    let shards: Vec<InitialShardInput> = (0..shard_count)
+    let shard_entries: Vec<_> = (0..shard_count)
         .map(|i| {
             let start = vec![(i as u8) * 0x40];
             let end = vec![((i + 1) as u8) * 0x40];
-            InitialShardInput::new(
+            (
                 ShardId::from_raw(i as u64),
                 crate::coordination::shard_spec::ShardSpec::with_range(start, end),
                 Cursor::initial(),
             )
+        })
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = shard_entries
+        .iter()
+        .map(|(shard, spec, cursor)| {
+            InitialShardInput::new(*shard, spec.as_ref(), CursorUpdate::from_cursor(cursor))
         })
         .collect();
 
@@ -163,7 +171,8 @@ fn split_residual_keeps_session() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan = SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec).unwrap();
+    let plan =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
 
     let result = session.split_residual(now(3), plan, OpId::from_raw(300));
     assert!(result.is_ok());
@@ -219,11 +228,18 @@ fn split_replace_consumes_session() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let child2_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
+    let child1_cursor = Cursor::initial();
+    let child2_cursor = Cursor::initial();
 
-    use crate::coordination::split::SplitReplaceChild;
     let plan = SplitReplacePlan::try_new(vec![
-        SplitReplaceChild::new(child1_spec, Cursor::initial()),
-        SplitReplaceChild::new(child2_spec, Cursor::initial()),
+        SplitReplaceChild::new(
+            child1_spec.as_ref(),
+            CursorUpdate::from_cursor(&child1_cursor),
+        ),
+        SplitReplaceChild::new(
+            child2_spec.as_ref(),
+            CursorUpdate::from_cursor(&child2_cursor),
+        ),
     ])
     .unwrap();
 
@@ -267,7 +283,8 @@ fn split_residual_replayed_does_not_rebuild_snapshot() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
 
     // First call: Executed — snapshot is rebuilt with narrowed range.
-    let plan1 = SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec.clone()).unwrap();
+    let plan1 =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
     let op = OpId::from_raw(700);
     let r1 = session.split_residual(now(3), plan1, op).unwrap();
     assert!(r1.is_executed());
@@ -277,7 +294,8 @@ fn split_residual_replayed_does_not_rebuild_snapshot() {
     assert_eq!(spawned_after_first.len(), 1);
 
     // Second call with same OpId: Replayed — snapshot must NOT change.
-    let plan2 = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
+    let plan2 =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
     let r2 = session.split_residual(now(4), plan2, op).unwrap();
     assert!(r2.is_replay());
 
@@ -301,7 +319,8 @@ fn split_residual_replayed_after_oplog_eviction() {
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
     let split_op = OpId::from_raw(700);
-    let plan = SplitResidualPlan::try_new(parent_new_spec.clone(), residual_spec.clone()).unwrap();
+    let plan =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
     let r = session.split_residual(now(3), plan, split_op).unwrap();
     assert!(r.is_executed(), "first call must be Executed");
 
@@ -320,7 +339,8 @@ fn split_residual_replayed_after_oplog_eviction() {
 
     // Retry split_residual with the same OpId — op-log entry is
     // evicted, but the spawned-probe fallback detects the residual.
-    let plan2 = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
+    let plan2 =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
     let r2 = session.split_residual(now(t), plan2, split_op).unwrap();
     assert!(
         r2.is_replay(),
@@ -389,7 +409,8 @@ fn checkpoint_after_split_validates_narrowed_bounds() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
+    let plan =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
     let _ = session
         .split_residual(now(3), plan, OpId::from_raw(800))
         .unwrap();
@@ -447,9 +468,7 @@ fn already_leased_rejected_through_session() {
     let (mut coord, keys) = setup_coordinator(1);
 
     // Worker 1 acquires via raw backend call (borrow released on return).
-    let _w1 = coord
-        .acquire_and_restore(now(2), test_tenant(), keys[0], test_worker(1))
-        .unwrap();
+    let _w1 = acquire_result(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
 
     // Worker 2 tries to create a session on the same shard.
     match WorkerSession::new(&mut coord, now(3), test_tenant(), keys[0], test_worker(2)) {
@@ -605,7 +624,8 @@ fn split_residual_error_does_not_corrupt_snapshot() {
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
     let residual_spec =
         crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
-    let plan = SplitResidualPlan::try_new(parent_new_spec, residual_spec).unwrap();
+    let plan =
+        SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
     let err = session.split_residual(now(50), plan, OpId::from_raw(900));
     assert!(
         err.is_err(),
@@ -634,7 +654,12 @@ fn successive_split_residual_accumulates_spawned() {
     coord.create_run(now(1), tenant, run, config).unwrap();
 
     let shard_spec = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x60]);
-    let shard = InitialShardInput::new(ShardId::from_raw(0), shard_spec, Cursor::initial());
+    let shard_cursor = Cursor::initial();
+    let shard = InitialShardInput::new(
+        ShardId::from_raw(0),
+        shard_spec.as_ref(),
+        CursorUpdate::from_cursor(&shard_cursor),
+    );
     let _ = coord
         .register_shards(now(1), tenant, run, &[shard], OpId::from_raw(100))
         .unwrap();
@@ -643,11 +668,10 @@ fn successive_split_residual_accumulates_spawned() {
     let mut session = WorkerSession::new(&mut coord, now(2), tenant, key, test_worker(1)).unwrap();
 
     // First split: [0x00, 0x60) -> [0x00, 0x40) + residual [0x40, 0x60).
-    let plan1 = SplitResidualPlan::try_new(
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x40]),
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x40], vec![0x60]),
-    )
-    .unwrap();
+    let parent_new_1 =
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x40]);
+    let residual_1 = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x40], vec![0x60]);
+    let plan1 = SplitResidualPlan::try_new(parent_new_1.as_ref(), residual_1.as_ref()).unwrap();
     let r1 = session
         .split_residual(now(3), plan1, OpId::from_raw(300))
         .unwrap();
@@ -656,11 +680,10 @@ fn successive_split_residual_accumulates_spawned() {
     assert_eq!(session.initial_snapshot().spawned().len(), 1);
 
     // Second split: [0x00, 0x40) -> [0x00, 0x20) + residual [0x20, 0x40).
-    let plan2 = SplitResidualPlan::try_new(
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]),
-        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]),
-    )
-    .unwrap();
+    let parent_new_2 =
+        crate::coordination::shard_spec::ShardSpec::with_range(vec![0x00], vec![0x20]);
+    let residual_2 = crate::coordination::shard_spec::ShardSpec::with_range(vec![0x20], vec![0x40]);
+    let plan2 = SplitResidualPlan::try_new(parent_new_2.as_ref(), residual_2.as_ref()).unwrap();
     let r2 = session
         .split_residual(now(4), plan2, OpId::from_raw(301))
         .unwrap();
@@ -790,8 +813,7 @@ proptest! {
                             vec![mid],
                             vec![range_end],
                         );
-                    let plan =
-                        SplitResidualPlan::try_new(parent_new, residual).unwrap();
+                    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
                     let result = session
                         .split_residual(now(t), plan, OpId::from_raw(op_counter))
                         .map_err(|e| {

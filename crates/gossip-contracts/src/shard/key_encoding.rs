@@ -419,63 +419,6 @@ pub fn shard_spec_from_manifest_range_into(
     arena.alloc_spec(spec).map_err(ShardIntoError::SlabFull)
 }
 
-/// Test convenience: allocating key-pair shard constructor.
-///
-/// Creates temporary `KeyBuf` scratch on each call. Prefer
-/// [`shard_spec_from_keys_ref`] with reusable buffers in hot paths.
-#[cfg(any(test, feature = "test-support"))]
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_keys<Start: KeyEncoding, End: KeyEncoding>(
-    start: &Start,
-    end: &End,
-    metadata: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut start_buf = KeyBuf::new();
-    let mut end_buf = KeyBuf::new();
-    let spec = shard_spec_from_keys_ref(start, end, metadata, &mut start_buf, &mut end_buf)?;
-    ShardSpec::try_from_ref(spec)
-}
-
-/// Test convenience: allocating prefix shard constructor.
-///
-/// Creates temporary scratch on each call. Prefer
-/// [`shard_spec_from_prefix_ref`] with a reusable `KeyBuf` in hot paths.
-#[cfg(any(test, feature = "test-support"))]
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_prefix(
-    prefix: &[u8],
-    metadata: &[u8],
-) -> Result<ShardSpec, PrefixShardError> {
-    let mut successor_buf = KeyBuf::new();
-    let spec = shard_spec_from_prefix_ref(prefix, metadata, &mut successor_buf)?;
-    ShardSpec::try_from_ref(spec).map_err(PrefixShardError::from)
-}
-
-/// Test convenience: allocating manifest-range shard constructor.
-///
-/// Creates temporary scratch on each call. Prefer
-/// [`shard_spec_from_manifest_range_ref`] with reusable `KeyBuf`s in hot paths.
-#[cfg(any(test, feature = "test-support"))]
-#[must_use = "returns a Result that must be checked for validation errors"]
-pub fn shard_spec_from_manifest_range(
-    manifest_id: u64,
-    start_row: u64,
-    end_row: u64,
-    metadata: &[u8],
-) -> Result<ShardSpec, ShardSpecInputError> {
-    let mut start_buf = KeyBuf::new();
-    let mut end_buf = KeyBuf::new();
-    let spec = shard_spec_from_manifest_range_ref(
-        manifest_id,
-        start_row,
-        end_row,
-        metadata,
-        &mut start_buf,
-        &mut end_buf,
-    )?;
-    ShardSpec::try_from_ref(spec)
-}
-
 /// Compute the lexicographic successor of a byte prefix.
 ///
 /// Returns the smallest byte string strictly greater than `prefix` that also
