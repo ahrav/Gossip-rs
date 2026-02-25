@@ -193,8 +193,8 @@ fn ahash_set_with_capacity<T>(capacity: usize) -> HashSet<T, ahash::RandomState>
 ///
 /// This type drives operational constructor behavior:
 /// lease duration, shard limits, and optional claim cooldown.
-/// It intentionally excludes planning-only budget knobs from
-/// [`CoordinatorConfig`] so runtime enforcement and capacity estimation can
+/// It intentionally excludes planning-only budget knobs (see the test-only
+/// `CoordinatorConfig`) so runtime enforcement and capacity estimation can
 /// evolve independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CoordinatorRuntimeConfig {
