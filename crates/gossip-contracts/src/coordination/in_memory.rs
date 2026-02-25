@@ -19,7 +19,7 @@
 //!
 //! # Protocol foundations
 //!
-//! - **Fencing tokens** (Kleppmann 2016): each `acquire_and_restore` bumps a
+//! - **Fencing tokens** (Kleppmann 2016): each `acquire_and_restore_into` bumps a
 //!   monotonic `fence_epoch`. Stale workers are rejected by epoch comparison.
 //! - **Leases** (Gray & Cheriton 1989): time-bounded ownership via
 //!   `LeaseHolder { owner, deadline }`. Expiry makes shards re-acquirable.
@@ -2673,7 +2673,7 @@ impl InMemoryCoordinator {
     ///
     /// On arithmetic overflow (`last_claim + interval > u64::MAX`), the deadline
     /// saturates to `LogicalTime::MAX`, making the cooldown effectively permanent.
-    /// This matches the lease deadline saturation in `acquire_and_restore`.
+    /// This matches the lease deadline saturation in `acquire_and_restore_into`.
     fn check_cooldown(&self, worker: WorkerId, now: LogicalTime) -> Option<LogicalTime> {
         if self.claim_cooldown_interval == 0 {
             return None;

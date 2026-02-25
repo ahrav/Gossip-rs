@@ -4,7 +4,7 @@
 //! The claim algorithm uses a two-step list-then-acquire pattern: it queries
 //! the backend for available (active, unleased) shards, then tries to acquire
 //! each candidate sequentially. Because the fencing protocol in
-//! `acquire_and_restore` guarantees at-most-one winner per shard, the TOCTOU
+//! `acquire_and_restore_into` guarantees at-most-one winner per shard, the TOCTOU
 //! gap between list and acquire is safe --- losers advance to the next
 //! candidate.
 //!
@@ -18,7 +18,7 @@
 //! - **Cooldown enforcement**: per-worker throttling across runs, boundary
 //!   timing, isolation between workers, priority over downstream errors,
 //!   overflow saturation, and the deliberate bypass on direct
-//!   `acquire_and_restore`.
+//!   `acquire_and_restore_into`.
 //! - **Property tests**: random shard/lease mixes, mixed terminal/leased
 //!   states, expired lease reclamation, and cooldown invariant validation
 //!   across random timestamp sequences.
@@ -818,7 +818,7 @@ fn claim_cooldown_overflow_saturates_to_permanent() {
 }
 
 /// Cooldown is enforced only in `claim_next_available`, not in direct
-/// `acquire_and_restore` calls. This is intentional: cooldown gates the
+/// `acquire_and_restore_into` calls. This is intentional: cooldown gates the
 /// high-level claiming facade, while direct acquire targets a known shard.
 #[test]
 fn cooldown_not_enforced_on_direct_acquire() {
@@ -839,7 +839,7 @@ fn cooldown_not_enforced_on_direct_acquire() {
         "facade path should be throttled"
     );
 
-    // Direct acquire_and_restore on a different shard is NOT gated by cooldown.
+    // Direct acquire_and_restore_into on a different shard is NOT gated by cooldown.
     // We created 3 shards (IDs 0..3); target shard 1 which wasn't claimed above.
     let other_shard = ShardKey::new(run, ShardId::from_raw(1));
     let direct = acquire_lease(&mut coord, now(12), tenant, other_shard, worker);

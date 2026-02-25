@@ -325,7 +325,7 @@ impl std::error::Error for CoordError {
 // Operation-specific error types
 // ============================================================================
 
-/// Error from `acquire_and_restore`.
+/// Error from `acquire_and_restore_into`.
 ///
 /// Acquire is special: it does NOT require a pre-existing lease, so
 /// it cannot produce `StaleFence` or `LeaseExpired`. It can fail if
@@ -1527,7 +1527,7 @@ impl AcquireScratch {
     }
 }
 
-/// Result of a successful `acquire_and_restore` operation.
+/// Result of a successful `acquire_and_restore_into` operation.
 ///
 /// Contains everything a worker needs to start or resume scanning:
 /// - `lease`: proof of ownership with fencing token

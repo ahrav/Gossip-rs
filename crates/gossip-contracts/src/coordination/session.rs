@@ -1,7 +1,7 @@
 //! Ergonomic `WorkerSession` wrapper for shard operations.
 //!
 //! Most [`CoordinationBackend`] methods require `(now, tenant, lease, ...)`
-//! parameters (`acquire_and_restore` takes `key` and `worker` instead, since
+//! parameters (`acquire_and_restore_into` takes `key` and `worker` instead, since
 //! no lease exists yet). `WorkerSession` captures these at acquisition time
 //! and threads them through every subsequent call, eliminating repetitive
 //! boilerplate and preventing tenant/lease mismatches across operations on
@@ -151,7 +151,7 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
     /// available via [`Self::worker()`] for diagnostics.
     worker: WorkerId,
 
-    /// The active lease granted by `acquire_and_restore`. Updated in place
+    /// The active lease granted by `acquire_and_restore_into`. Updated in place
     /// by [`Self::renew()`] (deadline extension only; fence epoch is
     /// immutable after acquisition). Consumed by terminal operations.
     lease: Lease,
@@ -508,7 +508,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// On `Replayed`, the snapshot is left unchanged — the first call in
     /// this session already narrowed it, or (after crash-recovery) the
-    /// snapshot from `acquire_and_restore` already reflects the narrowed spec.
+    /// snapshot from `acquire_and_restore_into` already reflects the narrowed spec.
     ///
     /// This rebuild is necessary because the backend validates cursor
     /// bounds against the shard record's spec (which has been narrowed).
@@ -556,7 +556,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             //     narrowed by the first call in this session.
             // (b) New session retried after crash — the backend's shard
             //     record already reflects the narrowed spec, so the snapshot
-            //     from `acquire_and_restore` is already correct.
+            //     from `acquire_and_restore_into` is already correct.
             // In both cases, skipping the rebuild is safe.
             self.snapshot = ShardSnapshot::new(
                 self.snapshot.status(),

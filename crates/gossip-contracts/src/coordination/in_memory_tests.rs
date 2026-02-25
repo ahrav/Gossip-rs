@@ -47,7 +47,7 @@ use crate::identity::FenceEpoch;
 use crate::sim::backend::SimIntrospection;
 use gossip_stdx::RingBuffer;
 
-// -- acquire_and_restore tests ----------------------------------------
+// -- acquire_and_restore_into tests ------------------------------------
 //
 // Validates the shard acquisition contract: successful acquire returns a
 // valid lease (correct owner, fence bumped from INITIAL, deadline =

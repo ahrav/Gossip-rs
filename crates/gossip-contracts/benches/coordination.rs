@@ -28,7 +28,7 @@
 //! cargo bench -p gossip-contracts --bench coordination
 //! ```
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::error::AcquireScratch;
@@ -129,7 +129,7 @@ fn bench_acquire(c: &mut Criterion) {
                     let result = coord
                         .acquire_and_restore_into(time, tenant(), key, worker(), &mut scratch)
                         .unwrap();
-                    let _ = black_box(result.lease);
+                    let _ = black_box(&result);
                 });
             },
         );
@@ -194,9 +194,8 @@ fn bench_checkpoint(c: &mut Criterion) {
 ///
 /// Measures the cost of `register_shards` which inserts `n` shard records
 /// into the two-level map and allocates spec/cursor storage in the byte
-/// slab. Each iteration creates a fresh coordinator (the measured cost
-/// includes `create_run` + `register_shards`), so this benchmarks the
-/// cold-start registration path rather than steady-state mutation.
+/// slab. Coordinator construction and `create_run` happen in the setup
+/// closure (not measured); only `register_shards` is timed.
 ///
 /// The shard spec vectors are pre-allocated (leaked to `'static`) outside
 /// the benchmark loop so spec construction cost does not pollute the
@@ -221,27 +220,32 @@ fn bench_register_shards(c: &mut Criterion) {
 
                 let mut run_counter = 0u64;
 
-                b.iter(|| {
-                    run_counter += 1;
-                    let mut coord = InMemoryCoordinator::with_limits(1000, n + 1000, n + 1000);
-                    let run = RunId::from_raw(run_counter);
-                    let config =
-                        RunConfig::try_new(CursorSemantics::Completed, 1000, None).unwrap();
-
-                    coord
-                        .create_run(LogicalTime::from_raw(1), tenant(), run, config)
-                        .unwrap();
-                    let ids = coord
-                        .register_shards(
-                            LogicalTime::from_raw(2),
-                            tenant(),
-                            run,
-                            &shards,
-                            OpId::from_raw(run_counter),
-                        )
-                        .unwrap();
-                    let _ = black_box(ids);
-                });
+                b.iter_batched(
+                    || {
+                        run_counter += 1;
+                        let mut coord = InMemoryCoordinator::with_limits(1000, n + 1000, n + 1000);
+                        let run = RunId::from_raw(run_counter);
+                        let config =
+                            RunConfig::try_new(CursorSemantics::Completed, 1000, None).unwrap();
+                        coord
+                            .create_run(LogicalTime::from_raw(1), tenant(), run, config)
+                            .unwrap();
+                        (coord, run, run_counter)
+                    },
+                    |(mut coord, run, counter)| {
+                        let ids = coord
+                            .register_shards(
+                                LogicalTime::from_raw(2),
+                                tenant(),
+                                run,
+                                &shards,
+                                OpId::from_raw(counter),
+                            )
+                            .unwrap();
+                        let _ = black_box(ids);
+                    },
+                    BatchSize::PerIteration,
+                );
             },
         );
     }

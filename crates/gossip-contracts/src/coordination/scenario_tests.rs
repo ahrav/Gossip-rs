@@ -57,7 +57,7 @@ use crate::sim::backend::SimIntrospection;
 ///
 /// Manually constructs the coordinator (no `seeded_coordinator`) to exercise
 /// the full setup sequence: `create_run` -> `register_shards` ->
-/// `acquire_and_restore` -> three checkpoints with advancing cursors ->
+/// `acquire_and_restore_into` -> three checkpoints with advancing cursors ->
 /// `complete` (shard) -> `complete_run`.
 ///
 /// Verifies: shard starts Active after registration, cursor advances

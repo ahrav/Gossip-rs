@@ -6,7 +6,7 @@
 //! byte fields (key range start/end, metadata, cursor last-key, cursor
 //! token). Without pooling, every field is a separate `Box<[u8]>` heap
 //! allocation, making per-field allocation the dominant cost on the
-//! `checkpoint` and `acquire_and_restore` hot paths.
+//! `checkpoint` and `acquire_and_restore_into` hot paths.
 //!
 //! ## Solution
 //!

@@ -40,7 +40,7 @@
 //!
 //! | Backend operation   | Event(s) emitted                             |
 //! |---------------------|----------------------------------------------|
-//! | `acquire_and_restore` | `ShardAcquired`                            |
+//! | `acquire_and_restore_into` | `ShardAcquired`                       |
 //! | `checkpoint`        | `ShardCheckpointed`                          |
 //! | `complete`          | `ShardCompleted`                             |
 //! | `park_shard`        | `ShardParked`                                |
@@ -119,7 +119,7 @@ pub enum EventKind {
     // —— Shard events ——————————————————————————————————————————
     /// A worker acquired (or re-acquired) a shard.
     ///
-    /// Emitted by `acquire_and_restore`. The `fence_epoch` is the
+    /// Emitted by `acquire_and_restore_into`. The `fence_epoch` is the
     /// **new** epoch after the ownership transfer — any prior lease
     /// is now invalid.
     ShardAcquired {

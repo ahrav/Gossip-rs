@@ -1335,7 +1335,7 @@ pub struct ShardSummary {
     pub(crate) lease_deadline: Option<LogicalTime>,
     /// Number of times this shard has been acquired.
     ///
-    /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore`
+    /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore_into`
     /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
     /// exceeds 32-bit range (astronomically unlikely in practice).
     pub(crate) acquire_count: u32,

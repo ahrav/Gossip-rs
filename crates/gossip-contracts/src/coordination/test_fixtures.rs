@@ -309,7 +309,7 @@ pub fn short_lease_run_config() -> RunConfig {
 /// Creates a coordinator with a fully initialized run and an acquired lease.
 ///
 /// Performs: `create_run` -> `register_shards` (one shard `[a,z)`) ->
-/// `acquire_and_restore`. Returns `(coordinator, lease)` ready for
+/// `acquire_and_restore_into`. Returns `(coordinator, lease)` ready for
 /// split, park, or completion tests. Time advances through t=1..3;
 /// callers should start at t=4.
 ///

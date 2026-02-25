@@ -35,7 +35,7 @@
 //! "claim next" primitive from every backend. This keeps the
 //! `CoordinationBackend` trait minimal (no claim-specific method)
 //! while still being correct under concurrency -- the fencing
-//! protocol in `acquire_and_restore` ensures at most one worker
+//! protocol in `acquire_and_restore_into` ensures at most one worker
 //! succeeds for any given shard, so the TOCTOU gap between list
 //! and acquire is safe (losers simply retry the next candidate).
 //!
@@ -183,7 +183,7 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///    contention on the first shard. The offset is deterministic
 ///    (no RNG) — for a given candidate list length, the same worker
 ///    always starts at the same position.
-///    For each candidate, attempt `acquire_and_restore`.
+///    For each candidate, attempt `acquire_and_restore_into`.
 /// 4. On success, return the `AcquireResult` (lease, snapshot, capacity hint).
 /// 5. On a transient race error (`AlreadyLeased`, `ShardTerminal`,
 ///    `ShardNotFound`), skip that candidate and try the next.
@@ -196,8 +196,8 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// ## Concurrency
 ///
 /// There is an intentional TOCTOU gap between the `list_shards`
-/// snapshot and the per-shard `acquire_and_restore` calls. This is
-/// safe because the fencing protocol in `acquire_and_restore`
+/// snapshot and the per-shard `acquire_and_restore_into` calls. This is
+/// safe because the fencing protocol in `acquire_and_restore_into`
 /// guarantees at-most-one winner per shard. Workers that lose the
 /// race simply advance to the next candidate. The worst case for a
 /// single worker is O(S) failed acquire attempts where S is the
@@ -211,7 +211,7 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///   backend instance at a time -- concurrent claiming requires
 ///   separate backend instances (one per worker thread/task).
 /// - `now`: logical timestamp threaded into both `list_shards` and
-///   `acquire_and_restore`. The coordinator never reads a wall clock;
+///   `acquire_and_restore_into`. The coordinator never reads a wall clock;
 ///   passing time explicitly is required for deterministic simulation.
 /// - `tenant` / `run`: scope the candidate set and enforce isolation.
 /// - `worker`: identity recorded on the new lease if acquire succeeds.
@@ -303,7 +303,7 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 debug_assert!(
                     false,
                     "claim_next_available: list_shards returned shard {key:?} \
-                     but acquire_and_restore reports ShardNotFound"
+                     but acquire_and_restore_into reports ShardNotFound"
                 );
                 inconsistency_count += 1;
                 i += 1;
