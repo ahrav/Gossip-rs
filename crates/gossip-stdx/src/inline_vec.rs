@@ -626,7 +626,20 @@ mod kani_proofs {
         }
         let cloned = v.clone();
         assert_eq!(cloned.len(), v.len());
-        assert_eq!(cloned.as_slice(), v.as_slice());
+        let cs = cloned.as_slice();
+        let vs = v.as_slice();
+        if n > 0 {
+            assert_eq!(cs[0], vs[0]);
+        }
+        if n > 1 {
+            assert_eq!(cs[1], vs[1]);
+        }
+        if n > 2 {
+            assert_eq!(cs[2], vs[2]);
+        }
+        if n > 3 {
+            assert_eq!(cs[3], vs[3]);
+        }
     }
 
     // Verifies that `from_slice`'s bulk `copy_nonoverlapping` never
@@ -640,7 +653,19 @@ mod kani_proofs {
         kani::assume(len <= CAP);
         let v = InlineVec::<u32, CAP>::from_slice(&backing[..len]);
         assert_eq!(v.len(), len);
-        assert_eq!(v.as_slice(), &backing[..len]);
+        let s = v.as_slice();
+        if len > 0 {
+            assert_eq!(s[0], backing[0]);
+        }
+        if len > 1 {
+            assert_eq!(s[1], backing[1]);
+        }
+        if len > 2 {
+            assert_eq!(s[2], backing[2]);
+        }
+        if len > 3 {
+            assert_eq!(s[3], backing[3]);
+        }
     }
 
     // Verifies that `From<Vec>` writes each element within the inline
@@ -667,7 +692,19 @@ mod kani_proofs {
 
         assert_eq!(v.len(), len);
         assert!(matches!(&v.repr, Repr::Inline { .. }));
-        assert_eq!(v.as_slice(), &snapshot[..len]);
+        let s = v.as_slice();
+        if len > 0 {
+            assert_eq!(s[0], snapshot[0]);
+        }
+        if len > 1 {
+            assert_eq!(s[1], snapshot[1]);
+        }
+        if len > 2 {
+            assert_eq!(s[2], snapshot[2]);
+        }
+        if len > 3 {
+            assert_eq!(s[3], snapshot[3]);
+        }
     }
 
     // Verifies that `uninit_array` produces a valid array for both
@@ -697,8 +734,17 @@ mod kani_proofs {
         v.push(b);
         v.push(c);
         v.push(d);
-        assert_eq!(v.as_slice(), &[a, b, c, d]);
+        let s = v.as_slice();
+        assert_eq!(s[0], a);
+        assert_eq!(s[1], b);
+        assert_eq!(s[2], c);
+        assert_eq!(s[3], d);
         v.push(e); // spill
-        assert_eq!(v.as_slice(), &[a, b, c, d, e]);
+        let s = v.as_slice();
+        assert_eq!(s[0], a);
+        assert_eq!(s[1], b);
+        assert_eq!(s[2], c);
+        assert_eq!(s[3], d);
+        assert_eq!(s[4], e);
     }
 }

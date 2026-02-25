@@ -50,6 +50,7 @@
 
 use crate::coordination::shard_spec::{MAX_KEY_SIZE, ShardSpecInputError};
 use core::fmt;
+use gossip_stdx::SlabFull;
 
 /// Reusable stack buffer for shard-key arithmetic.
 ///

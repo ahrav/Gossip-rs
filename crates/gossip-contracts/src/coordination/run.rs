@@ -1,8 +1,9 @@
-//! Run-level types, validation, payload hashing, and the `RunManagement` trait.
+//! Run lifecycle: configuration, status, shard manifests, progress, and the
+//! [`RunManagement`] admin trait.
 //!
-//! A "run" is a single scan invocation — it groups a set of shards that
-//! collectively cover the target data source. The coordinator tracks run
-//! status, validates shard manifests, and provides progress aggregation.
+//! A **run** is a single scan invocation that groups a set of shards
+//! collectively covering a target data source. The run lifecycle proceeds
+//! through two phases:
 //!
 //! Startup registration uses borrowed [`InitialShardInput`] manifest rows.
 //! This keeps registration allocation-light by borrowing shard range and
@@ -129,14 +130,35 @@ impl std::error::Error for RunConfigError {}
 
 /// Per-run configuration, immutable after creation.
 ///
+/// Captures the three knobs that vary between runs:
+///
+/// - **Cursor semantics** — governs when cursor advancement counts as
+///   committed progress. `Completed` means progress is durable only on
+///   `complete`; `Checkpointed` means every checkpoint advances the
+///   durable position. The choice affects the strength of the progress
+///   guarantee and interacts with retry logic.
+///
+/// - **Lease duration** — how long (in logical time ticks) a worker holds
+///   exclusive ownership of a shard before the lease expires and the
+///   shard becomes re-acquirable. Stored as [`NonZeroU64`] so the
+///   zero-duration invariant is structurally unrepresentable.
+///
+/// - **Max shard retries** — optional cap on the number of times a
+///   shard may be re-acquired before the orchestrator should park it.
+///   `None` means unlimited retries. Enforcement is external to the
+///   coordination layer (the orchestrator inspects `ShardSummary::acquire_count`
+///   and calls `park_shard` when the budget is exhausted).
+///
 /// Fields are `pub(crate)` to allow coordinator-internal mutation during
 /// record construction, with public accessor methods for external callers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunConfig {
+    /// Controls when cursor advancement counts as durable progress.
     pub(crate) cursor_semantics: CursorSemantics,
     /// Lease duration in [`LogicalTime`] ticks. `NonZeroU64` makes the
     /// zero-duration invariant unrepresentable — no runtime check needed.
     pub(crate) lease_duration: NonZeroU64,
+    /// Optional retry budget per shard. `None` = unlimited.
     pub(crate) max_shard_retries: Option<u32>,
 }
 
@@ -942,14 +964,22 @@ pub enum RunTerminalEvaluation {
     HasFailures,
 }
 
-/// Pure function: evaluate whether a run should transition to terminal.
+/// Pure function: evaluate whether a run should transition to a terminal
+/// state based on its shard progress counts.
 ///
-/// Priority order: `active > 0` → [`StillActive`](RunTerminalEvaluation::StillActive),
-/// then `parked > 0` → [`HasFailures`](RunTerminalEvaluation::HasFailures),
-/// otherwise → [`AllDone`](RunTerminalEvaluation::AllDone).
+/// Decision tree (checked in priority order):
 ///
-/// This is intentionally external to `RunRecord` — the coordinator decides
-/// when and whether to auto-transition (D2.19: external terminal evaluation).
+/// 1. `active > 0` --> [`StillActive`](RunTerminalEvaluation::StillActive):
+///    at least one shard is still being processed. The run cannot terminate.
+/// 2. `parked > 0` --> [`HasFailures`](RunTerminalEvaluation::HasFailures):
+///    all shards settled but some parked. The orchestrator should call
+///    `fail_run` (or decide to unpark and retry).
+/// 3. Otherwise --> [`AllDone`](RunTerminalEvaluation::AllDone): every shard
+///    is Done or Split. The orchestrator should call `complete_run`.
+///
+/// This function is intentionally external to `RunRecord` -- the coordinator
+/// decides *when* and *whether* to act on the evaluation. The function only
+/// provides the recommendation; it does not mutate any state.
 #[must_use]
 pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
     assert!(
@@ -1132,6 +1162,18 @@ fn validate_manifest_common(
         }
     }
 
+    // Validate per-spec size limits (key sizes, metadata size, range ordering).
+    // ShardSpecRef is intentionally unvalidated at construction time; this is the
+    // gate that prevents oversized specs from reaching AcquireScratch::write_spec,
+    // which uses panicking asserts on the same size ceilings.
+    for shard in shards {
+        if ShardSpec::validate_ref(shard.spec).is_err() {
+            return Err(ManifestValidationError::InvalidSpec {
+                shard_id: shard.shard,
+            });
+        }
+    }
+
     // Sort by key_range_start for overlap detection.
     let mut sorted: Vec<(ShardId, ShardSpecRef<'_>)> = shards
         .iter()
@@ -1228,9 +1270,20 @@ pub fn validate_manifest_inputs(
 // ShardSummary
 // ============================================================================
 
-/// Lightweight shard summary for listing and observability.
+/// Lightweight, heap-owned shard summary for listing and observability.
 ///
-/// Constructed from a `ShardRecord` via `from_record`, using accessor methods.
+/// Constructed from a [`ShardRecord`] via `from_record`, which copies
+/// slab-backed byte fields into owned `Box<[u8]>` allocations. This
+/// decouples the summary from the coordinator's internal slab lifetime,
+/// making it safe to return across API boundaries.
+///
+/// [`ShardFilter::matches_record`] provides a pre-filter that checks
+/// status/lease/root criteria on the record directly, avoiding the
+/// 2-3 heap allocations that `from_record` performs for key ranges.
+/// At 10K shards with a selective filter, this turns thousands of
+/// wasted allocations into dozens.
+///
+/// [`ShardRecord`]: super::record::ShardRecord
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardSummary {
     pub(crate) shard: ShardId,
@@ -1347,9 +1400,18 @@ impl ShardSummary {
 
 /// Filter criteria for [`RunManagement::list_shards`].
 ///
-/// All fields default to "match anything". Named constructors compose
-/// common filter patterns; fields are `pub(crate)` to prevent ad-hoc
-/// construction outside the crate.
+/// All fields default to "match anything" (no constraint). Named
+/// constructors compose common filter patterns:
+///
+/// - [`ShardFilter::all()`] -- every shard (no filter)
+/// - [`ShardFilter::active()`] -- Active shards (leased or unleased)
+/// - [`ShardFilter::available()`] -- Active AND unleased (candidates for claiming)
+/// - [`ShardFilter::parked()`] -- Parked shards (candidates for unpark)
+///
+/// Fields are `pub(crate)` to prevent ad-hoc construction outside the
+/// crate. The `is_leased` filter is evaluated at the `now` parameter
+/// passed to `list_shards`: a lease whose deadline has passed is treated
+/// as unleased.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ShardFilter {
     pub(crate) status: Option<ShardStatus>,
@@ -1510,11 +1572,37 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 // RunManagement trait
 // ============================================================================
 
-/// Run-level management operations.
+/// Run-level management operations: setup, terminal transitions, listing,
+/// progress, and shard unparking.
 ///
-/// Separated from `CoordinationBackend` (D2.22) because:
-/// - Different authorization model (admin/scheduler vs worker)
-/// - Independent testability
+/// Separated from [`CoordinationBackend`](super::traits::CoordinationBackend)
+/// because the two trait surfaces serve different callers with different
+/// authorization models:
+///
+/// - **`CoordinationBackend`** — called by *workers* during shard processing.
+///   Every mutation requires a valid lease (worker proof-of-ownership).
+/// - **`RunManagement`** — called by the *orchestrator/scheduler* or an
+///   *admin operator*. No lease required; authorization is out-of-band.
+///
+/// Keeping them separate also enables independent testability: a run
+/// management test does not need to set up shard leases, and a shard
+/// lifecycle test does not need run creation boilerplate.
+///
+/// ## Lifecycle
+///
+/// ```text
+/// create_run(Initializing) --> register_shards(Active) --> complete_run(Done)
+///                          \-> cancel_run(Cancelled)       fail_run(Failed)
+///                                                          cancel_run(Cancelled)
+/// ```
+///
+/// ## Idempotency
+///
+/// All mutating methods (except `create_run`) accept an `OpId` and are
+/// idempotent via the run's bounded op-log. The op-log has capacity
+/// [`RunRecord::OP_LOG_CAP`] (8 entries). Evicted entries are treated as
+/// new operations, but status-check guards prevent re-execution on an
+/// already-transitioned run.
 ///
 /// ## Cross-cutting: `unpark_shard` idempotency
 ///
@@ -1522,7 +1610,6 @@ pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
 /// entries in the **shard** op-log (cap=16), not the run op-log. This is
 /// because unpark targets a specific shard, and the run op-log would need
 /// a keying scheme to distinguish `unpark(shard_A)` from `unpark(shard_B)`.
-/// See also: `CoordinationBackend` shard op-log documentation.
 pub trait RunManagement {
     /// Create a new run in `Initializing` status. **NOT** idempotent.
     ///

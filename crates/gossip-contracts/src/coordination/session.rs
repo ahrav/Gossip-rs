@@ -1,7 +1,7 @@
 //! Ergonomic `WorkerSession` wrapper for shard operations.
 //!
 //! Most [`CoordinationBackend`] methods require `(now, tenant, lease, ...)`
-//! parameters (`acquire_and_restore` takes `key` and `worker` instead, since
+//! parameters (`acquire_and_restore_into` takes `key` and `worker` instead, since
 //! no lease exists yet). `WorkerSession` captures these at acquisition time
 //! and threads them through every subsequent call, eliminating repetitive
 //! boilerplate and preventing tenant/lease mismatches across operations on
@@ -88,8 +88,8 @@
 
 use crate::coordination::cursor::{Cursor, CursorUpdate};
 use crate::coordination::error::{
-    AcquireError, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome, ParkError,
-    RenewError, RenewResult, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireScratch, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome,
+    ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
 };
 use crate::coordination::lease::Lease;
 use crate::coordination::record::{ParkReason, ShardSnapshot, ShardStatus};
@@ -151,13 +151,13 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
     /// available via [`Self::worker()`] for diagnostics.
     worker: WorkerId,
 
-    /// The active lease granted by `acquire_and_restore`. Updated in place
+    /// The active lease granted by `acquire_and_restore_into`. Updated in place
     /// by [`Self::renew()`] (deadline extension only; fence epoch is
     /// immutable after acquisition). Consumed by terminal operations.
     lease: Lease,
 
     /// Shard state snapshot from acquisition time. Intentionally not
-    /// updated by [`Self::checkpoint()`] or [`Self::checkpoint()`]
+    /// updated by [`Self::checkpoint()`] or [`Self::renew()`]
     /// (the worker already knows its cursor). Rebuilt by
     /// [`Self::split_residual()`] to reflect the narrowed key range so
     /// subsequent cursor-bounds checks are accurate.
@@ -175,7 +175,7 @@ pub struct WorkerSession<'b, B: CoordinationBackend> {
 impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// Acquire a shard and create a new session.
     ///
-    /// Delegates to [`CoordinationBackend::acquire_and_restore`], which
+    /// Delegates to [`CoordinationBackend::acquire_and_restore_into`], which
     /// increments the shard's fence epoch and grants a new lease. The
     /// returned session caches the lease, tenant, worker, and the
     /// shard's snapshot (cursor + spec at acquisition time).
@@ -211,7 +211,29 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         key: ShardKey,
         worker: WorkerId,
     ) -> Result<Self, AcquireError> {
-        let result = backend.acquire_and_restore(now, tenant, key, worker)?;
+        let mut scratch = AcquireScratch::new();
+        let result = backend.acquire_and_restore_into(now, tenant, key, worker, &mut scratch)?;
+        // Panic is intentional: the backend's slab only stores specs that
+        // passed write_spec validation (size ceilings enforced by assert),
+        // so an invalid spec here means internal slab corruption.
+        let spec = ShardSpec::try_from_ref(result.snapshot.spec())
+            .expect("WorkerSession::new: backend returned invalid shard spec");
+        let cursor = match (
+            result.snapshot.cursor().last_key(),
+            result.snapshot.cursor().token(),
+        ) {
+            (None, _) => Cursor::initial(),
+            (Some(last_key), None) => Cursor::with_last_key(last_key.to_vec()),
+            (Some(last_key), Some(token)) => Cursor::from_parts(last_key.to_vec(), token.to_vec()),
+        };
+        let snapshot = ShardSnapshot::new(
+            result.snapshot.status(),
+            spec,
+            cursor,
+            result.snapshot.cursor_semantics(),
+            result.snapshot.parent(),
+            result.snapshot.spawned().iter(),
+        );
         // Tenant is a security boundary — must hold in all builds.
         assert_eq!(result.lease.tenant(), tenant, "lease tenant mismatch");
         // The remaining assertions are correctness sanity checks: if the
@@ -220,16 +242,13 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         // avoid redundant checks on the hot path in release builds.
         debug_assert_eq!(result.lease.shard_key(), key, "lease shard_key mismatch");
         debug_assert_eq!(result.lease.owner(), worker, "lease owner mismatch");
-        debug_assert!(
-            !result.snapshot.status().is_terminal(),
-            "acquired terminal shard"
-        );
+        debug_assert!(!snapshot.status().is_terminal(), "acquired terminal shard");
         Ok(Self {
             backend,
             tenant,
             worker,
             lease: result.lease,
-            snapshot: result.snapshot,
+            snapshot,
             capacity: result.capacity,
         })
     }
@@ -462,7 +481,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     pub fn split_replace(
         self,
         now: LogicalTime,
-        plan: SplitReplacePlan,
+        plan: SplitReplacePlan<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
         self.backend
@@ -489,7 +508,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// On `Replayed`, the snapshot is left unchanged — the first call in
     /// this session already narrowed it, or (after crash-recovery) the
-    /// snapshot from `acquire_and_restore` already reflects the narrowed spec.
+    /// snapshot from `acquire_and_restore_into` already reflects the narrowed spec.
     ///
     /// This rebuild is necessary because the backend validates cursor
     /// bounds against the shard record's spec (which has been narrowed).
@@ -515,15 +534,20 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     pub fn split_residual(
         &mut self,
         now: LogicalTime,
-        plan: SplitResidualPlan,
+        plan: SplitResidualPlan<'_>,
         op_id: OpId,
     ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
         // Capture the narrowed spec before `plan` is moved into the backend call.
-        let new_spec = plan.parent_new_spec().clone();
+        let new_spec = plan.parent_new_spec();
         let result = self
             .backend
             .split_residual(now, self.tenant, &self.lease, plan, op_id)?;
         if let IdempotentOutcome::Executed(ref res) = result {
+            // Panic is intentional: the plan's spec passed validation at
+            // construction time, so an invalid spec here means internal
+            // corruption in the plan or coordinator.
+            let new_spec = ShardSpec::try_from_ref(new_spec)
+                .expect("split_residual produced invalid parent spec");
             // Rebuild the cached snapshot so that subsequent operations
             // (especially checkpoint) validate against the narrowed range.
             //
@@ -532,11 +556,11 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
             //     narrowed by the first call in this session.
             // (b) New session retried after crash — the backend's shard
             //     record already reflects the narrowed spec, so the snapshot
-            //     from `acquire_and_restore` is already correct.
+            //     from `acquire_and_restore_into` is already correct.
             // In both cases, skipping the rebuild is safe.
             self.snapshot = ShardSnapshot::new(
                 self.snapshot.status(),
-                new_spec.clone(),
+                new_spec,
                 self.snapshot.cursor().clone(),
                 self.snapshot.cursor_semantics(),
                 self.snapshot.parent(),

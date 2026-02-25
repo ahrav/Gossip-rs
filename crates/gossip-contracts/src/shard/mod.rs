@@ -9,8 +9,29 @@
 //! borrowed/spec-handle inputs and produces validated borrowed
 //! [`crate::coordination::InitialShardInput`] rows for run registration.
 //!
-//! **Dependency direction:** may depend on `identity` and `coordination`;
-//! must not reference `connector` or `persistence`.
+//! - [`key_encoding`] -- byte-order-preserving key encoders
+//!   ([`KeyEncoding`], [`PathKey`], [`ManifestRowKey`]), range arithmetic
+//!   ([`prefix_successor`], [`key_successor`], [`byte_midpoint`]), and
+//!   `ShardSpec` constructors from typed key inputs.
+//!
+//! - [`hint`] -- versionless shard-hint wire framing ([`ShardHint`],
+//!   [`ShardMetadata`]), allocation-free typed shard-spec builders
+//!   ([`range_shard_ref`], [`prefix_shard_ref`], [`manifest_shard_ref`]),
+//!   decode helpers, and split-propagation logic
+//!   ([`propagate_hint_on_split`]).
+//!
+//! # Zero-allocation design
+//!
+//! Both submodules follow the same caller-owned-buffer pattern: callers
+//! provide a reusable scratch buffer ([`KeyBuf`], [`MetadataBuf`], or
+//! [`ShardSpecScratch`]) and receive borrowed output slices. This
+//! eliminates per-operation heap allocation on the coordination hot path
+//! (acquire, checkpoint, split).
+//!
+//! # Dependency direction
+//!
+//! May depend on `identity` and `coordination::shard_spec`. Must not
+//! reference `connector` or `persistence`.
 
 pub mod builder;
 pub mod hint;
