@@ -768,6 +768,53 @@ fn arena_rollback_on_slab_byte_exhaustion() {
 }
 
 // -------------------------------------------------------------------
+// try_view_spec
+// -------------------------------------------------------------------
+
+#[test]
+fn try_view_spec_returns_some_for_live_handle() {
+    let mut arena = test_arena(4, 4096);
+    let spec = ShardSpecRef::new(b"a", b"z", b"meta");
+    let handle = arena.alloc_spec(spec).unwrap();
+    let view = arena.try_view_spec(&handle).unwrap();
+    assert_eq!(view.key_range_start(), b"a");
+    assert_eq!(view.key_range_end(), b"z");
+    assert_eq!(view.metadata(), b"meta");
+    arena.free_spec(handle);
+}
+
+#[test]
+fn try_view_spec_returns_none_for_foreign_arena() {
+    let mut arena_a = test_arena(2, 4096);
+    let arena_b = test_arena(2, 4096);
+    let spec = ShardSpecRef::new(b"a", b"z", &[]);
+    let handle = arena_a.alloc_spec(spec).unwrap();
+    assert!(arena_b.try_view_spec(&handle).is_none());
+    arena_a.free_spec(handle);
+}
+
+#[test]
+fn try_view_spec_returns_none_for_stale_handle() {
+    let mut arena = test_arena(4, 4096);
+    let handle = arena
+        .alloc_spec(ShardSpecRef::new(b"a", b"z", &[]))
+        .unwrap();
+    arena.free_spec(handle);
+    assert!(arena.try_view_spec(&handle).is_none());
+}
+
+#[test]
+fn try_view_spec_returns_none_for_invalid_slot() {
+    let arena = test_arena(2, 4096);
+    let bogus = ShardSpecHandle {
+        slot: 999,
+        generation: 0,
+        arena_id: arena.arena_id,
+    };
+    assert!(arena.try_view_spec(&bogus).is_none());
+}
+
+// -------------------------------------------------------------------
 // validate_ref error paths
 // -------------------------------------------------------------------
 

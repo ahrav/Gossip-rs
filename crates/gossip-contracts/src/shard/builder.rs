@@ -390,7 +390,11 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         Ok(self.push_entry(handle, cursor))
     }
 
-    /// Validate and add a borrowed spec by copying bytes into the arena.
+    /// Validate and add a borrowed spec with an initial cursor, copying
+    /// bytes into the arena.
+    ///
+    /// The entry is staged with [`CursorUpdate::initial`]; there is no
+    /// `_with_cursor` variant for borrowed-spec inputs.
     ///
     /// # Errors
     ///
@@ -454,8 +458,15 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// - [`PreallocShardBuilderError::InvalidSpecHandle`] when any staged
     ///   handle is stale/foreign.
     /// - [`PreallocShardBuilderError::ManifestInvalid`] when the staged rows
-    ///   violate manifest constraints (overlap, duplicate IDs, cursor bounds,
-    ///   and related checks).
+    ///   violate manifest constraints:
+    ///   - empty manifest (no entries staged)
+    ///   - duplicate shard IDs
+    ///   - overlapping key ranges
+    ///   - unbounded ranges (empty start or end key)
+    ///   - invalid spec (fails [`ShardSpec::validate_ref`])
+    ///   - too many shards (exceeds [`MAX_INITIAL_SHARDS`])
+    ///   - cursor out of bounds (`last_key` outside spec range)
+    ///   - cursor key too large (exceeds `MAX_KEY_SIZE`)
     pub fn build_inputs<'s>(
         &'s self,
     ) -> Result<InlineVec<InitialShardInput<'s>, CAP>, PreallocShardBuilderError>

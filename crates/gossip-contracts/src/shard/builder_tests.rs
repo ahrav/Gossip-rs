@@ -154,3 +154,172 @@ fn reset_allows_fresh_reuse_and_resets_ids() {
     assert_eq!(inputs.len(), 1);
     assert_eq!(inputs.as_slice()[0].shard().as_raw(), 0);
 }
+
+// -- add_spec_ref ------------------------------------------------------------
+
+#[test]
+fn add_spec_ref_happy_path() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let spec = ShardSpecRef::new(b"a", b"z", b"meta");
+    let id = builder.add_spec_ref(spec).unwrap();
+    assert_eq!(id.as_raw(), 0);
+    let inputs = builder.build_inputs().unwrap();
+    assert_eq!(inputs.as_slice()[0].spec().key_range_start(), b"a");
+    assert_eq!(inputs.as_slice()[0].spec().metadata(), b"meta");
+    assert!(inputs.as_slice()[0].cursor().last_key().is_none());
+}
+
+#[test]
+fn add_spec_ref_rejects_inverted_range() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let err = builder
+        .add_spec_ref(ShardSpecRef::new(b"z", b"a", &[]))
+        .unwrap_err();
+    assert!(matches!(err, PreallocShardBuilderError::SpecInvalid(_)));
+}
+
+#[test]
+fn add_spec_ref_slab_full() {
+    let mut arena = ShardArena::with_capacity(1, 4_096);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    builder
+        .add_spec_ref(ShardSpecRef::new(b"a", b"m", &[]))
+        .unwrap();
+    let err = builder
+        .add_spec_ref(ShardSpecRef::new(b"m", b"z", &[]))
+        .unwrap_err();
+    assert!(matches!(err, PreallocShardBuilderError::SlabFull(_)));
+}
+
+// -- build_inputs on empty builder -------------------------------------------
+
+#[test]
+fn build_inputs_on_empty_builder_returns_manifest_empty() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let err = builder.build_inputs().unwrap_err();
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::ManifestInvalid(ManifestValidationError::Empty)
+    ));
+}
+
+// -- Config validation -------------------------------------------------------
+
+#[test]
+fn config_rejects_zero_entry_limit() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let err = PreallocShardBuilder::<4>::new(&mut arena, 0).unwrap_err();
+    assert_eq!(err, PreallocShardBuilderError::EntryLimitZero);
+}
+
+#[test]
+fn config_rejects_entry_limit_exceeding_cap() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let err = PreallocShardBuilder::<2>::new(&mut arena, 4).unwrap_err();
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::CapMismatch {
+            entry_limit: 4,
+            cap: 2
+        }
+    ));
+}
+
+// -- Error-mapping paths -----------------------------------------------------
+
+#[test]
+fn add_range_with_inverted_bounds_returns_range_invalid() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let err = builder.add_range(b"z", b"a", b"").unwrap_err();
+    assert!(matches!(err, PreallocShardBuilderError::RangeInvalid(_)));
+}
+
+#[test]
+fn add_prefix_with_empty_prefix_returns_prefix_invalid() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let err = builder.add_prefix(b"", b"").unwrap_err();
+    assert!(matches!(err, PreallocShardBuilderError::PrefixInvalid(_)));
+}
+
+#[test]
+fn add_manifest_with_inverted_rows_returns_manifest_ctor_invalid() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    let err = builder.add_manifest(1, 10, 5, b"").unwrap_err();
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::ManifestCtorInvalid(_)
+    ));
+}
+
+// -- Cursor out of bounds at build time --------------------------------------
+
+#[test]
+fn cursor_outside_range_fails_manifest_validation() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    builder
+        .add_range_with_cursor(b"a", b"f", b"", CursorUpdate::new(b"z"))
+        .unwrap();
+    let err = builder.build_inputs().unwrap_err();
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::ManifestInvalid(
+            ManifestValidationError::CursorOutOfBounds { .. }
+        )
+    ));
+}
+
+// -- Manifest with cursor ----------------------------------------------------
+
+#[test]
+fn add_manifest_with_cursor_preserves_initial_cursor() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    builder
+        .add_manifest_with_cursor(7, 0, 10, b"", CursorUpdate::initial())
+        .unwrap();
+    let inputs = builder.build_inputs().unwrap();
+    assert!(inputs.as_slice()[0].cursor().last_key().is_none());
+}
+
+#[test]
+fn add_manifest_with_cursor_preserves_explicit_cursor() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    // Manifest key encoding: BE(manifest_id) ++ BE(row), 16 bytes total.
+    // For manifest_id=7, row range [0, 10), a cursor at row=5 is in-bounds.
+    let mut cursor_key = [0u8; 16];
+    cursor_key[..8].copy_from_slice(&7u64.to_be_bytes());
+    cursor_key[8..].copy_from_slice(&5u64.to_be_bytes());
+    builder
+        .add_manifest_with_cursor(7, 0, 10, b"", CursorUpdate::new(&cursor_key))
+        .unwrap();
+    let inputs = builder.build_inputs().unwrap();
+    assert_eq!(
+        inputs.as_slice()[0].cursor().last_key(),
+        Some(cursor_key.as_slice())
+    );
+}
+
+// -- build_inputs idempotency ------------------------------------------------
+
+#[test]
+fn build_inputs_is_idempotent() {
+    let mut arena = ShardArena::with_capacity(4, 2_048);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    builder.add_range(b"a", b"f", b"").unwrap();
+    builder.add_prefix(b"m/", b"").unwrap();
+    let first = builder.build_inputs().unwrap();
+    let second = builder.build_inputs().unwrap();
+    assert_eq!(first.len(), second.len());
+    for (a, b) in first.iter().zip(second.iter()) {
+        assert_eq!(a.shard().as_raw(), b.shard().as_raw());
+        assert_eq!(a.spec().key_range_start(), b.spec().key_range_start());
+    }
+}
