@@ -48,6 +48,7 @@ use crate::coordination::test_fixtures::{derived_shard_id, test_run, test_spec, 
 use crate::test_util::{TestSlab, canonical_digest};
 use gossip_stdx::{ByteSlab, InlineVec, RingBuffer};
 use proptest::prelude::*;
+use rstest::rstest;
 
 // -- Test fixtures ---------------------------------------------------
 
@@ -90,81 +91,58 @@ fn make_entry(op_raw: u64) -> OpLogEntry {
 // discriminant-to-variant mapping and the terminal/non-terminal partition.
 // ============================================================================
 
-/// Active is the only non-terminal status; Done, Split, and Parked are
-/// all terminal (no further shard-level operations except idempotent replay).
-#[test]
-fn shard_status_terminal_truth_table() {
-    assert!(!ShardStatus::Active.is_terminal());
-    assert!(ShardStatus::Done.is_terminal());
-    assert!(ShardStatus::Split.is_terminal());
-    assert!(ShardStatus::Parked.is_terminal());
+/// Each valid discriminant roundtrips through `as_u8`/`from_u8`, produces
+/// the expected `Display` output, and is correctly classified as terminal
+/// or non-terminal.
+#[rstest]
+#[case::active(0, ShardStatus::Active, "Active", false)]
+#[case::done(1, ShardStatus::Done, "Done", true)]
+#[case::split(2, ShardStatus::Split, "Split", true)]
+#[case::parked(3, ShardStatus::Parked, "Parked", true)]
+fn shard_status_properties(
+    #[case] disc: u8,
+    #[case] status: ShardStatus,
+    #[case] display: &str,
+    #[case] terminal: bool,
+) {
+    assert_eq!(ShardStatus::from_u8(disc), Some(status));
+    assert_eq!(status.as_u8(), disc);
+    assert_eq!(status.to_string(), display);
+    assert_eq!(status.is_terminal(), terminal);
 }
 
-/// Exhaustive roundtrip: every valid discriminant survives `as_u8`/`from_u8`,
-/// out-of-range values return `None`, and `Display` matches expectations.
-#[test]
-fn shard_status_roundtrip_table() {
-    let cases: &[(u8, Option<ShardStatus>, Option<&str>)] = &[
-        (0, Some(ShardStatus::Active), Some("Active")),
-        (1, Some(ShardStatus::Done), Some("Done")),
-        (2, Some(ShardStatus::Split), Some("Split")),
-        (3, Some(ShardStatus::Parked), Some("Parked")),
-        (4, None, None),
-        (u8::MAX, None, None),
-    ];
-    for &(disc, expected, display) in cases {
-        assert_eq!(
-            ShardStatus::from_u8(disc),
-            expected,
-            "ShardStatus::from_u8({disc})"
-        );
-        if let Some(status) = expected {
-            assert_eq!(status.as_u8(), disc, "ShardStatus::as_u8({status:?})");
-            assert_eq!(
-                status.to_string(),
-                display.unwrap(),
-                "ShardStatus::Display({status:?})"
-            );
-        }
-    }
+/// Out-of-range discriminants must return `None`.
+#[rstest]
+#[case::out_of_range_4(4)]
+#[case::out_of_range_max(u8::MAX)]
+fn shard_status_from_u8_rejects_invalid(#[case] disc: u8) {
+    assert_eq!(ShardStatus::from_u8(disc), None);
 }
 
 // ============================================================================
 // ParkReason discriminant stability
 // ============================================================================
 
-/// Same roundtrip + display test as `ShardStatus`, but for `ParkReason`.
-/// All five variants (PermissionDenied..Other) roundtrip; values 5+ are invalid.
-#[test]
-fn park_reason_roundtrip_table() {
-    let cases: &[(u8, Option<ParkReason>, Option<&str>)] = &[
-        (
-            0,
-            Some(ParkReason::PermissionDenied),
-            Some("permission denied"),
-        ),
-        (1, Some(ParkReason::NotFound), Some("not found")),
-        (2, Some(ParkReason::Poisoned), Some("poisoned")),
-        (3, Some(ParkReason::TooManyErrors), Some("too many errors")),
-        (4, Some(ParkReason::Other), Some("other")),
-        (5, None, None),
-        (u8::MAX, None, None),
-    ];
-    for &(disc, expected, display) in cases {
-        assert_eq!(
-            ParkReason::from_u8(disc),
-            expected,
-            "ParkReason::from_u8({disc})"
-        );
-        if let Some(reason) = expected {
-            assert_eq!(reason.as_u8(), disc, "ParkReason::as_u8({reason:?})");
-            assert_eq!(
-                reason.to_string(),
-                display.unwrap(),
-                "ParkReason::Display({reason:?})"
-            );
-        }
-    }
+/// Each valid discriminant roundtrips through `as_u8`/`from_u8` and produces
+/// the expected `Display` output.
+#[rstest]
+#[case::permission_denied(0, ParkReason::PermissionDenied, "permission denied")]
+#[case::not_found(1, ParkReason::NotFound, "not found")]
+#[case::poisoned(2, ParkReason::Poisoned, "poisoned")]
+#[case::too_many_errors(3, ParkReason::TooManyErrors, "too many errors")]
+#[case::other(4, ParkReason::Other, "other")]
+fn park_reason_properties(#[case] disc: u8, #[case] reason: ParkReason, #[case] display: &str) {
+    assert_eq!(ParkReason::from_u8(disc), Some(reason));
+    assert_eq!(reason.as_u8(), disc);
+    assert_eq!(reason.to_string(), display);
+}
+
+/// Out-of-range discriminants must return `None`.
+#[rstest]
+#[case::out_of_range_5(5)]
+#[case::out_of_range_max(u8::MAX)]
+fn park_reason_from_u8_rejects_invalid(#[case] disc: u8) {
+    assert_eq!(ParkReason::from_u8(disc), None);
 }
 
 // ============================================================================
@@ -246,89 +224,38 @@ fn assert_invariants_active_with_reason_panics() {
 /// Terminal shards (Done, Parked, Split) must have their lease cleared.
 /// A lingering lease would block future admin operations and violate the
 /// "terminal = no owner" invariant.
-#[test]
-fn assert_invariants_terminal_with_lease_panics() {
+#[rstest]
+#[case::done(ShardStatus::Done, None, InlineVec::new())]
+#[case::parked(ShardStatus::Parked, Some(ParkReason::TooManyErrors), InlineVec::new())]
+#[case::split(ShardStatus::Split, None, InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]))]
+#[should_panic(expected = "must not have a lease")]
+fn assert_invariants_terminal_with_lease_panics(
+    #[case] status: ShardStatus,
+    #[case] park_reason: Option<ParkReason>,
+    #[case] spawned: SpawnedList,
+) {
     let mut slab = TestSlab::new();
     let lease = Some(LeaseHolder::new(
         WorkerId::from_raw(1),
         LogicalTime::from_raw(100),
     ));
-    let cases: Vec<(&str, ShardRecord)> = vec![
-        (
-            "Done",
-            ShardRecord::from_raw_parts(
-                test_tenant(),
-                test_run(),
-                ShardId::from_raw(10),
-                ShardStatus::Done,
-                None,
-                &test_spec(),
-                &Cursor::initial(),
-                CursorSemantics::Completed,
-                lease,
-                FenceEpoch::INITIAL,
-                None,
-                InlineVec::new(),
-                RingBuffer::new(),
-                &mut slab,
-            ),
-        ),
-        (
-            "Parked",
-            ShardRecord::from_raw_parts(
-                test_tenant(),
-                test_run(),
-                ShardId::from_raw(10),
-                ShardStatus::Parked,
-                Some(ParkReason::TooManyErrors),
-                &test_spec(),
-                &Cursor::initial(),
-                CursorSemantics::Completed,
-                lease,
-                FenceEpoch::INITIAL,
-                None,
-                InlineVec::new(),
-                RingBuffer::new(),
-                &mut slab,
-            ),
-        ),
-        (
-            "Split",
-            ShardRecord::from_raw_parts(
-                test_tenant(),
-                test_run(),
-                ShardId::from_raw(10),
-                ShardStatus::Split,
-                None,
-                &test_spec(),
-                &Cursor::initial(),
-                CursorSemantics::Completed,
-                lease,
-                FenceEpoch::INITIAL,
-                None,
-                InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]),
-                RingBuffer::new(),
-                &mut slab,
-            ),
-        ),
-    ];
-    for (label, record) in cases {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            record.assert_invariants();
-        }));
-        let err = result.expect_err(&format!(
-            "{label}: assert_invariants should panic for terminal shard with lease"
-        ));
-        let msg = err
-            .downcast_ref::<String>()
-            .map(|s| s.as_str())
-            .or_else(|| err.downcast_ref::<&str>().copied())
-            .unwrap_or("<non-string panic>");
-        assert!(
-            msg.contains("must not have a lease"),
-            "{label}: expected 'must not have a lease' in panic, got: {msg}"
-        );
-    }
+    let r = ShardRecord::from_raw_parts(
+        test_tenant(),
+        test_run(),
+        ShardId::from_raw(10),
+        status,
+        park_reason,
+        &test_spec(),
+        &Cursor::initial(),
+        CursorSemantics::Completed,
+        lease,
+        FenceEpoch::INITIAL,
+        None,
+        spawned,
+        RingBuffer::new(),
+        &mut slab,
+    );
+    r.assert_invariants();
 }
 
 // NOTE: op_log overflow test removed — RingBuffer prevents overflow at the
@@ -628,26 +555,15 @@ fn assert_invariants_derived_without_parent_panics() {
 // Done -> Active, Parked -> Active, Split -> Done) are illegal.
 // ============================================================================
 
-/// Active -> Done is the normal completion path.
-#[test]
-fn assert_transition_legal_active_to_done_ok() {
+/// Active -> {Done, Parked, Split} are the three valid terminal transitions.
+#[rstest]
+#[case::to_done(ShardStatus::Done)]
+#[case::to_parked(ShardStatus::Parked)]
+#[case::to_split(ShardStatus::Split)]
+fn transition_legal_active_to_terminal(#[case] target: ShardStatus) {
     let mut slab = TestSlab::new();
     let r = active_record(&mut slab);
-    r.assert_transition_legal(ShardStatus::Done);
-}
-
-#[test]
-fn assert_transition_legal_active_to_parked_ok() {
-    let mut slab = TestSlab::new();
-    let r = active_record(&mut slab);
-    r.assert_transition_legal(ShardStatus::Parked);
-}
-
-#[test]
-fn assert_transition_legal_active_to_split_ok() {
-    let mut slab = TestSlab::new();
-    let r = active_record(&mut slab);
-    r.assert_transition_legal(ShardStatus::Split);
+    r.assert_transition_legal(target);
 }
 
 /// Done -> Done is allowed (idempotent terminal replay).
@@ -659,34 +575,23 @@ fn assert_transition_legal_done_to_done_ok() {
     r.assert_transition_legal(ShardStatus::Done);
 }
 
-/// Done -> Active is illegal (terminal irreversibility).
-#[test]
+/// Terminal -> different-terminal or terminal -> Active are all illegal.
+#[rstest]
+#[case::done_to_active(ShardStatus::Done, ShardStatus::Active)]
+#[case::parked_to_active(ShardStatus::Parked, ShardStatus::Active)]
+#[case::split_to_done(ShardStatus::Split, ShardStatus::Done)]
 #[should_panic(expected = "illegal transition from terminal")]
-fn assert_transition_legal_done_to_active_panics() {
+fn transition_illegal_from_terminal(#[case] from: ShardStatus, #[case] to: ShardStatus) {
     let mut slab = TestSlab::new();
     let mut r = active_record(&mut slab);
-    r.status = ShardStatus::Done;
-    r.assert_transition_legal(ShardStatus::Active);
-}
-
-#[test]
-#[should_panic(expected = "illegal transition from terminal")]
-fn assert_transition_legal_parked_to_active_panics() {
-    let mut slab = TestSlab::new();
-    let mut r = active_record(&mut slab);
-    r.status = ShardStatus::Parked;
-    r.park_reason = Some(ParkReason::TooManyErrors);
-    r.assert_transition_legal(ShardStatus::Active);
-}
-
-#[test]
-#[should_panic(expected = "illegal transition from terminal")]
-fn assert_transition_legal_split_to_done_panics() {
-    let mut slab = TestSlab::new();
-    let mut r = active_record(&mut slab);
-    r.status = ShardStatus::Split;
-    r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
-    r.assert_transition_legal(ShardStatus::Done);
+    r.status = from;
+    if from == ShardStatus::Parked {
+        r.park_reason = Some(ParkReason::TooManyErrors);
+    }
+    if from == ShardStatus::Split {
+        r.spawned = InlineVec::from_slice(&[derived_shard_id(1), derived_shard_id(2)]);
+    }
+    r.assert_transition_legal(to);
 }
 
 // ============================================================================

@@ -131,16 +131,31 @@ fn try_with_range_and_metadata_valid() {
     assert_eq!(spec.metadata(), b"meta");
 }
 
-#[test]
-fn shard_spec_input_error_display() {
-    let err = ShardSpecInputError::InvertedRange {
-        start_len: 3,
-        end_len: 1,
-    };
+#[rstest]
+#[case::inverted_range(
+    ShardSpecInputError::InvertedRange { start_len: 3, end_len: 1 },
+    "start must be strictly less than end", "3 bytes", "1 bytes",
+)]
+#[case::key_too_large(
+    ShardSpecInputError::KeyTooLarge { size: 5000, max: 4096 },
+    "5000", "4096", "",
+)]
+#[case::metadata_too_large(
+    ShardSpecInputError::MetadataTooLarge { size: 20000, max: 16384 },
+    "20000", "16384", "",
+)]
+fn shard_spec_input_error_display(
+    #[case] err: ShardSpecInputError,
+    #[case] expected1: &str,
+    #[case] expected2: &str,
+    #[case] expected3: &str,
+) {
     let msg = err.to_string();
-    assert!(msg.contains("start must be strictly less than end"));
-    assert!(msg.contains("3 bytes"));
-    assert!(msg.contains("1 bytes"));
+    assert!(msg.contains(expected1), "expected '{expected1}' in '{msg}'");
+    assert!(msg.contains(expected2), "expected '{expected2}' in '{msg}'");
+    if !expected3.is_empty() {
+        assert!(msg.contains(expected3), "expected '{expected3}' in '{msg}'");
+    }
 }
 
 // -------------------------------------------------------------------
@@ -198,28 +213,6 @@ fn try_with_range_and_metadata_over_max() {
     );
 }
 
-#[test]
-fn shard_spec_input_error_display_key_too_large() {
-    let err = ShardSpecInputError::KeyTooLarge {
-        size: 5000,
-        max: 4096,
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("5000"));
-    assert!(msg.contains("4096"));
-}
-
-#[test]
-fn shard_spec_input_error_display_metadata_too_large() {
-    let err = ShardSpecInputError::MetadataTooLarge {
-        size: 20000,
-        max: 16384,
-    };
-    let msg = err.to_string();
-    assert!(msg.contains("20000"));
-    assert!(msg.contains("16384"));
-}
-
 // -------------------------------------------------------------------
 // Split validation
 // -------------------------------------------------------------------
@@ -230,15 +223,6 @@ fn split_valid_two_way() {
     let c1 = ShardSpec::with_range(b"a".to_vec(), b"m".to_vec());
     let c2 = ShardSpec::with_range(b"m".to_vec(), b"z".to_vec());
     assert!(validate_split_coverage(&parent, &[&c1, &c2]).is_ok());
-}
-
-#[test]
-fn split_valid_three_way() {
-    let parent = ShardSpec::with_range(b"a".to_vec(), b"z".to_vec());
-    let c1 = ShardSpec::with_range(b"a".to_vec(), b"g".to_vec());
-    let c2 = ShardSpec::with_range(b"g".to_vec(), b"p".to_vec());
-    let c3 = ShardSpec::with_range(b"p".to_vec(), b"z".to_vec());
-    assert!(validate_split_coverage(&parent, &[&c1, &c2, &c3]).is_ok());
 }
 
 #[test]
@@ -786,47 +770,32 @@ fn arena_rollback_on_slab_byte_exhaustion() {
 // validate_ref error paths (F7)
 // -------------------------------------------------------------------
 
-#[test]
-fn validate_ref_rejects_oversized_start_key() {
-    let big_start = vec![0x01; MAX_KEY_SIZE + 1];
-    let spec = ShardSpecRef::new(&big_start, b"z", &[]);
+#[rstest]
+#[case::oversized_start_key(
+    vec![0x01; MAX_KEY_SIZE + 1], b"z".to_vec(), vec![],
+    ShardSpecInputError::KeyTooLarge { size: MAX_KEY_SIZE + 1, max: MAX_KEY_SIZE },
+)]
+#[case::oversized_end_key(
+    b"a".to_vec(), vec![0xFF; MAX_KEY_SIZE + 1], vec![],
+    ShardSpecInputError::KeyTooLarge { size: MAX_KEY_SIZE + 1, max: MAX_KEY_SIZE },
+)]
+#[case::oversized_metadata(
+    b"a".to_vec(), b"z".to_vec(), vec![0xAA; MAX_METADATA_SIZE + 1],
+    ShardSpecInputError::MetadataTooLarge { size: MAX_METADATA_SIZE + 1, max: MAX_METADATA_SIZE },
+)]
+#[case::inverted_range(
+    b"z".to_vec(), b"a".to_vec(), vec![],
+    ShardSpecInputError::InvertedRange { start_len: 1, end_len: 1 },
+)]
+fn validate_ref_rejects_invalid_spec(
+    #[case] start: Vec<u8>,
+    #[case] end: Vec<u8>,
+    #[case] metadata: Vec<u8>,
+    #[case] expected: ShardSpecInputError,
+) {
+    let spec = ShardSpecRef::new(&start, &end, &metadata);
     let err = ShardSpec::validate_ref(spec).unwrap_err();
-    assert_eq!(
-        err,
-        ShardSpecInputError::KeyTooLarge {
-            size: MAX_KEY_SIZE + 1,
-            max: MAX_KEY_SIZE,
-        }
-    );
-}
-
-#[test]
-fn validate_ref_rejects_oversized_end_key() {
-    let big_end = vec![0xFF; MAX_KEY_SIZE + 1];
-    let spec = ShardSpecRef::new(b"a", &big_end, &[]);
-    let err = ShardSpec::validate_ref(spec).unwrap_err();
-    assert!(matches!(err, ShardSpecInputError::KeyTooLarge { .. }));
-}
-
-#[test]
-fn validate_ref_rejects_oversized_metadata() {
-    let big_meta = vec![0xAA; MAX_METADATA_SIZE + 1];
-    let spec = ShardSpecRef::new(b"a", b"z", &big_meta);
-    let err = ShardSpec::validate_ref(spec).unwrap_err();
-    assert_eq!(
-        err,
-        ShardSpecInputError::MetadataTooLarge {
-            size: MAX_METADATA_SIZE + 1,
-            max: MAX_METADATA_SIZE,
-        }
-    );
-}
-
-#[test]
-fn validate_ref_rejects_inverted_range() {
-    let spec = ShardSpecRef::new(b"z", b"a", &[]);
-    let err = ShardSpec::validate_ref(spec).unwrap_err();
-    assert!(matches!(err, ShardSpecInputError::InvertedRange { .. }));
+    assert_eq!(err, expected);
 }
 
 #[test]

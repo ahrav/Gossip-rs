@@ -323,25 +323,15 @@ fn claim_wrong_tenant_rejected() {
 
 // -- From<GetRunError> conversion tests --------------------------------
 
-#[test]
-fn claim_error_from_get_run_error_tenant_mismatch() {
-    let err = GetRunError::TenantMismatch {
-        expected: test_tenant(),
-    };
-    let claim_err: ClaimError = err.into();
-    assert_eq!(
-        claim_err,
-        ClaimError::TenantMismatch {
-            expected: test_tenant()
-        }
-    );
-}
-
-#[test]
-fn claim_error_from_get_run_error_run_not_found() {
-    let err = GetRunError::RunNotFound;
-    let claim_err: ClaimError = err.into();
-    assert_eq!(claim_err, ClaimError::RunNotFound);
+#[rstest]
+#[case::tenant_mismatch(
+    GetRunError::TenantMismatch { expected: test_tenant() },
+    ClaimError::TenantMismatch { expected: test_tenant() },
+)]
+#[case::run_not_found(GetRunError::RunNotFound, ClaimError::RunNotFound)]
+fn claim_error_from_get_run_error(#[case] input: GetRunError, #[case] expected: ClaimError) {
+    let result: ClaimError = input.into();
+    assert_eq!(result, expected);
 }
 
 // -- Property tests --------------------------------------------------
