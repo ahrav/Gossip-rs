@@ -545,21 +545,6 @@ fn coord_error_size_regression() {
 // -- FixedBuf ---------------------------------------------------------------
 
 #[test]
-fn fixed_buf_write_and_read_roundtrip() {
-    let mut buf = FixedBuf::<64>::new();
-    buf.write(b"hello world", "test");
-    assert_eq!(buf.read(), b"hello world");
-    assert!(buf.has_data());
-}
-
-#[test]
-fn fixed_buf_write_at_max_capacity() {
-    let mut buf = FixedBuf::<4>::new();
-    buf.write(b"abcd", "test");
-    assert_eq!(buf.read(), b"abcd");
-}
-
-#[test]
 #[should_panic(expected = "oversized")]
 fn fixed_buf_write_oversized_panics() {
     let mut buf = FixedBuf::<4>::new();
@@ -577,31 +562,7 @@ fn fixed_buf_reset_clears_logically() {
 }
 
 #[test]
-fn fixed_buf_replace_shorter_preserves_only_new() {
-    let mut buf = FixedBuf::<16>::new();
-    buf.write(b"12345678", "test");
-    assert_eq!(buf.read().len(), 8);
-    buf.write(b"abcd", "test");
-    assert_eq!(buf.read(), b"abcd");
-    assert_eq!(buf.read().len(), 4);
-}
-
-#[test]
-fn fixed_buf_equality_same_content() {
-    let a = FixedBuf::<16>::from_slice(b"test", "test");
-    let b = FixedBuf::<16>::from_slice(b"test", "test");
-    assert_eq!(a, b);
-}
-
-#[test]
-fn fixed_buf_equality_different_content() {
-    let a = FixedBuf::<16>::from_slice(b"aaa", "test");
-    let b = FixedBuf::<16>::from_slice(b"bbb", "test");
-    assert_ne!(a, b);
-}
-
-#[test]
-fn fixed_buf_debug_output_safe() {
+fn fixed_buf_debug_output_format() {
     let buf = FixedBuf::<16>::from_slice(b"abcdef", "test");
     let dbg = format!("{buf:?}");
     assert!(dbg.contains("6 bytes"), "should contain byte count: {dbg}");
@@ -609,4 +570,42 @@ fn fixed_buf_debug_output_safe() {
     let empty = FixedBuf::<8>::new();
     let dbg_empty = format!("{empty:?}");
     assert!(dbg_empty.contains("empty"), "should say empty: {dbg_empty}");
+}
+
+proptest::proptest! {
+    #![proptest_config(crate::test_util::miri_proptest_config())]
+
+    /// write→read roundtrip: any slice that fits is returned verbatim.
+    /// Subsumes individual roundtrip, at-capacity, and replace-shorter tests.
+    #[test]
+    fn fixed_buf_write_read_roundtrip(
+        first in proptest::collection::vec(proptest::num::u8::ANY, 0..=64),
+        second in proptest::collection::vec(proptest::num::u8::ANY, 0..=64),
+    ) {
+        let mut buf = FixedBuf::<64>::new();
+
+        buf.write(&first, "test");
+        proptest::prop_assert_eq!(buf.read(), first.as_slice());
+        proptest::prop_assert_eq!(buf.has_data(), !first.is_empty());
+
+        // Overwrite with second value — only new content survives.
+        buf.write(&second, "test");
+        proptest::prop_assert_eq!(buf.read(), second.as_slice());
+    }
+
+    /// Equality tracks logical content, not backing-array padding bytes.
+    #[test]
+    fn fixed_buf_equality_matches_content(
+        a in proptest::collection::vec(proptest::num::u8::ANY, 0..=32),
+        b in proptest::collection::vec(proptest::num::u8::ANY, 0..=32),
+    ) {
+        let fa = FixedBuf::<32>::from_slice(&a, "test");
+        let fb = FixedBuf::<32>::from_slice(&b, "test");
+
+        if a == b {
+            proptest::prop_assert_eq!(&fa, &fb);
+        } else {
+            proptest::prop_assert_ne!(&fa, &fb);
+        }
+    }
 }
