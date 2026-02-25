@@ -22,7 +22,7 @@
 use super::*;
 use crate::coordination::cursor::CursorUpdate;
 use crate::coordination::run::{InitialShardInput, RunManagement, ShardFilter, ShardSummary};
-use crate::coordination::shard_spec::ShardSpec;
+use crate::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use crate::coordination::test_fixtures::{
     LEASE_DURATION, acquire_result, acquire_shard, coordinator_with_run_and_lease,
     do_split_replace, now, test_run, test_tenant, test_worker,
@@ -1065,30 +1065,25 @@ fn memory_budget_constants_match_struct_sizes() {
 // construction and slab byte copies.
 // ============================================================================
 
-/// Empty run returns empty candidates and no deadline.
+/// An Initializing run (no shards registered yet) returns empty candidates
+/// and no deadline.
 #[test]
-fn collect_candidates_empty_run() {
-    let (coord, _lease) = coordinator_with_run_and_lease();
-    // Create a second run with zero shards.
-    let mut coord = coord;
-    let empty_run = crate::identity::RunId::from_raw(999);
+fn collect_candidates_no_shards_registered() {
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
+    let tenant = test_tenant();
+    let run = test_run();
     let config = crate::coordination::run::RunConfig::try_new(
-        ShardSpec::default_cursor_semantics(),
-        30,
+        CursorSemantics::Completed,
+        LEASE_DURATION,
         None,
     )
     .unwrap();
-    coord
-        .create_run(now(1), test_tenant(), empty_run, config)
-        .unwrap();
-    // Register zero shards to transition to Active.
-    let _ = coord
-        .register_shards(now(1), test_tenant(), empty_run, &[], OpId::from_raw(500))
-        .unwrap();
+    coord.create_run(now(1), tenant, run, config).unwrap();
 
+    // Run exists but has zero shards (still Initializing).
     let mut candidates = Vec::new();
     let deadline = coord
-        .collect_claim_candidates_into(now(2), test_tenant(), empty_run, &mut candidates)
+        .collect_claim_candidates_into(now(2), tenant, run, &mut candidates)
         .unwrap();
     assert!(candidates.is_empty());
     assert_eq!(deadline, None);
@@ -1098,42 +1093,80 @@ fn collect_candidates_empty_run() {
 /// in candidates; the earliest lease deadline is from the leased shard.
 #[test]
 fn collect_candidates_mixed_states() {
-    let (coord, lease) = coordinator_with_run_and_lease();
-    let mut coord = coord;
+    use crate::coordination::run::{InitialShardInput, RunConfig};
+
+    let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     let tenant = test_tenant();
     let run = test_run();
+    let config = RunConfig::try_new(CursorSemantics::Completed, LEASE_DURATION, None).unwrap();
+    coord.create_run(now(1), tenant, run, config).unwrap();
 
-    // Shard 0 is Active + leased (from the fixture).
-    // Split shard 0 to create children shards 1 and 2. This gives us
-    // terminal (shard 0 after split) and new Active shards.
-    let (child_a, child_b) = do_split_replace(&mut coord, &lease, now(5));
+    // Register 3 shards.
+    let specs: Vec<_> = (0u8..3)
+        .map(|i| {
+            (
+                ShardId::from_raw(i as u64),
+                crate::coordination::shard_spec::ShardSpec::with_range(
+                    vec![i * 10],
+                    vec![i * 10 + 9],
+                ),
+                CursorUpdate::initial(),
+            )
+        })
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = specs
+        .iter()
+        .map(|(id, spec, cursor)| InitialShardInput::new(*id, spec.as_ref(), *cursor))
+        .collect();
+    let _ = coord
+        .register_shards(now(1), tenant, run, &shards, OpId::from_raw(1))
+        .unwrap();
 
-    // child_a and child_b are Active + unleased.
-    // Lease child_a to make it Active + leased.
-    let child_a_key = ShardKey::new(run, child_a);
-    let child_a_lease = acquire_shard(&mut coord, now(6), child_a_key);
+    // Shard 0: acquire and complete (terminal Done).
+    let key0 = ShardKey::new(run, ShardId::from_raw(0));
+    let mut scratch = crate::coordination::error::AcquireScratch::new();
+    let lease0 = coord
+        .acquire_and_restore_into(now(2), tenant, key0, test_worker(1), &mut scratch)
+        .unwrap()
+        .lease;
+    let _ = coord
+        .complete(
+            now(3),
+            tenant,
+            &lease0,
+            &CursorUpdate::new(&[0x00]),
+            OpId::from_raw(10),
+        )
+        .unwrap();
 
-    // child_b stays Active + unleased.
+    // Shard 1: acquire (Active + leased at now(4), deadline = 4 + LEASE_DURATION).
+    let key1 = ShardKey::new(run, ShardId::from_raw(1));
+    let _ = coord
+        .acquire_and_restore_into(now(4), tenant, key1, test_worker(2), &mut scratch)
+        .unwrap();
+
+    // Shard 2: remains Active + unleased.
+
     let shard_count = coord
         .run_shards
         .get(&(tenant, run))
         .map_or(0, |ids| ids.len());
     let mut candidates = Vec::with_capacity(shard_count);
     let deadline = coord
-        .collect_claim_candidates_into(now(7), tenant, run, &mut candidates)
+        .collect_claim_candidates_into(now(5), tenant, run, &mut candidates)
         .unwrap();
 
-    // Only child_b should be a candidate (Active + unleased).
+    // Only shard 2 should appear (Active + unleased).
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0], child_b);
+    assert_eq!(candidates[0], ShardId::from_raw(2));
 
-    // Deadline should reflect child_a's lease (acquired at now(6), duration=30 → deadline=36).
-    assert_eq!(deadline, Some(now(36)));
+    // Deadline should reflect shard 1's lease.
+    assert_eq!(deadline, Some(now(4 + LEASE_DURATION)));
 
-    // Original shard 0 is terminal (Split) — must not appear.
+    // Terminal shard 0 must not appear.
     assert!(!candidates.contains(&ShardId::from_raw(0)));
-    // child_a is Active + leased — must not appear as candidate.
-    assert!(!candidates.contains(&child_a));
+    // Leased shard 1 must not appear as candidate.
+    assert!(!candidates.contains(&ShardId::from_raw(1)));
 }
 
 /// All shards leased: empty candidates, earliest deadline populated.
@@ -1175,7 +1208,7 @@ fn collect_candidates_buffer_reuse() {
     let mut candidates = Vec::with_capacity(shard_count + 10);
     let initial_capacity = candidates.capacity();
 
-    // Call once (all leased at now(4)).
+    // Call once (all leased at now(4), deadline = 3 + LEASE_DURATION).
     let _ = coord
         .collect_claim_candidates_into(now(4), tenant, run, &mut candidates)
         .unwrap();
@@ -1185,9 +1218,10 @@ fn collect_candidates_buffer_reuse() {
         "capacity must not change"
     );
 
-    // Call again after lease expiry (now(34) > deadline(33)).
+    // Call again after lease expiry.
+    let after_expiry = 3 + LEASE_DURATION + 1;
     let _ = coord
-        .collect_claim_candidates_into(now(34), tenant, run, &mut candidates)
+        .collect_claim_candidates_into(now(after_expiry), tenant, run, &mut candidates)
         .unwrap();
     assert_eq!(
         candidates.capacity(),

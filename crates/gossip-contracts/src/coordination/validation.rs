@@ -62,7 +62,7 @@
 //!   If it is `None`, the record is in an inconsistent state and
 //!   `validate_lease` returns `StaleFence` to force re-acquisition.
 
-use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
 use crate::coordination::error::CoordError;
 use crate::coordination::lease::{Lease, OpLogEntry};
 use crate::coordination::record::ShardRecord;
@@ -216,6 +216,16 @@ pub(crate) fn validate_cursor_update_pooled(
         return Err(CoordError::CursorKeyTooLarge {
             size: new_last_key.len(),
             max: MAX_KEY_SIZE,
+        });
+    }
+
+    // 2b. Token size.
+    if let Some(token) = new_cursor.token()
+        && token.len() > MAX_TOKEN_SIZE
+    {
+        return Err(CoordError::CursorTokenTooLarge {
+            size: token.len(),
+            max: MAX_TOKEN_SIZE,
         });
     }
 
@@ -674,6 +684,25 @@ mod tests {
                     if size == MAX_KEY_SIZE + 1 && max == MAX_KEY_SIZE
             ),
             "expected CursorKeyTooLarge, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn validate_cursor_update_rejects_oversized_token() {
+        use crate::coordination::cursor::MAX_TOKEN_SIZE;
+
+        let spec = test_spec();
+        let old_cursor = CursorUpdate::initial();
+        let oversized_token = vec![0xCD; MAX_TOKEN_SIZE + 1];
+        let new_cursor = CursorUpdate::with_token(b"b", &oversized_token);
+        let result = validate_cursor_update_for_tests(&new_cursor, &old_cursor, &spec);
+        assert!(
+            matches!(
+                result,
+                Err(CoordError::CursorTokenTooLarge { size, max })
+                    if size == MAX_TOKEN_SIZE + 1 && max == MAX_TOKEN_SIZE
+            ),
+            "expected CursorTokenTooLarge, got {result:?}",
         );
     }
 

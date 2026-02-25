@@ -2434,6 +2434,19 @@ impl RunManagement for InMemoryCoordinator {
     ///   5. Shard-count limit guard.
     ///   6. Stage shard record creation with rollback on allocation failure.
     ///   7. Insert staged records, update index, transition run to `Active`.
+    ///
+    /// # Panic safety
+    ///
+    /// Step 6 rolls back partially-allocated shard records via
+    /// `deallocate_fields` on `SlabFull`. If `deallocate_fields` itself
+    /// panics (slab metadata exhaustion or double-free assertion), the
+    /// scratch buffers (`register_shard_ids_scratch`, `register_stage_scratch`)
+    /// are lost because the restore lines never execute. Subsequent
+    /// `register_shards` calls would allocate fresh Vecs. In practice,
+    /// `deallocate_fields` only panics on slab invariant violations that
+    /// indicate data corruption — at that point losing scratch buffers is
+    /// the least of the problems. Same reasoning as
+    /// `split_replace_rollback_inserted_children`.
     fn register_shards(
         &mut self,
         now: LogicalTime,
@@ -2750,14 +2763,25 @@ impl RunManagement for InMemoryCoordinator {
     ///
     /// Iterates the run's shard set once, pushing unleased Active shard IDs
     /// into `candidates` and tracking the earliest lease deadline among
-    /// leased Active shards.  Does **not** sort — the free function uses
-    /// modular-offset iteration and does not depend on ordering.
-    ///
-    /// Structurally identical to the filtering loop in
-    /// [`claim_next_available`](Self::claim_next_available) (lines 3069–3092),
-    /// but exposed through the [`RunManagement`] trait so the free function
+    /// leased Active shards.  Does **not** sort — the free function
     /// [`default_claim_next_available`](super::facade::default_claim_next_available)
-    /// can avoid constructing [`ShardSummary`] objects.
+    /// uses modular-offset iteration and does not depend on ordering.
+    ///
+    /// The filtering logic (status check, lease check, deadline tracking)
+    /// is identical to the inline candidate loop in
+    /// [`claim_next_available`](Self::claim_next_available), but capacity
+    /// handling differs: this method panics on undersized buffers to enforce
+    /// the zero-allocation contract, whereas the inline loop uses
+    /// `try_reserve` to grow.  Exposed through the [`RunManagement`] trait
+    /// so the free function can avoid constructing [`ShardSummary`] objects.
+    ///
+    /// # Panics
+    ///
+    /// - If `candidates.capacity()` is smaller than the run's shard count.
+    ///   The buffer must be pre-allocated at startup; panicking on undersized
+    ///   capacity enforces the zero-allocation contract on the hot path.
+    /// - If a shard ID in the `run_shards` index has no corresponding record
+    ///   in the primary shard map (index desynchronization — data corruption).
     fn collect_claim_candidates_into(
         &self,
         now: LogicalTime,
@@ -3021,6 +3045,7 @@ impl RunManagement for InMemoryCoordinator {
                 | crate::coordination::error::CoordError::CursorRegression { .. }
                 | crate::coordination::error::CoordError::CursorOutOfBounds(_)
                 | crate::coordination::error::CoordError::CursorKeyTooLarge { .. }
+                | crate::coordination::error::CoordError::CursorTokenTooLarge { .. }
                 | crate::coordination::error::CoordError::SplitInvalid(_)
                 | crate::coordination::error::CoordError::CheckpointMissingKey => {
                     unreachable!("check_op_idempotency only returns OpIdConflict")

@@ -1932,7 +1932,16 @@ pub trait RunManagement {
     /// the soonest expiry instead of busy-spinning.
     ///
     /// `candidates` is cleared before use.  The caller owns the buffer and
-    /// reuses it across calls (zero-alloc after startup per rule 4).
+    /// reuses it across calls — no allocation in steady state.
+    ///
+    /// # Panics
+    ///
+    /// Implementations may panic if `candidates.capacity()` is smaller than
+    /// the run's shard count.  This enforces the zero-allocation contract:
+    /// the caller must pre-allocate the buffer at startup so the hot path
+    /// never grows it.  The in-memory backend panics on this condition and
+    /// also panics if its internal shard index references a shard ID with
+    /// no corresponding record (index desynchronization — data corruption).
     ///
     /// # Errors
     ///

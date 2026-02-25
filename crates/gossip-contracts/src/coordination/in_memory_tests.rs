@@ -2016,3 +2016,35 @@ fn split_residual_lease_expired_does_not_leak_slab_memory() {
         "split_residual LeaseExpired must not leak slab memory"
     );
 }
+
+// -- Token size validation tests ------------------------------------------
+//
+// `validate_cursor_update_pooled` must reject tokens exceeding
+// MAX_TOKEN_SIZE with a typed error rather than accepting them and
+// panicking later when `AcquireScratch::write_cursor` hits the
+// FixedBuf capacity assert.
+
+#[test]
+fn checkpoint_rejects_oversized_cursor_token() {
+    use crate::coordination::cursor::MAX_TOKEN_SIZE;
+
+    let mut coord = seeded_coordinator();
+    let lease = acquire_shard(&mut coord, 1, 1);
+
+    let oversized_token = vec![0xABu8; MAX_TOKEN_SIZE + 1];
+    let cursor = CursorUpdate::with_token(b"b", &oversized_token);
+
+    let result = coord.checkpoint(now(2), test_tenant(), &lease, &cursor, OpId::from_raw(1));
+
+    assert!(
+        result.is_err(),
+        "checkpoint must reject tokens exceeding MAX_TOKEN_SIZE"
+    );
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            CheckpointError::CursorTokenTooLarge { .. }
+        ),
+        "expected CursorTokenTooLarge error variant"
+    );
+}

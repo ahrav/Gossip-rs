@@ -39,6 +39,7 @@
 //! | `CursorRegression`     |   --  |    yes     |   yes    |  --  |   --  |
 //! | `CursorOutOfBounds`    |   --  |    yes     |   yes    |  --  |   --  |
 //! | `CursorKeyTooLarge`    |   --  |    yes     |   yes    |  --  |   --  |
+//! | `CursorTokenTooLarge`  |   --  |    yes     |   yes    |  --  |   --  |
 //! | `SplitInvalid`         |   --  |     --     |    --    |  --  |  yes  |
 //! | `CheckpointMissingKey` |   --  |    yes     |   yes    |  --  |   --  |
 //!
@@ -176,6 +177,11 @@ pub enum CoordError {
     /// Emitted by `validate_cursor_update_pooled` before monotonicity/bounds checks.
     CursorKeyTooLarge { size: usize, max: usize },
 
+    /// Cursor token exceeds the maximum allowed length.
+    ///
+    /// Emitted by `validate_cursor_update_pooled` before storing the token in the slab.
+    CursorTokenTooLarge { size: usize, max: usize },
+
     /// Split validation failed. Wraps the detailed error from
     /// `validate_split_coverage` / `validate_residual_split`.
     ///
@@ -271,6 +277,11 @@ impl fmt::Debug for CoordError {
                 .field("size", size)
                 .field("max", max)
                 .finish(),
+            Self::CursorTokenTooLarge { size, max } => f
+                .debug_struct("CursorTokenTooLarge")
+                .field("size", size)
+                .field("max", max)
+                .finish(),
             Self::SplitInvalid(inner) => f.debug_tuple("SplitInvalid").field(inner).finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
         }
@@ -305,6 +316,9 @@ impl fmt::Display for CoordError {
             ),
             Self::CursorKeyTooLarge { size, max } => {
                 write!(f, "cursor key too large ({size} bytes, max {max})")
+            }
+            Self::CursorTokenTooLarge { size, max } => {
+                write!(f, "cursor token too large ({size} bytes, max {max})")
             }
             Self::SplitInvalid(inner) => write!(f, "split invalid: {inner}"),
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
@@ -507,6 +521,8 @@ pub enum CheckpointError {
     CursorOutOfBounds(CursorOutOfBoundsDetail),
     /// See [`CoordError::CursorKeyTooLarge`].
     CursorKeyTooLarge { size: usize, max: usize },
+    /// See [`CoordError::CursorTokenTooLarge`].
+    CursorTokenTooLarge { size: usize, max: usize },
     /// The checkpoint cursor did not contain a `last_key`, which is required
     /// to track scan progress.
     CheckpointMissingKey,
@@ -560,6 +576,11 @@ impl fmt::Debug for CheckpointError {
                 .field("size", size)
                 .field("max", max)
                 .finish(),
+            Self::CursorTokenTooLarge { size, max } => f
+                .debug_struct("CursorTokenTooLarge")
+                .field("size", size)
+                .field("max", max)
+                .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
         }
@@ -594,6 +615,9 @@ impl fmt::Display for CheckpointError {
             ),
             Self::CursorKeyTooLarge { size, max } => {
                 write!(f, "cursor key too large ({size} bytes, max {max})")
+            }
+            Self::CursorTokenTooLarge { size, max } => {
+                write!(f, "cursor token too large ({size} bytes, max {max})")
             }
             Self::CheckpointMissingKey => write!(f, "checkpoint requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
@@ -655,6 +679,8 @@ pub enum CompleteError {
     CursorOutOfBounds(CursorOutOfBoundsDetail),
     /// See [`CoordError::CursorKeyTooLarge`].
     CursorKeyTooLarge { size: usize, max: usize },
+    /// See [`CoordError::CursorTokenTooLarge`].
+    CursorTokenTooLarge { size: usize, max: usize },
     /// Complete requires a final cursor with a `last_key` to confirm
     /// the worker reached the end of its assigned range.
     CheckpointMissingKey,
@@ -708,6 +734,11 @@ impl fmt::Debug for CompleteError {
                 .field("size", size)
                 .field("max", max)
                 .finish(),
+            Self::CursorTokenTooLarge { size, max } => f
+                .debug_struct("CursorTokenTooLarge")
+                .field("size", size)
+                .field("max", max)
+                .finish(),
             Self::CheckpointMissingKey => write!(f, "CheckpointMissingKey"),
             Self::ResourceExhausted(e) => f.debug_tuple("ResourceExhausted").field(e).finish(),
         }
@@ -742,6 +773,9 @@ impl fmt::Display for CompleteError {
             ),
             Self::CursorKeyTooLarge { size, max } => {
                 write!(f, "cursor key too large ({size} bytes, max {max})")
+            }
+            Self::CursorTokenTooLarge { size, max } => {
+                write!(f, "cursor token too large ({size} bytes, max {max})")
             }
             Self::CheckpointMissingKey => write!(f, "complete requires a last_key"),
             Self::ResourceExhausted(e) => write!(f, "slab full: {e}"),
@@ -1029,6 +1063,9 @@ impl From<CoordError> for CheckpointError {
             }
             CoordError::CursorOutOfBounds(detail) => Self::CursorOutOfBounds(detail),
             CoordError::CursorKeyTooLarge { size, max } => Self::CursorKeyTooLarge { size, max },
+            CoordError::CursorTokenTooLarge { size, max } => {
+                Self::CursorTokenTooLarge { size, max }
+            }
             CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
             // Explicitly reject all variants CheckpointError does not cover.
             // Adding a new CoordError variant triggers a compile error here.
@@ -1063,6 +1100,9 @@ impl From<CoordError> for CompleteError {
             }
             CoordError::CursorOutOfBounds(detail) => Self::CursorOutOfBounds(detail),
             CoordError::CursorKeyTooLarge { size, max } => Self::CursorKeyTooLarge { size, max },
+            CoordError::CursorTokenTooLarge { size, max } => {
+                Self::CursorTokenTooLarge { size, max }
+            }
             CoordError::CheckpointMissingKey => Self::CheckpointMissingKey,
             // Explicitly reject all variants CompleteError does not cover.
             CoordError::SplitInvalid(_) => {
@@ -1095,6 +1135,7 @@ impl From<CoordError> for ParkError {
             CoordError::CursorRegression { .. }
             | CoordError::CursorOutOfBounds(_)
             | CoordError::CursorKeyTooLarge { .. }
+            | CoordError::CursorTokenTooLarge { .. }
             | CoordError::SplitInvalid(_)
             | CoordError::CheckpointMissingKey => {
                 unreachable!("CoordError::{e} is not valid for ParkError")
@@ -1127,6 +1168,7 @@ impl From<CoordError> for SplitError {
             CoordError::CursorRegression { .. }
             | CoordError::CursorOutOfBounds(_)
             | CoordError::CursorKeyTooLarge { .. }
+            | CoordError::CursorTokenTooLarge { .. }
             | CoordError::CheckpointMissingKey => {
                 unreachable!("CoordError::{e} is not valid for SplitError")
             }
@@ -1149,6 +1191,7 @@ impl From<CoordError> for RenewError {
             | CoordError::CursorRegression { .. }
             | CoordError::CursorOutOfBounds(_)
             | CoordError::CursorKeyTooLarge { .. }
+            | CoordError::CursorTokenTooLarge { .. }
             | CoordError::SplitInvalid(_)
             | CoordError::CheckpointMissingKey => {
                 unreachable!("CoordError::{e} is not valid for RenewError")

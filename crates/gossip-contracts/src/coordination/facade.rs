@@ -196,8 +196,8 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 /// per-shard `acquire_and_restore_into` calls. This is safe because the
 /// fencing protocol in `acquire_and_restore_into` guarantees at-most-one
 /// winner per shard. Workers that lose the race simply advance to the next
-/// candidate. The worst case for a single worker is O(S) failed acquire
-/// attempts where S is the number of available shards, since it tries each
+/// candidate. The worst case for a single worker is O(C) failed acquire
+/// attempts where C is the number of candidates, since it tries each
 /// candidate at most once.
 ///
 /// ## Parameters
@@ -212,8 +212,10 @@ const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
 ///   is required for deterministic simulation.
 /// - `tenant` / `run`: scope the candidate set and enforce isolation.
 /// - `worker`: identity recorded on the new lease if acquire succeeds.
+/// - `out`: caller-owned scratch space for the shard snapshot returned on
+///   success. Reused across calls — no allocation in steady state.
 /// - `candidates`: caller-owned buffer for shard IDs. Cleared and reused
-///   per call (zero-alloc after startup per rule 4).
+///   per call — no allocation in steady state.
 ///
 /// ## Complexity
 ///
