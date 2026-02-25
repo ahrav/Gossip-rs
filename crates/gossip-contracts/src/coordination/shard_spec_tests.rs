@@ -693,7 +693,7 @@ fn arena_slot_exhaustion_returns_slab_full() {
 fn arena_byte_capacity_exhaustion_returns_slab_full() {
     // Very small byte capacity: not enough for even one spec.
     let mut arena = test_arena(4, 1);
-    let spec = ShardSpecRef::new(b"start_key", b"end_key", b"metadata_payload");
+    let spec = ShardSpecRef::new(b"a", b"z", b"metadata_payload");
     assert!(arena.alloc_spec(spec).is_err());
 }
 
