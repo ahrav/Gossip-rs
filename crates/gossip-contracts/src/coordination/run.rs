@@ -1140,19 +1140,6 @@ pub const MAX_INITIAL_SHARDS: usize = 10_000;
 
 const _: () = assert!(MAX_INITIAL_SHARDS > 0);
 
-/// Fill the first `len` elements of `indices` with `0..len`.
-///
-/// Used to build a sortable index array over manifest shards without
-/// heap allocation. The caller provides a stack-allocated array of
-/// [`MAX_INITIAL_SHARDS`] elements and passes the actual shard count as `len`.
-#[inline]
-fn init_dense_indices(indices: &mut [usize], len: usize) {
-    debug_assert!(len <= indices.len());
-    for (index, slot) in indices.iter_mut().take(len).enumerate() {
-        *slot = index;
-    }
-}
-
 /// A borrowed shard registration input for a run's initial manifest.
 ///
 /// Used in the second phase of two-phase run creation (D2.20):
@@ -1321,9 +1308,7 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         return Err(ManifestValidationError::Empty);
     }
 
-    let mut sorted_indices_storage = [0usize; MAX_INITIAL_SHARDS];
-    init_dense_indices(&mut sorted_indices_storage, shards.len());
-    let sorted_indices = &mut sorted_indices_storage[..shards.len()];
+    let mut sorted_indices: Vec<usize> = (0..shards.len()).collect();
 
     // Check for duplicate IDs.
     sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
@@ -1376,10 +1361,10 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     }
 
     // Check for overlapping ranges.
-    // Ranges are sorted by key_range_start. Two adjacent ranges [a_start, a_end)
-    // and [b_start, b_end) overlap iff a_end > b_start, where:
-    //   - empty a_end means [a_start, ∞) → always overlaps with the next shard
-    //   - empty b_start means [min, b_end) → any non-empty a_end exceeds min
+    // Ranges are sorted by key_range_start. Two adjacent sorted ranges
+    // [a_start, a_end) and [b_start, b_end) overlap iff a_end > b_start.
+    // The empty checks are defense-in-depth: the unbounded-range rejection
+    // above guarantees all starts/ends are non-empty at this point.
     for window in sorted_indices.windows(2) {
         let a = &shards[window[0]];
         let b = &shards[window[1]];
@@ -1573,6 +1558,8 @@ impl ShardSummary {
             } else {
                 None
             },
+            // Derive acquire count from fence epoch: each successful acquire
+            // bumps the epoch by 1, so (current - initial) = total acquisitions.
             acquire_count: u32::try_from(
                 record
                     .fence_epoch
@@ -1777,26 +1764,6 @@ pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
     op_payload_hash(b"register_shards", |h| {
         (shards.len() as u32).write_canonical(h);
 
-        if shards.len() <= MAX_INITIAL_SHARDS {
-            let mut sorted_indices_storage = [0usize; MAX_INITIAL_SHARDS];
-            init_dense_indices(&mut sorted_indices_storage, shards.len());
-            let sorted_indices = &mut sorted_indices_storage[..shards.len()];
-            sorted_indices.sort_by_key(|&idx| shards[idx].shard.as_raw());
-
-            for &index in sorted_indices.iter() {
-                let shard = &shards[index];
-                shard.shard.write_canonical(h);
-                shard.spec.write_canonical(h);
-                shard.cursor.write_canonical(h);
-            }
-            return;
-        }
-
-        // Fallback for oversized slices. Registration rejects manifests
-        // above MAX_INITIAL_SHARDS, but the hash is computed before
-        // validation so this path CAN execute for invalid input.
-        // Use a heap-allocated Vec to maintain O(N log N) sorting
-        // instead of the O(N²) selection sort that was here before.
         let mut sorted: Vec<usize> = (0..shards.len()).collect();
         sorted.sort_by_key(|&idx| shards[idx].shard.as_raw());
         for &index in &sorted {
@@ -1947,16 +1914,23 @@ pub trait RunManagement {
         op_id: OpId,
     ) -> Result<IdempotentOutcome<RunRecord>, CreateRunError> {
         match self.create_run(now, tenant, run, config) {
-            Ok(_) => {}
+            Ok(_) => {} // Fresh creation succeeded; proceed to registration.
             Err(CreateRunError::RunAlreadyExists { .. }) => {
+                // Retry path: the run already exists (prior attempt may have
+                // crashed between create and register). Verify configs match
+                // to ensure the caller isn't accidentally reusing a RunId.
                 let existing = self.get_run(tenant, run)?;
                 if existing.config != config {
                     return Err(CreateRunError::ConfigMismatch { run });
                 }
+                // Config matches: fall through to register_shards, which is
+                // idempotent via op_id and will detect replays.
             }
             Err(e) => return Err(e),
         }
 
+        // register_shards is idempotent: on retry it returns Replayed
+        // with the same shard IDs from the original execution.
         let outcome = self.register_shards(now, tenant, run, shards, op_id)?;
 
         let record = self.get_run(tenant, run)?;

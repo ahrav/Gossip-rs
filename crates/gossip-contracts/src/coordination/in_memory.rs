@@ -847,6 +847,8 @@ impl InMemoryCoordinator {
             .entry(tenant)
             .or_insert_with(|| ahash_map_with_capacity(inner_initial_capacity));
         if let Some(mut old) = inner.insert(key, record) {
+            // Release the replaced record's slab allocations (spec key ranges,
+            // cursor, metadata, spawned list) to prevent arena leaks.
             old.deallocate_fields(&mut self.slab);
         } else {
             self.total_shard_count += 1;
@@ -946,14 +948,18 @@ impl InMemoryCoordinator {
             return Ok(());
         }
 
+        // -- Phase 1: ensure the per-tenant inner shard map can absorb new entries --
         let additional = shard_ids.len();
         if let Some(tenant_map) = self.shards.get_mut(&tenant) {
+            // Tenant already exists: reserve space in the existing inner map.
             tenant_map.try_reserve(additional).map_err(|_| {
                 RegisterShardsError::ResourceExhausted {
                     resource: "tenant_shards",
                 }
             })?;
         } else {
+            // First registration for this tenant: reserve one slot in the
+            // outer map and probe-allocate the inner map to confirm it fits.
             self.shards
                 .try_reserve(1)
                 .map_err(|_| RegisterShardsError::ResourceExhausted {
@@ -969,8 +975,10 @@ impl InMemoryCoordinator {
                 })?;
         }
 
+        // -- Phase 2: ensure the run→shard secondary index can absorb new entries --
         let run_key = (tenant, run);
         if let Some(existing) = self.run_shards.get_mut(&run_key) {
+            // Run index exists (idempotent retry): only reserve for genuinely new IDs.
             let additional_unique = shard_ids.iter().filter(|id| !existing.contains(id)).count();
             if additional_unique > 0 {
                 existing.try_reserve(additional_unique).map_err(|_| {
@@ -982,6 +990,7 @@ impl InMemoryCoordinator {
             return Ok(());
         }
 
+        // First registration for this run: reserve in outer index + inner set.
         self.run_shards
             .try_reserve(1)
             .map_err(|_| RegisterShardsError::ResourceExhausted {
@@ -1561,6 +1570,9 @@ const _: () = assert!(MAX_SPLIT_CHILDREN <= u16::MAX as usize);
 /// Fixed-capacity sorted index scratch for `SplitReplacePlan::children()`.
 ///
 /// Stores child indices sorted by `key_range_start` without allocating.
+/// The indirection (storing sorted indices rather than sorted children)
+/// avoids copying `SplitReplaceChild` values while still enabling
+/// contiguous-boundary validation in `key_range_start` order.
 #[derive(Clone, Copy)]
 struct SplitChildOrder {
     len: usize,
@@ -1602,6 +1614,15 @@ impl SplitChildOrder {
     }
 }
 
+/// Verify that the sorted children form a contiguous, non-overlapping
+/// partition of the parent's key range `[parent_start, parent_end)`.
+///
+/// Checks (all on pre-sorted children):
+///   1. At least 2 children exist.
+///   2. First child starts at `parent_start`.
+///   3. Last child ends at `parent_end`.
+///   4. Adjacent children share an exact boundary (no gaps, no overlaps).
+///   5. No child has an inverted range (`start >= end` for bounded ranges).
 fn split_replace_validate_coverage_sorted(
     parent_start: &[u8],
     parent_end: &[u8],
@@ -2981,6 +3002,9 @@ impl RunManagement for InMemoryCoordinator {
         }
 
         {
+            // Re-borrow mutably for the actual mutation. The preceding read-only
+            // checks used `shard_get` (shared ref) which also took `&self.runs`;
+            // switching to `shard_get_mut` here keeps the two borrow phases separate.
             let record = self
                 .shard_get_mut(&tenant, &key)
                 .expect("shard record must exist: verified by read-only check above");
@@ -3033,6 +3057,9 @@ impl ShardClaiming for InMemoryCoordinator {
             return Err(ClaimError::Throttled { retry_after });
         }
 
+        // Extract the scratch buffer via `mem::take` to avoid a simultaneous
+        // `&mut self` (for `default_claim_next_available`) and borrow of
+        // `self.claim_candidates_scratch`. Restored unconditionally after the call.
         let mut candidates = std::mem::take(&mut self.claim_candidates_scratch);
         candidates.clear();
         let claim_result =

@@ -256,6 +256,8 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
     let len = candidates.len();
     let offset = worker.as_raw() as usize % len;
     let mut inconsistency_count = 0usize;
+    // Merge the scan-phase earliest deadline with any tighter deadlines
+    // discovered during per-shard acquire attempts (AlreadyLeased errors).
     let mut earliest_deadline: Option<LogicalTime> = scan_deadline;
     let mut i = 0usize;
     let acquired = loop {
@@ -266,6 +268,10 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
         let key = ShardKey::new(run, shard_id);
         match backend.acquire_and_restore_into(now, tenant, key, worker, out) {
             Ok(result) => {
+                // Destructure into owned values before breaking out of the loop.
+                // `result.snapshot` borrows `out`, and the loop needs to yield
+                // ownership back to the caller — extracting the fields here
+                // drops the borrow so `out.view()` can be called after the loop.
                 let snapshot = result.snapshot;
                 break Some((
                     result.lease,
