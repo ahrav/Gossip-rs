@@ -61,13 +61,10 @@ use gossip_contracts::coordination::cursor::CursorUpdate;
 #[cfg(test)]
 use gossip_contracts::coordination::shard_spec::ShardSpec;
 use gossip_contracts::coordination::shard_spec::ShardSpecRef;
-#[cfg(test)]
-use gossip_contracts::coordination::shard_spec::validate_split_coverage_bounds;
 use gossip_contracts::coordination::split::SplitReplacePlan;
 #[cfg(test)]
 use gossip_contracts::coordination::split::{
-    SplitReplaceChild, SplitReplacePlanError, SplitReplacePlanningError, plan_split_replace,
-    plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,
+    SplitReplaceChild, plan_split_replace_at_points_initial_cursor,
 };
 use gossip_contracts::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
 use gossip_contracts::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
@@ -602,89 +599,12 @@ mod tests {
         );
     }
 
-    /// Boundary validation for `plan_split_replace` over child-count edges:
-    /// 0, 1, 2, MAX, MAX+1.
+    // -- Execution-layer hash determinism --------------------------------
+
+    /// Verify that `hash_split_replace_payload` produces identical hashes for
+    /// identical plans. Planner correctness is tested in `gossip-contracts`.
     #[test]
-    fn split_replace_planner_boundary_validation() {
-        let cases: &[(usize, Result<(), SplitReplacePlanningError>)] = &[
-            (
-                0,
-                Err(SplitReplacePlanningError::InvalidChildCount(
-                    SplitReplacePlanError::TooFewChildren { count: 0 },
-                )),
-            ),
-            (
-                1,
-                Err(SplitReplacePlanningError::InvalidChildCount(
-                    SplitReplacePlanError::TooFewChildren { count: 1 },
-                )),
-            ),
-            (2, Ok(())),
-            (MAX_SPLIT_CHILDREN, Ok(())),
-            (
-                MAX_SPLIT_CHILDREN + 1,
-                Err(SplitReplacePlanningError::InvalidChildCount(
-                    SplitReplacePlanError::TooManyChildren {
-                        count: MAX_SPLIT_CHILDREN + 1,
-                    },
-                )),
-            ),
-        ];
-
-        for &(count, ref expected) in cases {
-            let parent = if count == 0 {
-                ShardSpec::with_range([0, 0], [0, 1])
-            } else {
-                ShardSpec::with_range([0, 0], (count as u16).to_be_bytes())
-            };
-            let boundaries: Vec<[u8; 2]> = (0..=count).map(|i| (i as u16).to_be_bytes()).collect();
-            let children: Vec<_> = (0..count)
-                .map(|i| {
-                    let spec = ShardSpecRef::with_range(&boundaries[i], &boundaries[i + 1]);
-                    SplitReplaceChild::new(spec, CursorUpdate::initial())
-                })
-                .collect();
-
-            let result = plan_split_replace(parent.as_ref(), children);
-            match expected {
-                Ok(()) => assert!(result.is_ok(), "count={count} should be accepted"),
-                Err(e) => assert_eq!(&result.unwrap_err(), e, "count={count}"),
-            }
-        }
-    }
-
-    /// `plan_split_replace_at_points` must reject `MAX+1` children before
-    /// constructing any child specs/cursors.
-    #[test]
-    fn split_replace_planner_points_rejects_over_fanout_before_materialization() {
-        let max_plus_one = MAX_SPLIT_CHILDREN + 1;
-        let parent = ShardSpec::with_range([0, 0], (max_plus_one as u16).to_be_bytes());
-        let split_points: Vec<[u8; 2]> = (1..=MAX_SPLIT_CHILDREN)
-            .map(|i| (i as u16).to_be_bytes())
-            .collect();
-        let mut cursor_calls = 0usize;
-        let result = plan_split_replace_at_points(
-            parent.as_ref(),
-            split_points.iter().map(<[u8; 2]>::as_slice),
-            |_, _| {
-                cursor_calls += 1;
-                CursorUpdate::initial()
-            },
-        );
-
-        assert_eq!(
-            result,
-            Err(SplitReplacePlanningError::InvalidChildCount(
-                SplitReplacePlanError::TooManyChildren {
-                    count: MAX_SPLIT_CHILDREN + 1,
-                }
-            ))
-        );
-        assert_eq!(cursor_calls, 0, "children should not be materialized");
-    }
-
-    #[test]
-    fn split_replace_planner_points_produces_coverage_valid_deterministic_plan() {
+    fn hash_split_replace_payload_deterministic_across_identical_plans() {
         let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
         let split_points = [b"m".as_slice()];
 
@@ -693,27 +613,10 @@ mod tests {
         let plan_b =
             plan_split_replace_at_points_initial_cursor(parent.as_ref(), split_points).unwrap();
 
-        assert_eq!(plan_a.children().len(), 2);
-        assert_eq!(plan_a.children()[0].spec().key_range_start(), b"a");
-        assert_eq!(plan_a.children()[0].spec().key_range_end(), b"m");
-        assert_eq!(plan_a.children()[1].spec().key_range_start(), b"m");
-        assert_eq!(plan_a.children()[1].spec().key_range_end(), b"z");
-        assert_eq!(plan_a.children()[0].spec().metadata(), b"meta");
-        assert_eq!(plan_a.children()[1].spec().metadata(), b"meta");
         assert_eq!(
             hash_split_replace_payload(&plan_a),
-            hash_split_replace_payload(&plan_b)
-        );
-
-        let child_specs: Vec<_> = plan_a.children().iter().map(|child| child.spec()).collect();
-        assert!(
-            validate_split_coverage_bounds(
-                parent.as_ref().key_range_start(),
-                parent.as_ref().key_range_end(),
-                &child_specs
-            )
-            .is_ok(),
-            "planned children must exactly cover the parent range"
+            hash_split_replace_payload(&plan_b),
+            "identical plans must produce identical payload hashes"
         );
     }
 

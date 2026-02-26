@@ -366,8 +366,7 @@ mod tests {
             } else {
                 ShardSpec::with_range([0, 0], (count as u16).to_be_bytes())
             };
-            let boundaries: Vec<[u8; 2]> =
-                (0..=count).map(|i| (i as u16).to_be_bytes()).collect();
+            let boundaries: Vec<[u8; 2]> = (0..=count).map(|i| (i as u16).to_be_bytes()).collect();
             let children: Vec<_> = (0..count)
                 .map(|i| {
                     let spec = ShardSpecRef::with_range(&boundaries[i], &boundaries[i + 1]);
