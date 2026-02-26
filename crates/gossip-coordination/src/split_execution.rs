@@ -17,17 +17,19 @@
 //!
 //! ## Planning vs Execution
 //!
-//! This module defines the **planning** layer: value types that describe
-//! *what* a split should produce (child ranges, cursors, residual specs).
-//! Plans are pure data with lightweight structural validation (child count,
-//! non-identical specs). The **execution** layer lives in the
-//! [`CoordinationBackend`](crate::traits::CoordinationBackend) trait impls
-//! (`split_replace`, `split_residual`), which enforce the full contract:
-//! lease ownership, fence epoch, coverage validation, shard-record
-//! mutation, and op-log idempotency. The planning helpers in this module
-//! (e.g., [`plan_split_replace`]) also perform coverage validation via
-//! [`validate_split_coverage_bounds`]. This separation lets callers
-//! construct and inspect plans without requiring a coordinator instance.
+//! Split-replace planner mechanics (plan types and `plan_split_replace*`
+//! constructors) are owned by
+//! [`gossip_contracts::coordination::split`]. This module owns
+//! coordination-layer split execution support: derived IDs, payload hashes,
+//! and split-residual plan/result types used directly by the backend.
+//!
+//! This module intentionally does not own full split precondition validation.
+//! Backend implementations validate live-state invariants (lease/fence
+//! validity, spawn limits, and derived-ID collision checks) before mutating
+//! records.
+//!
+//! Child cursors in split-replace plans are currently passed through as
+//! payload and are not re-validated against child specs at execution time.
 //!
 //! ## Derived Shard IDs
 //!
@@ -45,7 +47,8 @@
 //! conflicts. Each operation type (`checkpoint`, `complete`, `park`,
 //! `split_replace`, `split_residual`) gets a distinct `op_tag` byte
 //! string as a secondary domain-separation layer within the shared
-//! `OP_PAYLOAD_V1` domain.
+//! `OP_PAYLOAD_V1` domain. Hash helpers are intentionally pure and do not
+//! validate protocol preconditions.
 
 use std::fmt;
 
@@ -53,11 +56,18 @@ use blake3::Hasher;
 use gossip_stdx::InlineVec;
 
 use crate::record::ParkReason;
+#[cfg(test)]
 use gossip_contracts::coordination::cursor::CursorUpdate;
 #[cfg(test)]
 use gossip_contracts::coordination::shard_spec::ShardSpec;
-use gossip_contracts::coordination::shard_spec::{
-    ShardSpecRef, SplitValidationError, validate_split_coverage_bounds,
+use gossip_contracts::coordination::shard_spec::ShardSpecRef;
+#[cfg(test)]
+use gossip_contracts::coordination::shard_spec::validate_split_coverage_bounds;
+use gossip_contracts::coordination::split::SplitReplacePlan;
+#[cfg(test)]
+use gossip_contracts::coordination::split::{
+    SplitReplaceChild, SplitReplacePlanError, SplitReplacePlanningError, plan_split_replace,
+    plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,
 };
 use gossip_contracts::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
 use gossip_contracts::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
@@ -122,339 +132,12 @@ const _: () = assert!(DerivedShardKind::Residual as u8 == 1);
 const _: () = assert!(core::mem::size_of::<DerivedShardKind>() == 1);
 
 // ============================================================================
-// SplitReplaceChild
+// Split-replace planning
 // ============================================================================
-
-/// A single child in a [`SplitReplacePlan`].
-///
-/// Each child carries its own [`ShardSpecRef`] (the key sub-range it covers)
-/// and an initial [`CursorUpdate`] (where scanning should begin).
-///
-/// ## Cursor Pre-Positioning
-///
-/// The cursor field allows the coordinator to pre-position a child at the
-/// parent's last checkpoint within that sub-range. If the parent had
-/// scanned keys `[a, m)` and the child covers `[a, f)`, the child's cursor
-/// can start at the parent's progress point, avoiding re-scanning
-/// already-processed keys. Children whose range is entirely unprocessed
-/// use `CursorUpdate::initial()`.
-///
-/// ## Canonical Encoding
-///
-/// `CanonicalBytes` encodes `(spec, cursor)` in that order, used for
-/// op-log payload hashing to detect "same OpId, different plan" conflicts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SplitReplaceChild<'a> {
-    spec: ShardSpecRef<'a>,
-    cursor: CursorUpdate<'a>,
-}
-
-impl<'a> SplitReplaceChild<'a> {
-    /// Construct a new child entry from a key sub-range and initial cursor.
-    ///
-    /// No validation is performed here — the child's spec is validated
-    /// against the parent's key range at plan construction time
-    /// ([`plan_split_replace`]) or at coordinator execution time.
-    #[must_use]
-    pub fn new(spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
-        Self { spec, cursor }
-    }
-
-    /// The child's shard specification (key sub-range).
-    #[inline]
-    #[must_use]
-    pub fn spec(&self) -> ShardSpecRef<'a> {
-        self.spec
-    }
-
-    /// The child's initial cursor position.
-    #[inline]
-    #[must_use]
-    pub fn cursor(&self) -> CursorUpdate<'a> {
-        self.cursor
-    }
-}
-
-impl CanonicalBytes for SplitReplaceChild<'_> {
-    /// Encodes `spec || cursor` in field order. Both fields are
-    /// self-framing (length-prefixed internally), so the boundary
-    /// between them is unambiguous.
-    #[inline]
-    fn write_canonical(&self, h: &mut Hasher) {
-        self.spec.write_canonical(h);
-        self.cursor.write_canonical(h);
-    }
-}
-
-// ============================================================================
-// SplitReplacePlan
-// ============================================================================
-
-/// Plan for a split-replace operation: parent is replaced by >= 2 children
-/// that collectively cover the parent's key range.
-///
-/// ## Invariants
-///
-/// - **Minimum children**: >= 2 (a single child is not a split).
-/// - **Maximum children**: <= [`MAX_SPLIT_CHILDREN`] (256, resource guard).
-/// - **Coverage**: children must exactly partition the parent's `[start, end)`.
-///   This is NOT checked by the plan constructor — it is validated by the
-///   coordinator's split-validation path at execution time before apply.
-///
-/// The `children` field is private to enforce the count invariants.
-///
-/// ## Canonical Encoding
-///
-/// Length-prefixed: `count || child[0] || child[1] || ...`. The length prefix
-/// ensures plans with different child counts produce distinct hashes even if
-/// concatenated child bytes happen to collide.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitReplacePlan<'a> {
-    children: InlineVec<SplitReplaceChild<'a>, MAX_SPLIT_CHILDREN>,
-}
-
-/// Error returned when a [`SplitReplacePlan`] is constructed with an
-/// invalid number of children.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SplitReplacePlanError {
-    /// Fewer than 2 children — not a split.
-    TooFewChildren { count: usize },
-    /// More than [`MAX_SPLIT_CHILDREN`] children.
-    ///
-    /// `count` is a lower bound: the iterator is not fully consumed once
-    /// the limit is exceeded, so the actual count may be higher.
-    TooManyChildren { count: usize },
-}
-
-impl fmt::Display for SplitReplacePlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TooFewChildren { count } => {
-                write!(f, "split-replace requires >= 2 children, got {count}")
-            }
-            Self::TooManyChildren { count } => {
-                write!(
-                    f,
-                    "split-replace exceeds max children ({count} > {MAX_SPLIT_CHILDREN})"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplitReplacePlanError {}
-
-impl<'a> SplitReplacePlan<'a> {
-    /// Construct a validated split-replace plan.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SplitReplacePlanError`] if `children.len() < 2` or
-    /// `children.len() > MAX_SPLIT_CHILDREN`.
-    pub fn try_new(
-        children: impl IntoIterator<Item = SplitReplaceChild<'a>>,
-    ) -> Result<Self, SplitReplacePlanError> {
-        let mut collected = InlineVec::new();
-        for child in children {
-            // Early exit: reject on the first child that would exceed capacity.
-            // The iterator is intentionally not fully consumed — remaining
-            // children are never materialized, keeping the error path cheap.
-            if collected.len() == MAX_SPLIT_CHILDREN {
-                return Err(SplitReplacePlanError::TooManyChildren {
-                    count: MAX_SPLIT_CHILDREN + 1,
-                });
-            }
-            collected.push(child);
-        }
-        if collected.len() < 2 {
-            return Err(SplitReplacePlanError::TooFewChildren {
-                count: collected.len(),
-            });
-        }
-        Ok(Self {
-            children: collected,
-        })
-    }
-
-    /// The children in this plan.
-    #[inline]
-    #[must_use]
-    pub fn children(&self) -> &[SplitReplaceChild<'a>] {
-        self.children.as_slice()
-    }
-}
-
-/// Error returned by split-replace planning free functions.
-///
-/// Distinguishes shape errors (invalid child count) from semantic errors
-/// (children do not form a valid partition of the parent range).
-///
-/// This wrapper preserves the underlying error detail so callers can
-/// branch on "plan shape" vs "coverage semantics" without losing context.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SplitReplacePlanningError {
-    /// Plan child-count invariants failed (`< 2` or `> MAX_SPLIT_CHILDREN`).
-    InvalidChildCount(SplitReplacePlanError),
-    /// Child ranges failed split coverage validation against the parent.
-    InvalidCoverage(SplitValidationError),
-}
-
-impl fmt::Display for SplitReplacePlanningError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidChildCount(err) => err.fmt(f),
-            Self::InvalidCoverage(err) => err.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for SplitReplacePlanningError {}
-
-/// Build and validate a split-replace plan against a parent shard.
-///
-/// This helper enforces both:
-/// - child-count bounds via [`SplitReplacePlan::try_new`], and
-/// - coverage correctness via [`validate_split_coverage_bounds`].
-///
-/// The output remains bounded (`InlineVec`) and fully borrowed (`ShardSpecRef`,
-/// `CursorUpdate`) for direct coordinator submission.
-///
-/// Child order in the returned plan is preserved as provided. Coverage
-/// validation is order-insensitive because
-/// [`validate_split_coverage_bounds`] sorts by child start key.
-///
-/// # Lifetimes
-///
-/// The returned plan borrows all child `ShardSpecRef`/`CursorUpdate` data
-/// and therefore cannot outlive the borrowed inputs (`'a`).
-///
-/// # Errors
-///
-/// - [`SplitReplacePlanningError::InvalidChildCount`] if fewer than 2 or
-///   more than [`MAX_SPLIT_CHILDREN`] children are provided.
-/// - [`SplitReplacePlanningError::InvalidCoverage`] if children fail
-///   partition validation against `parent` (mismatched bounds, gaps/overlaps,
-///   inverted ranges, or invalid child spec sizes).
-pub fn plan_split_replace<'a>(
-    parent: ShardSpecRef<'a>,
-    children: impl IntoIterator<Item = SplitReplaceChild<'a>>,
-) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
-    let plan = SplitReplacePlan::try_new(children)
-        .map_err(SplitReplacePlanningError::InvalidChildCount)?;
-    let mut child_specs: InlineVec<ShardSpecRef<'a>, MAX_SPLIT_CHILDREN> = InlineVec::new();
-    for child in plan.children() {
-        child_specs.push(child.spec());
-    }
-    validate_split_coverage_bounds(
-        parent.key_range_start(),
-        parent.key_range_end(),
-        child_specs.as_slice(),
-    )
-    .map_err(SplitReplacePlanningError::InvalidCoverage)?;
-    Ok(plan)
-}
-
-/// Build a split-replace plan from explicit split points.
-///
-/// Split points define child boundaries over the parent range:
-/// `[start, p0), [p0, p1), ..., [pn, end)`.
-///
-/// Fan-out is checked *before* child materialization: the
-/// `MAX_SPLIT_CHILDREN`-th split point is rejected because it would imply
-/// `MAX_SPLIT_CHILDREN + 1` children. Child specs borrow range-boundary
-/// slices from `parent`/`split_points` and metadata bytes from `parent`;
-/// cursors are produced by `cursor_for_child`.
-///
-/// `cursor_for_child` is invoked once per materialized child, in input point
-/// order, then once for the tail child.
-///
-/// # Lifetimes
-///
-/// The returned plan borrows from:
-/// - `parent` (start/end/metadata slices),
-/// - each `split_points` slice, and
-/// - any borrowed data captured in `CursorUpdate<'a>` returned by
-///   `cursor_for_child`.
-///
-/// # Errors
-///
-/// - [`SplitReplacePlanningError::InvalidChildCount`] when split-point fan-out
-///   would exceed [`MAX_SPLIT_CHILDREN`] children, or when no split points
-///   produce only one child.
-/// - [`SplitReplacePlanningError::InvalidCoverage`] when points do not form a
-///   valid partition of `parent` (for example out of order, out of bounds, or
-///   duplicate boundaries).
-pub fn plan_split_replace_at_points<'a>(
-    parent: ShardSpecRef<'a>,
-    split_points: impl IntoIterator<Item = &'a [u8]>,
-    mut cursor_for_child: impl FnMut(usize, ShardSpecRef<'a>) -> CursorUpdate<'a>,
-) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
-    let mut points: Vec<&'a [u8]> = Vec::new();
-    for point in split_points {
-        // N split points produce N+1 children (N intervals plus the tail).
-        // At this point we have `points.len()` accepted points; accepting
-        // one more would give `points.len() + 1` points and therefore
-        // `points.len() + 2` children. Reject before materialization if
-        // that fan-out exceeds MAX_SPLIT_CHILDREN.
-        if points.len() + 2 > MAX_SPLIT_CHILDREN {
-            return Err(SplitReplacePlanningError::InvalidChildCount(
-                SplitReplacePlanError::TooManyChildren {
-                    count: MAX_SPLIT_CHILDREN + 1,
-                },
-            ));
-        }
-        points.push(point);
-    }
-
-    let mut children: InlineVec<SplitReplaceChild<'a>, MAX_SPLIT_CHILDREN> = InlineVec::new();
-    let mut child_start = parent.key_range_start();
-    for (index, point) in points.into_iter().enumerate() {
-        let spec = ShardSpecRef::new(child_start, point, parent.metadata());
-        let cursor = cursor_for_child(index, spec);
-        children.push(SplitReplaceChild::new(spec, cursor));
-        child_start = point;
-    }
-
-    let tail_index = children.len();
-    let tail_spec = ShardSpecRef::new(child_start, parent.key_range_end(), parent.metadata());
-    let tail_cursor = cursor_for_child(tail_index, tail_spec);
-    children.push(SplitReplaceChild::new(tail_spec, tail_cursor));
-
-    plan_split_replace(parent, children.as_slice().iter().copied())
-}
-
-/// Build a split-replace plan from explicit split points using
-/// [`CursorUpdate::initial`] for all children.
-///
-/// Equivalent to [`plan_split_replace_at_points`] with a cursor factory that
-/// always returns `CursorUpdate::initial()`.
-///
-/// # Errors
-///
-/// Propagates [`SplitReplacePlanningError`] from
-/// [`plan_split_replace_at_points`].
-pub fn plan_split_replace_at_points_initial_cursor<'a>(
-    parent: ShardSpecRef<'a>,
-    split_points: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
-    plan_split_replace_at_points(parent, split_points, |_, _| CursorUpdate::initial())
-}
-
-impl CanonicalBytes for SplitReplacePlan<'_> {
-    /// Length-prefixed encoding: `len || child[0] || child[1] || ...`.
-    ///
-    /// The length prefix ensures plans with different child counts produce
-    /// distinct byte sequences even if the concatenated child bytes happen
-    /// to collide.
-    fn write_canonical(&self, h: &mut Hasher) {
-        u32::try_from(self.children.len())
-            .expect("child count exceeds u32")
-            .write_canonical(h);
-        for child in &self.children {
-            child.write_canonical(h);
-        }
-    }
-}
+//
+// Split-replace planner types and constructors live in
+// `gossip_contracts::coordination::split`. This module consumes those types
+// for payload hashing and backend execution.
 
 // ============================================================================
 // SplitResidualPlan
@@ -489,6 +172,13 @@ impl CanonicalBytes for SplitReplacePlan<'_> {
 /// `ShardSpec` range, with no overlap. This is enforced by the coordinator
 /// at execution time via [`validate_residual_split`](gossip_contracts::coordination::shard_spec::validate_residual_split),
 /// not by this plan type.
+///
+/// ## Intentional Minimalism
+///
+/// This type carries only target specs so call sites can stage a residual
+/// operation without needing mutable access to live parent state. Invariants
+/// that depend on live state (for example, parent cursor remaining in-bounds
+/// after shrink) are validated by backend execution code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitResidualPlan<'a> {
     parent_new_spec: ShardSpecRef<'a>,
@@ -699,7 +389,8 @@ pub fn op_payload_hash(op_tag: &[u8], write_fields: impl FnOnce(&mut Hasher)) ->
 /// different cursor" conflicts during idempotent replay.
 ///
 /// Accepts any cursor representation with canonical bytes (for example,
-/// borrowed [`CursorUpdate`] or any equivalent canonical representation).
+/// borrowed [`gossip_contracts::coordination::cursor::CursorUpdate`] or any
+/// equivalent canonical representation).
 #[must_use]
 pub fn hash_checkpoint_payload(new_cursor: &impl CanonicalBytes) -> u64 {
     op_payload_hash(b"checkpoint", |h| {

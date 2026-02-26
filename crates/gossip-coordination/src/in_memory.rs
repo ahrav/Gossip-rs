@@ -109,10 +109,10 @@ use crate::run::{
 use crate::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::split::{
-    DerivedShardKind, SplitReplaceChild, SplitReplacePlan, SplitReplaceResult, SplitResidualPlan,
-    SplitResidualResult, derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload,
-    hash_park_payload, hash_split_replace_payload, hash_split_residual_payload,
+use crate::split_execution::{
+    DerivedShardKind, SplitReplaceResult, SplitResidualPlan, SplitResidualResult,
+    derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
+    hash_split_replace_payload, hash_split_residual_payload,
 };
 use crate::traits::CoordinationBackend;
 use crate::validation::{check_op_idempotency, validate_cursor_update_pooled, validate_lease};
@@ -122,6 +122,7 @@ use gossip_contracts::coordination::manifest::{InitialShardInput, validate_manif
 use gossip_contracts::coordination::shard_spec::{
     ShardLimitScope, ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
 };
+use gossip_contracts::coordination::split::{SplitReplaceChild, SplitReplacePlan};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_stdx::{ByteSlab, RingBuffer};
 

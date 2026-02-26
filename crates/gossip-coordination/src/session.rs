@@ -94,11 +94,12 @@ use crate::error::{
 };
 use crate::lease::Lease;
 use crate::record::{ParkReason, ShardStatus};
-use crate::split::{SplitReplacePlan, SplitReplaceResult, SplitResidualPlan, SplitResidualResult};
+use crate::split_execution::{SplitReplaceResult, SplitResidualPlan, SplitResidualResult};
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
+use gossip_contracts::coordination::split::SplitReplacePlan;
 use gossip_contracts::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
@@ -515,7 +516,7 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     /// whose key ranges exactly partition the parent's range (no gaps,
     /// no overlaps). Child shard IDs are derived deterministically from
     /// the parent's identity and spawn index via
-    /// [`derive_split_shard_id`](crate::split::derive_split_shard_id).
+    /// [`derive_split_shard_id`](crate::split_execution::derive_split_shard_id).
     ///
     /// Use this when the entire range should be subdivided (e.g., the
     /// shard is too large for a single worker). For carving off just the

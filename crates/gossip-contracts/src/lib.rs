@@ -9,19 +9,27 @@
 //!   domain-separated hashing helpers, ID newtype macros, and the domain-tag
 //!   registry.
 //! - **Coordination data model** — shard spec, cursor, pooled wrappers,
-//!   manifest validation, and split capacity constants. Protocol traits and
-//!   the in-memory backend live in `gossip-coordination`.
+//!   split-replace planning core, manifest validation, and split capacity
+//!   constants. Protocol traits and the in-memory backend live in
+//!   `gossip-coordination`.
 //! - **Connector boundary** — enumeration/read traits and connector
 //!   registration.
 //! - **Persistence boundary** — done-ledger/findings-sink traits and commit
 //!   protocol typestate.
 //!
+//! Ownership boundary: this crate provides contracts, canonical encodings,
+//! and pure validation logic. It does not implement coordinator state
+//! transitions, lease/fence semantics, or storage backends.
+//!
 //! # Design principles
 //!
 //! 1. **No unsafe code.** This crate is pure computation — no FFI, no raw
 //!    pointers.
-//! 2. **Minimal dependencies.** Only `blake3` at runtime.
+//! 2. **Narrow runtime surface.** Runtime dependencies are intentionally
+//!    limited to shared primitives (`blake3`, `subtle`, `gossip-stdx`).
 //! 3. **Boundary isolation.** Modules mirror the boundary decomposition.
+//! 4. **Backend neutrality.** Public APIs avoid backend-specific sequencing or
+//!    storage assumptions.
 //!
 //! # Feature flags
 //!

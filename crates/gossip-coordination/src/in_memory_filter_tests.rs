@@ -241,8 +241,8 @@ fn list_shards_into_reuses_buffer_on_repeated_query() {
 // deterministic unit tests above by exploring operation orderings and
 // parameter combinations that a human would not enumerate by hand.
 
-use crate::split::SplitReplacePlan;
 use crate::test_fixtures::{seeded_coordinator, test_key};
+use gossip_contracts::coordination::split::SplitReplacePlan;
 use gossip_contracts::test_util::miri_proptest_config;
 use proptest::prelude::*;
 

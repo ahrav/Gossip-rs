@@ -102,9 +102,10 @@ use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::session::WorkerSession;
 use crate::sim::backend::SimulationBackend;
-use crate::split::{SplitResidualPlan, plan_split_replace_at_points_initial_cursor};
+use crate::split_execution::SplitResidualPlan;
 use gossip_contracts::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
+use gossip_contracts::coordination::split::plan_split_replace_at_points_initial_cursor;
 use gossip_contracts::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };

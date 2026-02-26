@@ -5,6 +5,10 @@ infrastructure. Four tiers target distinct quality dimensions: isolation,
 invariant interaction, workflow correctness, and large-scale randomized
 validation.
 
+Split-replace planner construction (`SplitReplacePlan`, `plan_split_replace*`)
+is contracts-owned in `gossip-contracts::coordination::split`; coordination
+tests validate backend execution semantics using those shared planner surfaces.
+
 For protocol details see [boundary-2-coordination.md](boundary-2-coordination.md).
 For simulation architecture see [simulation-harness.md](simulation-harness.md).
 

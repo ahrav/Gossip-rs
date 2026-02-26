@@ -49,7 +49,7 @@ use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::split::op_payload_hash;
+use crate::split_execution::op_payload_hash;
 use gossip_contracts::coordination::cursor::MAX_KEY_SIZE;
 use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::CursorSemantics;

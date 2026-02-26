@@ -5,8 +5,9 @@
 Boundary 2 (Shard Coordination Protocol) manages distributed shard lifecycle,
 lease-based ownership, and bounded idempotent operations for the gossip-rs
 secret scanner. The shared data model (shard spec, cursor, pooled wrappers,
-manifest validation) lives in `crates/gossip-contracts/src/coordination/`, and
-the protocol layer (traits, state machine, InMemoryCoordinator, sim harness)
+manifest validation, split-replace planning core) lives in
+`crates/gossip-contracts/src/coordination/`, and the protocol layer
+(traits, state machine, InMemoryCoordinator, sim harness)
 lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
@@ -39,7 +40,8 @@ The module provides six core capabilities:
 | `traits.rs`     | `CoordinationBackend` trait -- the semantic contract for all backends |
 | `record.rs`     | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshot`           |
 | `run.rs`        | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait          |
-| `split.rs`      | Split operations, derived shard IDs, payload hashing                  |
+| `coordination/split.rs` | Contracts-owned split-replace planner core (`SplitReplacePlan`, `plan_split_replace*`) |
+| `split_execution.rs` | Coordination-owned split execution helpers: residual plan/result, derived shard IDs, payload hashing |
 | `in_memory.rs`  | In-memory reference implementation (executable spec)                  |
 | `lease.rs`      | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`            |
 | `cursor.rs`     | `Cursor` type with monotonicity and bounds semantics                  |

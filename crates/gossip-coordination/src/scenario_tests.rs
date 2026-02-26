@@ -39,7 +39,7 @@ use crate::record::ShardStatus;
 use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RegisterShardsError, RunTransitionError};
 use crate::sim::backend::SimIntrospection;
-use crate::split::SplitResidualPlan;
+use crate::split_execution::SplitResidualPlan;
 use crate::test_fixtures::*;
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;

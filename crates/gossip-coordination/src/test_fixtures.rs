@@ -34,11 +34,12 @@ use crate::in_memory::InMemoryCoordinator;
 use crate::lease::Lease;
 use crate::record::{ParkReason, ShardStatus};
 use crate::run::{RunConfig, RunManagement};
-use crate::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
+use crate::split_execution::SplitResidualPlan;
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
+use gossip_contracts::coordination::split::{SplitReplaceChild, SplitReplacePlan};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
