@@ -56,13 +56,9 @@ pub const MAX_TOKEN_SIZE: usize = CursorMaxTokenSize;
 ///
 /// `Empty` and `TooLarge` are emitted by the byte-wrapper constructors in
 /// this module (`ItemKey`, `ItemRef`, `TokenBytes`). `TokenWithoutLastKey`
-/// is reserved for higher-level request validation that checks cursor field
-/// combinations.
-///
-/// Marked `non_exhaustive` so new boundary validation failures can be added
-/// without a breaking change.
+/// is defined for use by higher-level request validation that checks cursor
+/// field combinations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ConnectorInputError {
     /// A required field was empty (zero-length byte slice).
     Empty { field: &'static str },
@@ -80,8 +76,8 @@ pub enum ConnectorInputError {
     /// attached to an explicit ordered position. Without a last_key the
     /// coordinator cannot determine where enumeration should resume.
     ///
-    /// Not emitted by the byte-wrapper constructors in this module; reserved
-    /// for higher-level cursor/request validators.
+    /// Not emitted by the byte-wrapper constructors in this module; defined
+    /// for use by higher-level cursor/request validators.
     TokenWithoutLastKey,
 }
 
@@ -101,8 +97,8 @@ impl std::error::Error for ConnectorInputError {}
 
 /// Returns the first 4 bytes of the BLAKE3 digest of `bytes`.
 ///
-/// Used exclusively by [`fmt_toxic_bytes`] to produce a short, deterministic
-/// fingerprint for log correlation. Four bytes (8 hex chars) provide enough
+/// Used exclusively by [`fmt_toxic_bytes`], which renders these 4 bytes as
+/// 8 lowercase hex characters for log correlation. This provides enough
 /// uniqueness for operational debugging while keeping formatted output compact.
 #[inline]
 fn hash_prefix_4(bytes: &[u8]) -> [u8; 4] {
@@ -179,6 +175,7 @@ fn validate_toxic_bytes(
 /// accessible only through [`as_bytes`](Self::as_bytes) /
 /// [`AsRef<[u8]>`](AsRef).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(clippy::len_without_is_empty)]
 pub struct ItemKey(Box<[u8]>);
 
 impl ItemKey {
@@ -230,6 +227,22 @@ impl ItemKey {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Returns the byte length, which is always >= 1 because constructors
+    /// reject empty input. `is_empty()` is intentionally absent since it
+    /// would unconditionally return `false`.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Consumes the wrapper and returns the owned byte buffer.
+    #[inline]
+    #[must_use]
+    pub fn into_bytes(self) -> Box<[u8]> {
+        self.0
+    }
 }
 
 impl AsRef<[u8]> for ItemKey {
@@ -271,6 +284,7 @@ impl fmt::Display for ItemKey {
 /// accessible only through [`as_bytes`](Self::as_bytes) /
 /// [`AsRef<[u8]>`](AsRef).
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::len_without_is_empty)]
 pub struct ItemRef(Box<[u8]>);
 
 impl ItemRef {
@@ -322,6 +336,22 @@ impl ItemRef {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Returns the byte length, which is always >= 1 because constructors
+    /// reject empty input. `is_empty()` is intentionally absent since it
+    /// would unconditionally return `false`.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Consumes the wrapper and returns the owned byte buffer.
+    #[inline]
+    #[must_use]
+    pub fn into_bytes(self) -> Box<[u8]> {
+        self.0
+    }
 }
 
 impl AsRef<[u8]> for ItemRef {
@@ -363,6 +393,7 @@ impl fmt::Display for ItemRef {
 /// accessible only through [`as_bytes`](Self::as_bytes) /
 /// [`AsRef<[u8]>`](AsRef).
 #[derive(Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::len_without_is_empty)]
 pub struct TokenBytes(Box<[u8]>);
 
 impl TokenBytes {
@@ -413,6 +444,22 @@ impl TokenBytes {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    /// Returns the byte length, which is always >= 1 because constructors
+    /// reject empty input. `is_empty()` is intentionally absent since it
+    /// would unconditionally return `false`.
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Consumes the wrapper and returns the owned byte buffer.
+    #[inline]
+    #[must_use]
+    pub fn into_bytes(self) -> Box<[u8]> {
+        self.0
     }
 }
 
@@ -483,6 +530,86 @@ mod tests {
                 field: "TokenBytes"
             })
         );
+    }
+
+    #[test]
+    fn item_key_lexicographic_ordering() {
+        let a = ItemKey::from_vec(vec![0x00]);
+        let b = ItemKey::from_vec(vec![0x00, 0x01]);
+        let c = ItemKey::from_vec(vec![0x01]);
+        let d = ItemKey::from_vec(vec![0xFF]);
+
+        assert!(a < b, "prefix sorts before longer extension");
+        assert!(b < c, "[0x00,0x01] sorts before [0x01]");
+        assert!(c < d);
+        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn boundary_exact_sizes() {
+        // 1-byte (minimum valid).
+        assert!(ItemKey::try_from_slice(&[0xAB]).is_ok());
+        assert!(ItemRef::try_from_slice(&[0xAB]).is_ok());
+        assert!(TokenBytes::try_from_slice(&[0xAB]).is_ok());
+
+        // Exactly MAX (maximum valid).
+        assert!(ItemKey::try_from_vec(vec![0x42; MAX_ITEM_KEY_SIZE]).is_ok());
+        assert!(ItemRef::try_from_vec(vec![0x42; MAX_ITEM_REF_SIZE]).is_ok());
+        assert!(TokenBytes::try_from_vec(vec![0x42; MAX_TOKEN_SIZE]).is_ok());
+
+        // Exactly MAX+1 (minimum invalid).
+        assert!(ItemKey::try_from_vec(vec![0x42; MAX_ITEM_KEY_SIZE + 1]).is_err());
+        assert!(ItemRef::try_from_vec(vec![0x42; MAX_ITEM_REF_SIZE + 1]).is_err());
+        assert!(TokenBytes::try_from_vec(vec![0x42; MAX_TOKEN_SIZE + 1]).is_err());
+    }
+
+    #[test]
+    fn from_vec_succeeds_with_valid_input() {
+        let key = ItemKey::from_vec(vec![1, 2, 3]);
+        assert_eq!(key.as_bytes(), &[1, 2, 3]);
+        let r = ItemRef::from_vec(vec![4, 5]);
+        assert_eq!(r.as_bytes(), &[4, 5]);
+        let t = TokenBytes::from_vec(vec![6]);
+        assert_eq!(t.as_bytes(), &[6]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty")]
+    fn item_key_from_vec_panics_on_empty() {
+        let _ = ItemKey::from_vec(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty")]
+    fn item_ref_from_vec_panics_on_empty() {
+        let _ = ItemRef::from_vec(vec![]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty")]
+    fn token_bytes_from_vec_panics_on_empty() {
+        let _ = TokenBytes::from_vec(vec![]);
+    }
+
+    #[test]
+    fn try_from_slice_roundtrips() {
+        let data = b"hello-world";
+        assert_eq!(ItemKey::try_from_slice(data).unwrap().as_bytes(), data);
+        assert_eq!(ItemRef::try_from_slice(data).unwrap().as_bytes(), data);
+        assert_eq!(TokenBytes::try_from_slice(data).unwrap().as_bytes(), data);
+    }
+
+    #[test]
+    fn format_output_is_deterministic() {
+        let key = ItemKey::from_vec(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let output = format!("{key}");
+        let hash = blake3::hash(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let b = hash.as_bytes();
+        let expected = format!(
+            "ItemKey(len=4, hash={:02x}{:02x}{:02x}{:02x}..)",
+            b[0], b[1], b[2], b[3]
+        );
+        assert_eq!(output, expected);
     }
 
     proptest! {
