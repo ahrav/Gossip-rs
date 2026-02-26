@@ -153,6 +153,8 @@ impl<'a> SplitReplacePlan<'a> {
     }
 }
 
+const _: () = assert!(MAX_SPLIT_CHILDREN <= u32::MAX as usize);
+
 impl CanonicalBytes for SplitReplacePlan<'_> {
     fn write_canonical(&self, h: &mut Hasher) {
         u32::try_from(self.children.len())
@@ -244,7 +246,7 @@ pub fn plan_split_replace_at_points<'a>(
     split_points: impl IntoIterator<Item = &'a [u8]>,
     mut cursor_for_child: impl FnMut(usize, ShardSpecRef<'a>) -> CursorUpdate<'a>,
 ) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
-    let mut points: Vec<&'a [u8]> = Vec::new();
+    let mut points: InlineVec<&'a [u8], MAX_SPLIT_CHILDREN> = InlineVec::new();
     for point in split_points {
         // N split points produce N+1 children (N intervals plus the tail).
         if points.len() + 2 > MAX_SPLIT_CHILDREN {
@@ -329,6 +331,88 @@ mod tests {
         }
     }
 
+    /// Boundary validation for `plan_split_replace` over child-count edges:
+    /// 0, 1, 2, MAX, MAX+1.
+    #[test]
+    fn plan_split_replace_boundary_validation() {
+        let cases: &[(usize, Result<(), SplitReplacePlanningError>)] = &[
+            (
+                0,
+                Err(SplitReplacePlanningError::InvalidChildCount(
+                    SplitReplacePlanError::TooFewChildren { count: 0 },
+                )),
+            ),
+            (
+                1,
+                Err(SplitReplacePlanningError::InvalidChildCount(
+                    SplitReplacePlanError::TooFewChildren { count: 1 },
+                )),
+            ),
+            (2, Ok(())),
+            (MAX_SPLIT_CHILDREN, Ok(())),
+            (
+                MAX_SPLIT_CHILDREN + 1,
+                Err(SplitReplacePlanningError::InvalidChildCount(
+                    SplitReplacePlanError::TooManyChildren {
+                        count: MAX_SPLIT_CHILDREN + 1,
+                    },
+                )),
+            ),
+        ];
+
+        for &(count, ref expected) in cases {
+            let parent = if count == 0 {
+                ShardSpec::with_range([0, 0], [0, 1])
+            } else {
+                ShardSpec::with_range([0, 0], (count as u16).to_be_bytes())
+            };
+            let boundaries: Vec<[u8; 2]> =
+                (0..=count).map(|i| (i as u16).to_be_bytes()).collect();
+            let children: Vec<_> = (0..count)
+                .map(|i| {
+                    let spec = ShardSpecRef::with_range(&boundaries[i], &boundaries[i + 1]);
+                    SplitReplaceChild::new(spec, CursorUpdate::initial())
+                })
+                .collect();
+
+            let result = plan_split_replace(parent.as_ref(), children);
+            match expected {
+                Ok(()) => assert!(result.is_ok(), "count={count} should be accepted"),
+                Err(e) => assert_eq!(&result.unwrap_err(), e, "count={count}"),
+            }
+        }
+    }
+
+    /// `plan_split_replace_at_points` must reject `MAX+1` children before
+    /// constructing any child specs/cursors.
+    #[test]
+    fn plan_split_replace_at_points_rejects_over_fanout_before_materialization() {
+        let max_plus_one = MAX_SPLIT_CHILDREN + 1;
+        let parent = ShardSpec::with_range([0, 0], (max_plus_one as u16).to_be_bytes());
+        let split_points: Vec<[u8; 2]> = (1..=MAX_SPLIT_CHILDREN)
+            .map(|i| (i as u16).to_be_bytes())
+            .collect();
+        let mut cursor_calls = 0usize;
+        let result = plan_split_replace_at_points(
+            parent.as_ref(),
+            split_points.iter().map(<[u8; 2]>::as_slice),
+            |_, _| {
+                cursor_calls += 1;
+                CursorUpdate::initial()
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(SplitReplacePlanningError::InvalidChildCount(
+                SplitReplacePlanError::TooManyChildren {
+                    count: MAX_SPLIT_CHILDREN + 1,
+                }
+            ))
+        );
+        assert_eq!(cursor_calls, 0, "children should not be materialized");
+    }
+
     #[test]
     fn split_replace_planner_points_produces_coverage_valid_deterministic_plan() {
         let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
@@ -347,5 +431,66 @@ mod tests {
         assert_eq!(plan_a.children()[0].spec().metadata(), b"meta");
         assert_eq!(plan_a.children()[1].spec().metadata(), b"meta");
         assert_eq!(canonical_digest(&plan_a), canonical_digest(&plan_b));
+    }
+
+    #[test]
+    fn split_replace_at_points_three_children() {
+        let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
+        let split_points: &[&[u8]] = &[b"g", b"m"];
+
+        let plan = plan_split_replace_at_points_initial_cursor(
+            parent.as_ref(),
+            split_points.iter().copied(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.children().len(), 3);
+        assert_eq!(plan.children()[0].spec().key_range_start(), b"a");
+        assert_eq!(plan.children()[0].spec().key_range_end(), b"g");
+        assert_eq!(plan.children()[1].spec().key_range_start(), b"g");
+        assert_eq!(plan.children()[1].spec().key_range_end(), b"m");
+        assert_eq!(plan.children()[2].spec().key_range_start(), b"m");
+        assert_eq!(plan.children()[2].spec().key_range_end(), b"z");
+        for child in plan.children() {
+            assert_eq!(child.spec().metadata(), b"meta");
+        }
+    }
+
+    #[test]
+    fn split_replace_at_points_empty_rejected() {
+        let parent = ShardSpec::with_range(b"a", b"z");
+        let split_points: &[&[u8]] = &[];
+
+        let err = plan_split_replace_at_points_initial_cursor(
+            parent.as_ref(),
+            split_points.iter().copied(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            SplitReplacePlanningError::InvalidChildCount(SplitReplacePlanError::TooFewChildren {
+                count: 1
+            },),
+        );
+    }
+
+    #[test]
+    fn split_replace_invalid_coverage_gap_rejected() {
+        let parent = ShardSpec::with_range(b"a", b"z");
+        let child_a_spec = ShardSpec::with_range(b"a", b"m");
+        let child_b_spec = ShardSpec::with_range(b"n", b"z");
+        let cursor = CursorUpdate::initial();
+
+        let children = [
+            SplitReplaceChild::new(child_a_spec.as_ref(), cursor),
+            SplitReplaceChild::new(child_b_spec.as_ref(), cursor),
+        ];
+
+        let err = plan_split_replace(parent.as_ref(), children).unwrap_err();
+        assert!(
+            matches!(err, SplitReplacePlanningError::InvalidCoverage(_)),
+            "expected InvalidCoverage, got {err:?}",
+        );
     }
 }

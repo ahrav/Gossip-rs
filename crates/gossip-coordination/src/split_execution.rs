@@ -602,47 +602,6 @@ mod tests {
         );
     }
 
-    // -- SplitReplacePlan validation -------------------------------------
-
-    /// Table-driven boundary validation for `SplitReplacePlan::try_new`.
-    ///
-    /// Consolidates the five boundary tests (empty, 1, 2, MAX, MAX+1)
-    /// into a single test that exercises every critical threshold.
-    #[test]
-    fn split_replace_plan_boundary_validation() {
-        let cases: &[(usize, Result<(), SplitReplacePlanError>)] = &[
-            (0, Err(SplitReplacePlanError::TooFewChildren { count: 0 })),
-            (1, Err(SplitReplacePlanError::TooFewChildren { count: 1 })),
-            (2, Ok(())),
-            (MAX_SPLIT_CHILDREN, Ok(())),
-            (
-                MAX_SPLIT_CHILDREN + 1,
-                Err(SplitReplacePlanError::TooManyChildren {
-                    count: MAX_SPLIT_CHILDREN + 1,
-                }),
-            ),
-        ];
-
-        for &(count, ref expected) in cases {
-            let specs: Vec<_> = (0..count)
-                .map(|i| {
-                    let start = (i as u16).to_be_bytes().to_vec();
-                    let end = ((i + 1) as u16).to_be_bytes().to_vec();
-                    ShardSpec::with_range(start, end)
-                })
-                .collect();
-            let cursors: Vec<_> = (0..count).map(|_| CursorUpdate::initial()).collect();
-            let children: Vec<SplitReplaceChild> = (0..count)
-                .map(|i| SplitReplaceChild::new(specs[i].as_ref(), cursors[i]))
-                .collect();
-            let result = SplitReplacePlan::try_new(children);
-            match expected {
-                Ok(()) => assert!(result.is_ok(), "count={count} should be accepted"),
-                Err(e) => assert_eq!(&result.unwrap_err(), e, "count={count}"),
-            }
-        }
-    }
-
     /// Boundary validation for `plan_split_replace` over child-count edges:
     /// 0, 1, 2, MAX, MAX+1.
     #[test]

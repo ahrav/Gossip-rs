@@ -40,7 +40,7 @@ The module provides six core capabilities:
 | `traits.rs`     | `CoordinationBackend` trait -- the semantic contract for all backends |
 | `record.rs`     | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshot`           |
 | `run.rs`        | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait          |
-| `coordination/split.rs` | Contracts-owned split-replace planner core (`SplitReplacePlan`, `plan_split_replace*`) |
+| `gossip-contracts::coordination/split.rs` | Contracts-owned split-replace planner core (`SplitReplacePlan`, `plan_split_replace*`) |
 | `split_execution.rs` | Coordination-owned split execution helpers: residual plan/result, derived shard IDs, payload hashing |
 | `in_memory.rs`  | In-memory reference implementation (executable spec)                  |
 | `lease.rs`      | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`            |

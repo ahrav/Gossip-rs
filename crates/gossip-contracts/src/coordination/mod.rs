@@ -13,7 +13,7 @@
 //!   idempotency behavior, and backend mutation semantics.
 //! - Split-replace planning is defined here (`split.rs`); split execution
 //!   result types and residual split execution helpers live in
-//!   `gossip-coordination::split`.
+//!   `gossip-coordination::split_execution`.
 //!
 //! ## Module Map
 //!

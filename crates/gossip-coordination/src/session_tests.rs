@@ -18,8 +18,9 @@
 //!   the session (move semantics), while `split_residual`, `checkpoint`, and
 //!   `renew` borrow mutably and keep the session usable.
 //!
-//! - **Error propagation**: `LeaseExpired`, `AlreadyLeased`, and `StaleFence`
-//!   errors from the backend surface through the session API without wrapping.
+//! - **Error propagation**: `LeaseExpired` and `AlreadyLeased` errors from the
+//!   backend surface through the session API without wrapping; `StaleFence`
+//!   behavior is verified through the underlying backend path.
 //!
 //! - **Snapshot integrity**: checkpoint does not update the cached snapshot;
 //!   failed `split_residual` does not corrupt it; replayed `split_residual`
@@ -41,7 +42,7 @@
 //!
 //! - **Property test**: random Renew/Checkpoint/SplitResidual sequences
 //!   preserve identity invariants (tenant, worker, shard_key never change)
-//!   and terminate cleanly with complete.
+//!   and end with either a successful `complete` or safe session drop.
 
 use super::*;
 use crate::in_memory::InMemoryCoordinator;
@@ -71,7 +72,7 @@ fn now(t: u64) -> LogicalTime {
 }
 
 /// Returns a run config with `CursorSemantics::Completed`, a 30-tick
-/// lease duration, and a max-workers-per-run of 5.
+/// lease duration, and a max-shard-retries value of 5.
 fn test_run_config() -> RunConfig {
     RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap()
 }
