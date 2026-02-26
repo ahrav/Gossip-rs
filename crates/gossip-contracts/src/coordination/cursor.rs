@@ -379,12 +379,83 @@ pub fn check_cursor_bounds(cursor: CursorUpdate<'_>, spec: ShardSpecRef<'_>) -> 
     CursorBoundsCheck::InBounds
 }
 
+/// Compute the lexicographic prefix-successor of `prefix` into `out`.
+///
+/// The prefix-successor is the shortest byte string that is strictly
+/// greater than `prefix` *and* is not a prefix-extension of `prefix`.
+/// It is computed by stripping trailing `0xFF` bytes and incrementing the
+/// last non-`0xFF` byte:
+///
+/// ```text
+///   "abc"      -> "abd"          (increment last byte)
+///   "ab\xFF"   -> "ac"           (strip 0xFF, increment 'b')
+///   "\xFF\xFF" -> None           (all-0xFF has no prefix successor)
+/// ```
+///
+/// Returns `None` when the input is empty, exceeds `MAX_KEY_SIZE`, or
+/// consists entirely of `0xFF` bytes (the maximum element in the
+/// lexicographic byte order has no successor).
+///
+/// Writes into caller-owned `out` so the result borrows from the caller's
+/// scratch buffer rather than allocating.
+#[inline]
+pub fn prefix_successor_into<'a>(
+    prefix: &[u8],
+    out: &'a mut [u8; MAX_KEY_SIZE],
+) -> Option<&'a [u8]> {
+    if prefix.is_empty() || prefix.len() > MAX_KEY_SIZE {
+        return None;
+    }
+    let last_non_ff = prefix.iter().rposition(|&byte| byte != u8::MAX)?;
+    let out_len = last_non_ff + 1;
+    out[..out_len].copy_from_slice(&prefix[..out_len]);
+    debug_assert!(out[last_non_ff] < u8::MAX);
+    out[last_non_ff] += 1;
+    Some(&out[..out_len])
+}
+
+/// Compute the lexicographic key-successor of `key` into `out`.
+///
+/// The key-successor is the smallest byte string that is strictly greater
+/// than `key` in the lexicographic byte order. Two strategies are used
+/// depending on the key length:
+///
+/// 1. **Short keys** (`len < MAX_KEY_SIZE`): append a `0x00` byte.
+///    `"abc"` becomes `"abc\x00"`. This is the immediate successor
+///    because no byte string exists between `"abc"` and `"abc\x00"` in
+///    lexicographic order.
+///
+/// 2. **Maximum-length keys** (`len == MAX_KEY_SIZE`): appending is
+///    impossible, so fall back to [`prefix_successor_into`], which strips
+///    trailing `0xFF` bytes and increments. Returns `None` when the key
+///    is all-`0xFF` at maximum length (the absolute maximum of the
+///    keyspace).
+///
+/// Keys longer than `MAX_KEY_SIZE` are rejected (returns `None`).
+#[inline]
+pub fn key_successor_into<'a>(key: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Option<&'a [u8]> {
+    if key.len() > MAX_KEY_SIZE {
+        return None;
+    }
+
+    // Fast path: room to append a 0x00 byte, producing the immediate successor.
+    if key.len() < MAX_KEY_SIZE {
+        out[..key.len()].copy_from_slice(key);
+        out[key.len()] = 0;
+        return Some(&out[..key.len() + 1]);
+    }
+
+    // Slow path: key is already at maximum length, must use prefix increment.
+    prefix_successor_into(key, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coordination::shard_spec::ShardSpec;
     use crate::test_util::{arb_bounded_shard_spec, arb_shard_spec, canonical_digest};
     use proptest::prelude::*;
+    use rstest::rstest;
 
     #[test]
     fn initial_has_no_key_or_token() {
@@ -467,6 +538,95 @@ mod tests {
         assert_eq!(canonical_digest(&a), canonical_digest(&b));
     }
 
+    // -- prefix_successor_into smoke tests --
+
+    #[test]
+    fn prefix_successor_into_basic() {
+        let mut out = [0u8; MAX_KEY_SIZE];
+
+        // Normal increment.
+        assert_eq!(
+            prefix_successor_into(b"abc", &mut out),
+            Some(b"abd".as_slice())
+        );
+
+        // Trailing 0xFF strip.
+        assert_eq!(
+            prefix_successor_into(b"ab\xFF", &mut out),
+            Some(b"ac".as_slice()),
+        );
+
+        // All-0xFF → None.
+        assert_eq!(prefix_successor_into(&[0xFF, 0xFF], &mut out), None);
+
+        // Empty → None.
+        assert_eq!(prefix_successor_into(b"", &mut out), None);
+    }
+
+    // -- key_successor_into smoke tests --
+
+    #[test]
+    fn key_successor_into_basic() {
+        let mut out = [0u8; MAX_KEY_SIZE];
+
+        // Short key: append 0x00.
+        assert_eq!(
+            key_successor_into(b"abc", &mut out),
+            Some(b"abc\x00".as_slice()),
+        );
+
+        // MAX_KEY_SIZE key: fallback to prefix successor.
+        let mut max_key = [0x50u8; MAX_KEY_SIZE];
+        let result = key_successor_into(&max_key, &mut out).unwrap();
+        max_key[MAX_KEY_SIZE - 1] = 0x51;
+        assert_eq!(result, &max_key);
+
+        // All-0xFF at MAX_KEY_SIZE → None.
+        assert_eq!(key_successor_into(&[0xFF; MAX_KEY_SIZE], &mut out), None);
+    }
+
+    // rstest parameterized tests for prefix_successor_into
+    #[rstest]
+    #[case::normal(b"abc", Some(b"abd".as_slice()))]
+    #[case::trailing_ff_strip(b"ab\xFF", Some(b"ac".as_slice()))]
+    #[case::multi_ff_strip(b"a\xFF\xFF", Some(b"b".as_slice()))]
+    #[case::all_ff(&[0xFF, 0xFF], None)]
+    #[case::single_ff(&[0xFF], None)]
+    #[case::empty(b"", None)]
+    #[case::single_byte(b"a", Some(b"b".as_slice()))]
+    #[case::single_byte_fe(&[0xFE], Some([0xFF].as_slice()))]
+    fn prefix_successor_into_cases(#[case] input: &[u8], #[case] expected: Option<&[u8]>) {
+        let mut out = [0u8; MAX_KEY_SIZE];
+        assert_eq!(prefix_successor_into(input, &mut out), expected);
+    }
+
+    // rstest parameterized tests for key_successor_into
+    #[rstest]
+    #[case::short_key(b"abc".as_slice(), Some(b"abc\x00".as_slice()))]
+    #[case::empty_key(b"".as_slice(), Some([0x00].as_slice()))]
+    #[case::all_ff_at_max([0xFF; MAX_KEY_SIZE].as_slice(), None)]
+    fn key_successor_into_cases(#[case] input: &[u8], #[case] expected: Option<&[u8]>) {
+        let mut out = [0u8; MAX_KEY_SIZE];
+        assert_eq!(key_successor_into(input, &mut out), expected);
+    }
+
+    #[test]
+    fn key_successor_into_max_key_prefix_fallback() {
+        let key = [0x50u8; MAX_KEY_SIZE];
+        let mut out = [0u8; MAX_KEY_SIZE];
+        let result = key_successor_into(&key, &mut out).unwrap();
+        let mut expected = [0x50u8; MAX_KEY_SIZE];
+        expected[MAX_KEY_SIZE - 1] = 0x51;
+        assert_eq!(result, &expected);
+    }
+
+    #[test]
+    fn key_successor_into_oversized_key() {
+        let key = vec![0x42u8; MAX_KEY_SIZE + 1];
+        let mut out = [0u8; MAX_KEY_SIZE];
+        assert_eq!(key_successor_into(&key, &mut out), None);
+    }
+
     proptest! {
         #![proptest_config(crate::test_util::miri_proptest_config())]
 
@@ -509,6 +669,28 @@ mod tests {
                 (Some(_), Some(_)) => CursorAdvance::Regression,
             };
             prop_assert_eq!(got, want);
+        }
+
+        #[test]
+        fn prefix_successor_into_is_strictly_greater(
+            input in proptest::collection::vec(any::<u8>(), 1..64)
+                .prop_filter("must not be all-0xFF", |v| v.iter().any(|&b| b != 0xFF)),
+        ) {
+            let mut out = [0u8; MAX_KEY_SIZE];
+            let succ = prefix_successor_into(&input, &mut out).unwrap();
+            prop_assert!(succ > input.as_slice(), "successor {succ:?} must be > input {input:?}");
+        }
+
+        #[test]
+        fn key_successor_into_is_strictly_greater(
+            input in proptest::collection::vec(any::<u8>(), 0..MAX_KEY_SIZE)
+                .prop_filter("must not be all-0xFF at MAX_KEY_SIZE", |v| {
+                    v.len() < MAX_KEY_SIZE || v.iter().any(|&b| b != 0xFF)
+                }),
+        ) {
+            let mut out = [0u8; MAX_KEY_SIZE];
+            let succ = key_successor_into(&input, &mut out).unwrap();
+            prop_assert!(succ > input.as_slice(), "successor {succ:?} must be > input {input:?}");
         }
     }
 }

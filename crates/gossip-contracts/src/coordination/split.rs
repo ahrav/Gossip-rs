@@ -44,7 +44,7 @@
 
 use std::fmt;
 
-use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, key_successor_into};
 use crate::coordination::limits::MAX_SPLIT_CHILDREN;
 use crate::coordination::shard_spec::{
     ShardSpecRef, SplitValidationError, validate_residual_split, validate_split_coverage_bounds,
@@ -570,72 +570,6 @@ pub fn plan_split_residual_at_point<'a>(
     plan_split_residual(parent, parent_new_spec, residual_spec)
 }
 
-/// Compute the lexicographic prefix-successor of `prefix` into `out`.
-///
-/// The prefix-successor is the shortest byte string that is strictly
-/// greater than `prefix` *and* is not a prefix-extension of `prefix`.
-/// It is computed by stripping trailing `0xFF` bytes and incrementing the
-/// last non-`0xFF` byte:
-///
-/// ```text
-///   "abc"      -> "abd"          (increment last byte)
-///   "ab\xFF"   -> "ac"           (strip 0xFF, increment 'b')
-///   "\xFF\xFF" -> None           (all-0xFF has no prefix successor)
-/// ```
-///
-/// Returns `None` when the input is empty, exceeds `MAX_KEY_SIZE`, or
-/// consists entirely of `0xFF` bytes (the maximum element in the
-/// lexicographic byte order has no successor).
-///
-/// Writes into caller-owned `out` so the result borrows from the caller's
-/// scratch buffer rather than allocating.
-#[inline]
-fn prefix_successor_into<'a>(prefix: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Option<&'a [u8]> {
-    if prefix.is_empty() || prefix.len() > MAX_KEY_SIZE {
-        return None;
-    }
-    let last_non_ff = prefix.iter().rposition(|&byte| byte != u8::MAX)?;
-    let out_len = last_non_ff + 1;
-    out[..out_len].copy_from_slice(&prefix[..out_len]);
-    out[last_non_ff] += 1;
-    Some(&out[..out_len])
-}
-
-/// Compute the lexicographic key-successor of `key` into `out`.
-///
-/// The key-successor is the smallest byte string that is strictly greater
-/// than `key` in the lexicographic byte order. Two strategies are used
-/// depending on the key length:
-///
-/// 1. **Short keys** (`len < MAX_KEY_SIZE`): append a `0x00` byte.
-///    `"abc"` becomes `"abc\x00"`. This is the immediate successor
-///    because no byte string exists between `"abc"` and `"abc\x00"` in
-///    lexicographic order.
-///
-/// 2. **Maximum-length keys** (`len == MAX_KEY_SIZE`): appending is
-///    impossible, so fall back to [`prefix_successor_into`], which strips
-///    trailing `0xFF` bytes and increments. Returns `None` when the key
-///    is all-`0xFF` at maximum length (the absolute maximum of the
-///    keyspace).
-///
-/// Keys longer than `MAX_KEY_SIZE` are rejected (returns `None`).
-#[inline]
-fn key_successor_into<'a>(key: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Option<&'a [u8]> {
-    if key.len() > MAX_KEY_SIZE {
-        return None;
-    }
-
-    // Fast path: room to append a 0x00 byte, producing the immediate successor.
-    if key.len() < MAX_KEY_SIZE {
-        out[..key.len()].copy_from_slice(key);
-        out[key.len()] = 0;
-        return Some(&out[..key.len() + 1]);
-    }
-
-    // Slow path: key is already at maximum length, must use prefix increment.
-    prefix_successor_into(key, out)
-}
-
 /// Build a split-residual plan from a cursor, using successor semantics.
 ///
 /// Derives the split point as `key_successor(cursor.last_key)` -- the
@@ -705,7 +639,7 @@ pub fn plan_split_residual_from_cursor<'a>(
 mod tests {
     use super::*;
     use crate::coordination::shard_spec::ShardSpec;
-    use crate::test_util::{arb_valid_n_way_split, canonical_digest};
+    use crate::test_util::{arb_residual_split, arb_valid_n_way_split, canonical_digest};
     use proptest::prelude::*;
     use rstest::rstest;
 
@@ -900,6 +834,29 @@ mod tests {
             prop_assert_eq!(plan_a.residual_spec().metadata(), meta.as_slice());
             // Deterministic: same inputs produce the same canonical digest.
             prop_assert_eq!(canonical_digest(&plan_a), canonical_digest(&plan_b));
+        }
+
+        #[test]
+        fn split_residual_strategy_coverage(
+            (parent, split_point) in arb_residual_split(),
+            meta in proptest::collection::vec(any::<u8>(), 0..32),
+        ) {
+            let parent = ShardSpec::with_range_and_metadata(
+                parent.key_range_start(),
+                parent.key_range_end(),
+                &meta,
+            );
+            let plan = plan_split_residual_at_point(parent.as_ref(), &split_point).unwrap();
+
+            // Parent_new covers [start, split_point).
+            prop_assert_eq!(plan.parent_new_spec().key_range_start(), parent.key_range_start());
+            prop_assert_eq!(plan.parent_new_spec().key_range_end(), split_point.as_slice());
+            // Residual covers [split_point, end).
+            prop_assert_eq!(plan.residual_spec().key_range_start(), split_point.as_slice());
+            prop_assert_eq!(plan.residual_spec().key_range_end(), parent.key_range_end());
+            // Metadata propagated.
+            prop_assert_eq!(plan.parent_new_spec().metadata(), meta.as_slice());
+            prop_assert_eq!(plan.residual_spec().metadata(), meta.as_slice());
         }
     }
 
@@ -1185,5 +1142,31 @@ mod tests {
             err,
             SplitResidualPlanningError::InvalidPlan(SplitResidualPlanError::IdenticalSpecs),
         );
+    }
+
+    #[rstest]
+    #[case::split_at_parent_start(b"m", b"z", b"m", true)]
+    #[case::split_at_parent_end(b"a", b"m", b"m", true)]
+    #[case::split_beyond_parent_end(b"a", b"m", b"z", true)]
+    #[case::valid_interior(b"a", b"z", b"m", false)]
+    fn plan_split_residual_at_point_edge_cases(
+        #[case] start: &[u8],
+        #[case] end: &[u8],
+        #[case] split_point: &[u8],
+        #[case] should_err: bool,
+    ) {
+        let parent = ShardSpec::with_range(start, end);
+        let result = plan_split_residual_at_point(parent.as_ref(), split_point);
+        if should_err {
+            assert!(
+                result.is_err(),
+                "expected error for split_point={split_point:?} in [{start:?}, {end:?})"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "expected success for split_point={split_point:?} in [{start:?}, {end:?})"
+            );
+        }
     }
 }

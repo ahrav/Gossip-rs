@@ -103,6 +103,28 @@ pub fn arb_valid_n_way_split() -> impl Strategy<Value = (ShardSpec, Vec<ShardSpe
         })
 }
 
+/// Generate a valid parent [`ShardSpec`] plus a split point guaranteed to be
+/// strictly between `parent.start` and `parent.end`.
+///
+/// Uses suffix accumulation (same proven pattern as [`arb_bounded_shard_spec`])
+/// to guarantee strict lexicographic ordering: `start < split_point < end`.
+pub fn arb_residual_split() -> impl Strategy<Value = (ShardSpec, Vec<u8>)> {
+    (
+        proptest::collection::vec(any::<u8>(), 1..16),
+        proptest::collection::vec(any::<u8>(), 1..8),
+        proptest::collection::vec(any::<u8>(), 1..8),
+    )
+        .prop_map(|(base, suffix1, suffix2)| {
+            let start = base.clone();
+            let mut split_point = base;
+            split_point.extend_from_slice(&suffix1);
+            let mut end = split_point.clone();
+            end.extend_from_slice(&suffix2);
+            let parent = ShardSpec::with_range(start, end);
+            (parent, split_point)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // TestSlab — shared drop-safe slab wrapper for test code
 // ---------------------------------------------------------------------------

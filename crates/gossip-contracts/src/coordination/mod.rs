@@ -11,8 +11,8 @@
 //! - This module owns data contracts and pure validation helpers.
 //! - `gossip-coordination` owns protocol sequencing, lease/fence enforcement,
 //!   idempotency behavior, and backend mutation semantics.
-//! - Split-replace planning is defined here (`split.rs`); split execution
-//!   result types and residual split execution helpers live in
+//! - Split planning (replace + residual) is defined here (`split.rs`);
+//!   split execution result types live in
 //!   `gossip-coordination::split_execution`.
 //!
 //! ## Module Map
@@ -44,6 +44,7 @@ pub mod split;
 pub use cursor::{
     CursorAdvance, CursorBoundsCheck, CursorInputError, CursorUpdate, MAX_KEY_SIZE,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
+    key_successor_into, prefix_successor_into,
 };
 
 // -- Split capacity limits --
