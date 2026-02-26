@@ -28,7 +28,7 @@ The crate provides three core capabilities:
   stages shard registrations into a borrowed arena with bounded capacity,
   transactional add semantics, and build-time manifest validation.
 
-### Source files
+### Source files (excluding `*_tests.rs`)
 
 | File               | Role                                                                                       |
 |--------------------|--------------------------------------------------------------------------------------------|
@@ -146,12 +146,14 @@ prefixes. Analogous to FoundationDB `strinc` / CockroachDB
 (infallible, tightest possible successor). At `MAX_KEY_SIZE`, delegate to
 `prefix_successor`. Above `MAX_KEY_SIZE`, return `None`.
 
-**`byte_midpoint` algorithm (4 phases):**
+**`byte_midpoint` algorithm (5 phases):**
 1. Pad shorter input to `max_len`, compute `a + b` from LSB with carry.
 2. Halve the sum by long division from MSB.
 3. Try overflow-normalized candidate (drop leading `0x00` if
    `len == max_len + 1`).
-4. Fallback to `key_successor(a)` if it remains `< b`.
+4. Try fixed-width candidate: return the unmodified quotient bytes if
+   `len <= MAX_KEY_SIZE` and `a < candidate < b`.
+5. Fallback to `key_successor(a)` if it remains `< b`.
 
 Returns `None` when `a >= b`, either input exceeds `MAX_KEY_SIZE`, or no
 interior point can be represented within the size bound.
@@ -390,50 +392,54 @@ Following the project's tiered allocation policy:
 | 18 | Manifest range rejects inverted/degenerate | proptest             | `shard_spec_from_manifest_range_rejects_inverted_or_degenerate`                        | `key_encoding_tests.rs` |
 | 19 | Error Display formatting                   | rstest parameterized | `prefix_shard_error_display_contains` (3 cases)                                       | `key_encoding_tests.rs` |
 | 20 | Error source delegation                    | unit test            | `prefix_shard_error_source_delegates_for_invalid_shard_spec`                           | `key_encoding_tests.rs` |
+| 21 | `KeyEncoding` trait basic contract         | unit test            | `key_encoding_returns_encoded_bytes`                                                   | `key_encoding_tests.rs` |
+| 22 | `shard_spec_from_keys` rejects oversized keys | unit test        | `shard_spec_from_keys_surfaces_oversized_encoded_boundary`                             | `key_encoding_tests.rs` |
 
 ### Hint Metadata Invariants
 
 | #  | Invariant                                  | Enforcement          | Test Name(s)                                                                          | Source File      |
 |----|--------------------------------------------|----------------------|---------------------------------------------------------------------------------------|------------------|
-| 21 | `ShardHint` encode/decode roundtrip        | unit + proptest      | `shard_hint_range_roundtrip`, `shard_hint_prefix_roundtrip`, `shard_hint_manifest_roundtrip`, `shard_hint_proptest_roundtrip` | `hint_tests.rs`  |
-| 22 | `ShardHint` decode rejects malformed       | unit test            | `shard_hint_decode_rejects_empty_data`, `shard_hint_decode_rejects_unknown_tag`, `shard_hint_decode_rejects_truncated_prefix_header`, `shard_hint_decode_rejects_truncated_prefix_payload`, `shard_hint_decode_rejects_truncated_manifest` | `hint_tests.rs`  |
-| 23 | Manifest `start_row < end_row` enforced    | unit test            | `shard_hint_decode_rejects_inverted_manifest_rows`, `shard_hint_decode_rejects_equal_manifest_rows`, `shard_hint_encode_rejects_inverted_manifest_rows`, `shard_hint_encode_rejects_equal_manifest_rows`, `shard_hint_decode_rejects_raw_inverted_manifest` | `hint_tests.rs`  |
-| 24 | Trailing bytes returned as consumed length | unit test            | `shard_hint_decode_returns_consumed_length_with_trailing_bytes`                        | `hint_tests.rs`  |
-| 25 | `ShardMetadata` envelope roundtrip         | unit + proptest      | `shard_metadata_encode_decode_roundtrip`, `shard_metadata_proptest_roundtrip`          | `hint_tests.rs`  |
-| 26 | Empty metadata defaults to Range           | unit test            | `shard_metadata_decode_empty_defaults_to_range_hint`                                  | `hint_tests.rs`  |
-| 27 | `ShardMetadata` rejects malformed envelope | unit test            | `shard_metadata_decode_rejects_non_empty_non_conforming_input`, `shard_metadata_encode_rejects_oversized_payload` | `hint_tests.rs`  |
-| 28 | Convenience constructors roundtrip         | unit test            | `range_shard_roundtrip_with_decode_helpers`, `prefix_shard_roundtrip_with_decode_helpers`, `manifest_shard_roundtrip_with_decode_helpers` | `hint_tests.rs`  |
-| 29 | Prefix shard rejects invalid prefixes      | unit test            | `prefix_shard_rejects_oversized_prefix_with_prefix_too_large`, `prefix_shard_rejects_all_ff_prefix`, `prefix_shard_rejects_empty_prefix` | `hint_tests.rs`  |
-| 30 | Prefix shard contains all prefixed keys    | proptest             | `prefix_shard_contains_all_keys_with_prefix`                                          | `hint_tests.rs`  |
-| 31 | Range propagation stays Range              | unit test            | `propagate_hint_on_split_range_stays_range`                                           | `hint_tests.rs`  |
-| 32 | Prefix propagation demotes to Range        | unit test            | `propagate_hint_on_split_prefix_demotes_to_range`                                     | `hint_tests.rs`  |
-| 33 | Prefix propagation validates bounds        | unit test            | `propagate_hint_on_split_prefix_rejects_out_of_range_start`, `propagate_hint_on_split_prefix_rejects_out_of_range_end` | `hint_tests.rs`  |
-| 34 | Manifest propagation narrows rows          | unit test            | `propagate_hint_on_split_manifest_adjusts_child_rows`, `propagate_hint_on_split_manifest_child_end_at_parent_end` | `hint_tests.rs`  |
-| 35 | Manifest propagation rejects invalid       | unit test            | `propagate_hint_on_split_manifest_rejects_non_manifest_boundaries`, `propagate_hint_on_split_manifest_rejects_manifest_id_mismatch`, `propagate_hint_on_split_manifest_rejects_out_of_parent_bounds`, `propagate_hint_on_split_manifest_rejects_empty_child_range`, `propagate_hint_on_split_manifest_rejects_non_manifest_end_boundary`, `propagate_hint_on_split_manifest_rejects_end_manifest_id_mismatch`, `propagate_hint_on_split_manifest_rejects_end_row_beyond_parent` | `hint_tests.rs`  |
-| 36 | Decode helpers propagate errors            | unit test            | `decode_helpers_propagate_malformed_metadata_errors`                                  | `hint_tests.rs`  |
+| 23 | `ShardHint` encode/decode roundtrip        | unit + proptest      | `shard_hint_range_roundtrip`, `shard_hint_prefix_roundtrip`, `shard_hint_manifest_roundtrip`, `shard_hint_proptest_roundtrip` | `hint_tests.rs`  |
+| 24 | `ShardHint` decode rejects malformed       | unit test            | `shard_hint_decode_rejects_empty_data`, `shard_hint_decode_rejects_unknown_tag`, `shard_hint_decode_rejects_truncated_prefix_header`, `shard_hint_decode_rejects_truncated_prefix_payload`, `shard_hint_decode_rejects_truncated_manifest` | `hint_tests.rs`  |
+| 25 | Manifest `start_row < end_row` enforced    | unit test            | `shard_hint_decode_rejects_inverted_manifest_rows`, `shard_hint_decode_rejects_equal_manifest_rows`, `shard_hint_encode_rejects_inverted_manifest_rows`, `shard_hint_encode_rejects_equal_manifest_rows`, `shard_hint_decode_rejects_raw_inverted_manifest` | `hint_tests.rs`  |
+| 26 | Trailing bytes returned as consumed length | unit test            | `shard_hint_decode_returns_consumed_length_with_trailing_bytes`                        | `hint_tests.rs`  |
+| 27 | `ShardMetadata` envelope roundtrip         | unit + proptest      | `shard_metadata_encode_decode_roundtrip`, `shard_metadata_proptest_roundtrip`          | `hint_tests.rs`  |
+| 28 | Empty metadata defaults to Range           | unit test            | `shard_metadata_decode_empty_defaults_to_range_hint`                                  | `hint_tests.rs`  |
+| 29 | `ShardMetadata` rejects malformed envelope | unit test            | `shard_metadata_decode_rejects_non_empty_non_conforming_input`, `shard_metadata_encode_rejects_oversized_payload` | `hint_tests.rs`  |
+| 30 | Convenience constructors roundtrip         | unit test            | `range_shard_roundtrip_with_decode_helpers`, `prefix_shard_roundtrip_with_decode_helpers`, `manifest_shard_roundtrip_with_decode_helpers` | `hint_tests.rs`  |
+| 31 | Prefix shard rejects invalid prefixes      | unit test            | `prefix_shard_rejects_oversized_prefix_with_prefix_too_large`, `prefix_shard_rejects_all_ff_prefix`, `prefix_shard_rejects_empty_prefix` | `hint_tests.rs`  |
+| 32 | Prefix shard contains all prefixed keys    | proptest             | `prefix_shard_contains_all_keys_with_prefix`                                          | `hint_tests.rs`  |
+| 33 | Range propagation stays Range              | unit test            | `propagate_hint_on_split_range_stays_range`                                           | `hint_tests.rs`  |
+| 34 | Prefix propagation demotes to Range        | unit test            | `propagate_hint_on_split_prefix_demotes_to_range`                                     | `hint_tests.rs`  |
+| 35 | Prefix propagation validates bounds        | unit test            | `propagate_hint_on_split_prefix_rejects_out_of_range_start`, `propagate_hint_on_split_prefix_rejects_out_of_range_end` | `hint_tests.rs`  |
+| 36 | Manifest propagation narrows rows          | unit test            | `propagate_hint_on_split_manifest_adjusts_child_rows`, `propagate_hint_on_split_manifest_child_end_at_parent_end` | `hint_tests.rs`  |
+| 37 | Manifest propagation rejects invalid       | unit test            | `propagate_hint_on_split_manifest_rejects_non_manifest_boundaries`, `propagate_hint_on_split_manifest_rejects_manifest_id_mismatch`, `propagate_hint_on_split_manifest_rejects_out_of_parent_bounds`, `propagate_hint_on_split_manifest_rejects_empty_child_range`, `propagate_hint_on_split_manifest_rejects_non_manifest_end_boundary`, `propagate_hint_on_split_manifest_rejects_end_manifest_id_mismatch`, `propagate_hint_on_split_manifest_rejects_end_row_beyond_parent` | `hint_tests.rs`  |
+| 38 | Decode helpers propagate errors            | unit test            | `decode_helpers_propagate_malformed_metadata_errors`                                  | `hint_tests.rs`  |
+| 39 | Convenience constructors reject oversized metadata | unit test   | `range_shard_rejects_oversized_metadata`                                               | `hint_tests.rs`  |
+| 40 | `manifest_shard` rejects inverted rows     | unit test            | `manifest_shard_rejects_inverted_rows`                                                 | `hint_tests.rs`  |
 
 ### Builder Invariants
 
 | #  | Invariant                                  | Enforcement          | Test Name(s)                                                                          | Source File        |
 |----|--------------------------------------------|----------------------|---------------------------------------------------------------------------------------|--------------------|
-| 37 | Mixed shard types build valid manifest     | unit test            | `mixed_range_prefix_manifest_builds_valid_manifest`                                   | `builder_tests.rs` |
-| 38 | IDs assigned sequentially from 0           | unit test            | `ids_are_assigned_in_insertion_order`                                                  | `builder_tests.rs` |
-| 39 | Default add uses initial cursor            | unit test            | `default_add_methods_use_initial_cursor`                                              | `builder_tests.rs` |
-| 40 | `*_with_cursor` preserves explicit cursor  | unit test            | `with_cursor_methods_preserve_non_initial_cursor`, `add_manifest_with_cursor_preserves_initial_cursor`, `add_manifest_with_cursor_preserves_explicit_cursor` | `builder_tests.rs` |
-| 41 | Cursor-out-of-bounds fails at build time   | unit test            | `cursor_outside_range_fails_manifest_validation`                                      | `builder_tests.rs` |
-| 42 | Overlapping ranges fail at build time      | unit test            | `overlapping_ranges_fail_on_build_validation`                                         | `builder_tests.rs` |
-| 43 | Empty builder fails at build time          | unit test            | `build_inputs_on_empty_builder_returns_manifest_empty`                                | `builder_tests.rs` |
-| 44 | `build_inputs` is idempotent               | unit test            | `build_inputs_is_idempotent`                                                          | `builder_tests.rs` |
-| 45 | Entry limit enforced                       | unit test            | `entry_limit_exhaustion_returns_capacity_exceeded`                                    | `builder_tests.rs` |
-| 46 | Arena exhaustion surfaced as `SlabFull`     | unit test            | `arena_slot_exhaustion_returns_slab_full`, `arena_byte_exhaustion_returns_slab_full`, `add_spec_ref_slab_full` | `builder_tests.rs` |
-| 47 | Stale/foreign handles rejected             | unit test            | `stale_or_foreign_handle_is_rejected_without_panic`                                   | `builder_tests.rs` |
-| 48 | `reset` restores builder to fresh state    | unit test            | `reset_allows_fresh_reuse_and_resets_ids`                                             | `builder_tests.rs` |
-| 49 | `add_spec_ref` validates and allocates     | unit test            | `add_spec_ref_happy_path`, `add_spec_ref_rejects_inverted_range`                      | `builder_tests.rs` |
-| 50 | Config rejects invalid limits              | unit test            | `config_rejects_zero_entry_limit`, `config_rejects_entry_limit_exceeding_cap`         | `builder_tests.rs` |
-| 51 | Error mapping for invalid inputs           | unit test            | `add_range_with_inverted_bounds_returns_range_invalid`, `add_prefix_with_empty_prefix_returns_prefix_invalid`, `add_manifest_with_inverted_rows_returns_manifest_ctor_invalid` | `builder_tests.rs` |
-| 52 | `split_range_by_boundaries` atomicity      | unit test            | `split_range_by_boundaries_exact_capacity_preserves_ordering`, `split_range_by_boundaries_under_capacity_succeeds`, `split_range_capacity_exceeded_has_no_partial_writes`, `split_range_fan_out_exceeded_has_no_partial_writes` | `builder_tests.rs` |
-| 53 | `split_manifest_by_rows` atomicity         | unit test            | `split_manifest_by_rows_exact_capacity_tiles_manifest_rows`, `split_manifest_by_rows_under_capacity_succeeds`, `split_manifest_by_rows_capacity_exceeded_has_no_partial_writes`, `split_manifest_by_rows_fan_out_exceeded_has_no_partial_writes` | `builder_tests.rs` |
-| 54 | Manifest split handles u64 boundary        | unit test            | `split_manifest_by_rows_handles_u64_boundary_without_wrap`                             | `builder_tests.rs` |
+| 41 | Mixed shard types build valid manifest     | unit test            | `mixed_range_prefix_manifest_builds_valid_manifest`                                   | `builder_tests.rs` |
+| 42 | IDs assigned sequentially from 0           | unit test            | `ids_are_assigned_in_insertion_order`                                                  | `builder_tests.rs` |
+| 43 | Default add uses initial cursor            | unit test            | `default_add_methods_use_initial_cursor`                                              | `builder_tests.rs` |
+| 44 | `*_with_cursor` preserves explicit cursor  | unit test            | `with_cursor_methods_preserve_non_initial_cursor`, `add_manifest_with_cursor_preserves_initial_cursor`, `add_manifest_with_cursor_preserves_explicit_cursor` | `builder_tests.rs` |
+| 45 | Cursor-out-of-bounds fails at build time   | unit test            | `cursor_outside_range_fails_manifest_validation`                                      | `builder_tests.rs` |
+| 46 | Overlapping ranges fail at build time      | unit test            | `overlapping_ranges_fail_on_build_validation`                                         | `builder_tests.rs` |
+| 47 | Empty builder fails at build time          | unit test            | `build_inputs_on_empty_builder_returns_manifest_empty`                                | `builder_tests.rs` |
+| 48 | `build_inputs` is idempotent               | unit test            | `build_inputs_is_idempotent`                                                          | `builder_tests.rs` |
+| 49 | Entry limit enforced                       | unit test            | `entry_limit_exhaustion_returns_capacity_exceeded`                                    | `builder_tests.rs` |
+| 50 | Arena exhaustion surfaced as `SlabFull`     | unit test            | `arena_slot_exhaustion_returns_slab_full`, `arena_byte_exhaustion_returns_slab_full`, `add_spec_ref_slab_full` | `builder_tests.rs` |
+| 51 | Stale/foreign handles rejected             | unit test            | `stale_or_foreign_handle_is_rejected_without_panic`                                   | `builder_tests.rs` |
+| 52 | `reset` restores builder to fresh state    | unit test            | `reset_allows_fresh_reuse_and_resets_ids`                                             | `builder_tests.rs` |
+| 53 | `add_spec_ref` validates and allocates     | unit test            | `add_spec_ref_happy_path`, `add_spec_ref_rejects_inverted_range`                      | `builder_tests.rs` |
+| 54 | Config rejects invalid limits              | unit test            | `config_rejects_zero_entry_limit`, `config_rejects_entry_limit_exceeding_cap`         | `builder_tests.rs` |
+| 55 | Error mapping for invalid inputs           | unit test            | `add_range_with_inverted_bounds_returns_range_invalid`, `add_prefix_with_empty_prefix_returns_prefix_invalid`, `add_manifest_with_inverted_rows_returns_manifest_ctor_invalid` | `builder_tests.rs` |
+| 56 | `split_range_by_boundaries` atomicity      | unit test            | `split_range_by_boundaries_exact_capacity_preserves_ordering`, `split_range_by_boundaries_under_capacity_succeeds`, `split_range_capacity_exceeded_has_no_partial_writes`, `split_range_fan_out_exceeded_has_no_partial_writes` | `builder_tests.rs` |
+| 57 | `split_manifest_by_rows` atomicity         | unit test            | `split_manifest_by_rows_exact_capacity_tiles_manifest_rows`, `split_manifest_by_rows_under_capacity_succeeds`, `split_manifest_by_rows_capacity_exceeded_has_no_partial_writes`, `split_manifest_by_rows_fan_out_exceeded_has_no_partial_writes` | `builder_tests.rs` |
+| 58 | Manifest split handles u64 boundary        | unit test            | `split_manifest_by_rows_handles_u64_boundary_without_wrap`                             | `builder_tests.rs` |
 
 ---
 
@@ -468,7 +474,7 @@ cargo test -p gossip-frontier --lib builder_tests
 | D3.11 | `byte_midpoint` uses integer arithmetic (add-then-halve) with overflow-normalized fallback |
 | D3.12 | `key_successor` prefers append-zero over increment for tightest possible successor        |
 | D3.13 | `prefix_successor` follows FoundationDB `strinc` / CockroachDB `Key.PrefixEnd` semantics |
-| D3.14 | Empty metadata decodes to `ShardHint::Range` (backward-compatible default)                |
+| D3.14 | Empty metadata decodes to `ShardHint::Range` (conservative default behavior)              |
 | D3.15 | `propagate_hint_on_split` validates child boundaries against parent hint before deriving   |
 | D3.16 | `#![forbid(unsafe_code)]` -- entire crate is safe Rust                                    |
 
