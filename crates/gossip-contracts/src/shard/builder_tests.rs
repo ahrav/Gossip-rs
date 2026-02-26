@@ -1,6 +1,22 @@
+//! Behavioral contract tests for [`PreallocShardBuilder`].
+//!
+//! These tests focus on the builder's public guarantees:
+//! - add-path validation and error mapping (`RangeInvalid`, `PrefixInvalid`,
+//!   `ManifestCtorInvalid`, `SlabFull`, `CapacityExceeded`)
+//! - staging/build-phase separation (some invalid states are accepted at add
+//!   time and rejected by `build_inputs` manifest validation)
+//! - split helper semantics (up-front entry-budget checks, bounded fan-out, and
+//!   no partial writes when projected capacity is insufficient)
+//! - lifecycle/reset behavior (ID sequencing, reuse, and stale-handle rejection)
+//!
+//! The goal is to pin externally visible behavior rather than internal layout.
+
+use rstest::rstest;
+
 use super::{PreallocShardBuilder, PreallocShardBuilderError};
 use crate::coordination::{
-    CursorUpdate, ManifestValidationError, ShardArena, ShardSpecRef, validate_manifest,
+    CursorUpdate, MAX_SPLIT_CHILDREN, ManifestValidationError, ShardArena, ShardSpecRef,
+    validate_manifest,
 };
 use crate::shard::key_encoding::decode_manifest_row_key;
 
@@ -126,6 +142,9 @@ fn arena_byte_exhaustion_returns_slab_full() {
 
 #[test]
 fn stale_or_foreign_handle_is_rejected_without_panic() {
+    // Build a handle that is definitely invalid for the builder arena: allocate
+    // in a different arena, then free it so both arena identity and generation
+    // checks may reject it.
     let mut foreign_arena = ShardArena::with_capacity(1, 256);
     let handle = foreign_arena
         .alloc_spec(ShardSpecRef::new(b"a", b"b", b""))
@@ -294,7 +313,8 @@ fn add_manifest_with_cursor_preserves_initial_cursor() {
 fn add_manifest_with_cursor_preserves_explicit_cursor() {
     // Manifest key encoding: BE(manifest_id) ++ BE(row), 16 bytes total.
     // For manifest_id=7, row range [0, 10), a cursor at row=5 is in-bounds.
-    // Declared before arena/builder so it outlives the borrowed CursorUpdate.
+    // Declared before arena/builder so the borrowed cursor bytes outlive both
+    // add-time staging and build-time validation.
     let mut cursor_key = [0u8; 16];
     cursor_key[..8].copy_from_slice(&7u64.to_be_bytes());
     cursor_key[8..].copy_from_slice(&5u64.to_be_bytes());
@@ -353,10 +373,34 @@ fn split_range_by_boundaries_exact_capacity_preserves_ordering() {
 }
 
 #[test]
-fn split_range_by_boundaries_over_capacity_has_no_partial_writes() {
-    let mut arena = ShardArena::with_capacity(4, 4_096);
-    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 3).unwrap();
+fn split_range_by_boundaries_under_capacity_succeeds() {
+    let mut arena = ShardArena::with_capacity(5, 4_096);
+    let mut builder = PreallocShardBuilder::<5>::new(&mut arena, 5).unwrap();
     let split_points: [&[u8]; 3] = [b"f", b"m", b"t"];
+    builder
+        .split_range_by_boundaries(b"a", &split_points, b"z", b"")
+        .unwrap();
+
+    assert_eq!(builder.len(), 4);
+    assert_eq!(builder.remaining_entries(), 1);
+}
+
+#[rstest]
+#[case::over_capacity(4, 3, vec![b"f".as_slice(), b"m", b"t"], 3, 4)]
+#[case::over_max_split_children(
+    512, 512,
+    vec![b"m".as_slice(); MAX_SPLIT_CHILDREN],
+    MAX_SPLIT_CHILDREN, MAX_SPLIT_CHILDREN + 1,
+)]
+fn split_range_capacity_exceeded_has_no_partial_writes(
+    #[case] arena_slots: usize,
+    #[case] entry_limit: usize,
+    #[case] split_points: Vec<&[u8]>,
+    #[case] exp_limit: usize,
+    #[case] exp_additional: usize,
+) {
+    let mut arena = ShardArena::with_capacity(arena_slots, 4_096);
+    let mut builder = PreallocShardBuilder::<512>::new(&mut arena, entry_limit).unwrap();
     let err = builder
         .split_range_by_boundaries(b"a", &split_points, b"z", b"")
         .unwrap_err();
@@ -364,10 +408,10 @@ fn split_range_by_boundaries_over_capacity_has_no_partial_writes() {
     assert!(matches!(
         err,
         PreallocShardBuilderError::CapacityExceeded {
-            limit: 3,
+            limit,
             current: 0,
-            additional: 4
-        }
+            additional,
+        } if limit == exp_limit && additional == exp_additional
     ));
     assert!(builder.is_empty());
 }
@@ -392,20 +436,54 @@ fn split_manifest_by_rows_exact_capacity_tiles_manifest_rows() {
 }
 
 #[test]
-fn split_manifest_by_rows_over_capacity_has_no_partial_writes() {
-    let mut arena = ShardArena::with_capacity(3, 4_096);
-    let mut builder = PreallocShardBuilder::<3>::new(&mut arena, 2).unwrap();
+fn split_manifest_by_rows_under_capacity_succeeds() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let mut builder = PreallocShardBuilder::<4>::new(&mut arena, 4).unwrap();
+    builder.split_manifest_by_rows(7, 0, 10, 4, b"").unwrap();
+
+    assert_eq!(builder.len(), 3);
+    assert_eq!(builder.remaining_entries(), 1);
+}
+
+#[rstest]
+#[case::over_capacity(3, 2, 10, 4, 4_096, 2, 3)]
+#[case::over_max_split_children(
+    512, 512,
+    u64::try_from(MAX_SPLIT_CHILDREN).unwrap() + 1,
+    1, 4_096,
+    MAX_SPLIT_CHILDREN, MAX_SPLIT_CHILDREN + 1,
+)]
+#[case::rounding_overflow(
+    512, 512, u64::MAX,
+    {
+        let target = u64::try_from(MAX_SPLIT_CHILDREN + 1).unwrap();
+        (u64::MAX / target).saturating_add(1)
+    },
+    1_000_000,
+    MAX_SPLIT_CHILDREN, MAX_SPLIT_CHILDREN + 1,
+)]
+fn split_manifest_by_rows_capacity_exceeded_has_no_partial_writes(
+    #[case] arena_slots: usize,
+    #[case] entry_limit: usize,
+    #[case] end_row: u64,
+    #[case] rows_per_shard: u64,
+    #[case] arena_bytes: usize,
+    #[case] exp_limit: usize,
+    #[case] exp_additional: usize,
+) {
+    let mut arena = ShardArena::with_capacity(arena_slots, arena_bytes);
+    let mut builder = PreallocShardBuilder::<512>::new(&mut arena, entry_limit).unwrap();
     let err = builder
-        .split_manifest_by_rows(7, 0, 10, 4, b"")
+        .split_manifest_by_rows(7, 0, end_row, rows_per_shard, b"")
         .unwrap_err();
 
     assert!(matches!(
         err,
         PreallocShardBuilderError::CapacityExceeded {
-            limit: 2,
+            limit,
             current: 0,
-            additional: 3
-        }
+            additional,
+        } if limit == exp_limit && additional == exp_additional
     ));
     assert!(builder.is_empty());
 }
