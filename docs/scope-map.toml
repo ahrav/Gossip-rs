@@ -34,9 +34,9 @@ dir = "crates/gossip-coordination/src/"
 doc = "docs/coordination-testing.md"
 dir = "crates/gossip-coordination/src/sim/"
 
-# Shard algebra moved to frontier.
+# Boundary 3: Shard algebra (key encoding, hints, builder).
 [[scopes]]
-doc = "docs/coordination-testing.md"
+doc = "docs/boundary-3-shard-algebra.md"
 dir = "crates/gossip-frontier/src/"
 
 [[scopes]]
