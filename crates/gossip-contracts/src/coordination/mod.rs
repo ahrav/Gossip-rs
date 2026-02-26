@@ -22,7 +22,7 @@
 //! ├── shard_spec.rs    ShardSpec, ShardSpecRef, CursorSemantics — key ranges and split validation
 //! ├── cursor.rs        CursorUpdate — two-layer progress marker
 //! ├── pooled.rs        PooledShardSpec, PooledCursor — arena-backed zero-alloc hot-path storage
-//! ├── split.rs         Split-replace planner core (shape+coverage, backend-agnostic)
+//! ├── split.rs         Split planner core (replace + residual, backend-agnostic)
 //! ├── manifest.rs      InitialShardInput, validate_manifest — shard registration validation
 //! └── limits.rs        MAX_SPLIT_CHILDREN, MAX_SPAWNED_PER_SHARD — split capacity constants
 //! ```
@@ -64,10 +64,12 @@ pub use shard_spec::{
     validate_residual_split, validate_split_coverage,
 };
 
-// -- Split-replace planning core (execution lives in gossip-coordination) --
+// -- Split planning core (execution lives in gossip-coordination) --
 pub use split::{
     SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError, SplitReplacePlanningError,
-    plan_split_replace, plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,
+    SplitResidualPlan, SplitResidualPlanError, SplitResidualPlanningError, plan_split_replace,
+    plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor, plan_split_residual,
+    plan_split_residual_at_point, plan_split_residual_from_cursor,
 };
 
 // shard_spec_tests.rs is declared inside shard_spec.rs via #[path] attribute.

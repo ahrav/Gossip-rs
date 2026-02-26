@@ -17,11 +17,10 @@
 //!
 //! ## Planning vs Execution
 //!
-//! Split-replace planner mechanics (plan types and `plan_split_replace*`
-//! constructors) are owned by
-//! [`gossip_contracts::coordination::split`]. This module owns
+//! Split planner mechanics (plan types and `plan_split_*` constructors) are
+//! owned by [`gossip_contracts::coordination::split`]. This module owns
 //! coordination-layer split execution support: derived IDs, payload hashes,
-//! and split-residual plan/result types used directly by the backend.
+//! and execution result types used directly by the backend.
 //!
 //! This module intentionally does not own full split precondition validation.
 //! Backend implementations validate live-state invariants (lease/fence
@@ -50,8 +49,6 @@
 //! `OP_PAYLOAD_V1` domain. Hash helpers are intentionally pure and do not
 //! validate protocol preconditions.
 
-use std::fmt;
-
 use blake3::Hasher;
 use gossip_stdx::InlineVec;
 
@@ -60,12 +57,11 @@ use crate::record::ParkReason;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 #[cfg(test)]
 use gossip_contracts::coordination::shard_spec::ShardSpec;
-use gossip_contracts::coordination::shard_spec::ShardSpecRef;
-use gossip_contracts::coordination::split::SplitReplacePlan;
 #[cfg(test)]
 use gossip_contracts::coordination::split::{
-    SplitReplaceChild, plan_split_replace_at_points_initial_cursor,
+    SplitReplaceChild, SplitResidualPlanError, plan_split_replace_at_points_initial_cursor,
 };
+use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
 use gossip_contracts::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
 use gossip_contracts::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
 
@@ -129,135 +125,12 @@ const _: () = assert!(DerivedShardKind::Residual as u8 == 1);
 const _: () = assert!(core::mem::size_of::<DerivedShardKind>() == 1);
 
 // ============================================================================
-// Split-replace planning
+// Split plan ownership notes
 // ============================================================================
 //
-// Split-replace planner types and constructors live in
-// `gossip_contracts::coordination::split`. This module consumes those types
-// for payload hashing and backend execution.
-
-// ============================================================================
-// SplitResidualPlan
-// ============================================================================
-
-/// Plan for a split-residual operation: parent shrinks its key range and
-/// a new residual shard covers the remainder.
-///
-/// ```text
-/// Before:  parent [────────────────────────)
-///                  ^cursor here
-///
-/// After:   parent [──────────)              ← keeps scanning (Active)
-///                  ^cursor    residual [────) ← new shard, initial cursor
-/// ```
-///
-/// The parent keeps `parent_new_spec` (the prefix it has already partially
-/// scanned) and continues processing with its existing lease. The residual
-/// shard gets `residual_spec` (the unprocessed suffix) and starts from
-/// `CursorUpdate::initial()` (enforced by the coordinator, not by this type).
-///
-/// ## Key Difference from Split-Replace
-///
-/// Split-replace is terminal for the parent (status -> Split). Split-residual
-/// is non-terminal: the parent stays Active with a narrowed range. This makes
-/// split-residual the right choice when a worker wants to shed its tail
-/// while continuing to process its prefix.
-///
-/// ## Coverage Contract
-///
-/// `parent_new_spec union residual_spec` must equal the parent's original
-/// `ShardSpec` range, with no overlap. This is enforced by the coordinator
-/// at execution time via [`validate_residual_split`](gossip_contracts::coordination::shard_spec::validate_residual_split),
-/// not by this plan type.
-///
-/// ## Intentional Minimalism
-///
-/// This type carries only target specs so call sites can stage a residual
-/// operation without needing mutable access to live parent state. Invariants
-/// that depend on live state (for example, parent cursor remaining in-bounds
-/// after shrink) are validated by backend execution code.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SplitResidualPlan<'a> {
-    parent_new_spec: ShardSpecRef<'a>,
-    residual_spec: ShardSpecRef<'a>,
-}
-
-/// Error returned when a [`SplitResidualPlan`] is constructed with
-/// identical specs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SplitResidualPlanError {
-    /// `parent_new_spec` and `residual_spec` are identical — a residual
-    /// split must actually shrink the parent and produce a distinct range.
-    IdenticalSpecs,
-}
-
-impl fmt::Display for SplitResidualPlanError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::IdenticalSpecs => {
-                write!(
-                    f,
-                    "split-residual requires parent_new_spec and residual_spec to differ"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for SplitResidualPlanError {}
-
-impl<'a> SplitResidualPlan<'a> {
-    /// Construct a residual plan with a minimal structural guard.
-    ///
-    /// The only check performed here is that the two specs differ
-    /// (identical specs would mean no actual split occurred). The full
-    /// coverage contract — `parent_new_spec ∪ residual_spec` equals the
-    /// original parent range with no overlap — is enforced by the
-    /// coordinator at execution time via
-    /// [`validate_residual_split`](gossip_contracts::coordination::shard_spec::validate_residual_split).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SplitResidualPlanError::IdenticalSpecs`] if
-    /// `parent_new_spec == residual_spec`.
-    pub fn try_new(
-        parent_new_spec: ShardSpecRef<'a>,
-        residual_spec: ShardSpecRef<'a>,
-    ) -> Result<Self, SplitResidualPlanError> {
-        if parent_new_spec == residual_spec {
-            return Err(SplitResidualPlanError::IdenticalSpecs);
-        }
-        Ok(Self {
-            parent_new_spec,
-            residual_spec,
-        })
-    }
-
-    /// The parent's new (shrunk) specification — the range it keeps.
-    #[inline]
-    #[must_use]
-    pub fn parent_new_spec(&self) -> ShardSpecRef<'a> {
-        self.parent_new_spec
-    }
-
-    /// The residual shard's specification — the range split off.
-    #[inline]
-    #[must_use]
-    pub fn residual_spec(&self) -> ShardSpecRef<'a> {
-        self.residual_spec
-    }
-}
-
-impl CanonicalBytes for SplitResidualPlan<'_> {
-    /// Encodes `parent_new_spec || residual_spec` in that order.
-    ///
-    /// No length prefix is needed because a residual plan always has exactly
-    /// two fixed-position fields, so the boundary is unambiguous.
-    fn write_canonical(&self, h: &mut Hasher) {
-        self.parent_new_spec.write_canonical(h);
-        self.residual_spec.write_canonical(h);
-    }
-}
+// Split-replace and split-residual planner types/constructors live in
+// `gossip_contracts::coordination::split`. This module only consumes those
+// plans for payload hashing, derived-ID computation, and execution results.
 
 // ============================================================================
 // Split operation result types

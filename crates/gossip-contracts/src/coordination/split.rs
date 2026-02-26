@@ -1,8 +1,9 @@
-//! Split-replace planning types and helper constructors.
+//! Split planning types and helper constructors.
 //!
 //! Ownership boundary:
-//! - This module owns backend-agnostic split-replace planning: child-count
-//!   shape checks and parent-range coverage validation.
+//! - This module owns backend-agnostic split planning:
+//!   - split-replace child-count shape checks and parent-range coverage validation
+//!   - split-residual partition planning and cursor-successor split-point derivation
 //! - Execution-time concerns stay in `gossip-coordination` backends:
 //!   lease/fence checks, spawn-limit checks, derived-ID collision handling,
 //!   idempotency/op-log behavior, and record mutation ordering.
@@ -13,10 +14,10 @@
 
 use std::fmt;
 
-use crate::coordination::cursor::CursorUpdate;
+use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use crate::coordination::limits::MAX_SPLIT_CHILDREN;
 use crate::coordination::shard_spec::{
-    ShardSpecRef, SplitValidationError, validate_split_coverage_bounds,
+    ShardSpecRef, SplitValidationError, validate_residual_split, validate_split_coverage_bounds,
 };
 use crate::identity::CanonicalBytes;
 use blake3::Hasher;
@@ -290,6 +291,241 @@ pub fn plan_split_replace_at_points_initial_cursor<'a>(
     plan_split_replace_at_points(parent, split_points, |_, _| CursorUpdate::initial())
 }
 
+// ============================================================================
+// Split-residual planning
+// ============================================================================
+
+/// Plan for a split-residual operation: parent shrinks its key range and
+/// a new residual shard covers the remainder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitResidualPlan<'a> {
+    parent_new_spec: ShardSpecRef<'a>,
+    residual_spec: ShardSpecRef<'a>,
+}
+
+/// Error returned when a [`SplitResidualPlan`] is constructed with
+/// identical specs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitResidualPlanError {
+    /// `parent_new_spec` and `residual_spec` are identical — a residual
+    /// split must shrink the parent and produce a distinct range.
+    IdenticalSpecs,
+}
+
+impl fmt::Display for SplitResidualPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdenticalSpecs => {
+                write!(
+                    f,
+                    "split-residual requires parent_new_spec and residual_spec to differ"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SplitResidualPlanError {}
+
+impl<'a> SplitResidualPlan<'a> {
+    /// Construct a residual plan with a minimal structural guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SplitResidualPlanError::IdenticalSpecs`] if
+    /// `parent_new_spec == residual_spec`.
+    pub fn try_new(
+        parent_new_spec: ShardSpecRef<'a>,
+        residual_spec: ShardSpecRef<'a>,
+    ) -> Result<Self, SplitResidualPlanError> {
+        if parent_new_spec == residual_spec {
+            return Err(SplitResidualPlanError::IdenticalSpecs);
+        }
+        Ok(Self {
+            parent_new_spec,
+            residual_spec,
+        })
+    }
+
+    /// The parent's new (shrunk) specification.
+    #[inline]
+    #[must_use]
+    pub fn parent_new_spec(&self) -> ShardSpecRef<'a> {
+        self.parent_new_spec
+    }
+
+    /// The residual shard's specification.
+    #[inline]
+    #[must_use]
+    pub fn residual_spec(&self) -> ShardSpecRef<'a> {
+        self.residual_spec
+    }
+}
+
+impl CanonicalBytes for SplitResidualPlan<'_> {
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.parent_new_spec.write_canonical(h);
+        self.residual_spec.write_canonical(h);
+    }
+}
+
+/// Error returned by split-residual planning helpers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitResidualPlanningError {
+    /// Cursor-derived planning requires `cursor.last_key`.
+    MissingCursor,
+    /// `cursor.last_key` has no representable successor within the keyspace.
+    NoSuccessor,
+    /// Cursor-derived split point falls outside the parent range.
+    ///
+    /// Fields store byte lengths rather than raw key bytes to avoid logging
+    /// potentially large cursor payloads.
+    SplitPointOutOfBounds {
+        /// Length of the derived split point (`key_successor(cursor.last_key)`).
+        split_point: usize,
+        /// Length of `parent.key_range_start()`.
+        parent_start: usize,
+        /// Length of `parent.key_range_end()`.
+        parent_end: usize,
+    },
+    /// Residual plan shape invariants failed.
+    InvalidPlan(SplitResidualPlanError),
+    /// Residual partition validation failed against the parent range.
+    InvalidCoverage(SplitValidationError),
+}
+
+impl fmt::Display for SplitResidualPlanningError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingCursor => {
+                write!(f, "split-residual cursor planning requires cursor.last_key")
+            }
+            Self::NoSuccessor => write!(f, "cursor key has no representable successor"),
+            Self::SplitPointOutOfBounds { .. } => {
+                write!(f, "cursor successor falls outside parent range")
+            }
+            Self::InvalidPlan(err) => err.fmt(f),
+            Self::InvalidCoverage(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SplitResidualPlanningError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPlan(err) => Some(err),
+            Self::InvalidCoverage(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+/// Build and validate a split-residual plan against a parent shard.
+///
+/// # Errors
+///
+/// - [`SplitResidualPlanningError::InvalidPlan`] when the candidate specs are
+///   structurally invalid.
+/// - [`SplitResidualPlanningError::InvalidCoverage`] when the specs do not
+///   form a valid residual partition of `parent`.
+pub fn plan_split_residual<'a>(
+    parent: ShardSpecRef<'a>,
+    parent_new_spec: ShardSpecRef<'a>,
+    residual_spec: ShardSpecRef<'a>,
+) -> Result<SplitResidualPlan<'a>, SplitResidualPlanningError> {
+    let plan = SplitResidualPlan::try_new(parent_new_spec, residual_spec)
+        .map_err(SplitResidualPlanningError::InvalidPlan)?;
+    validate_residual_split(parent, plan.parent_new_spec(), plan.residual_spec())
+        .map_err(SplitResidualPlanningError::InvalidCoverage)?;
+    Ok(plan)
+}
+
+/// Build a split-residual plan from an explicit split point.
+///
+/// The split point defines:
+/// - parent new range: `[parent.start, split_point)`
+/// - residual range: `[split_point, parent.end)`
+///
+/// # Errors
+///
+/// Propagates [`SplitResidualPlanningError`] from [`plan_split_residual`].
+pub fn plan_split_residual_at_point<'a>(
+    parent: ShardSpecRef<'a>,
+    split_point: &'a [u8],
+) -> Result<SplitResidualPlan<'a>, SplitResidualPlanningError> {
+    let parent_new_spec =
+        ShardSpecRef::new(parent.key_range_start(), split_point, parent.metadata());
+    let residual_spec = ShardSpecRef::new(split_point, parent.key_range_end(), parent.metadata());
+    plan_split_residual(parent, parent_new_spec, residual_spec)
+}
+
+#[inline]
+fn prefix_successor_into<'a>(prefix: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Option<&'a [u8]> {
+    if prefix.is_empty() || prefix.len() > MAX_KEY_SIZE {
+        return None;
+    }
+    let last_non_ff = prefix.iter().rposition(|&byte| byte != u8::MAX)?;
+    let out_len = last_non_ff + 1;
+    out[..out_len].copy_from_slice(&prefix[..out_len]);
+    out[last_non_ff] += 1;
+    Some(&out[..out_len])
+}
+
+#[inline]
+fn key_successor_into<'a>(key: &[u8], out: &'a mut [u8; MAX_KEY_SIZE]) -> Option<&'a [u8]> {
+    if key.len() > MAX_KEY_SIZE {
+        return None;
+    }
+
+    if key.len() < MAX_KEY_SIZE {
+        out[..key.len()].copy_from_slice(key);
+        out[key.len()] = 0;
+        return Some(&out[..key.len() + 1]);
+    }
+
+    prefix_successor_into(key, out)
+}
+
+/// Build a split-residual plan from a cursor, using successor semantics.
+///
+/// The split point is derived as `key_successor(cursor.last_key)` and the plan
+/// is then built as `[parent.start, split_point)` + `[split_point, parent.end)`.
+///
+/// `successor_scratch` is caller-owned reusable storage for the derived split
+/// point and allows the returned plan to remain fully borrowed.
+///
+/// # Errors
+///
+/// - [`SplitResidualPlanningError::MissingCursor`] when `cursor.last_key()` is
+///   absent.
+/// - [`SplitResidualPlanningError::NoSuccessor`] when the key has no
+///   representable successor.
+/// - [`SplitResidualPlanningError::SplitPointOutOfBounds`] when the successor
+///   is outside `(parent.start, parent.end)`.
+/// - Any validation error from [`plan_split_residual_at_point`].
+pub fn plan_split_residual_from_cursor<'a>(
+    parent: ShardSpecRef<'a>,
+    cursor: CursorUpdate<'a>,
+    successor_scratch: &'a mut [u8; MAX_KEY_SIZE],
+) -> Result<SplitResidualPlan<'a>, SplitResidualPlanningError> {
+    let last_key = cursor
+        .last_key()
+        .ok_or(SplitResidualPlanningError::MissingCursor)?;
+    let split_point = key_successor_into(last_key, successor_scratch)
+        .ok_or(SplitResidualPlanningError::NoSuccessor)?;
+
+    if split_point <= parent.key_range_start() || split_point >= parent.key_range_end() {
+        return Err(SplitResidualPlanningError::SplitPointOutOfBounds {
+            split_point: split_point.len(),
+            parent_start: parent.key_range_start().len(),
+            parent_end: parent.key_range_end().len(),
+        });
+    }
+
+    plan_split_residual_at_point(parent, split_point)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +758,103 @@ mod tests {
         assert!(
             matches!(err, SplitReplacePlanningError::InvalidCoverage(_)),
             "expected InvalidCoverage, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn split_residual_plan_valid() {
+        let parent = ShardSpec::with_range(b"a", b"m");
+        let residual = ShardSpec::with_range(b"m", b"z");
+        let plan = SplitResidualPlan::try_new(parent.as_ref(), residual.as_ref()).unwrap();
+        assert_eq!(plan.parent_new_spec(), parent.as_ref());
+        assert_eq!(plan.residual_spec(), residual.as_ref());
+    }
+
+    #[test]
+    fn split_residual_plan_identical_specs_returns_error() {
+        let spec = ShardSpec::with_range(b"a", b"z");
+        assert_eq!(
+            SplitResidualPlan::try_new(spec.as_ref(), spec.as_ref()),
+            Err(SplitResidualPlanError::IdenticalSpecs),
+        );
+    }
+
+    #[test]
+    fn plan_split_residual_accepts_valid_partition() {
+        let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
+        let new_parent = ShardSpecRef::new(b"a", b"m", b"meta");
+        let residual = ShardSpecRef::new(b"m", b"z", b"meta");
+        let plan = plan_split_residual(parent.as_ref(), new_parent, residual).unwrap();
+        assert_eq!(plan.parent_new_spec().key_range_start(), b"a");
+        assert_eq!(plan.parent_new_spec().key_range_end(), b"m");
+        assert_eq!(plan.residual_spec().key_range_start(), b"m");
+        assert_eq!(plan.residual_spec().key_range_end(), b"z");
+        assert_eq!(plan.parent_new_spec().metadata(), b"meta");
+        assert_eq!(plan.residual_spec().metadata(), b"meta");
+    }
+
+    #[test]
+    fn plan_split_residual_rejects_coverage_violation() {
+        let parent = ShardSpec::with_range(b"a", b"z");
+        let new_parent = ShardSpecRef::new(b"a", b"m", b"");
+        let residual = ShardSpecRef::new(b"n", b"z", b"");
+        let err = plan_split_residual(parent.as_ref(), new_parent, residual).unwrap_err();
+        assert!(
+            matches!(err, SplitResidualPlanningError::InvalidCoverage(_)),
+            "expected InvalidCoverage, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn plan_split_residual_from_cursor_uses_successor_split_point() {
+        let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
+        let cursor = CursorUpdate::with_last_key(b"m");
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let plan = plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap();
+
+        assert_eq!(plan.parent_new_spec().key_range_start(), b"a");
+        assert_eq!(plan.parent_new_spec().key_range_end(), b"m\0");
+        assert_eq!(plan.residual_spec().key_range_start(), b"m\0");
+        assert_eq!(plan.residual_spec().key_range_end(), b"z");
+        assert_eq!(plan.parent_new_spec().metadata(), b"meta");
+        assert_eq!(plan.residual_spec().metadata(), b"meta");
+    }
+
+    #[test]
+    fn plan_split_residual_from_cursor_rejects_missing_cursor() {
+        let parent = ShardSpec::with_range(b"a", b"z");
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let err =
+            plan_split_residual_from_cursor(parent.as_ref(), CursorUpdate::initial(), &mut scratch)
+                .unwrap_err();
+        assert_eq!(err, SplitResidualPlanningError::MissingCursor);
+    }
+
+    #[test]
+    fn plan_split_residual_from_cursor_rejects_no_successor() {
+        let end = vec![u8::MAX; MAX_KEY_SIZE];
+        let parent = ShardSpec::with_range([0u8], end.as_slice());
+        let cursor = CursorUpdate::with_last_key(end.as_slice());
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let err =
+            plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap_err();
+        assert_eq!(err, SplitResidualPlanningError::NoSuccessor);
+    }
+
+    #[test]
+    fn plan_split_residual_from_cursor_rejects_successor_on_parent_end() {
+        let parent = ShardSpec::with_range(b"a", b"m\0");
+        let cursor = CursorUpdate::with_last_key(b"m");
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let err =
+            plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap_err();
+        assert_eq!(
+            err,
+            SplitResidualPlanningError::SplitPointOutOfBounds {
+                split_point: 2,
+                parent_start: 1,
+                parent_end: 2,
+            },
         );
     }
 }

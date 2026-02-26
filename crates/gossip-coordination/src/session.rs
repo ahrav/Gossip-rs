@@ -79,12 +79,12 @@
 //! deadline (via `Lease::set_deadline`) and the capacity hint, but
 //! not the snapshot.
 //!
-//! The snapshot state **is** refreshed by
+//! The snapshot state **is** refreshed after an executed
 //! [`split_residual`](WorkerSession::split_residual) because the key range
 //! narrows, and subsequent [`checkpoint`](WorkerSession::checkpoint) calls
-//! must not present cursors outside the narrowed range. While the backend
-//! would reject such cursors regardless, keeping the session view consistent
-//! avoids confusing the worker's own bounds logic.
+//! must not present cursors outside the narrowed range. Replay outcomes keep
+//! the existing snapshot unchanged: either this session already narrowed it,
+//! or a fresh acquire already observed the narrowed spec.
 
 use gossip_stdx::InlineVec;
 
@@ -94,12 +94,12 @@ use crate::error::{
 };
 use crate::lease::Lease;
 use crate::record::{ParkReason, ShardStatus};
-use crate::split_execution::{SplitReplaceResult, SplitResidualPlan, SplitResidualResult};
+use crate::split_execution::{SplitReplaceResult, SplitResidualResult};
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
-use gossip_contracts::coordination::split::SplitReplacePlan;
+use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
 use gossip_contracts::identity::{LogicalTime, OpId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================

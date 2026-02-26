@@ -32,9 +32,9 @@ use crate::error::{
 };
 use crate::lease::Lease;
 use crate::record::ParkReason;
-use crate::split_execution::{SplitReplaceResult, SplitResidualPlan, SplitResidualResult};
+use crate::split_execution::{SplitReplaceResult, SplitResidualResult};
 use gossip_contracts::coordination::cursor::CursorUpdate;
-use gossip_contracts::coordination::split::SplitReplacePlan;
+use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
 use gossip_contracts::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 
 /// The coordination contract for the distributed secret scanner.
@@ -193,7 +193,6 @@ pub trait CoordinationBackend {
     /// - `TenantMismatch` -- the record belongs to a different tenant.
     /// - `ShardTerminal` -- the shard is in a terminal state (Done/Split/Parked).
     /// - `AlreadyLeased` -- the shard has a live lease held by another worker.
-    /// - `SlabFull` -- the backend's byte slab lacks capacity for the snapshot.
     ///
     /// `out` is caller-owned scratch reused across calls. Implementations may
     /// overwrite it fully and must not retain references into it after return.
@@ -444,9 +443,11 @@ pub trait CoordinationBackend {
     /// Returns [`SplitReplaceError`] on failure:
     /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
     /// - Lease validation failures (same as other lease-gated operations).
-    /// - `SplitCoverage` -- children do not exactly partition the parent's range.
-    /// - `SpawnLimitExceeded` -- total spawned children would exceed
-    ///   [`MAX_SPAWNED_PER_SHARD`](gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD).
+    /// - `SplitInvalid(SplitValidationError)` -- split geometry or spawn-cap
+    ///   preconditions failed (for example: coverage mismatch, invalid child
+    ///   spec, or spawn limit exceeded).
+    /// - `ResourceExhausted` -- allocation failed while materializing split
+    ///   records in slab-backed storage.
     ///
     /// ## Production note
     ///
@@ -474,7 +475,9 @@ pub trait CoordinationBackend {
     /// 1. Check idempotency via `op_id` (replay succeeds even after
     ///    lease expiry or terminal status).
     /// 2. Validate lease and preconditions.
-    /// 3. Validate residual split via `validate_residual_split`.
+    /// 3. Validate residual split geometry against the parent bounds and
+    ///    ensure the existing parent cursor remains inside the narrowed
+    ///    `plan.parent_new_spec()`.
     /// 4. Derive deterministic residual ID via `derive_split_shard_id`
     ///    with `DerivedShardKind::Residual` and index `spawned.len()`.
     /// 5. Update parent's spec to `plan.parent_new_spec`.
@@ -504,10 +507,11 @@ pub trait CoordinationBackend {
     /// Returns [`SplitResidualError`] on failure:
     /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
     /// - Lease validation failures (same as other lease-gated operations).
-    /// - `ResidualSplitInvalid` -- `parent_new_spec union residual_spec` does
-    ///   not exactly cover the parent's original range.
-    /// - `SpawnLimitExceeded` -- total spawned shards would exceed
-    ///   [`MAX_SPAWNED_PER_SHARD`](gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD).
+    /// - `SplitInvalid(SplitValidationError)` -- residual partition or
+    ///   preconditions failed (for example: invalid geometry, cursor
+    ///   stranded by shrink, or spawn limit exceeded).
+    /// - `ResourceExhausted` -- allocation failed while materializing split
+    ///   records in slab-backed storage.
     ///
     /// ## Production note
     ///
