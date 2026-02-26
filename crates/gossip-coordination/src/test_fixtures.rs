@@ -2,7 +2,7 @@
 //!
 //! Promotes commonly duplicated test helpers (tenant, run, shard factories,
 //! seeded coordinator setup) to a single `pub` location. Consumed by
-//! `in_memory_tests`, `conformance_tests`, `scenario_tests`, and any future
+//! `in_memory_tests`, `conformance_tests`, `scenario_tests`, and other
 //! coordination test modules.
 //!
 //! # Design rationale

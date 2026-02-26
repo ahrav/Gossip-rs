@@ -28,8 +28,8 @@
 //! validity, spawn limits, and derived-ID collision checks) before mutating
 //! records.
 //!
-//! Child cursors in split-replace plans are currently passed through as
-//! payload and are not re-validated against child specs at execution time.
+//! Child cursors in split-replace plans are passed through as payload and are
+//! not re-validated against child specs at execution time.
 //!
 //! ## Derived Shard IDs
 //!

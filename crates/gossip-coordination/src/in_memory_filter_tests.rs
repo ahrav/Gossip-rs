@@ -891,13 +891,12 @@ fn capacity_hint_helpers() {
 // `InMemoryCoordinator` offers multiple constructor entry points
 // (`new`, `with_limits`, `with_cooldown`, `with_runtime_config`).
 // These tests verify that constructors producing the same logical
-// configuration yield bit-identical internal state so callers can
-// migrate between constructors without behavioral drift.
+// configuration yield bit-identical internal state.
 
 /// Asserts constructor wrappers are behaviorally equivalent at initialization.
 ///
-/// This guards the runtime-config migration: legacy constructor entry points
-/// must preserve both limits/cooldown semantics and initial capacity policy.
+/// This guards constructor consistency: each entry point must preserve
+/// limits/cooldown semantics and initial capacity policy.
 fn assert_constructor_equivalent(lhs: &InMemoryCoordinator, rhs: &InMemoryCoordinator) {
     assert_eq!(lhs.default_lease_duration, rhs.default_lease_duration);
     assert_eq!(lhs.max_shards_per_tenant, rhs.max_shards_per_tenant);
@@ -926,8 +925,8 @@ fn runtime_constructor_matches_new_defaults() {
         DEFAULT_MAX_SHARDS_PER_TENANT,
         DEFAULT_MAX_TOTAL_SHARDS,
     ));
-    let legacy = InMemoryCoordinator::new(LEASE_DURATION);
-    assert_constructor_equivalent(&runtime, &legacy);
+    let wrapper = InMemoryCoordinator::new(LEASE_DURATION);
+    assert_constructor_equivalent(&runtime, &wrapper);
 }
 
 #[test]
@@ -937,8 +936,8 @@ fn runtime_constructor_matches_with_limits() {
         123,
         456,
     ));
-    let legacy = InMemoryCoordinator::with_limits(LEASE_DURATION, 123, 456);
-    assert_constructor_equivalent(&runtime, &legacy);
+    let wrapper = InMemoryCoordinator::with_limits(LEASE_DURATION, 123, 456);
+    assert_constructor_equivalent(&runtime, &wrapper);
 }
 
 #[test]
@@ -949,8 +948,8 @@ fn runtime_constructor_matches_with_cooldown() {
         456,
         9,
     ));
-    let legacy = InMemoryCoordinator::with_cooldown(LEASE_DURATION, 123, 456, 9);
-    assert_constructor_equivalent(&runtime, &legacy);
+    let wrapper = InMemoryCoordinator::with_cooldown(LEASE_DURATION, 123, 456, 9);
+    assert_constructor_equivalent(&runtime, &wrapper);
 }
 
 #[test]

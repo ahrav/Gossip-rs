@@ -13,8 +13,8 @@
 //!   concurrency concerns so invariants can be verified in-line.
 //! - **Purely in-memory** — two-level `AHashMap<TenantId, AHashMap<ShardKey, ShardRecord>>`.
 //!   No I/O, no transactions, no retries.
-//! - **No event emission wiring yet** — operation sites contain
-//!   `TODO(events)` markers where `EventCollector` hooks can be added later.
+//! - **Event hook points are explicit** — operation sites mark
+//!   `TODO(events)` integration points.
 //! - **Tiger-style invariant enforcement** — mutation paths that can affect
 //!   multi-field shard invariants call [`ShardRecord::assert_invariants()`]
 //!   before returning. Simpler paths (for example lease refresh/acquire
@@ -30,7 +30,7 @@
 //! - **Bounded idempotency** (Stripe pattern): shard-level mutations use a
 //!   16-entry FIFO op-log for `(OpId, payload_hash)` replay detection.
 //!   Run-level lifecycle operations use a separate run op-log
-//!   ([`RunRecord::OP_LOG_CAP`], currently 8 entries). Replays return cached
+//!   ([`RunRecord::OP_LOG_CAP`], 8 entries). Replays return cached
 //!   results; hash mismatches yield `OpIdConflict`.
 //!
 //! # Shard state machine
@@ -604,8 +604,8 @@ impl InMemoryCoordinator {
 
     /// Create a coordinator from explicit runtime constructor config.
     ///
-    /// `new`, `with_limits`, and `with_cooldown` all delegate here so
-    /// constructor behavior stays aligned while preserving existing call sites.
+    /// All public constructors delegate here so configuration semantics stay
+    /// aligned.
     /// The config also seeds conservative initial map/set capacities; shard
     /// limits are enforced by runtime checks, not by those initial capacities.
     /// Explicit slab capacity requests are sanitized through
@@ -656,8 +656,6 @@ impl InMemoryCoordinator {
 
     /// Create a coordinator with explicit shard count limits.
     ///
-    /// Compatibility wrapper for call sites that do not need claim cooldown.
-    ///
     /// # Panics
     ///
     /// Panics if `default_lease_duration` is 0 or if either limit is 0.
@@ -674,8 +672,6 @@ impl InMemoryCoordinator {
     }
 
     /// Create a coordinator with explicit shard limits and claim cooldown.
-    ///
-    /// Compatibility wrapper for call sites that set cooldown explicitly.
     ///
     /// # Parameters
     ///
@@ -1575,8 +1571,8 @@ impl SplitChildOrder {
                 .cmp(plan.children()[usize::from(*b)].spec().key_range_start())
         });
         // Defense-in-depth: `SplitReplacePlan::try_new` already enforces >= 2
-        // children at construction time, but this assertion guards against
-        // future refactors that might bypass the constructor.
+        // children at construction time; this assertion catches accidental
+        // bypass of constructor invariants.
         assert!(len >= 2, "split_replace requires >= 2 children");
         Self { len, indices }
     }

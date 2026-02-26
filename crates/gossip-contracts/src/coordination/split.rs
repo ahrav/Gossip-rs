@@ -30,9 +30,9 @@ use gossip_stdx::InlineVec;
 /// The planner carries cursor payloads through unchanged. It does not
 /// validate cursor semantics against live shard state.
 ///
-/// Today, `split_replace` execution also treats child cursors as opaque plan
-/// payload (shape/coverage are validated, cursor bounds are not re-checked), so
-/// callers should construct child cursors intentionally.
+/// `split_replace` execution treats child cursors as opaque plan payload.
+/// Execution validates shape/coverage but does not re-check cursor bounds
+/// against child specs, so callers must construct child cursors intentionally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SplitReplaceChild<'a> {
     spec: ShardSpecRef<'a>,
