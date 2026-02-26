@@ -53,6 +53,33 @@ fn push_and_as_slice() {
 }
 
 #[test]
+fn as_mut_slice_inline() {
+    let mut v = InlineVec::<u32, 4>::new();
+    v.push(30);
+    v.push(10);
+    v.push(20);
+    v.as_mut_slice().sort();
+    assert_eq!(v.as_slice(), &[10, 20, 30]);
+}
+
+#[test]
+fn as_mut_slice_heap() {
+    let mut v = InlineVec::<u32, 2>::new();
+    v.push(3);
+    v.push(1);
+    v.push(2); // spills to heap
+    assert!(matches!(v.repr, Repr::Heap(_)));
+    v.as_mut_slice().sort();
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+}
+
+#[test]
+fn as_mut_slice_empty() {
+    let mut v = InlineVec::<u32, 4>::new();
+    assert_eq!(v.as_mut_slice(), &mut []);
+}
+
+#[test]
 fn push_exactly_n() {
     let mut v = InlineVec::<u32, 4>::new();
     for i in 0..4 {

@@ -297,6 +297,27 @@ impl<T, const N: usize> InlineVec<T, N> {
         }
     }
 
+    /// Returns a mutable slice view of all elements.
+    ///
+    /// For the inline path, this constructs a mutable slice from the
+    /// `MaybeUninit` buffer. For the heap path, delegates to
+    /// `Vec::as_mut_slice`.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        match &mut self.repr {
+            Repr::Inline { buf, len } => {
+                let len = *len as usize;
+                // SAFETY: buf[0..len] are all initialized per the inline
+                // invariant. MaybeUninit<T> has the same layout as T, and
+                // the buffer is contiguous, so from_raw_parts_mut on the
+                // cast pointer is valid for len elements. We hold `&mut self`,
+                // so no aliasing violations.
+                unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<T>(), len) }
+            }
+            Repr::Heap(v) => v.as_mut_slice(),
+        }
+    }
+
     /// Returns an iterator over references to the elements.
     ///
     /// Delegates to `as_slice().iter()`.
