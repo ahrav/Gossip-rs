@@ -5,12 +5,15 @@
 //! startup preallocation. Arena slot/byte sizing is the caller's responsibility;
 //! the builder only validates logical entry limits.
 //!
-//! Two-phase workflow:
-//! - `add_*` methods validate and stage shard specs plus optional borrowed
-//!   cursor updates.
-//! - [`PreallocShardBuilder::build_inputs`] materializes
-//!   [`InitialShardInput`] rows and re-checks manifest-level invariants before
-//!   handoff to run registration.
+//! # Two-phase workflow
+//!
+//! 1. **Stage** -- `add_*` and `split_*` methods validate individual shard
+//!    specs and append them to the entry buffer, allocating arena-backed storage
+//!    for each spec's key range and metadata.
+//! 2. **Finalize** -- [`PreallocShardBuilder::build_inputs`] materializes
+//!    [`InitialShardInput`] rows and re-checks manifest-level invariants
+//!    (uniqueness, bounded ranges, overlap, cursor bounds) before handoff
+//!    to run registration.
 //!
 //! Error reporting is intentionally split by phase:
 //! - add-time errors isolate entry-limit violations, arena capacity failures,
@@ -18,14 +21,42 @@
 //!   [`PreallocShardBuilder::add_spec_handle`].
 //! - build-time errors surface manifest-shape violations and defensively report
 //!   invalid staged handles if they are observed.
+//!
+//! # Capacity hierarchy
+//!
+//! Three limits constrain how many entries can be staged, checked from
+//! innermost to outermost:
+//!
+//! - **`entry_limit`** -- the logical manifest cardinality cap chosen by the
+//!   caller at construction. All `add_*` / `split_*` methods check this first.
+//! - **`CAP`** -- the const-generic inline buffer size. `entry_limit <= CAP`
+//!   is enforced at construction; a compile-time assertion rejects `CAP > 1024`.
+//! - **[`MAX_INITIAL_SHARDS`]** -- the system-wide absolute ceiling.
+//!   `entry_limit <= MAX_INITIAL_SHARDS` is enforced at construction.
+//!
+//! Bulk split helpers additionally enforce [`MAX_SPLIT_CHILDREN`] as a per-call
+//! fan-out cap before checking the remaining entry budget.
+//!
+//! # Transactional semantics
+//!
+//! A successful `add_*` call appends exactly one new entry and consumes one
+//! shard ID. Failed `add_*` calls leave the staged manifest unchanged.
+//!
+//! Bulk split helpers preflight fan-out and entry budget before entering the
+//! allocation loop. `split_range_by_boundaries` additionally validates all
+//! child boundaries in a read-only pass before allocating, so **boundary
+//! errors leave the builder state completely unchanged**. However, if arena
+//! slab allocation fails mid-loop in either split helper, previously appended
+//! children remain staged while later children are lost.
 
 use core::fmt;
 
 use gossip_stdx::{InlineVec, SlabFull};
 
 use crate::coordination::{
-    CursorUpdate, InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, ShardArena,
-    ShardSpec, ShardSpecHandle, ShardSpecInputError, ShardSpecRef, validate_manifest,
+    CursorUpdate, InitialShardInput, MAX_INITIAL_SHARDS, MAX_SPLIT_CHILDREN,
+    ManifestValidationError, ShardArena, ShardSpec, ShardSpecHandle, ShardSpecInputError,
+    ShardSpecRef, validate_manifest,
 };
 use crate::identity::ShardId;
 use crate::shard::hint::{
@@ -59,6 +90,8 @@ pub enum PreallocShardBuilderError {
         current: usize,
         additional: usize,
     },
+    /// Bulk split fan-out exceeds [`MAX_SPLIT_CHILDREN`].
+    FanOutExceeded { limit: usize, requested: usize },
     /// Arena handle table or byte slab could not allocate another spec.
     SlabFull(SlabFull),
     /// Range constructor rejected bounds or metadata sizing.
@@ -94,6 +127,10 @@ impl fmt::Display for PreallocShardBuilderError {
                 f,
                 "entry capacity exceeded: {current} existing + {additional} new > {limit} limit"
             ),
+            Self::FanOutExceeded { limit, requested } => write!(
+                f,
+                "split fan-out exceeded: {requested} children requested > {limit} limit"
+            ),
             Self::SlabFull(err) => write!(f, "{err}"),
             Self::RangeInvalid(err) => write!(f, "{err}"),
             Self::PrefixInvalid(err) => write!(f, "{err}"),
@@ -118,6 +155,7 @@ impl std::error::Error for PreallocShardBuilderError {
             | Self::CapMismatch { .. }
             | Self::EntryLimitExceedsManifestMax { .. }
             | Self::CapacityExceeded { .. }
+            | Self::FanOutExceeded { .. }
             | Self::InvalidSpecHandle => None,
         }
     }
@@ -126,7 +164,8 @@ impl std::error::Error for PreallocShardBuilderError {
 /// Startup-preallocated shard builder backed by a borrowed arena.
 ///
 /// - Specs are stored in a caller-provided [`ShardArena`] via mutable borrow.
-/// - Entries are tracked in fixed-capacity [`InlineVec`].
+/// - Entries are tracked in an [`InlineVec`] that never spills because
+///   `entry_limit <= CAP`.
 /// - Public add paths accept borrowed/spec-handle inputs only.
 /// - Dropping the builder clears the borrowed arena; use a dedicated arena
 ///   when specs must outlive builder teardown.
@@ -150,7 +189,12 @@ pub struct PreallocShardBuilder<'a, const CAP: usize> {
 }
 
 impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
-    /// Sentinel error for invalid manifest split bounds.
+    /// Canonical split-argument error for manifest-row splitting helpers.
+    ///
+    /// `split_manifest_by_rows` intentionally reports malformed split inputs
+    /// (`start_row >= end_row` or `rows_per_shard == 0`) using the same
+    /// `ManifestCtorInvalid(InvertedRange)` shape used by manifest constructors.
+    /// The fixed encoded lengths keep diagnostics aligned with manifest row keys.
     const fn manifest_split_invalid_bounds() -> PreallocShardBuilderError {
         PreallocShardBuilderError::ManifestCtorInvalid(ShardSpecInputError::InvertedRange {
             start_len: ManifestRowKey::ENCODED_LEN,
@@ -161,8 +205,11 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// Compute the number of fixed-width row chunks in `[start_row, end_row)`.
     ///
     /// Returns the ceiling division `(end_row - start_row) / rows_per_shard`,
-    /// clamped to `usize::MAX` on overflow. Rejects empty ranges and zero
-    /// chunk width.
+    /// clamped to `usize::MAX` on conversion overflow. The clamped value is
+    /// safe because callers pass it to [`Self::ensure_bulk_split_capacity`],
+    /// which rejects anything above [`MAX_SPLIT_CHILDREN`].
+    ///
+    /// Rejects empty ranges (`start_row >= end_row`) and zero chunk width.
     fn manifest_split_count(
         start_row: u64,
         end_row: u64,
@@ -174,8 +221,9 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         let span = end_row
             .checked_sub(start_row)
             .ok_or_else(Self::manifest_split_invalid_bounds)?;
-        let rounded = span.saturating_add(rows_per_shard - 1);
-        let shard_count = rounded / rows_per_shard;
+        let whole_chunks = span / rows_per_shard;
+        let has_tail = span % rows_per_shard != 0;
+        let shard_count = whole_chunks.saturating_add(u64::from(has_tail));
         Ok(usize::try_from(shard_count).unwrap_or(usize::MAX))
     }
 
@@ -257,8 +305,9 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// Frees arena-backed specs for all tracked entries, clears the entry
     /// buffer, and restarts shard IDs at 0.
     ///
-    /// This invalidates all previously returned [`ShardSpecHandle`] values and
-    /// any [`InitialShardInput`] slices built from earlier state.
+    /// This invalidates any handles staged in this builder (including handles
+    /// accepted through [`Self::add_spec_handle`]) and any
+    /// [`InitialShardInput`] slices built from earlier state.
     pub fn reset(&mut self) {
         let old = std::mem::replace(&mut self.entries, InlineVec::new());
         for entry in old.as_slice() {
@@ -269,6 +318,9 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     }
 
     /// Check that `additional` more entries fit within `entry_limit`.
+    ///
+    /// Uses saturating arithmetic so very large `additional` values cannot wrap
+    /// and bypass the limit guard.
     fn ensure_entry_capacity(&self, additional: usize) -> Result<(), PreallocShardBuilderError> {
         let current = self.entries.len();
         if current.saturating_add(additional) > self.entry_limit {
@@ -281,7 +333,30 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         Ok(())
     }
 
+    /// Enforce split fan-out and remaining entry-budget limits.
+    ///
+    /// Returns [`PreallocShardBuilderError::FanOutExceeded`] when `additional`
+    /// exceeds [`MAX_SPLIT_CHILDREN`], then delegates to
+    /// [`Self::ensure_entry_capacity`] for the remaining entry budget check.
+    fn ensure_bulk_split_capacity(
+        &self,
+        additional: usize,
+    ) -> Result<(), PreallocShardBuilderError> {
+        if additional > MAX_SPLIT_CHILDREN {
+            return Err(PreallocShardBuilderError::FanOutExceeded {
+                limit: MAX_SPLIT_CHILDREN,
+                requested: additional,
+            });
+        }
+        self.ensure_entry_capacity(additional)
+    }
+
     /// Allocate the next sequential shard ID (monotonically increasing from 0).
+    ///
+    /// IDs advance only when an entry is actually appended via
+    /// [`Self::push_entry`]. Failed add calls that append nothing do not consume
+    /// IDs. Split helpers may still consume IDs for already appended children
+    /// before returning [`PreallocShardBuilderError::SlabFull`].
     ///
     /// # Panics
     ///
@@ -327,6 +402,9 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
 
     /// Add a range shard with an explicit borrowed cursor update.
     ///
+    /// Cursor/key consistency is validated at [`Self::build_inputs`] time by
+    /// [`validate_manifest`], not during this append step.
+    ///
     /// # Errors
     ///
     /// - [`PreallocShardBuilderError::CapacityExceeded`] if `entry_limit`
@@ -363,6 +441,9 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     }
 
     /// Add a prefix shard with an explicit borrowed cursor update.
+    ///
+    /// Cursor/key consistency is validated at [`Self::build_inputs`] time by
+    /// [`validate_manifest`], not during this append step.
     ///
     /// # Errors
     ///
@@ -409,6 +490,9 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
 
     /// Add a manifest-row shard with an explicit borrowed cursor update.
     ///
+    /// Cursor/key consistency is validated at [`Self::build_inputs`] time by
+    /// [`validate_manifest`], not during this append step.
+    ///
     /// # Errors
     ///
     /// - [`PreallocShardBuilderError::CapacityExceeded`] if `entry_limit`
@@ -446,8 +530,14 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// For example, `start=a`, `split_points=[m, t]`, `end=z` yields:
     /// `[a,m)`, `[m,t)`, `[t,z)`.
     ///
+    /// Boundaries must be strictly increasing and interior to `[start, end)`.
+    /// Duplicate, unsorted, or out-of-range points are rejected as
+    /// [`PreallocShardBuilderError::RangeInvalid`].
+    ///
     /// Capacity is checked up front for all children to prevent partial writes
     /// on entry-limit exhaustion.
+    ///
+    /// All children are staged with [`CursorUpdate::initial`].
     ///
     /// This method is not transactional for slab exhaustion: if a later child
     /// allocation returns [`PreallocShardBuilderError::SlabFull`], previously
@@ -455,6 +545,8 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ///
     /// # Errors
     ///
+    /// - [`PreallocShardBuilderError::FanOutExceeded`] if child count exceeds
+    ///   [`MAX_SPLIT_CHILDREN`].
     /// - [`PreallocShardBuilderError::CapacityExceeded`] if all children would
     ///   not fit in the remaining entry budget.
     /// - [`PreallocShardBuilderError::RangeInvalid`] if any child range is
@@ -468,10 +560,12 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         connector_extra: &[u8],
     ) -> Result<(), PreallocShardBuilderError> {
         let additional = split_points.len().saturating_add(1);
-        self.ensure_entry_capacity(additional)?;
+        self.ensure_bulk_split_capacity(additional)?;
 
-        // Validate all child ranges first so invalid boundaries do not produce
-        // partially appended split entries.
+        // Pass 1 (validation-only): call `range_shard_ref` which validates
+        // bounds without allocating arena storage. This catches inverted,
+        // duplicate, or out-of-order boundaries before any entries are staged,
+        // preserving the builder's state on boundary errors.
         let mut child_start = start;
         for &child_end in split_points {
             range_shard_ref(child_start, child_end, connector_extra, &mut self.scratch)
@@ -481,6 +575,8 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         range_shard_ref(child_start, end, connector_extra, &mut self.scratch)
             .map_err(PreallocShardBuilderError::RangeInvalid)?;
 
+        // Pass 2 (allocate-and-stage): re-derive each child range and commit
+        // it to the arena. SlabFull errors here leave a partial prefix staged.
         let mut child_start = start;
         for &child_end in split_points {
             let handle = range_shard_into(
@@ -519,12 +615,18 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// Capacity is checked up front for all derived children to prevent
     /// partial writes on entry-limit exhaustion.
     ///
+    /// Chunk arithmetic uses saturating addition and end-clamping, so ranges
+    /// near `u64::MAX` cannot wrap. All children are staged with
+    /// [`CursorUpdate::initial`].
+    ///
     /// This method is not transactional for slab exhaustion: if a later child
     /// allocation returns [`PreallocShardBuilderError::SlabFull`], previously
     /// appended children remain staged.
     ///
     /// # Errors
     ///
+    /// - [`PreallocShardBuilderError::FanOutExceeded`] if chunk count exceeds
+    ///   [`MAX_SPLIT_CHILDREN`].
     /// - [`PreallocShardBuilderError::CapacityExceeded`] if all chunks would
     ///   not fit in the remaining entry budget.
     /// - [`PreallocShardBuilderError::ManifestCtorInvalid`] for invalid row
@@ -540,12 +642,15 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
         connector_extra: &[u8],
     ) -> Result<(), PreallocShardBuilderError> {
         let additional = Self::manifest_split_count(start_row, end_row, rows_per_shard)?;
-        self.ensure_entry_capacity(additional)?;
+        self.ensure_bulk_split_capacity(additional)?;
 
         let mut chunk_start = start_row;
         while chunk_start < end_row {
             // Saturating add avoids wrapping on large row IDs, then clamps to
             // the parent end bound to preserve half-open tiling semantics.
+            // Progress is guaranteed: rows_per_shard > 0 (checked by
+            // manifest_split_count) and chunk_start < end_row (loop guard),
+            // so chunk_end is always strictly greater than chunk_start.
             let chunk_end = chunk_start.saturating_add(rows_per_shard).min(end_row);
             debug_assert!(
                 chunk_end > chunk_start,
@@ -634,6 +739,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     /// so callers see registration-time manifest errors before touching
     /// coordinator state.
     ///
+    /// This is a read-only view construction: it does not consume or mutate
+    /// builder state. Repeated calls return equivalent rows while the builder
+    /// remains unchanged.
+    ///
     /// # Errors
     ///
     /// - [`PreallocShardBuilderError::InvalidSpecHandle`] when any staged
@@ -645,7 +754,6 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ///   - overlapping key ranges
     ///   - unbounded ranges (empty start or end key)
     ///   - invalid spec (fails [`ShardSpec::validate_ref`])
-    ///   - too many shards (exceeds [`MAX_INITIAL_SHARDS`])
     ///   - cursor out of bounds (`last_key` outside spec range)
     ///   - cursor key too large (exceeds `MAX_KEY_SIZE`)
     pub fn build_inputs<'s>(
