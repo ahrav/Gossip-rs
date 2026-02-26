@@ -120,6 +120,9 @@ pub use traits::CoordinationBackend;
 pub use validation::{check_op_idempotency, validate_lease};
 
 // Re-export split-replace planner core from contracts for ergonomic call sites.
+// Convention: coordination-layer code imports directly from
+// `gossip_contracts::coordination::split`; these re-exports serve external
+// consumers that depend only on `gossip-coordination`.
 pub use gossip_contracts::coordination::split::{
     SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError, SplitReplacePlanningError,
     plan_split_replace, plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,

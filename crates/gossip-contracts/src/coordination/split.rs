@@ -475,6 +475,38 @@ mod tests {
     }
 
     #[test]
+    fn plan_split_replace_at_points_rejects_out_of_order() {
+        let parent = ShardSpec::with_range(b"a", b"z");
+        let result = plan_split_replace_at_points_initial_cursor(
+            parent.as_ref(),
+            [b"m".as_slice(), b"f".as_slice()],
+        );
+        assert!(
+            matches!(result, Err(SplitReplacePlanningError::InvalidCoverage(_))),
+            "expected InvalidCoverage for out-of-order points, got {result:?}",
+        );
+    }
+
+    #[test]
+    fn plan_split_replace_at_points_accepts_max_children() {
+        let max_points = MAX_SPLIT_CHILDREN - 1;
+        let parent = ShardSpec::with_range(
+            [0u8, 0].as_slice(),
+            (MAX_SPLIT_CHILDREN as u16).to_be_bytes().as_slice(),
+        );
+        let points: Vec<[u8; 2]> = (1..=max_points).map(|i| (i as u16).to_be_bytes()).collect();
+        let plan = plan_split_replace_at_points_initial_cursor(
+            parent.as_ref(),
+            points.iter().map(|p| p.as_slice()),
+        );
+        assert!(
+            plan.is_ok(),
+            "MAX_SPLIT_CHILDREN children should be accepted"
+        );
+        assert_eq!(plan.unwrap().children().len(), MAX_SPLIT_CHILDREN);
+    }
+
+    #[test]
     fn split_replace_invalid_coverage_gap_rejected() {
         let parent = ShardSpec::with_range(b"a", b"z");
         let child_a_spec = ShardSpec::with_range(b"a", b"m");
