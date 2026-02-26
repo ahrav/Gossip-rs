@@ -20,13 +20,14 @@
 //! filter/capacity-hint contracts.
 
 use super::*;
-use crate::run::{InitialShardInput, RunManagement, ShardFilter, ShardSummary};
+use crate::run::{RunManagement, ShardFilter, ShardSummary};
 use crate::sim::backend::SimIntrospection;
 use crate::test_fixtures::{
     LEASE_DURATION, acquire_result, acquire_shard, coordinator_with_run_and_lease,
     do_split_replace, now, test_run, test_tenant, test_worker,
 };
 use gossip_contracts::coordination::cursor::CursorUpdate;
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use gossip_contracts::identity::{FenceEpoch, LogicalTime, OpId, ShardId, ShardKey, WorkerId};
 
@@ -1106,7 +1107,8 @@ fn collect_candidates_no_shards_registered() {
 /// in candidates; the earliest lease deadline is from the leased shard.
 #[test]
 fn collect_candidates_mixed_states() {
-    use crate::run::{InitialShardInput, RunConfig};
+    use crate::run::RunConfig;
+    use gossip_contracts::coordination::manifest::InitialShardInput;
 
     let mut coord = InMemoryCoordinator::new(LEASE_DURATION);
     let tenant = test_tenant();

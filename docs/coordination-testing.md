@@ -103,7 +103,7 @@ All tests use shared fixtures from `test_fixtures.rs` (see Section 5).
 ## 3. Tier 2 — Conformance Tests
 
 **File:** `coordination/conformance_tests.rs`
-**Declared in:** `coordination/mod.rs` (`#[cfg(test)]`)
+**Declared in:** `lib.rs` (`#[cfg(test)]`)
 
 Invariant-interaction tests. Each test composes two or more of the
 protocol's safety invariants and verifies they hold simultaneously. The
@@ -161,7 +161,7 @@ conformance tests fail at compile time.
 ## 4. Tier 3 — Scenario Tests
 
 **File:** `coordination/scenario_tests.rs`
-**Declared in:** `coordination/mod.rs` (`#[cfg(test)]`)
+**Declared in:** `lib.rs` (`#[cfg(test)]`)
 
 Multi-step workflow tests that exercise realistic end-to-end stories.
 Each scenario chains operations in production-realistic order, including
@@ -383,10 +383,10 @@ preserves safety.
 
 ```bash
 # CI-friendly (not ignored)
-cargo test -p gossip-contracts prop_short_sequences_preserve_invariants
+cargo test -p gossip-coordination prop_short_sequences_preserve_invariants
 
 # Deep tests (ignored)
-cargo test -p gossip-contracts proptest_state_machine -- --ignored --nocapture
+cargo test -p gossip-coordination proptest_state_machine -- --ignored --nocapture
 ```
 
 For simulation architecture, the invariant table (S1–S9), determinism
@@ -454,7 +454,7 @@ cargo test -p gossip-coordination multi_tenant -- --nocapture
 The mega sim prints reproduction commands for every failing seed:
 
 ```bash
-GOSSIP_SIM_SEED=<seed> cargo test -p gossip-contracts mega_sim -- --ignored --nocapture
+GOSSIP_SIM_SEED=<seed> cargo test -p gossip-coordination mega_sim -- --ignored --nocapture
 ```
 
 Or programmatically:
@@ -522,20 +522,31 @@ Full invariant definitions and the checker implementation are in
 
 | File                                | Role                                                             |
 |-------------------------------------|------------------------------------------------------------------|
-| `coordination/in_memory_tests.rs`   | Tier 1: unit tests + proptest property tests                     |
-| `coordination/conformance_tests.rs` | Tier 2: invariant-interaction tests (Groups A, B, C)             |
-| `coordination/scenario_tests.rs`    | Tier 3: multi-step end-to-end workflows (S1–S9)                  |
-| `coordination/test_fixtures.rs`     | Shared factory functions and seeded coordinator setup            |
-| `sim/sim_behavioral_tests.rs`       | Tier 4a: fixed-seed behavioral regression + deterministic replay |
-| `sim/mega_sim_tests.rs`             | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
-| `sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking    |
-| `sim/harness.rs`                    | Simulation driver (`run` + `run_overload`)                       |
-| `sim/invariants.rs`                 | External invariant checker (S1–S9)                               |
-| `sim/overload.rs`                   | Overload scenario/reports and scripted op generators             |
-| `sim/overload_tests.rs`            | Overload scenario tests: per-kind, replay, D1 accuracy, proptest |
-| `sim/worker.rs`                     | Simulated worker bookkeeping                                     |
-| `sim/test_util.rs`                  | Shared test helpers: record builder, proptest strategies         |
-| `sim/mod.rs`                        | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
+| `coordination/in_memory_tests.rs`     | Tier 1: unit tests + proptest property tests                     |
+| `coordination/error_tests.rs`         | Tier 1: error type Display/source/Debug coverage                 |
+| `coordination/record_tests.rs`        | Tier 1: `ShardRecord`, `ShardStatus`, `ParkReason`, `OpLogEntry` tests |
+| `coordination/run_tests.rs`           | Tier 1: run lifecycle types, validation, and state machine tests |
+| `coordination/facade_tests.rs`        | Tier 1: `CoordinationFacade`, `ShardClaiming`, claim algorithm tests |
+| `coordination/session_tests.rs`       | Tier 1: `WorkerSession` RAII handle and delegation tests         |
+| `coordination/in_memory_filter_tests.rs` | Tier 1: `ShardFilter` predicates for `list_shards_into`       |
+| `coordination/in_memory_run_tests.rs` | Tier 1: `RunManagement` trait implementation tests               |
+| `coordination/conformance_tests.rs`   | Tier 2: invariant-interaction tests (Groups A, B, C)             |
+| `coordination/scenario_tests.rs`      | Tier 3: multi-step end-to-end workflows (S1–S9)                  |
+| `coordination/test_fixtures.rs`       | Shared factory functions and seeded coordinator setup            |
+| `sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay |
+| `sim/mega_sim_tests.rs`               | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
+| `sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking      |
+| `sim/harness.rs`                      | Simulation driver (`run` + `run_overload`)                       |
+| `sim/harness_tests.rs`               | Harness unit and property tests for bookkeeping and op generation |
+| `sim/invariants.rs`                   | External invariant checker (S1–S9)                               |
+| `sim/invariants_tests.rs`            | Targeted unit tests for `InvariantChecker` edge cases            |
+| `sim/overload.rs`                     | Overload scenario/reports and scripted op generators             |
+| `sim/overload_tests.rs`              | Overload scenario tests: per-kind, replay, D1 accuracy, proptest |
+| `sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions     |
+| `sim/fault_injector.rs`              | Fault-injecting introspector for invariant checker validation    |
+| `sim/worker.rs`                       | Simulated worker bookkeeping                                     |
+| `sim/test_util.rs`                    | Shared test helpers: record builder, proptest strategies         |
+| `sim/mod.rs`                          | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
 
 ---
 

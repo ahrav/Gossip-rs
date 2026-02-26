@@ -102,10 +102,9 @@ use crate::facade::{ClaimError, ShardClaiming, default_claim_next_available};
 use crate::lease::{Lease, LeaseHolder, OpKind, OpLogEntry, OpResult};
 use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run::{
-    InitialShardInput, RunConfig, RunManagement, RunOpKind, RunOpLogEntry, RunOpResult,
-    RunProgress, RunRecord, RunStatus, ShardFilter, ShardSummary, hash_cancel_run_payload,
-    hash_complete_run_payload, hash_fail_run_payload, hash_register_shards_payload,
-    hash_unpark_payload, validate_manifest,
+    RunConfig, RunManagement, RunOpKind, RunOpLogEntry, RunOpResult, RunProgress, RunRecord,
+    RunStatus, ShardFilter, ShardSummary, hash_cancel_run_payload, hash_complete_run_payload,
+    hash_fail_run_payload, hash_register_shards_payload, hash_unpark_payload,
 };
 use crate::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
@@ -119,6 +118,7 @@ use crate::traits::CoordinationBackend;
 use crate::validation::{check_op_idempotency, validate_cursor_update_pooled, validate_lease};
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::limits::{MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN};
+use gossip_contracts::coordination::manifest::{InitialShardInput, validate_manifest};
 use gossip_contracts::coordination::shard_spec::{
     ShardLimitScope, ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
 };

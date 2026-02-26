@@ -34,7 +34,7 @@
 //!
 //! ## Manifest validation
 //!
-//! [`validate_manifest`] enforces that the initial shard set is non-empty,
+//! [`validate_manifest`](gossip_contracts::coordination::manifest::validate_manifest) enforces that the initial shard set is non-empty,
 //! contains no duplicate IDs, uses bounded key ranges, and has cursor values
 //! within declared shard bounds. This prevents invalid initial states from
 //! entering the coordination layer.
@@ -51,6 +51,7 @@ use crate::run_errors::{
 };
 use crate::split::op_payload_hash;
 use gossip_contracts::coordination::cursor::MAX_KEY_SIZE;
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::CursorSemantics;
 use gossip_contracts::identity::{
     CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
@@ -1127,11 +1128,6 @@ pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
         RunTerminalEvaluation::AllDone
     }
 }
-
-// Re-export manifest types from their own module.
-pub use gossip_contracts::coordination::manifest::{
-    InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, validate_manifest,
-};
 
 // ============================================================================
 // ShardSummary

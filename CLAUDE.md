@@ -1,5 +1,57 @@
 **NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
 
+<!-- code-search-v1 -->
+
+## Code Search — Use osgrep
+
+`osgrep` is a semantic code search tool indexed against this project. It is
+**substantially better than the built-in Grep/Glob tools for conceptual queries**
+and should be your first choice for any search that is not an exact identifier
+lookup.
+
+**Preference order for code search:**
+1. `osgrep` — conceptual/semantic queries (first choice)
+2. `Grep`/`Glob` — exact identifiers, file patterns, known regex
+3. `Explore` subagent — broad multi-file exploration, architecture understanding,
+   tracing flows across boundaries (use when the task requires *exploration*,
+   not just *search*)
+
+Do NOT use Grep for conceptual or natural-language searches — use `osgrep`.
+
+### When to use osgrep
+
+- "How does X work?" → `osgrep "how does X work"`
+- "Where is Y implemented?" → `osgrep "Y implementation"`
+- "Find code that does Z" → `osgrep "code that does Z"`
+- Any conceptual, architectural, or behavior-based search
+
+### When to use Grep/Glob
+
+- Exact identifier lookup: `Grep(pattern="ShardRecord")`
+- File name or path pattern: `Glob(pattern="**/coordination/**/*.rs")`
+- Known regex: `Grep(pattern="fn acquire.*restore")`
+
+### When to use Explore subagent
+
+- Deep multi-file architecture exploration requiring many reads
+- Tracing a concept across multiple crate boundaries
+- Understanding how subsystems connect (when osgrep results need follow-up)
+
+### Usage
+
+```bash
+osgrep "how does shard splitting work"              # semantic search in project
+osgrep "error handling for resource exhaustion" -m 10  # more results
+osgrep "claim lifecycle management" crates/gossip-coordination  # scope to directory
+osgrep trace "split_replace"                        # call graph tracing
+osgrep skeleton crates/gossip-coordination/src/session.rs  # file structure overview
+```
+
+Use `--compact` for terse output (paths + line ranges only).
+Write **specific, descriptive queries** — not single keywords.
+
+<!-- end-code-search -->
+
 ## Task Management
 
 This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.

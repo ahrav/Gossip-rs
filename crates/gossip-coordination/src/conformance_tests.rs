@@ -36,7 +36,7 @@
 use crate::error::{CheckpointError, IdempotentOutcome};
 use crate::lease::Lease;
 use crate::record::{ParkReason, ShardRecord, ShardStatus};
-use crate::run::{InitialShardInput, RunManagement, RunStatus};
+use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::sim::backend::SimIntrospection;
 use crate::test_fixtures::{
@@ -47,6 +47,7 @@ use crate::test_fixtures::{
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
 use gossip_contracts::identity::{OpId, RunId, ShardId, ShardKey};
 

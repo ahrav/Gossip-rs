@@ -43,15 +43,14 @@ pub mod sim;
 // ---------------------------------------------------------------------------
 
 pub use gossip_contracts::coordination::{
-    // Cursor types
+    // Cursor types (from coordination::cursor)
     CursorAdvance,
     CursorBoundsCheck,
     CursorInputError,
     CursorMaxTokenSize,
-    // Shard spec types
     CursorSemantics,
     CursorUpdate,
-    // Manifest types
+    // Manifest types (from coordination::manifest)
     InitialShardInput,
     MAX_INITIAL_SHARDS,
     MAX_KEY_SIZE,

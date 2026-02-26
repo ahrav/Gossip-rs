@@ -36,13 +36,14 @@ use crate::error::CheckpointError;
 use crate::facade::ClaimError;
 use crate::in_memory::InMemoryCoordinator;
 use crate::record::ShardStatus;
-use crate::run::{InitialShardInput, RunManagement, RunStatus};
+use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RegisterShardsError, RunTransitionError};
 use crate::sim::backend::SimIntrospection;
 use crate::split::SplitResidualPlan;
 use crate::test_fixtures::*;
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::ShardSpec;
 use gossip_contracts::identity::{OpId, RunId, ShardId, ShardKey};
 

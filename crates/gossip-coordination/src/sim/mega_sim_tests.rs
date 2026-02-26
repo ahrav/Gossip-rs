@@ -661,10 +661,11 @@ mod multi_tenant {
     use crate::error::AcquireError;
     use crate::in_memory::InMemoryCoordinator;
     use crate::record::ParkReason;
-    use crate::run::{InitialShardInput, RunConfig, RunManagement};
+    use crate::run::{RunConfig, RunManagement};
     use crate::sim::invariants::InvariantChecker;
     use crate::traits::CoordinationBackend;
     use gossip_contracts::coordination::cursor::CursorUpdate;
+    use gossip_contracts::coordination::manifest::InitialShardInput;
     use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec};
     use gossip_contracts::identity::{
         LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,

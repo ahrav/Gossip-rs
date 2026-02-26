@@ -26,7 +26,8 @@
 use std::fmt;
 
 use crate::record::ShardStatus;
-use crate::run::{ManifestValidationError, RunConfigError, RunOpIdConflict, RunStatus};
+use crate::run::{RunConfigError, RunOpIdConflict, RunStatus};
+use gossip_contracts::coordination::manifest::ManifestValidationError;
 use gossip_contracts::coordination::shard_spec::ShardLimitScope;
 use gossip_contracts::identity::{RunId, TenantId};
 
@@ -419,7 +420,8 @@ impl_from_run_op_id_conflict!(UnparkError);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::{ManifestValidationError, RunConfigError, RunOpIdConflict};
+    use crate::run::{RunConfigError, RunOpIdConflict};
+    use gossip_contracts::coordination::manifest::ManifestValidationError;
     use gossip_contracts::coordination::shard_spec::ShardLimitScope;
     use gossip_contracts::identity::{OpId, RunId, ShardId, TenantId};
     use rstest::rstest;

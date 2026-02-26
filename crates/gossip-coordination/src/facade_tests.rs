@@ -27,9 +27,10 @@
 
 use super::*;
 use crate::in_memory::InMemoryCoordinator;
-use crate::run::{InitialShardInput, RunConfig, RunManagement};
+use crate::run::{RunConfig, RunManagement};
 use crate::test_fixtures::{now, test_run, test_tenant, test_worker};
 use gossip_contracts::coordination::cursor::CursorUpdate;
+use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::CursorSemantics;
 use gossip_contracts::identity::{OpId, ShardId};
 use gossip_contracts::test_util::miri_proptest_config;

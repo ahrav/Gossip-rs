@@ -36,10 +36,11 @@ use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, c
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
+use gossip_coordination::InitialShardInput;
 use gossip_coordination::error::AcquireScratch;
 use gossip_coordination::facade::ShardClaiming;
 use gossip_coordination::in_memory::InMemoryCoordinator;
-use gossip_coordination::run::{InitialShardInput, RunConfig, RunManagement, ShardFilter};
+use gossip_coordination::run::{RunConfig, RunManagement, ShardFilter};
 use gossip_coordination::traits::CoordinationBackend;
 
 // ---------------------------------------------------------------------------

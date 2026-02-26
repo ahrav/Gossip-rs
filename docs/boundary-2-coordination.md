@@ -45,6 +45,8 @@ The module provides six core capabilities:
 | `cursor.rs`     | `Cursor` type with monotonicity and bounds semantics                  |
 | `shard_spec.rs` | `ShardSpec` key-range type, `CursorSemantics`, split validation       |
 | `pooled.rs`     | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers |
+| `limits.rs`     | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`) |
+| `manifest.rs`   | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards` |
 | `error.rs`      | Shared `CoordError` and `IdempotentOutcome`                           |
 | `run_errors.rs` | Run-management error types                                            |
 | `validation.rs` | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency` |
@@ -606,7 +608,7 @@ half-open `[start, end)` byte-key ranges.
 
 ### CoordError
 
-A shared `CoordError` enum with 10 variants provides the building blocks for
+A shared `CoordError` enum with 12 variants provides the building blocks for
 all operation-specific errors. Variants cover tenant isolation, fencing, lease
 expiry, terminal status, OpId conflicts, cursor violations, split validation
 failures, and missing checkpoint keys.
