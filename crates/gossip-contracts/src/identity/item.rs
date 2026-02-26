@@ -6,16 +6,16 @@
 //! | Type | Width | Construction | Purpose |
 //! |------|-------|-------------|---------|
 //! | [`ConnectorTag`] | 8 B | `from_ascii` / `from_bytes` | Source-system discriminator |
-//! | [`ItemKey`] | variable | `new(connector, path)` | Human-meaningful item identity |
-//! | [`StableItemId`] | 32 B | derived via `ItemKey::stable_id` | Fixed-width item identity for derivation |
+//! | [`ItemIdentityKey`] | variable | `new(connector, locator)` | Human-meaningful item identity |
+//! | [`StableItemId`] | 32 B | derived via `ItemIdentityKey::stable_id` | Fixed-width item identity for derivation |
 //! | [`ObjectVersionId`] | 32 B | `from_version_bytes` | Version-specific content identity |
 //!
 //! # Derivation flow
 //!
 //! ```text
-//! ConnectorTag + path ──► ItemKey ──(blake3 derive-key)──► StableItemId
-//!                                                              │
-//!                                                    enters FindingId derivation
+//! ConnectorTag + locator ──► ItemIdentityKey ──(blake3 derive-key)──► StableItemId
+//!                                                                         │
+//!                                                               enters FindingId derivation
 //!
 //! version token bytes ──(blake3 derive-key)──► ObjectVersionId
 //!                                                    │
@@ -41,7 +41,7 @@ use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
 /// Errors from identity type construction.
 ///
 /// These are returned by the `try_*` constructors on [`ConnectorTag`],
-/// [`ItemKey`], and [`ObjectVersionId`]. The panicking constructors
+/// [`ItemIdentityKey`], and [`ObjectVersionId`]. The panicking constructors
 /// (`from_ascii`, `new`, `from_version_bytes`) remain available for
 /// trusted internal code; only [`ConnectorTag::from_ascii`] is `const`.
 ///
@@ -60,8 +60,8 @@ pub enum IdentityInputError {
         /// The invalid byte value.
         byte: u8,
     },
-    /// Item path is empty.
-    EmptyPath,
+    /// Item locator is empty.
+    EmptyLocator,
     /// Version bytes are empty.
     EmptyVersionBytes,
 }
@@ -81,7 +81,7 @@ impl fmt::Display for IdentityInputError {
                     "ConnectorTag byte at index {index} is not ASCII graphic: 0x{byte:02X}"
                 )
             }
-            Self::EmptyPath => write!(f, "ItemKey path must not be empty"),
+            Self::EmptyLocator => write!(f, "ItemIdentityKey locator must not be empty"),
             Self::EmptyVersionBytes => write!(f, "version bytes must not be empty"),
         }
     }
@@ -95,7 +95,7 @@ impl std::error::Error for IdentityInputError {}
 // ---------------------------------------------------------------------------
 
 /// Fixed-width tag identifying the connector (source system) that produced
-/// an [`ItemKey`].
+/// an [`ItemIdentityKey`].
 ///
 /// Prevents cross-source collisions: a GitHub file at `org/repo/path.txt`
 /// and a GitLab file at `org/repo/path.txt` hash to different
@@ -249,7 +249,7 @@ impl ConnectorTag {
 impl CanonicalBytes for ConnectorTag {
     /// Writes the full 8-byte array (including null padding) with no length
     /// prefix. Fixed-width encoding ensures unambiguous framing when
-    /// concatenated with subsequent fields in composite types like [`ItemKey`].
+    /// concatenated with subsequent fields in composite types like [`ItemIdentityKey`].
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         h.update(&self.0);
@@ -257,107 +257,113 @@ impl CanonicalBytes for ConnectorTag {
 }
 
 // ---------------------------------------------------------------------------
-// ItemKey — variable-length scannable-item identity
+// ItemIdentityKey — variable-length scannable-item identity
 // ---------------------------------------------------------------------------
 
 /// Logical identity of a scannable item: a file, page, object, etc.
 ///
-/// `ItemKey` is the full, human-meaningful identity. It carries enough
-/// information to uniquely locate an item across all connectors. The
-/// fixed-width [`StableItemId`] is derived from it for use in finding
+/// `ItemIdentityKey` is the full, human-meaningful identity. It carries
+/// enough information to uniquely locate an item across all connectors.
+/// The fixed-width [`StableItemId`] is derived from it for use in finding
 /// derivation.
 ///
 /// # Structure
 ///
 /// ```text
 /// ┌──────────────┬───────────────────────────────────┐
-/// │ ConnectorTag  │ path (connector-defined bytes)     │
+/// │ ConnectorTag  │ locator (connector-defined bytes)  │
 /// │   [u8; 8]     │ Box<[u8]>                          │
 /// └──────────────┴───────────────────────────────────┘
 /// ```
 ///
-/// The `path` field is opaque to the contracts crate. Connectors define
+/// The `locator` field is opaque to the contracts crate. Connectors define
 /// its encoding:
 ///
 /// - GitHub: `"{owner}/{repo}\0{file_path}"` (UTF-8, null-separated)
 /// - S3: `"{bucket}\0{object_key}"` (UTF-8, null-separated)
+/// - Jira: `"{project}\0{issue_key}"` (UTF-8, null-separated)
 /// - Generic: any deterministic byte sequence
 ///
 /// # Invariants
 ///
 /// **Safety (determinism)**: The same logical item MUST always produce
-/// the same `ItemKey` bytes. Connectors MUST normalize before construction
-/// (e.g., path canonicalization, case folding if the source is
-/// case-insensitive).
+/// the same `ItemIdentityKey` bytes. Connectors MUST normalize before
+/// construction (e.g., locator canonicalization, case folding if the
+/// source is case-insensitive).
 ///
 /// **Safety (collision-freedom)**: Two distinct items from the same
-/// connector MUST produce distinct `path` bytes. Two items from different
-/// connectors are automatically distinct due to `ConnectorTag`.
+/// connector MUST produce distinct `locator` bytes. Two items from
+/// different connectors are automatically distinct due to `ConnectorTag`.
 ///
 /// # `CanonicalBytes` encoding
 ///
-/// `ConnectorTag` (8 bytes, fixed) + `path` (length-prefixed).
-/// The length prefix is a `u32` LE (max path length: ~4 GiB, far more
+/// `ConnectorTag` (8 bytes, fixed) + `locator` (length-prefixed).
+/// The length prefix is a `u32` LE (max locator length: ~4 GiB, far more
 /// than needed).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ItemKey {
+pub struct ItemIdentityKey {
     connector: ConnectorTag,
-    path: Box<[u8]>,
+    locator: Box<[u8]>,
 }
 
-impl ItemKey {
-    /// Construct an `ItemKey` from a connector tag and path bytes.
+impl ItemIdentityKey {
+    /// Construct an `ItemIdentityKey` from a connector tag and locator bytes.
     ///
-    /// The `path` encoding is connector-defined. A common convention is
+    /// The `locator` encoding is connector-defined. A common convention is
     /// null-separated segments (`b"org/repo\0src/main.rs"`), but any
     /// deterministic byte sequence works.
     ///
     /// # Examples
     ///
     /// ```
-    /// use gossip_contracts::identity::{ConnectorTag, ItemKey};
+    /// use gossip_contracts::identity::{ConnectorTag, ItemIdentityKey};
     ///
     /// let github = ConnectorTag::from_ascii(b"github");
-    /// let key = ItemKey::new(github, b"org/repo\0src/main.rs");
+    /// let key = ItemIdentityKey::new(github, b"org/repo\0src/main.rs");
     ///
     /// assert_eq!(key.connector(), github);
-    /// assert_eq!(key.path(), b"org/repo\0src/main.rs");
+    /// assert_eq!(key.locator(), b"org/repo\0src/main.rs");
     /// ```
     ///
     /// # Panics
     ///
-    /// Panics if `path` is empty.  An empty path is a programming error in
-    /// the connector — every scannable item has a non-empty location.  This
-    /// is not a user-input validation boundary; connectors are trusted
-    /// internal code, so a panic (rather than `Result`) is appropriate.
-    pub fn new(connector: ConnectorTag, path: impl AsRef<[u8]>) -> Self {
-        let path = path.as_ref();
-        assert!(!path.is_empty(), "ItemKey path must not be empty");
+    /// Panics if `locator` is empty.  An empty locator is a programming
+    /// error in the connector — every scannable item has a non-empty
+    /// location.  This is not a user-input validation boundary; connectors
+    /// are trusted internal code, so a panic (rather than `Result`) is
+    /// appropriate.
+    pub fn new(connector: ConnectorTag, locator: impl AsRef<[u8]>) -> Self {
+        let locator = locator.as_ref();
+        assert!(
+            !locator.is_empty(),
+            "ItemIdentityKey locator must not be empty"
+        );
         Self {
             connector,
-            path: path.into(),
+            locator: locator.into(),
         }
     }
 
     /// Fallible version of [`new`](Self::new).
     ///
-    /// Returns an error instead of panicking when the path is empty.
-    /// Use this at system boundaries where the path comes from external input.
+    /// Returns an error instead of panicking when the locator is empty.
+    /// Use this at system boundaries where the locator comes from external
+    /// input.
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityInputError::EmptyPath`] if the path is empty.
+    /// Returns [`IdentityInputError::EmptyLocator`] if the locator is empty.
     pub fn try_new(
         connector: ConnectorTag,
-        path: impl AsRef<[u8]>,
+        locator: impl AsRef<[u8]>,
     ) -> Result<Self, IdentityInputError> {
-        let path = path.as_ref();
-        if path.is_empty() {
-            return Err(IdentityInputError::EmptyPath);
+        let locator = locator.as_ref();
+        if locator.is_empty() {
+            return Err(IdentityInputError::EmptyLocator);
         }
         Ok(Self {
             connector,
-            path: path.into(),
+            locator: locator.into(),
         })
     }
 
@@ -367,20 +373,21 @@ impl ItemKey {
         self.connector
     }
 
-    /// The opaque, connector-defined path bytes for this item.
+    /// The opaque, connector-defined locator bytes for this item.
     ///
-    /// The encoding is connector-specific; see [`ItemKey`] struct docs for
-    /// examples. The returned slice never includes the connector tag.
+    /// The encoding is connector-specific; see [`ItemIdentityKey`] struct
+    /// docs for examples. The returned slice never includes the connector
+    /// tag.
     #[inline]
-    pub fn path(&self) -> &[u8] {
-        &self.path
+    pub fn locator(&self) -> &[u8] {
+        &self.locator
     }
 
     /// Derive the fixed-width [`StableItemId`] for this key.
     ///
     /// Uses BLAKE3 derive-key mode with [`domain::ITEM_ID_V1`](super::domain::ITEM_ID_V1)
     /// via a cached hasher clone. This is a pure, infallible function: same
-    /// `ItemKey` always produces the same `StableItemId`.
+    /// `ItemIdentityKey` always produces the same `StableItemId`.
     pub fn stable_id(&self) -> StableItemId {
         let mut h = ITEM_ID_HASHER.clone();
         self.write_canonical(&mut h);
@@ -388,15 +395,15 @@ impl ItemKey {
     }
 }
 
-impl CanonicalBytes for ItemKey {
-    /// Writes `ConnectorTag` (8 bytes, fixed-width) followed by `path`
+impl CanonicalBytes for ItemIdentityKey {
+    /// Writes `ConnectorTag` (8 bytes, fixed-width) followed by `locator`
     /// (4-byte LE length prefix + variable-length body). The length prefix
-    /// on the path prevents concatenation ambiguity between connector tag
-    /// padding and path content.
+    /// on the locator prevents concatenation ambiguity between connector tag
+    /// padding and locator content.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.connector.write_canonical(h);
-        self.path.write_canonical(h);
+        self.locator.write_canonical(h);
     }
 }
 
@@ -416,10 +423,10 @@ crate::define_id_32! {
     ///
     /// # Invariants
     ///
-    /// **Safety**: `StableItemId` MUST be a pure function of `ItemKey`.
-    /// Given the same `ItemKey`, the output is always the same.
+    /// **Safety**: `StableItemId` MUST be a pure function of `ItemIdentityKey`.
+    /// Given the same `ItemIdentityKey`, the output is always the same.
     ///
-    /// **Safety**: Distinct `ItemKey` values MUST produce distinct
+    /// **Safety**: Distinct `ItemIdentityKey` values MUST produce distinct
     /// `StableItemId` values (with cryptographic collision resistance).
     StableItemId
 }
@@ -579,23 +586,23 @@ mod tests {
         assert!(dbg.contains("githubXY"), "got: {dbg}");
     }
 
-    // -- ItemKey --
+    // -- ItemIdentityKey --
 
     #[test]
     #[should_panic(expected = "must not be empty")]
-    fn item_key_empty_path_panics() {
-        ItemKey::new(ConnectorTag::from_ascii(b"github"), vec![]);
+    fn item_identity_key_empty_locator_panics() {
+        ItemIdentityKey::new(ConnectorTag::from_ascii(b"github"), vec![]);
     }
 
-    // -- ItemKey CanonicalBytes --
+    // -- ItemIdentityKey CanonicalBytes --
 
     #[test]
-    fn item_key_canonical_bytes_unambiguous() {
-        // Connector tag + path must not collide with different splits.
-        // ConnectorTag is fixed-width and path is length-prefixed,
+    fn item_identity_key_canonical_bytes_unambiguous() {
+        // Connector tag + locator must not collide with different splits.
+        // ConnectorTag is fixed-width and locator is length-prefixed,
         // so this is structurally impossible. Verify anyway:
-        let a = ItemKey::new(ConnectorTag::from_bytes(*b"ab\0\0\0\0\0\0"), b"cd");
-        let b = ItemKey::new(ConnectorTag::from_bytes(*b"abcd\0\0\0\0"), b"ef");
+        let a = ItemIdentityKey::new(ConnectorTag::from_bytes(*b"ab\0\0\0\0\0\0"), b"cd");
+        let b = ItemIdentityKey::new(ConnectorTag::from_bytes(*b"abcd\0\0\0\0"), b"ef");
         let mut ha = Hasher::new();
         let mut hb = Hasher::new();
         a.write_canonical(&mut ha);
@@ -636,11 +643,11 @@ mod tests {
         #![proptest_config(crate::test_util::miri_proptest_config())]
 
         #[test]
-        fn item_key_stable_id_is_pure(
+        fn item_identity_key_stable_id_is_pure(
             tag_bytes in proptest::array::uniform8(proptest::num::u8::ANY),
-            path in proptest::collection::vec(proptest::num::u8::ANY, 1..256),
+            locator in proptest::collection::vec(proptest::num::u8::ANY, 1..256),
         ) {
-            let key = ItemKey::new(ConnectorTag::from_bytes(tag_bytes), path);
+            let key = ItemIdentityKey::new(ConnectorTag::from_bytes(tag_bytes), locator);
             let id1 = key.stable_id();
             let id2 = key.stable_id();
             proptest::prop_assert_eq!(id1, id2);
@@ -656,11 +663,11 @@ mod tests {
         }
 
         #[test]
-        fn item_key_canonical_bytes_stable(
+        fn item_identity_key_canonical_bytes_stable(
             tag_bytes in proptest::array::uniform8(proptest::num::u8::ANY),
-            path in proptest::collection::vec(proptest::num::u8::ANY, 1..128),
+            locator in proptest::collection::vec(proptest::num::u8::ANY, 1..128),
         ) {
-            let key = ItemKey::new(ConnectorTag::from_bytes(tag_bytes), path);
+            let key = ItemIdentityKey::new(ConnectorTag::from_bytes(tag_bytes), locator);
             let mut h1 = Hasher::new();
             let mut h2 = Hasher::new();
             key.write_canonical(&mut h1);
@@ -699,27 +706,27 @@ mod tests {
         }
 
         #[test]
-        fn item_key_stable_id_collision_free(
+        fn item_identity_key_stable_id_collision_free(
             tag_a in proptest::array::uniform8(proptest::num::u8::ANY),
             tag_b in proptest::array::uniform8(proptest::num::u8::ANY),
-            path_a in proptest::collection::vec(proptest::num::u8::ANY, 1..128),
-            path_b in proptest::collection::vec(proptest::num::u8::ANY, 1..128),
+            locator_a in proptest::collection::vec(proptest::num::u8::ANY, 1..128),
+            locator_b in proptest::collection::vec(proptest::num::u8::ANY, 1..128),
         ) {
-            proptest::prop_assume!(tag_a != tag_b || path_a != path_b);
-            let a = ItemKey::new(ConnectorTag::from_bytes(tag_a), path_a);
-            let b = ItemKey::new(ConnectorTag::from_bytes(tag_b), path_b);
+            proptest::prop_assume!(tag_a != tag_b || locator_a != locator_b);
+            let a = ItemIdentityKey::new(ConnectorTag::from_bytes(tag_a), locator_a);
+            let b = ItemIdentityKey::new(ConnectorTag::from_bytes(tag_b), locator_b);
             proptest::prop_assert_ne!(a.stable_id(), b.stable_id());
         }
 
         #[test]
-        fn item_key_accessors_roundtrip(
+        fn item_identity_key_accessors_roundtrip(
             tag_bytes in proptest::array::uniform8(proptest::num::u8::ANY),
-            path in proptest::collection::vec(proptest::num::u8::ANY, 1..256),
+            locator in proptest::collection::vec(proptest::num::u8::ANY, 1..256),
         ) {
             let connector = ConnectorTag::from_bytes(tag_bytes);
-            let key = ItemKey::new(connector, path.clone());
+            let key = ItemIdentityKey::new(connector, locator.clone());
             proptest::prop_assert_eq!(key.connector(), connector);
-            proptest::prop_assert_eq!(key.path(), path.as_slice());
+            proptest::prop_assert_eq!(key.locator(), locator.as_slice());
         }
 
         #[test]

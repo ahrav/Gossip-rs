@@ -1,9 +1,9 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use gossip_contracts::identity::{
-    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemKey, NormHash, ObjectVersionId,
-    OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint, StableItemId, TenantId, TenantSecretKey,
-    compute_policy_hash, derive_finding_id, derive_occurrence_id, key_secret_hash,
+    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey, NormHash,
+    ObjectVersionId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint, StableItemId, TenantId,
+    TenantSecretKey, compute_policy_hash, derive_finding_id, derive_occurrence_id, key_secret_hash,
 };
 
 fn bench_key_secret_hash(c: &mut Criterion) {
@@ -59,7 +59,7 @@ fn bench_compute_policy_hash(c: &mut Criterion) {
 }
 
 fn bench_item_key_stable_id(c: &mut Criterion) {
-    let key = ItemKey::new(
+    let key = ItemIdentityKey::new(
         ConnectorTag::from_ascii(b"github"),
         b"org/repo\0src/main.rs",
     );
@@ -80,7 +80,7 @@ fn bench_full_derivation_chain(c: &mut Criterion) {
 
     c.bench_function("full_derivation_chain", |b| {
         b.iter(|| {
-            let key = ItemKey::new(connector, path.clone());
+            let key = ItemIdentityKey::new(connector, path.clone());
             let stable_id = key.stable_id();
             let secret = key_secret_hash(&tenant_key, &norm);
             let finding = derive_finding_id(&FindingIdInputs {

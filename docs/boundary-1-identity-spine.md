@@ -35,7 +35,7 @@ macros.
 | `canonical.rs` | `CanonicalBytes` trait + primitive impls                                                   |
 | `hashing.rs`   | `domain_hasher`, `finalize_32`                                                             |
 | `domain.rs`    | 13 domain-separation constants + `ALL` registry                                            |
-| `item.rs`      | `ConnectorTag`, `ItemKey`, `StableItemId`, `ObjectVersionId`                               |
+| `item.rs`      | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`                       |
 | `finding.rs`   | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId` + derivation fns  |
 | `policy.rs`    | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                    |
 | `macros.rs`    | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                             |
@@ -52,7 +52,7 @@ TenantSecretKey ───┘                                     │
                                                          │
                         TenantId ────────────────────────┤
                                                          ├─ derive_finding_id() ──> FindingId ──┐
-ItemKey ──> StableItemId ────────────────────────────────┤                                      │
+ItemIdentityKey ──> StableItemId ────────────────────────┤                                      │
                                                          │                                      │
             RuleFingerprint ─────────────────────────────┘                                      │
                                                                                                 │
@@ -66,8 +66,8 @@ ItemKey ──> StableItemId ─────────────────
 
 | Type              | Role                                                                                          |
 |-------------------|-----------------------------------------------------------------------------------------------|
-| `ItemKey`         | Human-meaningful item identity: `ConnectorTag` (8 B) + opaque path bytes                      |
-| `StableItemId`    | Fixed-width (32 B) content-addressed identity derived from `ItemKey` via `domain::ITEM_ID_V1` |
+| `ItemIdentityKey` | Human-meaningful item identity: `ConnectorTag` (8 B) + opaque locator bytes                   |
+| `StableItemId`    | Fixed-width (32 B) content-addressed identity derived from `ItemIdentityKey` via `domain::ITEM_ID_V1` |
 | `NormHash`        | Normalized secret digest from the detection engine (tenant-agnostic)                          |
 | `SecretHash`      | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`            |
 | `RuleFingerprint` | Identity of the detection rule that matched                                                   |
@@ -167,8 +167,8 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `PolicyHash`           | 32 B             | `from_bytes` (pub)                                 | `POLICY_HASH_V2` (via `compute_...`)   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
 | `TenantSecretKey`      | 32 B             | `from_bytes` (pub)                                 | --                                     | Clone Copy Eq (constant-time)           | Yes: no Ord, Hash, CanonicalBytes; redacted Debug  |
 | `ConnectorTag`         | 8 B              | `from_ascii` / `from_bytes`                        | --                                     | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `ItemKey`              | variable         | `new(connector, path)`                             | --                                     | Clone Eq Hash CanonicalBytes            | No                                                 |
-| `StableItemId`         | 32 B             | derived via `ItemKey::stable_id()`                 | `ITEM_ID_V1`                           | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
+| `ItemIdentityKey`      | variable         | `new(connector, locator)`                          | --                                     | Clone Eq Hash CanonicalBytes            | No                                                 |
+| `StableItemId`         | 32 B             | derived via `ItemIdentityKey::stable_id()`         | `ITEM_ID_V1`                           | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
 | `ObjectVersionId`      | 32 B             | `from_version_bytes` / `from_bytes`                | `OBJECT_VERSION_V1`                    | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
 | `NormHash`             | 32 B             | `from_digest` / `from_bytes_internal` (pub(crate)) | --                                     | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                                |
 | `SecretHash`           | 32 B             | `from_bytes_internal` (pub(crate))                 | `SECRET_HASH_V1` (keyed mode)          | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                                |
@@ -288,7 +288,7 @@ If a golden vector test fails, follow this 5-step protocol:
 
 | Vector                         | Domain Constant      | Triggers                                    |
 |--------------------------------|----------------------|---------------------------------------------|
-| `STABLE_ITEM_ID_EXPECTED`      | `ITEM_ID_V1`         | `ItemKey` encoding or domain tag changes    |
+| `STABLE_ITEM_ID_EXPECTED`      | `ITEM_ID_V1`         | `ItemIdentityKey` encoding or domain tag changes |
 | `OBJECT_VERSION_ID_EXPECTED`   | `OBJECT_VERSION_V1`  | `ObjectVersionId` encoding changes          |
 | `KEY_SECRET_HASH_EXPECTED`     | `SECRET_HASH_V1`     | Secret keying scheme changes                |
 | `FINDING_ID_EXPECTED`          | `FINDING_ID_V1`      | `FindingIdInputs` encoding changes          |

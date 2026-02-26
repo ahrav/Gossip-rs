@@ -1,4 +1,4 @@
-use gossip_contracts::identity::{ConnectorTag, ItemKey, ObjectVersionId, StableItemId};
+use gossip_contracts::identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId, StableItemId};
 
 // --- Size + ZERO sentinel checks -------------------------------------------
 gossip_contracts::smoke_test_id_32!(StableItemId, ObjectVersionId);
@@ -17,14 +17,14 @@ fn connector_tag_from_ascii_works() {
 }
 
 #[test]
-fn item_key_derives_non_zero_stable_id() {
+fn item_identity_key_derives_non_zero_stable_id() {
     let tag = ConnectorTag::from_ascii(b"github");
-    let key = ItemKey::new(tag, b"org/repo\0src/main.rs");
+    let key = ItemIdentityKey::new(tag, b"org/repo\0src/main.rs");
 
     let id = key.stable_id();
     assert_ne!(id, StableItemId::ZERO);
     assert_eq!(key.connector(), tag);
-    assert_eq!(key.path(), b"org/repo\0src/main.rs");
+    assert_eq!(key.locator(), b"org/repo\0src/main.rs");
 }
 
 #[test]

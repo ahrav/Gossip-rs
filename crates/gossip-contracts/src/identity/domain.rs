@@ -63,7 +63,7 @@ pub const OCCURRENCE_ID_V1: &str = "gossip/occurrence/v1";
 /// fed as data *inside* the keyed hasher, not as a derive-key context.
 pub const SECRET_HASH_V1: &str = "gossip/secret-hash/v1";
 
-/// `StableItemId` derivation from `ItemKey`.
+/// `StableItemId` derivation from `ItemIdentityKey`.
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const ITEM_ID_V1: &str = "gossip/item-id/v1";

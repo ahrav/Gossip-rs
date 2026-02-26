@@ -34,7 +34,7 @@ pub use finding::{
     SecretHash, derive_finding_id, derive_occurrence_id, key_secret_hash,
 };
 pub use hashing::{domain_hasher, finalize_32, finalize_64};
-pub use item::{ConnectorTag, IdentityInputError, ItemKey, ObjectVersionId, StableItemId};
+pub use item::{ConnectorTag, IdentityInputError, ItemIdentityKey, ObjectVersionId, StableItemId};
 pub use policy::{
     CURRENT_EVIDENCE_VERSION, CURRENT_VERSION, IdHashMode, PolicyHashInputs, compute_policy_hash,
 };
