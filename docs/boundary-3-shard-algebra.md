@@ -55,10 +55,10 @@ The crate provides three core capabilities:
          ┌──────────────────────────────────┐
          │  gossip-contracts::coordination  │  ShardSpec, Cursor, split planning
          │  (Boundary 2 data model)         │  core, limits, validation
-         └──────────┬───────────────────────┘
-                    │ sibling (same dependency)
-                    │
-         ┌──────────────────────────────────┐
+         └──────────────────────────────────┘
+                    ▲
+                    │ depends on
+         ┌──────────┴───────────────────────┐
          │  gossip-coordination             │  split execution, protocol,
          │  (Boundary 2 protocol)           │  state machine, sim harness
          └──────────────────────────────────┘
