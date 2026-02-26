@@ -104,9 +104,10 @@ pub use run_errors::{
 pub use session::WorkerSession;
 pub use split::{
     DerivedShardKind, SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError,
-    SplitReplaceResult, SplitResidualPlan, SplitResidualPlanError, SplitResidualResult,
-    derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
-    hash_split_replace_payload, hash_split_residual_payload,
+    SplitReplacePlanningError, SplitReplaceResult, SplitResidualPlan, SplitResidualPlanError,
+    SplitResidualResult, derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload,
+    hash_park_payload, hash_split_replace_payload, hash_split_residual_payload, plan_split_replace,
+    plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,
 };
 pub use traits::CoordinationBackend;
 pub use validation::{check_op_idempotency, validate_lease};

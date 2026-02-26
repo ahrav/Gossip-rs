@@ -15,16 +15,36 @@
 //! [`derive_split_shard_id`], and all operations are fingerprinted for
 //! op-log idempotency via the `hash_*_payload` functions.
 //!
+//! ## Planning vs Execution
+//!
+//! This module defines the **planning** layer: value types that describe
+//! *what* a split should produce (child ranges, cursors, residual specs).
+//! Plans are pure data with lightweight structural validation (child count,
+//! non-identical specs). The **execution** layer lives in the
+//! [`CoordinationBackend`](crate::traits::CoordinationBackend) trait impls
+//! (`split_replace`, `split_residual`), which enforce the full contract:
+//! lease ownership, fence epoch, coverage validation
+//! ([`validate_split_coverage_bounds`]), shard-record mutation, and op-log
+//! idempotency. This separation lets callers construct and inspect plans
+//! without requiring a coordinator instance.
+//!
+//! ## Derived Shard IDs
+//!
 //! Derived shard IDs have bit 63 set — distinguishing root shards
 //! (externally assigned) from split-derived shards (deterministically
 //! computed). Birthday collision bound ~2^31.5 values before 50%
 //! collision probability (63 effective bits); acceptable for bounded
 //! coordination use cases.
 //!
-//! Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`
+//! ## Payload Hashing
+//!
+//! Payload hashes use domain-separated BLAKE3 with [`CanonicalBytes`]
 //! encoding. This ties the op-log idempotency check to the actual
 //! operation parameters, detecting "same OpId, different payload"
-//! conflicts.
+//! conflicts. Each operation type (`checkpoint`, `complete`, `park`,
+//! `split_replace`, `split_residual`) gets a distinct `op_tag` byte
+//! string as a secondary domain-separation layer within the shared
+//! `OP_PAYLOAD_V1` domain.
 
 use std::fmt;
 
@@ -35,7 +55,9 @@ use crate::record::ParkReason;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 #[cfg(test)]
 use gossip_contracts::coordination::shard_spec::ShardSpec;
-use gossip_contracts::coordination::shard_spec::ShardSpecRef;
+use gossip_contracts::coordination::shard_spec::{
+    ShardSpecRef, SplitValidationError, validate_split_coverage_bounds,
+};
 use gossip_contracts::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
 use gossip_contracts::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
 
@@ -127,7 +149,11 @@ pub struct SplitReplaceChild<'a> {
 }
 
 impl<'a> SplitReplaceChild<'a> {
-    /// Construct a new child entry.
+    /// Construct a new child entry from a key sub-range and initial cursor.
+    ///
+    /// No validation is performed here — the child's spec is validated
+    /// against the parent's key range at plan construction time
+    /// ([`plan_split_replace`]) or at coordinator execution time.
     #[must_use]
     pub fn new(spec: ShardSpecRef<'a>, cursor: CursorUpdate<'a>) -> Self {
         Self { spec, cursor }
@@ -172,7 +198,7 @@ impl CanonicalBytes for SplitReplaceChild<'_> {
 /// - **Maximum children**: <= [`MAX_SPLIT_CHILDREN`] (256, resource guard).
 /// - **Coverage**: children must exactly partition the parent's `[start, end)`.
 ///   This is NOT checked by the plan constructor — it is validated by the
-///   coordinator at execution time via [`validate_split_coverage`](gossip_contracts::coordination::shard_spec::validate_split_coverage).
+///   coordinator's split-validation path at execution time before apply.
 ///
 /// The `children` field is private to enforce the count invariants.
 ///
@@ -229,6 +255,9 @@ impl<'a> SplitReplacePlan<'a> {
     ) -> Result<Self, SplitReplacePlanError> {
         let mut collected = InlineVec::new();
         for child in children {
+            // Early exit: reject on the first child that would exceed capacity.
+            // The iterator is intentionally not fully consumed — remaining
+            // children are never materialized, keeping the error path cheap.
             if collected.len() == MAX_SPLIT_CHILDREN {
                 return Err(SplitReplacePlanError::TooManyChildren {
                     count: MAX_SPLIT_CHILDREN + 1,
@@ -252,6 +281,162 @@ impl<'a> SplitReplacePlan<'a> {
     pub fn children(&self) -> &[SplitReplaceChild<'a>] {
         self.children.as_slice()
     }
+}
+
+/// Error returned by split-replace planning free functions.
+///
+/// Distinguishes shape errors (invalid child count) from semantic errors
+/// (children do not form a valid partition of the parent range).
+///
+/// This wrapper preserves the underlying error detail so callers can
+/// branch on "plan shape" vs "coverage semantics" without losing context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SplitReplacePlanningError {
+    /// Plan child-count invariants failed (`< 2` or `> MAX_SPLIT_CHILDREN`).
+    InvalidChildCount(SplitReplacePlanError),
+    /// Child ranges failed split coverage validation against the parent.
+    InvalidCoverage(SplitValidationError),
+}
+
+impl fmt::Display for SplitReplacePlanningError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidChildCount(err) => err.fmt(f),
+            Self::InvalidCoverage(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SplitReplacePlanningError {}
+
+/// Build and validate a split-replace plan against a parent shard.
+///
+/// This helper enforces both:
+/// - child-count bounds via [`SplitReplacePlan::try_new`], and
+/// - coverage correctness via [`validate_split_coverage_bounds`].
+///
+/// The output remains bounded (`InlineVec`) and fully borrowed (`ShardSpecRef`,
+/// `CursorUpdate`) for direct coordinator submission.
+///
+/// Child order in the returned plan is preserved as provided. Coverage
+/// validation is order-insensitive because
+/// [`validate_split_coverage_bounds`] sorts by child start key.
+///
+/// # Lifetimes
+///
+/// The returned plan borrows all child `ShardSpecRef`/`CursorUpdate` data
+/// and therefore cannot outlive the borrowed inputs (`'a`).
+///
+/// # Errors
+///
+/// - [`SplitReplacePlanningError::InvalidChildCount`] if fewer than 2 or
+///   more than [`MAX_SPLIT_CHILDREN`] children are provided.
+/// - [`SplitReplacePlanningError::InvalidCoverage`] if children fail
+///   partition validation against `parent` (mismatched bounds, gaps/overlaps,
+///   inverted ranges, or invalid child spec sizes).
+pub fn plan_split_replace<'a>(
+    parent: ShardSpecRef<'a>,
+    children: impl IntoIterator<Item = SplitReplaceChild<'a>>,
+) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
+    let plan = SplitReplacePlan::try_new(children)
+        .map_err(SplitReplacePlanningError::InvalidChildCount)?;
+    let mut child_specs: InlineVec<ShardSpecRef<'a>, MAX_SPLIT_CHILDREN> = InlineVec::new();
+    for child in plan.children() {
+        child_specs.push(child.spec());
+    }
+    validate_split_coverage_bounds(
+        parent.key_range_start(),
+        parent.key_range_end(),
+        child_specs.as_slice(),
+    )
+    .map_err(SplitReplacePlanningError::InvalidCoverage)?;
+    Ok(plan)
+}
+
+/// Build a split-replace plan from explicit split points.
+///
+/// Split points define child boundaries over the parent range:
+/// `[start, p0), [p0, p1), ..., [pn, end)`.
+///
+/// Fan-out is checked *before* child materialization: the
+/// `MAX_SPLIT_CHILDREN`-th split point is rejected because it would imply
+/// `MAX_SPLIT_CHILDREN + 1` children. Child specs borrow range-boundary
+/// slices from `parent`/`split_points` and metadata bytes from `parent`;
+/// cursors are produced by `cursor_for_child`.
+///
+/// `cursor_for_child` is invoked once per materialized child, in input point
+/// order, then once for the tail child.
+///
+/// # Lifetimes
+///
+/// The returned plan borrows from:
+/// - `parent` (start/end/metadata slices),
+/// - each `split_points` slice, and
+/// - any borrowed data captured in `CursorUpdate<'a>` returned by
+///   `cursor_for_child`.
+///
+/// # Errors
+///
+/// - [`SplitReplacePlanningError::InvalidChildCount`] when split-point fan-out
+///   would exceed [`MAX_SPLIT_CHILDREN`] children, or when no split points
+///   produce only one child.
+/// - [`SplitReplacePlanningError::InvalidCoverage`] when points do not form a
+///   valid partition of `parent` (for example out of order, out of bounds, or
+///   duplicate boundaries).
+pub fn plan_split_replace_at_points<'a>(
+    parent: ShardSpecRef<'a>,
+    split_points: impl IntoIterator<Item = &'a [u8]>,
+    mut cursor_for_child: impl FnMut(usize, ShardSpecRef<'a>) -> CursorUpdate<'a>,
+) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
+    let mut points: Vec<&'a [u8]> = Vec::new();
+    for point in split_points {
+        // N split points produce N+1 children (N intervals plus the tail).
+        // At this point we have `points.len()` accepted points; accepting
+        // one more would give `points.len() + 1` points and therefore
+        // `points.len() + 2` children. Reject before materialization if
+        // that fan-out exceeds MAX_SPLIT_CHILDREN.
+        if points.len() + 2 > MAX_SPLIT_CHILDREN {
+            return Err(SplitReplacePlanningError::InvalidChildCount(
+                SplitReplacePlanError::TooManyChildren {
+                    count: MAX_SPLIT_CHILDREN + 1,
+                },
+            ));
+        }
+        points.push(point);
+    }
+
+    let mut children: InlineVec<SplitReplaceChild<'a>, MAX_SPLIT_CHILDREN> = InlineVec::new();
+    let mut child_start = parent.key_range_start();
+    for (index, point) in points.into_iter().enumerate() {
+        let spec = ShardSpecRef::new(child_start, point, parent.metadata());
+        let cursor = cursor_for_child(index, spec);
+        children.push(SplitReplaceChild::new(spec, cursor));
+        child_start = point;
+    }
+
+    let tail_index = children.len();
+    let tail_spec = ShardSpecRef::new(child_start, parent.key_range_end(), parent.metadata());
+    let tail_cursor = cursor_for_child(tail_index, tail_spec);
+    children.push(SplitReplaceChild::new(tail_spec, tail_cursor));
+
+    plan_split_replace(parent, children.as_slice().iter().copied())
+}
+
+/// Build a split-replace plan from explicit split points using
+/// [`CursorUpdate::initial`] for all children.
+///
+/// Equivalent to [`plan_split_replace_at_points`] with a cursor factory that
+/// always returns `CursorUpdate::initial()`.
+///
+/// # Errors
+///
+/// Propagates [`SplitReplacePlanningError`] from
+/// [`plan_split_replace_at_points`].
+pub fn plan_split_replace_at_points_initial_cursor<'a>(
+    parent: ShardSpecRef<'a>,
+    split_points: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<SplitReplacePlan<'a>, SplitReplacePlanningError> {
+    plan_split_replace_at_points(parent, split_points, |_, _| CursorUpdate::initial())
 }
 
 impl CanonicalBytes for SplitReplacePlan<'_> {
@@ -334,14 +519,19 @@ impl fmt::Display for SplitResidualPlanError {
 impl std::error::Error for SplitResidualPlanError {}
 
 impl<'a> SplitResidualPlan<'a> {
-    /// Construct a validated residual plan.
+    /// Construct a residual plan with a minimal structural guard.
+    ///
+    /// The only check performed here is that the two specs differ
+    /// (identical specs would mean no actual split occurred). The full
+    /// coverage contract — `parent_new_spec ∪ residual_spec` equals the
+    /// original parent range with no overlap — is enforced by the
+    /// coordinator at execution time via
+    /// [`validate_residual_split`](gossip_contracts::coordination::shard_spec::validate_residual_split).
     ///
     /// # Errors
     ///
     /// Returns [`SplitResidualPlanError::IdenticalSpecs`] if
-    /// `parent_new_spec == residual_spec`. Full coverage validation
-    /// (parent_new ∪ residual == old_parent, no overlap) is performed
-    /// by the coordinator at execution time via `validate_residual_split`.
+    /// `parent_new_spec == residual_spec`.
     pub fn try_new(
         parent_new_spec: ShardSpecRef<'a>,
         residual_spec: ShardSpecRef<'a>,
@@ -437,9 +627,12 @@ pub struct SplitResidualResult {
 ///
 /// ## Caller Responsibility
 ///
-/// The `index` parameter must be `parent.spawned.len() as u32` at call
-/// time — callers must not hardcode 0. Different indices produce different
-/// IDs (tested by `derive_split_shard_id_collision_free`).
+/// The `index` parameter should be a deterministic position in the
+/// parent-derived sequence for this operation (for example
+/// `base_spawned_len + child_offset`) — callers must not hardcode 0.
+/// Changing `index` changes the hash input and therefore changes the
+/// derived ID in practice (barring astronomically unlikely hash collisions;
+/// see collision bound above).
 #[must_use]
 pub fn derive_split_shard_id(
     run: RunId,
@@ -455,6 +648,9 @@ pub fn derive_split_shard_id(
     kind.write_canonical(&mut h);
     index.write_canonical(&mut h);
 
+    // Force bit 63 so ShardId::is_derived() returns true, distinguishing
+    // this ID from externally-assigned root shard IDs (which have bit 63
+    // clear). This reduces effective entropy from 64 to 63 bits.
     let id = finalize_64(&h) | (1u64 << 63);
     let result = ShardId::from_raw(id);
     assert!(result.is_derived(), "derived shard ID must have bit 63 set");
@@ -465,14 +661,27 @@ pub fn derive_split_shard_id(
 // ============================================================================
 // Payload hash functions
 // ============================================================================
+//
+// Every coordinator mutation (checkpoint, complete, park, split-replace,
+// split-residual) fingerprints its parameters into a 64-bit payload hash
+// stored alongside the OpId in the shard's op-log. On idempotent replay,
+// the coordinator compares the stored hash against the incoming payload to
+// detect "same OpId, different parameters" conflicts.
+//
+// All hash functions below are thin wrappers around `op_payload_hash`,
+// differing only in their `op_tag` and the fields they encode.
 
-/// Internal helper: compute a domain-tagged payload hash.
+/// Shared implementation for all payload hash functions.
 ///
-/// Uses the cached `OP_PAYLOAD_HASHER` (`OP_PAYLOAD_V1` domain) and
-/// prepends the operation-specific `op_tag` before calling `write_fields`.
-/// The tag acts as a second domain-separation layer — even if two different
-/// operation types happen to produce identical field bytes, the different
-/// tags guarantee distinct hashes (tested by `checkpoint_and_complete_hashes_differ`).
+/// Clones the cached `OP_PAYLOAD_HASHER` (`OP_PAYLOAD_V1` domain),
+/// prepends the operation-specific `op_tag`, then delegates to
+/// `write_fields` for the operation's canonical payload.
+///
+/// The `op_tag` acts as a secondary domain-separation layer within the
+/// shared `OP_PAYLOAD_V1` domain: even if two different operation types
+/// happen to produce identical field bytes, the different tags guarantee
+/// distinct hashes (verified by `checkpoint_and_complete_hashes_differ`
+/// property test).
 #[must_use]
 pub fn op_payload_hash(op_tag: &[u8], write_fields: impl FnOnce(&mut Hasher)) -> u64 {
     let mut h = OP_PAYLOAD_HASHER.clone();
@@ -740,6 +949,121 @@ mod tests {
         }
     }
 
+    /// Boundary validation for `plan_split_replace` over child-count edges:
+    /// 0, 1, 2, MAX, MAX+1.
+    #[test]
+    fn split_replace_planner_boundary_validation() {
+        let cases: &[(usize, Result<(), SplitReplacePlanningError>)] = &[
+            (
+                0,
+                Err(SplitReplacePlanningError::InvalidChildCount(
+                    SplitReplacePlanError::TooFewChildren { count: 0 },
+                )),
+            ),
+            (
+                1,
+                Err(SplitReplacePlanningError::InvalidChildCount(
+                    SplitReplacePlanError::TooFewChildren { count: 1 },
+                )),
+            ),
+            (2, Ok(())),
+            (MAX_SPLIT_CHILDREN, Ok(())),
+            (
+                MAX_SPLIT_CHILDREN + 1,
+                Err(SplitReplacePlanningError::InvalidChildCount(
+                    SplitReplacePlanError::TooManyChildren {
+                        count: MAX_SPLIT_CHILDREN + 1,
+                    },
+                )),
+            ),
+        ];
+
+        for &(count, ref expected) in cases {
+            let parent = if count == 0 {
+                ShardSpec::with_range([0, 0], [0, 1])
+            } else {
+                ShardSpec::with_range([0, 0], (count as u16).to_be_bytes())
+            };
+            let boundaries: Vec<[u8; 2]> = (0..=count).map(|i| (i as u16).to_be_bytes()).collect();
+            let children: Vec<_> = (0..count)
+                .map(|i| {
+                    let spec = ShardSpecRef::with_range(&boundaries[i], &boundaries[i + 1]);
+                    SplitReplaceChild::new(spec, CursorUpdate::initial())
+                })
+                .collect();
+
+            let result = plan_split_replace(parent.as_ref(), children);
+            match expected {
+                Ok(()) => assert!(result.is_ok(), "count={count} should be accepted"),
+                Err(e) => assert_eq!(&result.unwrap_err(), e, "count={count}"),
+            }
+        }
+    }
+
+    /// `plan_split_replace_at_points` must reject `MAX+1` children before
+    /// constructing any child specs/cursors.
+    #[test]
+    fn split_replace_planner_points_rejects_over_fanout_before_materialization() {
+        let max_plus_one = MAX_SPLIT_CHILDREN + 1;
+        let parent = ShardSpec::with_range([0, 0], (max_plus_one as u16).to_be_bytes());
+        let split_points: Vec<[u8; 2]> = (1..=MAX_SPLIT_CHILDREN)
+            .map(|i| (i as u16).to_be_bytes())
+            .collect();
+        let mut cursor_calls = 0usize;
+        let result = plan_split_replace_at_points(
+            parent.as_ref(),
+            split_points.iter().map(<[u8; 2]>::as_slice),
+            |_, _| {
+                cursor_calls += 1;
+                CursorUpdate::initial()
+            },
+        );
+
+        assert_eq!(
+            result,
+            Err(SplitReplacePlanningError::InvalidChildCount(
+                SplitReplacePlanError::TooManyChildren {
+                    count: MAX_SPLIT_CHILDREN + 1,
+                }
+            ))
+        );
+        assert_eq!(cursor_calls, 0, "children should not be materialized");
+    }
+
+    #[test]
+    fn split_replace_planner_points_produces_coverage_valid_deterministic_plan() {
+        let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
+        let split_points = [b"m".as_slice()];
+
+        let plan_a =
+            plan_split_replace_at_points_initial_cursor(parent.as_ref(), split_points).unwrap();
+        let plan_b =
+            plan_split_replace_at_points_initial_cursor(parent.as_ref(), split_points).unwrap();
+
+        assert_eq!(plan_a.children().len(), 2);
+        assert_eq!(plan_a.children()[0].spec().key_range_start(), b"a");
+        assert_eq!(plan_a.children()[0].spec().key_range_end(), b"m");
+        assert_eq!(plan_a.children()[1].spec().key_range_start(), b"m");
+        assert_eq!(plan_a.children()[1].spec().key_range_end(), b"z");
+        assert_eq!(plan_a.children()[0].spec().metadata(), b"meta");
+        assert_eq!(plan_a.children()[1].spec().metadata(), b"meta");
+        assert_eq!(
+            hash_split_replace_payload(&plan_a),
+            hash_split_replace_payload(&plan_b)
+        );
+
+        let child_specs: Vec<_> = plan_a.children().iter().map(|child| child.spec()).collect();
+        assert!(
+            validate_split_coverage_bounds(
+                parent.as_ref().key_range_start(),
+                parent.as_ref().key_range_end(),
+                &child_specs
+            )
+            .is_ok(),
+            "planned children must exactly cover the parent range"
+        );
+    }
+
     // -- SplitResidualPlan validation ------------------------------------
 
     #[test]
@@ -779,7 +1103,8 @@ mod tests {
     proptest! {
         #![proptest_config(gossip_contracts::test_util::miri_proptest_config())]
 
-        // Collision-freedom: distinct inputs → different derived shard IDs.
+        // Distinct input tuples should map to distinct derived shard IDs in
+        // practice (hash collisions are astronomically unlikely).
         #[test]
         fn derive_split_shard_id_collision_free(
             run_a in any::<u64>(), parent_a in any::<u64>(), op_a in any::<u64>(),
