@@ -504,8 +504,16 @@ impl fmt::Display for SplitResidualPlanningError {
                 write!(f, "split-residual cursor planning requires cursor.last_key")
             }
             Self::NoSuccessor => write!(f, "cursor key has no representable successor"),
-            Self::SplitPointOutOfBounds { .. } => {
-                write!(f, "cursor successor falls outside parent range")
+            Self::SplitPointOutOfBounds {
+                split_point,
+                parent_start,
+                parent_end,
+            } => {
+                write!(
+                    f,
+                    "cursor successor (len={split_point}) falls outside parent range \
+                     (start_len={parent_start}, end_len={parent_end})"
+                )
             }
             Self::InvalidPlan(err) => err.fmt(f),
             Self::InvalidCoverage(err) => err.fmt(f),
@@ -862,6 +870,37 @@ mod tests {
             // Deterministic: same inputs produce the same canonical digest.
             prop_assert_eq!(canonical_digest(&plan_a), canonical_digest(&plan_b));
         }
+
+        #[test]
+        fn split_residual_at_point_coverage_and_determinism(
+            base in proptest::collection::vec(any::<u8>(), 1..16),
+            suffix1 in proptest::collection::vec(any::<u8>(), 1..8),
+            suffix2 in proptest::collection::vec(any::<u8>(), 1..8),
+            meta in proptest::collection::vec(any::<u8>(), 0..32),
+        ) {
+            // Build (start, mid, end) via suffix accumulation: start < mid < end.
+            let start = base.clone();
+            let mut mid = base.clone();
+            mid.extend_from_slice(&suffix1);
+            let mut end = mid.clone();
+            end.extend_from_slice(&suffix2);
+
+            let parent = ShardSpec::with_range_and_metadata(&start, &end, &meta);
+            let plan_a = plan_split_residual_at_point(parent.as_ref(), &mid).unwrap();
+            let plan_b = plan_split_residual_at_point(parent.as_ref(), &mid).unwrap();
+
+            // Parent_new covers [start, mid).
+            prop_assert_eq!(plan_a.parent_new_spec().key_range_start(), start.as_slice());
+            prop_assert_eq!(plan_a.parent_new_spec().key_range_end(), mid.as_slice());
+            // Residual covers [mid, end).
+            prop_assert_eq!(plan_a.residual_spec().key_range_start(), mid.as_slice());
+            prop_assert_eq!(plan_a.residual_spec().key_range_end(), end.as_slice());
+            // Metadata propagated to both halves.
+            prop_assert_eq!(plan_a.parent_new_spec().metadata(), meta.as_slice());
+            prop_assert_eq!(plan_a.residual_spec().metadata(), meta.as_slice());
+            // Deterministic: same inputs produce the same canonical digest.
+            prop_assert_eq!(canonical_digest(&plan_a), canonical_digest(&plan_b));
+        }
     }
 
     #[test]
@@ -1018,6 +1057,16 @@ mod tests {
             parent_end: 2,
         },
     )]
+    #[case::successor_below_parent_start(
+        b"m".as_slice(),
+        b"z".as_slice(),
+        Some(b"a".as_slice()),
+        SplitResidualPlanningError::SplitPointOutOfBounds {
+            split_point: 2,
+            parent_start: 1,
+            parent_end: 1,
+        },
+    )]
     fn plan_split_residual_from_cursor_rejects(
         #[case] start: &[u8],
         #[case] end: &[u8],
@@ -1056,5 +1105,85 @@ mod tests {
         assert_eq!(plan.residual_spec().key_range_start(), b"m\0");
         // Residual inherits the unbounded end.
         assert!(plan.residual_spec().key_range_end().is_empty());
+    }
+
+    // -- prefix_successor_into stripping logic at MAX_KEY_SIZE ----------------
+
+    #[test]
+    fn cursor_split_strips_trailing_0xff_at_max_key_size() {
+        // Key: [0x01, 0xFF, 0xFF, ...] at MAX_KEY_SIZE.
+        // prefix_successor_into strips trailing 0xFF bytes, leaving [0x01],
+        // then increments → [0x02].
+        let mut key = [0xFF; MAX_KEY_SIZE];
+        key[0] = 0x01;
+        let parent = ShardSpec::with_range([0x00], [0x03]);
+        let cursor = CursorUpdate::with_last_key(&key);
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let plan = plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap();
+
+        assert_eq!(plan.parent_new_spec().key_range_start(), &[0x00]);
+        assert_eq!(plan.parent_new_spec().key_range_end(), &[0x02]);
+        assert_eq!(plan.residual_spec().key_range_start(), &[0x02]);
+        assert_eq!(plan.residual_spec().key_range_end(), &[0x03]);
+    }
+
+    #[test]
+    fn cursor_split_increments_last_byte_at_max_key_size() {
+        // Key: all 0x50 at MAX_KEY_SIZE.
+        // prefix_successor_into finds the last non-0xFF byte (the last byte,
+        // 0x50) and increments it → 0x51. Successor stays at MAX_KEY_SIZE.
+        let key = [0x50; MAX_KEY_SIZE];
+        let parent = ShardSpec::with_range([0x00], [0xFF]);
+        let cursor = CursorUpdate::with_last_key(&key);
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let plan = plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap();
+
+        let mut expected_successor = [0x50; MAX_KEY_SIZE];
+        expected_successor[MAX_KEY_SIZE - 1] = 0x51;
+        assert_eq!(plan.parent_new_spec().key_range_start(), &[0x00]);
+        assert_eq!(plan.parent_new_spec().key_range_end(), &expected_successor);
+        assert_eq!(plan.residual_spec().key_range_start(), &expected_successor);
+        assert_eq!(plan.residual_spec().key_range_end(), &[0xFF]);
+    }
+
+    // -- Direct tests for plan_split_residual_at_point ------------------------
+
+    #[test]
+    fn plan_split_residual_at_point_happy_path() {
+        let parent = ShardSpec::with_range_and_metadata(b"a", b"z", b"meta");
+        let plan = plan_split_residual_at_point(parent.as_ref(), b"m").unwrap();
+
+        assert_eq!(plan.parent_new_spec().key_range_start(), b"a");
+        assert_eq!(plan.parent_new_spec().key_range_end(), b"m");
+        assert_eq!(plan.residual_spec().key_range_start(), b"m");
+        assert_eq!(plan.residual_spec().key_range_end(), b"z");
+        assert_eq!(plan.parent_new_spec().metadata(), b"meta");
+        assert_eq!(plan.residual_spec().metadata(), b"meta");
+    }
+
+    #[test]
+    fn plan_split_residual_at_point_rejects_split_before_range() {
+        // Split point before parent start reorders sorted children,
+        // causing a StartMismatch in coverage validation.
+        let parent = ShardSpec::with_range(b"c", b"m");
+        let err = plan_split_residual_at_point(parent.as_ref(), b"a").unwrap_err();
+        assert!(
+            matches!(err, SplitResidualPlanningError::InvalidCoverage(_)),
+            "split before parent range should be rejected, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn plan_split_residual_at_point_rejects_identical_specs() {
+        // Degenerate parent where start == end: splitting at the shared
+        // boundary produces identical parent_new and residual specs.
+        // Uses ShardSpecRef::new (no validation) to bypass the owned-type
+        // panic on start >= end.
+        let parent = ShardSpecRef::new(b"m", b"m", b"");
+        let err = plan_split_residual_at_point(parent, b"m").unwrap_err();
+        assert_eq!(
+            err,
+            SplitResidualPlanningError::InvalidPlan(SplitResidualPlanError::IdenticalSpecs),
+        );
     }
 }
