@@ -43,27 +43,28 @@ pub mod sim;
 // ---------------------------------------------------------------------------
 
 pub use gossip_contracts::coordination::{
-    // Cursor types (from coordination::cursor)
+    // Cursor types
     CursorAdvance,
     CursorBoundsCheck,
     CursorInputError,
     CursorMaxTokenSize,
     CursorSemantics,
     CursorUpdate,
-    // Manifest types (from coordination::manifest)
+    // Manifest types
     InitialShardInput,
     MAX_INITIAL_SHARDS,
+    // Limits (from coordination::limits)
     MAX_KEY_SIZE,
-    // Limits
     MAX_SPAWNED_PER_SHARD,
     MAX_SPLIT_CHILDREN,
     ManifestValidationError,
-    // Pooled types
+    // Pooled arena wrappers
     PooledCursor,
     PooledShardSpec,
     PooledSpawned,
     PooledSpawnedIter,
     ShardArena,
+    // Shard spec types
     ShardSpec,
     ShardSpecHandle,
     ShardSpecInputError,

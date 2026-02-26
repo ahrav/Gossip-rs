@@ -54,6 +54,9 @@
 
 use super::*;
 use gossip_contracts::coordination::cursor::CursorUpdate;
+use gossip_contracts::coordination::manifest::{
+    InitialShardInput, MAX_INITIAL_SHARDS, ManifestValidationError, validate_manifest,
+};
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
 use gossip_contracts::identity::{OpId, RunId, ShardId};
 use gossip_stdx::{ByteSlab, RingBuffer};
