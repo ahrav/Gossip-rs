@@ -11,8 +11,8 @@
 //! - This module owns data contracts and pure validation helpers.
 //! - `gossip-coordination` owns protocol sequencing, lease/fence enforcement,
 //!   idempotency behavior, and backend mutation semantics.
-//! - Split-replace planning is defined here (`split.rs`); split execution
-//!   result types and residual split execution helpers live in
+//! - Split planning (replace + residual) is defined here (`split.rs`);
+//!   split execution result types and ID/hash derivation helpers live in
 //!   `gossip-coordination::split_execution`.
 //!
 //! ## Module Map
@@ -22,7 +22,7 @@
 //! ├── shard_spec.rs    ShardSpec, ShardSpecRef, CursorSemantics — key ranges and split validation
 //! ├── cursor.rs        CursorUpdate — two-layer progress marker
 //! ├── pooled.rs        PooledShardSpec, PooledCursor — arena-backed zero-alloc hot-path storage
-//! ├── split.rs         Split-replace planner core (shape+coverage, backend-agnostic)
+//! ├── split.rs         Split planner core (replace + residual, backend-agnostic)
 //! ├── manifest.rs      InitialShardInput, validate_manifest — shard registration validation
 //! └── limits.rs        MAX_SPLIT_CHILDREN, MAX_SPAWNED_PER_SHARD — split capacity constants
 //! ```
@@ -44,6 +44,7 @@ pub mod split;
 pub use cursor::{
     CursorAdvance, CursorBoundsCheck, CursorInputError, CursorUpdate, MAX_KEY_SIZE,
     MAX_TOKEN_SIZE as CursorMaxTokenSize, check_cursor_advance, check_cursor_bounds,
+    key_successor_into, prefix_successor_into,
 };
 
 // -- Split capacity limits --
@@ -64,10 +65,12 @@ pub use shard_spec::{
     validate_residual_split, validate_split_coverage,
 };
 
-// -- Split-replace planning core (execution lives in gossip-coordination) --
+// -- Split planning core (execution lives in gossip-coordination) --
 pub use split::{
     SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError, SplitReplacePlanningError,
-    plan_split_replace, plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,
+    SplitResidualPlan, SplitResidualPlanError, SplitResidualPlanningError, plan_split_replace,
+    plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor, plan_split_residual,
+    plan_split_residual_at_point, plan_split_residual_from_cursor,
 };
 
 // shard_spec_tests.rs is declared inside shard_spec.rs via #[path] attribute.

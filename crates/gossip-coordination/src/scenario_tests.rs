@@ -39,12 +39,12 @@ use crate::record::ShardStatus;
 use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RegisterShardsError, RunTransitionError};
 use crate::sim::backend::SimIntrospection;
-use crate::split_execution::SplitResidualPlan;
 use crate::test_fixtures::*;
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::ShardSpec;
+use gossip_contracts::coordination::split::SplitResidualPlan;
 use gossip_contracts::identity::{OpId, RunId, ShardId, ShardKey};
 
 // ============================================================================

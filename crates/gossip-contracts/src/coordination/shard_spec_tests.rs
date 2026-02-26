@@ -2,7 +2,8 @@ use rstest::rstest;
 
 use super::*;
 use crate::test_util::{
-    arb_bounded_shard_spec, arb_bounded_shard_spec_with_metadata, arb_shard_spec, canonical_digest,
+    arb_bounded_shard_spec, arb_bounded_shard_spec_with_metadata, arb_shard_spec,
+    arb_valid_n_way_split, canonical_digest,
 };
 use proptest::prelude::*;
 
@@ -489,30 +490,6 @@ fn with_range_and_metadata_stores_and_hashes_metadata() {
 // -------------------------------------------------------------------
 // Property-based tests
 // -------------------------------------------------------------------
-
-/// Generate a valid parent + 2–4 contiguous children via suffix
-/// accumulation (same proven pattern as `arb_bounded_shard_spec`).
-fn arb_valid_n_way_split() -> impl Strategy<Value = (ShardSpec, Vec<ShardSpec>)> {
-    (
-        proptest::collection::vec(any::<u8>(), 1..16),
-        proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..8), 2..=4),
-    )
-        .prop_map(|(base, suffixes)| {
-            let mut boundaries = vec![base.clone()];
-            let mut current = base;
-            for suffix in &suffixes {
-                current.extend_from_slice(suffix);
-                boundaries.push(current.clone());
-            }
-            let parent =
-                ShardSpec::with_range(boundaries[0].clone(), boundaries.last().unwrap().clone());
-            let children: Vec<ShardSpec> = boundaries
-                .windows(2)
-                .map(|w| ShardSpec::with_range(w[0].clone(), w[1].clone()))
-                .collect();
-            (parent, children)
-        })
-}
 
 proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]

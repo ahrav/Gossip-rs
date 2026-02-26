@@ -76,6 +76,55 @@ pub fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
     ]
 }
 
+/// Generate a valid parent [`ShardSpec`] plus 2–4 contiguous children whose
+/// ranges form an exact partition of the parent's `[start, end)` interval.
+///
+/// Uses suffix accumulation (same proven pattern as [`arb_bounded_shard_spec`])
+/// to guarantee strict lexicographic ordering at each boundary.
+pub fn arb_valid_n_way_split() -> impl Strategy<Value = (ShardSpec, Vec<ShardSpec>)> {
+    (
+        proptest::collection::vec(any::<u8>(), 1..16),
+        proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..8), 2..=4),
+    )
+        .prop_map(|(base, suffixes)| {
+            let mut boundaries = vec![base.clone()];
+            let mut current = base;
+            for suffix in &suffixes {
+                current.extend_from_slice(suffix);
+                boundaries.push(current.clone());
+            }
+            let parent =
+                ShardSpec::with_range(boundaries[0].clone(), boundaries.last().unwrap().clone());
+            let children: Vec<ShardSpec> = boundaries
+                .windows(2)
+                .map(|w| ShardSpec::with_range(w[0].clone(), w[1].clone()))
+                .collect();
+            (parent, children)
+        })
+}
+
+/// Generate a valid parent [`ShardSpec`] plus a split point guaranteed to be
+/// strictly between `parent.start` and `parent.end`.
+///
+/// Uses suffix accumulation (same proven pattern as [`arb_bounded_shard_spec`])
+/// to guarantee strict lexicographic ordering: `start < split_point < end`.
+pub fn arb_residual_split() -> impl Strategy<Value = (ShardSpec, Vec<u8>)> {
+    (
+        proptest::collection::vec(any::<u8>(), 1..16),
+        proptest::collection::vec(any::<u8>(), 1..8),
+        proptest::collection::vec(any::<u8>(), 1..8),
+    )
+        .prop_map(|(base, suffix1, suffix2)| {
+            let start = base.clone();
+            let mut split_point = base;
+            split_point.extend_from_slice(&suffix1);
+            let mut end = split_point.clone();
+            end.extend_from_slice(&suffix2);
+            let parent = ShardSpec::with_range(start, end);
+            (parent, split_point)
+        })
+}
+
 // ---------------------------------------------------------------------------
 // TestSlab — shared drop-safe slab wrapper for test code
 // ---------------------------------------------------------------------------

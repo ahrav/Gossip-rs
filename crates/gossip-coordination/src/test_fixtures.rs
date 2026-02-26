@@ -34,12 +34,13 @@ use crate::in_memory::InMemoryCoordinator;
 use crate::lease::Lease;
 use crate::record::{ParkReason, ShardStatus};
 use crate::run::{RunConfig, RunManagement};
-use crate::split_execution::SplitResidualPlan;
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpec, ShardSpecRef};
-use gossip_contracts::coordination::split::{SplitReplaceChild, SplitReplacePlan};
+use gossip_contracts::coordination::split::{
+    SplitReplaceChild, SplitReplacePlan, SplitResidualPlan, plan_split_residual_at_point,
+};
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 
 // ============================================================================
@@ -89,7 +90,7 @@ pub fn test_key() -> ShardKey {
 }
 
 /// Create a derived `ShardId` (bit 63 set), matching the convention
-/// used by the split subsystem for child shard IDs.
+/// used by the split subsystem for child and residual shard IDs.
 pub fn derived_shard_id(base: u64) -> ShardId {
     ShardId::from_raw(base | (1u64 << 63))
 }
@@ -243,11 +244,7 @@ pub fn test_split_replace_plan() -> SplitReplacePlan<'static> {
 
 /// The canonical `[a,m)` parent + `[m,z)` residual plan.
 pub fn test_split_residual_plan() -> SplitResidualPlan<'static> {
-    SplitResidualPlan::try_new(
-        ShardSpecRef::new(b"a", b"m", b""),
-        ShardSpecRef::new(b"m", b"z", b""),
-    )
-    .unwrap()
+    plan_split_residual_at_point(ShardSpecRef::new(b"a", b"z", b""), b"m").unwrap()
 }
 
 // ============================================================================

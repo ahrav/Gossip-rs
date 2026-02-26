@@ -102,10 +102,11 @@ use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::session::WorkerSession;
 use crate::sim::backend::SimulationBackend;
-use crate::split_execution::SplitResidualPlan;
 use gossip_contracts::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
-use gossip_contracts::coordination::split::plan_split_replace_at_points_initial_cursor;
+use gossip_contracts::coordination::split::{
+    plan_split_replace_at_points_initial_cursor, plan_split_residual_at_point,
+};
 use gossip_contracts::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
@@ -1756,10 +1757,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         let mid = self.context.rng().random_range(lo..hi);
 
         let mid_key = [mid];
-        let new_parent_spec = ShardSpecRef::with_range(start, &mid_key);
-        let residual_spec = ShardSpecRef::with_range(&mid_key, end);
-
-        let plan = match SplitResidualPlan::try_new(new_parent_spec, residual_spec) {
+        let parent_spec = ShardSpecRef::with_range(start, end);
+        let plan = match plan_split_residual_at_point(parent_spec, mid_key.as_slice()) {
             Ok(p) => p,
             Err(_e) => {
                 debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
@@ -2358,17 +2357,20 @@ impl<B: SimulationBackend> CoordinationSim<B> {
     // -----------------------------------------------------------------------
 
     /// Generate a cursor that is lexicographically >= the worker's last cursor
-    /// for this shard and within the shard spec bounds.
+    /// for this shard, using first-byte range bounds from the shard spec.
     ///
     /// Naively random cursors would frequently regress behind the worker's
     /// last checkpoint, causing the coordinator to correctly reject the
     /// operation. That masks real bugs behind a flood of expected
     /// `CursorRegression` rejections. By tracking per-worker cursor progress
-    /// and only generating forward cursors, rejections in the simulation
-    /// signal actual protocol violations rather than test-harness noise.
+    /// and only generating forward cursors, the harness substantially reduces
+    /// expected regression noise so rejection-heavy runs are easier to
+    /// interpret.
     ///
     /// Generates variable-length keys (1–3 bytes) to exercise multi-byte
-    /// lexicographic comparison paths in the coordinator.
+    /// lexicographic comparison paths in the coordinator. The range model here
+    /// is intentionally first-byte-oriented (matching default sim shard shapes),
+    /// not a full arbitrary-byte `ShardSpecRef` interval sampler.
     fn generate_forward_cursor(&mut self, worker: WorkerId, key: ShardKey) -> Vec<u8> {
         let last = self
             .workers
@@ -2794,9 +2796,8 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     let range_lo_key = [range_lo];
                     let mid_key = [mid];
                     let range_hi_key = [range_hi];
-                    let new_parent_spec = ShardSpecRef::with_range(&range_lo_key, &mid_key);
-                    let residual_spec = ShardSpecRef::with_range(&mid_key, &range_hi_key);
-                    let plan = match SplitResidualPlan::try_new(new_parent_spec, residual_spec) {
+                    let parent_spec = ShardSpecRef::with_range(&range_lo_key, &range_hi_key);
+                    let plan = match plan_split_residual_at_point(parent_spec, mid_key.as_slice()) {
                         Ok(plan) => plan,
                         Err(_e) => {
                             debug_assert!(false, "unexpected split-residual plan failure: {_e:?}");
