@@ -2,9 +2,9 @@
 use libfuzzer_sys::fuzz_target;
 
 use gossip_contracts::identity::{
-    ConnectorTag, FindingIdInputs, ItemKey, NormHash, ObjectVersionId, OccurrenceIdInputs,
-    RuleFingerprint, TenantId, TenantSecretKey, derive_finding_id, derive_occurrence_id,
-    key_secret_hash,
+    derive_finding_id, derive_occurrence_id, key_secret_hash, ConnectorTag, FindingIdInputs,
+    ItemIdentityKey, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId,
+    TenantSecretKey,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -27,7 +27,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let connector = ConnectorTag::from_bytes(*b"fuzztest");
-    let item_key = ItemKey::new(connector, path);
+    let item_key = ItemIdentityKey::new(connector, path);
     let stable_id = item_key.stable_id();
 
     let tenant_key = TenantSecretKey::from_bytes(tenant_key_bytes);
@@ -44,7 +44,10 @@ fuzz_target!(|data: &[u8]| {
     // Derive twice and assert determinism.
     let finding_1 = derive_finding_id(&finding_inputs);
     let finding_2 = derive_finding_id(&finding_inputs);
-    assert_eq!(finding_1, finding_2, "FindingId derivation is not deterministic");
+    assert_eq!(
+        finding_1, finding_2,
+        "FindingId derivation is not deterministic"
+    );
 
     let version = ObjectVersionId::from_version_bytes(b"fuzz-version");
     let occ_inputs = OccurrenceIdInputs {

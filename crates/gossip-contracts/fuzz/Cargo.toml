@@ -15,8 +15,8 @@ path = ".."
 features = ["test-support"]
 
 [[bin]]
-name = "fuzz_item_key"
-path = "fuzz_targets/fuzz_item_key.rs"
+name = "fuzz_item_identity_key"
+path = "fuzz_targets/fuzz_item_identity_key.rs"
 doc = false
 
 [[bin]]

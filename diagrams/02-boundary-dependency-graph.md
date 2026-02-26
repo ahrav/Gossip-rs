@@ -57,7 +57,7 @@ graph TB
 
     B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId"| B1
     B3 -->|"StableItemId<br/>(key encoding via<br/>CanonicalBytes)"| B1
-    B4 -->|"ConnectorTag, ItemKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
+    B4 -->|"ConnectorTag, ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
     B5 -->|"FindingId, OccurrenceId,<br/>DoneLedgerKey, OvidHash,<br/>TriageGroupKey, TenantId,<br/>PolicyHash, SecretHash"| B1
 
     B2 -->|"ShardSpec, KeyEncoding<br/>(shard range types<br/>for split operations)"| B3
@@ -129,7 +129,7 @@ graph TD
     B3 -->|"StableItemId"| B1
     B2 -->|"TenantId, ShardId,<br/>FenceEpoch, ..."| B1
     B2 -->|"ShardSpec"| B3
-    B4 -->|"ConnectorTag,<br/>ItemKey, ..."| B1
+    B4 -->|"ConnectorTag,<br/>ItemIdentityKey, ..."| B1
     B4 -->|"KeyEncoding"| B3
     B5 -->|"FindingId, OvidHash,<br/>DoneLedgerKey, ..."| B1
     B5 -->|"Cursor, ShardStatus,<br/>ParkReason"| B2

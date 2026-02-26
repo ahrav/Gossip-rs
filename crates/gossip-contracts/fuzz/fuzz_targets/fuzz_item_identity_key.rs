@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-use gossip_contracts::identity::{ConnectorTag, ItemKey, ObjectVersionId};
+use gossip_contracts::identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId};
 
 fuzz_target!(|data: &[u8]| {
     // Fuzz ConnectorTag::from_ascii — must not panic on arbitrary bytes
@@ -10,13 +10,13 @@ fuzz_target!(|data: &[u8]| {
         let _ = std::panic::catch_unwind(|| ConnectorTag::from_ascii(data));
     }
 
-    // Fuzz ItemKey::new — must not panic except on empty path.
+    // Fuzz ItemIdentityKey::new — must not panic except on empty locator.
     if data.len() >= 9 {
         let tag_bytes: [u8; 8] = data[..8].try_into().unwrap();
-        let path = data[8..].to_vec();
-        if !path.is_empty() {
+        let locator = data[8..].to_vec();
+        if !locator.is_empty() {
             let connector = ConnectorTag::from_bytes(tag_bytes);
-            let key = ItemKey::new(connector, path);
+            let key = ItemIdentityKey::new(connector, locator);
             // Derive stable_id — must not panic.
             let _ = key.stable_id();
         }

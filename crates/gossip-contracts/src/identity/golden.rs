@@ -26,7 +26,7 @@
 //!
 //! | Vector | Domain constant | Trigger conditions |
 //! |--------|----------------|--------------------|
-//! | `STABLE_ITEM_ID_EXPECTED` | `domain::ITEM_ID_V1` | `ItemKey` encoding or domain tag changes |
+//! | `STABLE_ITEM_ID_EXPECTED` | `domain::ITEM_ID_V1` | `ItemIdentityKey` encoding or domain tag changes |
 //! | `OBJECT_VERSION_ID_EXPECTED` | `domain::OBJECT_VERSION_V1` | `ObjectVersionId` encoding changes |
 //! | `KEY_SECRET_HASH_EXPECTED` | `domain::SECRET_HASH_V1` | Secret keying scheme changes |
 //! | `FINDING_ID_EXPECTED` | `domain::FINDING_ID_V1` | `FindingIdInputs` encoding changes |
@@ -47,10 +47,10 @@
 //! 5. Update the [`registry_is_complete`] test assertion.
 
 use super::{
-    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemKey, NormHash, ObjectVersionId,
-    OccurrenceId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint, SecretHash, StableItemId,
-    TenantId, TenantSecretKey, compute_policy_hash, derive_finding_id, derive_occurrence_id,
-    domain_hasher, finalize_64, key_secret_hash,
+    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey, NormHash,
+    ObjectVersionId, OccurrenceId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint,
+    SecretHash, StableItemId, TenantId, TenantSecretKey, compute_policy_hash, derive_finding_id,
+    derive_occurrence_id, domain_hasher, finalize_64, key_secret_hash,
 };
 
 // ============================================================================
@@ -75,7 +75,7 @@ const ALL: [&str; 7] = [
 // Expected byte arrays
 // ============================================================================
 
-/// `ItemKey::stable_id()` with connector `b"github"`, path `b"org/repo\0src/main.rs"`.
+/// `ItemIdentityKey::stable_id()` with connector `b"github"`, locator `b"org/repo\0src/main.rs"`.
 #[rustfmt::skip]
 const STABLE_ITEM_ID_EXPECTED: [u8; 32] = [
     0x6D, 0x29, 0x2B, 0x2F, 0x4D, 0x9C, 0x56, 0x8A,
@@ -144,7 +144,7 @@ const FINALIZE_64_EXPECTED: u64 = 0x_8665_9F94_9814_3183;
 
 #[test]
 fn stable_item_id_golden_value() {
-    let key = ItemKey::new(
+    let key = ItemIdentityKey::new(
         ConnectorTag::from_ascii(b"github"),
         b"org/repo\0src/main.rs",
     );
@@ -292,7 +292,7 @@ fn registry_is_complete() {
 proptest::proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
-    /// Generate random inputs, derive the full chain `ItemKey → StableItemId →
+    /// Generate random inputs, derive the full chain `ItemIdentityKey → StableItemId →
     /// FindingId → OccurrenceId` twice, and assert determinism.
     #[test]
     fn full_chain_item_to_occurrence_is_pure(
@@ -306,7 +306,7 @@ proptest::proptest! {
         byte_offset in proptest::num::u64::ANY,
         byte_length in proptest::num::u64::ANY,
     ) {
-        let key = ItemKey::new(ConnectorTag::from_bytes(connector_bytes), path);
+        let key = ItemIdentityKey::new(ConnectorTag::from_bytes(connector_bytes), path);
         let tenant_key = TenantSecretKey::from_bytes(tenant_key_bytes);
         let norm = NormHash::from_digest(norm_bytes);
 
@@ -345,8 +345,8 @@ proptest::proptest! {
         proptest::prop_assert_eq!(occ_1, occ_2);
     }
 
-    /// Two distinct `ItemKey` inputs (different connector or path) must produce
-    /// different `OccurrenceId` values when all other inputs are held constant.
+    /// Two distinct `ItemIdentityKey` inputs (different connector or locator) must
+    /// produce different `OccurrenceId` values when all other inputs are held constant.
     #[test]
     fn full_chain_collision_free(
         connector_a in proptest::array::uniform8(proptest::num::u8::ANY),
@@ -363,7 +363,7 @@ proptest::proptest! {
         let rule = RuleFingerprint::from_bytes([0x33; 32]);
         let version = ObjectVersionId::from_bytes([0x66; 32]);
 
-        let key_a = ItemKey::new(ConnectorTag::from_bytes(connector_a), path_a);
+        let key_a = ItemIdentityKey::new(ConnectorTag::from_bytes(connector_a), path_a);
         let finding_a = derive_finding_id(&FindingIdInputs {
             tenant,
             item: key_a.stable_id(),
@@ -377,7 +377,7 @@ proptest::proptest! {
             byte_length: 42,
         });
 
-        let key_b = ItemKey::new(ConnectorTag::from_bytes(connector_b), path_b);
+        let key_b = ItemIdentityKey::new(ConnectorTag::from_bytes(connector_b), path_b);
         let finding_b = derive_finding_id(&FindingIdInputs {
             tenant,
             item: key_b.stable_id(),
