@@ -50,27 +50,27 @@ pub use gossip_contracts::coordination::{
     CursorMaxTokenSize,
     CursorSemantics,
     CursorUpdate,
-    // Manifest types
+    // Manifest types and limit constants
     InitialShardInput,
     MAX_INITIAL_SHARDS,
-    // Limits (from coordination::limits)
     MAX_KEY_SIZE,
     MAX_SPAWNED_PER_SHARD,
     MAX_SPLIT_CHILDREN,
     ManifestValidationError,
-    // Pooled arena wrappers
+    // Pooled types
     PooledCursor,
     PooledShardSpec,
     PooledSpawned,
     PooledSpawnedIter,
-    ShardArena,
     // Shard spec types
+    ShardArena,
     ShardSpec,
     ShardSpecHandle,
     ShardSpecInputError,
     ShardSpecMaxMetadataSize,
     ShardSpecRef,
     SplitValidationError,
+    // Validation functions
     check_cursor_advance,
     check_cursor_bounds,
     validate_manifest,
@@ -145,7 +145,7 @@ pub use record::SpawnedList;
 mod conformance_tests;
 #[cfg(test)]
 mod scenario_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_fixtures;
 
 // Individual module test files are declared inside their parent modules

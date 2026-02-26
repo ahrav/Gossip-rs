@@ -227,6 +227,7 @@ impl PooledShardSpec {
     /// # Errors
     ///
     /// Returns [`SlabFull`] if the slab cannot accommodate the new fields.
+    #[inline]
     pub fn update_from_ref(
         &mut self,
         new_spec: ShardSpecRef<'_>,
@@ -355,6 +356,7 @@ impl PooledCursor {
     ///
     /// Returns [`SlabFull`] if the slab cannot accommodate the new fields.
     /// On error, `self` is unchanged.
+    #[inline]
     pub fn update_from_ref(
         &mut self,
         update: &CursorUpdate<'_>,

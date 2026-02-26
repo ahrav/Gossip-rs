@@ -9,9 +9,9 @@
 //! storage stack-resident or pre-allocated.
 //!
 //! It exists as a separate crate from `gossip-contracts` because that crate
-//! uses `#![forbid(unsafe_code)]`, and the types here require `unsafe` for
-//! `MaybeUninit`-based storage. The safe public APIs are re-exported by
-//! `gossip-coordination` for downstream consumers.
+//! uses `#![forbid(unsafe_code)]`, and two of the three types here
+//! (`InlineVec`, `RingBuffer`) require `unsafe` for `MaybeUninit`-based
+//! storage. Key types are re-exported by `gossip-coordination`.
 //!
 //! # Provided types
 //!
@@ -21,9 +21,9 @@
 //! | [`InlineVec`] | Stack-first small vector; stores up to N elements inline, one-way spill to heap beyond N; replaces `Vec<T>` for small collections (e.g., spawned children per shard) |
 //! | [`RingBuffer`] | Fixed-capacity circular buffer with power-of-2 bitwise indexing; zero heap allocation; used for bounded event/history queues |
 //!
-//! All three share a common design philosophy: capacity is fixed at
-//! construction (or compile time), storage is contiguous, and the hot-path
-//! operations (`allocate`/`deallocate`, `push`, `push_back`) perform no
+//! All three share a common design philosophy: the hot-path representation
+//! uses contiguous, pre-sized storage, and the hot-path operations
+//! (`allocate`/`deallocate`, `push` while inline, `push_back`) perform no
 //! heap allocation.
 //!
 //! # Safety and verification
@@ -34,9 +34,9 @@
 //!
 //! - **Miri** (runtime): detects undefined behavior, use-after-free, and
 //!   uninitialized reads under the stacked-borrows model.
-//! - **Kani** (formal): exhaustive symbolic verification of all `InlineVec`
-//!   unsafe operations (9 proofs covering bounds, spill preservation, and
-//!   drop correctness).
+//! - **Kani** (formal): symbolic verification of `InlineVec` unsafe
+//!   operations (9 proofs covering 8 of 9 unsafe blocks — bounds, spill
+//!   preservation, and drop correctness).
 //! - **Fuzz testing** (coverage): `cargo-fuzz` targets exercise randomized
 //!   operation sequences for all three types (see `fuzz/fuzz_targets/`).
 //!
@@ -79,8 +79,8 @@ pub use byte_slab::{ByteSlab, ByteSlot, SlabFull};
 ///
 /// Stores up to `N` elements inline with zero heap allocation. On the
 /// `N+1`th push, all elements spill one-way to a heap `Vec<T>`.
-/// Typical use: `InlineVec<ShardId, 8>` for spawned-children lists where
-/// 99%+ of shards have 0-2 children.
+/// Typical use: `InlineVec<ShardId, N>` for spawned-children lists where
+/// most shards have few children and the inline path avoids allocation.
 pub use inline_vec::InlineVec;
 
 /// Fixed-capacity ring buffer with stack-allocated storage and power-of-2

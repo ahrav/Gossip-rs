@@ -19,13 +19,13 @@ Coordination follows a HOT/WARM/COLD allocation policy:
 - **COLD** lifecycle/setup paths optimize for clarity and atomicity over
   preallocation plumbing (`register_shards` preflight + staged rollback).
 
-Simulation/test-support code (`sim/`) remains free to allocate for
+Simulation/test-support code (`crates/gossip-coordination/src/sim/`) remains free to allocate for
 readability, workload generation, and diagnostics.
 
 Feature-aware enforcement remains in place for production-facing signatures:
 
 - `#[cfg(not(feature = "test-support"))]` compile-time guards in
-  `coordination/conformance_tests.rs` preserve borrowed/scratch hot-path
+  `crates/gossip-coordination/src/conformance_tests.rs` preserve borrowed/scratch hot-path
   forms.
 - The same guards are intentionally absent with `test-support` enabled, so
   simulation infrastructure can evolve without hot-path false positives.
@@ -64,8 +64,8 @@ parallel verification layer that exhaustively verifies the protocol design.
 
 ## 2. Tier 1 — Unit Tests
 
-**File:** `coordination/in_memory_tests.rs`
-**Declared in:** `coordination/in_memory.rs` (`#[cfg(test)]` submodule)
+**File:** `crates/gossip-coordination/src/in_memory_tests.rs`
+**Declared in:** `crates/gossip-coordination/src/in_memory.rs` (`#[cfg(test)]` submodule)
 
 Single-operation isolation tests against `InMemoryCoordinator`. Each test
 exercises one backend operation or one edge case, with deterministic
@@ -102,7 +102,7 @@ All tests use shared fixtures from `test_fixtures.rs` (see Section 5).
 
 ## 3. Tier 2 — Conformance Tests
 
-**File:** `coordination/conformance_tests.rs`
+**File:** `crates/gossip-coordination/src/conformance_tests.rs`
 **Declared in:** `lib.rs` (`#[cfg(test)]`)
 
 Invariant-interaction tests. Each test composes two or more of the
@@ -160,7 +160,7 @@ conformance tests fail at compile time.
 
 ## 4. Tier 3 — Scenario Tests
 
-**File:** `coordination/scenario_tests.rs`
+**File:** `crates/gossip-coordination/src/scenario_tests.rs`
 **Declared in:** `lib.rs` (`#[cfg(test)]`)
 
 Multi-step workflow tests that exercise realistic end-to-end stories.
@@ -182,7 +182,7 @@ state restoration across ownership transfers.
 
 ## 5. Test Infrastructure
 
-### Test Fixtures (`coordination/test_fixtures.rs`)
+### Test Fixtures (`crates/gossip-coordination/src/test_fixtures.rs`)
 
 Shared factory functions consumed by all three coordination test modules.
 
@@ -234,12 +234,12 @@ invariant accidentally violates another.
 
 ## 6. Tier 4 — Simulation Tests
 
-**Files:** `sim/sim_behavioral_tests.rs`, `sim/mega_sim_tests.rs`
-**Declared in:** `sim/mod.rs` (`#[cfg(test)]`)
+**Files:** `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`, `crates/gossip-coordination/src/sim/mega_sim_tests.rs`
+**Declared in:** `crates/gossip-coordination/src/sim/mod.rs` (`#[cfg(test)]`)
 
 Seven sub-tiers exercise the full simulation harness.
 
-### Overload Scenario Tests (`sim/overload_tests.rs`)
+### Overload Scenario Tests (`crates/gossip-coordination/src/sim/overload_tests.rs`)
 
 Targeted tests for the scripted overload path (`run_overload`). Fixed-seed
 tests cover each `OverloadKind` under different fault levels, a deterministic
@@ -522,31 +522,31 @@ Full invariant definitions and the checker implementation are in
 
 | File                                | Role                                                             |
 |-------------------------------------|------------------------------------------------------------------|
-| `coordination/in_memory_tests.rs`     | Tier 1: unit tests + proptest property tests                     |
-| `coordination/error_tests.rs`         | Tier 1: error type Display/source/Debug coverage                 |
-| `coordination/record_tests.rs`        | Tier 1: `ShardRecord`, `ShardStatus`, `ParkReason`, `OpLogEntry` tests |
-| `coordination/run_tests.rs`           | Tier 1: run lifecycle types, validation, and state machine tests |
-| `coordination/facade_tests.rs`        | Tier 1: `CoordinationFacade`, `ShardClaiming`, claim algorithm tests |
-| `coordination/session_tests.rs`       | Tier 1: `WorkerSession` RAII handle and delegation tests         |
-| `coordination/in_memory_filter_tests.rs` | Tier 1: `ShardFilter` predicates for `list_shards_into`       |
-| `coordination/in_memory_run_tests.rs` | Tier 1: `RunManagement` trait implementation tests               |
-| `coordination/conformance_tests.rs`   | Tier 2: invariant-interaction tests (Groups A, B, C)             |
-| `coordination/scenario_tests.rs`      | Tier 3: multi-step end-to-end workflows (S1–S9)                  |
-| `coordination/test_fixtures.rs`       | Shared factory functions and seeded coordinator setup            |
-| `sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay |
-| `sim/mega_sim_tests.rs`               | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
-| `sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking      |
-| `sim/harness.rs`                      | Simulation driver (`run` + `run_overload`)                       |
-| `sim/harness_tests.rs`               | Harness unit and property tests for bookkeeping and op generation |
-| `sim/invariants.rs`                   | External invariant checker (S1–S9)                               |
-| `sim/invariants_tests.rs`            | Targeted unit tests for `InvariantChecker` edge cases            |
-| `sim/overload.rs`                     | Overload scenario/reports and scripted op generators             |
-| `sim/overload_tests.rs`              | Overload scenario tests: per-kind, replay, D1 accuracy, proptest |
-| `sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions     |
-| `sim/fault_injector.rs`              | Fault-injecting introspector for invariant checker validation    |
-| `sim/worker.rs`                       | Simulated worker bookkeeping                                     |
-| `sim/test_util.rs`                    | Shared test helpers: record builder, proptest strategies         |
-| `sim/mod.rs`                          | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
+| `crates/gossip-coordination/src/in_memory_tests.rs`     | Tier 1: unit tests + proptest property tests                     |
+| `crates/gossip-coordination/src/error_tests.rs`         | Tier 1: error type Display/source/Debug coverage                 |
+| `crates/gossip-coordination/src/record_tests.rs`        | Tier 1: `ShardRecord`, `ShardStatus`, `ParkReason`, `OpLogEntry` tests |
+| `crates/gossip-coordination/src/run_tests.rs`           | Tier 1: run lifecycle types, validation, and state machine tests |
+| `crates/gossip-coordination/src/facade_tests.rs`        | Tier 1: `CoordinationFacade`, `ShardClaiming`, claim algorithm tests |
+| `crates/gossip-coordination/src/session_tests.rs`       | Tier 1: `WorkerSession` RAII handle and delegation tests         |
+| `crates/gossip-coordination/src/in_memory_filter_tests.rs` | Tier 1: `ShardFilter` predicates for `list_shards_into`       |
+| `crates/gossip-coordination/src/in_memory_run_tests.rs` | Tier 1: `RunManagement` trait implementation tests               |
+| `crates/gossip-coordination/src/conformance_tests.rs`   | Tier 2: invariant-interaction tests (Groups A, B, C)             |
+| `crates/gossip-coordination/src/scenario_tests.rs`      | Tier 3: multi-step end-to-end workflows (S1–S9)                  |
+| `crates/gossip-coordination/src/test_fixtures.rs`       | Shared factory functions and seeded coordinator setup            |
+| `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay |
+| `crates/gossip-coordination/src/sim/mega_sim_tests.rs`               | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
+| `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking      |
+| `crates/gossip-coordination/src/sim/harness.rs`                      | Simulation driver (`run` + `run_overload`)                       |
+| `crates/gossip-coordination/src/sim/harness_tests.rs`               | Harness unit and property tests for bookkeeping and op generation |
+| `crates/gossip-coordination/src/sim/invariants.rs`                   | External invariant checker (S1–S9)                               |
+| `crates/gossip-coordination/src/sim/invariants_tests.rs`            | Targeted unit tests for `InvariantChecker` edge cases            |
+| `crates/gossip-coordination/src/sim/overload.rs`                     | Overload scenario/reports and scripted op generators             |
+| `crates/gossip-coordination/src/sim/overload_tests.rs`              | Overload scenario tests: per-kind, replay, D1 accuracy, proptest |
+| `crates/gossip-coordination/src/sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions     |
+| `crates/gossip-coordination/src/sim/fault_injector.rs`              | Fault-injecting introspector for invariant checker validation    |
+| `crates/gossip-coordination/src/sim/worker.rs`                       | Simulated worker bookkeeping                                     |
+| `crates/gossip-coordination/src/sim/test_util.rs`                    | Shared test helpers: record builder, proptest strategies         |
+| `crates/gossip-coordination/src/sim/mod.rs`                          | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
 
 ---
 

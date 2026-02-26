@@ -33,14 +33,8 @@
 //! | `OCCURRENCE_ID_EXPECTED` | `domain::OCCURRENCE_ID_V1` | `OccurrenceIdInputs` encoding changes |
 //! | `POLICY_HASH_EXPECTED` | `domain::POLICY_HASH_V2` | `PolicyHashInputs` encoding changes |
 //! | `FINALIZE_64_EXPECTED` | (test-only domain) | `finalize_64` truncation or endianness changes |
-//! | `DERIVE_SPLIT_CHILD_0_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `DERIVE_SPLIT_CHILD_1_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `DERIVE_SPLIT_RESIDUAL_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `HASH_CHECKPOINT_EXPECTED` | `domain::OP_PAYLOAD_V1` | Checkpoint payload encoding or `CursorUpdate` canonical encoding changes |
-//! | `HASH_COMPLETE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Complete payload encoding or `CursorUpdate` canonical encoding changes |
-//! | `HASH_PARK_EXPECTED` | `domain::OP_PAYLOAD_V1` | Park payload encoding or `ParkReason` discriminant changes |
-//! | `HASH_SPLIT_REPLACE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-replace payload or `ShardSpec`/`CursorUpdate` canonical encoding changes |
-//! | `HASH_SPLIT_RESIDUAL_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-residual payload or `ShardSpec` canonical encoding changes |
+//!
+//! Coordination derivation vectors live in `gossip_coordination::split::tests`.
 //!
 //! # Adding a new vector
 //!
@@ -142,8 +136,7 @@ const POLICY_HASH_EXPECTED: [u8; 32] = [
 /// Unlike 32-byte vectors, this is a `u64` since `finalize_64` returns a truncated 64-bit digest.
 const FINALIZE_64_EXPECTED: u64 = 0x_8665_9F94_9814_3183;
 
-// Coordination derivation golden vectors (derive_split_shard_id, hash_*_payload)
-// have moved to `gossip-coordination`'s test suite.
+// Coordination derivation golden vectors live in gossip-coordination::split::tests.
 
 // ============================================================================
 // Golden vector tests

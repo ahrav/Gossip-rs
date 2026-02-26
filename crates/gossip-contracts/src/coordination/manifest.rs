@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
-use crate::coordination::shard_spec::{ShardSpec, ShardSpecRef};
+use crate::coordination::shard_spec::{ShardSpec, ShardSpecInputError, ShardSpecRef};
 use crate::identity::ShardId;
 
 // ============================================================================
@@ -94,7 +94,10 @@ pub enum ManifestValidationError {
     /// Two shards have overlapping key ranges.
     OverlappingRanges { shard_a: ShardId, shard_b: ShardId },
     /// A shard's spec is internally invalid.
-    InvalidSpec { shard_id: ShardId },
+    InvalidSpec {
+        shard_id: ShardId,
+        reason: ShardSpecInputError,
+    },
     /// Too many shards (SEC-3).
     TooManyShards { count: usize, max: usize },
     /// A non-initial cursor falls outside the shard's key range.
@@ -127,8 +130,8 @@ impl fmt::Display for ManifestValidationError {
                     shard_a, shard_b,
                 )
             }
-            Self::InvalidSpec { shard_id } => {
-                write!(f, "invalid spec for shard {:?}", shard_id)
+            Self::InvalidSpec { shard_id, reason } => {
+                write!(f, "invalid spec for shard {:?}: {}", shard_id, reason)
             }
             Self::TooManyShards { count, max } => {
                 write!(f, "too many shards: {count} exceeds max {max}")
@@ -228,9 +231,10 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
     // gate that prevents oversized specs from reaching AcquireScratch::write_spec,
     // which uses panicking asserts on the same size ceilings.
     for shard in shards {
-        if ShardSpec::validate_ref(shard.spec).is_err() {
+        if let Err(reason) = ShardSpec::validate_ref(shard.spec) {
             return Err(ManifestValidationError::InvalidSpec {
                 shard_id: shard.shard,
+                reason,
             });
         }
     }
@@ -251,6 +255,10 @@ pub fn validate_manifest(shards: &[InitialShardInput<'_>]) -> Result<(), Manifes
         if !start.is_empty() && !end.is_empty() && start >= end {
             return Err(ManifestValidationError::InvalidSpec {
                 shard_id: shard.shard,
+                reason: ShardSpecInputError::InvertedRange {
+                    start_len: start.len(),
+                    end_len: end.len(),
+                },
             });
         }
     }
