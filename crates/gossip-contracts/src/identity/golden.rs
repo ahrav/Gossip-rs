@@ -34,7 +34,7 @@
 //! | `POLICY_HASH_EXPECTED` | `domain::POLICY_HASH_V2` | `PolicyHashInputs` encoding changes |
 //! | `FINALIZE_64_EXPECTED` | (test-only domain) | `finalize_64` truncation or endianness changes |
 //!
-//! Coordination derivation vectors live in `gossip_coordination::split::tests`.
+//! Coordination derivation vectors live in `gossip_coordination::split_execution::tests`.
 //!
 //! # Adding a new vector
 //!
@@ -136,7 +136,7 @@ const POLICY_HASH_EXPECTED: [u8; 32] = [
 /// Unlike 32-byte vectors, this is a `u64` since `finalize_64` returns a truncated 64-bit digest.
 const FINALIZE_64_EXPECTED: u64 = 0x_8665_9F94_9814_3183;
 
-// Coordination derivation golden vectors live in gossip-coordination::split::tests.
+// Coordination derivation golden vectors live in gossip-coordination::split_execution::tests.
 
 // ============================================================================
 // Golden vector tests

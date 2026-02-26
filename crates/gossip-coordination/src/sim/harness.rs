@@ -102,9 +102,10 @@ use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::session::WorkerSession;
 use crate::sim::backend::SimulationBackend;
-use crate::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
+use crate::split_execution::SplitResidualPlan;
 use gossip_contracts::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE};
 use gossip_contracts::coordination::shard_spec::{CursorSemantics, ShardSpecRef};
+use gossip_contracts::coordination::split::plan_split_replace_at_points_initial_cursor;
 use gossip_contracts::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId,
 };
@@ -1675,23 +1676,17 @@ impl<B: SimulationBackend> CoordinationSim<B> {
         };
 
         let mid_key = [mid];
-        let child_a_spec = ShardSpecRef::with_range(start, &mid_key);
-        let child_b_spec = ShardSpecRef::with_range(&mid_key, end);
-
-        let child_a_cursor = CursorUpdate::initial();
-        let child_b_cursor = CursorUpdate::initial();
-        let plan = match SplitReplacePlan::try_new([
-            SplitReplaceChild::new(child_a_spec, child_a_cursor),
-            SplitReplaceChild::new(child_b_spec, child_b_cursor),
-        ]) {
-            Ok(p) => p,
-            Err(_e) => {
-                debug_assert!(false, "unexpected split-replace plan failure: {_e:?}");
-                return SimEvent::Rejected {
-                    kind: RejectionKind::SplitValidation,
-                };
-            }
-        };
+        let parent_spec = ShardSpecRef::with_range(start, end);
+        let plan =
+            match plan_split_replace_at_points_initial_cursor(parent_spec, [mid_key.as_slice()]) {
+                Ok(p) => p,
+                Err(_e) => {
+                    debug_assert!(false, "unexpected split-replace plan failure: {_e:?}");
+                    return SimEvent::Rejected {
+                        kind: RejectionKind::SplitValidation,
+                    };
+                }
+            };
 
         let now = self.context.now();
         match self
@@ -2745,14 +2740,11 @@ impl<B: SimulationBackend> CoordinationSim<B> {
                     let range_lo_key = [range_lo];
                     let mid_key = [mid];
                     let range_hi_key = [range_hi];
-                    let child_a_spec = ShardSpecRef::with_range(&range_lo_key, &mid_key);
-                    let child_b_spec = ShardSpecRef::with_range(&mid_key, &range_hi_key);
-                    let child_a_cursor = CursorUpdate::initial();
-                    let child_b_cursor = CursorUpdate::initial();
-                    let plan = match SplitReplacePlan::try_new([
-                        SplitReplaceChild::new(child_a_spec, child_a_cursor),
-                        SplitReplaceChild::new(child_b_spec, child_b_cursor),
-                    ]) {
+                    let parent_spec = ShardSpecRef::with_range(&range_lo_key, &range_hi_key);
+                    let plan = match plan_split_replace_at_points_initial_cursor(
+                        parent_spec,
+                        [mid_key.as_slice()],
+                    ) {
                         Ok(plan) => plan,
                         Err(_e) => {
                             debug_assert!(false, "unexpected split-replace plan failure: {_e:?}");

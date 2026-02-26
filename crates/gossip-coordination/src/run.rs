@@ -49,7 +49,7 @@ use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
-use crate::split::op_payload_hash;
+use crate::split_execution::op_payload_hash;
 use gossip_contracts::coordination::cursor::MAX_KEY_SIZE;
 use gossip_contracts::coordination::manifest::InitialShardInput;
 use gossip_contracts::coordination::shard_spec::CursorSemantics;
@@ -231,9 +231,8 @@ impl RunConfig {
     ///
     /// # Panics
     ///
-    /// Currently a no-op because `NonZeroU64` structurally prevents the
-    /// only invariant (`lease_duration > 0`). Retained as a hook for
-    /// future constraints.
+    /// This is a no-op because `NonZeroU64` structurally enforces
+    /// `lease_duration > 0`.
     pub fn assert_valid(&self) {
         // lease_duration > 0 is guaranteed by NonZeroU64.
         let _ = self.lease_duration;
@@ -288,7 +287,7 @@ pub enum RunOpKind {
 impl RunOpKind {
     /// Parse a `u8` discriminant to the corresponding variant.
     ///
-    /// Returns `None` for unrecognized values -- forward compatibility.
+    /// Returns `None` for unrecognized values.
     #[must_use]
     pub const fn from_u8(v: u8) -> Option<Self> {
         match v {

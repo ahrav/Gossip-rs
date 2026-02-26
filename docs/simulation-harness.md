@@ -44,6 +44,10 @@ The top-level driver. Runs a three-stage simulation (zombie preamble, safety,
 then liveness) with weighted random op generation, fault injection, and full
 invariant checking after every step.
 
+For split-replace operations, the harness uses the contracts-owned planner
+helper (`gossip_contracts::coordination::split::plan_split_replace_at_points_initial_cursor`)
+so simulation planning behavior stays aligned across boundary consumers.
+
 ## Determinism Model
 
 All randomness flows through a single `ChaCha8Rng` seeded from a `u64`.

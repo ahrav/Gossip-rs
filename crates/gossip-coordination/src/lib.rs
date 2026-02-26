@@ -8,6 +8,15 @@
 //! [`gossip_contracts::coordination`]. This crate provides the protocol
 //! layer that consumes those types.
 //!
+//! Ownership boundary:
+//! - `gossip-contracts` owns split-replace planner types/constructors and
+//!   shared validation contracts.
+//! - `gossip-coordination` owns execution semantics: lease/fence validation,
+//!   idempotency/op-log behavior, and backend mutation ordering.
+//! - `split_execution` in this crate owns split execution helpers (derived IDs/payload
+//!   hashes plus split-residual plan/result types) and re-exports
+//!   split-replace planner types from `gossip-contracts` for ergonomics.
+//!
 //! **Start here:** [`CoordinationBackend`] defines the semantic contract.
 //! [`InMemoryCoordinator`] is the executable reference spec.
 //! [`WorkerSession`] shows the typical caller flow.
@@ -27,7 +36,7 @@ pub mod record;
 pub mod run;
 pub mod run_errors;
 pub mod session;
-pub mod split;
+pub mod split_execution;
 pub mod traits;
 pub mod validation;
 
@@ -102,14 +111,22 @@ pub use run_errors::{
     CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
 };
 pub use session::WorkerSession;
-pub use split::{
-    DerivedShardKind, SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError,
-    SplitReplaceResult, SplitResidualPlan, SplitResidualPlanError, SplitResidualResult,
-    derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload, hash_park_payload,
-    hash_split_replace_payload, hash_split_residual_payload,
+pub use split_execution::{
+    DerivedShardKind, SplitReplaceResult, SplitResidualPlan, SplitResidualPlanError,
+    SplitResidualResult, derive_split_shard_id, hash_checkpoint_payload, hash_complete_payload,
+    hash_park_payload, hash_split_replace_payload, hash_split_residual_payload,
 };
 pub use traits::CoordinationBackend;
 pub use validation::{check_op_idempotency, validate_lease};
+
+// Re-export split-replace planner core from contracts for ergonomic call sites.
+// Convention: coordination-layer code imports directly from
+// `gossip_contracts::coordination::split`; these re-exports serve external
+// consumers that depend only on `gossip-coordination`.
+pub use gossip_contracts::coordination::split::{
+    SplitReplaceChild, SplitReplacePlan, SplitReplacePlanError, SplitReplacePlanningError,
+    plan_split_replace, plan_split_replace_at_points, plan_split_replace_at_points_initial_cursor,
+};
 
 // Identity types re-exported for convenience (test files use `super::*`).
 pub use gossip_contracts::identity::{

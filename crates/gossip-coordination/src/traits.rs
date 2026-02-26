@@ -32,8 +32,9 @@ use crate::error::{
 };
 use crate::lease::Lease;
 use crate::record::ParkReason;
-use crate::split::{SplitReplacePlan, SplitReplaceResult, SplitResidualPlan, SplitResidualResult};
+use crate::split_execution::{SplitReplaceResult, SplitResidualPlan, SplitResidualResult};
 use gossip_contracts::coordination::cursor::CursorUpdate;
+use gossip_contracts::coordination::split::SplitReplacePlan;
 use gossip_contracts::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
 
 /// The coordination contract for the distributed secret scanner.
