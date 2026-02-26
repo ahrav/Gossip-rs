@@ -235,7 +235,14 @@ impl fmt::Display for SplitReplacePlanningError {
     }
 }
 
-impl std::error::Error for SplitReplacePlanningError {}
+impl std::error::Error for SplitReplacePlanningError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidChildCount(err) => Some(err),
+            Self::InvalidCoverage(err) => Some(err),
+        }
+    }
+}
 
 /// Build and validate a split-replace plan against a parent shard.
 ///
@@ -480,17 +487,7 @@ pub enum SplitResidualPlanningError {
     /// key exceeds `MAX_KEY_SIZE`.
     NoSuccessor,
     /// Cursor-derived split point falls outside the parent range.
-    ///
-    /// Fields store byte lengths rather than raw key bytes to avoid logging
-    /// potentially large cursor payloads.
-    SplitPointOutOfBounds {
-        /// Length of the derived split point (`key_successor(cursor.last_key)`).
-        split_point: usize,
-        /// Length of `parent.key_range_start()`.
-        parent_start: usize,
-        /// Length of `parent.key_range_end()`.
-        parent_end: usize,
-    },
+    SplitPointOutOfBounds,
     /// Residual plan shape invariants failed.
     InvalidPlan(SplitResidualPlanError),
     /// Residual partition validation failed against the parent range.
@@ -504,16 +501,8 @@ impl fmt::Display for SplitResidualPlanningError {
                 write!(f, "split-residual cursor planning requires cursor.last_key")
             }
             Self::NoSuccessor => write!(f, "cursor key has no representable successor"),
-            Self::SplitPointOutOfBounds {
-                split_point,
-                parent_start,
-                parent_end,
-            } => {
-                write!(
-                    f,
-                    "cursor successor (len={split_point}) falls outside parent range \
-                     (start_len={parent_start}, end_len={parent_end})"
-                )
+            Self::SplitPointOutOfBounds => {
+                write!(f, "cursor successor falls outside parent range")
             }
             Self::InvalidPlan(err) => err.fmt(f),
             Self::InvalidCoverage(err) => err.fmt(f),
@@ -625,11 +614,7 @@ pub fn plan_split_residual_from_cursor<'a>(
     // split point is below the upper bound in that case.
     let above_end = !parent.is_end_unbounded() && split_point >= parent.key_range_end();
     if split_point <= parent.key_range_start() || above_end {
-        return Err(SplitResidualPlanningError::SplitPointOutOfBounds {
-            split_point: split_point.len(),
-            parent_start: parent.key_range_start().len(),
-            parent_end: parent.key_range_end().len(),
-        });
+        return Err(SplitResidualPlanningError::SplitPointOutOfBounds);
     }
 
     plan_split_residual_at_point(parent, split_point)
@@ -1008,21 +993,19 @@ mod tests {
         b"a".as_slice(),
         b"m\0",
         Some(b"m".as_slice()),
-        SplitResidualPlanningError::SplitPointOutOfBounds {
-            split_point: 2,
-            parent_start: 1,
-            parent_end: 2,
-        },
+        SplitResidualPlanningError::SplitPointOutOfBounds,
     )]
     #[case::successor_below_parent_start(
         b"m".as_slice(),
         b"z".as_slice(),
         Some(b"a".as_slice()),
-        SplitResidualPlanningError::SplitPointOutOfBounds {
-            split_point: 2,
-            parent_start: 1,
-            parent_end: 1,
-        },
+        SplitResidualPlanningError::SplitPointOutOfBounds,
+    )]
+    #[case::cursor_above_parent_end(
+        b"a".as_slice(),
+        b"m".as_slice(),
+        Some(b"z".as_slice()),
+        SplitResidualPlanningError::SplitPointOutOfBounds,
     )]
     fn plan_split_residual_from_cursor_rejects(
         #[case] start: &[u8],
@@ -1039,6 +1022,19 @@ mod tests {
         let err =
             plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap_err();
         assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn cursor_split_at_parent_start_boundary() {
+        let parent = ShardSpec::with_range(b"a", b"z");
+        let cursor = CursorUpdate::with_last_key(b"a");
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+        let plan = plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap();
+        // successor of "a" is "a\0", which is strictly inside (a, z)
+        assert_eq!(plan.parent_new_spec().key_range_start(), b"a");
+        assert_eq!(plan.parent_new_spec().key_range_end(), b"a\0");
+        assert_eq!(plan.residual_spec().key_range_start(), b"a\0");
+        assert_eq!(plan.residual_spec().key_range_end(), b"z");
     }
 
     #[test]

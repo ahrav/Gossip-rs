@@ -12,7 +12,7 @@
 //! - `gossip-coordination` owns protocol sequencing, lease/fence enforcement,
 //!   idempotency behavior, and backend mutation semantics.
 //! - Split planning (replace + residual) is defined here (`split.rs`);
-//!   split execution result types live in
+//!   split execution result types and ID/hash derivation helpers live in
 //!   `gossip-coordination::split_execution`.
 //!
 //! ## Module Map

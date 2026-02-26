@@ -59,7 +59,7 @@ use gossip_contracts::coordination::cursor::CursorUpdate;
 use gossip_contracts::coordination::shard_spec::ShardSpec;
 #[cfg(test)]
 use gossip_contracts::coordination::split::{
-    SplitReplaceChild, SplitResidualPlanError, plan_split_replace_at_points_initial_cursor,
+    SplitReplaceChild, plan_split_replace_at_points_initial_cursor,
 };
 use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
 use gossip_contracts::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
@@ -490,26 +490,6 @@ mod tests {
             hash_split_replace_payload(&plan_a),
             hash_split_replace_payload(&plan_b),
             "identical plans must produce identical payload hashes"
-        );
-    }
-
-    // -- SplitResidualPlan validation ------------------------------------
-
-    #[test]
-    fn split_residual_plan_valid() {
-        let parent = ShardSpec::with_range(b"a", b"m");
-        let residual = ShardSpec::with_range(b"m", b"z");
-        let plan = SplitResidualPlan::try_new(parent.as_ref(), residual.as_ref()).unwrap();
-        assert_eq!(plan.parent_new_spec(), parent.as_ref());
-        assert_eq!(plan.residual_spec(), residual.as_ref());
-    }
-
-    #[test]
-    fn split_residual_plan_identical_specs_returns_error() {
-        let spec = ShardSpec::with_range(b"a", b"z");
-        assert_eq!(
-            SplitResidualPlan::try_new(spec.as_ref(), spec.as_ref()),
-            Err(SplitResidualPlanError::IdenticalSpecs),
         );
     }
 
