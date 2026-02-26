@@ -52,6 +52,7 @@ use core::fmt;
 use gossip_contracts::coordination::shard_spec::{
     MAX_KEY_SIZE, ShardArena, ShardSpec, ShardSpecHandle, ShardSpecInputError, ShardSpecRef,
 };
+use gossip_contracts::coordination::{key_successor_into, prefix_successor_into};
 use gossip_stdx::SlabFull;
 
 /// Reusable stack buffer for shard-key arithmetic.
@@ -507,20 +508,13 @@ pub fn shard_spec_from_manifest_range_into(
 /// prefix_successor(b"", &mut buf)        => None              // nothing to increment
 /// ```
 pub fn prefix_successor<'a>(prefix: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
-    if prefix.len() > KeyBuf::CAPACITY {
-        return None;
-    }
-
-    // Strip trailing 0xFF bytes by finding the last byte that can be incremented.
-    let last_non_ff = prefix.iter().rposition(|&byte| byte != u8::MAX)?;
-    let out_len = last_non_ff + 1;
-
-    // Truncate and increment: the result is shorter than or equal to `prefix`,
-    // which guarantees it is the tightest possible upper bound.
-    buf.buf[..out_len].copy_from_slice(&prefix[..out_len]);
-    debug_assert!(buf.buf[last_non_ff] < u8::MAX);
-    buf.buf[last_non_ff] += 1;
-    buf.len = out_len;
+    // Delegate to the canonical implementation in gossip-contracts::coordination::cursor.
+    // The block limits the mutable borrow of buf.buf so we can set buf.len afterwards.
+    let result_len = {
+        let scratch: &mut [u8; MAX_KEY_SIZE] = (&mut buf.buf[..MAX_KEY_SIZE]).try_into().unwrap();
+        prefix_successor_into(prefix, scratch)?.len()
+    };
+    buf.len = result_len;
     Some(buf.as_bytes())
 }
 
@@ -659,22 +653,14 @@ pub fn byte_midpoint<'a>(a: &[u8], b: &[u8], out: &'a mut KeyBuf) -> Option<&'a 
 ///
 /// `O(key.len())` time, no heap allocation.
 pub fn key_successor<'a>(key: &[u8], buf: &'a mut KeyBuf) -> Option<&'a [u8]> {
-    if key.len() > MAX_KEY_SIZE {
-        return None;
-    }
-
-    // Prefer append-zero: it is infallible and produces the tightest
-    // possible successor (the key extended by the smallest byte value).
-    if key.len() < MAX_KEY_SIZE {
-        let out_len = key.len() + 1;
-        buf.buf[..key.len()].copy_from_slice(key);
-        buf.buf[key.len()] = 0;
-        buf.len = out_len;
-        return Some(buf.as_bytes());
-    }
-
-    // At the size ceiling: cannot grow, so fall back to in-place increment.
-    prefix_successor(key, buf)
+    // Delegate to the canonical implementation in gossip-contracts::coordination::cursor.
+    // The block limits the mutable borrow of buf.buf so we can set buf.len afterwards.
+    let result_len = {
+        let scratch: &mut [u8; MAX_KEY_SIZE] = (&mut buf.buf[..MAX_KEY_SIZE]).try_into().unwrap();
+        key_successor_into(key, scratch)?.len()
+    };
+    buf.len = result_len;
+    Some(buf.as_bytes())
 }
 
 /// Error for invalid prefix-based shard operations.
