@@ -407,8 +407,9 @@ overwhelm the coordinator's shard tracking.
 | File | Purpose |
 |:-----|:--------|
 | `04-boundary-2-coordination/06-split-operations.md` | Deep dive document on split operations |
-| `crates/gossip-contracts/src/coordination/` and `crates/gossip-coordination/` | Coordination module containing split implementation |
-| `crates/gossip-contracts/src/coordination/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()` |
-| `crates/gossip-contracts/src/coordination/record.rs` | `ShardStatus::Split`, `ShardRecord` with range fields |
-| `crates/gossip-contracts/src/coordination/error.rs` | `SplitError::SplitInvalid`, `SplitError::ShardTerminal` |
-| `crates/gossip-contracts/src/coordination/traits.rs` | `CoordinationBackend::split_replace()`, `CoordinationBackend::split_residual()` |
+| `crates/gossip-contracts/src/coordination/` | Coordination data types (shard_spec, cursor, pooled, manifest, limits) |
+| `crates/gossip-coordination/src/` | Coordination protocol containing split implementation |
+| `crates/gossip-coordination/src/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()` |
+| `crates/gossip-coordination/src/record.rs` | `ShardStatus::Split`, `ShardRecord` with range fields |
+| `crates/gossip-coordination/src/error.rs` | `SplitError::SplitInvalid`, `SplitError::ShardTerminal` |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend::split_replace()`, `CoordinationBackend::split_residual()` |

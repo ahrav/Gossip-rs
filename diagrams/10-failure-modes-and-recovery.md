@@ -618,9 +618,10 @@ skipped.
 | Component | Path |
 |:----------|:-----|
 | Design specification | `08-cross-cutting/03-failure-modes-and-recovery.md` |
-| Coordination module (lease, fencing, shard ops) | `crates/gossip-contracts/src/coordination/` and `crates/gossip-coordination/` |
+| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/` |
+| Coordination protocol (lease, fencing, shard ops) | `crates/gossip-coordination/src/` |
 | Connector module (circuit breaker, source abstraction) | `crates/gossip-contracts/src/connector/` and `crates/gossip-connectors/` |
-| Shard record and state transitions | `crates/gossip-contracts/src/coordination/record.rs` |
-| Fencing validation logic | `crates/gossip-contracts/src/coordination/validation.rs` |
-| Lease management | `crates/gossip-contracts/src/coordination/lease.rs` |
-| Error types (StaleFence, AcquireError, etc.) | `crates/gossip-contracts/src/coordination/error.rs` |
+| Shard record and state transitions | `crates/gossip-coordination/src/record.rs` |
+| Fencing validation logic | `crates/gossip-coordination/src/validation.rs` |
+| Lease management | `crates/gossip-coordination/src/lease.rs` |
+| Error types (StaleFence, AcquireError, etc.) | `crates/gossip-coordination/src/error.rs` |

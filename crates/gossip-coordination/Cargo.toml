@@ -5,7 +5,34 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Coordination trait + backends: etcd, SQL, in-memory"
+description = "Coordination protocol: traits, state machine, InMemoryCoordinator, sim harness"
+
+[features]
+default = []
+test-support = ["gossip-contracts/test-support", "dep:rand", "dep:rand_chacha"]
 
 [dependencies]
 gossip-contracts.workspace = true
+gossip-stdx.workspace = true
+ahash = "0.8"
+blake3 = "1.8"
+rand = { version = "0.9", optional = true }
+rand_chacha = { version = "0.9", optional = true }
+
+[dev-dependencies]
+gossip-contracts = { workspace = true, features = ["test-support"] }
+proptest = "1.10"
+rstest = "0.25"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.9"
+rand_chacha = "0.9"
+
+[[bench]]
+name = "coordination"
+harness = false
+required-features = ["test-support"]
+
+[[bench]]
+name = "sim"
+harness = false
+required-features = ["test-support"]

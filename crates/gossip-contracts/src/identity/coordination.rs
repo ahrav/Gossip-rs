@@ -77,7 +77,7 @@ impl ShardId {
     /// Returns `true` if bit 63 is set, marking this as a split-derived shard.
     ///
     /// Root shards (externally assigned) have bit 63 clear. Derived shards are
-    /// produced by [`derive_split_shard_id`](crate::coordination::split::derive_split_shard_id)
+    /// produced by `derive_split_shard_id` (in `gossip-coordination`)
     /// which forces bit 63 high.
     #[inline]
     pub const fn is_derived(&self) -> bool {

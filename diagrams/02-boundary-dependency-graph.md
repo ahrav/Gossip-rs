@@ -96,20 +96,18 @@ have no mutual dependencies and can compile in parallel.
 
 The tiered view below shows three compilation tiers. Tier 0 is the foundation:
 B1 (Identity) and B3 (Shard Algebra) have no dependencies on higher boundaries.
-In the crate structure, both live in `gossip-contracts`, so the entire
-foundation compiles as a single unit. Tier 1 contains B2 (Coordination) and B4
-(Connector), which depend on the foundation but not on each other -- they
-compile in parallel once Tier 0 finishes. Tier 2 contains B5 (Persistence),
-which depends on both Tier 0 and B2 from Tier 1.
+B1 lives in `gossip-contracts` and B3 lives in its own crate `gossip-frontier`.
+Both are pure, stateless contract boundaries with no I/O, no async runtime, and
+no platform dependencies, so they compile at the bottom of the DAG with no
+prerequisites. Tier 1 contains B2 (Coordination) and B4 (Connector), which
+depend on the foundation but not on each other -- they compile in parallel once
+Tier 0 finishes. Tier 2 contains B5 (Persistence), which depends on both Tier 0
+and B2 from Tier 1.
 
-This tiering is why `gossip-contracts` bundles B1 and B3 in a single crate.
-Both boundaries are pure, stateless contracts with no I/O, no async runtime, and
-no platform dependencies. Separating them into two crates would gain nothing:
-they would still both land in Tier 0, and the extra crate boundary would add
-Cargo manifest overhead without improving parallelism. More importantly, B3's
-key encoding uses `CanonicalBytes` and `StableItemId` from B1, so a separate
-crate for B3 would need `gossip-contracts` as a dependency anyway -- the
-dependency is one-directional, not circular, but bundling removes the indirection.
+B3's key encoding uses `CanonicalBytes` and `StableItemId` from B1, so
+`gossip-frontier` depends on `gossip-contracts`. The dependency is
+one-directional (B3 depends on B1, never the reverse), and both crates remain
+in Tier 0 because neither depends on anything above the foundation.
 
 ```mermaid
 %% Diagram: tiered-compilation-view
@@ -146,7 +144,8 @@ graph TD
 **Parallel compilation.** Within Tier 1, `gossip-coordination` (B2) and
 `gossip-connectors` (B4) compile simultaneously. Neither imports types from the
 other. This parallelism is preserved in CI pipelines and in local development:
-`cargo build` spawns both compilations as soon as `gossip-contracts` finishes.
+`cargo build` spawns both compilations as soon as the Tier 0 crates
+(`gossip-contracts` and `gossip-frontier`) finish.
 
 **Tier membership rules.** A boundary's tier is determined by its deepest
 dependency. B5 depends on B2 (Tier 1), so B5 cannot be earlier than Tier 2.
@@ -216,9 +215,9 @@ guarantees simultaneously:
    under async executor starvation or lock contention.
 
 **How violations are caught.** The primary defense is the crate boundary itself:
-Cargo's dependency resolver rejects cycles at build time. Within the
-`gossip-contracts` crate (which hosts B1 and B3 in the same crate), the defense
-is code review. Every pull request that adds a `use crate::` statement crossing
+Cargo's dependency resolver rejects cycles at build time. Within a
+single crate (such as `gossip-contracts`, which hosts B1 alongside B2's data
+types), the defense is code review. Every pull request that adds a `use crate::` statement crossing
 a boundary module is checked against the DAG. If `coordination/` imports from
 `persistence/` (or vice versa beyond the documented edges), the review is
 rejected with a request to restructure the types so that shared abstractions
@@ -252,13 +251,15 @@ documented DAG. The crate graph provides a hard structural barrier (Cargo
 rejects cycles), and within-crate boundaries are enforced by convention and
 review.
 
-**Why gossip-contracts bundles B1 and B3.** Both B1 (Identity) and B3 (Shard
-Algebra) are pure, stateless contract boundaries with no I/O dependencies. B3
-uses `StableItemId` and `CanonicalBytes` from B1 for key encoding. Placing them
-in a single crate eliminates an unnecessary crate boundary while preserving the
-one-directional dependency (B3 depends on B1, never the reverse). Separating
-them would add Cargo manifest overhead without improving build parallelism,
-since both are Tier 0 and would still compile before anything else.
+**Why B1 and B3 are separate crates.** B1 (Identity) lives in
+`gossip-contracts` and B3 (Shard Algebra) lives in `gossip-frontier`. Both are
+pure, stateless contract boundaries with no I/O dependencies. B3 uses
+`StableItemId` and `CanonicalBytes` from B1 for key encoding, so
+`gossip-frontier` depends on `gossip-contracts`. The dependency is
+one-directional (B3 depends on B1, never the reverse). Both crates remain in
+Tier 0 and compile before anything else. The separate crate boundary gives B3
+its own namespace and allows downstream crates to depend on frontier types
+without pulling in all of `gossip-contracts`.
 
 ---
 
@@ -279,8 +280,9 @@ since both are Tier 0 and would still compile before anything else.
 |-----------|----------|
 | Architecture prose (source) | `08-cross-cutting/01-boundary-dependency-graph.md` |
 | B1 Identity contracts | `crates/gossip-contracts/src/identity/` |
-| B3 Shard Algebra contracts | `crates/gossip-contracts/src/shard/` |
-| B2 Coordination contracts | `crates/gossip-contracts/src/coordination/` |
+| B3 Shard Algebra | `crates/gossip-frontier/src/` |
+| B2 Coordination data types | `crates/gossip-contracts/src/coordination/` (shard_spec, cursor, pooled, manifest, limits) |
+| B2 Coordination protocol | `crates/gossip-coordination/src/` (traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
 | B4 Connector contracts | `crates/gossip-contracts/src/connector/` |
 | B5 Persistence contracts | `crates/gossip-contracts/src/persistence/` |
 | Cargo workspace manifest | `Cargo.toml` (root) |

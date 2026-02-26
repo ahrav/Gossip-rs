@@ -42,3 +42,4 @@ specs/tla2tools.jar
 **/fuzz/target/
 **/fuzz/corpus/
 **/fuzz/artifacts/
+.osgrep

@@ -211,5 +211,5 @@ platform.
    does not produce false positives:
 
    ```bash
-   cargo test --all-features -p gossip-contracts -- sim
+   cargo test --all-features -p gossip-coordination -- sim
    ```

@@ -619,7 +619,7 @@ impl ShardSpec {
     /// without re-running validation.
     #[cfg(any(test, feature = "test-support"))]
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_raw_parts(
+    pub fn from_raw_parts(
         key_range_start: Box<[u8]>,
         key_range_end: Box<[u8]>,
         metadata: Box<[u8]>,
@@ -1053,7 +1053,7 @@ impl fmt::Display for ShardLimitScope {
 /// ## Display Redaction
 ///
 /// Byte field lengths are shown instead of raw content in `Display` output,
-/// consistent with the cursor redaction policy in [`CoordError`](super::error::CoordError).
+/// consistent with the cursor redaction policy in `CoordError` (in `gossip-coordination`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SplitValidationError {
@@ -1115,7 +1115,7 @@ pub enum SplitValidationError {
     },
 
     /// The split would exceed the parent's spawn capacity
-    /// ([`MAX_SPAWNED_PER_SHARD`](super::split::MAX_SPAWNED_PER_SHARD)).
+    /// ([`MAX_SPAWNED_PER_SHARD`](super::limits::MAX_SPAWNED_PER_SHARD)).
     ///
     /// Production backends would surface this as a constraint violation;
     /// the in-memory reference spec matches by returning this error

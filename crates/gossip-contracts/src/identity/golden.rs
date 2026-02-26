@@ -33,14 +33,8 @@
 //! | `OCCURRENCE_ID_EXPECTED` | `domain::OCCURRENCE_ID_V1` | `OccurrenceIdInputs` encoding changes |
 //! | `POLICY_HASH_EXPECTED` | `domain::POLICY_HASH_V2` | `PolicyHashInputs` encoding changes |
 //! | `FINALIZE_64_EXPECTED` | (test-only domain) | `finalize_64` truncation or endianness changes |
-//! | `DERIVE_SPLIT_CHILD_0_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `DERIVE_SPLIT_CHILD_1_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `DERIVE_SPLIT_RESIDUAL_EXPECTED` | `domain::SPLIT_ID_V1` | Split shard-ID derivation or kind discriminants change |
-//! | `HASH_CHECKPOINT_EXPECTED` | `domain::OP_PAYLOAD_V1` | Checkpoint payload encoding or `CursorUpdate` canonical encoding changes |
-//! | `HASH_COMPLETE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Complete payload encoding or `CursorUpdate` canonical encoding changes |
-//! | `HASH_PARK_EXPECTED` | `domain::OP_PAYLOAD_V1` | Park payload encoding or `ParkReason` discriminant changes |
-//! | `HASH_SPLIT_REPLACE_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-replace payload or `ShardSpec`/`CursorUpdate` canonical encoding changes |
-//! | `HASH_SPLIT_RESIDUAL_EXPECTED` | `domain::OP_PAYLOAD_V1` | Split-residual payload or `ShardSpec` canonical encoding changes |
+//!
+//! Coordination derivation vectors live in `gossip_coordination::split::tests`.
 //!
 //! # Adding a new vector
 //!
@@ -67,7 +61,7 @@ use super::{
 ///
 /// The compile-time array length enforces exhaustiveness: adding a new
 /// derivation without updating this array is a compile error.
-const ALL: [&str; 15] = [
+const ALL: [&str; 7] = [
     "StableItemId",
     "ObjectVersionId",
     "key_secret_hash",
@@ -75,14 +69,6 @@ const ALL: [&str; 15] = [
     "OccurrenceId",
     "PolicyHash",
     "finalize_64",
-    "derive_split_child_0",
-    "derive_split_child_1",
-    "derive_split_residual",
-    "hash_checkpoint",
-    "hash_complete",
-    "hash_park",
-    "hash_split_replace",
-    "hash_split_residual",
 ];
 
 // ============================================================================
@@ -150,31 +136,7 @@ const POLICY_HASH_EXPECTED: [u8; 32] = [
 /// Unlike 32-byte vectors, this is a `u64` since `finalize_64` returns a truncated 64-bit digest.
 const FINALIZE_64_EXPECTED: u64 = 0x_8665_9F94_9814_3183;
 
-// -- Coordination derivation golden vectors --------------------------------
-
-/// `derive_split_shard_id(run=1, parent=100, op=999, Child, 0)`.
-const DERIVE_SPLIT_CHILD_0_EXPECTED: u64 = 0xada8_c6fc_a389_4936;
-
-/// `derive_split_shard_id(run=1, parent=100, op=999, Child, 1)`.
-const DERIVE_SPLIT_CHILD_1_EXPECTED: u64 = 0xac88_444c_76bd_fa28;
-
-/// `derive_split_shard_id(run=1, parent=100, op=999, Residual, 0)`.
-const DERIVE_SPLIT_RESIDUAL_EXPECTED: u64 = 0xfea1_0675_fdf7_8c46;
-
-/// `hash_checkpoint_payload` with cursor last_key `b"golden-cursor-key"`.
-const HASH_CHECKPOINT_EXPECTED: u64 = 0x0806_b9d3_83fd_8430;
-
-/// `hash_complete_payload` with cursor last_key `b"golden-cursor-key"`.
-const HASH_COMPLETE_EXPECTED: u64 = 0x9a83_e072_185a_bf89;
-
-/// `hash_park_payload(ParkReason::Poisoned)`.
-const HASH_PARK_EXPECTED: u64 = 0xf0e5_baaa_11b5_6d8d;
-
-/// `hash_split_replace_payload` with `[a,m) + [m,z)` children, initial cursors.
-const HASH_SPLIT_REPLACE_EXPECTED: u64 = 0xa592_eea6_db2f_cb49;
-
-/// `hash_split_residual_payload` with parent_new `[a,m)`, residual `[m,z)`.
-const HASH_SPLIT_RESIDUAL_EXPECTED: u64 = 0x4be2_bdea_6344_7e13;
+// Coordination derivation golden vectors live in gossip-coordination::split::tests.
 
 // ============================================================================
 // Golden vector tests
@@ -307,9 +269,10 @@ fn finalize_64_golden_value() {
 fn registry_is_complete() {
     assert_eq!(
         ALL.len(),
-        15,
-        "ALL registry has {} entries, expected 15. Did you add a derivation \
-         without updating the registry?",
+        7,
+        "ALL registry has {} entries, expected 7. Did you add a derivation \
+         without updating the registry? (Coordination golden vectors moved \
+         to gossip-coordination.)",
         ALL.len(),
     );
     for entry in &ALL {
@@ -430,129 +393,6 @@ proptest::proptest! {
 
         proptest::prop_assert_ne!(occ_a, occ_b);
     }
-}
-
-// -- Coordination derivation golden vectors --------------------------------
-
-#[test]
-fn derive_split_shard_id_golden_values() {
-    use crate::coordination::split::{DerivedShardKind, derive_split_shard_id};
-    use crate::identity::{OpId, RunId, ShardId};
-
-    let cases: &[(DerivedShardKind, u32, u64)] = &[
-        (DerivedShardKind::Child, 0, DERIVE_SPLIT_CHILD_0_EXPECTED),
-        (DerivedShardKind::Child, 1, DERIVE_SPLIT_CHILD_1_EXPECTED),
-        (
-            DerivedShardKind::Residual,
-            0,
-            DERIVE_SPLIT_RESIDUAL_EXPECTED,
-        ),
-    ];
-    for &(kind, index, expected) in cases {
-        let id = derive_split_shard_id(
-            RunId::from_raw(1),
-            ShardId::from_raw(100),
-            OpId::from_raw(999),
-            kind,
-            index,
-        );
-        assert_eq!(
-            id.as_raw(),
-            expected,
-            "derive_split_shard_id({kind:?}, {index}) golden vector changed \
-             (domain::SPLIT_ID_V1).\nActual: {:#018x}",
-            id.as_raw(),
-        );
-    }
-}
-
-// Compile-time assertion: all derived shard ID golden values have bit 63 set.
-// `derive_split_shard_id` forces bit 63 high so that hash-derived shard IDs
-// are always distinguishable from sequentially-allocated IDs (which start at
-// small values and grow upward). If a golden value has bit 63 clear, the
-// derivation logic has regressed.
-const _: () = assert!(DERIVE_SPLIT_CHILD_0_EXPECTED & (1u64 << 63) != 0);
-const _: () = assert!(DERIVE_SPLIT_CHILD_1_EXPECTED & (1u64 << 63) != 0);
-const _: () = assert!(DERIVE_SPLIT_RESIDUAL_EXPECTED & (1u64 << 63) != 0);
-
-#[test]
-fn hash_checkpoint_golden_value() {
-    use crate::coordination::cursor::CursorUpdate;
-    use crate::coordination::split::hash_checkpoint_payload;
-
-    let cursor = CursorUpdate::with_last_key(b"golden-cursor-key");
-    let hash = hash_checkpoint_payload(&cursor);
-    assert_eq!(
-        hash, HASH_CHECKPOINT_EXPECTED,
-        "hash_checkpoint_payload golden vector changed (domain::OP_PAYLOAD_V1).\n\
-         Actual: {hash:#018x}",
-    );
-}
-
-#[test]
-fn hash_complete_golden_value() {
-    use crate::coordination::cursor::CursorUpdate;
-    use crate::coordination::split::hash_complete_payload;
-
-    let cursor = CursorUpdate::with_last_key(b"golden-cursor-key");
-    let hash = hash_complete_payload(&cursor);
-    assert_eq!(
-        hash, HASH_COMPLETE_EXPECTED,
-        "hash_complete_payload golden vector changed (domain::OP_PAYLOAD_V1).\n\
-         Actual: {hash:#018x}",
-    );
-}
-
-#[test]
-fn hash_park_golden_value() {
-    use crate::coordination::record::ParkReason;
-    use crate::coordination::split::hash_park_payload;
-
-    let hash = hash_park_payload(ParkReason::Poisoned);
-    assert_eq!(
-        hash, HASH_PARK_EXPECTED,
-        "hash_park_payload(Poisoned) golden vector changed (domain::OP_PAYLOAD_V1).\n\
-         Actual: {hash:#018x}",
-    );
-}
-
-#[test]
-fn hash_split_replace_golden_value() {
-    use crate::coordination::cursor::CursorUpdate;
-    use crate::coordination::shard_spec::ShardSpec;
-    use crate::coordination::split::{
-        SplitReplaceChild, SplitReplacePlan, hash_split_replace_payload,
-    };
-
-    let spec1 = ShardSpec::with_range(b"a", b"m");
-    let spec2 = ShardSpec::with_range(b"m", b"z");
-    let cursor1 = CursorUpdate::initial();
-    let cursor2 = CursorUpdate::initial();
-    let c1 = SplitReplaceChild::new(spec1.as_ref(), cursor1);
-    let c2 = SplitReplaceChild::new(spec2.as_ref(), cursor2);
-    let plan = SplitReplacePlan::try_new(vec![c1, c2]).unwrap();
-    let hash = hash_split_replace_payload(&plan);
-    assert_eq!(
-        hash, HASH_SPLIT_REPLACE_EXPECTED,
-        "hash_split_replace_payload golden vector changed (domain::OP_PAYLOAD_V1).\n\
-         Actual: {hash:#018x}",
-    );
-}
-
-#[test]
-fn hash_split_residual_golden_value() {
-    use crate::coordination::shard_spec::ShardSpec;
-    use crate::coordination::split::{SplitResidualPlan, hash_split_residual_payload};
-
-    let parent_new = ShardSpec::with_range(b"a", b"m");
-    let residual = ShardSpec::with_range(b"m", b"z");
-    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref()).unwrap();
-    let hash = hash_split_residual_payload(&plan);
-    assert_eq!(
-        hash, HASH_SPLIT_RESIDUAL_EXPECTED,
-        "hash_split_residual_payload golden vector changed (domain::OP_PAYLOAD_V1).\n\
-         Actual: {hash:#018x}",
-    );
 }
 
 /// Boundary values for `u64` fields in `OccurrenceIdInputs` must each produce

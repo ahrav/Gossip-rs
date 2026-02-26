@@ -551,10 +551,11 @@ but they are computed independently at different abstraction levels.
 |:-----|:--------|
 | `04-boundary-2-coordination/09-worker-session.md` | Worker session design document covering claim, scan, and completion phases |
 | `04-boundary-2-coordination/04-cursor-monotonicity.md` | Cursor monotonicity invariant specification and proof sketch |
-| `crates/gossip-contracts/src/coordination/` and `crates/gossip-coordination/` | Coordination module containing lease, fencing, and session implementations |
-| `crates/gossip-contracts/src/coordination/lease.rs` | `Lease`, `ShardLease`, and `LeaseHolder` types |
-| `crates/gossip-contracts/src/coordination/record.rs` | `ShardRecord` with lease state and cursor position |
-| `crates/gossip-contracts/src/coordination/traits.rs` | `CoordinationBackend` trait defining `acquire_and_restore`, `checkpoint`, `complete` |
-| `crates/gossip-contracts/src/coordination/error.rs` | `CapacityHint`, `AcquireResult`, `RenewResult` types |
-| `crates/gossip-contracts/src/coordination/facade.rs` | `ClaimError::NoneAvailable { earliest_deadline }`, `default_claim_next_available` retry loop |
-| `crates/gossip-contracts/src/coordination/session.rs` | `WorkerSession` with `capacity` field and `capacity()` accessor |
+| `crates/gossip-contracts/src/coordination/` | Coordination data types (shard_spec, cursor, pooled, manifest, limits) |
+| `crates/gossip-coordination/src/` | Coordination protocol (lease, fencing, session, facade, traits, record, error, etc.) |
+| `crates/gossip-coordination/src/lease.rs` | `Lease` and `LeaseHolder` types |
+| `crates/gossip-coordination/src/record.rs` | `ShardRecord` with lease state and cursor position |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend` trait defining `acquire_and_restore`, `checkpoint`, `complete` |
+| `crates/gossip-coordination/src/error.rs` | `CapacityHint`, `AcquireResultView`, `RenewResult` types |
+| `crates/gossip-coordination/src/facade.rs` | `ClaimError::NoneAvailable { earliest_deadline }`, `default_claim_next_available` retry loop |
+| `crates/gossip-coordination/src/session.rs` | `WorkerSession` with `capacity` field and `capacity()` accessor |
