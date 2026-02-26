@@ -23,10 +23,11 @@
 //! non-identical specs). The **execution** layer lives in the
 //! [`CoordinationBackend`](crate::traits::CoordinationBackend) trait impls
 //! (`split_replace`, `split_residual`), which enforce the full contract:
-//! lease ownership, fence epoch, coverage validation
-//! ([`validate_split_coverage_bounds`]), shard-record mutation, and op-log
-//! idempotency. This separation lets callers construct and inspect plans
-//! without requiring a coordinator instance.
+//! lease ownership, fence epoch, coverage validation, shard-record
+//! mutation, and op-log idempotency. The planning helpers in this module
+//! (e.g., [`plan_split_replace`]) also perform coverage validation via
+//! [`validate_split_coverage_bounds`]. This separation lets callers
+//! construct and inspect plans without requiring a coordinator instance.
 //!
 //! ## Derived Shard IDs
 //!
@@ -627,12 +628,14 @@ pub struct SplitResidualResult {
 ///
 /// ## Caller Responsibility
 ///
-/// The `index` parameter should be a deterministic position in the
+/// The `index` parameter must be a unique, deterministic position in the
 /// parent-derived sequence for this operation (for example
-/// `base_spawned_len + child_offset`) — callers must not hardcode 0.
-/// Changing `index` changes the hash input and therefore changes the
-/// derived ID in practice (barring astronomically unlikely hash collisions;
-/// see collision bound above).
+/// `base_spawned_len + child_offset`). Using the same index for two
+/// siblings of the same split produces identical IDs — all other hash
+/// inputs (`run`, `parent`, `op`, `kind`) are shared, so `index` is the
+/// only discriminator between siblings. This is not enforced at the
+/// call site; correctness depends on the caller supplying distinct
+/// indices.
 #[must_use]
 pub fn derive_split_shard_id(
     run: RunId,
