@@ -389,6 +389,7 @@ it was committed in a previous page's transaction.
 | Component | Path |
 |-----------|------|
 | Identity derivation (StableItemId, FindingId, NormHash) | `crates/gossip-contracts/src/identity/` |
-| Coordination (run creation, shard assignment, completion) | `crates/gossip-contracts/src/coordination/` and `crates/gossip-coordination/` |
+| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/` |
+| Coordination protocol (run creation, shard assignment, completion) | `crates/gossip-coordination/src/` |
 | Persistence (done-ledger, findings sink, op-log) | `crates/gossip-contracts/src/persistence/` |
 | Design specification | `08-cross-cutting/02-data-flow-end-to-end.md` |

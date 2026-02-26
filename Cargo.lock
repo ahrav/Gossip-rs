@@ -387,13 +387,10 @@ dependencies = [
 name = "gossip-contracts"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "blake3",
  "criterion",
  "gossip-stdx",
  "proptest",
- "rand",
- "rand_chacha",
  "rstest",
  "subtle",
 ]
@@ -402,7 +399,15 @@ dependencies = [
 name = "gossip-coordination"
 version = "0.1.0"
 dependencies = [
+ "ahash",
+ "blake3",
+ "criterion",
  "gossip-contracts",
+ "gossip-stdx",
+ "proptest",
+ "rand",
+ "rand_chacha",
+ "rstest",
 ]
 
 [[package]]
@@ -410,6 +415,16 @@ name = "gossip-engine"
 version = "0.1.0"
 dependencies = [
  "gossip-contracts",
+]
+
+[[package]]
+name = "gossip-frontier"
+version = "0.1.0"
+dependencies = [
+ "gossip-contracts",
+ "gossip-stdx",
+ "proptest",
+ "rstest",
 ]
 
 [[package]]

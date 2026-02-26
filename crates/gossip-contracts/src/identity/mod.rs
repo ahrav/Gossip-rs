@@ -18,7 +18,7 @@ mod canonical;
 mod coordination;
 pub mod domain;
 mod finding;
-pub(crate) mod hashing;
+pub mod hashing;
 mod item;
 mod macros;
 mod policy;

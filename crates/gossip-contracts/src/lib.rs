@@ -1,18 +1,16 @@
 //! Shared contract types, encodings, and invariants for the gossip-rs distributed
 //! secret scanner.
 //!
-//! This crate defines the boundary-oriented API surface that all runtime crates
-//! depend on.
+//! This crate defines the shared data model that all runtime crates depend on.
 //!
 //! It contains:
 //!
 //! - **Identity primitives** — canonical encoding (`CanonicalBytes`),
 //!   domain-separated hashing helpers, ID newtype macros, and the domain-tag
 //!   registry.
-//! - **Coordination boundary** — shard lifecycle, lease management, and the
-//!   `CoordinationBackend` trait.
-//! - **Shard boundary** — key encoding schemas, range arithmetic, and split
-//!   computation.
+//! - **Coordination data model** — shard spec, cursor, pooled wrappers,
+//!   manifest validation, and split capacity constants. Protocol traits and
+//!   the in-memory backend live in `gossip-coordination`.
 //! - **Connector boundary** — enumeration/read traits and connector
 //!   registration.
 //! - **Persistence boundary** — done-ledger/findings-sink traits and commit
@@ -23,25 +21,13 @@
 //! 1. **No unsafe code.** This crate is pure computation — no FFI, no raw
 //!    pointers.
 //! 2. **Minimal dependencies.** Only `blake3` at runtime.
-//! 3. **Boundary isolation.** Modules mirror the five-boundary decomposition
-//!    and follow an acyclic dependency direction:
-//!    `identity → coordination → shard → connector → persistence`.
+//! 3. **Boundary isolation.** Modules mirror the boundary decomposition.
 //!
 //! # Feature flags
 //!
 //! | Flag | Default | Purpose |
 //! |------|---------|---------|
 //! | `test-support` | off | Enables test doubles and helpers for downstream crate tests. |
-//!
-//! # Allocation Contract Boundary
-//!
-//! Runtime allocation policy is tiered:
-//! - HOT paths prioritize allocation-silent execution (borrowed/scratch/slab).
-//! - WARM/COLD paths prioritize simpler API contracts and may allocate.
-//!
-//! The `sim` module remains deterministic verification infrastructure exposed
-//! only for `#[cfg(test)]` or `test-support` builds, and may allocate freely
-//! for ergonomics and diagnostics.
 
 #![forbid(unsafe_code)]
 
@@ -53,24 +39,15 @@ pub use blake3;
 
 // ---------------------------------------------------------------------------
 // Boundary modules.
-//
-// Dependency direction is:
-// `identity -> coordination -> shard -> connector -> persistence`.
-// Declarations below do not imply or enforce dependency order; each module's
-// docs define what it may reference.
 // ---------------------------------------------------------------------------
 
 pub mod connector;
 pub mod coordination;
 pub mod identity;
 pub mod persistence;
-pub mod shard;
-
-#[cfg(test)]
-mod test_util;
 
 #[cfg(any(test, feature = "test-support"))]
-pub mod sim;
+pub mod test_util;
 
 #[cfg(test)]
 mod tests {

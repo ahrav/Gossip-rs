@@ -6,21 +6,38 @@
 doc = "docs/boundary-1-identity-spine.md"
 dir = "crates/gossip-contracts/src/identity/"
 
+# Data model (shard_spec, cursor, pooled, manifest, limits) stays in contracts.
 [[scopes]]
 doc = "docs/boundary-2-coordination.md"
 dir = "crates/gossip-contracts/src/coordination/"
 
+# Protocol (traits, record, error, run, split, in_memory, etc.) moved to coordination.
+[[scopes]]
+doc = "docs/boundary-2-coordination.md"
+dir = "crates/gossip-coordination/src/"
+
+# Simulation harness moved to coordination.
 [[scopes]]
 doc = "docs/simulation-harness.md"
-dir = "crates/gossip-contracts/src/sim/"
+dir = "crates/gossip-coordination/src/sim/"
 
+# Coordination testing spans both the data model and protocol crates.
 [[scopes]]
 doc = "docs/coordination-testing.md"
 dir = "crates/gossip-contracts/src/coordination/"
 
 [[scopes]]
 doc = "docs/coordination-testing.md"
-dir = "crates/gossip-contracts/src/sim/"
+dir = "crates/gossip-coordination/src/"
+
+[[scopes]]
+doc = "docs/coordination-testing.md"
+dir = "crates/gossip-coordination/src/sim/"
+
+# Shard algebra moved to frontier.
+[[scopes]]
+doc = "docs/coordination-testing.md"
+dir = "crates/gossip-frontier/src/"
 
 [[scopes]]
 doc = "specs/coordination/README.md"

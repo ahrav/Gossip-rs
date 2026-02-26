@@ -4,7 +4,7 @@
 /// blocked by Miri's default isolation mode) and reduces cases from the
 /// proptest default of 256 to 32, since Miri interpretation is far slower
 /// than native execution.
-pub(crate) fn miri_proptest_config() -> proptest::test_runner::Config {
+pub fn miri_proptest_config() -> proptest::test_runner::Config {
     if cfg!(miri) {
         proptest::test_runner::Config {
             failure_persistence: None,
@@ -16,11 +16,11 @@ pub(crate) fn miri_proptest_config() -> proptest::test_runner::Config {
     }
 }
 
-/// Hash a value via [`CanonicalBytes`] and return the BLAKE3 digest.
+/// Hash a value via [`CanonicalBytes`](crate::identity::CanonicalBytes) and return the BLAKE3 digest.
 ///
 /// Convenience wrapper used across test modules to verify determinism
 /// and collision-freedom of canonical encodings.
-pub(crate) fn canonical_digest<T: crate::identity::CanonicalBytes>(val: &T) -> blake3::Hash {
+pub fn canonical_digest<T: crate::identity::CanonicalBytes>(val: &T) -> blake3::Hash {
     let mut h = blake3::Hasher::new();
     val.write_canonical(&mut h);
     h.finalize()
@@ -35,7 +35,7 @@ use proptest::prelude::*;
 
 /// Generate a valid bounded [`ShardSpec`]: end = start ++ non-empty suffix,
 /// guaranteeing `start < end` lexicographically.
-pub(crate) fn arb_bounded_shard_spec() -> impl Strategy<Value = ShardSpec> {
+pub fn arb_bounded_shard_spec() -> impl Strategy<Value = ShardSpec> {
     (
         proptest::collection::vec(any::<u8>(), 1..64),
         proptest::collection::vec(any::<u8>(), 1..8),
@@ -48,7 +48,7 @@ pub(crate) fn arb_bounded_shard_spec() -> impl Strategy<Value = ShardSpec> {
 }
 
 /// Generate a valid bounded [`ShardSpec`] with non-empty metadata.
-pub(crate) fn arb_bounded_shard_spec_with_metadata() -> impl Strategy<Value = ShardSpec> {
+pub fn arb_bounded_shard_spec_with_metadata() -> impl Strategy<Value = ShardSpec> {
     (
         proptest::collection::vec(any::<u8>(), 1..64),
         proptest::collection::vec(any::<u8>(), 1..8),
@@ -64,7 +64,7 @@ pub(crate) fn arb_bounded_shard_spec_with_metadata() -> impl Strategy<Value = Sh
 /// Generate a [`ShardSpec`] covering all four boundedness variants plus
 /// a metadata variant: fully bounded (weight 4), bounded-with-metadata
 /// (weight 2), start-unbounded, end-unbounded, fully unbounded.
-pub(crate) fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
+pub fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
     proptest::prop_oneof![
         4 => arb_bounded_shard_spec(),
         2 => arb_bounded_shard_spec_with_metadata(),
@@ -85,11 +85,17 @@ pub(crate) fn arb_shard_spec() -> impl Strategy<Value = ShardSpec> {
 /// In test code, records are often created but not explicitly deallocated
 /// before the slab drops. This wrapper calls `clear()` in its `Drop` impl
 /// so the slab's debug leak detector does not panic.
-pub(crate) struct TestSlab(gossip_stdx::ByteSlab);
+pub struct TestSlab(gossip_stdx::ByteSlab);
 
 impl TestSlab {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self(gossip_stdx::ByteSlab::with_capacity(64 * 1024))
+    }
+}
+
+impl Default for TestSlab {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

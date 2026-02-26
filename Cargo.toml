@@ -7,6 +7,7 @@ members = [
     "crates/gossip-scan-pipeline",
     "crates/gossip-connectors",
     "crates/gossip-coordination",
+    "crates/gossip-frontier",
     "crates/gossip-worker",
 ]
 
@@ -25,3 +26,4 @@ gossip-engine = { path = "crates/gossip-engine" }
 gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }
 gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }
+gossip-frontier = { path = "crates/gossip-frontier" }

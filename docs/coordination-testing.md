@@ -400,42 +400,45 @@ model, fault injection levels, and three-stage run model, see
 ### Quick test cycles
 
 ```bash
-# All coordination tests (unit + conformance + scenario)
+# All coordination protocol tests (unit + conformance + scenario)
+cargo test -p gossip-coordination
+
+# Data model tests (shard_spec, cursor, pooled)
 cargo test -p gossip-contracts --lib coordination
 
 # Individual tiers
-cargo test -p gossip-contracts --lib in_memory_tests
-cargo test -p gossip-contracts --lib conformance_tests
-cargo test -p gossip-contracts --lib scenario_tests
+cargo test -p gossip-coordination --lib in_memory_tests
+cargo test -p gossip-coordination --lib conformance_tests
+cargo test -p gossip-coordination --lib scenario_tests
 ```
 
 ### Overload tests
 
 ```bash
 # Overload scenario tests (fast, runs in default cargo test)
-cargo test -p gossip-contracts overload
+cargo test -p gossip-coordination overload
 
 # Including the slow radioactive test
-cargo test -p gossip-contracts overload -- --ignored --nocapture
+cargo test -p gossip-coordination overload -- --ignored --nocapture
 ```
 
 ### Simulation tests
 
 ```bash
 # Behavioral regression tests (fast, runs in default cargo test)
-cargo test --all-features -p gossip-contracts -- sim
+cargo test --all-features -p gossip-coordination -- sim
 
 # Mega simulation (slow, #[ignore])
-cargo test -p gossip-contracts mega_sim -- --ignored --nocapture
+cargo test -p gossip-coordination mega_sim -- --ignored --nocapture
 
 # Convergence proptests (slow, #[ignore])
-cargo test -p gossip-contracts proptest_convergence -- --ignored --nocapture
+cargo test -p gossip-coordination proptest_convergence -- --ignored --nocapture
 
 # Stress tests (slow, #[ignore])
-cargo test -p gossip-contracts stress_ -- --ignored --nocapture
+cargo test -p gossip-coordination stress_ -- --ignored --nocapture
 
 # Multi-tenant isolation (fast, runs in default cargo test)
-cargo test -p gossip-contracts multi_tenant -- --nocapture
+cargo test -p gossip-coordination multi_tenant -- --nocapture
 ```
 
 ### Environment variables

@@ -173,9 +173,9 @@ The diagrams reference source code in the main [gossip-rs](https://github.com/ah
 | Crate | Path | Boundaries |
 |-------|------|------------|
 | `gossip-contracts` | `crates/gossip-contracts/src/identity/` | B1: Identity |
-| `gossip-contracts` | `crates/gossip-contracts/src/shard/` | B3: Shard Algebra |
-| `gossip-contracts` | `crates/gossip-contracts/src/coordination/` | B2: Coordination |
-| `gossip-coordination` | `crates/gossip-coordination/` | B2: Coordination (crate) |
+| `gossip-frontier` | `crates/gossip-frontier/src/` | B3: Shard Algebra |
+| `gossip-contracts` | `crates/gossip-contracts/src/coordination/` | B2: Coordination (data types: shard_spec, cursor, pooled, manifest, limits) |
+| `gossip-coordination` | `crates/gossip-coordination/src/` | B2: Coordination (protocol: traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/` | B4: Connector |
 | `gossip-connectors` | `crates/gossip-connectors/` | B4: Connector (crate) |
 | `gossip-contracts` | `crates/gossip-contracts/src/persistence/` | B5: Persistence |

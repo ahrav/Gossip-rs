@@ -74,11 +74,11 @@ pub(crate) static POLICY_HASH_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::POLICY_HASH_V2));
 
 /// Cached derive-key hasher for split shard-ID derivation in the coordination layer.
-pub(crate) static SPLIT_ID_HASHER: LazyLock<Hasher> =
+pub static SPLIT_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::SPLIT_ID_V1));
 
 /// Cached derive-key hasher for op-log payload hashing in the coordination layer.
-pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
+pub static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OP_PAYLOAD_V1));
 
 /// Clone a cached hasher, feed canonical input, and finalize to 32 bytes.
@@ -91,13 +91,13 @@ pub(crate) static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
 /// post-setup internal state.
 ///
 /// `base` is expected to be one of this module's `LazyLock<Hasher>` statics
-/// (e.g., [`FINDING_HASHER`]); deref coercion provides `&Hasher` transparently.
+/// (e.g., `FINDING_HASHER`); deref coercion provides `&Hasher` transparently.
 ///
-/// The `T: CanonicalBytes` bound guarantees that `inputs` produces a
-/// collision-free, deterministic byte encoding, so the resulting 32-byte
-/// digest is a pure function of `(domain, inputs)`.
+/// The `T: [CanonicalBytes](super::CanonicalBytes)` bound guarantees that
+/// `inputs` produces a collision-free, deterministic byte encoding, so the
+/// resulting 32-byte digest is a pure function of `(domain, inputs)`.
 #[inline]
-pub(crate) fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
+pub fn derive_from_cached<T: super::CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32] {
     let mut h = base.clone();
     inputs.write_canonical(&mut h);
     finalize_32(&h)

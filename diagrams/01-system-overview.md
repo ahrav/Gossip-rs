@@ -268,8 +268,8 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | Boundary | Primary Source |
 |----------|---------------|
 | B1: Identity | `crates/gossip-contracts/src/identity/` |
-| B3: Shard Algebra | `crates/gossip-contracts/src/shard/` |
-| B2: Coordination | `crates/gossip-contracts/src/coordination/` + `crates/gossip-coordination/` |
+| B3: Shard Algebra | `crates/gossip-frontier/src/` |
+| B2: Coordination | `crates/gossip-contracts/src/coordination/` (data types) + `crates/gossip-coordination/src/` (protocol) |
 | B4: Connector | `crates/gossip-contracts/src/connector/` + `crates/gossip-connectors/` |
 | B5: Persistence | `crates/gossip-contracts/src/persistence/` |
 | Worker binary | `crates/gossip-worker/` |

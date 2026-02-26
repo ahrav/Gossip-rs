@@ -279,8 +279,9 @@ since both are Tier 0 and would still compile before anything else.
 |-----------|----------|
 | Architecture prose (source) | `08-cross-cutting/01-boundary-dependency-graph.md` |
 | B1 Identity contracts | `crates/gossip-contracts/src/identity/` |
-| B3 Shard Algebra contracts | `crates/gossip-contracts/src/shard/` |
-| B2 Coordination contracts | `crates/gossip-contracts/src/coordination/` |
+| B3 Shard Algebra | `crates/gossip-frontier/src/` |
+| B2 Coordination data types | `crates/gossip-contracts/src/coordination/` (shard_spec, cursor, pooled, manifest, limits) |
+| B2 Coordination protocol | `crates/gossip-coordination/src/` (traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
 | B4 Connector contracts | `crates/gossip-contracts/src/connector/` |
 | B5 Persistence contracts | `crates/gossip-contracts/src/persistence/` |
 | Cargo workspace manifest | `Cargo.toml` (root) |

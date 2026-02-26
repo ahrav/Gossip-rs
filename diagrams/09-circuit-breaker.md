@@ -382,5 +382,5 @@ them.
 - **Deep dive document**: `06-boundary-4-connector/04-circuit-breaker.md`
 - **Connector module**: `crates/gossip-connectors/`
 - **Connector trait**: `crates/gossip-contracts/src/connector/`
-- **Coordination backend**: `crates/gossip-contracts/src/coordination/traits.rs`
-- **Park reason types**: `crates/gossip-contracts/src/coordination/record.rs`
+- **Coordination backend**: `crates/gossip-coordination/src/traits.rs`
+- **Park reason types**: `crates/gossip-coordination/src/record.rs`

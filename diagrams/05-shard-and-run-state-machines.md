@@ -347,9 +347,8 @@ The backend's enforcement strategy is layered:
 
 | File | Purpose |
 |:-----|:--------|
-| `crates/gossip-contracts/src/coordination/record.rs` | `ShardStatus` enum, `ShardRecord` struct, `assert_transition_legal()`, `assert_invariants()` |
-| `crates/gossip-contracts/src/coordination/traits.rs` | `CoordinationBackend` trait defining all shard operations |
-| `crates/gossip-contracts/src/coordination/error.rs` | `CoordError`, `AcquireError`, `CompleteError`, `SplitError`, `ParkError` |
-| `crates/gossip-contracts/src/coordination/lease.rs` | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind` |
-| `crates/gossip-contracts/src/coordination/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()` |
-| `crates/gossip-contracts/src/coordination/mod.rs` | Module exports and architectural overview |
+| `crates/gossip-coordination/src/record.rs` | `ShardStatus` enum, `ShardRecord` struct, `assert_transition_legal()`, `assert_invariants()` |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend` trait defining all shard operations |
+| `crates/gossip-coordination/src/error.rs` | `CoordError`, `AcquireError`, `CompleteError`, `SplitError`, `ParkError` |
+| `crates/gossip-coordination/src/lease.rs` | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind` |
+| `crates/gossip-coordination/src/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()` |

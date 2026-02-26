@@ -4,9 +4,12 @@
 
 Boundary 2 (Shard Coordination Protocol) manages distributed shard lifecycle,
 lease-based ownership, and bounded idempotent operations for the gossip-rs
-secret scanner. It lives in `crates/gossip-contracts/src/coordination/` and
-depends on Boundary 1 (Identity & Hashing Spine) for `TenantId`, `ShardId`,
-`RunId`, `OpId`, `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
+secret scanner. The shared data model (shard spec, cursor, pooled wrappers,
+manifest validation) lives in `crates/gossip-contracts/src/coordination/`, and
+the protocol layer (traits, state machine, InMemoryCoordinator, sim harness)
+lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
+(Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
+`FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
 The module provides six core capabilities:
 
