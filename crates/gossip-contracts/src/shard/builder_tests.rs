@@ -385,22 +385,15 @@ fn split_range_by_boundaries_under_capacity_succeeds() {
     assert_eq!(builder.remaining_entries(), 1);
 }
 
-#[rstest]
-#[case::over_capacity(4, 3, vec![b"f".as_slice(), b"m", b"t"], 3, 4)]
-#[case::over_max_split_children(
-    512, 512,
-    vec![b"m".as_slice(); MAX_SPLIT_CHILDREN],
-    MAX_SPLIT_CHILDREN, MAX_SPLIT_CHILDREN + 1,
-)]
-fn split_range_capacity_exceeded_has_no_partial_writes(
-    #[case] arena_slots: usize,
-    #[case] entry_limit: usize,
-    #[case] split_points: Vec<&[u8]>,
-    #[case] exp_limit: usize,
-    #[case] exp_additional: usize,
-) {
-    let mut arena = ShardArena::with_capacity(arena_slots, 4_096);
-    let mut builder = PreallocShardBuilder::<512>::new(&mut arena, entry_limit).unwrap();
+// CAP = 2 × MAX_SPLIT_CHILDREN (512) so the inline buffer can hold a full
+// fan-out without hitting the CAP ceiling — this isolates the
+// MAX_SPLIT_CHILDREN check from the entry_limit check.
+
+#[test]
+fn split_range_capacity_exceeded_has_no_partial_writes() {
+    let mut arena = ShardArena::with_capacity(4, 4_096);
+    let mut builder = PreallocShardBuilder::<512>::new(&mut arena, 3).unwrap();
+    let split_points: Vec<&[u8]> = vec![b"f", b"m", b"t"];
     let err = builder
         .split_range_by_boundaries(b"a", &split_points, b"z", b"")
         .unwrap_err();
@@ -408,10 +401,29 @@ fn split_range_capacity_exceeded_has_no_partial_writes(
     assert!(matches!(
         err,
         PreallocShardBuilderError::CapacityExceeded {
-            limit,
+            limit: 3,
             current: 0,
-            additional,
-        } if limit == exp_limit && additional == exp_additional
+            additional: 4,
+        }
+    ));
+    assert!(builder.is_empty());
+}
+
+#[test]
+fn split_range_fan_out_exceeded_has_no_partial_writes() {
+    let mut arena = ShardArena::with_capacity(512, 4_096);
+    let mut builder = PreallocShardBuilder::<512>::new(&mut arena, 512).unwrap();
+    let split_points: Vec<&[u8]> = vec![b"m"; MAX_SPLIT_CHILDREN];
+    let err = builder
+        .split_range_by_boundaries(b"a", &split_points, b"z", b"")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::FanOutExceeded {
+            limit,
+            requested,
+        } if limit == MAX_SPLIT_CHILDREN && requested == MAX_SPLIT_CHILDREN + 1
     ));
     assert!(builder.is_empty());
 }
@@ -445,13 +457,31 @@ fn split_manifest_by_rows_under_capacity_succeeds() {
     assert_eq!(builder.remaining_entries(), 1);
 }
 
+#[test]
+fn split_manifest_by_rows_capacity_exceeded_has_no_partial_writes() {
+    let mut arena = ShardArena::with_capacity(3, 4_096);
+    let mut builder = PreallocShardBuilder::<512>::new(&mut arena, 2).unwrap();
+    let err = builder
+        .split_manifest_by_rows(7, 0, 10, 4, b"")
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        PreallocShardBuilderError::CapacityExceeded {
+            limit: 2,
+            current: 0,
+            additional: 3,
+        }
+    ));
+    assert!(builder.is_empty());
+}
+
 #[rstest]
-#[case::over_capacity(3, 2, 10, 4, 4_096, 2, 3)]
 #[case::over_max_split_children(
     512, 512,
     u64::try_from(MAX_SPLIT_CHILDREN).unwrap() + 1,
     1, 4_096,
-    MAX_SPLIT_CHILDREN, MAX_SPLIT_CHILDREN + 1,
+    MAX_SPLIT_CHILDREN + 1,
 )]
 #[case::rounding_overflow(
     512, 512, u64::MAX,
@@ -460,16 +490,15 @@ fn split_manifest_by_rows_under_capacity_succeeds() {
         (u64::MAX / target).saturating_add(1)
     },
     1_000_000,
-    MAX_SPLIT_CHILDREN, MAX_SPLIT_CHILDREN + 1,
+    MAX_SPLIT_CHILDREN + 1,
 )]
-fn split_manifest_by_rows_capacity_exceeded_has_no_partial_writes(
+fn split_manifest_by_rows_fan_out_exceeded_has_no_partial_writes(
     #[case] arena_slots: usize,
     #[case] entry_limit: usize,
     #[case] end_row: u64,
     #[case] rows_per_shard: u64,
     #[case] arena_bytes: usize,
-    #[case] exp_limit: usize,
-    #[case] exp_additional: usize,
+    #[case] exp_requested: usize,
 ) {
     let mut arena = ShardArena::with_capacity(arena_slots, arena_bytes);
     let mut builder = PreallocShardBuilder::<512>::new(&mut arena, entry_limit).unwrap();
@@ -479,11 +508,10 @@ fn split_manifest_by_rows_capacity_exceeded_has_no_partial_writes(
 
     assert!(matches!(
         err,
-        PreallocShardBuilderError::CapacityExceeded {
+        PreallocShardBuilderError::FanOutExceeded {
             limit,
-            current: 0,
-            additional,
-        } if limit == exp_limit && additional == exp_additional
+            requested,
+        } if limit == MAX_SPLIT_CHILDREN && requested == exp_requested
     ));
     assert!(builder.is_empty());
 }

@@ -40,12 +40,13 @@
 //! # Transactional semantics
 //!
 //! A successful `add_*` call appends exactly one new entry and consumes one
-//! shard ID. Failed `add_*` calls leave the staged manifest unchanged. Bulk
-//! split helpers (`split_range_by_boundaries`, `split_manifest_by_rows`)
-//! preflight fan-out and entry budget before entering the allocation loop.
-//! `split_range_by_boundaries` also validates all child boundaries in a
-//! read-only pass before allocating. However, neither split helper is fully
-//! transactional: if arena slab allocation fails mid-loop, previously appended
+//! shard ID. Failed `add_*` calls leave the staged manifest unchanged.
+//!
+//! Bulk split helpers preflight fan-out and entry budget before entering the
+//! allocation loop. `split_range_by_boundaries` additionally validates all
+//! child boundaries in a read-only pass before allocating, so **boundary
+//! errors leave the builder state completely unchanged**. However, if arena
+//! slab allocation fails mid-loop in either split helper, previously appended
 //! children remain staged while later children are lost.
 
 use core::fmt;
@@ -89,6 +90,8 @@ pub enum PreallocShardBuilderError {
         current: usize,
         additional: usize,
     },
+    /// Bulk split fan-out exceeds [`MAX_SPLIT_CHILDREN`].
+    FanOutExceeded { limit: usize, requested: usize },
     /// Arena handle table or byte slab could not allocate another spec.
     SlabFull(SlabFull),
     /// Range constructor rejected bounds or metadata sizing.
@@ -124,6 +127,10 @@ impl fmt::Display for PreallocShardBuilderError {
                 f,
                 "entry capacity exceeded: {current} existing + {additional} new > {limit} limit"
             ),
+            Self::FanOutExceeded { limit, requested } => write!(
+                f,
+                "split fan-out exceeded: {requested} children requested > {limit} limit"
+            ),
             Self::SlabFull(err) => write!(f, "{err}"),
             Self::RangeInvalid(err) => write!(f, "{err}"),
             Self::PrefixInvalid(err) => write!(f, "{err}"),
@@ -148,6 +155,7 @@ impl std::error::Error for PreallocShardBuilderError {
             | Self::CapMismatch { .. }
             | Self::EntryLimitExceedsManifestMax { .. }
             | Self::CapacityExceeded { .. }
+            | Self::FanOutExceeded { .. }
             | Self::InvalidSpecHandle => None,
         }
     }
@@ -327,18 +335,17 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
 
     /// Enforce split fan-out and remaining entry-budget limits.
     ///
-    /// Fan-out violations are reported with `current = 0` to signal that the
-    /// failure came from the absolute `MAX_SPLIT_CHILDREN` ceiling, not from
-    /// existing staged entries.
+    /// Returns [`PreallocShardBuilderError::FanOutExceeded`] when `additional`
+    /// exceeds [`MAX_SPLIT_CHILDREN`], then delegates to
+    /// [`Self::ensure_entry_capacity`] for the remaining entry budget check.
     fn ensure_bulk_split_capacity(
         &self,
         additional: usize,
     ) -> Result<(), PreallocShardBuilderError> {
         if additional > MAX_SPLIT_CHILDREN {
-            return Err(PreallocShardBuilderError::CapacityExceeded {
+            return Err(PreallocShardBuilderError::FanOutExceeded {
                 limit: MAX_SPLIT_CHILDREN,
-                current: 0,
-                additional,
+                requested: additional,
             });
         }
         self.ensure_entry_capacity(additional)
@@ -538,9 +545,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ///
     /// # Errors
     ///
-    /// - [`PreallocShardBuilderError::CapacityExceeded`] if all children would
-    ///   not fit in the remaining entry budget or child count exceeds
+    /// - [`PreallocShardBuilderError::FanOutExceeded`] if child count exceeds
     ///   [`MAX_SPLIT_CHILDREN`].
+    /// - [`PreallocShardBuilderError::CapacityExceeded`] if all children would
+    ///   not fit in the remaining entry budget.
     /// - [`PreallocShardBuilderError::RangeInvalid`] if any child range is
     ///   invalid.
     /// - [`PreallocShardBuilderError::SlabFull`] if arena storage is exhausted.
@@ -617,9 +625,10 @@ impl<'a, const CAP: usize> PreallocShardBuilder<'a, CAP> {
     ///
     /// # Errors
     ///
-    /// - [`PreallocShardBuilderError::CapacityExceeded`] if all chunks would
-    ///   not fit in the remaining entry budget or chunk count exceeds
+    /// - [`PreallocShardBuilderError::FanOutExceeded`] if chunk count exceeds
     ///   [`MAX_SPLIT_CHILDREN`].
+    /// - [`PreallocShardBuilderError::CapacityExceeded`] if all chunks would
+    ///   not fit in the remaining entry budget.
     /// - [`PreallocShardBuilderError::ManifestCtorInvalid`] for invalid row
     ///   bounds (`start_row >= end_row`), zero `rows_per_shard`, or invalid
     ///   encoded manifest ranges.
