@@ -678,7 +678,11 @@ pub fn plan_split_residual_from_cursor<'a>(
     // start, the parent's new range would be empty; if it equals or exceeds
     // end, the residual's range would be empty. Either produces a degenerate
     // zero-width shard, which is invalid.
-    if split_point <= parent.key_range_start() || split_point >= parent.key_range_end() {
+    //
+    // An empty key_range_end represents an unbounded upper range (+∞), so any
+    // split point is below the upper bound in that case.
+    let above_end = !parent.is_end_unbounded() && split_point >= parent.key_range_end();
+    if split_point <= parent.key_range_start() || above_end {
         return Err(SplitResidualPlanningError::SplitPointOutOfBounds {
             split_point: split_point.len(),
             parent_start: parent.key_range_start().len(),
@@ -1029,5 +1033,28 @@ mod tests {
         let err =
             plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch).unwrap_err();
         assert_eq!(err, expected);
+    }
+
+    #[test]
+    fn cursor_split_accepts_unbounded_tail_parent() {
+        // Parent with unbounded upper range: [b"a", +∞).
+        // Empty key_range_end represents unbounded.
+        let parent = ShardSpec::with_range(b"a".as_slice(), b"".as_slice());
+        let cursor = CursorUpdate::with_last_key(b"m");
+        let mut scratch = [0u8; MAX_KEY_SIZE];
+
+        // Successor of "m" is "m\0", which lies inside [a, +∞).
+        let plan = plan_split_residual_from_cursor(parent.as_ref(), cursor, &mut scratch);
+        assert!(
+            plan.is_ok(),
+            "unbounded-tail parent should accept a valid interior split, got {plan:?}",
+        );
+
+        let plan = plan.unwrap();
+        assert_eq!(plan.parent_new_spec().key_range_start(), b"a");
+        assert_eq!(plan.parent_new_spec().key_range_end(), b"m\0");
+        assert_eq!(plan.residual_spec().key_range_start(), b"m\0");
+        // Residual inherits the unbounded end.
+        assert!(plan.residual_spec().key_range_end().is_empty());
     }
 }
