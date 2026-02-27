@@ -3,7 +3,7 @@
 //! These types model connector operation outcomes **after** boundary validation
 //! has succeeded. Input-shape and size failures use
 //! [`ConnectorInputError`](crate::connector::ConnectorInputError) in
-//! `connector/types.rs`.
+//! the sibling [`types`](super::types) module.
 //!
 //! ## Surface overview
 //!
@@ -17,8 +17,8 @@
 //! ## Why two structurally identical error types?
 //!
 //! [`EnumerateError`] and [`ReadError`] carry the same three fields but are
-//! distinct types. This is intentional: enumeration and reading are separate
-//! connector traits with independent scaling characteristics (metadata-bound
+//! distinct types. This is intentional: enumeration and reading are modeled as
+//! separate operations with independent scaling characteristics (metadata-bound
 //! vs bandwidth-bound). Keeping their error types distinct means:
 //!
 //! - Public signatures are unambiguous about which operation failed.
@@ -31,8 +31,9 @@
 //! - `retry_after_ms` is advisory backoff metadata, not a scheduler contract.
 //!   The runtime may enforce stricter global policies regardless of connector
 //!   hints.
-//! - `message` is passthrough connector text and is **not** sanitized here.
-//!   Callers must treat it as untrusted when logging or surfacing to users.
+//! - `message` is passthrough connector text. The `Display` impl replaces
+//!   control characters with U+FFFD to prevent log injection, but raw field
+//!   access via [`message()`] returns the original unsanitized value.
 //! - These types are value-level contracts only. Retry scheduling, circuit
 //!   breaking, and backoff policy live in the runtime crate.
 
@@ -57,205 +58,204 @@ pub enum ErrorClass {
     Permanent,
 }
 
-/// Error returned by connector enumeration/list operations.
-///
-/// Bundles orchestration-facing policy metadata ([`ErrorClass`] and an
-/// optional backoff hint) with a connector-originated diagnostic message.
-/// Constructed via named constructors ([`retryable`](Self::retryable),
-/// [`rate_limited`](Self::rate_limited), [`permanent`](Self::permanent))
-/// that enforce consistent class/retry combinations. Fields are private
-/// to preserve these invariants; use [`class`](Self::class),
-/// [`message`](Self::message), and [`retry_after_ms`](Self::retry_after_ms)
-/// to inspect.
-///
-/// See also [`ReadError`], the structurally parallel type for the read/open
-/// path. The two are kept separate intentionally -- see the module docs for
-/// rationale.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnumerateError {
-    class: ErrorClass,
-    message: String,
-    retry_after_ms: Option<u64>,
-}
-
-impl EnumerateError {
-    /// Returns the retryability classification for this failure.
+impl ErrorClass {
+    /// Returns `true` when the classification is [`Retryable`](Self::Retryable).
     #[inline]
     #[must_use]
-    pub fn class(&self) -> ErrorClass {
-        self.class
-    }
-
-    /// Returns the connector-originated diagnostic text.
-    ///
-    /// Not sanitized by this type -- callers must treat it as untrusted
-    /// when logging or displaying.
-    #[inline]
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// Returns the optional connector-provided retry hint in milliseconds.
-    ///
-    /// Advisory only: the runtime may impose stricter or global backoff
-    /// policies. A value of `0` is passed through without normalization.
-    #[inline]
-    #[must_use]
-    pub fn retry_after_ms(&self) -> Option<u64> {
-        self.retry_after_ms
-    }
-
-    /// Construct a retryable enumeration error without a backoff hint.
-    ///
-    /// Use for transient failures where the connector has no opinion on
-    /// when to retry (e.g., a generic network timeout).
-    #[must_use]
-    pub fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            class: ErrorClass::Retryable,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-
-    /// Construct a retryable enumeration error with a connector-supplied
-    /// backoff hint.
-    ///
-    /// Typical source: an HTTP `Retry-After` header or equivalent API signal.
-    /// The `retry_after_ms` value is stored as-is (including `0`) with no
-    /// clamping or normalization -- that is the runtime's responsibility.
-    #[must_use]
-    pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
-        Self {
-            class: ErrorClass::Retryable,
-            message: message.into(),
-            retry_after_ms: Some(retry_after_ms),
-        }
-    }
-
-    /// Construct a permanent enumeration error.
-    ///
-    /// Use when the failure will persist until something external changes
-    /// (credentials, permissions, resource existence). The runtime should
-    /// not retry blindly; typical follow-up is to park the shard with a
-    /// diagnostic reason.
-    #[must_use]
-    pub fn permanent(message: impl Into<String>) -> Self {
-        Self {
-            class: ErrorClass::Permanent,
-            message: message.into(),
-            retry_after_ms: None,
-        }
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Retryable)
     }
 }
 
-impl fmt::Display for EnumerateError {
+impl fmt::Display for ErrorClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.retry_after_ms {
-            Some(retry_after_ms) => write!(
-                f,
-                "{:?}: {} (retry_after_ms={})",
-                self.class, self.message, retry_after_ms
-            ),
-            None => write!(f, "{:?}: {}", self.class, self.message),
+        match self {
+            Self::Retryable => f.write_str("retryable"),
+            Self::Permanent => f.write_str("permanent"),
         }
     }
 }
 
-impl std::error::Error for EnumerateError {}
+/// Writes `message` to `f`, replacing control characters with U+FFFD
+/// (REPLACEMENT CHARACTER) to prevent log injection.
+///
+/// Replaced ranges: C0 (U+0000..U+001F) except HT/LF/CR, DEL (U+007F),
+/// and C1 (U+0080..U+009F). These are the characters for which
+/// [`char::is_control()`] returns `true`.
+#[inline]
+fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
+    for ch in message.chars() {
+        if ch.is_control() && !matches!(ch, '\t' | '\n' | '\r') {
+            f.write_str("\u{FFFD}")?;
+        } else {
+            fmt::Write::write_char(f, ch)?;
+        }
+    }
+    Ok(())
+}
 
-/// Error returned by connector read/open operations.
+/// Generates a connector error type with private fields, named constructors,
+/// accessors, and trait impls (`Display`, `Error`).
 ///
-/// Structurally identical to [`EnumerateError`] (same three fields, same
-/// named-constructor pattern), but kept as a distinct type so the compiler
-/// enforces which operation path produced the error. This also allows
-/// orchestration to apply independent retry and circuit-breaker policies
-/// for reads vs enumerations.
+/// Each invocation produces a distinct nominal type with identical structure,
+/// preserving type safety between different connector operations (see module
+/// docs for rationale). The generated struct has three private fields:
 ///
-/// Fields are private to preserve constructor invariants; use
-/// [`class`](Self::class), [`message`](Self::message), and
-/// [`retry_after_ms`](Self::retry_after_ms) to inspect.
+/// - `class: ErrorClass` — binary retry posture
+/// - `message: String` — connector-originated diagnostic text
+/// - `retry_after_ms: Option<u64>` — optional advisory backoff hint
 ///
-/// In addition to the shared constructors, `ReadError` provides
-/// [`unsupported`](Self::unsupported) for capability mismatches discovered
-/// at call time.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadError {
-    class: ErrorClass,
-    message: String,
-    retry_after_ms: Option<u64>,
+/// Generated API surface per type:
+/// - Accessors: `class()`, `message()`, `retry_after_ms()`, `into_message()`
+/// - Constructors: `retryable()`, `rate_limited()`, `permanent()`
+/// - Traits: `Clone`, `Debug`, `PartialEq`, `Eq`, `Display`, `Error`
+macro_rules! define_connector_error {
+    (
+        $(#[$meta:meta])*
+        $name:ident
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct $name {
+            class: ErrorClass,
+            message: String,
+            retry_after_ms: Option<u64>,
+        }
+
+        impl $name {
+            /// Returns the retryability classification for this failure.
+            #[inline]
+            #[must_use]
+            pub fn class(&self) -> ErrorClass {
+                self.class
+            }
+
+            /// Returns the connector-originated diagnostic text.
+            ///
+            /// Not sanitized by this type -- callers must treat it as untrusted
+            /// when logging or displaying.
+            #[inline]
+            #[must_use]
+            pub fn message(&self) -> &str {
+                &self.message
+            }
+
+            /// Returns the optional connector-provided retry hint in milliseconds.
+            ///
+            /// Advisory only: the runtime may impose stricter or global backoff
+            /// policies. A value of `0` is passed through without normalization.
+            #[inline]
+            #[must_use]
+            pub fn retry_after_ms(&self) -> Option<u64> {
+                self.retry_after_ms
+            }
+
+            /// Consumes the error and returns the owned diagnostic message.
+            #[inline]
+            #[must_use]
+            pub fn into_message(self) -> String {
+                self.message
+            }
+
+            /// Construct a retryable error without a backoff hint.
+            ///
+            /// Use for transient failures where the connector has no opinion on
+            /// when to retry (e.g., a generic network timeout).
+            #[must_use]
+            pub fn retryable(message: impl Into<String>) -> Self {
+                Self {
+                    class: ErrorClass::Retryable,
+                    message: message.into(),
+                    retry_after_ms: None,
+                }
+            }
+
+            /// Construct a retryable error with a connector-supplied backoff hint.
+            ///
+            /// Typical source: an HTTP `Retry-After` header or equivalent API signal.
+            /// The `retry_after_ms` value is stored as-is (including `0`) with no
+            /// clamping or normalization -- that is the runtime's responsibility.
+            #[must_use]
+            pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
+                Self {
+                    class: ErrorClass::Retryable,
+                    message: message.into(),
+                    retry_after_ms: Some(retry_after_ms),
+                }
+            }
+
+            /// Construct a permanent error.
+            ///
+            /// Use when the failure will persist until something external changes
+            /// (credentials, permissions, resource existence). The runtime should
+            /// not retry blindly; typical follow-up is to park the shard or skip
+            /// the item with a diagnostic reason.
+            #[must_use]
+            pub fn permanent(message: impl Into<String>) -> Self {
+                Self {
+                    class: ErrorClass::Permanent,
+                    message: message.into(),
+                    retry_after_ms: None,
+                }
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}: ", self.class)?;
+                fmt_sanitized_message(f, &self.message)?;
+                if let Some(retry_after_ms) = self.retry_after_ms {
+                    write!(f, " (retry_after_ms={})", retry_after_ms)?;
+                }
+                Ok(())
+            }
+        }
+
+        /// Boundary-terminal: the underlying cause (IO, HTTP, parse errors) is
+        /// flattened into `message` at construction time. Connectors should log
+        /// the original error before constructing this type.
+        impl std::error::Error for $name {}
+    };
+}
+
+define_connector_error! {
+    /// Error returned by connector enumeration/list operations.
+    ///
+    /// Bundles orchestration-facing policy metadata ([`ErrorClass`] and an
+    /// optional backoff hint) with a connector-originated diagnostic message.
+    /// Constructed via named constructors ([`retryable`](Self::retryable),
+    /// [`rate_limited`](Self::rate_limited), [`permanent`](Self::permanent))
+    /// that enforce consistent class/retry combinations. Fields are private
+    /// to preserve these invariants; use [`class`](Self::class),
+    /// [`message`](Self::message), and [`retry_after_ms`](Self::retry_after_ms)
+    /// to inspect.
+    ///
+    /// See also [`ReadError`], the structurally parallel type for the read/open
+    /// path. The two are kept separate intentionally -- see the module docs for
+    /// rationale.
+    EnumerateError
+}
+
+define_connector_error! {
+    /// Error returned by connector read/open operations.
+    ///
+    /// Structurally identical to [`EnumerateError`] (same three fields, same
+    /// named-constructor pattern), but kept as a distinct type so the compiler
+    /// enforces which operation path produced the error. This also allows
+    /// orchestration to apply independent retry and circuit-breaker policies
+    /// for reads vs enumerations.
+    ///
+    /// Fields are private to preserve constructor invariants; use
+    /// [`class`](Self::class), [`message`](Self::message), and
+    /// [`retry_after_ms`](Self::retry_after_ms) to inspect.
+    ///
+    /// In addition to the shared constructors, `ReadError` provides
+    /// [`unsupported`](Self::unsupported) for capability mismatches discovered
+    /// at call time.
+    ReadError
 }
 
 impl ReadError {
-    /// Returns the retryability classification for this failure.
-    #[inline]
-    #[must_use]
-    pub fn class(&self) -> ErrorClass {
-        self.class
-    }
-
-    /// Returns the connector-originated diagnostic text.
-    ///
-    /// Not sanitized by this type -- callers must treat it as untrusted
-    /// when logging or displaying.
-    #[inline]
-    #[must_use]
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    /// Returns the optional connector-provided retry hint in milliseconds.
-    ///
-    /// Advisory only: the runtime may impose stricter or global backoff
-    /// policies. A value of `0` is passed through without normalization.
-    #[inline]
-    #[must_use]
-    pub fn retry_after_ms(&self) -> Option<u64> {
-        self.retry_after_ms
-    }
-
-    /// Construct a retryable read error without a backoff hint.
-    ///
-    /// Use for transient failures where the connector has no opinion on
-    /// when to retry (e.g., a generic network timeout during content fetch).
-    #[must_use]
-    pub fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            class: ErrorClass::Retryable,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-
-    /// Construct a retryable read error with a connector-supplied backoff hint.
-    ///
-    /// Typical source: an HTTP `Retry-After` header or equivalent API signal.
-    /// The `retry_after_ms` value is stored as-is (including `0`) with no
-    /// clamping or normalization -- that is the runtime's responsibility.
-    #[must_use]
-    pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
-        Self {
-            class: ErrorClass::Retryable,
-            message: message.into(),
-            retry_after_ms: Some(retry_after_ms),
-        }
-    }
-
-    /// Construct a permanent read error.
-    ///
-    /// Use when the failure will persist until something external changes.
-    /// The runtime should not retry blindly; typical follow-up is to skip
-    /// the item or park the shard with a diagnostic reason.
-    #[must_use]
-    pub fn permanent(message: impl Into<String>) -> Self {
-        Self {
-            class: ErrorClass::Permanent,
-            message: message.into(),
-            retry_after_ms: None,
-        }
-    }
-
     /// Construct a permanent read error for an unsupported operation.
     ///
     /// Convenience for capability mismatches discovered at call time -- for
@@ -267,21 +267,6 @@ impl ReadError {
         Self::permanent(format!("{feature} not supported"))
     }
 }
-
-impl fmt::Display for ReadError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.retry_after_ms {
-            Some(retry_after_ms) => write!(
-                f,
-                "{:?}: {} (retry_after_ms={})",
-                self.class, self.message, retry_after_ms
-            ),
-            None => write!(f, "{:?}: {}", self.class, self.message),
-        }
-    }
-}
-
-impl std::error::Error for ReadError {}
 
 /// Feature flags that a connector advertises at registration time.
 ///
@@ -345,6 +330,12 @@ mod tests {
         "too many requests",
         Some(1_250)
     )]
+    #[case::rate_limited_zero_backoff(
+        EnumerateError::rate_limited("zero backoff", 0),
+        ErrorClass::Retryable,
+        "zero backoff",
+        Some(0)
+    )]
     #[case::permanent(
         EnumerateError::permanent("invalid credentials"),
         ErrorClass::Permanent,
@@ -405,11 +396,15 @@ mod tests {
     #[rstest]
     #[case::without_retry(
         EnumerateError::permanent("enumeration disabled"),
-        "Permanent: enumeration disabled"
+        "permanent: enumeration disabled"
     )]
     #[case::with_retry(
         EnumerateError::rate_limited("throttled", 250),
-        "Retryable: throttled (retry_after_ms=250)"
+        "retryable: throttled (retry_after_ms=250)"
+    )]
+    #[case::with_zero_retry(
+        EnumerateError::rate_limited("zero hint", 0),
+        "retryable: zero hint (retry_after_ms=0)"
     )]
     fn enumerate_error_display(#[case] error: EnumerateError, #[case] expected: &str) {
         assert_eq!(error.to_string(), expected);
@@ -418,11 +413,11 @@ mod tests {
     #[rstest]
     #[case::without_retry(
         ReadError::retryable("temporary backend error"),
-        "Retryable: temporary backend error"
+        "retryable: temporary backend error"
     )]
     #[case::with_retry(
         ReadError::rate_limited("slow down", 750),
-        "Retryable: slow down (retry_after_ms=750)"
+        "retryable: slow down (retry_after_ms=750)"
     )]
     fn read_error_display(#[case] error: ReadError, #[case] expected: &str) {
         assert_eq!(error.to_string(), expected);
