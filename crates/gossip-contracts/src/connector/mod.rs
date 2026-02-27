@@ -1,5 +1,5 @@
-//! Connector boundary value types shared between connector runtimes and
-//! coordinator-facing contracts.
+//! Connector contract types and page-validation diagnostics shared between
+//! connector runtimes and coordinator-facing contracts.
 //!
 //! This module intentionally stays narrow: it exports validated wrapper types for
 //! connector-originated bytes (`ItemKey`, `ItemRef`, `TokenBytes`), cursor and
