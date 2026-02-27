@@ -800,6 +800,13 @@ impl ScanItem {
         self.location.as_ref()
     }
 
+    /// Consume this scan item, returning its ordered key for cursor advancement.
+    #[inline]
+    #[must_use]
+    pub fn into_item_key(self) -> ItemKey {
+        self.item_key
+    }
+
     /// Consume the scan item, returning all fields as owned values.
     ///
     /// The tuple order matches the struct field declaration:
@@ -849,6 +856,7 @@ pub struct EnumerationPage {
 
 impl EnumerationPage {
     /// Construct a page from scan items and the continuation cursor.
+    #[inline]
     #[must_use]
     pub fn new(items: Vec<ScanItem>, next_cursor: Cursor) -> Self {
         Self { items, next_cursor }
@@ -899,6 +907,7 @@ impl Budgets {
     ///
     /// Returns [`ConnectorInputError::ZeroBudget`] when `max_items` or
     /// `max_bytes` is zero.
+    #[inline]
     pub fn try_new(
         max_items: usize,
         max_bytes: u64,
@@ -943,6 +952,7 @@ impl Budgets {
     ///
     /// Accepting the current instant as a parameter keeps this function pure
     /// and deterministic, which is required for simulation testing.
+    #[inline]
     #[must_use]
     pub fn is_expired_at(&self, now: Instant) -> bool {
         self.deadline.is_some_and(|deadline| now >= deadline)
