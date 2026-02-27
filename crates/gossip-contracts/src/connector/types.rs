@@ -809,6 +809,7 @@ impl ScanItem {
 
     /// Consume the scan item, returning all fields as owned values.
     ///
+    /// Use this when you need owned access to multiple fields without cloning.
     /// The tuple order matches the struct field declaration:
     /// `(item_key, item_ref, stable_item_id, version, size_hint,
     /// content_hints, location)`.
@@ -877,6 +878,9 @@ impl EnumerationPage {
     }
 
     /// Consume the page, returning owned items and the continuation cursor.
+    ///
+    /// Use this when you need to process the items and cursor separately
+    /// without borrowing from the page.
     #[must_use]
     pub fn into_parts(self) -> (Vec<ScanItem>, Cursor) {
         (self.items, self.next_cursor)
@@ -989,6 +993,13 @@ mod tests {
         assert_eq!(
             ConnectorInputError::TokenWithoutLastKey.to_string(),
             "token must not be present without last_key"
+        );
+        assert_eq!(
+            ConnectorInputError::ZeroBudget {
+                field: "Budgets.max_items"
+            }
+            .to_string(),
+            "Budgets.max_items must be non-zero"
         );
     }
 
