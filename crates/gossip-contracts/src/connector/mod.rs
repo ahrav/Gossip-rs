@@ -6,6 +6,10 @@
 //! metadata types used by enumeration/read flows, and page-level validation
 //! diagnostics used to reject malformed connector pages.
 //!
+//! A sibling conformance harness module ([`conformance`]) builds on these
+//! contracts to validate connector behavior end-to-end in tests and
+//! bring-up workflows.
+//!
 //! ## Surface split
 //!
 //! The connector contract surface is intentionally split into focused layers:
@@ -19,8 +23,10 @@
 //!   `ConnectorInstance`).
 //! - `page_validator.rs` defines log-safe page-validation diagnostics plus
 //!   validation helpers (`validate_page` and generic `validate_page_range`).
+//! - `conformance.rs` defines strict-by-default harness configuration,
+//!   observation records, and failure taxonomy for cross-run connector checks.
 //!
-//! Re-exporting all three layers here gives runtime crates a single import boundary
+//! Re-exporting all four layers here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
 //!
 //! ## Trait composition
@@ -61,6 +67,8 @@
 //! - Runtime connector traits: [`EnumerationConnector`], [`ReadConnector`],
 //!   [`ConnectorInstance`] (`choose_split_point` defaults to no hint;
 //!   `read_range` defaults to unsupported)
+//! - Conformance harness: [`conformance`] module (assertion entry point,
+//!   conformance config, and diagnostics)
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
@@ -73,7 +81,6 @@
 //! scheduling, backoff policy) live in runtime crates.
 
 mod api;
-#[cfg(any(test, feature = "test-support"))]
 pub mod conformance;
 pub mod page_validator;
 mod types;

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(clippy::result_large_err)]
 
 //! Conformance harness configuration and digest-only diagnostic vocabulary.
 //!
@@ -23,23 +24,23 @@
 //! - **Configuration**: strict-by-default harness knobs
 //!   ([`ConformanceConfig`]) that control page limits, ordering policy,
 //!   determinism expectations, resume-path perturbation, and secret scanning.
-//! - **Observation types**: digest-only records for cross-run comparison
-//!   ([`ItemObservation`], [`EnumerationTrace`]).
+//! - **Observation types**: redacted records for cross-run comparison
+//!   ([`ItemObservation`] digests plus [`EnumerationTrace`] cursor checkpoints).
 //! - **Error taxonomy**: a flat enum ([`ConformanceError`]) covering every
 //!   failure mode from capability gates through secret-scan findings.
 //!
 //! ## Relationship to page validation
 //!
 //! Per-page structural checks (ordering, cursor membership, range bounds)
-//! are delegated to [`super::page_validator::validate_page`]. This module
+//! are delegated to [`super::page_validator::validate_page_range`]. This module
 //! layers additional cross-page and cross-run checks on top: duplicate
 //! detection, strict-increase enforcement, determinism comparison, and
 //! resume-path suffix matching.
 //!
 //! ## Invariants
 //!
-//! - All diagnostic payloads use [`ToxicDigest`] -- no raw connector bytes
-//!   appear in error messages or trace records.
+//! - Error payloads and item observations use [`ToxicDigest`] -- no raw
+//!   connector bytes appear in error messages.
 //! - [`ToxicDigest`] and [`ItemObservation`] format as redacted, stable
 //!   tokens suitable for log correlation.
 //! - [`ConformanceConfig::default()`] is intentionally strict: connectors
@@ -51,13 +52,24 @@
 //! while its `Display` output prints only the first 8 bytes as hex (16
 //! characters). This preserves compact log lines while retaining precise
 //! in-memory comparisons.
+//!
+//! ## Known limits
+//!
+//! - Item fingerprints are currently derived from [`ScanItem::item_ref`]
+//!   bytes (see `fingerprint_item`), not from item payload reads. If a
+//!   backend mutates content without changing `item_ref`, conformance checks
+//!   will not observe that drift.
+//! - The harness strictly enforces per-page `max_items`, but `max_bytes` and
+//!   `deadline` in [`Budgets`] are advisory at this layer and are only passed
+//!   through to the connector.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
 
-use super::api::{ConnectorCapabilities, ErrorClass};
-use super::page_validator::{PageValidationError, ToxicDigest};
-use super::types::{Budgets, Cursor};
+use super::api::{ConnectorCapabilities, EnumerateError, ErrorClass};
+use super::page_validator::{PageValidationError, ToxicDigest, validate_page_range};
+use super::types::{Budgets, Cursor, EnumerationPage, ItemKey, ItemRef, ScanItem, TokenBytes};
 
 /// Default best-effort secret patterns that should not appear in `ItemRef`.
 ///
@@ -111,9 +123,10 @@ pub enum DeterminismExpectation {
     Deterministic,
     /// Determinism is not strictly required by caller policy.
     ///
-    /// The harness records but does not fail on cross-run differences. This
-    /// is appropriate for connectors over live, mutable data sources where
-    /// concurrent modifications may change enumeration results between runs.
+    /// The harness skips the comparison rerun entirely (no cross-run
+    /// difference checks). This is appropriate for connectors over live,
+    /// mutable data sources where concurrent modifications may change
+    /// enumeration results between runs.
     BestEffort,
 }
 
@@ -164,7 +177,7 @@ impl Default for ResumeChecks {
     }
 }
 
-/// Best-effort secret scan configuration for [`ItemRef`](super::ItemRef) bytes.
+/// Best-effort secret scan configuration for [`ItemRef`] bytes.
 ///
 /// The harness performs a byte-substring search over every `ItemRef` emitted
 /// during an enumeration run. A match triggers
@@ -249,12 +262,13 @@ pub struct ConformanceConfig {
     /// Hard cap on collected items per run. The harness stops and reports
     /// [`ConformanceError::TooManyItems`] when exceeded.
     pub max_total_items: NonZeroUsize,
-    /// [`Budgets`] forwarded to each `enumerate_page` call. Controls
-    /// per-page item count, byte limit, and optional deadline.
+    /// [`Budgets`] forwarded to each `enumerate_page` call. The harness
+    /// enforces `max_items` directly, while `max_bytes` and `deadline` are
+    /// advisory hints for the connector/runtime.
     pub page_budgets: Budgets,
     /// When `true`, the harness requires strictly increasing keys within
     /// each page (no duplicate keys allowed). When `false`, non-decreasing
-    /// order (as enforced by [`super::page_validator::validate_page`]) is
+    /// order (as enforced by [`super::page_validator::validate_page_range`]) is
     /// sufficient.
     pub require_strict_key_order: bool,
     /// When `true`, non-empty pages must have
@@ -294,18 +308,18 @@ impl Default for ConformanceConfig {
 ///
 /// Two observations are compared element-by-element during determinism and
 /// resume checks. The `key` digest identifies position (which item), while
-/// `fingerprint` identifies content (what the item contained). A mismatch
+/// `fingerprint` tracks the observable handle bytes for that item. A mismatch
 /// in either field between runs constitutes a conformance failure.
 ///
 /// `ItemObservation` is `Copy` (80 bytes: two [`ToxicDigest`] values at
 /// 40 bytes each) and safe to store in bulk inside [`EnumerationTrace`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemObservation {
-    /// BLAKE3 digest of the item's [`ItemKey`](super::ItemKey) bytes.
+    /// BLAKE3 digest of the item's [`ItemKey`] bytes.
     pub key: ToxicDigest,
-    /// BLAKE3 digest derived from item content (e.g., `item_ref` or a
-    /// connector-specific content hash), used to detect content changes
-    /// across runs even when the key remains stable.
+    /// BLAKE3 digest of the item's [`ItemRef`] bytes (computed by
+    /// `fingerprint_item`). This detects handle-level drift across runs
+    /// for a stable key.
     pub fingerprint: ToxicDigest,
 }
 
@@ -378,14 +392,14 @@ pub enum ResumeMode {
 ///
 /// 1. **Capability gate** -- connector does not advertise required features.
 /// 2. **Per-page collection** -- `enumerate_page` errors, budget overruns,
-///    and structural violations detected by
-///    [`validate_page`](super::page_validator::validate_page).
+///    structural violations detected by
+///    [`validate_page_range`],
+///    and secret-scan findings.
 /// 3. **Cross-page checks** -- strict ordering, cursor-last-item matching,
 ///    and duplicate key detection within a single run.
 /// 4. **Run-level caps** -- page or item count exceeded.
 /// 5. **Cross-run comparisons** -- determinism mismatch between two full runs.
 /// 6. **Resume checks** -- suffix divergence after token perturbation.
-/// 7. **Secret scan** -- forbidden pattern found in `ItemRef` bytes.
 ///
 /// Implements [`std::error::Error`] as a leaf error (no `source()` chain).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -412,9 +426,8 @@ pub enum ConformanceError {
         max: usize,
     },
     /// Page-level structural violation detected by
-    /// [`validate_page`](super::page_validator::validate_page). The wrapped
-    /// [`PageValidationError`] carries the specific rule violation and
-    /// redacted diagnostic context.
+    /// [`validate_page_range`]. The wrapped [`PageValidationError`] carries
+    /// the specific rule violation and redacted diagnostic context.
     PageValidationFailed {
         /// Zero-based page index where violation occurred.
         at_page: usize,
@@ -605,6 +618,454 @@ impl fmt::Display for ConformanceError {
             }
         }
     }
+}
+
+/// Execute the connector conformance harness with strict-by-default checks.
+///
+/// The harness performs:
+///
+/// 1. Capability gate (`seek_by_key` required)
+/// 2. Baseline full enumeration trace collection
+/// 3. Optional deterministic rerun + item-by-item comparison
+/// 4. Optional resume checks from selected cursor checkpoints
+/// 5. Optional per-item secret scan during collection passes
+///
+/// Returns `Ok(())` only when all enabled checks pass.
+pub fn assert_connector_conforms<C, Make, Caps, Enum>(
+    make: Make,
+    caps: Caps,
+    enumerate_page: Enum,
+    start: &ItemKey,
+    end: &ItemKey,
+    cfg: ConformanceConfig,
+) -> Result<(), ConformanceError>
+where
+    Make: Fn() -> C,
+    Caps: Fn(&C) -> ConnectorCapabilities,
+    Enum: Fn(&mut C, &Cursor, Budgets) -> Result<EnumerationPage, EnumerateError>,
+{
+    let mut baseline_connector = make();
+    let connector_caps = caps(&baseline_connector);
+    if !connector_caps.seek_by_key {
+        return Err(ConformanceError::CapabilityMissingSeekByKey {
+            caps: connector_caps,
+        });
+    }
+
+    let baseline = collect_trace(
+        &mut baseline_connector,
+        &enumerate_page,
+        start,
+        end,
+        &cfg,
+        Cursor::initial(),
+    )?;
+
+    if matches!(cfg.determinism, DeterminismExpectation::Deterministic) {
+        let mut rerun_connector = make();
+        let rerun = collect_trace(
+            &mut rerun_connector,
+            &enumerate_page,
+            start,
+            end,
+            &cfg,
+            Cursor::initial(),
+        )?;
+        assert_same_items(&baseline.items, &rerun.items)?;
+    }
+
+    run_resume_checks(&make, &enumerate_page, start, end, &cfg, &baseline)?;
+    Ok(())
+}
+
+/// Collect one full enumeration trace from `initial_cursor` until the first
+/// empty page (inclusive).
+///
+/// Every page response contributes one cursor checkpoint, including the
+/// terminal empty page that signals completion.
+fn collect_trace<C, Enum>(
+    connector: &mut C,
+    enumerate_page: &Enum,
+    start: &ItemKey,
+    end: &ItemKey,
+    cfg: &ConformanceConfig,
+    initial_cursor: Cursor,
+) -> Result<EnumerationTrace, ConformanceError>
+where
+    Enum: Fn(&mut C, &Cursor, Budgets) -> Result<EnumerationPage, EnumerateError>,
+{
+    let mut trace = EnumerationTrace {
+        items: Vec::new(),
+        cursors: Vec::new(),
+        pages: 0,
+    };
+    let mut cursor = initial_cursor;
+    let mut seen_keys = HashSet::new();
+
+    loop {
+        if trace.pages >= cfg.max_pages.get() {
+            return Err(ConformanceError::TooManyPages {
+                max_pages: cfg.max_pages.get(),
+            });
+        }
+
+        let at_page = trace.pages;
+        let page = enumerate_page(connector, &cursor, cfg.page_budgets).map_err(|err| {
+            ConformanceError::EnumerateFailed {
+                at_page,
+                class: err.class(),
+            }
+        })?;
+        let page_items = page.items();
+        let next_cursor = page.next_cursor();
+
+        if page_items.len() > cfg.page_budgets.max_items() {
+            return Err(ConformanceError::ReturnedTooManyItems {
+                at_page,
+                got: page_items.len(),
+                max: cfg.page_budgets.max_items(),
+            });
+        }
+
+        validate_page_range(
+            start,
+            end,
+            cursor.last_key(),
+            page_items,
+            next_cursor.last_key(),
+        )
+        .map_err(|err| ConformanceError::PageValidationFailed { at_page, err })?;
+
+        if cfg.require_strict_key_order {
+            assert_strict_increasing_within_page(at_page, page_items)?;
+        }
+
+        if cfg.require_cursor_eq_last_item
+            && let Some(last_item) = page_items.last()
+        {
+            let cursor_matches_last = next_cursor
+                .last_key()
+                .is_some_and(|cursor_key| cursor_key == last_item.item_key());
+            if !cursor_matches_last {
+                return Err(ConformanceError::CursorDoesNotMatchLastItem {
+                    at_page,
+                    cursor_key: next_cursor.last_key().map(ToxicDigest::of),
+                    last_item_key: ToxicDigest::of(last_item.item_key()),
+                });
+            }
+        }
+
+        for item in page_items {
+            if cfg.secret_scan.enabled {
+                assert_item_ref_secret_free(item.item_ref(), &cfg.secret_scan)?;
+            }
+
+            let observation = observe_item(item);
+            if !seen_keys.insert(observation.key) {
+                return Err(ConformanceError::DuplicateKeyInRun {
+                    key: observation.key,
+                });
+            }
+
+            trace.items.push(observation);
+            if trace.items.len() > cfg.max_total_items.get() {
+                return Err(ConformanceError::TooManyItems {
+                    max_total_items: cfg.max_total_items.get(),
+                });
+            }
+        }
+
+        trace.cursors.push(next_cursor.clone());
+        trace.pages += 1;
+
+        if page_items.is_empty() {
+            break;
+        }
+
+        cursor = next_cursor.clone();
+    }
+
+    Ok(trace)
+}
+
+/// Compare two full-run observation vectors in encounter order.
+///
+/// For length mismatches, the error payload uses an empty-byte digest sentinel
+/// for the missing side so callers still get a single
+/// [`ConformanceError::DeterminismMismatch`] shape.
+fn assert_same_items(
+    run1: &[ItemObservation],
+    run2: &[ItemObservation],
+) -> Result<(), ConformanceError> {
+    for (at_index, (&left, &right)) in run1.iter().zip(run2.iter()).enumerate() {
+        if left != right {
+            return Err(ConformanceError::DeterminismMismatch {
+                at_index,
+                run1: left,
+                run2: right,
+            });
+        }
+    }
+
+    if run1.len() != run2.len() {
+        let at_index = run1.len().min(run2.len());
+        let missing = ItemObservation {
+            key: ToxicDigest::of_bytes(&[]),
+            fingerprint: ToxicDigest::of_bytes(&[]),
+        };
+        return Err(ConformanceError::DeterminismMismatch {
+            at_index,
+            run1: run1.get(at_index).copied().unwrap_or(missing),
+            run2: run2.get(at_index).copied().unwrap_or(missing),
+        });
+    }
+
+    Ok(())
+}
+
+/// Re-run enumeration from selected baseline checkpoints under each enabled
+/// token-perturbation mode and compare the resulting suffixes against the
+/// baseline trace.
+fn run_resume_checks<C, Make, Enum>(
+    make: &Make,
+    enumerate_page: &Enum,
+    start: &ItemKey,
+    end: &ItemKey,
+    cfg: &ConformanceConfig,
+    baseline: &EnumerationTrace,
+) -> Result<(), ConformanceError>
+where
+    Make: Fn() -> C,
+    Enum: Fn(&mut C, &Cursor, Budgets) -> Result<EnumerationPage, EnumerateError>,
+{
+    let modes: Vec<_> = cfg.resume_checks.modes().collect();
+    if modes.is_empty() || baseline.cursors.is_empty() {
+        return Ok(());
+    }
+
+    let restart_points = select_restart_points(cfg.restart_points, baseline.cursors.len());
+    if restart_points.is_empty() {
+        return Ok(());
+    }
+
+    let mut key_to_index = HashMap::new();
+    for (index, observation) in baseline.items.iter().enumerate() {
+        key_to_index.entry(observation.key).or_insert(index);
+    }
+
+    for restart_cursor_index in restart_points {
+        let baseline_cursor = &baseline.cursors[restart_cursor_index];
+        let expected = expected_suffix_from_cursor(&baseline.items, baseline_cursor, &key_to_index);
+        for mode in modes.iter().copied() {
+            let restart_cursor = match mode {
+                ResumeMode::DropToken => drop_token(baseline_cursor),
+                ResumeMode::CorruptToken => {
+                    corrupt_token(baseline_cursor, restart_cursor_index as u64)
+                }
+            };
+
+            let mut resume_connector = make();
+            let got = collect_suffix(
+                &mut resume_connector,
+                enumerate_page,
+                start,
+                end,
+                cfg,
+                restart_cursor,
+            )?;
+            assert_same_suffix(restart_cursor_index, mode, expected, &got)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_suffix<C, Enum>(
+    connector: &mut C,
+    enumerate_page: &Enum,
+    start: &ItemKey,
+    end: &ItemKey,
+    cfg: &ConformanceConfig,
+    restart_cursor: Cursor,
+) -> Result<Vec<ItemObservation>, ConformanceError>
+where
+    Enum: Fn(&mut C, &Cursor, Budgets) -> Result<EnumerationPage, EnumerateError>,
+{
+    Ok(collect_trace(connector, enumerate_page, start, end, cfg, restart_cursor)?.items)
+}
+
+fn assert_same_suffix(
+    restart_cursor_index: usize,
+    mode: ResumeMode,
+    expected: &[ItemObservation],
+    got: &[ItemObservation],
+) -> Result<(), ConformanceError> {
+    if expected.len() != got.len() {
+        return Err(ConformanceError::ResumeLengthMismatch {
+            restart_cursor_index,
+            mode,
+            expected_len: expected.len(),
+            got_len: got.len(),
+        });
+    }
+
+    for (at_index, (&expected, &got)) in expected.iter().zip(got.iter()).enumerate() {
+        if expected != got {
+            return Err(ConformanceError::ResumeMismatch {
+                restart_cursor_index,
+                mode,
+                at_index,
+                expected,
+                got,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn expected_suffix_from_cursor<'a>(
+    baseline_items: &'a [ItemObservation],
+    cursor: &Cursor,
+    key_to_index: &HashMap<ToxicDigest, usize>,
+) -> &'a [ItemObservation] {
+    let Some(last_key) = cursor.last_key() else {
+        return baseline_items;
+    };
+
+    let Some(index) = key_to_index.get(&ToxicDigest::of(last_key)) else {
+        // Defensive fallback for non-observed cursor keys. In strict mode this
+        // should not happen because `require_cursor_eq_last_item` ties cursor
+        // keys to observed items.
+        return &[];
+    };
+
+    baseline_items.get(index.saturating_add(1)..).unwrap_or(&[])
+}
+
+/// Normalize restart-point selection into sorted, unique, in-range indices.
+///
+/// `Auto(N)` spreads points across `[0, len - 1]` and includes both ends when
+/// `N >= 2`.
+fn select_restart_points(restart_points: RestartPoints, len: usize) -> Vec<usize> {
+    match restart_points {
+        RestartPoints::Auto(requested) => {
+            if requested == 0 || len == 0 {
+                return Vec::new();
+            }
+
+            let count = requested.min(len);
+            if count == 1 {
+                return vec![0];
+            }
+
+            let max_index = len - 1;
+            let mut out = Vec::with_capacity(count);
+            for i in 0..count {
+                out.push(i * max_index / (count - 1));
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        RestartPoints::Explicit(indices) => {
+            let mut out: Vec<_> = indices.iter().copied().filter(|&idx| idx < len).collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+    }
+}
+
+fn assert_strict_increasing_within_page(
+    at_page: usize,
+    items: &[ScanItem],
+) -> Result<(), ConformanceError> {
+    for (index, pair) in items.windows(2).enumerate() {
+        let prev = pair[0].item_key();
+        let next = pair[1].item_key();
+        if next <= prev {
+            return Err(ConformanceError::NotStrictlyIncreasingWithinPage {
+                at_page,
+                at_index: index + 1,
+                prev_key: ToxicDigest::of(prev),
+                next_key: ToxicDigest::of(next),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn observe_item(item: &ScanItem) -> ItemObservation {
+    ItemObservation {
+        key: ToxicDigest::of(item.item_key()),
+        fingerprint: fingerprint_item(item),
+    }
+}
+
+fn fingerprint_item(item: &ScanItem) -> ToxicDigest {
+    ToxicDigest::of(item.item_ref())
+}
+
+fn drop_token(cursor: &Cursor) -> Cursor {
+    match cursor.last_key() {
+        Some(last_key) => Cursor::with_last_key(last_key.clone()),
+        None => Cursor::initial(),
+    }
+}
+
+fn corrupt_token(cursor: &Cursor, seed: u64) -> Cursor {
+    let Some(last_key) = cursor.last_key() else {
+        return Cursor::initial();
+    };
+
+    // Deterministic mutation keeps failures reproducible across runs.
+    let hash = blake3::hash(&seed.to_le_bytes());
+    let token = TokenBytes::try_from_slice(&hash.as_bytes()[..16])
+        .expect("blake3 16-byte token is always valid for TokenBytes");
+    Cursor::with_token(last_key.clone(), token)
+}
+
+fn assert_item_ref_secret_free(
+    item_ref: &ItemRef,
+    secret_scan: &SecretScanConfig,
+) -> Result<(), ConformanceError> {
+    for pattern in &secret_scan.forbidden_substrings {
+        if contains_subslice(item_ref.as_bytes(), pattern) {
+            return Err(ConformanceError::ItemRefAppearsToContainSecret {
+                pattern: ToxicDigest::of_bytes(pattern),
+                item_ref: ToxicDigest::of(item_ref),
+            });
+        }
+    }
+
+    for canary in &secret_scan.secret_canaries {
+        if contains_subslice(item_ref.as_bytes(), canary) {
+            return Err(ConformanceError::ItemRefAppearsToContainSecret {
+                pattern: ToxicDigest::of_bytes(canary),
+                item_ref: ToxicDigest::of(item_ref),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Naive byte-substring search used by secret scanning.
+///
+/// Simplicity is intentional here: pattern sets and item_ref values are both
+/// small in conformance workloads.
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Leaf error: conformance failures do not wrap an underlying cause.
