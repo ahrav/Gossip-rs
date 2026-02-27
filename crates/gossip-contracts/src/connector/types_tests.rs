@@ -45,10 +45,8 @@ fn cursor_initial_has_no_key_or_token() {
 
 #[test]
 fn cursor_try_from_update_rejects_token_without_last_key() {
-    let invalid = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
-        None,
-        Some(b"tok-1"),
-    );
+    let invalid =
+        crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(None, Some(b"tok-1"));
     assert_eq!(
         Cursor::try_from_update(invalid),
         Err(ConnectorInputError::TokenWithoutLastKey)
@@ -57,10 +55,8 @@ fn cursor_try_from_update_rejects_token_without_last_key() {
 
 #[test]
 fn cursor_try_from_update_normalizes_empty_token_to_none() {
-    let update = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
-        Some(b"k-1"),
-        Some(b""),
-    );
+    let update =
+        crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(Some(b"k-1"), Some(b""));
     let cursor = Cursor::try_from_update(update).unwrap();
     assert_eq!(cursor.last_key().unwrap().as_bytes(), b"k-1");
     assert!(cursor.token().is_none());
