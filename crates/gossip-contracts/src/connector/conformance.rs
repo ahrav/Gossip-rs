@@ -354,14 +354,17 @@ impl fmt::Display for ItemObservation {
 /// can reach ~76 MiB. Additional allocations during a full harness run:
 ///
 /// - `seen_keys: HashSet<ToxicDigest>` — ~69 MiB at 1M items (40-byte keys
-///   plus hash-map overhead).
+///   plus hash-map overhead). Allocated per `collect_trace` call and dropped
+///   when the call returns.
 /// - `key_to_index: HashMap<ToxicDigest, usize>` — ~76 MiB for resume-check
 ///   baseline lookups.
-/// - Determinism reruns allocate a second `EnumerationTrace` (~76 MiB).
+/// - Determinism reruns allocate a second `EnumerationTrace` (~76 MiB),
+///   dropped before resume checks begin.
 ///
-/// Peak working set with all checks enabled at default 1M-item limit is
-/// roughly 400–500 MiB. `cursors` grows with `max_pages` but is typically
-/// modest.
+/// Because intermediate allocations are dropped between phases, peak working
+/// set with all checks enabled at default 1M-item limit is roughly
+/// 220–300 MiB (not the sum of all components). `cursors` grows with
+/// `max_pages` but is typically modest.
 ///
 /// Callers should tune [`ConformanceConfig::max_pages`] and
 /// [`ConformanceConfig::max_total_items`] when targeting connectors with
