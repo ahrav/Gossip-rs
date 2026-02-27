@@ -21,7 +21,7 @@
 //!   unpark lifecycle, and same-worker reacquire fence bumps.
 //!
 //! - **Group C — Run-Level Conformance.** Run lifecycle state machine:
-//!   terminal irreversibility from Done (Failed and Cancelled share the same
+//!   terminal irreversibility (Done, Failed, and Cancelled all share the
 //!   `apply_terminal_run_transition` code path), registration preconditions,
 //!   `completed_at` consistency, and run-terminal blocking of shard-level
 //!   admin operations (unpark).
@@ -38,7 +38,7 @@ use crate::lease::Lease;
 use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
-use crate::sim::backend::SimIntrospection;
+use crate::sim::backend::SimIntrospection as _;
 use crate::test_fixtures::{
     LEASE_DURATION, acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
     seeded_coordinator_with_semantics, test_cursor, test_key, test_run, test_run_config,
@@ -213,7 +213,7 @@ fn cursor_monotonicity_combined_with_split_residual() {
 /// Invariants under test: OpId idempotency, terminal irreversibility,
 /// and their relative priority in the validation pipeline.
 #[test]
-fn idempotency_before_lease_validation() {
+fn idempotency_before_terminal_state_rejection() {
     let mut coord = seeded_coordinator();
 
     let lease = acquire_shard(&mut coord, 10, 1);
@@ -222,7 +222,7 @@ fn idempotency_before_lease_validation() {
     checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
     let complete_cursor = test_cursor(b"m");
     let complete_op = OpId::from_raw(2);
-    let _ = coord
+    let outcome = coord
         .complete(
             now(12),
             test_tenant(),
@@ -231,6 +231,10 @@ fn idempotency_before_lease_validation() {
             complete_op,
         )
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time complete must be Executed"
+    );
 
     // Shard is now Done. Replay complete with the same lease, cursor, and op_id.
     let replay = coord.complete(
@@ -257,6 +261,101 @@ fn idempotency_before_lease_validation() {
         Some(b"m".as_slice()),
         "replay must not mutate cursor"
     );
+}
+
+/// Split-residual narrowing is preserved through a park/unpark round-trip.
+///
+/// Performs split_residual (narrowing [a,z) to [a,m)), parks the shard,
+/// unparks it, and re-acquires. Verifies three properties across all
+/// transitions: (1) the narrowed key range [a,m) persists, (2) the cursor
+/// from before the split is preserved, and (3) fence monotonicity holds
+/// at every step.
+///
+/// Invariants under test: split-residual spec narrowing, cursor
+/// preservation across park/unpark, fence monotonicity through admin ops.
+#[test]
+fn split_residual_preserved_through_park_unpark() {
+    let mut coord = seeded_coordinator();
+
+    let lease = acquire_shard(&mut coord, 10, 1);
+    let f0 = lease.fence();
+
+    // Checkpoint at "d" within original [a,z).
+    checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
+
+    // Split residual: parent narrows to [a,m).
+    let plan = test_split_residual_plan();
+    let result = coord
+        .split_residual(now(12), test_tenant(), &lease, plan, OpId::from_raw(2))
+        .unwrap();
+    assert!(result.is_executed(), "split_residual must be Executed");
+
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(rec.fence_epoch, f0, "split_residual must not change fence");
+
+    // Park the shard.
+    park_ok(&mut coord, 13, &lease, ParkReason::TooManyErrors, 3);
+
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(rec.status, ShardStatus::Parked);
+    assert_eq!(rec.fence_epoch, f0, "park must not change fence");
+    assert_eq!(
+        rec.cursor.last_key(coord.slab()),
+        Some(b"d".as_slice()),
+        "park must preserve cursor"
+    );
+    assert_eq!(
+        rec.spec.key_range_start(coord.slab()),
+        b"a",
+        "park must preserve narrowed range start"
+    );
+    assert_eq!(
+        rec.spec.key_range_end(coord.slab()),
+        b"m",
+        "park must preserve narrowed range end"
+    );
+
+    // Unpark.
+    let outcome = coord
+        .unpark_shard(now(14), test_tenant(), test_key(), OpId::from_raw(4))
+        .unwrap();
+    assert!(outcome.is_executed(), "first-time unpark must be Executed");
+
+    let fence_after_unpark = {
+        let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+        assert_eq!(rec.status, ShardStatus::Active);
+        assert!(
+            rec.fence_epoch > f0,
+            "unpark must bump fence above pre-park value"
+        );
+        assert_eq!(
+            rec.cursor.last_key(coord.slab()),
+            Some(b"d".as_slice()),
+            "unpark must preserve cursor through park round-trip"
+        );
+        assert_eq!(
+            rec.spec.key_range_start(coord.slab()),
+            b"a",
+            "unpark must preserve narrowed range start"
+        );
+        assert_eq!(
+            rec.spec.key_range_end(coord.slab()),
+            b"m",
+            "unpark must preserve narrowed range end"
+        );
+        rec.fence_epoch
+    };
+
+    // Re-acquire by a new worker — can checkpoint within narrowed [a,m).
+    let lease2 = acquire_shard(&mut coord, 15, 2);
+    assert!(
+        lease2.fence() > fence_after_unpark,
+        "re-acquire must bump fence again"
+    );
+
+    checkpoint_ok(&mut coord, 16, &lease2, b"f", 5);
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(rec.cursor.last_key(coord.slab()), Some(b"f".as_slice()));
 }
 
 /// Lease validation rejects a forged lease whose fence matches but owner diverges.
@@ -332,6 +431,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
+        let fence = lease.fence();
         complete_ok(&mut coord, 11, &lease, b"m", 1);
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(
@@ -342,6 +442,7 @@ fn terminal_clears_lease() {
             rec.lease_deadline().is_none(),
             "complete must clear lease deadline"
         );
+        assert_eq!(rec.fence_epoch, fence, "complete must not change fence");
         assert_eq!(rec.status, ShardStatus::Done);
     }
 
@@ -349,6 +450,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
+        let fence = lease.fence();
         park_ok(&mut coord, 11, &lease, ParkReason::TooManyErrors, 1);
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(rec.lease_owner().is_none(), "park must clear lease owner");
@@ -356,6 +458,7 @@ fn terminal_clears_lease() {
             rec.lease_deadline().is_none(),
             "park must clear lease deadline"
         );
+        assert_eq!(rec.fence_epoch, fence, "park must not change fence");
         assert_eq!(rec.status, ShardStatus::Parked);
     }
 
@@ -363,10 +466,15 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
+        let fence = lease.fence();
         let plan = test_split_replace_plan();
-        let _ = coord
+        let outcome = coord
             .split_replace(now(11), test_tenant(), &lease, plan, OpId::from_raw(1))
             .unwrap();
+        assert!(
+            outcome.is_executed(),
+            "first-time split_replace must be Executed"
+        );
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(
             rec.lease_owner().is_none(),
@@ -375,6 +483,10 @@ fn terminal_clears_lease() {
         assert!(
             rec.lease_deadline().is_none(),
             "split_replace must clear lease deadline"
+        );
+        assert_eq!(
+            rec.fence_epoch, fence,
+            "split_replace must not change fence"
         );
         assert_eq!(rec.status, ShardStatus::Split);
     }
@@ -511,6 +623,32 @@ fn split_coverage_key_range_partition() {
     // Both children are Active.
     assert_eq!(rec_a.status, ShardStatus::Active);
     assert_eq!(rec_b.status, ShardStatus::Active);
+
+    // Acquire child_a and checkpoint within its range [a,m).
+    let mut scratch = crate::AcquireScratch::new();
+    let child_lease = coord
+        .acquire_and_restore_into(now(12), test_tenant(), key_a, test_worker(1), &mut scratch)
+        .expect("child acquire must succeed")
+        .lease;
+    let outcome = coord
+        .checkpoint(
+            now(13),
+            test_tenant(),
+            &child_lease,
+            &test_cursor(b"f"),
+            OpId::from_raw(2),
+        )
+        .expect("child checkpoint must succeed");
+    assert!(
+        outcome.is_executed(),
+        "first-time child checkpoint must be Executed"
+    );
+    let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
+    assert_eq!(
+        rec_a.cursor.last_key(coord.slab()),
+        Some(b"f".as_slice()),
+        "child checkpoint must advance cursor"
+    );
 }
 
 /// Op-log eviction interacts correctly with idempotency on a terminal shard.
@@ -533,7 +671,7 @@ fn oplog_eviction_then_replay() {
     for i in 1..=ShardRecord::OP_LOG_CAP as u64 {
         let key = vec![b'a' + i as u8]; // "b", "c", ..., "q"
         let update = CursorUpdate::new(key.as_slice());
-        let _ = coord
+        let outcome = coord
             .checkpoint(
                 now(10 + i),
                 test_tenant(),
@@ -542,6 +680,10 @@ fn oplog_eviction_then_replay() {
                 OpId::from_raw(i),
             )
             .unwrap();
+        assert!(
+            outcome.is_executed(),
+            "first-time checkpoint must be Executed"
+        );
     }
 
     // One more checkpoint to evict op_id=1.
@@ -606,9 +748,10 @@ fn unpark_lifecycle_fence_and_cursor_preserved() {
     assert_eq!(rec.status, ShardStatus::Parked);
 
     // Unpark via RunManagement.
-    let _ = coord
+    let outcome = coord
         .unpark_shard(now(13), test_tenant(), test_key(), OpId::from_raw(3))
         .unwrap();
+    assert!(outcome.is_executed(), "first-time unpark must be Executed");
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.status, ShardStatus::Active);
@@ -691,68 +834,80 @@ fn same_worker_reacquire_bumps_fence() {
 // run blocks shard-level admin operations.
 // ============================================================================
 
-/// Once a run reaches Done, all further state transitions are rejected.
+/// Once a run reaches a terminal state, all further state transitions are
+/// rejected.
 ///
-/// Completes a run to Done, then attempts complete_run, fail_run, and
-/// cancel_run with fresh op_ids. All three must fail. This verifies
-/// terminal irreversibility at the run level (analogous to shard-level
-/// terminal irreversibility tested elsewhere).
-#[test]
-fn run_terminal_irreversibility() {
+/// Parametrized over Done and Cancelled to cover both terminal paths that
+/// share the `apply_terminal_run_transition` code path. Done requires
+/// completing all shards first; Cancelled can be reached directly from
+/// Active.
+#[rstest::rstest]
+#[case::done(RunStatus::Done)]
+#[case::cancelled(RunStatus::Cancelled)]
+fn run_terminal_irreversibility(#[case] expected_status: RunStatus) {
     let mut coord = seeded_coordinator();
 
-    // Complete the shard so we can complete the run.
     let lease = acquire_shard(&mut coord, 10, 1);
-    complete_ok(&mut coord, 11, &lease, b"y", 1);
 
-    // Complete the run -> Done.
-    let _ = coord
-        .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
-        .unwrap();
+    // Drive the run to the expected terminal state.
+    match expected_status {
+        RunStatus::Done => {
+            complete_ok(&mut coord, 11, &lease, b"y", 1);
+            let outcome = coord
+                .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
+                .unwrap();
+            assert!(
+                outcome.is_executed(),
+                "first-time complete_run must be Executed"
+            );
+        }
+        RunStatus::Cancelled => {
+            let outcome = coord
+                .cancel_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
+                .unwrap();
+            assert!(
+                outcome.is_executed(),
+                "first-time cancel_run must be Executed"
+            );
+        }
+        _ => unreachable!("test only covers Done and Cancelled"),
+    }
 
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(rec.status(), RunStatus::Done);
+    assert_eq!(rec.status(), expected_status);
 
-    // Try complete_run again with a different op_id -> RunTerminal(Done).
+    // All three transition attempts must fail with RunTerminal.
     let err = coord
         .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
+            RunTransitionError::RunTerminal { status } if status == expected_status
         ),
-        "complete_run on Done run must return RunTerminal(Done), got: {err:?}"
+        "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
     );
 
-    // Try fail_run -> RunTerminal(Done).
     let err = coord
         .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
+            RunTransitionError::RunTerminal { status } if status == expected_status
         ),
-        "fail_run on Done run must return RunTerminal(Done), got: {err:?}"
+        "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
     );
 
-    // Try cancel_run -> RunTerminal(Done).
     let err = coord
         .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
+            RunTransitionError::RunTerminal { status } if status == expected_status
         ),
-        "cancel_run on Done run must return RunTerminal(Done), got: {err:?}"
+        "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
     );
 }
 
@@ -818,9 +973,13 @@ fn run_completed_at_consistency() {
     // Complete the shard, then complete the run.
     let lease = acquire_shard(&mut coord, 10, 1);
     complete_ok(&mut coord, 11, &lease, b"y", 1);
-    let _ = coord
+    let outcome = coord
         .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time complete_run must be Executed"
+    );
 
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(rec.status(), RunStatus::Done);
@@ -842,9 +1001,13 @@ fn run_completed_at_consistency() {
         "Initializing run must have completed_at == None"
     );
 
-    let _ = coord
+    let outcome = coord
         .cancel_run(now(21), test_tenant(), run2, OpId::from_raw(200))
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time cancel_run must be Executed"
+    );
 
     let rec = coord.get_run(test_tenant(), run2).unwrap();
     assert_eq!(rec.status(), RunStatus::Cancelled);
@@ -869,9 +1032,13 @@ fn unpark_after_run_terminal_rejected() {
     park_ok(&mut coord, 11, &lease, ParkReason::TooManyErrors, 1);
 
     // Cancel the run (run becomes Cancelled).
-    let _ = coord
+    let outcome = coord
         .cancel_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time cancel_run must be Executed"
+    );
 
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(rec.status(), RunStatus::Cancelled);

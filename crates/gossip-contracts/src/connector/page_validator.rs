@@ -139,7 +139,7 @@ impl PageItem<[u8]> for ScanItem {
 /// `ToxicDigest` is `Copy` (40 bytes on 64-bit targets). Error types in
 /// this module embed digests by value, avoiding indirection for what are
 /// fundamentally small, immutable tokens.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToxicDigest {
     /// Byte length of the original input. Preserved so diagnostics can
     /// distinguish zero-length sentinels from short keys without revealing
@@ -220,6 +220,9 @@ pub enum CursorWhich {
 /// Variants are grouped by concern (spec, cursor membership, item checks,
 /// and cursor progression). Runtime validation order is defined by
 /// [`validate_page_range`], not by enum declaration order.
+///
+/// Marked `#[non_exhaustive]` so new page-contract rules can be added
+/// without a breaking change to downstream `match` arms.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageValidationViolation {
@@ -264,6 +267,9 @@ pub enum PageValidationViolation {
 /// These conventions are reflected in the `Display` output of
 /// [`PageValidationError`], which uses `[start, end]` for cursor ranges
 /// and `[start, end)` for item ranges.
+///
+/// Marked `#[non_exhaustive]` alongside [`PageValidationViolation`] so
+/// new detail shapes can be introduced with new violation rules.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageValidationDetails {
@@ -745,6 +751,10 @@ pub fn validate_page(
     )
 }
 
+/// Compile-time guard: `PageValidationError` must fit within 256 bytes to
+/// justify the `#[allow(clippy::result_large_err)]` on the validation
+/// functions. If this fires after adding fields, consider boxing the
+/// largest `PageValidationDetails` variant.
 const _: () = assert!(
     std::mem::size_of::<PageValidationError>() <= 256,
     "PageValidationError grew beyond expected size budget"

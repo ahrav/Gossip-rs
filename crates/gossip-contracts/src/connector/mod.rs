@@ -73,6 +73,8 @@
 //! scheduling, backoff policy) live in runtime crates.
 
 mod api;
+#[cfg(any(test, feature = "test-support"))]
+pub mod conformance;
 pub mod page_validator;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
