@@ -796,6 +796,34 @@ impl ScanItem {
     pub fn location(&self) -> Option<&Location> {
         self.location.as_ref()
     }
+
+    /// Consume the scan item, returning all fields as owned values.
+    ///
+    /// The tuple order matches the struct field declaration:
+    /// `(item_key, item_ref, stable_item_id, version, size_hint,
+    /// content_hints, location)`.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ItemKey,
+        ItemRef,
+        StableItemId,
+        VersionId,
+        Option<u64>,
+        Option<ContentHints>,
+        Option<Location>,
+    ) {
+        (
+            self.item_key,
+            self.item_ref,
+            self.stable_item_id,
+            self.version,
+            self.size_hint,
+            self.content_hints,
+            self.location,
+        )
+    }
 }
 
 /// A connector enumeration page and continuation cursor.
@@ -827,6 +855,12 @@ impl EnumerationPage {
     #[must_use]
     pub fn next_cursor(&self) -> &Cursor {
         &self.next_cursor
+    }
+
+    /// Consume the page, returning owned items and the continuation cursor.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ScanItem>, Cursor) {
+        (self.items, self.next_cursor)
     }
 }
 
