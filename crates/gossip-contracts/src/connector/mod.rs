@@ -37,6 +37,7 @@
 //! crates.
 
 mod types;
+// types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
