@@ -1,3 +1,7 @@
+// Conformance types are consumed by the conformance harness (not yet landed).
+// The module is `pub(crate)` so the harness can import these types.
+#![allow(dead_code)]
+
 //! Conformance harness configuration and digest-only diagnostic vocabulary.
 //!
 //! This module is a contracts-only surface for connector conformance checks.
@@ -5,26 +9,28 @@
 //!
 //! - strict-by-default harness configuration knobs ([`ConformanceConfig`]),
 //! - observation types for cross-run comparisons
-//!   ([`Digest32`], [`ItemObservation`], [`EnumerationTrace`]),
+//!   ([`ToxicDigest`], [`ItemObservation`], [`EnumerationTrace`]),
 //! - and an invariant-failure taxonomy ([`ConformanceError`]).
 //!
 //! ## Invariants
 //!
-//! - Conformance diagnostic payloads represented by [`Digest32`] avoid raw
+//! - Conformance diagnostic payloads represented by [`ToxicDigest`] avoid raw
 //!   connector byte exposure.
-//! - [`Digest32`] and [`ItemObservation`] format as redacted, stable tokens for
+//! - [`ToxicDigest`] and [`ItemObservation`] format as redacted, stable tokens for
 //!   log correlation.
 //!
 //! ## Trade-off
 //!
-//! [`Digest32`] keeps full 32-byte hashes for equality and map/set keys, while
-//! its `Display` output prints only an 8-byte hex prefix. This preserves
-//! compact log lines while retaining precise in-memory comparisons.
+//! [`ToxicDigest`] keeps full 32-byte hashes for equality and map/set keys,
+//! while its `Display` output prints only the first 8 bytes as hex (16
+//! characters). This preserves compact log lines while retaining precise
+//! in-memory comparisons.
 
 use std::fmt;
+use std::num::NonZeroUsize;
 
 use super::api::{ConnectorCapabilities, ErrorClass};
-use super::page_validator::PageValidationError;
+use super::page_validator::{PageValidationError, ToxicDigest};
 use super::types::{Budgets, Cursor};
 
 /// Default best-effort secret patterns that should not appear in `ItemRef`.
@@ -72,7 +78,6 @@ pub enum DeterminismExpectation {
     ///
     /// This type records the expectation only; enforcement behavior is defined
     /// by the harness that consumes this configuration.
-    #[allow(dead_code)] // Consumed by the conformance harness (not yet landed).
     BestEffort,
 }
 
@@ -86,6 +91,18 @@ pub struct ResumeChecks {
     pub drop_token: bool,
     /// Require forward progress when pagination token state is corrupted.
     pub corrupt_token: bool,
+}
+
+impl ResumeChecks {
+    /// Iterates over the [`ResumeMode`] variants enabled by this configuration.
+    ///
+    /// Returns zero, one, or two items depending on which flags are set.
+    pub fn modes(&self) -> impl Iterator<Item = ResumeMode> {
+        self.drop_token
+            .then_some(ResumeMode::DropToken)
+            .into_iter()
+            .chain(self.corrupt_token.then_some(ResumeMode::CorruptToken))
+    }
 }
 
 impl Default for ResumeChecks {
@@ -130,7 +147,6 @@ pub enum RestartPoints {
     /// Choose up to `N` points spread across a baseline run.
     Auto(usize),
     /// Restart from explicit cursor checkpoint indices.
-    #[allow(dead_code)] // Consumed by the conformance harness (not yet landed).
     Explicit(&'static [usize]),
 }
 
@@ -141,9 +157,9 @@ pub enum RestartPoints {
 #[derive(Clone, Debug)]
 pub struct ConformanceConfig {
     /// Hard cap on number of page requests in a single run.
-    pub max_pages: usize,
+    pub max_pages: NonZeroUsize,
     /// Hard cap on number of collected items in a single run.
-    pub max_total_items: usize,
+    pub max_total_items: NonZeroUsize,
     /// Budgets forwarded to each `enumerate_page` call.
     pub page_budgets: Budgets,
     /// Enforce strictly increasing keys within each page.
@@ -163,8 +179,10 @@ pub struct ConformanceConfig {
 impl Default for ConformanceConfig {
     fn default() -> Self {
         Self {
-            max_pages: 10_000,
-            max_total_items: 1_000_000,
+            max_pages: NonZeroUsize::new(10_000)
+                .expect("conformance default max_pages must be non-zero"),
+            max_total_items: NonZeroUsize::new(1_000_000)
+                .expect("conformance default max_total_items must be non-zero"),
             page_budgets: Budgets::try_new(32, u64::MAX, None)
                 .expect("conformance default page budgets must be non-zero"),
             require_strict_key_order: true,
@@ -177,73 +195,18 @@ impl Default for ConformanceConfig {
     }
 }
 
-/// Writes the first 8 bytes of a 32-byte hash as lowercase hex directly to a
-/// formatter, avoiding an intermediate `String` allocation.
-#[inline]
-fn write_hash_prefix8_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
-    for byte in bytes.iter().take(8) {
-        write!(f, "{byte:02x}")?;
-    }
-    Ok(())
-}
-
-/// Hash-only digest used in conformance diagnostics and set/map keys.
-///
-/// The original payload is never stored directly. This keeps diagnostics
-/// log-safe while allowing deterministic equality/hash behavior.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Digest32 {
-    /// Original payload length, saturating at `u32::MAX` for oversized inputs.
-    len: u32,
-    /// Full 32-byte BLAKE3 digest of the original payload.
-    hash: [u8; 32],
-}
-
-impl Digest32 {
-    /// Builds a digest from raw bytes.
-    ///
-    /// # Edge case
-    ///
-    /// `len` is stored as `u32`. Inputs larger than `u32::MAX` bytes retain
-    /// their full hash but report `len == u32::MAX`.
-    #[must_use]
-    pub fn of_bytes(bytes: &[u8]) -> Self {
-        let hash = blake3::hash(bytes);
-        Self {
-            len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
-            hash: *hash.as_bytes(),
-        }
-    }
-}
-
-impl fmt::Debug for Digest32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Digest32 {{ len: {}, hash_prefix8: ", self.len)?;
-        write_hash_prefix8_hex(f, &self.hash)?;
-        f.write_str(" }")
-    }
-}
-
-impl fmt::Display for Digest32 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "len={} hash_prefix8=", self.len)?;
-        write_hash_prefix8_hex(f, &self.hash)
-    }
-}
-
 /// Per-item observation used for cross-run comparisons.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemObservation {
     /// Digest of the item key.
-    pub key: Digest32,
-    /// Full 32-byte fingerprint used for cross-run item identity checks.
-    pub fingerprint: [u8; 32],
+    pub key: ToxicDigest,
+    /// Digest of the item content, used for cross-run item identity checks.
+    pub fingerprint: ToxicDigest,
 }
 
 impl fmt::Display for ItemObservation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "key=({}) item_fp_prefix8=", self.key)?;
-        write_hash_prefix8_hex(f, &self.fingerprint)
+        write!(f, "key=({}) fingerprint=({})", self.key, self.fingerprint)
     }
 }
 
@@ -254,13 +217,13 @@ impl fmt::Display for ItemObservation {
 ///
 /// ## Memory
 ///
-/// `ItemObservation` is 68 bytes. At default config limits
-/// (`max_total_items = 1_000_000`), the `items` vector alone can reach
-/// ~65 MB. `cursors` grows with `max_pages` but is typically modest.
+/// `ItemObservation` is 80 bytes (two `ToxicDigest` fields). At default
+/// config limits (`max_total_items = 1_000_000`), the `items` vector alone
+/// can reach ~76 MiB. `cursors` grows with `max_pages` but is typically
+/// modest.
 /// Callers should tune [`ConformanceConfig::max_pages`] and
 /// [`ConformanceConfig::max_total_items`] when targeting connectors with
 /// large datasets.
-#[allow(dead_code)] // Consumed by the conformance harness (not yet landed).
 #[derive(Clone, Debug)]
 pub struct EnumerationTrace {
     /// Item observations in encounter order.
@@ -325,23 +288,23 @@ pub enum ConformanceError {
         /// Index of the second key in the violating pair.
         at_index: usize,
         /// Previous key digest.
-        prev_key: Digest32,
+        prev_key: ToxicDigest,
         /// Next key digest.
-        next_key: Digest32,
+        next_key: ToxicDigest,
     },
     /// Non-empty page returned a cursor key that differs from the last item key.
     CursorDoesNotMatchLastItem {
         /// Zero-based page index where violation occurred.
         at_page: usize,
         /// Returned cursor key digest (or `None`).
-        cursor_key: Option<Digest32>,
+        cursor_key: Option<ToxicDigest>,
         /// Last item key digest from the same page.
-        last_item_key: Digest32,
+        last_item_key: ToxicDigest,
     },
     /// Key digest appeared more than once in a single run.
     DuplicateKeyInRun {
         /// Duplicate key digest.
-        key: Digest32,
+        key: ToxicDigest,
     },
     /// Run exceeded configured `max_pages`.
     TooManyPages {
@@ -389,9 +352,9 @@ pub enum ConformanceError {
     /// Secret-scan heuristic found a forbidden pattern inside an `ItemRef`.
     ItemRefAppearsToContainSecret {
         /// Digest of the matched pattern/canary bytes.
-        pattern: Digest32,
+        pattern: ToxicDigest,
         /// Digest of the offending `ItemRef` bytes.
-        item_ref: Digest32,
+        item_ref: ToxicDigest,
     },
 }
 

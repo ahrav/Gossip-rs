@@ -21,7 +21,7 @@
 //!   unpark lifecycle, and same-worker reacquire fence bumps.
 //!
 //! - **Group C — Run-Level Conformance.** Run lifecycle state machine:
-//!   terminal irreversibility from Done (Failed and Cancelled share the same
+//!   terminal irreversibility (Done, Failed, and Cancelled all share the
 //!   `apply_terminal_run_transition` code path), registration preconditions,
 //!   `completed_at` consistency, and run-terminal blocking of shard-level
 //!   admin operations (unpark).
@@ -38,7 +38,7 @@ use crate::lease::Lease;
 use crate::record::{ParkReason, ShardRecord, ShardStatus};
 use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
-use crate::sim::backend::SimIntrospection;
+use crate::sim::backend::SimIntrospection as _;
 use crate::test_fixtures::{
     LEASE_DURATION, acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
     seeded_coordinator_with_semantics, test_cursor, test_key, test_run, test_run_config,
@@ -213,7 +213,7 @@ fn cursor_monotonicity_combined_with_split_residual() {
 /// Invariants under test: OpId idempotency, terminal irreversibility,
 /// and their relative priority in the validation pipeline.
 #[test]
-fn idempotency_before_lease_validation() {
+fn idempotency_before_terminal_state_rejection() {
     let mut coord = seeded_coordinator();
 
     let lease = acquire_shard(&mut coord, 10, 1);
@@ -222,7 +222,7 @@ fn idempotency_before_lease_validation() {
     checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
     let complete_cursor = test_cursor(b"m");
     let complete_op = OpId::from_raw(2);
-    let _ = coord
+    let outcome = coord
         .complete(
             now(12),
             test_tenant(),
@@ -231,6 +231,10 @@ fn idempotency_before_lease_validation() {
             complete_op,
         )
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time complete must be Executed"
+    );
 
     // Shard is now Done. Replay complete with the same lease, cursor, and op_id.
     let replay = coord.complete(
@@ -312,9 +316,10 @@ fn split_residual_preserved_through_park_unpark() {
     );
 
     // Unpark.
-    let _ = coord
+    let outcome = coord
         .unpark_shard(now(14), test_tenant(), test_key(), OpId::from_raw(4))
         .unwrap();
+    assert!(outcome.is_executed(), "first-time unpark must be Executed");
 
     let fence_after_unpark = {
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
@@ -463,9 +468,13 @@ fn terminal_clears_lease() {
         let lease = acquire_shard(&mut coord, 10, 1);
         let fence = lease.fence();
         let plan = test_split_replace_plan();
-        let _ = coord
+        let outcome = coord
             .split_replace(now(11), test_tenant(), &lease, plan, OpId::from_raw(1))
             .unwrap();
+        assert!(
+            outcome.is_executed(),
+            "first-time split_replace must be Executed"
+        );
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(
             rec.lease_owner().is_none(),
@@ -621,7 +630,7 @@ fn split_coverage_key_range_partition() {
         .acquire_and_restore_into(now(12), test_tenant(), key_a, test_worker(1), &mut scratch)
         .expect("child acquire must succeed")
         .lease;
-    let _ = coord
+    let outcome = coord
         .checkpoint(
             now(13),
             test_tenant(),
@@ -630,6 +639,10 @@ fn split_coverage_key_range_partition() {
             OpId::from_raw(2),
         )
         .expect("child checkpoint must succeed");
+    assert!(
+        outcome.is_executed(),
+        "first-time child checkpoint must be Executed"
+    );
     let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
     assert_eq!(
         rec_a.cursor.last_key(coord.slab()),
@@ -658,7 +671,7 @@ fn oplog_eviction_then_replay() {
     for i in 1..=ShardRecord::OP_LOG_CAP as u64 {
         let key = vec![b'a' + i as u8]; // "b", "c", ..., "q"
         let update = CursorUpdate::new(key.as_slice());
-        let _ = coord
+        let outcome = coord
             .checkpoint(
                 now(10 + i),
                 test_tenant(),
@@ -667,6 +680,10 @@ fn oplog_eviction_then_replay() {
                 OpId::from_raw(i),
             )
             .unwrap();
+        assert!(
+            outcome.is_executed(),
+            "first-time checkpoint must be Executed"
+        );
     }
 
     // One more checkpoint to evict op_id=1.
@@ -731,9 +748,10 @@ fn unpark_lifecycle_fence_and_cursor_preserved() {
     assert_eq!(rec.status, ShardStatus::Parked);
 
     // Unpark via RunManagement.
-    let _ = coord
+    let outcome = coord
         .unpark_shard(now(13), test_tenant(), test_key(), OpId::from_raw(3))
         .unwrap();
+    assert!(outcome.is_executed(), "first-time unpark must be Executed");
 
     let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
     assert_eq!(rec.status, ShardStatus::Active);
@@ -816,68 +834,80 @@ fn same_worker_reacquire_bumps_fence() {
 // run blocks shard-level admin operations.
 // ============================================================================
 
-/// Once a run reaches Done, all further state transitions are rejected.
+/// Once a run reaches a terminal state, all further state transitions are
+/// rejected.
 ///
-/// Completes a run to Done, then attempts complete_run, fail_run, and
-/// cancel_run with fresh op_ids. All three must fail. This verifies
-/// terminal irreversibility at the run level (analogous to shard-level
-/// terminal irreversibility tested elsewhere).
-#[test]
-fn run_terminal_irreversibility() {
+/// Parametrized over Done and Cancelled to cover both terminal paths that
+/// share the `apply_terminal_run_transition` code path. Done requires
+/// completing all shards first; Cancelled can be reached directly from
+/// Active.
+#[rstest::rstest]
+#[case::done(RunStatus::Done)]
+#[case::cancelled(RunStatus::Cancelled)]
+fn run_terminal_irreversibility(#[case] expected_status: RunStatus) {
     let mut coord = seeded_coordinator();
 
-    // Complete the shard so we can complete the run.
     let lease = acquire_shard(&mut coord, 10, 1);
-    complete_ok(&mut coord, 11, &lease, b"y", 1);
 
-    // Complete the run -> Done.
-    let _ = coord
-        .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
-        .unwrap();
+    // Drive the run to the expected terminal state.
+    match expected_status {
+        RunStatus::Done => {
+            complete_ok(&mut coord, 11, &lease, b"y", 1);
+            let outcome = coord
+                .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
+                .unwrap();
+            assert!(
+                outcome.is_executed(),
+                "first-time complete_run must be Executed"
+            );
+        }
+        RunStatus::Cancelled => {
+            let outcome = coord
+                .cancel_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
+                .unwrap();
+            assert!(
+                outcome.is_executed(),
+                "first-time cancel_run must be Executed"
+            );
+        }
+        _ => unreachable!("test only covers Done and Cancelled"),
+    }
 
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
-    assert_eq!(rec.status(), RunStatus::Done);
+    assert_eq!(rec.status(), expected_status);
 
-    // Try complete_run again with a different op_id -> RunTerminal(Done).
+    // All three transition attempts must fail with RunTerminal.
     let err = coord
         .complete_run(now(13), test_tenant(), test_run(), OpId::from_raw(101))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
+            RunTransitionError::RunTerminal { status } if status == expected_status
         ),
-        "complete_run on Done run must return RunTerminal(Done), got: {err:?}"
+        "complete_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
     );
 
-    // Try fail_run -> RunTerminal(Done).
     let err = coord
         .fail_run(now(14), test_tenant(), test_run(), OpId::from_raw(102))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
+            RunTransitionError::RunTerminal { status } if status == expected_status
         ),
-        "fail_run on Done run must return RunTerminal(Done), got: {err:?}"
+        "fail_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
     );
 
-    // Try cancel_run -> RunTerminal(Done).
     let err = coord
         .cancel_run(now(15), test_tenant(), test_run(), OpId::from_raw(103))
         .unwrap_err();
     assert!(
         matches!(
             err,
-            RunTransitionError::RunTerminal {
-                status: RunStatus::Done
-            }
+            RunTransitionError::RunTerminal { status } if status == expected_status
         ),
-        "cancel_run on Done run must return RunTerminal(Done), got: {err:?}"
+        "cancel_run on {expected_status:?} run must return RunTerminal, got: {err:?}"
     );
 }
 
@@ -943,9 +973,13 @@ fn run_completed_at_consistency() {
     // Complete the shard, then complete the run.
     let lease = acquire_shard(&mut coord, 10, 1);
     complete_ok(&mut coord, 11, &lease, b"y", 1);
-    let _ = coord
+    let outcome = coord
         .complete_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time complete_run must be Executed"
+    );
 
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(rec.status(), RunStatus::Done);
@@ -967,9 +1001,13 @@ fn run_completed_at_consistency() {
         "Initializing run must have completed_at == None"
     );
 
-    let _ = coord
+    let outcome = coord
         .cancel_run(now(21), test_tenant(), run2, OpId::from_raw(200))
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time cancel_run must be Executed"
+    );
 
     let rec = coord.get_run(test_tenant(), run2).unwrap();
     assert_eq!(rec.status(), RunStatus::Cancelled);
@@ -994,9 +1032,13 @@ fn unpark_after_run_terminal_rejected() {
     park_ok(&mut coord, 11, &lease, ParkReason::TooManyErrors, 1);
 
     // Cancel the run (run becomes Cancelled).
-    let _ = coord
+    let outcome = coord
         .cancel_run(now(12), test_tenant(), test_run(), OpId::from_raw(100))
         .unwrap();
+    assert!(
+        outcome.is_executed(),
+        "first-time cancel_run must be Executed"
+    );
 
     let rec = coord.get_run(test_tenant(), test_run()).unwrap();
     assert_eq!(rec.status(), RunStatus::Cancelled);

@@ -139,7 +139,7 @@ impl PageItem<[u8]> for ScanItem {
 /// `ToxicDigest` is `Copy` (40 bytes on 64-bit targets). Error types in
 /// this module embed digests by value, avoiding indirection for what are
 /// fundamentally small, immutable tokens.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ToxicDigest {
     /// Byte length of the original input. Preserved so diagnostics can
     /// distinguish zero-length sentinels from short keys without revealing
