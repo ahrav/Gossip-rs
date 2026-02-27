@@ -20,7 +20,7 @@
 //! - `page_validator.rs` defines log-safe page-validation diagnostics plus
 //!   validation helpers (`validate_page` and generic `validate_page_range`).
 //!
-//! Re-exporting both sets here gives runtime crates a single import boundary
+//! Re-exporting all three layers here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
 //!
 //! ## Trait composition
@@ -49,10 +49,13 @@
 //! - Scan budgets: [`Budgets`]
 //! - Validation errors: [`ConnectorInputError`]
 //! - Page-validation diagnostics: [`PageValidationError`],
-//!   [`PageValidationViolation`], [`ToxicDigest`]
+//!   [`PageValidationViolation`], [`PageValidationDetails`],
+//!   [`CursorWhich`], [`ToxicDigest`]
+//! - Page-validation trait: [`page_validator::PageItem`] (stays module-qualified;
+//!   used by generic [`page_validator::validate_page_range`])
 //! - Page-validation helper: [`validate_page`] (generic
-//!   [`page_validator::validate_page_range`] stays module-qualified to avoid
-//!   widening the root surface)
+//!   `validate_page_range` stays module-qualified to avoid widening the root
+//!   surface)
 //! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
 //! - Connector feature flags: [`ConnectorCapabilities`]
 //! - Runtime connector traits: [`EnumerationConnector`], [`ReadConnector`],
@@ -79,7 +82,8 @@ pub use api::{
     ReadConnector, ReadError,
 };
 pub use page_validator::{
-    PageValidationError, PageValidationViolation, ToxicDigest, validate_page,
+    CursorWhich, PageValidationDetails, PageValidationError, PageValidationViolation, ToxicDigest,
+    validate_page,
 };
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,

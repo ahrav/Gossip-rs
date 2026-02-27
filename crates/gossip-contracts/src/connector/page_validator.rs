@@ -39,6 +39,12 @@
 //! upper boundary. Callers that require strict half-open cursor membership must
 //! enforce that policy separately.
 //!
+//! **Note on [`ShardSpec`]'s convention**: `ShardSpec` documents its cursor
+//! invariant as `[start, end)` (half-open). This validator's `[start, end]`
+//! closed-range cursor check is deliberately more permissive at the upper
+//! boundary. Callers enforcing `ShardSpec`'s stricter invariant must do so
+//! separately.
+//!
 //! ## Error anatomy
 //!
 //! Each [`PageValidationError`] pairs a [`PageValidationViolation`] (a thin,
@@ -214,6 +220,7 @@ pub enum CursorWhich {
 /// Variants are grouped by concern (spec, cursor membership, item checks,
 /// and cursor progression). Runtime validation order is defined by
 /// [`validate_page_range`], not by enum declaration order.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageValidationViolation {
     /// The declared page spec bounds are internally inconsistent.
@@ -257,13 +264,14 @@ pub enum PageValidationViolation {
 /// These conventions are reflected in the `Display` output of
 /// [`PageValidationError`], which uses `[start, end]` for cursor ranges
 /// and `[start, end)` for item ranges.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PageValidationDetails {
     /// Details for [`PageValidationViolation::SpecRangeInvalid`].
     Spec {
         /// Inclusive lower bound from the page spec.
         start: ToxicDigest,
-        /// Upper bound from the page spec.
+        /// Upper bound from the page spec (exclusive for items, inclusive for cursors).
         end: ToxicDigest,
     },
     /// Details for cursor-bound checks.
@@ -289,7 +297,7 @@ pub enum PageValidationDetails {
         end: ToxicDigest,
     },
     /// Details for local ordering failures between adjacent items.
-    NotOrdered {
+    ItemsNotOrdered {
         /// Index of the later item in the offending pair.
         index: usize,
         /// Digest of the previous item key.
@@ -298,7 +306,7 @@ pub enum PageValidationDetails {
         next: ToxicDigest,
     },
     /// Details for the "items must advance past input cursor" rule.
-    NotAfterCursor {
+    ItemsNotAfterCursor {
         /// Input cursor digest.
         cursor: ToxicDigest,
         /// Digest of the first returned item key.
@@ -319,7 +327,7 @@ pub enum PageValidationDetails {
         next: ToxicDigest,
     },
     /// Details for cursor movement on empty pages.
-    EmptyCursorAdvanced {
+    EmptyPageCursorAdvanced {
         /// Input cursor digest (if present).
         input: Option<ToxicDigest>,
         /// Next cursor digest (if present).
@@ -351,12 +359,31 @@ pub enum PageValidationDetails {
 ///
 /// Implements [`std::error::Error`] with no `source()` chain, since page
 /// validation failures are leaf errors -- they do not wrap an underlying cause.
+///
+/// Fields are private; use [`violation()`](Self::violation) and
+/// [`details()`](Self::details) for read access. The `(violation, details)`
+/// pair is always consistent when produced by [`validate_page_range`] or
+/// [`validate_page`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageValidationError {
     /// The violated rule, suitable for `match`-based dispatch and metrics labels.
-    pub violation: PageValidationViolation,
+    violation: PageValidationViolation,
     /// Redacted diagnostic context for the violation.
-    pub details: PageValidationDetails,
+    details: PageValidationDetails,
+}
+
+impl PageValidationError {
+    /// The violated rule, for `match`-based dispatch and metrics labels.
+    #[must_use]
+    pub fn violation(&self) -> PageValidationViolation {
+        self.violation
+    }
+
+    /// Redacted diagnostic context for the violation.
+    #[must_use]
+    pub fn details(&self) -> &PageValidationDetails {
+        &self.details
+    }
 }
 
 impl fmt::Display for PageValidationError {
@@ -404,13 +431,13 @@ impl fmt::Display for PageValidationError {
                     "item key out of range at index {index}: key={key}, allowed=[{start}, {end})"
                 )
             }
-            (V::ItemsNotOrdered, D::NotOrdered { index, prev, next }) => {
+            (V::ItemsNotOrdered, D::ItemsNotOrdered { index, prev, next }) => {
                 write!(
                     f,
                     "items not ordered at index {index}: prev={prev}, next={next}"
                 )
             }
-            (V::ItemsNotAfterCursor, D::NotAfterCursor { cursor, first_item }) => {
+            (V::ItemsNotAfterCursor, D::ItemsNotAfterCursor { cursor, first_item }) => {
                 write!(
                     f,
                     "items must start strictly after input cursor: cursor={cursor}, first_item={first_item}"
@@ -434,15 +461,22 @@ impl fmt::Display for PageValidationError {
             (V::CursorRegressed, D::CursorRegressed { input, next }) => {
                 write!(f, "cursor regressed: input={input}, next={next}")
             }
-            (V::EmptyPageCursorAdvanced, D::EmptyCursorAdvanced { input, next }) => {
+            (V::EmptyPageCursorAdvanced, D::EmptyPageCursorAdvanced { input, next }) => {
                 write!(
                     f,
                     "empty page advanced cursor: input={input:?}, next={next:?}"
                 )
             }
-            // Preserve a stable, non-panicking fallback if caller code builds an
-            // inconsistent `(violation, details)` pair.
-            _ => write!(f, "page validation violation: {:?}", self.violation),
+            (violation, details) => {
+                debug_assert!(
+                    false,
+                    "mismatched (violation, details) pair: {violation:?} / {details:?}"
+                );
+                write!(
+                    f,
+                    "page validation violation: {violation:?} (details: {details:?})"
+                )
+            }
         }
     }
 }
@@ -451,14 +485,15 @@ impl std::error::Error for PageValidationError {}
 
 /// Validate one connector page against ordering, membership, and cursor rules.
 ///
-/// `start`/`end` define the shard range, with empty slices treated as
+/// `start`/`end` define the key range, with empty slices treated as
 /// unbounded boundaries. Validation runs in a fixed order and returns on the
 /// first failure:
 ///
 /// 1. range sanity (`start <= end` for bounded ranges),
-/// 2. input/next cursor membership,
-/// 3. item membership,
-/// 4. local item ordering,
+/// 2. input cursor in range,
+/// 3. next cursor in range,
+/// 4. item membership and local ordering (single pass; membership checked
+///    before ordering for each item),
 /// 5. empty-page cursor stability,
 /// 6. non-empty page requires `next_last_key`,
 /// 7. first item must be strictly after `input_last_key`,
@@ -489,10 +524,20 @@ impl std::error::Error for PageValidationError {}
 /// Validation is allocation-free on the success path. Toxic hashing is
 /// performed only while constructing error payloads.
 ///
+/// # Caller responsibilities
+///
+/// This function does not enforce a maximum item count. Callers must
+/// bound page size (e.g., via [`Budgets`](super::Budgets)) before invoking
+/// validation.
+///
 /// # Errors
 ///
 /// Returns the first [`PageValidationError`] in the validation order listed
 /// above.
+// PageValidationError is ~176 bytes (largest variant: CursorOutOfRange with
+// 3 ToxicDigest at 40 bytes each). Acceptable: errors are constructed only on
+// validation failure (cold path) and carry essential diagnostic context.
+// Boxing would add heap allocation on error for negligible stack savings.
 #[allow(clippy::result_large_err)]
 pub fn validate_page_range<K, I>(
     start: &K,
@@ -555,54 +600,56 @@ where
         });
     }
 
-    // (c) Membership: every item key must be in [start, end).
+    // (c+d) Membership and ordering in one pass.
+    // Each item is checked for range membership first, then for non-decreasing
+    // order relative to its predecessor. Membership errors take priority over
+    // ordering errors for the same item.
+    let mut prev: Option<&K> = None;
     for (index, item) in items.iter().enumerate() {
         let key = item.item_key();
         let key_bytes = key.as_ref();
+
+        // Membership: item key must be in [start, end).
         let in_range = (start_unbounded || key_bytes >= start_bytes)
             && (end_unbounded || key_bytes < end_bytes);
-        if in_range {
-            continue;
-        }
-        return Err(PageValidationError {
-            violation: PageValidationViolation::ItemKeyOutOfRange,
-            details: PageValidationDetails::ItemOutOfRange {
-                index,
-                key: ToxicDigest::of(key),
-                start: ToxicDigest::of(start),
-                end: ToxicDigest::of(end),
-            },
-        });
-    }
-
-    // (d) Ordering: item keys must be non-decreasing.
-    // Sliding-window comparison: seed `prev` with the first item key, then
-    // iterate from index 1, comparing each item against its predecessor.
-    let mut prev = items.first().map(PageItem::item_key);
-    for (index, item) in items.iter().enumerate().skip(1) {
-        let next = item.item_key();
-        if let Some(prev_key) = prev
-            && prev_key.as_ref() > next.as_ref()
-        {
+        if !in_range {
             return Err(PageValidationError {
-                violation: PageValidationViolation::ItemsNotOrdered,
-                details: PageValidationDetails::NotOrdered {
+                violation: PageValidationViolation::ItemKeyOutOfRange,
+                details: PageValidationDetails::ItemOutOfRange {
                     index,
-                    prev: ToxicDigest::of(prev_key),
-                    next: ToxicDigest::of(next),
+                    key: ToxicDigest::of(key),
+                    start: ToxicDigest::of(start),
+                    end: ToxicDigest::of(end),
                 },
             });
         }
-        prev = Some(next);
+
+        // Ordering: item keys must be non-decreasing.
+        if let Some(prev_key) = prev
+            && prev_key.as_ref() > key_bytes
+        {
+            return Err(PageValidationError {
+                violation: PageValidationViolation::ItemsNotOrdered,
+                details: PageValidationDetails::ItemsNotOrdered {
+                    index,
+                    prev: ToxicDigest::of(prev_key),
+                    next: ToxicDigest::of(key),
+                },
+            });
+        }
+        prev = Some(key);
     }
 
     // (e) Empty-page rule: cursor must not advance.
-    // The `!=` compares Option<&K> by value (K: PartialEq), not by pointer
-    // identity, so `Some(&"a") != Some(&"a")` is false as expected.
-    if items.is_empty() && input_last_key != next_last_key {
+    // Compare byte-level representations for consistency with every other
+    // comparison in this function (see doc: "All ordering and membership
+    // comparisons operate on byte-level representations").
+    let input_bytes = input_last_key.map(|k| k.as_ref());
+    let next_bytes = next_last_key.map(|k| k.as_ref());
+    if items.is_empty() && input_bytes != next_bytes {
         return Err(PageValidationError {
             violation: PageValidationViolation::EmptyPageCursorAdvanced,
-            details: PageValidationDetails::EmptyCursorAdvanced {
+            details: PageValidationDetails::EmptyPageCursorAdvanced {
                 input: input_last_key.map(ToxicDigest::of),
                 next: next_last_key.map(ToxicDigest::of),
             },
@@ -623,7 +670,7 @@ where
         if first_key.as_ref() <= input.as_ref() {
             return Err(PageValidationError {
                 violation: PageValidationViolation::ItemsNotAfterCursor,
-                details: PageValidationDetails::NotAfterCursor {
+                details: PageValidationDetails::ItemsNotAfterCursor {
                     cursor: ToxicDigest::of(input),
                     first_item: ToxicDigest::of(first_key),
                 },
@@ -668,9 +715,16 @@ where
 /// additional policy checks; callers get the same invariant set, range
 /// conventions, and first-failure behavior as [`validate_page_range`].
 ///
+/// # Caller responsibilities
+///
+/// This function does not enforce a maximum item count. Callers must
+/// bound page size (e.g., via [`Budgets`](super::Budgets)) before invoking
+/// validation.
+///
 /// # Errors
 ///
 /// Forwards any [`PageValidationError`] produced by [`validate_page_range`].
+// See `validate_page_range` for `result_large_err` justification.
 #[allow(clippy::result_large_err)]
 pub fn validate_page(
     spec: &ShardSpec,
@@ -691,9 +745,19 @@ pub fn validate_page(
     )
 }
 
+const _: () = assert!(
+    std::mem::size_of::<PageValidationError>() <= 256,
+    "PageValidationError grew beyond expected size budget"
+);
+
 #[cfg(test)]
 mod tests {
-    use super::{PageItem, PageValidationViolation, validate_page_range};
+    use rstest::rstest;
+
+    use super::{
+        PageItem, PageValidationDetails, PageValidationError, PageValidationViolation, ToxicDigest,
+        validate_page_range,
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Item {
@@ -714,90 +778,325 @@ mod tests {
         Item { k: key(bytes) }
     }
 
-    #[test]
-    fn rejects_out_of_range_item_key() {
-        let start = key(b"a");
-        let end = key(b"c");
-        let next = key(b"c");
-        let items = vec![item(b"c")];
+    // -- Rejection cases: one rstest covering all 10 violation types --
 
-        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
-        assert_eq!(err.violation, PageValidationViolation::ItemKeyOutOfRange);
+    #[rstest]
+    #[case::spec_range_invalid(
+        b"z", b"a", None, &[] as &[&[u8]], None,
+        PageValidationViolation::SpecRangeInvalid,
+    )]
+    #[case::input_cursor_out_of_range(
+        b"c", b"z", Some(b"a" as &[u8]), &[] as &[&[u8]], Some(b"a" as &[u8]),
+        PageValidationViolation::InputCursorOutOfRange,
+    )]
+    #[case::next_cursor_out_of_range(
+        b"a", b"m", Some(b"b" as &[u8]), &[b"c" as &[u8]], Some(b"z" as &[u8]),
+        PageValidationViolation::NextCursorOutOfRange,
+    )]
+    #[case::item_out_of_range(
+        b"a", b"c", None, &[b"c" as &[u8]], Some(b"c" as &[u8]),
+        PageValidationViolation::ItemKeyOutOfRange,
+    )]
+    #[case::unsorted_items(
+        b"a", b"z", None, &[b"b" as &[u8], b"a"], Some(b"b" as &[u8]),
+        PageValidationViolation::ItemsNotOrdered,
+    )]
+    #[case::item_not_after_cursor(
+        b"a", b"z", Some(b"b" as &[u8]), &[b"b" as &[u8]], Some(b"b" as &[u8]),
+        PageValidationViolation::ItemsNotAfterCursor,
+    )]
+    #[case::missing_next_cursor(
+        b"a", b"z", None, &[b"b" as &[u8]], None,
+        PageValidationViolation::NextCursorMissing,
+    )]
+    #[case::next_cursor_behind_last_item(
+        b"a", b"z", None, &[b"b" as &[u8], b"d"], Some(b"c" as &[u8]),
+        PageValidationViolation::NextCursorBehindLastItem,
+    )]
+    #[case::cursor_regression(
+        b"a", b"z", Some(b"c" as &[u8]), &[b"d" as &[u8]], Some(b"b" as &[u8]),
+        PageValidationViolation::CursorRegressed,
+    )]
+    #[case::empty_page_cursor_advance(
+        b"a", b"z", Some(b"a" as &[u8]), &[] as &[&[u8]], Some(b"b" as &[u8]),
+        PageValidationViolation::EmptyPageCursorAdvanced,
+    )]
+    fn rejects_violation(
+        #[case] start: &[u8],
+        #[case] end: &[u8],
+        #[case] input: Option<&[u8]>,
+        #[case] item_keys: &[&[u8]],
+        #[case] next: Option<&[u8]>,
+        #[case] expected: PageValidationViolation,
+    ) {
+        let start = key(start);
+        let end = key(end);
+        let input = input.map(key);
+        let next = next.map(key);
+        let items: Vec<Item> = item_keys.iter().map(|k| item(k)).collect();
+
+        let err =
+            validate_page_range(&start, &end, input.as_ref(), &items, next.as_ref()).unwrap_err();
+        assert_eq!(err.violation(), expected);
     }
 
-    #[test]
-    fn rejects_unsorted_items() {
-        let start = key(b"a");
-        let end = key(b"z");
-        let next = key(b"b");
-        let items = vec![item(b"b"), item(b"a")];
-
-        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
-        assert_eq!(err.violation, PageValidationViolation::ItemsNotOrdered);
+    /// A key type where `PartialEq` and `AsRef<[u8]>` disagree.
+    ///
+    /// `PartialEq` compares `(data, tag)`, but `AsRef<[u8]>` exposes only
+    /// `data`. Two `TaggedKey` values with the same `data` but different `tag`
+    /// are *unequal* by `PartialEq` yet *equal* at byte level.
+    #[derive(Clone, Debug)]
+    struct TaggedKey {
+        data: Vec<u8>,
+        tag: u8,
     }
 
-    #[test]
-    fn rejects_item_not_after_cursor() {
-        let start = key(b"a");
-        let end = key(b"z");
-        let input = key(b"b");
-        let next = key(b"b");
-        let items = vec![item(b"b")];
-
-        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
-        assert_eq!(err.violation, PageValidationViolation::ItemsNotAfterCursor);
+    impl TaggedKey {
+        fn new(data: &[u8], tag: u8) -> Self {
+            Self {
+                data: data.to_vec(),
+                tag,
+            }
+        }
     }
 
-    #[test]
-    fn rejects_next_cursor_behind_last_item() {
-        let start = key(b"a");
-        let end = key(b"z");
-        let next = key(b"c");
-        let items = vec![item(b"b"), item(b"d")];
-
-        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
-        assert_eq!(
-            err.violation,
-            PageValidationViolation::NextCursorBehindLastItem
-        );
+    impl PartialEq for TaggedKey {
+        fn eq(&self, other: &Self) -> bool {
+            self.data == other.data && self.tag == other.tag
+        }
     }
 
-    #[test]
-    fn rejects_cursor_regression() {
-        let start = key(b"a");
-        let end = key(b"z");
-        let input = key(b"c");
-        let next = key(b"b");
-        let items = vec![item(b"d")];
+    impl Eq for TaggedKey {}
 
-        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
-        assert_eq!(err.violation, PageValidationViolation::CursorRegressed);
+    impl PartialOrd for TaggedKey {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
     }
 
-    #[test]
-    fn rejects_empty_page_cursor_advance() {
-        let start = key(b"a");
-        let end = key(b"z");
-        let input = key(b"a");
-        let next = key(b"b");
-        let items = Vec::<Item>::new();
-
-        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
-        assert_eq!(
-            err.violation,
-            PageValidationViolation::EmptyPageCursorAdvanced
-        );
+    impl Ord for TaggedKey {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.data.cmp(&other.data).then(self.tag.cmp(&other.tag))
+        }
     }
 
-    #[test]
-    fn accepts_valid_page() {
-        let start = key(b"a");
-        let end = key(b"z");
-        let input = key(b"b");
-        let next = key(b"d");
-        let items = vec![item(b"c"), item(b"d")];
+    impl AsRef<[u8]> for TaggedKey {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
 
+    struct TaggedItem {
+        k: TaggedKey,
+    }
+
+    impl PageItem<TaggedKey> for TaggedItem {
+        fn item_key(&self) -> &TaggedKey {
+            &self.k
+        }
+    }
+
+    /// Regression: the empty-page check must compare byte-level representations,
+    /// not `K::PartialEq`. Two cursors with the same bytes but different metadata
+    /// (tag) are "the same cursor" from the page contract's perspective.
+    #[test]
+    fn empty_page_check_uses_byte_comparison_not_partial_eq() {
+        let start = TaggedKey::new(b"a", 0);
+        let end = TaggedKey::new(b"z", 0);
+        // Same data bytes, different tag => PartialEq says not-equal,
+        // but byte-level comparison says equal.
+        let input = TaggedKey::new(b"c", 1);
+        let next = TaggedKey::new(b"c", 2);
+
+        // Empty page: cursor bytes haven't changed, so this should be Ok.
+        let items: Vec<TaggedItem> = Vec::new();
         let result = validate_page_range(&start, &end, Some(&input), &items, Some(&next));
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "empty page with byte-equal cursors should pass, but got: {result:?}"
+        );
+    }
+
+    // -- Acceptance cases: one rstest covering all 9 valid-page scenarios --
+
+    #[rstest]
+    #[case::valid_page(
+        b"a", b"z", Some(b"b" as &[u8]), &[b"c" as &[u8], b"d"], Some(b"d" as &[u8]),
+    )]
+    #[case::unbounded_start(
+        b"" as &[u8], b"m", None, &[b"a" as &[u8], b"b"], Some(b"b" as &[u8]),
+    )]
+    #[case::unbounded_end(
+        b"m", b"" as &[u8], None, &[b"n" as &[u8], b"z"], Some(b"z" as &[u8]),
+    )]
+    #[case::fully_unbounded(
+        b"" as &[u8], b"" as &[u8], None, &[b"a" as &[u8], b"m", b"z"], Some(b"z" as &[u8]),
+    )]
+    #[case::first_page_no_input_cursor(
+        b"a", b"z", None, &[b"b" as &[u8], b"c"], Some(b"c" as &[u8]),
+    )]
+    #[case::single_item_page(
+        b"a", b"z", None, &[b"c" as &[u8]], Some(b"c" as &[u8]),
+    )]
+    #[case::duplicate_keys(
+        b"a", b"z", None, &[b"b" as &[u8], b"b"], Some(b"b" as &[u8]),
+    )]
+    #[case::empty_page_stable_cursor(
+        b"a", b"z", Some(b"d" as &[u8]), &[] as &[&[u8]], Some(b"d" as &[u8]),
+    )]
+    #[case::next_cursor_equals_last_item(
+        b"a", b"z", Some(b"b" as &[u8]), &[b"c" as &[u8], b"d"], Some(b"d" as &[u8]),
+    )]
+    fn accepts_valid_page(
+        #[case] start: &[u8],
+        #[case] end: &[u8],
+        #[case] input: Option<&[u8]>,
+        #[case] item_keys: &[&[u8]],
+        #[case] next: Option<&[u8]>,
+    ) {
+        let start = key(start);
+        let end = key(end);
+        let input = input.map(key);
+        let next = next.map(key);
+        let items: Vec<Item> = item_keys.iter().map(|k| item(k)).collect();
+
+        let result = validate_page_range(&start, &end, input.as_ref(), &items, next.as_ref());
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    // -- Display format tests --
+
+    #[test]
+    fn toxic_digest_display_format() {
+        let digest = ToxicDigest::of(b"hello");
+        let display = format!("{digest}");
+
+        // Format: `len=N, hash=XXXXXXXXXXXXXXXX` (16 hex chars).
+        assert!(
+            display.starts_with("len=5, hash="),
+            "unexpected prefix: {display}"
+        );
+        let hash_part = &display["len=5, hash=".len()..];
+        assert_eq!(hash_part.len(), 16, "hash prefix should be 16 hex chars");
+        assert!(
+            hash_part.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash should be hex: {hash_part}"
+        );
+
+        // Debug delegates to Display.
+        assert_eq!(format!("{digest:?}"), display);
+    }
+
+    #[test]
+    fn page_validation_error_display_spec_invalid() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::SpecRangeInvalid,
+            details: PageValidationDetails::Spec {
+                start: ToxicDigest::of(b"z"),
+                end: ToxicDigest::of(b"a"),
+            },
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.starts_with("invalid spec range: start="),
+            "unexpected display: {msg}"
+        );
+        assert!(msg.contains("end="), "should contain end= field: {msg}");
+    }
+
+    // -- Boundary and edge-case tests --
+
+    #[test]
+    fn unbounded_start_accepts_low_items() {
+        let start = key(b"");
+        let end = key(b"z");
+        let items = vec![item(b"\x00"), item(b"a")];
+        let next = key(b"a");
+        let result = validate_page_range(&start, &end, None, &items, Some(&next));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn unbounded_end_accepts_high_items() {
+        let start = key(b"a");
+        let end = key(b"");
+        let items = vec![item(b"y"), item(b"z"), item(b"\xff")];
+        let next = key(b"\xff");
+        let result = validate_page_range(&start, &end, None, &items, Some(&next));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn fully_unbounded_range_accepts_any_items() {
+        let start = key(b"");
+        let end = key(b"");
+        let items = vec![item(b"\x00"), item(b"\x80"), item(b"\xff")];
+        let next = key(b"\xff");
+        let result = validate_page_range(&start, &end, None, &items, Some(&next));
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+    }
+
+    #[test]
+    fn equal_adjacent_keys_accepted() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let items = vec![item(b"m"), item(b"m"), item(b"n")];
+        let next = key(b"n");
+        let result = validate_page_range(&start, &end, None, &items, Some(&next));
+        assert!(
+            result.is_ok(),
+            "non-decreasing duplicates should pass, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn cursor_at_exact_end_boundary_passes() {
+        let start = key(b"a");
+        let end = key(b"m");
+        let items = vec![item(b"b")];
+        let next = key(b"m");
+        let result = validate_page_range(&start, &end, None, &items, Some(&next));
+        assert!(
+            result.is_ok(),
+            "cursor at end boundary should pass (closed range), got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn empty_page_both_cursors_none_passes() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let items: Vec<Item> = Vec::new();
+        let result = validate_page_range::<Vec<u8>, Item>(&start, &end, None, &items, None);
+        assert!(
+            result.is_ok(),
+            "empty page with no cursors should pass, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_item_below_start_boundary() {
+        let start = key(b"d");
+        let end = key(b"z");
+        let items = vec![item(b"c")];
+        let next = key(b"d");
+        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
+        assert_eq!(err.violation(), PageValidationViolation::ItemKeyOutOfRange);
+    }
+
+    #[test]
+    fn toxic_digest_deterministic_and_display() {
+        let d1 = ToxicDigest::of(b"same-input");
+        let d2 = ToxicDigest::of(b"same-input");
+        assert_eq!(d1, d2, "same input should produce equal digests");
+
+        let d3 = ToxicDigest::of(b"different");
+        assert_ne!(d1, d3, "different inputs should produce different digests");
+
+        let display = format!("{d1}");
+        assert!(
+            display.starts_with("len=10, hash="),
+            "unexpected: {display}"
+        );
     }
 }
