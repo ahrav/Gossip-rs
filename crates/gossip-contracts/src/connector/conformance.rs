@@ -225,8 +225,22 @@ pub enum RestartPoints {
 
 /// Conformance harness knobs.
 ///
-/// Defaults are intentionally strict so connectors explicitly opt out of weaker
-/// checks.
+/// Defaults are intentionally strict so connectors must explicitly opt out of
+/// checks they cannot satisfy rather than silently passing weaker coverage.
+///
+/// ## Default strategy
+///
+/// | Field | Default | Rationale |
+/// |-------|---------|-----------|
+/// | `max_pages` | 10 000 | Generous ceiling; most connectors finish well below |
+/// | `max_total_items` | 1 000 000 | Permits large datasets without unbounded memory |
+/// | `page_budgets` | 32 items, unlimited bytes, no deadline | Small pages exercise cursor logic frequently |
+/// | `require_strict_key_order` | `true` | Catches duplicate-key bugs early |
+/// | `require_cursor_eq_last_item` | `true` | Verifies cursor bookkeeping tracks actual data |
+/// | `determinism` | `Deterministic` | Strictest; connectors over mutable stores opt out |
+/// | `resume_checks` | both enabled | Both token perturbation paths tested |
+/// | `secret_scan` | enabled, default patterns | Catches common credential leakage |
+/// | `restart_points` | `Auto(4)` | Four evenly-spaced resume points |
 #[derive(Clone, Debug)]
 pub struct ConformanceConfig {
     /// Hard cap on page requests per run. The harness stops and reports
