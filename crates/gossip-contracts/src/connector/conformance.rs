@@ -332,17 +332,17 @@ impl fmt::Display for ItemObservation {
 /// Trace captured from one full enumeration run.
 ///
 /// The harness populates this incrementally: after each `enumerate_page` call
-/// it appends one [`ItemObservation`] per returned item to `items`, pushes
-/// the page's `next_cursor` onto `cursors`, and increments `pages`.
+/// it appends one [`ItemObservation`] per returned item to `items` and pushes
+/// the page's `next_cursor` onto `cursors`.
 ///
 /// This is a passive record type: it does not enforce internal consistency
-/// between `items`, `cursors`, and `pages`. In particular, `items.len()`
-/// may be less than `pages * page_size` when pages return variable-length
-/// results.
+/// between `items` and `cursors`. In particular, `items.len()` may be less
+/// than `cursors.len() * page_size` when pages return variable-length results.
 ///
 /// ## Field relationships
 ///
-/// - `cursors.len() == pages` (one cursor checkpoint per page response).
+/// - `cursors.len()` equals the total number of page responses (one cursor
+///   checkpoint per page).
 /// - `items` contains every observed item across all pages, in encounter
 ///   order. Resume checks slice into this vector using cursor checkpoint
 ///   boundaries.
@@ -375,11 +375,9 @@ pub struct EnumerationTrace {
     pub items: Vec<ItemObservation>,
     /// Cursor checkpoint after each page, in page order. `cursors[i]` is
     /// the `next_cursor` returned by the `i`-th `enumerate_page` call.
-    /// Resume checks select restart points from this vector.
+    /// Resume checks select restart points from this vector. The total
+    /// page count equals `cursors.len()`.
     pub cursors: Vec<Cursor>,
-    /// Total number of page responses observed in the run. Always equals
-    /// `cursors.len()` when the harness populates the trace.
-    pub pages: usize,
 }
 
 /// Token perturbation mode applied during a resume check.
@@ -429,6 +427,9 @@ pub enum ConformanceError {
         at_page: usize,
         /// Retryability class reported by the connector.
         class: ErrorClass,
+        /// Redacted digest of the connector's error message. The raw text
+        /// is not stored to avoid leaking untrusted connector output.
+        message_digest: ToxicDigest,
     },
     /// Connector returned more items than the configured page bound.
     ReturnedTooManyItems {
@@ -447,6 +448,14 @@ pub enum ConformanceError {
         at_page: usize,
         /// Specific page-validation diagnostic.
         err: PageValidationError,
+    },
+    /// Secret-scan heuristic found a forbidden pattern inside an `ItemRef`.
+    /// Checked during page collection alongside structural validation.
+    ItemRefAppearsToContainSecret {
+        /// Digest of the matched pattern/canary bytes.
+        pattern: ToxicDigest,
+        /// Digest of the offending `ItemRef` bytes.
+        item_ref: ToxicDigest,
     },
     /// Adjacent keys within a page are equal (non-decreasing but not
     /// strictly increasing). Only raised when
@@ -491,11 +500,6 @@ pub enum ConformanceError {
     /// the same index. Only raised when
     /// [`ConformanceConfig::determinism`] is
     /// [`Deterministic`](DeterminismExpectation::Deterministic).
-    ///
-    /// When the two runs differ in length, `at_index` equals the shorter
-    /// run's length and the missing side uses an empty-byte digest sentinel
-    /// (`ToxicDigest::of_bytes(&[])`) so callers always receive a uniform
-    /// payload shape.
     DeterminismMismatch {
         /// Index into the compared item sequences where divergence was first detected.
         at_index: usize,
@@ -503,6 +507,16 @@ pub enum ConformanceError {
         run1: ItemObservation,
         /// Observation from comparison run.
         run2: ItemObservation,
+    },
+    /// Two full enumeration runs produced different numbers of items.
+    /// Only raised when [`ConformanceConfig::determinism`] is
+    /// [`Deterministic`](DeterminismExpectation::Deterministic).
+    /// Checked before element-by-element comparison.
+    DeterminismLengthMismatch {
+        /// Number of items in the baseline (first) run.
+        expected_len: usize,
+        /// Number of items in the comparison (second) run.
+        got_len: usize,
     },
     /// A resume run from a baseline cursor checkpoint produced a different
     /// item at the same suffix position. The baseline suffix (items after
@@ -541,13 +555,6 @@ pub enum ConformanceError {
         /// Digest of the unrecognized cursor key.
         cursor_key: ToxicDigest,
     },
-    /// Secret-scan heuristic found a forbidden pattern inside an `ItemRef`.
-    ItemRefAppearsToContainSecret {
-        /// Digest of the matched pattern/canary bytes.
-        pattern: ToxicDigest,
-        /// Digest of the offending `ItemRef` bytes.
-        item_ref: ToxicDigest,
-    },
 }
 
 impl fmt::Display for ConformanceError {
@@ -556,8 +563,15 @@ impl fmt::Display for ConformanceError {
             Self::CapabilityMissingSeekByKey { caps } => {
                 write!(f, "connector caps missing seek_by_key: {caps:?}")
             }
-            Self::EnumerateFailed { at_page, class } => {
-                write!(f, "enumerate_page failed at page {at_page} with {class}")
+            Self::EnumerateFailed {
+                at_page,
+                class,
+                message_digest,
+            } => {
+                write!(
+                    f,
+                    "enumerate_page failed at page {at_page} with {class}: message=({message_digest})"
+                )
             }
             Self::ReturnedTooManyItems { at_page, got, max } => {
                 write!(
@@ -567,6 +581,12 @@ impl fmt::Display for ConformanceError {
             }
             Self::PageValidationFailed { at_page, err } => {
                 write!(f, "page validation failed at page {at_page}: {err}")
+            }
+            Self::ItemRefAppearsToContainSecret { pattern, item_ref } => {
+                write!(
+                    f,
+                    "item_ref appears to contain secret substring: pattern=({pattern}) item_ref=({item_ref})"
+                )
             }
             Self::NotStrictlyIncreasingWithinPage {
                 at_page,
@@ -614,6 +634,15 @@ impl fmt::Display for ConformanceError {
                     "determinism mismatch at item index {at_index}: run1={run1} run2={run2}"
                 )
             }
+            Self::DeterminismLengthMismatch {
+                expected_len,
+                got_len,
+            } => {
+                write!(
+                    f,
+                    "determinism length mismatch: expected_len={expected_len} got_len={got_len}"
+                )
+            }
             Self::ResumeMismatch {
                 restart_cursor_index,
                 mode,
@@ -641,12 +670,6 @@ impl fmt::Display for ConformanceError {
                 write!(
                     f,
                     "resume cursor last_key not found in baseline items: cursor_key=({cursor_key})"
-                )
-            }
-            Self::ItemRefAppearsToContainSecret { pattern, item_ref } => {
-                write!(
-                    f,
-                    "item_ref appears to contain secret substring: pattern=({pattern}) item_ref=({item_ref})"
                 )
             }
         }
@@ -735,23 +758,23 @@ where
     let mut trace = EnumerationTrace {
         items: Vec::new(),
         cursors: Vec::new(),
-        pages: 0,
     };
     let mut cursor = initial_cursor;
     let mut seen_keys = HashSet::new();
 
     loop {
-        if trace.pages >= cfg.max_pages.get() {
+        if trace.cursors.len() >= cfg.max_pages.get() {
             return Err(ConformanceError::TooManyPages {
                 max_pages: cfg.max_pages.get(),
             });
         }
 
-        let at_page = trace.pages;
+        let at_page = trace.cursors.len();
         let page = enumerate_page(connector, &cursor, cfg.page_budgets).map_err(|err| {
             ConformanceError::EnumerateFailed {
                 at_page,
                 class: err.class(),
+                message_digest: ToxicDigest::of_bytes(err.message().as_bytes()),
             }
         })?;
         let page_items = page.items();
@@ -814,7 +837,6 @@ where
         }
 
         trace.cursors.push(next_cursor.clone());
-        trace.pages += 1;
 
         if page_items.is_empty() {
             break;
@@ -828,14 +850,21 @@ where
 
 /// Compare two full-run observation vectors in encounter order.
 ///
-/// For length mismatches, the error payload uses an empty-byte digest sentinel
-/// for the missing side so callers still get a single
-/// [`ConformanceError::DeterminismMismatch`] shape.
+/// Length is checked first so callers get a precise
+/// [`ConformanceError::DeterminismLengthMismatch`] before attempting the
+/// element-by-element comparison.
 #[allow(clippy::result_large_err)]
 fn check_same_items(
     run1: &[ItemObservation],
     run2: &[ItemObservation],
 ) -> Result<(), ConformanceError> {
+    if run1.len() != run2.len() {
+        return Err(ConformanceError::DeterminismLengthMismatch {
+            expected_len: run1.len(),
+            got_len: run2.len(),
+        });
+    }
+
     for (at_index, (&left, &right)) in run1.iter().zip(run2.iter()).enumerate() {
         if left != right {
             return Err(ConformanceError::DeterminismMismatch {
@@ -844,19 +873,6 @@ fn check_same_items(
                 run2: right,
             });
         }
-    }
-
-    if run1.len() != run2.len() {
-        let at_index = run1.len().min(run2.len());
-        let missing = ItemObservation {
-            key: ToxicDigest::of_bytes(&[]),
-            fingerprint: ToxicDigest::of_bytes(&[]),
-        };
-        return Err(ConformanceError::DeterminismMismatch {
-            at_index,
-            run1: run1.get(at_index).copied().unwrap_or(missing),
-            run2: run2.get(at_index).copied().unwrap_or(missing),
-        });
     }
 
     Ok(())
@@ -1074,6 +1090,7 @@ fn check_item_ref_secret_free(
         .chain(secret_scan.secret_canaries.iter().map(|c| c.as_slice()));
 
     for needle in all_patterns {
+        debug_assert!(!needle.is_empty(), "secret scan pattern must not be empty");
         if contains_subslice(ref_bytes, needle) {
             return Err(ConformanceError::ItemRefAppearsToContainSecret {
                 pattern: ToxicDigest::of_bytes(needle),
@@ -1109,12 +1126,12 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// [`ToxicDigest`]).
 impl std::error::Error for ConformanceError {}
 
-/// Compile-time guard: `ConformanceError` must fit within 320 bytes to
+/// Compile-time guard: `ConformanceError` must fit within 256 bytes to
 /// justify the `#[allow(clippy::result_large_err)]` on the public harness
 /// entry point. If this fires after adding fields, consider boxing the
 /// largest variant.
 const _: () = assert!(
-    std::mem::size_of::<ConformanceError>() <= 320,
+    std::mem::size_of::<ConformanceError>() <= 256,
     "ConformanceError grew beyond expected size budget"
 );
 

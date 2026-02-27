@@ -246,8 +246,9 @@ fn item_observation_display_uses_only_safe_digests() {
     ConformanceError::EnumerateFailed {
         at_page: 2,
         class: ErrorClass::Retryable,
+        message_digest: ToxicDigest::of_bytes(b"simulated failure"),
     },
-    "enumerate_page failed at page 2 with retryable"
+    "enumerate_page failed at page 2 with retryable: message=("
 )]
 #[case::too_many_items_page(
     ConformanceError::ReturnedTooManyItems {
@@ -312,6 +313,13 @@ fn item_observation_display_uses_only_safe_digests() {
         run2: sample_observation(RAW_KEY_BYTES_ALT, RAW_FINGERPRINT_B),
     },
     "determinism mismatch at item index 9:"
+)]
+#[case::determinism_length_mismatch(
+    ConformanceError::DeterminismLengthMismatch {
+        expected_len: 5,
+        got_len: 3,
+    },
+    "determinism length mismatch: expected_len=5 got_len=3"
 )]
 #[case::resume_mismatch(
     ConformanceError::ResumeMismatch {
@@ -461,7 +469,6 @@ fn enumeration_trace_debug_does_not_leak_raw_bytes() {
     let trace = EnumerationTrace {
         items: vec![sample_observation(raw_key, raw_fp_seed)],
         cursors: vec![cursor],
-        pages: 1,
     };
 
     let rendered = format!("{trace:?}");
@@ -886,7 +893,16 @@ fn check_connector_conforms_detects_determinism_length_mismatch() {
     cfg.determinism = DeterminismExpectation::Deterministic;
     let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
         .expect_err("length mismatch should fail determinism");
-    assert!(matches!(err, ConformanceError::DeterminismMismatch { .. }));
+    assert!(
+        matches!(
+            err,
+            ConformanceError::DeterminismLengthMismatch {
+                expected_len: 2,
+                got_len: 1,
+            }
+        ),
+        "expected DeterminismLengthMismatch, got: {err:?}",
+    );
 }
 
 /// Verify that collecting exactly `max_total_items` items succeeds.
@@ -1011,6 +1027,7 @@ fn check_connector_conforms_maps_enumerate_error() {
             ConformanceError::EnumerateFailed {
                 at_page: 0,
                 class: ErrorClass::Retryable,
+                ..
             }
         ),
         "expected EnumerateFailed at page 0, got: {err:?}",
