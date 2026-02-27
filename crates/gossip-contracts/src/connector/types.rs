@@ -1283,6 +1283,69 @@ mod tests {
     }
 
     #[test]
+    fn budgets_try_new_rejects_zero_items() {
+        assert_eq!(
+            Budgets::try_new(0, 1_024, None),
+            Err(ConnectorInputError::ZeroBudget {
+                field: "Budgets.max_items",
+            })
+        );
+    }
+
+    #[test]
+    fn budgets_try_new_rejects_zero_bytes() {
+        assert_eq!(
+            Budgets::try_new(10, 0, None),
+            Err(ConnectorInputError::ZeroBudget {
+                field: "Budgets.max_bytes",
+            })
+        );
+    }
+
+    #[test]
+    fn scan_item_into_parts_returns_owned_fields() {
+        let content_hints = ContentHints::try_new(Some("text/plain".to_owned()), None).unwrap();
+        let location = Location::try_new("repo/path.txt".to_owned(), None).unwrap();
+        let item = ScanItem::new(
+            ItemKey::try_from_slice(b"k").unwrap(),
+            ItemRef::try_from_slice(b"r").unwrap(),
+            StableItemId::from_bytes([0xAA; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        )
+        .with_size_hint(42)
+        .with_content_hints(content_hints.clone())
+        .with_location(location.clone());
+
+        let (key, iref, sid, ver, sz, ch, loc) = item.into_parts();
+        assert_eq!(key.as_bytes(), b"k");
+        assert_eq!(iref.as_bytes(), b"r");
+        assert_eq!(sid, StableItemId::from_bytes([0xAA; 32]));
+        assert_eq!(
+            ver,
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1"))
+        );
+        assert_eq!(sz, Some(42));
+        assert_eq!(ch.as_ref(), Some(&content_hints));
+        assert_eq!(loc.as_ref(), Some(&location));
+    }
+
+    #[test]
+    fn enumeration_page_into_parts_returns_owned_fields() {
+        let item = ScanItem::new(
+            ItemKey::try_from_slice(b"k").unwrap(),
+            ItemRef::try_from_slice(b"r").unwrap(),
+            StableItemId::from_bytes([0xBB; 32]),
+            VersionId::Weak(ObjectVersionId::from_version_bytes(b"v2")),
+        );
+        let cursor = Cursor::with_last_key(ItemKey::try_from_slice(b"next").unwrap());
+        let page = EnumerationPage::new(vec![item.clone()], cursor.clone());
+
+        let (items, next) = page.into_parts();
+        assert_eq!(items, vec![item]);
+        assert_eq!(next, cursor);
+    }
+
+    #[test]
     fn enumeration_page_empty_is_valid() {
         let page = EnumerationPage::new(vec![], Cursor::initial());
         assert!(page.items().is_empty());
