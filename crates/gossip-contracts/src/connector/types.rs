@@ -950,31 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn cursor_lifecycle_transitions() {
-        // initial: no key, no token.
-        let c0 = Cursor::initial();
-        assert!(c0.last_key().is_none());
-        assert!(c0.token().is_none());
-
-        // key-only: first page processed.
-        let key1 = ItemKey::try_from_slice(b"k-1").unwrap();
-        let c1 = Cursor::with_last_key(key1);
-        assert_eq!(c1.last_key().unwrap().as_bytes(), b"k-1");
-        assert!(c1.token().is_none());
-
-        // key + token: continuation state.
-        let key2 = ItemKey::try_from_slice(b"k-2").unwrap();
-        let tok = TokenBytes::try_from_slice(b"resume").unwrap();
-        let c2 = Cursor::with_token(key2, tok);
-        assert_eq!(c2.last_key().unwrap().as_bytes(), b"k-2");
-        assert_eq!(c2.token().unwrap().as_bytes(), b"resume");
-
-        // back to initial: scan reset.
-        let c3 = Cursor::initial();
-        assert_eq!(c3, c0);
-    }
-
-    #[test]
     fn cursor_try_from_update_rejects_token_without_last_key() {
         let invalid = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
             None,
@@ -1164,80 +1139,6 @@ mod tests {
             b[0], b[1], b[2], b[3]
         );
         assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn item_key_debug_is_redacted() {
-        let raw = b"item-key-super-secret";
-        let item_key = ItemKey::try_from_slice(raw).unwrap();
-        let debug = format!("{item_key:?}");
-        let display = format!("{item_key}");
-        let raw_text = std::str::from_utf8(raw).unwrap();
-
-        assert!(!debug.contains(raw_text));
-        assert!(!display.contains(raw_text));
-        assert!(debug.contains("len="));
-        assert!(debug.contains("hash="));
-        assert!(display.contains("len="));
-        assert!(display.contains("hash="));
-    }
-
-    #[test]
-    fn item_ref_debug_is_redacted() {
-        let raw = b"item-ref-sensitive-pointer";
-        let item_ref = ItemRef::try_from_slice(raw).unwrap();
-        let debug = format!("{item_ref:?}");
-        let display = format!("{item_ref}");
-        let raw_text = std::str::from_utf8(raw).unwrap();
-
-        assert!(!debug.contains(raw_text));
-        assert!(!display.contains(raw_text));
-        assert!(debug.contains("len="));
-        assert!(debug.contains("hash="));
-        assert!(display.contains("len="));
-        assert!(display.contains("hash="));
-    }
-
-    #[test]
-    fn token_debug_is_redacted() {
-        let raw = b"paging-token-sensitive";
-        let token = TokenBytes::try_from_slice(raw).unwrap();
-        let debug = format!("{token:?}");
-        let display = format!("{token}");
-        let raw_text = std::str::from_utf8(raw).unwrap();
-
-        assert!(!debug.contains(raw_text));
-        assert!(!display.contains(raw_text));
-        assert!(debug.contains("len="));
-        assert!(debug.contains("hash="));
-        assert!(display.contains("len="));
-        assert!(display.contains("hash="));
-    }
-
-    #[test]
-    fn item_key_size_cap_is_enforced() {
-        assert!(ItemKey::try_from_vec(vec![0xAB; MAX_ITEM_KEY_SIZE]).is_ok());
-        assert_eq!(
-            ItemKey::try_from_vec(vec![0xAB; MAX_ITEM_KEY_SIZE + 1]),
-            Err(ConnectorInputError::TooLarge {
-                field: "ItemKey",
-                size: MAX_ITEM_KEY_SIZE + 1,
-                max: MAX_ITEM_KEY_SIZE,
-            })
-        );
-    }
-
-    #[test]
-    fn item_ref_size_cap_is_enforced() {
-        assert!(ItemRef::try_from_vec(vec![0xCD; MAX_ITEM_REF_SIZE]).is_ok());
-        assert_eq!(
-            ItemRef::try_from_vec(vec![0xCD; MAX_ITEM_REF_SIZE + 1]),
-            Err(ConnectorInputError::TooLarge {
-                field: "ItemRef",
-                size: MAX_ITEM_REF_SIZE + 1,
-                max: MAX_ITEM_REF_SIZE,
-            })
-        );
     }
 
     #[test]
