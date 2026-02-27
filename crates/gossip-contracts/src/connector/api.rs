@@ -235,20 +235,44 @@ impl fmt::Display for ReadError {
 
 impl std::error::Error for ReadError {}
 
-/// Optional connector features consumed by orchestration/planning layers.
+/// Feature flags that a connector advertises at registration time.
 ///
-/// `Default` is a conservative "feature absent" profile (all fields `false`).
-/// Callers should still handle runtime unsupported errors even when a feature
-/// is advertised as available.
+/// Orchestration and planning layers use these to choose enumeration strategy
+/// (key-seek vs token-resume), decide whether range reads are available, and
+/// determine if the connector can emit split hints for dynamic re-sharding.
+///
+/// `Default` produces a conservative "no features" profile (all fields
+/// `false`), which is safe for connectors that have not been updated to
+/// declare capabilities. Callers should still handle [`ReadError::unsupported`]
+/// at call time, because a capability flag is a *static declaration of
+/// intent*, not a guarantee that every call will succeed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConnectorCapabilities {
-    /// Supports resuming enumeration from a provided key seek position.
+    /// The connector can resume enumeration from an arbitrary key position.
+    ///
+    /// When `true`, the runtime may supply a `last_key` cursor field to skip
+    /// ahead in sorted enumeration order. Connectors without this must
+    /// enumerate from the beginning of each shard range.
     pub seek_by_key: bool,
-    /// Supports connector-native opaque token continuation.
+    /// The connector supports opaque token-based pagination.
+    ///
+    /// When `true`, the runtime will round-trip an opaque [`TokenBytes`]
+    /// continuation token between pages. This is the natural model for APIs
+    /// that return a "next page token" (e.g., S3 `ListObjectsV2`).
+    ///
+    /// [`TokenBytes`]: crate::connector::TokenBytes
     pub token_resume: bool,
-    /// Supports direct range reads.
+    /// The connector can serve byte-range reads of item content.
+    ///
+    /// When `false`, the runtime must read entire items. Attempted range
+    /// reads against a non-capable connector produce
+    /// [`ReadError::unsupported`].
     pub range_read: bool,
-    /// Emits split hints for downstream sharding/partitioning.
+    /// The connector emits split hints alongside enumeration pages.
+    ///
+    /// Split hints inform the sharding layer where natural partition
+    /// boundaries exist (e.g., Git tree object boundaries, S3 key prefixes).
+    /// The runtime may use these to dynamically subdivide large shards.
     pub split_hints: bool,
 }
 
