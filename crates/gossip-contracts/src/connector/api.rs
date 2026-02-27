@@ -112,8 +112,10 @@ impl EnumerateError {
 
     /// Construct a permanent enumeration error.
     ///
-    /// Use this when blind retries are not expected to help (for example,
-    /// authorization or unsupported-operation failures).
+    /// Use when the failure will persist until something external changes
+    /// (credentials, permissions, resource existence). The runtime should
+    /// not retry blindly; typical follow-up is to park the shard with a
+    /// diagnostic reason.
     #[must_use]
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
