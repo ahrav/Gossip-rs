@@ -1,4 +1,4 @@
-//! Connector operation error taxonomy and capability negotiation surface.
+//! Connector operation error taxonomy, capability negotiation, and runtime trait contracts.
 //!
 //! These types model connector operation outcomes **after** boundary validation
 //! has succeeded. Input-shape and size failures use
@@ -13,6 +13,22 @@
 //! | [`EnumerateError`] | Failure from enumeration/listing connector operations |
 //! | [`ReadError`] | Failure from item read/open connector operations |
 //! | [`ConnectorCapabilities`] | Feature-flag struct advertising optional connector abilities |
+//! | [`EnumerationConnector`] | Runtime contract for enumeration operations |
+//! | [`ReadConnector`] | Runtime contract for read/open operations |
+//! | [`ConnectorInstance`] | Convenience supertrait (`EnumerationConnector + ReadConnector`) |
+//!
+//! ## Trait defaults and capability signaling
+//!
+//! The connector traits expose optional hooks with conservative defaults:
+//!
+//! - [`EnumerationConnector::choose_split_point`] defaults to `Ok(None)`.
+//!   Keep this default when the connector cannot provide reliable split hints,
+//!   and advertise `ConnectorCapabilities { split_hints: false, .. }`.
+//! - [`ReadConnector::read_range`] defaults to
+//!   `Err(ReadError::unsupported("range_read"))`.
+//!   Keep this default unless the connector truly supports random-access reads,
+//!   and advertise `ConnectorCapabilities { range_read: true, .. }` only when
+//!   the method is implemented.
 //!
 //! ## Why two structurally identical error types?
 //!
@@ -31,13 +47,18 @@
 //! - `retry_after_ms` is advisory backoff metadata, not a scheduler contract.
 //!   The runtime may enforce stricter global policies regardless of connector
 //!   hints.
-//! - `message` is passthrough connector text. The `Display` impl replaces
-//!   control characters with U+FFFD to prevent log injection, but raw field
-//!   access via [`message()`] returns the original unsanitized value.
+//! - `message` is passthrough connector text. The `Display` impl replaces most
+//!   control characters with U+FFFD (preserving HT/LF/CR) to prevent log
+//!   injection, but raw field access via [`message()`] returns the original
+//!   unsanitized value.
 //! - These types are value-level contracts only. Retry scheduling, circuit
 //!   breaking, and backoff policy live in the runtime crate.
 
-use std::fmt;
+use std::{fmt, io};
+
+use crate::coordination::ShardSpec;
+
+use super::{Budgets, Cursor, EnumerationPage, ItemKey, ItemRef};
 
 /// Binary retry posture for connector operation failures.
 ///
@@ -80,8 +101,9 @@ impl fmt::Display for ErrorClass {
 /// (REPLACEMENT CHARACTER) to prevent log injection.
 ///
 /// Replaced ranges: C0 (U+0000..U+001F) except HT/LF/CR, DEL (U+007F),
-/// and C1 (U+0080..U+009F). These are the characters for which
-/// [`char::is_control()`] returns `true`.
+/// and C1 (U+0080..U+009F). Together with HT/LF/CR (which are preserved),
+/// these ranges form the full set for which [`char::is_control()`] returns
+/// `true`.
 #[inline]
 fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
     for ch in message.chars() {
@@ -319,270 +341,169 @@ pub struct ConnectorCapabilities {
     pub split_hints: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use rstest::rstest;
+/// Runtime contract for connector enumeration/listing operations.
+///
+/// This trait is intentionally separate from [`ReadConnector`]: some backends
+/// can list metadata efficiently but have different cost/failure behavior for
+/// content reads. Keeping the surfaces split lets orchestration compose them
+/// independently, while [`ConnectorInstance`] provides a shorthand bound when
+/// both are required.
+pub trait EnumerationConnector: Send {
+    /// Advertise connector capabilities used by orchestration planning.
+    ///
+    /// This is a declarative, static profile for the configured
+    /// connector instance. It should align with method behavior, but callers
+    /// must still handle runtime `unsupported`/policy errors.
+    fn caps(&self) -> ConnectorCapabilities;
 
-    use super::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
+    /// Enumerate one page of items for `shard` from `cursor` under `budgets`.
+    ///
+    /// Returns scan items plus the continuation cursor for the next request
+    /// (see [`EnumerationPage`]). Empty pages are valid and carry meaning
+    /// through the returned cursor state.
+    ///
+    /// # Budget enforcement
+    ///
+    /// [`Budgets`] values are **advisory at this trait layer**. Connector
+    /// implementations **should** honor [`Budgets::max_items`] as an upper
+    /// bound on the returned page length, but callers **must not** assume
+    /// compliance. The runtime orchestration layer is responsible for
+    /// enforcement: it **may** truncate excess items, apply backpressure,
+    /// or terminate a misbehaving connector.
+    fn enumerate_page(
+        &mut self,
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<EnumerationPage, EnumerateError>;
 
-    // -- EnumerateError constructor cases (each runs as an isolated sub-test) --
-
-    #[rstest]
-    #[case::retryable(
-        EnumerateError::retryable("transient outage"),
-        ErrorClass::Retryable,
-        "transient outage",
-        None
-    )]
-    #[case::rate_limited(
-        EnumerateError::rate_limited("too many requests", 1_250),
-        ErrorClass::Retryable,
-        "too many requests",
-        Some(1_250)
-    )]
-    #[case::rate_limited_zero_backoff(
-        EnumerateError::rate_limited("zero backoff", 0),
-        ErrorClass::Retryable,
-        "zero backoff",
-        Some(0)
-    )]
-    #[case::permanent(
-        EnumerateError::permanent("invalid credentials"),
-        ErrorClass::Permanent,
-        "invalid credentials",
-        None
-    )]
-    #[case::empty_message(EnumerateError::retryable(""), ErrorClass::Retryable, "", None)]
-    #[case::max_retry(
-        EnumerateError::rate_limited("max backoff", u64::MAX),
-        ErrorClass::Retryable,
-        "max backoff",
-        Some(u64::MAX)
-    )]
-    fn enumerate_error_constructors(
-        #[case] error: EnumerateError,
-        #[case] expected_class: ErrorClass,
-        #[case] expected_message: &str,
-        #[case] expected_retry: Option<u64>,
-    ) {
-        assert_eq!(error.class(), expected_class);
-        assert_eq!(error.message(), expected_message);
-        assert_eq!(error.retry_after_ms(), expected_retry);
-    }
-
-    // -- ReadError constructor cases (includes `unsupported` convenience ctor) --
-
-    #[rstest]
-    #[case::retryable(
-        ReadError::retryable("temporary read failure"),
-        ErrorClass::Retryable,
-        "temporary read failure",
-        None
-    )]
-    #[case::rate_limited(
-        ReadError::rate_limited("rate limited", 5_000),
-        ErrorClass::Retryable,
-        "rate limited",
-        Some(5_000)
-    )]
-    #[case::permanent(
-        ReadError::permanent("document missing"),
-        ErrorClass::Permanent,
-        "document missing",
-        None
-    )]
-    #[case::unsupported(
-        ReadError::unsupported("range_read"),
-        ErrorClass::Permanent,
-        "range_read not supported",
-        None
-    )]
-    #[case::empty_message(ReadError::retryable(""), ErrorClass::Retryable, "", None)]
-    #[case::max_retry(
-        ReadError::rate_limited("max backoff", u64::MAX),
-        ErrorClass::Retryable,
-        "max backoff",
-        Some(u64::MAX)
-    )]
-    fn read_error_constructors(
-        #[case] error: ReadError,
-        #[case] expected_class: ErrorClass,
-        #[case] expected_message: &str,
-        #[case] expected_retry: Option<u64>,
-    ) {
-        assert_eq!(error.class(), expected_class);
-        assert_eq!(error.message(), expected_message);
-        assert_eq!(error.retry_after_ms(), expected_retry);
-    }
-
-    // -- Display formatting (with / without retry hint) --
-
-    #[rstest]
-    #[case::without_retry(
-        EnumerateError::permanent("enumeration disabled"),
-        "permanent: enumeration disabled"
-    )]
-    #[case::with_retry(
-        EnumerateError::rate_limited("throttled", 250),
-        "retryable: throttled (retry_after_ms=250)"
-    )]
-    #[case::with_zero_retry(
-        EnumerateError::rate_limited("zero hint", 0),
-        "retryable: zero hint (retry_after_ms=0)"
-    )]
-    #[case::empty_message(EnumerateError::permanent(""), "permanent: ")]
-    fn enumerate_error_display(#[case] error: EnumerateError, #[case] expected: &str) {
-        assert_eq!(error.to_string(), expected);
-    }
-
-    #[rstest]
-    #[case::without_retry(
-        ReadError::retryable("temporary backend error"),
-        "retryable: temporary backend error"
-    )]
-    #[case::with_retry(
-        ReadError::rate_limited("slow down", 750),
-        "retryable: slow down (retry_after_ms=750)"
-    )]
-    #[case::with_zero_retry(
-        ReadError::rate_limited("zero hint", 0),
-        "retryable: zero hint (retry_after_ms=0)"
-    )]
-    #[case::empty_message(ReadError::permanent(""), "permanent: ")]
-    fn read_error_display(#[case] error: ReadError, #[case] expected: &str) {
-        assert_eq!(error.to_string(), expected);
-    }
-
-    // -- Standalone tests (unique setup, not worth parameterizing) --
-
-    #[test]
-    fn connector_capabilities_default_is_all_false() {
-        let capabilities = ConnectorCapabilities::default();
-        assert!(!capabilities.seek_by_key);
-        assert!(!capabilities.token_resume);
-        assert!(!capabilities.range_read);
-        assert!(!capabilities.split_hints);
-    }
-
-    #[test]
-    fn error_trait_impls_compile() {
-        fn assert_error_impl<T: std::error::Error>() {}
-
-        assert_error_impl::<EnumerateError>();
-        assert_error_impl::<ReadError>();
-    }
-
-    // -- Display sanitization --
-
-    #[test]
-    fn display_sanitizes_control_characters() {
-        let msg = "hello\x00world\x1b[31m\x7fred";
-        let err = EnumerateError::retryable(msg);
-        let display = err.to_string();
-        assert_eq!(
-            display,
-            "retryable: hello\u{FFFD}world\u{FFFD}[31m\u{FFFD}red"
+    /// Optional split-point hint for dynamic shard subdivision.
+    ///
+    /// Default behavior is `Ok(None)`, indicating "no hint available". Keep
+    /// this default unless the connector can provide useful, low-risk split
+    /// candidates. Returned hints are advisory and may be ignored by callers.
+    /// Runtime callers **should** validate that returned keys fall within
+    /// the shard's key range before acting on them.
+    ///
+    /// # Capability consistency
+    ///
+    /// The default implementation includes a `debug_assert!` that fires when
+    /// [`caps().split_hints`](ConnectorCapabilities::split_hints) is `true`
+    /// but this method has not been overridden. This catches a misconfiguration
+    /// where the connector advertises split-hint support without providing an
+    /// implementation. Connectors that override this method **must** also
+    /// return `split_hints: true` from [`caps`](EnumerationConnector::caps).
+    fn choose_split_point(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+        _budgets: Budgets,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        debug_assert!(
+            !self.caps().split_hints,
+            "connector advertises split_hints but does not override choose_split_point"
         );
-
-        // Allowed whitespace passes through unchanged.
-        let err2 = ReadError::permanent("line1\tline2\nline3\rline4");
-        assert_eq!(err2.to_string(), "permanent: line1\tline2\nline3\rline4");
-    }
-
-    // -- is_retryable predicate --
-
-    #[test]
-    fn error_class_is_retryable() {
-        assert!(ErrorClass::Retryable.is_retryable());
-        assert!(!ErrorClass::Permanent.is_retryable());
-    }
-
-    #[test]
-    fn enumerate_error_is_retryable_delegates_to_class() {
-        assert!(EnumerateError::retryable("transient").is_retryable());
-        assert!(EnumerateError::rate_limited("throttled", 100).is_retryable());
-        assert!(!EnumerateError::permanent("gone").is_retryable());
-    }
-
-    #[test]
-    fn read_error_is_retryable_delegates_to_class() {
-        assert!(ReadError::retryable("transient").is_retryable());
-        assert!(ReadError::rate_limited("throttled", 100).is_retryable());
-        assert!(!ReadError::permanent("gone").is_retryable());
-        assert!(!ReadError::unsupported("range_read").is_retryable());
-    }
-
-    // -- Proptest: property-based coverage for error types --
-
-    mod proptests {
-        use proptest::prelude::*;
-
-        use super::{EnumerateError, ErrorClass, ReadError};
-
-        fn arb_error_class() -> impl Strategy<Value = ErrorClass> {
-            prop_oneof![Just(ErrorClass::Retryable), Just(ErrorClass::Permanent),]
-        }
-
-        fn arb_enumerate_error() -> impl Strategy<Value = EnumerateError> {
-            (arb_error_class(), ".*", proptest::option::of(any::<u64>())).prop_map(
-                |(class, msg, retry)| match class {
-                    ErrorClass::Retryable => match retry {
-                        Some(r) => EnumerateError::rate_limited(msg, r),
-                        None => EnumerateError::retryable(msg),
-                    },
-                    ErrorClass::Permanent => EnumerateError::permanent(msg),
-                },
-            )
-        }
-
-        fn arb_read_error() -> impl Strategy<Value = ReadError> {
-            (arb_error_class(), ".*", proptest::option::of(any::<u64>())).prop_map(
-                |(class, msg, retry)| match class {
-                    ErrorClass::Retryable => match retry {
-                        Some(r) => ReadError::rate_limited(msg, r),
-                        None => ReadError::retryable(msg),
-                    },
-                    ErrorClass::Permanent => ReadError::permanent(msg),
-                },
-            )
-        }
-
-        proptest! {
-            #![proptest_config(crate::test_util::miri_proptest_config())]
-
-            #[test]
-            fn enumerate_error_display_never_panics(err in arb_enumerate_error()) {
-                let display = err.to_string();
-                let prefix = match err.class() {
-                    ErrorClass::Retryable => "retryable: ",
-                    ErrorClass::Permanent => "permanent: ",
-                };
-                prop_assert!(display.starts_with(prefix));
-            }
-
-            #[test]
-            fn read_error_display_never_panics(err in arb_read_error()) {
-                let display = err.to_string();
-                let prefix = match err.class() {
-                    ErrorClass::Retryable => "retryable: ",
-                    ErrorClass::Permanent => "permanent: ",
-                };
-                prop_assert!(display.starts_with(prefix));
-            }
-
-            #[test]
-            fn display_strips_control_characters(err in arb_enumerate_error()) {
-                let display = err.to_string();
-                for ch in display.chars() {
-                    if ch.is_control() {
-                        prop_assert!(
-                            matches!(ch, '\t' | '\n' | '\r'),
-                            "unexpected control char U+{:04X} in display output",
-                            ch as u32,
-                        );
-                    }
-                }
-            }
-        }
+        Ok(None)
     }
 }
+
+/// Runtime contract for connector item reads.
+///
+/// This surface is split from [`EnumerationConnector`] so orchestration can
+/// reason separately about metadata traversal and payload IO costs.
+pub trait ReadConnector: Send {
+    /// Open an item for sequential read access.
+    ///
+    /// # Return type: `Box<dyn Read + Send>`
+    ///
+    /// The boxed trait object is intentional: it preserves object safety so
+    /// callers can work with `dyn ReadConnector` at runtime (connector
+    /// polymorphism). The heap allocation is acceptable because `open` sits
+    /// on the **WARM** read path — called once per item, not per byte —
+    /// and the IO cost of the subsequent read dominates.
+    ///
+    /// The returned reader must be self-contained (`'static`): implementations
+    /// cannot borrow from `&self` or other local references. Readers must own
+    /// their resources (e.g., an open file handle, a cloned HTTP client, or an
+    /// `Arc`-backed buffer).
+    ///
+    /// # Budget enforcement
+    ///
+    /// [`Budgets`] values are **advisory at this trait layer**. Connector
+    /// implementations **should** respect budget hints (e.g., for chunked
+    /// fetching or deadline-aware reads), but callers **must not** assume
+    /// compliance. The runtime orchestration layer is responsible for
+    /// enforcement: it **must** wrap the returned reader in a size-bounded,
+    /// deadline-aware adapter before passing it to downstream consumers.
+    ///
+    /// Callers may drop the reader at any point; implementations must ensure
+    /// resource cleanup via [`Drop`], not via read-to-completion.
+    ///
+    /// # Item reference affinity
+    ///
+    /// `item_ref` **must** originate from an [`EnumerationPage`] produced by
+    /// this connector instance (or a compatible instance backed by the same
+    /// data source). Passing an [`ItemRef`] obtained from a different
+    /// connector type is a caller error and may produce garbage reads or
+    /// opaque failures.
+    fn open(
+        &mut self,
+        item_ref: &ItemRef,
+        budgets: Budgets,
+    ) -> Result<Box<dyn io::Read + Send>, ReadError>;
+
+    /// Optional range-read fast path.
+    ///
+    /// Writes up to `dst.len()` bytes from `item_ref` starting at `offset`
+    /// into `dst`, returning the number of bytes written. Implementations
+    /// **must** return a value `<= dst.len()`. Runtime callers **should**
+    /// defensively clamp before using the value as a slice bound.
+    ///
+    /// # Overflow safety
+    ///
+    /// Implementors **must** guard against `offset + dst.len()` overflow
+    /// before performing arithmetic on the combined value. Use
+    /// `offset.checked_add(dst.len() as u64)` and return an appropriate
+    /// [`ReadError`] if the addition wraps.
+    ///
+    /// **EOF behavior:** when `offset` is at or past the end of the item,
+    /// implementations must return `Ok(0)` (consistent with
+    /// [`std::io::Read`] semantics). A short read (returned count less than
+    /// `dst.len()`) does not necessarily indicate EOF -- only `Ok(0)` is
+    /// the definitive end-of-item signal.
+    ///
+    /// Connectors without native range support should keep this default,
+    /// which returns a permanent [`ReadError::unsupported`] classification.
+    fn read_range(
+        &mut self,
+        _item_ref: &ItemRef,
+        _offset: u64,
+        _dst: &mut [u8],
+        _budgets: Budgets,
+    ) -> Result<usize, ReadError> {
+        Err(ReadError::unsupported("range_read"))
+    }
+}
+
+/// Convenience supertrait for connector types.
+///
+/// Use this as a bound when a call path requires both enumeration and read
+/// capabilities. The blanket implementation means connector types do not
+/// need an explicit `impl ConnectorInstance`.
+///
+/// # Design constraint
+///
+/// Because there is a blanket `impl<T: EnumerationConnector + ReadConnector
+/// + ?Sized> ConnectorInstance for T` (the `?Sized` bound enables `dyn
+///   ConnectorInstance`), adding required methods to this trait would break the
+/// blanket impl — the empty body cannot supply an implementation for
+/// arbitrary `T`. This is intentional: `ConnectorInstance` is a **pure bound
+/// alias**, not an extension point. New connector surface area belongs on
+/// [`EnumerationConnector`] or [`ReadConnector`] directly.
+pub trait ConnectorInstance: EnumerationConnector + ReadConnector {}
+
+impl<T: EnumerationConnector + ReadConnector + ?Sized> ConnectorInstance for T {}
+
+#[cfg(test)]
+#[path = "api_tests.rs"]
+mod tests;
