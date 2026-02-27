@@ -5,6 +5,19 @@
 //! for connector-originated bytes (`ItemKey`, `ItemRef`, `TokenBytes`) plus
 //! cursor/version/display metadata types used by connector enumeration flows.
 //!
+//! ## Surface split
+//!
+//! The connector contract surface is intentionally split in two:
+//!
+//! - `types.rs` defines validated value wrappers and paging/value invariants
+//!   (including toxic-byte redaction and size bounds).
+//! - `api.rs` defines operation-outcome classification and optional capability
+//!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
+//!   `ConnectorCapabilities`).
+//!
+//! Re-exporting both sets here gives runtime crates a single import boundary
+//! while keeping invariants and policy signaling concerns separated.
+//!
 //! ## Invariants
 //!
 //! - Boundary byte wrappers are always non-empty and bounded by hard limits.
@@ -25,6 +38,8 @@
 //! - Enumeration composites: [`ScanItem`], [`EnumerationPage`]
 //! - Scan budgets: [`Budgets`]
 //! - Validation errors: [`ConnectorInputError`]
+//! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
+//! - Connector feature flags: [`ConnectorCapabilities`]
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
@@ -33,12 +48,14 @@
 //! ## Ownership boundary
 //!
 //! `gossip-contracts` defines value contracts and validation rules only.
-//! Runtime connector implementations and orchestration logic live in runtime
-//! crates.
+//! Runtime connector implementations and orchestration decisions (retry,
+//! scheduling, backoff policy) live in runtime crates.
 
+mod api;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
+pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
     Location, MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE,
