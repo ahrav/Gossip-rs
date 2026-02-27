@@ -56,7 +56,7 @@
 //! ## Known limits
 //!
 //! - Item fingerprints are currently derived from [`ScanItem::item_ref`]
-//!   bytes (see `fingerprint_item`), not from item payload reads. If a
+//!   bytes (see `observe_item`), not from item payload reads. If a
 //!   backend mutates content without changing `item_ref`, conformance checks
 //!   will not observe that drift.
 //! - The harness strictly enforces per-page `max_items`, but `max_bytes` and
@@ -82,6 +82,9 @@ use super::types::{Budgets, Cursor, EnumerationPage, ItemKey, ItemRef, ScanItem,
 /// private key markers, GitHub token prefixes (`ghp_`, `gho_`, `ghs_`,
 /// `ghr_`), JWT Base64-encoded header prefix (`eyJ`), and common
 /// database connection-string schemes.
+///
+/// For domain-specific patterns not covered here, callers should extend
+/// detection via [`SecretScanConfig::secret_canaries`].
 pub const DEFAULT_FORBIDDEN_ITEMREF_PATTERNS: &[&[u8]] = &[
     b"Authorization:",
     b"Bearer ",
@@ -318,7 +321,7 @@ pub struct ItemObservation {
     /// BLAKE3 digest of the item's [`ItemKey`] bytes.
     pub key: ToxicDigest,
     /// BLAKE3 digest of the item's [`ItemRef`] bytes (computed by
-    /// `fingerprint_item`). This detects handle-level drift across runs
+    /// `observe_item`). This detects handle-level drift across runs
     /// for a stable key.
     pub fingerprint: ToxicDigest,
 }
@@ -351,8 +354,18 @@ impl fmt::Display for ItemObservation {
 ///
 /// `ItemObservation` is 80 bytes (two `ToxicDigest` fields). At default
 /// config limits (`max_total_items = 1_000_000`), the `items` vector alone
-/// can reach ~76 MiB. `cursors` grows with `max_pages` but is typically
+/// can reach ~76 MiB. Additional allocations during a full harness run:
+///
+/// - `seen_keys: HashSet<ToxicDigest>` — ~69 MiB at 1M items (40-byte keys
+///   plus hash-map overhead).
+/// - `key_to_index: HashMap<ToxicDigest, usize>` — ~76 MiB for resume-check
+///   baseline lookups.
+/// - Determinism reruns allocate a second `EnumerationTrace` (~76 MiB).
+///
+/// Peak working set with all checks enabled at default 1M-item limit is
+/// roughly 400–500 MiB. `cursors` grows with `max_pages` but is typically
 /// modest.
+///
 /// Callers should tune [`ConformanceConfig::max_pages`] and
 /// [`ConformanceConfig::max_total_items`] when targeting connectors with
 /// large datasets.
@@ -402,6 +415,7 @@ pub enum ResumeMode {
 /// 6. **Resume checks** -- suffix divergence after token perturbation.
 ///
 /// Implements [`std::error::Error`] as a leaf error (no `source()` chain).
+// Intentionally exhaustive — no `#[non_exhaustive]` per no-versioning policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConformanceError {
     /// Connector does not advertise required `seek_by_key` capability.
@@ -477,6 +491,11 @@ pub enum ConformanceError {
     /// the same index. Only raised when
     /// [`ConformanceConfig::determinism`] is
     /// [`Deterministic`](DeterminismExpectation::Deterministic).
+    ///
+    /// When the two runs differ in length, `at_index` equals the shorter
+    /// run's length and the missing side uses an empty-byte digest sentinel
+    /// (`ToxicDigest::of_bytes(&[])`) so callers always receive a uniform
+    /// payload shape.
     DeterminismMismatch {
         /// Index into the compared item sequences where divergence was first detected.
         at_index: usize,
@@ -513,6 +532,14 @@ pub enum ConformanceError {
         expected_len: usize,
         /// Number of items the resume run actually produced.
         got_len: usize,
+    },
+    /// A resume checkpoint's `last_key` does not match any item observed
+    /// in the baseline run. This indicates the baseline trace and cursor
+    /// checkpoints are inconsistent — the cursor references an item that
+    /// was never recorded.
+    CursorKeyNotInBaseline {
+        /// Digest of the unrecognized cursor key.
+        cursor_key: ToxicDigest,
     },
     /// Secret-scan heuristic found a forbidden pattern inside an `ItemRef`.
     ItemRefAppearsToContainSecret {
@@ -610,6 +637,12 @@ impl fmt::Display for ConformanceError {
                     "resume length mismatch (restart_cursor_index={restart_cursor_index}, mode={mode:?}): expected_len={expected_len} got_len={got_len}"
                 )
             }
+            Self::CursorKeyNotInBaseline { cursor_key } => {
+                write!(
+                    f,
+                    "resume cursor last_key not found in baseline items: cursor_key=({cursor_key})"
+                )
+            }
             Self::ItemRefAppearsToContainSecret { pattern, item_ref } => {
                 write!(
                     f,
@@ -631,7 +664,11 @@ impl fmt::Display for ConformanceError {
 /// 5. Optional per-item secret scan during collection passes
 ///
 /// Returns `Ok(())` only when all enabled checks pass.
-pub fn assert_connector_conforms<C, Make, Caps, Enum>(
+// `ConformanceError` is returned only on conformance failure (cold path) and
+// carries essential diagnostic context. Boxing would add heap allocation on
+// error for negligible stack savings.
+#[allow(clippy::result_large_err)]
+pub fn check_connector_conforms<C, Make, Caps, Enum>(
     make: Make,
     caps: Caps,
     enumerate_page: Enum,
@@ -671,7 +708,7 @@ where
             &cfg,
             Cursor::initial(),
         )?;
-        assert_same_items(&baseline.items, &rerun.items)?;
+        check_same_items(&baseline.items, &rerun.items)?;
     }
 
     run_resume_checks(&make, &enumerate_page, start, end, &cfg, &baseline)?;
@@ -683,6 +720,7 @@ where
 ///
 /// Every page response contributes one cursor checkpoint, including the
 /// terminal empty page that signals completion.
+#[allow(clippy::result_large_err)]
 fn collect_trace<C, Enum>(
     connector: &mut C,
     enumerate_page: &Enum,
@@ -737,7 +775,7 @@ where
         .map_err(|err| ConformanceError::PageValidationFailed { at_page, err })?;
 
         if cfg.require_strict_key_order {
-            assert_strict_increasing_within_page(at_page, page_items)?;
+            check_strict_increasing_within_page(at_page, page_items)?;
         }
 
         if cfg.require_cursor_eq_last_item
@@ -757,7 +795,7 @@ where
 
         for item in page_items {
             if cfg.secret_scan.enabled {
-                assert_item_ref_secret_free(item.item_ref(), &cfg.secret_scan)?;
+                check_item_ref_secret_free(item.item_ref(), &cfg.secret_scan)?;
             }
 
             let observation = observe_item(item);
@@ -793,7 +831,8 @@ where
 /// For length mismatches, the error payload uses an empty-byte digest sentinel
 /// for the missing side so callers still get a single
 /// [`ConformanceError::DeterminismMismatch`] shape.
-fn assert_same_items(
+#[allow(clippy::result_large_err)]
+fn check_same_items(
     run1: &[ItemObservation],
     run2: &[ItemObservation],
 ) -> Result<(), ConformanceError> {
@@ -826,6 +865,7 @@ fn assert_same_items(
 /// Re-run enumeration from selected baseline checkpoints under each enabled
 /// token-perturbation mode and compare the resulting suffixes against the
 /// baseline trace.
+#[allow(clippy::result_large_err)]
 fn run_resume_checks<C, Make, Enum>(
     make: &Make,
     enumerate_page: &Enum,
@@ -855,7 +895,8 @@ where
 
     for restart_cursor_index in restart_points {
         let baseline_cursor = &baseline.cursors[restart_cursor_index];
-        let expected = expected_suffix_from_cursor(&baseline.items, baseline_cursor, &key_to_index);
+        let expected =
+            expected_suffix_from_cursor(&baseline.items, baseline_cursor, &key_to_index)?;
         for mode in modes.iter().copied() {
             let restart_cursor = match mode {
                 ResumeMode::DropToken => drop_token(baseline_cursor),
@@ -865,36 +906,24 @@ where
             };
 
             let mut resume_connector = make();
-            let got = collect_suffix(
+            let got = collect_trace(
                 &mut resume_connector,
                 enumerate_page,
                 start,
                 end,
                 cfg,
                 restart_cursor,
-            )?;
-            assert_same_suffix(restart_cursor_index, mode, expected, &got)?;
+            )?
+            .items;
+            check_same_suffix(restart_cursor_index, mode, expected, &got)?;
         }
     }
 
     Ok(())
 }
 
-fn collect_suffix<C, Enum>(
-    connector: &mut C,
-    enumerate_page: &Enum,
-    start: &ItemKey,
-    end: &ItemKey,
-    cfg: &ConformanceConfig,
-    restart_cursor: Cursor,
-) -> Result<Vec<ItemObservation>, ConformanceError>
-where
-    Enum: Fn(&mut C, &Cursor, Budgets) -> Result<EnumerationPage, EnumerateError>,
-{
-    Ok(collect_trace(connector, enumerate_page, start, end, cfg, restart_cursor)?.items)
-}
-
-fn assert_same_suffix(
+#[allow(clippy::result_large_err)]
+fn check_same_suffix(
     restart_cursor_index: usize,
     mode: ResumeMode,
     expected: &[ItemObservation],
@@ -924,23 +953,32 @@ fn assert_same_suffix(
     Ok(())
 }
 
+/// Compute the expected suffix of items after resuming from a cursor checkpoint.
+///
+/// Returns all items that should appear when enumerating from `cursor` onward:
+/// - Initial cursor (no `last_key`): returns the entire baseline.
+/// - `last_key` found in baseline: returns items strictly after that position.
+/// - `last_key` not found in `key_to_index`: returns
+///   [`ConformanceError::CursorKeyNotInBaseline`] because the cursor references
+///   an item never recorded in the baseline trace.
+#[allow(clippy::result_large_err)]
 fn expected_suffix_from_cursor<'a>(
     baseline_items: &'a [ItemObservation],
     cursor: &Cursor,
     key_to_index: &HashMap<ToxicDigest, usize>,
-) -> &'a [ItemObservation] {
+) -> Result<&'a [ItemObservation], ConformanceError> {
     let Some(last_key) = cursor.last_key() else {
-        return baseline_items;
+        return Ok(baseline_items);
     };
 
-    let Some(index) = key_to_index.get(&ToxicDigest::of(last_key)) else {
-        // Defensive fallback for non-observed cursor keys. In strict mode this
-        // should not happen because `require_cursor_eq_last_item` ties cursor
-        // keys to observed items.
-        return &[];
+    let cursor_digest = ToxicDigest::of(last_key);
+    let Some(index) = key_to_index.get(&cursor_digest) else {
+        return Err(ConformanceError::CursorKeyNotInBaseline {
+            cursor_key: cursor_digest,
+        });
     };
 
-    baseline_items.get(index.saturating_add(1)..).unwrap_or(&[])
+    Ok(baseline_items.get(index.saturating_add(1)..).unwrap_or(&[]))
 }
 
 /// Normalize restart-point selection into sorted, unique, in-range indices.
@@ -977,7 +1015,8 @@ fn select_restart_points(restart_points: RestartPoints, len: usize) -> Vec<usize
     }
 }
 
-fn assert_strict_increasing_within_page(
+#[allow(clippy::result_large_err)]
+fn check_strict_increasing_within_page(
     at_page: usize,
     items: &[ScanItem],
 ) -> Result<(), ConformanceError> {
@@ -999,12 +1038,8 @@ fn assert_strict_increasing_within_page(
 fn observe_item(item: &ScanItem) -> ItemObservation {
     ItemObservation {
         key: ToxicDigest::of(item.item_key()),
-        fingerprint: fingerprint_item(item),
+        fingerprint: ToxicDigest::of(item.item_ref()),
     }
-}
-
-fn fingerprint_item(item: &ScanItem) -> ToxicDigest {
-    ToxicDigest::of(item.item_ref())
 }
 
 fn drop_token(cursor: &Cursor) -> Cursor {
@@ -1026,23 +1061,22 @@ fn corrupt_token(cursor: &Cursor, seed: u64) -> Cursor {
     Cursor::with_token(last_key.clone(), token)
 }
 
-fn assert_item_ref_secret_free(
+#[allow(clippy::result_large_err)]
+fn check_item_ref_secret_free(
     item_ref: &ItemRef,
     secret_scan: &SecretScanConfig,
 ) -> Result<(), ConformanceError> {
-    for pattern in &secret_scan.forbidden_substrings {
-        if contains_subslice(item_ref.as_bytes(), pattern) {
-            return Err(ConformanceError::ItemRefAppearsToContainSecret {
-                pattern: ToxicDigest::of_bytes(pattern),
-                item_ref: ToxicDigest::of(item_ref),
-            });
-        }
-    }
+    let ref_bytes = item_ref.as_bytes();
+    let all_patterns = secret_scan
+        .forbidden_substrings
+        .iter()
+        .map(|p| p.as_ref())
+        .chain(secret_scan.secret_canaries.iter().map(|c| c.as_slice()));
 
-    for canary in &secret_scan.secret_canaries {
-        if contains_subslice(item_ref.as_bytes(), canary) {
+    for needle in all_patterns {
+        if contains_subslice(ref_bytes, needle) {
             return Err(ConformanceError::ItemRefAppearsToContainSecret {
-                pattern: ToxicDigest::of_bytes(canary),
+                pattern: ToxicDigest::of_bytes(needle),
                 item_ref: ToxicDigest::of(item_ref),
             });
         }
@@ -1054,7 +1088,9 @@ fn assert_item_ref_secret_free(
 /// Naive byte-substring search used by secret scanning.
 ///
 /// Simplicity is intentional here: pattern sets and item_ref values are both
-/// small in conformance workloads.
+/// small in conformance workloads. For large-scale workloads with many
+/// patterns, `memchr::memmem` (single pattern) or `aho-corasick` (multi-
+/// pattern) would reduce scanning from O(n*m*p) to near-linear.
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() {
         return true;
@@ -1072,6 +1108,15 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 /// The `Display` output is log-safe (all byte content is redacted through
 /// [`ToxicDigest`]).
 impl std::error::Error for ConformanceError {}
+
+/// Compile-time guard: `ConformanceError` must fit within 320 bytes to
+/// justify the `#[allow(clippy::result_large_err)]` on the public harness
+/// entry point. If this fires after adding fields, consider boxing the
+/// largest variant.
+const _: () = assert!(
+    std::mem::size_of::<ConformanceError>() <= 320,
+    "ConformanceError grew beyond expected size budget"
+);
 
 #[cfg(test)]
 #[path = "conformance_tests.rs"]
