@@ -724,10 +724,13 @@ impl ScanItem {
         }
     }
 
-    /// Set or clear the optional size hint in bytes.
+    /// Set the optional size hint in bytes.
     #[must_use]
-    pub fn with_size_hint(self, size_hint: Option<u64>) -> Self {
-        Self { size_hint, ..self }
+    pub fn with_size_hint(self, size_hint: u64) -> Self {
+        Self {
+            size_hint: Some(size_hint),
+            ..self
+        }
     }
 
     /// Set optional content hints.
@@ -830,6 +833,14 @@ impl ScanItem {
 ///
 /// `items` are the scan results for the current page. `next_cursor` encodes
 /// where to resume, including connector token state when present.
+///
+/// ## Empty-page semantics
+///
+/// An empty `items` slice is valid and its meaning depends on the cursor:
+///
+/// - Empty items + [`Cursor::initial()`] → scan is complete (no more data).
+/// - Empty items + non-initial cursor → no results in the current range,
+///   but more data may exist beyond the cursor position.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumerationPage {
     items: Vec<ScanItem>,
@@ -1244,7 +1255,7 @@ mod tests {
             StableItemId::from_bytes([0x22; 32]),
             VersionId::Weak(ObjectVersionId::from_version_bytes(b"v2")),
         )
-        .with_size_hint(Some(4_096))
+        .with_size_hint(4_096)
         .with_content_hints(content_hints.clone())
         .with_location(location.clone());
 
@@ -1269,6 +1280,13 @@ mod tests {
         let page = EnumerationPage::new(vec![scan_item.clone()], next_cursor.clone());
         assert_eq!(page.items(), &[scan_item]);
         assert_eq!(page.next_cursor(), &next_cursor);
+    }
+
+    #[test]
+    fn enumeration_page_empty_is_valid() {
+        let page = EnumerationPage::new(vec![], Cursor::initial());
+        assert!(page.items().is_empty());
+        assert_eq!(page.next_cursor(), &Cursor::initial());
     }
 
     #[test]
