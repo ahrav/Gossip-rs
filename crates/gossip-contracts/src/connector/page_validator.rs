@@ -90,6 +90,11 @@ impl PageItem<ItemKey> for ScanItem {
     }
 }
 
+/// Provides byte-level key access for [`validate_page`], which projects
+/// cursor keys through `ItemKey::as_ref()` to `&[u8]` in order to unify
+/// the `K` parameter across cursors and items. Without this impl the
+/// generic `validate_page_range::<[u8], _>` instantiation cannot treat
+/// `ScanItem` as a [`PageItem`].
 impl PageItem<[u8]> for ScanItem {
     fn item_key(&self) -> &[u8] {
         ScanItem::item_key(self).as_ref()
@@ -130,7 +135,12 @@ impl PageItem<[u8]> for ScanItem {
 /// fundamentally small, immutable tokens.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ToxicDigest {
+    /// Byte length of the original input. Preserved so diagnostics can
+    /// distinguish zero-length sentinels from short keys without revealing
+    /// content.
     len: usize,
+    /// Full 32-byte BLAKE3 digest of the original input. Only the first
+    /// 8 bytes are shown in display output; equality uses all 32.
     hash: [u8; 32],
 }
 
@@ -180,6 +190,12 @@ impl fmt::Debug for ToxicDigest {
 }
 
 /// Identifies which cursor a violation refers to.
+///
+/// This discriminant exists because
+/// [`PageValidationDetails::CursorOutOfRange`] is shared between the
+/// `InputCursorOutOfRange` and `NextCursorOutOfRange` violations. Embedding
+/// `CursorWhich` in the details variant avoids duplicating the
+/// `{key, start, end}` field set while preserving full diagnostic specificity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorWhich {
     /// The caller-provided input cursor for this page request.
@@ -458,6 +474,16 @@ impl std::error::Error for PageValidationError {}
 /// semantics, while cursor checks stay slightly more permissive at the upper
 /// boundary.
 ///
+/// ## Comparison semantics
+///
+/// All ordering and membership comparisons operate on byte-level
+/// representations (`key.as_ref()` slices), not on `K`'s `Ord` impl
+/// directly. The `K: Ord` bound serves as a contract constraint -- it
+/// prevents callers from accidentally instantiating the validator with an
+/// unordered type -- but the actual comparison is always byte-lexicographic.
+/// For the concrete types in this crate (`ItemKey`, `[u8]`, `Vec<u8>`),
+/// byte-lexicographic order and `Ord` agree.
+///
 /// ## Performance
 ///
 /// Validation is allocation-free on the success path. Toxic hashing is
@@ -550,6 +576,8 @@ where
     }
 
     // (d) Ordering: item keys must be non-decreasing.
+    // Sliding-window comparison: seed `prev` with the first item key, then
+    // iterate from index 1, comparing each item against its predecessor.
     let mut prev = items.first().map(PageItem::item_key);
     for (index, item) in items.iter().enumerate().skip(1) {
         let next = item.item_key();
@@ -569,6 +597,8 @@ where
     }
 
     // (e) Empty-page rule: cursor must not advance.
+    // The `!=` compares Option<&K> by value (K: PartialEq), not by pointer
+    // identity, so `Some(&"a") != Some(&"a")` is false as expected.
     if items.is_empty() && input_last_key != next_last_key {
         return Err(PageValidationError {
             violation: PageValidationViolation::EmptyPageCursorAdvanced,
@@ -648,6 +678,10 @@ pub fn validate_page(
     items: &[ScanItem],
     next_cursor: &Cursor,
 ) -> Result<(), PageValidationError> {
+    // ShardSpec returns `&[u8]` for range bounds, and cursor keys are
+    // projected through `ItemKey::as_ref()` to `&[u8]`, so the generic
+    // instantiation is `validate_page_range::<[u8], ScanItem>`. This
+    // requires `ScanItem: PageItem<[u8]>` (see the impl above).
     validate_page_range(
         spec.key_range_start(),
         spec.key_range_end(),
