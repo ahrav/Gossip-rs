@@ -40,7 +40,11 @@
 //! - Cursor states with `token` but no `last_key` are invalid by contract and
 //!   rejected when crossing the coordination boundary.
 
-use std::{fmt, time::Instant};
+use std::{
+    fmt,
+    num::{NonZeroU64, NonZeroUsize},
+    time::Instant,
+};
 
 use crate::coordination::CursorUpdate;
 use crate::identity::{ObjectVersionId, StableItemId};
@@ -93,6 +97,8 @@ pub const MAX_LOCATION_URL_SIZE: usize = 4_096;
 /// - [`TokenWithoutLastKey`](ConnectorInputError::TokenWithoutLastKey)
 ///   captures a violated paging invariant when converting from coordination's
 ///   borrowed [`CursorUpdate`] into owned [`Cursor`].
+/// - [`ZeroBudget`](ConnectorInputError::ZeroBudget) rejects zero-valued
+///   budget fields in [`Budgets::try_new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorInputError {
     /// A required field was empty (zero-length byte slice).
@@ -107,6 +113,8 @@ pub enum ConnectorInputError {
     },
     /// Cursor update had `token` without `last_key`.
     TokenWithoutLastKey,
+    /// A budget field was zero, which would make the budget vacuous.
+    ZeroBudget { field: &'static str },
 }
 
 impl fmt::Display for ConnectorInputError {
@@ -117,6 +125,7 @@ impl fmt::Display for ConnectorInputError {
                 write!(f, "{field} too large ({size} bytes, max {max})")
             }
             Self::TokenWithoutLastKey => write!(f, "token must not be present without last_key"),
+            Self::ZeroBudget { field } => write!(f, "{field} must be non-zero"),
         }
     }
 }
@@ -823,40 +832,58 @@ impl EnumerationPage {
 
 /// Page/scan budget controls used by connector enumeration APIs.
 ///
-/// `Budgets` combines three stop conditions:
+/// `Budgets` combines up to three stop conditions:
 /// - `max_items`: upper bound on number of returned items.
 /// - `max_bytes`: upper bound on cumulative bytes consumed.
 /// - `deadline`: optional monotonic deadline (`Instant`).
-#[derive(Clone, Copy, Debug)]
+///
+/// `max_items` and `max_bytes` are stored as [`NonZeroUsize`] and
+/// [`NonZeroU64`] respectively so that a vacuous zero budget is
+/// unrepresentable. Use [`try_new`](Self::try_new) to construct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budgets {
-    max_items: usize,
-    max_bytes: u64,
+    max_items: NonZeroUsize,
+    max_bytes: NonZeroU64,
     deadline: Option<Instant>,
 }
 
 impl Budgets {
-    /// Construct a new set of scan budgets.
-    #[must_use]
-    pub fn new(max_items: usize, max_bytes: u64, deadline: Option<Instant>) -> Self {
-        Self {
+    /// Construct a validated set of scan budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorInputError::ZeroBudget`] when `max_items` or
+    /// `max_bytes` is zero.
+    pub fn try_new(
+        max_items: usize,
+        max_bytes: u64,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ConnectorInputError> {
+        let max_items = NonZeroUsize::new(max_items).ok_or(ConnectorInputError::ZeroBudget {
+            field: "Budgets.max_items",
+        })?;
+        let max_bytes = NonZeroU64::new(max_bytes).ok_or(ConnectorInputError::ZeroBudget {
+            field: "Budgets.max_bytes",
+        })?;
+        Ok(Self {
             max_items,
             max_bytes,
             deadline,
-        }
+        })
     }
 
     /// Returns the maximum number of items allowed for the scan/page.
     #[inline]
     #[must_use]
     pub fn max_items(&self) -> usize {
-        self.max_items
+        self.max_items.get()
     }
 
     /// Returns the maximum number of bytes allowed for the scan/page.
     #[inline]
     #[must_use]
     pub fn max_bytes(&self) -> u64 {
-        self.max_bytes
+        self.max_bytes.get()
     }
 
     /// Returns the optional scan deadline.
@@ -866,11 +893,14 @@ impl Budgets {
         self.deadline
     }
 
-    /// Returns `true` when the configured deadline has elapsed.
+    /// Returns `true` when the configured deadline has elapsed relative to
+    /// `now`. Returns `false` when no deadline is set.
+    ///
+    /// Accepting the current instant as a parameter keeps this function pure
+    /// and deterministic, which is required for simulation testing.
     #[must_use]
-    pub fn is_expired(&self) -> bool {
-        self.deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
     }
 }
 
@@ -1208,25 +1238,29 @@ mod tests {
     }
 
     #[test]
-    fn budgets_is_expired_respects_deadline() {
+    fn budgets_is_expired_at_respects_deadline() {
         use std::time::Duration;
 
-        let none = Budgets::new(10, 1_024, None);
+        let anchor = Instant::now();
+
+        let none = Budgets::try_new(10, 1_024, None).unwrap();
         assert_eq!(none.max_items(), 10);
         assert_eq!(none.max_bytes(), 1_024);
         assert_eq!(none.deadline(), None);
-        assert!(!none.is_expired());
+        assert!(!none.is_expired_at(anchor));
 
-        let now = Instant::now();
-        let future = Budgets::new(10, 1_024, Some(now + Duration::from_secs(30)));
-        assert!(!future.is_expired());
+        let deadline = anchor + Duration::from_secs(30);
+        let future = Budgets::try_new(10, 1_024, Some(deadline)).unwrap();
+        assert!(!future.is_expired_at(anchor));
+        assert!(future.is_expired_at(deadline));
+        assert!(future.is_expired_at(deadline + Duration::from_secs(1)));
 
-        let past_deadline = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
-        let past = Budgets::new(10, 1_024, Some(past_deadline));
-        assert!(past.is_expired());
+        let past_deadline = anchor.checked_sub(Duration::from_secs(1)).unwrap_or(anchor);
+        let past = Budgets::try_new(10, 1_024, Some(past_deadline)).unwrap();
+        assert!(past.is_expired_at(anchor));
 
-        let boundary = Budgets::new(10, 1_024, Some(Instant::now()));
-        assert!(boundary.is_expired());
+        let boundary = Budgets::try_new(10, 1_024, Some(anchor)).unwrap();
+        assert!(boundary.is_expired_at(anchor));
     }
 
     /// Generates roundtrip + redaction and oversized-rejection proptests for
