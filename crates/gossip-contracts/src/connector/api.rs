@@ -495,7 +495,7 @@ pub trait ReadConnector: Send {
 ///
 /// Because there is a blanket `impl<T: EnumerationConnector + ReadConnector
 /// + ?Sized> ConnectorInstance for T` (the `?Sized` bound enables `dyn
-/// ConnectorInstance`), adding required methods to this trait would break the
+///   ConnectorInstance`), adding required methods to this trait would break the
 /// blanket impl — the empty body cannot supply an implementation for
 /// arbitrary `T`. This is intentional: `ConnectorInstance` is a **pure bound
 /// alias**, not an extension point. New connector surface area belongs on
