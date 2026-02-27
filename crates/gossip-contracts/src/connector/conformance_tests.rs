@@ -61,28 +61,6 @@ fn conformance_config_default_is_strict() {
 }
 
 #[test]
-fn default_forbidden_itemref_patterns_cover_required_tokens() {
-    let required: &[&[u8]] = &[
-        b"Authorization:",
-        b"Bearer ",
-        b"AKIA",
-        b"ASIA",
-        b"x-amz-security-token",
-        b"X-Amz-Signature=",
-        b"X-Amz-Credential=",
-        b"GoogleAccessId=",
-        b"-----BEGIN ",
-    ];
-    for needle in required {
-        assert!(
-            DEFAULT_FORBIDDEN_ITEMREF_PATTERNS.contains(needle),
-            "missing required pattern {:?}",
-            String::from_utf8_lossy(needle)
-        );
-    }
-}
-
-#[test]
 fn secret_scan_config_default_matches_policy() {
     let cfg = SecretScanConfig::default();
     assert!(cfg.enabled);

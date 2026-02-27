@@ -72,6 +72,7 @@ pub enum DeterminismExpectation {
     ///
     /// This type records the expectation only; enforcement behavior is defined
     /// by the harness that consumes this configuration.
+    #[allow(dead_code)] // Consumed by the conformance harness (not yet landed).
     BestEffort,
 }
 
@@ -129,6 +130,7 @@ pub enum RestartPoints {
     /// Choose up to `N` points spread across a baseline run.
     Auto(usize),
     /// Restart from explicit cursor checkpoint indices.
+    #[allow(dead_code)] // Consumed by the conformance harness (not yet landed).
     Explicit(&'static [usize]),
 }
 
@@ -175,19 +177,14 @@ impl Default for ConformanceConfig {
     }
 }
 
-/// Formats the first 8 bytes of a 32-byte hash as lowercase hex.
-///
-/// Used in human-facing diagnostics to keep output compact while preserving
-/// enough entropy for log-line correlation.
+/// Writes the first 8 bytes of a 32-byte hash as lowercase hex directly to a
+/// formatter, avoiding an intermediate `String` allocation.
 #[inline]
-fn hash_prefix8_hex(bytes: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(16);
+fn write_hash_prefix8_hex(f: &mut fmt::Formatter<'_>, bytes: &[u8; 32]) -> fmt::Result {
     for byte in bytes.iter().take(8) {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+        write!(f, "{byte:02x}")?;
     }
-    out
+    Ok(())
 }
 
 /// Hash-only digest used in conformance diagnostics and set/map keys.
@@ -217,28 +214,20 @@ impl Digest32 {
             hash: *hash.as_bytes(),
         }
     }
-
-    /// Returns the lowercase hex prefix (16 chars) used in diagnostics.
-    #[must_use]
-    pub fn prefix8_hex(&self) -> String {
-        hash_prefix8_hex(&self.hash)
-    }
 }
 
 impl fmt::Debug for Digest32 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Digest32 {{ len: {}, hash_prefix8: {} }}",
-            self.len,
-            self.prefix8_hex()
-        )
+        write!(f, "Digest32 {{ len: {}, hash_prefix8: ", self.len)?;
+        write_hash_prefix8_hex(f, &self.hash)?;
+        f.write_str(" }")
     }
 }
 
 impl fmt::Display for Digest32 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "len={} hash_prefix8={}", self.len, self.prefix8_hex())
+        write!(f, "len={} hash_prefix8=", self.len)?;
+        write_hash_prefix8_hex(f, &self.hash)
     }
 }
 
@@ -251,21 +240,10 @@ pub struct ItemObservation {
     pub fingerprint: [u8; 32],
 }
 
-impl ItemObservation {
-    #[must_use]
-    fn fingerprint_prefix8_hex(&self) -> String {
-        hash_prefix8_hex(&self.fingerprint)
-    }
-}
-
 impl fmt::Display for ItemObservation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "key=({}) item_fp_prefix8={}",
-            self.key,
-            self.fingerprint_prefix8_hex()
-        )
+        write!(f, "key=({}) item_fp_prefix8=", self.key)?;
+        write_hash_prefix8_hex(f, &self.fingerprint)
     }
 }
 
@@ -273,6 +251,16 @@ impl fmt::Display for ItemObservation {
 ///
 /// This is a passive record type: it does not enforce internal consistency
 /// between `items`, `cursors`, and `pages`.
+///
+/// ## Memory
+///
+/// `ItemObservation` is 68 bytes. At default config limits
+/// (`max_total_items = 1_000_000`), the `items` vector alone can reach
+/// ~65 MB. `cursors` grows with `max_pages` but is typically modest.
+/// Callers should tune [`ConformanceConfig::max_pages`] and
+/// [`ConformanceConfig::max_total_items`] when targeting connectors with
+/// large datasets.
+#[allow(dead_code)] // Consumed by the conformance harness (not yet landed).
 #[derive(Clone, Debug)]
 pub struct EnumerationTrace {
     /// Item observations in encounter order.
