@@ -384,6 +384,15 @@ pub trait EnumerationConnector: Send {
     /// candidates. Returned hints are advisory and may be ignored by callers.
     /// Runtime callers **should** validate that returned keys fall within
     /// the shard's key range before acting on them.
+    ///
+    /// # Capability consistency
+    ///
+    /// The default implementation includes a `debug_assert!` that fires when
+    /// [`caps().split_hints`](ConnectorCapabilities::split_hints) is `true`
+    /// but this method has not been overridden. This catches a misconfiguration
+    /// where the connector advertises split-hint support without providing an
+    /// implementation. Connectors that override this method **must** also
+    /// return `split_hints: true` from [`caps`](EnumerationConnector::caps).
     fn choose_split_point(
         &mut self,
         _shard: &ShardSpec,
@@ -429,6 +438,14 @@ pub trait ReadConnector: Send {
     ///
     /// Callers may drop the reader at any point; implementations must ensure
     /// resource cleanup via [`Drop`], not via read-to-completion.
+    ///
+    /// # Item reference affinity
+    ///
+    /// `item_ref` **must** originate from an [`EnumerationPage`] produced by
+    /// this connector instance (or a compatible instance backed by the same
+    /// data source). Passing an [`ItemRef`] obtained from a different
+    /// connector type is a caller error and may produce garbage reads or
+    /// opaque failures.
     fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -748,6 +765,152 @@ mod tests {
         }
         let mut c = MisconfiguredConnector;
         let _ = c.choose_split_point(&ShardSpec::unbounded(), &Cursor::initial(), budgets());
+    }
+
+    // -- Object-safety coercion (concrete → dyn) --
+
+    #[test]
+    fn concrete_type_coerces_to_dyn_enum_connector() {
+        let mut d = Dummy;
+        let _: &mut dyn EnumerationConnector = &mut d;
+    }
+
+    #[test]
+    fn concrete_type_coerces_to_dyn_read_connector() {
+        let mut d = Dummy;
+        let _: &mut dyn ReadConnector = &mut d;
+    }
+
+    #[test]
+    fn concrete_type_coerces_to_dyn_connector_instance() {
+        let mut d = Dummy;
+        let _: &mut dyn ConnectorInstance = &mut d;
+    }
+
+    // -- Successful open() reader --
+
+    #[test]
+    fn open_returns_readable_reader() {
+        use std::io::Read;
+
+        struct WorkingConnector;
+
+        impl EnumerationConnector for WorkingConnector {
+            fn caps(&self) -> ConnectorCapabilities {
+                ConnectorCapabilities::default()
+            }
+            fn enumerate_page(
+                &mut self,
+                _: &ShardSpec,
+                _: &Cursor,
+                _: Budgets,
+            ) -> Result<EnumerationPage, EnumerateError> {
+                Err(EnumerateError::permanent("stub"))
+            }
+        }
+
+        impl ReadConnector for WorkingConnector {
+            fn open(
+                &mut self,
+                _item_ref: &ItemRef,
+                _budgets: Budgets,
+            ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+                Ok(Box::new(io::Cursor::new(b"hello world")))
+            }
+        }
+
+        let mut connector = WorkingConnector;
+        let iref = item_ref();
+        let mut reader = connector
+            .open(&iref, budgets())
+            .expect("WorkingConnector::open should succeed");
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .expect("reading from cursor should not fail");
+        assert_eq!(buf, b"hello world");
+    }
+
+    // -- Empty-page enumeration semantics --
+
+    #[test]
+    fn empty_page_with_initial_cursor_signals_scan_complete() {
+        struct EmptyDoneConnector;
+
+        impl EnumerationConnector for EmptyDoneConnector {
+            fn caps(&self) -> ConnectorCapabilities {
+                ConnectorCapabilities::default()
+            }
+            fn enumerate_page(
+                &mut self,
+                _: &ShardSpec,
+                _: &Cursor,
+                _: Budgets,
+            ) -> Result<EnumerationPage, EnumerateError> {
+                Ok(EnumerationPage::new(vec![], Cursor::initial()))
+            }
+        }
+
+        impl ReadConnector for EmptyDoneConnector {
+            fn open(
+                &mut self,
+                _: &ItemRef,
+                _: Budgets,
+            ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+                Err(ReadError::permanent("stub"))
+            }
+        }
+
+        let mut c = EmptyDoneConnector;
+        let page = c
+            .enumerate_page(&ShardSpec::unbounded(), &Cursor::initial(), budgets())
+            .expect("empty-done page should succeed");
+        assert!(page.items().is_empty());
+        // Initial cursor returned → no more data.
+        assert_eq!(*page.next_cursor(), Cursor::initial());
+    }
+
+    #[test]
+    fn empty_page_with_advanced_cursor_signals_more_data() {
+        use super::super::ItemKey;
+
+        struct EmptyNotDoneConnector;
+
+        impl EnumerationConnector for EmptyNotDoneConnector {
+            fn caps(&self) -> ConnectorCapabilities {
+                ConnectorCapabilities::default()
+            }
+            fn enumerate_page(
+                &mut self,
+                _: &ShardSpec,
+                _: &Cursor,
+                _: Budgets,
+            ) -> Result<EnumerationPage, EnumerateError> {
+                let next = Cursor::with_last_key(
+                    ItemKey::try_from_slice(b"progress-key").expect("valid test key"),
+                );
+                Ok(EnumerationPage::new(vec![], next))
+            }
+        }
+
+        impl ReadConnector for EmptyNotDoneConnector {
+            fn open(
+                &mut self,
+                _: &ItemRef,
+                _: Budgets,
+            ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+                Err(ReadError::permanent("stub"))
+            }
+        }
+
+        let mut c = EmptyNotDoneConnector;
+        let page = c
+            .enumerate_page(&ShardSpec::unbounded(), &Cursor::initial(), budgets())
+            .expect("empty-not-done page should succeed");
+        assert!(page.items().is_empty());
+        // Non-initial cursor returned → more data may exist.
+        assert_ne!(*page.next_cursor(), Cursor::initial());
+        assert!(page.next_cursor().last_key().is_some());
     }
 
     // -- Display sanitization --
