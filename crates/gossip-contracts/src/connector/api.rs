@@ -5,15 +5,36 @@
 //! [`ConnectorInputError`](crate::connector::ConnectorInputError) in
 //! `connector/types.rs`.
 //!
-//! - [`EnumerateError`] reports enumeration/listing failures.
-//! - [`ReadError`] reports item read/open failures.
-//! - [`ErrorClass`] classifies retry posture (`Retryable` vs `Permanent`).
-//! - [`ConnectorCapabilities`] advertises optional connector features.
+//! ## Surface overview
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`ErrorClass`] | Binary retry posture: `Retryable` vs `Permanent` |
+//! | [`EnumerateError`] | Failure from enumeration/listing connector operations |
+//! | [`ReadError`] | Failure from item read/open connector operations |
+//! | [`ConnectorCapabilities`] | Feature-flag struct advertising optional connector abilities |
+//!
+//! ## Why two structurally identical error types?
+//!
+//! [`EnumerateError`] and [`ReadError`] carry the same three fields but are
+//! distinct types. This is intentional: enumeration and reading are separate
+//! connector traits with independent scaling characteristics (metadata-bound
+//! vs bandwidth-bound). Keeping their error types distinct means:
+//!
+//! - Public signatures are unambiguous about which operation failed.
+//! - Orchestration can apply different retry/circuit-breaker policies per
+//!   operation without downcasting or tag-matching.
+//! - The compiler prevents accidental cross-assignment between the two paths.
 //!
 //! ## Boundary notes
 //!
 //! - `retry_after_ms` is advisory backoff metadata, not a scheduler contract.
-//! - `message` is passthrough connector text and is not sanitized here.
+//!   The runtime may enforce stricter global policies regardless of connector
+//!   hints.
+//! - `message` is passthrough connector text and is **not** sanitized here.
+//!   Callers must treat it as untrusted when logging or surfacing to users.
+//! - These types are value-level contracts only. Retry scheduling, circuit
+//!   breaking, and backoff policy live in the runtime crate.
 
 use std::fmt;
 
@@ -190,75 +211,109 @@ pub struct ConnectorCapabilities {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 
-    #[test]
-    fn enumerate_error_constructors_set_class_and_retry_after() {
-        let retryable = EnumerateError::retryable("transient outage");
-        assert_eq!(retryable.class, ErrorClass::Retryable);
-        assert_eq!(retryable.message, "transient outage");
-        assert_eq!(retryable.retry_after_ms, None);
+    // -- EnumerateError constructor cases (each runs as an isolated sub-test) --
 
-        let rate_limited = EnumerateError::rate_limited("too many requests", 1_250);
-        assert_eq!(rate_limited.class, ErrorClass::Retryable);
-        assert_eq!(rate_limited.message, "too many requests");
-        assert_eq!(rate_limited.retry_after_ms, Some(1_250));
-
-        let permanent = EnumerateError::permanent("invalid credentials");
-        assert_eq!(permanent.class, ErrorClass::Permanent);
-        assert_eq!(permanent.message, "invalid credentials");
-        assert_eq!(permanent.retry_after_ms, None);
+    #[rstest]
+    #[case::retryable(
+        EnumerateError::retryable("transient outage"),
+        ErrorClass::Retryable,
+        "transient outage",
+        None
+    )]
+    #[case::rate_limited(
+        EnumerateError::rate_limited("too many requests", 1_250),
+        ErrorClass::Retryable,
+        "too many requests",
+        Some(1_250)
+    )]
+    #[case::permanent(
+        EnumerateError::permanent("invalid credentials"),
+        ErrorClass::Permanent,
+        "invalid credentials",
+        None
+    )]
+    fn enumerate_error_constructors(
+        #[case] error: EnumerateError,
+        #[case] expected_class: ErrorClass,
+        #[case] expected_message: &str,
+        #[case] expected_retry: Option<u64>,
+    ) {
+        assert_eq!(error.class, expected_class);
+        assert_eq!(error.message, expected_message);
+        assert_eq!(error.retry_after_ms, expected_retry);
     }
 
-    #[test]
-    fn read_error_constructors_set_class_and_retry_after() {
-        let retryable = ReadError::retryable("temporary read failure");
-        assert_eq!(retryable.class, ErrorClass::Retryable);
-        assert_eq!(retryable.message, "temporary read failure");
-        assert_eq!(retryable.retry_after_ms, None);
+    // -- ReadError constructor cases (includes `unsupported` convenience ctor) --
 
-        let rate_limited = ReadError::rate_limited("rate limited", 5_000);
-        assert_eq!(rate_limited.class, ErrorClass::Retryable);
-        assert_eq!(rate_limited.message, "rate limited");
-        assert_eq!(rate_limited.retry_after_ms, Some(5_000));
-
-        let permanent = ReadError::permanent("document missing");
-        assert_eq!(permanent.class, ErrorClass::Permanent);
-        assert_eq!(permanent.message, "document missing");
-        assert_eq!(permanent.retry_after_ms, None);
+    #[rstest]
+    #[case::retryable(
+        ReadError::retryable("temporary read failure"),
+        ErrorClass::Retryable,
+        "temporary read failure",
+        None
+    )]
+    #[case::rate_limited(
+        ReadError::rate_limited("rate limited", 5_000),
+        ErrorClass::Retryable,
+        "rate limited",
+        Some(5_000)
+    )]
+    #[case::permanent(
+        ReadError::permanent("document missing"),
+        ErrorClass::Permanent,
+        "document missing",
+        None
+    )]
+    #[case::unsupported(
+        ReadError::unsupported("range_read"),
+        ErrorClass::Permanent,
+        "range_read not supported",
+        None
+    )]
+    fn read_error_constructors(
+        #[case] error: ReadError,
+        #[case] expected_class: ErrorClass,
+        #[case] expected_message: &str,
+        #[case] expected_retry: Option<u64>,
+    ) {
+        assert_eq!(error.class, expected_class);
+        assert_eq!(error.message, expected_message);
+        assert_eq!(error.retry_after_ms, expected_retry);
     }
 
-    #[test]
-    fn read_error_unsupported_is_permanent_and_not_supported() {
-        let error = ReadError::unsupported("range_read");
-        assert_eq!(error.class, ErrorClass::Permanent);
-        assert_eq!(error.message, "range_read not supported");
-        assert_eq!(error.retry_after_ms, None);
+    // -- Display formatting (with / without retry hint) --
+
+    #[rstest]
+    #[case::without_retry(
+        EnumerateError::permanent("enumeration disabled"),
+        "Permanent: enumeration disabled"
+    )]
+    #[case::with_retry(
+        EnumerateError::rate_limited("throttled", 250),
+        "Retryable: throttled (retry_after_ms=250)"
+    )]
+    fn enumerate_error_display(#[case] error: EnumerateError, #[case] expected: &str) {
+        assert_eq!(error.to_string(), expected);
     }
 
-    #[test]
-    fn enumerate_error_display_formats_with_and_without_retry_after() {
-        let plain = EnumerateError::permanent("enumeration disabled");
-        assert_eq!(plain.to_string(), "Permanent: enumeration disabled");
-
-        let hinted = EnumerateError::rate_limited("throttled", 250);
-        assert_eq!(
-            hinted.to_string(),
-            "Retryable: throttled (retry_after_ms=250)"
-        );
+    #[rstest]
+    #[case::without_retry(
+        ReadError::retryable("temporary backend error"),
+        "Retryable: temporary backend error"
+    )]
+    #[case::with_retry(
+        ReadError::rate_limited("slow down", 750),
+        "Retryable: slow down (retry_after_ms=750)"
+    )]
+    fn read_error_display(#[case] error: ReadError, #[case] expected: &str) {
+        assert_eq!(error.to_string(), expected);
     }
 
-    #[test]
-    fn read_error_display_formats_with_and_without_retry_after() {
-        let plain = ReadError::retryable("temporary backend error");
-        assert_eq!(plain.to_string(), "Retryable: temporary backend error");
-
-        let hinted = ReadError::rate_limited("slow down", 750);
-        assert_eq!(
-            hinted.to_string(),
-            "Retryable: slow down (retry_after_ms=750)"
-        );
-    }
+    // -- Standalone tests (unique setup, not worth parameterizing) --
 
     #[test]
     fn connector_capabilities_default_is_all_false() {
