@@ -62,7 +62,7 @@ impl ErrorClass {
     /// Returns `true` when the classification is [`Retryable`](Self::Retryable).
     #[inline]
     #[must_use]
-    pub fn is_retryable(self) -> bool {
+    pub const fn is_retryable(self) -> bool {
         matches!(self, Self::Retryable)
     }
 }
@@ -106,7 +106,7 @@ fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Resu
 /// - `retry_after_ms: Option<u64>` — optional advisory backoff hint
 ///
 /// Generated API surface per type:
-/// - Accessors: `class()`, `message()`, `retry_after_ms()`, `into_message()`
+/// - Accessors: `class()`, `message()`, `retry_after_ms()`, `is_retryable()`, `into_message()`
 /// - Constructors: `retryable()`, `rate_limited()`, `permanent()`
 /// - Traits: `Clone`, `Debug`, `PartialEq`, `Eq`, `Display`, `Error`
 macro_rules! define_connector_error {
@@ -148,6 +148,16 @@ macro_rules! define_connector_error {
             #[must_use]
             pub fn retry_after_ms(&self) -> Option<u64> {
                 self.retry_after_ms
+            }
+
+            /// Returns `true` when the error is classified as
+            /// [`Retryable`](ErrorClass::Retryable).
+            ///
+            /// Convenience shorthand for `self.class().is_retryable()`.
+            #[inline]
+            #[must_use]
+            pub fn is_retryable(&self) -> bool {
+                self.class.is_retryable()
             }
 
             /// Consumes the error and returns the owned diagnostic message.
@@ -477,6 +487,29 @@ mod tests {
         // Allowed whitespace passes through unchanged.
         let err2 = ReadError::permanent("line1\tline2\nline3\rline4");
         assert_eq!(err2.to_string(), "permanent: line1\tline2\nline3\rline4");
+    }
+
+    // -- is_retryable predicate --
+
+    #[test]
+    fn error_class_is_retryable() {
+        assert!(ErrorClass::Retryable.is_retryable());
+        assert!(!ErrorClass::Permanent.is_retryable());
+    }
+
+    #[test]
+    fn enumerate_error_is_retryable_delegates_to_class() {
+        assert!(EnumerateError::retryable("transient").is_retryable());
+        assert!(EnumerateError::rate_limited("throttled", 100).is_retryable());
+        assert!(!EnumerateError::permanent("gone").is_retryable());
+    }
+
+    #[test]
+    fn read_error_is_retryable_delegates_to_class() {
+        assert!(ReadError::retryable("transient").is_retryable());
+        assert!(ReadError::rate_limited("throttled", 100).is_retryable());
+        assert!(!ReadError::permanent("gone").is_retryable());
+        assert!(!ReadError::unsupported("range_read").is_retryable());
     }
 
     // -- Proptest: property-based coverage for error types --
