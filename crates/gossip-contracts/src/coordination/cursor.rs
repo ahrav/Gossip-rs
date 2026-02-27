@@ -20,6 +20,13 @@
 //!   for boundaries accepting untrusted input. These validate both
 //!   emptiness and size limits, returning [`CursorInputError`] on
 //!   violations.
+//!
+//! ## Boundary interop
+//!
+//! Connector-facing code uses the owned `connector::Cursor` wrapper. Boundary
+//! import (`connector::Cursor::try_from_update`) copies into owned wrappers,
+//! while export (`connector::Cursor::as_update`) projects borrowed slices
+//! allocation-free so coordination paths stay lean.
 
 use std::fmt;
 
@@ -46,6 +53,11 @@ pub const MAX_TOKEN_SIZE: usize = 16_384;
 /// - Size limits ([`MAX_KEY_SIZE`], [`MAX_TOKEN_SIZE`]) are enforced
 ///   by the `try_*` constructors but not by the panicking constructors.
 ///   Use the `try_*` variants when accepting untrusted input.
+///
+/// ## Lifetime contract
+///
+/// `CursorUpdate` borrows slices from caller-owned storage. It does not retain
+/// or clone data, so the referenced bytes must outlive the update value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorUpdate<'a> {
     last_key: Option<&'a [u8]>,
@@ -92,6 +104,9 @@ impl<'a> CursorUpdate<'a> {
     /// Construct an update from key + token.
     ///
     /// Empty `token` normalizes to `None`.
+    ///
+    /// `token`-without-`last_key` is unrepresentable because the API requires
+    /// `last_key` as the first argument.
     ///
     /// # Panics
     ///
@@ -154,6 +169,8 @@ impl<'a> CursorUpdate<'a> {
     /// Fallible constructor for key + token updates.
     ///
     /// Empty `token` normalizes to `None`.
+    /// This is a convenience for connectors that encode "no token" as
+    /// an empty byte slice.
     ///
     /// # Errors
     ///
@@ -208,6 +225,19 @@ impl<'a> CursorUpdate<'a> {
     }
 }
 
+#[cfg(test)]
+impl<'a> CursorUpdate<'a> {
+    /// Test-only escape hatch for constructing states that public constructors
+    /// intentionally forbid, so boundary adapters can exercise defensive paths.
+    #[must_use]
+    pub(crate) fn from_raw_parts_for_test(
+        last_key: Option<&'a [u8]>,
+        token: Option<&'a [u8]>,
+    ) -> Self {
+        Self { last_key, token }
+    }
+}
+
 /// Encode cursor fields into a BLAKE3 hasher using a tagged-option format.
 ///
 /// Each optional field is prefixed with a discriminant byte (`0` for `None`,
@@ -245,6 +275,10 @@ impl CanonicalBytes for CursorUpdate<'_> {
 }
 
 /// Error returned by fallible [`CursorUpdate`] constructors.
+///
+/// This type captures local field validation only. There is intentionally no
+/// `TokenWithoutLastKey` variant because that state is unrepresentable through
+/// the public constructors on [`CursorUpdate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorInputError {
     /// The `last_key` was empty.

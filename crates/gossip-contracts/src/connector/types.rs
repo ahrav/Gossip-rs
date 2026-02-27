@@ -12,6 +12,15 @@
 //! | [`ItemRef`] | Opaque handle a connector returns for read/open | 16 KiB | No |
 //! | [`TokenBytes`] | Pagination/resume token the connector round-trips | 16 KiB | No |
 //!
+//! ## Additional boundary types
+//!
+//! - [`Cursor`] owns connector paging state and bridges to borrowed
+//!   [`CursorUpdate`] for coordination APIs.
+//! - [`VersionId`] records whether a connector's version evidence is strong or
+//!   weak while preserving the same [`ObjectVersionId`] representation.
+//! - [`ContentHints`] and [`Location`] are bounded metadata carriers for
+//!   presentation and downstream routing decisions.
+//!
 //! ## Core contract
 //!
 //! - Constructors enforce non-empty bytes and hard upper bounds.
@@ -19,13 +28,19 @@
 //!   without borrowing caller memory.
 //! - Formatting is always redacted (`len + short hash prefix`), so logs can be
 //!   correlated without leaking payload contents. The hash is a truncated
-//!   BLAKE3 digest -- fast, collision-resistant, and deterministic across runs.
+//!   BLAKE3 digest prefix -- fast and deterministic, but intentionally short for
+//!   correlation rather than cryptographic collision guarantees.
 //! - `MAX_ITEM_KEY_SIZE` and `MAX_TOKEN_SIZE` intentionally track coordination
 //!   cursor limits to keep connector paging contracts aligned.
 //!   `MAX_ITEM_REF_SIZE` is independent; it bounds connector-specific handles
 //!   that never enter the cursor path.
+//! - Cursor states with `token` but no `last_key` are invalid by contract and
+//!   rejected when crossing the coordination boundary.
 
 use std::fmt;
+
+use crate::coordination::CursorUpdate;
+use crate::identity::ObjectVersionId;
 
 /// Maximum size of an [`ItemKey`] in bytes (4 KiB).
 ///
@@ -52,10 +67,29 @@ pub const MAX_ITEM_REF_SIZE: usize = 16_384;
 /// `constants_align_with_coordination_limits` test.
 pub const MAX_TOKEN_SIZE: usize = 16_384;
 
+/// Maximum size of [`ContentHints::media_type`] in bytes.
+const MAX_CONTENT_HINT_MEDIA_TYPE_SIZE: usize = 256;
+
+/// Maximum size of [`ContentHints::encoding`] in bytes.
+const MAX_CONTENT_HINT_ENCODING_SIZE: usize = 128;
+
+/// Maximum size of [`Location::display`] in bytes.
+pub const MAX_LOCATION_DISPLAY_SIZE: usize = 4_096;
+
+/// Maximum size of [`Location::url`] in bytes.
+pub const MAX_LOCATION_URL_SIZE: usize = 4_096;
+
 /// Input validation errors for connector boundary value types.
 ///
-/// `Empty` and `TooLarge` are emitted by the byte-wrapper constructors in
-/// this module (`ItemKey`, `ItemRef`, `TokenBytes`).
+/// This single error surface keeps connector-boundary failures easy to route:
+///
+/// - [`Empty`](ConnectorInputError::Empty) and
+///   [`TooLarge`](ConnectorInputError::TooLarge) capture field validation
+///   failures from `ItemKey` / `ItemRef` / `TokenBytes`, and from bounded
+///   metadata constructors ([`ContentHints::try_new`], [`Location::try_new`]).
+/// - [`TokenWithoutLastKey`](ConnectorInputError::TokenWithoutLastKey)
+///   captures a violated paging invariant when converting from coordination's
+///   borrowed [`CursorUpdate`] into owned [`Cursor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorInputError {
     /// A required field was empty (zero-length byte slice).
@@ -68,6 +102,8 @@ pub enum ConnectorInputError {
         /// Upper bound for this field (one of the `MAX_*` constants).
         max: usize,
     },
+    /// Cursor update had `token` without `last_key`.
+    TokenWithoutLastKey,
 }
 
 impl fmt::Display for ConnectorInputError {
@@ -77,6 +113,7 @@ impl fmt::Display for ConnectorInputError {
             Self::TooLarge { field, size, max } => {
                 write!(f, "{field} too large ({size} bytes, max {max})")
             }
+            Self::TokenWithoutLastKey => write!(f, "token must not be present without last_key"),
         }
     }
 }
@@ -319,6 +356,321 @@ define_toxic_bytes! {
     TokenBytes, max = MAX_TOKEN_SIZE
 }
 
+/// Owned cursor used across connector boundaries.
+///
+/// This bridges to/from the coordination layer's borrowed [`CursorUpdate`]
+/// without exposing connector internals to coordination callers.
+///
+/// ## Invariants
+///
+/// - `token` is only meaningful when paired with a `last_key`.
+/// - Constructors make the invalid `(None, Some(token))` state
+///   unrepresentable.
+/// - [`try_from_update`](Self::try_from_update) validates external cursor
+///   updates and rejects token-without-key states via
+///   [`ConnectorInputError::TokenWithoutLastKey`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    last_key: Option<ItemKey>,
+    token: Option<TokenBytes>,
+}
+
+impl Cursor {
+    /// Initial cursor: no progress key and no resume token.
+    ///
+    /// This is the neutral state used at scan start and for defensive
+    /// normalization when malformed external input is discarded.
+    #[inline]
+    #[must_use]
+    pub fn initial() -> Self {
+        Self {
+            last_key: None,
+            token: None,
+        }
+    }
+
+    /// Cursor with a `last_key` and no token.
+    ///
+    /// Use this after processing a page that does not require connector-side
+    /// continuation state.
+    #[inline]
+    #[must_use]
+    pub fn with_last_key(last_key: ItemKey) -> Self {
+        Self {
+            last_key: Some(last_key),
+            token: None,
+        }
+    }
+
+    /// Cursor with both `last_key` and token.
+    ///
+    /// This represents continuation state for connectors that require an
+    /// opaque token in addition to the ordered progress key.
+    #[inline]
+    #[must_use]
+    pub fn with_token(last_key: ItemKey, token: TokenBytes) -> Self {
+        Self {
+            last_key: Some(last_key),
+            token: Some(token),
+        }
+    }
+
+    /// Returns the last fully processed key, if any.
+    #[inline]
+    #[must_use]
+    pub fn last_key(&self) -> Option<&ItemKey> {
+        self.last_key.as_ref()
+    }
+
+    /// Returns the connector-opaque resume token, if any.
+    ///
+    /// `Some` implies [`last_key`](Self::last_key) is also `Some`.
+    #[inline]
+    #[must_use]
+    pub fn token(&self) -> Option<&TokenBytes> {
+        self.token.as_ref()
+    }
+
+    /// Borrow this owned cursor as a coordination [`CursorUpdate`].
+    ///
+    /// This projection is allocation-free. The returned update borrows from
+    /// `self` and remains valid for the same lifetime.
+    ///
+    /// The `(None, Some(_))` state is unreachable because all constructors
+    /// prevent token-without-key. If reached, this panics to surface the
+    /// logic error rather than silently resetting cursor progress.
+    #[inline]
+    #[must_use]
+    pub fn as_update(&self) -> CursorUpdate<'_> {
+        match (&self.last_key, &self.token) {
+            (None, None) => CursorUpdate::initial(),
+            (Some(last_key), None) => CursorUpdate::with_last_key(last_key.as_bytes()),
+            (Some(last_key), Some(token)) => {
+                CursorUpdate::with_token(last_key.as_bytes(), token.as_bytes())
+            }
+            (None, Some(_)) => unreachable!(
+                "Cursor invariant violated: token present without last_key. \
+                 All constructors prevent this state."
+            ),
+        }
+    }
+
+    /// Copy from a borrowed coordination cursor update.
+    ///
+    /// Empty token values normalize to `None` so caller behavior does not
+    /// depend on whether a connector emits "no token" as `None` or `Some([])`.
+    ///
+    /// # Errors
+    ///
+    /// - Returns [`ConnectorInputError::TokenWithoutLastKey`] if `token` is
+    ///   present but `last_key` is not.
+    /// - Returns [`ConnectorInputError::Empty`] / [`ConnectorInputError::TooLarge`]
+    ///   when `last_key` or `token` fail wrapper validation.
+    pub fn try_from_update(update: CursorUpdate<'_>) -> Result<Self, ConnectorInputError> {
+        let last_key = match update.last_key() {
+            None => None,
+            Some(last_key) => Some(ItemKey::try_from_slice(last_key)?),
+        };
+        let token = match update.token() {
+            None => None,
+            Some([]) => None,
+            Some(token) => Some(TokenBytes::try_from_slice(token)?),
+        };
+        if last_key.is_none() && token.is_some() {
+            return Err(ConnectorInputError::TokenWithoutLastKey);
+        }
+        Ok(Self { last_key, token })
+    }
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self::initial()
+    }
+}
+
+/// Version claim strength for an item's content identity.
+///
+/// Connectors often have both a 32-byte derived content identifier and
+/// additional semantics about how trustworthy that identifier is as an
+/// immutability signal. `VersionId` keeps both pieces together:
+///
+/// - variant (`Strong` vs `Weak`) communicates confidence semantics;
+/// - payload ([`ObjectVersionId`]) keeps the hashing/derivation surface stable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VersionId {
+    /// Strong version identity that should reliably reference immutable content.
+    Strong(ObjectVersionId),
+    /// Weak version identity where content may change without version changes.
+    Weak(ObjectVersionId),
+}
+
+impl VersionId {
+    /// Returns the wrapped [`ObjectVersionId`] regardless of claim strength.
+    ///
+    /// This allows downstream code to derive occurrence identities without
+    /// branching on strength semantics.
+    #[inline]
+    #[must_use]
+    pub const fn object_version_id(self) -> ObjectVersionId {
+        match self {
+            Self::Strong(version_id) | Self::Weak(version_id) => version_id,
+        }
+    }
+
+    /// Returns whether this is a strong version identity.
+    ///
+    /// Callers can use this to gate trust-sensitive behavior (for example,
+    /// deciding whether to treat unchanged version IDs as a strong no-change
+    /// signal).
+    #[inline]
+    #[must_use]
+    pub const fn is_strong(self) -> bool {
+        matches!(self, Self::Strong(_))
+    }
+}
+
+/// Optional hints about how to interpret item content.
+///
+/// These fields are intentionally advisory. The contracts layer enforces only
+/// byte-size bounds, not MIME/encoding grammar, so connector implementations
+/// can forward source-native metadata without lossy normalization.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ContentHints {
+    media_type: Option<String>,
+    encoding: Option<String>,
+}
+
+impl ContentHints {
+    /// Construct bounded content hints.
+    ///
+    /// Empty strings are normalized to `None` so callers cannot observe a
+    /// semantic difference between "not provided" and "provided but empty".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorInputError::TooLarge`] when:
+    ///
+    /// - `media_type` exceeds `MAX_CONTENT_HINT_MEDIA_TYPE_SIZE`
+    /// - `encoding` exceeds `MAX_CONTENT_HINT_ENCODING_SIZE`
+    pub fn try_new(
+        media_type: Option<String>,
+        encoding: Option<String>,
+    ) -> Result<Self, ConnectorInputError> {
+        // Normalize empty strings to None before validation.
+        let media_type = media_type.filter(|s| !s.is_empty());
+        let encoding = encoding.filter(|s| !s.is_empty());
+
+        if let Some(media_type) = media_type.as_ref()
+            && media_type.len() > MAX_CONTENT_HINT_MEDIA_TYPE_SIZE
+        {
+            return Err(ConnectorInputError::TooLarge {
+                field: "ContentHints.media_type",
+                size: media_type.len(),
+                max: MAX_CONTENT_HINT_MEDIA_TYPE_SIZE,
+            });
+        }
+        if let Some(encoding) = encoding.as_ref()
+            && encoding.len() > MAX_CONTENT_HINT_ENCODING_SIZE
+        {
+            return Err(ConnectorInputError::TooLarge {
+                field: "ContentHints.encoding",
+                size: encoding.len(),
+                max: MAX_CONTENT_HINT_ENCODING_SIZE,
+            });
+        }
+        Ok(Self {
+            media_type,
+            encoding,
+        })
+    }
+
+    /// Returns the MIME-like media type, if known.
+    ///
+    /// `None` means "unknown" — empty strings are normalized away by the
+    /// constructor.
+    #[inline]
+    #[must_use]
+    pub fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+
+    /// Returns the transfer/content encoding name, if known.
+    ///
+    /// `None` means no encoding hint is available.
+    #[inline]
+    #[must_use]
+    pub fn encoding(&self) -> Option<&str> {
+        self.encoding.as_deref()
+    }
+}
+
+/// Display-safe location metadata for UI/debugging.
+///
+/// `Location` gives consumers a bounded, human-readable reference they can
+/// safely surface in logs and UI without requiring raw connector internals.
+/// `url` is optional and size-bounded, but intentionally not parsed or
+/// canonicalized at this layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    display: String,
+    url: Option<String>,
+}
+
+impl Location {
+    /// Construct a bounded display location.
+    ///
+    /// `display` is required because it is the stable fallback shown when
+    /// no `url` is available or safe to render. Empty URL strings are
+    /// normalized to `None` so callers cannot observe a semantic difference
+    /// between "not provided" and "provided but empty".
+    ///
+    /// # Errors
+    ///
+    /// - [`ConnectorInputError::Empty`] when `display` is empty.
+    /// - [`ConnectorInputError::TooLarge`] when `display` or `url` exceeds
+    ///   the corresponding `MAX_LOCATION_*` limits.
+    pub fn try_new(display: String, url: Option<String>) -> Result<Self, ConnectorInputError> {
+        let url = url.filter(|u| !u.is_empty());
+        if display.is_empty() {
+            return Err(ConnectorInputError::Empty {
+                field: "Location.display",
+            });
+        }
+        if display.len() > MAX_LOCATION_DISPLAY_SIZE {
+            return Err(ConnectorInputError::TooLarge {
+                field: "Location.display",
+                size: display.len(),
+                max: MAX_LOCATION_DISPLAY_SIZE,
+            });
+        }
+        if let Some(url) = url.as_ref()
+            && url.len() > MAX_LOCATION_URL_SIZE
+        {
+            return Err(ConnectorInputError::TooLarge {
+                field: "Location.url",
+                size: url.len(),
+                max: MAX_LOCATION_URL_SIZE,
+            });
+        }
+        Ok(Self { display, url })
+    }
+
+    /// Returns the human-readable location string.
+    #[inline]
+    #[must_use]
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Returns the optional URL-like deep link.
+    #[inline]
+    #[must_use]
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,6 +698,199 @@ mod tests {
             .to_string(),
             "ItemRef too large (9999 bytes, max 10)"
         );
+        assert_eq!(
+            ConnectorInputError::TokenWithoutLastKey.to_string(),
+            "token must not be present without last_key"
+        );
+    }
+
+    #[test]
+    fn cursor_initial_has_no_key_or_token() {
+        let cursor = Cursor::initial();
+        assert!(cursor.last_key().is_none());
+        assert!(cursor.token().is_none());
+        assert_eq!(cursor, Cursor::default());
+
+        let update = cursor.as_update();
+        assert!(update.last_key().is_none());
+        assert!(update.token().is_none());
+    }
+
+    #[test]
+    fn cursor_with_token_roundtrips_through_update() {
+        let key = ItemKey::try_from_slice(b"k-1").unwrap();
+        let token = TokenBytes::try_from_slice(b"tok-1").unwrap();
+        let cursor = Cursor::with_token(key, token);
+
+        let update = cursor.as_update();
+        assert_eq!(update.last_key(), Some(b"k-1".as_slice()));
+        assert_eq!(update.token(), Some(b"tok-1".as_slice()));
+
+        let reparsed = Cursor::try_from_update(update).unwrap();
+        assert_eq!(reparsed, cursor);
+    }
+
+    #[test]
+    fn cursor_with_last_key_roundtrips_through_update() {
+        let key = ItemKey::try_from_slice(b"k-1").unwrap();
+        let cursor = Cursor::with_last_key(key);
+
+        assert!(cursor.last_key().is_some());
+        assert!(cursor.token().is_none());
+
+        let update = cursor.as_update();
+        assert_eq!(update.last_key(), Some(b"k-1".as_slice()));
+        assert!(update.token().is_none());
+
+        let reparsed = Cursor::try_from_update(update).unwrap();
+        assert_eq!(reparsed, cursor);
+    }
+
+    #[test]
+    fn cursor_lifecycle_transitions() {
+        // initial: no key, no token.
+        let c0 = Cursor::initial();
+        assert!(c0.last_key().is_none());
+        assert!(c0.token().is_none());
+
+        // key-only: first page processed.
+        let key1 = ItemKey::try_from_slice(b"k-1").unwrap();
+        let c1 = Cursor::with_last_key(key1);
+        assert_eq!(c1.last_key().unwrap().as_bytes(), b"k-1");
+        assert!(c1.token().is_none());
+
+        // key + token: continuation state.
+        let key2 = ItemKey::try_from_slice(b"k-2").unwrap();
+        let tok = TokenBytes::try_from_slice(b"resume").unwrap();
+        let c2 = Cursor::with_token(key2, tok);
+        assert_eq!(c2.last_key().unwrap().as_bytes(), b"k-2");
+        assert_eq!(c2.token().unwrap().as_bytes(), b"resume");
+
+        // back to initial: scan reset.
+        let c3 = Cursor::initial();
+        assert_eq!(c3, c0);
+    }
+
+    #[test]
+    fn cursor_try_from_update_rejects_token_without_last_key() {
+        let invalid = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
+            None,
+            Some(b"tok-1"),
+        );
+        assert_eq!(
+            Cursor::try_from_update(invalid),
+            Err(ConnectorInputError::TokenWithoutLastKey)
+        );
+    }
+
+    #[test]
+    fn cursor_try_from_update_normalizes_empty_token_to_none() {
+        let update = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
+            Some(b"k-1"),
+            Some(b""),
+        );
+        let cursor = Cursor::try_from_update(update).unwrap();
+        assert_eq!(cursor.last_key().unwrap().as_bytes(), b"k-1");
+        assert!(cursor.token().is_none());
+    }
+
+    #[test]
+    fn version_id_helpers_work() {
+        let object_version = ObjectVersionId::from_version_bytes(b"v1");
+        let strong = VersionId::Strong(object_version);
+        let weak = VersionId::Weak(object_version);
+        assert!(strong.is_strong());
+        assert!(!weak.is_strong());
+        assert_eq!(strong.object_version_id(), object_version);
+        assert_eq!(weak.object_version_id(), object_version);
+    }
+
+    #[test]
+    fn content_hints_normalizes_empty_strings_to_none() {
+        let hints = ContentHints::try_new(Some(String::new()), Some(String::new())).unwrap();
+        assert_eq!(hints.media_type(), None);
+        assert_eq!(hints.encoding(), None);
+
+        let hints =
+            ContentHints::try_new(Some("text/plain".to_owned()), Some(String::new())).unwrap();
+        assert_eq!(hints.media_type(), Some("text/plain"));
+        assert_eq!(hints.encoding(), None);
+    }
+
+    #[test]
+    fn content_hints_accessors_return_values() {
+        let hints =
+            ContentHints::try_new(Some("application/json".to_owned()), Some("gzip".to_owned()))
+                .unwrap();
+        assert_eq!(hints.media_type(), Some("application/json"));
+        assert_eq!(hints.encoding(), Some("gzip"));
+
+        let empty = ContentHints::default();
+        assert_eq!(empty.media_type(), None);
+        assert_eq!(empty.encoding(), None);
+    }
+
+    #[test]
+    fn content_hints_enforce_size_limits() {
+        assert!(ContentHints::try_new(Some("text/plain".to_owned()), None).is_ok());
+        assert!(ContentHints::try_new(None, Some("gzip".to_owned())).is_ok());
+        assert_eq!(
+            ContentHints::try_new(Some("a".repeat(257)), None),
+            Err(ConnectorInputError::TooLarge {
+                field: "ContentHints.media_type",
+                size: 257,
+                max: 256,
+            })
+        );
+        assert_eq!(
+            ContentHints::try_new(None, Some("a".repeat(129))),
+            Err(ConnectorInputError::TooLarge {
+                field: "ContentHints.encoding",
+                size: 129,
+                max: 128,
+            })
+        );
+    }
+
+    #[test]
+    fn location_normalizes_empty_url_to_none() {
+        let loc = Location::try_new("ok".to_owned(), Some(String::new())).unwrap();
+        assert_eq!(loc.display(), "ok");
+        assert_eq!(loc.url(), None);
+    }
+
+    #[test]
+    fn location_validates_required_and_size_limited_fields() {
+        assert_eq!(
+            Location::try_new(String::new(), None),
+            Err(ConnectorInputError::Empty {
+                field: "Location.display",
+            })
+        );
+        assert_eq!(
+            Location::try_new("x".repeat(MAX_LOCATION_DISPLAY_SIZE + 1), None),
+            Err(ConnectorInputError::TooLarge {
+                field: "Location.display",
+                size: MAX_LOCATION_DISPLAY_SIZE + 1,
+                max: MAX_LOCATION_DISPLAY_SIZE,
+            })
+        );
+        assert_eq!(
+            Location::try_new("ok".to_owned(), Some("u".repeat(MAX_LOCATION_URL_SIZE + 1))),
+            Err(ConnectorInputError::TooLarge {
+                field: "Location.url",
+                size: MAX_LOCATION_URL_SIZE + 1,
+                max: MAX_LOCATION_URL_SIZE,
+            })
+        );
+
+        let loc = Location::try_new(
+            "repo/path".to_owned(),
+            Some("https://example.com".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(loc.display(), "repo/path");
+        assert_eq!(loc.url(), Some("https://example.com"));
     }
 
     #[test]
@@ -475,6 +1020,35 @@ mod tests {
                 }
             }
         };
+    }
+
+    /// Generates a valid `Cursor` from one of three variants: initial,
+    /// key-only, or key + token.
+    fn arb_cursor() -> impl Strategy<Value = Cursor> {
+        prop_oneof![
+            Just(Cursor::initial()),
+            proptest::collection::vec(any::<u8>(), 1..=64)
+                .prop_map(|b| Cursor::with_last_key(ItemKey::try_from_vec(b).unwrap())),
+            (
+                proptest::collection::vec(any::<u8>(), 1..=64),
+                proptest::collection::vec(any::<u8>(), 1..=64),
+            )
+                .prop_map(|(k, t)| Cursor::with_token(
+                    ItemKey::try_from_vec(k).unwrap(),
+                    TokenBytes::try_from_vec(t).unwrap(),
+                )),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        #[test]
+        fn cursor_roundtrips_through_update(cursor in arb_cursor()) {
+            let update = cursor.as_update();
+            let reparsed = Cursor::try_from_update(update).unwrap();
+            prop_assert_eq!(reparsed, cursor);
+        }
     }
 
     toxic_bytes_tests! {
