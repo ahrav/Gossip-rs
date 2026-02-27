@@ -13,6 +13,22 @@
 //! | [`EnumerateError`] | Failure from enumeration/listing connector operations |
 //! | [`ReadError`] | Failure from item read/open connector operations |
 //! | [`ConnectorCapabilities`] | Feature-flag struct advertising optional connector abilities |
+//! | [`EnumerationConnector`] | Runtime contract for enumeration operations |
+//! | [`ReadConnector`] | Runtime contract for read/open operations |
+//! | [`ConnectorInstance`] | Convenience supertrait (`EnumerationConnector + ReadConnector`) |
+//!
+//! ## Trait defaults and capability signaling
+//!
+//! The connector traits expose optional hooks with conservative defaults:
+//!
+//! - [`EnumerationConnector::choose_split_point`] defaults to `Ok(None)`.
+//!   Keep this default when the connector cannot provide reliable split hints,
+//!   and advertise `ConnectorCapabilities { split_hints: false, .. }`.
+//! - [`ReadConnector::read_range`] defaults to
+//!   `Err(ReadError::unsupported("range_read"))`.
+//!   Keep this default unless the connector truly supports random-access reads,
+//!   and advertise `ConnectorCapabilities { range_read: true, .. }` only when
+//!   the method is implemented.
 //!
 //! ## Why two structurally identical error types?
 //!
@@ -31,13 +47,18 @@
 //! - `retry_after_ms` is advisory backoff metadata, not a scheduler contract.
 //!   The runtime may enforce stricter global policies regardless of connector
 //!   hints.
-//! - `message` is passthrough connector text. The `Display` impl replaces
-//!   control characters with U+FFFD to prevent log injection, but raw field
-//!   access via [`message()`] returns the original unsanitized value.
+//! - `message` is passthrough connector text. The `Display` impl replaces most
+//!   control characters with U+FFFD (preserving HT/LF/CR) to prevent log
+//!   injection, but raw field access via [`message()`] returns the original
+//!   unsanitized value.
 //! - These types are value-level contracts only. Retry scheduling, circuit
 //!   breaking, and backoff policy live in the runtime crate.
 
-use std::fmt;
+use std::{fmt, io};
+
+use crate::coordination::ShardSpec;
+
+use super::{Budgets, Cursor, EnumerationPage, ItemKey, ItemRef};
 
 /// Binary retry posture for connector operation failures.
 ///
@@ -319,11 +340,138 @@ pub struct ConnectorCapabilities {
     pub split_hints: bool,
 }
 
+/// Runtime contract for connector enumeration/listing operations.
+///
+/// This trait is intentionally separate from [`ReadConnector`]: some backends
+/// can list metadata efficiently but have different cost/failure behavior for
+/// content reads. Keeping the surfaces split lets orchestration compose them
+/// independently, while [`ConnectorInstance`] provides a shorthand bound when
+/// both are required.
+pub trait EnumerationConnector: Send {
+    /// Advertise connector capabilities used by orchestration planning.
+    ///
+    /// This is a declarative, mostly-static profile for the configured
+    /// connector instance. It should align with method behavior, but callers
+    /// must still handle runtime `unsupported`/policy errors.
+    fn caps(&self) -> ConnectorCapabilities;
+
+    /// Enumerate one page of items for `shard` from `cursor` under `budgets`.
+    ///
+    /// Returns scan items plus the continuation cursor for the next request
+    /// (see [`EnumerationPage`]). Empty pages are valid and carry meaning
+    /// through the returned cursor state.
+    fn enumerate_page(
+        &mut self,
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<EnumerationPage, EnumerateError>;
+
+    /// Optional split-point hint for dynamic shard subdivision.
+    ///
+    /// Default behavior is `Ok(None)`, indicating "no hint available". Keep
+    /// this default unless the connector can provide useful, low-risk split
+    /// candidates. Returned hints are advisory and may be ignored by callers.
+    fn choose_split_point(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        Ok(None)
+    }
+}
+
+/// Runtime contract for connector item reads.
+///
+/// This surface is split from [`EnumerationConnector`] so orchestration can
+/// reason separately about metadata traversal and payload IO costs.
+pub trait ReadConnector: Send {
+    /// Open an item for sequential read access.
+    ///
+    /// The returned reader is connector-owned and may stream lazily. Budget
+    /// enforcement strategy (chunking, throttling, deadline behavior) is
+    /// connector-specific.
+    fn open(
+        &mut self,
+        item_ref: &ItemRef,
+        budgets: Budgets,
+    ) -> Result<Box<dyn io::Read + Send>, ReadError>;
+
+    /// Optional range-read fast path.
+    ///
+    /// Writes up to `dst.len()` bytes from `item_ref` starting at `offset`
+    /// into `dst`, returning the number of bytes written.
+    ///
+    /// Connectors without native range support should keep this default,
+    /// which returns a permanent [`ReadError::unsupported`] classification.
+    fn read_range(
+        &mut self,
+        _item_ref: &ItemRef,
+        _offset: u64,
+        _dst: &mut [u8],
+        _budgets: Budgets,
+    ) -> Result<usize, ReadError> {
+        Err(ReadError::unsupported("range_read"))
+    }
+}
+
+/// Convenience supertrait for concrete connector instances.
+///
+/// Use this as a bound when a call path requires both enumeration and read
+/// capabilities. The blanket implementation means concrete connector types do
+/// not need an explicit `impl ConnectorInstance`.
+pub trait ConnectorInstance: EnumerationConnector + ReadConnector {}
+
+impl<T: EnumerationConnector + ReadConnector + ?Sized> ConnectorInstance for T {}
+
 #[cfg(test)]
 mod tests {
+    use std::io;
+
     use rstest::rstest;
 
-    use super::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
+    use crate::coordination::ShardSpec;
+
+    use super::{
+        Budgets, ConnectorCapabilities, ConnectorInstance, Cursor, EnumerateError,
+        EnumerationConnector, EnumerationPage, ErrorClass, ItemRef, ReadConnector, ReadError,
+    };
+
+    struct Dummy;
+
+    impl EnumerationConnector for Dummy {
+        fn caps(&self) -> ConnectorCapabilities {
+            ConnectorCapabilities::default()
+        }
+
+        fn enumerate_page(
+            &mut self,
+            _shard: &ShardSpec,
+            _cursor: &Cursor,
+            _budgets: Budgets,
+        ) -> Result<EnumerationPage, EnumerateError> {
+            Err(EnumerateError::permanent("not implemented"))
+        }
+    }
+
+    impl ReadConnector for Dummy {
+        fn open(
+            &mut self,
+            _item_ref: &ItemRef,
+            _budgets: Budgets,
+        ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+            Err(ReadError::permanent("not implemented"))
+        }
+    }
+
+    fn budgets() -> Budgets {
+        Budgets::try_new(4, 1024, None).unwrap_or_else(|err| panic!("valid test budgets: {err}"))
+    }
+
+    fn item_ref() -> ItemRef {
+        ItemRef::try_from_slice(b"dummy-item-ref")
+            .unwrap_or_else(|err| panic!("valid test item ref: {err}"))
+    }
 
     // -- EnumerateError constructor cases (each runs as an isolated sub-test) --
 
@@ -456,12 +604,38 @@ mod tests {
     // -- Standalone tests (unique setup, not worth parameterizing) --
 
     #[test]
-    fn connector_capabilities_default_is_all_false() {
+    fn default_caps_are_conservative() {
         let capabilities = ConnectorCapabilities::default();
         assert!(!capabilities.seek_by_key);
         assert!(!capabilities.token_resume);
         assert!(!capabilities.range_read);
         assert!(!capabilities.split_hints);
+    }
+
+    #[test]
+    fn default_read_range_is_unsupported() {
+        let mut connector = Dummy;
+        let mut dst = [0_u8; 8];
+        let err = connector
+            .read_range(&item_ref(), 0, &mut dst, budgets())
+            .expect_err("default read_range should be unsupported");
+        assert_eq!(err.class(), ErrorClass::Permanent);
+        assert!(err.message().contains("not supported"));
+    }
+
+    #[test]
+    fn default_choose_split_point_returns_none() {
+        let mut connector = Dummy;
+        let split = connector
+            .choose_split_point(&ShardSpec::unbounded(), &Cursor::initial())
+            .expect("default choose_split_point should not fail");
+        assert!(split.is_none());
+    }
+
+    #[test]
+    fn dummy_is_connector_instance() {
+        fn assert_connector_instance<T: ConnectorInstance>() {}
+        assert_connector_instance::<Dummy>();
     }
 
     #[test]

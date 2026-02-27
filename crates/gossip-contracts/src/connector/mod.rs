@@ -11,12 +11,21 @@
 //!
 //! - `types.rs` defines validated value wrappers and paging/value invariants
 //!   (including toxic-byte redaction and size bounds).
-//! - `api.rs` defines operation-outcome classification and optional capability
-//!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
-//!   `ConnectorCapabilities`).
+//! - `api.rs` defines operation-outcome classification, optional capability
+//!   negotiation, and runtime connector trait contracts plus their conservative
+//!   defaults (`ErrorClass`, `EnumerateError`, `ReadError`,
+//!   `ConnectorCapabilities`, `EnumerationConnector`, `ReadConnector`,
+//!   `ConnectorInstance`).
 //!
 //! Re-exporting both sets here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
+//!
+//! ## Trait composition tradeoff
+//!
+//! Enumeration and reads are split into separate traits to reflect different
+//! scaling/failure domains (metadata traversal vs payload IO). This keeps
+//! call sites honest about which capability they require. For paths that need
+//! both, [`ConnectorInstance`] provides a single bound via blanket impl.
 //!
 //! ## Invariants
 //!
@@ -40,6 +49,9 @@
 //! - Validation errors: [`ConnectorInputError`]
 //! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
 //! - Connector feature flags: [`ConnectorCapabilities`]
+//! - Runtime connector traits: [`EnumerationConnector`], [`ReadConnector`],
+//!   [`ConnectorInstance`] (`choose_split_point` defaults to no hint;
+//!   `read_range` defaults to unsupported)
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
@@ -55,7 +67,10 @@ mod api;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
-pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
+pub use api::{
+    ConnectorCapabilities, ConnectorInstance, EnumerateError, EnumerationConnector, ErrorClass,
+    ReadConnector, ReadError,
+};
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
     Location, MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE,
