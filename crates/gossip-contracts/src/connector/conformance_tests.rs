@@ -174,6 +174,14 @@ fn item_observation_display_uses_only_safe_digests() {
     },
     "next_cursor.last_key mismatch at page 6:"
 )]
+#[case::cursor_last_item_mismatch_none(
+    ConformanceError::CursorDoesNotMatchLastItem {
+        at_page: 7,
+        cursor_key: None,
+        last_item_key: Digest32::of_bytes(RAW_KEY_BYTES),
+    },
+    "cursor_key=<none>"
+)]
 #[case::duplicate_key(
     ConformanceError::DuplicateKeyInRun {
         key: Digest32::of_bytes(RAW_KEY_BYTES),
@@ -263,4 +271,38 @@ fn digest32_display_only_contains_len_and_prefix() {
         prefix.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f')),
         "prefix must be lowercase hex: {prefix}"
     );
+}
+
+#[test]
+fn digest32_empty_input() {
+    let d = Digest32::of_bytes(b"");
+    assert_eq!(d, Digest32::of_bytes(b""), "empty input must be stable");
+    assert_ne!(d, Digest32::of_bytes(b"\0"), "empty differs from null byte");
+    let rendered = d.to_string();
+    assert!(
+        rendered.starts_with("len=0 hash_prefix8="),
+        "empty input must display len=0: {rendered}"
+    );
+}
+
+proptest::proptest! {
+    #![proptest_config(crate::test_util::miri_proptest_config())]
+
+    #[test]
+    fn digest32_stability(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256)) {
+        let a = Digest32::of_bytes(&bytes);
+        let b = Digest32::of_bytes(&bytes);
+        proptest::prop_assert_eq!(a, b, "of_bytes must be deterministic");
+    }
+
+    #[test]
+    fn digest32_collision_freedom(
+        x in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        y in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+    ) {
+        proptest::prelude::prop_assume!(x != y);
+        let dx = Digest32::of_bytes(&x);
+        let dy = Digest32::of_bytes(&y);
+        proptest::prop_assert_ne!(dx, dy, "distinct inputs must produce distinct digests");
+    }
 }

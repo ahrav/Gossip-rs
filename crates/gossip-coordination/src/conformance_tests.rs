@@ -259,6 +259,100 @@ fn idempotency_before_lease_validation() {
     );
 }
 
+/// Split-residual narrowing is preserved through a park/unpark round-trip.
+///
+/// Performs split_residual (narrowing [a,z) to [a,m)), parks the shard,
+/// unparks it, and re-acquires. Verifies three properties across all
+/// transitions: (1) the narrowed key range [a,m) persists, (2) the cursor
+/// from before the split is preserved, and (3) fence monotonicity holds
+/// at every step.
+///
+/// Invariants under test: split-residual spec narrowing, cursor
+/// preservation across park/unpark, fence monotonicity through admin ops.
+#[test]
+fn split_residual_preserved_through_park_unpark() {
+    let mut coord = seeded_coordinator();
+
+    let lease = acquire_shard(&mut coord, 10, 1);
+    let f0 = lease.fence();
+
+    // Checkpoint at "d" within original [a,z).
+    checkpoint_ok(&mut coord, 11, &lease, b"d", 1);
+
+    // Split residual: parent narrows to [a,m).
+    let plan = test_split_residual_plan();
+    let result = coord
+        .split_residual(now(12), test_tenant(), &lease, plan, OpId::from_raw(2))
+        .unwrap();
+    assert!(result.is_executed(), "split_residual must be Executed");
+
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(rec.fence_epoch, f0, "split_residual must not change fence");
+
+    // Park the shard.
+    park_ok(&mut coord, 13, &lease, ParkReason::TooManyErrors, 3);
+
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(rec.status, ShardStatus::Parked);
+    assert_eq!(rec.fence_epoch, f0, "park must not change fence");
+    assert_eq!(
+        rec.cursor.last_key(coord.slab()),
+        Some(b"d".as_slice()),
+        "park must preserve cursor"
+    );
+    assert_eq!(
+        rec.spec.key_range_start(coord.slab()),
+        b"a",
+        "park must preserve narrowed range start"
+    );
+    assert_eq!(
+        rec.spec.key_range_end(coord.slab()),
+        b"m",
+        "park must preserve narrowed range end"
+    );
+
+    // Unpark.
+    let _ = coord
+        .unpark_shard(now(14), test_tenant(), test_key(), OpId::from_raw(4))
+        .unwrap();
+
+    let fence_after_unpark = {
+        let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+        assert_eq!(rec.status, ShardStatus::Active);
+        assert!(
+            rec.fence_epoch > f0,
+            "unpark must bump fence above pre-park value"
+        );
+        assert_eq!(
+            rec.cursor.last_key(coord.slab()),
+            Some(b"d".as_slice()),
+            "unpark must preserve cursor through park round-trip"
+        );
+        assert_eq!(
+            rec.spec.key_range_start(coord.slab()),
+            b"a",
+            "unpark must preserve narrowed range start"
+        );
+        assert_eq!(
+            rec.spec.key_range_end(coord.slab()),
+            b"m",
+            "unpark must preserve narrowed range end"
+        );
+        rec.fence_epoch
+    };
+
+    // Re-acquire by a new worker — can checkpoint within narrowed [a,m).
+    let lease2 = acquire_shard(&mut coord, 15, 2);
+    assert!(
+        lease2.fence() > fence_after_unpark,
+        "re-acquire must bump fence again"
+    );
+
+    checkpoint_ok(&mut coord, 16, &lease2, b"f", 5);
+    let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
+    assert_eq!(rec.cursor.last_key(coord.slab()), Some(b"f".as_slice()));
+}
+
 /// Lease validation rejects a forged lease whose fence matches but owner diverges.
 ///
 /// Constructs a lease that has the correct fence epoch but a different
@@ -332,6 +426,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
+        let fence = lease.fence();
         complete_ok(&mut coord, 11, &lease, b"m", 1);
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(
@@ -342,6 +437,7 @@ fn terminal_clears_lease() {
             rec.lease_deadline().is_none(),
             "complete must clear lease deadline"
         );
+        assert_eq!(rec.fence_epoch, fence, "complete must not change fence");
         assert_eq!(rec.status, ShardStatus::Done);
     }
 
@@ -349,6 +445,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
+        let fence = lease.fence();
         park_ok(&mut coord, 11, &lease, ParkReason::TooManyErrors, 1);
         let rec = coord.shard_lookup(&test_tenant(), &test_key()).unwrap();
         assert!(rec.lease_owner().is_none(), "park must clear lease owner");
@@ -356,6 +453,7 @@ fn terminal_clears_lease() {
             rec.lease_deadline().is_none(),
             "park must clear lease deadline"
         );
+        assert_eq!(rec.fence_epoch, fence, "park must not change fence");
         assert_eq!(rec.status, ShardStatus::Parked);
     }
 
@@ -363,6 +461,7 @@ fn terminal_clears_lease() {
     {
         let mut coord = seeded_coordinator();
         let lease = acquire_shard(&mut coord, 10, 1);
+        let fence = lease.fence();
         let plan = test_split_replace_plan();
         let _ = coord
             .split_replace(now(11), test_tenant(), &lease, plan, OpId::from_raw(1))
@@ -375,6 +474,10 @@ fn terminal_clears_lease() {
         assert!(
             rec.lease_deadline().is_none(),
             "split_replace must clear lease deadline"
+        );
+        assert_eq!(
+            rec.fence_epoch, fence,
+            "split_replace must not change fence"
         );
         assert_eq!(rec.status, ShardStatus::Split);
     }
@@ -511,6 +614,28 @@ fn split_coverage_key_range_partition() {
     // Both children are Active.
     assert_eq!(rec_a.status, ShardStatus::Active);
     assert_eq!(rec_b.status, ShardStatus::Active);
+
+    // Acquire child_a and checkpoint within its range [a,m).
+    let mut scratch = crate::AcquireScratch::new();
+    let child_lease = coord
+        .acquire_and_restore_into(now(12), test_tenant(), key_a, test_worker(1), &mut scratch)
+        .expect("child acquire must succeed")
+        .lease;
+    let _ = coord
+        .checkpoint(
+            now(13),
+            test_tenant(),
+            &child_lease,
+            &test_cursor(b"f"),
+            OpId::from_raw(2),
+        )
+        .expect("child checkpoint must succeed");
+    let rec_a = coord.shard_lookup(&test_tenant(), &key_a).unwrap();
+    assert_eq!(
+        rec_a.cursor.last_key(coord.slab()),
+        Some(b"f".as_slice()),
+        "child checkpoint must advance cursor"
+    );
 }
 
 /// Op-log eviction interacts correctly with idempotency on a terminal shard.
