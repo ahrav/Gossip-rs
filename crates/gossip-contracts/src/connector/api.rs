@@ -360,6 +360,10 @@ pub trait EnumerationConnector: Send {
     /// Returns scan items plus the continuation cursor for the next request
     /// (see [`EnumerationPage`]). Empty pages are valid and carry meaning
     /// through the returned cursor state.
+    ///
+    /// Connectors **should** honor [`Budgets::max_items`] as an upper bound on
+    /// the returned page length. The runtime **may** truncate excess items or
+    /// terminate the connector if this bound is violated.
     fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
@@ -372,6 +376,8 @@ pub trait EnumerationConnector: Send {
     /// Default behavior is `Ok(None)`, indicating "no hint available". Keep
     /// this default unless the connector can provide useful, low-risk split
     /// candidates. Returned hints are advisory and may be ignored by callers.
+    /// Runtime callers **should** validate that returned keys fall within
+    /// the shard's key range before acting on them.
     fn choose_split_point(
         &mut self,
         _shard: &ShardSpec,
@@ -388,9 +394,22 @@ pub trait EnumerationConnector: Send {
 pub trait ReadConnector: Send {
     /// Open an item for sequential read access.
     ///
-    /// The returned reader is connector-owned and may stream lazily. Budget
-    /// enforcement strategy (chunking, throttling, deadline behavior) is
-    /// connector-specific.
+    /// The returned reader must be self-contained (`'static`): because the
+    /// return type is `Box<dyn io::Read + Send>`, implementations cannot
+    /// borrow from `&self` or other local references. Readers must own their
+    /// resources (e.g., an open file handle, a cloned HTTP client, or an
+    /// `Arc`-backed buffer).
+    ///
+    /// Budget enforcement strategy (chunking, throttling, deadline behavior)
+    /// is connector-specific.
+    ///
+    /// # Caller obligations
+    ///
+    /// The trait cannot enforce size or deadline limits on the returned reader.
+    /// Runtime callers **must** wrap it in a size-bounded, deadline-aware adapter
+    /// before passing it to downstream consumers. Callers may drop the reader
+    /// at any point; implementations must ensure resource cleanup via [`Drop`],
+    /// not via read-to-completion.
     fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -400,7 +419,15 @@ pub trait ReadConnector: Send {
     /// Optional range-read fast path.
     ///
     /// Writes up to `dst.len()` bytes from `item_ref` starting at `offset`
-    /// into `dst`, returning the number of bytes written.
+    /// into `dst`, returning the number of bytes written. Implementations
+    /// **must** return a value `<= dst.len()`. Runtime callers **should**
+    /// defensively clamp before using the value as a slice bound.
+    ///
+    /// **EOF behavior:** when `offset` is at or past the end of the item,
+    /// implementations must return `Ok(0)` (consistent with
+    /// [`std::io::Read`] semantics). A short read (returned count less than
+    /// `dst.len()`) does not necessarily indicate EOF -- only `Ok(0)` is
+    /// the definitive end-of-item signal.
     ///
     /// Connectors without native range support should keep this default,
     /// which returns a permanent [`ReadError::unsupported`] classification.

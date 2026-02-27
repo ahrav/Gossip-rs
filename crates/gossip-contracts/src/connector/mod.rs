@@ -20,12 +20,10 @@
 //! Re-exporting both sets here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
 //!
-//! ## Trait composition tradeoff
+//! ## Trait composition
 //!
-//! Enumeration and reads are split into separate traits to reflect different
-//! scaling/failure domains (metadata traversal vs payload IO). This keeps
-//! call sites honest about which capability they require. For paths that need
-//! both, [`ConnectorInstance`] provides a single bound via blanket impl.
+//! See [`EnumerationConnector`] for the rationale behind the enumeration/read
+//! trait split and [`ConnectorInstance`] for the convenience supertrait.
 //!
 //! ## Invariants
 //!
