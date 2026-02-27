@@ -1,13 +1,14 @@
-//! Connector boundary value types shared between connector runtimes and
-//! coordinator-facing contracts.
+//! Connector contract types and page-validation diagnostics shared between
+//! connector runtimes and coordinator-facing contracts.
 //!
-//! This module intentionally stays narrow: it exports validated wrapper types
-//! for connector-originated bytes (`ItemKey`, `ItemRef`, `TokenBytes`) plus
-//! cursor/version/display metadata types used by connector enumeration flows.
+//! This module intentionally stays narrow: it exports validated wrapper types for
+//! connector-originated bytes (`ItemKey`, `ItemRef`, `TokenBytes`), cursor and
+//! metadata types used by enumeration/read flows, and page-level validation
+//! diagnostics used to reject malformed connector pages.
 //!
 //! ## Surface split
 //!
-//! The connector contract surface is intentionally split in two:
+//! The connector contract surface is intentionally split into focused layers:
 //!
 //! - `types.rs` defines validated value wrappers and paging/value invariants
 //!   (including toxic-byte redaction and size bounds).
@@ -16,8 +17,10 @@
 //!   defaults (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`, `EnumerationConnector`, `ReadConnector`,
 //!   `ConnectorInstance`).
+//! - `page_validator.rs` defines log-safe page-validation diagnostics plus
+//!   validation helpers (`validate_page` and generic `validate_page_range`).
 //!
-//! Re-exporting both sets here gives runtime crates a single import boundary
+//! Re-exporting all three layers here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
 //!
 //! ## Trait composition
@@ -34,7 +37,7 @@
 //!   `CursorUpdate`.
 //! - `MAX_ITEM_KEY_SIZE` and `MAX_TOKEN_SIZE` mirror coordination cursor
 //!   limits so connector paging state and cursor updates stay aligned.
-//!   Alignment is verified by `types::tests::constants_align_with_coordination_limits`.
+//!   Alignment is covered by connector type tests.
 //!
 //! ## Public surface
 //!
@@ -45,6 +48,14 @@
 //! - Enumeration composites: [`ScanItem`], [`EnumerationPage`]
 //! - Scan budgets: [`Budgets`]
 //! - Validation errors: [`ConnectorInputError`]
+//! - Page-validation diagnostics: [`PageValidationError`],
+//!   [`PageValidationViolation`], [`PageValidationDetails`],
+//!   [`CursorWhich`], [`ToxicDigest`]
+//! - Page-validation trait: [`page_validator::PageItem`] (stays module-qualified;
+//!   used by generic [`page_validator::validate_page_range`])
+//! - Page-validation helper: [`validate_page`] (generic
+//!   `validate_page_range` stays module-qualified to avoid widening the root
+//!   surface)
 //! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
 //! - Connector feature flags: [`ConnectorCapabilities`]
 //! - Runtime connector traits: [`EnumerationConnector`], [`ReadConnector`],
@@ -62,12 +73,17 @@
 //! scheduling, backoff policy) live in runtime crates.
 
 mod api;
+pub mod page_validator;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use api::{
     ConnectorCapabilities, ConnectorInstance, EnumerateError, EnumerationConnector, ErrorClass,
     ReadConnector, ReadError,
+};
+pub use page_validator::{
+    CursorWhich, PageValidationDetails, PageValidationError, PageValidationViolation, ToxicDigest,
+    validate_page,
 };
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
