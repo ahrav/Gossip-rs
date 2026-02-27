@@ -362,9 +362,14 @@ pub trait EnumerationConnector: Send {
     /// (see [`EnumerationPage`]). Empty pages are valid and carry meaning
     /// through the returned cursor state.
     ///
-    /// Connectors **should** honor [`Budgets::max_items`] as an upper bound on
-    /// the returned page length. The runtime **may** truncate excess items or
-    /// terminate the connector if this bound is violated.
+    /// # Budget enforcement
+    ///
+    /// [`Budgets`] values are **advisory at this trait layer**. Connector
+    /// implementations **should** honor [`Budgets::max_items`] as an upper
+    /// bound on the returned page length, but callers **must not** assume
+    /// compliance. The runtime orchestration layer is responsible for
+    /// enforcement: it **may** truncate excess items, apply backpressure,
+    /// or terminate a misbehaving connector.
     fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
@@ -400,22 +405,30 @@ pub trait EnumerationConnector: Send {
 pub trait ReadConnector: Send {
     /// Open an item for sequential read access.
     ///
-    /// The returned reader must be self-contained (`'static`): because the
-    /// return type is `Box<dyn io::Read + Send>`, implementations cannot
-    /// borrow from `&self` or other local references. Readers must own their
-    /// resources (e.g., an open file handle, a cloned HTTP client, or an
+    /// # Return type: `Box<dyn Read + Send>`
+    ///
+    /// The boxed trait object is intentional: it preserves object safety so
+    /// callers can work with `dyn ReadConnector` at runtime (connector
+    /// polymorphism). The heap allocation is acceptable because `open` sits
+    /// on the **WARM** read path — called once per item, not per byte —
+    /// and the IO cost of the subsequent read dominates.
+    ///
+    /// The returned reader must be self-contained (`'static`): implementations
+    /// cannot borrow from `&self` or other local references. Readers must own
+    /// their resources (e.g., an open file handle, a cloned HTTP client, or an
     /// `Arc`-backed buffer).
     ///
-    /// Budget enforcement strategy (chunking, throttling, deadline behavior)
-    /// is connector-specific.
+    /// # Budget enforcement
     ///
-    /// # Caller obligations
+    /// [`Budgets`] values are **advisory at this trait layer**. Connector
+    /// implementations **should** respect budget hints (e.g., for chunked
+    /// fetching or deadline-aware reads), but callers **must not** assume
+    /// compliance. The runtime orchestration layer is responsible for
+    /// enforcement: it **must** wrap the returned reader in a size-bounded,
+    /// deadline-aware adapter before passing it to downstream consumers.
     ///
-    /// The trait cannot enforce size or deadline limits on the returned reader.
-    /// Runtime callers **must** wrap it in a size-bounded, deadline-aware adapter
-    /// before passing it to downstream consumers. Callers may drop the reader
-    /// at any point; implementations must ensure resource cleanup via [`Drop`],
-    /// not via read-to-completion.
+    /// Callers may drop the reader at any point; implementations must ensure
+    /// resource cleanup via [`Drop`], not via read-to-completion.
     fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -428,6 +441,13 @@ pub trait ReadConnector: Send {
     /// into `dst`, returning the number of bytes written. Implementations
     /// **must** return a value `<= dst.len()`. Runtime callers **should**
     /// defensively clamp before using the value as a slice bound.
+    ///
+    /// # Overflow safety
+    ///
+    /// Implementors **must** guard against `offset + dst.len()` overflow
+    /// before performing arithmetic on the combined value. Use
+    /// `offset.checked_add(dst.len() as u64)` and return an appropriate
+    /// [`ReadError`] if the addition wraps.
     ///
     /// **EOF behavior:** when `offset` is at or past the end of the item,
     /// implementations must return `Ok(0)` (consistent with
@@ -453,6 +473,15 @@ pub trait ReadConnector: Send {
 /// Use this as a bound when a call path requires both enumeration and read
 /// capabilities. The blanket implementation means connector types do not
 /// need an explicit `impl ConnectorInstance`.
+///
+/// # Design constraint
+///
+/// Because there is a blanket `impl<T: EnumerationConnector + ReadConnector>
+/// ConnectorInstance for T`, adding methods to this trait would require every
+/// `EnumerationConnector + ReadConnector` type to implement them. This is
+/// intentional: `ConnectorInstance` is a **pure bound alias**, not an
+/// extension point. New connector surface area belongs on
+/// [`EnumerationConnector`] or [`ReadConnector`] directly.
 pub trait ConnectorInstance: EnumerationConnector + ReadConnector {}
 
 impl<T: EnumerationConnector + ReadConnector + ?Sized> ConnectorInstance for T {}
