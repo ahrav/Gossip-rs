@@ -1,23 +1,49 @@
-// Conformance types are consumed by the conformance harness (not yet landed).
-// The module is `pub(crate)` so the harness can import these types.
 #![allow(dead_code)]
 
 //! Conformance harness configuration and digest-only diagnostic vocabulary.
 //!
-//! This module is a contracts-only surface for connector conformance checks.
-//! It provides:
+//! The conformance harness validates that a connector implementation
+//! satisfies the enumeration contract defined in the connector API module. A typical
+//! conformance session:
 //!
-//! - strict-by-default harness configuration knobs ([`ConformanceConfig`]),
-//! - observation types for cross-run comparisons
-//!   ([`ToxicDigest`], [`ItemObservation`], [`EnumerationTrace`]),
-//! - and an invariant-failure taxonomy ([`ConformanceError`]).
+//! 1. Performs a **baseline** full enumeration, collecting
+//!    [`ItemObservation`]s and cursor checkpoints into an
+//!    [`EnumerationTrace`].
+//! 2. Optionally performs a **comparison** run and checks determinism
+//!    (item-by-item digest equality).
+//! 3. Selects restart points from the baseline trace and performs
+//!    **resume** runs under token perturbation ([`ResumeChecks`]),
+//!    verifying that the suffix of items matches the baseline.
+//! 4. Scans every `ItemRef` for forbidden byte patterns
+//!    ([`SecretScanConfig`]) to catch accidental credential leakage.
+//!
+//! This module provides the types that parameterize and report on those
+//! steps:
+//!
+//! - **Configuration**: strict-by-default harness knobs
+//!   ([`ConformanceConfig`]) that control page limits, ordering policy,
+//!   determinism expectations, resume-path perturbation, and secret scanning.
+//! - **Observation types**: digest-only records for cross-run comparison
+//!   ([`ItemObservation`], [`EnumerationTrace`]).
+//! - **Error taxonomy**: a flat enum ([`ConformanceError`]) covering every
+//!   failure mode from capability gates through secret-scan findings.
+//!
+//! ## Relationship to page validation
+//!
+//! Per-page structural checks (ordering, cursor membership, range bounds)
+//! are delegated to [`super::page_validator::validate_page`]. This module
+//! layers additional cross-page and cross-run checks on top: duplicate
+//! detection, strict-increase enforcement, determinism comparison, and
+//! resume-path suffix matching.
 //!
 //! ## Invariants
 //!
-//! - Conformance diagnostic payloads represented by [`ToxicDigest`] avoid raw
-//!   connector byte exposure.
-//! - [`ToxicDigest`] and [`ItemObservation`] format as redacted, stable tokens for
-//!   log correlation.
+//! - All diagnostic payloads use [`ToxicDigest`] -- no raw connector bytes
+//!   appear in error messages or trace records.
+//! - [`ToxicDigest`] and [`ItemObservation`] format as redacted, stable
+//!   tokens suitable for log correlation.
+//! - [`ConformanceConfig::default()`] is intentionally strict: connectors
+//!   must explicitly opt out of checks they cannot satisfy.
 //!
 //! ## Trade-off
 //!
@@ -69,27 +95,50 @@ pub const DEFAULT_FORBIDDEN_ITEMREF_PATTERNS: &[&[u8]] = &[
     b"mongodb+srv://",
 ];
 
-/// Whether a connector run is expected to be fully deterministic.
+/// Whether repeated full enumeration runs are expected to produce identical
+/// item sequences.
+///
+/// The harness uses this to decide whether to compare a second full run
+/// against the baseline. Connectors backed by mutable or eventually-consistent
+/// data sources should use [`BestEffort`](Self::BestEffort) to avoid spurious
+/// failures from concurrent writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeterminismExpectation {
-    /// Repeated full scans are expected to produce identical observations.
+    /// Repeated full scans must produce identical [`ItemObservation`]
+    /// sequences. The harness compares a second run element-by-element and
+    /// reports [`ConformanceError::DeterminismMismatch`] on the first
+    /// divergence.
     Deterministic,
     /// Determinism is not strictly required by caller policy.
     ///
-    /// This type records the expectation only; enforcement behavior is defined
-    /// by the harness that consumes this configuration.
+    /// The harness records but does not fail on cross-run differences. This
+    /// is appropriate for connectors over live, mutable data sources where
+    /// concurrent modifications may change enumeration results between runs.
     BestEffort,
 }
 
 /// Resume-by-key checks toggled by the conformance harness.
 ///
-/// Each flag independently enables a token perturbation scenario. Keeping the
-/// controls separate allows callers to narrow failures to one recovery path.
+/// The conformance harness tests a connector's ability to resume enumeration
+/// using only the cursor `last_key` (without a valid pagination token). Each
+/// flag independently enables a token perturbation scenario:
+///
+/// - **`drop_token`**: the harness removes the cursor's `token` field
+///   entirely, leaving only `last_key`. The connector must resume from the
+///   key position without the token.
+/// - **`corrupt_token`**: the harness replaces the cursor's `token` with
+///   random bytes. The connector must either fall back to key-based resume
+///   or reject the corrupted token gracefully.
+///
+/// Keeping the controls separate allows callers to narrow failures to one
+/// recovery path at a time.
+///
+/// Both flags default to `true` so connectors must explicitly opt out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResumeChecks {
-    /// Require forward progress when pagination token state is removed.
+    /// When `true`, test resume with the pagination token removed entirely.
     pub drop_token: bool,
-    /// Require forward progress when pagination token state is corrupted.
+    /// When `true`, test resume with the pagination token replaced by random bytes.
     pub corrupt_token: bool,
 }
 
@@ -97,6 +146,7 @@ impl ResumeChecks {
     /// Iterates over the [`ResumeMode`] variants enabled by this configuration.
     ///
     /// Returns zero, one, or two items depending on which flags are set.
+    /// Emission order is always `DropToken` before `CorruptToken`.
     pub fn modes(&self) -> impl Iterator<Item = ResumeMode> {
         self.drop_token
             .then_some(ResumeMode::DropToken)
@@ -114,17 +164,31 @@ impl Default for ResumeChecks {
     }
 }
 
-/// Best-effort secret scan configuration for `ItemRef` bytes.
+/// Best-effort secret scan configuration for [`ItemRef`](super::ItemRef) bytes.
+///
+/// The harness performs a byte-substring search over every `ItemRef` emitted
+/// during an enumeration run. A match triggers
+/// [`ConformanceError::ItemRefAppearsToContainSecret`] with digest-only
+/// diagnostics (no raw bytes are exposed).
 ///
 /// This is a heuristic leak-detection surface. It is intentionally configurable
 /// so tests can tune false-positive/false-negative trade-offs per connector.
+/// Defaults enable scanning with [`DEFAULT_FORBIDDEN_ITEMREF_PATTERNS`] and
+/// no additional canaries.
 #[derive(Clone, Debug)]
 pub struct SecretScanConfig {
-    /// Global on/off switch for secret scanning.
+    /// Global on/off switch for secret scanning. When `false`, the harness
+    /// skips all substring and canary checks.
     pub enabled: bool,
     /// Byte substrings that should not appear in connector item references.
+    /// Defaults to [`DEFAULT_FORBIDDEN_ITEMREF_PATTERNS`]. Callers can
+    /// narrow or extend this list per connector to manage false positives.
     pub forbidden_substrings: Vec<&'static [u8]>,
-    /// Full-byte canaries injected by tests for connector-specific leak checks.
+    /// Full-byte canaries injected by tests for connector-specific leak
+    /// checks. Unlike `forbidden_substrings` (which match common credential
+    /// prefixes), canaries are exact secret values that a test plants in the
+    /// connector's credential store and then verifies do not appear in
+    /// enumerated handles.
     pub secret_canaries: Vec<Vec<u8>>,
 }
 
@@ -140,13 +204,22 @@ impl Default for SecretScanConfig {
 
 /// Restart-point selection strategy for resume checks.
 ///
-/// Restart points refer to cursor checkpoint indices from a baseline run.
-/// Index validation and out-of-range handling are owned by the harness.
+/// During a baseline enumeration run the harness records a cursor checkpoint
+/// after each page (stored in [`EnumerationTrace::cursors`]). Resume checks
+/// then pick a subset of those checkpoints, perturb the token, and re-run
+/// enumeration from each selected cursor. This enum controls how the subset
+/// is chosen.
+///
+/// Index validation and out-of-range handling are owned by the harness;
+/// invalid indices are silently clamped or skipped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RestartPoints {
-    /// Choose up to `N` points spread across a baseline run.
+    /// Have the harness automatically choose up to `N` points spread
+    /// evenly across the baseline run's cursor checkpoints. A value of
+    /// `0` disables resume checks even when [`ResumeChecks`] flags are set.
     Auto(usize),
-    /// Restart from explicit cursor checkpoint indices.
+    /// Restart from specific cursor checkpoint indices (zero-based
+    /// positions into [`EnumerationTrace::cursors`]).
     Explicit(&'static [usize]),
 }
 
@@ -156,23 +229,31 @@ pub enum RestartPoints {
 /// checks.
 #[derive(Clone, Debug)]
 pub struct ConformanceConfig {
-    /// Hard cap on number of page requests in a single run.
+    /// Hard cap on page requests per run. The harness stops and reports
+    /// [`ConformanceError::TooManyPages`] when exceeded.
     pub max_pages: NonZeroUsize,
-    /// Hard cap on number of collected items in a single run.
+    /// Hard cap on collected items per run. The harness stops and reports
+    /// [`ConformanceError::TooManyItems`] when exceeded.
     pub max_total_items: NonZeroUsize,
-    /// Budgets forwarded to each `enumerate_page` call.
+    /// [`Budgets`] forwarded to each `enumerate_page` call. Controls
+    /// per-page item count, byte limit, and optional deadline.
     pub page_budgets: Budgets,
-    /// Enforce strictly increasing keys within each page.
+    /// When `true`, the harness requires strictly increasing keys within
+    /// each page (no duplicate keys allowed). When `false`, non-decreasing
+    /// order (as enforced by [`super::page_validator::validate_page`]) is
+    /// sufficient.
     pub require_strict_key_order: bool,
-    /// Enforce `next_cursor.last_key == last_item.key` when pages are non-empty.
+    /// When `true`, non-empty pages must have
+    /// `next_cursor.last_key == last_item.item_key`. This catches
+    /// connectors that advance the cursor past the data they returned.
     pub require_cursor_eq_last_item: bool,
-    /// Cross-run determinism policy.
+    /// Cross-run determinism policy. See [`DeterminismExpectation`].
     pub determinism: DeterminismExpectation,
-    /// Resume-path perturbation checks.
+    /// Which token-perturbation scenarios to exercise during resume checks.
     pub resume_checks: ResumeChecks,
     /// Secret-scan policy for connector `ItemRef` values.
     pub secret_scan: SecretScanConfig,
-    /// Baseline cursor checkpoint selection for resume comparisons.
+    /// How to select baseline cursor checkpoints for resume comparisons.
     pub restart_points: RestartPoints,
 }
 
@@ -195,12 +276,22 @@ impl Default for ConformanceConfig {
     }
 }
 
-/// Per-item observation used for cross-run comparisons.
+/// Digest-only snapshot of one item observed during an enumeration run.
+///
+/// Two observations are compared element-by-element during determinism and
+/// resume checks. The `key` digest identifies position (which item), while
+/// `fingerprint` identifies content (what the item contained). A mismatch
+/// in either field between runs constitutes a conformance failure.
+///
+/// `ItemObservation` is `Copy` (80 bytes: two [`ToxicDigest`] values at
+/// 40 bytes each) and safe to store in bulk inside [`EnumerationTrace`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ItemObservation {
-    /// Digest of the item key.
+    /// BLAKE3 digest of the item's [`ItemKey`](super::ItemKey) bytes.
     pub key: ToxicDigest,
-    /// Digest of the item content, used for cross-run item identity checks.
+    /// BLAKE3 digest derived from item content (e.g., `item_ref` or a
+    /// connector-specific content hash), used to detect content changes
+    /// across runs even when the key remains stable.
     pub fingerprint: ToxicDigest,
 }
 
@@ -212,8 +303,21 @@ impl fmt::Display for ItemObservation {
 
 /// Trace captured from one full enumeration run.
 ///
+/// The harness populates this incrementally: after each `enumerate_page` call
+/// it appends one [`ItemObservation`] per returned item to `items`, pushes
+/// the page's `next_cursor` onto `cursors`, and increments `pages`.
+///
 /// This is a passive record type: it does not enforce internal consistency
-/// between `items`, `cursors`, and `pages`.
+/// between `items`, `cursors`, and `pages`. In particular, `items.len()`
+/// may be less than `pages * page_size` when pages return variable-length
+/// results.
+///
+/// ## Field relationships
+///
+/// - `cursors.len() == pages` (one cursor checkpoint per page response).
+/// - `items` contains every observed item across all pages, in encounter
+///   order. Resume checks slice into this vector using cursor checkpoint
+///   boundaries.
 ///
 /// ## Memory
 ///
@@ -226,31 +330,50 @@ impl fmt::Display for ItemObservation {
 /// large datasets.
 #[derive(Clone, Debug)]
 pub struct EnumerationTrace {
-    /// Item observations in encounter order.
+    /// Item observations in encounter order across all pages.
     pub items: Vec<ItemObservation>,
-    /// Cursor checkpoints captured during the run.
+    /// Cursor checkpoint after each page, in page order. `cursors[i]` is
+    /// the `next_cursor` returned by the `i`-th `enumerate_page` call.
+    /// Resume checks select restart points from this vector.
     pub cursors: Vec<Cursor>,
-    /// Number of page responses observed in the run.
+    /// Total number of page responses observed in the run. Always equals
+    /// `cursors.len()` when the harness populates the trace.
     pub pages: usize,
 }
 
-/// Resume check mode used in mismatch diagnostics.
+/// Token perturbation mode applied during a resume check.
+///
+/// Appears in [`ConformanceError::ResumeMismatch`] and
+/// [`ConformanceError::ResumeLengthMismatch`] to indicate which
+/// perturbation scenario triggered the failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResumeMode {
-    /// Resume comparison where token state was removed.
+    /// The cursor's pagination token was removed before restarting.
+    /// The connector should fall back to key-based positioning.
     DropToken,
-    /// Resume comparison where token state was mutated.
+    /// The cursor's pagination token was replaced with random bytes.
+    /// The connector should detect the invalid token and either reject
+    /// it or fall back to key-based positioning.
     CorruptToken,
 }
 
 /// Conformance failure taxonomy.
 ///
-/// Variants are grouped by failure stage:
-/// - capability gate (`CapabilityMissingSeekByKey`)
-/// - per-page collection/validation failures
-/// - run-level caps and determinism checks
-/// - resume-path mismatch checks
-/// - secret-scan findings
+/// Each variant represents a single, actionable failure. Variants are
+/// ordered by the harness execution stage where they can occur:
+///
+/// 1. **Capability gate** -- connector does not advertise required features.
+/// 2. **Per-page collection** -- `enumerate_page` errors, budget overruns,
+///    and structural violations detected by
+///    [`validate_page`](super::page_validator::validate_page).
+/// 3. **Cross-page checks** -- strict ordering, cursor-last-item matching,
+///    and duplicate key detection within a single run.
+/// 4. **Run-level caps** -- page or item count exceeded.
+/// 5. **Cross-run comparisons** -- determinism mismatch between two full runs.
+/// 6. **Resume checks** -- suffix divergence after token perturbation.
+/// 7. **Secret scan** -- forbidden pattern found in `ItemRef` bytes.
+///
+/// Implements [`std::error::Error`] as a leaf error (no `source()` chain).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConformanceError {
     /// Connector does not advertise required `seek_by_key` capability.
@@ -274,14 +397,19 @@ pub enum ConformanceError {
         /// Maximum allowed item count for this page.
         max: usize,
     },
-    /// Generic page invariant failure from `validate_page`.
+    /// Page-level structural violation detected by
+    /// [`validate_page`](super::page_validator::validate_page). The wrapped
+    /// [`PageValidationError`] carries the specific rule violation and
+    /// redacted diagnostic context.
     PageValidationFailed {
         /// Zero-based page index where violation occurred.
         at_page: usize,
         /// Specific page-validation diagnostic.
         err: PageValidationError,
     },
-    /// Page keys are not strictly increasing where strict order is required.
+    /// Adjacent keys within a page are equal (non-decreasing but not
+    /// strictly increasing). Only raised when
+    /// [`ConformanceConfig::require_strict_key_order`] is `true`.
     NotStrictlyIncreasingWithinPage {
         /// Zero-based page index where violation occurred.
         at_page: usize,
@@ -292,7 +420,9 @@ pub enum ConformanceError {
         /// Next key digest.
         next_key: ToxicDigest,
     },
-    /// Non-empty page returned a cursor key that differs from the last item key.
+    /// Non-empty page returned a cursor key that differs from the last
+    /// item key. Only raised when
+    /// [`ConformanceConfig::require_cursor_eq_last_item`] is `true`.
     CursorDoesNotMatchLastItem {
         /// Zero-based page index where violation occurred.
         at_page: usize,
@@ -316,37 +446,45 @@ pub enum ConformanceError {
         /// Configured maximum number of collected items.
         max_total_items: usize,
     },
-    /// Cross-run item mismatch under deterministic expectation.
+    /// Two full enumeration runs produced different [`ItemObservation`]s at
+    /// the same index. Only raised when
+    /// [`ConformanceConfig::determinism`] is
+    /// [`Deterministic`](DeterminismExpectation::Deterministic).
     DeterminismMismatch {
-        /// Index into compared item sequences.
+        /// Index into the compared item sequences where divergence was first detected.
         at_index: usize,
         /// Observation from baseline run.
         run1: ItemObservation,
         /// Observation from comparison run.
         run2: ItemObservation,
     },
-    /// Resume run diverged from baseline suffix content.
+    /// A resume run from a baseline cursor checkpoint produced a different
+    /// item at the same suffix position. The baseline suffix (items after
+    /// the restart cursor) and the resume run's output should match
+    /// element-by-element when the connector correctly resumes from key.
     ResumeMismatch {
-        /// Baseline cursor checkpoint index used for restart.
+        /// Index into [`EnumerationTrace::cursors`] identifying the restart point.
         restart_cursor_index: usize,
-        /// Token perturbation mode used for this restart.
+        /// Token perturbation mode that triggered this mismatch.
         mode: ResumeMode,
-        /// Index within the compared suffix.
+        /// Zero-based index within the compared suffix where divergence occurred.
         at_index: usize,
-        /// Expected observation from baseline suffix.
+        /// Expected observation from the baseline suffix.
         expected: ItemObservation,
-        /// Observed item from resume run.
+        /// Actual observation from the resume run.
         got: ItemObservation,
     },
-    /// Resume run produced a suffix length different from baseline expectation.
+    /// A resume run produced a different total number of items than the
+    /// baseline suffix. This is checked before element-by-element
+    /// comparison.
     ResumeLengthMismatch {
-        /// Baseline cursor checkpoint index used for restart.
+        /// Index into [`EnumerationTrace::cursors`] identifying the restart point.
         restart_cursor_index: usize,
-        /// Token perturbation mode used for this restart.
+        /// Token perturbation mode that triggered this mismatch.
         mode: ResumeMode,
-        /// Expected suffix length from baseline run.
+        /// Number of items in the baseline suffix (items after the restart cursor).
         expected_len: usize,
-        /// Actual suffix length from resume run.
+        /// Number of items the resume run actually produced.
         got_len: usize,
     },
     /// Secret-scan heuristic found a forbidden pattern inside an `ItemRef`.
@@ -455,6 +593,9 @@ impl fmt::Display for ConformanceError {
     }
 }
 
+/// Leaf error: conformance failures do not wrap an underlying cause.
+/// The `Display` output is log-safe (all byte content is redacted through
+/// [`ToxicDigest`]).
 impl std::error::Error for ConformanceError {}
 
 #[cfg(test)]

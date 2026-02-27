@@ -312,6 +312,38 @@ fn resume_checks_modes_all_combinations() {
     assert_eq!(modes, vec![ResumeMode::CorruptToken]);
 }
 
+#[test]
+fn enumeration_trace_debug_does_not_leak_raw_bytes() {
+    use crate::connector::{Cursor, ItemKey, TokenBytes};
+
+    let raw_key = b"secret-key-material-xyzzy";
+    let raw_token = b"opaque-token-material-plugh";
+    let raw_fp_seed = b"fingerprint-seed-abcde";
+
+    let cursor = Cursor::with_token(
+        ItemKey::try_from_slice(raw_key).unwrap(),
+        TokenBytes::try_from_slice(raw_token).unwrap(),
+    );
+    let trace = EnumerationTrace {
+        items: vec![sample_observation(raw_key, raw_fp_seed)],
+        cursors: vec![cursor],
+        pages: 1,
+    };
+
+    let rendered = format!("{trace:?}");
+
+    for raw in [
+        "secret-key-material-xyzzy",
+        "opaque-token-material-plugh",
+        "fingerprint-seed-abcde",
+    ] {
+        assert!(
+            !rendered.contains(raw),
+            "EnumerationTrace Debug leaked raw bytes marker {raw}: {rendered}"
+        );
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(crate::test_util::miri_proptest_config())]
 
