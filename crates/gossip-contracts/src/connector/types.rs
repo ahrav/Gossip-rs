@@ -20,6 +20,9 @@
 //!   weak while preserving the same [`ObjectVersionId`] representation.
 //! - [`ContentHints`] and [`Location`] are bounded metadata carriers for
 //!   presentation and downstream routing decisions.
+//! - [`ScanItem`] and [`EnumerationPage`] bundle validated boundary fields for
+//!   page-oriented connector enumeration handoff.
+//! - [`Budgets`] carries scan-level stop conditions (count, bytes, deadline).
 //!
 //! ## Core contract
 //!
@@ -37,10 +40,14 @@
 //! - Cursor states with `token` but no `last_key` are invalid by contract and
 //!   rejected when crossing the coordination boundary.
 
-use std::fmt;
+use std::{
+    fmt,
+    num::{NonZeroU64, NonZeroUsize},
+    time::Instant,
+};
 
 use crate::coordination::CursorUpdate;
-use crate::identity::ObjectVersionId;
+use crate::identity::{ObjectVersionId, StableItemId};
 
 /// Maximum size of an [`ItemKey`] in bytes (4 KiB).
 ///
@@ -90,6 +97,8 @@ pub const MAX_LOCATION_URL_SIZE: usize = 4_096;
 /// - [`TokenWithoutLastKey`](ConnectorInputError::TokenWithoutLastKey)
 ///   captures a violated paging invariant when converting from coordination's
 ///   borrowed [`CursorUpdate`] into owned [`Cursor`].
+/// - [`ZeroBudget`](ConnectorInputError::ZeroBudget) rejects zero-valued
+///   budget fields in [`Budgets::try_new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorInputError {
     /// A required field was empty (zero-length byte slice).
@@ -104,6 +113,8 @@ pub enum ConnectorInputError {
     },
     /// Cursor update had `token` without `last_key`.
     TokenWithoutLastKey,
+    /// A budget field was zero, which would make the budget vacuous.
+    ZeroBudget { field: &'static str },
 }
 
 impl fmt::Display for ConnectorInputError {
@@ -114,6 +125,7 @@ impl fmt::Display for ConnectorInputError {
                 write!(f, "{field} too large ({size} bytes, max {max})")
             }
             Self::TokenWithoutLastKey => write!(f, "token must not be present without last_key"),
+            Self::ZeroBudget { field } => write!(f, "{field} must be non-zero"),
         }
     }
 }
@@ -462,8 +474,8 @@ impl Cursor {
     ///
     /// # Errors
     ///
-    /// - Returns [`ConnectorInputError::TokenWithoutLastKey`] if `token` is
-    ///   present but `last_key` is not.
+    /// - Returns [`ConnectorInputError::TokenWithoutLastKey`] if a non-empty
+    ///   `token` is present but `last_key` is not.
     /// - Returns [`ConnectorInputError::Empty`] / [`ConnectorInputError::TooLarge`]
     ///   when `last_key` or `token` fail wrapper validation.
     pub fn try_from_update(update: CursorUpdate<'_>) -> Result<Self, ConnectorInputError> {
@@ -671,401 +683,286 @@ impl Location {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
+/// Connector-owned item metadata produced by an enumeration pass.
+///
+/// `ScanItem` keeps core identity fields (`item_key`, `item_ref`,
+/// `stable_item_id`, `version`) alongside optional bounded metadata used for
+/// presentation and scheduling (`size_hint`, `content_hints`, `location`).
+///
+/// Optional fields default to `None` and can be set with builder-style methods
+/// after constructing the required identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanItem {
+    item_key: ItemKey,
+    item_ref: ItemRef,
+    stable_item_id: StableItemId,
+    version: VersionId,
+    size_hint: Option<u64>,
+    content_hints: Option<ContentHints>,
+    location: Option<Location>,
+}
 
-    #[test]
-    fn constants_align_with_coordination_limits() {
-        use crate::coordination::{CursorMaxTokenSize, MAX_KEY_SIZE};
-        assert_eq!(MAX_ITEM_KEY_SIZE, MAX_KEY_SIZE);
-        assert_eq!(MAX_TOKEN_SIZE, CursorMaxTokenSize);
-    }
-
-    #[test]
-    fn connector_input_error_display_messages() {
-        assert_eq!(
-            ConnectorInputError::Empty { field: "ItemKey" }.to_string(),
-            "ItemKey must not be empty"
-        );
-        assert_eq!(
-            ConnectorInputError::TooLarge {
-                field: "ItemRef",
-                size: 9_999,
-                max: 10,
-            }
-            .to_string(),
-            "ItemRef too large (9999 bytes, max 10)"
-        );
-        assert_eq!(
-            ConnectorInputError::TokenWithoutLastKey.to_string(),
-            "token must not be present without last_key"
-        );
-    }
-
-    #[test]
-    fn cursor_initial_has_no_key_or_token() {
-        let cursor = Cursor::initial();
-        assert!(cursor.last_key().is_none());
-        assert!(cursor.token().is_none());
-        assert_eq!(cursor, Cursor::default());
-
-        let update = cursor.as_update();
-        assert!(update.last_key().is_none());
-        assert!(update.token().is_none());
-    }
-
-    #[test]
-    fn cursor_with_token_roundtrips_through_update() {
-        let key = ItemKey::try_from_slice(b"k-1").unwrap();
-        let token = TokenBytes::try_from_slice(b"tok-1").unwrap();
-        let cursor = Cursor::with_token(key, token);
-
-        let update = cursor.as_update();
-        assert_eq!(update.last_key(), Some(b"k-1".as_slice()));
-        assert_eq!(update.token(), Some(b"tok-1".as_slice()));
-
-        let reparsed = Cursor::try_from_update(update).unwrap();
-        assert_eq!(reparsed, cursor);
-    }
-
-    #[test]
-    fn cursor_with_last_key_roundtrips_through_update() {
-        let key = ItemKey::try_from_slice(b"k-1").unwrap();
-        let cursor = Cursor::with_last_key(key);
-
-        assert!(cursor.last_key().is_some());
-        assert!(cursor.token().is_none());
-
-        let update = cursor.as_update();
-        assert_eq!(update.last_key(), Some(b"k-1".as_slice()));
-        assert!(update.token().is_none());
-
-        let reparsed = Cursor::try_from_update(update).unwrap();
-        assert_eq!(reparsed, cursor);
-    }
-
-    #[test]
-    fn cursor_lifecycle_transitions() {
-        // initial: no key, no token.
-        let c0 = Cursor::initial();
-        assert!(c0.last_key().is_none());
-        assert!(c0.token().is_none());
-
-        // key-only: first page processed.
-        let key1 = ItemKey::try_from_slice(b"k-1").unwrap();
-        let c1 = Cursor::with_last_key(key1);
-        assert_eq!(c1.last_key().unwrap().as_bytes(), b"k-1");
-        assert!(c1.token().is_none());
-
-        // key + token: continuation state.
-        let key2 = ItemKey::try_from_slice(b"k-2").unwrap();
-        let tok = TokenBytes::try_from_slice(b"resume").unwrap();
-        let c2 = Cursor::with_token(key2, tok);
-        assert_eq!(c2.last_key().unwrap().as_bytes(), b"k-2");
-        assert_eq!(c2.token().unwrap().as_bytes(), b"resume");
-
-        // back to initial: scan reset.
-        let c3 = Cursor::initial();
-        assert_eq!(c3, c0);
-    }
-
-    #[test]
-    fn cursor_try_from_update_rejects_token_without_last_key() {
-        let invalid = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
-            None,
-            Some(b"tok-1"),
-        );
-        assert_eq!(
-            Cursor::try_from_update(invalid),
-            Err(ConnectorInputError::TokenWithoutLastKey)
-        );
-    }
-
-    #[test]
-    fn cursor_try_from_update_normalizes_empty_token_to_none() {
-        let update = crate::coordination::cursor::CursorUpdate::from_raw_parts_for_test(
-            Some(b"k-1"),
-            Some(b""),
-        );
-        let cursor = Cursor::try_from_update(update).unwrap();
-        assert_eq!(cursor.last_key().unwrap().as_bytes(), b"k-1");
-        assert!(cursor.token().is_none());
-    }
-
-    #[test]
-    fn version_id_helpers_work() {
-        let object_version = ObjectVersionId::from_version_bytes(b"v1");
-        let strong = VersionId::Strong(object_version);
-        let weak = VersionId::Weak(object_version);
-        assert!(strong.is_strong());
-        assert!(!weak.is_strong());
-        assert_eq!(strong.object_version_id(), object_version);
-        assert_eq!(weak.object_version_id(), object_version);
-    }
-
-    #[test]
-    fn content_hints_normalizes_empty_strings_to_none() {
-        let hints = ContentHints::try_new(Some(String::new()), Some(String::new())).unwrap();
-        assert_eq!(hints.media_type(), None);
-        assert_eq!(hints.encoding(), None);
-
-        let hints =
-            ContentHints::try_new(Some("text/plain".to_owned()), Some(String::new())).unwrap();
-        assert_eq!(hints.media_type(), Some("text/plain"));
-        assert_eq!(hints.encoding(), None);
-    }
-
-    #[test]
-    fn content_hints_accessors_return_values() {
-        let hints =
-            ContentHints::try_new(Some("application/json".to_owned()), Some("gzip".to_owned()))
-                .unwrap();
-        assert_eq!(hints.media_type(), Some("application/json"));
-        assert_eq!(hints.encoding(), Some("gzip"));
-
-        let empty = ContentHints::default();
-        assert_eq!(empty.media_type(), None);
-        assert_eq!(empty.encoding(), None);
-    }
-
-    #[test]
-    fn content_hints_enforce_size_limits() {
-        assert!(ContentHints::try_new(Some("text/plain".to_owned()), None).is_ok());
-        assert!(ContentHints::try_new(None, Some("gzip".to_owned())).is_ok());
-        assert_eq!(
-            ContentHints::try_new(Some("a".repeat(257)), None),
-            Err(ConnectorInputError::TooLarge {
-                field: "ContentHints.media_type",
-                size: 257,
-                max: 256,
-            })
-        );
-        assert_eq!(
-            ContentHints::try_new(None, Some("a".repeat(129))),
-            Err(ConnectorInputError::TooLarge {
-                field: "ContentHints.encoding",
-                size: 129,
-                max: 128,
-            })
-        );
-    }
-
-    #[test]
-    fn location_normalizes_empty_url_to_none() {
-        let loc = Location::try_new("ok".to_owned(), Some(String::new())).unwrap();
-        assert_eq!(loc.display(), "ok");
-        assert_eq!(loc.url(), None);
-    }
-
-    #[test]
-    fn location_validates_required_and_size_limited_fields() {
-        assert_eq!(
-            Location::try_new(String::new(), None),
-            Err(ConnectorInputError::Empty {
-                field: "Location.display",
-            })
-        );
-        assert_eq!(
-            Location::try_new("x".repeat(MAX_LOCATION_DISPLAY_SIZE + 1), None),
-            Err(ConnectorInputError::TooLarge {
-                field: "Location.display",
-                size: MAX_LOCATION_DISPLAY_SIZE + 1,
-                max: MAX_LOCATION_DISPLAY_SIZE,
-            })
-        );
-        assert_eq!(
-            Location::try_new("ok".to_owned(), Some("u".repeat(MAX_LOCATION_URL_SIZE + 1))),
-            Err(ConnectorInputError::TooLarge {
-                field: "Location.url",
-                size: MAX_LOCATION_URL_SIZE + 1,
-                max: MAX_LOCATION_URL_SIZE,
-            })
-        );
-
-        let loc = Location::try_new(
-            "repo/path".to_owned(),
-            Some("https://example.com".to_owned()),
-        )
-        .unwrap();
-        assert_eq!(loc.display(), "repo/path");
-        assert_eq!(loc.url(), Some("https://example.com"));
-    }
-
-    #[test]
-    fn constructors_reject_empty_values() {
-        assert_eq!(
-            ItemKey::try_from_slice(b""),
-            Err(ConnectorInputError::Empty { field: "ItemKey" })
-        );
-        assert_eq!(
-            ItemRef::try_from_slice(b""),
-            Err(ConnectorInputError::Empty { field: "ItemRef" })
-        );
-        assert_eq!(
-            TokenBytes::try_from_slice(b""),
-            Err(ConnectorInputError::Empty {
-                field: "TokenBytes"
-            })
-        );
-    }
-
-    #[test]
-    fn item_key_lexicographic_ordering() {
-        let a = ItemKey::try_from_vec(vec![0x00]).unwrap();
-        let b = ItemKey::try_from_vec(vec![0x00, 0x01]).unwrap();
-        let c = ItemKey::try_from_vec(vec![0x01]).unwrap();
-        let d = ItemKey::try_from_vec(vec![0xFF]).unwrap();
-
-        assert!(a < b, "prefix sorts before longer extension");
-        assert!(b < c, "[0x00,0x01] sorts before [0x01]");
-        assert!(c < d);
-        assert_eq!(a.cmp(&a), std::cmp::Ordering::Equal);
-    }
-
-    #[test]
-    fn boundary_exact_sizes() {
-        // 1-byte (minimum valid).
-        assert!(ItemKey::try_from_slice(&[0xAB]).is_ok());
-        assert!(ItemRef::try_from_slice(&[0xAB]).is_ok());
-        assert!(TokenBytes::try_from_slice(&[0xAB]).is_ok());
-
-        // Exactly MAX (maximum valid).
-        assert!(ItemKey::try_from_vec(vec![0x42; MAX_ITEM_KEY_SIZE]).is_ok());
-        assert!(ItemRef::try_from_vec(vec![0x42; MAX_ITEM_REF_SIZE]).is_ok());
-        assert!(TokenBytes::try_from_vec(vec![0x42; MAX_TOKEN_SIZE]).is_ok());
-
-        // Exactly MAX+1 (minimum invalid).
-        assert!(ItemKey::try_from_vec(vec![0x42; MAX_ITEM_KEY_SIZE + 1]).is_err());
-        assert!(ItemRef::try_from_vec(vec![0x42; MAX_ITEM_REF_SIZE + 1]).is_err());
-        assert!(TokenBytes::try_from_vec(vec![0x42; MAX_TOKEN_SIZE + 1]).is_err());
-    }
-
-    #[test]
-    fn try_from_slice_roundtrips() {
-        let data = b"hello-world";
-        assert_eq!(ItemKey::try_from_slice(data).unwrap().as_bytes(), data);
-        assert_eq!(ItemRef::try_from_slice(data).unwrap().as_bytes(), data);
-        assert_eq!(TokenBytes::try_from_slice(data).unwrap().as_bytes(), data);
-    }
-
-    #[test]
-    fn format_output_is_deterministic() {
-        let key = ItemKey::try_from_vec(vec![0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
-        let output = format!("{key}");
-        let hash = blake3::hash(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let b = hash.as_bytes();
-        let expected = format!(
-            "ItemKey(len=4, hash={:02x}{:02x}{:02x}{:02x}..)",
-            b[0], b[1], b[2], b[3]
-        );
-        assert_eq!(output, expected);
-    }
-
-    /// Generates roundtrip + redaction and oversized-rejection proptests for
-    /// a toxic-byte wrapper type.
-    macro_rules! toxic_bytes_tests {
-        (
-            type = $ty:ident, max = $max:expr,
-            roundtrip_test = $rt:ident,
-            oversized_test = $ov:ident $(,)?
-        ) => {
-            proptest! {
-                #![proptest_config(crate::test_util::miri_proptest_config())]
-
-                #[test]
-                fn $rt(
-                    bytes in proptest::collection::vec(any::<u8>(), 1..=$max),
-                ) {
-                    let val = $ty::try_from_vec(bytes.clone()).unwrap();
-                    prop_assert_eq!(val.as_bytes(), &bytes[..]);
-                    prop_assert_eq!(val.as_ref(), &bytes[..]);
-
-                    let dbg = format!("{val:?}");
-                    let display = format!("{val}");
-                    let prefix = format!(
-                        concat!(stringify!($ty), "(len={}, hash="),
-                        bytes.len(),
-                    );
-                    prop_assert!(dbg.starts_with(&prefix), "Debug: {}", dbg);
-                    prop_assert!(display.starts_with(&prefix), "Display: {}", display);
-
-                    if bytes.len() >= 8 {
-                        let raw = String::from_utf8_lossy(&bytes);
-                        prop_assert!(
-                            !dbg.contains(raw.as_ref()),
-                            "leaked raw bytes in Debug",
-                        );
-                    }
-
-                    prop_assert_eq!(dbg, display, "Debug and Display must match");
-                }
-
-                #[test]
-                fn $ov(
-                    bytes in proptest::collection::vec(
-                        any::<u8>(),
-                        ($max + 1)..=($max + 512),
-                    ),
-                ) {
-                    prop_assert_eq!(
-                        $ty::try_from_vec(bytes.clone()),
-                        Err(ConnectorInputError::TooLarge {
-                            field: stringify!($ty),
-                            size: bytes.len(),
-                            max: $max,
-                        })
-                    );
-                }
-            }
-        };
-    }
-
-    /// Generates a valid `Cursor` from one of three variants: initial,
-    /// key-only, or key + token.
-    fn arb_cursor() -> impl Strategy<Value = Cursor> {
-        prop_oneof![
-            Just(Cursor::initial()),
-            proptest::collection::vec(any::<u8>(), 1..=64)
-                .prop_map(|b| Cursor::with_last_key(ItemKey::try_from_vec(b).unwrap())),
-            (
-                proptest::collection::vec(any::<u8>(), 1..=64),
-                proptest::collection::vec(any::<u8>(), 1..=64),
-            )
-                .prop_map(|(k, t)| Cursor::with_token(
-                    ItemKey::try_from_vec(k).unwrap(),
-                    TokenBytes::try_from_vec(t).unwrap(),
-                )),
-        ]
-    }
-
-    proptest! {
-        #![proptest_config(crate::test_util::miri_proptest_config())]
-
-        #[test]
-        fn cursor_roundtrips_through_update(cursor in arb_cursor()) {
-            let update = cursor.as_update();
-            let reparsed = Cursor::try_from_update(update).unwrap();
-            prop_assert_eq!(reparsed, cursor);
+impl ScanItem {
+    /// Construct a scan item with required identity fields.
+    ///
+    /// Optional metadata fields initialize to `None`.
+    #[must_use]
+    pub fn new(
+        item_key: ItemKey,
+        item_ref: ItemRef,
+        stable_item_id: StableItemId,
+        version: VersionId,
+    ) -> Self {
+        Self {
+            item_key,
+            item_ref,
+            stable_item_id,
+            version,
+            size_hint: None,
+            content_hints: None,
+            location: None,
         }
     }
 
-    toxic_bytes_tests! {
-        type = ItemKey, max = MAX_ITEM_KEY_SIZE,
-        roundtrip_test = item_key_roundtrips_and_redacts,
-        oversized_test = item_key_rejects_oversized,
+    /// Set the optional size hint in bytes.
+    #[must_use]
+    pub fn with_size_hint(self, size_hint: u64) -> Self {
+        Self {
+            size_hint: Some(size_hint),
+            ..self
+        }
     }
 
-    toxic_bytes_tests! {
-        type = ItemRef, max = MAX_ITEM_REF_SIZE,
-        roundtrip_test = item_ref_roundtrips_and_redacts,
-        oversized_test = item_ref_rejects_oversized,
+    /// Set optional content hints.
+    #[must_use]
+    pub fn with_content_hints(self, content_hints: ContentHints) -> Self {
+        Self {
+            content_hints: Some(content_hints),
+            ..self
+        }
     }
 
-    toxic_bytes_tests! {
-        type = TokenBytes, max = MAX_TOKEN_SIZE,
-        roundtrip_test = token_bytes_roundtrips_and_redacts,
-        oversized_test = token_bytes_rejects_oversized,
+    /// Set optional display-safe location metadata.
+    #[must_use]
+    pub fn with_location(self, location: Location) -> Self {
+        Self {
+            location: Some(location),
+            ..self
+        }
+    }
+
+    /// Returns the ordered item key used for paging progression.
+    #[inline]
+    #[must_use]
+    pub fn item_key(&self) -> &ItemKey {
+        &self.item_key
+    }
+
+    /// Returns the connector-opaque item reference used for later reads.
+    #[inline]
+    #[must_use]
+    pub fn item_ref(&self) -> &ItemRef {
+        &self.item_ref
+    }
+
+    /// Returns the stable tenant-independent item identity.
+    #[inline]
+    #[must_use]
+    pub fn stable_item_id(&self) -> StableItemId {
+        self.stable_item_id
+    }
+
+    /// Returns connector-provided version semantics for this item.
+    #[inline]
+    #[must_use]
+    pub fn version(&self) -> VersionId {
+        self.version
+    }
+
+    /// Returns an optional byte-size estimate for this item.
+    #[inline]
+    #[must_use]
+    pub fn size_hint(&self) -> Option<u64> {
+        self.size_hint
+    }
+
+    /// Returns optional content interpretation hints.
+    #[inline]
+    #[must_use]
+    pub fn content_hints(&self) -> Option<&ContentHints> {
+        self.content_hints.as_ref()
+    }
+
+    /// Returns optional display-safe location metadata.
+    #[inline]
+    #[must_use]
+    pub fn location(&self) -> Option<&Location> {
+        self.location.as_ref()
+    }
+
+    /// Consume this scan item, returning its ordered key for cursor advancement.
+    #[inline]
+    #[must_use]
+    pub fn into_item_key(self) -> ItemKey {
+        self.item_key
+    }
+
+    /// Consume the scan item, returning all fields as owned values.
+    ///
+    /// Use this when you need owned access to multiple fields without cloning.
+    /// The tuple order matches the struct field declaration:
+    /// `(item_key, item_ref, stable_item_id, version, size_hint,
+    /// content_hints, location)`.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        ItemKey,
+        ItemRef,
+        StableItemId,
+        VersionId,
+        Option<u64>,
+        Option<ContentHints>,
+        Option<Location>,
+    ) {
+        (
+            self.item_key,
+            self.item_ref,
+            self.stable_item_id,
+            self.version,
+            self.size_hint,
+            self.content_hints,
+            self.location,
+        )
     }
 }
+
+/// A connector enumeration page and continuation cursor.
+///
+/// `items` are the scan results for the current page. `next_cursor` encodes
+/// where to resume, including connector token state when present.
+///
+/// ## Empty-page semantics
+///
+/// An empty `items` slice is valid and its meaning depends on the cursor:
+///
+/// - Empty items + [`Cursor::initial()`] → scan is complete (no more data).
+/// - Empty items + non-initial cursor → no results in the current range,
+///   but more data may exist beyond the cursor position.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumerationPage {
+    items: Vec<ScanItem>,
+    next_cursor: Cursor,
+}
+
+impl EnumerationPage {
+    /// Construct a page from scan items and the continuation cursor.
+    #[inline]
+    #[must_use]
+    pub fn new(items: Vec<ScanItem>, next_cursor: Cursor) -> Self {
+        Self { items, next_cursor }
+    }
+
+    /// Returns the current page items.
+    #[inline]
+    #[must_use]
+    pub fn items(&self) -> &[ScanItem] {
+        &self.items
+    }
+
+    /// Returns the cursor to use for the next page request.
+    #[inline]
+    #[must_use]
+    pub fn next_cursor(&self) -> &Cursor {
+        &self.next_cursor
+    }
+
+    /// Consume the page, returning owned items and the continuation cursor.
+    ///
+    /// Use this when you need to process the items and cursor separately
+    /// without borrowing from the page.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<ScanItem>, Cursor) {
+        (self.items, self.next_cursor)
+    }
+}
+
+/// Page/scan budget controls used by connector enumeration APIs.
+///
+/// `Budgets` combines up to three stop conditions:
+/// - `max_items`: upper bound on number of returned items.
+/// - `max_bytes`: upper bound on cumulative bytes consumed.
+/// - `deadline`: optional monotonic deadline (`Instant`).
+///
+/// `max_items` and `max_bytes` are stored as [`NonZeroUsize`] and
+/// [`NonZeroU64`] respectively so that a vacuous zero budget is
+/// unrepresentable. Use [`try_new`](Self::try_new) to construct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budgets {
+    max_items: NonZeroUsize,
+    max_bytes: NonZeroU64,
+    deadline: Option<Instant>,
+}
+
+impl Budgets {
+    /// Construct a validated set of scan budgets.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConnectorInputError::ZeroBudget`] when `max_items` or
+    /// `max_bytes` is zero.
+    #[inline]
+    pub fn try_new(
+        max_items: usize,
+        max_bytes: u64,
+        deadline: Option<Instant>,
+    ) -> Result<Self, ConnectorInputError> {
+        let max_items = NonZeroUsize::new(max_items).ok_or(ConnectorInputError::ZeroBudget {
+            field: "Budgets.max_items",
+        })?;
+        let max_bytes = NonZeroU64::new(max_bytes).ok_or(ConnectorInputError::ZeroBudget {
+            field: "Budgets.max_bytes",
+        })?;
+        Ok(Self {
+            max_items,
+            max_bytes,
+            deadline,
+        })
+    }
+
+    /// Returns the maximum number of items allowed for the scan/page.
+    #[inline]
+    #[must_use]
+    pub fn max_items(&self) -> usize {
+        self.max_items.get()
+    }
+
+    /// Returns the maximum number of bytes allowed for the scan/page.
+    #[inline]
+    #[must_use]
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes.get()
+    }
+
+    /// Returns the optional scan deadline.
+    #[inline]
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Returns `true` when the configured deadline has elapsed relative to
+    /// `now`. Returns `false` when no deadline is set.
+    ///
+    /// Accepting the current instant as a parameter keeps this function pure
+    /// and deterministic, which is required for simulation testing.
+    #[inline]
+    #[must_use]
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+}
+
+#[cfg(test)]
+#[path = "types_tests.rs"]
+mod tests;
