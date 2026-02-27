@@ -167,7 +167,10 @@ pub struct ReadError {
 }
 
 impl ReadError {
-    /// Construct a retryable read error without a retry delay hint.
+    /// Construct a retryable read error without a backoff hint.
+    ///
+    /// Use for transient failures where the connector has no opinion on
+    /// when to retry (e.g., a generic network timeout during content fetch).
     #[must_use]
     pub fn retryable(message: impl Into<String>) -> Self {
         Self {
@@ -177,9 +180,11 @@ impl ReadError {
         }
     }
 
-    /// Construct a retryable read error with an explicit backoff hint.
+    /// Construct a retryable read error with a connector-supplied backoff hint.
     ///
-    /// `retry_after_ms` is stored as-is (including `0`), with no normalization.
+    /// Typical source: an HTTP `Retry-After` header or equivalent API signal.
+    /// The `retry_after_ms` value is stored as-is (including `0`) with no
+    /// clamping or normalization -- that is the runtime's responsibility.
     #[must_use]
     pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
         Self {
@@ -191,8 +196,9 @@ impl ReadError {
 
     /// Construct a permanent read error.
     ///
-    /// Use this when retries with unchanged request semantics are not expected
-    /// to recover.
+    /// Use when the failure will persist until something external changes.
+    /// The runtime should not retry blindly; typical follow-up is to skip
+    /// the item or park the shard with a diagnostic reason.
     #[must_use]
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
@@ -202,10 +208,12 @@ impl ReadError {
         }
     }
 
-    /// Construct a permanent read error for unsupported connector functionality.
+    /// Construct a permanent read error for an unsupported operation.
     ///
-    /// This is a convenience helper for capability mismatches discovered at
-    /// runtime (for example, an attempted range read without support).
+    /// Convenience for capability mismatches discovered at call time -- for
+    /// example, a range-read attempt against a connector that does not
+    /// advertise [`ConnectorCapabilities::range_read`]. The message is
+    /// formatted as `"{feature} not supported"`.
     #[must_use]
     pub fn unsupported(feature: &'static str) -> Self {
         Self::permanent(format!("{feature} not supported"))
