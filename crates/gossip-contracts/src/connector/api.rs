@@ -141,19 +141,28 @@ impl fmt::Display for EnumerateError {
 
 impl std::error::Error for EnumerateError {}
 
-/// Error returned by connector read/open APIs.
+/// Error returned by connector read/open operations.
 ///
-/// Semantics mirror [`EnumerateError`], but this distinct type keeps read and
-/// enumerate surfaces separate in public signatures.
+/// Structurally identical to [`EnumerateError`] (same three fields, same
+/// named-constructor pattern), but kept as a distinct type so the compiler
+/// enforces which operation path produced the error. This also allows
+/// orchestration to apply independent retry and circuit-breaker policies
+/// for reads vs enumerations.
+///
+/// In addition to the shared constructors, `ReadError` provides
+/// [`unsupported`](Self::unsupported) for capability mismatches discovered
+/// at call time.
 #[derive(Clone, Debug)]
 pub struct ReadError {
     /// Retryability classification for this failure.
     pub class: ErrorClass,
-    /// Human-readable connector message (not sanitized by this type).
+    /// Connector-originated diagnostic text. Not sanitized by this type --
+    /// callers must treat it as untrusted when logging or displaying.
     pub message: String,
     /// Optional connector-provided retry hint in milliseconds.
     ///
-    /// This is advisory metadata; callers may apply stricter/global policies.
+    /// Advisory only: the runtime may impose stricter or global backoff
+    /// policies. A value of `0` is passed through without normalization.
     pub retry_after_ms: Option<u64>,
 }
 
