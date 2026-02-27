@@ -38,33 +38,54 @@
 
 use std::fmt;
 
-/// Retry posture classification for connector operation failures.
+/// Binary retry posture for connector operation failures.
+///
+/// Orchestration layers use this to decide whether to re-attempt an operation
+/// or to escalate (park the shard, trigger a circuit breaker transition, etc.).
+/// The classification is set by the connector at error-construction time and is
+/// immutable thereafter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorClass {
-    /// Transient/capacity failure; callers may retry with the same semantics.
+    /// Transient or capacity-related failure. The same request may succeed on
+    /// retry without any change to inputs or configuration. Typical causes:
+    /// network timeouts, HTTP 429/503, temporary service unavailability.
     Retryable,
-    /// Same request is unlikely to succeed until inputs/configuration change.
+    /// The same request will not succeed until something external changes --
+    /// credentials, permissions, resource existence, or connector configuration.
+    /// Typical causes: HTTP 401/403/404, malformed resource identifiers.
     Permanent,
 }
 
-/// Error returned by connector enumeration/list APIs.
+/// Error returned by connector enumeration/list operations.
 ///
-/// This carries orchestration-facing policy metadata (`class`,
-/// `retry_after_ms`) plus a connector-originated human message.
+/// Bundles orchestration-facing policy metadata ([`ErrorClass`] and an
+/// optional backoff hint) with a connector-originated diagnostic message.
+/// Constructed via named constructors ([`retryable`](Self::retryable),
+/// [`rate_limited`](Self::rate_limited), [`permanent`](Self::permanent))
+/// that enforce consistent `class`/`retry_after_ms` combinations.
+///
+/// See also [`ReadError`], the structurally parallel type for the read/open
+/// path. The two are kept separate intentionally -- see the module docs for
+/// rationale.
 #[derive(Clone, Debug)]
 pub struct EnumerateError {
     /// Retryability classification for this failure.
     pub class: ErrorClass,
-    /// Human-readable connector message (not sanitized by this type).
+    /// Connector-originated diagnostic text. Not sanitized by this type --
+    /// callers must treat it as untrusted when logging or displaying.
     pub message: String,
     /// Optional connector-provided retry hint in milliseconds.
     ///
-    /// This is advisory metadata; callers may apply stricter/global policies.
+    /// Advisory only: the runtime may impose stricter or global backoff
+    /// policies. A value of `0` is passed through without normalization.
     pub retry_after_ms: Option<u64>,
 }
 
 impl EnumerateError {
-    /// Construct a retryable enumeration error without a retry delay hint.
+    /// Construct a retryable enumeration error without a backoff hint.
+    ///
+    /// Use for transient failures where the connector has no opinion on
+    /// when to retry (e.g., a generic network timeout).
     #[must_use]
     pub fn retryable(message: impl Into<String>) -> Self {
         Self {
@@ -74,9 +95,12 @@ impl EnumerateError {
         }
     }
 
-    /// Construct a retryable enumeration error with an explicit backoff hint.
+    /// Construct a retryable enumeration error with a connector-supplied
+    /// backoff hint.
     ///
-    /// `retry_after_ms` is stored as-is (including `0`), with no normalization.
+    /// Typical source: an HTTP `Retry-After` header or equivalent API signal.
+    /// The `retry_after_ms` value is stored as-is (including `0`) with no
+    /// clamping or normalization -- that is the runtime's responsibility.
     #[must_use]
     pub fn rate_limited(message: impl Into<String>, retry_after_ms: u64) -> Self {
         Self {
