@@ -755,8 +755,8 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        PageItem, PageValidationDetails, PageValidationError, PageValidationViolation, ToxicDigest,
-        validate_page_range,
+        CursorWhich, PageItem, PageValidationDetails, PageValidationError, PageValidationViolation,
+        ToxicDigest, validate_page_range,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1075,6 +1075,45 @@ mod tests {
     }
 
     #[test]
+    fn accepts_empty_page_no_cursors() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let items: Vec<Item> = Vec::new();
+        let result = validate_page_range::<Vec<u8>, Item>(&start, &end, None, &items, None);
+        assert!(
+            result.is_ok(),
+            "empty page with None/None cursors should pass, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_item_at_start_boundary() {
+        let start = key(b"b");
+        let end = key(b"z");
+        let items = vec![item(b"b")];
+        let next = key(b"b");
+        let result = validate_page_range(&start, &end, None, &items, Some(&next));
+        assert!(
+            result.is_ok(),
+            "item at inclusive start boundary should pass, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn accepts_cursor_at_upper_bound() {
+        let start = key(b"a");
+        let end = key(b"m");
+        let items = vec![item(b"c")];
+        let input = key(b"b");
+        let next = key(b"m");
+        let result = validate_page_range(&start, &end, Some(&input), &items, Some(&next));
+        assert!(
+            result.is_ok(),
+            "cursor at closed upper bound should pass, got: {result:?}"
+        );
+    }
+
+    #[test]
     fn rejects_item_below_start_boundary() {
         let start = key(b"d");
         let end = key(b"z");
@@ -1082,6 +1121,236 @@ mod tests {
         let next = key(b"d");
         let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
         assert_eq!(err.violation(), PageValidationViolation::ItemKeyOutOfRange);
+    }
+
+    // -- Details assertions for rejection cases (F9) --
+
+    #[test]
+    fn rejects_out_of_range_item_key_details() {
+        let start = key(b"a");
+        let end = key(b"c");
+        let items = vec![item(b"c")];
+        let next = key(b"c");
+        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
+        assert_eq!(err.violation(), PageValidationViolation::ItemKeyOutOfRange);
+        match err.details() {
+            PageValidationDetails::ItemOutOfRange {
+                index,
+                key,
+                start,
+                end,
+            } => {
+                assert_eq!(*index, 0);
+                assert_eq!(*key, ToxicDigest::of(b"c"));
+                assert_eq!(*start, ToxicDigest::of(b"a"));
+                assert_eq!(*end, ToxicDigest::of(b"c"));
+            }
+            other => panic!("expected ItemOutOfRange, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("item key out of range"));
+    }
+
+    #[test]
+    fn rejects_unsorted_items_details() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let items = vec![item(b"b"), item(b"a")];
+        let next = key(b"b");
+        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
+        assert_eq!(err.violation(), PageValidationViolation::ItemsNotOrdered);
+        match err.details() {
+            PageValidationDetails::ItemsNotOrdered { index, prev, next } => {
+                assert_eq!(*index, 1);
+                assert_eq!(*prev, ToxicDigest::of(b"b"));
+                assert_eq!(*next, ToxicDigest::of(b"a"));
+            }
+            other => panic!("expected ItemsNotOrdered, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("items not ordered"));
+    }
+
+    #[test]
+    fn rejects_item_not_after_cursor_details() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let input = key(b"b");
+        let items = vec![item(b"b")];
+        let next = key(b"b");
+        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
+        assert_eq!(
+            err.violation(),
+            PageValidationViolation::ItemsNotAfterCursor
+        );
+        match err.details() {
+            PageValidationDetails::ItemsNotAfterCursor { cursor, first_item } => {
+                assert_eq!(*cursor, ToxicDigest::of(b"b"));
+                assert_eq!(*first_item, ToxicDigest::of(b"b"));
+            }
+            other => panic!("expected ItemsNotAfterCursor, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("items must start strictly after"));
+    }
+
+    #[test]
+    fn rejects_next_cursor_behind_last_item_details() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let items = vec![item(b"b"), item(b"d")];
+        let next = key(b"c");
+        let err = validate_page_range(&start, &end, None, &items, Some(&next)).unwrap_err();
+        assert_eq!(
+            err.violation(),
+            PageValidationViolation::NextCursorBehindLastItem
+        );
+        match err.details() {
+            PageValidationDetails::NextCursorBehindLastItem {
+                next_cursor,
+                last_item,
+            } => {
+                assert_eq!(*next_cursor, ToxicDigest::of(b"c"));
+                assert_eq!(*last_item, ToxicDigest::of(b"d"));
+            }
+            other => panic!("expected NextCursorBehindLastItem, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("next_cursor.last_key is behind"));
+    }
+
+    #[test]
+    fn rejects_cursor_regression_details() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let input = key(b"c");
+        let items = vec![item(b"d")];
+        let next = key(b"b");
+        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
+        assert_eq!(err.violation(), PageValidationViolation::CursorRegressed);
+        match err.details() {
+            PageValidationDetails::CursorRegressed {
+                input: d_input,
+                next: d_next,
+            } => {
+                assert_eq!(*d_input, ToxicDigest::of(b"c"));
+                assert_eq!(*d_next, ToxicDigest::of(b"b"));
+            }
+            other => panic!("expected CursorRegressed, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("cursor regressed:"));
+    }
+
+    #[test]
+    fn rejects_empty_page_cursor_advance_details() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let input = key(b"a");
+        let items: Vec<Item> = Vec::new();
+        let next = key(b"b");
+        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
+        assert_eq!(
+            err.violation(),
+            PageValidationViolation::EmptyPageCursorAdvanced
+        );
+        match err.details() {
+            PageValidationDetails::EmptyPageCursorAdvanced {
+                input: d_input,
+                next: d_next,
+            } => {
+                assert_eq!(*d_input, Some(ToxicDigest::of(b"a")));
+                assert_eq!(*d_next, Some(ToxicDigest::of(b"b")));
+            }
+            other => panic!("expected EmptyPageCursorAdvanced, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("empty page advanced cursor:"));
+    }
+
+    #[test]
+    fn rejects_spec_range_start_greater_than_end_details() {
+        let start = key(b"z");
+        let end = key(b"a");
+        let items: Vec<Item> = Vec::new();
+        let err =
+            validate_page_range::<Vec<u8>, Item>(&start, &end, None, &items, None).unwrap_err();
+        assert_eq!(err.violation(), PageValidationViolation::SpecRangeInvalid);
+        match err.details() {
+            PageValidationDetails::Spec {
+                start: d_start,
+                end: d_end,
+            } => {
+                assert_eq!(*d_start, ToxicDigest::of(b"z"));
+                assert_eq!(*d_end, ToxicDigest::of(b"a"));
+            }
+            other => panic!("expected Spec, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("invalid spec range:"));
+    }
+
+    #[test]
+    fn rejects_input_cursor_out_of_range_details() {
+        let start = key(b"c");
+        let end = key(b"z");
+        let input = key(b"a");
+        let items: Vec<Item> = Vec::new();
+        let err =
+            validate_page_range(&start, &end, Some(&input), &items, Some(&input)).unwrap_err();
+        assert_eq!(
+            err.violation(),
+            PageValidationViolation::InputCursorOutOfRange
+        );
+        match err.details() {
+            PageValidationDetails::CursorOutOfRange {
+                which,
+                key,
+                start,
+                end,
+            } => {
+                assert_eq!(*which, CursorWhich::Input);
+                assert_eq!(*key, ToxicDigest::of(b"a"));
+                assert_eq!(*start, ToxicDigest::of(b"c"));
+                assert_eq!(*end, ToxicDigest::of(b"z"));
+            }
+            other => panic!("expected CursorOutOfRange, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("input cursor out of range:"));
+    }
+
+    #[test]
+    fn rejects_next_cursor_out_of_range_details() {
+        let start = key(b"a");
+        let end = key(b"m");
+        let input = key(b"b");
+        let items = vec![item(b"c")];
+        let next = key(b"z");
+        let err = validate_page_range(&start, &end, Some(&input), &items, Some(&next)).unwrap_err();
+        assert_eq!(
+            err.violation(),
+            PageValidationViolation::NextCursorOutOfRange
+        );
+        match err.details() {
+            PageValidationDetails::CursorOutOfRange {
+                which,
+                key,
+                start,
+                end,
+            } => {
+                assert_eq!(*which, CursorWhich::Next);
+                assert_eq!(*key, ToxicDigest::of(b"z"));
+                assert_eq!(*start, ToxicDigest::of(b"a"));
+                assert_eq!(*end, ToxicDigest::of(b"m"));
+            }
+            other => panic!("expected CursorOutOfRange, got: {other:?}"),
+        }
+        assert!(err.to_string().contains("next cursor out of range:"));
+    }
+
+    #[test]
+    fn rejects_missing_next_cursor_on_nonempty_page_details() {
+        let start = key(b"a");
+        let end = key(b"z");
+        let items = vec![item(b"b")];
+        let err =
+            validate_page_range::<Vec<u8>, Item>(&start, &end, None, &items, None).unwrap_err();
+        assert_eq!(err.violation(), PageValidationViolation::NextCursorMissing);
+        assert_eq!(err.details(), &PageValidationDetails::NextCursorMissing);
+        assert!(err.to_string().contains("next_cursor.last_key is missing"));
     }
 
     #[test]
@@ -1097,6 +1366,270 @@ mod tests {
         assert!(
             display.starts_with("len=10, hash="),
             "unexpected: {display}"
+        );
+    }
+
+    #[test]
+    fn toxic_digest_equality_semantics() {
+        // Same content => equal.
+        let a = ToxicDigest::of_bytes(b"payload");
+        let b = ToxicDigest::of_bytes(b"payload");
+        assert_eq!(a, b);
+
+        // Different content, same length => not equal.
+        let c = ToxicDigest::of_bytes(b"PAYLOAD");
+        assert_ne!(a, c);
+
+        // `of_bytes` and `of` agree for the same input.
+        let via_of = ToxicDigest::of(b"payload");
+        assert_eq!(a, via_of);
+    }
+
+    // -- Display format tests: remaining 9 match arms + fallback --
+
+    #[test]
+    fn display_input_cursor_out_of_range() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::InputCursorOutOfRange,
+            details: PageValidationDetails::CursorOutOfRange {
+                which: CursorWhich::Input,
+                key: ToxicDigest::of(b"k"),
+                start: ToxicDigest::of(b"a"),
+                end: ToxicDigest::of(b"z"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("input cursor out of range:"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_next_cursor_out_of_range() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::NextCursorOutOfRange,
+            details: PageValidationDetails::CursorOutOfRange {
+                which: CursorWhich::Next,
+                key: ToxicDigest::of(b"k"),
+                start: ToxicDigest::of(b"a"),
+                end: ToxicDigest::of(b"z"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("next cursor out of range:"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_item_key_out_of_range() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::ItemKeyOutOfRange,
+            details: PageValidationDetails::ItemOutOfRange {
+                index: 3,
+                key: ToxicDigest::of(b"k"),
+                start: ToxicDigest::of(b"a"),
+                end: ToxicDigest::of(b"z"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("item key out of range at index 3:"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_items_not_ordered() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::ItemsNotOrdered,
+            details: PageValidationDetails::ItemsNotOrdered {
+                index: 2,
+                prev: ToxicDigest::of(b"b"),
+                next: ToxicDigest::of(b"a"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("items not ordered at index 2:"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_items_not_after_cursor() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::ItemsNotAfterCursor,
+            details: PageValidationDetails::ItemsNotAfterCursor {
+                cursor: ToxicDigest::of(b"c"),
+                first_item: ToxicDigest::of(b"c"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("items must start strictly after"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_next_cursor_missing() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::NextCursorMissing,
+            details: PageValidationDetails::NextCursorMissing,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("next_cursor.last_key is missing"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_next_cursor_behind_last() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::NextCursorBehindLastItem,
+            details: PageValidationDetails::NextCursorBehindLastItem {
+                next_cursor: ToxicDigest::of(b"b"),
+                last_item: ToxicDigest::of(b"d"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("next_cursor.last_key is behind"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_cursor_regressed() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::CursorRegressed,
+            details: PageValidationDetails::CursorRegressed {
+                input: ToxicDigest::of(b"c"),
+                next: ToxicDigest::of(b"a"),
+            },
+        };
+        let msg = err.to_string();
+        assert!(msg.starts_with("cursor regressed:"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn display_empty_page_cursor_advanced() {
+        let err = PageValidationError {
+            violation: PageValidationViolation::EmptyPageCursorAdvanced,
+            details: PageValidationDetails::EmptyPageCursorAdvanced {
+                input: Some(ToxicDigest::of(b"a")),
+                next: Some(ToxicDigest::of(b"b")),
+            },
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("empty page advanced cursor:"),
+            "unexpected: {msg}"
+        );
+    }
+
+    #[test]
+    fn display_fallback_for_mismatched_pair() {
+        // Deliberately inconsistent (violation, details) pair to exercise
+        // the catch-all `_` arm. The arm contains a `debug_assert!(false, ...)`
+        // that fires in debug builds, so we catch the panic and verify
+        // the fallback format from the panic message.
+        let err = PageValidationError {
+            violation: PageValidationViolation::SpecRangeInvalid,
+            details: PageValidationDetails::NextCursorMissing,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| err.to_string()));
+        match result {
+            Ok(msg) => {
+                // Release builds: debug_assert is stripped, fallback write runs.
+                assert!(
+                    msg.contains("page validation violation: SpecRangeInvalid"),
+                    "fallback should name the violation: {msg}"
+                );
+            }
+            Err(payload) => {
+                // Debug builds: debug_assert fires before the write.
+                let panic_msg = payload
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("");
+                assert!(
+                    panic_msg.contains("mismatched (violation, details) pair"),
+                    "unexpected panic: {panic_msg}"
+                );
+            }
+        }
+    }
+
+    // -- validate_page adapter tests (F8) --
+
+    #[test]
+    fn validate_page_accepts_valid_production_types() {
+        use super::validate_page;
+        use crate::connector::{Cursor, ItemKey, ItemRef, ScanItem};
+        use crate::coordination::ShardSpec;
+        use crate::identity::{ObjectVersionId, StableItemId};
+
+        let spec = ShardSpec::from_raw_parts(
+            b"a".to_vec().into_boxed_slice(),
+            b"z".to_vec().into_boxed_slice(),
+            Box::default(),
+        );
+        let input = Cursor::with_last_key(ItemKey::try_from_slice(b"b").unwrap());
+        let items = vec![
+            ScanItem::new(
+                ItemKey::try_from_slice(b"c").unwrap(),
+                ItemRef::try_from_slice(b"ref-c").unwrap(),
+                StableItemId::from_bytes([0xAA; 32]),
+                crate::connector::VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+            ),
+            ScanItem::new(
+                ItemKey::try_from_slice(b"d").unwrap(),
+                ItemRef::try_from_slice(b"ref-d").unwrap(),
+                StableItemId::from_bytes([0xBB; 32]),
+                crate::connector::VersionId::Strong(ObjectVersionId::from_version_bytes(b"v2")),
+            ),
+        ];
+        let next = Cursor::with_last_key(ItemKey::try_from_slice(b"d").unwrap());
+
+        let result = validate_page(&spec, &input, &items, &next);
+        assert!(
+            result.is_ok(),
+            "valid production page should pass: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_page_rejects_invalid_production_page() {
+        use super::validate_page;
+        use crate::connector::{Cursor, ItemKey, ItemRef, ScanItem};
+        use crate::coordination::ShardSpec;
+        use crate::identity::{ObjectVersionId, StableItemId};
+
+        let spec = ShardSpec::from_raw_parts(
+            b"a".to_vec().into_boxed_slice(),
+            b"m".to_vec().into_boxed_slice(),
+            Box::default(),
+        );
+        let input = Cursor::with_last_key(ItemKey::try_from_slice(b"b").unwrap());
+        let items = vec![ScanItem::new(
+            ItemKey::try_from_slice(b"c").unwrap(),
+            ItemRef::try_from_slice(b"ref-c").unwrap(),
+            StableItemId::from_bytes([0xAA; 32]),
+            crate::connector::VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        )];
+        // z > end "m" — should fail.
+        let next = Cursor::with_last_key(ItemKey::try_from_slice(b"z").unwrap());
+
+        let err = validate_page(&spec, &input, &items, &next).unwrap_err();
+        assert_eq!(
+            err.violation(),
+            PageValidationViolation::NextCursorOutOfRange
         );
     }
 }
