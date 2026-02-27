@@ -45,6 +45,7 @@ use std::fmt;
 /// The classification is set by the connector at error-construction time and is
 /// immutable thereafter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ErrorClass {
     /// Transient or capacity-related failure. The same request may succeed on
     /// retry without any change to inputs or configuration. Typical causes:
@@ -62,26 +63,49 @@ pub enum ErrorClass {
 /// optional backoff hint) with a connector-originated diagnostic message.
 /// Constructed via named constructors ([`retryable`](Self::retryable),
 /// [`rate_limited`](Self::rate_limited), [`permanent`](Self::permanent))
-/// that enforce consistent `class`/`retry_after_ms` combinations.
+/// that enforce consistent class/retry combinations. Fields are private
+/// to preserve these invariants; use [`class`](Self::class),
+/// [`message`](Self::message), and [`retry_after_ms`](Self::retry_after_ms)
+/// to inspect.
 ///
 /// See also [`ReadError`], the structurally parallel type for the read/open
 /// path. The two are kept separate intentionally -- see the module docs for
 /// rationale.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnumerateError {
-    /// Retryability classification for this failure.
-    pub class: ErrorClass,
-    /// Connector-originated diagnostic text. Not sanitized by this type --
-    /// callers must treat it as untrusted when logging or displaying.
-    pub message: String,
-    /// Optional connector-provided retry hint in milliseconds.
-    ///
-    /// Advisory only: the runtime may impose stricter or global backoff
-    /// policies. A value of `0` is passed through without normalization.
-    pub retry_after_ms: Option<u64>,
+    class: ErrorClass,
+    message: String,
+    retry_after_ms: Option<u64>,
 }
 
 impl EnumerateError {
+    /// Returns the retryability classification for this failure.
+    #[inline]
+    #[must_use]
+    pub fn class(&self) -> ErrorClass {
+        self.class
+    }
+
+    /// Returns the connector-originated diagnostic text.
+    ///
+    /// Not sanitized by this type -- callers must treat it as untrusted
+    /// when logging or displaying.
+    #[inline]
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the optional connector-provided retry hint in milliseconds.
+    ///
+    /// Advisory only: the runtime may impose stricter or global backoff
+    /// policies. A value of `0` is passed through without normalization.
+    #[inline]
+    #[must_use]
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
+    }
+
     /// Construct a retryable enumeration error without a backoff hint.
     ///
     /// Use for transient failures where the connector has no opinion on
@@ -149,24 +173,48 @@ impl std::error::Error for EnumerateError {}
 /// orchestration to apply independent retry and circuit-breaker policies
 /// for reads vs enumerations.
 ///
+/// Fields are private to preserve constructor invariants; use
+/// [`class`](Self::class), [`message`](Self::message), and
+/// [`retry_after_ms`](Self::retry_after_ms) to inspect.
+///
 /// In addition to the shared constructors, `ReadError` provides
 /// [`unsupported`](Self::unsupported) for capability mismatches discovered
 /// at call time.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadError {
-    /// Retryability classification for this failure.
-    pub class: ErrorClass,
-    /// Connector-originated diagnostic text. Not sanitized by this type --
-    /// callers must treat it as untrusted when logging or displaying.
-    pub message: String,
-    /// Optional connector-provided retry hint in milliseconds.
-    ///
-    /// Advisory only: the runtime may impose stricter or global backoff
-    /// policies. A value of `0` is passed through without normalization.
-    pub retry_after_ms: Option<u64>,
+    class: ErrorClass,
+    message: String,
+    retry_after_ms: Option<u64>,
 }
 
 impl ReadError {
+    /// Returns the retryability classification for this failure.
+    #[inline]
+    #[must_use]
+    pub fn class(&self) -> ErrorClass {
+        self.class
+    }
+
+    /// Returns the connector-originated diagnostic text.
+    ///
+    /// Not sanitized by this type -- callers must treat it as untrusted
+    /// when logging or displaying.
+    #[inline]
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the optional connector-provided retry hint in milliseconds.
+    ///
+    /// Advisory only: the runtime may impose stricter or global backoff
+    /// policies. A value of `0` is passed through without normalization.
+    #[inline]
+    #[must_use]
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
+    }
+
     /// Construct a retryable read error without a backoff hint.
     ///
     /// Use for transient failures where the connector has no opinion on
@@ -309,9 +357,9 @@ mod tests {
         #[case] expected_message: &str,
         #[case] expected_retry: Option<u64>,
     ) {
-        assert_eq!(error.class, expected_class);
-        assert_eq!(error.message, expected_message);
-        assert_eq!(error.retry_after_ms, expected_retry);
+        assert_eq!(error.class(), expected_class);
+        assert_eq!(error.message(), expected_message);
+        assert_eq!(error.retry_after_ms(), expected_retry);
     }
 
     // -- ReadError constructor cases (includes `unsupported` convenience ctor) --
@@ -347,9 +395,9 @@ mod tests {
         #[case] expected_message: &str,
         #[case] expected_retry: Option<u64>,
     ) {
-        assert_eq!(error.class, expected_class);
-        assert_eq!(error.message, expected_message);
-        assert_eq!(error.retry_after_ms, expected_retry);
+        assert_eq!(error.class(), expected_class);
+        assert_eq!(error.message(), expected_message);
+        assert_eq!(error.retry_after_ms(), expected_retry);
     }
 
     // -- Display formatting (with / without retry hint) --
