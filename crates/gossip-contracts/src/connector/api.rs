@@ -687,6 +687,40 @@ mod tests {
         assert_obj_safe_send::<dyn ConnectorInstance>();
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "does not override choose_split_point")]
+    fn misconfigured_split_hints_fires_debug_assert() {
+        struct MisconfiguredConnector;
+        impl EnumerationConnector for MisconfiguredConnector {
+            fn caps(&self) -> ConnectorCapabilities {
+                ConnectorCapabilities {
+                    split_hints: true,
+                    ..ConnectorCapabilities::default()
+                }
+            }
+            fn enumerate_page(
+                &mut self,
+                _: &ShardSpec,
+                _: &Cursor,
+                _: Budgets,
+            ) -> Result<EnumerationPage, EnumerateError> {
+                Err(EnumerateError::permanent("stub"))
+            }
+        }
+        impl ReadConnector for MisconfiguredConnector {
+            fn open(
+                &mut self,
+                _: &ItemRef,
+                _: Budgets,
+            ) -> Result<Box<dyn io::Read + Send>, ReadError> {
+                Err(ReadError::permanent("stub"))
+            }
+        }
+        let mut c = MisconfiguredConnector;
+        let _ = c.choose_split_point(&ShardSpec::unbounded(), &Cursor::initial(), budgets());
+    }
+
     // -- Display sanitization --
 
     #[test]
