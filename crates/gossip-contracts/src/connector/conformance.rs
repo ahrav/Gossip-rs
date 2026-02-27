@@ -1,6 +1,3 @@
-#![allow(dead_code)]
-#![allow(clippy::result_large_err)]
-
 //! Conformance harness configuration and digest-only diagnostic vocabulary.
 //!
 //! The conformance harness validates that a connector implementation
