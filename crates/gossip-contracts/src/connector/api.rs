@@ -1,4 +1,4 @@
-//! Connector operation error taxonomy and capability negotiation surface.
+//! Connector operation error taxonomy, capability negotiation, and runtime trait contracts.
 //!
 //! These types model connector operation outcomes **after** boundary validation
 //! has succeeded. Input-shape and size failures use
@@ -101,8 +101,9 @@ impl fmt::Display for ErrorClass {
 /// (REPLACEMENT CHARACTER) to prevent log injection.
 ///
 /// Replaced ranges: C0 (U+0000..U+001F) except HT/LF/CR, DEL (U+007F),
-/// and C1 (U+0080..U+009F). These are the characters for which
-/// [`char::is_control()`] returns `true`.
+/// and C1 (U+0080..U+009F). Together with HT/LF/CR (which are preserved),
+/// these ranges form the full set for which [`char::is_control()`] returns
+/// `true`.
 #[inline]
 fn fmt_sanitized_message(f: &mut fmt::Formatter<'_>, message: &str) -> fmt::Result {
     for ch in message.chars() {
@@ -350,7 +351,7 @@ pub struct ConnectorCapabilities {
 pub trait EnumerationConnector: Send {
     /// Advertise connector capabilities used by orchestration planning.
     ///
-    /// This is a declarative, mostly-static profile for the configured
+    /// This is a declarative, static profile for the configured
     /// connector instance. It should align with method behavior, but callers
     /// must still handle runtime `unsupported`/policy errors.
     fn caps(&self) -> ConnectorCapabilities;
@@ -382,7 +383,12 @@ pub trait EnumerationConnector: Send {
         &mut self,
         _shard: &ShardSpec,
         _cursor: &Cursor,
+        _budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
+        debug_assert!(
+            !self.caps().split_hints,
+            "connector advertises split_hints but does not override choose_split_point"
+        );
         Ok(None)
     }
 }
@@ -442,11 +448,11 @@ pub trait ReadConnector: Send {
     }
 }
 
-/// Convenience supertrait for concrete connector instances.
+/// Convenience supertrait for connector types.
 ///
 /// Use this as a bound when a call path requires both enumeration and read
-/// capabilities. The blanket implementation means concrete connector types do
-/// not need an explicit `impl ConnectorInstance`.
+/// capabilities. The blanket implementation means connector types do not
+/// need an explicit `impl ConnectorInstance`.
 pub trait ConnectorInstance: EnumerationConnector + ReadConnector {}
 
 impl<T: EnumerationConnector + ReadConnector + ?Sized> ConnectorInstance for T {}
@@ -654,7 +660,7 @@ mod tests {
     fn default_choose_split_point_returns_none() {
         let mut connector = Dummy;
         let split = connector
-            .choose_split_point(&ShardSpec::unbounded(), &Cursor::initial())
+            .choose_split_point(&ShardSpec::unbounded(), &Cursor::initial(), budgets())
             .expect("default choose_split_point should not fail");
         assert!(split.is_none());
     }
@@ -671,6 +677,14 @@ mod tests {
 
         assert_error_impl::<EnumerateError>();
         assert_error_impl::<ReadError>();
+    }
+
+    #[test]
+    fn traits_are_object_safe_and_send() {
+        fn assert_obj_safe_send<T: Send + ?Sized>() {}
+        assert_obj_safe_send::<dyn EnumerationConnector>();
+        assert_obj_safe_send::<dyn ReadConnector>();
+        assert_obj_safe_send::<dyn ConnectorInstance>();
     }
 
     // -- Display sanitization --
