@@ -13,7 +13,8 @@
 //! - `Cursor` owns paging state and bridges safely to coordination's borrowed
 //!   `CursorUpdate`.
 //! - `MAX_ITEM_KEY_SIZE` and `MAX_TOKEN_SIZE` mirror coordination cursor
-//!   limits so connector paging state and cursor updates cannot drift.
+//!   limits so connector paging state and cursor updates stay aligned.
+//!   Alignment is verified by `types::tests::constants_align_with_coordination_limits`.
 //!
 //! ## Public surface
 //!
@@ -21,6 +22,8 @@
 //! - Paging bridge: [`Cursor`]
 //! - Version semantics: [`VersionId`]
 //! - Optional metadata: [`ContentHints`], [`Location`]
+//! - Enumeration composites: [`ScanItem`], [`EnumerationPage`]
+//! - Scan budgets: [`Budgets`]
 //! - Validation errors: [`ConnectorInputError`]
 //!
 //! These types are intentionally composable: a connector validates once at the
@@ -36,7 +39,7 @@
 mod types;
 
 pub use types::{
-    ConnectorInputError, ContentHints, Cursor, ItemKey, ItemRef, Location, MAX_ITEM_KEY_SIZE,
-    MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE, MAX_LOCATION_URL_SIZE, MAX_TOKEN_SIZE,
-    TokenBytes, VersionId,
+    Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
+    Location, MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE,
+    MAX_LOCATION_URL_SIZE, MAX_TOKEN_SIZE, ScanItem, TokenBytes, VersionId,
 };

@@ -20,6 +20,9 @@
 //!   weak while preserving the same [`ObjectVersionId`] representation.
 //! - [`ContentHints`] and [`Location`] are bounded metadata carriers for
 //!   presentation and downstream routing decisions.
+//! - [`ScanItem`] and [`EnumerationPage`] bundle validated boundary fields for
+//!   page-oriented connector enumeration handoff.
+//! - [`Budgets`] carries scan-level stop conditions (count, bytes, deadline).
 //!
 //! ## Core contract
 //!
@@ -37,10 +40,10 @@
 //! - Cursor states with `token` but no `last_key` are invalid by contract and
 //!   rejected when crossing the coordination boundary.
 
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use crate::coordination::CursorUpdate;
-use crate::identity::ObjectVersionId;
+use crate::identity::{ObjectVersionId, StableItemId};
 
 /// Maximum size of an [`ItemKey`] in bytes (4 KiB).
 ///
@@ -462,8 +465,8 @@ impl Cursor {
     ///
     /// # Errors
     ///
-    /// - Returns [`ConnectorInputError::TokenWithoutLastKey`] if `token` is
-    ///   present but `last_key` is not.
+    /// - Returns [`ConnectorInputError::TokenWithoutLastKey`] if a non-empty
+    ///   `token` is present but `last_key` is not.
     /// - Returns [`ConnectorInputError::Empty`] / [`ConnectorInputError::TooLarge`]
     ///   when `last_key` or `token` fail wrapper validation.
     pub fn try_from_update(update: CursorUpdate<'_>) -> Result<Self, ConnectorInputError> {
@@ -668,6 +671,206 @@ impl Location {
     #[must_use]
     pub fn url(&self) -> Option<&str> {
         self.url.as_deref()
+    }
+}
+
+/// Connector-owned item metadata produced by an enumeration pass.
+///
+/// `ScanItem` keeps core identity fields (`item_key`, `item_ref`,
+/// `stable_item_id`, `version`) alongside optional bounded metadata used for
+/// presentation and scheduling (`size_hint`, `content_hints`, `location`).
+///
+/// Optional fields default to `None` and can be set with builder-style methods
+/// after constructing the required identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanItem {
+    item_key: ItemKey,
+    item_ref: ItemRef,
+    stable_item_id: StableItemId,
+    version: VersionId,
+    size_hint: Option<u64>,
+    content_hints: Option<ContentHints>,
+    location: Option<Location>,
+}
+
+impl ScanItem {
+    /// Construct a scan item with required identity fields.
+    ///
+    /// Optional metadata fields initialize to `None`.
+    #[must_use]
+    pub fn new(
+        item_key: ItemKey,
+        item_ref: ItemRef,
+        stable_item_id: StableItemId,
+        version: VersionId,
+    ) -> Self {
+        Self {
+            item_key,
+            item_ref,
+            stable_item_id,
+            version,
+            size_hint: None,
+            content_hints: None,
+            location: None,
+        }
+    }
+
+    /// Set or clear the optional size hint in bytes.
+    #[must_use]
+    pub fn with_size_hint(self, size_hint: Option<u64>) -> Self {
+        Self { size_hint, ..self }
+    }
+
+    /// Set optional content hints.
+    #[must_use]
+    pub fn with_content_hints(self, content_hints: ContentHints) -> Self {
+        Self {
+            content_hints: Some(content_hints),
+            ..self
+        }
+    }
+
+    /// Set optional display-safe location metadata.
+    #[must_use]
+    pub fn with_location(self, location: Location) -> Self {
+        Self {
+            location: Some(location),
+            ..self
+        }
+    }
+
+    /// Returns the ordered item key used for paging progression.
+    #[inline]
+    #[must_use]
+    pub fn item_key(&self) -> &ItemKey {
+        &self.item_key
+    }
+
+    /// Returns the connector-opaque item reference used for later reads.
+    #[inline]
+    #[must_use]
+    pub fn item_ref(&self) -> &ItemRef {
+        &self.item_ref
+    }
+
+    /// Returns the stable tenant-independent item identity.
+    #[inline]
+    #[must_use]
+    pub fn stable_item_id(&self) -> StableItemId {
+        self.stable_item_id
+    }
+
+    /// Returns connector-provided version semantics for this item.
+    #[inline]
+    #[must_use]
+    pub fn version(&self) -> VersionId {
+        self.version
+    }
+
+    /// Returns an optional byte-size estimate for this item.
+    #[inline]
+    #[must_use]
+    pub fn size_hint(&self) -> Option<u64> {
+        self.size_hint
+    }
+
+    /// Returns optional content interpretation hints.
+    #[inline]
+    #[must_use]
+    pub fn content_hints(&self) -> Option<&ContentHints> {
+        self.content_hints.as_ref()
+    }
+
+    /// Returns optional display-safe location metadata.
+    #[inline]
+    #[must_use]
+    pub fn location(&self) -> Option<&Location> {
+        self.location.as_ref()
+    }
+}
+
+/// A connector enumeration page and continuation cursor.
+///
+/// `items` are the scan results for the current page. `next_cursor` encodes
+/// where to resume, including connector token state when present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumerationPage {
+    items: Vec<ScanItem>,
+    next_cursor: Cursor,
+}
+
+impl EnumerationPage {
+    /// Construct a page from scan items and the continuation cursor.
+    #[must_use]
+    pub fn new(items: Vec<ScanItem>, next_cursor: Cursor) -> Self {
+        Self { items, next_cursor }
+    }
+
+    /// Returns the current page items.
+    #[inline]
+    #[must_use]
+    pub fn items(&self) -> &[ScanItem] {
+        &self.items
+    }
+
+    /// Returns the cursor to use for the next page request.
+    #[inline]
+    #[must_use]
+    pub fn next_cursor(&self) -> &Cursor {
+        &self.next_cursor
+    }
+}
+
+/// Page/scan budget controls used by connector enumeration APIs.
+///
+/// `Budgets` combines three stop conditions:
+/// - `max_items`: upper bound on number of returned items.
+/// - `max_bytes`: upper bound on cumulative bytes consumed.
+/// - `deadline`: optional monotonic deadline (`Instant`).
+#[derive(Clone, Copy, Debug)]
+pub struct Budgets {
+    max_items: usize,
+    max_bytes: u64,
+    deadline: Option<Instant>,
+}
+
+impl Budgets {
+    /// Construct a new set of scan budgets.
+    #[must_use]
+    pub fn new(max_items: usize, max_bytes: u64, deadline: Option<Instant>) -> Self {
+        Self {
+            max_items,
+            max_bytes,
+            deadline,
+        }
+    }
+
+    /// Returns the maximum number of items allowed for the scan/page.
+    #[inline]
+    #[must_use]
+    pub fn max_items(&self) -> usize {
+        self.max_items
+    }
+
+    /// Returns the maximum number of bytes allowed for the scan/page.
+    #[inline]
+    #[must_use]
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Returns the optional scan deadline.
+    #[inline]
+    #[must_use]
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Returns `true` when the configured deadline has elapsed.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 }
 
@@ -961,6 +1164,168 @@ mod tests {
             b[0], b[1], b[2], b[3]
         );
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn item_key_debug_is_redacted() {
+        let raw = b"item-key-super-secret";
+        let item_key = ItemKey::try_from_slice(raw).unwrap();
+        let debug = format!("{item_key:?}");
+        let display = format!("{item_key}");
+        let raw_text = std::str::from_utf8(raw).unwrap();
+
+        assert!(!debug.contains(raw_text));
+        assert!(!display.contains(raw_text));
+        assert!(debug.contains("len="));
+        assert!(debug.contains("hash="));
+        assert!(display.contains("len="));
+        assert!(display.contains("hash="));
+    }
+
+    #[test]
+    fn item_ref_debug_is_redacted() {
+        let raw = b"item-ref-sensitive-pointer";
+        let item_ref = ItemRef::try_from_slice(raw).unwrap();
+        let debug = format!("{item_ref:?}");
+        let display = format!("{item_ref}");
+        let raw_text = std::str::from_utf8(raw).unwrap();
+
+        assert!(!debug.contains(raw_text));
+        assert!(!display.contains(raw_text));
+        assert!(debug.contains("len="));
+        assert!(debug.contains("hash="));
+        assert!(display.contains("len="));
+        assert!(display.contains("hash="));
+    }
+
+    #[test]
+    fn token_debug_is_redacted() {
+        let raw = b"paging-token-sensitive";
+        let token = TokenBytes::try_from_slice(raw).unwrap();
+        let debug = format!("{token:?}");
+        let display = format!("{token}");
+        let raw_text = std::str::from_utf8(raw).unwrap();
+
+        assert!(!debug.contains(raw_text));
+        assert!(!display.contains(raw_text));
+        assert!(debug.contains("len="));
+        assert!(debug.contains("hash="));
+        assert!(display.contains("len="));
+        assert!(display.contains("hash="));
+    }
+
+    #[test]
+    fn item_key_size_cap_is_enforced() {
+        assert!(ItemKey::try_from_vec(vec![0xAB; MAX_ITEM_KEY_SIZE]).is_ok());
+        assert_eq!(
+            ItemKey::try_from_vec(vec![0xAB; MAX_ITEM_KEY_SIZE + 1]),
+            Err(ConnectorInputError::TooLarge {
+                field: "ItemKey",
+                size: MAX_ITEM_KEY_SIZE + 1,
+                max: MAX_ITEM_KEY_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn item_ref_size_cap_is_enforced() {
+        assert!(ItemRef::try_from_vec(vec![0xCD; MAX_ITEM_REF_SIZE]).is_ok());
+        assert_eq!(
+            ItemRef::try_from_vec(vec![0xCD; MAX_ITEM_REF_SIZE + 1]),
+            Err(ConnectorInputError::TooLarge {
+                field: "ItemRef",
+                size: MAX_ITEM_REF_SIZE + 1,
+                max: MAX_ITEM_REF_SIZE,
+            })
+        );
+    }
+
+    #[test]
+    fn scan_item_new_defaults_optional_fields_to_none() {
+        let scan_item = ScanItem::new(
+            ItemKey::try_from_slice(b"item-key").unwrap(),
+            ItemRef::try_from_slice(b"item-ref").unwrap(),
+            StableItemId::from_bytes([0x11; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        );
+
+        assert_eq!(scan_item.item_key().as_bytes(), b"item-key");
+        assert_eq!(scan_item.item_ref().as_bytes(), b"item-ref");
+        assert_eq!(
+            scan_item.stable_item_id(),
+            StableItemId::from_bytes([0x11; 32])
+        );
+        assert_eq!(
+            scan_item.version(),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1"))
+        );
+        assert_eq!(scan_item.size_hint(), None);
+        assert_eq!(scan_item.content_hints(), None);
+        assert_eq!(scan_item.location(), None);
+    }
+
+    #[test]
+    fn scan_item_builder_methods_chain() {
+        let content_hints =
+            ContentHints::try_new(Some("text/plain".to_owned()), Some("gzip".to_owned())).unwrap();
+        let location = Location::try_new(
+            "repo/path.txt".to_owned(),
+            Some("https://example.invalid/path.txt".to_owned()),
+        )
+        .unwrap();
+        let scan_item = ScanItem::new(
+            ItemKey::try_from_slice(b"item-key-2").unwrap(),
+            ItemRef::try_from_slice(b"item-ref-2").unwrap(),
+            StableItemId::from_bytes([0x22; 32]),
+            VersionId::Weak(ObjectVersionId::from_version_bytes(b"v2")),
+        )
+        .with_size_hint(Some(4_096))
+        .with_content_hints(content_hints.clone())
+        .with_location(location.clone());
+
+        assert_eq!(scan_item.size_hint(), Some(4_096));
+        assert_eq!(scan_item.content_hints(), Some(&content_hints));
+        assert_eq!(scan_item.location(), Some(&location));
+    }
+
+    #[test]
+    fn enumeration_page_new_stores_items_and_cursor() {
+        let scan_item = ScanItem::new(
+            ItemKey::try_from_slice(b"item-key-3").unwrap(),
+            ItemRef::try_from_slice(b"item-ref-3").unwrap(),
+            StableItemId::from_bytes([0x33; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v3")),
+        );
+        let next_cursor = Cursor::with_token(
+            ItemKey::try_from_slice(b"next-key").unwrap(),
+            TokenBytes::try_from_slice(b"next-token").unwrap(),
+        );
+
+        let page = EnumerationPage::new(vec![scan_item.clone()], next_cursor.clone());
+        assert_eq!(page.items(), &[scan_item]);
+        assert_eq!(page.next_cursor(), &next_cursor);
+    }
+
+    #[test]
+    fn budgets_is_expired_respects_deadline() {
+        use std::time::Duration;
+
+        let none = Budgets::new(10, 1_024, None);
+        assert_eq!(none.max_items(), 10);
+        assert_eq!(none.max_bytes(), 1_024);
+        assert_eq!(none.deadline(), None);
+        assert!(!none.is_expired());
+
+        let now = Instant::now();
+        let future = Budgets::new(10, 1_024, Some(now + Duration::from_secs(30)));
+        assert!(!future.is_expired());
+
+        let past_deadline = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        let past = Budgets::new(10, 1_024, Some(past_deadline));
+        assert!(past.is_expired());
+
+        let boundary = Budgets::new(10, 1_024, Some(Instant::now()));
+        assert!(boundary.is_expired());
     }
 
     /// Generates roundtrip + redaction and oversized-rejection proptests for
