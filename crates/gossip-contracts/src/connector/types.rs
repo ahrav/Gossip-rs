@@ -436,24 +436,22 @@ impl Cursor {
     /// This projection is allocation-free. The returned update borrows from
     /// `self` and remains valid for the same lifetime.
     ///
-    /// In debug builds, this asserts the token-without-key invariant. In
-    /// release builds, malformed states are defensively collapsed to
-    /// [`CursorUpdate::initial`] rather than emitting an invalid update.
+    /// The `(None, Some(_))` state is unreachable because all constructors
+    /// prevent token-without-key. If reached, this panics to surface the
+    /// logic error rather than silently resetting cursor progress.
     #[inline]
     #[must_use]
     pub fn as_update(&self) -> CursorUpdate<'_> {
-        debug_assert!(
-            self.last_key.is_some() || self.token.is_none(),
-            "Cursor invariant violated: token without last_key"
-        );
         match (&self.last_key, &self.token) {
             (None, None) => CursorUpdate::initial(),
             (Some(last_key), None) => CursorUpdate::with_last_key(last_key.as_bytes()),
             (Some(last_key), Some(token)) => {
                 CursorUpdate::with_token(last_key.as_bytes(), token.as_bytes())
             }
-            // Defensive fallback for potentially malformed states.
-            (None, Some(_)) => CursorUpdate::initial(),
+            (None, Some(_)) => unreachable!(
+                "Cursor invariant violated: token present without last_key. \
+                 All constructors prevent this state."
+            ),
         }
     }
 
@@ -539,22 +537,15 @@ impl VersionId {
 /// can forward source-native metadata without lossy normalization.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ContentHints {
-    /// MIME-like media type (for example, `text/plain` or
-    /// `application/json`).
-    ///
-    /// `None` means "unknown", not "empty string".
-    pub media_type: Option<String>,
-    /// Optional transfer/content encoding name (for example, `gzip`).
-    ///
-    /// `None` means no encoding hint is available.
-    pub encoding: Option<String>,
+    media_type: Option<String>,
+    encoding: Option<String>,
 }
 
 impl ContentHints {
     /// Construct bounded content hints.
     ///
-    /// This validates only field size caps to preserve a predictable memory
-    /// footprint at boundary crossings.
+    /// Empty strings are normalized to `None` so callers cannot observe a
+    /// semantic difference between "not provided" and "provided but empty".
     ///
     /// # Errors
     ///
@@ -566,6 +557,10 @@ impl ContentHints {
         media_type: Option<String>,
         encoding: Option<String>,
     ) -> Result<Self, ConnectorInputError> {
+        // Normalize empty strings to None before validation.
+        let media_type = media_type.filter(|s| !s.is_empty());
+        let encoding = encoding.filter(|s| !s.is_empty());
+
         if let Some(media_type) = media_type.as_ref()
             && media_type.len() > MAX_CONTENT_HINT_MEDIA_TYPE_SIZE
         {
@@ -589,6 +584,25 @@ impl ContentHints {
             encoding,
         })
     }
+
+    /// Returns the MIME-like media type, if known.
+    ///
+    /// `None` means "unknown" — empty strings are normalized away by the
+    /// constructor.
+    #[inline]
+    #[must_use]
+    pub fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
+
+    /// Returns the transfer/content encoding name, if known.
+    ///
+    /// `None` means no encoding hint is available.
+    #[inline]
+    #[must_use]
+    pub fn encoding(&self) -> Option<&str> {
+        self.encoding.as_deref()
+    }
 }
 
 /// Display-safe location metadata for UI/debugging.
@@ -599,17 +613,17 @@ impl ContentHints {
 /// canonicalized at this layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Location {
-    /// Human-readable location string shown to operators/users.
-    pub display: String,
-    /// Optional URL-like deep link for source-system navigation.
-    pub url: Option<String>,
+    display: String,
+    url: Option<String>,
 }
 
 impl Location {
     /// Construct a bounded display location.
     ///
     /// `display` is required because it is the stable fallback shown when
-    /// no `url` is available or safe to render.
+    /// no `url` is available or safe to render. Empty URL strings are
+    /// normalized to `None` so callers cannot observe a semantic difference
+    /// between "not provided" and "provided but empty".
     ///
     /// # Errors
     ///
@@ -617,6 +631,7 @@ impl Location {
     /// - [`ConnectorInputError::TooLarge`] when `display` or `url` exceeds
     ///   the corresponding `MAX_LOCATION_*` limits.
     pub fn try_new(display: String, url: Option<String>) -> Result<Self, ConnectorInputError> {
+        let url = url.filter(|u| !u.is_empty());
         if display.is_empty() {
             return Err(ConnectorInputError::Empty {
                 field: "Location.display",
@@ -639,6 +654,20 @@ impl Location {
             });
         }
         Ok(Self { display, url })
+    }
+
+    /// Returns the human-readable location string.
+    #[inline]
+    #[must_use]
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Returns the optional URL-like deep link.
+    #[inline]
+    #[must_use]
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
     }
 }
 
@@ -681,6 +710,10 @@ mod tests {
         assert!(cursor.last_key().is_none());
         assert!(cursor.token().is_none());
         assert_eq!(cursor, Cursor::default());
+
+        let update = cursor.as_update();
+        assert!(update.last_key().is_none());
+        assert!(update.token().is_none());
     }
 
     #[test]
@@ -695,6 +728,47 @@ mod tests {
 
         let reparsed = Cursor::try_from_update(update).unwrap();
         assert_eq!(reparsed, cursor);
+    }
+
+    #[test]
+    fn cursor_with_last_key_roundtrips_through_update() {
+        let key = ItemKey::try_from_slice(b"k-1").unwrap();
+        let cursor = Cursor::with_last_key(key);
+
+        assert!(cursor.last_key().is_some());
+        assert!(cursor.token().is_none());
+
+        let update = cursor.as_update();
+        assert_eq!(update.last_key(), Some(b"k-1".as_slice()));
+        assert!(update.token().is_none());
+
+        let reparsed = Cursor::try_from_update(update).unwrap();
+        assert_eq!(reparsed, cursor);
+    }
+
+    #[test]
+    fn cursor_lifecycle_transitions() {
+        // initial: no key, no token.
+        let c0 = Cursor::initial();
+        assert!(c0.last_key().is_none());
+        assert!(c0.token().is_none());
+
+        // key-only: first page processed.
+        let key1 = ItemKey::try_from_slice(b"k-1").unwrap();
+        let c1 = Cursor::with_last_key(key1);
+        assert_eq!(c1.last_key().unwrap().as_bytes(), b"k-1");
+        assert!(c1.token().is_none());
+
+        // key + token: continuation state.
+        let key2 = ItemKey::try_from_slice(b"k-2").unwrap();
+        let tok = TokenBytes::try_from_slice(b"resume").unwrap();
+        let c2 = Cursor::with_token(key2, tok);
+        assert_eq!(c2.last_key().unwrap().as_bytes(), b"k-2");
+        assert_eq!(c2.token().unwrap().as_bytes(), b"resume");
+
+        // back to initial: scan reset.
+        let c3 = Cursor::initial();
+        assert_eq!(c3, c0);
     }
 
     #[test]
@@ -732,6 +806,31 @@ mod tests {
     }
 
     #[test]
+    fn content_hints_normalizes_empty_strings_to_none() {
+        let hints = ContentHints::try_new(Some(String::new()), Some(String::new())).unwrap();
+        assert_eq!(hints.media_type(), None);
+        assert_eq!(hints.encoding(), None);
+
+        let hints =
+            ContentHints::try_new(Some("text/plain".to_owned()), Some(String::new())).unwrap();
+        assert_eq!(hints.media_type(), Some("text/plain"));
+        assert_eq!(hints.encoding(), None);
+    }
+
+    #[test]
+    fn content_hints_accessors_return_values() {
+        let hints =
+            ContentHints::try_new(Some("application/json".to_owned()), Some("gzip".to_owned()))
+                .unwrap();
+        assert_eq!(hints.media_type(), Some("application/json"));
+        assert_eq!(hints.encoding(), Some("gzip"));
+
+        let empty = ContentHints::default();
+        assert_eq!(empty.media_type(), None);
+        assert_eq!(empty.encoding(), None);
+    }
+
+    #[test]
     fn content_hints_enforce_size_limits() {
         assert!(ContentHints::try_new(Some("text/plain".to_owned()), None).is_ok());
         assert!(ContentHints::try_new(None, Some("gzip".to_owned())).is_ok());
@@ -751,6 +850,13 @@ mod tests {
                 max: 128,
             })
         );
+    }
+
+    #[test]
+    fn location_normalizes_empty_url_to_none() {
+        let loc = Location::try_new("ok".to_owned(), Some(String::new())).unwrap();
+        assert_eq!(loc.display(), "ok");
+        assert_eq!(loc.url(), None);
     }
 
     #[test]
@@ -778,17 +884,13 @@ mod tests {
             })
         );
 
-        assert_eq!(
-            Location::try_new(
-                "repo/path".to_owned(),
-                Some("https://example.com".to_owned())
-            )
-            .unwrap(),
-            Location {
-                display: "repo/path".to_owned(),
-                url: Some("https://example.com".to_owned()),
-            }
-        );
+        let loc = Location::try_new(
+            "repo/path".to_owned(),
+            Some("https://example.com".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(loc.display(), "repo/path");
+        assert_eq!(loc.url(), Some("https://example.com"));
     }
 
     #[test]
@@ -918,6 +1020,35 @@ mod tests {
                 }
             }
         };
+    }
+
+    /// Generates a valid `Cursor` from one of three variants: initial,
+    /// key-only, or key + token.
+    fn arb_cursor() -> impl Strategy<Value = Cursor> {
+        prop_oneof![
+            Just(Cursor::initial()),
+            proptest::collection::vec(any::<u8>(), 1..=64)
+                .prop_map(|b| Cursor::with_last_key(ItemKey::try_from_vec(b).unwrap())),
+            (
+                proptest::collection::vec(any::<u8>(), 1..=64),
+                proptest::collection::vec(any::<u8>(), 1..=64),
+            )
+                .prop_map(|(k, t)| Cursor::with_token(
+                    ItemKey::try_from_vec(k).unwrap(),
+                    TokenBytes::try_from_vec(t).unwrap(),
+                )),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(crate::test_util::miri_proptest_config())]
+
+        #[test]
+        fn cursor_roundtrips_through_update(cursor in arb_cursor()) {
+            let update = cursor.as_update();
+            let reparsed = Cursor::try_from_update(update).unwrap();
+            prop_assert_eq!(reparsed, cursor);
+        }
     }
 
     toxic_bytes_tests! {
