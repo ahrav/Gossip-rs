@@ -73,7 +73,7 @@
 //! scheduling, backoff policy) live in runtime crates.
 
 mod api;
-#[allow(dead_code)]
+#[cfg(test)]
 mod conformance;
 pub mod page_validator;
 mod types;

@@ -32,6 +32,12 @@ use super::types::{Budgets, Cursor};
 /// These are heuristics used by conformance checks to catch accidental
 /// credential leakage in connector handles. The harness reports digest-only
 /// diagnostics for matches.
+///
+/// Coverage includes: HTTP auth headers, AWS access keys, AWS signed
+/// request parameters, GCP service-account identifiers, PEM/OpenSSH
+/// private key markers, GitHub token prefixes (`ghp_`, `gho_`, `ghs_`,
+/// `ghr_`), JWT Base64-encoded header prefix (`eyJ`), and common
+/// database connection-string schemes.
 pub const DEFAULT_FORBIDDEN_ITEMREF_PATTERNS: &[&[u8]] = &[
     b"Authorization:",
     b"Bearer ",
@@ -42,6 +48,19 @@ pub const DEFAULT_FORBIDDEN_ITEMREF_PATTERNS: &[&[u8]] = &[
     b"X-Amz-Credential=",
     b"GoogleAccessId=",
     b"-----BEGIN ",
+    // GitHub token prefixes.
+    b"ghp_",
+    b"gho_",
+    b"ghs_",
+    b"ghr_",
+    // JWT Base64-encoded header prefix.
+    b"eyJ",
+    // Narrower PEM key markers (supplement the generic `-----BEGIN `).
+    b"-----BEGIN RSA PRIVATE",
+    b"-----BEGIN OPENSSH",
+    // Database connection-string schemes.
+    b"postgres://",
+    b"mongodb+srv://",
 ];
 
 /// Whether a connector run is expected to be fully deterministic.
