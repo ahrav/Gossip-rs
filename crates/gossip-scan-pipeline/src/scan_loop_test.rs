@@ -981,12 +981,15 @@ fn park_failure_preserves_trigger_context() {
     }
 }
 
-/// A4: `session.complete()` failure returns `Error(Complete(..))`.
+/// A4: Expired lease on empty-page path returns `LeaseLost`, not
+/// `Error(Complete(..))`.
 ///
 /// Two pages: first page checkpoints successfully (time within lease),
-/// second page is empty (terminal) but complete fails due to lease expiry.
+/// second page is empty (terminal) but the deadline has elapsed. The
+/// pre-complete deadline guard catches this and returns `LeaseLost`
+/// with `pages_completed: 1` (one successful checkpoint already persisted).
 #[test]
-fn complete_failure_returns_error() {
+fn expired_lease_on_empty_page_after_checkpoint_returns_lease_lost() {
     // Lease duration = 8, acquired at t=3, so deadline = 11.
     let mut coord = seeded_coordinator(8, CursorUpdate::initial());
 
@@ -1022,11 +1025,22 @@ fn complete_failure_returns_error() {
     );
 
     match outcome {
-        ScanLoopOutcome::Error(ScanLoopError::Complete(CompleteError::LeaseExpired { .. })) => {} // expected
-        other => panic!("expected Error(Complete(LeaseExpired)), got {other:?}"),
+        ScanLoopOutcome::LeaseLost {
+            pages_completed,
+            cause:
+                LeaseLossCause::DeadlineElapsed {
+                    now: lease_lost_now,
+                    deadline,
+                },
+        } => {
+            assert_eq!(pages_completed, 1);
+            assert_eq!(lease_lost_now, now(20));
+            assert_eq!(deadline, now(11));
+        }
+        other => panic!("expected LeaseLost(DeadlineElapsed), got {other:?}"),
     }
 
-    // Checkpoint at "b" was durable before the complete failure.
+    // Checkpoint at "b" was durable before lease loss was detected.
     let summary = shard_summary(&coord, 21);
     assert_eq!(summary.status(), ShardStatus::Active);
     assert_eq!(summary.last_key(), Some(&b"b"[..]));
@@ -1121,6 +1135,61 @@ fn should_renew_small_duration_edge_cases() {
     assert!(should_renew(now(10), now(10), 1, policy_zero)); // now == deadline
 }
 
+/// Empty page with expired lease returns `LeaseLost(DeadlineElapsed)`.
+///
+/// When the connector returns an empty page (terminal), the loop must check the
+/// deadline before calling `session.complete()`. If the lease has expired, the
+/// loop should return `LeaseLost` rather than attempting `complete` (which would
+/// fail with `LeaseExpired` and surface as `Error(Complete(..))`).
+#[test]
+fn empty_page_with_expired_lease_returns_lease_lost() {
+    // Lease duration = 8, acquired at t=3, so deadline = 11.
+    let mut coord = seeded_coordinator(8, CursorUpdate::with_last_key(b"a"));
+
+    let empty_page = EnumerationPage::new(Vec::new(), Cursor::with_last_key(make_key(b"a")));
+    let mut connector = ScriptedConnector::new(vec![Ok(empty_page)]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(1050);
+
+    // baseline_now = 4 (within lease), then complete_now = 20 (past deadline=11).
+    let script: &[u64] = &[4, 20];
+    let idx = Cell::new(0usize);
+    let outcome = run_scan_loop(
+        session,
+        &mut connector,
+        budgets(10),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || {
+            let i = idx.get();
+            idx.set(i + 1);
+            now(script[i])
+        },
+    );
+    assert_eq!(idx.get(), script.len(), "time script not fully consumed");
+
+    match outcome {
+        ScanLoopOutcome::LeaseLost {
+            pages_completed,
+            cause:
+                LeaseLossCause::DeadlineElapsed {
+                    now: lease_lost_now,
+                    deadline,
+                },
+        } => {
+            assert_eq!(pages_completed, 0);
+            assert_eq!(lease_lost_now, now(20));
+            assert_eq!(deadline, now(11));
+        }
+        other => panic!("expected LeaseLost(DeadlineElapsed), got {other:?}"),
+    }
+
+    // No terminal transition succeeded — shard stays Active.
+    let summary = shard_summary(&coord, 21);
+    assert_eq!(summary.status(), ShardStatus::Active);
+}
+
 // -- F2: parameterized should_renew coverage ---------------------------------
 
 #[rstest]
@@ -1143,6 +1212,9 @@ fn should_renew_small_duration_edge_cases() {
 // Branch D: zero-duration with positive fraction (guard sets threshold=1)
 #[case(now(5), now(10), 0, RenewalPolicy::new(0.5), false)] // threshold=1, remaining=5
 #[case(now(9), now(10), 0, RenewalPolicy::new(0.5), true)] // threshold=1, remaining=1
+// Branch E: zero-duration with zero fraction (threshold stays 0)
+#[case(now(5), now(10), 0, RenewalPolicy::new(0.0), false)] // threshold=0, remaining=5
+#[case(now(9), now(10), 0, RenewalPolicy::new(0.0), false)] // threshold=0, remaining=1
 fn should_renew_parameterized(
     #[case] at: LogicalTime,
     #[case] deadline: LogicalTime,
@@ -1183,6 +1255,27 @@ fn effective_fraction_panics_on_infinity_in_debug() {
 #[should_panic(expected = "non-finite")]
 fn effective_fraction_panics_on_neg_infinity_in_debug() {
     let _ = RenewalPolicy::new(f64::NEG_INFINITY).effective_fraction();
+}
+
+/// In release mode, non-finite fractions fall back to DEFAULT (0.5) inside
+/// `should_renew` via `effective_fraction`. Verify the end-to-end path.
+#[cfg(not(debug_assertions))]
+#[rstest]
+#[case(f64::NAN, now(10), now(20), 20, true)] // falls back to 0.5, threshold=10, remaining=10 → true
+#[case(f64::NAN, now(2), now(20), 20, false)] // falls back to 0.5, threshold=10, remaining=18 → false
+#[case(f64::INFINITY, now(10), now(20), 20, true)] // falls back to 0.5, threshold=10, remaining=10 → true
+#[case(f64::NEG_INFINITY, now(10), now(20), 20, true)] // falls back to 0.5
+fn should_renew_non_finite_falls_back_in_release(
+    #[case] fraction: f64,
+    #[case] at: LogicalTime,
+    #[case] deadline: LogicalTime,
+    #[case] duration: u64,
+    #[case] expected: bool,
+) {
+    assert_eq!(
+        should_renew(at, deadline, duration, RenewalPolicy::new(fraction)),
+        expected,
+    );
 }
 
 #[cfg(not(debug_assertions))]

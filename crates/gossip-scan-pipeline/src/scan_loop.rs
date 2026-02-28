@@ -32,9 +32,10 @@
 //!              │ Ok
 //!              ▼
 //!        ┌──────────┐       ┌────────────────────────────────────┐
-//!        │  empty?  │──yes──►  complete(final_cursor) ──► Done   │
-//!        └────┬─────┘       │  (no deadline guard — see note)    │
-//!             │ no          └────────────────────────────────────┘
+//!        │  empty?  │──yes──►  deadline guard (now)              │
+//!        └────┬─────┘       │   ├── expired ──► LeaseLost       │
+//!             │ no          │   └── ok ──► complete ──► Done     │
+//!                           └────────────────────────────────────┘
 //!             ▼
 //!     ┌────────────────────────┐
 //!     │  deadline guard (now)  │── expired ──► LeaseLost
@@ -81,6 +82,10 @@
 //!   `validate_page` runs first, and validation rejects
 //!   `EmptyPageCursorAdvanced` — so any empty page that reaches the
 //!   terminal check has an unchanged `last_key` and cannot skip items.
+//! - **SL7 — Renewal-after-checkpoint ordering:** Lease renewal is attempted
+//!   only after a successful checkpoint. A renewal failure therefore never
+//!   rolls back already-persisted progress, preserving forward-progress
+//!   guarantees even when lease loss is detected.
 //!
 //! ## Design trade-offs
 //!
@@ -89,6 +94,11 @@
 //!   enabling fully reproducible simulation tests.
 //! - Lease renewal is checked synchronously between pages (no background task
 //!   or async runtime).
+//! - Retry-after-error is composed externally (callers re-acquire and re-enter
+//!   the loop), while lease renewal is internal. The asymmetry is intentional:
+//!   renewal requires access to the live session and lease metadata, so it must
+//!   happen inside the loop. Retry orchestration (backoff, jitter, scheduling)
+//!   is policy-heavy and session-independent, so it belongs in the caller.
 //! - `LeaseLost` is emitted only on "abandon without mutation" paths
 //!   (deadline elapsed before checkpoint, or renewal failure). Once a
 //!   coordination mutation is attempted, backend rejections - including
@@ -240,8 +250,8 @@ pub enum ScanLoopOutcome {
     /// Lease was lost while scanning, so the loop aborted without issuing
     /// terminal transitions (`park`/`complete`).
     ///
-    /// This variant is produced only by the pre-checkpoint deadline guard and
-    /// by failed `renew` calls.
+    /// This variant is produced by deadline guards (both pre-checkpoint and
+    /// pre-complete) and by failed `renew` calls.
     ///
     /// `pages_completed` counts successful checkpoints already persisted in
     /// this session before lease loss was detected.
@@ -376,6 +386,13 @@ where
 /// terminal transitions. `LeaseLost` reports lease loss without terminal
 /// mutation attempts. `Error` reports failed coordination mutations.
 ///
+/// ## Time injection contract
+///
+/// `now_fn` must return monotonically non-decreasing [`LogicalTime`] values.
+/// The loop calls `now_fn` multiple times per page iteration (deadline guard,
+/// checkpoint timestamp, renewal evaluation). Non-monotonic values would
+/// invalidate deadline comparisons and renewal threshold calculations.
+///
 /// ## Lease renewal model
 ///
 /// Renewal remains synchronous and deterministic: after each successful
@@ -407,7 +424,7 @@ where
 /// | Retryable enumerate error (streak < limit) | Retry immediately |
 /// | Retryable enumerate error (streak >= limit) | Park `TooManyErrors` |
 /// | Permanent enumerate error | Park via message heuristic |
-/// | Deadline elapsed before checkpoint | Return `LeaseLost` |
+/// | Deadline elapsed before checkpoint or complete | Return `LeaseLost` |
 /// | Lease renewal failure | Return `LeaseLost` |
 /// | Coordination checkpoint/complete failure | Return `Error` directly |
 /// | Park call failure | Return compound `Error::Park` |
@@ -476,6 +493,9 @@ where
             },
         };
     }
+    // Degenerate case: if baseline_now >= deadline, observed_lease_duration is 0.
+    // The early-exit guard above catches this before we reach the loop, returning
+    // LeaseLost(DeadlineElapsed) before should_renew is ever evaluated.
     let mut observed_lease_duration = session
         .lease()
         .deadline()
@@ -551,15 +571,26 @@ where
         // empty+non-initial (gap at cursor position), but the scan loop treats
         // both as terminal -- gap handling is composed externally if needed.
         //
-        // No deadline pre-check before complete: unlike checkpoint (which
-        // allows retry-resumable progress), complete is a terminal mutation.
-        // If the lease expired, the backend's LeaseExpired rejection correctly
-        // surfaces as Error(Complete(..)), consistent with the documented
-        // contract that LeaseLost is reserved for "abandon without mutation"
-        // paths.
+        // Deadline guard before complete: if the lease expired between
+        // `enumerate_page` and this point, surface `LeaseLost` rather than
+        // attempting a `complete` mutation that would be rejected with
+        // `LeaseExpired`. This keeps the LeaseLost contract consistent:
+        // all detectable lease expiry is reported as LeaseLost, regardless
+        // of whether the page was empty or non-empty.
         if is_terminal {
+            let complete_now = now_fn();
+            let deadline = session.lease().deadline();
+            if complete_now >= deadline {
+                return ScanLoopOutcome::LeaseLost {
+                    pages_completed,
+                    cause: LeaseLossCause::DeadlineElapsed {
+                        now: complete_now,
+                        deadline,
+                    },
+                };
+            }
             let final_cursor = next_cursor.as_update();
-            return match session.complete(now_fn(), &final_cursor, op_id_fn()) {
+            return match session.complete(complete_now, &final_cursor, op_id_fn()) {
                 Ok(_) => ScanLoopOutcome::Completed,
                 Err(error) => ScanLoopOutcome::Error(ScanLoopError::Complete(error)),
             };
