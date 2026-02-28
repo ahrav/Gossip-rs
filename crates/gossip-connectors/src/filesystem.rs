@@ -626,6 +626,9 @@ impl FilesystemConnector {
         let mut dir_fd: Option<OwnedFd> = None;
 
         for (i, component) in components.iter().enumerate() {
+            // Defense-in-depth: `encode_rel_path` only produces Normal segments,
+            // and `verify_membership` rejects refs absent from the index, so this
+            // guard is unreachable through any public API path.
             if component.is_empty() || *component == b"." || *component == b".." {
                 return Err(ReadError::permanent("invalid path component in item_ref"));
             }

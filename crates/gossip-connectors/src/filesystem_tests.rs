@@ -953,7 +953,7 @@ fn consecutive_read_ranges_on_same_file_succeed() {
 }
 
 // ---------------------------------------------------------------
-// ShardSpec trait-method coverage (F11)
+// ShardSpec trait-method coverage
 // ---------------------------------------------------------------
 
 #[test]
@@ -991,7 +991,7 @@ fn choose_split_point_via_shard_spec() {
 }
 
 // ---------------------------------------------------------------
-// FD cache eviction (F13)
+// FD cache eviction
 // ---------------------------------------------------------------
 
 #[test]
@@ -1329,7 +1329,7 @@ fn version_id_changes_when_file_modified() {
 }
 
 // ---------------------------------------------------------------
-// Walk depth limit tests (F2)
+// Walk depth limit tests
 // ---------------------------------------------------------------
 
 #[test]
@@ -1385,7 +1385,7 @@ fn walk_depth_zero_indexes_only_root_files() {
 }
 
 // ---------------------------------------------------------------
-// Edge case tests (F6)
+// Edge case tests
 // ---------------------------------------------------------------
 
 #[test]
