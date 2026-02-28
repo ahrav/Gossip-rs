@@ -652,6 +652,10 @@ where
                         .deadline()
                         .as_raw()
                         .saturating_sub(renew_now.as_raw());
+                    debug_assert!(
+                        observed_lease_duration > 0,
+                        "renewed lease deadline must be strictly after renew time"
+                    );
                 }
                 Err(error) => {
                     debug_assert!(

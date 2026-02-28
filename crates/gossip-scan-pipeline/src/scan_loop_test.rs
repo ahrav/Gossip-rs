@@ -800,7 +800,7 @@ fn classify_permanent_error_maps_keywords_to_park_reason(
 
 // -- unit tests for loop logic gaps ------------------------------------------
 
-/// A1: Retry streak resets after a successful page.
+/// Retry streak resets after a successful page.
 ///
 /// Script: `[Err(retryable), Ok(page "b"), Err(retryable), Err(retryable)]`
 /// with `max_transient_retries: 1`. If the streak reset regresses, the loop
@@ -845,7 +845,7 @@ fn retry_streak_resets_after_successful_page() {
     assert_eq!(summary.last_key(), Some(&b"b"[..]));
 }
 
-/// A2: Empty first page completes immediately without any checkpoint.
+/// Empty first page completes immediately without any checkpoint.
 ///
 /// When resumed from a prior cursor position, the connector may return an
 /// empty page echoing the same cursor. The loop validates (cursor did not
@@ -875,7 +875,7 @@ fn empty_first_page_completes_immediately() {
     assert_eq!(summary.status(), ShardStatus::Done);
 }
 
-/// A3: `max_transient_retries = 0` parks on the first retryable error.
+/// `max_transient_retries = 0` parks on the first retryable error.
 #[test]
 fn zero_retries_parks_on_first_retryable_error() {
     let mut coord = seeded_coordinator(40, CursorUpdate::initial());
@@ -897,7 +897,7 @@ fn zero_retries_parks_on_first_retryable_error() {
     assert_eq!(connector.calls, 1, "no retries with limit 0");
 }
 
-/// A5: `rate_limited` error surfaces `retry_after_ms` hint in `Parked` outcome.
+/// `rate_limited` error surfaces `retry_after_ms` hint in `Parked` outcome.
 ///
 /// Script: two consecutive `rate_limited(5000)` errors with `max_transient_retries: 1`.
 /// The scan loop parks with `TooManyErrors` and the outcome carries the
@@ -926,7 +926,7 @@ fn rate_limited_error_surfaces_retry_after_hint() {
     assert_eq!(connector.calls, 2);
 }
 
-/// B1: Park failure preserves the trigger context in a compound error.
+/// Park failure preserves the trigger context in a compound error.
 ///
 /// Connector returns a permanent auth error, but by the time the loop
 /// calls `session.park()` the lease has expired, so the park call fails.
@@ -981,7 +981,7 @@ fn park_failure_preserves_trigger_context() {
     }
 }
 
-/// A4: Expired lease on empty-page path returns `LeaseLost`, not
+/// Expired lease on empty-page path returns `LeaseLost`, not
 /// `Error(Complete(..))`.
 ///
 /// Two pages: first page checkpoints successfully (time within lease),
@@ -1190,7 +1190,64 @@ fn empty_page_with_expired_lease_returns_lease_lost() {
     assert_eq!(summary.status(), ShardStatus::Active);
 }
 
-// -- F2: parameterized should_renew coverage ---------------------------------
+// -- Expired lease at loop entry ----------------------------------------
+
+/// Pre-loop guard: if `baseline_now >= deadline`, the loop returns
+/// `LeaseLost(DeadlineElapsed)` with `pages_completed: 0` immediately,
+/// without calling the connector at all.
+#[test]
+fn expired_lease_at_loop_entry_returns_lease_lost_without_connector_call() {
+    // Lease duration = 8, acquired at t=3, so deadline = 11.
+    let mut coord = seeded_coordinator(8, CursorUpdate::initial());
+
+    let page_b = EnumerationPage::new(
+        vec![make_scan_item(b"b")],
+        Cursor::with_last_key(make_key(b"b")),
+    );
+    let mut connector = ScriptedConnector::new(vec![Ok(page_b)]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(1300);
+
+    // baseline_now = 20 (past deadline=11) → pre-loop guard fires.
+    let outcome = run_scan_loop(
+        session,
+        &mut connector,
+        budgets(10),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || now(20),
+    );
+
+    match outcome {
+        ScanLoopOutcome::LeaseLost {
+            pages_completed,
+            cause:
+                LeaseLossCause::DeadlineElapsed {
+                    now: lease_lost_now,
+                    deadline,
+                },
+        } => {
+            assert_eq!(pages_completed, 0);
+            assert_eq!(lease_lost_now, now(20));
+            assert_eq!(deadline, now(11));
+        }
+        other => panic!("expected LeaseLost(DeadlineElapsed), got {other:?}"),
+    }
+
+    // Connector was never called — the pre-loop guard short-circuited.
+    assert_eq!(
+        connector.calls, 0,
+        "connector should not be called when lease already expired"
+    );
+
+    // Shard remains Active at initial cursor.
+    let summary = shard_summary(&coord, 21);
+    assert_eq!(summary.status(), ShardStatus::Active);
+    assert_eq!(summary.last_key(), None);
+}
+
+// -- Parameterized should_renew coverage --------------------------------------
 
 #[rstest]
 // Branch A: now >= deadline (early true)
@@ -1225,7 +1282,7 @@ fn should_renew_parameterized(
     assert_eq!(should_renew(at, deadline, duration, policy), expected);
 }
 
-// -- F9: RenewalPolicy::default() value test ---------------------------------
+// -- RenewalPolicy::default() value test --------------------------------------
 
 #[test]
 fn renewal_policy_default_is_half_life() {
@@ -1295,7 +1352,7 @@ fn effective_fraction_falls_back_on_non_finite_in_release() {
     );
 }
 
-// -- F5: CheckpointError path ------------------------------------------------
+// -- CheckpointError path -----------------------------------------------------
 
 /// Checkpoint failure returns `Error(Checkpoint(..))`.
 ///
@@ -1337,7 +1394,7 @@ fn checkpoint_missing_key_returns_error() {
     }
 }
 
-// -- F10: Multi-renewal recalibration ----------------------------------------
+// -- Multi-renewal recalibration ----------------------------------------------
 
 /// Two renewals across a 3-page scan verify threshold recalibration.
 ///
@@ -1392,7 +1449,7 @@ fn multi_renewal_recalibrates_threshold() {
     assert_eq!(summary.last_key(), Some(&b"c"[..]));
 }
 
-// -- F11: Negative test — no renewal when ample time -------------------------
+// -- Negative test — no renewal when ample time -------------------------------
 
 /// With a long lease (1000), should_renew never triggers, so the
 /// `NoRenewBackend` (which panics on renew) must not fire.
