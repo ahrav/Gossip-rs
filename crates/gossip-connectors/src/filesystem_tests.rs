@@ -1468,3 +1468,362 @@ fn very_long_filename_is_indexed() {
     reader.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"long name content");
 }
+
+// ---------------------------------------------------------------
+// Membership enforcement tests
+// ---------------------------------------------------------------
+
+#[test]
+fn read_rejects_non_indexed_item_ref() {
+    let dir = create_test_dir(&[("a.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Trigger indexing.
+    let _ = collect_all(&mut c, &start, &end);
+
+    // Create a new file after indexing.
+    fs::write(dir.path().join("b.txt"), b"post-index").unwrap();
+
+    // Attempt to read the non-indexed file.
+    let bad_ref = ItemRef::try_from_slice(b"b.txt").unwrap();
+    let result = c.open(&bad_ref, default_budgets());
+    let err = result.err().expect("should reject item_ref not in index");
+    assert!(
+        !err.is_retryable(),
+        "membership rejection should be permanent"
+    );
+}
+
+#[test]
+fn read_range_rejects_non_indexed_item_ref() {
+    let dir = create_test_dir(&[("a.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+
+    let bad_ref = ItemRef::try_from_slice(b"nonexistent.txt").unwrap();
+    let mut buf = [0u8; 32];
+    let result = c.read_range(&bad_ref, 0, &mut buf, default_budgets());
+    assert!(result.is_err(), "should reject item_ref not in index");
+}
+
+#[rstest]
+#[case::current_dir_prefix(b"./a.txt")]
+#[case::double_slash(b"a//b.txt")]
+#[case::trailing_slash(b"a.txt/")]
+#[case::just_dot(b".")]
+fn non_canonical_item_ref_rejected(#[case] ref_bytes: &[u8]) {
+    let dir = create_test_dir(&[("a.txt", b"data"), ("a/b.txt", b"nested")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Trigger indexing.
+    let _ = collect_all(&mut c, &start, &end);
+
+    // These non-canonical spellings don't match any indexed key.
+    let bad_ref = ItemRef::try_from_slice(ref_bytes).unwrap();
+    let result = c.open(&bad_ref, default_budgets());
+    assert!(
+        result.is_err(),
+        "non-canonical ref {:?} should be rejected",
+        ref_bytes
+    );
+}
+
+#[test]
+fn open_without_prior_enumerate_fails() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let item_ref = ItemRef::try_from_slice(b"file.txt").unwrap();
+    let result = c.open(&item_ref, default_budgets());
+    assert!(result.is_err(), "open before enumerate should fail");
+    let err = result.err().expect("should be an error");
+    assert!(
+        err.message().contains("not indexed"),
+        "error should mention indexing"
+    );
+}
+
+// ---------------------------------------------------------------
+// Warning cap tests
+// ---------------------------------------------------------------
+
+#[test]
+fn warning_cap_limits_storage() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    // Create many symlinks to exceed the warning cap.
+    for i in 0..20 {
+        std::os::unix::fs::symlink("target", dir.path().join(format!("link_{i:03}"))).unwrap();
+    }
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_warnings(5);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+    assert!(
+        c.walk_warnings().len() <= 5,
+        "warnings should be capped at max_warnings"
+    );
+    assert!(
+        c.overflow_warning_count() > 0,
+        "overflow count should be nonzero when warnings exceed cap"
+    );
+    assert_eq!(
+        c.walk_warnings().len() + c.overflow_warning_count(),
+        20,
+        "total warnings + overflow should equal number of symlinks"
+    );
+}
+
+#[test]
+fn zero_max_warnings_drops_all() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_warnings(0);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+    assert!(c.walk_warnings().is_empty(), "no warnings should be stored");
+    assert_eq!(
+        c.overflow_warning_count(),
+        1,
+        "overflow should count the dropped warning"
+    );
+}
+
+// ---------------------------------------------------------------
+// Error classification tests
+// ---------------------------------------------------------------
+
+#[test]
+fn eloop_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::ELOOP);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "ELOOP should be permanent"
+    );
+}
+
+#[test]
+fn enotdir_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::ENOTDIR);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "ENOTDIR should be permanent"
+    );
+}
+
+#[test]
+fn eisdir_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::EISDIR);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "EISDIR should be permanent"
+    );
+}
+
+#[test]
+fn transient_error_remains_retryable() {
+    // EAGAIN / EWOULDBLOCK is transient.
+    let err = io::Error::from_raw_os_error(libc::EAGAIN);
+    assert!(
+        !super::is_permanent_io_error(&err),
+        "EAGAIN should be retryable"
+    );
+}
+
+// ---------------------------------------------------------------
+// Deadline-aware indexing tests
+// ---------------------------------------------------------------
+
+#[test]
+fn deadline_expires_during_walk_returns_retryable() {
+    // Create a directory tree with multiple subdirectories.
+    let dir = create_test_dir(&[("a/f1.txt", b"1"), ("b/f2.txt", b"2"), ("c/f3.txt", b"3")]);
+
+    // Use an already-expired deadline.
+    let expired_deadline = Instant::now() - Duration::from_secs(1);
+    let budgets = Budgets::try_new(100, u64::MAX, Some(expired_deadline)).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), budgets);
+    assert!(result.is_err(), "expired deadline should abort indexing");
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline expiry should be retryable"
+    );
+}
+
+#[test]
+fn deadline_expiry_allows_retry_with_fresh_deadline() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+
+    // First call with expired deadline fails.
+    let expired =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
+    assert!(result.is_err());
+
+    // Second call with no deadline succeeds.
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(page.items().len(), 1);
+}
+
+// ---------------------------------------------------------------
+// Root canonicalization tests
+// ---------------------------------------------------------------
+
+#[test]
+fn relative_root_is_canonicalized() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Use a relative path through the tempdir's parent.
+    let abs_path = dir.path().to_path_buf();
+    let parent = abs_path.parent().unwrap();
+    let dir_name = abs_path.file_name().unwrap();
+    let relative = PathBuf::from(".").join(dir_name);
+
+    // Create connector with relative path and set cwd to parent.
+    let original_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(parent).unwrap();
+
+    let mut c = FilesystemConnector::new(&relative);
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(page.items().len(), 1);
+
+    // After indexing, reads still work even if we change cwd.
+    std::env::set_current_dir(&original_cwd).unwrap();
+    let item_ref = page.items()[0].item_ref().clone();
+    let mut reader = c.open(&item_ref, default_budgets()).unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"data");
+}
+
+// ---------------------------------------------------------------
+// openat traversal tests
+// ---------------------------------------------------------------
+
+#[test]
+fn openat_rejects_intermediate_symlink_replacement() {
+    // Create a directory tree: dir/sub/file.txt
+    let dir = create_test_dir(&[("sub/file.txt", b"original")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index the tree.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].item_key().as_bytes(), b"sub/file.txt");
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace the intermediate directory with a symlink.
+    let escape_dir = tempfile::tempdir().expect("create escape dir");
+    fs::write(escape_dir.path().join("file.txt"), b"escaped content").unwrap();
+
+    fs::remove_dir_all(dir.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink(escape_dir.path(), dir.path().join("sub")).unwrap();
+
+    // openat with O_NOFOLLOW on the intermediate "sub" should fail.
+    let result = c.open(&item_ref, default_budgets());
+    assert!(
+        result.is_err(),
+        "openat should reject intermediate symlink (sub -> escape)"
+    );
+}
+
+// ---------------------------------------------------------------
+// Prefix-sum split consistency test
+// ---------------------------------------------------------------
+
+#[test]
+fn prefix_sum_split_matches_linear_scan() {
+    // Verify that the prefix-sum-based split produces the same result as the
+    // linear-scan in common::choose_split_index for various file configurations.
+    let configs: &[&[(&str, &[u8])]] = &[
+        &[
+            ("a.txt", &[0u8; 100] as &[u8]),
+            ("b.txt", &[0u8; 100]),
+            ("c.txt", &[0u8; 100]),
+            ("d.txt", &[0u8; 100]),
+        ],
+        &[
+            ("a.txt", &[0u8; 900] as &[u8]),
+            ("b.txt", &[0u8; 50]),
+            ("c.txt", &[0u8; 50]),
+        ],
+        &[
+            ("a.txt", &[0u8; 10] as &[u8]),
+            ("b.txt", &[0u8; 10]),
+            ("c.txt", &[0u8; 900]),
+        ],
+    ];
+
+    for (i, config) in configs.iter().enumerate() {
+        let dir = create_test_dir(config);
+        let mut c = FilesystemConnector::new(dir.path());
+        let start = make_key(b"\x00");
+        let end = make_key(b"\xff");
+
+        // Trigger indexing.
+        let _ = collect_all(&mut c, &start, &end);
+
+        // Prefix-sum split.
+        let ps_split = c
+            .choose_split_point_range(&start, &end, &Cursor::initial())
+            .unwrap();
+
+        // Linear-scan split via common::choose_split_index.
+        let linear_idx = common::choose_split_index(&c.files, 0, c.files.len());
+        let linear_split = linear_idx.map(|idx| c.files[idx].key.clone());
+
+        assert_eq!(
+            ps_split, linear_split,
+            "config {i}: prefix-sum split should match linear scan"
+        );
+    }
+}
+
+// ---------------------------------------------------------------
+// Split deadline enforcement test
+// ---------------------------------------------------------------
+
+#[test]
+fn choose_split_point_respects_deadline() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let shard = ShardSpec::try_with_range(b"\x00", b"\xff").unwrap();
+    let expired =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+
+    let result = c.choose_split_point(&shard, &Cursor::initial(), expired);
+    assert!(result.is_err(), "expired deadline should cause an error");
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline error should be retryable"
+    );
+}
