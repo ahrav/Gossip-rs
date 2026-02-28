@@ -538,6 +538,7 @@ fn read_range_budget_clamps_read() {
 #[case::absolute_path(b"/etc/passwd")]
 #[case::parent_traversal(b"../etc/passwd")]
 #[case::embedded_traversal(b"sub/../../etc/passwd")]
+#[case::traversal_after_valid(b"valid/../../../etc/passwd")]
 #[case::null_byte_injection(b"file.txt\x00../../etc/passwd")]
 fn resolve_rejects_malicious_paths(#[case] path: &[u8]) {
     let dir = create_test_dir(&[("file.txt", b"data")]);
@@ -1843,6 +1844,92 @@ fn openat_rejects_intermediate_symlink_replacement() {
         result.is_err(),
         "openat should reject intermediate symlink (sub -> escape)"
     );
+}
+
+// ---------------------------------------------------------------
+// File-modification-after-index tests
+// ---------------------------------------------------------------
+
+#[test]
+fn file_deleted_after_indexing_returns_permanent_error() {
+    let dir = create_test_dir(&[("ephemeral.txt", b"will be deleted")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Delete the file after indexing.
+    fs::remove_file(dir.path().join("ephemeral.txt")).unwrap();
+
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("open should succeed for deleted file"),
+    };
+    assert!(
+        !err.is_retryable(),
+        "deleted file should be a permanent error"
+    );
+}
+
+#[test]
+fn file_truncated_after_indexing_reads_shorter() {
+    let dir = create_test_dir(&[("shrink.txt", b"original content here")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Truncate the file after indexing.
+    fs::write(dir.path().join("shrink.txt"), b"").unwrap();
+
+    let mut buf = [0u8; 128];
+    let n = c
+        .read_range(&item_ref, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(n, 0, "truncated file should return 0 bytes");
+}
+
+#[test]
+fn permissions_removed_after_indexing_returns_permanent_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = create_test_dir(&[("locked.txt", b"sensitive")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Remove read permissions after indexing.
+    fs::set_permissions(
+        dir.path().join("locked.txt"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("open should fail when permissions are removed"),
+    };
+    assert!(
+        !err.is_retryable(),
+        "permission denied should be a permanent error"
+    );
+
+    // Restore permissions for tempdir cleanup.
+    fs::set_permissions(
+        dir.path().join("locked.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
 }
 
 // ---------------------------------------------------------------

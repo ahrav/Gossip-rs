@@ -258,7 +258,9 @@ pub struct FilesystemConnector {
     /// Directory fd for the canonical root, opened during indexing.
     root_fd: Option<OwnedFd>,
     /// Single-entry FD cache for sequential `read_range` calls.
-    cached_file: Option<(Box<[u8]>, fs::File)>,
+    /// Keyed on the index position within [`Self::files`] to avoid
+    /// heap-allocating a copy of the item-ref bytes on every cache miss.
+    cached_file: Option<(usize, fs::File)>,
 }
 
 impl FilesystemConnector {
@@ -382,18 +384,12 @@ impl FilesystemConnector {
                 Ok(())
             }
             Err(err) => {
-                let permanent = !err.is_retryable();
-                let message = err.into_message();
                 self.walk_warnings = warnings;
                 self.overflow_warning_count = overflow_count;
-                if permanent {
-                    self.index_state = IndexState::Failed(message.clone());
+                if !err.is_retryable() {
+                    self.index_state = IndexState::Failed(err.message().to_owned());
                 }
-                Err(if permanent {
-                    EnumerateError::permanent(message)
-                } else {
-                    EnumerateError::retryable(message)
-                })
+                Err(err)
             }
         }
     }
@@ -557,6 +553,10 @@ impl FilesystemConnector {
     }
 
     /// O(log n) byte-weighted median split using prefix sums.
+    ///
+    /// The linear-scan equivalent lives in [`common::choose_split_index`]; both
+    /// produce identical results but this version uses the precomputed
+    /// [`prefix_sums`](Self::prefix_sums) for O(log n) selection.
     fn byte_weighted_split_idx(&self, start_idx: usize, range_end: usize) -> Option<usize> {
         let count = range_end.saturating_sub(start_idx);
         if count < 2 {
@@ -590,7 +590,7 @@ impl FilesystemConnector {
     // Read-path: openat traversal + membership enforcement
     // ---------------------------------------------------------------
 
-    fn verify_membership(&mut self, item_ref: &ItemRef) -> Result<(), ReadError> {
+    fn verify_membership(&mut self, item_ref: &ItemRef) -> Result<usize, ReadError> {
         self.ensure_indexed(None).map_err(|e| {
             if e.is_retryable() {
                 ReadError::retryable(e.into_message())
@@ -599,14 +599,9 @@ impl FilesystemConnector {
             }
         })?;
         let ref_bytes = item_ref.as_bytes();
-        if self
-            .files
+        self.files
             .binary_search_by(|f| f.key.as_bytes().cmp(ref_bytes))
-            .is_err()
-        {
-            return Err(ReadError::permanent("item_ref not found in index"));
-        }
-        Ok(())
+            .map_err(|_| ReadError::permanent("item_ref not found in index"))
     }
 
     /// Open a file beneath `root_fd` using component-by-component `openat`
@@ -681,12 +676,12 @@ impl FilesystemConnector {
         let need_open = self
             .cached_file
             .as_ref()
-            .is_none_or(|(key, _)| &**key != ref_bytes);
+            .is_none_or(|(idx, _)| self.files[*idx].key.as_bytes() != ref_bytes);
         if need_open {
-            self.verify_membership(item_ref)?;
+            let idx = self.verify_membership(item_ref)?;
             let (file, _metadata) = self.open_beneath_root(ref_bytes)?;
             clear_nonblock(&file)?;
-            self.cached_file = Some((ref_bytes.into(), file));
+            self.cached_file = Some((idx, file));
         }
         Ok(&self.cached_file.as_ref().unwrap().1)
     }
