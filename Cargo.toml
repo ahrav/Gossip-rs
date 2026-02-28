@@ -27,3 +27,7 @@ gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }
 gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }
 gossip-frontier = { path = "crates/gossip-frontier" }
+
+# External dev/test dependencies
+rstest = "0.25"
+proptest = "1.6"

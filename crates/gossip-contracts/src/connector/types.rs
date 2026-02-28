@@ -885,6 +885,16 @@ impl EnumerationPage {
     pub fn into_parts(self) -> (Vec<ScanItem>, Cursor) {
         (self.items, self.next_cursor)
     }
+
+    /// Consume the page, returning only the continuation cursor.
+    ///
+    /// Use this when page items have already been inspected by reference and
+    /// only the cursor is needed by value (e.g., after validation in the scan
+    /// loop). Avoids cloning the cursor's heap-allocated key and token fields.
+    #[must_use]
+    pub fn into_next_cursor(self) -> Cursor {
+        self.next_cursor
+    }
 }
 
 /// Page/scan budget controls used by connector enumeration APIs.
