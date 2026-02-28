@@ -157,7 +157,7 @@ Every split operation must satisfy two invariants:
 - **INV-S21**: Shards cover the entire keyspace. The union of all child ranges
   must exactly equal the parent's original range.
 
-These invariants are enforced by the `validate_coverage()` function in the coordination
+These invariants are enforced by the `validate_split_coverage()` function in the coordination
 backend and are verified in the shard lifecycle tests (see [Shard and Run State Machines](./05-shard-and-run-state-machines.md)
 for the shard state machine that constrains when splits can occur).
 
@@ -221,7 +221,7 @@ graph LR
     style note3 fill:#FFF7ED,stroke:#9A3412,stroke-width:1px,color:#9A3412
 ```
 
-If validation fails, the coordinator returns a `SplitError::SplitInvalid(Box<SplitValidationError>)`
+If validation fails, the coordinator returns a `SplitError::SplitInvalid(SplitValidationError)`
 and no state changes occur. The parent remains in its original state, and no
 children are created. This makes the validation check a gate, not a cleanup step
 -- the system never enters a state with gaps or overlaps.
@@ -401,15 +401,19 @@ overwhelm the coordinator's shard tracking.
   separator used for deterministic child ID derivation
 - [System Overview](./01-system-overview.md) -- B2 Coordination and B3 Shard
   Algebra boundaries that house split logic
+- [Shard Algebra Types](./13-shard-algebra-types.md) -- B3 deep dive covering
+  key encoding, hint framing, builder lifecycle, and connector enumeration
 
 ## Source Code References
 
 | File | Purpose |
 |:-----|:--------|
-| `04-boundary-2-coordination/06-split-operations.md` | Deep dive document on split operations |
-| `crates/gossip-contracts/src/coordination/` | Coordination data types (shard_spec, cursor, pooled, manifest, limits) |
-| `crates/gossip-coordination/src/` | Coordination protocol containing split implementation |
-| `crates/gossip-coordination/src/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()` |
-| `crates/gossip-coordination/src/record.rs` | `ShardStatus::Split`, `ShardRecord` with range fields |
-| `crates/gossip-coordination/src/error.rs` | `SplitError::SplitInvalid`, `SplitError::ShardTerminal` |
-| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend::split_replace()`, `CoordinationBackend::split_residual()` |
+| `crates/gossip-contracts/src/coordination/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace_at_points()` |
+| `crates/gossip-coordination/src/split_execution.rs` | `derive_split_shard_id()`, `DerivedShardKind`, payload hash |
+| `crates/gossip-contracts/src/coordination/shard_spec.rs` | `validate_split_coverage()`, `validate_split_coverage_bounds()`, `ShardSpec` |
+| `crates/gossip-coordination/src/error.rs` | `SplitError::SplitInvalid(SplitValidationError)` |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend::split_replace()`, `split_residual()` |
+| `crates/gossip-coordination/src/record.rs` | `ShardStatus::Split`, `ShardRecord` |
+| `crates/gossip-frontier/src/hint.rs` | `propagate_hint_on_split()` |
+| `crates/gossip-frontier/src/builder.rs` | `PreallocShardBuilder::split_range_by_boundaries()` |
+| `crates/gossip-contracts/src/connector/api.rs` | `EnumerationConnector::choose_split_point()` |

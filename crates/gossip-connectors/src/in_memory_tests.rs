@@ -1,7 +1,7 @@
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
+use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
 use rstest::rstest;
 
 use super::*;
@@ -201,9 +201,10 @@ fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
     let bad_ref = ItemRef::try_from_slice(ref_bytes).unwrap();
     assert!(c.open(&bad_ref, default_budgets()).is_err());
     let mut buf = [0u8; 16];
-    assert!(c
-        .read_range(&bad_ref, 0, &mut buf, default_budgets())
-        .is_err());
+    assert!(
+        c.read_range(&bad_ref, 0, &mut buf, default_budgets())
+            .is_err()
+    );
 }
 
 // ---------------------------------------------------------------

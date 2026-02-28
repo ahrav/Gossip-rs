@@ -32,7 +32,7 @@ module boundaries.
 
 Several observations stand out. B1 (Identity) has no outgoing dependency edges;
 it is the universal leaf. B3 (Shard Algebra) depends only on B1, using
-`StableItemId` for key encoding within shard ranges. B2 (Coordination) and B4
+`ShardId` for shard identity and `MAX_KEY_SIZE` as the key-range ceiling. B2 (Coordination) and B4
 (Connector) both sit in the middle tier, each depending on B1 and B3 but not on
 each other. B5 (Persistence) is the highest boundary, depending on B1 for
 content-addressed identity and on B2 for run/shard metadata used in commit
@@ -56,12 +56,12 @@ graph TB
     B5["<b>B5: Persistence</b><br/>Done-ledger, findings sink,<br/>commit protocol, typestate machine"]
 
     B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId"| B1
-    B3 -->|"StableItemId<br/>(key encoding via<br/>CanonicalBytes)"| B1
+    B3 -->|"ShardId, MAX_KEY_SIZE<br/>(shard identity &amp;<br/>key-range ceiling)"| B1
     B4 -->|"ConnectorTag, ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
     B5 -->|"FindingId, OccurrenceId,<br/>DoneLedgerKey, OvidHash,<br/>TriageGroupKey, TenantId,<br/>PolicyHash, SecretHash"| B1
 
     B2 -->|"ShardSpec, KeyEncoding<br/>(shard range types<br/>for split operations)"| B3
-    B4 -->|"KeyEncoding<br/>(cursor construction<br/>from shard ranges)"| B3
+    B4 -->|"ShardSpec<br/>(shard range bounds<br/>for enumeration)"| B3
 
     B5 -->|"Cursor, ShardStatus,<br/>ParkReason<br/>(run/shard metadata<br/>for commit validation)"| B2
 
@@ -126,11 +126,11 @@ graph TD
         B5["<b>B5: Persistence</b><br/>Done-ledger, findings sink, commit protocol"]
     end
 
-    B3 -->|"StableItemId"| B1
+    B3 -->|"ShardId, MAX_KEY_SIZE"| B1
     B2 -->|"TenantId, ShardId,<br/>FenceEpoch, ..."| B1
     B2 -->|"ShardSpec"| B3
     B4 -->|"ConnectorTag,<br/>ItemIdentityKey, ..."| B1
-    B4 -->|"KeyEncoding"| B3
+    B4 -->|"ShardSpec"| B3
     B5 -->|"FindingId, OvidHash,<br/>DoneLedgerKey, ..."| B1
     B5 -->|"Cursor, ShardStatus,<br/>ParkReason"| B2
 

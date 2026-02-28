@@ -308,9 +308,7 @@ impl InMemoryDeterministicConnector {
         if let (Some(s), Some(e)) = (start, end)
             && s > e
         {
-            return Err(EnumerateError::permanent(
-                "shard start key exceeds end key",
-            ));
+            return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
         // Phase 3: resolve key bounds to vector indices.

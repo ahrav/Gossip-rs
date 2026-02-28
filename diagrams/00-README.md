@@ -48,6 +48,7 @@ graph TD
     FM[10-failure-modes-and-recovery.md<br/>6 failure scenarios<br/>6 diagrams]
     TI[11-tenant-isolation.md<br/>3 isolation layers<br/>5 diagrams]
     SP[12-split-operations.md<br/>split_replace + split_residual<br/>5 diagrams]
+    SA[13-shard-algebra-types.md<br/>B3 deep dive: types, keys,<br/>hints, builder<br/>7 diagrams]
 
     R --> SO
     SO --> BD
@@ -63,6 +64,8 @@ graph TD
     FP --> FM
     FP --> TI
     ID --> TI
+    BD --> SA
+    SP --> SA
 
     style R fill:#F3F4F6,stroke:#374151
     style SO fill:#F3F4F6,stroke:#374151
@@ -77,6 +80,7 @@ graph TD
     style FM fill:#F3F4F6,stroke:#374151
     style TI fill:#F3F4F6,stroke:#374151
     style SP fill:#FFF7ED,stroke:#9A3412
+    style SA fill:#FFF7ED,stroke:#9A3412
 ```
 
 ### Suggested Reading Paths
@@ -103,6 +107,10 @@ graph TD
 8. `11-tenant-isolation.md` — Cryptographic multi-tenancy
 9. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
+**Deep dive into shard algebra**:
+10. `12-split-operations.md` — Split operations and coverage validation
+11. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+
 ## File Index
 
 | # | File | Diagrams | Primary Boundary | Key Concepts |
@@ -120,7 +128,8 @@ graph TD
 | 10 | `10-failure-modes-and-recovery.md` | 6 | All | Worker crash, coordinator crash, partitions, split-brain |
 | 11 | `11-tenant-isolation.md` | 5 | B1, B2 | 3 isolation layers, correlation attack, TenantSecretKey |
 | 12 | `12-split-operations.md` | 5 | B2, B3 | split_replace, split_residual, coverage validation |
-| | **Total** | **56** | | |
+| 13 | `13-shard-algebra-types.md` | 7 | B3 | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration |
+| | **Total** | **63** | | |
 
 ## Implementation Status Legend
 
@@ -165,6 +174,7 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `10-failure-modes-and-recovery.md` | `08-cross-cutting/03-failure-modes-and-recovery.md` |
 | `11-tenant-isolation.md` | `08-cross-cutting/04-tenant-isolation.md` |
 | `12-split-operations.md` | `04-boundary-2-coordination/06-split-operations.md` |
+| `13-shard-algebra-types.md` | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
 
 ## Source Code References
 

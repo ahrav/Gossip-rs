@@ -44,13 +44,13 @@ graph TD
     B4["<b>B4: Connector</b><br/>External data-source enumeration &amp; fetch"]
     B5["<b>B5: Persistence</b><br/>Done-ledger, cursor &amp; finding storage"]
 
-    B3 -->|"ShardId, ShardRange"| B1
-    B2 -->|"FencingToken, NodeId"| B1
+    B3 -->|"ShardId, ShardSpec"| B1
+    B2 -->|"FenceEpoch, WorkerId"| B1
     B2 -->|"ShardSpec"| B3
     B4 -->|"StableItemId"| B1
-    B4 -->|"ShardRange"| B3
+    B4 -->|"ShardSpec"| B3
     B5 -->|"FindingId, StableItemId"| B1
-    B5 -->|"FencingToken"| B2
+    B5 -->|"FenceEpoch"| B2
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style B2 fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
@@ -95,6 +95,8 @@ graph LR
 
     subgraph Crates
         contracts["gossip-contracts"]
+        stdx["gossip-stdx"]
+        frontier["gossip-frontier"]
         coordination["gossip-coordination"]
         connectors["gossip-connectors"]
         engine["gossip-engine"]
@@ -104,11 +106,15 @@ graph LR
 
     B1 -->|"contains"| contracts
     B3 -->|"contains"| contracts
+    B3 -->|"contains"| frontier
     B5 -->|"persistence contracts"| contracts
     B2 -->|"contains"| coordination
     B4 -->|"contains"| connectors
 
+    frontier -->|"depends on"| contracts
+    frontier -->|"depends on"| stdx
     coordination -->|"depends on"| contracts
+    coordination -->|"depends on"| stdx
     connectors -->|"depends on"| contracts
     engine -->|"depends on"| contracts
     engine -->|"depends on"| coordination
@@ -123,6 +129,8 @@ graph LR
     style B5 fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
 
     style contracts fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
+    style stdx fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style frontier fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style coordination fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style connectors fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
@@ -206,17 +214,21 @@ sequenceDiagram
 
 ## Build DAG
 
-The crate graph compiles in four tiers. Tier 0 (`gossip-contracts`) has no
-internal dependencies and compiles first. Tier 1 (`gossip-coordination` and
-`gossip-connectors`) compiles in parallel once Tier 0 finishes -- these two
-crates are independent by design. Tier 2 (`gossip-engine`, `gossip-scan-pipeline`)
-depends on everything below it, and Tier 3 (`gossip-worker`) is the final binary.
+The crate graph compiles in four tiers. Tier 0 (`gossip-stdx`, `gossip-contracts`,
+and `gossip-frontier`) has no dependencies on higher-level crates and compiles
+first. `gossip-stdx` is a foundational utility crate depended on by contracts,
+frontier, and coordination. Tier 1 (`gossip-coordination` and `gossip-connectors`)
+compiles in parallel once Tier 0 finishes -- these two crates are independent by
+design. Tier 2 (`gossip-engine`, `gossip-scan-pipeline`) depends on everything
+below it, and Tier 3 (`gossip-worker`) is the final binary.
 
 ```mermaid
 %% Diagram: build-dag
 graph TD
     subgraph "Tier 0"
+        stdx["gossip-stdx"]
         contracts["gossip-contracts"]
+        frontier["gossip-frontier"]
     end
 
     subgraph "Tier 1"
@@ -233,6 +245,10 @@ graph TD
         worker["gossip-worker"]
     end
 
+    stdx --> contracts
+    stdx --> frontier
+    stdx --> coordination
+    contracts --> frontier
     contracts --> coordination
     contracts --> connectors
     contracts --> engine
@@ -241,7 +257,9 @@ graph TD
     engine --> pipeline
     pipeline --> worker
 
+    style stdx fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style contracts fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
+    style frontier fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style coordination fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style connectors fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
@@ -258,6 +276,7 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | Topic | Diagram File |
 |-------|-------------|
 | Identity boundary deep-dive | [03-id-derivation-dag.md](03-id-derivation-dag.md) |
+| Shard algebra deep-dive | [13-shard-algebra-types.md](13-shard-algebra-types.md) |
 | Shard algebra operations | [12-split-operations.md](12-split-operations.md) |
 | Coordination protocol | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
 | Connector lifecycle | [09-circuit-breaker.md](09-circuit-breaker.md) |
@@ -268,7 +287,8 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | Boundary | Primary Source |
 |----------|---------------|
 | B1: Identity | `crates/gossip-contracts/src/identity/` |
-| B3: Shard Algebra | `crates/gossip-frontier/src/` |
+| B3: Shard Algebra | `crates/gossip-contracts/src/coordination/shard_spec.rs` (data model) + `crates/gossip-frontier/src/` (key encoding, hints, builder) |
+| Shared utilities | `crates/gossip-stdx/` |
 | B2: Coordination | `crates/gossip-contracts/src/coordination/` (data types) + `crates/gossip-coordination/src/` (protocol) |
 | B4: Connector | `crates/gossip-contracts/src/connector/` + `crates/gossip-connectors/` |
 | B5: Persistence | `crates/gossip-contracts/src/persistence/` |
