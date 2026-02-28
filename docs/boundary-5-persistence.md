@@ -157,6 +157,13 @@ The `create_run_with_shards` default method in `run.rs:1617-1624` already
 documents this TOCTOU window and notes that production backends should
 override it. This saga is the production override.
 
+**Orphaned shard cleanup:** If a registration is permanently abandoned
+(run remains in `Initializing` beyond a configurable timeout), a periodic
+garbage collector should delete shard records whose run is still
+`Initializing` after N hours. At 10K shards × ~300 bytes per failed
+registration, the storage leak is ~3 MB per failure — negligible at
+expected failure rates, but unbounded if left unaddressed.
+
 ### 2.4 Properties NOT needed from the coordination store
 
 These simplify backend selection:

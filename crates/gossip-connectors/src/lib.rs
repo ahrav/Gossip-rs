@@ -13,3 +13,4 @@
 //! `gossip-persistence` or the coordination backend implementation.
 
 pub mod in_memory;
+pub use in_memory::{InMemoryDeterministicConnector, MemItem};

@@ -14,7 +14,8 @@
 //! 3. **Deterministic IDs** -- [`StableItemId`] derived via
 //!    [`ItemIdentityKey::stable_id`] (connector-tag + key, domain-separated),
 //!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
-//!    (domain-separated BLAKE3), [`ItemRef`] = big-endian index.
+//!    (domain-separated BLAKE3 of content bytes), [`ItemRef`] = big-endian
+//!    index. All items carry [`VersionId::Strong`] since content is immutable.
 //!
 //! # Resume semantics
 //!
@@ -88,8 +89,10 @@ impl MemItem {
 ///   so the Nth item always gets `ItemRef(N)`.
 /// - [`StableItemId`] is derived via [`ItemIdentityKey::stable_id`]
 ///   (domain-separated BLAKE3 of connector-tag + key) and [`ObjectVersionId`]
-///   via [`ObjectVersionId::from_version_bytes`] (domain-separated BLAKE3),
-///   both deterministic.
+///   via [`ObjectVersionId::from_version_bytes`] (domain-separated BLAKE3 of
+///   the item's content bytes), both deterministic. All items are emitted with
+///   [`VersionId::Strong`] because the in-memory content is immutable after
+///   construction.
 ///
 /// Together these choices make enumeration order, identity fields, and read
 /// handles reproducible across runs for identical inputs.
@@ -221,9 +224,9 @@ impl InMemoryDeterministicConnector {
             // well-formed token, verify that it agrees with the key-derived resume
             // position. For this deterministic connector the data is immutable after
             // construction, so a mismatch indicates a bug in token emission/parsing
-            // rather than legitimate staleness. The assert fires in debug/test
-            // builds; in release builds it is stripped and the key-based position
-            // remains authoritative (tokens are advisory per the module contract).
+            // rather than legitimate staleness. The entire block is compiled out in
+            // release builds so the parsing chain has zero runtime cost.
+            #[cfg(debug_assertions)]
             if self.emit_tokens
                 && let Some(token) = cursor.token()
                 && let Some(token_idx_u64) = parse_u64_be(token.as_bytes())
@@ -286,9 +289,10 @@ impl InMemoryDeterministicConnector {
 
     /// Choose a midpoint key that can be used as a shard split hint.
     ///
-    /// The candidate is selected from remaining keys after cursor progress so
-    /// the hint stays forward-only. Returning `None` means the remaining range
-    /// is too small to split while keeping meaningful work on both sides.
+    /// The candidate is the median of remaining keys after cursor progress.
+    /// Returns `None` when fewer than two keys remain, when the candidate
+    /// would not advance past the cursor, or when it falls at or beyond the
+    /// upper shard bound (which would produce an empty right shard).
     fn choose_split_point_bounds(
         &self,
         start: Option<&ItemKey>,
@@ -311,6 +315,9 @@ impl InMemoryDeterministicConnector {
         let split_idx = start_idx + (range_end - start_idx) / 2;
         let candidate = self.items[split_idx].key.clone();
 
+        // Reject candidates that would not advance past the cursor. Splitting
+        // behind or at the cursor position would assign already-processed keys
+        // to the left shard, violating the forward-progress guarantee.
         if cursor.last_key().is_some_and(|last| &candidate <= last) {
             return Ok(None);
         }
@@ -388,6 +395,8 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
 }
 
 impl ReadConnector for InMemoryDeterministicConnector {
+    /// Eagerly rejects items whose total size exceeds `max_bytes` before
+    /// returning the reader, since the full content is already in memory.
     fn open(
         &mut self,
         item_ref: &ItemRef,
@@ -400,6 +409,8 @@ impl ReadConnector for InMemoryDeterministicConnector {
         Ok(Box::new(io::Cursor::new(bytes)))
     }
 
+    /// Clamps the copy length to `min(dst.len(), max_bytes, available)` so
+    /// the budget acts as an additional upper bound on bytes returned.
     fn read_range(
         &mut self,
         item_ref: &ItemRef,
