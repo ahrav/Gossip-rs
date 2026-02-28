@@ -1029,6 +1029,44 @@ fn fd_cache_eviction_on_different_file() {
 }
 
 // ---------------------------------------------------------------
+// Cached FD clears O_NONBLOCK
+// ---------------------------------------------------------------
+
+#[test]
+fn cached_fd_has_clear_nonblock_after_read_range() {
+    let dir = create_test_dir(&[("file.txt", b"hello")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let item_ref = page.items()[0].item_ref().clone();
+
+    // Trigger get_or_open_cached via read_range.
+    let mut buf = [0u8; 5];
+    let n = c
+        .read_range(&item_ref, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n], b"hello");
+
+    // Inspect the cached fd — O_NONBLOCK must NOT be set.
+    let cached = c
+        .cached_file
+        .as_ref()
+        .expect("cached_file should be populated after read_range");
+    let fd = cached.1.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "fcntl(F_GETFL) failed");
+    assert_eq!(
+        flags & libc::O_NONBLOCK,
+        0,
+        "cached fd should NOT have O_NONBLOCK set (flags={flags:#x})"
+    );
+}
+
+// ---------------------------------------------------------------
 // Property-based tests
 // ---------------------------------------------------------------
 
@@ -1536,17 +1574,39 @@ fn non_canonical_item_ref_rejected(#[case] ref_bytes: &[u8]) {
 }
 
 #[test]
-fn open_without_prior_enumerate_fails() {
+fn open_without_prior_enumerate_triggers_lazy_indexing() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
 
+    // A valid ItemRef that exists on disk should succeed even without
+    // prior enumeration — lazy indexing satisfies the ReadConnector
+    // affinity contract for compatible instances.
     let item_ref = ItemRef::try_from_slice(b"file.txt").unwrap();
-    let result = c.open(&item_ref, default_budgets());
-    assert!(result.is_err(), "open before enumerate should fail");
-    let err = result.err().expect("should be an error");
+    let mut reader = match c.open(&item_ref, default_budgets()) {
+        Ok(r) => r,
+        Err(e) => panic!("open should trigger lazy indexing, got: {e:?}"),
+    };
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"data");
+}
+
+#[test]
+fn open_without_enumerate_rejects_absent_item_ref() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    // An ItemRef for a file that does not exist should still fail
+    // after lazy indexing because membership enforcement rejects it.
+    let item_ref = ItemRef::try_from_slice(b"no_such_file.txt").unwrap();
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("absent item_ref should be rejected"),
+    };
     assert!(
-        err.message().contains("not indexed"),
-        "error should mention indexing"
+        err.message().contains("not found in index"),
+        "error should indicate item_ref not found, got: {}",
+        err.message()
     );
 }
 
@@ -1628,6 +1688,15 @@ fn eisdir_classified_as_permanent() {
     assert!(
         super::is_permanent_io_error(&err),
         "EISDIR should be permanent"
+    );
+}
+
+#[test]
+fn enametoolong_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "ENAMETOOLONG should be permanent"
     );
 }
 
@@ -1825,5 +1894,50 @@ fn choose_split_point_respects_deadline() {
     assert!(
         result.unwrap_err().is_retryable(),
         "deadline error should be retryable"
+    );
+}
+
+// ---------------------------------------------------------------
+// Cross-instance read compatibility
+// ---------------------------------------------------------------
+
+#[test]
+fn compatible_instance_reads_item_ref_from_another_instance() {
+    let dir = create_test_dir(&[("hello.txt", b"hello world")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Instance A: enumerate and grab an ItemRef.
+    let mut a = FilesystemConnector::new(dir.path());
+    let page = a
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let item_ref = page.items()[0].item_ref().clone();
+
+    // Instance B: fresh connector over the same root, never enumerated.
+    // The ReadConnector contract allows compatible instances to read
+    // ItemRefs from each other.
+    let mut b = FilesystemConnector::new(dir.path());
+    let mut reader = match b.open(&item_ref, default_budgets()) {
+        Ok(r) => r,
+        Err(e) => {
+            panic!("a compatible instance should read ItemRefs from another instance, got: {e:?}")
+        }
+    };
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello world");
+}
+
+// ---------------------------------------------------------------
+// ENAMETOOLONG classification
+// ---------------------------------------------------------------
+
+#[test]
+fn enametoolong_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+    assert!(
+        is_permanent_io_error(&err),
+        "ENAMETOOLONG should be classified as permanent"
     );
 }

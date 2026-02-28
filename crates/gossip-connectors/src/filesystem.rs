@@ -7,9 +7,11 @@
 //!
 //! # Algorithm
 //!
-//! 1. **Lazy indexing** -- The first enumerate/split call walks the root using
-//!    an explicit stack (no recursion), collecting regular files only. Symlinks
-//!    are skipped.
+//! 1. **Lazy indexing** -- The first enumerate, split, or read call walks the
+//!    root using an explicit stack (no recursion), collecting regular files
+//!    only. Symlinks are skipped. This allows a fresh connector instance to
+//!    read [`ItemRef`]s obtained from a compatible instance over the same root
+//!    without requiring explicit enumeration first.
 //! 2. **Canonical path encoding** -- Each relative path is encoded to raw bytes
 //!    with `/` separators and reused for both [`ItemKey`] and [`ItemRef`].
 //! 3. **Deterministic serving** -- Entries are globally sorted by key, then
@@ -61,8 +63,9 @@
 //! `openat` traversal from a root directory file descriptor, applying
 //! `O_NOFOLLOW` at every path component. This prevents symlink following on
 //! intermediate directories, not just the leaf. Files are opened with
-//! `O_NONBLOCK` to prevent blocking on FIFOs or devices, then validated via
-//! `fstat` as regular files before any read occurs. `ELOOP` from symlink
+//! `O_NONBLOCK` to prevent blocking on FIFOs or devices, validated via
+//! `fstat` as regular files, and then `O_NONBLOCK` is cleared (`fcntl
+//! F_SETFL`) before any read occurs. `ELOOP` from symlink
 //! replacement and `ENOTDIR` from intermediate directory replacement are both
 //! classified as permanent errors.
 //!
@@ -587,12 +590,14 @@ impl FilesystemConnector {
     // Read-path: openat traversal + membership enforcement
     // ---------------------------------------------------------------
 
-    fn verify_membership(&self, item_ref: &ItemRef) -> Result<(), ReadError> {
-        if !matches!(self.index_state, IndexState::Indexed) {
-            return Err(ReadError::permanent(
-                "connector not indexed; call enumerate first",
-            ));
-        }
+    fn verify_membership(&mut self, item_ref: &ItemRef) -> Result<(), ReadError> {
+        self.ensure_indexed(None).map_err(|e| {
+            if e.is_retryable() {
+                ReadError::retryable(e.into_message())
+            } else {
+                ReadError::permanent(e.into_message())
+            }
+        })?;
         let ref_bytes = item_ref.as_bytes();
         if self
             .files
@@ -676,6 +681,7 @@ impl FilesystemConnector {
         if need_open {
             self.verify_membership(item_ref)?;
             let (file, _metadata) = self.open_beneath_root(ref_bytes)?;
+            clear_nonblock(&file)?;
             self.cached_file = Some((ref_bytes.into(), file));
         }
         Ok(&self.cached_file.as_ref().unwrap().1)
@@ -1058,6 +1064,12 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Clear `O_NONBLOCK` from an already-opened file descriptor.
+///
+/// The read path opens leaf files with `O_NONBLOCK` to avoid blocking on
+/// FIFOs or device nodes that slip past the `fstat` regular-file check in
+/// a TOCTOU race. After validation, this function clears the flag so that
+/// subsequent `read`/`read_at` calls use normal blocking semantics.
 fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     let fd = file.as_raw_fd();
     // SAFETY: fcntl F_GETFL/F_SETFL on a valid fd.
