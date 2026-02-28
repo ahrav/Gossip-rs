@@ -381,7 +381,10 @@ name = "gossip-connectors"
 version = "0.1.0"
 dependencies = [
  "gossip-contracts",
+ "libc",
  "proptest",
+ "rstest",
+ "tempfile",
 ]
 
 [[package]]

@@ -10,6 +10,11 @@ description = "Source connectors: filesystem, git, SaaS integrations"
 [dependencies]
 gossip-contracts.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 gossip-contracts = { workspace = true, features = ["test-support"] }
 proptest = "1.10"
+rstest = "0.25"
+tempfile = "3"
