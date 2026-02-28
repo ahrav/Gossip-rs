@@ -487,6 +487,20 @@ where
             };
         }
 
+        // Two separate `now_fn()` samples bracket the checkpoint:
+        //
+        //   checkpoint_now  — sampled here, before the checkpoint mutation.
+        //                     Used for the deadline guard and the checkpoint
+        //                     timestamp itself.
+        //   renew_now       — sampled after `session.checkpoint()` returns
+        //                     (see below). Used for the renewal decision so
+        //                     the remaining-time calculation accounts for
+        //                     work performed during the checkpoint.
+        //
+        // This split is intentional: a single sample would under-count
+        // elapsed time when the checkpoint involves I/O (network round-trip,
+        // WAL fsync, etc.), causing the renewal check to believe more lease
+        // time remains than actually does.
         let checkpoint_now = now_fn();
         let deadline = session.lease().deadline();
         // Guard before checkpoint so we surface lease loss explicitly instead
@@ -513,6 +527,8 @@ where
             Err(error) => return ScanLoopOutcome::Error(ScanLoopError::Checkpoint(error)),
         }
 
+        // Second time sample — see the "two-sample" comment above
+        // `checkpoint_now` for why this is a separate call.
         let renew_now = now_fn();
         if should_renew(
             renew_now,
@@ -546,9 +562,17 @@ where
 /// The trigger compares remaining lease time to a fraction of the most recently
 /// observed lease duration. If `now` is already at/past the deadline, this
 /// returns `true` to force an immediate renewal attempt (which will surface a
-/// precise [`RenewError`] if the lease is already invalid). Non-finite policy
-/// values fall back to [`DEFAULT_RENEW_AT_FRACTION`], and finite values are
-/// clamped into `[0.0, 1.0]`.
+/// precise [`RenewError`] if the lease is already invalid).
+///
+/// **Reachability note:** The pre-checkpoint deadline guard in the scan loop
+/// uses a separate, earlier `now_fn()` sample (`checkpoint_now`). This function
+/// receives `renew_now`, a *later* sample taken after the checkpoint completes.
+/// Time elapsed during the checkpoint can push `renew_now` past the deadline
+/// even though `checkpoint_now` was still within bounds, making the
+/// `now >= deadline` early-return reachable in practice.
+///
+/// Non-finite policy values fall back to [`DEFAULT_RENEW_AT_FRACTION`], and
+/// finite values are clamped into `[0.0, 1.0]`.
 fn should_renew(
     now: LogicalTime,
     deadline: LogicalTime,
