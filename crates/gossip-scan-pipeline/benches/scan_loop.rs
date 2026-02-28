@@ -14,8 +14,8 @@
 //!
 //! | Benchmark | What it measures |
 //! |---|---|
-//! | `scan_loop/pages_{N}` | End-to-end throughput with N items per page |
-//! | `validate_page/{N}_items` | Isolated `validate_page` cost per item count |
+//! | `scan_loop/pages/{T}_items_{P}_per_page` | End-to-end throughput with T total items, P per page |
+//! | `validate_page/{N}` | Isolated `validate_page` cost at N items |
 //!
 //! # Running
 //!
@@ -35,7 +35,7 @@ use gossip_contracts::identity::{
     TenantId, WorkerId,
 };
 use gossip_coordination::{InMemoryCoordinator, RunConfig, RunManagement, WorkerSession};
-use gossip_scan_pipeline::{CounterOpIdSource, run_scan_loop};
+use gossip_scan_pipeline::{DEFAULT_MAX_TRANSIENT_RETRIES, run_scan_loop};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -134,11 +134,13 @@ fn bench_scan_loop(c: &mut Criterion) {
 
     // (total_items, page_size) combinations.
     let params: &[(usize, usize)] = &[
+        (100, 1),
         (100, 10),
         (100, 100),
         (1_000, 10),
         (1_000, 100),
         (1_000, 1_000),
+        (10_000, 100),
     ];
 
     for &(total, page_size) in params {
@@ -159,13 +161,18 @@ fn bench_scan_loop(c: &mut Criterion) {
                     },
                     |(mut coord, mut connector)| {
                         let session = acquire_session(&mut coord, 100);
-                        let mut op_ids = CounterOpIdSource::from_raw(1000);
+                        let mut op_raw = 1000u64;
                         let mut tick = 101u64;
                         let outcome = run_scan_loop(
                             session,
                             &mut connector,
                             budgets(page_size),
-                            &mut op_ids,
+                            DEFAULT_MAX_TRANSIENT_RETRIES,
+                            || {
+                                let raw = op_raw;
+                                op_raw += 1;
+                                OpId::from_raw(raw)
+                            },
                             || {
                                 let out = now(tick);
                                 tick += 1;
@@ -174,7 +181,11 @@ fn bench_scan_loop(c: &mut Criterion) {
                         );
                         let _ = black_box(outcome);
                     },
-                    criterion::BatchSize::SmallInput,
+                    if total >= 1_000 {
+                        criterion::BatchSize::LargeInput
+                    } else {
+                        criterion::BatchSize::SmallInput
+                    },
                 );
             },
         );

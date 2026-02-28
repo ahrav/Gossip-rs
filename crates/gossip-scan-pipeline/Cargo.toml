@@ -10,7 +10,6 @@ description = "Scheduler-like pipeline: I/O threads, chunking, CPU executor"
 [dependencies]
 gossip-contracts.workspace = true
 gossip-coordination.workspace = true
-gossip-engine.workspace = true
 
 [dev-dependencies]
 gossip-connectors.workspace = true

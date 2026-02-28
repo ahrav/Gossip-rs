@@ -439,7 +439,6 @@ dependencies = [
  "gossip-connectors",
  "gossip-contracts",
  "gossip-coordination",
- "gossip-engine",
  "proptest",
  "rstest",
 ]

@@ -37,15 +37,28 @@
 //!         advance cursor, loop
 //! ```
 //!
-//! ## Coordination invariants
+//! ## Scan-loop invariants
 //!
-//! - Validation always happens before checkpoint/complete so malformed connector
-//!   output never becomes durable cursor state.
-//! - Retry accounting is consecutive: a successful page resets the streak counter
-//!   to zero, so intermittent transient errors do not accumulate across
-//!   otherwise-healthy pages.
-//! - Poisoned local/session state (invalid spec bytes, unconvertible cursor) is
-//!   parked immediately without retry.
+//! These invariants are enforced by the loop implementation and verified by
+//! the test suite. The labels (SL1–SL5) are stable identifiers used for
+//! cross-referencing in tests and design documents.
+//!
+//! - **SL1 — Validate-before-persist:** A page is always validated before any
+//!   checkpoint or complete call. Malformed connector output never becomes
+//!   durable cursor state.
+//! - **SL2 — Consecutive retry accounting:** The transient-failure streak
+//!   counter resets to zero after every successful `enumerate_page` call, so
+//!   intermittent errors do not accumulate across otherwise-healthy pages.
+//! - **SL3 — Poisoned state never retried:** Invalid spec bytes, unconvertible
+//!   cursors, and failed page validations are parked `Poisoned` immediately
+//!   without consuming any retry budget.
+//! - **SL4 — Park-failure preserves trigger:** When a park call fails, the
+//!   original trigger error is preserved in [`ScanLoopError::Park::trigger`]
+//!   so callers can distinguish "connector broke" from "coordinator broke
+//!   while handling connector breakage."
+//! - **SL5 — Terminal outcome exhaustiveness:** Every `run_scan_loop` call
+//!   returns exactly one of `Completed`, `Parked`, or `Error`. No silent
+//!   drops, no unobservable exits.
 //!
 //! ## Design trade-offs
 //!
@@ -58,6 +71,8 @@
 //!   to [`ParkReason::Other`] rather than guessing a more specific category.
 //! - The loop does not process page items for detection. It only advances
 //!   coordination cursor state. Detection fan-out is composed externally.
+
+use std::fmt;
 
 use gossip_contracts::connector::{
     Budgets, ConnectorInputError, Cursor, EnumerateError, EnumerationConnector,
@@ -75,91 +90,7 @@ use gossip_coordination::{
 /// is parked with [`ParkReason::TooManyErrors`].
 pub const DEFAULT_MAX_TRANSIENT_RETRIES: usize = 3;
 
-/// Configuration knobs for [`run_scan_loop_with_config`].
-///
-/// All fields have sensible defaults via [`Default`]. The struct is `Copy` so
-/// it can be shared across invocations without cloning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanLoopConfig {
-    /// Maximum retries for a *consecutive* streak of retryable enumeration
-    /// failures before the shard is parked with [`ParkReason::TooManyErrors`].
-    ///
-    /// A successful `enumerate_page` call resets the streak counter to zero,
-    /// so a shard that fails intermittently but eventually returns good pages
-    /// will never exhaust this budget.
-    ///
-    /// Set to [`DEFAULT_MAX_TRANSIENT_RETRIES`] by default.
-    pub max_transient_retries: usize,
-}
-
-impl Default for ScanLoopConfig {
-    fn default() -> Self {
-        Self {
-            max_transient_retries: DEFAULT_MAX_TRANSIENT_RETRIES,
-        }
-    }
-}
-
-/// Source of operation IDs for checkpoint/complete/park calls.
-///
-/// Coordination backends can use operation IDs to deduplicate retries. Callers
-/// should therefore provide IDs that are stable and unique enough for their
-/// backend's idempotency contract.
-pub trait OpIdSource {
-    /// Return the next operation ID, advancing internal state.
-    ///
-    /// Each call must return a distinct ID. The scan loop calls this once per
-    /// checkpoint, complete, or park attempt.
-    fn next_op_id(&mut self) -> OpId;
-}
-
-/// Monotonic `OpId` source backed by a `u64` counter.
-///
-/// This implementation is deterministic and panic-on-overflow, which is usually
-/// acceptable for tests and bounded worker lifetimes.
-#[derive(Clone, Debug)]
-pub struct CounterOpIdSource {
-    next_raw: u64,
-}
-
-impl CounterOpIdSource {
-    /// Start generating IDs from `start_raw`.
-    ///
-    /// The first `next_op_id` call returns `OpId::from_raw(start_raw)`.
-    #[must_use]
-    pub fn from_raw(start_raw: u64) -> Self {
-        Self {
-            next_raw: start_raw,
-        }
-    }
-
-    /// Start generating IDs from the raw value underlying `start`.
-    ///
-    /// Equivalent to `CounterOpIdSource::from_raw(start.as_raw())`.
-    #[must_use]
-    pub fn from_op_id(start: OpId) -> Self {
-        Self::from_raw(start.as_raw())
-    }
-}
-
-impl Default for CounterOpIdSource {
-    fn default() -> Self {
-        Self::from_raw(1)
-    }
-}
-
-impl OpIdSource for CounterOpIdSource {
-    fn next_op_id(&mut self) -> OpId {
-        let raw = self.next_raw;
-        self.next_raw = self
-            .next_raw
-            .checked_add(1)
-            .expect("CounterOpIdSource exhausted u64 space");
-        OpId::from_raw(raw)
-    }
-}
-
-/// Terminal outcome from [`run_scan_loop`] / [`run_scan_loop_with_config`].
+/// Terminal outcome from [`run_scan_loop`].
 ///
 /// Every call returns exactly one of these three variants. `Completed` and
 /// `Parked` indicate that the coordination backend accepted a terminal state
@@ -174,7 +105,15 @@ pub enum ScanLoopOutcome {
     Completed,
     /// The shard was parked due to a connector or validation failure.
     /// The `reason` categorizes the failure for operational triage.
-    Parked { reason: ParkReason },
+    ///
+    /// `retry_after_ms` carries the connector-supplied backoff advisory from
+    /// the final [`EnumerateError`], if one was present. The scan loop itself
+    /// is synchronous and does not enforce delays; callers that schedule
+    /// re-acquisition should use this hint to pace retries.
+    Parked {
+        reason: ParkReason,
+        retry_after_ms: Option<u64>,
+    },
     /// The loop failed before a successful terminal transition could be
     /// recorded. This includes coordination-level failures (checkpoint,
     /// complete) as well as compound park-on-error failures where the park
@@ -194,12 +133,7 @@ pub enum ScanLoopOutcome {
 /// error, but the park call itself failed. The original trigger is preserved
 /// in `Park::trigger` so diagnostic tooling can distinguish "connector broke"
 /// from "coordinator broke while handling connector breakage."
-///
-/// Marked `#[non_exhaustive]` because additional failure modes (e.g., lease
-/// renewal errors, detection fan-out errors) may be added as the scan pipeline
-/// grows.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum ScanLoopError {
     /// Acquired shard spec bytes could not be materialized into an owned
     /// [`ShardSpec`]. Indicates corrupted coordinator state; the shard is
@@ -240,31 +174,34 @@ pub enum ScanLoopError {
     },
 }
 
-/// Run the scan loop with [`ScanLoopConfig::default()`] retry behavior.
-///
-/// Convenience wrapper around [`run_scan_loop_with_config`]. See that function
-/// for full parameter documentation and behavioral contract.
-pub fn run_scan_loop<B, C, O, N>(
-    session: WorkerSession<'_, B>,
-    connector: &mut C,
-    budgets: Budgets,
-    op_ids: &mut O,
-    now_fn: N,
-) -> ScanLoopOutcome
-where
-    B: CoordinationBackend,
-    C: EnumerationConnector,
-    O: OpIdSource,
-    N: FnMut() -> LogicalTime,
-{
-    run_scan_loop_with_config(
-        session,
-        connector,
-        budgets,
-        ScanLoopConfig::default(),
-        op_ids,
-        now_fn,
-    )
+impl fmt::Display for ScanLoopError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidShardSpec(e) => write!(f, "invalid shard spec: {e}"),
+            Self::CursorBridge(e) => write!(f, "cursor bridge failed: {e}"),
+            Self::PageValidation(e) => write!(f, "page validation failed: {e}"),
+            Self::Enumerate(e) => write!(f, "enumerate error: {e}"),
+            Self::Checkpoint(e) => write!(f, "checkpoint failed: {e}"),
+            Self::Complete(e) => write!(f, "complete failed: {e}"),
+            Self::Park {
+                reason, trigger, ..
+            } => write!(f, "park ({reason}) failed while handling: {trigger}"),
+        }
+    }
+}
+
+impl std::error::Error for ScanLoopError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidShardSpec(e) => Some(e),
+            Self::CursorBridge(e) => Some(e),
+            Self::PageValidation(e) => Some(e),
+            Self::Enumerate(e) => Some(e),
+            Self::Checkpoint(e) => Some(e),
+            Self::Complete(e) => Some(e),
+            Self::Park { trigger, .. } => Some(trigger.as_ref()),
+        }
+    }
 }
 
 /// Run the connector enumeration loop for one acquired shard session.
@@ -301,23 +238,23 @@ where
 /// - `session` -- acquired [`WorkerSession`] for the shard to scan. Consumed.
 /// - `connector` -- the [`EnumerationConnector`] that produces pages.
 /// - `budgets` -- per-page item/byte budgets forwarded to the connector.
-/// - `config` -- retry limits and behavioral knobs.
-/// - `op_ids` -- source of unique operation IDs for idempotent coordination
-///   calls.
+/// - `max_transient_retries` -- maximum consecutive retryable enumeration
+///   failures before parking with [`ParkReason::TooManyErrors`].
+/// - `op_id_fn` -- called once per checkpoint/complete/park to obtain a
+///   unique operation ID for idempotent coordination calls.
 /// - `now_fn` -- called before each coordination mutation to obtain the
 ///   current logical timestamp. Must be monotonic within a session.
-pub fn run_scan_loop_with_config<B, C, O, N>(
+pub fn run_scan_loop<B, C, N>(
     mut session: WorkerSession<'_, B>,
     connector: &mut C,
     budgets: Budgets,
-    config: ScanLoopConfig,
-    op_ids: &mut O,
+    max_transient_retries: usize,
+    mut op_id_fn: impl FnMut() -> OpId,
     mut now_fn: N,
 ) -> ScanLoopOutcome
 where
     B: CoordinationBackend,
     C: EnumerationConnector,
-    O: OpIdSource,
     N: FnMut() -> LogicalTime,
 {
     // -- Pre-loop bridging: coordination domain -> connector domain ----------
@@ -331,9 +268,10 @@ where
             return park_and_return(
                 session,
                 now_fn(),
-                op_ids.next_op_id(),
+                op_id_fn(),
                 ParkReason::Poisoned,
                 ScanLoopError::InvalidShardSpec(error),
+                None,
             );
         }
     };
@@ -344,9 +282,10 @@ where
             return park_and_return(
                 session,
                 now_fn(),
-                op_ids.next_op_id(),
+                op_id_fn(),
                 ParkReason::Poisoned,
                 ScanLoopError::CursorBridge(error),
+                None,
             );
         }
     };
@@ -362,27 +301,31 @@ where
             }
             Err(error) => {
                 if error.class().is_retryable() {
-                    if transient_failures < config.max_transient_retries {
+                    if transient_failures < max_transient_retries {
                         transient_failures += 1;
                         continue;
                     }
 
+                    let hint = error.retry_after_ms();
                     return park_and_return(
                         session,
                         now_fn(),
-                        op_ids.next_op_id(),
+                        op_id_fn(),
                         ParkReason::TooManyErrors,
                         ScanLoopError::Enumerate(error),
+                        hint,
                     );
                 }
 
+                let hint = error.retry_after_ms();
                 let reason = classify_permanent_enumerate_error(&error);
                 return park_and_return(
                     session,
                     now_fn(),
-                    op_ids.next_op_id(),
+                    op_id_fn(),
                     reason,
                     ScanLoopError::Enumerate(error),
+                    hint,
                 );
             }
         };
@@ -395,14 +338,15 @@ where
             return park_and_return(
                 session,
                 now_fn(),
-                op_ids.next_op_id(),
+                op_id_fn(),
                 ParkReason::Poisoned,
                 ScanLoopError::PageValidation(error),
+                None,
             );
         }
 
-        // Check emptiness while the page is still borrowed, then take
-        // ownership of the cursor without cloning its heap-allocated fields.
+        // Check emptiness by reference before consuming the page for its
+        // cursor, avoiding a clone of heap-allocated key and token fields.
         let is_terminal = page.items().is_empty();
         let next_cursor = page.into_next_cursor();
 
@@ -410,14 +354,14 @@ where
         // with the final cursor so the coordinator records the terminal position.
         if is_terminal {
             let final_cursor = next_cursor.as_update();
-            return match session.complete(now_fn(), &final_cursor, op_ids.next_op_id()) {
+            return match session.complete(now_fn(), &final_cursor, op_id_fn()) {
                 Ok(_) => ScanLoopOutcome::Completed,
                 Err(error) => ScanLoopOutcome::Error(ScanLoopError::Complete(error)),
             };
         }
 
         let checkpoint_cursor = next_cursor.as_update();
-        match session.checkpoint(now_fn(), &checkpoint_cursor, op_ids.next_op_id()) {
+        match session.checkpoint(now_fn(), &checkpoint_cursor, op_id_fn()) {
             Ok(_) => {
                 // Only cursor state is advanced here. Detection-engine
                 // processing of page items is composed externally by the
@@ -431,20 +375,28 @@ where
 
 /// Attempt to park the shard and return the appropriate [`ScanLoopOutcome`].
 ///
-/// On success, returns `Parked { reason }`. On failure, wraps the park error
-/// and the original `trigger` into [`ScanLoopError::Park`] so callers can
-/// distinguish "connector failed" from "coordinator failed while parking a
-/// connector failure." The `trigger` is boxed inside the `Park` variant to
-/// break the recursive enum size.
+/// On success, returns `Parked { reason, retry_after_ms }`. On failure, wraps
+/// the park error and the original `trigger` into [`ScanLoopError::Park`] so
+/// callers can distinguish "connector failed" from "coordinator failed while
+/// parking a connector failure." The `trigger` is boxed inside the `Park`
+/// variant to break the recursive enum size.
+///
+/// `retry_after_ms` is the connector-supplied backoff advisory from the error
+/// that triggered the park. Pass `None` for non-enumerate triggers (e.g.,
+/// validation, spec bridging) that carry no backoff hint.
 fn park_and_return<B: CoordinationBackend>(
     session: WorkerSession<'_, B>,
     now: LogicalTime,
     op_id: OpId,
     reason: ParkReason,
     trigger: ScanLoopError,
+    retry_after_ms: Option<u64>,
 ) -> ScanLoopOutcome {
     match session.park(now, reason, op_id) {
-        Ok(_) => ScanLoopOutcome::Parked { reason },
+        Ok(_) => ScanLoopOutcome::Parked {
+            reason,
+            retry_after_ms,
+        },
         Err(source) => ScanLoopOutcome::Error(ScanLoopError::Park {
             reason,
             source,
@@ -476,50 +428,46 @@ fn classify_permanent_enumerate_error(error: &EnumerateError) -> ParkReason {
         "permanent classification called for retryable error"
     );
 
-    let message = error.message().to_ascii_lowercase();
-    if looks_like_permission_error(&message) {
+    let msg = error.message();
+
+    // Permission/auth keywords (401/403, EACCES).
+    if contains_ascii_ci(msg, "auth")
+        || contains_ascii_ci(msg, "permission")
+        || contains_ascii_ci(msg, "forbidden")
+        || contains_ascii_ci(msg, "unauthorized")
+    {
         ParkReason::PermissionDenied
-    } else if looks_like_not_found_error(&message) {
+    // Not-found keywords (404, ENOENT).
+    } else if contains_ascii_ci(msg, "not found")
+        || contains_ascii_ci(msg, "404")
+        || contains_ascii_ci(msg, "missing")
+    {
         ParkReason::NotFound
-    } else if looks_like_contract_violation(&message) {
+    // Contract/invariant keywords — connector bug, not environmental.
+    } else if contains_ascii_ci(msg, "contract")
+        || contains_ascii_ci(msg, "invariant")
+        || contains_ascii_ci(msg, "validation")
+    {
         ParkReason::Poisoned
     } else {
         ParkReason::Other
     }
 }
 
-/// Heuristic: does the message suggest an access/authorization failure?
+/// Case-insensitive ASCII substring search without heap allocation.
 ///
-/// Matches substrings commonly emitted by HTTP-based connectors on 401/403
-/// responses and by filesystem connectors on EACCES. Raw POSIX EPERM text
-/// ("Operation not permitted") is not matched unless the connector
-/// reformulates it to include "permission" or "auth".
+/// All keyword needles in this module are pure ASCII, so byte-level comparison
+/// with [`u8::eq_ignore_ascii_case`] is sufficient and avoids the `String`
+/// allocation that [`str::to_ascii_lowercase`] would require.
 #[inline]
-fn looks_like_permission_error(message: &str) -> bool {
-    message.contains("auth")
-        || message.contains("permission")
-        || message.contains("forbidden")
-        || message.contains("unauthorized")
-}
-
-/// Heuristic: does the message suggest the target resource does not exist?
-///
-/// Matches substrings commonly emitted on HTTP 404 responses. Raw POSIX ENOENT
-/// text ("No such file or directory") is not matched unless the connector
-/// reformulates it to include "not found" or "missing".
-#[inline]
-fn looks_like_not_found_error(message: &str) -> bool {
-    message.contains("not found") || message.contains("404") || message.contains("missing")
-}
-
-/// Heuristic: does the message suggest a connector-contract or data-integrity
-/// violation?
-///
-/// These are parked as `Poisoned` because they indicate a bug in the connector
-/// rather than a transient environmental issue.
-#[inline]
-fn looks_like_contract_violation(message: &str) -> bool {
-    message.contains("contract") || message.contains("invariant") || message.contains("validation")
+fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    h.windows(n.len())
+        .any(|w| w.iter().zip(n).all(|(a, b)| a.eq_ignore_ascii_case(b)))
 }
 
 #[cfg(test)]
@@ -540,6 +488,15 @@ mod tests {
     use rstest::rstest;
 
     const TAG: ConnectorTag = ConnectorTag::from_ascii(b"scanloop");
+
+    fn counter_op_ids(start: u64) -> impl FnMut() -> OpId {
+        let mut next = start;
+        move || {
+            let raw = next;
+            next += 1;
+            OpId::from_raw(raw)
+        }
+    }
 
     fn tenant() -> TenantId {
         TenantId::from_bytes([0x21; 32])
@@ -686,13 +643,20 @@ mod tests {
         );
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(100);
+        let mut op_ids = counter_op_ids(100);
         let mut tick = 4u64;
-        let outcome = run_scan_loop(session, &mut connector, budgets(2), &mut op_ids, || {
-            let out = now(tick);
-            tick += 1;
-            out
-        });
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(2),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        );
 
         assert_eq!(outcome, ScanLoopOutcome::Completed);
         let summary = shard_summary(&coord, 60);
@@ -710,18 +674,26 @@ mod tests {
         let mut connector = ScriptedConnector::new(vec![Ok(bad_page)]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(200);
+        let mut op_ids = counter_op_ids(200);
         let mut tick = 4u64;
-        let outcome = run_scan_loop(session, &mut connector, budgets(10), &mut op_ids, || {
-            let out = now(tick);
-            tick += 1;
-            out
-        });
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        );
 
         assert_eq!(
             outcome,
             ScanLoopOutcome::Parked {
-                reason: ParkReason::Poisoned
+                reason: ParkReason::Poisoned,
+                retry_after_ms: None,
             }
         );
         let summary = shard_summary(&coord, 60);
@@ -736,13 +708,21 @@ mod tests {
             ScriptedConnector::new(vec![Err(EnumerateError::permanent("auth denied"))]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(300);
-        let outcome = run_scan_loop(session, &mut connector, budgets(10), &mut op_ids, || now(4));
+        let mut op_ids = counter_op_ids(300);
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(4),
+        );
 
         assert_eq!(
             outcome,
             ScanLoopOutcome::Parked {
-                reason: ParkReason::PermissionDenied
+                reason: ParkReason::PermissionDenied,
+                retry_after_ms: None,
             }
         );
         let summary = shard_summary(&coord, 60);
@@ -759,23 +739,16 @@ mod tests {
         ]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(400);
-        let config = ScanLoopConfig {
-            max_transient_retries: 1,
-        };
-        let outcome = run_scan_loop_with_config(
-            session,
-            &mut connector,
-            budgets(10),
-            config,
-            &mut op_ids,
-            || now(4),
-        );
+        let mut op_ids = counter_op_ids(400);
+        let outcome = run_scan_loop(session, &mut connector, budgets(10), 1, &mut op_ids, || {
+            now(4)
+        });
 
         assert_eq!(
             outcome,
             ScanLoopOutcome::Parked {
-                reason: ParkReason::TooManyErrors
+                reason: ParkReason::TooManyErrors,
+                retry_after_ms: None,
             }
         );
         assert_eq!(connector.calls, 2, "expected one retry then park");
@@ -797,12 +770,13 @@ mod tests {
         );
         let session = acquire_session(&mut coord, 3, 1);
 
-        let mut op_ids = CounterOpIdSource::from_raw(500);
+        let mut op_ids = counter_op_ids(500);
         let mut times = vec![4u64, 5u64, 12u64].into_iter();
         let first_outcome = run_scan_loop(
             session,
             &mut first_connector,
             budgets(1),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
             &mut op_ids,
             || now(times.next().expect("time script exhausted")),
         );
@@ -827,12 +801,13 @@ mod tests {
             ],
         );
         let second_session = acquire_session(&mut coord, 30, 2);
-        let mut second_op_ids = CounterOpIdSource::from_raw(600);
+        let mut second_op_ids = counter_op_ids(600);
         let mut tick = 31u64;
         let second_outcome = run_scan_loop(
             second_session,
             &mut second_connector,
             budgets(1),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
             &mut second_op_ids,
             || {
                 let out = now(tick);
@@ -883,8 +858,8 @@ mod tests {
     /// A1: Retry streak resets after a successful page.
     ///
     /// Script: `[Err(retryable), Ok(page "b"), Err(retryable), Err(retryable)]`
-    /// with `max_transient_retries: 1`. If the reset on line 360 regresses, the
-    /// loop would park after 3 calls (accumulated streak) instead of 4.
+    /// with `max_transient_retries: 1`. If the streak reset regresses, the loop
+    /// would park after 3 calls (accumulated streak) instead of 4.
     #[test]
     fn retry_streak_resets_after_successful_page() {
         let mut coord = seeded_coordinator(40, CursorUpdate::initial());
@@ -901,28 +876,19 @@ mod tests {
         ]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(500);
-        let config = ScanLoopConfig {
-            max_transient_retries: 1,
-        };
+        let mut op_ids = counter_op_ids(500);
         let mut tick = 4u64;
-        let outcome = run_scan_loop_with_config(
-            session,
-            &mut connector,
-            budgets(10),
-            config,
-            &mut op_ids,
-            || {
-                let out = now(tick);
-                tick += 1;
-                out
-            },
-        );
+        let outcome = run_scan_loop(session, &mut connector, budgets(10), 1, &mut op_ids, || {
+            let out = now(tick);
+            tick += 1;
+            out
+        });
 
         assert_eq!(
             outcome,
             ScanLoopOutcome::Parked {
-                reason: ParkReason::TooManyErrors
+                reason: ParkReason::TooManyErrors,
+                retry_after_ms: None,
             }
         );
         // All 4 scripted responses consumed: retry, success, retry, park.
@@ -947,8 +913,15 @@ mod tests {
         let mut connector = ScriptedConnector::new(vec![Ok(empty_page)]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(600);
-        let outcome = run_scan_loop(session, &mut connector, budgets(10), &mut op_ids, || now(4));
+        let mut op_ids = counter_op_ids(600);
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(4),
+        );
 
         assert_eq!(outcome, ScanLoopOutcome::Completed);
         assert_eq!(connector.calls, 1, "single page fetch expected");
@@ -964,26 +937,48 @@ mod tests {
         let mut connector = ScriptedConnector::new(vec![Err(EnumerateError::retryable("timeout"))]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(700);
-        let config = ScanLoopConfig {
-            max_transient_retries: 0,
-        };
-        let outcome = run_scan_loop_with_config(
-            session,
-            &mut connector,
-            budgets(10),
-            config,
-            &mut op_ids,
-            || now(4),
-        );
+        let mut op_ids = counter_op_ids(700);
+        let outcome = run_scan_loop(session, &mut connector, budgets(10), 0, &mut op_ids, || {
+            now(4)
+        });
 
         assert_eq!(
             outcome,
             ScanLoopOutcome::Parked {
-                reason: ParkReason::TooManyErrors
+                reason: ParkReason::TooManyErrors,
+                retry_after_ms: None,
             }
         );
         assert_eq!(connector.calls, 1, "no retries with limit 0");
+    }
+
+    /// A5: `rate_limited` error surfaces `retry_after_ms` hint in `Parked` outcome.
+    ///
+    /// Script: two consecutive `rate_limited(5000)` errors with `max_transient_retries: 1`.
+    /// The scan loop parks with `TooManyErrors` and the outcome carries the
+    /// backoff hint from the final error so callers can pace re-acquisition.
+    #[test]
+    fn rate_limited_error_surfaces_retry_after_hint() {
+        let mut coord = seeded_coordinator(40, CursorUpdate::initial());
+        let mut connector = ScriptedConnector::new(vec![
+            Err(EnumerateError::rate_limited("429 too many requests", 5000)),
+            Err(EnumerateError::rate_limited("429 too many requests", 5000)),
+        ]);
+
+        let session = acquire_session(&mut coord, 3, 1);
+        let mut op_ids = counter_op_ids(750);
+        let outcome = run_scan_loop(session, &mut connector, budgets(10), 1, &mut op_ids, || {
+            now(4)
+        });
+
+        assert_eq!(
+            outcome,
+            ScanLoopOutcome::Parked {
+                reason: ParkReason::TooManyErrors,
+                retry_after_ms: Some(5000),
+            }
+        );
+        assert_eq!(connector.calls, 2);
     }
 
     /// B1: Park failure preserves the trigger context in a compound error.
@@ -998,12 +993,17 @@ mod tests {
             ScriptedConnector::new(vec![Err(EnumerateError::permanent("auth denied"))]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(800);
+        let mut op_ids = counter_op_ids(800);
 
         // now_fn returns t=20 which is past the lease deadline of 11.
-        let outcome = run_scan_loop(session, &mut connector, budgets(10), &mut op_ids, || {
-            now(20)
-        });
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(20),
+        );
 
         match outcome {
             ScanLoopOutcome::Error(ScanLoopError::Park {
@@ -1043,14 +1043,19 @@ mod tests {
         let mut connector = ScriptedConnector::new(vec![Ok(page_b), Ok(empty_terminal)]);
 
         let session = acquire_session(&mut coord, 3, 1);
-        let mut op_ids = CounterOpIdSource::from_raw(900);
+        let mut op_ids = counter_op_ids(900);
 
         // First now_fn call (checkpoint) at t=4 (within lease).
         // Second now_fn call (complete) at t=20 (past lease deadline of 11).
         let mut times = [4u64, 20].into_iter();
-        let outcome = run_scan_loop(session, &mut connector, budgets(10), &mut op_ids, || {
-            now(times.next().expect("time script exhausted"))
-        });
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(times.next().expect("time script exhausted")),
+        );
 
         match outcome {
             ScanLoopOutcome::Error(ScanLoopError::Complete(CompleteError::LeaseExpired {

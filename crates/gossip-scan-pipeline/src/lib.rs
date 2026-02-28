@@ -17,9 +17,9 @@
 //! - The loop is synchronous and deterministic; retry pacing/backoff is not handled
 //!   internally.
 //! - Retry behavior is intentionally bounded and caller-configured via
-//!   [`ScanLoopConfig`].
+//!   `max_transient_retries`.
 //! - Chunking and detection-engine fan-out are out of scope in this crate revision.
 
 mod scan_loop;
 
-pub use scan_loop::*;
+pub use scan_loop::{DEFAULT_MAX_TRANSIENT_RETRIES, ScanLoopError, ScanLoopOutcome, run_scan_loop};
