@@ -1,7 +1,8 @@
 use std::io::Read as _;
+use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
+use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
 use rstest::rstest;
 
 use super::*;
@@ -645,8 +646,12 @@ fn enumerated_item_refs_round_trip_to_files() {
     }
 }
 
+// ---------------------------------------------------------------
+// Symlink handling tests
+// ---------------------------------------------------------------
+
 #[test]
-fn symlink_to_file_is_indexed() {
+fn symlink_to_file_is_skipped() {
     let dir = create_test_dir(&[("real.txt", b"real content")]);
     std::os::unix::fs::symlink(dir.path().join("real.txt"), dir.path().join("link.txt")).unwrap();
 
@@ -655,18 +660,282 @@ fn symlink_to_file_is_indexed() {
     let end = make_key(b"\xff");
 
     let all = collect_all(&mut c, &start, &end);
-    let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
-    assert!(keys.contains(&b"real.txt".as_slice()));
-    assert!(keys.contains(&b"link.txt".as_slice()));
-    assert_eq!(all.len(), 2);
+    // Only real.txt is indexed; link.txt is skipped.
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"real.txt");
 
-    // Both should be readable.
-    for item in &all {
-        let mut reader = c.open(item.item_ref(), default_budgets()).unwrap();
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf).unwrap();
-        assert_eq!(buf, b"real content");
+    // The symlink should be recorded as a warning.
+    assert!(
+        c.walk_warnings().iter().any(|w| w.message == "symlink"),
+        "expected a symlink warning"
+    );
+}
+
+#[test]
+fn symlink_cycle_does_not_hang() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    // Create a symlink cycle: loop -> .
+    std::os::unix::fs::symlink(".", dir.path().join("loop")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"file.txt");
+
+    assert!(
+        c.walk_warnings().iter().any(|w| w.message == "symlink"),
+        "expected a symlink warning for the cycle link"
+    );
+}
+
+#[test]
+fn symlink_escape_root_is_skipped() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    std::os::unix::fs::symlink("/etc/passwd", dir.path().join("escape")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"file.txt");
+
+    assert!(
+        c.walk_warnings().iter().any(|w| w.message == "symlink"),
+        "expected a symlink warning for the escape link"
+    );
+}
+
+#[test]
+fn symlink_to_directory_is_skipped() {
+    let dir = create_test_dir(&[("sub/file.txt", b"data"), ("other.txt", b"ok")]);
+    std::os::unix::fs::symlink(dir.path().join("sub"), dir.path().join("link_dir")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
+
+    // link_dir/file.txt should NOT appear -- the symlink to directory is skipped.
+    assert!(!keys.iter().any(|k| k.starts_with(b"link_dir")));
+    // But the real sub/file.txt and other.txt should be there.
+    assert!(keys.contains(&b"sub/file.txt".as_slice()));
+    assert!(keys.contains(&b"other.txt".as_slice()));
+}
+
+#[test]
+fn dangling_symlink_is_skipped() {
+    let dir = create_test_dir(&[]);
+    std::os::unix::fs::symlink("/nonexistent/target", dir.path().join("dangling")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Indexing succeeds; the dangling symlink is skipped with a warning.
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert!(page.items().is_empty());
+    assert!(
+        c.walk_warnings().iter().any(|w| w.message == "symlink"),
+        "expected a symlink warning for the dangling link"
+    );
+}
+
+// ---------------------------------------------------------------
+// Error classification & memoization tests
+// ---------------------------------------------------------------
+
+#[test]
+fn root_not_found_is_permanent() {
+    let mut c = FilesystemConnector::new("/nonexistent/path/that/does/not/exist");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets());
+    let err = result.unwrap_err();
+    assert!(!err.is_retryable(), "NotFound should be a permanent error");
+}
+
+#[test]
+fn index_failure_is_memoized() {
+    let mut c = FilesystemConnector::new("/nonexistent/path/that/does/not/exist");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // First call fails.
+    let err1 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap_err();
+    // Second call returns the memoized error without re-walking.
+    let err2 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap_err();
+    assert_eq!(err1.message(), err2.message());
+    assert_eq!(err1.is_retryable(), err2.is_retryable());
+}
+
+#[test]
+fn open_rejects_directory_path() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    fs::create_dir(dir.path().join("subdir")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let dir_ref = ItemRef::try_from_slice(b"subdir").unwrap();
+    let err = c
+        .open(&dir_ref, default_budgets())
+        .expect_err("should reject directory");
+    assert!(!err.is_retryable(), "directory open should be permanent");
+}
+
+// ---------------------------------------------------------------
+// Unreadable entry tests
+// ---------------------------------------------------------------
+
+#[test]
+fn unreadable_subdir_is_skipped_with_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = create_test_dir(&[("good.txt", b"ok"), ("sub/file.txt", b"hidden")]);
+    fs::set_permissions(dir.path().join("sub"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"good.txt");
+    assert!(
+        !c.walk_warnings().is_empty(),
+        "expected a warning for the unreadable subdirectory"
+    );
+
+    // Restore permissions for tempdir cleanup.
+    fs::set_permissions(dir.path().join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+// ---------------------------------------------------------------
+// Byte-weighted split tests
+// ---------------------------------------------------------------
+
+#[test]
+fn byte_weighted_split_balances_by_size() {
+    let dir = create_test_dir(&[
+        ("a.txt", &[0u8; 500] as &[u8]),
+        ("b.txt", &[0u8; 500]),
+        ("c.txt", b"x"),
+        ("d.txt", b"x"),
+        ("e.txt", b"x"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap()
+        .expect("should have a split point");
+
+    // Count-balanced would split at c.txt (index 2, 5/2=2).
+    // Byte-weighted: cumulative at a.txt (500) < half (501),
+    // cumulative at b.txt (1000) >= half -> split_idx = 1.
+    assert_eq!(
+        split.as_bytes(),
+        b"b.txt",
+        "byte-weighted split should balance by file size, not count"
+    );
+}
+
+#[test]
+fn byte_weighted_split_falls_back_for_zero_size() {
+    let dir = create_test_dir(&[
+        ("a.txt", b""),
+        ("b.txt", b""),
+        ("c.txt", b""),
+        ("d.txt", b""),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap()
+        .expect("should have a split point");
+
+    // Count-balanced: 4/2 = 2 -> files[2].key = "c.txt".
+    assert_eq!(
+        split.as_bytes(),
+        b"c.txt",
+        "zero-size fallback should use count-balanced median"
+    );
+}
+
+// ---------------------------------------------------------------
+// Deep directory test
+// ---------------------------------------------------------------
+
+#[test]
+fn deep_directory_does_not_stack_overflow() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let mut path = dir.path().to_path_buf();
+    for i in 0..200 {
+        path = path.join(format!("d{i:03}"));
     }
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("leaf.txt"), b"deep").unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), 1);
+    let key = all[0].item_key();
+    assert!(
+        key.as_bytes().len() > 100,
+        "key should be a long nested path"
+    );
+}
+
+// ---------------------------------------------------------------
+// FD cache test
+// ---------------------------------------------------------------
+
+#[test]
+fn consecutive_read_ranges_on_same_file_succeed() {
+    let dir = create_test_dir(&[("file.txt", b"abcdefghij")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let item_ref = page.items()[0].item_ref().clone();
+
+    let mut buf = [0u8; 3];
+    let n1 = c
+        .read_range(&item_ref, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n1], b"abc");
+
+    let n2 = c
+        .read_range(&item_ref, 3, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n2], b"def");
+
+    let n3 = c
+        .read_range(&item_ref, 6, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n3], b"ghi");
 }
 
 // ---------------------------------------------------------------
@@ -839,20 +1108,6 @@ fn non_utf8_filename_is_indexed() {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"non-utf8 content");
-}
-
-#[test]
-fn dangling_symlink_produces_retryable_error() {
-    let dir = create_test_dir(&[]);
-    std::os::unix::fs::symlink("/nonexistent/target", dir.path().join("dangling")).unwrap();
-
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    // Indexing should fail with a retryable error for the dangling symlink.
-    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets());
-    assert!(result.is_err());
 }
 
 #[test]

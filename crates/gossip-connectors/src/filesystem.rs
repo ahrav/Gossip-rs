@@ -7,8 +7,9 @@
 //!
 //! # Algorithm
 //!
-//! 1. **Lazy indexing** -- The first enumerate/split call recursively walks the
-//!    root, collecting regular files only.
+//! 1. **Lazy indexing** -- The first enumerate/split call walks the root using
+//!    an explicit stack (no recursion), collecting regular files only. Symlinks
+//!    are skipped.
 //! 2. **Canonical path encoding** -- Each relative path is encoded to raw bytes
 //!    with `/` separators and reused for both [`ItemKey`] and [`ItemRef`].
 //! 3. **Deterministic serving** -- Entries are globally sorted by key, then
@@ -16,9 +17,8 @@
 //!
 //! # Determinism and trade-offs
 //!
-//! - Enumeration order is stable for a fixed directory snapshot because each
-//!   directory's entries are sorted by raw filename bytes before recursion, then
-//!   a global key sort is applied.
+//! - Enumeration order is stable for a fixed directory snapshot because the
+//!   collected entries are globally sorted by key bytes.
 //! - Indexing is one-shot per connector instance (`ensure_indexed`); this favors
 //!   deterministic page progression over live directory updates.
 //! - [`StableItemId`] uses the standard connector-tag + key derivation, while
@@ -38,6 +38,32 @@
 //! is silently ignored. Pagination advances monotonically by key regardless of
 //! token state.
 //!
+//! # Symlink handling
+//!
+//! Symlinks are **skipped** during the directory walk. [`DirEntry::file_type`]
+//! (backed by `d_type` on Unix) classifies each entry without following links.
+//! Symlinks to files and symlinks to directories are both skipped and recorded
+//! in [`FilesystemConnector::walk_warnings`]. This prevents symlink-cycle
+//! hangs, root-escape via symlink targets, and snapshot inconsistency from
+//! mutable symlink targets.
+//!
+//! # Split-point heuristic
+//!
+//! [`choose_split_point`](EnumerationConnector::choose_split_point) selects a
+//! byte-weighted median: the split key is chosen where cumulative file size
+//! crosses the halfway mark, so that shards are balanced by total byte volume
+//! rather than item count. Falls back to count-balanced when all files are
+//! zero-size.
+//!
+//! # TOCTOU limitations
+//!
+//! The file index is built once per connector instance. Reads (`open`,
+//! `read_range`) later reopen files by path. If a file is replaced, renamed,
+//! or truncated between indexing and reading, the [`VersionId`] from
+//! enumeration may describe a different object than what the read returns.
+//! Callers requiring snapshot consistency should use version checks at a
+//! higher layer (e.g., the orchestration runtime).
+//!
 //! # Platform and path handling
 //!
 //! This implementation is Unix-only because deterministic handling of non-UTF8
@@ -48,14 +74,13 @@
 //! # Scope and limitations
 //!
 //! - Designed for single-threaded sequential page calls; the struct holds
-//!   mutable state (`indexed`, `files`) with no interior synchronization.
+//!   mutable state (`index_state`, `files`) with no interior synchronization.
 //! - The file index is built once per connector instance. Directory mutations
 //!   after the first enumerate call are invisible; construct a new connector
 //!   to observe changes.
-//! - Symlinks are transparently resolved via `fs::metadata` (which follows
-//!   links): symlinks to regular files are indexed normally, symlinks to
-//!   directories are recursed into, and dangling symlinks produce retryable
-//!   errors. Device nodes, FIFOs, and sockets are silently skipped.
+//! - Non-fatal walk issues (unreadable entries, symlinks, encoding failures)
+//!   are recorded in [`WalkWarning`]s rather than aborting the entire index.
+//!   Only root-directory failures are hard errors.
 //! - [`ItemRef`] values are the raw relative-path bytes of each file and are
 //!   stable for a given directory snapshot, unlike the positional indices used
 //!   by the in-memory connector.
@@ -78,8 +103,8 @@ use gossip_contracts::{
 
 #[cfg(unix)]
 use std::os::unix::{
-    ffi::{OsStrExt, OsStringExt},
-    fs::MetadataExt,
+    ffi::OsStrExt,
+    fs::{FileExt, MetadataExt},
 };
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
@@ -88,31 +113,45 @@ use std::os::unix::{
 /// disjoint from items produced by other connector types (in-memory, git, SaaS).
 const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
 
-/// Deterministic filesystem connector rooted at a local directory.
+/// A non-fatal issue encountered during the directory walk.
 ///
-/// The first enumerate or split call builds an in-memory sorted file index.
-/// Subsequent enumeration and split-hint calls use binary search over that
-/// stable index.
+/// Warnings are collected in [`FilesystemConnector::walk_warnings`] and do
+/// not abort indexing. They report entries that were skipped due to I/O
+/// errors, symlinks, encoding failures, or other non-fatal conditions.
+#[derive(Debug)]
+pub struct WalkWarning {
+    /// Path of the entry that triggered the warning.
+    pub path: PathBuf,
+    /// Human-readable description of why the entry was skipped.
+    pub message: String,
+}
+
+impl WalkWarning {
+    fn io(path: &Path, op: &str, err: &io::Error) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            message: format!("{op} failed: {err}"),
+        }
+    }
+
+    fn skipped(path: &Path, reason: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            message: reason.to_owned(),
+        }
+    }
+}
+
+/// Tri-state indexing lifecycle.
 ///
-/// # Resume semantics
-///
-/// Cursor progression is keyed by `Cursor::last_key`; tokens are optional
-/// advisory state (`emit_tokens` defaults to `false`). When tokens are enabled,
-/// debug builds assert that a well-formed token index matches the key-derived
-/// resume position.
-pub struct FilesystemConnector {
-    /// Absolute or relative directory root; all indexed paths are relative to this.
-    root: PathBuf,
-    /// When `true`, each returned [`EnumerationPage`] cursor carries an opaque
-    /// big-endian `u64` token encoding the next absolute index. Defaults to
-    /// `false` because key-based resume is always authoritative.
-    emit_tokens: bool,
-    /// Set once after the first successful [`ensure_indexed`](Self::ensure_indexed)
-    /// call. Guards against redundant re-walks.
-    indexed: bool,
-    /// Sorted file index built by [`ensure_indexed`](Self::ensure_indexed).
-    /// Empty until the first enumerate or split call triggers a walk.
-    files: Vec<FileEntry>,
+/// - `NotIndexed`: walk has not been attempted yet.
+/// - `Indexed`: walk succeeded; `files` is populated and sorted.
+/// - `Failed`: walk failed; the error is memoized so that repeated calls
+///   return immediately without redundant re-walks.
+enum IndexState {
+    NotIndexed,
+    Indexed,
+    Failed { permanent: bool, message: String },
 }
 
 /// One entry in the sorted file index.
@@ -127,7 +166,7 @@ pub struct FilesystemConnector {
 #[derive(Debug)]
 struct FileEntry {
     /// Canonical key derived from normalized relative path bytes.
-    /// Also serves as the `ItemRef` source — `key.as_bytes()` yields the
+    /// Also serves as the `ItemRef` source -- `key.as_bytes()` yields the
     /// relative-path payload needed for read operations.
     key: ItemKey,
     /// Deterministic per-item identity derived from connector tag + key.
@@ -136,6 +175,46 @@ struct FileEntry {
     version: VersionId,
     /// File size observed during index build.
     size: u64,
+}
+
+/// Deterministic filesystem connector rooted at a local directory.
+///
+/// The first enumerate or split call builds an in-memory sorted file index.
+/// Subsequent enumeration and split-hint calls use binary search over that
+/// stable index.
+///
+/// # Resume semantics
+///
+/// Cursor progression is keyed by `Cursor::last_key`; tokens are optional
+/// advisory state (`emit_tokens` defaults to `false`). When tokens are enabled,
+/// debug builds assert that a well-formed token index matches the key-derived
+/// resume position.
+///
+/// # Symlink handling
+///
+/// Symlinks are skipped during indexing and recorded in
+/// [`walk_warnings`](Self::walk_warnings). This prevents symlink-cycle hangs
+/// and root-escape attacks.
+pub struct FilesystemConnector {
+    /// Absolute or relative directory root; all indexed paths are relative to this.
+    root: PathBuf,
+    /// When `true`, each returned [`EnumerationPage`] cursor carries an opaque
+    /// big-endian `u64` token encoding the next absolute index. Defaults to
+    /// `false` because key-based resume is always authoritative.
+    emit_tokens: bool,
+    /// Indexing lifecycle state. Transitions once from `NotIndexed` to either
+    /// `Indexed` or `Failed`; subsequent calls use the memoized result.
+    index_state: IndexState,
+    /// Sorted file index built by [`ensure_indexed`](Self::ensure_indexed).
+    /// Empty until the first enumerate or split call triggers a walk.
+    files: Vec<FileEntry>,
+    /// Non-fatal issues encountered during the directory walk. Populated
+    /// alongside `files` during [`ensure_indexed`](Self::ensure_indexed).
+    walk_warnings: Vec<WalkWarning>,
+    /// Single-entry file-descriptor cache for sequential
+    /// [`ReadConnector::read_range`] calls. Avoids re-opening the same file
+    /// for consecutive chunked reads on the same item.
+    cached_file: Option<(PathBuf, fs::File)>,
 }
 
 impl FilesystemConnector {
@@ -150,8 +229,10 @@ impl FilesystemConnector {
         Self {
             root: root.into(),
             emit_tokens: false,
-            indexed: false,
+            index_state: IndexState::NotIndexed,
             files: Vec::new(),
+            walk_warnings: Vec::new(),
+            cached_file: None,
         }
     }
 
@@ -165,30 +246,70 @@ impl FilesystemConnector {
         self
     }
 
+    /// Non-fatal issues collected during the directory walk.
+    ///
+    /// Returns an empty slice until the first enumerate or split call
+    /// triggers indexing. Warnings include skipped symlinks, unreadable
+    /// entries, and encoding failures.
+    pub fn walk_warnings(&self) -> &[WalkWarning] {
+        &self.walk_warnings
+    }
+
     /// Build the file index once on first use.
     ///
-    /// The index is intentionally immutable afterward. If the directory changes
-    /// on disk, callers must construct a new connector to observe those changes.
+    /// On success, transitions to `Indexed` and populates `files`.
+    /// On failure, transitions to `Failed` and memoizes the error so
+    /// repeated calls return immediately without redundant re-walks.
     fn ensure_indexed(&mut self) -> Result<(), EnumerateError> {
-        if self.indexed {
-            return Ok(());
+        match &self.index_state {
+            IndexState::Indexed => return Ok(()),
+            IndexState::Failed { permanent, message } => {
+                return if *permanent {
+                    Err(EnumerateError::permanent(message.clone()))
+                } else {
+                    Err(EnumerateError::retryable(message.clone()))
+                };
+            }
+            IndexState::NotIndexed => {}
         }
 
         #[cfg(not(unix))]
         {
-            return Err(EnumerateError::permanent(
-                "FilesystemConnector indexing is unsupported on non-unix targets",
-            ));
+            let msg = "FilesystemConnector indexing is unsupported on non-unix targets".to_owned();
+            self.index_state = IndexState::Failed {
+                permanent: true,
+                message: msg.clone(),
+            };
+            return Err(EnumerateError::permanent(msg));
         }
 
         #[cfg(unix)]
         {
             let mut files = Vec::new();
-            walk_dir_collect_files(&self.root, &self.root, &mut files)?;
-            files.sort_by(|left, right| left.key.cmp(&right.key));
-            self.files = files;
-            self.indexed = true;
-            Ok(())
+            let mut warnings = Vec::new();
+            match walk_dir_collect_files(&self.root, &mut files, &mut warnings) {
+                Ok(()) => {
+                    files.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+                    self.files = files;
+                    self.walk_warnings = warnings;
+                    self.index_state = IndexState::Indexed;
+                    Ok(())
+                }
+                Err(err) => {
+                    let permanent = !err.is_retryable();
+                    let message = err.into_message();
+                    self.walk_warnings = warnings;
+                    self.index_state = IndexState::Failed {
+                        permanent,
+                        message: message.clone(),
+                    };
+                    Err(if permanent {
+                        EnumerateError::permanent(message)
+                    } else {
+                        EnumerateError::retryable(message)
+                    })
+                }
+            }
         }
     }
 
@@ -314,7 +435,12 @@ impl FilesystemConnector {
         Ok(EnumerationPage::new(out, next_cursor))
     }
 
-    /// Choose a median split hint from the unconsumed portion of the range.
+    /// Choose a byte-weighted split-point hint from the unconsumed portion of
+    /// the range.
+    ///
+    /// The split key is placed where cumulative file size crosses the halfway
+    /// mark, producing shards balanced by total byte volume rather than item
+    /// count. Falls back to count-balanced when all files are zero-size.
     ///
     /// Returns `None` when fewer than two items remain, when the candidate
     /// would not advance beyond `cursor.last_key()`, or when the candidate
@@ -340,7 +466,27 @@ impl FilesystemConnector {
             return Ok(None);
         }
 
-        let split_idx = start_idx + (range_end - start_idx) / 2;
+        let range = &self.files[start_idx..range_end];
+        let total_bytes: u64 = range.iter().map(|f| f.size).sum();
+        let split_idx = if total_bytes == 0 {
+            // All files empty; fall back to count-balanced.
+            start_idx + range.len() / 2
+        } else {
+            let half = total_bytes / 2;
+            let mut cumulative = 0u64;
+            // Default to count-median; overwritten once cumulative crosses half.
+            let mut idx = start_idx + range.len() / 2;
+            for (i, file) in range.iter().enumerate() {
+                cumulative += file.size;
+                if cumulative >= half {
+                    idx = start_idx + i;
+                    break;
+                }
+            }
+            // Ensure at least one item on each side.
+            idx.max(start_idx + 1).min(range_end - 1)
+        };
+
         let candidate = &self.files[split_idx].key;
 
         // Splits must move forward relative to cursor position.
@@ -370,6 +516,9 @@ impl FilesystemConnector {
     /// The reference bytes are interpreted as a Unix path payload. Absolute
     /// paths and lexical traversal (`..`, root, or platform prefix components)
     /// are rejected before joining with the connector root.
+    ///
+    /// Uses zero-copy `OsStr::from_bytes` on Unix to avoid allocating an
+    /// intermediate `OsString`.
     fn resolve_item_ref(&self, item_ref: &ItemRef) -> Result<PathBuf, ReadError> {
         #[cfg(not(unix))]
         {
@@ -381,8 +530,10 @@ impl FilesystemConnector {
 
         #[cfg(unix)]
         {
-            let rel = std::ffi::OsString::from_vec(item_ref.as_bytes().to_vec());
-            let rel_path = PathBuf::from(rel);
+            use std::ffi::OsStr;
+
+            let rel = OsStr::from_bytes(item_ref.as_bytes());
+            let rel_path = Path::new(rel);
             if rel_path.is_absolute() {
                 return Err(ReadError::permanent("item_ref must be a relative path"));
             }
@@ -400,6 +551,21 @@ impl FilesystemConnector {
             }
             Ok(self.root.join(rel_path))
         }
+    }
+
+    /// Open a file or return the cached handle if the path matches.
+    ///
+    /// Single-entry cache optimized for sequential `read_range` calls on the
+    /// same item. On cache miss, the previous handle (if any) is dropped and a
+    /// new one opened.
+    #[cfg(unix)]
+    fn get_or_open_cached(&mut self, path: &Path) -> Result<&fs::File, ReadError> {
+        let need_open = self.cached_file.as_ref().is_none_or(|(p, _)| p != path);
+        if need_open {
+            let file = fs::File::open(path).map_err(|err| classify_io_read_error("open", &err))?;
+            self.cached_file = Some((path.to_path_buf(), file));
+        }
+        Ok(&self.cached_file.as_ref().unwrap().1)
     }
 }
 
@@ -449,20 +615,22 @@ impl EnumerationConnector for FilesystemConnector {
 impl ReadConnector for FilesystemConnector {
     /// Open a file for streaming whole-object reads.
     ///
-    /// Unlike `read_range`, this path can preflight total object size via
-    /// metadata and reject files larger than `max_bytes` before returning a
-    /// reader handle.
+    /// Opens the file first, then verifies via `fstat` on the descriptor that
+    /// the target is a regular file and within the `max_bytes` budget before
+    /// returning a reader handle.
     fn open(
         &mut self,
         item_ref: &ItemRef,
         budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
         let path = self.resolve_item_ref(item_ref)?;
-        let file = fs::File::open(&path)
-            .map_err(|err| ReadError::retryable(format!("open failed: {err}")))?;
+        let file = fs::File::open(&path).map_err(|err| classify_io_read_error("open", &err))?;
         let metadata = file
             .metadata()
-            .map_err(|err| ReadError::retryable(format!("metadata failed: {err}")))?;
+            .map_err(|err| classify_io_read_error("fstat", &err))?;
+        if !metadata.is_file() {
+            return Err(ReadError::permanent("path is not a regular file"));
+        }
         if metadata.len() > budgets.max_bytes() {
             return Err(ReadError::permanent("item exceeds max_bytes budget"));
         }
@@ -472,7 +640,11 @@ impl ReadConnector for FilesystemConnector {
     /// Read a byte range starting at `offset` into `dst`.
     ///
     /// The read length is clamped to `min(dst.len(), max_bytes)`. `offset` past
-    /// EOF naturally yields `Ok(0)` from the underlying file read.
+    /// EOF naturally yields `Ok(0)` from the underlying `read_at` / `pread`.
+    ///
+    /// On Unix, uses [`FileExt::read_at`] (positional `pread`) to avoid seeking.
+    /// A single-entry FD cache avoids re-opening the file for consecutive
+    /// chunked reads on the same item.
     fn read_range(
         &mut self,
         item_ref: &ItemRef,
@@ -480,8 +652,6 @@ impl ReadConnector for FilesystemConnector {
         dst: &mut [u8],
         budgets: Budgets,
     ) -> Result<usize, ReadError> {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-
         if offset.checked_add(dst.len() as u64).is_none() {
             return Err(ReadError::permanent("offset + dst length overflow"));
         }
@@ -493,12 +663,22 @@ impl ReadConnector for FilesystemConnector {
         }
 
         let path = self.resolve_item_ref(item_ref)?;
-        let mut file = fs::File::open(path)
-            .map_err(|err| ReadError::retryable(format!("open failed: {err}")))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|err| ReadError::retryable(format!("seek failed: {err}")))?;
-        file.read(&mut dst[..allowed])
-            .map_err(|err| ReadError::retryable(format!("read failed: {err}")))
+
+        #[cfg(unix)]
+        {
+            let file = self.get_or_open_cached(&path)?;
+            file.read_at(&mut dst[..allowed], offset)
+                .map_err(|err| classify_io_read_error("read_at", &err))
+        }
+
+        #[cfg(not(unix))]
+        {
+            // resolve_item_ref returns Err on non-unix, so this is unreachable.
+            let _ = (path, offset, allowed);
+            Err(ReadError::unsupported(
+                "filesystem read_range requires unix",
+            ))
+        }
     }
 }
 
@@ -528,83 +708,165 @@ fn derive_stable_item_id(key: &ItemKey) -> StableItemId {
     ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, key.as_bytes()).stable_id()
 }
 
-/// Recursively collect regular files under `dir`, appending [`FileEntry`]s to
-/// `out` in deterministic order.
+/// Classify an I/O error for read operations.
 ///
-/// Determinism is enforced by sorting each directory's entries by raw filename
-/// bytes before descending, then sorting the final `Vec<FileEntry>` by key in
-/// [`FilesystemConnector::ensure_indexed`]. The two-level sort (local then
-/// global) keeps the walk order predictable even though the final key sort is
-/// what matters for enumeration.
+/// `NotFound` and `PermissionDenied` are permanent (retrying will not help
+/// without external changes). All other I/O errors are treated as potentially
+/// transient.
+fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
+    match err.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
+            ReadError::permanent(format!("{op} failed: {err}"))
+        }
+        _ => ReadError::retryable(format!("{op} failed: {err}")),
+    }
+}
+
+/// Classify an I/O error for enumeration operations.
 ///
-/// Symlinks are transparently resolved via `fs::metadata` (which follows
-/// links): symlinks to regular files are indexed, symlinks to directories
-/// are recursed into, and dangling symlinks produce retryable errors. Device
-/// nodes, FIFOs, and sockets are silently skipped; only entries whose
-/// resolved metadata reports `is_file()` produce index entries.
+/// Same classification as [`classify_io_read_error`] but returns
+/// [`EnumerateError`] and includes the path in the message.
+fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> EnumerateError {
+    match err.kind() {
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => {
+            EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
+        }
+        _ => EnumerateError::retryable(format!("{op} failed for {}: {err}", path.display())),
+    }
+}
+
+/// Iteratively collect regular files under `root`, appending [`FileEntry`]s
+/// to `out`.
+///
+/// Uses an explicit directory stack instead of recursion to avoid
+/// stack-overflow on deeply nested trees. Each directory's entries are
+/// classified via [`DirEntry::file_type`] (which uses `d_type` on Unix and
+/// does not follow symlinks):
+///
+/// - **Symlinks** are skipped and recorded in `warnings`.
+/// - **Directories** are pushed onto the stack for later processing.
+/// - **Regular files** are indexed via `symlink_metadata` (no follow).
+/// - **Special files** (devices, FIFOs, sockets) are silently skipped.
+///
+/// Root-directory failures are hard errors; all other failures are recorded
+/// as warnings and the walk continues.
 ///
 /// # Errors
 ///
-/// Returns a retryable error for I/O failures (directory read, metadata fetch)
-/// and a permanent error if a collected path escapes the connector root or
-/// encodes to an invalid [`ItemKey`].
+/// Returns a permanent or retryable error only when the root directory
+/// itself is inaccessible.
 #[cfg(unix)]
 fn walk_dir_collect_files(
     root: &Path,
-    dir: &Path,
     out: &mut Vec<FileEntry>,
+    warnings: &mut Vec<WalkWarning>,
 ) -> Result<(), EnumerateError> {
-    let mut entries = Vec::new();
-    let reader = fs::read_dir(dir).map_err(|err| {
-        EnumerateError::retryable(format!("read_dir failed for {}: {err}", dir.display()))
-    })?;
-    for entry in reader {
-        let entry = entry.map_err(|err| {
-            EnumerateError::retryable(format!(
-                "read_dir entry failed for {}: {err}",
-                dir.display()
-            ))
-        })?;
-        entries.push(entry);
-    }
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
 
-    entries.sort_by(|left, right| {
-        left.file_name()
-            .as_bytes()
-            .cmp(right.file_name().as_bytes())
-    });
+    while let Some(dir) = stack.pop() {
+        let is_root = dir == root;
+        let reader = match fs::read_dir(&dir) {
+            Ok(r) => r,
+            Err(err) => {
+                if is_root {
+                    return Err(classify_io_enumerate_error("read_dir", &dir, &err));
+                }
+                warnings.push(WalkWarning::io(&dir, "read_dir", &err));
+                continue;
+            }
+        };
 
-    for entry in entries {
-        let path = entry.path();
-        let metadata = fs::metadata(&path).map_err(|err| {
-            EnumerateError::retryable(format!("metadata failed for {}: {err}", path.display()))
-        })?;
-        if metadata.is_dir() {
-            walk_dir_collect_files(root, &path, out)?;
-            continue;
+        for entry_result in reader {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(err) => {
+                    warnings.push(WalkWarning::io(&dir, "read_dir entry", &err));
+                    continue;
+                }
+            };
+
+            let path = entry.path();
+
+            // DirEntry::file_type() uses d_type on Unix -- no extra syscall, no
+            // symlink following. On filesystems that report DT_UNKNOWN, std
+            // falls back to lstat internally.
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(err) => {
+                    warnings.push(WalkWarning::io(&path, "file_type", &err));
+                    continue;
+                }
+            };
+
+            if file_type.is_symlink() {
+                warnings.push(WalkWarning::skipped(&path, "symlink"));
+                continue;
+            }
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if !file_type.is_file() {
+                // Device, FIFO, socket -- skip silently.
+                continue;
+            }
+
+            // Regular file: get metadata for size/mtime/ino.
+            // symlink_metadata avoids following if a TOCTOU race replaced
+            // the file with a symlink between file_type() and now.
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(err) => {
+                    warnings.push(WalkWarning::io(&path, "metadata", &err));
+                    continue;
+                }
+            };
+
+            // TOCTOU guard: if the entry was replaced between file_type()
+            // and symlink_metadata(), the type may have changed.
+            if !metadata.is_file() {
+                continue;
+            }
+
+            let rel = match path.strip_prefix(root) {
+                Ok(r) => r,
+                Err(_) => {
+                    warnings.push(WalkWarning::skipped(&path, "path escaped connector root"));
+                    continue;
+                }
+            };
+
+            let rel_bytes = match encode_rel_path(rel) {
+                Ok(b) => b,
+                Err(_) => {
+                    warnings.push(WalkWarning::skipped(&path, "path encoding failed"));
+                    continue;
+                }
+            };
+
+            let key = match ItemKey::try_from_slice(&rel_bytes) {
+                Ok(k) => k,
+                Err(err) => {
+                    warnings.push(WalkWarning::skipped(
+                        &path,
+                        &format!("invalid file key: {err}"),
+                    ));
+                    continue;
+                }
+            };
+
+            let stable_item_id = derive_stable_item_id(&key);
+            let version = VersionId::Weak(derive_fs_version_id(&metadata));
+
+            out.push(FileEntry {
+                key,
+                stable_item_id,
+                version,
+                size: metadata.len(),
+            });
         }
-        // Skip non-regular files (symlinks, devices, FIFOs, sockets).
-        // Symlinks are already resolved by `fs::metadata` (follows links),
-        // so this branch catches only true special files.
-        if !metadata.is_file() {
-            continue;
-        }
-
-        let rel = path.strip_prefix(root).map_err(|_| {
-            EnumerateError::permanent(format!("path escaped connector root: {}", path.display()))
-        })?;
-        let rel_bytes = encode_rel_path(rel)?;
-        let key = ItemKey::try_from_slice(&rel_bytes)
-            .map_err(|err| EnumerateError::permanent(format!("invalid file key: {err}")))?;
-        let stable_item_id = derive_stable_item_id(&key);
-        let version = VersionId::Weak(derive_fs_version_id(&metadata));
-
-        out.push(FileEntry {
-            key,
-            stable_item_id,
-            version,
-            size: metadata.len(),
-        });
     }
 
     Ok(())
