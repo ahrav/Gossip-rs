@@ -606,18 +606,23 @@ impl FilesystemConnector {
 
     /// Open a file beneath `root_fd` using component-by-component `openat`
     /// with `O_NOFOLLOW` at every step.
+    ///
+    /// The returned file descriptor has `O_NONBLOCK` set (to avoid blocking on
+    /// FIFOs or device nodes in a TOCTOU race). Callers must [`clear_nonblock`]
+    /// before performing any reads.
     fn open_beneath_root(&self, ref_bytes: &[u8]) -> Result<(fs::File, fs::Metadata), ReadError> {
         let root_fd = self
             .root_fd
             .as_ref()
             .ok_or_else(|| ReadError::permanent("connector not indexed; call enumerate first"))?;
 
-        // Count components without allocating a Vec. `split` on a non-empty
-        // slice always yields at least one element.
-        let n = ref_bytes.iter().filter(|&&b| b == b'/').count() + 1;
         if ref_bytes.is_empty() {
             return Err(ReadError::permanent("empty item_ref"));
         }
+
+        // Pre-count components (separators + 1) to detect the last component
+        // without collecting into a Vec.
+        let n = ref_bytes.iter().filter(|&&b| b == b'/').count() + 1;
 
         let mut dir_fd: Option<OwnedFd> = None;
 
