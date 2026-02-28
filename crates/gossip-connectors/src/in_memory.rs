@@ -449,9 +449,7 @@ impl InMemoryDeterministicConnector {
 
         let candidate = self.items[split_idx].key.clone();
 
-        // Reject candidates that would not advance past the cursor. Splitting
-        // behind or at the cursor position would assign already-processed keys
-        // to the left shard, violating the forward-progress guarantee.
+        // Reject candidates that would not advance past the cursor.
         if cursor.last_key().is_some_and(|last| &candidate <= last) {
             return Ok(None);
         }
