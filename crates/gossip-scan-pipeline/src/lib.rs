@@ -18,7 +18,7 @@
 //!   internally.
 //! - Retry behavior is intentionally bounded and caller-configured via
 //!   `max_transient_retries`.
-//! - Chunking and detection-engine fan-out are out of scope in this crate revision.
+//! - Chunking and detection-engine fan-out are handled externally, not in this crate.
 
 mod scan_loop;
 

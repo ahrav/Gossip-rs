@@ -3,7 +3,7 @@
 //! Measures end-to-end pages/sec through `run_scan_loop` with an in-memory
 //! connector, isolating the per-page overhead of:
 //! - `validate_page` (CPU: byte comparisons over page items)
-//! - cursor ownership transfer (previously a clone, now `into_next_cursor`)
+//! - cursor ownership transfer via `into_next_cursor` (zero-copy)
 //! - `session.checkpoint` (coordination: lease check + cursor update + op-log)
 //!
 //! Connector I/O dominates wall-clock time in production, but these benchmarks

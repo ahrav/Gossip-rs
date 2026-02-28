@@ -40,7 +40,7 @@
 //! ## Scan-loop invariants
 //!
 //! These invariants are enforced by the loop implementation and verified by
-//! the test suite. The labels (SL1–SL5) are stable identifiers used for
+//! the test suite. The labels (SL1–SL6) are stable identifiers used for
 //! cross-referencing in tests and design documents.
 //!
 //! - **SL1 — Validate-before-persist:** A page is always validated before any
@@ -59,6 +59,11 @@
 //! - **SL5 — Terminal outcome exhaustiveness:** Every `run_scan_loop` call
 //!   returns exactly one of `Completed`, `Parked`, or `Error`. No silent
 //!   drops, no unobservable exits.
+//! - **SL6 — Empty-page terminal safety:** Empty pages are treated as terminal
+//!   (triggering `complete`). This is safe because SL1 guarantees
+//!   `validate_page` runs first, and validation rejects
+//!   `EmptyPageCursorAdvanced` — so any empty page that reaches the
+//!   terminal check has an unchanged `last_key` and cannot skip items.
 //!
 //! ## Design trade-offs
 //!
@@ -84,10 +89,10 @@ use gossip_coordination::{
     CheckpointError, CompleteError, CoordinationBackend, ParkError, ParkReason, WorkerSession,
 };
 
-/// Default number of retry attempts for retryable connector enumeration errors.
+/// Default number of consecutive retryable errors tolerated before parking.
 ///
-/// A value of 3 means "first call + up to 3 retries", after which the shard
-/// is parked with [`ParkReason::TooManyErrors`].
+/// A value of 3 means up to 3 consecutive retryable failures are tolerated
+/// before the shard is parked with [`ParkReason::TooManyErrors`].
 pub const DEFAULT_MAX_TRANSIENT_RETRIES: usize = 3;
 
 /// Terminal outcome from [`run_scan_loop`].
@@ -99,6 +104,7 @@ pub const DEFAULT_MAX_TRANSIENT_RETRIES: usize = 3;
 /// `Active` from the coordinator's perspective, and its lease will eventually
 /// expire.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[must_use = "ignoring a ScanLoopOutcome silently discards Error and Parked states"]
 pub enum ScanLoopOutcome {
     /// The connector returned a terminal empty page and the coordination
     /// backend accepted the `complete` transition. The shard is now `Done`.
@@ -136,21 +142,21 @@ pub enum ScanLoopOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScanLoopError {
     /// Acquired shard spec bytes could not be materialized into an owned
-    /// [`ShardSpec`]. Indicates corrupted coordinator state; the shard is
-    /// parked `Poisoned`.
+    /// [`ShardSpec`]. Indicates corrupted coordinator state; the loop
+    /// attempts to park the shard as `Poisoned`.
     InvalidShardSpec(ShardSpecInputError),
     /// Session cursor could not be converted into the connector's [`Cursor`]
     /// form. Indicates a type/size mismatch between coordination and connector
-    /// cursor domains; the shard is parked `Poisoned`.
+    /// cursor domains; the loop attempts to park the shard as `Poisoned`.
     CursorBridge(ConnectorInputError),
     /// Connector returned a page that failed ordering, membership, or cursor
-    /// invariant checks. The shard is parked `Poisoned` because malformed
-    /// pages must never become durable cursor state.
+    /// invariant checks. The loop attempts to park the shard as `Poisoned`
+    /// because malformed pages must never become durable cursor state.
     PageValidation(PageValidationError),
     /// Connector enumeration call failed. Retryable errors may have been
     /// retried up to `max_transient_retries` times before reaching this point.
-    /// Permanent errors are classified by message heuristic and parked with
-    /// the corresponding [`ParkReason`].
+    /// Permanent errors are classified by message heuristic; the loop
+    /// attempts to park with the corresponding [`ParkReason`].
     Enumerate(EnumerateError),
     /// Coordination checkpoint transition failed (e.g., lease expired, cursor
     /// monotonicity violation). The shard remains `Active` from the
@@ -350,8 +356,14 @@ where
         let is_terminal = page.items().is_empty();
         let next_cursor = page.into_next_cursor();
 
-        // Empty page = connector signals "no more items." Complete the shard
-        // with the final cursor so the coordinator records the terminal position.
+        // Empty page: complete the shard with the page's cursor as the terminal
+        // position. This is safe because `validate_page` (run above) rejects
+        // `EmptyPageCursorAdvanced` -- any empty page reaching this point has
+        // an unchanged `last_key`, so completing here never skips items.
+        //
+        // EnumerationPage distinguishes empty+initial (scan complete) from
+        // empty+non-initial (gap at cursor position), but the scan loop treats
+        // both as terminal -- gap handling is composed externally if needed.
         if is_terminal {
             let final_cursor = next_cursor.as_update();
             return match session.complete(now_fn(), &final_cursor, op_id_fn()) {
@@ -407,23 +419,28 @@ fn park_and_return<B: CoordinationBackend>(
 
 /// Map a non-retryable [`EnumerateError`] to a coarse [`ParkReason`].
 ///
-/// The classification is keyword-based against the lowercased error message.
+/// The classification is keyword-based with case-insensitive matching against
+/// the error message.
 /// This is deliberately loose coupling: the scan loop does not depend on
 /// connector-specific error enums, and connectors can influence park-reason
 /// triage simply by including recognized keywords in their error text.
 ///
 /// Evaluation order matters -- the first matching category wins:
-/// 1. Permission/auth keywords -> `PermissionDenied`
+/// 1. Permission/auth keywords -> `PermissionDenied` (note: the "auth"
+///    substring is deliberately broad — matches "author", "authority", etc. —
+///    as a conservative bet: false positives park as `PermissionDenied` rather
+///    than the less-actionable `Other`. Connectors control the message text
+///    and can avoid false matches by omitting the substring.)
 /// 2. Not-found keywords -> `NotFound`
 /// 3. Contract/invariant keywords -> `Poisoned`
 /// 4. Everything else -> `Other`
 ///
 /// # Panics
 ///
-/// Debug-asserts that the error is *not* retryable. Calling this on a
-/// retryable error is a logic bug in the scan loop.
+/// Panics if the error is retryable. Calling this on a retryable error
+/// is a logic bug in the scan loop.
 fn classify_permanent_enumerate_error(error: &EnumerateError) -> ParkReason {
-    debug_assert!(
+    assert!(
         !error.class().is_retryable(),
         "permanent classification called for retryable error"
     );
@@ -617,14 +634,16 @@ mod tests {
         fn enumerate_page(
             &mut self,
             _shard: &ShardSpec,
-            cursor: &Cursor,
+            _cursor: &Cursor,
             _budgets: Budgets,
         ) -> Result<EnumerationPage, EnumerateError> {
-            let response = self
-                .responses
-                .get(self.calls)
-                .cloned()
-                .unwrap_or_else(|| Ok(EnumerationPage::new(Vec::new(), cursor.clone())));
+            let response = self.responses.get(self.calls).cloned().unwrap_or_else(|| {
+                panic!(
+                    "ScriptedConnector: unexpected call #{} ({} responses scripted)",
+                    self.calls + 1,
+                    self.responses.len(),
+                )
+            });
             self.calls += 1;
             response
         }
@@ -822,7 +841,7 @@ mod tests {
         assert_eq!(final_summary.last_key(), Some(&b"c"[..]));
     }
 
-    // -- Step 2: rstest parameterized classifier tests ----------------------------
+    // -- rstest parameterized classifier tests -----------------------------------
 
     #[rstest]
     #[case("auth denied", ParkReason::PermissionDenied)]
@@ -853,7 +872,7 @@ mod tests {
         assert_eq!(reason, expected, "message: {message:?}");
     }
 
-    // -- Step 3: unit tests for loop logic gaps -----------------------------------
+    // -- unit tests for loop logic gaps ------------------------------------------
 
     /// A1: Retry streak resets after a successful page.
     ///
@@ -1070,7 +1089,50 @@ mod tests {
         assert_eq!(summary.last_key(), Some(&b"b"[..]));
     }
 
-    // -- Step 4: proptest classification properties -------------------------------
+    /// Checkpoint failure (lease expiry) returns `Error(Checkpoint(..))`.
+    ///
+    /// A single non-empty page is fetched successfully, but by the time the
+    /// loop calls `session.checkpoint()` the lease has expired. The shard
+    /// remains `Active` because no terminal transition succeeded.
+    #[test]
+    fn checkpoint_failure_returns_error() {
+        // Lease duration = 8, acquired at t=3, so deadline = 11.
+        let mut coord = seeded_coordinator(8, CursorUpdate::initial());
+
+        let page_b = EnumerationPage::new(
+            vec![make_scan_item(b"b")],
+            Cursor::with_last_key(make_key(b"b")),
+        );
+        let mut connector = ScriptedConnector::new(vec![Ok(page_b)]);
+
+        let session = acquire_session(&mut coord, 3, 1);
+        let mut op_ids = counter_op_ids(950);
+
+        // now_fn returns t=20 which is past the lease deadline of 11.
+        // The first (and only) now_fn call is for the checkpoint.
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(20),
+        );
+
+        match outcome {
+            ScanLoopOutcome::Error(ScanLoopError::Checkpoint(CheckpointError::LeaseExpired {
+                ..
+            })) => {} // expected
+            other => panic!("expected Error(Checkpoint(LeaseExpired)), got {other:?}"),
+        }
+
+        // No checkpoint was durable — shard is still Active at initial cursor.
+        let summary = shard_summary(&coord, 21);
+        assert_eq!(summary.status(), ShardStatus::Active);
+        assert_eq!(summary.last_key(), None);
+    }
+
+    // -- proptest classification properties --------------------------------------
 
     mod prop_tests {
         use super::*;
