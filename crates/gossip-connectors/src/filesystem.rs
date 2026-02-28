@@ -57,6 +57,11 @@
 //! hangs, root-escape via symlink targets, and snapshot inconsistency from
 //! mutable symlink targets.
 //!
+//! Read-path operations (`open`, `read_range`) additionally open files with
+//! `O_NOFOLLOW` so that a regular file replaced with a symlink between indexing
+//! and reading produces an `ELOOP` error instead of following the link. This
+//! closes the TOCTOU window for symlink-based root-escape.
+//!
 //! # Split-point heuristic
 //!
 //! [`choose_split_point`](EnumerationConnector::choose_split_point) selects a
@@ -100,6 +105,8 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+
+use std::ffi::OsStr;
 
 use gossip_contracts::{
     connector::{
@@ -159,13 +166,14 @@ impl WalkWarning {
 ///
 /// - `NotIndexed`: walk has not been attempted yet.
 /// - `Indexed`: walk succeeded; `files` is populated and sorted.
-/// - `Failed`: walk failed with a permanent error; the error is memoized
+/// - `Failed`: walk failed with a permanent error; the message is memoized
 ///   so that repeated calls return immediately without redundant re-walks.
-///   Retryable failures leave the state as `NotIndexed` to permit re-attempts.
+///   Only permanent failures are memoized — retryable failures leave the
+///   state as `NotIndexed` to permit re-attempts.
 enum IndexState {
     NotIndexed,
     Indexed,
-    Failed { permanent: bool, message: String },
+    Failed(String),
 }
 
 /// One entry in the sorted file index.
@@ -191,9 +199,15 @@ struct FileEntry {
     size: u64,
 }
 
-impl crate::common::KeyedEntry for FileEntry {
+impl common::KeyedEntry for FileEntry {
     fn key_bytes(&self) -> &[u8] {
         self.key.as_bytes()
+    }
+}
+
+impl common::SizedEntry for FileEntry {
+    fn entry_size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -215,6 +229,19 @@ impl crate::common::KeyedEntry for FileEntry {
 /// Symlinks are skipped during indexing and recorded in
 /// [`walk_warnings`](Self::walk_warnings). This prevents symlink-cycle hangs
 /// and root-escape attacks.
+///
+/// # TOCTOU and consistency
+///
+/// The file index is built once per connector instance. Reads (`open`,
+/// `read_range`) later reopen files by path (or use a single-entry FD cache
+/// keyed on [`ItemRef`] bytes). If a file is replaced, renamed, or truncated
+/// between indexing and reading, the [`VersionId`] from enumeration may
+/// describe a different object than what the read returns. The FD cache
+/// widens this window slightly for consecutive reads on the same item, since
+/// the cached descriptor may outlive a concurrent replace. Callers requiring
+/// snapshot consistency should use version checks at a higher layer. See the
+/// module-level [TOCTOU limitations](self#toctou-limitations) section for
+/// details.
 pub struct FilesystemConnector {
     /// Absolute or relative directory root; all indexed paths are relative to this.
     root: PathBuf,
@@ -237,8 +264,10 @@ pub struct FilesystemConnector {
     walk_warnings: Vec<WalkWarning>,
     /// Single-entry file-descriptor cache for sequential
     /// [`ReadConnector::read_range`] calls. Avoids re-opening the same file
-    /// for consecutive chunked reads on the same item.
-    cached_file: Option<(PathBuf, fs::File)>,
+    /// for consecutive chunked reads on the same item. Keyed on the raw
+    /// [`ItemRef`] bytes to avoid `resolve_item_ref` + `PathBuf` allocation
+    /// on cache hits.
+    cached_file: Option<(Box<[u8]>, fs::File)>,
 }
 
 impl FilesystemConnector {
@@ -303,12 +332,8 @@ impl FilesystemConnector {
     fn ensure_indexed(&mut self) -> Result<(), EnumerateError> {
         match &self.index_state {
             IndexState::Indexed => return Ok(()),
-            IndexState::Failed { permanent, message } => {
-                return if *permanent {
-                    Err(EnumerateError::permanent(message.clone()))
-                } else {
-                    Err(EnumerateError::retryable(message.clone()))
-                };
+            IndexState::Failed(message) => {
+                return Err(EnumerateError::permanent(message.clone()));
             }
             IndexState::NotIndexed => {}
         }
@@ -332,10 +357,7 @@ impl FilesystemConnector {
                 let message = err.into_message();
                 self.walk_warnings = warnings;
                 if permanent {
-                    self.index_state = IndexState::Failed {
-                        permanent: true,
-                        message: message.clone(),
-                    };
+                    self.index_state = IndexState::Failed(message.clone());
                 }
                 // Retryable errors leave index_state as NotIndexed so
                 // the next call re-attempts the walk.
@@ -410,9 +432,7 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| {
-            lower_bound(&self.files, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound.as_bytes()));
         let range_end = end.map_or(self.files.len(), |bound| {
             lower_bound(&self.files, bound.as_bytes())
         });
@@ -502,9 +522,7 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| {
-            lower_bound(&self.files, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound.as_bytes()));
         let range_end = end.map_or(self.files.len(), |bound| {
             lower_bound(&self.files, bound.as_bytes())
         });
@@ -513,34 +531,9 @@ impl FilesystemConnector {
         });
 
         let start_idx = range_start.max(resume_start);
-        if range_end.saturating_sub(start_idx) < 2 {
-            return Ok(None);
-        }
-
-        let range = &self.files[start_idx..range_end];
-        let total_bytes: u64 = range.iter().map(|f| f.size).fold(0u64, u64::saturating_add);
-        let split_idx = if total_bytes == 0 {
-            // All files empty; fall back to count-balanced.
-            start_idx + range.len() / 2
-        } else {
-            let half = total_bytes / 2;
-            let mut cumulative = 0u64;
-            let mut idx = start_idx;
-            for (i, file) in range.iter().enumerate() {
-                cumulative = cumulative.saturating_add(file.size);
-                if cumulative >= half {
-                    idx = start_idx + i;
-                    break;
-                }
-            }
-
-            // Guard: if all weight concentrates in the first item, the loop
-            // exits with idx == start_idx. That produces a zero-item left
-            // shard, which is useless. Fall back to count-based midpoint.
-            if idx == start_idx {
-                idx = start_idx + (range_end - start_idx) / 2;
-            }
-            idx
+        let split_idx = match common::choose_split_index(&self.files, start_idx, range_end) {
+            Some(idx) => idx,
+            None => return Ok(None),
         };
 
         let candidate = &self.files[split_idx].key;
@@ -604,16 +597,23 @@ impl FilesystemConnector {
             .map_err(|err| classify_io_read_error("open", &err))
     }
 
-    /// Open a file or return the cached handle if the path matches.
+    /// Open a file or return the cached handle if the item ref matches.
     ///
     /// Single-entry cache optimized for sequential `read_range` calls on the
-    /// same item. On cache miss, the previous handle (if any) is dropped and a
-    /// new one opened. Opens with `O_NOFOLLOW` to prevent symlink traversal.
-    fn get_or_open_cached(&mut self, path: &Path) -> Result<&fs::File, ReadError> {
-        let need_open = self.cached_file.as_ref().is_none_or(|(p, _)| p != path);
+    /// same item. Keyed on the raw [`ItemRef`] bytes so cache hits avoid
+    /// `resolve_item_ref` and `PathBuf` allocation entirely. On cache miss,
+    /// the previous handle (if any) is dropped, the item ref is resolved to
+    /// a path, and a new file is opened with `O_NOFOLLOW`.
+    fn get_or_open_cached(&mut self, item_ref: &ItemRef) -> Result<&fs::File, ReadError> {
+        let ref_bytes = item_ref.as_bytes();
+        let need_open = self
+            .cached_file
+            .as_ref()
+            .is_none_or(|(key, _)| &**key != ref_bytes);
         if need_open {
-            let file = Self::open_nofollow(path)?;
-            self.cached_file = Some((path.to_path_buf(), file));
+            let path = self.resolve_item_ref(item_ref)?;
+            let file = Self::open_nofollow(&path)?;
+            self.cached_file = Some((ref_bytes.into(), file));
         }
         Ok(&self.cached_file.as_ref().unwrap().1)
     }
@@ -696,8 +696,10 @@ impl ReadConnector for FilesystemConnector {
     /// EOF naturally yields `Ok(0)` from the underlying `read_at` / `pread`.
     ///
     /// On Unix, uses [`FileExt::read_at`] (positional `pread`) to avoid seeking.
-    /// A single-entry FD cache avoids re-opening the file for consecutive
-    /// chunked reads on the same item.
+    /// A single-entry FD cache keyed on [`ItemRef`] bytes avoids re-opening
+    /// (and re-resolving the path for) consecutive chunked reads on the same
+    /// item. Note that the cached FD may outlive a concurrent file replace,
+    /// reading stale content; see the struct-level TOCTOU section.
     ///
     /// Returns a permanent error if `offset + dst.len()` would overflow `u64`.
     fn read_range(
@@ -717,14 +719,11 @@ impl ReadConnector for FilesystemConnector {
             return Ok(0);
         }
 
-        let path = self.resolve_item_ref(item_ref)?;
-        let file = self.get_or_open_cached(&path)?;
+        let file = self.get_or_open_cached(item_ref)?;
         file.read_at(&mut dst[..allowed], offset)
             .map_err(|err| classify_io_read_error("read_at", &err))
     }
 }
-
-use crate::common::parse_u64_be;
 
 /// Classify an I/O error for read operations.
 ///
@@ -873,7 +872,7 @@ fn walk_dir_collect_files(
                 }
             };
 
-            let key = match ItemKey::try_from_slice(&rel_bytes) {
+            let key = match ItemKey::try_from_vec(rel_bytes) {
                 Ok(k) => k,
                 Err(err) => {
                     warnings.push(WalkWarning::skipped(
@@ -884,8 +883,7 @@ fn walk_dir_collect_files(
                 }
             };
 
-            let stable_item_id =
-                derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, &key);
+            let stable_item_id = derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, &key);
             let version = VersionId::Weak(derive_fs_version_id(&metadata));
 
             out.push(FileEntry {

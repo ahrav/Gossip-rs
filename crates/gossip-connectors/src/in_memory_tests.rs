@@ -5,6 +5,7 @@ use gossip_contracts::connector::conformance::{ConformanceConfig, check_connecto
 use rstest::rstest;
 
 use super::*;
+use crate::common::test_util::{default_budgets, make_key, small_page_budgets};
 
 // ---------------------------------------------------------------
 // Test helpers
@@ -12,20 +13,8 @@ use super::*;
 
 const TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmemdet");
 
-fn make_key(s: &[u8]) -> ItemKey {
-    ItemKey::try_from_slice(s).expect("test key")
-}
-
 fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     MemItem::new(make_key(key), Vec::from(data))
-}
-
-fn default_budgets() -> Budgets {
-    Budgets::try_new(100, u64::MAX, None).unwrap()
-}
-
-fn small_page_budgets(max_items: usize) -> Budgets {
-    Budgets::try_new(max_items, u64::MAX, None).unwrap()
 }
 
 /// Collect all items from a connector by paging until empty.

@@ -72,6 +72,10 @@ use gossip_contracts::{
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
+use crate::common::{
+    self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
+};
+
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
 #[derive(Clone, Debug)]
 pub struct MemItem {
@@ -120,9 +124,15 @@ struct PreparedItem {
     size_hint: u64,
 }
 
-impl crate::common::KeyedEntry for PreparedItem {
+impl common::KeyedEntry for PreparedItem {
     fn key_bytes(&self) -> &[u8] {
         self.key.as_bytes()
+    }
+}
+
+impl common::SizedEntry for PreparedItem {
+    fn entry_size(&self) -> u64 {
+        self.size_hint
     }
 }
 
@@ -312,11 +322,9 @@ impl InMemoryDeterministicConnector {
         }
 
         // Phase 3: resolve key bounds to vector indices.
-        let range_start = start.map_or(0, |bound| {
-            crate::common::lower_bound(&self.items, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));
         let range_end = end.map_or(self.items.len(), |bound| {
-            crate::common::lower_bound(&self.items, bound.as_bytes())
+            lower_bound(&self.items, bound.as_bytes())
         });
 
         // Phase 4: advance past the cursor's last-emitted key.
@@ -339,7 +347,7 @@ impl InMemoryDeterministicConnector {
                     break 'resolve idx;
                 }
                 // Fallback: O(log n) binary search.
-                let key_idx = crate::common::upper_bound(&self.items, last_key.as_bytes());
+                let key_idx = upper_bound(&self.items, last_key.as_bytes());
                 #[cfg(debug_assertions)]
                 if self.emit_tokens
                     && let Some(token) = cursor.token()
@@ -425,46 +433,19 @@ impl InMemoryDeterministicConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| {
-            crate::common::lower_bound(&self.items, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));
         let range_end = end.map_or(self.items.len(), |bound| {
-            crate::common::lower_bound(&self.items, bound.as_bytes())
+            lower_bound(&self.items, bound.as_bytes())
         });
         let resume_start = cursor.last_key().map_or(range_start, |last| {
-            crate::common::upper_bound(&self.items, last.as_bytes())
+            upper_bound(&self.items, last.as_bytes())
         });
 
         let start_idx = range_start.max(resume_start);
-        if range_end.saturating_sub(start_idx) < 2 {
-            return Ok(None);
-        }
-
-        // Byte-weight median: find the item whose cumulative size first
-        // reaches half the total byte volume. This produces balanced shards
-        // even when object sizes are highly skewed.
-        let slice = &self.items[start_idx..range_end];
-        let total_bytes: u64 = slice
-            .iter()
-            .map(|i| i.size_hint)
-            .fold(0u64, u64::saturating_add);
-        let half = total_bytes / 2;
-        let mut cumulative = 0u64;
-        let mut split_idx = start_idx;
-        for (i, item) in slice.iter().enumerate() {
-            cumulative = cumulative.saturating_add(item.size_hint);
-            if cumulative >= half {
-                split_idx = start_idx + i;
-                break;
-            }
-        }
-
-        // Guard: if all weight concentrates in the first item, the loop
-        // exits with split_idx == start_idx. That produces a zero-item left
-        // shard, which is useless. Fall back to count-based midpoint.
-        if split_idx == start_idx {
-            split_idx = start_idx + (range_end - start_idx) / 2;
-        }
+        let split_idx = match common::choose_split_index(&self.items, start_idx, range_end) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
 
         let candidate = self.items[split_idx].key.clone();
 
@@ -474,9 +455,7 @@ impl InMemoryDeterministicConnector {
         if cursor.last_key().is_some_and(|last| &candidate <= last) {
             return Ok(None);
         }
-        // Reject candidates at or beyond the upper bound. A split at exactly
-        // `end` would produce an empty right shard [end, end), which is valid
-        // but useless. Rejecting >= keeps both shards non-trivially sized.
+        // Reject candidates at or beyond the upper bound.
         if end.is_some_and(|upper| &candidate >= upper) {
             return Ok(None);
         }
@@ -518,8 +497,8 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        let start = crate::common::shard_bound(shard.key_range_start(), "start")?;
-        let end = crate::common::shard_bound(shard.key_range_end(), "end")?;
+        let start = shard_bound(shard.key_range_start(), "start")?;
+        let end = shard_bound(shard.key_range_end(), "end")?;
         self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
     }
 
@@ -531,8 +510,8 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         cursor: &Cursor,
         _budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let start = crate::common::shard_bound(shard.key_range_start(), "start")?;
-        let end = crate::common::shard_bound(shard.key_range_end(), "end")?;
+        let start = shard_bound(shard.key_range_start(), "start")?;
+        let end = shard_bound(shard.key_range_end(), "end")?;
         self.choose_split_point_bounds(start.as_ref(), end.as_ref(), cursor)
     }
 }
@@ -588,8 +567,6 @@ impl ReadConnector for InMemoryDeterministicConnector {
         Ok(to_copy)
     }
 }
-
-use crate::common::{derive_stable_item_id, parse_u64_be};
 
 #[cfg(test)]
 #[path = "in_memory_tests.rs"]

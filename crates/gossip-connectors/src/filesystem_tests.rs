@@ -6,22 +6,7 @@ use gossip_contracts::connector::conformance::{ConformanceConfig, check_connecto
 use rstest::rstest;
 
 use super::*;
-
-// ---------------------------------------------------------------
-// Test helpers
-// ---------------------------------------------------------------
-
-fn make_key(s: &[u8]) -> ItemKey {
-    ItemKey::try_from_slice(s).expect("test key")
-}
-
-fn default_budgets() -> Budgets {
-    Budgets::try_new(100, u64::MAX, None).unwrap()
-}
-
-fn small_page_budgets(max_items: usize) -> Budgets {
-    Budgets::try_new(max_items, u64::MAX, None).unwrap()
-}
+use crate::common::test_util::{default_budgets, make_key, small_page_budgets};
 
 /// Create a temporary directory populated with the given files.
 ///
