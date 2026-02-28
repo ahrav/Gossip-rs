@@ -791,7 +791,8 @@ fn open_rejects_directory_path() {
     let dir_ref = ItemRef::try_from_slice(b"subdir").unwrap();
     let err = c
         .open(&dir_ref, default_budgets())
-        .expect_err("should reject directory");
+        .err()
+        .expect("should reject directory");
     assert!(!err.is_retryable(), "directory open should be permanent");
 }
 
