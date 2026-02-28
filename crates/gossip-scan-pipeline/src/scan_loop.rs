@@ -57,8 +57,8 @@
 //!   so callers can distinguish "connector broke" from "coordinator broke
 //!   while handling connector breakage."
 //! - **SL5 — Terminal outcome exhaustiveness:** Every `run_scan_loop` call
-//!   returns exactly one of `Completed`, `Parked`, or `Error`. No silent
-//!   drops, no unobservable exits.
+//!   returns exactly one of `Completed`, `Parked`, `LeaseLost`, or `Error`.
+//!   No silent drops, no unobservable exits.
 //! - **SL6 — Empty-page terminal safety:** Empty pages are treated as terminal
 //!   (triggering `complete`). This is safe because SL1 guarantees
 //!   `validate_page` runs first, and validation rejects
@@ -70,6 +70,12 @@
 //! - The loop is synchronous and deterministic (no sleeps, backoff, or jitter).
 //!   Logical time is injected via `now_fn` so callers control time progression,
 //!   enabling fully reproducible simulation tests.
+//! - Lease renewal is checked synchronously between pages (no background task
+//!   or async runtime).
+//! - `LeaseLost` is emitted only on "abandon without mutation" paths
+//!   (deadline elapsed before checkpoint, or renewal failure). Once a
+//!   coordination mutation is attempted, backend rejections - including
+//!   lease-expired errors - are returned as `Error`.
 //! - Permanent error classification is message-heuristic based because the
 //!   connector contract only surfaces a binary retryability class plus free-form
 //!   error text. The heuristic is conservative: unrecognized messages fall through
@@ -86,7 +92,8 @@ use gossip_contracts::connector::{
 use gossip_contracts::coordination::{ShardSpec, ShardSpecInputError};
 use gossip_contracts::identity::{LogicalTime, OpId};
 use gossip_coordination::{
-    CheckpointError, CompleteError, CoordinationBackend, ParkError, ParkReason, WorkerSession,
+    CheckpointError, CompleteError, CoordinationBackend, ParkError, ParkReason, RenewError,
+    WorkerSession,
 };
 
 /// Default number of consecutive retryable errors tolerated before parking.
@@ -95,21 +102,78 @@ use gossip_coordination::{
 /// before the shard is parked with [`ParkReason::TooManyErrors`].
 pub const DEFAULT_MAX_TRANSIENT_RETRIES: usize = 3;
 
+/// Default lease-renew trigger: renew at half-life (`remaining <= duration / 2`).
+pub const DEFAULT_RENEW_AT_FRACTION: f64 = 0.5;
+
+/// Lease-renew scheduling policy for [`run_scan_loop_with_policy`].
+///
+/// The loop evaluates this policy after each successful checkpoint. If the
+/// remaining lease window is at or below the configured fraction of the last
+/// observed lease duration, it attempts `session.renew(now)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenewalPolicy {
+    /// Renew when remaining lease time is at or below this fraction of the
+    /// observed lease duration.
+    ///
+    /// Finite values outside `[0.0, 1.0]` are clamped. Non-finite values fall
+    /// back to [`DEFAULT_RENEW_AT_FRACTION`] to keep behavior deterministic and
+    /// fail-safe.
+    pub renew_at_fraction: f64,
+}
+
+impl RenewalPolicy {
+    /// Construct a policy with an explicit renew-at fraction.
+    #[must_use]
+    pub const fn new(renew_at_fraction: f64) -> Self {
+        Self { renew_at_fraction }
+    }
+}
+
+impl Default for RenewalPolicy {
+    fn default() -> Self {
+        Self {
+            renew_at_fraction: DEFAULT_RENEW_AT_FRACTION,
+        }
+    }
+}
+
+/// Diagnostic cause for [`ScanLoopOutcome::LeaseLost`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseLossCause {
+    /// Lease renewal failed after at least one successful checkpoint.
+    ///
+    /// The loop stops immediately and does not attempt `park` or `complete`,
+    /// so the shard remains resumable from its last persisted checkpoint.
+    RenewFailed(RenewError),
+    /// Lease deadline elapsed before a checkpoint could be attempted.
+    ///
+    /// The current page was validated but not persisted; `pages_completed`
+    /// still reflects only durable checkpoint progress.
+    DeadlineElapsed {
+        now: LogicalTime,
+        deadline: LogicalTime,
+    },
+}
+
 /// Terminal outcome from [`run_scan_loop`].
 ///
-/// Every call returns exactly one of these three variants. `Completed` and
+/// Every call returns exactly one of these four variants. `Completed` and
 /// `Parked` indicate that the coordination backend accepted a terminal state
-/// transition (the session is consumed). `Error` means the loop exited before
-/// reaching a successful terminal transition -- the shard may still be
-/// `Active` from the coordinator's perspective, and its lease will eventually
-/// expire.
+/// transition (the session is consumed). `LeaseLost` means the worker detected
+/// lease loss and aborted without attempting a terminal operation. `Error`
+/// means the loop exited before a successful terminal transition after an
+/// attempted coordination mutation failed (including lease-expired rejections
+/// from those attempted mutations).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "ignoring a ScanLoopOutcome silently discards Error and Parked states"]
+#[must_use = "ignoring a ScanLoopOutcome silently discards Error, Parked, and LeaseLost states"]
 pub enum ScanLoopOutcome {
     /// The connector returned a terminal empty page and the coordination
     /// backend accepted the `complete` transition. The shard is now `Done`.
     Completed,
-    /// The shard was parked due to a connector or validation failure.
+    /// The shard was parked due to a non-recoverable scan failure.
+    ///
+    /// This includes connector/validation failures and pre-loop poisoned-input
+    /// failures (invalid shard spec or cursor bridging).
     /// The `reason` categorizes the failure for operational triage.
     ///
     /// `retry_after_ms` carries the connector-supplied backoff advisory from
@@ -119,6 +183,18 @@ pub enum ScanLoopOutcome {
     Parked {
         reason: ParkReason,
         retry_after_ms: Option<u64>,
+    },
+    /// Lease was lost while scanning, so the loop aborted without issuing
+    /// terminal transitions (`park`/`complete`).
+    ///
+    /// This variant is produced only by the pre-checkpoint deadline guard and
+    /// by failed `renew` calls.
+    ///
+    /// `pages_completed` counts successful checkpoints already persisted in
+    /// this session before lease loss was detected.
+    LeaseLost {
+        pages_completed: u64,
+        cause: LeaseLossCause,
     },
     /// The loop failed before a successful terminal transition could be
     /// recorded. This includes coordination-level failures (checkpoint,
@@ -210,23 +286,62 @@ impl std::error::Error for ScanLoopError {
     }
 }
 
+/// Run the connector enumeration loop with the default lease-renew policy.
+///
+/// This is a convenience wrapper around [`run_scan_loop_with_policy`] using
+/// [`RenewalPolicy::default`] (renew at half-life).
+pub fn run_scan_loop<B, C, N>(
+    session: WorkerSession<'_, B>,
+    connector: &mut C,
+    budgets: Budgets,
+    max_transient_retries: usize,
+    op_id_fn: impl FnMut() -> OpId,
+    now_fn: N,
+) -> ScanLoopOutcome
+where
+    B: CoordinationBackend,
+    C: EnumerationConnector,
+    N: FnMut() -> LogicalTime,
+{
+    run_scan_loop_with_policy(
+        session,
+        connector,
+        budgets,
+        RenewalPolicy::default(),
+        max_transient_retries,
+        op_id_fn,
+        now_fn,
+    )
+}
+
 /// Run the connector enumeration loop for one acquired shard session.
 ///
 /// ## Lifecycle
 ///
 /// The function takes ownership of `session` and always returns a
-/// [`ScanLoopOutcome`]. On `Completed` or `Parked` the session has been
-/// consumed by a terminal coordination transition. On `Error` the session
-/// was consumed by a failed terminal call, or was dropped without reaching
-/// a terminal state (the lease will expire naturally).
+/// [`ScanLoopOutcome`]. `Completed` and `Parked` consume the session via
+/// terminal transitions. `LeaseLost` reports lease loss without terminal
+/// mutation attempts. `Error` reports failed coordination mutations.
 ///
-/// ## Pre-loop bridging
+/// ## Lease renewal model
 ///
-/// Before entering the page loop, the session's borrowed spec and cursor
-/// bytes are converted into owned connector-domain types ([`ShardSpec`],
-/// [`Cursor`]). If either conversion fails the shard is parked `Poisoned`
-/// immediately -- these failures indicate corrupted coordinator state that
-/// no amount of retrying can fix.
+/// Renewal remains synchronous and deterministic: after each successful
+/// checkpoint, the loop evaluates `renewal_policy` and may call
+/// `session.renew(now)`. Any renewal failure is treated as immediate lease
+/// loss, and the loop exits with `ScanLoopOutcome::LeaseLost`.
+///
+/// The renew threshold is derived from the most recently observed lease window
+/// (`deadline - now`), then recalibrated after each successful renewal. This
+/// keeps renewal timing stable even if time has already elapsed between acquire
+/// and entering the loop.
+///
+/// ## Lease-loss boundary
+///
+/// `LeaseLost` is intentionally narrow: it is returned only when the loop can
+/// detect lease loss before issuing a coordination mutation (`checkpoint`) or
+/// when `renew` itself fails. If `checkpoint`, `complete`, or `park` is
+/// attempted and rejected by the backend (including lease-expired cases), the
+/// outcome remains `Error`.
 ///
 /// ## Error-to-action mapping
 ///
@@ -236,24 +351,15 @@ impl std::error::Error for ScanLoopError {
 /// | Retryable enumerate error (streak < limit) | Retry immediately |
 /// | Retryable enumerate error (streak >= limit) | Park `TooManyErrors` |
 /// | Permanent enumerate error | Park via message heuristic |
+/// | Deadline elapsed before checkpoint | Return `LeaseLost` |
+/// | Lease renewal failure | Return `LeaseLost` |
 /// | Coordination checkpoint/complete failure | Return `Error` directly |
 /// | Park call failure | Return compound `Error::Park` |
-///
-/// ## Parameters
-///
-/// - `session` -- acquired [`WorkerSession`] for the shard to scan. Consumed.
-/// - `connector` -- the [`EnumerationConnector`] that produces pages.
-/// - `budgets` -- per-page item/byte budgets forwarded to the connector.
-/// - `max_transient_retries` -- maximum consecutive retryable enumeration
-///   failures before parking with [`ParkReason::TooManyErrors`].
-/// - `op_id_fn` -- called once per checkpoint/complete/park to obtain a
-///   unique operation ID for idempotent coordination calls.
-/// - `now_fn` -- called before each coordination mutation to obtain the
-///   current logical timestamp. Must be monotonic within a session.
-pub fn run_scan_loop<B, C, N>(
+pub fn run_scan_loop_with_policy<B, C, N>(
     mut session: WorkerSession<'_, B>,
     connector: &mut C,
     budgets: Budgets,
+    renewal_policy: RenewalPolicy,
     max_transient_retries: usize,
     mut op_id_fn: impl FnMut() -> OpId,
     mut now_fn: N,
@@ -296,7 +402,16 @@ where
         }
     };
 
+    // Seed the renew threshold from the lease time still remaining when the
+    // loop actually starts, not from the run's configured lease duration.
+    let baseline_now = now_fn();
+    let mut observed_lease_duration = session
+        .lease()
+        .deadline()
+        .as_raw()
+        .saturating_sub(baseline_now.as_raw());
     let mut transient_failures = 0usize;
+    let mut pages_completed = 0u64;
 
     loop {
         let page = match connector.enumerate_page(&spec, &connector_cursor, budgets) {
@@ -372,17 +487,90 @@ where
             };
         }
 
+        let checkpoint_now = now_fn();
+        let deadline = session.lease().deadline();
+        // Guard before checkpoint so we surface lease loss explicitly instead
+        // of issuing a mutation that is already stale.
+        if checkpoint_now >= deadline {
+            return ScanLoopOutcome::LeaseLost {
+                pages_completed,
+                cause: LeaseLossCause::DeadlineElapsed {
+                    now: checkpoint_now,
+                    deadline,
+                },
+            };
+        }
+
         let checkpoint_cursor = next_cursor.as_update();
-        match session.checkpoint(now_fn(), &checkpoint_cursor, op_id_fn()) {
+        match session.checkpoint(checkpoint_now, &checkpoint_cursor, op_id_fn()) {
             Ok(_) => {
                 // Only cursor state is advanced here. Detection-engine
                 // processing of page items is composed externally by the
                 // caller, not handled inside the scan loop.
                 connector_cursor = next_cursor;
+                pages_completed += 1;
             }
             Err(error) => return ScanLoopOutcome::Error(ScanLoopError::Checkpoint(error)),
         }
+
+        let renew_now = now_fn();
+        if should_renew(
+            renew_now,
+            session.lease().deadline(),
+            observed_lease_duration,
+            renewal_policy,
+        ) {
+            match session.renew(renew_now) {
+                Ok(_) => {
+                    observed_lease_duration = session
+                        .lease()
+                        .deadline()
+                        .as_raw()
+                        .saturating_sub(renew_now.as_raw());
+                }
+                Err(error) => {
+                    // Renewal failure is treated as lease loss, not a generic
+                    // mutation error: we abandon the session immediately.
+                    return ScanLoopOutcome::LeaseLost {
+                        pages_completed,
+                        cause: LeaseLossCause::RenewFailed(error),
+                    };
+                }
+            }
+        }
     }
+}
+
+/// Decide whether a renewal attempt should run at this checkpoint boundary.
+///
+/// The trigger compares remaining lease time to a fraction of the most recently
+/// observed lease duration. If `now` is already at/past the deadline, this
+/// returns `true` to force an immediate renewal attempt (which will surface a
+/// precise [`RenewError`] if the lease is already invalid). Non-finite policy
+/// values fall back to [`DEFAULT_RENEW_AT_FRACTION`], and finite values are
+/// clamped into `[0.0, 1.0]`.
+fn should_renew(
+    now: LogicalTime,
+    deadline: LogicalTime,
+    observed_lease_duration: u64,
+    policy: RenewalPolicy,
+) -> bool {
+    if now >= deadline {
+        return true;
+    }
+
+    let remaining = deadline.as_raw().saturating_sub(now.as_raw());
+    let fraction = if policy.renew_at_fraction.is_finite() {
+        policy.renew_at_fraction.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_RENEW_AT_FRACTION
+    };
+    let mut renew_threshold = ((observed_lease_duration as f64) * fraction).ceil() as u64;
+    if renew_threshold == 0 && fraction > 0.0 {
+        renew_threshold = 1;
+    }
+
+    remaining <= renew_threshold
 }
 
 /// Attempt to park the shard and return the appropriate [`ScanLoopOutcome`].
@@ -499,8 +687,10 @@ mod tests {
         ConnectorTag, ObjectVersionId, RunId, ShardId, StableItemId, TenantId, WorkerId,
     };
     use gossip_coordination::{
-        InMemoryCoordinator, RunConfig, RunManagement, ShardFilter, ShardKey, ShardStatus,
-        ShardSummary,
+        AcquireError, AcquireResultView, AcquireScratch, IdempotentOutcome, InMemoryCoordinator,
+        Lease, RenewResult, RunConfig, RunManagement, ShardFilter, ShardKey, ShardStatus,
+        ShardSummary, SplitReplaceError, SplitReplacePlan, SplitReplaceResult, SplitResidualError,
+        SplitResidualPlan, SplitResidualResult,
     };
     use rstest::rstest;
 
@@ -588,11 +778,11 @@ mod tests {
         coord
     }
 
-    fn acquire_session<'a>(
-        coord: &'a mut InMemoryCoordinator,
+    fn acquire_session<'a, B: CoordinationBackend>(
+        coord: &'a mut B,
         at: u64,
         worker_id: u64,
-    ) -> WorkerSession<'a, InMemoryCoordinator> {
+    ) -> WorkerSession<'a, B> {
         WorkerSession::new(coord, now(at), tenant(), shard_key(), worker(worker_id))
             .expect("acquire session")
     }
@@ -604,6 +794,122 @@ mod tests {
             .expect("list shards");
         assert_eq!(out.len(), 1, "expected exactly one shard");
         out.remove(0)
+    }
+
+    /// Test-only backend wrapper that steals a shard lease on demand to force
+    /// a stale-fence renewal path through the real in-memory coordinator.
+    struct FenceStealingBackend {
+        inner: InMemoryCoordinator,
+        steal_on_or_after: LogicalTime,
+        stolen: bool,
+        thief_worker: WorkerId,
+    }
+
+    impl FenceStealingBackend {
+        fn new(
+            inner: InMemoryCoordinator,
+            steal_on_or_after: LogicalTime,
+            thief_worker: WorkerId,
+        ) -> Self {
+            Self {
+                inner,
+                steal_on_or_after,
+                stolen: false,
+                thief_worker,
+            }
+        }
+    }
+
+    impl CoordinationBackend for FenceStealingBackend {
+        fn acquire_and_restore_into<'a>(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            key: ShardKey,
+            worker: WorkerId,
+            out: &'a mut AcquireScratch,
+        ) -> Result<AcquireResultView<'a>, AcquireError> {
+            self.inner
+                .acquire_and_restore_into(now, tenant, key, worker, out)
+        }
+
+        fn renew(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            lease: &Lease,
+        ) -> Result<RenewResult, RenewError> {
+            if !self.stolen && now >= self.steal_on_or_after {
+                let mut scratch = AcquireScratch::default();
+                let _ = self
+                    .inner
+                    .acquire_and_restore_into(
+                        now,
+                        tenant,
+                        lease.shard_key(),
+                        self.thief_worker,
+                        &mut scratch,
+                    )
+                    .expect("test setup: thief must acquire before stale-fence renew");
+                self.stolen = true;
+            }
+            self.inner.renew(now, tenant, lease)
+        }
+
+        fn checkpoint(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            lease: &Lease,
+            new_cursor: &CursorUpdate<'_>,
+            op_id: OpId,
+        ) -> Result<IdempotentOutcome<()>, CheckpointError> {
+            self.inner.checkpoint(now, tenant, lease, new_cursor, op_id)
+        }
+
+        fn complete(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            lease: &Lease,
+            final_cursor: &CursorUpdate<'_>,
+            op_id: OpId,
+        ) -> Result<IdempotentOutcome<()>, CompleteError> {
+            self.inner.complete(now, tenant, lease, final_cursor, op_id)
+        }
+
+        fn park_shard(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            lease: &Lease,
+            reason: ParkReason,
+            op_id: OpId,
+        ) -> Result<IdempotentOutcome<()>, ParkError> {
+            self.inner.park_shard(now, tenant, lease, reason, op_id)
+        }
+
+        fn split_replace(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            lease: &Lease,
+            plan: SplitReplacePlan<'_>,
+            op_id: OpId,
+        ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
+            self.inner.split_replace(now, tenant, lease, plan, op_id)
+        }
+
+        fn split_residual(
+            &mut self,
+            now: LogicalTime,
+            tenant: TenantId,
+            lease: &Lease,
+            plan: SplitResidualPlan<'_>,
+            op_id: OpId,
+        ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
+            self.inner.split_residual(now, tenant, lease, plan, op_id)
+        }
     }
 
     #[derive(Clone)]
@@ -790,7 +1096,7 @@ mod tests {
         let session = acquire_session(&mut coord, 3, 1);
 
         let mut op_ids = counter_op_ids(500);
-        let mut times = vec![4u64, 5u64, 12u64].into_iter();
+        let mut times = vec![4u64, 5u64, 6u64, 12u64].into_iter();
         let first_outcome = run_scan_loop(
             session,
             &mut first_connector,
@@ -801,15 +1107,24 @@ mod tests {
         );
 
         match first_outcome {
-            ScanLoopOutcome::Error(ScanLoopError::Checkpoint(CheckpointError::LeaseExpired {
-                ..
-            })) => {}
-            other => panic!("expected checkpoint lease-expired error, got {other:?}"),
+            ScanLoopOutcome::LeaseLost {
+                pages_completed,
+                cause:
+                    LeaseLossCause::DeadlineElapsed {
+                        now: lease_lost_now,
+                        deadline,
+                    },
+            } => {
+                assert_eq!(pages_completed, 1);
+                assert_eq!(lease_lost_now, now(12));
+                assert_eq!(deadline, now(11));
+            }
+            other => panic!("expected LeaseLost(DeadlineElapsed), got {other:?}"),
         }
 
         let mid = shard_summary(&coord, 13);
         assert_eq!(mid.status(), ShardStatus::Active);
-        assert_eq!(mid.last_key(), Some(&b"b"[..]));
+        assert_eq!(mid.last_key(), Some(&b"a"[..]));
 
         let mut second_connector = InMemoryDeterministicConnector::new(
             TAG,
@@ -839,6 +1154,73 @@ mod tests {
         let final_summary = shard_summary(&coord, 80);
         assert_eq!(final_summary.status(), ShardStatus::Done);
         assert_eq!(final_summary.last_key(), Some(&b"c"[..]));
+    }
+
+    #[test]
+    fn renewal_extends_deadline_and_scan_continues() {
+        let mut coord = seeded_coordinator(20, CursorUpdate::initial());
+        let mut connector = InMemoryDeterministicConnector::new(
+            TAG,
+            vec![make_mem_item(b"a", b"one"), make_mem_item(b"b", b"two")],
+        );
+
+        let session = acquire_session(&mut coord, 3, 1);
+        let mut op_ids = counter_op_ids(650);
+        let mut times = vec![4u64, 5u64, 6u64, 20u64, 21u64, 30u64].into_iter();
+        let outcome = run_scan_loop_with_policy(
+            session,
+            &mut connector,
+            budgets(1),
+            RenewalPolicy::new(0.5),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(times.next().expect("time script exhausted")),
+        );
+
+        assert_eq!(outcome, ScanLoopOutcome::Completed);
+        let summary = shard_summary(&coord, 80);
+        assert_eq!(summary.status(), ShardStatus::Done);
+        assert_eq!(summary.last_key(), Some(&b"b"[..]));
+    }
+
+    #[test]
+    fn stale_fence_during_renew_returns_lease_lost() {
+        let base = seeded_coordinator(8, CursorUpdate::initial());
+        let mut coord = FenceStealingBackend::new(base, now(20), worker(99));
+        let mut connector = InMemoryDeterministicConnector::new(
+            TAG,
+            vec![make_mem_item(b"a", b"one"), make_mem_item(b"b", b"two")],
+        );
+
+        let session = acquire_session(&mut coord, 3, 1);
+        let mut op_ids = counter_op_ids(680);
+        let mut times = vec![4u64, 5u64, 6u64, 7u64, 20u64].into_iter();
+        let outcome = run_scan_loop(
+            session,
+            &mut connector,
+            budgets(1),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || now(times.next().expect("time script exhausted")),
+        );
+
+        match outcome {
+            ScanLoopOutcome::LeaseLost {
+                pages_completed,
+                cause: LeaseLossCause::RenewFailed(RenewError::StaleFence { .. }),
+            } => {
+                assert_eq!(pages_completed, 2);
+            }
+            other => panic!("expected LeaseLost(RenewFailed(StaleFence)), got {other:?}"),
+        }
+
+        assert!(
+            coord.stolen,
+            "test hook should have forced a competing acquire"
+        );
+        let summary = shard_summary(&coord.inner, 25);
+        assert_eq!(summary.status(), ShardStatus::Active);
+        assert_eq!(summary.last_key(), Some(&b"b"[..]));
     }
 
     // -- rstest parameterized classifier tests -----------------------------------
@@ -1064,9 +1446,8 @@ mod tests {
         let session = acquire_session(&mut coord, 3, 1);
         let mut op_ids = counter_op_ids(900);
 
-        // First now_fn call (checkpoint) at t=4 (within lease).
-        // Second now_fn call (complete) at t=20 (past lease deadline of 11).
-        let mut times = [4u64, 20].into_iter();
+        // baseline=4, checkpoint=5, renew-check=6 (no renew), complete=20.
+        let mut times = [4u64, 5, 6, 20].into_iter();
         let outcome = run_scan_loop(
             session,
             &mut connector,
@@ -1089,13 +1470,13 @@ mod tests {
         assert_eq!(summary.last_key(), Some(&b"b"[..]));
     }
 
-    /// Checkpoint failure (lease expiry) returns `Error(Checkpoint(..))`.
+    /// Lease expiry detected before checkpoint returns `LeaseLost`.
     ///
     /// A single non-empty page is fetched successfully, but by the time the
-    /// loop calls `session.checkpoint()` the lease has expired. The shard
+    /// loop is ready to checkpoint, the deadline has passed. The shard
     /// remains `Active` because no terminal transition succeeded.
     #[test]
-    fn checkpoint_failure_returns_error() {
+    fn checkpoint_deadline_elapsed_returns_lease_lost() {
         // Lease duration = 8, acquired at t=3, so deadline = 11.
         let mut coord = seeded_coordinator(8, CursorUpdate::initial());
 
@@ -1108,22 +1489,31 @@ mod tests {
         let session = acquire_session(&mut coord, 3, 1);
         let mut op_ids = counter_op_ids(950);
 
-        // now_fn returns t=20 which is past the lease deadline of 11.
-        // The first (and only) now_fn call is for the checkpoint.
+        // baseline=4, checkpoint-attempt=20 (past deadline=11).
+        let mut times = [4u64, 20].into_iter();
         let outcome = run_scan_loop(
             session,
             &mut connector,
             budgets(10),
             DEFAULT_MAX_TRANSIENT_RETRIES,
             &mut op_ids,
-            || now(20),
+            || now(times.next().expect("time script exhausted")),
         );
 
         match outcome {
-            ScanLoopOutcome::Error(ScanLoopError::Checkpoint(CheckpointError::LeaseExpired {
-                ..
-            })) => {} // expected
-            other => panic!("expected Error(Checkpoint(LeaseExpired)), got {other:?}"),
+            ScanLoopOutcome::LeaseLost {
+                pages_completed,
+                cause:
+                    LeaseLossCause::DeadlineElapsed {
+                        now: lease_lost_now,
+                        deadline,
+                    },
+            } => {
+                assert_eq!(pages_completed, 0);
+                assert_eq!(lease_lost_now, now(20));
+                assert_eq!(deadline, now(11));
+            }
+            other => panic!("expected LeaseLost(DeadlineElapsed), got {other:?}"),
         }
 
         // No checkpoint was durable — shard is still Active at initial cursor.

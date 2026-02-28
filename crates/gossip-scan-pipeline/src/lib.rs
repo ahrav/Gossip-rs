@@ -12,14 +12,27 @@
 //!   next cursor.
 //! - Invalid shard or cursor bridging input is treated as poisoned state and is
 //!   parked.
+//! - Lease renewal is synchronous and checked between pages.
+//! - `LeaseLost` is reserved for "abandon without terminal mutation" paths:
+//!   deadline elapsed before checkpoint, or renewal failure after checkpoint.
+//! - Once a coordination mutation is attempted (`checkpoint`/`complete`/`park`),
+//!   backend failures (including lease-expired rejections) surface as `Error`.
 //!
 //! Design trade-offs:
 //! - The loop is synchronous and deterministic; retry pacing/backoff is not handled
 //!   internally.
 //! - Retry behavior is intentionally bounded and caller-configured via
 //!   `max_transient_retries`.
+//! - Lease-renew timing is caller-configured via `RenewalPolicy` in
+//!   `run_scan_loop_with_policy`; `run_scan_loop` uses half-life renewal.
+//! - Reporting lease loss separately from mutation failures gives callers a clear
+//!   split between "reacquire and continue from last checkpoint" and
+//!   "coordination mutation failed; investigate backend error."
 //! - Chunking and detection-engine fan-out are handled externally, not in this crate.
 
 mod scan_loop;
 
-pub use scan_loop::{DEFAULT_MAX_TRANSIENT_RETRIES, ScanLoopError, ScanLoopOutcome, run_scan_loop};
+pub use scan_loop::{
+    DEFAULT_MAX_TRANSIENT_RETRIES, DEFAULT_RENEW_AT_FRACTION, LeaseLossCause, RenewalPolicy,
+    ScanLoopError, ScanLoopOutcome, run_scan_loop, run_scan_loop_with_policy,
+};
