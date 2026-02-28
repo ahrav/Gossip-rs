@@ -707,9 +707,8 @@ impl EnumerationConnector for FilesystemConnector {
         self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
     }
 
-    /// The first call may trigger a full filesystem walk via
-    /// [`ensure_indexed`](Self::ensure_indexed); subsequent calls operate
-    /// purely over the in-memory index.
+    /// The first call may trigger a full filesystem walk; subsequent calls
+    /// operate purely over the in-memory index.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
