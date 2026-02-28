@@ -12,5 +12,8 @@
 //! trait definitions and value types. It must not depend on
 //! `gossip-persistence` or the coordination backend implementation.
 
+pub mod filesystem;
 pub mod in_memory;
+
+pub use filesystem::FilesystemConnector;
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
