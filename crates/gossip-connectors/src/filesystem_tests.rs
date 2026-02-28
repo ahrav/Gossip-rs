@@ -796,16 +796,31 @@ fn index_failure_is_memoized() {
 
 #[test]
 fn open_rejects_directory_path() {
-    let dir = create_test_dir(&[("file.txt", b"data")]);
-    fs::create_dir(dir.path().join("subdir")).unwrap();
-
+    // Index a real file, then replace it with a directory to exercise the
+    // `metadata.is_file()` guard in `open_beneath_root`.
+    let dir = create_test_dir(&[("target.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
-    let dir_ref = ItemRef::try_from_slice(b"subdir").unwrap();
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace the indexed file with a directory.
+    fs::remove_file(dir.path().join("target.txt")).unwrap();
+    fs::create_dir(dir.path().join("target.txt")).unwrap();
+
     let err = c
-        .open(&dir_ref, default_budgets())
+        .open(&item_ref, default_budgets())
         .err()
         .expect("should reject directory");
     assert!(!err.is_retryable(), "directory open should be permanent");
+    assert!(
+        err.message().contains("not a regular file"),
+        "expected 'not a regular file' error, got: {}",
+        err.message(),
+    );
 }
 
 // ---------------------------------------------------------------

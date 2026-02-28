@@ -612,19 +612,23 @@ impl FilesystemConnector {
             .as_ref()
             .ok_or_else(|| ReadError::permanent("connector not indexed; call enumerate first"))?;
 
-        let components: Vec<&[u8]> = ref_bytes.split(|&b| b == b'/').collect();
-        if components.is_empty() {
+        // Count components without allocating a Vec. `split` on a non-empty
+        // slice always yields at least one element.
+        let n = ref_bytes.iter().filter(|&&b| b == b'/').count() + 1;
+        if ref_bytes.is_empty() {
             return Err(ReadError::permanent("empty item_ref"));
         }
 
-        let n = components.len();
         let mut dir_fd: Option<OwnedFd> = None;
 
-        for (i, component) in components.iter().enumerate() {
+        // Stack buffer for null-terminated component (NAME_MAX=255 + NUL).
+        let mut c_buf = [0u8; 256];
+
+        for (i, component) in ref_bytes.split(|&b| b == b'/').enumerate() {
             // Defense-in-depth: `encode_rel_path` only produces Normal segments,
             // and `verify_membership` rejects refs absent from the index, so this
             // guard is unreachable through any public API path.
-            if component.is_empty() || *component == b"." || *component == b".." {
+            if component.is_empty() || component == b"." || component == b".." {
                 return Err(ReadError::permanent("invalid path component in item_ref"));
             }
 
@@ -633,8 +637,18 @@ impl FilesystemConnector {
                 None => root_fd.as_raw_fd(),
             };
 
-            let c_component = CString::new(*component)
-                .map_err(|_| ReadError::permanent("null byte in path component"))?;
+            // Reject embedded NUL bytes before building the C string.
+            if component.contains(&0) {
+                return Err(ReadError::permanent("null byte in path component"));
+            }
+
+            // Build a null-terminated component on the stack (NAME_MAX=255 + NUL).
+            if component.len() >= c_buf.len() {
+                return Err(ReadError::permanent("path component exceeds NAME_MAX"));
+            }
+            c_buf[..component.len()].copy_from_slice(component);
+            c_buf[component.len()] = 0;
+            let c_ptr = c_buf.as_ptr().cast::<libc::c_char>();
 
             let is_last = i == n - 1;
             let flags = if is_last {
@@ -644,9 +658,9 @@ impl FilesystemConnector {
             };
 
             // SAFETY: `libc::openat` is a POSIX syscall. `parent_raw` is a valid
-            // fd. `c_component` is null-terminated. Returned fd is wrapped in
-            // `OwnedFd` for close-on-drop.
-            let raw = unsafe { libc::openat(parent_raw, c_component.as_ptr(), flags) };
+            // fd. `c_ptr` points to a null-terminated stack buffer. Returned fd
+            // is wrapped in `OwnedFd` for close-on-drop.
+            let raw = unsafe { libc::openat(parent_raw, c_ptr, flags) };
             if raw < 0 {
                 let comp = String::from_utf8_lossy(component);
                 return Err(classify_io_read_error(
