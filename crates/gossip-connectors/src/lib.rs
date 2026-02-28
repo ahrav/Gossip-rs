@@ -11,3 +11,5 @@
 //! **Dependency direction:** This crate depends on `gossip-contracts` for
 //! trait definitions and value types. It must not depend on
 //! `gossip-persistence` or the coordination backend implementation.
+
+pub mod in_memory;

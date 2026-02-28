@@ -211,6 +211,13 @@ the status into the CQL write timestamp:
 USING TIMESTAMP = (status_discriminant << 56) | logical_time
 ```
 
+**`logical_time` constraint:** The upper 8 bits are reserved for the status
+discriminant, so `logical_time` must fit in 56 bits (< 2^56). In practice
+this is a monotonic microsecond counter (epoch-relative). At microsecond
+granularity, 2^56 microseconds ≈ 2.28 billion years — overflow is not a
+practical concern. Implementations must reject or mask values ≥ 2^56 to
+prevent corrupting the status discriminant.
+
 ScyllaDB's built-in Last-Writer-Wins (LWW) resolution uses the highest
 timestamp. Since `Scanned(2) << 56` > `Failed(1) << 56`, a `Scanned` write
 always wins over a `Failed` write regardless of arrival order. This gives
