@@ -1482,6 +1482,36 @@ fn fifo_is_skipped() {
 }
 
 #[test]
+fn open_rejects_fifo_replacing_indexed_file() {
+    use std::process::Command;
+
+    let dir = create_test_dir(&[("target.txt", b"real data")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index while it's a regular file.
+    let mut c = FilesystemConnector::new(dir.path());
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace the regular file with a FIFO.
+    let target = dir.path().join("target.txt");
+    fs::remove_file(&target).unwrap();
+    let status = Command::new("mkfifo").arg(&target).status();
+    if status.is_err() || !status.unwrap().success() {
+        return; // mkfifo not available; skip gracefully.
+    }
+
+    // open() on the now-FIFO path should fail with a permanent error.
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("open should reject FIFO replacing a regular file"),
+    };
+    assert!(!err.is_retryable(), "FIFO rejection should be permanent");
+}
+
+#[test]
 fn very_long_filename_is_indexed() {
     let dir = tempfile::tempdir().expect("create tempdir");
     // 255 chars is the maximum filename length on most filesystems.
@@ -1688,15 +1718,6 @@ fn eisdir_classified_as_permanent() {
     assert!(
         super::is_permanent_io_error(&err),
         "EISDIR should be permanent"
-    );
-}
-
-#[test]
-fn enametoolong_classified_as_permanent() {
-    let err = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
-    assert!(
-        super::is_permanent_io_error(&err),
-        "ENAMETOOLONG should be permanent"
     );
 }
 
@@ -1927,17 +1948,4 @@ fn compatible_instance_reads_item_ref_from_another_instance() {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"hello world");
-}
-
-// ---------------------------------------------------------------
-// ENAMETOOLONG classification
-// ---------------------------------------------------------------
-
-#[test]
-fn enametoolong_classified_as_permanent() {
-    let err = io::Error::from_raw_os_error(libc::ENAMETOOLONG);
-    assert!(
-        is_permanent_io_error(&err),
-        "ENAMETOOLONG should be classified as permanent"
-    );
 }

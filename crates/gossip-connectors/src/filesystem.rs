@@ -650,8 +650,9 @@ impl FilesystemConnector {
             // `OwnedFd` for close-on-drop.
             let raw = unsafe { libc::openat(parent_raw, c_component.as_ptr(), flags) };
             if raw < 0 {
+                let comp = String::from_utf8_lossy(component);
                 return Err(classify_io_read_error(
-                    "openat",
+                    &format!("openat component {}/{n} '{comp}'", i + 1),
                     &io::Error::last_os_error(),
                 ));
             }
@@ -740,7 +741,11 @@ impl ReadConnector for FilesystemConnector {
         self.verify_membership(item_ref)?;
         let (file, metadata) = self.open_beneath_root(item_ref.as_bytes())?;
         if metadata.len() > budgets.max_bytes() {
-            return Err(ReadError::permanent("item exceeds max_bytes budget"));
+            return Err(ReadError::permanent(format!(
+                "item size {} exceeds max_bytes budget {}",
+                metadata.len(),
+                budgets.max_bytes(),
+            )));
         }
         clear_nonblock(&file)?;
         Ok(Box::new(file))
@@ -775,18 +780,15 @@ impl ReadConnector for FilesystemConnector {
 
 /// Returns `true` for I/O errors that are deterministically permanent.
 fn is_permanent_io_error(err: &io::Error) -> bool {
-    match err.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput => {
-            true
-        }
-        _ => {
-            // POSIX errnos mapped to unstable ErrorKind variants.
-            matches!(
-                err.raw_os_error(),
-                Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EISDIR)
-            )
-        }
-    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidFilename
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::IsADirectory
+    ) || err.raw_os_error() == Some(libc::ELOOP)
 }
 
 fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
@@ -935,6 +937,12 @@ fn walk_dir_collect_files(
             };
 
             if !metadata.is_file() {
+                push_warning(
+                    warnings,
+                    max_warnings,
+                    overflow_count,
+                    WalkWarning::skipped(&path, "file type changed between readdir and stat"),
+                );
                 continue;
             }
 
@@ -999,6 +1007,12 @@ fn walk_dir_collect_files(
 // Path encoding
 // ---------------------------------------------------------------------------
 
+/// Encode a relative path as a `/`-separated byte key.
+///
+/// Key ordering matches lexicographic path ordering on Unix because segments
+/// are joined with `/` (0x2F). The encoding is reversible by splitting on `/`
+/// since Unix filenames cannot contain `/`. Only [`Component::Normal`] segments
+/// are accepted; `.`, `..`, and root prefixes are rejected.
 fn encode_rel_path(rel: &Path) -> Result<Vec<u8>, EnumerateError> {
     let mut out = Vec::new();
     for component in rel.components() {
@@ -1080,6 +1094,7 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
             &io::Error::last_os_error(),
         ));
     }
+    // SAFETY: F_SETFL on a valid fd with flags obtained from F_GETFL above.
     let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
     if result < 0 {
         return Err(classify_io_read_error(
