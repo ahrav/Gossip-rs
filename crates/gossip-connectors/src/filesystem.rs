@@ -515,10 +515,10 @@ impl FilesystemConnector {
     ) -> Result<Option<ItemKey>, EnumerateError> {
         self.ensure_indexed(deadline)?;
 
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                return Err(EnumerateError::retryable("budget deadline expired"));
-            }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            return Err(EnumerateError::retryable("budget deadline expired"));
         }
 
         if let (Some(s), Some(e)) = (start, end)
@@ -830,10 +830,10 @@ fn walk_dir_collect_files(
 
     while let Some((dir, depth)) = stack.pop() {
         // Periodic deadline check: once per directory.
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                return Err(EnumerateError::retryable("indexing deadline expired"));
-            }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            return Err(EnumerateError::retryable("indexing deadline expired"));
         }
 
         let is_root = dir == root;
