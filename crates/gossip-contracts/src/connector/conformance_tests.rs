@@ -1,6 +1,26 @@
-use std::collections::HashSet;
+//! Conformance harness unit tests.
+//!
+//! Test strategy in this module:
+//!
+//! - Use a scripted connector fixture (`scripted_make`) so each test controls
+//!   exact page sequences and failure injection.
+//! - Start from a reduced baseline config (`harness_cfg`) that disables
+//!   optional checks, then opt into one behavior per test to keep failures
+//!   attributable.
+//! - Use raw byte marker constants only as leak sentinels to assert that
+//!   diagnostics remain digest-only.
+
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
 
 use rstest::rstest;
+
+use crate::connector::{
+    Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationPage, ErrorClass, ItemKey,
+    ItemRef, ScanItem, TokenBytes, VersionId,
+};
+use crate::identity::{ObjectVersionId, StableItemId};
 
 use super::*;
 
@@ -36,6 +56,114 @@ fn sample_page_validation_error() -> PageValidationError {
         None,
     )
     .expect_err("descending bounded range must fail validation")
+}
+
+#[derive(Clone)]
+struct ScriptConnector {
+    pages: VecDeque<Result<EnumerationPage, EnumerateError>>,
+}
+
+/// Build a connector factory where each factory call consumes one scripted run.
+///
+/// This mirrors `check_connector_conforms` behavior, which may construct
+/// multiple connector instances (baseline, determinism rerun, resume checks).
+fn scripted_make(
+    runs: Vec<Vec<Result<EnumerationPage, EnumerateError>>>,
+) -> impl Fn() -> ScriptConnector {
+    let runs: VecDeque<VecDeque<Result<EnumerationPage, EnumerateError>>> =
+        runs.into_iter().map(VecDeque::from).collect();
+    let runs = Rc::new(RefCell::new(runs));
+    move || {
+        let pages = runs
+            .borrow_mut()
+            .pop_front()
+            .expect("missing scripted connector run");
+        ScriptConnector { pages }
+    }
+}
+
+fn scripted_caps(_connector: &ScriptConnector) -> ConnectorCapabilities {
+    ConnectorCapabilities {
+        seek_by_key: true,
+        token_resume: true,
+        range_read: false,
+        split_hints: false,
+    }
+}
+
+fn scripted_enumerate(
+    connector: &mut ScriptConnector,
+    _cursor: &Cursor,
+    _budgets: Budgets,
+) -> Result<EnumerationPage, EnumerateError> {
+    connector
+        .pages
+        .pop_front()
+        .expect("unexpected enumerate_page call")
+}
+
+/// Baseline config for focused unit tests.
+///
+/// Optional conformance phases are disabled by default so tests can opt into
+/// exactly one phase and assert a specific error mapping.
+fn harness_cfg() -> ConformanceConfig {
+    ConformanceConfig {
+        determinism: DeterminismExpectation::BestEffort,
+        resume_checks: ResumeChecks {
+            drop_token: false,
+            corrupt_token: false,
+        },
+        secret_scan: SecretScanConfig {
+            enabled: false,
+            ..SecretScanConfig::default()
+        },
+        restart_points: RestartPoints::Auto(0),
+        ..ConformanceConfig::default()
+    }
+}
+
+fn scan_item(key: &[u8], item_ref: &[u8]) -> ScanItem {
+    let mut stable_id_bytes = [0_u8; 32];
+    stable_id_bytes.copy_from_slice(blake3::hash(key).as_bytes());
+    ScanItem::new(
+        ItemKey::try_from_slice(key).expect("valid item key bytes"),
+        ItemRef::try_from_slice(item_ref).expect("valid item_ref bytes"),
+        StableItemId::from_bytes(stable_id_bytes),
+        VersionId::Strong(ObjectVersionId::from_version_bytes(item_ref)),
+    )
+}
+
+fn cursor(next_key: Option<&[u8]>, token: Option<&[u8]>) -> Cursor {
+    match (next_key, token) {
+        (None, None) => Cursor::initial(),
+        (Some(last_key), None) => {
+            Cursor::with_last_key(ItemKey::try_from_slice(last_key).expect("valid cursor key"))
+        }
+        (Some(last_key), Some(token)) => Cursor::with_token(
+            ItemKey::try_from_slice(last_key).expect("valid cursor key"),
+            TokenBytes::try_from_slice(token).expect("valid token bytes"),
+        ),
+        (None, Some(_)) => panic!("token requires a last_key"),
+    }
+}
+
+fn page(
+    items: &[(&[u8], &[u8])],
+    next_key: Option<&[u8]>,
+    token: Option<&[u8]>,
+) -> EnumerationPage {
+    let scan_items = items
+        .iter()
+        .map(|(key, item_ref)| scan_item(key, item_ref))
+        .collect();
+    EnumerationPage::new(scan_items, cursor(next_key, token))
+}
+
+fn default_range() -> (ItemKey, ItemKey) {
+    (
+        ItemKey::try_from_slice(b"a").expect("valid range start"),
+        ItemKey::try_from_slice(b"z").expect("valid range end"),
+    )
 }
 
 #[test]
@@ -118,8 +246,9 @@ fn item_observation_display_uses_only_safe_digests() {
     ConformanceError::EnumerateFailed {
         at_page: 2,
         class: ErrorClass::Retryable,
+        message_digest: ToxicDigest::of_bytes(b"simulated failure"),
     },
-    "enumerate_page failed at page 2 with retryable"
+    "enumerate_page failed at page 2 with retryable: message=("
 )]
 #[case::too_many_items_page(
     ConformanceError::ReturnedTooManyItems {
@@ -185,6 +314,13 @@ fn item_observation_display_uses_only_safe_digests() {
     },
     "determinism mismatch at item index 9:"
 )]
+#[case::determinism_length_mismatch(
+    ConformanceError::DeterminismLengthMismatch {
+        expected_len: 5,
+        got_len: 3,
+    },
+    "determinism length mismatch: expected_len=5 got_len=3"
+)]
 #[case::resume_mismatch(
     ConformanceError::ResumeMismatch {
         restart_cursor_index: 2,
@@ -203,6 +339,12 @@ fn item_observation_display_uses_only_safe_digests() {
         got_len: 3,
     },
     "resume length mismatch (restart_cursor_index=3, mode=CorruptToken): expected_len=4 got_len=3"
+)]
+#[case::cursor_key_not_in_baseline(
+    ConformanceError::CursorKeyNotInBaseline {
+        cursor_key: ToxicDigest::of_bytes(RAW_KEY_BYTES),
+    },
+    "resume cursor last_key not found in baseline items:"
 )]
 #[case::item_ref_secret_match(
     ConformanceError::ItemRefAppearsToContainSecret {
@@ -327,7 +469,6 @@ fn enumeration_trace_debug_does_not_leak_raw_bytes() {
     let trace = EnumerationTrace {
         items: vec![sample_observation(raw_key, raw_fp_seed)],
         cursors: vec![cursor],
-        pages: 1,
     };
 
     let rendered = format!("{trace:?}");
@@ -342,6 +483,555 @@ fn enumeration_trace_debug_does_not_leak_raw_bytes() {
             "EnumerationTrace Debug leaked raw bytes marker {raw}: {rendered}"
         );
     }
+}
+
+#[test]
+fn select_restart_points_auto_is_bounded_and_sorted() {
+    assert_eq!(
+        select_restart_points(RestartPoints::Auto(4), 0),
+        Vec::<usize>::new()
+    );
+
+    let points = select_restart_points(RestartPoints::Auto(4), 10);
+    assert_eq!(points, vec![0, 3, 6, 9]);
+    assert!(points.windows(2).all(|window| window[0] < window[1]));
+    assert!(points.iter().all(|&idx| idx < 10));
+}
+
+#[test]
+fn select_restart_points_auto_one_returns_first() {
+    assert_eq!(select_restart_points(RestartPoints::Auto(1), 5), vec![0]);
+}
+
+#[test]
+fn select_restart_points_auto_exceeding_len_caps_at_len() {
+    assert_eq!(
+        select_restart_points(RestartPoints::Auto(100), 3),
+        vec![0, 1, 2]
+    );
+}
+
+#[test]
+fn select_restart_points_explicit_filters_sorts_and_dedupes() {
+    const EXPLICIT: &[usize] = &[4, 1, 1, 999, 0, 4];
+    let points = select_restart_points(RestartPoints::Explicit(EXPLICIT), 5);
+    assert_eq!(points, vec![0, 1, 4]);
+}
+
+#[test]
+fn contains_subslice_basic() {
+    assert!(contains_subslice(b"abcde", b"bcd"));
+    assert!(!contains_subslice(b"abcde", b"ace"));
+    assert!(contains_subslice(b"abcde", b""));
+    assert!(!contains_subslice(b"ab", b"abc"));
+}
+
+#[test]
+fn contains_subslice_equal_length() {
+    assert!(contains_subslice(b"abc", b"abc"));
+    assert!(!contains_subslice(b"abc", b"def"));
+}
+
+#[test]
+fn drop_token_on_initial_cursor_returns_initial() {
+    let initial = Cursor::initial();
+    let dropped = drop_token(&initial);
+    assert_eq!(dropped.last_key().map(|k| k.as_bytes()), None);
+    assert_eq!(dropped.token(), None);
+}
+
+#[test]
+fn drop_token_preserves_last_key_and_removes_token() {
+    let original = cursor(Some(b"cursor-k"), Some(b"cursor-token"));
+    let dropped = drop_token(&original);
+    assert_eq!(
+        dropped.last_key().map(|key| key.as_bytes()),
+        original.last_key().map(|key| key.as_bytes())
+    );
+    assert_eq!(dropped.token(), None);
+}
+
+#[test]
+fn corrupt_token_on_initial_cursor_returns_initial() {
+    let result = corrupt_token(&Cursor::initial(), 42);
+    assert_eq!(result.last_key().map(|k| k.as_bytes()), None);
+}
+
+#[test]
+fn corrupt_token_is_deterministic_for_seed_and_preserves_last_key() {
+    let original = cursor(Some(b"cursor-k"), Some(b"cursor-token"));
+    let first = corrupt_token(&original, 7);
+    let second = corrupt_token(&original, 7);
+    let different_seed = corrupt_token(&original, 8);
+
+    assert_eq!(first, second);
+    assert_ne!(first, different_seed);
+    assert_eq!(
+        first.last_key().map(|key| key.as_bytes()),
+        original.last_key().map(|key| key.as_bytes())
+    );
+    assert!(first.token().is_some());
+    assert_ne!(first.token(), original.token());
+}
+
+#[test]
+fn check_connector_conforms_rejects_missing_seek_by_key() {
+    let make = scripted_make(vec![vec![]]);
+    let (start, end) = default_range();
+    let err = check_connector_conforms(
+        make,
+        |_connector: &ScriptConnector| ConnectorCapabilities::default(),
+        scripted_enumerate,
+        &start,
+        &end,
+        harness_cfg(),
+    )
+    .expect_err("seek_by_key capability gate should fail");
+    assert!(matches!(
+        err,
+        ConformanceError::CapabilityMissingSeekByKey { .. }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_page_validator_failure() {
+    let make = scripted_make(vec![vec![Ok(page(
+        &[(b"0", b"item-ref")],
+        Some(b"a"),
+        None,
+    ))]]);
+    let (start, end) = default_range();
+    let err = check_connector_conforms(
+        make,
+        scripted_caps,
+        scripted_enumerate,
+        &start,
+        &end,
+        harness_cfg(),
+    )
+    .expect_err("out-of-range page should fail validation");
+    assert!(matches!(
+        err,
+        ConformanceError::PageValidationFailed { at_page: 0, .. }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_strict_order_violation() {
+    let make = scripted_make(vec![vec![Ok(page(
+        &[(b"b", b"item-ref-1"), (b"b", b"item-ref-2")],
+        Some(b"b"),
+        None,
+    ))]]);
+    let (start, end) = default_range();
+    let err = check_connector_conforms(
+        make,
+        scripted_caps,
+        scripted_enumerate,
+        &start,
+        &end,
+        harness_cfg(),
+    )
+    .expect_err("strict order violation should fail");
+    assert!(matches!(
+        err,
+        ConformanceError::NotStrictlyIncreasingWithinPage {
+            at_page: 0,
+            at_index: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_cursor_last_item_mismatch() {
+    let make = scripted_make(vec![vec![Ok(page(
+        &[(b"b", b"item-ref")],
+        Some(b"c"),
+        None,
+    ))]]);
+    let (start, end) = default_range();
+    let err = check_connector_conforms(
+        make,
+        scripted_caps,
+        scripted_enumerate,
+        &start,
+        &end,
+        harness_cfg(),
+    )
+    .expect_err("cursor last-item mismatch should fail");
+    assert!(matches!(
+        err,
+        ConformanceError::CursorDoesNotMatchLastItem { at_page: 0, .. }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_duplicate_key_in_run() {
+    let make = scripted_make(vec![vec![Ok(page(
+        &[(b"b", b"item-ref-1"), (b"b", b"item-ref-2")],
+        Some(b"b"),
+        None,
+    ))]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.require_strict_key_order = false;
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("duplicate keys should fail");
+    assert!(matches!(err, ConformanceError::DuplicateKeyInRun { .. }));
+}
+
+#[test]
+fn check_connector_conforms_maps_determinism_mismatch() {
+    let make = scripted_make(vec![
+        vec![
+            Ok(page(&[(b"b", b"item-ref-1")], Some(b"b"), None)),
+            Ok(page(&[], Some(b"b"), None)),
+        ],
+        vec![
+            Ok(page(&[(b"b", b"item-ref-2")], Some(b"b"), None)),
+            Ok(page(&[], Some(b"b"), None)),
+        ],
+    ]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.determinism = DeterminismExpectation::Deterministic;
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("determinism mismatch should fail");
+    assert!(matches!(
+        err,
+        ConformanceError::DeterminismMismatch { at_index: 0, .. }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_resume_suffix_mismatch_for_drop_token() {
+    const RESTART_0: &[usize] = &[0];
+    let make = scripted_make(vec![
+        vec![
+            Ok(page(&[(b"b", b"item-ref-b")], Some(b"b"), Some(b"token-b"))),
+            Ok(page(&[(b"c", b"item-ref-c")], Some(b"c"), None)),
+            Ok(page(&[], Some(b"c"), None)),
+        ],
+        vec![
+            Ok(page(&[(b"d", b"item-ref-d")], Some(b"d"), None)),
+            Ok(page(&[], Some(b"d"), None)),
+        ],
+    ]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.resume_checks = ResumeChecks {
+        drop_token: true,
+        corrupt_token: false,
+    };
+    cfg.restart_points = RestartPoints::Explicit(RESTART_0);
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("resume suffix mismatch should fail");
+    assert!(matches!(
+        err,
+        ConformanceError::ResumeMismatch {
+            restart_cursor_index: 0,
+            mode: ResumeMode::DropToken,
+            at_index: 0,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_resume_length_mismatch_for_corrupt_token() {
+    const RESTART_0: &[usize] = &[0];
+    let make = scripted_make(vec![
+        vec![
+            Ok(page(&[(b"b", b"item-ref-b")], Some(b"b"), Some(b"token-b"))),
+            Ok(page(&[(b"c", b"item-ref-c")], Some(b"c"), None)),
+            Ok(page(&[], Some(b"c"), None)),
+        ],
+        vec![
+            Ok(page(
+                &[(b"c", b"item-ref-c"), (b"d", b"item-ref-d")],
+                Some(b"d"),
+                None,
+            )),
+            Ok(page(&[], Some(b"d"), None)),
+        ],
+    ]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.resume_checks = ResumeChecks {
+        drop_token: false,
+        corrupt_token: true,
+    };
+    cfg.restart_points = RestartPoints::Explicit(RESTART_0);
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("resume length mismatch should fail");
+    assert!(matches!(
+        err,
+        ConformanceError::ResumeLengthMismatch {
+            restart_cursor_index: 0,
+            mode: ResumeMode::CorruptToken,
+            expected_len: 1,
+            got_len: 2,
+        }
+    ));
+}
+
+#[test]
+fn check_connector_conforms_maps_item_ref_secret_scan_findings() {
+    let make = scripted_make(vec![vec![Ok(page(
+        &[(b"b", b"xx-sekret-yy")],
+        Some(b"b"),
+        None,
+    ))]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.secret_scan.enabled = true;
+    cfg.secret_scan.forbidden_substrings = vec![b"sekret"];
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("secret scan should fail on matching pattern");
+    assert!(matches!(
+        err,
+        ConformanceError::ItemRefAppearsToContainSecret { .. }
+    ));
+}
+
+/// Happy-path test: a well-behaved 2-page connector passes all conformance checks.
+#[test]
+fn check_connector_conforms_succeeds_for_well_behaved_connector() {
+    let make = scripted_make(vec![vec![
+        Ok(page(
+            &[(b"b", b"ref-b"), (b"c", b"ref-c")],
+            Some(b"c"),
+            Some(b"tok"),
+        )),
+        Ok(page(&[(b"d", b"ref-d")], Some(b"d"), None)),
+        Ok(page(&[], Some(b"d"), None)),
+    ]]);
+    let (start, end) = default_range();
+    check_connector_conforms(
+        make,
+        scripted_caps,
+        scripted_enumerate,
+        &start,
+        &end,
+        harness_cfg(),
+    )
+    .expect("well-behaved connector should pass");
+}
+
+/// Resume with a cursor whose `last_key` was never observed in the baseline
+/// trace must produce `CursorKeyNotInBaseline`, not silently pass.
+#[test]
+fn resume_with_unrecognized_cursor_key_returns_error() {
+    const RESTART_0: &[usize] = &[0];
+    // Baseline: one page with item key "b", but cursor claims last_key "x"
+    // which was never emitted as an item. With `require_cursor_eq_last_item =
+    // false` the baseline collection succeeds, but resume suffix lookup must
+    // fail because "x" is not in key_to_index.
+    let make = scripted_make(vec![
+        // Baseline run.
+        vec![
+            Ok(page(&[(b"b", b"ref-b")], Some(b"x"), None)),
+            Ok(page(&[], Some(b"x"), None)),
+        ],
+    ]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.require_cursor_eq_last_item = false;
+    cfg.resume_checks = ResumeChecks {
+        drop_token: true,
+        corrupt_token: false,
+    };
+    cfg.restart_points = RestartPoints::Explicit(RESTART_0);
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("unrecognized cursor key must fail");
+    assert!(
+        matches!(err, ConformanceError::CursorKeyNotInBaseline { .. }),
+        "expected CursorKeyNotInBaseline, got: {err:?}",
+    );
+}
+
+/// Secret canaries: the harness detects canary values planted in item_refs.
+#[test]
+fn check_connector_conforms_detects_secret_canaries() {
+    let canary = b"my-secret-canary-value";
+    let make = scripted_make(vec![vec![Ok(page(&[(b"b", canary)], Some(b"b"), None))]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.secret_scan.enabled = true;
+    cfg.secret_scan.forbidden_substrings = vec![];
+    cfg.secret_scan.secret_canaries = vec![canary.to_vec()];
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("canary should trigger secret scan");
+    assert!(matches!(
+        err,
+        ConformanceError::ItemRefAppearsToContainSecret { .. }
+    ));
+}
+
+/// Determinism check catches length mismatches between two full runs.
+#[test]
+fn check_connector_conforms_detects_determinism_length_mismatch() {
+    let make = scripted_make(vec![
+        // Run 1: two items.
+        vec![
+            Ok(page(
+                &[(b"b", b"ref-b"), (b"c", b"ref-c")],
+                Some(b"c"),
+                None,
+            )),
+            Ok(page(&[], Some(b"c"), None)),
+        ],
+        // Run 2: one item.
+        vec![
+            Ok(page(&[(b"b", b"ref-b")], Some(b"b"), None)),
+            Ok(page(&[], Some(b"b"), None)),
+        ],
+    ]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.determinism = DeterminismExpectation::Deterministic;
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("length mismatch should fail determinism");
+    assert!(
+        matches!(
+            err,
+            ConformanceError::DeterminismLengthMismatch {
+                expected_len: 2,
+                got_len: 1,
+            }
+        ),
+        "expected DeterminismLengthMismatch, got: {err:?}",
+    );
+}
+
+/// Verify that collecting exactly `max_total_items` items succeeds.
+///
+/// The `collect_trace` loop uses `>` (post-push), so a trace with exactly
+/// `max_total_items` items must be accepted. If this test fails, the
+/// limit comparison operator is wrong.
+#[test]
+fn max_total_items_boundary_accepts_exact_limit() {
+    let max_items: usize = 3;
+    // Three items across two pages, each page within budgets.
+    let make = scripted_make(vec![vec![
+        Ok(page(
+            &[(b"b", b"ref-b"), (b"c", b"ref-c")],
+            Some(b"c"),
+            None,
+        )),
+        Ok(page(&[(b"d", b"ref-d")], Some(b"d"), None)),
+        Ok(page(&[], Some(b"d"), None)),
+    ]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.max_total_items = std::num::NonZeroUsize::new(max_items).expect("nonzero max_total_items");
+    check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect("exactly max_total_items items must be accepted");
+}
+
+/// Verify that collecting `max_total_items + 1` items triggers `TooManyItems`.
+///
+/// Companion to `max_total_items_boundary_accepts_exact_limit` — proves the
+/// limit is enforced at exactly one-past-max.
+#[test]
+fn max_total_items_boundary_rejects_one_over() {
+    let max_items: usize = 2;
+    // Three items but limit is 2.
+    let make = scripted_make(vec![vec![
+        Ok(page(
+            &[(b"b", b"ref-b"), (b"c", b"ref-c")],
+            Some(b"c"),
+            None,
+        )),
+        Ok(page(&[(b"d", b"ref-d")], Some(b"d"), None)),
+        Ok(page(&[], Some(b"d"), None)),
+    ]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.max_total_items = std::num::NonZeroUsize::new(max_items).expect("nonzero max_total_items");
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("one over max_total_items must fail");
+    assert!(
+        matches!(err, ConformanceError::TooManyItems { max_total_items } if max_total_items == max_items),
+        "expected TooManyItems with max={max_items}, got: {err:?}",
+    );
+}
+
+/// `TooManyPages` fires when pages reach the configured limit.
+#[test]
+fn check_connector_conforms_rejects_too_many_pages() {
+    // Two non-empty pages followed by a third; limit is 2.
+    let make = scripted_make(vec![vec![
+        Ok(page(&[(b"b", b"ref-b")], Some(b"b"), None)),
+        Ok(page(&[(b"c", b"ref-c")], Some(b"c"), None)),
+        Ok(page(&[(b"d", b"ref-d")], Some(b"d"), None)),
+    ]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.max_pages = std::num::NonZeroUsize::new(2).expect("nonzero max_pages");
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("exceeding max_pages must fail");
+    assert!(
+        matches!(err, ConformanceError::TooManyPages { max_pages: 2 }),
+        "expected TooManyPages with max=2, got: {err:?}",
+    );
+}
+
+/// `ReturnedTooManyItems` fires when a single page exceeds `max_items` budget.
+#[test]
+fn check_connector_conforms_rejects_page_exceeding_max_items_budget() {
+    // Single page returns 3 items, but budget allows only 2 per page.
+    let make = scripted_make(vec![vec![Ok(page(
+        &[(b"b", b"ref-b"), (b"c", b"ref-c"), (b"d", b"ref-d")],
+        Some(b"d"),
+        None,
+    ))]]);
+    let (start, end) = default_range();
+    let mut cfg = harness_cfg();
+    cfg.page_budgets = Budgets::try_new(2, u64::MAX, None).expect("valid budgets");
+    let err = check_connector_conforms(make, scripted_caps, scripted_enumerate, &start, &end, cfg)
+        .expect_err("page exceeding max_items budget must fail");
+    assert!(
+        matches!(
+            err,
+            ConformanceError::ReturnedTooManyItems {
+                at_page: 0,
+                got: 3,
+                max: 2,
+            }
+        ),
+        "expected ReturnedTooManyItems, got: {err:?}",
+    );
+}
+
+/// `EnumerateFailed` fires when the connector returns an error.
+#[test]
+fn check_connector_conforms_maps_enumerate_error() {
+    let make = scripted_make(vec![vec![Err(EnumerateError::retryable(
+        "simulated failure",
+    ))]]);
+    let (start, end) = default_range();
+    let err = check_connector_conforms(
+        make,
+        scripted_caps,
+        scripted_enumerate,
+        &start,
+        &end,
+        harness_cfg(),
+    )
+    .expect_err("enumerate error must propagate");
+    assert!(
+        matches!(
+            err,
+            ConformanceError::EnumerateFailed {
+                at_page: 0,
+                class: ErrorClass::Retryable,
+                ..
+            }
+        ),
+        "expected EnumerateFailed at page 0, got: {err:?}",
+    );
 }
 
 proptest::proptest! {
