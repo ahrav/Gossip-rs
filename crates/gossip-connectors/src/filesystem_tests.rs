@@ -1797,6 +1797,24 @@ fn deadline_expiry_allows_retry_with_fresh_deadline() {
 // Root canonicalization tests
 // ---------------------------------------------------------------
 
+/// RAII guard that restores the process working directory on drop,
+/// even if the test panics.
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn set(path: &Path) -> Self {
+        let original = std::env::current_dir().expect("get cwd");
+        std::env::set_current_dir(path).expect("set cwd");
+        Self(original)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 #[test]
 fn relative_root_is_canonicalized() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
@@ -1809,9 +1827,8 @@ fn relative_root_is_canonicalized() {
     let dir_name = abs_path.file_name().unwrap();
     let relative = PathBuf::from(".").join(dir_name);
 
-    // Create connector with relative path and set cwd to parent.
-    let original_cwd = std::env::current_dir().unwrap();
-    std::env::set_current_dir(parent).unwrap();
+    // CwdGuard restores the original cwd even on panic.
+    let _guard = CwdGuard::set(parent);
 
     let mut c = FilesystemConnector::new(&relative);
     let page = c
@@ -1820,7 +1837,7 @@ fn relative_root_is_canonicalized() {
     assert_eq!(page.items().len(), 1);
 
     // After indexing, reads still work even if we change cwd.
-    std::env::set_current_dir(&original_cwd).unwrap();
+    drop(_guard);
     let item_ref = page.items()[0].item_ref().clone();
     let mut reader = c.open(&item_ref, default_budgets()).unwrap();
     let mut buf = Vec::new();
