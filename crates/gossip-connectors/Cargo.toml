@@ -9,3 +9,4 @@ description = "Source connectors: filesystem, git, SaaS integrations"
 
 [dependencies]
 gossip-contracts.workspace = true
+blake3 = "1.8"
