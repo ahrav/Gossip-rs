@@ -2,7 +2,7 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
+use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
 use rstest::rstest;
 
 use super::*;
@@ -887,11 +887,13 @@ fn byte_weighted_split_falls_back_for_zero_size() {
 fn deep_directory_does_not_stack_overflow() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let mut path = dir.path().to_path_buf();
-    for i in 0..200 {
-        path = path.join(format!("d{i:03}"));
+    // Use short directory names to stay within OS path-length limits on macOS
+    // (NAME_MAX=255, PATH_MAX=1024). 100 levels of 2-char names is ~300 bytes.
+    for i in 0..100 {
+        path = path.join(format!("{i:02}"));
     }
     fs::create_dir_all(&path).unwrap();
-    fs::write(path.join("leaf.txt"), b"deep").unwrap();
+    fs::write(path.join("f.txt"), b"deep").unwrap();
 
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
