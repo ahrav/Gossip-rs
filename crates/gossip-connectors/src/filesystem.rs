@@ -38,6 +38,16 @@
 //! is silently ignored. Pagination advances monotonically by key regardless of
 //! token state.
 //!
+//! Unlike the in-memory connector, which uses tokens as an O(1) fast path
+//! with runtime key-validation fallback, the filesystem connector treats
+//! tokens as purely advisory. In debug builds, a `debug_assert_eq!` fires
+//! when the token disagrees with key-derived resume to catch cursor-
+//! construction bugs during testing. In release builds, key-based resume
+//! is the sole authority and tokens are silently ignored. This divergence
+//! reflects the different trust models: in-memory items are immutable after
+//! construction (tokens are always consistent), while filesystem state can
+//! change between connector instances.
+//!
 //! # Symlink handling
 //!
 //! Symlinks are **skipped** during the directory walk. [`std::fs::DirEntry::file_type`]
@@ -98,13 +108,16 @@ use gossip_contracts::{
         VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId, StableItemId},
+    identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
-#[cfg(unix)]
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{FileExt, MetadataExt},
+    fs::{FileExt, MetadataExt, OpenOptionsExt},
+};
+
+use crate::common::{
+    self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
 };
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
@@ -146,8 +159,9 @@ impl WalkWarning {
 ///
 /// - `NotIndexed`: walk has not been attempted yet.
 /// - `Indexed`: walk succeeded; `files` is populated and sorted.
-/// - `Failed`: walk failed; the error is memoized so that repeated calls
-///   return immediately without redundant re-walks.
+/// - `Failed`: walk failed with a permanent error; the error is memoized
+///   so that repeated calls return immediately without redundant re-walks.
+///   Retryable failures leave the state as `NotIndexed` to permit re-attempts.
 enum IndexState {
     NotIndexed,
     Indexed,
@@ -177,6 +191,12 @@ struct FileEntry {
     size: u64,
 }
 
+impl crate::common::KeyedEntry for FileEntry {
+    fn key_bytes(&self) -> &[u8] {
+        self.key.as_bytes()
+    }
+}
+
 /// Deterministic filesystem connector rooted at a local directory.
 ///
 /// The first enumerate or split call builds an in-memory sorted file index.
@@ -202,6 +222,10 @@ pub struct FilesystemConnector {
     /// big-endian `u64` token encoding the next absolute index. Defaults to
     /// `false` because key-based resume is always authoritative.
     emit_tokens: bool,
+    /// Maximum directory nesting depth during the walk. Directories deeper
+    /// than this limit are skipped with a [`WalkWarning`]. The root directory
+    /// is at depth 0. Defaults to 512.
+    max_walk_depth: usize,
     /// Indexing lifecycle state. Transitions once from `NotIndexed` to either
     /// `Indexed` or `Failed`; subsequent calls use the memoized result.
     index_state: IndexState,
@@ -218,6 +242,10 @@ pub struct FilesystemConnector {
 }
 
 impl FilesystemConnector {
+    /// Default maximum directory nesting depth for the walk. Directories
+    /// deeper than this are skipped with a warning.
+    const DEFAULT_MAX_WALK_DEPTH: usize = 512;
+
     /// Create a connector rooted at `root`.
     ///
     /// Indexing is lazy and performed on the first enumerate/split call.
@@ -229,6 +257,7 @@ impl FilesystemConnector {
         Self {
             root: root.into(),
             emit_tokens: false,
+            max_walk_depth: Self::DEFAULT_MAX_WALK_DEPTH,
             index_state: IndexState::NotIndexed,
             files: Vec::new(),
             walk_warnings: Vec::new(),
@@ -246,6 +275,16 @@ impl FilesystemConnector {
         self
     }
 
+    /// Set the maximum directory nesting depth for the walk.
+    ///
+    /// The root directory is at depth 0. Subdirectories exceeding this limit
+    /// are skipped with a [`WalkWarning`]. Defaults to 512.
+    #[must_use]
+    pub fn with_max_depth(mut self, max_depth: usize) -> Self {
+        self.max_walk_depth = max_depth;
+        self
+    }
+
     /// Non-fatal issues collected during the directory walk.
     ///
     /// Returns an empty slice until the first enumerate or split call
@@ -258,8 +297,9 @@ impl FilesystemConnector {
     /// Build the file index once on first use.
     ///
     /// On success, transitions to `Indexed` and populates `files`.
-    /// On failure, transitions to `Failed` and memoizes the error so
-    /// repeated calls return immediately without redundant re-walks.
+    /// On permanent failure, transitions to `Failed` and memoizes the error
+    /// so repeated calls return immediately without redundant re-walks.
+    /// Retryable failures leave the state as `NotIndexed` to permit re-attempts.
     fn ensure_indexed(&mut self) -> Result<(), EnumerateError> {
         match &self.index_state {
             IndexState::Indexed => return Ok(()),
@@ -273,42 +313,37 @@ impl FilesystemConnector {
             IndexState::NotIndexed => {}
         }
 
-        #[cfg(not(unix))]
-        {
-            let msg = "FilesystemConnector indexing is unsupported on non-unix targets".to_owned();
-            self.index_state = IndexState::Failed {
-                permanent: true,
-                message: msg.clone(),
-            };
-            return Err(EnumerateError::permanent(msg));
-        }
-
-        #[cfg(unix)]
-        {
-            let mut files = Vec::new();
-            let mut warnings = Vec::new();
-            match walk_dir_collect_files(&self.root, &mut files, &mut warnings) {
-                Ok(()) => {
-                    files.sort_unstable_by(|left, right| left.key.cmp(&right.key));
-                    self.files = files;
-                    self.walk_warnings = warnings;
-                    self.index_state = IndexState::Indexed;
-                    Ok(())
-                }
-                Err(err) => {
-                    let permanent = !err.is_retryable();
-                    let message = err.into_message();
-                    self.walk_warnings = warnings;
+        let mut files = Vec::new();
+        let mut warnings = Vec::new();
+        match walk_dir_collect_files(&self.root, self.max_walk_depth, &mut files, &mut warnings) {
+            Ok(()) => {
+                files.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+                debug_assert!(
+                    files.windows(2).all(|w| w[0].key != w[1].key),
+                    "filesystem walk produced duplicate keys after encoding"
+                );
+                self.files = files;
+                self.walk_warnings = warnings;
+                self.index_state = IndexState::Indexed;
+                Ok(())
+            }
+            Err(err) => {
+                let permanent = !err.is_retryable();
+                let message = err.into_message();
+                self.walk_warnings = warnings;
+                if permanent {
                     self.index_state = IndexState::Failed {
-                        permanent,
+                        permanent: true,
                         message: message.clone(),
                     };
-                    Err(if permanent {
-                        EnumerateError::permanent(message)
-                    } else {
-                        EnumerateError::retryable(message)
-                    })
                 }
+                // Retryable errors leave index_state as NotIndexed so
+                // the next call re-attempts the walk.
+                Err(if permanent {
+                    EnumerateError::permanent(message)
+                } else {
+                    EnumerateError::retryable(message)
+                })
             }
         }
     }
@@ -348,8 +383,8 @@ impl FilesystemConnector {
     /// - Bounds are treated as half-open `[start, end)` ranges.
     /// - Cursor advancement uses the first index strictly greater than
     ///   `cursor.last_key()`, preventing duplicate emission on resume.
-    /// - If the deadline budget is already expired, returns an empty page with
-    ///   the original cursor.
+    /// - If the deadline budget is already expired, returns a retryable error
+    ///   (avoids ambiguity with an empty EOF page).
     ///
     /// # Errors
     ///
@@ -366,17 +401,25 @@ impl FilesystemConnector {
         self.ensure_indexed()?;
 
         if budgets.is_expired_at(Instant::now()) {
-            return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
+            return Err(EnumerateError::retryable("budget deadline expired"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound_file(&self.files, bound.as_bytes()));
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            return Err(EnumerateError::permanent("shard start key exceeds end key"));
+        }
+
+        let range_start = start.map_or(0, |bound| {
+            lower_bound(&self.files, bound.as_bytes())
+        });
         let range_end = end.map_or(self.files.len(), |bound| {
-            lower_bound_file(&self.files, bound.as_bytes())
+            lower_bound(&self.files, bound.as_bytes())
         });
 
         let mut start_idx = range_start;
         if let Some(last_key) = cursor.last_key() {
-            let expected = upper_bound_file(&self.files, last_key.as_bytes());
+            let expected = upper_bound(&self.files, last_key.as_bytes());
             start_idx = start_idx.max(expected);
 
             // Tokens are advisory. In debug builds, check that any provided
@@ -453,12 +496,20 @@ impl FilesystemConnector {
     ) -> Result<Option<ItemKey>, EnumerateError> {
         self.ensure_indexed()?;
 
-        let range_start = start.map_or(0, |bound| lower_bound_file(&self.files, bound.as_bytes()));
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            return Err(EnumerateError::permanent("shard start key exceeds end key"));
+        }
+
+        let range_start = start.map_or(0, |bound| {
+            lower_bound(&self.files, bound.as_bytes())
+        });
         let range_end = end.map_or(self.files.len(), |bound| {
-            lower_bound_file(&self.files, bound.as_bytes())
+            lower_bound(&self.files, bound.as_bytes())
         });
         let resume_start = cursor.last_key().map_or(range_start, |last| {
-            upper_bound_file(&self.files, last.as_bytes())
+            upper_bound(&self.files, last.as_bytes())
         });
 
         let start_idx = range_start.max(resume_start);
@@ -467,24 +518,29 @@ impl FilesystemConnector {
         }
 
         let range = &self.files[start_idx..range_end];
-        let total_bytes: u64 = range.iter().map(|f| f.size).sum();
+        let total_bytes: u64 = range.iter().map(|f| f.size).fold(0u64, u64::saturating_add);
         let split_idx = if total_bytes == 0 {
             // All files empty; fall back to count-balanced.
             start_idx + range.len() / 2
         } else {
             let half = total_bytes / 2;
             let mut cumulative = 0u64;
-            // Default to count-median; overwritten once cumulative crosses half.
-            let mut idx = start_idx + range.len() / 2;
+            let mut idx = start_idx;
             for (i, file) in range.iter().enumerate() {
-                cumulative += file.size;
+                cumulative = cumulative.saturating_add(file.size);
                 if cumulative >= half {
                     idx = start_idx + i;
                     break;
                 }
             }
-            // Ensure at least one item on each side.
-            idx.max(start_idx + 1).min(range_end - 1)
+
+            // Guard: if all weight concentrates in the first item, the loop
+            // exits with idx == start_idx. That produces a zero-item left
+            // shard, which is useless. Fall back to count-based midpoint.
+            if idx == start_idx {
+                idx = start_idx + (range_end - start_idx) / 2;
+            }
+            idx
         };
 
         let candidate = &self.files[split_idx].key;
@@ -501,16 +557,6 @@ impl FilesystemConnector {
         Ok(Some(candidate.clone()))
     }
 
-    /// Decode a shard bound where `[]` means unbounded.
-    fn shard_bound(bound: &[u8], which: &'static str) -> Result<Option<ItemKey>, EnumerateError> {
-        if bound.is_empty() {
-            return Ok(None);
-        }
-        ItemKey::try_from_slice(bound)
-            .map(Some)
-            .map_err(|err| EnumerateError::permanent(format!("invalid shard {which} bound: {err}")))
-    }
-
     /// Resolve an item reference into an absolute path under `self.root`.
     ///
     /// The reference bytes are interpreted as a Unix path payload. Absolute
@@ -520,49 +566,53 @@ impl FilesystemConnector {
     /// Uses zero-copy `OsStr::from_bytes` on Unix to avoid allocating an
     /// intermediate `OsString`.
     fn resolve_item_ref(&self, item_ref: &ItemRef) -> Result<PathBuf, ReadError> {
-        #[cfg(not(unix))]
-        {
-            let _ = item_ref;
-            return Err(ReadError::unsupported(
-                "filesystem item_ref decoding is unsupported on non-unix targets",
+        if item_ref.as_bytes().contains(&0) {
+            return Err(ReadError::permanent("item_ref contains null bytes"));
+        }
+
+        let rel = OsStr::from_bytes(item_ref.as_bytes());
+        let rel_path = Path::new(rel);
+        if rel_path.is_absolute() {
+            return Err(ReadError::permanent("item_ref must be a relative path"));
+        }
+        if rel_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(ReadError::permanent(
+                "item_ref contains forbidden path traversal components",
             ));
         }
+        Ok(self.root.join(rel_path))
+    }
 
-        #[cfg(unix)]
-        {
-            use std::ffi::OsStr;
-
-            let rel = OsStr::from_bytes(item_ref.as_bytes());
-            let rel_path = Path::new(rel);
-            if rel_path.is_absolute() {
-                return Err(ReadError::permanent("item_ref must be a relative path"));
-            }
-            if rel_path.components().any(|component| {
-                matches!(
-                    component,
-                    std::path::Component::ParentDir
-                        | std::path::Component::RootDir
-                        | std::path::Component::Prefix(_)
-                )
-            }) {
-                return Err(ReadError::permanent(
-                    "item_ref contains forbidden path traversal components",
-                ));
-            }
-            Ok(self.root.join(rel_path))
-        }
+    /// Open a file with `O_NOFOLLOW` to prevent symlink traversal.
+    ///
+    /// If the path is a symlink (e.g., a file replaced after indexing),
+    /// the open fails with `ELOOP`, which is classified as a permanent error.
+    /// This prevents TOCTOU root-escape where an indexed regular file is
+    /// replaced with a symlink pointing outside the connector root.
+    fn open_nofollow(path: &Path) -> Result<fs::File, ReadError> {
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|err| classify_io_read_error("open", &err))
     }
 
     /// Open a file or return the cached handle if the path matches.
     ///
     /// Single-entry cache optimized for sequential `read_range` calls on the
     /// same item. On cache miss, the previous handle (if any) is dropped and a
-    /// new one opened.
-    #[cfg(unix)]
+    /// new one opened. Opens with `O_NOFOLLOW` to prevent symlink traversal.
     fn get_or_open_cached(&mut self, path: &Path) -> Result<&fs::File, ReadError> {
         let need_open = self.cached_file.as_ref().is_none_or(|(p, _)| p != path);
         if need_open {
-            let file = fs::File::open(path).map_err(|err| classify_io_read_error("open", &err))?;
+            let file = Self::open_nofollow(path)?;
             self.cached_file = Some((path.to_path_buf(), file));
         }
         Ok(&self.cached_file.as_ref().unwrap().1)
@@ -593,21 +643,24 @@ impl EnumerationConnector for FilesystemConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        let start = Self::shard_bound(shard.key_range_start(), "start")?;
-        let end = Self::shard_bound(shard.key_range_end(), "end")?;
+        let start = shard_bound(shard.key_range_start(), "start")?;
+        let end = shard_bound(shard.key_range_end(), "end")?;
         self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
     }
 
     /// Decode shard key-range bounds from [`ShardSpec`] and delegate to
     /// the internal split-point selection.
+    ///
+    /// Budgets are accepted for trait conformance but not consumed: split-point
+    /// selection is a metadata-only operation with no I/O or time-bounded work.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
         _budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let start = Self::shard_bound(shard.key_range_start(), "start")?;
-        let end = Self::shard_bound(shard.key_range_end(), "end")?;
+        let start = shard_bound(shard.key_range_start(), "start")?;
+        let end = shard_bound(shard.key_range_end(), "end")?;
         self.choose_split_point_bounds(start.as_ref(), end.as_ref(), cursor)
     }
 }
@@ -615,16 +668,16 @@ impl EnumerationConnector for FilesystemConnector {
 impl ReadConnector for FilesystemConnector {
     /// Open a file for streaming whole-object reads.
     ///
-    /// Opens the file first, then verifies via `fstat` on the descriptor that
-    /// the target is a regular file and within the `max_bytes` budget before
-    /// returning a reader handle.
+    /// Opens with `O_NOFOLLOW` to prevent symlink traversal, then verifies via
+    /// `fstat` on the descriptor that the target is a regular file and within
+    /// the `max_bytes` budget before returning a reader handle.
     fn open(
         &mut self,
         item_ref: &ItemRef,
         budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
         let path = self.resolve_item_ref(item_ref)?;
-        let file = fs::File::open(&path).map_err(|err| classify_io_read_error("open", &err))?;
+        let file = Self::open_nofollow(&path)?;
         let metadata = file
             .metadata()
             .map_err(|err| classify_io_read_error("fstat", &err))?;
@@ -645,6 +698,8 @@ impl ReadConnector for FilesystemConnector {
     /// On Unix, uses [`FileExt::read_at`] (positional `pread`) to avoid seeking.
     /// A single-entry FD cache avoids re-opening the file for consecutive
     /// chunked reads on the same item.
+    ///
+    /// Returns a permanent error if `offset + dst.len()` would overflow `u64`.
     fn read_range(
         &mut self,
         item_ref: &ItemRef,
@@ -663,50 +718,13 @@ impl ReadConnector for FilesystemConnector {
         }
 
         let path = self.resolve_item_ref(item_ref)?;
-
-        #[cfg(unix)]
-        {
-            let file = self.get_or_open_cached(&path)?;
-            file.read_at(&mut dst[..allowed], offset)
-                .map_err(|err| classify_io_read_error("read_at", &err))
-        }
-
-        #[cfg(not(unix))]
-        {
-            // resolve_item_ref returns Err on non-unix, so this is unreachable.
-            let _ = (path, offset, allowed);
-            Err(ReadError::unsupported(
-                "filesystem read_range requires unix",
-            ))
-        }
+        let file = self.get_or_open_cached(&path)?;
+        file.read_at(&mut dst[..allowed], offset)
+            .map_err(|err| classify_io_read_error("read_at", &err))
     }
 }
 
-/// Return the first index whose key is `>= key`.
-fn lower_bound_file(files: &[FileEntry], key: &[u8]) -> usize {
-    files.partition_point(|file| file.key.as_bytes() < key)
-}
-
-/// Return the first index whose key is `> key`.
-///
-/// Used for resume progression so the last emitted key is never re-emitted.
-fn upper_bound_file(files: &[FileEntry], key: &[u8]) -> usize {
-    files.partition_point(|file| file.key.as_bytes() <= key)
-}
-
-/// Parse an 8-byte big-endian index/token payload.
-///
-/// Returning `None` for non-8-byte payloads lets callers decide whether to
-/// treat malformed bytes as hard errors or advisory-state misses.
-fn parse_u64_be(bytes: &[u8]) -> Option<u64> {
-    let array: [u8; 8] = bytes.try_into().ok()?;
-    Some(u64::from_be_bytes(array))
-}
-
-/// Derive connector-scoped stable identity from canonical key bytes.
-fn derive_stable_item_id(key: &ItemKey) -> StableItemId {
-    ItemIdentityKey::new(FILESYSTEM_CONNECTOR_TAG, key.as_bytes()).stable_id()
-}
+use crate::common::parse_u64_be;
 
 /// Classify an I/O error for read operations.
 ///
@@ -744,9 +762,11 @@ fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> Enumer
 /// does not follow symlinks):
 ///
 /// - **Symlinks** are skipped and recorded in `warnings`.
-/// - **Directories** are pushed onto the stack for later processing.
+/// - **Directories** are pushed onto the stack for later processing, up to
+///   `max_depth` levels deep (root = depth 0). Directories exceeding the
+///   limit are skipped with a warning.
 /// - **Regular files** are indexed via `symlink_metadata` (no follow).
-/// - **Special files** (devices, FIFOs, sockets) are silently skipped.
+/// - **Special files** (devices, FIFOs, sockets) are skipped and warned.
 ///
 /// Root-directory failures are hard errors; all other failures are recorded
 /// as warnings and the walk continues.
@@ -755,15 +775,15 @@ fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> Enumer
 ///
 /// Returns a permanent or retryable error only when the root directory
 /// itself is inaccessible.
-#[cfg(unix)]
 fn walk_dir_collect_files(
     root: &Path,
+    max_depth: usize,
     out: &mut Vec<FileEntry>,
     warnings: &mut Vec<WalkWarning>,
 ) -> Result<(), EnumerateError> {
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
-    while let Some(dir) = stack.pop() {
+    while let Some((dir, depth)) = stack.pop() {
         let is_root = dir == root;
         let reader = match fs::read_dir(&dir) {
             Ok(r) => r,
@@ -804,12 +824,16 @@ fn walk_dir_collect_files(
             }
 
             if file_type.is_dir() {
-                stack.push(path);
+                if depth < max_depth {
+                    stack.push((path, depth + 1));
+                } else {
+                    warnings.push(WalkWarning::skipped(&path, "exceeded maximum walk depth"));
+                }
                 continue;
             }
 
             if !file_type.is_file() {
-                // Device, FIFO, socket -- skip silently.
+                warnings.push(WalkWarning::skipped(&path, "special file (not regular)"));
                 continue;
             }
 
@@ -840,8 +864,11 @@ fn walk_dir_collect_files(
 
             let rel_bytes = match encode_rel_path(rel) {
                 Ok(b) => b,
-                Err(_) => {
-                    warnings.push(WalkWarning::skipped(&path, "path encoding failed"));
+                Err(err) => {
+                    warnings.push(WalkWarning::skipped(
+                        &path,
+                        &format!("path encoding failed: {}", err.message()),
+                    ));
                     continue;
                 }
             };
@@ -857,7 +884,8 @@ fn walk_dir_collect_files(
                 }
             };
 
-            let stable_item_id = derive_stable_item_id(&key);
+            let stable_item_id =
+                derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, &key);
             let version = VersionId::Weak(derive_fs_version_id(&metadata));
 
             out.push(FileEntry {
@@ -884,7 +912,6 @@ fn walk_dir_collect_files(
 ///   Unix forbids in filenames).
 ///
 /// Returns a permanent error if the path is empty after encoding.
-#[cfg(unix)]
 fn encode_rel_path(rel: &Path) -> Result<Vec<u8>, EnumerateError> {
     let mut out = Vec::new();
     for component in rel.components() {
@@ -920,7 +947,6 @@ fn encode_rel_path(rel: &Path) -> Result<Vec<u8>, EnumerateError> {
 /// The resulting ID is wrapped in [`VersionId::Weak`] by the caller to
 /// signal that it is a metadata-derived freshness hint, not a
 /// content-addressed digest.
-#[cfg(unix)]
 fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
     // Fixed layout: each field occupies exactly 8 bytes at a known offset.
     let mut encoded = [0u8; 32];
@@ -932,6 +958,5 @@ fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 #[path = "filesystem_tests.rs"]
 mod tests;

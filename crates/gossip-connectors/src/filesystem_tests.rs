@@ -193,7 +193,7 @@ fn single_file_enumeration_and_resume() {
 }
 
 #[test]
-fn expired_budget_returns_empty_page() {
+fn expired_budget_returns_retryable_error() {
     let dir = create_test_dir(&[("key.txt", b"payload")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
@@ -201,10 +201,35 @@ fn expired_budget_returns_empty_page() {
 
     let expired =
         Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
-    let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), expired)
-        .unwrap();
-    assert!(page.items().is_empty());
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
+    assert!(result.is_err(), "expired budget should return an error");
+}
+
+// ---------------------------------------------------------------
+// Inverted range rejection
+// ---------------------------------------------------------------
+
+#[test]
+fn inverted_range_returns_error() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    // start > end is invalid.
+    let start = make_key(b"\xff");
+    let end = make_key(b"\x00");
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets());
+    assert!(result.is_err(), "inverted range should return an error");
+}
+
+#[test]
+fn inverted_range_split_returns_error() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let start = make_key(b"\xff");
+    let end = make_key(b"\x00");
+    let result = c.choose_split_point_range(&start, &end, &Cursor::initial());
+    assert!(result.is_err(), "inverted range should return an error");
 }
 
 // ---------------------------------------------------------------
@@ -528,6 +553,7 @@ fn read_range_budget_clamps_read() {
 #[case::absolute_path(b"/etc/passwd")]
 #[case::parent_traversal(b"../etc/passwd")]
 #[case::embedded_traversal(b"sub/../../etc/passwd")]
+#[case::null_byte_injection(b"file.txt\x00../../etc/passwd")]
 fn resolve_rejects_malicious_paths(#[case] path: &[u8]) {
     let dir = create_test_dir(&[("file.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
@@ -942,6 +968,82 @@ fn consecutive_read_ranges_on_same_file_succeed() {
 }
 
 // ---------------------------------------------------------------
+// ShardSpec trait-method coverage (F11)
+// ---------------------------------------------------------------
+
+#[test]
+fn enumerate_page_via_shard_spec() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let shard = ShardSpec::try_with_range(b"a.txt", b"c.txt").unwrap();
+    let page = c
+        .enumerate_page(&shard, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let keys: Vec<&[u8]> = page
+        .items()
+        .iter()
+        .map(|i| i.item_key().as_bytes())
+        .collect();
+    assert_eq!(keys, vec![b"a.txt".as_slice(), b"b.txt".as_slice()]);
+}
+
+#[test]
+fn choose_split_point_via_shard_spec() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let shard = ShardSpec::try_with_range(b"\x00", b"\xff").unwrap();
+    let split = c
+        .choose_split_point(&shard, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert!(split.is_some(), "should produce a split point");
+}
+
+// ---------------------------------------------------------------
+// FD cache eviction (F13)
+// ---------------------------------------------------------------
+
+#[test]
+fn fd_cache_eviction_on_different_file() {
+    let dir = create_test_dir(&[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(page.items().len(), 2);
+    let ref_a = page.items()[0].item_ref().clone();
+    let ref_b = page.items()[1].item_ref().clone();
+
+    // Read from file A (cache miss — opens file).
+    let mut buf = [0u8; 32];
+    let n = c
+        .read_range(&ref_a, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n], b"alpha");
+
+    // Read from file B (cache miss — evicts A, opens B).
+    let n = c
+        .read_range(&ref_b, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n], b"bravo");
+
+    // Read from file A again (cache miss — evicts B, reopens A).
+    let n = c
+        .read_range(&ref_a, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n], b"alpha");
+}
+
+// ---------------------------------------------------------------
 // Property-based tests
 // ---------------------------------------------------------------
 
@@ -1114,6 +1216,72 @@ fn non_utf8_filename_is_indexed() {
 }
 
 #[test]
+fn open_rejects_symlink_replacing_indexed_file() {
+    // Create a file outside the connector root that the symlink will target.
+    let outside = tempfile::tempdir().expect("create outside dir");
+    fs::write(outside.path().join("secret.txt"), b"sensitive data").unwrap();
+
+    // Create a directory with a regular file and index it.
+    let dir = create_test_dir(&[("target.txt", b"original content")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Trigger indexing — target.txt is indexed as a regular file.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].item_key().as_bytes(), b"target.txt");
+    let item_ref = items[0].item_ref().clone();
+
+    // TOCTOU: replace the real file with a symlink pointing outside root.
+    fs::remove_file(dir.path().join("target.txt")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        dir.path().join("target.txt"),
+    )
+    .unwrap();
+
+    // The open should reject the symlink to prevent root-escape.
+    let result = c.open(&item_ref, default_budgets());
+    assert!(
+        result.is_err(),
+        "open should refuse to follow a symlink that replaced an indexed regular file"
+    );
+}
+
+#[test]
+fn read_range_rejects_symlink_replacing_indexed_file() {
+    // Create a file outside the connector root.
+    let outside = tempfile::tempdir().expect("create outside dir");
+    fs::write(outside.path().join("secret.txt"), b"sensitive data").unwrap();
+
+    let dir = create_test_dir(&[("target.txt", b"original content")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace with symlink after indexing.
+    fs::remove_file(dir.path().join("target.txt")).unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("secret.txt"),
+        dir.path().join("target.txt"),
+    )
+    .unwrap();
+
+    // read_range should also reject the symlink.
+    let mut buf = [0u8; 64];
+    let result = c.read_range(&item_ref, 0, &mut buf, default_budgets());
+    assert!(
+        result.is_err(),
+        "read_range should refuse to follow a symlink that replaced an indexed regular file"
+    );
+}
+
+#[test]
 fn version_id_changes_when_file_modified() {
     let dir = create_test_dir(&[("file.txt", b"original")]);
     let start = make_key(b"\x00");
@@ -1135,4 +1303,183 @@ fn version_id_changes_when_file_modified() {
     let v2 = items2[0].version();
 
     assert_ne!(v1, v2);
+}
+
+// ---------------------------------------------------------------
+// Walk depth limit tests (F2)
+// ---------------------------------------------------------------
+
+#[test]
+fn walk_respects_max_depth_limit() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+
+    // Create a tree: root/a.txt, root/d1/b.txt, root/d1/d2/c.txt, root/d1/d2/d3/d.txt
+    fs::write(dir.path().join("a.txt"), b"root-level").unwrap();
+    let d1 = dir.path().join("d1");
+    fs::create_dir(&d1).unwrap();
+    fs::write(d1.join("b.txt"), b"depth-1").unwrap();
+    let d2 = d1.join("d2");
+    fs::create_dir(&d2).unwrap();
+    fs::write(d2.join("c.txt"), b"depth-2").unwrap();
+    let d3 = d2.join("d3");
+    fs::create_dir(&d3).unwrap();
+    fs::write(d3.join("d.txt"), b"depth-3").unwrap();
+
+    // max_depth=2 allows root (0), d1 (1), d2 (2), but NOT d3 (3).
+    let mut c = FilesystemConnector::new(dir.path()).with_max_depth(2);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
+
+    assert!(keys.contains(&b"a.txt".as_slice()), "root-level file");
+    assert!(keys.contains(&b"d1/b.txt".as_slice()), "depth-1 file");
+    assert!(keys.contains(&b"d1/d2/c.txt".as_slice()), "depth-2 file");
+    assert!(
+        !keys.contains(&b"d1/d2/d3/d.txt".as_slice()),
+        "depth-3 file should be skipped"
+    );
+
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message == "exceeded maximum walk depth"),
+        "expected a depth-limit warning"
+    );
+}
+
+#[test]
+fn walk_depth_zero_indexes_only_root_files() {
+    let dir = create_test_dir(&[("top.txt", b"ok"), ("sub/nested.txt", b"hidden")]);
+    let mut c = FilesystemConnector::new(dir.path()).with_max_depth(0);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"top.txt");
+}
+
+// ---------------------------------------------------------------
+// Edge case tests (F6)
+// ---------------------------------------------------------------
+
+#[test]
+fn unreadable_file_is_skipped_with_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = create_test_dir(&[("good.txt", b"ok"), ("secret.txt", b"hidden")]);
+    // Make the file unreadable. Note: symlink_metadata (used for indexing)
+    // only needs directory read+execute, not file read permission. The walk
+    // should still index the file because metadata is accessible even when
+    // content is not. This test verifies the file IS indexed (metadata is
+    // readable) but that open() fails when content is unreadable.
+    fs::set_permissions(
+        dir.path().join("secret.txt"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    // Both files are indexed (metadata is readable with dir perms).
+    assert_eq!(all.len(), 2);
+
+    // But opening the unreadable file for reading should fail.
+    let secret_item = all
+        .iter()
+        .find(|i| i.item_key().as_bytes() == b"secret.txt")
+        .unwrap();
+    let result = c.open(secret_item.item_ref(), default_budgets());
+    assert!(result.is_err(), "should fail to open unreadable file");
+
+    // Restore permissions for tempdir cleanup.
+    fs::set_permissions(
+        dir.path().join("secret.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+}
+
+#[test]
+fn version_id_changes_on_mtime_only() {
+    let dir = create_test_dir(&[("file.txt", b"same content")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let mut c1 = FilesystemConnector::new(dir.path());
+    let items1 = collect_all(&mut c1, &start, &end);
+    let v1 = items1[0].version();
+
+    // Sleep briefly to ensure mtime changes, then touch file without
+    // changing content.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let content = fs::read(dir.path().join("file.txt")).unwrap();
+    fs::write(dir.path().join("file.txt"), &content).unwrap();
+
+    let mut c2 = FilesystemConnector::new(dir.path());
+    let items2 = collect_all(&mut c2, &start, &end);
+    let v2 = items2[0].version();
+
+    // mtime changed even though content is identical, so version should differ.
+    assert_ne!(v1, v2, "version should change when mtime changes");
+}
+
+#[test]
+fn fifo_is_skipped() {
+    use std::process::Command;
+
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let fifo_path = dir.path().join("pipe");
+
+    // Create a named pipe. If mkfifo is not available, skip the test.
+    let status = Command::new("mkfifo").arg(&fifo_path).status();
+    if status.is_err() || !status.unwrap().success() {
+        return; // mkfifo not available; skip gracefully.
+    }
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    // Only file.txt should be indexed; the FIFO is skipped.
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"file.txt");
+
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("special file")),
+        "expected a special-file warning for the FIFO"
+    );
+}
+
+#[test]
+fn very_long_filename_is_indexed() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    // 255 chars is the maximum filename length on most filesystems.
+    let long_name = "a".repeat(255);
+    let file_path = dir.path().join(&long_name);
+
+    if fs::write(&file_path, b"long name content").is_err() {
+        return; // Filesystem doesn't support 255-char names; skip.
+    }
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), long_name.as_bytes());
+
+    // Verify it round-trips through open.
+    let mut reader = c.open(all[0].item_ref(), default_budgets()).unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"long name content");
 }

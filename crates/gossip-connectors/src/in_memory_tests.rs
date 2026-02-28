@@ -169,6 +169,8 @@ fn split_point_returns_none(#[case] items: Vec<MemItem>, #[case] cursor: Cursor)
 // ---------------------------------------------------------------
 
 #[rstest]
+#[case::full_read(0, 32, Ok(13))]
+#[case::partial_read_from_offset(6, 32, Ok(7))]
 #[case::offset_beyond_length(1000, 32, Ok(0))]
 #[case::zero_length_dst(0, 0, Ok(0))]
 #[case::overflow_offset(u64::MAX, 16, Err(()))]
@@ -177,12 +179,20 @@ fn read_range_edge_cases(
     #[case] buf_size: usize,
     #[case] expected: Result<usize, ()>,
 ) {
-    let mut c = InMemoryDeterministicConnector::new(TAG, vec![make_item(b"key", b"short payload")]);
+    let content = b"short payload"; // 13 bytes
+    let mut c = InMemoryDeterministicConnector::new(TAG, vec![make_item(b"key", content)]);
     let item_ref = enumerate_single_item_ref(&mut c);
     let mut buf = vec![0u8; buf_size];
     let result = c.read_range(&item_ref, offset, &mut buf, default_budgets());
     match expected {
-        Ok(n) => assert_eq!(result.unwrap(), n),
+        Ok(n) => {
+            let actual_n = result.unwrap();
+            assert_eq!(actual_n, n);
+            if n > 0 {
+                let start = offset as usize;
+                assert_eq!(&buf[..n], &content[start..start + n]);
+            }
+        }
         Err(()) => assert!(result.is_err()),
     }
 }
@@ -582,6 +592,91 @@ fn different_tags_produce_different_stable_ids() {
     let id_a = derive_stable_item_id(tag_a, &key);
     let id_b = derive_stable_item_id(tag_b, &key);
     assert_ne!(id_a, id_b);
+}
+
+// ---------------------------------------------------------------
+// Budget clamping (F10)
+// ---------------------------------------------------------------
+
+#[test]
+fn read_range_budget_clamps_read() {
+    let mut c = InMemoryDeterministicConnector::new(TAG, vec![make_item(b"key", b"0123456789")]);
+    let item_ref = enumerate_single_item_ref(&mut c);
+
+    let clamped_budget = Budgets::try_new(100, 3, None).unwrap();
+    let mut buf = [0u8; 10];
+    let n = c
+        .read_range(&item_ref, 0, &mut buf, clamped_budget)
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(&buf[..n], b"012");
+}
+
+// ---------------------------------------------------------------
+// ShardSpec trait-method coverage (F11)
+// ---------------------------------------------------------------
+
+#[test]
+fn enumerate_page_via_shard_spec() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    let shard = ShardSpec::try_with_range(b"a", b"c").unwrap();
+    let page = c
+        .enumerate_page(&shard, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let keys: Vec<&[u8]> = page
+        .items()
+        .iter()
+        .map(|i| i.item_key().as_bytes())
+        .collect();
+    assert_eq!(keys, vec![b"a".as_slice(), b"b".as_slice()]);
+}
+
+#[test]
+fn choose_split_point_via_shard_spec() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    let shard = ShardSpec::try_with_range(b"a", b"z").unwrap();
+    let split = c
+        .choose_split_point(&shard, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert!(split.is_some(), "should produce a split point");
+}
+
+// ---------------------------------------------------------------
+// Degenerate split point (F12)
+// ---------------------------------------------------------------
+
+#[test]
+fn split_point_degenerate_first_item_heavy() {
+    // First item holds >50% weight. Byte-weighted median exits on first
+    // item (split_idx == start_idx), triggering the count-based fallback.
+    let items = vec![
+        make_item(b"a", &vec![0u8; 1000]),
+        make_item(b"b", b"x"),
+        make_item(b"c", b"y"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap();
+    let split = split.expect("should produce a split point");
+    // Count-fallback: 3 items, midpoint at index 1 -> "b".
+    assert_eq!(split.as_bytes(), b"b");
 }
 
 // ---------------------------------------------------------------

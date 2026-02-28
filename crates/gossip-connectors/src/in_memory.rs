@@ -16,7 +16,7 @@
 //!    then yields up to [`Budgets::max_items`] by index iteration over
 //!    precomputed metadata.
 //! 3. **Deterministic IDs** -- [`StableItemId`] derived via
-//!    [`ItemIdentityKey::stable_id`] (connector-tag + key, domain-separated),
+//!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id) (connector-tag + key, domain-separated),
 //!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
 //!    (domain-separated BLAKE3 of content bytes), [`ItemRef`] = big-endian
 //!    index. All items carry [`VersionId::Strong`] since content is immutable.
@@ -69,7 +69,7 @@ use gossip_contracts::{
         VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId, StableItemId},
+    identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
@@ -98,11 +98,13 @@ impl MemItem {
 
 /// Precomputed per-item metadata, built once at construction time.
 ///
-/// Every field except `key` and `bytes` is derived deterministically from
-/// those two plus the connector tag. Computing them once at construction
-/// eliminates redundant BLAKE3 hashing and index-to-[`ItemRef`] conversion
-/// on every page emission. This mirrors the `FileEntry` pattern used by
-/// `FilesystemConnector`.
+/// Every field except `key` and `bytes` is precomputed at construction time.
+/// `stable_item_id` and `version_id` are derived from key/bytes plus the
+/// connector tag; `item_ref` is the item's positional index in the sorted
+/// array; `size_hint` is `bytes.len()`. All are deterministic for a fixed
+/// input set. Computing them once eliminates redundant BLAKE3 hashing and
+/// index-to-[`ItemRef`] conversion on every page emission. This mirrors the
+/// `FileEntry` pattern used by `FilesystemConnector`.
 struct PreparedItem {
     /// Sorted item key for ordering and cursor progression.
     key: ItemKey,
@@ -116,6 +118,12 @@ struct PreparedItem {
     version_id: ObjectVersionId,
     /// Precomputed `bytes.len() as u64`.
     size_hint: u64,
+}
+
+impl crate::common::KeyedEntry for PreparedItem {
+    fn key_bytes(&self) -> &[u8] {
+        self.key.as_bytes()
+    }
 }
 
 /// Deterministic in-memory connector for shard-based enumeration and reads.
@@ -133,7 +141,7 @@ struct PreparedItem {
 /// - Duplicate keys are **rejected** (the constructor panics).
 /// - [`ItemRef`] values are big-endian `u64` indices into that sorted vector,
 ///   so the Nth item always gets `ItemRef(N)`.
-/// - [`StableItemId`] is derived via [`ItemIdentityKey::stable_id`]
+/// - [`StableItemId`] is derived via [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id)
 ///   (domain-separated BLAKE3 of connector-tag + key) and [`ObjectVersionId`]
 ///   via [`ObjectVersionId::from_version_bytes`] (domain-separated BLAKE3 of
 ///   the item's content bytes), both deterministic and precomputed once at
@@ -160,15 +168,6 @@ pub struct InMemoryDeterministicConnector {
     /// Sorted, precomputed item storage shared via [`Arc`] for cheap cloning.
     /// Built once at construction; never mutated afterward.
     items: Arc<[PreparedItem]>,
-    /// Source-system discriminator included in [`ItemIdentityKey`] derivation.
-    /// Ensures `StableItemId` values are connector-scoped, preventing
-    /// cross-connector collisions when multiple connectors share key spaces.
-    ///
-    /// Read only during construction (identity hashing is precomputed into
-    /// [`PreparedItem`]). Retained for `Clone` correctness and potential
-    /// future use.
-    #[allow(dead_code)]
-    connector_tag: ConnectorTag,
     /// When `true`, enumeration pages emit big-endian index tokens and the
     /// resume path uses them as an O(1) fast path with key-based fallback.
     /// When `false`, tokens are neither emitted nor consumed.
@@ -198,11 +197,13 @@ impl InMemoryDeterministicConnector {
         // Enforce unique keys. Duplicate keys break cursor resume
         // (upper_bound skips remaining duplicates), StableItemId derivation
         // (collisions), and split-point selection (empty shards).
-        assert!(
-            items.windows(2).all(|w| w[0].key != w[1].key),
-            "InMemoryDeterministicConnector requires unique item keys; \
-             found duplicate after sort"
-        );
+        if let Some(pos) = items.windows(2).position(|w| w[0].key == w[1].key) {
+            panic!(
+                "InMemoryDeterministicConnector requires unique item keys; \
+                 duplicate key {:?} at sorted position {pos}",
+                items[pos].key.as_bytes()
+            );
+        }
 
         let prepared: Arc<[PreparedItem]> = items
             .into_iter()
@@ -227,7 +228,6 @@ impl InMemoryDeterministicConnector {
 
         Self {
             items: prepared,
-            connector_tag,
             emit_tokens: true,
         }
     }
@@ -312,9 +312,11 @@ impl InMemoryDeterministicConnector {
         }
 
         // Phase 3: resolve key bounds to vector indices.
-        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));
+        let range_start = start.map_or(0, |bound| {
+            crate::common::lower_bound(&self.items, bound.as_bytes())
+        });
         let range_end = end.map_or(self.items.len(), |bound| {
-            lower_bound(&self.items, bound.as_bytes())
+            crate::common::lower_bound(&self.items, bound.as_bytes())
         });
 
         // Phase 4: advance past the cursor's last-emitted key.
@@ -337,7 +339,22 @@ impl InMemoryDeterministicConnector {
                     break 'resolve idx;
                 }
                 // Fallback: O(log n) binary search.
-                upper_bound(&self.items, last_key.as_bytes())
+                let key_idx = crate::common::upper_bound(&self.items, last_key.as_bytes());
+                #[cfg(debug_assertions)]
+                if self.emit_tokens
+                    && let Some(token) = cursor.token()
+                    && let Some(token_idx_u64) = parse_u64_be(token.as_bytes())
+                    && let Ok(token_idx) = usize::try_from(token_idx_u64)
+                    && token_idx > 0
+                    && token_idx <= self.items.len()
+                {
+                    debug_assert_eq!(
+                        token_idx, key_idx,
+                        "token index {token_idx} disagrees with \
+                         key-derived resume position {key_idx}"
+                    );
+                }
+                key_idx
             };
             start_idx = start_idx.max(resume_idx);
         }
@@ -408,12 +425,14 @@ impl InMemoryDeterministicConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));
+        let range_start = start.map_or(0, |bound| {
+            crate::common::lower_bound(&self.items, bound.as_bytes())
+        });
         let range_end = end.map_or(self.items.len(), |bound| {
-            lower_bound(&self.items, bound.as_bytes())
+            crate::common::lower_bound(&self.items, bound.as_bytes())
         });
         let resume_start = cursor.last_key().map_or(range_start, |last| {
-            upper_bound(&self.items, last.as_bytes())
+            crate::common::upper_bound(&self.items, last.as_bytes())
         });
 
         let start_idx = range_start.max(resume_start);
@@ -425,7 +444,10 @@ impl InMemoryDeterministicConnector {
         // reaches half the total byte volume. This produces balanced shards
         // even when object sizes are highly skewed.
         let slice = &self.items[start_idx..range_end];
-        let total_bytes: u64 = slice.iter().map(|i| i.size_hint).sum();
+        let total_bytes: u64 = slice
+            .iter()
+            .map(|i| i.size_hint)
+            .fold(0u64, u64::saturating_add);
         let half = total_bytes / 2;
         let mut cumulative = 0u64;
         let mut split_idx = start_idx;
@@ -462,18 +484,6 @@ impl InMemoryDeterministicConnector {
         Ok(Some(candidate))
     }
 
-    /// Decode a shard bound.
-    ///
-    /// Empty bounds are treated as unbounded to match `ShardSpec` semantics.
-    fn shard_bound(bound: &[u8], which: &'static str) -> Result<Option<ItemKey>, EnumerateError> {
-        if bound.is_empty() {
-            return Ok(None);
-        }
-        ItemKey::try_from_slice(bound)
-            .map(Some)
-            .map_err(|err| EnumerateError::permanent(format!("invalid shard {which} bound: {err}")))
-    }
-
     /// Resolve an [`ItemRef`] into the backing bytes.
     ///
     /// `ItemRef` values are interpreted as big-endian indices into the sorted
@@ -508,19 +518,21 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        let start = Self::shard_bound(shard.key_range_start(), "start")?;
-        let end = Self::shard_bound(shard.key_range_end(), "end")?;
+        let start = crate::common::shard_bound(shard.key_range_start(), "start")?;
+        let end = crate::common::shard_bound(shard.key_range_end(), "end")?;
         self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
     }
 
+    /// Budgets are accepted for trait conformance but not consumed: split-point
+    /// selection is a metadata-only operation with no I/O or time-bounded work.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
         _budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let start = Self::shard_bound(shard.key_range_start(), "start")?;
-        let end = Self::shard_bound(shard.key_range_end(), "end")?;
+        let start = crate::common::shard_bound(shard.key_range_start(), "start")?;
+        let end = crate::common::shard_bound(shard.key_range_end(), "end")?;
         self.choose_split_point_bounds(start.as_ref(), end.as_ref(), cursor)
     }
 }
@@ -577,37 +589,7 @@ impl ReadConnector for InMemoryDeterministicConnector {
     }
 }
 
-/// Return the first index whose key is `>= key`.
-fn lower_bound(items: &[PreparedItem], key: &[u8]) -> usize {
-    items.partition_point(|item| item.key.as_bytes() < key)
-}
-
-/// Return the first index whose key is `> key`.
-///
-/// Used to advance past the last emitted key, preventing duplicate emission
-/// when resuming enumeration.
-fn upper_bound(items: &[PreparedItem], key: &[u8]) -> usize {
-    items.partition_point(|item| item.key.as_bytes() <= key)
-}
-
-/// Parse an 8-byte big-endian index.
-///
-/// Returning `None` for any non-8-byte input lets callers decide whether to
-/// treat malformed values as permanent errors (`ItemRef`) or as advisory-state
-/// misses (`Cursor` tokens).
-fn parse_u64_be(bytes: &[u8]) -> Option<u64> {
-    let array: [u8; 8] = bytes.try_into().ok()?;
-    Some(u64::from_be_bytes(array))
-}
-
-/// Derive a stable per-key identity via the canonical [`ItemIdentityKey`] path.
-///
-/// This matches production connectors: the hash input includes both the
-/// [`ConnectorTag`] and the key bytes under domain-separated BLAKE3, so
-/// identical key bytes from different connectors produce distinct IDs.
-fn derive_stable_item_id(connector: ConnectorTag, key: &ItemKey) -> StableItemId {
-    ItemIdentityKey::new(connector, key.as_bytes()).stable_id()
-}
+use crate::common::{derive_stable_item_id, parse_u64_be};
 
 #[cfg(test)]
 #[path = "in_memory_tests.rs"]
