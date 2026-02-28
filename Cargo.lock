@@ -435,8 +435,12 @@ dependencies = [
 name = "gossip-scan-pipeline"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "gossip-connectors",
  "gossip-contracts",
- "gossip-engine",
+ "gossip-coordination",
+ "proptest",
+ "rstest",
 ]
 
 [[package]]

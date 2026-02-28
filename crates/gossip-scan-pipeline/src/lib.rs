@@ -1,17 +1,25 @@
-//! Scan pipeline: I/O scheduling, chunking, and CPU-bound executor
-//! orchestration.
+//! Scan-pipeline runtime wiring for connector enumeration progress.
 //!
-//! This crate bridges the coordination layer ([`gossip_contracts`]) and the
-//! detection engine ([`gossip_engine`]) into a staged processing pipeline:
+//! Current scope:
+//! 1. Run one acquired shard through `enumerate -> validate -> checkpoint/complete`.
+//! 2. Convert connector failures into explicit coordination terminal actions.
+//! 3. Keep operation IDs and logical time injected by callers for deterministic
+//!    replay in simulation tests.
 //!
-//! 1. **I/O scheduling** — fetches data source content for assigned shards,
-//!    managing concurrency limits and back-pressure.
-//! 2. **Chunking** — splits fetched content into bounded byte slices
-//!    suitable for parallel detection.
-//! 3. **CPU-bound executor** — dispatches chunks to the detection engine
-//!    on dedicated threads, collecting match results without blocking
-//!    the I/O scheduler.
+//! Coordination invariants:
+//! - A page is validated before any checkpoint/complete transition is attempted.
+//! - An empty page is treated as terminal and completes the shard with the page's
+//!   next cursor.
+//! - Invalid shard or cursor bridging input is treated as poisoned state and is
+//!   parked.
 //!
-//! The pipeline consumes shard assignments from the coordinator and produces
-//! detection results, handling checkpoint progress and cursor management
-//! along the way.
+//! Design trade-offs:
+//! - The loop is synchronous and deterministic; retry pacing/backoff is not handled
+//!   internally.
+//! - Retry behavior is intentionally bounded and caller-configured via
+//!   `max_transient_retries`.
+//! - Chunking and detection-engine fan-out are handled externally, not in this crate.
+
+mod scan_loop;
+
+pub use scan_loop::{DEFAULT_MAX_TRANSIENT_RETRIES, ScanLoopError, ScanLoopOutcome, run_scan_loop};
