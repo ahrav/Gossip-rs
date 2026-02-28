@@ -2036,3 +2036,106 @@ fn compatible_instance_reads_item_ref_from_another_instance() {
     reader.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"hello world");
 }
+
+// ---------------------------------------------------------------
+// Unix socket skip test
+// ---------------------------------------------------------------
+
+#[test]
+fn unix_socket_is_skipped() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    // Bind a Unix domain socket inside the test directory.
+    let _listener = UnixListener::bind(dir.path().join("test.sock")).expect("bind unix socket");
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    // Only the regular file should be indexed; the socket is skipped.
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"file.txt");
+
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("special file")),
+        "expected a special-file warning for the unix socket"
+    );
+}
+
+// ---------------------------------------------------------------
+// Hard link behavior test
+// ---------------------------------------------------------------
+
+#[test]
+fn hard_links_indexed_as_separate_items() {
+    let dir = create_test_dir(&[("original.txt", b"shared content")]);
+    fs::hard_link(dir.path().join("original.txt"), dir.path().join("link.txt"))
+        .expect("create hard link");
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(
+        all.len(),
+        2,
+        "both the original and the hard link should be indexed"
+    );
+
+    let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
+    assert!(keys.contains(&b"link.txt".as_slice()));
+    assert!(keys.contains(&b"original.txt".as_slice()));
+
+    // Hard links share the same inode, so version IDs should match
+    // (same inode/mtime/size/dev).
+    assert_eq!(
+        all[0].version(),
+        all[1].version(),
+        "hard links with identical metadata should have the same version ID"
+    );
+
+    // Both should be independently readable via open().
+    for item in &all {
+        let mut reader = c.open(item.item_ref(), default_budgets()).unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"shared content");
+    }
+}
+
+// ---------------------------------------------------------------
+// Post-indexing enumerate deadline test
+// ---------------------------------------------------------------
+
+#[test]
+fn expired_deadline_after_successful_indexing_returns_retryable() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index successfully first.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1, "indexing should succeed");
+
+    // Now call enumerate with an already-expired deadline. This hits the
+    // deadline check in `enumerate_page_bounds` after `ensure_indexed`
+    // returns immediately from the memoized index.
+    let expired_budgets =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired_budgets);
+
+    assert!(
+        result.is_err(),
+        "expired deadline after indexing should error"
+    );
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline expiry should be a retryable error"
+    );
+}
