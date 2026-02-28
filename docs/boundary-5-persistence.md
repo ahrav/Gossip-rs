@@ -1,474 +1,544 @@
-# Boundary 5 -- Persistence Architecture
+# Boundary 5 - Persistence Architecture
 
-## 1. Overview
+Boundary 5 defines the durable storage plan for three subsystems:
 
-Boundary 5 (Persistence) manages durable storage for three distinct data
-subsystems: coordination state, the done-ledger (deduplication index), and
-scan findings. The shared trait surface (`DoneLedger`, `FindingsSink`,
-`PageCommit<S>`) lives in `crates/gossip-contracts/src/persistence/`, and
-the production backends will live in separate crates (TBD).
+- Coordination state (runs, shards, leases, fences, cursors, split state)
+- Done-ledger (dedupe index: “was this object-version scanned under this policy?”)
+- Findings store (triage/query plane: findings + occurrences)
 
-This document captures the storage architecture decisions derived from
-research into workload characteristics, scale requirements, and consistency
-semantics. It is the normative reference for anyone implementing the
-production persistence backends.
+This is the normative reference for production persistence backends behind:
 
-### Storage topology
+- Coordination: `CoordinationStore` + `PageCommit<S>` (worker commit protocol)
+- Done-ledger: `DoneLedger`
+- Findings: `FindingsSink`
 
-| Subsystem | Store | Why this store |
-|-----------|-------|----------------|
-| Coordination (shard records, run records, leases, fences) | **ScyllaDB** (LWT for CAS) | Single-row CAS maps to LWT; co-located partitions enable atomic splits |
-| Done-ledger (deduplication index) | **ScyllaDB** (LWW for CRDT merge) | Pure KV at 15 TB; LWW timestamp trick maps `Scanned > Failed` for free |
-| Findings + occurrences (detected secrets) | **PostgreSQL** | Triage UI needs SQL: filter, sort, aggregate, join, full-text search |
+Non-negotiables (project-wide):
 
-**Total external systems: 2** (ScyllaDB cluster + PostgreSQL).
-
-### Scale targets
-
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Minimum shard size | 5-10 GB | Smaller shards defeat scanner throughput |
-| Scanner throughput | 100-3000 MB/s per worker | Moderate m1 8-core machine |
-| Active shards (concurrent) | 200-10,000 | Depends on fleet size |
-| Total shards (PB scale) | 100K-1M | `DEFAULT_MAX_TOTAL_SHARDS = 1_000_000` |
-| Checkpoint writes/sec | 40-2,000 | At 5-second checkpoint intervals |
-| Done-ledger entries | 100M-100B | 15 GB to 15 TB |
-| Findings | 1M-100M | 0.3-30 GB |
-| Occurrences | 5M-500M | 1-100 GB |
+- Never store or emit raw secret bytes (DB rows, logs, metrics, traces, errors, tests).
+- Determinism: same bytes + same policy => same IDs and outputs.
+- Idempotency: assume at-least-once execution; sinks dedupe by deterministic IDs.
+- Multi-tenant isolation is correctness: strict tenant namespaces, explicit authz checks.
 
 ---
 
-## 2. ScyllaDB: Coordination State
+## 0. Summary of decisions
 
-### 2.1 Schema
+### Storage topology (recommended)
 
-All shard records for a run **must** share a partition to enable atomic
-split operations via single-partition LWT batches.
+| Subsystem                                               | Store          | Why                                                                                                                              |
+| ------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Coordination (runs/shards/leases/fences/cursors/splits) | **etcd**       | Small state (O(shards)), linearizable transactions, leases, proven fencing patterns. Avoids LWT hot-partition throughput cliffs. |
+| Done-ledger (dedupe KV)                                 | **ScyllaDB**   | Massive KV scale (10^8–10^11 entries), high-throughput point reads/writes, predictable cost.                                     |
+| Findings + occurrences (triage query plane)             | **PostgreSQL** | Rich queries: filter/sort/join/aggregate + optional full-text on safe display fields.                                            |
 
-```sql
-CREATE TABLE coordination.shards (
-    tenant_id       blob,
-    run_id          blob,
-    shard_id        bigint,
-    status          tinyint,        -- ShardStatus discriminant
-    fence_epoch     bigint,
-    lease_holder    blob,           -- WorkerId, NULL if unleased
-    lease_deadline  bigint,         -- LogicalTime
-    cursor_last_key blob,
-    cursor_token    blob,
-    cursor_semantics tinyint,
-    spec_start      blob,           -- key_range_start
-    spec_end        blob,           -- key_range_end
-    spec_metadata   blob,           -- ShardHint
-    parent_shard    bigint,         -- NULL for root shards
-    spawned_ids     blob,           -- concatenated child ShardIds
-    op_log          blob,           -- serialized RingBuffer<OpLogEntry, 16>
-    park_reason     tinyint,        -- NULL if not parked
-    PRIMARY KEY ((tenant_id, run_id), shard_id)
-) WITH CLUSTERING ORDER BY (shard_id ASC);
+Total external systems: 3 (etcd + ScyllaDB + PostgreSQL).
 
-CREATE TABLE coordination.runs (
-    tenant_id       blob,
-    run_id          blob,
-    status          tinyint,        -- RunStatus discriminant
-    cursor_semantics tinyint,
-    lease_duration  bigint,
-    max_shard_retries int,
-    created_at      bigint,
-    completed_at    bigint,
-    root_shards     blob,           -- serialized Vec<ShardId>
-    op_log          blob,           -- serialized RingBuffer<RunOpLogEntry, 8>
-    PRIMARY KEY ((tenant_id), run_id)
-);
-```
-
-**Partition key choice**: `(tenant_id, run_id)` for shards ensures all
-shards in a run co-locate on the same ScyllaDB partition. This enables
-single-partition LWT batches for split operations. The partition may grow
-large (up to `MAX_INITIAL_SHARDS = 10_000` rows plus split children), but
-each row is small (~200-500 bytes) so the partition stays under ScyllaDB's
-practical limit (~100 MB).
-
-### 2.2 Operation classification
-
-**9 of 13 operations are single-row CAS** and map directly to ScyllaDB LWT:
-
-| Operation | CAS condition | Frequency |
-|-----------|---------------|-----------|
-| `acquire_and_restore_into` | `IF fence_epoch = :expected AND status = 0` | Per shard claim |
-| `renew` | `IF fence_epoch = :expected` | Per lease renewal |
-| `checkpoint` | `IF fence_epoch = :expected` | **Hot path** (40-2000/sec) |
-| `complete` | `IF fence_epoch = :expected AND status = 0` | Terminal, once |
-| `park_shard` | `IF fence_epoch = :expected AND status = 0` | Terminal, once |
-| `create_run` | `IF NOT EXISTS` | Once per run |
-| `complete_run` | `IF status = 1` (Active) | Once per run |
-| `fail_run` / `cancel_run` | `IF status` precondition | Once per run |
-| `unpark_shard` | `IF status = 3` (Parked) | Admin, rare |
-
-All use single-partition LWT. Expected LWT throughput: 500-5000 ops/sec per
-partition, which exceeds our peak of ~2000 checkpoint writes/sec.
-
-**LWT latency**: 5-15ms per operation (Paxos round-trip). This is acceptable
-because workers process 5-10 GB shards over minutes; a 10ms checkpoint
-latency is negligible.
-
-**3 operations require multi-row atomicity:**
-
-| Operation | Rows | Solution |
-|-----------|------|----------|
-| `split_replace` | 1 parent + 2-256 children | Single-partition conditional batch (same `(tenant, run)`) |
-| `split_residual` | 1 parent + 1 child | Single-partition conditional batch |
-| `register_shards` | 1 run + up to 10,000 shards | Saga pattern (see Section 2.3) |
-
-### 2.3 `register_shards` saga pattern
-
-ScyllaDB LWT batches should stay under ~100-200 rows. `register_shards`
-can write up to 10,000 shard records. The solution is a saga with the run
-status as the commit point:
-
-```
-Step 1: Write shard records in chunks of 100 (unconditional INSERT).
-        Shards are keyed by deterministic BLAKE3-derived ShardId,
-        so re-inserting an already-written shard is a no-op.
-
-Step 2: If any chunk fails, retry it. Already-written shards are
-        idempotent (same key, same value).
-
-Step 3: Once ALL shards are written, CAS the run record:
-        UPDATE runs SET status = 1 WHERE ... IF status = 0;
-        (Initializing -> Active)
-
-Step 4: The run status flip IS the commit point.
-```
-
-**Failure modes:**
-
-| Failure point | State | Recovery |
-|---------------|-------|----------|
-| Crash during Step 1 | Some shards written, run still Initializing | Retry from beginning. Written shards are idempotent. |
-| Crash during Step 3 | All shards written, run still Initializing | Retry Step 3 only. |
-| Step 3 CAS fails (concurrent modification) | All shards written | Return error. Caller retries or investigates. |
-
-**Workers cannot see partially-registered runs** because `collect_claim_
-candidates_into` only returns shards from `Active` runs. Until Step 3
-succeeds, the run is `Initializing` and invisible to workers.
-
-The `create_run_with_shards` default method in `run.rs:1617-1624` already
-documents this TOCTOU window and notes that production backends should
-override it. This saga is the production override.
-
-**Orphaned shard cleanup:** If a registration is permanently abandoned
-(run remains in `Initializing` beyond a configurable timeout), a periodic
-garbage collector should delete shard records whose run is still
-`Initializing` after N hours. At 10K shards × ~300 bytes per failed
-registration, the storage leak is ~3 MB per failure — negligible at
-expected failure rates, but unbounded if left unaddressed.
-
-### 2.4 Properties NOT needed from the coordination store
-
-These simplify backend selection:
-
-- **No etcd watches.** Events are inert data returned alongside operation
-  results (`events.rs:5,16-17`). The system is pull-based.
-- **No external TTL.** Leases are application-level timestamp comparisons
-  (`now < deadline`). Expiry is lazily detected, not actively revoked.
-  ScyllaDB row TTL is not used.
-- **No cross-table transactions.** The coordination store and done-ledger
-  are independent. Ordering is enforced by the `PageCommit` typestate at
-  the worker level, not by cross-store transactions.
+If “2 systems” is mandatory, see Appendix A.
 
 ---
 
-## 3. ScyllaDB: Done-Ledger
+## 1. Scale targets
 
-### 3.1 Workload characteristics
+| Parameter                  |                    Value | Notes                                               |
+| -------------------------- | -----------------------: | --------------------------------------------------- |
+| Minimum shard size         |                  5–10 GB | Smaller shards can kill throughput due to overhead. |
+| Scanner throughput         | 100–3000 MB/s per worker | Connector-dependent.                                |
+| Active shards (concurrent) |               200–10,000 | Fleet dependent.                                    |
+| Total shards (PB scale)    |                  100K–1M | Coordination state is O(shards).                    |
+| Checkpoint writes/sec      |                 40–2,000 | Assuming 5-second checkpoint interval.              |
+| Done-ledger entries        |                100M–100B | 15 GB–15 TB (order-of-magnitude).                   |
+| Findings                   |                  1M–100M | Query-plane scale.                                  |
+| Occurrences                |                  5M–500M | Query-plane scale.                                  |
 
-The done-ledger answers: "has this versioned object been scanned under this
-policy for this tenant?" It is a pure KV workload with no SQL requirements.
+Checkpoint write math (sanity):
 
-| Property | Value |
-|----------|-------|
-| Key | `DoneLedgerKey`: 96 bytes fixed (`TenantId[32] \|\| PolicyHash[32] \|\| OvidHash[32]`). BLAKE3-derived, excellent uniformity. |
-| Value | `DoneLedgerEntry`: ~50 bytes (`status[1] + scanned_at[8] + run_id[8] + shard_id[8]` + overhead) |
-| Write pattern | Batch upsert (100 items/batch), fence-gated, monotonic merge (CRDT) |
-| Read pattern | Batch point-lookup (100 keys/batch). Binary: exists + status. |
-| Scale | 100M to 100B entries. 15 GB to 15 TB. |
-| No range scans | No joins, no aggregations, no deletes in hot path. |
+- 200 active shards / 5s = 40 checkpoints/sec
+- 10,000 active shards / 5s = 2,000 checkpoints/sec
 
-### 3.2 Why ScyllaDB (not Postgres)
+---
 
-- **96-byte keys in a B-tree** (Postgres) = ~40 keys per 4 KB page, 7 levels
-  deep at 100B entries. Every lookup = 7 random reads.
-- **No merge operator** in Postgres. `ON CONFLICT DO UPDATE` is a
-  read-modify-write that creates dead tuples. 50K upserts/sec =
-  4.3B dead tuples/day of VACUUM pressure.
-- **15 TB in Postgres** requires partitioning. The done-ledger doesn't need
-  SQL -- it's a pure KV problem.
-- **ScyllaDB's shard-per-core architecture** gives O(1) point lookups at any
-  scale. 1.5M reads/sec per node. A 3-node cluster handles our workload at
-  <10% utilization.
+## 2. Coordination persistence (etcd)
 
-### 3.3 CRDT merge via LWW timestamps
+### 2.1 Why etcd
 
-`DoneLedgerStatus` forms a join-semilattice: `Scanned(2)` absorbs
-`Failed(1)`. Instead of using LWT (expensive Paxos) for the merge, encode
-the status into the CQL write timestamp:
+Coordination requires:
 
-```
-USING TIMESTAMP = (status_discriminant << 56) | logical_time
-```
+- Linearizable compare-and-swap (CAS) for fenced mutations.
+- Atomic multi-key updates for shard splits (bounded fanout).
+- Lease TTL semantics for liveness and rapid reassignment.
+- Strong fencing: stale owners must not checkpoint/split/complete/park.
 
-**`logical_time` constraint:** The upper 8 bits are reserved for the status
-discriminant, so `logical_time` must fit in 56 bits (< 2^56). In practice
-this is a monotonic microsecond counter (epoch-relative). At microsecond
-granularity, 2^56 microseconds ≈ 2.28 billion years — overflow is not a
-practical concern. Implementations must reject or mask values ≥ 2^56 to
-prevent corrupting the status discriminant.
+This matches the Phase I coordination contract approach (lease + fencing token + CAS/txn).
 
-ScyllaDB's built-in Last-Writer-Wins (LWW) resolution uses the highest
-timestamp. Since `Scanned(2) << 56` > `Failed(1) << 56`, a `Scanned` write
-always wins over a `Failed` write regardless of arrival order. This gives
-correct CRDT merge semantics with **zero LWT overhead** -- normal writes only.
+### 2.2 Keyspace layout
+
+All values are versioned blobs (e.g., `v1` prefix + stable serialization). No raw secret bytes.
+
+Durable records:
+
+- `/gossip/v1/tenants/{tenant_id}/runs/{run_id}` -> `RunRecord`
+- `/gossip/v1/tenants/{tenant_id}/runs/{run_id}/shards/{shard_id}` -> `ShardRecord`
+
+Ephemeral ownership keys (attached to the worker’s etcd lease):
+
+- `/gossip/v1/tenants/{tenant_id}/runs/{run_id}/shards/{shard_id}/owner` -> `{worker_id, fence_epoch}`
+
+Optional pull-friendly indexes (avoid scanning everything):
+
+- `/gossip/v1/tenants/{tenant_id}/runs_active/{run_id}` -> empty value
+- `/gossip/v1/tenants/{tenant_id}/runs/{run_id}/shards_active/{shard_id}` -> empty value
+
+Ownership invariant (required):
+
+- A worker is the valid owner of a shard iff the `/owner` key exists, matches `worker_id`, and the shard’s `fence_epoch` equals the value stored in the owner key.
+
+### 2.3 ShardRecord fields (normative)
+
+Minimum required fields (exact struct lives in contracts; storage must persist these):
+
+- `status` (Active / Parked / Done / Split / etc.)
+- `fence_epoch` (monotonic, increments on each successful acquire)
+- `cursor` (last_key + token + semantics)
+- `spec` (key-range start/end + metadata/hints)
+- `parent_shard_id` (optional)
+- `spawned_shard_ids` (bounded list or compact encoding)
+- bounded `op_log` for idempotency (ring buffer; size is a contract)
+
+### 2.4 Operation mapping (etcd transactions)
+
+All coordination mutations must be:
+
+- fenced: require correct `(worker_id, expected_fence_epoch)`
+- idempotent: require stable `op_id` and a bounded `op_log`
+
+Common txn preconditions:
+
+- owner key exists and matches worker
+- `ShardRecord.fence_epoch == expected`
+- `ShardRecord.status` allows the operation
+- `op_id` not already present with different payload hash (idempotency)
+
+Operations:
+
+#### `acquire_and_restore_into`
+
+Effects must be atomic:
+
+- Create `/owner` key attached to the worker’s etcd lease
+- Bump `ShardRecord.fence_epoch = fence_epoch + 1`
+- Set/confirm `ShardRecord.status = Active` (if reacquiring from expired lease)
+- Append `op_log` entry for acquire
+
+#### `checkpoint` (hot path)
+
+Single txn:
+
+- Preconditions: owner key exists + fence matches + shard Active
+- Effects: update cursor (monotonic), append op_log entry
+
+Hard rule:
+
+- Do not ACK a checkpoint to the worker until the etcd txn commits.
+
+#### `complete` / `park_shard`
+
+Single txn:
+
+- Preconditions: owner key exists + fence matches + shard Active
+- Effects: set terminal status, set park reason if applicable, update indexes
+
+#### `split_residual` (preferred: bounded atomicity)
+
+Single txn:
+
+- Preconditions: owner key exists + fence matches + parent Active
+- Effects:
+  - Rewrite parent spec to smaller range
+  - Create one child shard record (Active)
+  - Record child id on parent
+  - Append op_log entry
+
+#### `split_replace` (terminal parent)
+
+Single txn:
+
+- Preconditions: owner key exists + fence matches + parent Active
+- Effects:
+  - Set parent status = Split
+  - Create N children shard records (Active)
+  - Record child ids on parent
+  - Append op_log entry
+
+### 2.5 Split fanout limits (required)
+
+etcd transactions are bounded in size and operation count. Therefore:
+
+- `split_replace` must enforce `max_children_per_op` (default 2–8).
+- Large connector-proposed splits must be implemented as iterative residual splits or multiple small replace splits.
+- Atomicity requirement: never publish a partially created children set as “the split result.”
+
+### 2.6 Run creation + shard registration (saga with explicit commit point)
+
+Goal: workers must not see partially registered runs.
+
+Plan:
+
+1. Create `RunRecord` with `status = Initializing` (CAS if-not-exists)
+2. Write shard records (unconditional puts) in bounded chunks
+3. Commit txn:
+   - compare `RunRecord.status == Initializing`
+   - set `status = Active`
+   - create `/runs_active/{run_id}` index key
+4. Workers enumerate only runs present in `/runs_active/`
+
+Orphan cleanup:
+
+- GC `Initializing` runs older than `N` hours by deleting run + shard key prefixes.
+
+### 2.7 Load and sizing notes (not hand-wavy)
+
+You must benchmark the exact etcd txn shapes (payload size, compares, updates, op_log mutation) under realistic concurrency.
+
+Allowed tuning knobs:
+
+- checkpoint interval (time or item-count based)
+- op_log size (bounded)
+- cursor encoding size (bounded)
+
+Not allowed:
+
+- batching coordination writes and ACKing before persistence (creates a “lie window”).
+
+---
+
+## 3. Done-ledger persistence (ScyllaDB)
+
+### 3.1 What the done-ledger guarantees
+
+The done-ledger answers:
+
+- Has `(tenant_id, policy_hash, ovid_hash)` been committed as scanned?
+- If yes, skip rescanning that object-version for that tenant+policy.
+
+Key:
+
+- `DoneLedgerKey = tenant_id[32] || policy_hash[32] || ovid_hash[32]` (BLAKE3-derived components)
+
+Value (minimal):
+
+- `status` (Failed < Scanned)
+- `scanned_at` (logical time)
+- `run_id`, `shard_id` (debug/traceability)
+
+### 3.2 Schema (bounded partitions, avoids unbounded wide partitions)
+
+Do not use `(tenant_id, policy_hash)` alone as a partition key at large scale.
+
+Use bucketing:
+
+- `bucket = prefix_bits(ovid_hash, BUCKET_BITS)` (configurable)
+
+Recommended starting point:
+
+- `BUCKET_BITS = 16` (65,536 buckets)
+- Adjust based on observed largest-tenant distribution and row size.
+
+Schema:
 
 ```sql
 CREATE TABLE done_ledger.entries (
-    tenant_id       blob,
-    policy_hash     blob,
-    ovid_hash       blob,
-    status          tinyint,
-    scanned_at      bigint,
-    run_id          blob,
-    shard_id        bigint,
-    PRIMARY KEY ((tenant_id, policy_hash), ovid_hash)
+    tenant_id   blob,
+    policy_hash blob,
+    bucket      smallint,
+    ovid_hash   blob,
+
+    status      tinyint,
+    scanned_at  bigint,
+    run_id      blob,
+    shard_id    bigint,
+
+    PRIMARY KEY ((tenant_id, policy_hash, bucket), ovid_hash)
 );
 ```
 
-**Partition key**: `(tenant_id, policy_hash)`. All entries for a tenant+policy
-co-locate. Policy-change invalidation = dropping the partition (or
-range-based TTL).
+Batch strategy:
 
-### 3.4 Fence-epoch enforcement
+- Group batch keys by `(tenant_id, policy_hash, bucket)`
+- Issue batched point reads/writes per bucket
+- Use bounded concurrency across buckets
 
-The done-ledger's `batch_upsert` carries `(shard_id, fence_epoch)`. The
-store must reject writes where `epoch <= last_accepted_epoch[shard_id]`.
+### 3.3 Merge semantics (Failed vs Scanned)
 
-**Under CRDT merge, fence violations are bounded in impact:** a stale
-worker's `Failed` cannot regress a `Scanned` (the LWW timestamp ensures
-this). The fence primarily prevents wasted work, not correctness violations.
+Required lattice property:
 
-Implementation: maintain a `fence_watermarks` table. Before `batch_upsert`,
-read the watermark and reject if stale. The watermark check is a normal
-read + compare at the application level, not an LWT. The CRDT merge
-guarantees that even if a stale write sneaks through a race, the result
-converges correctly.
+- `Scanned` absorbs `Failed` (no regression)
 
-```sql
-CREATE TABLE done_ledger.fence_watermarks (
-    shard_id        bigint,
-    fence_epoch     bigint,
-    PRIMARY KEY (shard_id)
-);
-```
+Two options:
 
-### 3.5 The done-ledger MUST be global
+#### Option A (recommended): LWW timestamp encoding
 
-`OvidHash` is derived from `(ConnectorTag, ConnectorInstanceId, StableItemId,
-ObjectVersionId, SubresourceKind)` -- none of these include `ShardId`. When
-a shard splits, items near the boundary may end up in a different child
-shard. A shard-local done-ledger would miss the parent's scan results.
+Encode status into the CQL write timestamp:
 
-The Mercator web crawler paper (Heydon & Najork, 1999) establishes the
-principle: "The URL-seen? test is a single shared data structure... We
-cannot simply partition it across machines."
+- `ts = (status_discriminant << 56) | logical_time_us`
 
-The done-ledger is range-partitioned by `(TenantId, PolicyHash)` prefix,
-which is correct -- all workers in a run share the same tenant+policy and
-query the same partition.
+Constraints:
+
+- `logical_time_us < 2^56` microseconds
+  - `2^56` microseconds is ~2,283 years, so overflow is not a practical concern
+- Every write must specify `USING TIMESTAMP`; forgetting it is a correctness bug.
+
+This yields:
+
+- Scanned always “wins” over Failed regardless of arrival order (no LWT).
+
+Operational guardrails (required):
+
+- A single library API must generate timestamps and perform writes.
+- A test must fail if any write path omits `USING TIMESTAMP`.
+
+#### Option B: LWT merge
+
+Use conditional updates to prevent regression.
+
+- Higher latency and lower throughput
+- Simpler to reason about than timestamp tricks
+- Only choose this if Option A becomes too footgun-prone in practice
+
+This document selects Option A, with strict wrapper enforcement.
+
+### 3.4 Retention and policy rollover (required decision)
+
+Policy changes create new `policy_hash`, so correctness does not require deleting old entries.
+
+Storage will grow without a retention plan. Supported strategies:
+
+- Keep last `N` policy_hash values per tenant (delete older by range scan and bucket iteration)
+- TTL-based retention (accept tombstones + compaction cost)
+- Offline archive then delete (export to object storage)
+
+Pick one per deployment and document it as a configuration.
 
 ---
 
-## 4. PostgreSQL: Findings + Occurrences
+## 4. Findings persistence (PostgreSQL)
 
-### 4.1 Why PostgreSQL
+### 4.1 Requirements
 
-The findings store needs rich queries for the triage UI that ScyllaDB
-cannot efficiently provide:
+Findings store supports the triage UI:
 
-| Query | ScyllaDB | PostgreSQL |
-|-------|----------|------------|
-| Filter by `rule_name` | Secondary index scatter | `WHERE` clause |
-| Filter by multiple fields | Cannot combine indexes | Composite `WHERE` |
-| Sort by `first_seen_at DESC` | Must be clustering key | `ORDER BY` |
-| Aggregate (count by rule) | Not supported | `GROUP BY` |
-| Join findings + occurrences | Not supported | `JOIN` |
-| Full-text search on `location` | Not supported | `tsvector`/GIN |
-| Paginate (offset-based) | Token-based only | `OFFSET/LIMIT` |
+- filter by rule, time, tenant, policy, asset scope
+- join findings to occurrences
+- aggregate counts and trends
+- optional full-text search on safe display fields
 
-At 1-130 GB (findings + occurrences), PostgreSQL handles this without
-partitioning.
+Hard rule:
 
-### 4.2 Schema sketch
+- never store raw secret bytes, even in “context snippets”
+
+### 4.2 Identifiers and fields
+
+IDs are content-addressed (BLAKE3 domain-separated per contracts). Inserts must be idempotent.
+
+Findings must include at minimum:
+
+- `tenant_id`, `policy_hash`
+- `rule_id`, `rule_name` (for display and grouping)
+- `ovid_hash`, `stable_item_id`
+- `secret_hash` (never raw secret)
+- `evidence_hash` (never raw secret)
+- `first_seen_at`, `last_seen_at`, plus run IDs for provenance
+- safe location display field(s) only
+
+### 4.3 Schema (minimal + query indexes)
 
 ```sql
 CREATE TABLE findings (
-    finding_id      BYTEA PRIMARY KEY,  -- 32B, content-addressed
+    finding_id      BYTEA PRIMARY KEY,
+
     tenant_id       BYTEA NOT NULL,
+    policy_hash     BYTEA NOT NULL,
+
+    rule_id         BYTEA NOT NULL,
+    rule_name       TEXT  NOT NULL,
+
+    ovid_hash       BYTEA NOT NULL,
     stable_item_id  BYTEA NOT NULL,
-    rule_fingerprint BYTEA NOT NULL,
-    rule_name       TEXT NOT NULL,
+
     secret_hash     BYTEA NOT NULL,
-    location        TEXT NOT NULL,
-    triage_group_key BYTEA NOT NULL,
+    evidence_hash   BYTEA NOT NULL,
+
+    -- Safe display only (redacted/normalized, never secret bytes)
+    location_safe   TEXT NOT NULL,
+
     first_seen_at   BIGINT NOT NULL,
-    first_seen_run  BYTEA NOT NULL
+    last_seen_at    BIGINT NOT NULL,
+
+    first_seen_run  BYTEA NOT NULL,
+    last_seen_run   BYTEA NOT NULL
 );
 
 CREATE TABLE occurrences (
-    occurrence_id   BYTEA PRIMARY KEY,  -- 32B, content-addressed
+    occurrence_id   BYTEA PRIMARY KEY,
+
     finding_id      BYTEA NOT NULL REFERENCES findings(finding_id),
+
     tenant_id       BYTEA NOT NULL,
+    policy_hash     BYTEA NOT NULL,
+
     version_id      BYTEA NOT NULL,
+
     byte_offset     BIGINT NOT NULL,
     byte_length     BIGINT NOT NULL,
-    first_seen_at   BIGINT NOT NULL,
-    first_seen_run  BYTEA NOT NULL,
+
+    seen_at         BIGINT NOT NULL,
+    run_id          BYTEA NOT NULL,
     shard_id        BIGINT NOT NULL
 );
 
--- Triage UI indexes
-CREATE INDEX idx_findings_tenant ON findings(tenant_id);
-CREATE INDEX idx_findings_rule ON findings(tenant_id, rule_name);
-CREATE INDEX idx_findings_triage ON findings(tenant_id, triage_group_key);
-CREATE INDEX idx_findings_time ON findings(tenant_id, first_seen_at DESC);
-CREATE INDEX idx_occurrences_finding ON occurrences(finding_id);
+-- Indexes for triage
+CREATE INDEX idx_findings_tenant_time   ON findings(tenant_id, first_seen_at DESC);
+CREATE INDEX idx_findings_tenant_rule   ON findings(tenant_id, rule_name);
+CREATE INDEX idx_findings_tenant_policy ON findings(tenant_id, policy_hash);
+
+CREATE INDEX idx_occ_finding            ON occurrences(finding_id);
+CREATE INDEX idx_occ_tenant_policy      ON occurrences(tenant_id, policy_hash);
+
+-- Optional: full-text on location_safe
+-- Add a generated tsvector column + GIN index when needed.
 ```
 
-### 4.3 Idempotent upsert
+### 4.4 Idempotent inserts
 
-Both `finding_id` and `occurrence_id` are content-addressed (BLAKE3).
-Upsert is first-write-wins:
+First-write-wins:
 
 ```sql
-INSERT INTO findings (finding_id, ...) VALUES ($1, ...)
+INSERT INTO findings (...) VALUES (...)
 ON CONFLICT (finding_id) DO NOTHING;
+
+INSERT INTO occurrences (...) VALUES (...)
+ON CONFLICT (occurrence_id) DO NOTHING;
 ```
 
-No VACUUM pressure from conflicts -- `DO NOTHING` skips the write entirely
-if the row exists.
+Updates:
 
-### 4.4 Fence-epoch enforcement
-
-Same pattern as the done-ledger: maintain a `fence_watermarks` table in
-Postgres, check before batch write. The `FindingsSink` trait requires
-independent per-shard fence watermarks.
+- If you want `last_seen_at` to advance, use an update that is monotonic:
+  - `last_seen_at = GREATEST(last_seen_at, EXCLUDED.last_seen_at)`
+  - but keep it bounded and avoid turning every insert into a hot update path.
 
 ---
 
-## 5. Coordinator Progress Durability
+## 5. Cross-subsystem commit ordering (correctness-critical)
 
-The coordinator's in-process state (the materialized view of shard records)
-uses a tiered durability model:
+The worker-side commit protocol is mandatory and enforces correctness without cross-store transactions:
 
-| Tier | Mechanism | Survives | Data loss window |
-|------|-----------|----------|-----------------|
-| 0 | In-memory only | Nothing (development) | Everything |
-| 1 | ScyllaDB-backed (every write is an LWT) | Process crash, machine loss | Zero |
+1. Findings durable (Postgres)
+2. Done-ledger durable (Scylla)
+3. Only then emit `ItemCommitted` enabling cursor checkpoint (etcd)
 
-In the production ScyllaDB backend, every coordination write is an LWT
-that is durable in ScyllaDB before the worker is ACK'd. There is no
-separate "redb + periodic snapshot" layer -- ScyllaDB IS the durable store.
+Consequences:
 
-If the coordinator process crashes, it restarts and loads all state from
-ScyllaDB. Workers detect unavailability (timeouts), wait, then re-acquire
-their shards. The fence epoch bumps, old leases are invalid, and workers
-resume from the last durably persisted cursor.
-
-**Recovery time** depends on shard count:
-
-| Shards | Data to load | Estimated recovery |
-|--------|-------------|-------------------|
-| 10K | ~5 MB | <1 second |
-| 100K | ~50 MB | 1-3 seconds |
-| 1M | ~500 MB | 5-15 seconds |
+- If done-ledger says “Scanned,” findings are already durable.
+- Cursor never advances beyond what has been durably committed.
+- Retries and reassignment are safe: idempotent sinks dedupe by deterministic IDs.
 
 ---
 
-## 6. Findings Deduplication Safety Net
+## 6. Recovery and failure behavior
 
-Re-scanning (due to coordinator restart, shard reassignment, or progress
-regression) is safe because of three dedup layers:
+- Coordination is authoritative for ownership and cursor.
+- Done-ledger and findings are idempotent sinks; duplicates are safe.
 
-1. **Done-ledger** checks before re-scanning (skip items marked `Scanned`).
-2. **Content-addressed FindingId/OccurrenceId** -- same content always
-   produces the same ID. `INSERT ... ON CONFLICT DO NOTHING` in Postgres.
-3. **Commit protocol typestate** enforces ordering:
-   findings durable -> done-ledger updated -> cursor advanced.
+Lease loss rule (hard):
 
-Re-scanning costs wasted compute, never produces duplicate findings.
+- If a worker cannot renew its etcd lease or loses the `/owner` key, it must stop scanning and must not checkpoint/split/complete/park.
 
----
+Coordinator restart:
 
-## 7. Anti-Patterns to Avoid
-
-These are drawn from the research and must not be violated during
-implementation:
-
-1. **Do NOT batch coordination writes and ACK before persistence.**
-   Every `checkpoint()` ACK must be backed by a completed ScyllaDB LWT.
-   Batching-then-ACK creates a lie window where the worker believes its
-   progress is durable but it isn't.
-
-2. **Do NOT use ScyllaDB row TTL for leases.** Leases are application-level
-   timestamp comparisons (`now < deadline`). External TTL would create
-   races between ScyllaDB's garbage collector and the coordinator's lease
-   validation logic.
-
-3. **Do NOT partition the done-ledger by ShardId.** `OvidHash` is not
-   shard-dependent. Shard splits move items between shards, and a
-   shard-local done-ledger would miss parent scan results.
-
-4. **Do NOT use LWT for done-ledger writes.** The CRDT merge (Scanned
-   absorbs Failed) is correctly handled by ScyllaDB's built-in LWW
-   resolution via timestamp encoding. LWT would add Paxos overhead for
-   no correctness benefit.
-
-5. **Do NOT use cross-partition batches for `register_shards`.** ScyllaDB
-   does not provide cross-partition atomicity. Use the saga pattern
-   (Section 2.3) with the run status as the commit point.
-
-6. **Do NOT use Postgres for the done-ledger.** 96-byte keys in a B-tree
-   at 15 TB creates poor fanout (7-level tree), and 50K upserts/sec
-   generates unsustainable VACUUM pressure.
+- Reload state from etcd via prefix scans + indexes.
+- Workers reacquire shards, `fence_epoch` bumps, and resume from last durable cursor.
 
 ---
 
-## 8. Technology Rationale Summary
+## 7. Anti-patterns (must not ship)
 
-| Requirement | Why ScyllaDB | Why not Postgres |
-|-------------|-------------|-----------------|
-| 15 TB done-ledger | Shard-per-core, O(1) lookups | B-tree depth, VACUUM |
-| CRDT merge | LWW timestamp trick (free) | `ON CONFLICT DO UPDATE` (dead tuples) |
-| 100K point lookups/sec | 1.5M ops/sec/node | Adequate but wasteful |
-| Coordination CAS | LWT (Paxos) | Viable but adds a 3rd system |
-
-| Requirement | Why PostgreSQL | Why not ScyllaDB |
-|-------------|---------------|-----------------|
-| Filter/sort/aggregate | Native SQL | Not supported or scatter-gather |
-| Join findings + occurrences | Native JOIN | Not supported |
-| Full-text search | tsvector/GIN | Not supported |
-| Ad-hoc triage queries | Arbitrary WHERE | Must pre-design query tables |
+1. Do not ACK checkpoints before the coordination txn commits.
+2. Do not implement coordination on a design that serializes hot fenced writes onto a single key/partition.
+3. Do not create unbounded wide partitions for the done-ledger.
+4. Do not store raw secret bytes in Postgres (including snippets). Store hashes and safe display fields only.
+5. Do not partition done-ledger by shard id (ledger key is shard-independent).
+6. Do not allow unbounded split fanout. Enforce `max_children_per_op`.
 
 ---
 
-## 9. Open Questions
+## 8. Implementation plan (what to build next)
 
-- **ScyllaDB deployment mode**: Self-hosted vs ScyllaDB Cloud. Cost
-  tradeoff at 15 TB: $3-6K/month self-hosted vs $8-15K/month managed.
-- **Postgres HA**: Patroni for automatic failover? Acceptable for
-  findings (not on the hot path).
-- **Done-ledger cleanup**: How to handle policy-generation rollover?
-  Drop-and-recreate partition? TTL on entries older than N days?
-- **Bloom filter optimization**: Application-level Bloom filter in front
-  of ScyllaDB for the done-ledger? Saves network round-trips for items
-  definitely not scanned. Adds memory cost (~1.2 GB per 1B entries at
-  1% FPR).
+### 8.1 Coordination backend (etcd)
+
+- Implement the full Phase I contract:
+  - acquire with fence bump
+  - checkpoint/complete/park with fencing
+  - atomic split operations with bounded fanout
+- Tests (required):
+  - property tests: no-overlap + no-gaps under churn
+  - deterministic simulation: crashes/retries/partitions/kv delays
+  - stale-fence rejection for all coordination writes
+  - atomic split publication under failures
+
+### 8.2 Done-ledger backend (Scylla)
+
+- Implement:
+  - batch get (bucket-grouped)
+  - batch upsert with CRDT merge semantics (Option A)
+- Tests (required):
+  - out-of-order writes converge (Failed then Scanned, Scanned then Failed)
+  - timestamp encoding always applied (no default timestamp path)
+  - policy hash isolation (policy rollover does not cause false skips)
+- Benchmark:
+  - per-tenant hot workload
+  - partition size distribution by bucket count
+
+### 8.3 Findings backend (Postgres)
+
+- Implement:
+  - idempotent insert path (and optional monotonic last_seen updates)
+  - indexes for triage queries
+- Tests (required):
+  - deterministic ID dedupe under retries and overlap
+  - “no secrets in DB rows” redaction tests (systematic)
+
+### 8.4 End-to-end commit protocol gates
+
+- Prove via deterministic simulation:
+  - findings -> ledger -> cursor ordering
+  - crashes between stages never produce cursor advancement without durable sinks
+  - retries never create duplicates
+
+---
+
+## 9. Open questions
+
+- etcd cluster sizing vs checkpoint rate targets (benchmark-driven).
+- Done-ledger retention policy selection (TTL vs keep-last-N policy hashes vs offline archive).
+- Findings partitioning policy if retention windows become multi-year at high volume.
+- Whether to add an in-process Bloom filter in front of done-ledger (requires careful sizing and eviction; not correctness-critical).
+
+---
+
+## Appendix A - If “2 systems” is mandatory
+
+Two realistic options:
+
+1. Postgres for coordination + findings; Scylla for done-ledger
+
+- Coordination becomes transactional and simple.
+- Done-ledger stays scalable KV.
+- You still keep strong fencing and atomic splits via SQL transactions.
+
+2. DynamoDB for coordination + done-ledger; Postgres for findings
+
+- Works well on AWS (conditional writes + TTL), but changes deployment assumptions.
+- Requires careful modeling for atomic split publication.
+
+Not recommended:
+
+- Scylla for coordination + done-ledger: high coordination throughput risk unless you accept substantial complexity (transaction records, reconciliation state machines) and prove it with simulation/property tests.

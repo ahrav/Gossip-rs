@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use super::*;
 use gossip_connectors::{InMemoryDeterministicConnector, MemItem};
 use gossip_contracts::connector::{
@@ -175,6 +177,198 @@ impl CoordinationBackend for FenceStealingBackend {
             self.stolen = true;
         }
         self.inner.renew(now, tenant, lease)
+    }
+
+    fn checkpoint(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        new_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CheckpointError> {
+        self.inner.checkpoint(now, tenant, lease, new_cursor, op_id)
+    }
+
+    fn complete(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        final_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CompleteError> {
+        self.inner.complete(now, tenant, lease, final_cursor, op_id)
+    }
+
+    fn park_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        reason: ParkReason,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, ParkError> {
+        self.inner.park_shard(now, tenant, lease, reason, op_id)
+    }
+
+    fn split_replace(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitReplacePlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
+        self.inner.split_replace(now, tenant, lease, plan, op_id)
+    }
+
+    fn split_residual(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitResidualPlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
+        self.inner.split_residual(now, tenant, lease, plan, op_id)
+    }
+}
+
+/// Test-only backend wrapper that injects a `CheckpointError` on a specific
+/// checkpoint call, delegating everything else to the real coordinator.
+struct CheckpointFailingBackend {
+    inner: InMemoryCoordinator,
+    /// 1-indexed: fail on the Nth checkpoint call.
+    fail_on_call: usize,
+    calls: usize,
+}
+
+impl CheckpointFailingBackend {
+    fn new(inner: InMemoryCoordinator, fail_on_call: usize) -> Self {
+        Self {
+            inner,
+            fail_on_call,
+            calls: 0,
+        }
+    }
+}
+
+impl CoordinationBackend for CheckpointFailingBackend {
+    fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, AcquireError> {
+        self.inner
+            .acquire_and_restore_into(now, tenant, key, worker, out)
+    }
+
+    fn renew(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+    ) -> Result<RenewResult, RenewError> {
+        self.inner.renew(now, tenant, lease)
+    }
+
+    fn checkpoint(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        new_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CheckpointError> {
+        self.calls += 1;
+        if self.calls == self.fail_on_call {
+            return Err(CheckpointError::CheckpointMissingKey);
+        }
+        self.inner.checkpoint(now, tenant, lease, new_cursor, op_id)
+    }
+
+    fn complete(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        final_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CompleteError> {
+        self.inner.complete(now, tenant, lease, final_cursor, op_id)
+    }
+
+    fn park_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        reason: ParkReason,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, ParkError> {
+        self.inner.park_shard(now, tenant, lease, reason, op_id)
+    }
+
+    fn split_replace(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitReplacePlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
+        self.inner.split_replace(now, tenant, lease, plan, op_id)
+    }
+
+    fn split_residual(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitResidualPlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
+        self.inner.split_residual(now, tenant, lease, plan, op_id)
+    }
+}
+
+/// Test-only backend wrapper that panics if `renew()` is ever called.
+/// Used to verify that the scan loop does NOT attempt renewal when ample
+/// lease time remains.
+struct NoRenewBackend {
+    inner: InMemoryCoordinator,
+}
+
+impl NoRenewBackend {
+    fn new(inner: InMemoryCoordinator) -> Self {
+        Self { inner }
+    }
+}
+
+impl CoordinationBackend for NoRenewBackend {
+    fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, AcquireError> {
+        self.inner
+            .acquire_and_restore_into(now, tenant, key, worker, out)
+    }
+
+    fn renew(
+        &mut self,
+        _now: LogicalTime,
+        _tenant: TenantId,
+        _lease: &Lease,
+    ) -> Result<RenewResult, RenewError> {
+        panic!("renew called unexpectedly — should_renew should have returned false");
     }
 
     fn checkpoint(
@@ -416,14 +610,24 @@ fn resume_from_checkpoint_after_failure_completes_remaining_work() {
     let session = acquire_session(&mut coord, 3, 1);
 
     let mut op_ids = counter_op_ids(500);
-    let mut times = vec![4u64, 5u64, 6u64, 12u64].into_iter();
+    let first_script: &[u64] = &[4, 5, 6, 12];
+    let first_idx = Cell::new(0usize);
     let first_outcome = run_scan_loop(
         session,
         &mut first_connector,
         budgets(1),
         DEFAULT_MAX_TRANSIENT_RETRIES,
         &mut op_ids,
-        || now(times.next().expect("time script exhausted")),
+        || {
+            let i = first_idx.get();
+            first_idx.set(i + 1);
+            now(first_script[i])
+        },
+    );
+    assert_eq!(
+        first_idx.get(),
+        first_script.len(),
+        "time script not fully consumed"
     );
 
     match first_outcome {
@@ -486,7 +690,8 @@ fn renewal_extends_deadline_and_scan_continues() {
 
     let session = acquire_session(&mut coord, 3, 1);
     let mut op_ids = counter_op_ids(650);
-    let mut times = vec![4u64, 5u64, 6u64, 20u64, 21u64, 30u64].into_iter();
+    let renew_script: &[u64] = &[4, 5, 6, 20, 21, 30];
+    let renew_idx = Cell::new(0usize);
     let outcome = run_scan_loop_with_policy(
         session,
         &mut connector,
@@ -494,7 +699,16 @@ fn renewal_extends_deadline_and_scan_continues() {
         RenewalPolicy::new(0.5),
         DEFAULT_MAX_TRANSIENT_RETRIES,
         &mut op_ids,
-        || now(times.next().expect("time script exhausted")),
+        || {
+            let i = renew_idx.get();
+            renew_idx.set(i + 1);
+            now(renew_script[i])
+        },
+    );
+    assert_eq!(
+        renew_idx.get(),
+        renew_script.len(),
+        "time script not fully consumed"
     );
 
     assert_eq!(outcome, ScanLoopOutcome::Completed);
@@ -514,14 +728,24 @@ fn stale_fence_during_renew_returns_lease_lost() {
 
     let session = acquire_session(&mut coord, 3, 1);
     let mut op_ids = counter_op_ids(680);
-    let mut times = vec![4u64, 5u64, 6u64, 7u64, 20u64].into_iter();
+    let fence_script: &[u64] = &[4, 5, 6, 7, 20];
+    let fence_idx = Cell::new(0usize);
     let outcome = run_scan_loop(
         session,
         &mut connector,
         budgets(1),
         DEFAULT_MAX_TRANSIENT_RETRIES,
         &mut op_ids,
-        || now(times.next().expect("time script exhausted")),
+        || {
+            let i = fence_idx.get();
+            fence_idx.set(i + 1);
+            now(fence_script[i])
+        },
+    );
+    assert_eq!(
+        fence_idx.get(),
+        fence_script.len(),
+        "time script not fully consumed"
     );
 
     match outcome {
@@ -715,14 +939,26 @@ fn park_failure_preserves_trigger_context() {
     let session = acquire_session(&mut coord, 3, 1);
     let mut op_ids = counter_op_ids(800);
 
-    // now_fn returns t=20 which is past the lease deadline of 11.
+    // baseline_now = 4 (valid, passes early lease check), then t=20 for
+    // the park_and_return call (past deadline=11, so park fails).
+    let park_script: &[u64] = &[4, 20];
+    let park_idx = Cell::new(0usize);
     let outcome = run_scan_loop(
         session,
         &mut connector,
         budgets(10),
         DEFAULT_MAX_TRANSIENT_RETRIES,
         &mut op_ids,
-        || now(20),
+        || {
+            let i = park_idx.get();
+            park_idx.set(i + 1);
+            now(park_script[i])
+        },
+    );
+    assert_eq!(
+        park_idx.get(),
+        park_script.len(),
+        "time script not fully consumed"
     );
 
     match outcome {
@@ -765,14 +1001,24 @@ fn complete_failure_returns_error() {
     let mut op_ids = counter_op_ids(900);
 
     // baseline=4, checkpoint=5, renew-check=6 (no renew), complete=20.
-    let mut times = [4u64, 5, 6, 20].into_iter();
+    let complete_script: &[u64] = &[4, 5, 6, 20];
+    let complete_idx = Cell::new(0usize);
     let outcome = run_scan_loop(
         session,
         &mut connector,
         budgets(10),
         DEFAULT_MAX_TRANSIENT_RETRIES,
         &mut op_ids,
-        || now(times.next().expect("time script exhausted")),
+        || {
+            let i = complete_idx.get();
+            complete_idx.set(i + 1);
+            now(complete_script[i])
+        },
+    );
+    assert_eq!(
+        complete_idx.get(),
+        complete_script.len(),
+        "time script not fully consumed"
     );
 
     match outcome {
@@ -806,14 +1052,24 @@ fn checkpoint_deadline_elapsed_returns_lease_lost() {
     let mut op_ids = counter_op_ids(950);
 
     // baseline=4, checkpoint-attempt=20 (past deadline=11).
-    let mut times = [4u64, 20].into_iter();
+    let deadline_script: &[u64] = &[4, 20];
+    let deadline_idx = Cell::new(0usize);
     let outcome = run_scan_loop(
         session,
         &mut connector,
         budgets(10),
         DEFAULT_MAX_TRANSIENT_RETRIES,
         &mut op_ids,
-        || now(times.next().expect("time script exhausted")),
+        || {
+            let i = deadline_idx.get();
+            deadline_idx.set(i + 1);
+            now(deadline_script[i])
+        },
+    );
+    assert_eq!(
+        deadline_idx.get(),
+        deadline_script.len(),
+        "time script not fully consumed"
     );
 
     match outcome {
@@ -836,6 +1092,246 @@ fn checkpoint_deadline_elapsed_returns_lease_lost() {
     let summary = shard_summary(&coord, 21);
     assert_eq!(summary.status(), ShardStatus::Active);
     assert_eq!(summary.last_key(), None);
+}
+
+/// Edge-case verification for should_renew with very small lease durations.
+///
+/// Confirms that ceil() rounding produces conservative (earlier) renewal for
+/// small durations, and the zero-threshold guard fires when fraction > 0 would
+/// otherwise compute a threshold of 0.
+#[test]
+fn should_renew_small_duration_edge_cases() {
+    let policy_half = RenewalPolicy::new(0.5);
+
+    // duration=1, fraction=0.5 → ceil(0.5) = 1 → renew when remaining <= 1
+    assert!(should_renew(now(9), now(10), 1, policy_half)); // remaining=1
+    assert!(!should_renew(now(8), now(10), 1, policy_half)); // remaining=2
+
+    // duration=2, fraction=0.5 → ceil(1.0) = 1 → renew when remaining <= 1
+    assert!(should_renew(now(9), now(10), 2, policy_half)); // remaining=1
+    assert!(!should_renew(now(8), now(10), 2, policy_half)); // remaining=2
+
+    // duration=0, fraction=0.5 → ceil(0.0) = 0, but fraction > 0 → threshold = 1
+    assert!(should_renew(now(9), now(10), 0, policy_half)); // remaining=1
+
+    // duration=1, fraction=0.0 → ceil(0.0) = 0, fraction=0 → threshold stays 0
+    let policy_zero = RenewalPolicy::new(0.0);
+    // Only renews when now >= deadline (the early return), not via threshold.
+    assert!(!should_renew(now(9), now(10), 1, policy_zero)); // remaining=1
+    assert!(should_renew(now(10), now(10), 1, policy_zero)); // now == deadline
+}
+
+// -- F2: parameterized should_renew coverage ---------------------------------
+
+#[rstest]
+// Branch A: now >= deadline (early true)
+#[case(now(10), now(10), 20, RenewalPolicy::new(0.5), true)] // at deadline
+#[case(now(15), now(10), 20, RenewalPolicy::new(0.5), true)] // past deadline
+// Branch B: normal threshold calculation
+#[case(now(2), now(20), 20, RenewalPolicy::new(0.5), false)] // plenty of time (remaining=18 > threshold=10)
+#[case(now(10), now(20), 20, RenewalPolicy::new(0.5), true)] // at threshold (remaining=10 <= threshold=10)
+#[case(now(11), now(20), 20, RenewalPolicy::new(0.5), true)] // below threshold
+// Branch B edge: clamping
+#[case(now(15), now(20), 20, RenewalPolicy::new(2.0), true)] // >1.0 clamped to 1.0, threshold=20
+#[case(now(15), now(20), 20, RenewalPolicy::new(-1.0), false)] // <0.0 clamped to 0.0, threshold=0
+// Fraction=0.0: never proactively renew (only at deadline)
+#[case(now(9), now(10), 20, RenewalPolicy::new(0.0), false)] // threshold=0, remaining=1
+#[case(now(10), now(10), 20, RenewalPolicy::new(0.0), true)] // at deadline, early return
+// Fraction=1.0: always renew
+#[case(now(1), now(20), 20, RenewalPolicy::new(1.0), true)]
+// threshold=20, remaining=19
+// Branch D: zero-duration with positive fraction (guard sets threshold=1)
+#[case(now(5), now(10), 0, RenewalPolicy::new(0.5), false)] // threshold=1, remaining=5
+#[case(now(9), now(10), 0, RenewalPolicy::new(0.5), true)] // threshold=1, remaining=1
+fn should_renew_parameterized(
+    #[case] at: LogicalTime,
+    #[case] deadline: LogicalTime,
+    #[case] duration: u64,
+    #[case] policy: RenewalPolicy,
+    #[case] expected: bool,
+) {
+    assert_eq!(should_renew(at, deadline, duration, policy), expected);
+}
+
+// -- F9: RenewalPolicy::default() value test ---------------------------------
+
+#[test]
+fn renewal_policy_default_is_half_life() {
+    let policy = RenewalPolicy::default();
+    assert_eq!(policy.renew_at_fraction(), DEFAULT_RENEW_AT_FRACTION);
+    assert_eq!(DEFAULT_RENEW_AT_FRACTION, 0.5);
+}
+
+// -- effective_fraction debug/release behavior for non-finite values ----------
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "non-finite")]
+fn effective_fraction_panics_on_nan_in_debug() {
+    let _ = RenewalPolicy::new(f64::NAN).effective_fraction();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "non-finite")]
+fn effective_fraction_panics_on_infinity_in_debug() {
+    let _ = RenewalPolicy::new(f64::INFINITY).effective_fraction();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "non-finite")]
+fn effective_fraction_panics_on_neg_infinity_in_debug() {
+    let _ = RenewalPolicy::new(f64::NEG_INFINITY).effective_fraction();
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn effective_fraction_falls_back_on_non_finite_in_release() {
+    assert_eq!(
+        RenewalPolicy::new(f64::NAN).effective_fraction(),
+        DEFAULT_RENEW_AT_FRACTION,
+    );
+    assert_eq!(
+        RenewalPolicy::new(f64::INFINITY).effective_fraction(),
+        DEFAULT_RENEW_AT_FRACTION,
+    );
+    assert_eq!(
+        RenewalPolicy::new(f64::NEG_INFINITY).effective_fraction(),
+        DEFAULT_RENEW_AT_FRACTION,
+    );
+}
+
+// -- F5: CheckpointError path ------------------------------------------------
+
+/// Checkpoint failure returns `Error(Checkpoint(..))`.
+///
+/// One non-empty page is fetched and validated. The injected backend
+/// returns `CheckpointMissingKey` on the first checkpoint call.
+/// The scan loop must surface it as `Error(Checkpoint(CheckpointMissingKey))`.
+#[test]
+fn checkpoint_missing_key_returns_error() {
+    let base = seeded_coordinator(40, CursorUpdate::initial());
+    let mut coord = CheckpointFailingBackend::new(base, 1);
+
+    let page_b = EnumerationPage::new(
+        vec![make_scan_item(b"b")],
+        Cursor::with_last_key(make_key(b"b")),
+    );
+    let mut connector = ScriptedConnector::new(vec![Ok(page_b)]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(1000);
+    let mut tick = 4u64;
+    let outcome = run_scan_loop(
+        session,
+        &mut connector,
+        budgets(10),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || {
+            let out = now(tick);
+            tick += 1;
+            out
+        },
+    );
+
+    match outcome {
+        ScanLoopOutcome::Error(ScanLoopError::Checkpoint(
+            CheckpointError::CheckpointMissingKey,
+        )) => {} // expected
+        other => panic!("expected Error(Checkpoint(CheckpointMissingKey)), got {other:?}"),
+    }
+}
+
+// -- F10: Multi-renewal recalibration ----------------------------------------
+
+/// Two renewals across a 3-page scan verify threshold recalibration.
+///
+/// Lease duration = 20, acquired at t=3, deadline = 23.
+/// Time script crafted so:
+/// - Page 1 checkpoint: renew_now=15, remaining=8 <= threshold=10 → renew
+///   (new deadline=35, recalibrated observed_duration=20)
+/// - Page 2 checkpoint: renew_now=18, remaining=17 > threshold=10 → skip
+/// - Page 3 checkpoint: renew_now=28, remaining=7 <= threshold=10 → renew
+///   (new deadline=48)
+/// - Page 4 (empty): complete at t=30 → Done
+#[test]
+fn multi_renewal_recalibrates_threshold() {
+    let mut coord = seeded_coordinator(20, CursorUpdate::initial());
+    let mut connector = InMemoryDeterministicConnector::new(
+        TAG,
+        vec![
+            make_mem_item(b"a", b"one"),
+            make_mem_item(b"b", b"two"),
+            make_mem_item(b"c", b"three"),
+        ],
+    );
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(1100);
+    // now_fn calls: baseline=4, ckpt1=5, renew1=15, ckpt2=17, renew2=18,
+    //              ckpt3=20, renew3=28, complete=30
+    let multi_script: &[u64] = &[4, 5, 15, 17, 18, 20, 28, 30];
+    let multi_idx = Cell::new(0usize);
+    let outcome = run_scan_loop_with_policy(
+        session,
+        &mut connector,
+        budgets(1),
+        RenewalPolicy::new(0.5),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || {
+            let i = multi_idx.get();
+            multi_idx.set(i + 1);
+            now(multi_script[i])
+        },
+    );
+    assert_eq!(
+        multi_idx.get(),
+        multi_script.len(),
+        "time script not fully consumed"
+    );
+
+    assert_eq!(outcome, ScanLoopOutcome::Completed);
+    let summary = shard_summary(&coord, 80);
+    assert_eq!(summary.status(), ShardStatus::Done);
+    assert_eq!(summary.last_key(), Some(&b"c"[..]));
+}
+
+// -- F11: Negative test — no renewal when ample time -------------------------
+
+/// With a long lease (1000), should_renew never triggers, so the
+/// `NoRenewBackend` (which panics on renew) must not fire.
+#[test]
+fn no_renewal_when_ample_lease_time() {
+    let base = seeded_coordinator(1000, CursorUpdate::initial());
+    let mut coord = NoRenewBackend::new(base);
+    let mut connector = InMemoryDeterministicConnector::new(
+        TAG,
+        vec![make_mem_item(b"a", b"one"), make_mem_item(b"b", b"two")],
+    );
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(1200);
+    let mut tick = 4u64;
+    let outcome = run_scan_loop(
+        session,
+        &mut connector,
+        budgets(1),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || {
+            let out = now(tick);
+            tick += 1;
+            out
+        },
+    );
+
+    assert_eq!(outcome, ScanLoopOutcome::Completed);
+    let summary = shard_summary(&coord.inner, 1100);
+    assert_eq!(summary.status(), ShardStatus::Done);
+    assert_eq!(summary.last_key(), Some(&b"b"[..]));
 }
 
 // -- proptest classification properties --------------------------------------

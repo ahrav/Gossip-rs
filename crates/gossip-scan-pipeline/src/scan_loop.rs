@@ -9,9 +9,16 @@
 //! spec materialization and cursor conversion); bridging failures are treated as
 //! poisoned state.
 //!
-//! ## Per-page control flow
+//! ## Control flow
 //!
 //! ```text
+//!     ┌──────────────────────────────────────┐
+//!     │  pre-loop: bridge spec + cursor       │
+//!     │  baseline_now = now_fn()              │
+//!     │  lease already expired? ──yes──► LeaseLost(0)
+//!     └────────┬─────────────────────────────┘
+//!              │ no
+//!              ▼
 //!     ┌───────────────────────────────┐
 //!     │  enumerate_page(spec, cursor) │
 //!     └────────┬──────────────────────┘
@@ -24,15 +31,25 @@
 //!     └────────┬───────────┘
 //!              │ Ok
 //!              ▼
-//!        ┌──────────┐       ┌────────────────────────────────┐
-//!        │  empty?  │──yes──►  complete(final_cursor) ──► Done
-//!        └────┬─────┘       └────────────────────────────────┘
-//!             │ no
+//!        ┌──────────┐       ┌────────────────────────────────────┐
+//!        │  empty?  │──yes──►  complete(final_cursor) ──► Done   │
+//!        └────┬─────┘       │  (no deadline guard — see note)    │
+//!             │ no          └────────────────────────────────────┘
 //!             ▼
+//!     ┌────────────────────────┐
+//!     │  deadline guard (now)  │── expired ──► LeaseLost
+//!     └────────┬───────────────┘
+//!              │ ok
+//!              ▼
 //!     ┌──────────────────┐
 //!     │  checkpoint(cur) │── Err ──► Error(Checkpoint)
 //!     └────────┬─────────┘
 //!              │ Ok
+//!              ▼
+//!     ┌──────────────────────┐
+//!     │  should_renew(now)?  │── yes ──► renew ── Err ──► LeaseLost
+//!     └────────┬─────────────┘                 ── Ok ──► recalibrate
+//!              │ no
 //!              ▼
 //!         advance cursor, loop
 //! ```
@@ -110,15 +127,14 @@ pub const DEFAULT_RENEW_AT_FRACTION: f64 = 0.5;
 /// The loop evaluates this policy after each successful checkpoint. If the
 /// remaining lease window is at or below the configured fraction of the last
 /// observed lease duration, it attempts `session.renew(now)`.
+///
+/// The raw fraction is accessed via [`Self::renew_at_fraction`] and the
+/// clamped/fallback-safe value via [`Self::effective_fraction`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenewalPolicy {
-    /// Renew when remaining lease time is at or below this fraction of the
-    /// observed lease duration.
-    ///
-    /// Finite values outside `[0.0, 1.0]` are clamped. Non-finite values fall
-    /// back to [`DEFAULT_RENEW_AT_FRACTION`] to keep behavior deterministic and
-    /// fail-safe.
-    pub renew_at_fraction: f64,
+    /// Raw renew-at fraction. Use [`Self::effective_fraction`] for the
+    /// clamped, non-finite-safe value used by the renewal decision.
+    renew_at_fraction: f64,
 }
 
 impl RenewalPolicy {
@@ -126,6 +142,32 @@ impl RenewalPolicy {
     #[must_use]
     pub const fn new(renew_at_fraction: f64) -> Self {
         Self { renew_at_fraction }
+    }
+
+    /// Return the raw fraction value as configured.
+    #[must_use]
+    pub fn renew_at_fraction(&self) -> f64 {
+        self.renew_at_fraction
+    }
+
+    /// Return the effective fraction used for renewal decisions.
+    ///
+    /// Finite values are clamped to `[0.0, 1.0]`. Non-finite values (NaN,
+    /// ±Infinity) fall back to [`DEFAULT_RENEW_AT_FRACTION`] so renewal
+    /// behavior remains deterministic and fail-safe.
+    #[must_use]
+    pub fn effective_fraction(&self) -> f64 {
+        if self.renew_at_fraction.is_finite() {
+            self.renew_at_fraction.clamp(0.0, 1.0)
+        } else {
+            debug_assert!(
+                false,
+                "RenewalPolicy::renew_at_fraction is non-finite ({:?}), \
+                 falling back to DEFAULT_RENEW_AT_FRACTION",
+                self.renew_at_fraction,
+            );
+            DEFAULT_RENEW_AT_FRACTION
+        }
     }
 }
 
@@ -153,6 +195,17 @@ pub enum LeaseLossCause {
         now: LogicalTime,
         deadline: LogicalTime,
     },
+}
+
+impl fmt::Display for LeaseLossCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RenewFailed(e) => write!(f, "lease renewal failed: {e}"),
+            Self::DeadlineElapsed { now, deadline } => {
+                write!(f, "deadline elapsed (now={now:?}, deadline={deadline:?})")
+            }
+        }
+    }
 }
 
 /// Terminal outcome from [`run_scan_loop`].
@@ -347,6 +400,9 @@ where
 ///
 /// | Failure class | Action |
 /// |---|---|
+/// | Invalid shard spec (pre-loop) | Park `Poisoned` |
+/// | Cursor bridge failure (pre-loop) | Park `Poisoned` |
+/// | Already-expired lease at loop entry | Return `LeaseLost` |
 /// | Page validation error | Park `Poisoned` |
 /// | Retryable enumerate error (streak < limit) | Retry immediately |
 /// | Retryable enumerate error (streak >= limit) | Park `TooManyErrors` |
@@ -355,6 +411,10 @@ where
 /// | Lease renewal failure | Return `LeaseLost` |
 /// | Coordination checkpoint/complete failure | Return `Error` directly |
 /// | Park call failure | Return compound `Error::Park` |
+///
+/// Note: `LeaseLost { pages_completed: 0 }` can occur either from the
+/// pre-loop entry check or from the pre-checkpoint deadline guard firing
+/// on the first non-empty page.
 pub fn run_scan_loop_with_policy<B, C, N>(
     mut session: WorkerSession<'_, B>,
     connector: &mut C,
@@ -405,6 +465,17 @@ where
     // Seed the renew threshold from the lease time still remaining when the
     // loop actually starts, not from the run's configured lease duration.
     let baseline_now = now_fn();
+    // Early exit: if the lease is already expired at loop entry, there is no
+    // point issuing a connector call that will produce work we cannot persist.
+    if baseline_now >= session.lease().deadline() {
+        return ScanLoopOutcome::LeaseLost {
+            pages_completed: 0,
+            cause: LeaseLossCause::DeadlineElapsed {
+                now: baseline_now,
+                deadline: session.lease().deadline(),
+            },
+        };
+    }
     let mut observed_lease_duration = session
         .lease()
         .deadline()
@@ -479,6 +550,13 @@ where
         // EnumerationPage distinguishes empty+initial (scan complete) from
         // empty+non-initial (gap at cursor position), but the scan loop treats
         // both as terminal -- gap handling is composed externally if needed.
+        //
+        // No deadline pre-check before complete: unlike checkpoint (which
+        // allows retry-resumable progress), complete is a terminal mutation.
+        // If the lease expired, the backend's LeaseExpired rejection correctly
+        // surfaces as Error(Complete(..)), consistent with the documented
+        // contract that LeaseLost is reserved for "abandon without mutation"
+        // paths.
         if is_terminal {
             let final_cursor = next_cursor.as_update();
             return match session.complete(now_fn(), &final_cursor, op_id_fn()) {
@@ -545,6 +623,10 @@ where
                         .saturating_sub(renew_now.as_raw());
                 }
                 Err(error) => {
+                    debug_assert!(
+                        pages_completed >= 1,
+                        "renewal runs only after checkpoint, so pages_completed must be >= 1"
+                    );
                     // Renewal failure is treated as lease loss, not a generic
                     // mutation error: we abandon the session immediately.
                     return ScanLoopOutcome::LeaseLost {
@@ -572,7 +654,8 @@ where
 /// `now >= deadline` early-return reachable in practice.
 ///
 /// Non-finite policy values fall back to [`DEFAULT_RENEW_AT_FRACTION`], and
-/// finite values are clamped into `[0.0, 1.0]`.
+/// finite values are clamped into `[0.0, 1.0]` — both via
+/// [`RenewalPolicy::effective_fraction`].
 fn should_renew(
     now: LogicalTime,
     deadline: LogicalTime,
@@ -584,11 +667,7 @@ fn should_renew(
     }
 
     let remaining = deadline.as_raw().saturating_sub(now.as_raw());
-    let fraction = if policy.renew_at_fraction.is_finite() {
-        policy.renew_at_fraction.clamp(0.0, 1.0)
-    } else {
-        DEFAULT_RENEW_AT_FRACTION
-    };
+    let fraction = policy.effective_fraction();
     let mut renew_threshold = ((observed_lease_duration as f64) * fraction).ceil() as u64;
     if renew_threshold == 0 && fraction > 0.0 {
         renew_threshold = 1;
