@@ -382,6 +382,8 @@ version = "0.1.0"
 dependencies = [
  "gossip-contracts",
  "proptest",
+ "rstest",
+ "tempfile",
 ]
 
 [[package]]

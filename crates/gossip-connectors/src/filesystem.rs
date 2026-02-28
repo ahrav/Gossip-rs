@@ -668,3 +668,8 @@ fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
     encoded[24..32].copy_from_slice(&metadata.ino().to_be_bytes());
     ObjectVersionId::from_version_bytes(&encoded)
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+#[path = "filesystem_tests.rs"]
+mod tests;
