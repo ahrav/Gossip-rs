@@ -69,7 +69,7 @@ parallel verification layer that exhaustively verifies the protocol design.
 ## 2. Tier 1 — Unit Tests
 
 **File:** `crates/gossip-coordination/src/in_memory_tests.rs`
-**Declared in:** `crates/gossip-coordination/src/in_memory.rs` (`#[cfg(test)]` submodule)
+**Declared in:** `crates/gossip-coordination/src/in_memory.rs` (via `#[path = "in_memory_tests.rs"]` attribute)
 
 Single-operation isolation tests against `InMemoryCoordinator`. Each test
 exercises one backend operation or one edge case, with deterministic
@@ -238,7 +238,7 @@ invariant accidentally violates another.
 
 ## 6. Tier 4 — Simulation Tests
 
-**Files:** `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`, `crates/gossip-coordination/src/sim/mega_sim_tests.rs`
+**Primary files:** `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`, `crates/gossip-coordination/src/sim/mega_sim_tests.rs`, `crates/gossip-coordination/src/sim/overload_tests.rs`, `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs`
 **Declared in:** `crates/gossip-coordination/src/sim/mod.rs` (`#[cfg(test)]`)
 
 Seven sub-tiers exercise the full simulation harness.
@@ -272,6 +272,7 @@ random calls shifts counts but must not break behavioral assertions.
 | `behavioral_seed_99_sunny`          | seed=99, SunnyDay, 2 workers, 3 shards, 300 ops    | No violations, converged, event coverage                             |
 | `behavioral_seed_7_radioactive`     | seed=7, Radioactive, 4 workers, 8 shards, 1500 ops | No violations (convergence not asserted under aggressive faults)     |
 | `deterministic_replay_cross_config` | Runs each config twice                             | Field-identical reports (`event_counts`, `ops_executed`, `end_time`) |
+| `behavioral_cooldown_fires_under_simulation` | seed=42, SunnyDay, 8 workers, 20 shards, cooldown=99, 2000 ops | Cooldown throttling fires, `ClaimThrottled` event present |
 
 A compile-time `const` match block provides exhaustiveness enforcement:
 if a variant is added to `SimEventKind` without updating the match, the
@@ -410,10 +411,10 @@ cargo test -p gossip-coordination
 # Data model tests (shard_spec, cursor, pooled)
 cargo test -p gossip-contracts --lib coordination
 
-# Individual tiers
-cargo test -p gossip-coordination --lib in_memory_tests
-cargo test -p gossip-coordination --lib conformance_tests
-cargo test -p gossip-coordination --lib scenario_tests
+# Individual tiers (module pattern matching)
+cargo test -p gossip-coordination in_memory_tests
+cargo test -p gossip-coordination conformance_tests
+cargo test -p gossip-coordination scenario_tests
 ```
 
 ### Overload tests

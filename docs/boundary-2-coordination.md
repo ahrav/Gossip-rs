@@ -38,7 +38,7 @@ The module provides six core capabilities:
 | File            | Role                                                                  |
 |-----------------|-----------------------------------------------------------------------|
 | `traits.rs`     | `CoordinationBackend` trait -- the semantic contract for all backends |
-| `record.rs`     | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshot`           |
+| `record.rs`     | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`       |
 | `run.rs`        | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait          |
 | `gossip-contracts::coordination/split.rs` | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
 | `split_execution.rs` | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types |
@@ -55,7 +55,7 @@ The module provides six core capabilities:
 | `events.rs`     | `EventCollector`, `EventKind`, `StateTransitionEvent`                 |
 | `facade.rs`     | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                   |
 | `session.rs`    | `WorkerSession` ergonomic wrapper with move/borrow lifecycle          |
-| `mod.rs`        | Module root and public re-exports                                     |
+| `lib.rs`        | Module root and public re-exports                                     |
 
 ---
 
@@ -588,7 +588,7 @@ half-open `[start, end)` byte-key ranges.
 | D2.8  | Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`                  |
 | D2.10 | Derived shard IDs have bit 63 set                                                 |
 | D2.11 | ShardRecord is self-contained (no back-references to RunConfig)                   |
-| D2.12 | ShardSnapshot excludes lease, fence, op_log, tenant, park_reason                  |
+| D2.12 | ShardSnapshotView excludes lease, fence, op_log, tenant, park_reason               |
 | D2.13 | Trait is synchronous (returns `Result`, not futures)                              |
 | D2.14 | Lease-gated operations take `(TenantId, Lease)`                                   |
 | D2.15 | `acquire_and_restore_into` is the only non-lease operation                             |

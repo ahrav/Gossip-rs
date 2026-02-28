@@ -11,7 +11,7 @@
 //! 1. **Construction** -- Items are sorted by [`ItemKey`] once (O(n log n)),
 //!    uniqueness is verified, and all per-item metadata ([`StableItemId`],
 //!    [`ObjectVersionId`], [`ItemRef`], size hint) is precomputed into internal
-//!    [`PreparedItem`] records. Subsequent pages pay only clone/copy costs.
+//!    `PreparedItem` records. Subsequent pages pay only clone/copy costs.
 //! 2. **Enumeration** -- Binary search resolves shard bounds (O(log n)),
 //!    then yields up to [`Budgets::max_items`] by index iteration over
 //!    precomputed metadata.
@@ -163,6 +163,11 @@ pub struct InMemoryDeterministicConnector {
     /// Source-system discriminator included in [`ItemIdentityKey`] derivation.
     /// Ensures `StableItemId` values are connector-scoped, preventing
     /// cross-connector collisions when multiple connectors share key spaces.
+    ///
+    /// Read only during construction (identity hashing is precomputed into
+    /// [`PreparedItem`]). Retained for `Clone` correctness and potential
+    /// future use.
+    #[allow(dead_code)]
     connector_tag: ConnectorTag,
     /// When `true`, enumeration pages emit big-endian index tokens and the
     /// resume path uses them as an O(1) fast path with key-based fallback.
@@ -300,10 +305,12 @@ impl InMemoryDeterministicConnector {
         }
 
         // Phase 2: range validation.
-        if let (Some(s), Some(e)) = (start, end) {
-            if s > e {
-                return Err(EnumerateError::permanent("shard start key exceeds end key"));
-            }
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            return Err(EnumerateError::permanent(
+                "shard start key exceeds end key",
+            ));
         }
 
         // Phase 3: resolve key bounds to vector indices.
@@ -320,19 +327,16 @@ impl InMemoryDeterministicConnector {
                 // a well-formed token, use the token index directly after
                 // validating that items[token_idx - 1].key matches last_key.
                 // This check runs in all build profiles.
-                if self.emit_tokens {
-                    if let Some(idx) = cursor
+                if self.emit_tokens
+                    && let Some(idx) = cursor
                         .token()
                         .and_then(|t| parse_u64_be(t.as_bytes()))
                         .and_then(|v| usize::try_from(v).ok())
-                    {
-                        if idx > 0
-                            && idx <= self.items.len()
-                            && self.items[idx - 1].key == *last_key
-                        {
-                            break 'resolve idx;
-                        }
-                    }
+                    && idx > 0
+                    && idx <= self.items.len()
+                    && self.items[idx - 1].key == *last_key
+                {
+                    break 'resolve idx;
                 }
                 // Fallback: O(log n) binary search.
                 upper_bound(&self.items, last_key.as_bytes())
@@ -400,10 +404,10 @@ impl InMemoryDeterministicConnector {
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
         // Range validation.
-        if let (Some(s), Some(e)) = (start, end) {
-            if s > e {
-                return Err(EnumerateError::permanent("shard start key exceeds end key"));
-            }
+        if let (Some(s), Some(e)) = (start, end)
+            && s > e
+        {
+            return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
         let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));

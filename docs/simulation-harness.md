@@ -31,14 +31,14 @@ An external observer that verifies nine safety properties against coordinator
 ground truth at every simulation step. It never trusts worker-side bookkeeping.
 See the invariant table below.
 
-### Layer 3.5: Overload Scenarios (`sim/overload.rs`)
+### Layer 4: Overload Scenarios (`sim/overload.rs`)
 
 Deterministic scripted stress workloads that exercise cooldown and capacity
 behavior. Defines scenario descriptors (`OverloadKind`, `OverloadScenario`),
 lightweight telemetry (`GoodputTracker`, `D1Observation`, `OverloadReport`),
 and operation burst generators consumed by `CoordinationSim::run_overload`.
 
-### Layer 4: CoordinationSim (`sim/harness.rs`)
+### Layer 5: CoordinationSim (`sim/harness.rs`)
 
 The top-level driver. Runs a three-stage simulation (zombie preamble, safety,
 then liveness) with weighted random op generation, fault injection, and full
@@ -72,7 +72,7 @@ platforms and prevent invalid probability construction.
 | S1    | MutualExclusion         | At most one worker holds a non-expired lease per shard.                           |
 | S2    | FenceMonotonicity       | `fence_epoch` never decreases for a given `(RunId, ShardId)`.                     |
 | S3    | TerminalIrreversibility | Terminal states (Done, Split, Parked) never revert, except Parked->Active (unpark) which requires a fence bump. |
-| S4    | RecordInvariant         | `ShardRecord::assert_invariants()` does not panic.                                |
+| S4    | RecordInvariant         | `ShardRecord::validate_invariants()` returns `Ok`.                                |
 | S5    | CursorMonotonicity      | `cursor.last_key()` never decreases per shard.                                    |
 | S6    | CursorBounds            | Non-initial cursors remain within shard spec key range.                           |
 | S7    | SplitCoverage           | Split-parent's spawned children exist and reference the correct parent.           |

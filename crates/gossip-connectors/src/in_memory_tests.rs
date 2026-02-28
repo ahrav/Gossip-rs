@@ -243,7 +243,7 @@ fn single_item_enumeration_and_resume() {
 }
 
 #[test]
-fn expired_budget_returns_empty_page() {
+fn expired_budget_returns_retryable_error() {
     let items = vec![make_item(b"key", b"payload")];
     let mut c = InMemoryDeterministicConnector::new(TAG, items);
     let start = make_key(b"a");
@@ -251,11 +251,233 @@ fn expired_budget_returns_empty_page() {
 
     let expired =
         Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
-    let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), expired)
-        .unwrap();
-    assert!(page.items().is_empty());
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
+    assert!(result.is_err(), "expired budget should return an error");
 }
+
+// ---------------------------------------------------------------
+// Duplicate key rejection
+// ---------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "unique item keys")]
+fn duplicate_keys_panic() {
+    let items = vec![make_item(b"dup", b"first"), make_item(b"dup", b"second")];
+    InMemoryDeterministicConnector::new(TAG, items);
+}
+
+// ---------------------------------------------------------------
+// Inverted range rejection
+// ---------------------------------------------------------------
+
+#[test]
+fn inverted_range_returns_error() {
+    let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    // start > end is invalid.
+    let start = make_key(b"z");
+    let end = make_key(b"a");
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets());
+    assert!(result.is_err(), "inverted range should return an error");
+}
+
+#[test]
+fn inverted_range_split_returns_error() {
+    let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    let start = make_key(b"z");
+    let end = make_key(b"a");
+    let result = c.choose_split_point_range(&start, &end, &Cursor::initial());
+    assert!(result.is_err(), "inverted range should return an error");
+}
+
+// ---------------------------------------------------------------
+// Token resume fast path
+// ---------------------------------------------------------------
+
+#[test]
+fn token_resume_fast_path_produces_correct_results() {
+    // Verify that the O(1) token fast path produces identical results
+    // to the O(log n) key-based fallback across multi-page enumeration.
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+        make_item(b"e", b"5"),
+    ];
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+    let budgets = small_page_budgets(2);
+
+    let mut c_token = InMemoryDeterministicConnector::new(TAG, items.clone());
+    let mut c_key = InMemoryDeterministicConnector::new(TAG, items).with_tokens(false);
+
+    let mut cursor_t = Cursor::initial();
+    let mut cursor_k = Cursor::initial();
+    loop {
+        let page_t = c_token
+            .enumerate_page_range(&start, &end, &cursor_t, budgets)
+            .unwrap();
+        let page_k = c_key
+            .enumerate_page_range(&start, &end, &cursor_k, budgets)
+            .unwrap();
+
+        assert_eq!(page_t.items().len(), page_k.items().len());
+        for (a, b) in page_t.items().iter().zip(page_k.items()) {
+            assert_eq!(a.item_key(), b.item_key());
+            assert_eq!(a.item_ref(), b.item_ref());
+        }
+
+        if page_t.items().is_empty() {
+            break;
+        }
+        cursor_t = page_t.next_cursor().clone();
+        cursor_k = page_k.next_cursor().clone();
+    }
+}
+
+#[test]
+fn corrupt_token_falls_back_to_key_search() {
+    // Construct a cursor with a valid last_key but a bogus token.
+    // The connector should fall back to key-based search and still
+    // return correct results.
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    // First page to get a real cursor pointing after "a".
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .unwrap();
+    assert_eq!(page.items()[0].item_key().as_bytes(), b"a");
+
+    // Forge a cursor with the correct last_key but a bogus token.
+    let bogus_token = TokenBytes::try_from_slice(&999u64.to_be_bytes()).unwrap();
+    let corrupt_cursor = Cursor::with_token(make_key(b"a"), bogus_token);
+
+    // Should still resume correctly after "a".
+    let page2 = c
+        .enumerate_page_range(&start, &end, &corrupt_cursor, default_budgets())
+        .unwrap();
+    let keys: Vec<&[u8]> = page2
+        .items()
+        .iter()
+        .map(|i| i.item_key().as_bytes())
+        .collect();
+    assert_eq!(keys, vec![b"b".as_slice(), b"c".as_slice()]);
+}
+
+// ---------------------------------------------------------------
+// Split point: byte-weight balancing
+// ---------------------------------------------------------------
+
+#[test]
+fn split_point_valid_returns_key_between_bounds() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap();
+    let split = split.expect("should produce a split point");
+    assert!(split > make_key(b"a"));
+    assert!(split < make_key(b"z"));
+}
+
+#[test]
+fn split_point_byte_weight_favors_heavy_items() {
+    // Items: a=1 byte, b=1 byte, c=1000 bytes, d=1 byte.
+    // Total bytes = 1003. Half = 501.
+    // Cumulative: a=1, b=2, c=1002 (>= 501). Split at c.
+    // Count-midpoint would split at index 2 (b), byte-weight splits at c.
+    let items = vec![
+        make_item(b"a", b"x"),
+        make_item(b"b", b"y"),
+        make_item(b"c", &vec![0u8; 1000]),
+        make_item(b"d", b"z"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap();
+    let split = split.expect("should produce a split point");
+    // Byte-weight median should land at "c" (where cumulative >= half).
+    assert_eq!(split.as_bytes(), b"c");
+}
+
+// ---------------------------------------------------------------
+// ReadConnector: open
+// ---------------------------------------------------------------
+
+#[test]
+fn open_reads_full_content() {
+    let items = vec![make_item(b"key", b"hello world")];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let item_ref = enumerate_single_item_ref(&mut c);
+
+    let mut reader = c.open(&item_ref, default_budgets()).unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello world");
+}
+
+#[test]
+fn open_succeeds_regardless_of_byte_budget() {
+    // open() no longer eagerly rejects oversized items; budget
+    // enforcement is the runtime's responsibility.
+    let items = vec![make_item(b"key", b"large payload here")];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let item_ref = enumerate_single_item_ref(&mut c);
+
+    let small_budget = Budgets::try_new(100, 5, None).unwrap();
+    let mut reader = c
+        .open(&item_ref, small_budget)
+        .expect("open should succeed");
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"large payload here");
+}
+
+// ---------------------------------------------------------------
+// Clone / sharing
+// ---------------------------------------------------------------
+
+#[test]
+fn clone_shares_data() {
+    let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
+    let c1 = InMemoryDeterministicConnector::new(TAG, items);
+    let mut c2 = c1.clone();
+
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    let page = c2
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(page.items().len(), 2);
+}
+
+// ---------------------------------------------------------------
+// Remaining standalone tests
+// ---------------------------------------------------------------
 
 #[test]
 fn token_enabled_vs_disabled_parity() {
@@ -280,50 +502,6 @@ fn token_enabled_vs_disabled_parity() {
         assert_eq!(a.stable_item_id(), b.stable_item_id());
         assert_eq!(a.version(), b.version());
     }
-}
-
-#[test]
-fn split_point_valid_returns_key_between_bounds() {
-    let items = vec![
-        make_item(b"a", b"1"),
-        make_item(b"b", b"2"),
-        make_item(b"c", b"3"),
-        make_item(b"d", b"4"),
-    ];
-    let mut c = InMemoryDeterministicConnector::new(TAG, items);
-    let start = make_key(b"a");
-    let end = make_key(b"z");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    let split = split.expect("should produce a split point");
-    assert!(split > make_key(b"a"));
-    assert!(split < make_key(b"z"));
-}
-
-#[test]
-fn open_reads_full_content() {
-    let items = vec![make_item(b"key", b"hello world")];
-    let mut c = InMemoryDeterministicConnector::new(TAG, items);
-    let item_ref = enumerate_single_item_ref(&mut c);
-
-    let mut reader = c.open(&item_ref, default_budgets()).unwrap();
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf).unwrap();
-    assert_eq!(buf, b"hello world");
-}
-
-#[test]
-fn open_budget_exceeded_returns_error() {
-    let items = vec![make_item(b"key", b"large payload here")];
-    let mut c = InMemoryDeterministicConnector::new(TAG, items);
-    let item_ref = enumerate_single_item_ref(&mut c);
-
-    // Budget smaller than the payload.
-    let small_budget = Budgets::try_new(100, 5, None).unwrap();
-    let result = c.open(&item_ref, small_budget);
-    assert!(result.is_err());
 }
 
 #[test]
@@ -417,7 +595,7 @@ mod prop {
     /// Strategy: generate 0..max_items unique keys as short byte strings.
     fn item_vec_strategy(max_items: usize) -> impl Strategy<Value = Vec<MemItem>> {
         pvec(pvec(1u8..=127u8, 1..8usize), 0..max_items).prop_map(|key_vecs| {
-            // Deduplicate keys.
+            // Deduplicate keys to satisfy the unique-key invariant.
             let mut seen = std::collections::HashSet::new();
             key_vecs
                 .into_iter()

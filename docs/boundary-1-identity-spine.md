@@ -4,7 +4,7 @@
 
 Boundary 1 (Identity & Hashing Spine) is the foundational leaf of the
 boundary-layer architecture. It lives in `crates/gossip-contracts/src/identity/`
-across 10 source files. No other boundary module may be referenced from here --
+across 11 source files. No other boundary module may be referenced from here --
 all four sibling boundaries depend on `identity`, but `identity` depends on none
 of them.
 
@@ -39,7 +39,8 @@ macros.
 | `finding.rs`   | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId` + derivation fns  |
 | `policy.rs`    | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                    |
 | `macros.rs`    | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                             |
-| `golden.rs`    | Golden vector tests (6 derivations)                                                        |
+| `coordination.rs` | `RunId`, `ShardId`, `WorkerId`, `OpId`, `JobId`, `FenceEpoch`, `LogicalTime`, `ShardKey` — 64-bit coordination identity types |
+| `golden.rs`    | Golden vector tests (7 derivations)                                                        |
 
 ---
 
@@ -254,7 +255,7 @@ All 13 domain constants live in `domain.rs` and follow the naming convention
 | 28 | `PolicyHash` per-field sensitivity                | proptest                               | `policy_hash_version_field_sensitivity`, `id_hash_mode_field_sensitivity`, `evidence_hash_version_field_sensitivity`, `rules_digest_field_sensitivity`    | `policy.rs`    |
 | 29 | `IdHashMode` discriminant stability               | unit test                              | `id_hash_mode_discriminants_are_stable`, `id_hash_mode_roundtrip`, `id_hash_mode_unknown_returns_none`                                                    | `policy.rs`    |
 | 30 | Macro-generated types: traits, Debug, Canonical   | compile-time + unit + proptest         | `macro_types_implement_required_traits`, `pub_debug_shows_hex_prefix`, `restricted_debug_is_redacted`, `pub_canonical_bytes_stable` (and more)            | `macros.rs`    |
-| 31 | Golden vectors (6 derivations)                    | unit test                              | `stable_item_id_golden_value`, `object_version_id_golden_value`, `key_secret_hash_golden_value`, `derive_finding_id_golden_value`, `derive_occurrence_id_golden_value`, `compute_policy_hash_golden_value` | `golden.rs`    |
+| 31 | Golden vectors (7 derivations)                    | unit test                              | `stable_item_id_golden_value`, `object_version_id_golden_value`, `key_secret_hash_golden_value`, `derive_finding_id_golden_value`, `derive_occurrence_id_golden_value`, `compute_policy_hash_golden_value`, `finalize_64_golden_value` | `golden.rs`    |
 | 32 | Golden vector registry completeness               | unit test                              | `registry_is_complete`                                                                                                                                    | `golden.rs`    |
 | 33 | Full-chain determinism (composed)                 | proptest                               | `full_chain_item_to_occurrence_is_pure`                                                                                                                   | `golden.rs`    |
 | 34 | Full-chain collision-freedom (composed)           | proptest                               | `full_chain_collision_free`                                                                                                                               | `golden.rs`    |

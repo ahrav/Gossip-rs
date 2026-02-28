@@ -95,15 +95,15 @@ practical limit (~100 MB).
 
 | Operation | CAS condition | Frequency |
 |-----------|---------------|-----------|
-| `acquire_and_restore_into` | `IF fence_epoch = :expected AND status = 1` | Per shard claim |
+| `acquire_and_restore_into` | `IF fence_epoch = :expected AND status = 0` | Per shard claim |
 | `renew` | `IF fence_epoch = :expected` | Per lease renewal |
 | `checkpoint` | `IF fence_epoch = :expected` | **Hot path** (40-2000/sec) |
-| `complete` | `IF fence_epoch = :expected AND status = 1` | Terminal, once |
-| `park_shard` | `IF fence_epoch = :expected AND status = 1` | Terminal, once |
+| `complete` | `IF fence_epoch = :expected AND status = 0` | Terminal, once |
+| `park_shard` | `IF fence_epoch = :expected AND status = 0` | Terminal, once |
 | `create_run` | `IF NOT EXISTS` | Once per run |
-| `complete_run` | `IF status = 2` (Active) | Once per run |
+| `complete_run` | `IF status = 1` (Active) | Once per run |
 | `fail_run` / `cancel_run` | `IF status` precondition | Once per run |
-| `unpark_shard` | `IF status = 4` (Parked) | Admin, rare |
+| `unpark_shard` | `IF status = 3` (Parked) | Admin, rare |
 
 All use single-partition LWT. Expected LWT throughput: 500-5000 ops/sec per
 partition, which exceeds our peak of ~2000 checkpoint writes/sec.
@@ -135,7 +135,7 @@ Step 2: If any chunk fails, retry it. Already-written shards are
         idempotent (same key, same value).
 
 Step 3: Once ALL shards are written, CAS the run record:
-        UPDATE runs SET status = 2 WHERE ... IF status = 1;
+        UPDATE runs SET status = 1 WHERE ... IF status = 0;
         (Initializing -> Active)
 
 Step 4: The run status flip IS the commit point.
