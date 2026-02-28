@@ -538,6 +538,7 @@ fn read_range_budget_clamps_read() {
 #[case::absolute_path(b"/etc/passwd")]
 #[case::parent_traversal(b"../etc/passwd")]
 #[case::embedded_traversal(b"sub/../../etc/passwd")]
+#[case::traversal_after_valid(b"valid/../../../etc/passwd")]
 #[case::null_byte_injection(b"file.txt\x00../../etc/passwd")]
 fn resolve_rejects_malicious_paths(#[case] path: &[u8]) {
     let dir = create_test_dir(&[("file.txt", b"data")]);
@@ -795,16 +796,31 @@ fn index_failure_is_memoized() {
 
 #[test]
 fn open_rejects_directory_path() {
-    let dir = create_test_dir(&[("file.txt", b"data")]);
-    fs::create_dir(dir.path().join("subdir")).unwrap();
-
+    // Index a real file, then replace it with a directory to exercise the
+    // `metadata.is_file()` guard in `open_beneath_root`.
+    let dir = create_test_dir(&[("target.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
-    let dir_ref = ItemRef::try_from_slice(b"subdir").unwrap();
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace the indexed file with a directory.
+    fs::remove_file(dir.path().join("target.txt")).unwrap();
+    fs::create_dir(dir.path().join("target.txt")).unwrap();
+
     let err = c
-        .open(&dir_ref, default_budgets())
+        .open(&item_ref, default_budgets())
         .err()
         .expect("should reject directory");
     assert!(!err.is_retryable(), "directory open should be permanent");
+    assert!(
+        err.message().contains("not a regular file"),
+        "expected 'not a regular file' error, got: {}",
+        err.message(),
+    );
 }
 
 // ---------------------------------------------------------------
@@ -953,7 +969,7 @@ fn consecutive_read_ranges_on_same_file_succeed() {
 }
 
 // ---------------------------------------------------------------
-// ShardSpec trait-method coverage (F11)
+// ShardSpec trait-method coverage
 // ---------------------------------------------------------------
 
 #[test]
@@ -991,7 +1007,7 @@ fn choose_split_point_via_shard_spec() {
 }
 
 // ---------------------------------------------------------------
-// FD cache eviction (F13)
+// FD cache eviction
 // ---------------------------------------------------------------
 
 #[test]
@@ -1026,6 +1042,44 @@ fn fd_cache_eviction_on_different_file() {
         .read_range(&ref_a, 0, &mut buf, default_budgets())
         .unwrap();
     assert_eq!(&buf[..n], b"alpha");
+}
+
+// ---------------------------------------------------------------
+// Cached FD clears O_NONBLOCK
+// ---------------------------------------------------------------
+
+#[test]
+fn cached_fd_has_clear_nonblock_after_read_range() {
+    let dir = create_test_dir(&[("file.txt", b"hello")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let item_ref = page.items()[0].item_ref().clone();
+
+    // Trigger get_or_open_cached via read_range.
+    let mut buf = [0u8; 5];
+    let n = c
+        .read_range(&item_ref, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(&buf[..n], b"hello");
+
+    // Inspect the cached fd — O_NONBLOCK must NOT be set.
+    let cached = c
+        .cached_file
+        .as_ref()
+        .expect("cached_file should be populated after read_range");
+    let fd = cached.1.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "fcntl(F_GETFL) failed");
+    assert_eq!(
+        flags & libc::O_NONBLOCK,
+        0,
+        "cached fd should NOT have O_NONBLOCK set (flags={flags:#x})"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -1291,7 +1345,7 @@ fn version_id_changes_when_file_modified() {
 }
 
 // ---------------------------------------------------------------
-// Walk depth limit tests (F2)
+// Walk depth limit tests
 // ---------------------------------------------------------------
 
 #[test]
@@ -1347,7 +1401,7 @@ fn walk_depth_zero_indexes_only_root_files() {
 }
 
 // ---------------------------------------------------------------
-// Edge case tests (F6)
+// Edge case tests
 // ---------------------------------------------------------------
 
 #[test]
@@ -1444,6 +1498,36 @@ fn fifo_is_skipped() {
 }
 
 #[test]
+fn open_rejects_fifo_replacing_indexed_file() {
+    use std::process::Command;
+
+    let dir = create_test_dir(&[("target.txt", b"real data")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index while it's a regular file.
+    let mut c = FilesystemConnector::new(dir.path());
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace the regular file with a FIFO.
+    let target = dir.path().join("target.txt");
+    fs::remove_file(&target).unwrap();
+    let status = Command::new("mkfifo").arg(&target).status();
+    if status.is_err() || !status.unwrap().success() {
+        return; // mkfifo not available; skip gracefully.
+    }
+
+    // open() on the now-FIFO path should fail with a permanent error.
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("open should reject FIFO replacing a regular file"),
+    };
+    assert!(!err.is_retryable(), "FIFO rejection should be permanent");
+}
+
+#[test]
 fn very_long_filename_is_indexed() {
     let dir = tempfile::tempdir().expect("create tempdir");
     // 255 chars is the maximum filename length on most filesystems.
@@ -1467,4 +1551,623 @@ fn very_long_filename_is_indexed() {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"long name content");
+}
+
+// ---------------------------------------------------------------
+// Membership enforcement tests
+// ---------------------------------------------------------------
+
+#[test]
+fn read_rejects_non_indexed_item_ref() {
+    let dir = create_test_dir(&[("a.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Trigger indexing.
+    let _ = collect_all(&mut c, &start, &end);
+
+    // Create a new file after indexing.
+    fs::write(dir.path().join("b.txt"), b"post-index").unwrap();
+
+    // Attempt to read the non-indexed file.
+    let bad_ref = ItemRef::try_from_slice(b"b.txt").unwrap();
+    let result = c.open(&bad_ref, default_budgets());
+    let err = result.err().expect("should reject item_ref not in index");
+    assert!(
+        !err.is_retryable(),
+        "membership rejection should be permanent"
+    );
+}
+
+#[test]
+fn read_range_rejects_non_indexed_item_ref() {
+    let dir = create_test_dir(&[("a.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+
+    let bad_ref = ItemRef::try_from_slice(b"nonexistent.txt").unwrap();
+    let mut buf = [0u8; 32];
+    let result = c.read_range(&bad_ref, 0, &mut buf, default_budgets());
+    assert!(result.is_err(), "should reject item_ref not in index");
+}
+
+#[rstest]
+#[case::current_dir_prefix(b"./a.txt")]
+#[case::double_slash(b"a//b.txt")]
+#[case::trailing_slash(b"a.txt/")]
+#[case::just_dot(b".")]
+fn non_canonical_item_ref_rejected(#[case] ref_bytes: &[u8]) {
+    let dir = create_test_dir(&[("a.txt", b"data"), ("a/b.txt", b"nested")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Trigger indexing.
+    let _ = collect_all(&mut c, &start, &end);
+
+    // These non-canonical spellings don't match any indexed key.
+    let bad_ref = ItemRef::try_from_slice(ref_bytes).unwrap();
+    let result = c.open(&bad_ref, default_budgets());
+    assert!(
+        result.is_err(),
+        "non-canonical ref {:?} should be rejected",
+        ref_bytes
+    );
+}
+
+#[test]
+fn open_without_prior_enumerate_triggers_lazy_indexing() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    // A valid ItemRef that exists on disk should succeed even without
+    // prior enumeration — lazy indexing satisfies the ReadConnector
+    // affinity contract for compatible instances.
+    let item_ref = ItemRef::try_from_slice(b"file.txt").unwrap();
+    let mut reader = match c.open(&item_ref, default_budgets()) {
+        Ok(r) => r,
+        Err(e) => panic!("open should trigger lazy indexing, got: {e:?}"),
+    };
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"data");
+}
+
+#[test]
+fn open_without_enumerate_rejects_absent_item_ref() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    // An ItemRef for a file that does not exist should still fail
+    // after lazy indexing because membership enforcement rejects it.
+    let item_ref = ItemRef::try_from_slice(b"no_such_file.txt").unwrap();
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("absent item_ref should be rejected"),
+    };
+    assert!(
+        err.message().contains("not found in index"),
+        "error should indicate item_ref not found, got: {}",
+        err.message()
+    );
+}
+
+// ---------------------------------------------------------------
+// Warning cap tests
+// ---------------------------------------------------------------
+
+#[test]
+fn warning_cap_limits_storage() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    // Create many symlinks to exceed the warning cap.
+    for i in 0..20 {
+        std::os::unix::fs::symlink("target", dir.path().join(format!("link_{i:03}"))).unwrap();
+    }
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_warnings(5);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+    assert!(
+        c.walk_warnings().len() <= 5,
+        "warnings should be capped at max_warnings"
+    );
+    assert!(
+        c.overflow_warning_count() > 0,
+        "overflow count should be nonzero when warnings exceed cap"
+    );
+    assert_eq!(
+        c.walk_warnings().len() + c.overflow_warning_count(),
+        20,
+        "total warnings + overflow should equal number of symlinks"
+    );
+}
+
+#[test]
+fn zero_max_warnings_drops_all() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    std::os::unix::fs::symlink("target", dir.path().join("link")).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_warnings(0);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+    assert!(c.walk_warnings().is_empty(), "no warnings should be stored");
+    assert_eq!(
+        c.overflow_warning_count(),
+        1,
+        "overflow should count the dropped warning"
+    );
+}
+
+// ---------------------------------------------------------------
+// Error classification tests
+// ---------------------------------------------------------------
+
+#[test]
+fn eloop_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::ELOOP);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "ELOOP should be permanent"
+    );
+}
+
+#[test]
+fn enotdir_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::ENOTDIR);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "ENOTDIR should be permanent"
+    );
+}
+
+#[test]
+fn eisdir_classified_as_permanent() {
+    let err = io::Error::from_raw_os_error(libc::EISDIR);
+    assert!(
+        super::is_permanent_io_error(&err),
+        "EISDIR should be permanent"
+    );
+}
+
+#[test]
+fn transient_error_remains_retryable() {
+    // EAGAIN / EWOULDBLOCK is transient.
+    let err = io::Error::from_raw_os_error(libc::EAGAIN);
+    assert!(
+        !super::is_permanent_io_error(&err),
+        "EAGAIN should be retryable"
+    );
+}
+
+// ---------------------------------------------------------------
+// Deadline-aware indexing tests
+// ---------------------------------------------------------------
+
+#[test]
+fn deadline_expires_during_walk_returns_retryable() {
+    // Create a directory tree with multiple subdirectories.
+    let dir = create_test_dir(&[("a/f1.txt", b"1"), ("b/f2.txt", b"2"), ("c/f3.txt", b"3")]);
+
+    // Use an already-expired deadline.
+    let expired_deadline = Instant::now() - Duration::from_secs(1);
+    let budgets = Budgets::try_new(100, u64::MAX, Some(expired_deadline)).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), budgets);
+    assert!(result.is_err(), "expired deadline should abort indexing");
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline expiry should be retryable"
+    );
+}
+
+#[test]
+fn deadline_expiry_allows_retry_with_fresh_deadline() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+
+    // First call with expired deadline fails.
+    let expired =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
+    assert!(result.is_err());
+
+    // Second call with no deadline succeeds.
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(page.items().len(), 1);
+}
+
+// ---------------------------------------------------------------
+// Root canonicalization tests
+// ---------------------------------------------------------------
+
+/// RAII guard that restores the process working directory on drop,
+/// even if the test panics.
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn set(path: &Path) -> Self {
+        let original = std::env::current_dir().expect("get cwd");
+        std::env::set_current_dir(path).expect("set cwd");
+        Self(original)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
+#[test]
+fn relative_root_is_canonicalized() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Use a relative path through the tempdir's parent.
+    let abs_path = dir.path().to_path_buf();
+    let parent = abs_path.parent().unwrap();
+    let dir_name = abs_path.file_name().unwrap();
+    let relative = PathBuf::from(".").join(dir_name);
+
+    // CwdGuard restores the original cwd even on panic.
+    let _guard = CwdGuard::set(parent);
+
+    let mut c = FilesystemConnector::new(&relative);
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(page.items().len(), 1);
+
+    // After indexing, reads still work even if we change cwd.
+    drop(_guard);
+    let item_ref = page.items()[0].item_ref().clone();
+    let mut reader = c.open(&item_ref, default_budgets()).unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"data");
+}
+
+// ---------------------------------------------------------------
+// openat traversal tests
+// ---------------------------------------------------------------
+
+#[test]
+fn openat_rejects_intermediate_symlink_replacement() {
+    // Create a directory tree: dir/sub/file.txt
+    let dir = create_test_dir(&[("sub/file.txt", b"original")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index the tree.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].item_key().as_bytes(), b"sub/file.txt");
+    let item_ref = items[0].item_ref().clone();
+
+    // Replace the intermediate directory with a symlink.
+    let escape_dir = tempfile::tempdir().expect("create escape dir");
+    fs::write(escape_dir.path().join("file.txt"), b"escaped content").unwrap();
+
+    fs::remove_dir_all(dir.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink(escape_dir.path(), dir.path().join("sub")).unwrap();
+
+    // openat with O_NOFOLLOW on the intermediate "sub" should fail.
+    let result = c.open(&item_ref, default_budgets());
+    assert!(
+        result.is_err(),
+        "openat should reject intermediate symlink (sub -> escape)"
+    );
+}
+
+// ---------------------------------------------------------------
+// File-modification-after-index tests
+// ---------------------------------------------------------------
+
+#[test]
+fn file_deleted_after_indexing_returns_permanent_error() {
+    let dir = create_test_dir(&[("ephemeral.txt", b"will be deleted")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Delete the file after indexing.
+    fs::remove_file(dir.path().join("ephemeral.txt")).unwrap();
+
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("open should succeed for deleted file"),
+    };
+    assert!(
+        !err.is_retryable(),
+        "deleted file should be a permanent error"
+    );
+}
+
+#[test]
+fn file_truncated_after_indexing_reads_shorter() {
+    let dir = create_test_dir(&[("shrink.txt", b"original content here")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Truncate the file after indexing.
+    fs::write(dir.path().join("shrink.txt"), b"").unwrap();
+
+    let mut buf = [0u8; 128];
+    let n = c
+        .read_range(&item_ref, 0, &mut buf, default_budgets())
+        .unwrap();
+    assert_eq!(n, 0, "truncated file should return 0 bytes");
+}
+
+#[test]
+fn permissions_removed_after_indexing_returns_permanent_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = create_test_dir(&[("locked.txt", b"sensitive")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    // Remove read permissions after indexing.
+    fs::set_permissions(
+        dir.path().join("locked.txt"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("open should fail when permissions are removed"),
+    };
+    assert!(
+        !err.is_retryable(),
+        "permission denied should be a permanent error"
+    );
+
+    // Restore permissions for tempdir cleanup.
+    fs::set_permissions(
+        dir.path().join("locked.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+}
+
+// ---------------------------------------------------------------
+// Prefix-sum split consistency test
+// ---------------------------------------------------------------
+
+#[test]
+fn prefix_sum_split_matches_linear_scan() {
+    // Verify that the prefix-sum-based split produces the same result as the
+    // linear-scan in common::choose_split_index for various file configurations.
+    let configs: &[&[(&str, &[u8])]] = &[
+        &[
+            ("a.txt", &[0u8; 100] as &[u8]),
+            ("b.txt", &[0u8; 100]),
+            ("c.txt", &[0u8; 100]),
+            ("d.txt", &[0u8; 100]),
+        ],
+        &[
+            ("a.txt", &[0u8; 900] as &[u8]),
+            ("b.txt", &[0u8; 50]),
+            ("c.txt", &[0u8; 50]),
+        ],
+        &[
+            ("a.txt", &[0u8; 10] as &[u8]),
+            ("b.txt", &[0u8; 10]),
+            ("c.txt", &[0u8; 900]),
+        ],
+    ];
+
+    for (i, config) in configs.iter().enumerate() {
+        let dir = create_test_dir(config);
+        let mut c = FilesystemConnector::new(dir.path());
+        let start = make_key(b"\x00");
+        let end = make_key(b"\xff");
+
+        // Trigger indexing.
+        let _ = collect_all(&mut c, &start, &end);
+
+        // Prefix-sum split.
+        let ps_split = c
+            .choose_split_point_range(&start, &end, &Cursor::initial())
+            .unwrap();
+
+        // Linear-scan split via common::choose_split_index.
+        let linear_idx = common::choose_split_index(&c.files, 0, c.files.len());
+        let linear_split = linear_idx.map(|idx| c.files[idx].key.clone());
+
+        assert_eq!(
+            ps_split, linear_split,
+            "config {i}: prefix-sum split should match linear scan"
+        );
+    }
+}
+
+// ---------------------------------------------------------------
+// Split deadline enforcement test
+// ---------------------------------------------------------------
+
+#[test]
+fn choose_split_point_respects_deadline() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let shard = ShardSpec::try_with_range(b"\x00", b"\xff").unwrap();
+    let expired =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+
+    let result = c.choose_split_point(&shard, &Cursor::initial(), expired);
+    assert!(result.is_err(), "expired deadline should cause an error");
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline error should be retryable"
+    );
+}
+
+// ---------------------------------------------------------------
+// Cross-instance read compatibility
+// ---------------------------------------------------------------
+
+#[test]
+fn compatible_instance_reads_item_ref_from_another_instance() {
+    let dir = create_test_dir(&[("hello.txt", b"hello world")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Instance A: enumerate and grab an ItemRef.
+    let mut a = FilesystemConnector::new(dir.path());
+    let page = a
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    let item_ref = page.items()[0].item_ref().clone();
+
+    // Instance B: fresh connector over the same root, never enumerated.
+    // The ReadConnector contract allows compatible instances to read
+    // ItemRefs from each other.
+    let mut b = FilesystemConnector::new(dir.path());
+    let mut reader = match b.open(&item_ref, default_budgets()) {
+        Ok(r) => r,
+        Err(e) => {
+            panic!("a compatible instance should read ItemRefs from another instance, got: {e:?}")
+        }
+    };
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"hello world");
+}
+
+// ---------------------------------------------------------------
+// Unix socket skip test
+// ---------------------------------------------------------------
+
+#[test]
+fn unix_socket_is_skipped() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    // Bind a Unix domain socket inside the test directory.
+    let _listener = UnixListener::bind(dir.path().join("test.sock")).expect("bind unix socket");
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    // Only the regular file should be indexed; the socket is skipped.
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"file.txt");
+
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("special file")),
+        "expected a special-file warning for the unix socket"
+    );
+}
+
+// ---------------------------------------------------------------
+// Hard link behavior test
+// ---------------------------------------------------------------
+
+#[test]
+fn hard_links_indexed_as_separate_items() {
+    let dir = create_test_dir(&[("original.txt", b"shared content")]);
+    fs::hard_link(dir.path().join("original.txt"), dir.path().join("link.txt"))
+        .expect("create hard link");
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(
+        all.len(),
+        2,
+        "both the original and the hard link should be indexed"
+    );
+
+    let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
+    assert!(keys.contains(&b"link.txt".as_slice()));
+    assert!(keys.contains(&b"original.txt".as_slice()));
+
+    // Hard links share the same inode, so version IDs should match
+    // (same inode/mtime/size/dev).
+    assert_eq!(
+        all[0].version(),
+        all[1].version(),
+        "hard links with identical metadata should have the same version ID"
+    );
+
+    // Both should be independently readable via open().
+    for item in &all {
+        let mut reader = c.open(item.item_ref(), default_budgets()).unwrap();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"shared content");
+    }
+}
+
+// ---------------------------------------------------------------
+// Post-indexing enumerate deadline test
+// ---------------------------------------------------------------
+
+#[test]
+fn expired_deadline_after_successful_indexing_returns_retryable() {
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index successfully first.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1, "indexing should succeed");
+
+    // Now call enumerate with an already-expired deadline. This hits the
+    // deadline check in `enumerate_page_bounds` after `ensure_indexed`
+    // returns immediately from the memoized index.
+    let expired_budgets =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired_budgets);
+
+    assert!(
+        result.is_err(),
+        "expired deadline after indexing should error"
+    );
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline expiry should be a retryable error"
+    );
 }
