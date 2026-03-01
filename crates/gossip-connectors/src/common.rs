@@ -101,6 +101,13 @@ pub(crate) trait SizedEntry {
 /// Mirrors `ByteSlab`'s size-class rule: `0 -> 0`, otherwise
 /// `max(len, 16).next_power_of_two()`.
 /// Returns `None` when the rounded size overflows `usize`.
+///
+/// # Why this matters
+///
+/// Pre-computing the exact allocation size allows us to pre-size slabs
+/// accurately, eliminating mid-loop allocation failures. The rounding
+/// must exactly match `ByteSlab`'s internal size-class logic or we'll
+/// underestimate capacity and fail during staging.
 #[inline]
 fn page_slab_alloc_size(len: usize) -> Option<usize> {
     if len == 0 {
@@ -176,6 +183,13 @@ pub(crate) struct StagedPage {
 /// When `emit_token` is true, encodes `start_idx + item_count` as a
 /// big-endian `u64` and stages it into `page_slab`. Returns `Ok(None)`
 /// when token emission is disabled.
+///
+/// # Token encoding invariant
+///
+/// The token encodes the next item's index (not the last emitted index).
+/// This allows O(1) resume: the connector can jump directly to `token_idx`
+/// without needing to search for `last_key + 1`. The trade-off is that
+/// token validation requires checking `items[token_idx - 1].key == last_key`.
 ///
 /// # Errors
 ///
@@ -511,6 +525,155 @@ mod page_slab_tests {
         // 10 rounds to MIN_BLOCK (16). Total = 16, which is >= MIN_BLOCK.
         let cap = page_slab_capacity([0, 10]).unwrap();
         assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
+    }
+
+    #[test]
+    fn capacity_sum_overflow() {
+        // Two fields that individually round fine but whose rounded sizes
+        // sum to more than usize::MAX.
+        let big = usize::MAX / 2 + 1; // rounds to a power of two
+        let result = page_slab_capacity([big, big]);
+        assert!(
+            result.is_err(),
+            "sum of two large rounded fields should overflow"
+        );
+    }
+
+    #[test]
+    fn capacity_exceeds_u32_max() {
+        // A single field whose rounded size exceeds u32::MAX.
+        // On 64-bit, (u32::MAX as usize) + 1 rounds up and exceeds the u32 cap.
+        let too_big = u32::MAX as usize + 1;
+        let result = page_slab_capacity([too_big]);
+        assert!(result.is_err(), "capacity exceeding u32::MAX should error");
+    }
+
+    #[test]
+    fn capacity_at_u32_max_boundary() {
+        // The largest power-of-two that fits in u32: 2^31 = 2_147_483_648.
+        // Two such fields sum to 2^32 = 4_294_967_296 which exceeds u32::MAX.
+        let half = 1usize << 31;
+        let single = page_slab_capacity([half]);
+        assert!(single.is_ok(), "single 2^31 field should fit in u32");
+
+        let double = page_slab_capacity([half, half]);
+        assert!(
+            double.is_err(),
+            "two 2^31 fields sum to 2^32, exceeding u32::MAX"
+        );
+    }
+
+    #[test]
+    fn capacity_multiple_zero_fields() {
+        // All fields zero → zero capacity (no slab needed).
+        let cap = page_slab_capacity([0, 0, 0]).unwrap();
+        assert_eq!(cap, 0);
+    }
+}
+
+/// Tests for byte-weighted split-point selection.
+///
+/// These tests verify that `choose_split_index` selects correct split points
+/// across edge cases: empty/singleton ranges, zero-size fallback, weight
+/// concentration fallback, and clamping to guarantee non-empty shards on
+/// each side.
+#[cfg(test)]
+mod choose_split_tests {
+    use super::*;
+
+    struct TestEntry {
+        size: u64,
+    }
+
+    impl SizedEntry for TestEntry {
+        fn entry_size(&self) -> u64 {
+            self.size
+        }
+    }
+
+    fn entries(sizes: &[u64]) -> Vec<TestEntry> {
+        sizes.iter().map(|&size| TestEntry { size }).collect()
+    }
+
+    #[test]
+    fn empty_range_returns_none() {
+        let items = entries(&[10, 20]);
+        // range_end == start_idx → zero items.
+        assert_eq!(choose_split_index(&items, 1, 1), None);
+    }
+
+    #[test]
+    fn single_item_returns_none() {
+        let items = entries(&[10, 20, 30]);
+        // range_end - start_idx == 1 → cannot split.
+        assert_eq!(choose_split_index(&items, 1, 2), None);
+    }
+
+    #[test]
+    fn two_items_returns_split() {
+        let items = entries(&[10, 20]);
+        // Minimal splittable range: must return Some.
+        let split = choose_split_index(&items, 0, 2);
+        assert_eq!(split, Some(1));
+    }
+
+    #[test]
+    fn all_zero_sizes_uses_count_midpoint() {
+        let items = entries(&[0, 0, 0, 0]);
+        // total_bytes == 0 → count midpoint at start_idx + len/2 = 0 + 2 = 2.
+        let split = choose_split_index(&items, 0, 4);
+        assert_eq!(split, Some(2));
+    }
+
+    #[test]
+    fn first_item_heavy_falls_back_to_count() {
+        // First item holds >50% weight → cumulative >= half at idx 0 → idx == start_idx.
+        // Triggers count-midpoint fallback.
+        let items = entries(&[100, 1, 1, 1]);
+        let split = choose_split_index(&items, 0, 4).unwrap();
+        // Count midpoint: 0 + (4 - 0) / 2 = 2.
+        assert_eq!(split, 2);
+    }
+
+    #[test]
+    fn byte_weight_splits_at_heavy_item() {
+        // Weight concentrated in the middle: [1, 1, 100, 1].
+        // total = 103, half = 51. cumulative: 1, 2, 102 → crosses at idx 2.
+        let items = entries(&[1, 1, 100, 1]);
+        let split = choose_split_index(&items, 0, 4).unwrap();
+        assert_eq!(split, 2);
+    }
+
+    #[test]
+    fn clamp_prevents_empty_left_shard() {
+        // Two items where all weight is in the second: [0, 100].
+        // total = 100, half = 50. cumulative: 0, 100 → crosses at idx 1.
+        // But with only 2 items, clamped to max(start+1, ...) = 1.
+        let items = entries(&[0, 100]);
+        let split = choose_split_index(&items, 0, 2).unwrap();
+        assert!(split >= 1, "split must leave at least one item on the left");
+    }
+
+    #[test]
+    fn clamp_prevents_empty_right_shard() {
+        // All weight in the last item: [0, 0, 0, 100].
+        // total = 100, half = 50. cumulative crosses at idx 3 (the last).
+        // Clamped to min(split, range_end - 1) = 3.
+        let items = entries(&[0, 0, 0, 100]);
+        let split = choose_split_index(&items, 0, 4).unwrap();
+        assert!(
+            split <= 3,
+            "split must leave at least one item on the right"
+        );
+    }
+
+    #[test]
+    fn nonzero_start_idx_offset() {
+        // Operate on items[2..5] → range of 3 items with sizes [10, 20, 30].
+        let items = entries(&[99, 99, 10, 20, 30]);
+        let split = choose_split_index(&items, 2, 5).unwrap();
+        // Must be in [3, 4] (start_idx+1 .. range_end-1).
+        assert!((3..=4).contains(&split), "split {split} out of [3, 4]");
     }
 }
 

@@ -55,6 +55,14 @@
 //! is silently ignored. Pagination advances monotonically by key regardless of
 //! token state.
 //!
+//! # Trust model
+//!
+//! This advisory-only treatment differs from the in-memory connector's
+//! O(1) token fast path with key-validation fallback, reflecting different
+//! trust models: in-memory items are immutable after construction (tokens
+//! are always consistent), while filesystem state can change between
+//! connector instances.
+//!
 //! # Symlink handling
 //!
 //! Symlinks are **skipped** during the directory walk. [`std::fs::DirEntry::file_type`]
@@ -810,6 +818,16 @@ impl ReadConnector for FilesystemConnector {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` for I/O errors that are deterministically permanent.
+///
+/// # Permanent errors
+///
+/// - `NotFound`: file/directory doesn't exist
+/// - `PermissionDenied`: insufficient access rights
+/// - `InvalidInput`: malformed arguments
+/// - `ELOOP`: symlink loop detected (POSIX-specific)
+///
+/// All other errors (e.g., `EAGAIN`, `EINTR`, network timeouts) are
+/// considered transient and warrant retry.
 fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
