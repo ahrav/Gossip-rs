@@ -238,10 +238,10 @@ graph TD
     subgraph "Tier 1"
         coordination["gossip-coordination"]
         connectors["gossip-connectors"]
+        engine["gossip-engine"]
     end
 
     subgraph "Tier 2"
-        engine["gossip-engine"]
         pipeline["gossip-scan-pipeline"]
     end
 

@@ -516,8 +516,8 @@ heuristic-classified `ParkReason`. Lease renewal uses
 ### Compilation tier
 
 B4 (`gossip-connectors`) sits in **Tier 1** of the build DAG, compiling
-in parallel with B2 (`gossip-coordination`) and B3 (`gossip-frontier`)
-after Tier 0 (`gossip-contracts`, `gossip-stdx`).
+in parallel with B2 (`gossip-coordination`) after Tier 0 (`gossip-stdx`,
+`gossip-contracts`, `gossip-frontier`).
 
 ---
 
