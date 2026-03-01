@@ -18,10 +18,11 @@
 //! 4. Findings exceeding [`ScannerCoreConfig::max_findings_per_page`] are
 //!    truncated with a [`ScanDiagnostic::FindingsTruncated`] diagnostic.
 //!
-//! # Phase 1A scope
+//! # Phase 1 scope
 //!
-//! The current surface intentionally ships a small typed contract used for
-//! parity scaffolding — no actual detection rules execute yet.
+//! The current surface intentionally keeps detector-specific logic out of
+//! `gossip-engine` while we lock down deterministic shared-core behavior:
+//! page signatures, finding fingerprints, dedupe, and diagnostics.
 //!
 //! | Concern         | Types |
 //! |-----------------|-------|
@@ -30,6 +31,7 @@
 //! | Inputs          | [`PageScanContext`], [`PageScanRequest`] |
 //! | Outputs         | [`PageScanOutput`], [`StreamScanOutput`], [`ScanFinding`], [`ScanStats`], [`ScanDedupeCounters`], [`ScanDiagnostic`] |
 //! | Errors          | [`ScannerCoreBuildError`], [`ScannerCoreError`] |
+//! | Parity helpers  | [`canonicalize_stream_output`], [`throughput_delta_pct`], [`median`], [`enforce_throughput_thresholds`] |
 //!
 //! # Design constraints
 //!
@@ -44,10 +46,18 @@
 
 mod core;
 mod error;
+mod parity;
+#[cfg(test)]
+mod test_support;
 mod types;
 
 pub use core::{ScannerCore, ScannerCoreBuilder, ScannerCoreConfig};
 pub use error::{ScannerCoreBuildError, ScannerCoreError};
+pub use parity::{
+    CanonicalFinding, CanonicalPageSummary, CanonicalRun, CanonicalVersionStrength,
+    ThroughputError, canonicalize_stream_output, enforce_throughput_thresholds, median,
+    throughput_delta_pct,
+};
 pub use types::{
     PageScanContext, PageScanOutput, PageScanRequest, PageScanSummary, ScanDedupState,
     ScanDedupeCounters, ScanDiagnostic, ScanFinding, ScanStats, StreamScanOutput,

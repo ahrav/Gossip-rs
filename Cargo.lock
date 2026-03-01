@@ -424,6 +424,8 @@ dependencies = [
  "gossip-stdx",
  "proptest",
  "rstest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
