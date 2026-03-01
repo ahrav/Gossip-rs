@@ -491,15 +491,19 @@ impl FilesystemConnector {
                 .flat_map(|file| [file.key.len(), file.key.len()])
                 .chain(self.emit_tokens.then_some(std::mem::size_of::<u64>())),
         )?;
-        let mut page_slab = ByteSlab::with_capacity(slab_capacity);
+        let mut page_slab = PooledByteSlab::new(ByteSlab::with_capacity(slab_capacity));
         let mut staged: Vec<(ByteSlot, ByteSlot, StableItemId, VersionId, u64)> =
             Vec::with_capacity(take);
-        for file in page_files {
+        for (item_idx, file) in page_files.iter().enumerate() {
             let key_slot = page_slab.allocate(file.key.as_bytes()).map_err(|err| {
-                EnumerateError::permanent(format!("failed to stage item key in page slab: {err}"))
+                EnumerateError::permanent(format!(
+                    "failed to stage item key in page slab (item {item_idx}/{take}): {err}"
+                ))
             })?;
             let item_ref_slot = page_slab.allocate(file.key.as_bytes()).map_err(|err| {
-                EnumerateError::permanent(format!("failed to stage item_ref in page slab: {err}"))
+                EnumerateError::permanent(format!(
+                    "failed to stage item_ref in page slab (item {item_idx}/{take}): {err}"
+                ))
             })?;
             staged.push((
                 key_slot,
@@ -525,7 +529,7 @@ impl FilesystemConnector {
 
         // Cursor and items share this Arc-backed slab; whichever value survives
         // by-value keeps pooled key/ref/token bytes alive.
-        let page_slab = Arc::new(PooledByteSlab::new(page_slab));
+        let page_slab = Arc::new(page_slab);
         let mut out = Vec::with_capacity(staged.len());
         for (key_slot, item_ref_slot, stable_item_id, version, size) in staged {
             let item_key =
@@ -541,13 +545,11 @@ impl FilesystemConnector {
             );
         }
 
-        // Defensive: handle empty `out` even though `take >= 1` is guaranteed
-        // by `Budgets::max_items()` returning `NonZeroUsize` and the
-        // `start_idx < range_end` guard above.
-        let last_key = match out.last() {
-            Some(item) => item.item_key().clone(),
-            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
-        };
+        let last_key = out
+            .last()
+            .expect("non-empty page must have a last key")
+            .item_key()
+            .clone();
         let next_cursor = if let Some(token_slot) = token_slot {
             let token = TokenBytes::try_from_slot(token_slot, Arc::clone(&page_slab))
                 .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?;
@@ -817,6 +819,9 @@ impl EnumerationConnector for FilesystemConnector {
 // ---------------------------------------------------------------------------
 
 impl ReadConnector for FilesystemConnector {
+    /// Budget enforcement is left to the runtime layer (which wraps the
+    /// returned reader in a bounded adapter), consistent with the advisory
+    /// budget contract in [`ReadConnector`].
     fn open(
         &mut self,
         item_ref: &ItemRef,

@@ -255,6 +255,46 @@ fn pooled_constructor_rejects_empty_and_oversized_slots() {
 }
 
 #[test]
+fn owned_and_pooled_satisfy_trait_consistency() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut slab = ByteSlab::with_capacity(128);
+    let key_slot = slab.allocate(b"shared-key").expect("allocate key");
+    let ref_slot = slab.allocate(b"shared-ref").expect("allocate ref");
+    let token_slot = slab.allocate(b"shared-token").expect("allocate token");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    let owned_key = ItemKey::try_from_slice(b"shared-key").unwrap();
+    let pooled_key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).unwrap();
+
+    let owned_ref = ItemRef::try_from_slice(b"shared-ref").unwrap();
+    let pooled_ref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).unwrap();
+
+    let owned_token = TokenBytes::try_from_slice(b"shared-token").unwrap();
+    let pooled_token = TokenBytes::try_from_slot(token_slot, Arc::clone(&shared)).unwrap();
+
+    // PartialEq: Owned == Pooled for identical bytes.
+    assert_eq!(owned_key, pooled_key);
+    assert_eq!(owned_ref, pooled_ref);
+    assert_eq!(owned_token, pooled_token);
+
+    // Hash: both variants produce the same hash.
+    fn hash_of(val: &impl Hash) -> u64 {
+        let mut h = DefaultHasher::new();
+        val.hash(&mut h);
+        h.finish()
+    }
+    assert_eq!(hash_of(&owned_key), hash_of(&pooled_key));
+    assert_eq!(hash_of(&owned_ref), hash_of(&pooled_ref));
+    assert_eq!(hash_of(&owned_token), hash_of(&pooled_token));
+
+    // Ord (ItemKey only — ItemRef/TokenBytes are unordered).
+    assert_eq!(owned_key.cmp(&pooled_key), std::cmp::Ordering::Equal);
+    assert_eq!(pooled_key.cmp(&owned_key), std::cmp::Ordering::Equal);
+}
+
+#[test]
 fn item_key_lexicographic_ordering() {
     let a = ItemKey::try_from_vec(vec![0x00]).unwrap();
     let b = ItemKey::try_from_vec(vec![0x00, 0x01]).unwrap();

@@ -263,7 +263,7 @@ mod page_slab_tests {
 
     #[test]
     fn capacity_empty_iterator_returns_min_block() {
-        let cap = page_slab_capacity(std::iter::empty()).unwrap();
+        let cap = page_slab_capacity(std::iter::empty::<usize>()).unwrap();
         assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
     }
 }
