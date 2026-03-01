@@ -67,3 +67,4 @@ issue-prefix: "gossip"
 # - github.repo
 
 no-git-ops: true
+no-db: true
