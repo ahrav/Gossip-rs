@@ -37,8 +37,8 @@ use gossip_engine::{
     ScannerCoreError,
 };
 use gossip_scan_pipeline::{
-    run_scan_loop_with_page_processor, PageProcessingContext, PageProcessingError, ScanLoopError,
-    ScanLoopOutcome, DEFAULT_MAX_TRANSIENT_RETRIES,
+    DEFAULT_MAX_TRANSIENT_RETRIES, PageProcessingContext, PageProcessingError, ScanLoopError,
+    ScanLoopOutcome, run_scan_loop_with_page_processor,
 };
 use tracing_subscriber::EnvFilter;
 

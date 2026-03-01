@@ -26,17 +26,21 @@
 //! - **Direct** — the runtime reads source metadata itself (filesystem
 //!   `stat`, `git ls-files`) and synthesises [`ScanItem`]s in-process.
 //! - **Connector** — the runtime delegates enumeration to a connector that
-//!   implements [`EnumerationConnector`]. Currently gated; selecting it
-//!   returns [`ScanRuntimeError::UnsupportedExecutionMode`].
+//!   implements [`EnumerationConnector`]. Filesystem connector mode runs
+//!   through the same scan-loop/page-hook seam used by worker execution.
+//!   Git connector mode remains gated until Phase 4B.
 //!
 //! # Pagination model
 //!
 //! Sources may contain millions of items. The runtime pages through them
 //! with bounded memory using [`ScanBudgets`]:
 //!
-//! - **Connector path** — `scan_from_connector_pages` calls
+//! - **Direct directory path** — `scan_from_connector_pages` calls
 //!   `enumerate_page` in a cursor-advancing loop until an empty page
 //!   signals completion.
+//! - **Connector mode path (filesystem)** — uses
+//!   `run_scan_loop_with_page_processor` for worker-parity cursor progression
+//!   and page processing.
 //! - **Materialized path** — `scan_materialized_items_pages` chunks a
 //!   pre-collected `&[ScanItem]` into fixed-size slices, synthesising
 //!   cursors from each chunk's last key.
@@ -73,8 +77,17 @@ use gossip_contracts::{
     coordination::ShardSpec,
     identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId},
 };
+use gossip_coordination::{
+    AcquireError, CreateRunError, CursorSemantics, CursorUpdate, InMemoryCoordinator,
+    InitialShardInput, LogicalTime, OpId, RegisterShardsError, RunConfig, RunConfigError, RunId,
+    RunManagement, ShardId, ShardKey, TenantId, WorkerId, WorkerSession,
+};
 use gossip_engine::{
     PageScanContext, PageScanOutput, PageScanRequest, ScanDedupState, ScannerCore, ScannerCoreError,
+};
+use gossip_scan_pipeline::{
+    DEFAULT_MAX_TRANSIENT_RETRIES, LeaseLossCause, PageProcessingContext, PageProcessingError,
+    ScanLoopError, ScanLoopOutcome, run_scan_loop_with_page_processor,
 };
 
 /// Connector identity tag for local-filesystem sources.
@@ -92,14 +105,13 @@ const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// The runtime reads the source directly (filesystem `stat` / `git ls-files`)
-    /// and constructs [`ScanItem`]s in-process. This is the only mode
-    /// currently enabled.
+    /// and constructs [`ScanItem`]s in-process.
     #[default]
     Direct,
     /// The runtime delegates enumeration to an [`EnumerationConnector`].
-    /// Selecting this mode currently returns
-    /// [`ScanRuntimeError::UnsupportedExecutionMode`]; it will be enabled
-    /// once the full connector pipeline is wired.
+    ///
+    /// Filesystem sources are enabled in this mode. Git sources still return
+    /// [`ScanRuntimeError::UnsupportedExecutionMode`] until Phase 4B.
     Connector,
 }
 
@@ -310,6 +322,26 @@ pub enum ScanRuntimeError {
     Enumerate(EnumerateError),
     /// Scanner-core page processing failure.
     Scanner(ScannerCoreError),
+    /// Invalid run configuration for connector-mode scan-loop setup.
+    RunConfig(RunConfigError),
+    /// Creating ephemeral scan-loop run state failed.
+    CreateRun(CreateRunError),
+    /// Registering the single connector-mode shard failed.
+    RegisterShards(RegisterShardsError),
+    /// Acquiring a worker session for connector-mode execution failed.
+    Acquire(AcquireError),
+    /// Connector-mode scan loop terminated with a non-terminal error.
+    ScanLoop(Box<ScanLoopError>),
+    /// Connector-mode scan loop parked the shard instead of completing.
+    ScanLoopParked {
+        reason: gossip_coordination::ParkReason,
+        retry_after_ms: Option<u64>,
+    },
+    /// Connector-mode scan loop lost lease before terminal completion.
+    ScanLoopLeaseLost {
+        pages_completed: u64,
+        cause: LeaseLossCause,
+    },
     /// Local I/O failure.
     Io {
         op: &'static str,
@@ -342,6 +374,32 @@ impl fmt::Display for ScanRuntimeError {
             Self::ConnectorInput(error) => write!(f, "connector input error: {error}"),
             Self::Enumerate(error) => write!(f, "enumeration error: {error}"),
             Self::Scanner(error) => write!(f, "scanner core error: {error}"),
+            Self::RunConfig(error) => write!(f, "connector-mode run config failed: {error}"),
+            Self::CreateRun(error) => write!(f, "connector-mode run creation failed: {error}"),
+            Self::RegisterShards(error) => {
+                write!(f, "connector-mode shard registration failed: {error}")
+            }
+            Self::Acquire(error) => write!(f, "connector-mode session acquire failed: {error}"),
+            Self::ScanLoop(error) => {
+                write!(f, "connector-mode scan loop failed: {}", error.as_ref())
+            }
+            Self::ScanLoopParked {
+                reason,
+                retry_after_ms,
+            } => {
+                write!(f, "connector-mode scan loop parked shard ({reason}")?;
+                if let Some(retry_after_ms) = retry_after_ms {
+                    write!(f, ", retry_after_ms={retry_after_ms}")?;
+                }
+                write!(f, ")")
+            }
+            Self::ScanLoopLeaseLost {
+                pages_completed,
+                cause,
+            } => write!(
+                f,
+                "connector-mode scan loop lost lease after {pages_completed} completed pages: {cause}"
+            ),
             Self::Io { op, path, error } => {
                 if let Some(path) = path {
                     write!(f, "{op} failed for '{}': {error}", path.display())
@@ -375,10 +433,17 @@ impl std::error::Error for ScanRuntimeError {
             Self::ConnectorInput(error) => Some(error),
             Self::Enumerate(error) => Some(error),
             Self::Scanner(error) => Some(error),
+            Self::RunConfig(error) => Some(error),
+            Self::CreateRun(error) => Some(error),
+            Self::RegisterShards(error) => Some(error),
+            Self::Acquire(error) => Some(error),
+            Self::ScanLoop(error) => Some(error.as_ref()),
             Self::Io { error, .. } => Some(error),
             Self::UnsupportedExecutionMode { .. }
             | Self::InvalidPath { .. }
             | Self::GitCommandFailed { .. }
+            | Self::ScanLoopParked { .. }
+            | Self::ScanLoopLeaseLost { .. }
             | Self::CursorStalled { .. } => None,
         }
     }
@@ -399,6 +464,36 @@ impl From<EnumerateError> for ScanRuntimeError {
 impl From<ScannerCoreError> for ScanRuntimeError {
     fn from(value: ScannerCoreError) -> Self {
         Self::Scanner(value)
+    }
+}
+
+impl From<RunConfigError> for ScanRuntimeError {
+    fn from(value: RunConfigError) -> Self {
+        Self::RunConfig(value)
+    }
+}
+
+impl From<CreateRunError> for ScanRuntimeError {
+    fn from(value: CreateRunError) -> Self {
+        Self::CreateRun(value)
+    }
+}
+
+impl From<RegisterShardsError> for ScanRuntimeError {
+    fn from(value: RegisterShardsError) -> Self {
+        Self::RegisterShards(value)
+    }
+}
+
+impl From<AcquireError> for ScanRuntimeError {
+    fn from(value: AcquireError) -> Self {
+        Self::Acquire(value)
+    }
+}
+
+impl From<ScanLoopError> for ScanRuntimeError {
+    fn from(value: ScanLoopError) -> Self {
+        Self::ScanLoop(Box::new(value))
     }
 }
 
@@ -498,13 +593,28 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntim
     scan_materialized_items_pages(&items, &scanner, &shard, config.budgets.max_items)
 }
 
-/// Connector-mode filesystem entrypoint stub (explicitly gated until later phases).
+/// Connector-mode filesystem scan.
+///
+/// Directory scans use the same connector scan-loop + page-processor seam as
+/// worker execution (`run_scan_loop_with_page_processor`).
+///
+/// Single-file scans keep the direct-mode single-item path because
+/// [`FilesystemConnector`] is directory-rooted by design.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
-    let _ = config;
-    Err(ScanRuntimeError::UnsupportedExecutionMode {
-        source: "filesystem",
-        mode: ExecutionMode::Connector,
-    })
+    validate_fs_path(&config.path)?;
+
+    let scanner = ScannerCore::default();
+
+    if config.path.is_dir() {
+        let shard = connector_mode_shard_spec();
+        let budgets = config.budgets.to_contract_budgets()?;
+        let mut connector = FilesystemConnector::new(&config.path);
+        scan_from_connector_pages_with_pipeline(&mut connector, &scanner, &shard, budgets)
+    } else {
+        let shard = ShardSpec::with_range([], []);
+        let single_item = build_local_file_scan_item(&config.path, FILESYSTEM_CONNECTOR_TAG)?;
+        scan_materialized_items_pages(&[single_item], &scanner, &shard, config.budgets.max_items)
+    }
 }
 
 /// Connector-mode git entrypoint stub (explicitly gated until later phases).
@@ -514,6 +624,150 @@ pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanOutcome, ScanRun
         source: "git",
         mode: ExecutionMode::Connector,
     })
+}
+
+const CONNECTOR_MODE_LEASE_DURATION_TICKS: u64 = 60_000;
+const CONNECTOR_MODE_TENANT: TenantId = TenantId::from_bytes([0x52; 32]);
+const CONNECTOR_MODE_RUN: RunId = RunId::from_raw(1);
+const CONNECTOR_MODE_SHARD: ShardId = ShardId::from_raw(1);
+const CONNECTOR_MODE_WORKER: WorkerId = WorkerId::from_raw(1);
+
+/// Build a bounded shard range for standalone connector-mode scans.
+///
+/// Coordination manifest validation rejects unbounded shard ranges, so we use
+/// `[0x00, 0xff..ff)` as a practical "full keyspace" envelope for local scans.
+fn connector_mode_shard_spec() -> ShardSpec {
+    ShardSpec::with_range([0], vec![0xff; gossip_coordination::MAX_KEY_SIZE])
+}
+
+/// Seed one in-memory run/shard and acquire a session for scan-loop execution.
+///
+/// This preserves worker-level loop semantics (checkpoint/complete transitions)
+/// for standalone runtime execution without requiring external coordination
+/// infrastructure.
+fn create_runtime_worker_session<'a>(
+    coordinator: &'a mut InMemoryCoordinator,
+    shard: &ShardSpec,
+) -> Result<WorkerSession<'a, InMemoryCoordinator>, ScanRuntimeError> {
+    let run_config = RunConfig::try_new(
+        CursorSemantics::Completed,
+        CONNECTOR_MODE_LEASE_DURATION_TICKS,
+        None,
+    )?;
+    coordinator.create_run(
+        LogicalTime::from_raw(1),
+        CONNECTOR_MODE_TENANT,
+        CONNECTOR_MODE_RUN,
+        run_config,
+    )?;
+
+    let shard_inputs = [InitialShardInput::new(
+        CONNECTOR_MODE_SHARD,
+        shard.as_ref(),
+        CursorUpdate::initial(),
+    )];
+    let _ = coordinator.register_shards(
+        LogicalTime::from_raw(2),
+        CONNECTOR_MODE_TENANT,
+        CONNECTOR_MODE_RUN,
+        &shard_inputs,
+        OpId::from_raw(1),
+    )?;
+
+    WorkerSession::new(
+        coordinator,
+        LogicalTime::from_raw(3),
+        CONNECTOR_MODE_TENANT,
+        ShardKey::new(CONNECTOR_MODE_RUN, CONNECTOR_MODE_SHARD),
+        CONNECTOR_MODE_WORKER,
+    )
+    .map_err(ScanRuntimeError::from)
+}
+
+/// Run a connector through the worker-style scan loop with scanner-core page processing.
+fn scan_from_connector_pages_with_pipeline<C>(
+    connector: &mut C,
+    scanner: &ScannerCore,
+    shard: &ShardSpec,
+    budgets: Budgets,
+) -> Result<ScanOutcome, ScanRuntimeError>
+where
+    C: EnumerationConnector,
+{
+    let mut coordinator = InMemoryCoordinator::new(CONNECTOR_MODE_LEASE_DURATION_TICKS);
+    let session = create_runtime_worker_session(&mut coordinator, shard)?;
+
+    let mut next_op_raw = 2u64;
+    let mut next_now_raw = 4u64;
+    let mut dedupe = ScanDedupState::default();
+    let mut outcome = ScanOutcome::default();
+
+    let scan_loop_outcome = run_scan_loop_with_page_processor(
+        session,
+        connector,
+        budgets,
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        || {
+            let out = OpId::from_raw(next_op_raw);
+            next_op_raw = next_op_raw.saturating_add(1);
+            out
+        },
+        || {
+            let out = LogicalTime::from_raw(next_now_raw);
+            next_now_raw = next_now_raw.saturating_add(1);
+            out
+        },
+        |context| process_page_with_engine(scanner, &mut dedupe, &mut outcome, context),
+    );
+
+    match scan_loop_outcome {
+        ScanLoopOutcome::Completed => Ok(outcome),
+        ScanLoopOutcome::Parked {
+            reason,
+            retry_after_ms,
+        } => Err(ScanRuntimeError::ScanLoopParked {
+            reason,
+            retry_after_ms,
+        }),
+        ScanLoopOutcome::LeaseLost {
+            pages_completed,
+            cause,
+        } => Err(ScanRuntimeError::ScanLoopLeaseLost {
+            pages_completed,
+            cause,
+        }),
+        ScanLoopOutcome::Error(error) => Err(ScanRuntimeError::ScanLoop(Box::new(error))),
+    }
+}
+
+/// Worker-compatible page-processing adapter: map page context to scanner request.
+fn process_page_with_engine(
+    scanner: &ScannerCore,
+    dedupe: &mut ScanDedupState,
+    outcome: &mut ScanOutcome,
+    context: PageProcessingContext<'_>,
+) -> Result<(), PageProcessingError> {
+    let request = PageScanRequest::metadata_only(
+        PageScanContext::new(
+            context.spec().key_range_start(),
+            context.spec().key_range_end(),
+            context.cursor(),
+            context.next_cursor(),
+            context.page_num(),
+        ),
+        context.items(),
+    );
+
+    let output = scanner
+        .scan_page_with_dedupe(request, dedupe)
+        .map_err(|error| {
+            PageProcessingError::new(format!(
+                "scanner core failed on page {}: {error}",
+                context.page_num()
+            ))
+        })?;
+    outcome.record_page(&output);
+    Ok(())
 }
 
 fn validate_fs_path(path: &Path) -> Result<(), ScanRuntimeError> {
@@ -862,21 +1116,50 @@ mod tests {
         ));
     }
 
-    // ── Connector-mode gating ──────────────────────────────────────
+    // ── Connector-mode filesystem path ─────────────────────────────
 
     #[test]
-    fn scan_fs_connector_is_explicitly_gated() {
+    fn scan_fs_connector_scans_directory() {
         let dir = tempdir().expect("tempdir");
-        let error =
-            scan_fs(&FsScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
-                .expect_err("connector mode should be gated");
-        assert!(matches!(
-            error,
-            ScanRuntimeError::UnsupportedExecutionMode {
-                source: "filesystem",
-                mode: ExecutionMode::Connector,
-            }
-        ));
+        fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
+        fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+
+        let outcome = scan_fs_connector(&FsScanConfig::new(dir.path())).expect("connector scan");
+        assert!(outcome.pages_scanned >= 1);
+        assert!(outcome.items_scanned >= 2);
+        assert!(outcome.findings_emitted >= 2);
+    }
+
+    #[test]
+    fn scan_fs_connector_scans_single_file() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("secret.txt");
+        fs::write(&file_path, "password=hunter2").expect("write");
+
+        let outcome = scan_fs_connector(&FsScanConfig::new(&file_path)).expect("single file scan");
+        assert_eq!(outcome.pages_scanned, 1);
+        assert_eq!(outcome.items_scanned, 1);
+    }
+
+    #[test]
+    fn scan_fs_direct_and_connector_match_for_directory() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
+        fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+
+        let budgets = ScanBudgets {
+            max_items: 1,
+            max_bytes: 1_000_000,
+        };
+        let direct =
+            scan_fs(&FsScanConfig::new(dir.path()).with_budgets(budgets)).expect("direct outcome");
+        let connector = scan_fs(
+            &FsScanConfig::new(dir.path())
+                .with_budgets(budgets)
+                .with_execution_mode(ExecutionMode::Connector),
+        )
+        .expect("connector outcome");
+        assert_eq!(direct, connector);
     }
 
     #[test]

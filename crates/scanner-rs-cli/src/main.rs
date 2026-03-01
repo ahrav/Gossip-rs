@@ -436,6 +436,7 @@ fn git_usage(exe_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -592,5 +593,19 @@ mod tests {
             msg.contains(expected_substring),
             "error '{msg}' should contain '{expected_substring}'"
         );
+    }
+
+    #[test]
+    fn execute_scan_fs_connector_mode_succeeds() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("secret.txt"), "password=hunter2").expect("write");
+        let command = ScanCommand {
+            source: ScanSource::Fs {
+                path: dir.path().to_path_buf(),
+            },
+            execution_mode: ExecutionMode::Connector,
+        };
+
+        execute_scan(command).expect("connector execution should succeed");
     }
 }
