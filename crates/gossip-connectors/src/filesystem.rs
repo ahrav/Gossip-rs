@@ -1148,6 +1148,12 @@ fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
 // Low-level fd helpers
 // ---------------------------------------------------------------------------
 
+/// Open a directory file descriptor for use with `openat`.
+///
+/// Uses `O_RDONLY | O_DIRECTORY | O_CLOEXEC` flags to ensure we get a
+/// directory handle that won't leak to child processes. The `O_DIRECTORY`
+/// flag causes `open` to fail if the path isn't a directory, preventing
+/// TOCTOU races where a directory is replaced with a symlink.
 fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let c_path = path_to_cstring(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "null byte in path"))?;
