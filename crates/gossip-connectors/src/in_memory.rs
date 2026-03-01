@@ -74,7 +74,7 @@
 //! - The connector is cheaply [`Clone`]able; internal data is shared via
 //!   [`Arc`].
 
-use std::{io, sync::Arc, time::Instant};
+use std::{io, sync::Arc};
 
 use gossip_contracts::{
     connector::{
@@ -85,9 +85,7 @@ use gossip_contracts::{
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
-use crate::common::{
-    self, borrowed_shard_bound, derive_stable_item_id, lower_bound, parse_u64_be, upper_bound,
-};
+use crate::common::{self, borrowed_shard_bound, derive_stable_item_id, parse_u64_be};
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
 #[derive(Clone, Debug)]
@@ -315,6 +313,8 @@ impl InMemoryDeterministicConnector {
     /// 2. **Range validation** -- Reject `start > end` as a permanent error.
     /// 3. **Range resolution** -- Map keys to indices via binary search.
     /// 4. **Cursor advancement** -- Resume from `last_key` position.
+    ///    The shared helper establishes this as the canonical floor; token
+    ///    handling below may advance further but never behind key-derived state.
     ///    When tokens are enabled, the token is used as an O(1) fast path:
     ///    validated by checking `items[token_idx - 1].key == last_key`. On
     ///    mismatch, falls back to O(log n) `upper_bound` binary search.
@@ -327,70 +327,52 @@ impl InMemoryDeterministicConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        // Phase 1: budget gate.
-        if budgets.is_expired_at(Instant::now()) {
-            return Err(EnumerateError::retryable("budget deadline expired"));
-        }
-
-        // Phase 2: range validation.
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
-        {
-            return Err(EnumerateError::permanent("shard start key exceeds end key"));
-        }
-
-        // Phase 3: resolve key bounds to vector indices.
-        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound));
-        let range_end = end.map_or(self.items.len(), |bound| lower_bound(&self.items, bound));
+        // Shared preamble keeps range math identical across connectors; the
+        // in-memory fast path below only refines `start_idx` when token state
+        // proves consistent with `last_key`.
+        let resolved = common::resolve_page_range(&self.items, start, end, cursor, budgets)?;
+        let mut start_idx = resolved.start_idx;
+        let token_idx = self
+            .emit_tokens
+            .then(|| common::cursor_token_index(cursor))
+            .flatten();
 
         // Phase 4: advance past the cursor's last-emitted key.
-        let mut start_idx = range_start;
         if let Some(last_key) = cursor.last_key() {
-            let resume_idx = 'resolve: {
-                // O(1) fast path: when tokens are enabled and the cursor carries
-                // a well-formed token, use the token index directly after
-                // validating that items[token_idx - 1].key matches last_key.
-                // This check runs in all build profiles.
-                if self.emit_tokens
-                    && let Some(idx) = cursor
-                        .token()
-                        .and_then(|t| parse_u64_be(t.as_bytes()))
-                        .and_then(|v| usize::try_from(v).ok())
-                    && idx > 0
-                    && idx <= self.items.len()
-                    && self.items[idx - 1].key == *last_key
-                {
-                    break 'resolve idx;
-                }
-                // Fallback: O(log n) binary search.
-                let key_idx = upper_bound(&self.items, last_key.as_bytes());
-                #[cfg(debug_assertions)]
-                if self.emit_tokens
-                    && let Some(token) = cursor.token()
-                    && let Some(token_idx_u64) = parse_u64_be(token.as_bytes())
-                    && let Ok(token_idx) = usize::try_from(token_idx_u64)
-                    && token_idx > 0
-                    && token_idx <= self.items.len()
-                {
-                    debug_assert_eq!(
-                        token_idx, key_idx,
-                        "token index {token_idx} disagrees with \
-                         key-derived resume position {key_idx}"
-                    );
-                }
-                key_idx
-            };
-            start_idx = start_idx.max(resume_idx);
+            // O(1) fast path: when tokens are enabled and the cursor carries a
+            // well-formed token, use the token index directly after validating
+            // that items[token_idx - 1].key matches last_key.
+            if let Some(token_idx) = token_idx
+                && token_idx > 0
+                && token_idx <= self.items.len()
+                && self.items[token_idx - 1].key == *last_key
+            {
+                start_idx = start_idx.max(token_idx);
+            }
+
+            // Fallback remains key-authoritative (`resolved.key_resume_idx`).
+            #[cfg(debug_assertions)]
+            if let Some(token_idx) = token_idx
+                && token_idx > 0
+                && token_idx <= self.items.len()
+            {
+                debug_assert_eq!(
+                    token_idx, resolved.key_resume_idx,
+                    "token index {token_idx} disagrees with \
+                     key-derived resume position {}",
+                    resolved.key_resume_idx
+                );
+            }
         }
 
-        if start_idx >= range_end {
+        if start_idx >= resolved.range_end {
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
         }
 
         // Phase 5: extract up to max_items consecutive items from precomputed
         // metadata via the shared staging helper. Trade-off: one per-page copy
         // up front for allocation-free wrapper cloning afterward.
-        let take = budgets.max_items().min(range_end - start_idx);
+        let take = budgets.max_items().min(resolved.range_end - start_idx);
         let page_items = &self.items[start_idx..start_idx + take];
 
         let staged = common::assemble_pooled_page(
@@ -401,8 +383,9 @@ impl InMemoryDeterministicConnector {
             start_idx,
         )?;
 
-        let mut out = Vec::with_capacity(staged.wrappers.len());
-        for ((item_key, item_ref), item) in staged.wrappers.into_iter().zip(page_items) {
+        let common::StagedPage { wrappers, token } = staged;
+        let mut out = Vec::with_capacity(wrappers.len());
+        for ((item_key, item_ref), item) in wrappers.into_iter().zip(page_items) {
             out.push(
                 ScanItem::new(
                     item_key,
@@ -421,11 +404,13 @@ impl InMemoryDeterministicConnector {
             Some(item) => item.item_key().clone(),
             None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
         };
-        let next_cursor = if let Some(token) = staged.token {
-            Cursor::with_token(last_key, token)
-        } else {
-            Cursor::with_last_key(last_key)
-        };
+        let next_cursor = common::build_next_cursor_from_staged(
+            last_key,
+            start_idx,
+            out.len(),
+            self.emit_tokens,
+            token,
+        )?;
 
         Ok(EnumerationPage::new(out, next_cursor))
     }
@@ -442,30 +427,23 @@ impl InMemoryDeterministicConnector {
     /// Returns `None` when fewer than two keys remain, when the candidate
     /// would not advance past the cursor, or when it falls at or beyond the
     /// upper shard bound (which would produce an empty right shard).
+    ///
+    /// Bound/cursor preamble logic is shared with filesystem via
+    /// [`common::resolve_split_range`], so both connectors enforce the same
+    /// split-eligibility window before applying connector-local heuristics.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        // Range validation.
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
-        {
-            return Err(EnumerateError::permanent("shard start key exceeds end key"));
-        }
-
-        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound));
-        let range_end = end.map_or(self.items.len(), |bound| lower_bound(&self.items, bound));
-        let resume_start = cursor.last_key().map_or(range_start, |last| {
-            upper_bound(&self.items, last.as_bytes())
-        });
-
-        let start_idx = range_start.max(resume_start);
-        let split_idx = match common::choose_split_index(&self.items, start_idx, range_end) {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+        let split_ctx = common::resolve_split_range(&self.items, start, end, cursor)?;
+        let split_idx =
+            match common::choose_split_index(&self.items, split_ctx.start_idx, split_ctx.range_end)
+            {
+                Some(idx) => idx,
+                None => return Ok(None),
+            };
 
         let candidate = self.items[split_idx].key.clone();
 
