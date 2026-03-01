@@ -40,12 +40,17 @@ doc = "docs/boundary-3-shard-algebra.md"
 dir = "crates/gossip-frontier/src/"
 
 [[scopes]]
-doc = "docs/boundary-3-shard-algebra.md"
+doc = "specs/coordination/README.md"
+dir = "specs/coordination/"
+
+# Boundary 4: Connectors (value types, traits, page validation, conformance).
+[[scopes]]
+doc = "docs/boundary-4-connectors.md"
 dir = "crates/gossip-contracts/src/connector/"
 
 [[scopes]]
-doc = "specs/coordination/README.md"
-dir = "specs/coordination/"
+doc = "docs/boundary-4-connectors.md"
+dir = "crates/gossip-connectors/src/"
 
 # Boundary 5: Persistence (done-ledger, findings sink, commit protocol).
 [[scopes]]

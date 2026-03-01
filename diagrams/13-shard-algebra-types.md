@@ -383,8 +383,9 @@ Source: `crates/gossip-frontier/src/builder.rs:1-60,183-776`
 ## 6. Connector Enumeration Lifecycle
 
 Connectors (B4) use `ShardSpec` range bounds from B3 to enumerate items within a
-shard's key range. The `EnumerationConnector` trait defines the contract: initial page
-via binary search, resume page from cursor, and optional split point selection.
+shard's key range. The `EnumerationConnector` trait defines the contract: a single
+`enumerate_page` method for both initial and resume requests (distinguished by cursor
+state), and optional split point selection.
 
 ```mermaid
 %% Diagram: connector-enumeration-lifecycle
@@ -393,18 +394,18 @@ sequenceDiagram
     participant C as Connector (B4)
     participant IDX as Sorted Index
 
-    Note over W,IDX: Initial page
+    Note over W,IDX: Initial page (Cursor::initial())
 
-    W->>C: enumerate(shard_spec)
+    W->>C: enumerate_page(shard, Cursor::initial(), budgets)
     C->>IDX: binary search on shard.start
     IDX-->>C: start position
     C->>IDX: yield items in [start, end)
     IDX-->>C: page of items
     C-->>W: EnumerationPage(items, cursor)
 
-    Note over W,IDX: Resume page (from cursor)
+    Note over W,IDX: Resume page (non-initial cursor)
 
-    W->>C: resume(shard_spec, cursor)
+    W->>C: enumerate_page(shard, cursor, budgets)
     C->>IDX: upper_bound(last_key)
     IDX-->>C: resume position
     C->>IDX: yield from resume position
@@ -413,24 +414,26 @@ sequenceDiagram
 
     Note over W,IDX: Split point selection
 
-    W->>C: choose_split_point(shard_spec)
+    W->>C: choose_split_point(shard, cursor, budgets)
     C->>IDX: Compute byte-weighted median<br/>or count-balanced fallback
     IDX-->>C: split key
     C-->>W: Ok(split_point)
 ```
 
-**Split point strategies.** `FilesystemConnector` uses a byte-weighted median that
-accounts for item sizes. `InMemoryDeterministicConnector` uses a simpler
-count-balanced approach. Both implementations ultimately call
-`choose_split_point_bounds` on the underlying sorted index.
+**Split point strategies.** Both `FilesystemConnector` and
+`InMemoryDeterministicConnector` use byte-weighted median split selection.
+`FilesystemConnector` uses a prefix-sum array for O(log n) selection;
+`InMemoryDeterministicConnector` uses the generic `common::choose_split_index`
+with linear scan. Both fall back to a count-balanced midpoint when all entries
+are zero-size or weight concentrates in the leading entry.
 
 **ConnectorCapabilities.** Each connector advertises its abilities through a
 capabilities struct: `seek_by_key`, `token_resume`, `range_read`, and `split_hints`.
 The worker uses these flags to choose the optimal enumeration and split strategy.
 
 Source: `crates/gossip-contracts/src/connector/api.rs:396-407`,
-`crates/gossip-connectors/src/filesystem.rs:335-603`,
-`crates/gossip-connectors/src/in_memory.rs:273-518`
+`crates/gossip-connectors/src/filesystem.rs:411-746`,
+`crates/gossip-connectors/src/in_memory.rs:264-515`
 
 ---
 

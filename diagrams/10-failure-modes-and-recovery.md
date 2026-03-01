@@ -270,17 +270,20 @@ compared to the risk of inconsistency.
 ## Diagram 4: Network Partition -- Worker to Source
 
 When the failure is between the worker and the external data source (GitHub, S3,
-etc.) rather than between the worker and the coordinator, the circuit breaker
-pattern contains the damage. The circuit breaker sits inside the connector
-boundary (B4) and monitors failure rates for each source. After a configurable
-number of consecutive failures, the breaker opens and begins rejecting requests
-immediately, preventing the worker from wasting time on a source that is known
-to be unreachable.
+etc.) rather than between the worker and the coordinator, the retry-budget
+pattern contains the damage. The scan loop tracks consecutive failures for each
+shard session. After a configurable number of consecutive failures
+(`DEFAULT_MAX_TRANSIENT_RETRIES = 3`), the shard is parked with
+`ParkReason::TooManyErrors`, freeing the worker for other shards.
+
+> **Note:** The sequence diagram below shows a **target design** where a full
+> circuit breaker state machine (Closed/Open/HalfOpen) mediates connector calls.
+> The current implementation uses a simpler consecutive-failure counter in
+> `scan_loop.rs`. The parking outcome (`ParkReason::TooManyErrors`) is the same;
+> the intermediate states (Open, HalfOpen, probe) are aspirational.
 
 The worker responds by parking the shard with a `ParkReason::TooManyErrors`
-designation and moving on to other available work. After a cooldown period, the
-circuit breaker transitions to half-open and allows a single probe request
-through. If the probe succeeds, the breaker closes and scanning resumes.
+designation and moving on to other available work.
 
 ```mermaid
 %% Diagram: network-partition-worker-source
