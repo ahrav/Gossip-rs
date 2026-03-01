@@ -1,6 +1,7 @@
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
+use gossip_contracts::connector::TokenBytes;
 use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
 use rstest::rstest;
 

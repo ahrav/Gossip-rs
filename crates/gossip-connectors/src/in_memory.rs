@@ -24,14 +24,14 @@
 //! # Pooled toxic-byte page assembly
 //!
 //! Enumeration stages item keys, item refs, and optional token bytes into a
-//! page-local [`ByteSlab`], then materializes wrappers with
-//! [`ItemKey::try_from_slot`], [`ItemRef::try_from_slot`], and
-//! [`TokenBytes::try_from_slot`]. This incurs one copy per staged field but
-//! keeps wrapper cloning allocation-free in the HOT page-emission loop.
+//! page-local [`gossip_stdx::ByteSlab`], then materializes wrappers with
+//! [`ItemKey::try_from_slot`], [`ItemRef::try_from_slot`], and token
+//! construction from slots. This incurs one copy per staged field but keeps
+//! wrapper cloning allocation-free in the HOT page-emission loop.
 //!
-//! The page's cursor and items share the same slab owner (`PooledByteSlab`), so
-//! returning either one by value keeps pooled bytes valid until the last clone
-//! is dropped.
+//! The page's cursor and items share the same slab owner
+//! ([`gossip_contracts::connector::PooledByteSlab`]), so returning either one
+//! by value keeps pooled bytes valid until the last clone is dropped.
 //!
 //! # Unique key requirement
 //!
@@ -77,13 +77,11 @@ use std::{io, sync::Arc, time::Instant};
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, PooledByteSlab, ReadConnector, ReadError, ScanItem,
-        TokenBytes, VersionId,
+        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
-use gossip_stdx::{ByteSlab, ByteSlot};
 
 use crate::common::{
     self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
@@ -385,92 +383,40 @@ impl InMemoryDeterministicConnector {
         }
 
         // Phase 5: extract up to max_items consecutive items from precomputed
-        // metadata. We stage key/ref/token bytes into one page-local slab, then
-        // build pooled wrappers from slots. Trade-off: one per-page copy up
-        // front for allocation-free wrapper cloning afterward.
+        // metadata via the shared staging helper. Trade-off: one per-page copy
+        // up front for allocation-free wrapper cloning afterward.
         let take = budgets.max_items().min(range_end - start_idx);
         let page_items = &self.items[start_idx..start_idx + take];
-        // Pre-size exactly using ByteSlab's size classes so staging failures are
-        // deterministic overflow/resource signals, not partial-progress behavior.
-        let slab_capacity = common::page_slab_capacity(
+
+        let staged = common::assemble_pooled_page(
             page_items
                 .iter()
-                .flat_map(|item| [item.key.len(), item.item_ref.len()])
-                .chain(self.emit_tokens.then_some(std::mem::size_of::<u64>())),
+                .map(|item| (item.key.as_bytes(), item.item_ref.as_bytes())),
+            self.emit_tokens,
+            start_idx,
         )?;
-        let mut page_slab = PooledByteSlab::new(ByteSlab::with_capacity(slab_capacity));
-        let mut staged: Vec<(ByteSlot, ByteSlot, StableItemId, ObjectVersionId, u64)> =
-            Vec::with_capacity(take);
-        for (item_idx, item) in page_items.iter().enumerate() {
-            let key_slot = page_slab.allocate(item.key.as_bytes()).map_err(|err| {
-                EnumerateError::permanent(format!(
-                    "failed to stage item key in page slab (item {item_idx}/{take}): {err}"
-                ))
-            })?;
-            let item_ref_slot = page_slab
-                .allocate(item.item_ref.as_bytes())
-                .map_err(|err| {
-                    EnumerateError::permanent(format!(
-                        "failed to stage item_ref in page slab (item {item_idx}/{take}): {err}"
-                    ))
-                })?;
-            staged.push((
-                key_slot,
-                item_ref_slot,
-                item.stable_item_id,
-                item.version_id,
-                item.size_hint,
-            ));
-        }
 
-        let token_slot = if self.emit_tokens {
-            let next_idx = start_idx
-                .checked_add(staged.len())
-                .and_then(|sum| u64::try_from(sum).ok())
-                .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
-            let token_bytes = next_idx.to_be_bytes();
-            Some(page_slab.allocate(&token_bytes).map_err(|err| {
-                EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
-            })?)
-        } else {
-            None
-        };
-
-        // Items and continuation cursor clone this Arc, so pooled bytes remain
-        // valid for whichever value escapes the function.
-        let page_slab = Arc::new(page_slab);
-        let mut out = Vec::with_capacity(staged.len());
-        for (key_slot, item_ref_slot, stable_item_id, version_id, size_hint) in staged {
-            let item_key =
-                ItemKey::try_from_slot(key_slot, Arc::clone(&page_slab)).map_err(|err| {
-                    EnumerateError::permanent(format!("invalid staged item key: {err}"))
-                })?;
-            let item_ref =
-                ItemRef::try_from_slot(item_ref_slot, Arc::clone(&page_slab)).map_err(|err| {
-                    EnumerateError::permanent(format!("invalid staged item_ref: {err}"))
-                })?;
+        let mut out = Vec::with_capacity(staged.wrappers.len());
+        for ((item_key, item_ref), item) in staged.wrappers.into_iter().zip(page_items) {
             out.push(
                 ScanItem::new(
                     item_key,
                     item_ref,
-                    stable_item_id,
-                    VersionId::Strong(version_id),
+                    item.stable_item_id,
+                    VersionId::Strong(item.version_id),
                 )
-                .with_size_hint(size_hint),
+                .with_size_hint(item.size_hint),
             );
         }
 
         // Build continuation cursor from the last emitted key.
-        // Defensive match mirrors filesystem.rs: if `out` is unexpectedly
-        // empty (e.g., all staged items failed validation), return an
-        // empty page instead of panicking.
+        // Defensive match: if `out` is unexpectedly empty (e.g., all staged
+        // items failed validation), return an empty page instead of panicking.
         let last_key = match out.last() {
             Some(item) => item.item_key().clone(),
             None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
         };
-        let next_cursor = if let Some(token_slot) = token_slot {
-            let token = TokenBytes::try_from_slot(token_slot, Arc::clone(&page_slab))
-                .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?;
+        let next_cursor = if let Some(token) = staged.token {
             Cursor::with_token(last_key, token)
         } else {
             Cursor::with_last_key(last_key)

@@ -230,13 +230,17 @@ impl ToxicBytesStorage {
 ///
 /// Connectors use the two-phase API:
 /// 1. **Mutable phase:** call [`allocate`](Self::allocate) to stage byte fields.
-/// 2. **Shared phase:** move into `Arc<PooledByteSlab>` for read-only access
+/// 2. **Shared phase:** wrap in `Arc` for shared read-only access
 ///    via pooled toxic-byte wrappers.
 ///
-/// The custom [`Drop`] clears all live slots before the inner `ByteSlab` is
-/// dropped, satisfying its debug leak assertion. This is critical on the
-/// error path: if staging fails mid-loop, `Drop` still runs and resets
-/// `live_count` to zero.
+/// The custom [`Drop`] implementation ensures safe cleanup: [`zeroize_used`]
+/// overwrites sensitive toxic-byte residue in the backing buffer, then
+/// [`clear`] resets the slab's live slot count to zero, satisfying
+/// `ByteSlab`'s debug leak assertion. This cleanup runs on all exit paths,
+/// including mid-loop staging failures that return early.
+///
+/// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
+/// [`clear`]: gossip_stdx::ByteSlab::clear
 pub struct PooledByteSlab {
     slab: ByteSlab,
 }
@@ -251,9 +255,18 @@ impl PooledByteSlab {
 
     /// Stage bytes into the slab during page assembly.
     ///
-    /// This is the mutable-phase API: connectors call `allocate` while
-    /// building a page, then move the `PooledByteSlab` into an `Arc` for
+    /// This is the mutable-phase API: connectors call `allocate` repeatedly
+    /// while building a page, then wrap the `PooledByteSlab` in an `Arc` for
     /// shared read access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlabFull`] when the remaining slab capacity is insufficient
+    /// for the allocation. Callers should pre-size slabs to make staging
+    /// failures deterministic overflow signals rather than partial-progress
+    /// behavior.
+    ///
+    /// [`SlabFull`]: gossip_stdx::SlabFull
     #[inline]
     pub fn allocate(&mut self, bytes: &[u8]) -> Result<ByteSlot, gossip_stdx::SlabFull> {
         self.slab.allocate(bytes)
@@ -265,6 +278,11 @@ impl PooledByteSlab {
     }
 }
 
+/// Debug format shows only metadata, never raw toxic-byte contents.
+///
+/// `live_count` is the number of active slots; `live_bytes` is the total
+/// size of all live allocations. These metrics help diagnose slab sizing
+/// and staging behavior without exposing sensitive payload data.
 impl fmt::Debug for PooledByteSlab {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PooledByteSlab")
@@ -274,14 +292,35 @@ impl fmt::Debug for PooledByteSlab {
     }
 }
 
+/// Clears sensitive toxic-byte data before the slab is dropped.
+///
+/// [`zeroize_used`] overwrites all allocated bytes with zeros to prevent
+/// sensitive residue from lingering in heap memory after the page is freed.
+/// [`clear`] then resets the slab's slot count to zero, satisfying
+/// `ByteSlab`'s debug assertion that no live slots remain at drop time.
+/// Both operations are required: zeroization protects data, clear
+/// maintains the slab invariant.
+///
+/// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
+/// [`clear`]: gossip_stdx::ByteSlab::clear
 impl Drop for PooledByteSlab {
     fn drop(&mut self) {
-        // Zero the used region of the backing buffer before releasing,
-        // preventing sensitive toxic-byte residue in freed heap memory.
+        // Safety reasoning: Arc guarantees this runs only when no
+        // PooledToxicBytes references remain, so no concurrent reads of slab
+        // slots are possible during zeroization or clear.
         self.slab.zeroize_used();
         self.slab.clear();
     }
 }
+
+// PooledByteSlab is shared across threads via Arc in connector page emission.
+// ByteSlab's backing storage is a plain Vec<u8> with no interior mutability,
+// so Send + Sync hold automatically. This assertion guards against future
+// field additions that might break thread safety.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PooledByteSlab>();
+};
 
 /// Slab-backed toxic-byte storage handle.
 ///

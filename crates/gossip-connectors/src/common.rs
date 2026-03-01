@@ -1,9 +1,12 @@
 //! Shared utilities used by multiple connector implementations.
 
+use std::sync::Arc;
+
 use gossip_contracts::{
-    connector::{EnumerateError, ItemKey},
+    connector::{EnumerateError, ItemKey, ItemRef, PooledByteSlab, TokenBytes},
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
+use gossip_stdx::{ByteSlab, ByteSlot};
 
 /// Parse an 8-byte big-endian `u64` from a byte slice.
 ///
@@ -119,6 +122,11 @@ pub(crate) fn page_slab_capacity(
             ))
         })?;
     }
+    // When all fields are zero-length, ByteSlab returns EMPTY slots without
+    // consuming slab space, so allocating a MIN_BLOCK-sized slab is wasted.
+    if capacity == 0 {
+        return Ok(0);
+    }
     let capacity = capacity.max(gossip_stdx::MIN_BLOCK as usize);
     if capacity > u32::MAX as usize {
         return Err(EnumerateError::permanent(
@@ -126,6 +134,104 @@ pub(crate) fn page_slab_capacity(
         ));
     }
     Ok(capacity)
+}
+
+/// Materialized page of pooled toxic-byte wrappers.
+///
+/// Produced by [`assemble_pooled_page`], which consolidates the slab staging
+/// pipeline shared by all connector implementations. Callers zip the returned
+/// `wrappers` with their connector-specific metadata (e.g., `StableItemId`,
+/// `VersionId`, size hints) to build [`ScanItem`]s.
+pub(crate) struct StagedPage {
+    /// Materialized (ItemKey, ItemRef) pairs, ready to zip with caller metadata.
+    /// Each wrapper holds an `Arc<PooledByteSlab>` internally, keeping the
+    /// backing slab alive as long as any wrapper exists.
+    pub wrappers: Vec<(ItemKey, ItemRef)>,
+    /// Optional continuation token (present when `emit_token` is true).
+    pub token: Option<TokenBytes>,
+}
+
+/// Stage key/ref byte pairs into a page-local slab and materialize wrappers.
+///
+/// Accepts an `ExactSizeIterator` of `(key_bytes, ref_bytes)` pairs. The
+/// iterator is cloned internally: once for capacity pre-sizing, once for
+/// staging. Callers supply the byte-pair iterator; this function handles
+/// slab allocation, Arc wrapping, and wrapper reconstruction.
+///
+/// When `emit_token` is true, a big-endian `u64` token encoding `start_idx +
+/// item_count` is staged into the same slab and returned as `StagedPage::token`.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` on slab capacity overflow or wrapper
+/// reconstruction failure — both indicate internal accounting bugs since
+/// inputs come from already-validated contract values.
+pub(crate) fn assemble_pooled_page<'a>(
+    key_ref_pairs: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])> + Clone,
+    emit_token: bool,
+    start_idx: usize,
+) -> Result<StagedPage, EnumerateError> {
+    let take = key_ref_pairs.len();
+
+    // Phase 1: pre-size slab using ByteSlab size classes.
+    let slab_capacity = page_slab_capacity(
+        key_ref_pairs
+            .clone()
+            .flat_map(|(k, r)| [k.len(), r.len()])
+            .chain(emit_token.then_some(std::mem::size_of::<u64>())),
+    )?;
+
+    // Phase 2: allocate and stage key/ref slots.
+    let mut page_slab = PooledByteSlab::new(ByteSlab::with_capacity(slab_capacity));
+    let mut staged: Vec<(ByteSlot, ByteSlot)> = Vec::with_capacity(take);
+    for (item_idx, (key_bytes, ref_bytes)) in key_ref_pairs.enumerate() {
+        let key_slot = page_slab.allocate(key_bytes).map_err(|err| {
+            EnumerateError::permanent(format!(
+                "failed to stage item key in page slab (item {item_idx}/{take}): {err}"
+            ))
+        })?;
+        let ref_slot = page_slab.allocate(ref_bytes).map_err(|err| {
+            EnumerateError::permanent(format!(
+                "failed to stage item_ref in page slab (item {item_idx}/{take}): {err}"
+            ))
+        })?;
+        staged.push((key_slot, ref_slot));
+    }
+
+    // Phase 3: optionally stage continuation token.
+    let token_slot = if emit_token {
+        let next_idx = start_idx
+            .checked_add(staged.len())
+            .and_then(|sum| u64::try_from(sum).ok())
+            .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
+        let token_bytes = next_idx.to_be_bytes();
+        Some(page_slab.allocate(&token_bytes).map_err(|err| {
+            EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
+        })?)
+    } else {
+        None
+    };
+
+    // Phase 4: wrap in Arc for shared read access, reconstruct wrappers.
+    let slab = Arc::new(page_slab);
+    let mut wrappers = Vec::with_capacity(staged.len());
+    for (key_slot, ref_slot) in staged {
+        let item_key = ItemKey::try_from_slot(key_slot, Arc::clone(&slab))
+            .map_err(|err| EnumerateError::permanent(format!("invalid staged item key: {err}")))?;
+        let item_ref = ItemRef::try_from_slot(ref_slot, Arc::clone(&slab))
+            .map_err(|err| EnumerateError::permanent(format!("invalid staged item_ref: {err}")))?;
+        wrappers.push((item_key, item_ref));
+    }
+
+    let token = match token_slot {
+        Some(slot) => Some(
+            TokenBytes::try_from_slot(slot, Arc::clone(&slab))
+                .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?,
+        ),
+        None => None,
+    };
+
+    Ok(StagedPage { wrappers, token })
 }
 
 /// Byte-weighted median split-point selection.
@@ -201,6 +307,12 @@ pub(crate) mod test_util {
     }
 }
 
+/// Tests for page-local slab capacity calculations.
+///
+/// These tests verify that `page_slab_alloc_size` and `page_slab_capacity`
+/// correctly mirror `ByteSlab`'s size-class rounding and enforce overflow
+/// protection. The rounding logic must match the slab allocator exactly so
+/// pre-sizing eliminates mid-loop staging failures.
 #[cfg(test)]
 mod page_slab_tests {
     use super::*;
@@ -248,10 +360,12 @@ mod page_slab_tests {
     }
 
     #[test]
-    fn capacity_enforces_min_block_floor() {
-        // Single zero-length field: rounded sum = 0, floor = MIN_BLOCK.
+    fn capacity_all_zero_returns_zero() {
+        // All zero-length fields produce a zero sum. ByteSlab returns EMPTY
+        // for zero-length allocations without consuming slab space, so a
+        // zero capacity avoids wasting a MIN_BLOCK-sized slab.
         let cap = page_slab_capacity([0]).unwrap();
-        assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
+        assert_eq!(cap, 0);
     }
 
     #[test]
@@ -262,8 +376,17 @@ mod page_slab_tests {
     }
 
     #[test]
-    fn capacity_empty_iterator_returns_min_block() {
+    fn capacity_empty_iterator_returns_zero() {
+        // No fields at all → zero capacity.
         let cap = page_slab_capacity(std::iter::empty::<usize>()).unwrap();
+        assert_eq!(cap, 0);
+    }
+
+    #[test]
+    fn capacity_mixed_zero_and_nonzero_applies_min_block() {
+        // One zero-length field + one 10-byte field: zero rounds to 0,
+        // 10 rounds to MIN_BLOCK (16). Total = 16, which is >= MIN_BLOCK.
+        let cap = page_slab_capacity([0, 10]).unwrap();
         assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
     }
 }
