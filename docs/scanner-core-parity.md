@@ -34,6 +34,22 @@ used by later cutover phases:
 `gossip_engine::throughput_delta_pct` and `gossip_engine::median` are companion
 utilities used by the same gate.
 
+## Runtime Integration Status
+
+Phase-2/3 runtime wiring now consumes `gossip-engine` directly in both
+standalone and worker paths:
+
+- `crates/gossip-scanner-runtime` provides typed `scan_fs_direct` and
+  `scan_git_direct` orchestration entrypoints.
+- `crates/scanner-rs-cli` exposes the workspace `scanner-rs` binary with
+  `scan fs|git` shape and `--execution-mode` defaulting to `direct`.
+- `crates/gossip-worker` page processing uses `ScannerCore` through
+  `run_scan_loop_with_page_processor`, replacing placeholder page-signature
+  hashing as the functional scan path.
+
+These paths intentionally keep connector mode explicit/gated until later
+phases complete durable runtime backends and parity gates.
+
 ## Refresh Workflow
 
 1. Run fixture test in print mode:
