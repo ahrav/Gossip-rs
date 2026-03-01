@@ -1,0 +1,45 @@
+{
+  "page_summaries": [
+    {
+      "page_num": 1,
+      "signature": 15610694095309993443,
+      "item_count": 2,
+      "bytes_scanned": 24
+    },
+    {
+      "page_num": 2,
+      "signature": 15110481767741341434,
+      "item_count": 2,
+      "bytes_scanned": 26
+    }
+  ],
+  "findings": [
+    {
+      "stable_item_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+      "version_strength": "strong",
+      "version_hex": "d3cdda3445d5bf079e5912682003c3bb94225c6f2bc1863c1ce2a178409cff01",
+      "page_num": 1,
+      "item_index": 0,
+      "fingerprint": 5738483377913809167,
+      "payload_bytes": 12
+    },
+    {
+      "stable_item_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+      "version_strength": "strong",
+      "version_hex": "b11b950938ef82e7e8f0efc8010410c8209929bc9a32b812a5f7c7b529a40c63",
+      "page_num": 1,
+      "item_index": 1,
+      "fingerprint": 16354121766071932425,
+      "payload_bytes": 12
+    },
+    {
+      "stable_item_id_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+      "version_strength": "strong",
+      "version_hex": "100eacaba76f9f743067b40ff6a746ccf90cb8ada5fa0d1cee868fbbab907468",
+      "page_num": 2,
+      "item_index": 1,
+      "fingerprint": 11950951556543751113,
+      "payload_bytes": 14
+    }
+  ]
+}

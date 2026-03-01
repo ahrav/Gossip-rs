@@ -422,6 +422,8 @@ dependencies = [
  "gossip-contracts",
  "proptest",
  "rstest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
