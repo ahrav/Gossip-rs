@@ -201,8 +201,9 @@ fn stage_token_slot(
 ///
 /// # Errors
 ///
-/// Returns `EnumerateError::permanent` on slab capacity overflow or wrapper
-/// reconstruction failure — both indicate internal accounting bugs since
+/// Returns `EnumerateError::permanent` on capacity overflow, key/ref/token
+/// staging failures, token-index overflow, or wrapper reconstruction failure.
+/// These indicate internal accounting/resource-exhaustion conditions because
 /// inputs come from already-validated contract values.
 pub(crate) fn assemble_pooled_page<'a>(
     key_ref_pairs: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])> + Clone,

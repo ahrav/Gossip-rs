@@ -92,8 +92,9 @@
 //! - **`max_items`**: Honored as a hard cap on page size during enumeration.
 //!   `Budgets` stores `max_items` as `NonZeroUsize` so zero-item pages from
 //!   budget capping are unrepresentable.
-//! - **`max_bytes`**: Enforced in `open()` (reject files exceeding budget) and
-//!   `read_range()` (clamp read length).
+//! - **`max_bytes`**: Enforced in `read_range()` (clamp read length). `open()`
+//!   leaves byte-budget enforcement to higher layers, matching the advisory
+//!   budget contract on [`ReadConnector`].
 //!
 //! # TOCTOU limitations
 //!
@@ -483,14 +484,6 @@ impl FilesystemConnector {
             self.emit_tokens,
             start_idx,
         )?;
-        if staged.wrappers.len() != page_files.len() {
-            return Err(EnumerateError::permanent(format!(
-                "filesystem staged wrapper count mismatch: wrappers={}, files={}",
-                staged.wrappers.len(),
-                page_files.len()
-            )));
-        }
-
         let mut out = Vec::with_capacity(staged.wrappers.len());
         for ((item_key, item_ref), file) in staged.wrappers.into_iter().zip(page_files) {
             out.push(
