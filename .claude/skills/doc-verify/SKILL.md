@@ -87,7 +87,7 @@ Parse any flags from the invocation:
 
 ### 4. Dispatch Verification Agent
 
-Launch a `Task` agent with `subagent_type="general-purpose"` and `model="opus"`. The prompt must include:
+Launch a `Task` agent with `subagent_type="general-purpose"`. The prompt must include:
 
 - The full contents of every target file
 - The full contents of adjacent module files (for cross-reference)

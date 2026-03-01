@@ -174,7 +174,7 @@ Include this Research Brief in every Phase 1 agent's prompt.
 ## Phase 1 — Wide Survey (8-10 Parallel Agents)
 
 Launch all selected research agents **in a single message** using the Task tool
-with `subagent_type=general-purpose` and `model="opus"`. Each agent has a distinct research lens
+with `subagent_type=general-purpose`. Each agent has a distinct research lens
 but receives the same problem statement and Research Brief.
 
 ### 10 Research Lenses
@@ -578,7 +578,7 @@ out, proceed with the agents that succeeded (minimum 5 required for Phase 2).
 ## Phase 2 — First Synthesis (Single Agent)
 
 Launch **1 synthesis agent** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`.
+`subagent_type=general-purpose`.
 
 ### First Synthesizer Prompt
 
@@ -692,7 +692,7 @@ Include all sections above, plus:
 ## Phase 3 — Targeted Deep-Dives (3-5 Parallel Agents)
 
 Launch **3-5 deep-dive agents in parallel** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`. Each agent gets a specific gap/question
+`subagent_type=general-purpose`. Each agent gets a specific gap/question
 identified in Phase 2's Deep-Dive Targets.
 
 **Phase 3 and Phase 4 MUST be launched in a single message** so they run
@@ -773,7 +773,7 @@ What this deep-dive could NOT resolve, and what would be needed to resolve it.
 ## Phase 4 — Adversarial Review (4 Parallel Agents)
 
 Launch **4 adversarial agents in parallel** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`.
+`subagent_type=general-purpose`.
 
 Each receives Phase 2's synthesis (NOT Phase 3 output — they run in parallel
 to prevent anchoring).
@@ -958,7 +958,7 @@ recommended approach, or is it edge-case/context-specific?}
 
 After Phase 3 (deep-dives) AND Phase 4 (adversarial) both complete, launch
 **1 final synthesis agent** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`.
+`subagent_type=general-purpose`.
 
 ### Final Synthesizer Prompt
 
@@ -1077,7 +1077,7 @@ Include all sections above, plus:
 ## Phase 6 — Integration (Single Agent)
 
 Launch **1 integration agent** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`.
+`subagent_type=general-purpose`.
 
 This agent maps the final synthesis to a concrete implementation plan with
 full traceability.

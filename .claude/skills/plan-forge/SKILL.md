@@ -145,7 +145,7 @@ Include file paths and brief descriptions.}
 ## Phase 1 --- Dual Review (2 Parallel Agents)
 
 Launch **2 agents in a single message** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`. Each covers all 4 review lenses but with
+`subagent_type=general-purpose`. Each covers all 4 review lenses but with
 different primary emphasis to reduce blind-spot overlap.
 
 | Agent | Label            | Primary Emphasis (40%)         | Secondary (20% each)                     |
@@ -288,7 +288,7 @@ it with a note that it was not resolved.
 ## Phase 2 --- Consolidation (1 Agent)
 
 After both reviewers complete, launch **1 consolidator agent** using the Task
-tool with `subagent_type=general-purpose` and `model="opus"`.
+tool with `subagent_type=general-purpose`.
 
 ### Consolidator Prompt
 

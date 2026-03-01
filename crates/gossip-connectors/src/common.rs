@@ -1,9 +1,13 @@
-//! Shared utilities used by multiple connector implementations.
+//! Shared connector utilities: shard-bound validation, binary search,
+//! pooled page assembly, split-point selection, and identity derivation.
 
 use std::sync::Arc;
 
 use gossip_contracts::{
-    connector::{EnumerateError, ItemKey, ItemRef, PooledByteSlab, TokenBytes},
+    connector::{
+        ConnectorInputError, EnumerateError, ItemKey, ItemRef, MAX_ITEM_KEY_SIZE, PooledByteSlab,
+        TokenBytes,
+    },
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
 use gossip_stdx::{ByteSlab, ByteSlot};
@@ -30,23 +34,38 @@ pub(crate) fn derive_stable_item_id(tag: ConnectorTag, key: &ItemKey) -> StableI
     ItemIdentityKey::new(tag, key.as_bytes()).stable_id()
 }
 
-/// Decode a shard key-range bound where `[]` (empty) means unbounded.
+/// Validate a shard key-range bound where `[]` (empty) means unbounded.
 ///
 /// Empty bounds are treated as unbounded to match [`ShardSpec`] semantics.
-/// Non-empty bounds are validated via [`ItemKey::try_from_slice`]; invalid
-/// payloads produce a permanent error including `which` for diagnostics.
+/// Non-empty bounds are validated allocation-free against [`ItemKey`] size
+/// limits and then returned as borrowed slices, so callers can run binary
+/// search without materializing temporary `ItemKey` wrappers.
+///
+/// This helper intentionally validates only boundary shape (`empty` vs
+/// `<= MAX_ITEM_KEY_SIZE`): connector bound resolution is byte-lexicographic,
+/// so no additional per-bound decoding is required.
+/// Malformed payloads produce a permanent error including `which` for
+/// diagnostics.
 ///
 /// [`ShardSpec`]: gossip_contracts::coordination::ShardSpec
-pub(crate) fn shard_bound(
-    bound: &[u8],
+pub(crate) fn borrowed_shard_bound<'a>(
+    bound: &'a [u8],
     which: &'static str,
-) -> Result<Option<ItemKey>, EnumerateError> {
+) -> Result<Option<&'a [u8]>, EnumerateError> {
     if bound.is_empty() {
         return Ok(None);
     }
-    ItemKey::try_from_slice(bound)
-        .map(Some)
-        .map_err(|err| EnumerateError::permanent(format!("invalid shard {which} bound: {err}")))
+    if bound.len() > MAX_ITEM_KEY_SIZE {
+        let err = ConnectorInputError::TooLarge {
+            field: "ItemKey",
+            size: bound.len(),
+            max: MAX_ITEM_KEY_SIZE,
+        };
+        return Err(EnumerateError::permanent(format!(
+            "invalid shard {which} bound: {err}"
+        )));
+    }
+    Ok(Some(bound))
 }
 
 /// Trait abstraction for entries that expose a key byte slice.
@@ -82,6 +101,13 @@ pub(crate) trait SizedEntry {
 /// Mirrors `ByteSlab`'s size-class rule: `0 -> 0`, otherwise
 /// `max(len, 16).next_power_of_two()`.
 /// Returns `None` when the rounded size overflows `usize`.
+///
+/// # Why this matters
+///
+/// Pre-computing the exact allocation size allows us to pre-size slabs
+/// accurately, eliminating mid-loop allocation failures. The rounding
+/// must exactly match `ByteSlab`'s internal size-class logic or we'll
+/// underestimate capacity and fail during staging.
 #[inline]
 fn page_slab_alloc_size(len: usize) -> Option<usize> {
     if len == 0 {
@@ -138,10 +164,11 @@ pub(crate) fn page_slab_capacity(
 
 /// Materialized page of pooled toxic-byte wrappers.
 ///
-/// Produced by [`assemble_pooled_page`], which consolidates the slab staging
-/// pipeline shared by all connector implementations. Callers zip the returned
-/// `wrappers` with their connector-specific metadata (e.g., `StableItemId`,
-/// `VersionId`, size hints) to build [`ScanItem`]s.
+/// Produced by [`assemble_pooled_page`] (generic two-slot path) and
+/// [`assemble_pooled_page_shared_key_ref`] (shared-slot path for key==ref
+/// connectors). Callers zip the returned `wrappers` with their
+/// connector-specific metadata (e.g., `StableItemId`, `VersionId`, size
+/// hints) to build [`ScanItem`]s.
 pub(crate) struct StagedPage {
     /// Materialized (ItemKey, ItemRef) pairs, ready to zip with caller metadata.
     /// Each wrapper holds an `Arc<PooledByteSlab>` internally, keeping the
@@ -149,6 +176,43 @@ pub(crate) struct StagedPage {
     pub wrappers: Vec<(ItemKey, ItemRef)>,
     /// Optional continuation token (present when `emit_token` is true).
     pub token: Option<TokenBytes>,
+}
+
+/// Allocate the continuation-token slot into the page slab.
+///
+/// When `emit_token` is true, encodes `start_idx + item_count` as a
+/// big-endian `u64` and stages it into `page_slab`. Returns `Ok(None)`
+/// when token emission is disabled.
+///
+/// # Token encoding invariant
+///
+/// The token encodes the next item's index (not the last emitted index).
+/// This allows O(1) resume: the connector can jump directly to `token_idx`
+/// without needing to search for `last_key + 1`. The trade-off is that
+/// token validation requires checking `items[token_idx - 1].key == last_key`.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` on index overflow or slab
+/// allocation failure.
+#[inline]
+fn stage_token_slot(
+    page_slab: &mut PooledByteSlab,
+    emit_token: bool,
+    start_idx: usize,
+    item_count: usize,
+) -> Result<Option<ByteSlot>, EnumerateError> {
+    if !emit_token {
+        return Ok(None);
+    }
+    let next_idx = start_idx
+        .checked_add(item_count)
+        .and_then(|sum| u64::try_from(sum).ok())
+        .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
+    let token_bytes = next_idx.to_be_bytes();
+    page_slab.allocate(&token_bytes).map(Some).map_err(|err| {
+        EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
+    })
 }
 
 /// Stage key/ref byte pairs into a page-local slab and materialize wrappers.
@@ -163,8 +227,9 @@ pub(crate) struct StagedPage {
 ///
 /// # Errors
 ///
-/// Returns `EnumerateError::permanent` on slab capacity overflow or wrapper
-/// reconstruction failure — both indicate internal accounting bugs since
+/// Returns `EnumerateError::permanent` on capacity overflow, key/ref/token
+/// staging failures, token-index overflow, or wrapper reconstruction failure.
+/// These indicate internal accounting/resource-exhaustion conditions because
 /// inputs come from already-validated contract values.
 pub(crate) fn assemble_pooled_page<'a>(
     key_ref_pairs: impl ExactSizeIterator<Item = (&'a [u8], &'a [u8])> + Clone,
@@ -198,19 +263,15 @@ pub(crate) fn assemble_pooled_page<'a>(
         staged.push((key_slot, ref_slot));
     }
 
+    if staged.len() != take {
+        return Err(EnumerateError::permanent(format!(
+            "staged wrapper count mismatch: wrappers={}, expected={take}",
+            staged.len()
+        )));
+    }
+
     // Phase 3: optionally stage continuation token.
-    let token_slot = if emit_token {
-        let next_idx = start_idx
-            .checked_add(staged.len())
-            .and_then(|sum| u64::try_from(sum).ok())
-            .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
-        let token_bytes = next_idx.to_be_bytes();
-        Some(page_slab.allocate(&token_bytes).map_err(|err| {
-            EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
-        })?)
-    } else {
-        None
-    };
+    let token_slot = stage_token_slot(&mut page_slab, emit_token, start_idx, staged.len())?;
 
     // Phase 4: wrap in Arc for shared read access, reconstruct wrappers.
     let slab = Arc::new(page_slab);
@@ -221,6 +282,82 @@ pub(crate) fn assemble_pooled_page<'a>(
         let item_ref = ItemRef::try_from_slot(ref_slot, Arc::clone(&slab))
             .map_err(|err| EnumerateError::permanent(format!("invalid staged item_ref: {err}")))?;
         wrappers.push((item_key, item_ref));
+    }
+
+    let token = match token_slot {
+        Some(slot) => Some(
+            TokenBytes::try_from_slot(slot, Arc::clone(&slab))
+                .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?,
+        ),
+        None => None,
+    };
+
+    Ok(StagedPage { wrappers, token })
+}
+
+/// Stage key bytes once and materialize both key/ref wrappers from one slot.
+///
+/// Filesystem enumeration uses this path because `ItemRef` bytes are
+/// identical-by-construction to `ItemKey` bytes (encoded relative path).
+/// This avoids redundant per-item slot staging while preserving pooled wrapper
+/// behavior and shared continuation-token encoding.
+///
+/// Invariant: use this helper only when key bytes and ref bytes are exactly
+/// equal for every item. The debug pointer-equality assertion verifies the
+/// shared-slot contract in debug builds; release builds rely on caller
+/// correctness.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` on slab capacity overflow, staging
+/// failure, wrapper reconstruction failure, or token-index overflow.
+pub(crate) fn assemble_pooled_page_shared_key_ref<'a>(
+    key_bytes: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
+    emit_token: bool,
+    start_idx: usize,
+) -> Result<StagedPage, EnumerateError> {
+    let take = key_bytes.len();
+
+    // One slot per key; refs reuse the same slot bytes.
+    let slab_capacity = page_slab_capacity(
+        key_bytes
+            .clone()
+            .map(|k| k.len())
+            .chain(emit_token.then_some(std::mem::size_of::<u64>())),
+    )?;
+
+    let mut page_slab = PooledByteSlab::new(ByteSlab::with_capacity(slab_capacity));
+    let mut staged: Vec<ByteSlot> = Vec::with_capacity(take);
+    for (item_idx, key) in key_bytes.enumerate() {
+        let slot = page_slab.allocate(key).map_err(|err| {
+            EnumerateError::permanent(format!(
+                "failed to stage filesystem key/item_ref in page slab (item {item_idx}/{take}): {err}"
+            ))
+        })?;
+        staged.push(slot);
+    }
+
+    let token_slot = stage_token_slot(&mut page_slab, emit_token, start_idx, staged.len())?;
+
+    let slab = Arc::new(page_slab);
+    let mut wrappers = Vec::with_capacity(staged.len());
+    for slot in staged {
+        let item_key = ItemKey::try_from_slot(slot, Arc::clone(&slab))
+            .map_err(|err| EnumerateError::permanent(format!("invalid staged item key: {err}")))?;
+        let item_ref = ItemRef::try_from_slot(slot, Arc::clone(&slab))
+            .map_err(|err| EnumerateError::permanent(format!("invalid staged item_ref: {err}")))?;
+        debug_assert_eq!(
+            item_key.as_bytes().as_ptr(),
+            item_ref.as_bytes().as_ptr(),
+            "filesystem key/ref wrappers must share staged backing bytes"
+        );
+        wrappers.push((item_key, item_ref));
+    }
+    if wrappers.len() != take {
+        return Err(EnumerateError::permanent(format!(
+            "staged wrapper count mismatch: wrappers={}, expected={take}",
+            wrappers.len()
+        )));
     }
 
     let token = match token_slot {
@@ -388,5 +525,272 @@ mod page_slab_tests {
         // 10 rounds to MIN_BLOCK (16). Total = 16, which is >= MIN_BLOCK.
         let cap = page_slab_capacity([0, 10]).unwrap();
         assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
+    }
+
+    #[test]
+    fn capacity_sum_overflow() {
+        // Two fields that individually round fine but whose rounded sizes
+        // sum to more than usize::MAX.
+        let big = usize::MAX / 2 + 1; // rounds to a power of two
+        let result = page_slab_capacity([big, big]);
+        assert!(
+            result.is_err(),
+            "sum of two large rounded fields should overflow"
+        );
+    }
+
+    #[test]
+    fn capacity_exceeds_u32_max() {
+        // A single field whose rounded size exceeds u32::MAX.
+        // On 64-bit, (u32::MAX as usize) + 1 rounds up and exceeds the u32 cap.
+        let too_big = u32::MAX as usize + 1;
+        let result = page_slab_capacity([too_big]);
+        assert!(result.is_err(), "capacity exceeding u32::MAX should error");
+    }
+
+    #[test]
+    fn capacity_at_u32_max_boundary() {
+        // The largest power-of-two that fits in u32: 2^31 = 2_147_483_648.
+        // Two such fields sum to 2^32 = 4_294_967_296 which exceeds u32::MAX.
+        let half = 1usize << 31;
+        let single = page_slab_capacity([half]);
+        assert!(single.is_ok(), "single 2^31 field should fit in u32");
+
+        let double = page_slab_capacity([half, half]);
+        assert!(
+            double.is_err(),
+            "two 2^31 fields sum to 2^32, exceeding u32::MAX"
+        );
+    }
+
+    #[test]
+    fn capacity_multiple_zero_fields() {
+        // All fields zero → zero capacity (no slab needed).
+        let cap = page_slab_capacity([0, 0, 0]).unwrap();
+        assert_eq!(cap, 0);
+    }
+}
+
+/// Tests for byte-weighted split-point selection.
+///
+/// These tests verify that `choose_split_index` selects correct split points
+/// across edge cases: empty/singleton ranges, zero-size fallback, weight
+/// concentration fallback, and clamping to guarantee non-empty shards on
+/// each side.
+#[cfg(test)]
+mod choose_split_tests {
+    use super::*;
+
+    struct TestEntry {
+        size: u64,
+    }
+
+    impl SizedEntry for TestEntry {
+        fn entry_size(&self) -> u64 {
+            self.size
+        }
+    }
+
+    fn entries(sizes: &[u64]) -> Vec<TestEntry> {
+        sizes.iter().map(|&size| TestEntry { size }).collect()
+    }
+
+    #[test]
+    fn empty_range_returns_none() {
+        let items = entries(&[10, 20]);
+        // range_end == start_idx → zero items.
+        assert_eq!(choose_split_index(&items, 1, 1), None);
+    }
+
+    #[test]
+    fn single_item_returns_none() {
+        let items = entries(&[10, 20, 30]);
+        // range_end - start_idx == 1 → cannot split.
+        assert_eq!(choose_split_index(&items, 1, 2), None);
+    }
+
+    #[test]
+    fn two_items_returns_split() {
+        let items = entries(&[10, 20]);
+        // Minimal splittable range: must return Some.
+        let split = choose_split_index(&items, 0, 2);
+        assert_eq!(split, Some(1));
+    }
+
+    #[test]
+    fn all_zero_sizes_uses_count_midpoint() {
+        let items = entries(&[0, 0, 0, 0]);
+        // total_bytes == 0 → count midpoint at start_idx + len/2 = 0 + 2 = 2.
+        let split = choose_split_index(&items, 0, 4);
+        assert_eq!(split, Some(2));
+    }
+
+    #[test]
+    fn first_item_heavy_falls_back_to_count() {
+        // First item holds >50% weight → cumulative >= half at idx 0 → idx == start_idx.
+        // Triggers count-midpoint fallback.
+        let items = entries(&[100, 1, 1, 1]);
+        let split = choose_split_index(&items, 0, 4).unwrap();
+        // Count midpoint: 0 + (4 - 0) / 2 = 2.
+        assert_eq!(split, 2);
+    }
+
+    #[test]
+    fn byte_weight_splits_at_heavy_item() {
+        // Weight concentrated in the middle: [1, 1, 100, 1].
+        // total = 103, half = 51. cumulative: 1, 2, 102 → crosses at idx 2.
+        let items = entries(&[1, 1, 100, 1]);
+        let split = choose_split_index(&items, 0, 4).unwrap();
+        assert_eq!(split, 2);
+    }
+
+    #[test]
+    fn clamp_prevents_empty_left_shard() {
+        // Two items where all weight is in the second: [0, 100].
+        // total = 100, half = 50. cumulative: 0, 100 → crosses at idx 1.
+        // But with only 2 items, clamped to max(start+1, ...) = 1.
+        let items = entries(&[0, 100]);
+        let split = choose_split_index(&items, 0, 2).unwrap();
+        assert!(split >= 1, "split must leave at least one item on the left");
+    }
+
+    #[test]
+    fn clamp_prevents_empty_right_shard() {
+        // All weight in the last item: [0, 0, 0, 100].
+        // total = 100, half = 50. cumulative crosses at idx 3 (the last).
+        // Clamped to min(split, range_end - 1) = 3.
+        let items = entries(&[0, 0, 0, 100]);
+        let split = choose_split_index(&items, 0, 4).unwrap();
+        assert!(
+            split <= 3,
+            "split must leave at least one item on the right"
+        );
+    }
+
+    #[test]
+    fn nonzero_start_idx_offset() {
+        // Operate on items[2..5] → range of 3 items with sizes [10, 20, 30].
+        let items = entries(&[99, 99, 10, 20, 30]);
+        let split = choose_split_index(&items, 2, 5).unwrap();
+        // Must be in [3, 4] (start_idx+1 .. range_end-1).
+        assert!((3..=4).contains(&split), "split {split} out of [3, 4]");
+    }
+}
+
+/// Tests for generic binary search helpers (`lower_bound`, `upper_bound`).
+///
+/// Uses rstest parameterized cases since all non-empty-slice cases share the
+/// identical structure: build sorted items, search for key, assert index.
+/// Empty-slice cases remain standalone because their setup differs.
+#[cfg(test)]
+mod binary_search_tests {
+    use super::*;
+    use rstest::rstest;
+
+    struct TestKey(Vec<u8>);
+
+    impl KeyedEntry for TestKey {
+        fn key_bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    fn sample_items() -> Vec<TestKey> {
+        // Sorted: "b", "d", "f"
+        vec![
+            TestKey(b"b".to_vec()),
+            TestKey(b"d".to_vec()),
+            TestKey(b"f".to_vec()),
+        ]
+    }
+
+    // -- lower_bound: first index where key >= target --
+
+    #[test]
+    fn lower_bound_empty_slice() {
+        let items: Vec<TestKey> = vec![];
+        assert_eq!(lower_bound(&items, b"x"), 0);
+    }
+
+    #[rstest]
+    #[case::before_all(b"a", 0)]
+    #[case::equal_to_first(b"b", 0)]
+    #[case::between_b_and_d(b"c", 1)]
+    #[case::equal_to_middle(b"d", 1)]
+    #[case::between_d_and_f(b"e", 2)]
+    #[case::after_all(b"z", 3)]
+    fn lower_bound_cases(#[case] key: &[u8], #[case] expected: usize) {
+        let items = sample_items();
+        assert_eq!(lower_bound(&items, key), expected);
+    }
+
+    // -- upper_bound: first index where key > target --
+
+    #[test]
+    fn upper_bound_empty_slice() {
+        let items: Vec<TestKey> = vec![];
+        assert_eq!(upper_bound(&items, b"x"), 0);
+    }
+
+    #[rstest]
+    #[case::before_all(b"a", 0)]
+    #[case::equal_to_first(b"b", 1)]
+    #[case::between_b_and_d(b"c", 1)]
+    #[case::equal_to_middle(b"d", 2)]
+    #[case::equal_to_last(b"f", 3)]
+    #[case::after_all(b"z", 3)]
+    fn upper_bound_cases(#[case] key: &[u8], #[case] expected: usize) {
+        let items = sample_items();
+        assert_eq!(upper_bound(&items, key), expected);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_shard_bound_tests {
+    use super::*;
+    use gossip_contracts::connector::MAX_ITEM_KEY_SIZE;
+
+    #[test]
+    fn empty_bound_returns_none() {
+        let result = borrowed_shard_bound(b"", "start").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn valid_bound_returns_some() {
+        let result = borrowed_shard_bound(b"abc", "start").unwrap();
+        assert_eq!(result, Some(b"abc".as_slice()));
+    }
+
+    #[test]
+    fn exact_max_size_returns_some() {
+        let key = vec![b'x'; MAX_ITEM_KEY_SIZE];
+        let result = borrowed_shard_bound(&key, "end").unwrap();
+        assert_eq!(result, Some(key.as_slice()));
+    }
+
+    #[test]
+    fn oversized_bound_returns_permanent_error() {
+        let key = vec![b'x'; MAX_ITEM_KEY_SIZE + 1];
+        let err = borrowed_shard_bound(&key, "start").expect_err("should reject oversized bound");
+        assert!(!err.is_retryable(), "oversized bound should be permanent");
+    }
+
+    #[test]
+    fn error_message_contains_which_param() {
+        let key = vec![b'x'; MAX_ITEM_KEY_SIZE + 1];
+        let err = borrowed_shard_bound(&key, "start").unwrap_err();
+        assert!(
+            err.message().contains("start"),
+            "error should mention 'start': {}",
+            err.message()
+        );
+
+        let err = borrowed_shard_bound(&key, "end").unwrap_err();
+        assert!(
+            err.message().contains("end"),
+            "error should mention 'end': {}",
+            err.message()
+        );
     }
 }

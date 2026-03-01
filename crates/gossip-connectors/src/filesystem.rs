@@ -29,10 +29,13 @@
 //!
 //! # Pooled toxic-byte page assembly
 //!
-//! Enumeration stages each page's key/ref/token bytes into a single page-local
-//! [`gossip_stdx::ByteSlab`], then constructs [`ItemKey`], [`ItemRef`], and
-//! optional token wrappers from slab slots. This front-loads one copy per field
-//! per page, but keeps wrapper cloning allocation-free in the HOT emit loop.
+//! Enumeration uses a shared-slot page assembly path: filesystem [`ItemRef`]
+//! bytes are identical to [`ItemKey`] bytes, so each item's bytes are staged
+//! once and both wrappers are materialized from that same slot.
+//!
+//! This cuts key/ref staging copies versus the generic two-slot path while
+//! keeping wrapper cloning allocation-free in the HOT emit loop. The
+//! optimization depends on the key==ref byte invariant from path encoding.
 //!
 //! Staging and wrapper reconstruction failures are reported as permanent
 //! `EnumerateError`s because page sizes are derived from already-validated
@@ -52,15 +55,13 @@
 //! is silently ignored. Pagination advances monotonically by key regardless of
 //! token state.
 //!
-//! Unlike the in-memory connector, which uses tokens as an O(1) fast path
-//! with runtime key-validation fallback, the filesystem connector treats
-//! tokens as purely advisory. In debug builds, a `debug_assert_eq!` fires
-//! when the token disagrees with key-derived resume to catch cursor-
-//! construction bugs during testing. In release builds, key-based resume
-//! is the sole authority and tokens are silently ignored. This divergence
-//! reflects the different trust models: in-memory items are immutable after
-//! construction (tokens are always consistent), while filesystem state can
-//! change between connector instances.
+//! # Trust model
+//!
+//! This advisory-only treatment differs from the in-memory connector's
+//! O(1) token fast path with key-validation fallback, reflecting different
+//! trust models: in-memory items are immutable after construction (tokens
+//! are always consistent), while filesystem state can change between
+//! connector instances.
 //!
 //! # Symlink handling
 //!
@@ -99,8 +100,9 @@
 //! - **`max_items`**: Honored as a hard cap on page size during enumeration.
 //!   `Budgets` stores `max_items` as `NonZeroUsize` so zero-item pages from
 //!   budget capping are unrepresentable.
-//! - **`max_bytes`**: Enforced in `open()` (reject files exceeding budget) and
-//!   `read_range()` (clamp read length).
+//! - **`max_bytes`**: Enforced in `read_range()` (clamp read length). `open()`
+//!   leaves byte-budget enforcement to higher layers, matching the advisory
+//!   budget contract on [`ReadConnector`].
 //!
 //! # TOCTOU limitations
 //!
@@ -161,7 +163,7 @@ use gossip_contracts::{
 };
 
 use crate::common::{
-    self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
+    self, borrowed_shard_bound, derive_stable_item_id, lower_bound, parse_u64_be, upper_bound,
 };
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
@@ -276,7 +278,9 @@ pub struct FilesystemConnector {
 }
 
 impl FilesystemConnector {
+    /// Maximum directory traversal depth to prevent infinite loops on cyclic bind mounts.
     const DEFAULT_MAX_WALK_DEPTH: usize = 512;
+    /// Maximum warnings to collect before suppressing further diagnostics.
     const DEFAULT_MAX_WARNINGS: usize = 1024;
 
     /// Create a connector rooted at `root`.
@@ -417,7 +421,12 @@ impl FilesystemConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        self.enumerate_page_bounds(Some(start), Some(end), cursor, budgets)
+        self.enumerate_page_bounds(
+            Some(start.as_bytes()),
+            Some(end.as_bytes()),
+            cursor,
+            budgets,
+        )
     }
 
     /// Core page enumeration used by both shard-based and explicit-range APIs.
@@ -434,8 +443,8 @@ impl FilesystemConnector {
     ///   from validated in-memory index fields.
     fn enumerate_page_bounds(
         &mut self,
-        start: Option<&ItemKey>,
-        end: Option<&ItemKey>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
@@ -451,10 +460,8 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound.as_bytes()));
-        let range_end = end.map_or(self.files.len(), |bound| {
-            lower_bound(&self.files, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound));
+        let range_end = end.map_or(self.files.len(), |bound| lower_bound(&self.files, bound));
 
         let mut start_idx = range_start;
         if let Some(last_key) = cursor.last_key() {
@@ -482,14 +489,11 @@ impl FilesystemConnector {
         let page_files = &self.files[start_idx..(start_idx + take)];
 
         // Filesystem item refs mirror key bytes exactly.
-        let staged = common::assemble_pooled_page(
-            page_files
-                .iter()
-                .map(|file| (file.key.as_bytes(), file.key.as_bytes())),
+        let staged = common::assemble_pooled_page_shared_key_ref(
+            page_files.iter().map(|file| file.key.as_bytes()),
             self.emit_tokens,
             start_idx,
         )?;
-
         let mut out = Vec::with_capacity(staged.wrappers.len());
         for ((item_key, item_ref), file) in staged.wrappers.into_iter().zip(page_files) {
             out.push(
@@ -522,13 +526,13 @@ impl FilesystemConnector {
         end: &ItemKey,
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        self.choose_split_point_bounds(Some(start), Some(end), cursor, None)
+        self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor, None)
     }
 
     fn choose_split_point_bounds(
         &mut self,
-        start: Option<&ItemKey>,
-        end: Option<&ItemKey>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         cursor: &Cursor,
         deadline: Option<Instant>,
     ) -> Result<Option<ItemKey>, EnumerateError> {
@@ -546,10 +550,8 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound.as_bytes()));
-        let range_end = end.map_or(self.files.len(), |bound| {
-            lower_bound(&self.files, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound));
+        let range_end = end.map_or(self.files.len(), |bound| lower_bound(&self.files, bound));
         let resume_start = cursor.last_key().map_or(range_start, |last| {
             upper_bound(&self.files, last.as_bytes())
         });
@@ -562,10 +564,13 @@ impl FilesystemConnector {
 
         let candidate = &self.files[split_idx].key;
 
-        if cursor.last_key().is_some_and(|last| candidate <= last) {
+        if cursor
+            .last_key()
+            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
+        {
             return Ok(None);
         }
-        if end.is_some_and(|upper| candidate >= upper) {
+        if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
             return Ok(None);
         }
 
@@ -740,15 +745,18 @@ impl EnumerationConnector for FilesystemConnector {
         }
     }
 
+    /// Shard bounds are validated allocation-free via the internal
+    /// `borrowed_shard_bound` helper
+    /// before index lookup (`[]` means unbounded; oversize is permanent).
     fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        let start = shard_bound(shard.key_range_start(), "start")?;
-        let end = shard_bound(shard.key_range_end(), "end")?;
-        self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
     /// The first call may trigger a full filesystem walk; subsequent calls
@@ -759,9 +767,9 @@ impl EnumerationConnector for FilesystemConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let start = shard_bound(shard.key_range_start(), "start")?;
-        let end = shard_bound(shard.key_range_end(), "end")?;
-        self.choose_split_point_bounds(start.as_ref(), end.as_ref(), cursor, budgets.deadline())
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        self.choose_split_point_bounds(start, end, cursor, budgets.deadline())
     }
 }
 
@@ -812,6 +820,16 @@ impl ReadConnector for FilesystemConnector {
 // ---------------------------------------------------------------------------
 
 /// Returns `true` for I/O errors that are deterministically permanent.
+///
+/// # Permanent errors
+///
+/// - `NotFound`: file/directory doesn't exist
+/// - `PermissionDenied`: insufficient access rights
+/// - `InvalidInput`: malformed arguments
+/// - `ELOOP`: symlink loop detected (POSIX-specific)
+///
+/// All other errors (e.g., `EAGAIN`, `EINTR`, network timeouts) are
+/// considered transient and warrant retry.
 fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -824,6 +842,10 @@ fn is_permanent_io_error(err: &io::Error) -> bool {
     ) || err.raw_os_error() == Some(libc::ELOOP)
 }
 
+/// Convert an I/O error to a `ReadError` with appropriate retryability.
+///
+/// Permanent errors (file not found, permission denied) become non-retryable.
+/// Transient errors (network hiccups, resource contention) become retryable.
 fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
     if is_permanent_io_error(err) {
         ReadError::permanent(format!("{op} failed: {err}"))
@@ -832,6 +854,10 @@ fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
     }
 }
 
+/// Convert an I/O error to an `EnumerateError` with appropriate retryability.
+///
+/// Similar to `classify_io_read_error` but includes the failing path in the
+/// error message for better diagnostics during directory traversal.
 fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> EnumerateError {
     if is_permanent_io_error(err) {
         EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
@@ -844,6 +870,28 @@ fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> Enumer
 // Directory walk
 // ---------------------------------------------------------------------------
 
+/// Walk directory tree depth-first and collect regular files.
+///
+/// # Algorithm
+///
+/// Uses an explicit stack to avoid recursion. Directories are processed
+/// in reverse order to maintain lexicographic ordering of results. Symlinks
+/// are skipped (logged as warnings) to avoid cycles and ensure determinism.
+///
+/// # Trade-offs
+///
+/// - **No recursion**: Explicit stack prevents stack overflow on deep trees
+/// - **Reverse iteration**: `read_dir` results are reversed before pushing
+///   to stack, ensuring lexicographic order in final output
+/// - **Skip symlinks**: Avoids cycles and non-deterministic resolution
+/// - **Regular files only**: Devices, FIFOs, sockets are skipped
+/// - **Depth limit**: Prevents infinite traversal of cyclic bind mounts
+/// - **Warning limit**: Caps diagnostic noise from problematic directories
+///
+/// # Errors
+///
+/// Returns permanent errors for invalid root path or encoding failures.
+/// I/O errors during traversal are logged as warnings but don't fail the walk.
 fn walk_dir_collect_files(
     root: &Path,
     max_depth: usize,
@@ -1080,6 +1128,14 @@ fn encode_rel_path(rel: &Path) -> Result<Vec<u8>, EnumerateError> {
 /// Layout: `[mtime(8) | mtime_nsec(8) | len(8) | ino(8) | dev(8)]` = 40 bytes.
 /// Including `dev()` ensures version IDs are distinct across filesystem
 /// boundaries where `ino()` alone can collide.
+///
+/// # Why not content hashing?
+///
+/// Content hashing would require reading every file during indexing, turning
+/// O(n) directory traversal into O(total_bytes) I/O. Metadata-based versioning
+/// provides "good enough" change detection for filesystem sources while keeping
+/// indexing fast. The trade-off: identical content with different mtimes gets
+/// different version IDs, and filesystem metadata manipulation can forge versions.
 fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
     let mut encoded = [0u8; 40];
     encoded[0..8].copy_from_slice(&metadata.mtime().to_be_bytes());
@@ -1094,6 +1150,12 @@ fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
 // Low-level fd helpers
 // ---------------------------------------------------------------------------
 
+/// Open a directory file descriptor for use with `openat`.
+///
+/// Uses `O_RDONLY | O_DIRECTORY | O_CLOEXEC` flags to ensure we get a
+/// directory handle that won't leak to child processes. The `O_DIRECTORY`
+/// flag causes `open` to fail if the path isn't a directory, preventing
+/// TOCTOU races where a directory is replaced with a symlink.
 fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let c_path = path_to_cstring(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "null byte in path"))?;
@@ -1117,6 +1179,14 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
 /// FIFOs or device nodes that slip past the `fstat` regular-file check in
 /// a TOCTOU race. After validation, this function clears the flag so that
 /// subsequent `read`/`read_at` calls use normal blocking semantics.
+///
+/// # Safety invariant
+///
+/// We validate the file is regular (via `fstat`) before clearing O_NONBLOCK.
+/// This prevents hanging on FIFOs/devices that might have been swapped in
+/// via TOCTOU race. The window is narrow but non-zero: between our `openat`
+/// and `fstat`, the filesystem could change. This validation ensures we
+/// never block indefinitely on special files.
 fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     let fd = file.as_raw_fd();
     // SAFETY: fcntl F_GETFL/F_SETFL on a valid fd.
@@ -1138,6 +1208,11 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Convert a Path to a null-terminated C string for syscall use.
+///
+/// Unix paths can contain any bytes except NUL, but C APIs require
+/// NUL-termination. This function validates no embedded NULs exist
+/// and appends the terminator.
 fn path_to_cstring(path: &Path) -> Result<CString, std::ffi::NulError> {
     CString::new(path.as_os_str().as_bytes())
 }

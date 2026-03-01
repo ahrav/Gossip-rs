@@ -3,8 +3,20 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '.beads/**'
+      - 'docs/**'
+      - 'diagrams/**'
+      - '*.md'
+      - 'LICENSE'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '.beads/**'
+      - 'docs/**'
+      - 'diagrams/**'
+      - '*.md'
+      - 'LICENSE'
   schedule:
     - cron: "0 2 * * *" # nightly at 02:00 UTC
   workflow_dispatch:
@@ -19,6 +31,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: "sccache"
 
@@ -27,6 +42,7 @@ jobs:
   changes:
     name: Detect Changes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       rust: ${{ steps.non_pr.outputs.rust || steps.filter.outputs.rust }}
     steps:
@@ -56,6 +72,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes]
     steps:
@@ -71,6 +88,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes, fmt]
     steps:
@@ -87,6 +105,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes, fmt]
     steps:
@@ -103,6 +122,7 @@ jobs:
   test-release:
     name: Test (release)
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes, fmt]
     steps:
@@ -118,6 +138,7 @@ jobs:
   bench:
     name: Bench (compile)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes, fmt]
     steps:
@@ -134,6 +155,7 @@ jobs:
   msrv:
     name: MSRV (1.93)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes]
     env:
@@ -149,6 +171,7 @@ jobs:
   doc:
     name: Doc
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes]
     env:
@@ -167,6 +190,7 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes]
     env:
@@ -182,6 +206,7 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     env:
       RUSTC_WRAPPER: ""
     steps:
@@ -194,6 +219,7 @@ jobs:
   miri:
     name: Miri
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'
@@ -217,6 +243,7 @@ jobs:
   kani:
     name: Kani
     runs-on: ubuntu-24.04
+    timeout-minutes: 180
     if: >-
       github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'

@@ -238,7 +238,7 @@ NIT and INFO findings are skipped by default (see Phase 1 severity filter).
 
 ### Within Each Wave
 
-1. **Dispatch parallel agents** for each non-conflicting group using the Task tool with `subagent_type=general-purpose` and `model="opus"`. Each agent gets the full self-contained task description from Phase 2.
+1. **Dispatch parallel agents** for each non-conflicting group using the Task tool with `subagent_type=general-purpose`. Each agent gets the full self-contained task description from Phase 2.
 
 2. **Agent prompt structure:**
    ```
@@ -298,7 +298,7 @@ Gather the list of all `.rs` files that were modified across all waves. Use `git
 
 ### Step 2: Dispatch Doc-Verify Agent
 
-Launch a fresh `Task` agent with `subagent_type="general-purpose"` and `model="opus"`. The agent prompt must:
+Launch a fresh `Task` agent with `subagent_type="general-purpose"`. The agent prompt must:
 
 1. Read every modified source file in full
 2. Read adjacent module files for cross-reference context

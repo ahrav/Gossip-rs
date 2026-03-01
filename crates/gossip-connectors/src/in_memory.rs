@@ -12,9 +12,11 @@
 //!    uniqueness is verified, and all per-item metadata ([`StableItemId`],
 //!    [`ObjectVersionId`], [`ItemRef`], size hint) is precomputed into internal
 //!    `PreparedItem` records. Subsequent pages pay only clone/copy costs.
-//! 2. **Enumeration** -- Binary search resolves shard bounds (O(log n)),
-//!    then yields up to [`Budgets::max_items`] by index iteration over
-//!    precomputed metadata.
+//! 2. **Enumeration** -- Shard bounds are normalized via the internal
+//!    `borrowed_shard_bound` helper (`[]` means unbounded, oversize is rejected)
+//!    and resolved with binary search (O(log n)), then up to
+//!    [`Budgets::max_items`] are yielded by index iteration over precomputed
+//!    metadata.
 //! 3. **Deterministic IDs** -- [`StableItemId`] derived via
 //!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id) (connector-tag + key, domain-separated),
 //!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
@@ -84,7 +86,7 @@ use gossip_contracts::{
 };
 
 use crate::common::{
-    self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
+    self, borrowed_shard_bound, derive_stable_item_id, lower_bound, parse_u64_be, upper_bound,
 };
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
@@ -279,7 +281,12 @@ impl InMemoryDeterministicConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        self.enumerate_page_bounds(Some(start), Some(end), cursor, budgets)
+        self.enumerate_page_bounds(
+            Some(start.as_bytes()),
+            Some(end.as_bytes()),
+            cursor,
+            budgets,
+        )
     }
 
     /// Return a split-point hint over the explicit half-open key range
@@ -297,7 +304,7 @@ impl InMemoryDeterministicConnector {
         end: &ItemKey,
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        self.choose_split_point_bounds(Some(start), Some(end), cursor)
+        self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor)
     }
 
     /// Core page enumeration for both shard-based and explicit-range callers.
@@ -315,8 +322,8 @@ impl InMemoryDeterministicConnector {
     ///    from precomputed metadata (clone/copy only, no hashing).
     fn enumerate_page_bounds(
         &self,
-        start: Option<&ItemKey>,
-        end: Option<&ItemKey>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
@@ -333,10 +340,8 @@ impl InMemoryDeterministicConnector {
         }
 
         // Phase 3: resolve key bounds to vector indices.
-        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));
-        let range_end = end.map_or(self.items.len(), |bound| {
-            lower_bound(&self.items, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound));
+        let range_end = end.map_or(self.items.len(), |bound| lower_bound(&self.items, bound));
 
         // Phase 4: advance past the cursor's last-emitted key.
         let mut start_idx = range_start;
@@ -439,8 +444,8 @@ impl InMemoryDeterministicConnector {
     /// upper shard bound (which would produce an empty right shard).
     fn choose_split_point_bounds(
         &self,
-        start: Option<&ItemKey>,
-        end: Option<&ItemKey>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
         // Range validation.
@@ -450,10 +455,8 @@ impl InMemoryDeterministicConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound.as_bytes()));
-        let range_end = end.map_or(self.items.len(), |bound| {
-            lower_bound(&self.items, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.items, bound));
+        let range_end = end.map_or(self.items.len(), |bound| lower_bound(&self.items, bound));
         let resume_start = cursor.last_key().map_or(range_start, |last| {
             upper_bound(&self.items, last.as_bytes())
         });
@@ -467,11 +470,14 @@ impl InMemoryDeterministicConnector {
         let candidate = self.items[split_idx].key.clone();
 
         // Reject candidates that would not advance past the cursor.
-        if cursor.last_key().is_some_and(|last| &candidate <= last) {
+        if cursor
+            .last_key()
+            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
+        {
             return Ok(None);
         }
         // Reject candidates at or beyond the upper bound.
-        if end.is_some_and(|upper| &candidate >= upper) {
+        if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
             return Ok(None);
         }
 
@@ -506,15 +512,18 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         }
     }
 
+    /// Shard bounds are validated allocation-free via the internal
+    /// `borrowed_shard_bound` helper:
+    /// empty means unbounded, oversize bounds are permanent input errors.
     fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        let start = shard_bound(shard.key_range_start(), "start")?;
-        let end = shard_bound(shard.key_range_end(), "end")?;
-        self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
     /// Budgets are accepted for trait conformance but not consumed: split-point
@@ -525,9 +534,9 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         cursor: &Cursor,
         _budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let start = shard_bound(shard.key_range_start(), "start")?;
-        let end = shard_bound(shard.key_range_end(), "end")?;
-        self.choose_split_point_bounds(start.as_ref(), end.as_ref(), cursor)
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        self.choose_split_point_bounds(start, end, cursor)
     }
 }
 

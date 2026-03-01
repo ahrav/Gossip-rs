@@ -1,5 +1,4 @@
 ---
-model: opus
 ---
 
 # Performance Analyzer Agent

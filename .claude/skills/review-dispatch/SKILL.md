@@ -60,7 +60,7 @@ findings can be linked back to the PR.
 ## Phase 1 — Specialist Reviews (6 Parallel Agents)
 
 Launch **all 6 agents in a single message** using the Task tool with
-`subagent_type=general-purpose` and `model="opus"`. Each agent gets the same code but a different
+`subagent_type=general-purpose`. Each agent gets the same code but a different
 review lens.
 
 ### Common Preamble (included in every agent's prompt)
@@ -272,7 +272,7 @@ Severity guide:
 ## Phase 2 — Rank & Merge (Single Agent)
 
 After all 6 specialists complete, launch **1 ranking agent** using the Task
-tool with `subagent_type=general-purpose` and `model="opus"`.
+tool with `subagent_type=general-purpose`.
 
 ### Ranker Prompt
 
