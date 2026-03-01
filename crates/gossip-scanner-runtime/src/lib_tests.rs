@@ -65,22 +65,53 @@ fn scan_fs_direct_rejects_nonexistent_path() {
     ));
 }
 
-// ── Connector-mode gating ──────────────────────────────────────
+// ── Connector-mode filesystem path ─────────────────────────────
 
 #[test]
-fn scan_fs_connector_is_explicitly_gated() {
+fn scan_fs_connector_scans_directory() {
     let dir = tempdir().expect("tempdir");
-    let error =
-        scan_fs(&FsScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
-            .expect_err("connector mode should be gated");
-    assert!(matches!(
-        error,
-        ScanRuntimeError::UnsupportedExecutionMode {
-            source: "filesystem",
-            mode: ExecutionMode::Connector,
-        }
-    ));
+    fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
+    fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+
+    let outcome = scan_fs_connector(&FsScanConfig::new(dir.path())).expect("connector scan");
+    assert!(outcome.pages_scanned() >= 1);
+    assert!(outcome.items_scanned() >= 2);
+    assert!(outcome.findings_emitted() >= 2);
 }
+
+#[test]
+fn scan_fs_connector_scans_single_file() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("secret.txt");
+    fs::write(&file_path, "password=hunter2").expect("write");
+
+    let outcome = scan_fs_connector(&FsScanConfig::new(&file_path)).expect("single file scan");
+    assert_eq!(outcome.pages_scanned(), 1);
+    assert_eq!(outcome.items_scanned(), 1);
+}
+
+#[test]
+fn scan_fs_direct_and_connector_match_for_directory() {
+    let dir = tempdir().expect("tempdir");
+    fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
+    fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+
+    let budgets = ScanBudgets {
+        max_items: 1,
+        max_bytes: 1_000_000,
+    };
+    let direct =
+        scan_fs(&FsScanConfig::new(dir.path()).with_budgets(budgets)).expect("direct outcome");
+    let connector = scan_fs(
+        &FsScanConfig::new(dir.path())
+            .with_budgets(budgets)
+            .with_execution_mode(ExecutionMode::Connector),
+    )
+    .expect("connector outcome");
+    assert_eq!(direct, connector);
+}
+
+// ── Connector-mode gating (git only) ─────────────────────────────
 
 #[test]
 fn scan_git_connector_is_explicitly_gated() {
