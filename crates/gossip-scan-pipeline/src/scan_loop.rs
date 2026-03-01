@@ -58,7 +58,7 @@
 //! ## Scan-loop invariants
 //!
 //! These invariants are enforced by the loop implementation and verified by
-//! the test suite. The labels (SL1–SL6) are stable identifiers used for
+//! the test suite. The labels (SL1–SL7) are stable identifiers used for
 //! cross-referencing in tests and design documents.
 //!
 //! - **SL1 — Validate-before-persist:** A page is always validated before any
@@ -99,10 +99,11 @@
 //!   renewal requires access to the live session and lease metadata, so it must
 //!   happen inside the loop. Retry orchestration (backoff, jitter, scheduling)
 //!   is policy-heavy and session-independent, so it belongs in the caller.
-//! - `LeaseLost` is emitted only on "abandon without mutation" paths
-//!   (deadline elapsed before checkpoint, or renewal failure). Once a
-//!   coordination mutation is attempted, backend rejections - including
-//!   lease-expired errors - are returned as `Error`.
+//! - `LeaseLost` is emitted only on explicit abandon paths: deadline elapsed
+//!   before `checkpoint`/`complete`, or failed `renew`. Backend rejections from
+//!   attempted `checkpoint`/`complete`/`park` mutations - including lease-expired
+//!   cases - are returned as `Error`. `renew` is the intentional exception:
+//!   renewal failure maps to `LeaseLost` so callers can re-acquire cleanly.
 //! - Permanent error classification is message-heuristic based because the
 //!   connector contract only surfaces a binary retryability class plus free-form
 //!   error text. The heuristic is conservative: unrecognized messages fall through
@@ -114,7 +115,7 @@ use std::fmt;
 
 use gossip_contracts::connector::{
     Budgets, ConnectorInputError, Cursor, EnumerateError, EnumerationConnector,
-    PageValidationError, validate_page,
+    PageValidationError, ScanItem, validate_page,
 };
 use gossip_contracts::coordination::{ShardSpec, ShardSpecInputError};
 use gossip_contracts::identity::{LogicalTime, OpId};
@@ -129,7 +130,10 @@ use gossip_coordination::{
 /// before the shard is parked with [`ParkReason::TooManyErrors`].
 pub const DEFAULT_MAX_TRANSIENT_RETRIES: usize = 3;
 
-/// Default lease-renew trigger: renew at half-life (`remaining <= duration / 2`).
+/// Default lease-renew trigger: renew near half-life using ceil-threshold logic.
+///
+/// The threshold uses `ceil(duration * fraction)` plus a minimum-threshold
+/// guard for positive fractions.
 pub const DEFAULT_RENEW_AT_FRACTION: f64 = 0.5;
 
 /// Lease-renew scheduling policy for [`run_scan_loop_with_policy`].
@@ -197,10 +201,11 @@ pub enum LeaseLossCause {
     /// The loop stops immediately and does not attempt `park` or `complete`,
     /// so the shard remains resumable from its last persisted checkpoint.
     RenewFailed(RenewError),
-    /// Lease deadline elapsed before a checkpoint could be attempted.
+    /// Lease deadline elapsed before a checkpoint/complete could be attempted.
     ///
-    /// The current page was validated but not persisted; `pages_completed`
-    /// still reflects only durable checkpoint progress.
+    /// This can happen at loop entry (before any page fetch) or after
+    /// enumeration when deadline guards run before `checkpoint`/`complete`.
+    /// `pages_completed` still reflects only durable checkpoint progress.
     DeadlineElapsed {
         now: LogicalTime,
         deadline: LogicalTime,
@@ -349,10 +354,85 @@ impl std::error::Error for ScanLoopError {
     }
 }
 
+/// Redacted `Cursor` formatter for tracing fields.
+///
+/// Uses `Display` on toxic fields (`ItemKey`, `TokenBytes`) so output is
+/// hash-only and never includes raw bytes.
+struct RedactedCursor<'a>(&'a Cursor);
+
+impl fmt::Display for RedactedCursor<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cursor = self.0;
+        f.write_str("Cursor(last_key=")?;
+        match cursor.last_key() {
+            Some(last_key) => write!(f, "{last_key}")?,
+            None => f.write_str("None")?,
+        }
+        f.write_str(", token=")?;
+        match cursor.token() {
+            Some(token) => write!(f, "Some({token})")?,
+            None => f.write_str("None")?,
+        }
+        f.write_str(")")
+    }
+}
+
+/// Compact redacted summary of first/last items in an enumerated page.
+///
+/// Keeps per-page tracing useful without logging the full item list.
+struct RedactedPageSample<'a> {
+    first: Option<&'a ScanItem>,
+    last: Option<&'a ScanItem>,
+}
+
+impl<'a> RedactedPageSample<'a> {
+    #[inline]
+    fn from_items(items: &'a [ScanItem]) -> Self {
+        Self {
+            first: items.first(),
+            last: items.last(),
+        }
+    }
+}
+
+impl fmt::Display for RedactedPageSample<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PageSample(first_key=")?;
+        match self.first {
+            Some(first) => write!(f, "Some({})", first.item_key())?,
+            None => f.write_str("None")?,
+        }
+        f.write_str(", first_ref=")?;
+        match self.first {
+            Some(first) => write!(f, "Some({})", first.item_ref())?,
+            None => f.write_str("None")?,
+        }
+        f.write_str(", last_key=")?;
+        match self.last {
+            Some(last) => write!(f, "Some({})", last.item_key())?,
+            None => f.write_str("None")?,
+        }
+        f.write_str(", last_ref=")?;
+        match self.last {
+            Some(last) => write!(f, "Some({})", last.item_ref())?,
+            None => f.write_str("None")?,
+        }
+        f.write_str(")")
+    }
+}
+
 /// Run the connector enumeration loop with the default lease-renew policy.
 ///
 /// This is a convenience wrapper around [`run_scan_loop_with_policy`] using
 /// [`RenewalPolicy::default`] (renew at half-life).
+#[tracing::instrument(
+    skip(session, connector, budgets, op_id_fn, now_fn),
+    fields(
+        shard_key = ?session.shard_key(),
+        tenant = ?session.tenant(),
+        worker = ?session.worker(),
+    )
+)]
 pub fn run_scan_loop<B, C, N>(
     session: WorkerSession<'_, B>,
     connector: &mut C,
@@ -393,6 +473,18 @@ where
 /// checkpoint timestamp, renewal evaluation). Non-monotonic values would
 /// invalidate deadline comparisons and renewal threshold calculations.
 ///
+/// ## Operation-ID contract
+///
+/// `op_id_fn` must yield fresh IDs for each coordination mutation attempted by
+/// this invocation (`checkpoint`, `complete`, `park`). Reusing an `OpId` with a
+/// different payload surfaces as backend idempotency conflicts.
+///
+/// ## Retry-budget semantics
+///
+/// `max_transient_retries` counts **consecutive** retryable enumerate failures.
+/// The streak resets after every successful page. `0` means "park on the first
+/// retryable error."
+///
 /// ## Lease renewal model
 ///
 /// Renewal remains synchronous and deterministic: after each successful
@@ -408,8 +500,8 @@ where
 /// ## Lease-loss boundary
 ///
 /// `LeaseLost` is intentionally narrow: it is returned only when the loop can
-/// detect lease loss before issuing a coordination mutation (`checkpoint`) or
-/// when `renew` itself fails. If `checkpoint`, `complete`, or `park` is
+/// detect lease loss before issuing a coordination mutation (`checkpoint` or
+/// `complete`) or when `renew` itself fails. If `checkpoint`, `complete`, or `park` is
 /// attempted and rejected by the backend (including lease-expired cases), the
 /// outcome remains `Error`.
 ///
@@ -429,9 +521,9 @@ where
 /// | Coordination checkpoint/complete failure | Return `Error` directly |
 /// | Park call failure | Return compound `Error::Park` |
 ///
-/// Note: `LeaseLost { pages_completed: 0 }` can occur either from the
-/// pre-loop entry check or from the pre-checkpoint deadline guard firing
-/// on the first non-empty page.
+/// Note: `LeaseLost { pages_completed: 0 }` can occur from the pre-loop entry
+/// check, from the pre-checkpoint deadline guard firing on the first non-empty
+/// page, or from the pre-complete deadline guard on an initial empty page.
 pub fn run_scan_loop_with_policy<B, C, N>(
     mut session: WorkerSession<'_, B>,
     connector: &mut C,
@@ -454,6 +546,7 @@ where
     let spec = match ShardSpec::try_from_ref(session.spec()) {
         Ok(spec) => spec,
         Err(error) => {
+            tracing::error!(error = %error, "contract violation, parking shard");
             return park_and_return(
                 session,
                 now_fn(),
@@ -468,6 +561,7 @@ where
     let mut connector_cursor = match Cursor::try_from_update(session.cursor()) {
         Ok(cursor) => cursor,
         Err(error) => {
+            tracing::error!(error = %error, "contract violation, parking shard");
             return park_and_return(
                 session,
                 now_fn(),
@@ -485,17 +579,16 @@ where
     // Early exit: if the lease is already expired at loop entry, there is no
     // point issuing a connector call that will produce work we cannot persist.
     if baseline_now >= session.lease().deadline() {
-        return ScanLoopOutcome::LeaseLost {
-            pages_completed: 0,
-            cause: LeaseLossCause::DeadlineElapsed {
+        return lease_lost_outcome(
+            0,
+            LeaseLossCause::DeadlineElapsed {
                 now: baseline_now,
                 deadline: session.lease().deadline(),
             },
-        };
+        );
     }
-    // Degenerate case: if baseline_now >= deadline, observed_lease_duration is 0.
-    // The early-exit guard above catches this before we reach the loop, returning
-    // LeaseLost(DeadlineElapsed) before should_renew is ever evaluated.
+    // observed_lease_duration can be 0 only when deadline == baseline_now;
+    // the guard above exits before renewal logic is reached in that case.
     let mut observed_lease_duration = session
         .lease()
         .deadline()
@@ -503,22 +596,45 @@ where
         .saturating_sub(baseline_now.as_raw());
     let mut transient_failures = 0usize;
     let mut pages_completed = 0u64;
+    let mut page_num = 0u64;
 
     loop {
         let page = match connector.enumerate_page(&spec, &connector_cursor, budgets) {
             Ok(page) => {
                 // Retry budget applies to consecutive errors only.
                 transient_failures = 0;
+                page_num = page_num.saturating_add(1);
+                tracing::debug!(
+                    page_num,
+                    items_count = page.items().len(),
+                    page_sample = %RedactedPageSample::from_items(page.items()),
+                    next_cursor = %RedactedCursor(page.next_cursor()),
+                    "page enumerated",
+                );
                 page
             }
             Err(error) => {
                 if error.class().is_retryable() {
                     if transient_failures < max_transient_retries {
                         transient_failures += 1;
+                        tracing::debug!(
+                            page_num,
+                            transient_failures,
+                            max_transient_retries,
+                            error = %error,
+                            "retryable enumerate error, retrying",
+                        );
                         continue;
                     }
 
                     let hint = error.retry_after_ms();
+                    tracing::warn!(
+                        page_num,
+                        transient_failures,
+                        retry_after_ms = ?hint,
+                        error = %error,
+                        "retry budget exhausted, parking shard",
+                    );
                     return park_and_return(
                         session,
                         now_fn(),
@@ -531,6 +647,22 @@ where
 
                 let hint = error.retry_after_ms();
                 let reason = classify_permanent_enumerate_error(&error);
+                if reason == ParkReason::PermissionDenied {
+                    tracing::error!(
+                        page_num,
+                        retry_after_ms = ?hint,
+                        error = %error,
+                        "connector auth error, parking shard",
+                    );
+                } else {
+                    tracing::warn!(
+                        page_num,
+                        reason = %reason,
+                        retry_after_ms = ?hint,
+                        error = %error,
+                        "connector error, parking shard",
+                    );
+                }
                 return park_and_return(
                     session,
                     now_fn(),
@@ -547,6 +679,13 @@ where
         if let Err(error) =
             validate_page(&spec, &connector_cursor, page.items(), page.next_cursor())
         {
+            tracing::error!(
+                page_num,
+                validation_error = %error,
+                page_sample = %RedactedPageSample::from_items(page.items()),
+                next_cursor = %RedactedCursor(page.next_cursor()),
+                "contract violation, parking shard",
+            );
             return park_and_return(
                 session,
                 now_fn(),
@@ -556,6 +695,7 @@ where
                 None,
             );
         }
+        tracing::debug!(page_num, "page validated");
 
         // Check emptiness by reference before consuming the page for its
         // cursor, avoiding a clone of heap-allocated key and token fields.
@@ -581,17 +721,25 @@ where
             let complete_now = now_fn();
             let deadline = session.lease().deadline();
             if complete_now >= deadline {
-                return ScanLoopOutcome::LeaseLost {
+                return lease_lost_outcome(
                     pages_completed,
-                    cause: LeaseLossCause::DeadlineElapsed {
+                    LeaseLossCause::DeadlineElapsed {
                         now: complete_now,
                         deadline,
                     },
-                };
+                );
             }
             let final_cursor = next_cursor.as_update();
             return match session.complete(complete_now, &final_cursor, op_id_fn()) {
-                Ok(_) => ScanLoopOutcome::Completed,
+                Ok(_) => {
+                    tracing::info!(
+                        page_num,
+                        pages_completed,
+                        final_cursor = %RedactedCursor(&next_cursor),
+                        "scan completed",
+                    );
+                    ScanLoopOutcome::Completed
+                }
                 Err(error) => ScanLoopOutcome::Error(ScanLoopError::Complete(error)),
             };
         }
@@ -615,13 +763,13 @@ where
         // Guard before checkpoint so we surface lease loss explicitly instead
         // of issuing a mutation that is already stale.
         if checkpoint_now >= deadline {
-            return ScanLoopOutcome::LeaseLost {
+            return lease_lost_outcome(
                 pages_completed,
-                cause: LeaseLossCause::DeadlineElapsed {
+                LeaseLossCause::DeadlineElapsed {
                     now: checkpoint_now,
                     deadline,
                 },
-            };
+            );
         }
 
         let checkpoint_cursor = next_cursor.as_update();
@@ -632,6 +780,12 @@ where
                 // caller, not handled inside the scan loop.
                 connector_cursor = next_cursor;
                 pages_completed += 1;
+                tracing::debug!(
+                    page_num,
+                    pages_completed,
+                    checkpoint_cursor = %RedactedCursor(&connector_cursor),
+                    "checkpoint persisted",
+                );
             }
             Err(error) => return ScanLoopOutcome::Error(ScanLoopError::Checkpoint(error)),
         }
@@ -656,6 +810,12 @@ where
                         observed_lease_duration > 0,
                         "renewed lease deadline must be strictly after renew time"
                     );
+                    tracing::info!(
+                        page_num,
+                        pages_completed,
+                        new_deadline = session.lease().deadline().as_raw(),
+                        "lease renewed",
+                    );
                 }
                 Err(error) => {
                     debug_assert!(
@@ -664,13 +824,20 @@ where
                     );
                     // Renewal failure is treated as lease loss, not a generic
                     // mutation error: we abandon the session immediately.
-                    return ScanLoopOutcome::LeaseLost {
-                        pages_completed,
-                        cause: LeaseLossCause::RenewFailed(error),
-                    };
+                    return lease_lost_outcome(pages_completed, LeaseLossCause::RenewFailed(error));
                 }
             }
         }
+    }
+}
+
+/// Emit a standardized lease-loss warning and build the terminal outcome.
+#[inline]
+fn lease_lost_outcome(pages_completed: u64, cause: LeaseLossCause) -> ScanLoopOutcome {
+    tracing::warn!(pages_completed, cause = %cause, "lease lost");
+    ScanLoopOutcome::LeaseLost {
+        pages_completed,
+        cause,
     }
 }
 

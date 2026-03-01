@@ -1,9 +1,25 @@
-use std::cell::Cell;
+//! Targeted tests for scan-loop control-flow invariants.
+//!
+//! This suite combines:
+//! - scenario tests for terminal outcomes (`Completed`, `Parked`, `LeaseLost`,
+//!   and `Error`),
+//! - parameterized branch coverage for helpers like `should_renew`, and
+//! - property tests for classification invariants.
+//!
+//! Most scenario tests script `now_fn` explicitly so lease deadlines and renew
+//! thresholds are deterministic and reproducible.
+
+use std::{
+    cell::Cell,
+    io,
+    sync::{Arc, Mutex},
+};
 
 use super::*;
 use gossip_connectors::{InMemoryDeterministicConnector, MemItem};
 use gossip_contracts::connector::{
-    ConnectorCapabilities, EnumerationPage, ItemKey, ItemRef, ScanItem, VersionId,
+    ConnectorCapabilities, Cursor, EnumerationPage, ItemKey, ItemRef, ScanItem, TokenBytes,
+    VersionId,
 };
 use gossip_contracts::coordination::{CursorSemantics, CursorUpdate, InitialShardInput};
 use gossip_contracts::identity::{
@@ -19,6 +35,7 @@ use rstest::rstest;
 
 const TAG: ConnectorTag = ConnectorTag::from_ascii(b"scanloop");
 
+/// Generate strictly increasing operation IDs for idempotency-sensitive calls.
 fn counter_op_ids(start: u64) -> impl FnMut() -> OpId {
     let mut next = start;
     move || {
@@ -78,6 +95,10 @@ fn budgets(max_items: usize) -> Budgets {
     Budgets::try_new(max_items, u64::MAX, None).expect("budgets")
 }
 
+/// Build a single-shard run fixture with configurable lease duration/cursor.
+///
+/// The shard range is fixed to `[a, z)` to keep tests focused on scan-loop
+/// behavior rather than range-planning mechanics.
 fn seeded_coordinator(
     lease_duration: u64,
     initial_cursor: CursorUpdate<'_>,
@@ -101,6 +122,7 @@ fn seeded_coordinator(
     coord
 }
 
+/// Acquire the canonical test shard at a scripted logical time.
 fn acquire_session<'a, B: CoordinationBackend>(
     coord: &'a mut B,
     at: u64,
@@ -110,6 +132,7 @@ fn acquire_session<'a, B: CoordinationBackend>(
         .expect("acquire session")
 }
 
+/// Return the only shard summary in the single-shard test fixture.
 fn shard_summary(coord: &InMemoryCoordinator, at: u64) -> ShardSummary {
     let mut out = Vec::new();
     coord
@@ -468,6 +491,135 @@ impl EnumerationConnector for ScriptedConnector {
         self.calls += 1;
         response
     }
+}
+
+/// Test-only tracing writer that captures subscriber output into shared bytes.
+#[derive(Clone, Default)]
+struct SharedLogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl SharedLogBuffer {
+    fn as_string(&self) -> String {
+        let bytes = self.0.lock().expect("test tracing buffer lock").clone();
+        String::from_utf8(bytes).expect("test tracing output should be valid UTF-8")
+    }
+}
+
+struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogBuffer {
+    type Writer = SharedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedLogWriter(Arc::clone(&self.0))
+    }
+}
+
+impl io::Write for SharedLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("test tracing buffer lock")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn tracing_output_redacts_toxic_fields() {
+    let mut coord = seeded_coordinator(40, CursorUpdate::initial());
+    let toxic_key_bytes = b"raw-key-secret-01";
+    let toxic_ref_bytes = b"raw-ref-secret-02";
+    let toxic_token_bytes = b"raw-token-secret-03";
+
+    let toxic_key = ItemKey::try_from_slice(toxic_key_bytes).expect("toxic key");
+    let toxic_ref = ItemRef::try_from_slice(toxic_ref_bytes).expect("toxic ref");
+    let toxic_token = TokenBytes::try_from_slice(toxic_token_bytes).expect("toxic token");
+    let redacted_token = toxic_token.to_string();
+    let mut stable = [0u8; 32];
+    let copy_len = toxic_key_bytes.len().min(stable.len());
+    stable[..copy_len].copy_from_slice(&toxic_key_bytes[..copy_len]);
+
+    let first_page = EnumerationPage::new(
+        vec![ScanItem::new(
+            toxic_key.clone(),
+            toxic_ref.clone(),
+            StableItemId::from_bytes(stable),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(toxic_key_bytes)),
+        )],
+        Cursor::with_token(toxic_key.clone(), toxic_token.clone()),
+    );
+    let terminal_page = EnumerationPage::new(
+        Vec::new(),
+        Cursor::with_token(toxic_key.clone(), toxic_token),
+    );
+    let mut connector = ScriptedConnector::new(vec![Ok(first_page), Ok(terminal_page)]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(1400);
+    let mut tick = 4u64;
+
+    let buffer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(buffer.clone())
+        .finish();
+
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        )
+    });
+
+    assert_eq!(outcome, ScanLoopOutcome::Completed);
+
+    let logs = buffer.as_string();
+    assert!(
+        !logs.contains("raw-key-secret-01"),
+        "raw key bytes leaked in tracing output:\n{logs}"
+    );
+    assert!(
+        !logs.contains("raw-ref-secret-02"),
+        "raw item-ref bytes leaked in tracing output:\n{logs}"
+    );
+    assert!(
+        !logs.contains("raw-token-secret-03"),
+        "raw token bytes leaked in tracing output:\n{logs}"
+    );
+
+    let redacted_key = toxic_key.to_string();
+    let redacted_ref = toxic_ref.to_string();
+    assert!(
+        logs.contains(&redacted_key),
+        "expected redacted key in tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains(&redacted_ref),
+        "expected redacted item-ref in tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains(&redacted_token),
+        "expected redacted token in tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains("Cursor(last_key=ItemKey("),
+        "expected redacted cursor formatting in tracing output:\n{logs}"
+    );
 }
 
 #[test]
