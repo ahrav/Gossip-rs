@@ -162,9 +162,7 @@ use gossip_contracts::{
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
-use crate::common::{
-    self, borrowed_shard_bound, derive_stable_item_id, lower_bound, parse_u64_be, upper_bound,
-};
+use crate::common::{self, borrowed_shard_bound, derive_stable_item_id};
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
 ///
@@ -414,6 +412,15 @@ impl FilesystemConnector {
     // Enumeration
     // ---------------------------------------------------------------
 
+    /// Enumerate one page over the explicit half-open key range `[start, end)`.
+    ///
+    /// This entry point bypasses [`ShardSpec`] decoding, letting tests exercise
+    /// the core pagination logic with known-good bounds and without needing to
+    /// construct a full shard object.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EnumerateError::permanent` if `start > end`.
     pub fn enumerate_page_range(
         &mut self,
         start: &ItemKey,
@@ -435,6 +442,10 @@ impl FilesystemConnector {
     /// resume semantics, then stages key/ref/token bytes in a page-local slab
     /// for pooled toxic-byte wrappers.
     ///
+    /// Unlike the in-memory connector, filesystem tokens are advisory only:
+    /// key-derived resume remains authoritative and token mismatch is debug-only
+    /// telemetry for cursor-construction bugs.
+    ///
     /// # Failure modes
     ///
     /// - Deadline expiry is retryable.
@@ -449,43 +460,28 @@ impl FilesystemConnector {
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
         self.ensure_indexed(budgets.deadline())?;
+        let bounds = common::resolve_page_bounds(&self.files, start, end, budgets)?;
+        let key_resume = common::key_resume_start(&self.files, cursor, bounds.range_start);
+        let start_idx = key_resume;
 
-        if budgets.is_expired_at(Instant::now()) {
-            return Err(EnumerateError::retryable("budget deadline expired"));
-        }
-
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
+        // Advisory-token check: keep release behavior key-authoritative while
+        // surfacing token drift during development.
+        #[cfg(debug_assertions)]
+        if self.emit_tokens
+            && cursor.last_key().is_some()
+            && let Some(token_idx) = common::cursor_token_index(cursor)
         {
-            return Err(EnumerateError::permanent("shard start key exceeds end key"));
+            debug_assert_eq!(
+                token_idx, key_resume,
+                "token index {token_idx} disagrees with key-derived resume position {key_resume}"
+            );
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound));
-        let range_end = end.map_or(self.files.len(), |bound| lower_bound(&self.files, bound));
-
-        let mut start_idx = range_start;
-        if let Some(last_key) = cursor.last_key() {
-            let expected = upper_bound(&self.files, last_key.as_bytes());
-            start_idx = start_idx.max(expected);
-
-            #[cfg(debug_assertions)]
-            if self.emit_tokens
-                && let Some(token) = cursor.token()
-                && let Some(token_idx_u64) = parse_u64_be(token.as_bytes())
-                && let Ok(token_idx) = usize::try_from(token_idx_u64)
-            {
-                debug_assert_eq!(
-                    token_idx, expected,
-                    "token index {token_idx} disagrees with key-derived resume position {expected}"
-                );
-            }
-        }
-
-        if start_idx >= range_end {
+        if start_idx >= bounds.range_end {
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
         }
 
-        let take = budgets.max_items().min(range_end - start_idx);
+        let take = budgets.max_items().min(bounds.range_end - start_idx);
         let page_files = &self.files[start_idx..(start_idx + take)];
 
         // Filesystem item refs mirror key bytes exactly.
@@ -494,24 +490,26 @@ impl FilesystemConnector {
             self.emit_tokens,
             start_idx,
         )?;
-        let mut out = Vec::with_capacity(staged.wrappers.len());
-        for ((item_key, item_ref), file) in staged.wrappers.into_iter().zip(page_files) {
+        let common::StagedPage { wrappers, token } = staged;
+        let mut out = Vec::with_capacity(wrappers.len());
+        for ((item_key, item_ref), file) in wrappers.into_iter().zip(page_files) {
             out.push(
                 ScanItem::new(item_key, item_ref, file.stable_item_id, file.version)
                     .with_size_hint(file.size),
             );
         }
 
-        let last_key = out
-            .last()
-            .expect("non-empty page must have a last key")
-            .item_key()
-            .clone();
-        let next_cursor = if let Some(token) = staged.token {
-            Cursor::with_token(last_key, token)
-        } else {
-            Cursor::with_last_key(last_key)
+        let last_key = match out.last() {
+            Some(item) => item.item_key().clone(),
+            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
         };
+        let next_cursor = common::build_next_cursor_from_staged(
+            last_key,
+            start_idx,
+            out.len(),
+            self.emit_tokens,
+            token,
+        )?;
 
         Ok(EnumerationPage::new(out, next_cursor))
     }
@@ -520,6 +518,15 @@ impl FilesystemConnector {
     // Split-point selection
     // ---------------------------------------------------------------
 
+    /// Return a split-point hint over the explicit half-open key range
+    /// `[start, end)`.
+    ///
+    /// This entry point mirrors shard-based split behavior without requiring a
+    /// [`ShardSpec`], keeping split-point unit tests focused and self-contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EnumerateError::permanent` if `start > end`.
     pub fn choose_split_point_range(
         &mut self,
         start: &ItemKey,
@@ -529,6 +536,16 @@ impl FilesystemConnector {
         self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor, None)
     }
 
+    /// Shared bound resolution + filesystem-specific split selection.
+    ///
+    /// The window `[start_idx, range_end)` comes from [`common::resolve_bounds`]
+    /// and [`common::key_resume_start`], then split selection uses the
+    /// precomputed prefix sums (`byte_weighted_split_idx`) for O(log n)
+    /// byte-balanced hints. Post-selection guards use
+    /// [`common::is_valid_split_candidate`].
+    ///
+    /// Returning `None` means no safe/meaningful split exists after applying
+    /// cursor-progress and upper-bound guards.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -543,34 +560,15 @@ impl FilesystemConnector {
         {
             return Err(EnumerateError::retryable("budget deadline expired"));
         }
-
-        if let (Some(s), Some(e)) = (start, end)
-            && s > e
-        {
-            return Err(EnumerateError::permanent("shard start key exceeds end key"));
-        }
-
-        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound));
-        let range_end = end.map_or(self.files.len(), |bound| lower_bound(&self.files, bound));
-        let resume_start = cursor.last_key().map_or(range_start, |last| {
-            upper_bound(&self.files, last.as_bytes())
-        });
-
-        let start_idx = range_start.max(resume_start);
-        let split_idx = match self.byte_weighted_split_idx(start_idx, range_end) {
+        let bounds = common::resolve_bounds(&self.files, start, end)?;
+        let start_idx = common::key_resume_start(&self.files, cursor, bounds.range_start);
+        let split_idx = match self.byte_weighted_split_idx(start_idx, bounds.range_end) {
             Some(idx) => idx,
             None => return Ok(None),
         };
 
         let candidate = &self.files[split_idx].key;
-
-        if cursor
-            .last_key()
-            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
-        {
-            return Ok(None);
-        }
-        if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
+        if !common::is_valid_split_candidate(candidate.as_bytes(), cursor, end) {
             return Ok(None);
         }
 
@@ -826,10 +824,12 @@ impl ReadConnector for FilesystemConnector {
 /// - `NotFound`: file/directory doesn't exist
 /// - `PermissionDenied`: insufficient access rights
 /// - `InvalidInput`: malformed arguments
+/// - `InvalidFilename`: invalid path bytes
+/// - `NotADirectory` / `IsADirectory`: wrong path kind for the operation
 /// - `ELOOP`: symlink loop detected (POSIX-specific)
 ///
-/// All other errors (e.g., `EAGAIN`, `EINTR`, network timeouts) are
-/// considered transient and warrant retry.
+/// Other errors (for example `EAGAIN`, `EINTR`) are treated as transient and
+/// warrant retry.
 fn is_permanent_io_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -874,15 +874,16 @@ fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> Enumer
 ///
 /// # Algorithm
 ///
-/// Uses an explicit stack to avoid recursion. Directories are processed
-/// in reverse order to maintain lexicographic ordering of results. Symlinks
-/// are skipped (logged as warnings) to avoid cycles and ensure determinism.
+/// Uses an explicit stack to avoid recursion and traverses each directory's
+/// entries in filesystem-provided order. A final global sort by encoded key
+/// enforces deterministic output ordering. Symlinks are skipped (logged as
+/// warnings) to avoid cycles and ensure deterministic membership.
 ///
 /// # Trade-offs
 ///
 /// - **No recursion**: Explicit stack prevents stack overflow on deep trees
-/// - **Reverse iteration**: `read_dir` results are reversed before pushing
-///   to stack, ensuring lexicographic order in final output
+/// - **Post-walk sort**: Keep traversal simple, then sort collected files by
+///   encoded key to guarantee deterministic final order
 /// - **Skip symlinks**: Avoids cycles and non-deterministic resolution
 /// - **Regular files only**: Devices, FIFOs, sockets are skipped
 /// - **Depth limit**: Prevents infinite traversal of cyclic bind mounts
@@ -890,8 +891,9 @@ fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> Enumer
 ///
 /// # Errors
 ///
-/// Returns permanent errors for invalid root path or encoding failures.
-/// I/O errors during traversal are logged as warnings but don't fail the walk.
+/// Returns hard errors for invalid root path and root-level traversal failures
+/// (for example `read_dir(root)` failure). Encoding failures for individual
+/// entries are downgraded to warnings and do not fail the walk.
 fn walk_dir_collect_files(
     root: &Path,
     max_depth: usize,
@@ -1154,8 +1156,9 @@ fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
 ///
 /// Uses `O_RDONLY | O_DIRECTORY | O_CLOEXEC` flags to ensure we get a
 /// directory handle that won't leak to child processes. The `O_DIRECTORY`
-/// flag causes `open` to fail if the path isn't a directory, preventing
-/// TOCTOU races where a directory is replaced with a symlink.
+/// flag causes `open` to fail if the path isn't a directory. Symlink traversal
+/// hardening for child path components is enforced later via `openat` with
+/// `O_NOFOLLOW`.
 fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
     let c_path = path_to_cstring(path)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "null byte in path"))?;
