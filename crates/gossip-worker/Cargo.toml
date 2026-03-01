@@ -13,3 +13,5 @@ gossip-engine.workspace = true
 gossip-scan-pipeline.workspace = true
 gossip-connectors.workspace = true
 gossip-coordination.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

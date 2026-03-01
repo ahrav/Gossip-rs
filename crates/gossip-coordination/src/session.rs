@@ -89,8 +89,9 @@
 use gossip_stdx::InlineVec;
 
 use crate::error::{
-    AcquireError, AcquireScratch, CapacityHint, CheckpointError, CompleteError, IdempotentOutcome,
-    ParkError, RenewError, RenewResult, ShardSnapshotView, SplitReplaceError, SplitResidualError,
+    AcquireError, AcquireResultView, AcquireScratch, CapacityHint, CheckpointError, CompleteError,
+    IdempotentOutcome, ParkError, RenewError, RenewResult, ShardSnapshotView, SplitReplaceError,
+    SplitResidualError,
 };
 use crate::lease::Lease;
 use crate::record::{ParkReason, ShardStatus};
@@ -289,6 +290,81 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
         })
     }
 
+    /// Build a session from a previously acquired snapshot/lease view.
+    ///
+    /// This bridge exists for claim-based orchestration paths:
+    /// [`ShardClaiming::claim_next_available`](crate::facade::ShardClaiming::claim_next_available)
+    /// returns an [`AcquireResultView`], while scan-loop execution operates on
+    /// [`WorkerSession`]. The method copies borrowed snapshot bytes into
+    /// session-owned scratch so the resulting session has the same ownership
+    /// and lifetime behavior as [`Self::new`].
+    ///
+    /// Unlike [`Self::new`], this constructor does not accept explicit
+    /// `tenant`/`worker` arguments. Both identities are sourced from
+    /// `acquired.lease`, which avoids accidental mismatches between an acquire
+    /// result and caller-supplied identity parameters.
+    ///
+    /// # Panics
+    ///
+    /// Panics (in all builds) if:
+    /// - the borrowed snapshot contains an invalid shard spec, or
+    /// - a present cursor `last_key` is zero-length (i.e., `Some` with an
+    ///   empty byte slice).
+    ///
+    /// Additional debug-only assertions verify that the acquired shard is
+    /// non-terminal.
+    pub fn from_acquire_result(backend: &'b mut B, acquired: AcquireResultView<'_>) -> Self {
+        // Copy borrowed acquire snapshot into session-owned scratch so the
+        // resulting session is independent of caller-owned acquire buffers.
+        let mut snapshot_scratch = Box::new(AcquireScratch::new());
+        snapshot_scratch.write_spec(
+            acquired.snapshot.spec().key_range_start(),
+            acquired.snapshot.spec().key_range_end(),
+            acquired.snapshot.spec().metadata(),
+        );
+        snapshot_scratch.write_cursor(
+            acquired.snapshot.cursor().last_key(),
+            acquired.snapshot.cursor().token(),
+        );
+        snapshot_scratch.write_spawned_iter(acquired.snapshot.spawned().iter().copied());
+
+        // Panic is intentional: acquire snapshots are expected to be valid and
+        // already vetted by backend write paths.
+        ShardSpec::validate_ref(acquired.snapshot.spec())
+            .expect("WorkerSession::from_acquire_result: invalid shard spec");
+        if let Some(last_key) = acquired.snapshot.cursor().last_key() {
+            assert!(
+                !last_key.is_empty(),
+                "WorkerSession::from_acquire_result: empty cursor last_key"
+            );
+        }
+
+        let status = acquired.snapshot.status();
+        let cursor_semantics = acquired.snapshot.cursor_semantics();
+        let parent = acquired.snapshot.parent();
+        let spawned = InlineVec::from_slice(acquired.snapshot.spawned());
+        let lease = acquired.lease;
+        let capacity = acquired.capacity;
+        let tenant = lease.tenant();
+        let worker = lease.owner();
+        debug_assert!(!status.is_terminal(), "acquired terminal shard");
+
+        Self {
+            backend,
+            tenant,
+            worker,
+            lease,
+            snapshot: SnapshotState {
+                scratch: snapshot_scratch,
+                status,
+                cursor_semantics,
+                parent,
+                spawned,
+            },
+            capacity,
+        }
+    }
+
     /// Build a borrowed snapshot view combining the scratch buffers with
     /// scalar snapshot metadata.
     ///
@@ -316,7 +392,8 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// Reflects shard state at acquisition, updated only after
     /// `split_residual` narrows the key range. Does not reflect
-    /// subsequent checkpoints.
+    /// subsequent checkpoints. The borrowed view is invalidated by any
+    /// `&mut self` operation.
     #[inline]
     pub fn initial_snapshot(&self) -> ShardSnapshotView<'_> {
         self.snapshot_view()
@@ -444,9 +521,10 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// # Errors
     ///
-    /// Returns [`CheckpointError`] on lease validation failure, cursor
-    /// monotonicity violation, out-of-bounds cursor, missing `last_key`,
-    /// or `OpId` conflict.
+    /// Returns any [`CheckpointError`] surfaced by the backend, including
+    /// lease validation failures, cursor monotonicity/bounds/size validation
+    /// errors, missing `last_key`, resource-exhaustion failures, and `OpId`
+    /// conflicts.
     ///
     /// `new_cursor` is borrowed input only. The backend copies bytes into
     /// pooled storage and never retains references past the call boundary.
@@ -469,8 +547,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// # Errors
     ///
-    /// Returns [`CompleteError`] on lease validation failure, cursor
-    /// constraint violation, or `OpId` conflict.
+    /// Returns any [`CompleteError`] surfaced by the backend, including lease
+    /// validation failures, cursor constraint/size validation errors,
+    /// resource-exhaustion failures, and `OpId` conflicts.
     ///
     /// `final_cursor` is borrowed input only. The backend copies bytes into
     /// pooled storage and never retains references past the call boundary.
@@ -498,7 +577,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// # Errors
     ///
-    /// Returns [`ParkError`] on lease validation failure or `OpId` conflict.
+    /// Returns any [`ParkError`] surfaced by the backend, including lease
+    /// validation failures, resource-exhaustion failures, and `OpId`
+    /// conflicts.
     pub fn park(
         self,
         now: LogicalTime,
@@ -525,9 +606,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// # Errors
     ///
-    /// Returns [`SplitReplaceError`] on lease validation failure, split
-    /// coverage violation (gaps or overlaps in child ranges), or `OpId`
-    /// conflict.
+    /// Returns any [`SplitReplaceError`] surfaced by the backend, including
+    /// lease validation failures, split-coverage validation errors,
+    /// resource-exhaustion failures, and `OpId` conflicts.
     pub fn split_replace(
         self,
         now: LogicalTime,
@@ -565,8 +646,9 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// # Errors
     ///
-    /// Returns [`SplitResidualError`] on lease validation failure,
-    /// residual range validation failure, or `OpId` conflict.
+    /// Returns any [`SplitResidualError`] surfaced by the backend, including
+    /// lease validation failures, residual-range validation errors,
+    /// resource-exhaustion failures, and `OpId` conflicts.
     ///
     /// # Op-log eviction caveat
     ///

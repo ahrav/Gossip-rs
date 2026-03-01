@@ -92,6 +92,15 @@ macro_rules! define_id_32 {
             }
         }
 
+        // `Display` intentionally produces the same output as `Debug` so
+        // that `tracing` span fields using `%` (Display) and `?` (Debug)
+        // are interchangeable for identity types.
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::fmt::Debug::fmt(self, f)
+            }
+        }
+
         impl $name {
             /// The all-zeros sentinel value, used as a default/placeholder in
             /// contexts where an ID is structurally required but not yet known
@@ -303,6 +312,15 @@ macro_rules! define_id_64 {
         impl ::core::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
                 write!(f, concat!(stringify!($name), "({})"), self.0)
+            }
+        }
+
+        // `Display` intentionally produces the same output as `Debug` so
+        // that `tracing` span fields using `%` (Display) and `?` (Debug)
+        // are interchangeable for identity types.
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::fmt::Debug::fmt(self, f)
             }
         }
 
