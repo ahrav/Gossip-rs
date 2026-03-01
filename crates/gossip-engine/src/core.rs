@@ -43,19 +43,13 @@
 use std::convert::TryFrom;
 
 use gossip_contracts::connector::{ScanItem, VersionId};
+use gossip_stdx::{FNV_OFFSET, fnv_mix_byte, fnv_mix_bytes, fnv_mix_opt_bytes, fnv_mix_u64};
 
 use crate::{
     PageScanContext, PageScanOutput, PageScanRequest, PageScanSummary, ScanDedupState,
     ScanDedupeCounters, ScanDiagnostic, ScanFinding, ScanStats, ScannerCoreBuildError,
     ScannerCoreError, StreamScanOutput,
 };
-
-/// FNV-1a 64-bit offset basis.
-///
-/// Chosen over `DefaultHasher` / SipHash for cross-platform determinism.
-/// See <http://www.isthe.com/chongo/tech/comp/fnv/>.
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
 
 /// Configuration for [`ScannerCore`].
 ///
@@ -182,9 +176,19 @@ impl Default for ScannerCoreBuilder {
 /// | [`scan_page_into`](Self::scan_page_into) | no (caller scratch) | no | Hot path |
 /// | [`scan_stream`](Self::scan_stream) | yes | yes | Full stream convenience |
 /// | [`scan_stream_with_dedupe`](Self::scan_stream_with_dedupe) | yes | no | Resumable stream |
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScannerCore {
     config: ScannerCoreConfig,
+}
+
+impl Default for ScannerCore {
+    /// Delegates to [`ScannerCore::new`] with [`ScannerCoreConfig::default`].
+    ///
+    /// This explicit impl exists (instead of `#[derive(Default)]`) so that
+    /// construction always goes through `new()`'s validation gate.
+    fn default() -> Self {
+        Self::new(ScannerCoreConfig::default()).expect("default config is valid")
+    }
 }
 
 impl ScannerCore {
@@ -268,6 +272,10 @@ impl ScannerCore {
         let items = request.items();
         let item_bytes = request.item_bytes();
 
+        // Pre-size the findings buffer to avoid incremental reallocation
+        // during the hot loop. Capped at the configured maximum.
+        output.reserve_findings(items.len().min(self.config.max_findings_per_page));
+
         // --- Preflight: validate parallel-slice invariant early. ---
         if let Some(item_bytes) = item_bytes
             && item_bytes.len() != items.len()
@@ -283,7 +291,6 @@ impl ScannerCore {
         // Every item will be mixed in during the loop below.
         let mut signature = page_signature_seed(context);
         let mut bytes_scanned = 0_u64;
-        let mut metadata_only_count = 0_usize;
         let mut findings_truncated = false;
         let mut counters = ScanDedupeCounters::default();
 
@@ -300,9 +307,6 @@ impl ScannerCore {
                 }
             })?;
             bytes_scanned = bytes_scanned.saturating_add(payload_len);
-            if payload.is_empty() {
-                metadata_only_count = metadata_only_count.saturating_add(1);
-            }
 
             // Page signature covers *all* structural item fields for parity
             // comparison; this is intentionally broader than the fingerprint.
@@ -312,7 +316,7 @@ impl ScannerCore {
             // The fingerprint is narrower than the signature: it covers only
             // (stable_item_id, version, payload) so that reordering items
             // across pages doesn't defeat dedup.
-            counters = counters.with_candidate();
+            counters.increment_candidate();
             let fingerprint = finding_fingerprint(item, payload);
             if dedupe.mark_seen(fingerprint) {
                 // First occurrence: emit if we haven't hit the per-page cap.
@@ -325,13 +329,13 @@ impl ScannerCore {
                         fingerprint,
                         payload_len,
                     ));
-                    counters = counters.with_emitted();
+                    counters.increment_emitted();
                 } else {
-                    counters = counters.with_limit_suppressed();
+                    counters.increment_limit_suppressed();
                     findings_truncated = true;
                 }
             } else {
-                counters = counters.with_duplicate_suppressed();
+                counters.increment_duplicate_suppressed();
             }
         }
 
@@ -345,10 +349,13 @@ impl ScannerCore {
         output.set_dedupe(counters);
 
         // --- Post-loop diagnostics ---
-        if self.config.emit_metadata_only_diagnostics && metadata_only_count > 0 {
+        // Metadata-only is a page-level property: item_bytes was not supplied
+        // at all.  Explicitly provided zero-length payloads (e.g. empty files)
+        // are *not* metadata-only — the caller did supply bytes.
+        if self.config.emit_metadata_only_diagnostics && item_bytes.is_none() && !items.is_empty() {
             output.push_diagnostic(ScanDiagnostic::MetadataOnlyInputs {
                 page_num: context.page_num(),
-                item_count: metadata_only_count,
+                item_count: items.len(),
             });
         }
         if findings_truncated {
@@ -418,63 +425,6 @@ impl ScannerCore {
         }
 
         Ok(output)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FNV-1a mixing helpers
-//
-// These form a self-contained, deterministic hashing toolkit used by both
-// page signatures and finding fingerprints. The contract is simple:
-//   - All multi-byte values are mixed in little-endian order.
-//   - Variable-length fields are length-prefixed before content so that
-//     ("ab", "c") hashes differently from ("a", "bc").
-//   - `Option<&[u8]>` is domain-separated with a tag byte (0 = None, 1 = Some).
-// ---------------------------------------------------------------------------
-
-/// Mix a single byte into the running FNV-1a state.
-#[inline]
-fn fnv_mix_byte(sig: &mut u64, byte: u8) {
-    *sig ^= u64::from(byte);
-    *sig = sig.wrapping_mul(FNV_PRIME);
-}
-
-/// Mix a `u64` as 8 little-endian bytes.
-#[inline]
-fn fnv_mix_u64(sig: &mut u64, value: u64) {
-    for byte in value.to_le_bytes() {
-        fnv_mix_byte(sig, byte);
-    }
-}
-
-/// Mix a byte slice, length-prefixed to avoid collisions between
-/// concatenations that share a common prefix.
-///
-/// Bulk processing in 8-byte words reduces per-byte overhead for large
-/// payloads without changing the hash result.
-#[inline]
-fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
-    fnv_mix_u64(sig, bytes.len() as u64);
-    let full_chunks = bytes.len() / 8;
-    let (bulk, tail) = bytes.split_at(full_chunks * 8);
-    for chunk in bulk.chunks_exact(8) {
-        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
-        fnv_mix_u64(sig, word);
-    }
-    for byte in tail {
-        fnv_mix_byte(sig, *byte);
-    }
-}
-
-/// Mix an optional byte slice with a tag byte for domain separation.
-#[inline]
-fn fnv_mix_opt_bytes(sig: &mut u64, bytes: Option<&[u8]>) {
-    match bytes {
-        Some(bytes) => {
-            fnv_mix_byte(sig, 1);
-            fnv_mix_bytes(sig, bytes);
-        }
-        None => fnv_mix_byte(sig, 0),
     }
 }
 

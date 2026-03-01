@@ -419,4 +419,160 @@ proptest! {
             d.candidates(), d.emitted(), d.duplicate_suppressed(), d.limit_suppressed(),
         );
     }
+
+    /// Scanning the same page twice with a fresh `ScannerCore` must produce
+    /// the same page signature both times.  The FNV-1a hash is pure: it
+    /// depends only on the key range, cursor pair, and item fields — no
+    /// hidden mutable state.
+    #[test]
+    fn page_signature_is_deterministic(
+        key in arb_key(),
+        version in arb_version_bytes(),
+        stable_id in prop::array::uniform32(any::<u8>()),
+    ) {
+        let items = [make_item(&key, &key, stable_id, &version)];
+        let cursor = Cursor::initial();
+        let next_cursor = Cursor::initial();
+
+        let context1 = PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1);
+        let output1 = ScannerCore::default()
+            .scan_page(PageScanRequest::metadata_only(context1, &items))
+            .expect("first scan should succeed");
+
+        let context2 = PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1);
+        let output2 = ScannerCore::default()
+            .scan_page(PageScanRequest::metadata_only(context2, &items))
+            .expect("second scan should succeed");
+
+        prop_assert_eq!(
+            output1.summary().signature(),
+            output2.summary().signature(),
+            "identical inputs must yield identical page signatures"
+        );
+    }
+}
+
+#[test]
+fn different_items_produce_different_signatures() {
+    let cursor = Cursor::initial();
+    let next_cursor = Cursor::initial();
+
+    let items_a = [make_item(b"alpha", b"ref-a", [0x11; 32], b"v1")];
+    let context_a = PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1);
+    let output_a = ScannerCore::default()
+        .scan_page(PageScanRequest::metadata_only(context_a, &items_a))
+        .expect("scan A should succeed");
+
+    let items_b = [make_item(b"bravo", b"ref-b", [0x22; 32], b"v2")];
+    let context_b = PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1);
+    let output_b = ScannerCore::default()
+        .scan_page(PageScanRequest::metadata_only(context_b, &items_b))
+        .expect("scan B should succeed");
+
+    assert_ne!(
+        output_a.summary().signature(),
+        output_b.summary().signature(),
+        "pages with different items must produce different signatures"
+    );
+}
+
+#[test]
+fn explicitly_empty_payload_not_classified_as_metadata_only() {
+    let core = ScannerCore::default();
+    let cursor = Cursor::initial();
+    let next_cursor = Cursor::with_last_key(ItemKey::try_from_slice(b"zulu").expect("valid key"));
+    let items = [make_item(b"alpha", b"ref-a", [0x11; 32], b"v1")];
+    // Bytes are explicitly provided but happen to be empty (e.g. empty file).
+    let payloads: &[&[u8]] = &[b""];
+    let context = PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1);
+
+    let output = core
+        .scan_page(PageScanRequest::with_item_bytes(context, &items, payloads))
+        .expect("scan with empty payload bytes should succeed");
+
+    // Bytes were supplied — the page is NOT metadata-only, even though
+    // the payload happens to be zero-length.
+    assert!(
+        !output
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d, ScanDiagnostic::MetadataOnlyInputs { .. })),
+        "MetadataOnlyInputs should not fire when item_bytes is Some (even if payloads are empty)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F8: Empty and single-page stream tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_stream_handles_empty_iterator() {
+    let core = ScannerCore::default();
+    let pages: Vec<PageScanRequest<'_>> = vec![];
+    let output = core
+        .scan_stream(pages)
+        .expect("empty stream should succeed");
+    assert!(output.findings().is_empty());
+    assert!(output.page_summaries().is_empty());
+    assert_eq!(output.stats().pages_scanned(), 0);
+    assert_eq!(output.stats().items_scanned(), 0);
+    assert_eq!(output.stats().bytes_scanned(), 0);
+    assert_eq!(output.dedupe().candidates(), 0);
+}
+
+#[test]
+fn scan_stream_handles_single_page() {
+    let core = ScannerCore::default();
+    let cursor = Cursor::initial();
+    let next_cursor = Cursor::initial();
+    let items = [make_item(b"alpha", b"ref-a", [0x11; 32], b"v1")];
+    let bytes: [&[u8]; 1] = [b"payload-alpha"];
+    let page = PageScanRequest::with_item_bytes(
+        PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1),
+        &items,
+        &bytes,
+    );
+    let output = core
+        .scan_stream([page])
+        .expect("single-page stream should succeed");
+    assert_eq!(output.page_summaries().len(), 1);
+    assert_eq!(output.findings().len(), 1);
+    assert_eq!(output.stats().pages_scanned(), 1);
+    assert_eq!(output.stats().items_scanned(), 1);
+    assert_eq!(output.dedupe().emitted(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// F9: Direct scan_page_with_dedupe test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_page_with_dedupe_preserves_state_across_calls() {
+    let core = ScannerCore::default();
+    let cursor = Cursor::initial();
+    let next_cursor = Cursor::initial();
+    let mut dedupe = ScanDedupState::default();
+
+    // First call: item A is new.
+    let items1 = [make_item(b"a", b"ra", [0x01; 32], b"v1")];
+    let ctx1 = PageScanContext::new(b"", b"", &cursor, &next_cursor, 1);
+    let out1 = core
+        .scan_page_with_dedupe(PageScanRequest::metadata_only(ctx1, &items1), &mut dedupe)
+        .unwrap();
+    assert_eq!(out1.findings().len(), 1);
+    assert_eq!(out1.dedupe().emitted(), 1);
+
+    // Second call: same item A is duplicate, item B is new.
+    let items2 = [
+        make_item(b"a", b"ra", [0x01; 32], b"v1"),
+        make_item(b"b", b"rb", [0x02; 32], b"v2"),
+    ];
+    let ctx2 = PageScanContext::new(b"", b"", &cursor, &next_cursor, 2);
+    let out2 = core
+        .scan_page_with_dedupe(PageScanRequest::metadata_only(ctx2, &items2), &mut dedupe)
+        .unwrap();
+    assert_eq!(out2.findings().len(), 1, "only item B should be emitted");
+    assert_eq!(out2.dedupe().candidates(), 2);
+    assert_eq!(out2.dedupe().emitted(), 1);
+    assert_eq!(out2.dedupe().duplicate_suppressed(), 1);
 }
