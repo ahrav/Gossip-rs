@@ -59,10 +59,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{
-    ffi::OsStr,
-    os::unix::ffi::{OsStrExt, OsStringExt},
-};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 use gossip_connectors::FilesystemConnector;
 use gossip_contracts::{
@@ -778,16 +775,31 @@ fn build_scan_item(
     let item_ref = ItemRef::try_from_slice(key_bytes)?;
     let stable_item_id = ItemIdentityKey::new(connector_tag, key_bytes).stable_id();
 
-    let mut version_material = Vec::with_capacity(version_material_prefix.len() + 32);
-    version_material.extend_from_slice(version_material_prefix);
-    version_material.extend_from_slice(&size_hint.to_le_bytes());
     let modified_nanos = modified
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    version_material.extend_from_slice(&modified_nanos.to_le_bytes());
 
-    let version = VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material));
+    // 8 bytes for size_hint (u64 LE) + 16 bytes for modified_nanos (u128 LE).
+    const METADATA_LEN: usize = 8 + 16;
+    // Stack buffer covers paths up to 128 bytes (covers 99%+ of real paths).
+    const INLINE_CAP: usize = 128 + METADATA_LEN;
+    let total_len = version_material_prefix.len() + METADATA_LEN;
+
+    let version = if total_len <= INLINE_CAP {
+        let mut buf = [0u8; INLINE_CAP];
+        buf[..version_material_prefix.len()].copy_from_slice(version_material_prefix);
+        let off = version_material_prefix.len();
+        buf[off..off + 8].copy_from_slice(&size_hint.to_le_bytes());
+        buf[off + 8..off + METADATA_LEN].copy_from_slice(&modified_nanos.to_le_bytes());
+        VersionId::Weak(ObjectVersionId::from_version_bytes(&buf[..total_len]))
+    } else {
+        let mut vm = Vec::with_capacity(total_len);
+        vm.extend_from_slice(version_material_prefix);
+        vm.extend_from_slice(&size_hint.to_le_bytes());
+        vm.extend_from_slice(&modified_nanos.to_le_bytes());
+        VersionId::Weak(ObjectVersionId::from_version_bytes(&vm))
+    };
     Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(size_hint))
 }
 
@@ -814,17 +826,12 @@ fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
 
 #[cfg(unix)]
 fn path_bytes(path: &Path) -> Vec<u8> {
-    path_to_raw_bytes(path.as_os_str()).to_vec()
+    path.as_os_str().as_bytes().to_vec()
 }
 
 #[cfg(not(unix))]
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().into_owned().into_bytes()
-}
-
-#[cfg(unix)]
-fn path_to_raw_bytes(path: &OsStr) -> &[u8] {
-    path.as_bytes()
 }
 
 #[cfg(test)]
