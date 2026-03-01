@@ -278,7 +278,9 @@ pub struct FilesystemConnector {
 }
 
 impl FilesystemConnector {
+    /// Maximum directory traversal depth to prevent infinite loops on cyclic bind mounts.
     const DEFAULT_MAX_WALK_DEPTH: usize = 512;
+    /// Maximum warnings to collect before suppressing further diagnostics.
     const DEFAULT_MAX_WARNINGS: usize = 1024;
 
     /// Create a connector rooted at `root`.
@@ -1177,6 +1179,14 @@ fn open_dir_fd(path: &Path) -> Result<OwnedFd, io::Error> {
 /// FIFOs or device nodes that slip past the `fstat` regular-file check in
 /// a TOCTOU race. After validation, this function clears the flag so that
 /// subsequent `read`/`read_at` calls use normal blocking semantics.
+///
+/// # Safety invariant
+///
+/// We validate the file is regular (via `fstat`) before clearing O_NONBLOCK.
+/// This prevents hanging on FIFOs/devices that might have been swapped in
+/// via TOCTOU race. The window is narrow but non-zero: between our `openat`
+/// and `fstat`, the filesystem could change. This validation ensures we
+/// never block indefinitely on special files.
 fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     let fd = file.as_raw_fd();
     // SAFETY: fcntl F_GETFL/F_SETFL on a valid fd.
@@ -1198,6 +1208,11 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     Ok(())
 }
 
+/// Convert a Path to a null-terminated C string for syscall use.
+///
+/// Unix paths can contain any bytes except NUL, but C APIs require
+/// NUL-termination. This function validates no embedded NULs exist
+/// and appends the terminator.
 fn path_to_cstring(path: &Path) -> Result<CString, std::ffi::NulError> {
     CString::new(path.as_os_str().as_bytes())
 }
