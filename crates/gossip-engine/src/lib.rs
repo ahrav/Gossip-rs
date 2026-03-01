@@ -59,6 +59,6 @@ pub use parity::{
     throughput_delta_pct,
 };
 pub use types::{
-    PageScanContext, PageScanOutput, PageScanRequest, PageScanSummary, ScanDedupState,
-    ScanDedupeCounters, ScanDiagnostic, ScanFinding, ScanStats, StreamScanOutput,
+    PageScanContext, PageScanOutput, PageScanRequest, PageScanSummary, ScanAggregateStats,
+    ScanDedupState, ScanDedupeCounters, ScanDiagnostic, ScanFinding, ScanStats, StreamScanOutput,
 };

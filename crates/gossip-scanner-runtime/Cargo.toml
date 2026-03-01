@@ -1,17 +1,17 @@
 [package]
-name = "gossip-worker"
+name = "gossip-scanner-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Binary: wires coordination + connectors + pipeline + sinks"
+description = "Runtime orchestration APIs for scanner-rs direct and connector execution modes"
 
 [dependencies]
 gossip-contracts.workspace = true
 gossip-engine.workspace = true
-gossip-scan-pipeline.workspace = true
 gossip-connectors.workspace = true
-gossip-coordination.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile = "3"

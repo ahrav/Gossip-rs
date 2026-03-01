@@ -56,3 +56,20 @@ dir = "crates/gossip-connectors/src/"
 [[scopes]]
 doc = "docs/boundary-5-persistence.md"
 dir = "crates/gossip-contracts/src/persistence/"
+
+# Scanner-core parity and runtime integration.
+[[scopes]]
+doc = "docs/scanner-core-parity.md"
+dir = "crates/gossip-engine/src/"
+
+[[scopes]]
+doc = "docs/scanner-core-parity.md"
+dir = "crates/gossip-scanner-runtime/src/"
+
+[[scopes]]
+doc = "docs/scanner-core-parity.md"
+dir = "crates/scanner-rs-cli/src/"
+
+[[scopes]]
+doc = "docs/scanner-core-parity.md"
+dir = "crates/gossip-worker/src/"
