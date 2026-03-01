@@ -29,10 +29,13 @@
 //!
 //! # Pooled toxic-byte page assembly
 //!
-//! Enumeration stages each page's key/ref/token bytes into a single page-local
-//! [`gossip_stdx::ByteSlab`], then constructs [`ItemKey`], [`ItemRef`], and
-//! optional token wrappers from slab slots. This front-loads one copy per field
-//! per page, but keeps wrapper cloning allocation-free in the HOT emit loop.
+//! Enumeration uses a shared-slot page assembly path: filesystem [`ItemRef`]
+//! bytes are identical to [`ItemKey`] bytes, so each item's bytes are staged
+//! once and both wrappers are materialized from that same slot.
+//!
+//! This cuts key/ref staging copies versus the generic two-slot path while
+//! keeping wrapper cloning allocation-free in the HOT emit loop. The
+//! optimization depends on the key==ref byte invariant from path encoding.
 //!
 //! Staging and wrapper reconstruction failures are reported as permanent
 //! `EnumerateError`s because page sizes are derived from already-validated
@@ -51,16 +54,6 @@
 //! connector or cursor-construction bug), while in release builds the mismatch
 //! is silently ignored. Pagination advances monotonically by key regardless of
 //! token state.
-//!
-//! Unlike the in-memory connector, which uses tokens as an O(1) fast path
-//! with runtime key-validation fallback, the filesystem connector treats
-//! tokens as purely advisory. In debug builds, a `debug_assert_eq!` fires
-//! when the token disagrees with key-derived resume to catch cursor-
-//! construction bugs during testing. In release builds, key-based resume
-//! is the sole authority and tokens are silently ignored. This divergence
-//! reflects the different trust models: in-memory items are immutable after
-//! construction (tokens are always consistent), while filesystem state can
-//! change between connector instances.
 //!
 //! # Symlink handling
 //!
@@ -746,6 +739,9 @@ impl EnumerationConnector for FilesystemConnector {
         }
     }
 
+    /// Shard bounds are validated allocation-free via the internal
+    /// `borrowed_shard_bound` helper
+    /// before index lookup (`[]` means unbounded; oversize is permanent).
     fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
@@ -759,6 +755,8 @@ impl EnumerationConnector for FilesystemConnector {
 
     /// The first call may trigger a full filesystem walk; subsequent calls
     /// operate purely over the in-memory index.
+    ///
+    /// Bounds use the same borrowed validation path as `enumerate_page`.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,

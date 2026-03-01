@@ -12,9 +12,11 @@
 //!    uniqueness is verified, and all per-item metadata ([`StableItemId`],
 //!    [`ObjectVersionId`], [`ItemRef`], size hint) is precomputed into internal
 //!    `PreparedItem` records. Subsequent pages pay only clone/copy costs.
-//! 2. **Enumeration** -- Binary search resolves shard bounds (O(log n)),
-//!    then yields up to [`Budgets::max_items`] by index iteration over
-//!    precomputed metadata.
+//! 2. **Enumeration** -- Shard bounds are normalized via the internal
+//!    `borrowed_shard_bound` helper (`[]` means unbounded, oversize is rejected)
+//!    and resolved with binary search (O(log n)), then up to
+//!    [`Budgets::max_items`] are yielded by index iteration over precomputed
+//!    metadata.
 //! 3. **Deterministic IDs** -- [`StableItemId`] derived via
 //!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id) (connector-tag + key, domain-separated),
 //!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
@@ -507,6 +509,9 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
         }
     }
 
+    /// Shard bounds are validated allocation-free via the internal
+    /// `borrowed_shard_bound` helper:
+    /// empty means unbounded, oversize bounds are permanent input errors.
     fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
@@ -520,6 +525,9 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
 
     /// Budgets are accepted for trait conformance but not consumed: split-point
     /// selection is a metadata-only operation with no I/O or time-bounded work.
+    ///
+    /// As in `enumerate_page`, shard bounds are validated by
+    /// `borrowed_shard_bound` without allocating temporary keys.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,

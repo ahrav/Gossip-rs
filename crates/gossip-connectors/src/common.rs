@@ -1,4 +1,4 @@
-//! Shared utilities used by multiple connector implementations.
+//! Shared connector utilities for shard-bound handling and pooled page assembly.
 
 use std::sync::Arc;
 
@@ -37,7 +37,13 @@ pub(crate) fn derive_stable_item_id(tag: ConnectorTag, key: &ItemKey) -> StableI
 ///
 /// Empty bounds are treated as unbounded to match [`ShardSpec`] semantics.
 /// Non-empty bounds are validated allocation-free against [`ItemKey`] size
-/// limits; malformed payloads produce a permanent error including `which` for
+/// limits and then returned as borrowed slices, so callers can run binary
+/// search without materializing temporary `ItemKey` wrappers.
+///
+/// This helper intentionally validates only boundary shape (`empty` vs
+/// `<= MAX_ITEM_KEY_SIZE`): connector bound resolution is byte-lexicographic,
+/// so no additional per-bound decoding is required.
+/// Malformed payloads produce a permanent error including `which` for
 /// diagnostics.
 ///
 /// [`ShardSpec`]: gossip_contracts::coordination::ShardSpec
@@ -261,6 +267,11 @@ pub(crate) fn assemble_pooled_page<'a>(
 /// identical-by-construction to `ItemKey` bytes (encoded relative path).
 /// This avoids redundant per-item slot staging while preserving pooled wrapper
 /// behavior and shared continuation-token encoding.
+///
+/// Invariant: use this helper only when key bytes and ref bytes are exactly
+/// equal for every item. The debug pointer-equality assertion verifies the
+/// shared-slot contract in debug builds; release builds rely on caller
+/// correctness.
 ///
 /// # Errors
 ///
