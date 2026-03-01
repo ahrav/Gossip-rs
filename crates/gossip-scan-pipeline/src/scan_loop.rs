@@ -449,14 +449,6 @@ impl fmt::Display for RedactedPageSample<'_> {
 ///
 /// This is a convenience wrapper around [`run_scan_loop_with_policy`] using
 /// [`RenewalPolicy::default`] (renew at half-life).
-#[tracing::instrument(
-    skip(session, connector, budgets, op_id_fn, now_fn),
-    fields(
-        shard_key = %session.shard_key(),
-        tenant = %session.tenant(),
-        worker = %session.worker(),
-    )
-)]
 pub fn run_scan_loop<B, C, N>(
     session: WorkerSession<'_, B>,
     connector: &mut C,
@@ -548,6 +540,14 @@ where
 /// Note: `LeaseLost { pages_completed: 0 }` can occur from the pre-loop entry
 /// check, from the pre-checkpoint deadline guard firing on the first non-empty
 /// page, or from the pre-complete deadline guard on an initial empty page.
+#[tracing::instrument(
+    skip(session, connector, budgets, renewal_policy, max_transient_retries, op_id_fn, now_fn),
+    fields(
+        shard_key = %session.shard_key(),
+        tenant = %session.tenant(),
+        worker = %session.worker(),
+    )
+)]
 pub fn run_scan_loop_with_policy<B, C, N>(
     mut session: WorkerSession<'_, B>,
     connector: &mut C,

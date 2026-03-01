@@ -691,6 +691,220 @@ fn enumerate_error_redacts_connector_message_in_tracing() {
     );
 }
 
+/// Validation failure logs `page_sample` and `next_cursor` — both contain
+/// toxic fields (ItemKey, TokenBytes). This test verifies no raw bytes leak
+/// through the validation-error tracing path (scan_loop.rs lines 706-711).
+#[test]
+fn tracing_redacts_on_validation_failure() {
+    let mut coord = seeded_coordinator(40, CursorUpdate::initial());
+    let toxic_key_a = b"sensitive-key-alpha";
+    let toxic_key_b = b"sensitive-key-bravo";
+    let toxic_token = b"sensitive-token-099";
+
+    // Items out of order: "bravo" before "alpha" triggers validate_page failure.
+    let item_b = make_scan_item(toxic_key_b);
+    let item_a = make_scan_item(toxic_key_a);
+    let bad_cursor = Cursor::with_token(
+        make_key(toxic_key_a),
+        TokenBytes::try_from_slice(toxic_token).expect("token"),
+    );
+    let bad_page = EnumerationPage::new(vec![item_b, item_a], bad_cursor);
+
+    let mut connector = ScriptedConnector::new(vec![Ok(bad_page)]);
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(2100);
+    let mut tick = 4u64;
+
+    let buffer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(buffer.clone())
+        .finish();
+
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        )
+    });
+
+    assert_eq!(
+        outcome,
+        ScanLoopOutcome::Parked {
+            reason: ParkReason::Poisoned,
+            retry_after_ms: None,
+        }
+    );
+
+    let logs = buffer.as_string();
+    assert!(
+        !logs.contains("sensitive-key-alpha"),
+        "raw key bytes leaked on validation failure:\n{logs}"
+    );
+    assert!(
+        !logs.contains("sensitive-key-bravo"),
+        "raw key bytes leaked on validation failure:\n{logs}"
+    );
+    assert!(
+        !logs.contains("sensitive-token-099"),
+        "raw token bytes leaked on validation failure:\n{logs}"
+    );
+    assert!(
+        logs.contains("PageSample(first_key=Some("),
+        "expected redacted page sample in validation failure output:\n{logs}"
+    );
+    assert!(
+        logs.contains("Cursor(last_key="),
+        "expected redacted cursor in validation failure output:\n{logs}"
+    );
+}
+
+/// Permanent enumerate errors must not leak sensitive connector messages.
+/// The error path logs via `RedactedEnumerateError` which strips the raw
+/// message and emits only the error class and retry metadata.
+#[test]
+fn tracing_redacts_on_permanent_enumerate_error() {
+    let mut coord = seeded_coordinator(40, CursorUpdate::initial());
+    let sensitive_token = "bearer eyJ0b2tlbi1zZWNyZXQ";
+    let error_message = format!("auth failed with token {sensitive_token}");
+
+    let connector_error = EnumerateError::permanent(&error_message);
+    let mut connector = ScriptedConnector::new(vec![Err(connector_error)]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(2200);
+    let mut tick = 4u64;
+
+    let buffer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(buffer.clone())
+        .finish();
+
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        )
+    });
+
+    assert_eq!(
+        outcome,
+        ScanLoopOutcome::Parked {
+            reason: ParkReason::PermissionDenied,
+            retry_after_ms: None,
+        }
+    );
+
+    let logs = buffer.as_string();
+    assert!(
+        !logs.contains(sensitive_token),
+        "sensitive token leaked in permanent error tracing output:\n{logs}"
+    );
+    assert!(
+        !logs.contains("bearer"),
+        "sensitive bearer prefix leaked in permanent error tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains("EnumerateError(class="),
+        "expected redacted error class in tracing output:\n{logs}"
+    );
+}
+
+/// Retry exhaustion must not leak sensitive content from retryable error
+/// messages. Each retry logs via `RedactedEnumerateError`, and the final
+/// park also uses the redacted form.
+#[test]
+fn tracing_redacts_on_retry_exhaustion() {
+    let mut coord = seeded_coordinator(40, CursorUpdate::initial());
+    let sensitive_path = "/mnt/secrets/credentials.db";
+    let error_message = format!("read timeout on {sensitive_path}");
+
+    // 4 retryable errors: 1 initial + 3 retries exhausts DEFAULT_MAX_TRANSIENT_RETRIES=3.
+    let mut connector = ScriptedConnector::new(vec![
+        Err(EnumerateError::retryable(&error_message)),
+        Err(EnumerateError::retryable(&error_message)),
+        Err(EnumerateError::retryable(&error_message)),
+        Err(EnumerateError::retryable(&error_message)),
+    ]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(2300);
+    let mut tick = 4u64;
+
+    let buffer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(buffer.clone())
+        .finish();
+
+    let outcome = tracing::subscriber::with_default(subscriber, || {
+        run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        )
+    });
+
+    assert_eq!(
+        outcome,
+        ScanLoopOutcome::Parked {
+            reason: ParkReason::TooManyErrors,
+            retry_after_ms: None,
+        }
+    );
+
+    let logs = buffer.as_string();
+    assert!(
+        !logs.contains(sensitive_path),
+        "sensitive path leaked in retry exhaustion tracing output:\n{logs}"
+    );
+    assert!(
+        !logs.contains("credentials.db"),
+        "sensitive filename leaked in retry exhaustion tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains("EnumerateError(class="),
+        "expected redacted error class in retry exhaustion tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains("transient_failures="),
+        "expected retry accounting in retry exhaustion tracing output:\n{logs}"
+    );
+}
+
 #[test]
 fn happy_path_completes_and_records_final_cursor() {
     let mut coord = seeded_coordinator(40, CursorUpdate::initial());
