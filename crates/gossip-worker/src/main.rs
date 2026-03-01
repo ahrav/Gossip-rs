@@ -35,21 +35,21 @@
 //! Production workers should replace these with persistent backends,
 //! long-lived scheduling, and robust retry/backoff orchestration.
 
-use std::{env, io, thread, time::Duration};
+use std::{env, fmt, io, thread, time::Duration};
 
 use gossip_connectors::{InMemoryDeterministicConnector, MemItem};
 use gossip_contracts::{
-    connector::{Budgets, ItemKey},
+    connector::{Budgets, ConnectorInputError, ItemKey},
     identity::ConnectorTag,
 };
 use gossip_coordination::{
-    AcquireScratch, ClaimError, CursorSemantics, InMemoryCoordinator, InitialShardInput,
-    LogicalTime, OpId, RunConfig, RunId, RunManagement, ShardClaiming, ShardId, ShardSpec,
-    TenantId, WorkerId, WorkerSession,
+    AcquireScratch, ClaimError, CreateRunError, CursorSemantics, InMemoryCoordinator,
+    InitialShardInput, LogicalTime, OpId, RegisterShardsError, RunConfig, RunConfigError, RunId,
+    RunManagement, ShardClaiming, ShardId, ShardSpec, TenantId, WorkerId, WorkerSession,
 };
 use gossip_scan_pipeline::{
-    DEFAULT_MAX_TRANSIENT_RETRIES, PageProcessingContext, PageProcessingError, ScanLoopOutcome,
-    run_scan_loop, run_scan_loop_with_page_processor,
+    DEFAULT_MAX_TRANSIENT_RETRIES, PageProcessingContext, PageProcessingError, ScanLoopError,
+    ScanLoopOutcome, run_scan_loop, run_scan_loop_with_page_processor,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -82,10 +82,12 @@ impl SharedCoreMode {
 
     /// Read the shared-core mode from `GOSSIP_SHARED_CORE_MODE`.
     ///
-    /// Defaults to [`Direct`](Self::Direct) when the variable is absent.
-    /// Returns `io::Error` for non-UTF-8 or unrecognized values.
+    /// Defaults to [`Direct`](Self::Direct) when the variable is absent or
+    /// contains only whitespace. Returns `io::Error` for non-UTF-8 or
+    /// unrecognized values.
     fn from_env() -> Result<Self, io::Error> {
         match env::var(SHARED_CORE_MODE_ENV) {
+            Ok(raw) if raw.trim().is_empty() => Ok(Self::Direct),
             Ok(raw) => Self::parse(&raw).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -111,6 +113,85 @@ impl SharedCoreMode {
     }
 }
 
+/// Concrete error type for the placeholder worker.
+///
+/// Each variant corresponds to a distinct failure class in the
+/// claim → scan → resolve lifecycle so callers (and structured logs)
+/// can distinguish configuration problems from runtime failures.
+#[derive(Debug)]
+enum WorkerError {
+    /// Environment configuration is invalid (e.g. unrecognized shared-core mode).
+    Config(io::Error),
+    /// Run manifest setup failed (config validation, create, or register).
+    Setup(String),
+    /// Connector or budget wiring failed.
+    Connector(ConnectorInputError),
+    /// Shard claim failed with an unrecoverable error.
+    Claim(ClaimError),
+    /// The scan loop terminated with an error outcome.
+    ScanLoop(Box<ScanLoopError>),
+}
+
+impl fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(e) => write!(f, "configuration error: {e}"),
+            Self::Setup(e) => write!(f, "run setup failed: {e}"),
+            Self::Connector(e) => write!(f, "connector wiring failed: {e}"),
+            Self::Claim(e) => write!(f, "claim failed: {e}"),
+            Self::ScanLoop(e) => write!(f, "scan loop error: {}", e.as_ref()),
+        }
+    }
+}
+
+impl std::error::Error for WorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(e) => Some(e),
+            Self::Setup(_) => None,
+            Self::Connector(e) => Some(e),
+            Self::Claim(e) => Some(e),
+            Self::ScanLoop(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<io::Error> for WorkerError {
+    fn from(e: io::Error) -> Self {
+        Self::Config(e)
+    }
+}
+
+impl From<RunConfigError> for WorkerError {
+    fn from(e: RunConfigError) -> Self {
+        Self::Setup(e.to_string())
+    }
+}
+
+impl From<CreateRunError> for WorkerError {
+    fn from(e: CreateRunError) -> Self {
+        Self::Setup(e.to_string())
+    }
+}
+
+impl From<RegisterShardsError> for WorkerError {
+    fn from(e: RegisterShardsError) -> Self {
+        Self::Setup(e.to_string())
+    }
+}
+
+impl From<ConnectorInputError> for WorkerError {
+    fn from(e: ConnectorInputError) -> Self {
+        Self::Connector(e)
+    }
+}
+
+impl From<ScanLoopError> for WorkerError {
+    fn from(e: ScanLoopError) -> Self {
+        Self::ScanLoop(Box::new(e))
+    }
+}
+
 // FNV-1a 64-bit constants (http://www.isthe.com/chongo/tech/comp/fnv/).
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
@@ -131,7 +212,14 @@ fn fnv_mix_u64(sig: &mut u64, value: u64) {
 #[inline]
 fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
     fnv_mix_u64(sig, bytes.len() as u64);
-    for byte in bytes {
+    // Process 8-byte aligned chunks to reduce per-byte multiply overhead.
+    let full_chunks = bytes.len() / 8;
+    let (bulk, tail) = bytes.split_at(full_chunks * 8);
+    for chunk in bulk.chunks_exact(8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
+        fnv_mix_u64(sig, word);
+    }
+    for byte in tail {
         fnv_mix_byte(sig, *byte);
     }
 }
@@ -244,10 +332,10 @@ impl ShadowComparisonStats {
     /// Operates entirely on borrowed data from the [`PageProcessingContext`]
     /// — no heap allocations per page.
     ///
-    /// Returns `Err` on the first mismatch so the scan loop can surface it
-    /// as a terminal page-processing failure. Hook failures are not retried
-    /// by the scan loop because shadow mismatches are deterministic (retrying
-    /// the same data produces the same result).
+    /// Shadow mode is observational: mismatches are logged and counted but
+    /// do not abort the scan. This keeps the scan progressing while
+    /// operators monitor the mismatch rate to decide when the connector
+    /// path is safe to promote.
     fn process_page(
         &mut self,
         context: PageProcessingContext<'_>,
@@ -267,12 +355,15 @@ impl ShadowComparisonStats {
 
         if direct_output != connector_output {
             self.mismatches = self.mismatches.saturating_add(1);
-            return Err(PageProcessingError::new(format!(
-                "shadow mismatch on page {}: direct={:?} connector={:?}",
-                context.page_num(),
-                direct_output,
-                connector_output
-            )));
+            tracing::warn!(
+                page_num = context.page_num(),
+                direct_sig = direct_output.signature,
+                connector_sig = connector_output.signature,
+                direct_items = direct_output.item_count,
+                connector_items = connector_output.item_count,
+                total_mismatches = self.mismatches,
+                "shadow mismatch detected",
+            );
         }
 
         Ok(())
@@ -351,7 +442,7 @@ fn init_tracing() {
 /// terminal outcome, and exits once no shard is available. Production workers
 /// should replace this with persistent backends, long-lived scheduling, and
 /// robust retry/backoff orchestration.
-fn run_placeholder_worker() -> Result<(), Box<dyn std::error::Error>> {
+fn run_placeholder_worker() -> Result<(), WorkerError> {
     let tenant = TenantId::from_bytes([0x21; 32]);
     let run = RunId::from_raw(1);
     let worker = WorkerId::from_raw(1);
@@ -495,7 +586,7 @@ fn run_placeholder_worker() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     ScanLoopOutcome::Error(error) => {
                         tracing::error!(error = %error, "scan loop failed");
-                        return Err(Box::new(error));
+                        return Err(WorkerError::ScanLoop(Box::new(error)));
                     }
                 }
             }
@@ -517,7 +608,7 @@ fn run_placeholder_worker() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 thread::sleep(Duration::from_millis(200));
             }
-            Err(error) => return Err(Box::new(error)),
+            Err(error) => return Err(WorkerError::Claim(error)),
         }
     }
 
@@ -595,5 +686,159 @@ mod tests {
         let connector = run_connector_shared_core(&ctx);
         assert_eq!(direct, connector);
         assert_eq!(direct.item_count, 2);
+    }
+
+    #[test]
+    fn evaluator_handles_empty_page() {
+        use gossip_contracts::connector::Cursor;
+
+        let spec = ShardSpec::with_range(b"a", b"z");
+        let cursor = Cursor::initial();
+        let items: [gossip_contracts::connector::ScanItem; 0] = [];
+        let next_cursor = Cursor::initial();
+
+        let ctx = PageProcessingContext::new(&spec, &cursor, &items, &next_cursor, 1, 0);
+        let output = evaluate_shared_core_page(&ctx);
+        assert_eq!(output.item_count, 0);
+        // Signature should be deterministic even for empty pages.
+        let output2 = evaluate_shared_core_page(&ctx);
+        assert_eq!(output.signature, output2.signature);
+    }
+
+    #[test]
+    fn evaluator_initial_cursor_all_none() {
+        use gossip_contracts::connector::{Cursor, ItemRef, ScanItem, VersionId};
+        use gossip_contracts::identity::{ObjectVersionId, StableItemId};
+
+        let spec = ShardSpec::with_range(b"a", b"z");
+        let cursor = Cursor::initial();
+        let next_cursor = Cursor::with_last_key(ItemKey::try_from_slice(b"alpha").unwrap());
+        let items = [ScanItem::new(
+            ItemKey::try_from_slice(b"alpha").unwrap(),
+            ItemRef::try_from_slice(b"ref-alpha").unwrap(),
+            StableItemId::from_bytes([0x11; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        )];
+
+        let ctx = PageProcessingContext::new(&spec, &cursor, &items, &next_cursor, 1, 0);
+        let output = evaluate_shared_core_page(&ctx);
+        assert_eq!(output.item_count, 1);
+
+        // Verify a different cursor produces a different hash.
+        let cursor2 = Cursor::with_last_key(ItemKey::try_from_slice(b"other").unwrap());
+        let ctx2 = PageProcessingContext::new(&spec, &cursor2, &items, &next_cursor, 1, 0);
+        let output2 = evaluate_shared_core_page(&ctx2);
+        assert_ne!(output.signature, output2.signature);
+    }
+
+    #[test]
+    fn evaluator_is_order_sensitive() {
+        use gossip_contracts::connector::{Cursor, ItemRef, ScanItem, VersionId};
+        use gossip_contracts::identity::{ObjectVersionId, StableItemId};
+
+        let spec = ShardSpec::with_range(b"a", b"z");
+        let cursor = Cursor::initial();
+        let next_cursor = Cursor::initial();
+
+        let item_a = ScanItem::new(
+            ItemKey::try_from_slice(b"alpha").unwrap(),
+            ItemRef::try_from_slice(b"ref-a").unwrap(),
+            StableItemId::from_bytes([0x11; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        );
+        let item_b = ScanItem::new(
+            ItemKey::try_from_slice(b"bravo").unwrap(),
+            ItemRef::try_from_slice(b"ref-b").unwrap(),
+            StableItemId::from_bytes([0x22; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v2")),
+        );
+
+        let forward = [item_a.clone(), item_b.clone()];
+        let reversed = [item_b, item_a];
+
+        let ctx_fwd = PageProcessingContext::new(&spec, &cursor, &forward, &next_cursor, 1, 0);
+        let ctx_rev = PageProcessingContext::new(&spec, &cursor, &reversed, &next_cursor, 1, 0);
+        assert_ne!(
+            evaluate_shared_core_page(&ctx_fwd).signature,
+            evaluate_shared_core_page(&ctx_rev).signature,
+            "different item order must produce different signatures",
+        );
+    }
+
+    #[test]
+    fn shadow_stats_accumulate_across_pages() {
+        use gossip_contracts::connector::{Cursor, ItemRef, ScanItem, VersionId};
+        use gossip_contracts::identity::{ObjectVersionId, StableItemId};
+
+        let spec = ShardSpec::with_range(b"a", b"z");
+        let cursor = Cursor::initial();
+        let next_cursor = Cursor::initial();
+        let items = [ScanItem::new(
+            ItemKey::try_from_slice(b"alpha").unwrap(),
+            ItemRef::try_from_slice(b"ref-alpha").unwrap(),
+            StableItemId::from_bytes([0x11; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        )];
+
+        let mut stats = ShadowComparisonStats::default();
+        for page_num in 1..=5 {
+            let ctx = PageProcessingContext::new(&spec, &cursor, &items, &next_cursor, page_num, 0);
+            assert!(stats.process_page(ctx).is_ok());
+        }
+        assert_eq!(stats.pages_compared, 5);
+        assert_eq!(stats.items_compared, 5);
+        assert_eq!(stats.mismatches, 0);
+        assert!(stats.direct_elapsed > Duration::ZERO || stats.connector_elapsed > Duration::ZERO);
+    }
+
+    #[test]
+    fn shared_core_mode_parse_whitespace_only_is_none() {
+        assert_eq!(SharedCoreMode::parse(""), None);
+        assert_eq!(SharedCoreMode::parse("   "), None);
+    }
+
+    #[test]
+    fn shared_core_mode_as_str_round_trips() {
+        assert_eq!(
+            SharedCoreMode::parse(SharedCoreMode::Direct.as_str()),
+            Some(SharedCoreMode::Direct),
+        );
+        assert_eq!(
+            SharedCoreMode::parse(SharedCoreMode::Shadow.as_str()),
+            Some(SharedCoreMode::Shadow),
+        );
+    }
+
+    #[test]
+    fn fnv_chunk_optimization_matches_byte_by_byte() {
+        // Verify the u64-chunked fnv_mix_bytes produces the same result
+        // as processing one byte at a time.
+        let data = b"hello, this is a 25-byte string for testing chunked FNV";
+
+        // Chunked path (current implementation).
+        let mut sig_chunked = FNV_OFFSET;
+        fnv_mix_bytes(&mut sig_chunked, data);
+
+        // Byte-at-a-time reference.
+        let mut sig_ref = FNV_OFFSET;
+        fnv_mix_u64(&mut sig_ref, data.len() as u64);
+        for byte in data {
+            fnv_mix_byte(&mut sig_ref, *byte);
+        }
+
+        assert_eq!(
+            sig_chunked, sig_ref,
+            "chunked and byte-at-a-time must agree"
+        );
+    }
+
+    #[test]
+    fn worker_error_display_includes_variant_context() {
+        let err = WorkerError::Config(io::Error::new(io::ErrorKind::InvalidInput, "bad mode"));
+        assert!(err.to_string().contains("configuration error"));
+        assert!(err.to_string().contains("bad mode"));
+
+        let err = WorkerError::Setup("run config invalid".to_string());
+        assert!(err.to_string().contains("run setup failed"));
     }
 }
