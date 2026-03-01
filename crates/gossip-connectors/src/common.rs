@@ -677,6 +677,74 @@ mod choose_split_tests {
     }
 }
 
+/// Tests for generic binary search helpers (`lower_bound`, `upper_bound`).
+///
+/// Uses rstest parameterized cases since all non-empty-slice cases share the
+/// identical structure: build sorted items, search for key, assert index.
+/// Empty-slice cases remain standalone because their setup differs.
+#[cfg(test)]
+mod binary_search_tests {
+    use super::*;
+    use rstest::rstest;
+
+    struct TestKey(Vec<u8>);
+
+    impl KeyedEntry for TestKey {
+        fn key_bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    fn sample_items() -> Vec<TestKey> {
+        // Sorted: "b", "d", "f"
+        vec![
+            TestKey(b"b".to_vec()),
+            TestKey(b"d".to_vec()),
+            TestKey(b"f".to_vec()),
+        ]
+    }
+
+    // -- lower_bound: first index where key >= target --
+
+    #[test]
+    fn lower_bound_empty_slice() {
+        let items: Vec<TestKey> = vec![];
+        assert_eq!(lower_bound(&items, b"x"), 0);
+    }
+
+    #[rstest]
+    #[case::before_all(b"a", 0)]
+    #[case::equal_to_first(b"b", 0)]
+    #[case::between_b_and_d(b"c", 1)]
+    #[case::equal_to_middle(b"d", 1)]
+    #[case::between_d_and_f(b"e", 2)]
+    #[case::after_all(b"z", 3)]
+    fn lower_bound_cases(#[case] key: &[u8], #[case] expected: usize) {
+        let items = sample_items();
+        assert_eq!(lower_bound(&items, key), expected);
+    }
+
+    // -- upper_bound: first index where key > target --
+
+    #[test]
+    fn upper_bound_empty_slice() {
+        let items: Vec<TestKey> = vec![];
+        assert_eq!(upper_bound(&items, b"x"), 0);
+    }
+
+    #[rstest]
+    #[case::before_all(b"a", 0)]
+    #[case::equal_to_first(b"b", 1)]
+    #[case::between_b_and_d(b"c", 1)]
+    #[case::equal_to_middle(b"d", 2)]
+    #[case::equal_to_last(b"f", 3)]
+    #[case::after_all(b"z", 3)]
+    fn upper_bound_cases(#[case] key: &[u8], #[case] expected: usize) {
+        let items = sample_items();
+        assert_eq!(upper_bound(&items, key), expected);
+    }
+}
+
 #[cfg(test)]
 mod borrowed_shard_bound_tests {
     use super::*;

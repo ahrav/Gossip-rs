@@ -840,6 +840,10 @@ fn is_permanent_io_error(err: &io::Error) -> bool {
     ) || err.raw_os_error() == Some(libc::ELOOP)
 }
 
+/// Convert an I/O error to a `ReadError` with appropriate retryability.
+///
+/// Permanent errors (file not found, permission denied) become non-retryable.
+/// Transient errors (network hiccups, resource contention) become retryable.
 fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
     if is_permanent_io_error(err) {
         ReadError::permanent(format!("{op} failed: {err}"))
@@ -848,6 +852,10 @@ fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
     }
 }
 
+/// Convert an I/O error to an `EnumerateError` with appropriate retryability.
+///
+/// Similar to `classify_io_read_error` but includes the failing path in the
+/// error message for better diagnostics during directory traversal.
 fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> EnumerateError {
     if is_permanent_io_error(err) {
         EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
@@ -860,6 +868,28 @@ fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> Enumer
 // Directory walk
 // ---------------------------------------------------------------------------
 
+/// Walk directory tree depth-first and collect regular files.
+///
+/// # Algorithm
+///
+/// Uses an explicit stack to avoid recursion. Directories are processed
+/// in reverse order to maintain lexicographic ordering of results. Symlinks
+/// are skipped (logged as warnings) to avoid cycles and ensure determinism.
+///
+/// # Trade-offs
+///
+/// - **No recursion**: Explicit stack prevents stack overflow on deep trees
+/// - **Reverse iteration**: `read_dir` results are reversed before pushing
+///   to stack, ensuring lexicographic order in final output
+/// - **Skip symlinks**: Avoids cycles and non-deterministic resolution
+/// - **Regular files only**: Devices, FIFOs, sockets are skipped
+/// - **Depth limit**: Prevents infinite traversal of cyclic bind mounts
+/// - **Warning limit**: Caps diagnostic noise from problematic directories
+///
+/// # Errors
+///
+/// Returns permanent errors for invalid root path or encoding failures.
+/// I/O errors during traversal are logged as warnings but don't fail the walk.
 fn walk_dir_collect_files(
     root: &Path,
     max_depth: usize,
@@ -1096,6 +1126,14 @@ fn encode_rel_path(rel: &Path) -> Result<Vec<u8>, EnumerateError> {
 /// Layout: `[mtime(8) | mtime_nsec(8) | len(8) | ino(8) | dev(8)]` = 40 bytes.
 /// Including `dev()` ensures version IDs are distinct across filesystem
 /// boundaries where `ino()` alone can collide.
+///
+/// # Why not content hashing?
+///
+/// Content hashing would require reading every file during indexing, turning
+/// O(n) directory traversal into O(total_bytes) I/O. Metadata-based versioning
+/// provides "good enough" change detection for filesystem sources while keeping
+/// indexing fast. The trade-off: identical content with different mtimes gets
+/// different version IDs, and filesystem metadata manipulation can forge versions.
 fn derive_fs_version_id(metadata: &fs::Metadata) -> ObjectVersionId {
     let mut encoded = [0u8; 40];
     encoded[0..8].copy_from_slice(&metadata.mtime().to_be_bytes());
