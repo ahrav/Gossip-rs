@@ -53,7 +53,7 @@
 use std::{
     ffi::OsString,
     fmt, fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     time::UNIX_EPOCH,
 };
@@ -74,7 +74,8 @@ use gossip_contracts::{
     identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId},
 };
 use gossip_engine::{
-    PageScanContext, PageScanOutput, PageScanRequest, ScanDedupState, ScannerCore, ScannerCoreError,
+    PageScanContext, PageScanRequest, ScanAggregateStats, ScanDedupState, ScannerCore,
+    ScannerCoreError,
 };
 
 /// Connector identity tag for local-filesystem sources.
@@ -174,6 +175,27 @@ impl ScanBudgets {
     }
 }
 
+/// Shared builder methods present on both [`FsScanConfig`] and [`GitScanConfig`].
+macro_rules! impl_scan_config_builders {
+    ($ty:ty) => {
+        impl $ty {
+            /// Override execution mode.
+            #[must_use]
+            pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
+                self.execution_mode = execution_mode;
+                self
+            }
+
+            /// Override budgets.
+            #[must_use]
+            pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
+                self.budgets = budgets;
+                self
+            }
+        }
+    };
+}
+
 /// Configuration for a filesystem scan.
 ///
 /// Supports both directory trees (enumerated via [`FilesystemConnector`]) and
@@ -200,21 +222,9 @@ impl FsScanConfig {
             budgets: ScanBudgets::default(),
         }
     }
-
-    /// Override execution mode.
-    #[must_use]
-    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
-        self.execution_mode = execution_mode;
-        self
-    }
-
-    /// Override budgets.
-    #[must_use]
-    pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
-        self.budgets = budgets;
-        self
-    }
 }
+
+impl_scan_config_builders!(FsScanConfig);
 
 /// Configuration for a git-tracked-file scan.
 ///
@@ -231,6 +241,9 @@ pub struct GitScanConfig {
     pub execution_mode: ExecutionMode,
     /// Per-page resource limits.
     pub budgets: ScanBudgets,
+    /// Upper bound on tracked files accepted from `git ls-files`.
+    /// `None` disables the limit. Defaults to 1,000,000.
+    pub max_tracked_files: Option<usize>,
 }
 
 impl GitScanConfig {
@@ -241,54 +254,25 @@ impl GitScanConfig {
             repo: repo.into(),
             execution_mode: ExecutionMode::Direct,
             budgets: ScanBudgets::default(),
+            max_tracked_files: Some(1_000_000),
         }
     }
 
-    /// Override execution mode.
+    /// Override the maximum number of tracked files accepted.
+    /// Pass `None` to disable the limit.
     #[must_use]
-    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
-        self.execution_mode = execution_mode;
-        self
-    }
-
-    /// Override budgets.
-    #[must_use]
-    pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
-        self.budgets = budgets;
+    pub fn with_max_tracked_files(mut self, limit: Option<usize>) -> Self {
+        self.max_tracked_files = limit;
         self
     }
 }
+
+impl_scan_config_builders!(GitScanConfig);
 
 /// Aggregated counters produced by a completed scan.
 ///
-/// All counters use saturating arithmetic, so overflow is impossible.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ScanOutcome {
-    /// Number of non-empty pages evaluated by scanner core.
-    pub pages_scanned: u64,
-    /// Number of scan items evaluated.
-    pub items_scanned: u64,
-    /// Number of findings emitted by scanner core.
-    pub findings_emitted: u64,
-    /// Number of diagnostics emitted by scanner core.
-    pub diagnostics_emitted: u64,
-}
-
-impl ScanOutcome {
-    /// Fold a single page's output into the running totals.
-    fn record_page(&mut self, page: &PageScanOutput) {
-        self.pages_scanned = self.pages_scanned.saturating_add(1);
-        self.items_scanned = self
-            .items_scanned
-            .saturating_add(page.summary().item_count() as u64);
-        self.findings_emitted = self
-            .findings_emitted
-            .saturating_add(page.findings().len() as u64);
-        self.diagnostics_emitted = self
-            .diagnostics_emitted
-            .saturating_add(page.diagnostics().len() as u64);
-    }
-}
+/// Type alias for the shared [`ScanAggregateStats`] from gossip-engine.
+pub type ScanOutcome = ScanAggregateStats;
 
 /// Runtime-level scan orchestration errors.
 #[derive(Debug)]
@@ -324,6 +308,8 @@ pub enum ScanRuntimeError {
     },
     /// Connector page returned non-empty items but did not advance cursor.
     CursorStalled { page_num: u64 },
+    /// Git repository tracks more files than the configured limit.
+    TooManyTrackedFiles { count: usize, limit: usize },
 }
 
 impl fmt::Display for ScanRuntimeError {
@@ -365,6 +351,10 @@ impl fmt::Display for ScanRuntimeError {
                 f,
                 "connector cursor did not advance on non-empty page {page_num}"
             ),
+            Self::TooManyTrackedFiles { count, limit } => write!(
+                f,
+                "git repository tracks {count} files, exceeding limit of {limit}"
+            ),
         }
     }
 }
@@ -379,7 +369,8 @@ impl std::error::Error for ScanRuntimeError {
             Self::UnsupportedExecutionMode { .. }
             | Self::InvalidPath { .. }
             | Self::GitCommandFailed { .. }
-            | Self::CursorStalled { .. } => None,
+            | Self::CursorStalled { .. }
+            | Self::TooManyTrackedFiles { .. } => None,
         }
     }
 }
@@ -462,24 +453,53 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeE
 /// Paths that no longer exist on disk (e.g. staged deletions) or that
 /// produce empty key bytes are silently skipped.
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
-    validate_git_repo_path(&config.repo)?;
+    let canonical_repo = validate_git_repo_path(&config.repo)?;
 
     let tracked_paths = list_git_tracked_paths(&config.repo)?;
+
+    if let Some(max) = config.max_tracked_files
+        && tracked_paths.len() > max
+    {
+        return Err(ScanRuntimeError::TooManyTrackedFiles {
+            count: tracked_paths.len(),
+            limit: max,
+        });
+    }
+
     let mut items = Vec::with_capacity(tracked_paths.len());
     for rel_path in tracked_paths {
-        let abs_path = config.repo.join(&rel_path);
-        if !abs_path.is_file() {
+        // Reject paths containing `..` to prevent directory traversal.
+        if rel_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+        {
             continue;
         }
+
+        let abs_path = canonical_repo.join(&rel_path);
+
+        // Verify the resolved path is still within the repo boundary.
+        let canonical_abs = match fs::canonicalize(&abs_path) {
+            Ok(p) => p,
+            Err(_) => continue, // file may have been deleted since ls-files
+        };
+        if !canonical_abs.starts_with(&canonical_repo) {
+            continue;
+        }
+
+        // Use symlink_metadata to avoid following symlinks.
+        let metadata = match fs::symlink_metadata(&abs_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+
         let key_bytes = path_bytes(&rel_path);
         if key_bytes.is_empty() {
             continue;
         }
-        let metadata = fs::metadata(&abs_path).map_err(|error| ScanRuntimeError::Io {
-            op: "metadata",
-            path: Some(abs_path.clone()),
-            error,
-        })?;
         let item = build_scan_item(
             &key_bytes,
             GIT_CONNECTOR_TAG,
@@ -534,7 +554,12 @@ fn validate_fs_path(path: &Path) -> Result<(), ScanRuntimeError> {
     Ok(())
 }
 
-fn validate_git_repo_path(path: &Path) -> Result<(), ScanRuntimeError> {
+/// Validate that `path` exists, is a directory, and return its canonical form.
+///
+/// Canonicalization resolves symlinks and `..` components in the repo root
+/// itself, producing a stable prefix for path-containment checks in the
+/// scan loop.
+fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
             source: "git",
@@ -549,7 +574,11 @@ fn validate_git_repo_path(path: &Path) -> Result<(), ScanRuntimeError> {
             message: "repository path must be a directory".to_owned(),
         });
     }
-    Ok(())
+    fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
+        op: "canonicalize",
+        path: Some(path.to_path_buf()),
+        error,
+    })
 }
 
 /// Collect git-tracked file paths via `git -C <repo> ls-files -z`.
@@ -563,6 +592,7 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<PathBuf>, ScanRuntimeError>
         .arg(repo)
         .arg("ls-files")
         .arg("-z")
+        .arg("--")
         .output()
         .map_err(|error| ScanRuntimeError::Io {
             op: "git ls-files",
@@ -695,17 +725,25 @@ fn scan_materialized_items_pages(
 
 /// Build a [`ScanItem`] for a single local file by stat-ing it.
 ///
-/// The file's path bytes serve as both the item key and the version
-/// material prefix.
+/// Uses `symlink_metadata` to avoid following symlinks — a symlink
+/// targeting a sensitive file outside the scan root would otherwise
+/// leak its metadata (size, mtime).
 fn build_local_file_scan_item(
     path: &Path,
     connector_tag: ConnectorTag,
 ) -> Result<ScanItem, ScanRuntimeError> {
-    let metadata = fs::metadata(path).map_err(|error| ScanRuntimeError::Io {
+    let metadata = fs::symlink_metadata(path).map_err(|error| ScanRuntimeError::Io {
         op: "metadata",
         path: Some(path.to_path_buf()),
         error,
     })?;
+    if metadata.is_symlink() {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "filesystem",
+            path: path.to_path_buf(),
+            message: "path is a symlink".to_owned(),
+        });
+    }
     let key_bytes = path_bytes(path);
     build_scan_item(
         &key_bytes,
@@ -790,116 +828,5 @@ fn path_to_raw_bytes(path: &OsStr) -> &[u8] {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io::Write;
-
-    use rstest::rstest;
-    use tempfile::tempdir;
-
-    use super::*;
-
-    // ── ExecutionMode parsing ──────────────────────────────────────
-
-    #[rstest]
-    #[case::lowercase_direct("direct", ExecutionMode::Direct)]
-    #[case::uppercase_direct("DIRECT", ExecutionMode::Direct)]
-    #[case::lowercase_connector("connector", ExecutionMode::Connector)]
-    #[case::uppercase_connector("CONNECTOR", ExecutionMode::Connector)]
-    #[case::mixed_case("DiReCt", ExecutionMode::Direct)]
-    #[case::padded("  direct  ", ExecutionMode::Direct)]
-    fn parse_execution_mode_valid(#[case] input: &str, #[case] expected: ExecutionMode) {
-        assert_eq!(input.parse::<ExecutionMode>().unwrap(), expected);
-    }
-
-    #[rstest]
-    #[case::unknown("unknown")]
-    #[case::empty("")]
-    #[case::numeric("42")]
-    fn parse_execution_mode_invalid(#[case] input: &str) {
-        let err = input.parse::<ExecutionMode>().unwrap_err();
-        assert_eq!(err.raw(), input);
-    }
-
-    // ── Filesystem scan integration ────────────────────────────────
-
-    #[test]
-    fn scan_fs_direct_scans_directory() {
-        let dir = tempdir().expect("tempdir");
-        let file_path = dir.path().join("a.txt");
-        let mut file = fs::File::create(&file_path).expect("create file");
-        writeln!(file, "hello world").expect("write file");
-
-        let outcome = scan_fs_direct(&FsScanConfig::new(dir.path())).expect("fs direct scan");
-        assert!(outcome.pages_scanned >= 1);
-        assert!(outcome.items_scanned >= 1);
-        assert!(outcome.findings_emitted >= 1);
-    }
-
-    #[test]
-    fn scan_fs_direct_scans_single_file() {
-        let dir = tempdir().expect("tempdir");
-        let file_path = dir.path().join("secret.txt");
-        fs::write(&file_path, "password=hunter2").expect("write");
-
-        let outcome = scan_fs_direct(&FsScanConfig::new(&file_path)).expect("single file scan");
-        assert_eq!(outcome.pages_scanned, 1);
-        assert_eq!(outcome.items_scanned, 1);
-    }
-
-    #[test]
-    fn scan_fs_direct_rejects_nonexistent_path() {
-        let err =
-            scan_fs_direct(&FsScanConfig::new("/no/such/path")).expect_err("nonexistent path");
-        assert!(matches!(
-            err,
-            ScanRuntimeError::InvalidPath {
-                source: "filesystem",
-                ..
-            }
-        ));
-    }
-
-    // ── Connector-mode gating ──────────────────────────────────────
-
-    #[test]
-    fn scan_fs_connector_is_explicitly_gated() {
-        let dir = tempdir().expect("tempdir");
-        let error =
-            scan_fs(&FsScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
-                .expect_err("connector mode should be gated");
-        assert!(matches!(
-            error,
-            ScanRuntimeError::UnsupportedExecutionMode {
-                source: "filesystem",
-                mode: ExecutionMode::Connector,
-            }
-        ));
-    }
-
-    #[test]
-    fn scan_git_connector_is_explicitly_gated() {
-        let dir = tempdir().expect("tempdir");
-        let error =
-            scan_git(&GitScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
-                .expect_err("connector mode should be gated");
-        assert!(matches!(
-            error,
-            ScanRuntimeError::UnsupportedExecutionMode {
-                source: "git",
-                mode: ExecutionMode::Connector,
-            }
-        ));
-    }
-
-    // ── Git scan error paths ───────────────────────────────────────
-
-    #[test]
-    fn scan_git_direct_errors_for_non_repo() {
-        let dir = tempdir().expect("tempdir");
-        let error = scan_git_direct(&GitScanConfig::new(dir.path())).expect_err("non-repo");
-        assert!(matches!(
-            error,
-            ScanRuntimeError::GitCommandFailed { .. } | ScanRuntimeError::Io { .. }
-        ));
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

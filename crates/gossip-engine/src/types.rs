@@ -726,6 +726,62 @@ impl ScanDedupState {
     }
 }
 
+/// Aggregated counters produced by a scan operation.
+///
+/// Shared between the scanner runtime and worker binary to avoid
+/// structural duplication. All counters use saturating arithmetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanAggregateStats {
+    pages_scanned: u64,
+    items_scanned: u64,
+    findings_emitted: u64,
+    diagnostics_emitted: u64,
+}
+
+impl ScanAggregateStats {
+    /// Fold a single page's output into the running totals.
+    ///
+    /// Increments `pages_scanned` by one, adds the page's item count to
+    /// `items_scanned`, and adds the lengths of the findings and diagnostics
+    /// slices to the respective emitted counters. All arithmetic is saturating.
+    pub fn record_page(&mut self, page: &PageScanOutput) {
+        self.pages_scanned = self.pages_scanned.saturating_add(1);
+        self.items_scanned = self
+            .items_scanned
+            .saturating_add(page.summary().item_count() as u64);
+        self.findings_emitted = self
+            .findings_emitted
+            .saturating_add(page.findings().len() as u64);
+        self.diagnostics_emitted = self
+            .diagnostics_emitted
+            .saturating_add(page.diagnostics().len() as u64);
+    }
+
+    /// Number of non-empty pages evaluated.
+    #[must_use]
+    pub fn pages_scanned(&self) -> u64 {
+        self.pages_scanned
+    }
+
+    /// Number of scan items evaluated across all pages.
+    #[must_use]
+    pub fn items_scanned(&self) -> u64 {
+        self.items_scanned
+    }
+
+    /// Number of findings emitted across all pages.
+    #[must_use]
+    pub fn findings_emitted(&self) -> u64 {
+        self.findings_emitted
+    }
+
+    /// Number of diagnostics emitted across all pages.
+    #[must_use]
+    pub fn diagnostics_emitted(&self) -> u64 {
+        self.diagnostics_emitted
+    }
+}
+
 #[cfg(test)]
 #[path = "types_tests.rs"]
 mod tests;

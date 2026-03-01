@@ -941,6 +941,7 @@ version = "0.1.0"
 dependencies = [
  "gossip-scanner-runtime",
  "rstest",
+ "tempfile",
 ]
 
 [[package]]

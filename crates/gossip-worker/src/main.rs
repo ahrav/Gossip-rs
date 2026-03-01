@@ -33,8 +33,8 @@ use gossip_coordination::{
     RunManagement, ShardClaiming, ShardId, ShardSpec, TenantId, WorkerId, WorkerSession,
 };
 use gossip_engine::{
-    PageScanContext, PageScanOutput, PageScanRequest, ScanDedupState, ScanDiagnostic, ScannerCore,
-    ScannerCoreError,
+    PageScanContext, PageScanOutput, PageScanRequest, ScanAggregateStats, ScanDedupState,
+    ScanDiagnostic, ScannerCore, ScannerCoreError,
 };
 use gossip_scan_pipeline::{
     DEFAULT_MAX_TRANSIENT_RETRIES, PageProcessingContext, PageProcessingError, ScanLoopError,
@@ -111,37 +111,15 @@ impl From<ScanLoopError> for WorkerError {
     }
 }
 
-/// Aggregate scanner-core stats across one shard scan-loop execution.
-#[derive(Clone, Debug, Default)]
-struct EngineScanStats {
-    pages_scanned: u64,
-    items_scanned: u64,
-    findings_emitted: u64,
-    diagnostics_emitted: u64,
-}
-
-impl EngineScanStats {
-    fn record_page(&mut self, output: &PageScanOutput) {
-        let stats = output.stats();
-        self.pages_scanned = self.pages_scanned.saturating_add(stats.pages_scanned());
-        self.items_scanned = self.items_scanned.saturating_add(stats.items_scanned());
-        self.findings_emitted = self
-            .findings_emitted
-            .saturating_add(output.findings().len() as u64);
-        self.diagnostics_emitted = self
-            .diagnostics_emitted
-            .saturating_add(output.diagnostics().len() as u64);
-    }
-
-    fn log_summary(&self) {
-        tracing::info!(
-            pages_scanned = self.pages_scanned,
-            items_scanned = self.items_scanned,
-            findings_emitted = self.findings_emitted,
-            diagnostics_emitted = self.diagnostics_emitted,
-            "scanner-core page processing summary",
-        );
-    }
+/// Log aggregate scanner-core stats for a completed shard scan-loop.
+fn log_scan_summary(stats: &ScanAggregateStats) {
+    tracing::info!(
+        pages_scanned = stats.pages_scanned(),
+        items_scanned = stats.items_scanned(),
+        findings_emitted = stats.findings_emitted(),
+        diagnostics_emitted = stats.diagnostics_emitted(),
+        "scanner-core page processing summary",
+    );
 }
 
 fn scan_page_with_engine(
@@ -165,7 +143,7 @@ fn scan_page_with_engine(
 fn process_page_with_engine(
     scanner: &ScannerCore,
     dedupe: &mut ScanDedupState,
-    stats: &mut EngineScanStats,
+    stats: &mut ScanAggregateStats,
     context: PageProcessingContext<'_>,
 ) -> Result<(), PageProcessingError> {
     let output = scan_page_with_engine(scanner, dedupe, context).map_err(|error| {
@@ -335,7 +313,7 @@ fn run_placeholder_worker() -> Result<(), WorkerError> {
                 let next_op_id = &mut clock.next_op_id;
                 let next_now = &mut clock.next_now;
                 let mut dedupe = ScanDedupState::default();
-                let mut engine_stats = EngineScanStats::default();
+                let mut engine_stats = ScanAggregateStats::default();
 
                 let outcome = run_scan_loop_with_page_processor(
                     session,
@@ -358,7 +336,7 @@ fn run_placeholder_worker() -> Result<(), WorkerError> {
                         process_page_with_engine(&scanner, &mut dedupe, &mut engine_stats, context)
                     },
                 );
-                engine_stats.log_summary();
+                log_scan_summary(&engine_stats);
 
                 match outcome {
                     ScanLoopOutcome::Completed => {

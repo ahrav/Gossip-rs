@@ -24,8 +24,7 @@ use std::{
 };
 
 use gossip_scanner_runtime::{
-    ExecutionMode, FsScanConfig, GitScanConfig, ParseExecutionModeError, ScanRuntimeError, scan_fs,
-    scan_git,
+    ExecutionMode, FsScanConfig, GitScanConfig, ScanRuntimeError, scan_fs, scan_git,
 };
 
 /// Result of argument parsing: either a runnable scan or a help string.
@@ -133,10 +132,10 @@ fn execute_scan(command: ScanCommand) -> Result<(), CliError> {
 
     println!(
         "scan complete: pages={} items={} findings={} diagnostics={}",
-        outcome.pages_scanned,
-        outcome.items_scanned,
-        outcome.findings_emitted,
-        outcome.diagnostics_emitted,
+        outcome.pages_scanned(),
+        outcome.items_scanned(),
+        outcome.findings_emitted(),
+        outcome.diagnostics_emitted(),
     );
     Ok(())
 }
@@ -149,9 +148,10 @@ fn runtime_error_to_cli(error: ScanRuntimeError) -> CliError {
 
 /// Three-level argument parser: `<exe> scan <source> [flags...]`.
 ///
-/// Dispatches to [`parse_fs_args`] or [`parse_git_args`] once the source
-/// keyword is consumed. Returns [`ParsedCommand::Help`] for `--help` / `-h`
-/// at any level, or when invoked with no arguments.
+/// Dispatches to [`parse_fs_args`] or [`parse_git_args`] (which delegate to
+/// [`parse_source_args`]) once the source keyword is consumed. Returns
+/// [`ParsedCommand::Help`] for `--help` / `-h` at any level, or when invoked
+/// with no arguments.
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedCommand, CliError> {
     let mut args = args.into_iter();
     let exe = args.next().unwrap_or_else(|| OsString::from("scanner-rs"));
@@ -196,109 +196,40 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedCommand,
 
 /// Parse `scan fs` flags.
 ///
-/// Accepts `--path <dir|file>` (required) and `--execution-mode <mode>`
-/// (optional, defaults to `direct`). A single bare positional argument is
-/// accepted as a shorthand for `--path`.
+/// Thin wrapper around [`parse_source_args`] for the `--path` flag.
 fn parse_fs_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, CliError> {
-    let usage = fs_usage(exe_name);
-    let mut path: Option<PathBuf> = None;
-    let mut execution_mode = ExecutionMode::Direct;
-
-    let mut index = 0usize;
-    while index < args.len() {
-        let arg = &args[index];
-        let arg_str = arg.to_string_lossy();
-
-        if matches!(arg_str.as_ref(), "--help" | "-h") {
-            return Ok(ParsedCommand::Help(usage));
-        }
-
-        if let Some(value) = arg_str.strip_prefix("--path=") {
-            if value.is_empty() {
-                return Err(CliError::with_usage(
-                    "--path requires a value",
-                    fs_usage(exe_name),
-                ));
-            }
-            path = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-
-        if arg_str == "--path" {
-            index += 1;
-            let Some(value) = args.get(index) else {
-                return Err(CliError::with_usage(
-                    "--path requires a value",
-                    fs_usage(exe_name),
-                ));
-            };
-            path = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-
-        if let Some(value) = arg_str.strip_prefix("--execution-mode=") {
-            execution_mode = parse_execution_mode(value, exe_name, "fs")?;
-            index += 1;
-            continue;
-        }
-
-        if arg_str == "--execution-mode" {
-            index += 1;
-            let Some(value) = args.get(index) else {
-                return Err(CliError::with_usage(
-                    "--execution-mode requires a value",
-                    fs_usage(exe_name),
-                ));
-            };
-            let value = value.to_string_lossy();
-            execution_mode = parse_execution_mode(value.as_ref(), exe_name, "fs")?;
-            index += 1;
-            continue;
-        }
-
-        if arg_str.starts_with('-') {
-            return Err(CliError::with_usage(
-                format!("unknown flag '{arg_str}'"),
-                fs_usage(exe_name),
-            ));
-        }
-
-        if path.is_none() {
-            path = Some(PathBuf::from(arg));
-            index += 1;
-            continue;
-        }
-
-        return Err(CliError::with_usage(
-            format!("unexpected positional argument '{arg_str}'"),
-            fs_usage(exe_name),
-        ));
-    }
-
-    let Some(path) = path else {
-        return Err(CliError::with_usage(
-            "missing --path <dir|file>",
-            fs_usage(exe_name),
-        ));
-    };
-
-    Ok(ParsedCommand::Run(ScanCommand {
-        source: ScanSource::Fs { path },
-        execution_mode,
-    }))
+    parse_source_args(exe_name, args, "--path", fs_usage, |p| ScanSource::Fs {
+        path: p,
+    })
 }
 
 /// Parse `scan git` flags.
 ///
-/// Accepts `--repo <path>` (required) and `--execution-mode <mode>`
-/// (optional, defaults to `direct`). A single bare positional argument is
-/// accepted as a shorthand for `--repo`.
+/// Thin wrapper around [`parse_source_args`] for the `--repo` flag.
 fn parse_git_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, CliError> {
-    let usage = git_usage(exe_name);
-    let mut repo: Option<PathBuf> = None;
+    parse_source_args(exe_name, args, "--repo", git_usage, |p| ScanSource::Git {
+        repo: p,
+    })
+}
+
+/// Generic source-flag argument parser shared by `fs` and `git` sub-commands.
+///
+/// `flag_name` is the required path flag (e.g. `"--path"` or `"--repo"`).
+/// `usage_fn` generates the usage string for error/help output.
+/// `build_source` wraps the validated [`PathBuf`] into the correct
+/// [`ScanSource`] variant.
+fn parse_source_args(
+    exe_name: &str,
+    args: &[OsString],
+    flag_name: &str,
+    usage_fn: fn(&str) -> String,
+    build_source: fn(PathBuf) -> ScanSource,
+) -> Result<ParsedCommand, CliError> {
+    let usage = usage_fn(exe_name);
+    let mut source_path: Option<PathBuf> = None;
     let mut execution_mode = ExecutionMode::Direct;
+
+    let flag_eq_prefix = format!("{flag_name}=");
 
     let mut index = 0usize;
     while index < args.len() {
@@ -309,33 +240,35 @@ fn parse_git_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, Cl
             return Ok(ParsedCommand::Help(usage));
         }
 
-        if let Some(value) = arg_str.strip_prefix("--repo=") {
+        if let Some(value) = arg_str.strip_prefix(flag_eq_prefix.as_str()) {
             if value.is_empty() {
                 return Err(CliError::with_usage(
-                    "--repo requires a value",
-                    git_usage(exe_name),
+                    format!("{flag_name} requires a value"),
+                    usage_fn(exe_name),
                 ));
             }
-            repo = Some(PathBuf::from(value));
+            source_path = Some(validate_path_input(&OsString::from(value))?);
             index += 1;
             continue;
         }
 
-        if arg_str == "--repo" {
+        if *arg_str == *flag_name {
             index += 1;
             let Some(value) = args.get(index) else {
                 return Err(CliError::with_usage(
-                    "--repo requires a value",
-                    git_usage(exe_name),
+                    format!("{flag_name} requires a value"),
+                    usage_fn(exe_name),
                 ));
             };
-            repo = Some(PathBuf::from(value));
+            source_path = Some(validate_path_input(value)?);
             index += 1;
             continue;
         }
 
         if let Some(value) = arg_str.strip_prefix("--execution-mode=") {
-            execution_mode = parse_execution_mode(value, exe_name, "git")?;
+            execution_mode = value
+                .parse::<ExecutionMode>()
+                .map_err(|e| CliError::with_usage(e.to_string(), usage_fn(exe_name)))?;
             index += 1;
             continue;
         }
@@ -345,11 +278,13 @@ fn parse_git_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, Cl
             let Some(value) = args.get(index) else {
                 return Err(CliError::with_usage(
                     "--execution-mode requires a value",
-                    git_usage(exe_name),
+                    usage_fn(exe_name),
                 ));
             };
             let value = value.to_string_lossy();
-            execution_mode = parse_execution_mode(value.as_ref(), exe_name, "git")?;
+            execution_mode = value
+                .parse::<ExecutionMode>()
+                .map_err(|e| CliError::with_usage(e.to_string(), usage_fn(exe_name)))?;
             index += 1;
             continue;
         }
@@ -357,52 +292,48 @@ fn parse_git_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, Cl
         if arg_str.starts_with('-') {
             return Err(CliError::with_usage(
                 format!("unknown flag '{arg_str}'"),
-                git_usage(exe_name),
+                usage_fn(exe_name),
             ));
         }
 
-        if repo.is_none() {
-            repo = Some(PathBuf::from(arg));
+        if source_path.is_none() {
+            source_path = Some(validate_path_input(arg)?);
             index += 1;
             continue;
         }
 
         return Err(CliError::with_usage(
             format!("unexpected positional argument '{arg_str}'"),
-            git_usage(exe_name),
+            usage_fn(exe_name),
         ));
     }
 
-    let Some(repo) = repo else {
+    let Some(source_path) = source_path else {
         return Err(CliError::with_usage(
-            "missing --repo <path>",
-            git_usage(exe_name),
+            format!("missing {flag_name} <path>"),
+            usage_fn(exe_name),
         ));
     };
 
     Ok(ParsedCommand::Run(ScanCommand {
-        source: ScanSource::Git { repo },
+        source: build_source(source_path),
         execution_mode,
     }))
 }
 
-/// Parse the `--execution-mode` value, attaching source-specific usage on
-/// failure.
-fn parse_execution_mode(
-    value: &str,
-    exe_name: &str,
-    source: &str,
-) -> Result<ExecutionMode, CliError> {
-    value
-        .parse::<ExecutionMode>()
-        .map_err(|error: ParseExecutionModeError| {
-            let usage = match source {
-                "fs" => fs_usage(exe_name),
-                "git" => git_usage(exe_name),
-                _ => top_usage(exe_name),
-            };
-            CliError::with_usage(error.to_string(), usage)
-        })
+/// Validate a raw CLI path argument before converting to [`PathBuf`].
+///
+/// Rejects null bytes and control characters (except tab) that can cause
+/// issues with C-level path APIs or produce confusing behavior.
+fn validate_path_input(value: &OsString) -> Result<PathBuf, CliError> {
+    let s = value.to_string_lossy();
+    if s.as_bytes().contains(&0) {
+        return Err(CliError::message_only("path contains null byte"));
+    }
+    if s.chars().any(|c| c.is_control() && c != '\t') {
+        return Err(CliError::message_only("path contains control character"));
+    }
+    Ok(PathBuf::from(value))
 }
 
 /// Extract the trailing filename component from `argv[0]` for use in usage
@@ -592,5 +523,59 @@ mod tests {
             msg.contains(expected_substring),
             "error '{msg}' should contain '{expected_substring}'"
         );
+    }
+
+    // ── Path validation ───────────────────────────────────────────
+
+    #[test]
+    fn parse_rejects_control_char_in_path() {
+        let err = parse_args(argv(&["scanner-rs", "scan", "fs", "--path", "foo\x01bar"]))
+            .expect_err("should reject control char");
+        assert!(err.to_string().contains("control character"));
+    }
+
+    #[test]
+    fn parse_rejects_control_char_in_path_equals_form() {
+        let args: Vec<OsString> = vec![
+            OsString::from("scanner-rs"),
+            OsString::from("scan"),
+            OsString::from("fs"),
+            OsString::from("--path=foo\x01bar"),
+        ];
+        let err = parse_args(args).expect_err("should reject control char");
+        assert!(err.to_string().contains("control character"));
+    }
+
+    #[test]
+    fn parse_rejects_control_char_in_positional_path() {
+        let err = parse_args(argv(&["scanner-rs", "scan", "fs", "foo\x01bar"]))
+            .expect_err("should reject control char");
+        assert!(err.to_string().contains("control character"));
+    }
+
+    #[test]
+    fn parse_rejects_control_char_in_git_repo() {
+        let err = parse_args(argv(&["scanner-rs", "scan", "git", "--repo", "foo\x02bar"]))
+            .expect_err("should reject control char");
+        assert!(err.to_string().contains("control character"));
+    }
+
+    // ── Integration: execute_scan ─────────────────────────────────
+
+    #[test]
+    fn execute_scan_fs_succeeds_on_tempdir() {
+        use std::fs;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("test.txt"), "hello").expect("write");
+
+        let cmd = ScanCommand {
+            source: ScanSource::Fs {
+                path: dir.path().to_path_buf(),
+            },
+            execution_mode: ExecutionMode::Direct,
+        };
+        execute_scan(cmd).expect("execute_scan should succeed");
     }
 }

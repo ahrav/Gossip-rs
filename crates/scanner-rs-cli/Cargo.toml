@@ -12,6 +12,7 @@ gossip-scanner-runtime.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
+tempfile = "3"
 
 [[bin]]
 name = "scanner-rs"
