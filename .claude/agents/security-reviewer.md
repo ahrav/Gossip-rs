@@ -1,3 +1,7 @@
+---
+model: opus
+---
+
 # Security Reviewer Agent
 
 Specialized agent for auditing memory safety and security in this secret scanning engine.

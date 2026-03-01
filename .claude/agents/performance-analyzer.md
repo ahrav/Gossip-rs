@@ -1,3 +1,7 @@
+---
+model: opus
+---
+
 # Performance Analyzer Agent
 
 Specialized agent for analyzing Rust code performance in this secret scanning engine.

@@ -65,7 +65,7 @@ an implementing agent 90% of the context it needs inline.
 
 **Skip when `--quick` is passed.**
 
-Spawn one `subagent_type=general-purpose` agent with the structured research prompt
+Spawn one `subagent_type=general-purpose`, `model="sonnet"` agent with the structured research prompt
 below. The agent performs up to ~30 tool calls across 6 steps.
 
 ### Research Agent Prompt

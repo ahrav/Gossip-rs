@@ -29,7 +29,7 @@ proceeding.
 ## Phase 1 — Diverge (Parallel Exploration)
 
 Launch **5 independent agents in parallel** using the Task tool with
-`subagent_type=general-purpose`. Every agent receives **identical instructions**
+`subagent_type=general-purpose` and `model="opus"`. Every agent receives **identical instructions**
 so that their outputs are independently generated with zero cross-contamination.
 
 **All 5 agents MUST be launched in a single message** (one message, five Task
@@ -97,7 +97,7 @@ out, proceed with the agents that succeeded (minimum 3 required).
 ## Phase 2 — Converge (Parallel Ranking)
 
 Launch **2 independent ranking agents in parallel** using the Task tool with
-`subagent_type=general-purpose`. Both receive **identical instructions** and
+`subagent_type=general-purpose` and `model="opus"`. Both receive **identical instructions** and
 the collected Phase 1 outputs.
 
 **Both rankers MUST be launched in a single message** (one message, two Task

@@ -87,7 +87,7 @@ If the plan file is empty or cannot be read, tell the user and stop.
 ## Phase 1 — Specialist Reviews (2-4 Parallel Agents)
 
 Launch **all selected agents in a single message** using the Task tool with
-`subagent_type=general-purpose`. Each agent gets the same plan + context but a
+`subagent_type=general-purpose` and `model="opus"`. Each agent gets the same plan + context but a
 different review lens.
 
 ### Common Preamble (included in every agent's prompt)
@@ -250,7 +250,7 @@ handle those.
 ## Phase 2 — Synthesize (Single Agent)
 
 After all specialists complete, launch **1 synthesizer agent** using the Task
-tool with `subagent_type=general-purpose`.
+tool with `subagent_type=general-purpose` and `model="opus"`.
 
 ### Synthesizer Prompt
 

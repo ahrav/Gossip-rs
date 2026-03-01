@@ -46,7 +46,7 @@ user for the problem statement before proceeding.
 ## Phase 1 — Research (3-5 Parallel Agents)
 
 Launch **5 research agents in parallel** using the Task tool with
-`subagent_type=general-purpose`. Each agent has a distinct research lens but
+`subagent_type=general-purpose` and `model="opus"`. Each agent has a distinct research lens but
 receives the same problem statement. All agents explore the codebase for context
 AND search the web for external evidence.
 
@@ -310,7 +310,7 @@ out, proceed with the agents that succeeded (minimum 3 required for Phase 2).
 ## Phase 2 — Synthesize (Single Agent)
 
 Launch **1 synthesis agent** using the Task tool with
-`subagent_type=general-purpose`.
+`subagent_type=general-purpose` and `model="opus"`.
 
 ### Synthesizer Prompt
 
@@ -405,7 +405,7 @@ won't read the full report.
 ## Phase 3 — Integrate (Single Agent)
 
 Launch **1 integration agent** using the Task tool with
-`subagent_type=general-purpose`.
+`subagent_type=general-purpose` and `model="opus"`.
 
 This agent maps the synthesized research to a concrete implementation plan
 grounded in the actual codebase.
