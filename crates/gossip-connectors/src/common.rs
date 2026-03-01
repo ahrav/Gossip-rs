@@ -156,10 +156,11 @@ pub(crate) fn page_slab_capacity(
 
 /// Materialized page of pooled toxic-byte wrappers.
 ///
-/// Produced by [`assemble_pooled_page`], which consolidates the slab staging
-/// pipeline shared by all connector implementations. Callers zip the returned
-/// `wrappers` with their connector-specific metadata (e.g., `StableItemId`,
-/// `VersionId`, size hints) to build [`ScanItem`]s.
+/// Produced by [`assemble_pooled_page`] (generic two-slot path) and
+/// [`assemble_pooled_page_shared_key_ref`] (shared-slot path for key==ref
+/// connectors). Callers zip the returned `wrappers` with their
+/// connector-specific metadata (e.g., `StableItemId`, `VersionId`, size
+/// hints) to build [`ScanItem`]s.
 pub(crate) struct StagedPage {
     /// Materialized (ItemKey, ItemRef) pairs, ready to zip with caller metadata.
     /// Each wrapper holds an `Arc<PooledByteSlab>` internally, keeping the
@@ -235,6 +236,13 @@ pub(crate) fn assemble_pooled_page<'a>(
             ))
         })?;
         staged.push((key_slot, ref_slot));
+    }
+
+    if staged.len() != take {
+        return Err(EnumerateError::permanent(format!(
+            "staged wrapper count mismatch: wrappers={}, expected={take}",
+            staged.len()
+        )));
     }
 
     // Phase 3: optionally stage continuation token.
@@ -320,11 +328,12 @@ pub(crate) fn assemble_pooled_page_shared_key_ref<'a>(
         );
         wrappers.push((item_key, item_ref));
     }
-    debug_assert_eq!(
-        wrappers.len(),
-        take,
-        "filesystem staged wrappers count must match selected entry count"
-    );
+    if wrappers.len() != take {
+        return Err(EnumerateError::permanent(format!(
+            "staged wrapper count mismatch: wrappers={}, expected={take}",
+            wrappers.len()
+        )));
+    }
 
     let token = match token_slot {
         Some(slot) => Some(
