@@ -412,6 +412,15 @@ impl FilesystemConnector {
     // Enumeration
     // ---------------------------------------------------------------
 
+    /// Enumerate one page over the explicit half-open key range `[start, end)`.
+    ///
+    /// This entry point bypasses [`ShardSpec`] decoding, letting tests exercise
+    /// the core pagination logic with known-good bounds and without needing to
+    /// construct a full shard object.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EnumerateError::permanent` if `start > end`.
     pub fn enumerate_page_range(
         &mut self,
         start: &ItemKey,
@@ -509,6 +518,15 @@ impl FilesystemConnector {
     // Split-point selection
     // ---------------------------------------------------------------
 
+    /// Return a split-point hint over the explicit half-open key range
+    /// `[start, end)`.
+    ///
+    /// This entry point mirrors shard-based split behavior without requiring a
+    /// [`ShardSpec`], keeping split-point unit tests focused and self-contained.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EnumerateError::permanent` if `start > end`.
     pub fn choose_split_point_range(
         &mut self,
         start: &ItemKey,

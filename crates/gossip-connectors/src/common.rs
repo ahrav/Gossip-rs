@@ -94,9 +94,11 @@ pub(crate) fn upper_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
 /// these indices with connector-specific cursor resume logic to determine the
 /// effective start position.
 pub(crate) struct ResolvedBounds {
-    /// Inclusive lower bound index (first item whose key is `>= shard start`).
+    /// Inclusive lower bound index (first item whose key is `>= shard start`,
+    /// or `0` when the shard start is unbounded).
     pub range_start: usize,
-    /// Exclusive upper bound index (first item whose key is `>= shard end`).
+    /// Exclusive upper bound index (first item whose key is `>= shard end`,
+    /// or `items.len()` when the shard end is unbounded).
     pub range_end: usize,
 }
 
