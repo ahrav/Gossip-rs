@@ -5,6 +5,12 @@ use gossip_contracts::{
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
 
+/// Must match `gossip_stdx::byte_slab::MIN_BLOCK` (16 bytes).
+///
+/// Keeping a local constant avoids exposing `gossip-stdx` internals from this
+/// module while preserving identical size-class rounding.
+const PAGE_SLAB_MIN_BLOCK: usize = 16;
+
 /// Parse an 8-byte big-endian `u64` from a byte slice.
 ///
 /// Returns `None` for non-8-byte payloads, letting callers decide whether to
@@ -72,6 +78,54 @@ pub(crate) fn upper_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
 /// `FileEntry` (`.size`) and `PreparedItem` (`.size_hint`).
 pub(crate) trait SizedEntry {
     fn entry_size(&self) -> u64;
+}
+
+/// Round a logical byte length to the slab allocation size.
+///
+/// Mirrors `ByteSlab`'s size-class rule: `0 -> 0`, otherwise
+/// `max(len, 16).next_power_of_two()`.
+/// Returns `None` when the rounded size overflows `usize`.
+#[inline]
+fn page_slab_alloc_size(len: usize) -> Option<usize> {
+    if len == 0 {
+        return Some(0);
+    }
+    len.max(PAGE_SLAB_MIN_BLOCK).checked_next_power_of_two()
+}
+
+/// Compute exact slab capacity needed for a page's staged byte fields.
+///
+/// Connectors pass all key/ref/token lengths for the page; this helper rounds
+/// each field to the same size classes used by `ByteSlab` and sums the result.
+///
+/// Pre-sizing up front avoids partial staging work followed by a late slab-full
+/// failure. Any failure here is treated as permanent because the inputs come
+/// from already-validated boundary values.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` when:
+/// - any rounded field size overflows `usize`,
+/// - the total rounded capacity overflows `usize`, or
+/// - the final capacity exceeds `u32::MAX` (the slab offset domain).
+pub(crate) fn page_slab_capacity(
+    lengths: impl IntoIterator<Item = usize>,
+) -> Result<usize, EnumerateError> {
+    let mut capacity = 0usize;
+    for len in lengths {
+        let rounded = page_slab_alloc_size(len)
+            .ok_or_else(|| EnumerateError::permanent("page slab field size overflow"))?;
+        capacity = capacity
+            .checked_add(rounded)
+            .ok_or_else(|| EnumerateError::permanent("page slab capacity overflow"))?;
+    }
+    let capacity = capacity.max(PAGE_SLAB_MIN_BLOCK);
+    if capacity > u32::MAX as usize {
+        return Err(EnumerateError::permanent(
+            "page slab capacity exceeds u32::MAX",
+        ));
+    }
+    Ok(capacity)
 }
 
 /// Byte-weighted median split-point selection.

@@ -44,10 +44,13 @@
 //! - `MAX_ITEM_KEY_SIZE` and `MAX_TOKEN_SIZE` mirror coordination cursor
 //!   limits so connector paging state and cursor updates stay aligned.
 //!   Alignment is covered by connector type tests.
+//! - Pooled toxic-byte wrappers retain a shared page slab (`PooledByteSlab`);
+//!   any key/ref/token clones that escape a page keep that slab alive.
 //!
 //! ## Public surface
 //!
 //! - Byte wrappers: [`ItemKey`], [`ItemRef`], [`TokenBytes`]
+//! - Pooled slab owner for page-scoped toxic-byte wrappers: [`PooledByteSlab`]
 //! - Paging bridge: [`Cursor`]
 //! - Version semantics: [`VersionId`]
 //! - Optional metadata: [`ContentHints`], [`Location`]
@@ -97,5 +100,5 @@ pub use page_validator::{
 pub use types::{
     Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
     Location, MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE,
-    MAX_LOCATION_URL_SIZE, MAX_TOKEN_SIZE, ScanItem, TokenBytes, VersionId,
+    MAX_LOCATION_URL_SIZE, MAX_TOKEN_SIZE, PooledByteSlab, ScanItem, TokenBytes, VersionId,
 };

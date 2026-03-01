@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use gossip_stdx::ByteSlab;
 use rstest::rstest;
 
 use super::*;
@@ -171,6 +174,55 @@ fn constructors_reject_empty_values() {
         TokenBytes::try_from_slice(b""),
         Err(ConnectorInputError::Empty {
             field: "TokenBytes"
+        })
+    );
+}
+
+#[test]
+fn pooled_constructor_roundtrips_without_heap_owned_storage() {
+    // One page-local slab supplies key/ref/token bytes for all wrappers.
+    let mut slab = ByteSlab::with_capacity(128);
+    let key_slot = slab.allocate(b"item-key").expect("allocate key");
+    let ref_slot = slab.allocate(b"item-ref").expect("allocate ref");
+    let token_slot = slab.allocate(b"token").expect("allocate token");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    let key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).expect("pooled key");
+    let iref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).expect("pooled item_ref");
+    let token = TokenBytes::try_from_slot(token_slot, Arc::clone(&shared)).expect("pooled token");
+
+    assert!(key.is_pooled());
+    assert!(iref.is_pooled());
+    assert!(token.is_pooled());
+    assert_eq!(key.as_bytes(), b"item-key");
+    assert_eq!(iref.as_bytes(), b"item-ref");
+    assert_eq!(token.as_bytes(), b"token");
+    assert!(
+        key.clone().is_pooled(),
+        "cloning pooled key should stay pooled"
+    );
+}
+
+#[test]
+fn pooled_constructor_rejects_empty_and_oversized_slots() {
+    // Slot-backed constructors must enforce the same non-empty/size bounds as
+    // vec/slice constructors.
+    let oversized_len = MAX_ITEM_KEY_SIZE + 1;
+    let mut slab = ByteSlab::with_capacity(oversized_len.next_power_of_two());
+    let oversized_bytes = vec![0xAB; oversized_len];
+    let oversized_slot = slab.allocate(&oversized_bytes).expect("allocate oversized");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    assert_eq!(
+        ItemKey::try_from_slot(gossip_stdx::ByteSlot::EMPTY, Arc::clone(&shared)),
+        Err(ConnectorInputError::Empty { field: "ItemKey" })
+    );
+    assert_eq!(
+        ItemKey::try_from_slot(oversized_slot, Arc::clone(&shared)),
+        Err(ConnectorInputError::TooLarge {
+            field: "ItemKey",
+            size: oversized_len,
+            max: MAX_ITEM_KEY_SIZE,
         })
     );
 }

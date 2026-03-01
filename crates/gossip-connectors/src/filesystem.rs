@@ -27,6 +27,18 @@
 //!   [`VersionId`] is weak metadata-derived (`mtime`, `mtime_nsec`, `len`,
 //!   `inode`, `dev`) to avoid content hashing during index build.
 //!
+//! # Pooled toxic-byte page assembly
+//!
+//! Enumeration stages each page's key/ref/token bytes into a single page-local
+//! [`ByteSlab`], then constructs [`ItemKey`], [`ItemRef`], and optional
+//! [`TokenBytes`] wrappers from slab slots. This front-loads one copy per field
+//! per page, but keeps wrapper cloning allocation-free in the HOT emit loop.
+//!
+//! Staging and wrapper reconstruction failures are reported as permanent
+//! `EnumerateError`s because page sizes are derived from already-validated
+//! contract values; failure indicates internal accounting/resource exhaustion,
+//! not external cursor drift.
+//!
 //! # Resume semantics
 //!
 //! Cursor progression is anchored on key ordering, not opaque tokens. The
@@ -115,8 +127,9 @@
 //! - Designed for single-threaded sequential page calls; the struct holds
 //!   mutable state (`index_state`, `files`) with no interior synchronization.
 //! - The file index is built once per connector instance. Directory mutations
-//!   after the first enumerate call are invisible; construct a new connector
-//!   to observe changes.
+//!   after the first indexing-triggering call (`enumerate_page`,
+//!   `choose_split_point`, `open`, or `read_range`) are invisible; construct a
+//!   new connector to observe changes.
 //! - Non-fatal walk issues (unreadable entries, symlinks, encoding failures)
 //!   are recorded in [`WalkWarning`]s (up to a configurable cap) rather than
 //!   aborting the entire index. Only root-directory failures are hard errors.
@@ -135,18 +148,20 @@ use std::{
         io::{AsRawFd, FromRawFd, OwnedFd},
     },
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, TokenBytes,
-        VersionId,
+        EnumerationPage, ItemKey, ItemRef, PooledByteSlab, ReadConnector, ReadError, ScanItem,
+        TokenBytes, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
+use gossip_stdx::{ByteSlab, ByteSlot};
 
 use crate::common::{
     self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
@@ -408,6 +423,18 @@ impl FilesystemConnector {
         self.enumerate_page_bounds(Some(start), Some(end), cursor, budgets)
     }
 
+    /// Core page enumeration used by both shard-based and explicit-range APIs.
+    ///
+    /// The method resolves bounds via binary search, applies key-authoritative
+    /// resume semantics, then stages key/ref/token bytes in a page-local slab
+    /// for pooled toxic-byte wrappers.
+    ///
+    /// # Failure modes
+    ///
+    /// - Deadline expiry is retryable.
+    /// - Invalid shard ranges (`start > end`) are permanent.
+    /// - Slab sizing/staging failures are permanent because staged lengths come
+    ///   from validated in-memory index fields.
     fn enumerate_page_bounds(
         &mut self,
         start: Option<&ItemKey>,
@@ -455,18 +482,62 @@ impl FilesystemConnector {
         }
 
         let take = budgets.max_items().min(range_end - start_idx);
-        let mut out = Vec::with_capacity(take);
-        for file in &self.files[start_idx..(start_idx + take)] {
-            let item_ref = ItemRef::try_from_slice(file.key.as_bytes())
-                .map_err(|err| EnumerateError::permanent(format!("invalid item_ref: {err}")))?;
+        let page_files = &self.files[start_idx..(start_idx + take)];
+        // Filesystem item refs mirror key bytes exactly, so each page item
+        // stages two identical-length fields: key + item_ref.
+        let slab_capacity = common::page_slab_capacity(
+            page_files
+                .iter()
+                .flat_map(|file| [file.key.len(), file.key.len()])
+                .chain(self.emit_tokens.then_some(std::mem::size_of::<u64>())),
+        )?;
+        let mut page_slab = ByteSlab::with_capacity(slab_capacity);
+        let mut staged: Vec<(ByteSlot, ByteSlot, StableItemId, VersionId, u64)> =
+            Vec::with_capacity(take);
+        for file in page_files {
+            let key_slot = page_slab.allocate(file.key.as_bytes()).map_err(|err| {
+                EnumerateError::permanent(format!("failed to stage item key in page slab: {err}"))
+            })?;
+            let item_ref_slot = page_slab.allocate(file.key.as_bytes()).map_err(|err| {
+                EnumerateError::permanent(format!("failed to stage item_ref in page slab: {err}"))
+            })?;
+            staged.push((
+                key_slot,
+                item_ref_slot,
+                file.stable_item_id,
+                file.version,
+                file.size,
+            ));
+        }
+
+        let token_slot = if self.emit_tokens {
+            let next_idx = start_idx
+                .checked_add(staged.len())
+                .and_then(|sum| u64::try_from(sum).ok())
+                .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
+            let token_bytes = next_idx.to_be_bytes();
+            Some(page_slab.allocate(&token_bytes).map_err(|err| {
+                EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
+            })?)
+        } else {
+            None
+        };
+
+        // Cursor and items share this Arc-backed slab; whichever value survives
+        // by-value keeps pooled key/ref/token bytes alive.
+        let page_slab = Arc::new(PooledByteSlab::new(page_slab));
+        let mut out = Vec::with_capacity(staged.len());
+        for (key_slot, item_ref_slot, stable_item_id, version, size) in staged {
+            let item_key =
+                ItemKey::try_from_slot(key_slot, Arc::clone(&page_slab)).map_err(|err| {
+                    EnumerateError::permanent(format!("invalid staged item key: {err}"))
+                })?;
+            let item_ref =
+                ItemRef::try_from_slot(item_ref_slot, Arc::clone(&page_slab)).map_err(|err| {
+                    EnumerateError::permanent(format!("invalid staged item_ref: {err}"))
+                })?;
             out.push(
-                ScanItem::new(
-                    file.key.clone(),
-                    item_ref,
-                    file.stable_item_id,
-                    file.version,
-                )
-                .with_size_hint(file.size),
+                ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(size),
             );
         }
 
@@ -477,13 +548,9 @@ impl FilesystemConnector {
             Some(item) => item.item_key().clone(),
             None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
         };
-        let next_cursor = if self.emit_tokens {
-            let next_idx = start_idx
-                .checked_add(out.len())
-                .and_then(|sum| u64::try_from(sum).ok())
-                .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
-            let token = TokenBytes::try_from_slice(&next_idx.to_be_bytes())
-                .map_err(|err| EnumerateError::permanent(format!("invalid token: {err}")))?;
+        let next_cursor = if let Some(token_slot) = token_slot {
+            let token = TokenBytes::try_from_slot(token_slot, Arc::clone(&page_slab))
+                .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?;
             Cursor::with_token(last_key, token)
         } else {
             Cursor::with_last_key(last_key)
