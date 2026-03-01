@@ -1,8 +1,54 @@
-//! Scanner runtime orchestration APIs shared by CLI and worker binaries.
+//! Scanner runtime orchestration for filesystem and git sources.
 //!
-//! This crate owns source-level scan orchestration (`fs` and `git`) while
-//! keeping process-exit behavior in binaries. Public functions return typed
-//! errors and deterministic summary outputs.
+//! This crate sits between source connectors (filesystem, git) and the
+//! [`ScannerCore`] engine. It owns the page-based scan loop: enumerate items
+//! from a source, chunk them into pages, feed each page through the engine,
+//! and aggregate results into a [`ScanOutcome`].
+//!
+//! # Architecture
+//!
+//! ```text
+//! ┌────────────┐     ┌──────────────────┐     ┌─────────────┐
+//! │ CLI / bin  │────▶│  scanner-runtime │────▶│ ScannerCore │
+//! └────────────┘     │                  │     └─────────────┘
+//!                    │  scan_fs()       │           ▲
+//!                    │  scan_git()      │           │
+//!                    │                  │     ┌─────┴───────┐
+//!                    │  page loop +     │     │ PageScan    │
+//!                    │  dedup state     │     │ Request/Out │
+//!                    └──────────────────┘     └─────────────┘
+//! ```
+//!
+//! # Execution modes
+//!
+//! Each scan function accepts an [`ExecutionMode`]:
+//!
+//! - **Direct** — the runtime reads source metadata itself (filesystem
+//!   `stat`, `git ls-files`) and synthesises [`ScanItem`]s in-process.
+//! - **Connector** — the runtime delegates enumeration to a connector that
+//!   implements [`EnumerationConnector`]. Currently gated; selecting it
+//!   returns [`ScanRuntimeError::UnsupportedExecutionMode`].
+//!
+//! # Pagination model
+//!
+//! Sources may contain millions of items. The runtime pages through them
+//! with bounded memory using [`ScanBudgets`]:
+//!
+//! - **Connector path** — `scan_from_connector_pages` calls
+//!   `enumerate_page` in a cursor-advancing loop until an empty page
+//!   signals completion.
+//! - **Materialized path** — `scan_materialized_items_pages` chunks a
+//!   pre-collected `&[ScanItem]` into fixed-size slices, synthesising
+//!   cursors from each chunk's last key.
+//!
+//! Both paths thread a shared [`ScanDedupState`] across pages so the engine
+//! can suppress duplicate findings across page boundaries.
+//!
+//! # Error handling
+//!
+//! All public functions return `Result<ScanOutcome, ScanRuntimeError>`.
+//! Process-exit policy (exit codes, stderr formatting) lives in the binary
+//! crates, not here.
 
 use std::{
     ffi::OsString,
@@ -31,16 +77,29 @@ use gossip_engine::{
     PageScanContext, PageScanOutput, PageScanRequest, ScanDedupState, ScannerCore, ScannerCoreError,
 };
 
+/// Connector identity tag for local-filesystem sources.
+///
+/// Embedded in every [`ScanItem`] so the engine can attribute findings back
+/// to the originating connector type.
 const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
+
+/// Connector identity tag for local-git sources.
 const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 
-/// Execution-mode selection shared across scanner runtime entrypoints.
+/// How the runtime acquires source items for scanning.
+///
+/// See the [module-level docs](self) for the architectural distinction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
-    /// Runtime-direct mode.
+    /// The runtime reads the source directly (filesystem `stat` / `git ls-files`)
+    /// and constructs [`ScanItem`]s in-process. This is the only mode
+    /// currently enabled.
     #[default]
     Direct,
-    /// Connector mode (explicit until later phases).
+    /// The runtime delegates enumeration to an [`EnumerationConnector`].
+    /// Selecting this mode currently returns
+    /// [`ScanRuntimeError::UnsupportedExecutionMode`]; it will be enabled
+    /// once the full connector pipeline is wired.
     Connector,
 }
 
@@ -84,12 +143,17 @@ impl fmt::Display for ParseExecutionModeError {
 
 impl std::error::Error for ParseExecutionModeError {}
 
-/// Page-budget controls for source enumeration.
+/// Per-page resource limits passed to connectors and used when chunking
+/// materialized item slices.
+///
+/// These caps prevent any single enumeration call from consuming unbounded
+/// memory. The defaults (256 items, 1 MB) are sized for interactive CLI
+/// usage; worker binaries may raise them for throughput.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
-    /// Maximum items per page.
+    /// Maximum items a single page may contain.
     pub max_items: usize,
-    /// Maximum bytes per read/enumerate call.
+    /// Maximum bytes a connector may transfer in one enumerate/read call.
     pub max_bytes: u64,
 }
 
@@ -103,19 +167,26 @@ impl Default for ScanBudgets {
 }
 
 impl ScanBudgets {
+    /// Convert to the contract-level [`Budgets`] type, validating that both
+    /// limits are non-zero.
     fn to_contract_budgets(self) -> Result<Budgets, ScanRuntimeError> {
         Budgets::try_new(self.max_items, self.max_bytes, None).map_err(ScanRuntimeError::from)
     }
 }
 
-/// Filesystem scan configuration.
+/// Configuration for a filesystem scan.
+///
+/// Supports both directory trees (enumerated via [`FilesystemConnector`]) and
+/// single files (wrapped into a one-item page). Use the builder methods
+/// ([`with_execution_mode`](Self::with_execution_mode),
+/// [`with_budgets`](Self::with_budgets)) to override defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsScanConfig {
     /// Root directory or single file path to scan.
     pub path: PathBuf,
-    /// Runtime execution mode.
+    /// How items are acquired (see [`ExecutionMode`]).
     pub execution_mode: ExecutionMode,
-    /// Enumeration/read budgets.
+    /// Per-page resource limits.
     pub budgets: ScanBudgets,
 }
 
@@ -145,14 +216,20 @@ impl FsScanConfig {
     }
 }
 
-/// Git scan configuration.
+/// Configuration for a git-tracked-file scan.
+///
+/// The runtime shells out to `git ls-files -z` to discover tracked paths,
+/// then stats each file to build [`ScanItem`]s. Use the builder methods
+/// ([`with_execution_mode`](Self::with_execution_mode),
+/// [`with_budgets`](Self::with_budgets)) to override defaults.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitScanConfig {
-    /// Repository working-tree path.
+    /// Repository working-tree path (must contain a `.git` directory
+    /// reachable by the `git` binary).
     pub repo: PathBuf,
-    /// Runtime execution mode.
+    /// How items are acquired (see [`ExecutionMode`]).
     pub execution_mode: ExecutionMode,
-    /// Enumeration/read budgets.
+    /// Per-page resource limits.
     pub budgets: ScanBudgets,
 }
 
@@ -182,7 +259,9 @@ impl GitScanConfig {
     }
 }
 
-/// Aggregated scan outcome for runtime entrypoints.
+/// Aggregated counters produced by a completed scan.
+///
+/// All counters use saturating arithmetic, so overflow is impossible.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanOutcome {
     /// Number of non-empty pages evaluated by scanner core.
@@ -196,6 +275,7 @@ pub struct ScanOutcome {
 }
 
 impl ScanOutcome {
+    /// Fold a single page's output into the running totals.
     fn record_page(&mut self, page: &PageScanOutput) {
         self.pages_scanned = self.pages_scanned.saturating_add(1);
         self.items_scanned = self
@@ -322,7 +402,10 @@ impl From<ScannerCoreError> for ScanRuntimeError {
     }
 }
 
-/// Dispatch filesystem scans according to [`FsScanConfig::execution_mode`].
+/// Top-level filesystem scan dispatcher.
+///
+/// Routes to [`scan_fs_direct`] or [`scan_fs_connector`] based on
+/// [`FsScanConfig::execution_mode`].
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
@@ -330,7 +413,10 @@ pub fn scan_fs(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
     }
 }
 
-/// Dispatch git scans according to [`GitScanConfig::execution_mode`].
+/// Top-level git scan dispatcher.
+///
+/// Routes to [`scan_git_direct`] or [`scan_git_connector`] based on
+/// [`GitScanConfig::execution_mode`].
 pub fn scan_git(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_git_direct(config),
@@ -338,7 +424,16 @@ pub fn scan_git(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError>
     }
 }
 
-/// Direct-mode filesystem scan entrypoint.
+/// Direct-mode filesystem scan.
+///
+/// Two branches depending on the target path:
+///
+/// - **Directory** — wraps the path in a [`FilesystemConnector`] and drives
+///   it through the paginated connector loop (`scan_from_connector_pages`).
+/// - **Single file** — stats the file, builds one [`ScanItem`], and runs it
+///   through the materialized-items path as a single-item page.
+///
+/// Uses an unbounded shard range (`[]..[]`) so every item is in scope.
 pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
     validate_fs_path(&config.path)?;
 
@@ -355,7 +450,17 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeE
     }
 }
 
-/// Direct-mode git scan entrypoint.
+/// Direct-mode git scan.
+///
+/// Pipeline:
+/// 1. Shell out to `git ls-files -z` to collect tracked relative paths.
+/// 2. For each path that resolves to a regular file, stat it and build a
+///    [`ScanItem`] keyed by the relative path bytes.
+/// 3. Sort items by key so the scanner core sees them in deterministic order.
+/// 4. Page the sorted items through `scan_materialized_items_pages`.
+///
+/// Paths that no longer exist on disk (e.g. staged deletions) or that
+/// produce empty key bytes are silently skipped.
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
     validate_git_repo_path(&config.repo)?;
 
@@ -385,6 +490,7 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntim
         items.push(item);
     }
 
+    // Deterministic key order so page boundaries and dedup are reproducible.
     items.sort_unstable_by(|left, right| left.item_key().cmp(right.item_key()));
 
     let scanner = ScannerCore::default();
@@ -446,6 +552,11 @@ fn validate_git_repo_path(path: &Path) -> Result<(), ScanRuntimeError> {
     Ok(())
 }
 
+/// Collect git-tracked file paths via `git -C <repo> ls-files -z`.
+///
+/// The `-z` flag produces NUL-delimited output, which is essential for
+/// correct handling of filenames containing newlines or other special
+/// characters. Returned paths are relative to `repo`.
 fn list_git_tracked_paths(repo: &Path) -> Result<Vec<PathBuf>, ScanRuntimeError> {
     let output = Command::new("git")
         .arg("-C")
@@ -477,6 +588,18 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<PathBuf>, ScanRuntimeError>
     Ok(paths)
 }
 
+/// Drive a connector through its full pagination sequence.
+///
+/// Repeatedly calls [`EnumerationConnector::enumerate_page`] until an empty
+/// page is returned. Each non-empty page is fed to
+/// [`ScannerCore::scan_page_with_dedupe`] so dedup state spans the entire
+/// source.
+///
+/// # Stall detection
+///
+/// If a non-empty page returns the same cursor it was called with, the loop
+/// would spin forever. This is caught and surfaced as
+/// [`ScanRuntimeError::CursorStalled`].
 fn scan_from_connector_pages<C>(
     connector: &mut C,
     scanner: &ScannerCore,
@@ -522,6 +645,16 @@ where
     Ok(outcome)
 }
 
+/// Page a pre-collected item slice through the scanner engine.
+///
+/// Used when items have already been materialised in memory (e.g. from
+/// `git ls-files` output or a single-file scan). The slice is split into
+/// chunks of `max_items_per_page`, and synthetic cursors are derived from
+/// each chunk's last [`ItemKey`] so the engine sees a well-formed page
+/// sequence.
+///
+/// The `max_bytes` budget is set to 1 (the contract minimum) because no
+/// actual byte transfer occurs — items are already in memory.
 fn scan_materialized_items_pages(
     items: &[ScanItem],
     scanner: &ScannerCore,
@@ -530,6 +663,7 @@ fn scan_materialized_items_pages(
 ) -> Result<ScanOutcome, ScanRuntimeError> {
     let budgets = ScanBudgets {
         max_items: max_items_per_page,
+        // No byte transfer — items are already materialised.
         max_bytes: 1,
     };
     let _ = budgets.to_contract_budgets()?;
@@ -562,6 +696,10 @@ fn scan_materialized_items_pages(
     Ok(outcome)
 }
 
+/// Build a [`ScanItem`] for a single local file by stat-ing it.
+///
+/// The file's path bytes serve as both the item key and the version
+/// material prefix.
 fn build_local_file_scan_item(
     path: &Path,
     connector_tag: ConnectorTag,
@@ -581,6 +719,19 @@ fn build_local_file_scan_item(
     )
 }
 
+/// Construct a [`ScanItem`] from raw key bytes and filesystem metadata.
+///
+/// # Version fingerprint
+///
+/// Because local files lack a strong server-assigned version (ETag, S3
+/// version-id, etc.), we synthesise a *weak* version by hashing:
+///
+/// ```text
+/// version_material = prefix ‖ size_le64 ‖ mtime_nanos_le128
+/// ```
+///
+/// This means the dedup layer treats a file as "changed" when its size or
+/// modification time changes — a reasonable proxy for local sources.
 fn build_scan_item(
     key_bytes: &[u8],
     connector_tag: ConnectorTag,
@@ -604,6 +755,17 @@ fn build_scan_item(
     let version = VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material));
     Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(size_hint))
 }
+
+// ---------------------------------------------------------------------------
+// Platform-aware path ↔ byte conversions.
+//
+// On Unix, paths are arbitrary byte sequences and can be round-tripped
+// losslessly via `OsStr::as_bytes` / `OsString::from_vec`.
+//
+// On non-Unix (primarily Windows), we fall back to lossy UTF-8 conversion.
+// This is acceptable because git itself normalises paths to UTF-8 on
+// Windows, so data loss is unlikely in practice.
+// ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
@@ -634,9 +796,34 @@ fn path_to_raw_bytes(path: &OsStr) -> &[u8] {
 mod tests {
     use std::io::Write;
 
+    use rstest::rstest;
     use tempfile::tempdir;
 
     use super::*;
+
+    // ── ExecutionMode parsing ──────────────────────────────────────
+
+    #[rstest]
+    #[case::lowercase_direct("direct", ExecutionMode::Direct)]
+    #[case::uppercase_direct("DIRECT", ExecutionMode::Direct)]
+    #[case::lowercase_connector("connector", ExecutionMode::Connector)]
+    #[case::uppercase_connector("CONNECTOR", ExecutionMode::Connector)]
+    #[case::mixed_case("DiReCt", ExecutionMode::Direct)]
+    #[case::padded("  direct  ", ExecutionMode::Direct)]
+    fn parse_execution_mode_valid(#[case] input: &str, #[case] expected: ExecutionMode) {
+        assert_eq!(input.parse::<ExecutionMode>().unwrap(), expected);
+    }
+
+    #[rstest]
+    #[case::unknown("unknown")]
+    #[case::empty("")]
+    #[case::numeric("42")]
+    fn parse_execution_mode_invalid(#[case] input: &str) {
+        let err = input.parse::<ExecutionMode>().unwrap_err();
+        assert_eq!(err.raw(), input);
+    }
+
+    // ── Filesystem scan integration ────────────────────────────────
 
     #[test]
     fn scan_fs_direct_scans_directory() {
@@ -650,6 +837,32 @@ mod tests {
         assert!(outcome.items_scanned >= 1);
         assert!(outcome.findings_emitted >= 1);
     }
+
+    #[test]
+    fn scan_fs_direct_scans_single_file() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("secret.txt");
+        fs::write(&file_path, "password=hunter2").expect("write");
+
+        let outcome = scan_fs_direct(&FsScanConfig::new(&file_path)).expect("single file scan");
+        assert_eq!(outcome.pages_scanned, 1);
+        assert_eq!(outcome.items_scanned, 1);
+    }
+
+    #[test]
+    fn scan_fs_direct_rejects_nonexistent_path() {
+        let err =
+            scan_fs_direct(&FsScanConfig::new("/no/such/path")).expect_err("nonexistent path");
+        assert!(matches!(
+            err,
+            ScanRuntimeError::InvalidPath {
+                source: "filesystem",
+                ..
+            }
+        ));
+    }
+
+    // ── Connector-mode gating ──────────────────────────────────────
 
     #[test]
     fn scan_fs_connector_is_explicitly_gated() {
@@ -667,6 +880,23 @@ mod tests {
     }
 
     #[test]
+    fn scan_git_connector_is_explicitly_gated() {
+        let dir = tempdir().expect("tempdir");
+        let error =
+            scan_git(&GitScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
+                .expect_err("connector mode should be gated");
+        assert!(matches!(
+            error,
+            ScanRuntimeError::UnsupportedExecutionMode {
+                source: "git",
+                mode: ExecutionMode::Connector,
+            }
+        ));
+    }
+
+    // ── Git scan error paths ───────────────────────────────────────
+
+    #[test]
     fn scan_git_direct_errors_for_non_repo() {
         let dir = tempdir().expect("tempdir");
         let error = scan_git_direct(&GitScanConfig::new(dir.path())).expect_err("non-repo");
@@ -674,18 +904,5 @@ mod tests {
             error,
             ScanRuntimeError::GitCommandFailed { .. } | ScanRuntimeError::Io { .. }
         ));
-    }
-
-    #[test]
-    fn parse_execution_mode_is_case_insensitive() {
-        assert_eq!(
-            "direct".parse::<ExecutionMode>().unwrap(),
-            ExecutionMode::Direct
-        );
-        assert_eq!(
-            "CONNECTOR".parse::<ExecutionMode>().unwrap(),
-            ExecutionMode::Connector
-        );
-        assert!("unknown".parse::<ExecutionMode>().is_err());
     }
 }

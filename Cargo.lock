@@ -459,6 +459,7 @@ dependencies = [
  "gossip-connectors",
  "gossip-contracts",
  "gossip-engine",
+ "rstest",
  "tempfile",
 ]
 
@@ -939,6 +940,7 @@ name = "scanner-rs"
 version = "0.1.0"
 dependencies = [
  "gossip-scanner-runtime",
+ "rstest",
 ]
 
 [[package]]
