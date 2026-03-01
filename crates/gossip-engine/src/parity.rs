@@ -184,6 +184,12 @@ pub enum ThroughputError {
         /// The invalid baseline value.
         baseline: f64,
     },
+    /// Candidate throughput was negative, which is invalid because throughput
+    /// is non-negative by definition.
+    NegativeCandidate {
+        /// The offending candidate value.
+        candidate: f64,
+    },
     /// A threshold limit parameter was zero or negative.
     NonPositiveLimit {
         /// Which limit was invalid.
@@ -214,6 +220,9 @@ impl fmt::Display for ThroughputError {
             }
             Self::NonPositiveBaseline { baseline } => {
                 write!(f, "baseline throughput must be > 0, got {}", baseline)
+            }
+            Self::NegativeCandidate { candidate } => {
+                write!(f, "candidate throughput must be >= 0, got {}", candidate)
             }
             Self::NonPositiveLimit { label, value } => {
                 write!(f, "threshold limit '{}' must be > 0, got {}", label, value)
@@ -254,15 +263,15 @@ impl std::error::Error for ThroughputError {}
 ///
 /// - `baseline == 0.0 && candidate == 0.0` returns `Ok(0.0)` (no change).
 /// - `baseline == 0.0 && candidate != 0.0` is an error (division by zero).
-/// - Negative baselines are rejected because throughput is non-negative by
-///   definition.  Negative *candidates* are allowed so that callers can
-///   detect regressions through the sign of the result.
+/// - Negative baselines and negative candidates are both rejected because
+///   throughput is non-negative by definition.
 ///
 /// # Errors
 ///
 /// - [`ThroughputError::NonFinite`] — either input is NaN or infinite.
 /// - [`ThroughputError::NonPositiveBaseline`] — baseline is negative, or
 ///   zero with a non-zero candidate.
+/// - [`ThroughputError::NegativeCandidate`] — candidate is negative.
 pub fn throughput_delta_pct(baseline: f64, candidate: f64) -> Result<f64, ThroughputError> {
     if !baseline.is_finite() {
         return Err(ThroughputError::NonFinite {
@@ -284,6 +293,9 @@ pub fn throughput_delta_pct(baseline: f64, candidate: f64) -> Result<f64, Throug
     }
     if baseline < 0.0 {
         return Err(ThroughputError::NonPositiveBaseline { baseline });
+    }
+    if candidate < 0.0 {
+        return Err(ThroughputError::NegativeCandidate { candidate });
     }
     Ok(((candidate - baseline) / baseline) * 100.0)
 }

@@ -100,3 +100,12 @@ fn median_handles_even_and_odd_input() {
     assert_eq!(median(&[1.0, 3.0, 2.0]).expect("odd median"), 2.0);
     assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]).expect("even median"), 2.5);
 }
+
+#[test]
+fn negative_candidate_throughput_is_rejected() {
+    let err = throughput_delta_pct(100.0, -5.0).expect_err("negative candidate must be rejected");
+    assert!(
+        matches!(err, ThroughputError::NegativeCandidate { candidate } if candidate == -5.0),
+        "expected NegativeCandidate, got {err:?}"
+    );
+}
