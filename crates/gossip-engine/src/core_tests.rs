@@ -1,32 +1,8 @@
-use gossip_contracts::{
-    connector::{Cursor, ItemKey, ItemRef, ScanItem, TokenBytes, VersionId},
-    identity::{ObjectVersionId, StableItemId},
-};
+use gossip_contracts::connector::{Cursor, ItemKey, ScanItem, TokenBytes};
 use proptest::prelude::*;
 
 use super::*;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn make_item(key: &[u8], item_ref: &[u8], stable: [u8; 32], version: &[u8]) -> ScanItem {
-    ScanItem::new(
-        ItemKey::try_from_slice(key).expect("key"),
-        ItemRef::try_from_slice(item_ref).expect("item_ref"),
-        StableItemId::from_bytes(stable),
-        VersionId::Strong(ObjectVersionId::from_version_bytes(version)),
-    )
-}
-
-fn make_weak_item(key: &[u8], item_ref: &[u8], stable: [u8; 32], version: &[u8]) -> ScanItem {
-    ScanItem::new(
-        ItemKey::try_from_slice(key).expect("key"),
-        ItemRef::try_from_slice(item_ref).expect("item_ref"),
-        StableItemId::from_bytes(stable),
-        VersionId::Weak(ObjectVersionId::from_version_bytes(version)),
-    )
-}
+use crate::test_support::{make_item, make_weak_item};
 
 // ---------------------------------------------------------------------------
 // Existing tests (extracted from core.rs inline module)

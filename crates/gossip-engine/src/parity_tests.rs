@@ -1,23 +1,12 @@
-use gossip_contracts::{
-    connector::{Cursor, ItemKey, ItemRef, ScanItem, TokenBytes, VersionId},
-    identity::{ObjectVersionId, StableItemId},
-};
+use gossip_contracts::connector::{Cursor, ItemKey, TokenBytes};
 
+use crate::test_support::make_item;
 use crate::{PageScanContext, PageScanRequest, ScannerCore};
 
 use super::{
     CanonicalVersionStrength, ThroughputError, canonicalize_stream_output,
     enforce_throughput_thresholds, median, throughput_delta_pct,
 };
-
-fn make_item(key: &[u8], item_ref: &[u8], stable: [u8; 32], version: &[u8]) -> ScanItem {
-    ScanItem::new(
-        ItemKey::try_from_slice(key).expect("valid key"),
-        ItemRef::try_from_slice(item_ref).expect("valid ref"),
-        StableItemId::from_bytes(stable),
-        VersionId::Strong(ObjectVersionId::from_version_bytes(version)),
-    )
-}
 
 #[test]
 fn canonicalize_stream_output_preserves_emission_order() {

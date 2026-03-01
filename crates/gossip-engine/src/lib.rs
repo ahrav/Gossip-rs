@@ -47,6 +47,8 @@
 mod core;
 mod error;
 mod parity;
+#[cfg(test)]
+mod test_support;
 mod types;
 
 pub use core::{ScannerCore, ScannerCoreBuilder, ScannerCoreConfig};
