@@ -1,0 +1,16 @@
+[package]
+name = "gossip-scanner-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Runtime orchestration APIs for scanner-rs direct and connector execution modes"
+
+[dependencies]
+gossip-contracts.workspace = true
+gossip-engine.workspace = true
+gossip-connectors.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -4,11 +4,13 @@ members = [
     "crates/gossip-stdx",
     "crates/gossip-contracts",
     "crates/gossip-engine",
+    "crates/gossip-scanner-runtime",
     "crates/gossip-scan-pipeline",
     "crates/gossip-connectors",
     "crates/gossip-coordination",
     "crates/gossip-frontier",
     "crates/gossip-worker",
+    "crates/scanner-rs-cli",
 ]
 
 [workspace.package]
@@ -23,6 +25,7 @@ repository = "https://github.com/ahrav/gossip-rs"
 gossip-stdx = { path = "crates/gossip-stdx" }
 gossip-contracts = { path = "crates/gossip-contracts" }
 gossip-engine = { path = "crates/gossip-engine" }
+gossip-scanner-runtime = { path = "crates/gossip-scanner-runtime" }
 gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }
 gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }

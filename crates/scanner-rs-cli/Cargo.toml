@@ -1,0 +1,15 @@
+[package]
+name = "scanner-rs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Standalone scanner CLI in gossip-rs workspace"
+
+[dependencies]
+gossip-scanner-runtime.workspace = true
+
+[[bin]]
+name = "scanner-rs"
+path = "src/main.rs"
