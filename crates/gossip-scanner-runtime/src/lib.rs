@@ -673,10 +673,7 @@ fn scan_materialized_items_pages(
     let mut outcome = ScanOutcome::default();
 
     for (index, chunk) in items.chunks(max_items_per_page).enumerate() {
-        if chunk.is_empty() {
-            continue;
-        }
-        let page_num = index as u64 + 1;
+        let page_num = (index as u64).saturating_add(1);
         let last_key = chunk.last().expect("non-empty chunk").item_key().clone();
         let next_cursor = Cursor::with_last_key(last_key);
 

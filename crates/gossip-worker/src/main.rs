@@ -37,8 +37,8 @@ use gossip_engine::{
     ScannerCoreError,
 };
 use gossip_scan_pipeline::{
-    run_scan_loop_with_page_processor, PageProcessingContext, PageProcessingError, ScanLoopError,
-    ScanLoopOutcome, DEFAULT_MAX_TRANSIENT_RETRIES,
+    DEFAULT_MAX_TRANSIENT_RETRIES, PageProcessingContext, PageProcessingError, ScanLoopError,
+    ScanLoopOutcome, run_scan_loop_with_page_processor,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -478,7 +478,7 @@ mod tests {
             PageProcessingContext::new(&spec, &cursor1, std::slice::from_ref(&item), &next1, 1, 0);
 
         let cursor2 = next1.clone();
-        let next2 = Cursor::with_last_key(ItemKey::try_from_slice(b"alpha").unwrap());
+        let next2 = Cursor::with_last_key(ItemKey::try_from_slice(b"bravo").unwrap());
         let page2 =
             PageProcessingContext::new(&spec, &cursor2, std::slice::from_ref(&item), &next2, 2, 1);
 
