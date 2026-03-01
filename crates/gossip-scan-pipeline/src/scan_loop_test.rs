@@ -1202,6 +1202,107 @@ fn stale_fence_during_renew_returns_lease_lost() {
     assert_eq!(summary.last_key(), Some(&b"b"[..]));
 }
 
+#[test]
+fn page_processor_runs_for_each_non_empty_page() {
+    let mut coord = seeded_coordinator(20, CursorUpdate::initial());
+    let mut connector = InMemoryDeterministicConnector::new(
+        TAG,
+        vec![make_mem_item(b"a", b"one"), make_mem_item(b"b", b"two")],
+    );
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(710);
+    let mut tick = 4u64;
+
+    let observed = Arc::new(Mutex::new(Vec::<(Option<Vec<u8>>, Vec<u8>)>::new()));
+    let observed_hook = Arc::clone(&observed);
+    let outcome = run_scan_loop_with_page_processor(
+        session,
+        &mut connector,
+        budgets(1),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || {
+            let out = now(tick);
+            tick += 1;
+            out
+        },
+        move |ctx| {
+            let cursor_key = ctx.cursor().last_key().map(|key| key.as_bytes().to_vec());
+            let next_key = ctx
+                .next_cursor()
+                .last_key()
+                .expect("non-empty page must advance cursor")
+                .as_bytes()
+                .to_vec();
+            assert!(
+                !ctx.items().is_empty(),
+                "hook receives only non-empty pages"
+            );
+            observed_hook.lock().unwrap().push((cursor_key, next_key));
+            Ok(())
+        },
+    );
+
+    assert_eq!(outcome, ScanLoopOutcome::Completed);
+    let observed = observed.lock().unwrap().clone();
+    assert_eq!(
+        observed,
+        vec![(None, b"a".to_vec()), (Some(b"a".to_vec()), b"b".to_vec()),]
+    );
+
+    let summary = shard_summary(&coord, 80);
+    assert_eq!(summary.status(), ShardStatus::Done);
+    assert_eq!(summary.last_key(), Some(&b"b"[..]));
+}
+
+#[test]
+fn page_processor_failure_aborts_before_checkpoint() {
+    let mut coord = seeded_coordinator(20, CursorUpdate::initial());
+    let mut connector = InMemoryDeterministicConnector::new(
+        TAG,
+        vec![make_mem_item(b"a", b"one"), make_mem_item(b"b", b"two")],
+    );
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(740);
+    let mut tick = 4u64;
+    let hook_calls = Cell::new(0usize);
+
+    let outcome = run_scan_loop_with_page_processor(
+        session,
+        &mut connector,
+        budgets(1),
+        DEFAULT_MAX_TRANSIENT_RETRIES,
+        &mut op_ids,
+        || {
+            let out = now(tick);
+            tick += 1;
+            out
+        },
+        |ctx| {
+            assert_eq!(ctx.page_num(), 1);
+            assert_eq!(ctx.pages_completed(), 0);
+            hook_calls.set(hook_calls.get() + 1);
+            Err(PageProcessingError::new("shadow mismatch"))
+        },
+    );
+
+    assert_eq!(hook_calls.get(), 1, "hook should fail on first page");
+    match outcome {
+        ScanLoopOutcome::Error(ScanLoopError::PageProcessing(error)) => {
+            assert_eq!(error.message(), "shadow mismatch");
+        }
+        other => panic!("expected Error(PageProcessing), got {other:?}"),
+    }
+
+    let summary = shard_summary(&coord, 40);
+    assert_eq!(summary.status(), ShardStatus::Active);
+    assert_eq!(
+        summary.last_key(),
+        None,
+        "cursor must remain at initial position when page hook fails",
+    );
+}
+
 // -- rstest parameterized classifier tests -----------------------------------
 
 #[rstest]

@@ -464,7 +464,7 @@ pre-loop: bridge ShardSpec + Cursor from coordination domain
     ▼
 enumerate_page(spec, cursor, budgets)
     │
-    ├─ Ok(page) ──► validate_page ──► checkpoint ──► renew? ──► loop
+    ├─ Ok(page) ──► validate_page ──► process_page_hook? ──► checkpoint ──► renew? ──► loop
     ├─ Err(retryable) ──► retry budget ──► park TooManyErrors
     └─ Err(permanent) ──► park (heuristic reason)
 ```
@@ -481,12 +481,20 @@ enumerate_page(spec, cursor, budgets)
   immediately.
 - **SL7 -- Renewal-after-checkpoint ordering:** lease renewal is
   attempted only after successful checkpoint, preserving forward progress.
+- **SL8 -- Process-before-persist ordering:** when using a page hook,
+  non-empty pages are processed after validation and before checkpoint.
+  Hook failure aborts without persisting cursor progress for that page.
 
 ### Current scope
 
-The scan loop advances coordination cursor state only. It does **not**
-perform item reads, detection fan-out, or finding derivation. These are
-composed externally by the full pipeline orchestration layer.
+Default APIs (`run_scan_loop`, `run_scan_loop_with_policy`) advance
+coordination cursor state only. They do **not** perform item reads,
+detection fan-out, or finding derivation.
+
+Hook-enabled APIs (`run_scan_loop_with_page_processor`,
+`run_scan_loop_with_policy_and_page_processor`) inject non-empty page
+processing before checkpoint for shadow-mode integration and adapter
+composition.
 
 ### Retry and failure handling
 
