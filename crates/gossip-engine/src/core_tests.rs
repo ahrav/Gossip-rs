@@ -420,3 +420,28 @@ proptest! {
         );
     }
 }
+
+#[test]
+fn explicitly_empty_payload_not_classified_as_metadata_only() {
+    let core = ScannerCore::default();
+    let cursor = Cursor::initial();
+    let next_cursor = Cursor::with_last_key(ItemKey::try_from_slice(b"zulu").expect("valid key"));
+    let items = [make_item(b"alpha", b"ref-a", [0x11; 32], b"v1")];
+    // Bytes are explicitly provided but happen to be empty (e.g. empty file).
+    let payloads: &[&[u8]] = &[b""];
+    let context = PageScanContext::new(b"a", b"z", &cursor, &next_cursor, 1);
+
+    let output = core
+        .scan_page(PageScanRequest::with_item_bytes(context, &items, payloads))
+        .expect("scan with empty payload bytes should succeed");
+
+    // Bytes were supplied — the page is NOT metadata-only, even though
+    // the payload happens to be zero-length.
+    assert!(
+        !output
+            .diagnostics()
+            .iter()
+            .any(|d| matches!(d, ScanDiagnostic::MetadataOnlyInputs { .. })),
+        "MetadataOnlyInputs should not fire when item_bytes is Some (even if payloads are empty)"
+    );
+}

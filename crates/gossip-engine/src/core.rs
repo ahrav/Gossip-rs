@@ -283,7 +283,6 @@ impl ScannerCore {
         // Every item will be mixed in during the loop below.
         let mut signature = page_signature_seed(context);
         let mut bytes_scanned = 0_u64;
-        let mut metadata_only_count = 0_usize;
         let mut findings_truncated = false;
         let mut counters = ScanDedupeCounters::default();
 
@@ -300,9 +299,6 @@ impl ScannerCore {
                 }
             })?;
             bytes_scanned = bytes_scanned.saturating_add(payload_len);
-            if payload.is_empty() {
-                metadata_only_count = metadata_only_count.saturating_add(1);
-            }
 
             // Page signature covers *all* structural item fields for parity
             // comparison; this is intentionally broader than the fingerprint.
@@ -345,10 +341,13 @@ impl ScannerCore {
         output.set_dedupe(counters);
 
         // --- Post-loop diagnostics ---
-        if self.config.emit_metadata_only_diagnostics && metadata_only_count > 0 {
+        // Metadata-only is a page-level property: item_bytes was not supplied
+        // at all.  Explicitly provided zero-length payloads (e.g. empty files)
+        // are *not* metadata-only — the caller did supply bytes.
+        if self.config.emit_metadata_only_diagnostics && item_bytes.is_none() && !items.is_empty() {
             output.push_diagnostic(ScanDiagnostic::MetadataOnlyInputs {
                 page_num: context.page_num(),
-                item_count: metadata_only_count,
+                item_count: items.len(),
             });
         }
         if findings_truncated {
