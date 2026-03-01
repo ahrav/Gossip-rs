@@ -428,9 +428,9 @@ impl fmt::Display for RedactedPageSample<'_> {
 #[tracing::instrument(
     skip(session, connector, budgets, op_id_fn, now_fn),
     fields(
-        shard_key = ?session.shard_key(),
-        tenant = ?session.tenant(),
-        worker = ?session.worker(),
+        shard_key = %session.shard_key(),
+        tenant = %session.tenant(),
+        worker = %session.worker(),
     )
 )]
 pub fn run_scan_loop<B, C, N>(

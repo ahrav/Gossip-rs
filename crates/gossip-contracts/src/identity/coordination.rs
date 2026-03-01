@@ -247,6 +247,15 @@ impl ::core::fmt::Debug for ShardKey {
     }
 }
 
+// `Display` intentionally produces the same output as `Debug` so that
+// `tracing` span fields using `%` (Display) and `?` (Debug) are
+// interchangeable for identity types.
+impl ::core::fmt::Display for ShardKey {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+        ::core::fmt::Debug::fmt(self, f)
+    }
+}
+
 impl ShardKey {
     /// Construct a new `ShardKey`.
     #[inline]

@@ -620,6 +620,20 @@ fn tracing_output_redacts_toxic_fields() {
         logs.contains("Cursor(last_key=ItemKey("),
         "expected redacted cursor formatting in tracing output:\n{logs}"
     );
+
+    // Verify Debug and Display produce identical redacted output for toxic
+    // types.  If a tracing callsite switches from `%` (Display) to `?`
+    // (Debug), no raw bytes may leak.
+    assert_eq!(
+        format!("{:?}", toxic_key),
+        redacted_key,
+        "Debug and Display must produce identical output for ItemKey"
+    );
+    assert_eq!(
+        format!("{:?}", toxic_ref),
+        redacted_ref,
+        "Debug and Display must produce identical output for ItemRef"
+    );
 }
 
 #[test]
