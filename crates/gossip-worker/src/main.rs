@@ -192,16 +192,31 @@ impl From<ScanLoopError> for WorkerError {
     }
 }
 
-// FNV-1a 64-bit constants (http://www.isthe.com/chongo/tech/comp/fnv/).
+// ---------------------------------------------------------------------------
+// FNV-1a 64-bit fingerprinting helpers for shadow-mode page comparison
+// ---------------------------------------------------------------------------
+//
+// These helpers produce a non-cryptographic fingerprint used solely for
+// equality testing in shadow mode (detecting drift between direct and
+// connector-fed evaluators). FNV-1a was chosen for simplicity and zero
+// external dependencies; collision resistance is adequate because the
+// fingerprints are compared within a single page, not across a hash table.
+//
+// Reference: http://www.isthe.com/chongo/tech/comp/fnv/
+
+/// FNV-1a offset basis.
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+/// FNV-1a prime multiplier.
 const FNV_PRIME: u64 = 0x100000001b3;
 
+/// Mix a single byte into the running FNV-1a state.
 #[inline]
 fn fnv_mix_byte(sig: &mut u64, byte: u8) {
     *sig ^= u64::from(byte);
     *sig = sig.wrapping_mul(FNV_PRIME);
 }
 
+/// Mix a `u64` value into `sig` by feeding its little-endian bytes.
 #[inline]
 fn fnv_mix_u64(sig: &mut u64, value: u64) {
     for byte in value.to_le_bytes() {
@@ -209,10 +224,17 @@ fn fnv_mix_u64(sig: &mut u64, value: u64) {
     }
 }
 
+/// Mix a byte slice into `sig`, length-prefixed to avoid ambiguity.
+///
+/// The length prefix ensures that `[b"ab", b"c"]` and `[b"a", b"bc"]`
+/// produce different fingerprints when mixed sequentially.
+///
+/// The inner loop processes 8-byte aligned chunks to reduce per-byte
+/// multiply overhead while remaining bitwise identical to the naive
+/// byte-at-a-time path (verified by `fnv_chunk_optimization_matches_byte_by_byte`).
 #[inline]
 fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
     fnv_mix_u64(sig, bytes.len() as u64);
-    // Process 8-byte aligned chunks to reduce per-byte multiply overhead.
     let full_chunks = bytes.len() / 8;
     let (bulk, tail) = bytes.split_at(full_chunks * 8);
     for chunk in bulk.chunks_exact(8) {
@@ -224,6 +246,8 @@ fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
     }
 }
 
+/// Mix an optional byte slice, using a 0/1 discriminant byte so `None`
+/// and `Some(b"")` hash differently.
 #[inline]
 fn fnv_mix_opt_bytes(sig: &mut u64, bytes: Option<&[u8]>) {
     match bytes {
@@ -249,33 +273,39 @@ struct SharedCorePageOutput {
     item_count: usize,
 }
 
-/// Adapter representing the scanner-rs direct shared-core surface.
+/// Adapter representing the scanner-rs direct shared-core evaluation surface.
 ///
-/// Today both adapters delegate to the same deterministic evaluator.
-/// They exist as separate functions so the shadow-mode comparison infra
-/// is in place when the real direct and connector paths diverge.
+/// Today both adapters delegate to the same deterministic evaluator
+/// ([`evaluate_shared_core_page`]). They exist as separate functions so
+/// the shadow-mode comparison infrastructure is wired end-to-end *before*
+/// the real direct and connector paths diverge. Once the connector adapter
+/// begins producing results from a different code path, this separation
+/// ensures the comparison hooks do not need structural changes.
 fn run_direct_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     evaluate_shared_core_page(ctx)
 }
 
-/// Adapter representing the connector-fed shared-core invocation.
+/// Adapter representing the connector-fed shared-core evaluation surface.
 ///
 /// See [`run_direct_shared_core`] for why this is a separate function.
 fn run_connector_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     evaluate_shared_core_page(ctx)
 }
 
-/// Deterministic stand-in for shared-core result identity used by shadow compare.
+/// Deterministic fingerprint over page identity for shadow-mode comparison.
 ///
 /// Produces an FNV-1a fingerprint over all contract-safe page identity and
 /// item metadata directly from the borrowed [`PageProcessingContext`],
-/// without materializing any owned copies. The hash is **order-sensitive**:
-/// shard boundaries, both cursor positions, and then items are mixed in
-/// sequence. This catches reordering bugs that a set-based comparison
-/// would miss.
+/// without materializing any owned copies. The mixing order is:
 ///
-/// FNV-1a was chosen because it is simple, non-cryptographic, and adequate
-/// for equality testing in shadow mode. It is not used for security.
+/// 1. Shard key range boundaries (`key_range_start`, `key_range_end`)
+/// 2. Current cursor position (`last_key`, `token`)
+/// 3. Next cursor position (`last_key`, `token`)
+/// 4. Items in iteration order (`item_key`, `item_ref`, `stable_item_id`, `size_hint`)
+///
+/// This order is **position-sensitive**: reordering items produces a
+/// different fingerprint, which catches ordering bugs that a set-based
+/// comparison would miss.
 fn evaluate_shared_core_page(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     let mut signature = FNV_OFFSET;
     fnv_mix_bytes(&mut signature, ctx.spec().key_range_start());
@@ -439,9 +469,16 @@ fn init_tracing() {
 ///
 /// This function intentionally favors clarity over production concerns:
 /// it seeds one run/shard in memory, repeatedly claims work, scans until a
-/// terminal outcome, and exits once no shard is available. Production workers
-/// should replace this with persistent backends, long-lived scheduling, and
-/// robust retry/backoff orchestration.
+/// terminal outcome, and exits once no shard is available.
+///
+/// The inner scan dispatch routes through [`SharedCoreMode`]: in `Direct`
+/// mode the loop runs with a no-op page hook; in `Shadow` mode it attaches
+/// a [`ShadowComparisonStats`] page processor that runs both evaluators and
+/// logs aggregate mismatch/timing stats after each shard completes.
+///
+/// Production workers should replace the in-memory coordinator and connector
+/// with persistent backends, long-lived scheduling, and robust retry/backoff
+/// orchestration.
 fn run_placeholder_worker() -> Result<(), WorkerError> {
     let tenant = TenantId::from_bytes([0x21; 32]);
     let run = RunId::from_raw(1);
@@ -489,6 +526,8 @@ fn run_placeholder_worker() -> Result<(), WorkerError> {
             ),
         ],
     );
+    // 2 items per page, 1 MB byte budget — small enough to exercise
+    // multi-page cursor progression with the 3-item demo dataset.
     let scan_budgets = Budgets::try_new(2, 1_000_000, None)?;
     let mut claim_scratch = AcquireScratch::new();
 
@@ -686,6 +725,42 @@ mod tests {
         let connector = run_connector_shared_core(&ctx);
         assert_eq!(direct, connector);
         assert_eq!(direct.item_count, 2);
+    }
+
+    /// Compile-time integration guard: verifies that the worker's page context
+    /// types (`ShardSpec`, `Cursor`, `ScanItem`) are ABI-compatible with the
+    /// `gossip_engine::ScannerCore` API. If the engine crate changes its
+    /// request types, this test fails at compile time rather than at runtime
+    /// in shadow mode.
+    #[test]
+    fn worker_page_context_compiles_against_scanner_core_api() {
+        use gossip_contracts::connector::{Cursor, ItemRef, ScanItem, VersionId};
+        use gossip_contracts::identity::{ObjectVersionId, StableItemId};
+        use gossip_engine::{PageScanContext, PageScanRequest, ScannerCore};
+
+        let spec = ShardSpec::with_range(b"a", b"z");
+        let cursor = Cursor::initial();
+        let next_cursor = Cursor::with_last_key(ItemKey::try_from_slice(b"alpha").unwrap());
+        let items = [ScanItem::new(
+            ItemKey::try_from_slice(b"alpha").unwrap(),
+            ItemRef::try_from_slice(b"ref-alpha").unwrap(),
+            StableItemId::from_bytes([0x11; 32]),
+            VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+        )];
+
+        let request = PageScanRequest::metadata_only(
+            PageScanContext::new(
+                spec.key_range_start(),
+                spec.key_range_end(),
+                &cursor,
+                &next_cursor,
+                1,
+            ),
+            &items,
+        );
+        let output = ScannerCore::default().scan_page(request).unwrap();
+        assert_eq!(output.summary().item_count(), 1);
+        assert_eq!(output.summary().page_num(), 1);
     }
 
     #[test]
