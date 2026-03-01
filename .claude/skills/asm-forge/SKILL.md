@@ -84,7 +84,7 @@ Launch three parallel subagents using the Task tool:
 
 ### Agent A: ASM Collection
 
-Use the Task tool with `subagent_type=Bash` and `model="opus"` to collect assembly:
+Use the Task tool with `subagent_type=Bash` to collect assembly:
 
 ```bash
 # List available functions in a module (find exact symbol names)
@@ -114,7 +114,7 @@ cargo asm --lib -p scanner-rs --mir '<function>' > /tmp/mir-before.mir
 
 ### Agent B: Benchmark Baseline
 
-Use the Task tool with `subagent_type=Bash` and `model="opus"`:
+Use the Task tool with `subagent_type=Bash`:
 
 ```bash
 # Save baseline for the relevant benchmarks
@@ -133,7 +133,7 @@ cargo bench --features bench --bench <relevant_bench> -- --save-baseline forge-b
 
 ### Agent C: Static Hotspot Analysis
 
-Use the Task tool with `subagent_type=general-purpose` and `model="opus"`:
+Use the Task tool with `subagent_type=general-purpose`:
 
 Prompt: Read the target file(s) and identify performance-relevant patterns:
 - Loops with potential bounds checks
