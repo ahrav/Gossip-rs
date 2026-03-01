@@ -9,6 +9,7 @@ description = "Binary: wires coordination + connectors + pipeline + sinks"
 
 [dependencies]
 gossip-contracts.workspace = true
+gossip-stdx.workspace = true
 gossip-engine.workspace = true
 gossip-scan-pipeline.workspace = true
 gossip-connectors.workspace = true

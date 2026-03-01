@@ -60,6 +60,7 @@
 #![deny(clippy::undocumented_unsafe_blocks)]
 
 mod byte_slab;
+pub mod fnv;
 mod inline_vec;
 mod ring_buffer;
 
@@ -74,6 +75,13 @@ mod ring_buffer;
 /// See [`ByteSlab`] type-level docs for design details, memory layout
 /// diagrams, and invariants.
 pub use byte_slab::{ByteSlab, ByteSlot, MIN_BLOCK, SlabFull};
+
+/// FNV-1a 64-bit hashing helpers for deterministic fingerprinting.
+///
+/// Re-exported from [`fnv`] for convenience. These are the shared primitives
+/// used across `gossip-engine` and `gossip-worker` for page signatures and
+/// finding fingerprints.
+pub use fnv::{FNV_OFFSET, FNV_PRIME, fnv_mix_byte, fnv_mix_bytes, fnv_mix_opt_bytes, fnv_mix_u64};
 
 /// Stack-first small vector backed by `[MaybeUninit<T>; N]`.
 ///

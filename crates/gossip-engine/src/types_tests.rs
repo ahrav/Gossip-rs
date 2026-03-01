@@ -14,16 +14,16 @@ use super::*;
 fn make_counters(candidates: u8, emitted: u8, dup: u8, limit: u8) -> ScanDedupeCounters {
     let mut c = ScanDedupeCounters::default();
     for _ in 0..candidates {
-        c = c.with_candidate();
+        c.increment_candidate();
     }
     for _ in 0..emitted {
-        c = c.with_emitted();
+        c.increment_emitted();
     }
     for _ in 0..dup {
-        c = c.with_duplicate_suppressed();
+        c.increment_duplicate_suppressed();
     }
     for _ in 0..limit {
-        c = c.with_limit_suppressed();
+        c.increment_limit_suppressed();
     }
     c
 }

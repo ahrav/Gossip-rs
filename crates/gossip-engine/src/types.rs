@@ -38,6 +38,11 @@ use gossip_contracts::{
     identity::StableItemId,
 };
 
+/// `HashSet<u64>` using ahash (non-cryptographic, faster than SipHash for
+/// small integer keys). Safe here because the keys are already FNV-1a
+/// fingerprints — no DoS concern.
+type AHashSet64 = HashSet<u64, ahash::RandomState>;
+
 /// Borrowed page-level context that seeds deterministic scan identities.
 ///
 /// A `PageScanContext` captures the minimal set of boundary fields —
@@ -340,10 +345,9 @@ impl ScanFinding {
 ///
 /// **Invariant:** `candidates == emitted + duplicate_suppressed + limit_suppressed`.
 ///
-/// Counters are built with an immutable builder-chain pattern
-/// (`with_candidate`, `with_emitted`, …) so the core loop can compose them
-/// without interior mutability.  Internally, `merge` combines page-level
-/// counters into stream-level aggregates.
+/// Counters are updated in-place via `increment_*` methods on the hot path.
+/// Internally, `merge` combines page-level counters into stream-level
+/// aggregates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanDedupeCounters {
     candidates: u64,
@@ -353,28 +357,24 @@ pub struct ScanDedupeCounters {
 }
 
 impl ScanDedupeCounters {
-    #[must_use]
-    pub(crate) fn with_candidate(mut self) -> Self {
+    /// Increment candidates in place (hot-path mutation, avoids struct copy).
+    pub(crate) fn increment_candidate(&mut self) {
         self.candidates = self.candidates.saturating_add(1);
-        self
     }
 
-    #[must_use]
-    pub(crate) fn with_emitted(mut self) -> Self {
+    /// Increment emitted in place.
+    pub(crate) fn increment_emitted(&mut self) {
         self.emitted = self.emitted.saturating_add(1);
-        self
     }
 
-    #[must_use]
-    pub(crate) fn with_duplicate_suppressed(mut self) -> Self {
+    /// Increment duplicate_suppressed in place.
+    pub(crate) fn increment_duplicate_suppressed(&mut self) {
         self.duplicate_suppressed = self.duplicate_suppressed.saturating_add(1);
-        self
     }
 
-    #[must_use]
-    pub(crate) fn with_limit_suppressed(mut self) -> Self {
+    /// Increment limit_suppressed in place.
+    pub(crate) fn increment_limit_suppressed(&mut self) {
         self.limit_suppressed = self.limit_suppressed.saturating_add(1);
-        self
     }
 
     /// Combine two counter snapshots (e.g., page-level into stream-level).
@@ -537,6 +537,13 @@ impl PageScanOutput {
         self.dedupe = dedupe;
     }
 
+    /// Ensure the findings buffer has room for at least `additional` more
+    /// entries. Called at the top of `scan_page_into` so the hot loop avoids
+    /// incremental reallocation.
+    pub(crate) fn reserve_findings(&mut self, additional: usize) {
+        self.findings.reserve(additional);
+    }
+
     pub(crate) fn push_finding(&mut self, finding: ScanFinding) {
         self.findings.push(finding);
     }
@@ -652,12 +659,23 @@ impl StreamScanOutput {
 /// - **Per-session**: carry state across multiple streams to deduplicate
 ///   an entire scan session.
 ///
-/// Internally a `HashSet<u64>` keyed on finding fingerprints.  This means
-/// dedup granularity is `(stable_item_id, version, payload)` — the same
-/// fields mixed into [`ScanFinding::fingerprint`].
-#[derive(Clone, Debug, Default)]
+/// Internally a `HashSet<u64, ahash::RandomState>` keyed on finding
+/// fingerprints.  Uses ahash instead of the default SipHash for faster
+/// lookups — the keys are already FNV-1a hashes, so cryptographic hash
+/// resistance is unnecessary.  Dedup granularity is
+/// `(stable_item_id, version, payload)` — the same fields mixed into
+/// [`ScanFinding::fingerprint`].
+#[derive(Clone, Debug)]
 pub struct ScanDedupState {
-    seen: HashSet<u64>,
+    seen: AHashSet64,
+}
+
+impl Default for ScanDedupState {
+    fn default() -> Self {
+        Self {
+            seen: HashSet::with_hasher(ahash::RandomState::new()),
+        }
+    }
 }
 
 impl ScanDedupState {
@@ -665,6 +683,21 @@ impl ScanDedupState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a dedupe state pre-sized for `capacity` unique fingerprints.
+    ///
+    /// Use this when the approximate item count is known up-front (e.g.,
+    /// from a manifest or page-count estimate) to avoid rehashing during
+    /// the scan loop.
+    ///
+    /// Each entry is a `u64` fingerprint (8 bytes) plus hash-map overhead,
+    /// so budget roughly 40–56 bytes per entry depending on load factor.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            seen: HashSet::with_capacity_and_hasher(capacity, ahash::RandomState::new()),
+        }
     }
 
     /// Number of unique fingerprints tracked so far.

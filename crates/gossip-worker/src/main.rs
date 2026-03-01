@@ -192,72 +192,7 @@ impl From<ScanLoopError> for WorkerError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// FNV-1a 64-bit fingerprinting helpers for shadow-mode page comparison
-// ---------------------------------------------------------------------------
-//
-// These helpers produce a non-cryptographic fingerprint used solely for
-// equality testing in shadow mode (detecting drift between direct and
-// connector-fed evaluators). FNV-1a was chosen for simplicity and zero
-// external dependencies; collision resistance is adequate because the
-// fingerprints are compared within a single page, not across a hash table.
-//
-// Reference: http://www.isthe.com/chongo/tech/comp/fnv/
-
-/// FNV-1a offset basis.
-const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-/// FNV-1a prime multiplier.
-const FNV_PRIME: u64 = 0x100000001b3;
-
-/// Mix a single byte into the running FNV-1a state.
-#[inline]
-fn fnv_mix_byte(sig: &mut u64, byte: u8) {
-    *sig ^= u64::from(byte);
-    *sig = sig.wrapping_mul(FNV_PRIME);
-}
-
-/// Mix a `u64` value into `sig` by feeding its little-endian bytes.
-#[inline]
-fn fnv_mix_u64(sig: &mut u64, value: u64) {
-    for byte in value.to_le_bytes() {
-        fnv_mix_byte(sig, byte);
-    }
-}
-
-/// Mix a byte slice into `sig`, length-prefixed to avoid ambiguity.
-///
-/// The length prefix ensures that `[b"ab", b"c"]` and `[b"a", b"bc"]`
-/// produce different fingerprints when mixed sequentially.
-///
-/// The inner loop processes 8-byte aligned chunks to reduce per-byte
-/// multiply overhead while remaining bitwise identical to the naive
-/// byte-at-a-time path (verified by `fnv_chunk_optimization_matches_byte_by_byte`).
-#[inline]
-fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
-    fnv_mix_u64(sig, bytes.len() as u64);
-    let full_chunks = bytes.len() / 8;
-    let (bulk, tail) = bytes.split_at(full_chunks * 8);
-    for chunk in bulk.chunks_exact(8) {
-        let word = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
-        fnv_mix_u64(sig, word);
-    }
-    for byte in tail {
-        fnv_mix_byte(sig, *byte);
-    }
-}
-
-/// Mix an optional byte slice, using a 0/1 discriminant byte so `None`
-/// and `Some(b"")` hash differently.
-#[inline]
-fn fnv_mix_opt_bytes(sig: &mut u64, bytes: Option<&[u8]>) {
-    match bytes {
-        Some(bytes) => {
-            fnv_mix_byte(sig, 1);
-            fnv_mix_bytes(sig, bytes);
-        }
-        None => fnv_mix_byte(sig, 0),
-    }
-}
+use gossip_stdx::{FNV_OFFSET, fnv_mix_bytes, fnv_mix_opt_bytes, fnv_mix_u64};
 
 /// Result of evaluating one page through the shared-core path.
 ///
@@ -281,6 +216,10 @@ struct SharedCorePageOutput {
 /// the real direct and connector paths diverge. Once the connector adapter
 /// begins producing results from a different code path, this separation
 /// ensures the comparison hooks do not need structural changes.
+///
+/// Once the connector adapter begins surfacing per-item payload bytes,
+/// these adapters should mix payload into the signature to converge
+/// with the engine's `mix_page_item_signature` field set.
 fn run_direct_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     evaluate_shared_core_page(ctx)
 }
@@ -288,6 +227,10 @@ fn run_direct_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutp
 /// Adapter representing the connector-fed shared-core evaluation surface.
 ///
 /// See [`run_direct_shared_core`] for why this is a separate function.
+///
+/// Once the connector adapter begins surfacing per-item payload bytes,
+/// these adapters should mix payload into the signature to converge
+/// with the engine's `mix_page_item_signature` field set.
 fn run_connector_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     evaluate_shared_core_page(ctx)
 }
@@ -306,6 +249,15 @@ fn run_connector_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageO
 /// This order is **position-sensitive**: reordering items produces a
 /// different fingerprint, which catches ordering bugs that a set-based
 /// comparison would miss.
+///
+/// # Payload exclusion (intentional divergence from gossip-engine)
+///
+/// Unlike the engine's `mix_page_item_signature`, this evaluator does **not**
+/// mix `item_bytes` / payload content into the signature. The worker's shadow
+/// mode compares structural metadata only — key, ref, stable_item_id, and
+/// size_hint — because payload bytes are not available in the
+/// `PageProcessingContext` at this layer. Once the connector adapter surfaces
+/// per-item content, the field set should converge with the engine.
 fn evaluate_shared_core_page(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     let mut signature = FNV_OFFSET;
     fnv_mix_bytes(&mut signature, ctx.spec().key_range_start());
@@ -881,29 +833,6 @@ mod tests {
         assert_eq!(
             SharedCoreMode::parse(SharedCoreMode::Shadow.as_str()),
             Some(SharedCoreMode::Shadow),
-        );
-    }
-
-    #[test]
-    fn fnv_chunk_optimization_matches_byte_by_byte() {
-        // Verify the u64-chunked fnv_mix_bytes produces the same result
-        // as processing one byte at a time.
-        let data = b"hello, this is a 25-byte string for testing chunked FNV";
-
-        // Chunked path (current implementation).
-        let mut sig_chunked = FNV_OFFSET;
-        fnv_mix_bytes(&mut sig_chunked, data);
-
-        // Byte-at-a-time reference.
-        let mut sig_ref = FNV_OFFSET;
-        fnv_mix_u64(&mut sig_ref, data.len() as u64);
-        for byte in data {
-            fnv_mix_byte(&mut sig_ref, *byte);
-        }
-
-        assert_eq!(
-            sig_chunked, sig_ref,
-            "chunked and byte-at-a-time must agree"
         );
     }
 
