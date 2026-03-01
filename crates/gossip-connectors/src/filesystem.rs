@@ -451,8 +451,9 @@ impl FilesystemConnector {
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
         self.ensure_indexed(budgets.deadline())?;
-        let resolved = common::resolve_page_range(&self.files, start, end, cursor, budgets)?;
-        let start_idx = resolved.start_idx;
+        let bounds = common::resolve_page_bounds(&self.files, start, end, budgets)?;
+        let key_resume = common::key_resume_start(&self.files, cursor, bounds.range_start);
+        let start_idx = key_resume;
 
         // Advisory-token check: keep release behavior key-authoritative while
         // surfacing token drift during development.
@@ -462,17 +463,16 @@ impl FilesystemConnector {
             && let Some(token_idx) = common::cursor_token_index(cursor)
         {
             debug_assert_eq!(
-                token_idx, resolved.key_resume_idx,
-                "token index {token_idx} disagrees with key-derived resume position {}",
-                resolved.key_resume_idx
+                token_idx, key_resume,
+                "token index {token_idx} disagrees with key-derived resume position {key_resume}"
             );
         }
 
-        if start_idx >= resolved.range_end {
+        if start_idx >= bounds.range_end {
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
         }
 
-        let take = budgets.max_items().min(resolved.range_end - start_idx);
+        let take = budgets.max_items().min(bounds.range_end - start_idx);
         let page_files = &self.files[start_idx..(start_idx + take)];
 
         // Filesystem item refs mirror key bytes exactly.
@@ -490,11 +490,10 @@ impl FilesystemConnector {
             );
         }
 
-        let last_key = out
-            .last()
-            .expect("non-empty page must have a last key")
-            .item_key()
-            .clone();
+        let last_key = match out.last() {
+            Some(item) => item.item_key().clone(),
+            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
+        };
         let next_cursor = common::build_next_cursor_from_staged(
             last_key,
             start_idx,
@@ -519,12 +518,13 @@ impl FilesystemConnector {
         self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor, None)
     }
 
-    /// Shared split preamble + filesystem-specific split selection.
+    /// Shared bound resolution + filesystem-specific split selection.
     ///
-    /// The window `[start_idx, range_end)` comes from
-    /// [`common::resolve_split_range`], then split selection uses the
+    /// The window `[start_idx, range_end)` comes from [`common::resolve_bounds`]
+    /// and [`common::key_resume_start`], then split selection uses the
     /// precomputed prefix sums (`byte_weighted_split_idx`) for O(log n)
-    /// byte-balanced hints.
+    /// byte-balanced hints. Post-selection guards use
+    /// [`common::is_valid_split_candidate`].
     ///
     /// Returning `None` means no safe/meaningful split exists after applying
     /// cursor-progress and upper-bound guards.
@@ -542,22 +542,15 @@ impl FilesystemConnector {
         {
             return Err(EnumerateError::retryable("budget deadline expired"));
         }
-        let split_ctx = common::resolve_split_range(&self.files, start, end, cursor)?;
-        let split_idx = match self.byte_weighted_split_idx(split_ctx.start_idx, split_ctx.range_end)
-        {
+        let bounds = common::resolve_bounds(&self.files, start, end)?;
+        let start_idx = common::key_resume_start(&self.files, cursor, bounds.range_start);
+        let split_idx = match self.byte_weighted_split_idx(start_idx, bounds.range_end) {
             Some(idx) => idx,
             None => return Ok(None),
         };
 
         let candidate = &self.files[split_idx].key;
-
-        if cursor
-            .last_key()
-            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
-        {
-            return Ok(None);
-        }
-        if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
+        if !common::is_valid_split_candidate(candidate.as_bytes(), cursor, end) {
             return Ok(None);
         }
 

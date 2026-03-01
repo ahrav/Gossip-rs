@@ -437,29 +437,19 @@ impl InMemoryDeterministicConnector {
         end: Option<&[u8]>,
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let split_ctx = common::resolve_split_range(&self.items, start, end, cursor)?;
-        let split_idx =
-            match common::choose_split_index(&self.items, split_ctx.start_idx, split_ctx.range_end)
-            {
-                Some(idx) => idx,
-                None => return Ok(None),
-            };
+        let bounds = common::resolve_bounds(&self.items, start, end)?;
+        let start_idx = common::key_resume_start(&self.items, cursor, bounds.range_start);
+        let split_idx = match common::choose_split_index(&self.items, start_idx, bounds.range_end) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
 
-        let candidate = self.items[split_idx].key.clone();
-
-        // Reject candidates that would not advance past the cursor.
-        if cursor
-            .last_key()
-            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
-        {
-            return Ok(None);
-        }
-        // Reject candidates at or beyond the upper bound.
-        if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
+        let candidate = &self.items[split_idx].key;
+        if !common::is_valid_split_candidate(candidate.as_bytes(), cursor, end) {
             return Ok(None);
         }
 
-        Ok(Some(candidate))
+        Ok(Some(candidate.clone()))
     }
 
     /// Resolve an [`ItemRef`] into the backing bytes.

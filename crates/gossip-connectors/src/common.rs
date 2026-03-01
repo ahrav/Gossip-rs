@@ -88,111 +88,102 @@ pub(crate) fn upper_bound<T: KeyedEntry>(items: &[T], key: &[u8]) -> usize {
     items.partition_point(|item| item.key_bytes() <= key)
 }
 
-/// Canonical range + resume indices for one enumeration page.
+/// Half-open index range `[range_start, range_end)` within a sorted item slice.
 ///
-/// This is the shared output of [`resolve_page_range`]. Keeping this logic in
-/// one helper ensures in-memory and filesystem connectors agree on half-open
-/// shard semantics and cursor progression by key.
-pub(crate) struct ResolvedPageRange {
-    /// Exclusive upper bound index for the shard range.
+/// Produced by [`resolve_page_bounds`] and [`resolve_bounds`]. Callers combine
+/// these indices with connector-specific cursor resume logic to determine the
+/// effective start position.
+pub(crate) struct ResolvedBounds {
+    /// Inclusive lower bound index (first item whose key is `>= shard start`).
+    pub range_start: usize,
+    /// Exclusive upper bound index (first item whose key is `>= shard end`).
     pub range_end: usize,
-    /// Resume index derived from `cursor.last_key()` via `upper_bound`.
-    ///
-    /// This value is intentionally *not* clamped to `range_end`; callers can
-    /// use it for token/key consistency checks even when the cursor points past
-    /// the current shard suffix.
-    pub key_resume_idx: usize,
-    /// Effective first index to emit (`max(range_start, key_resume_idx)`).
-    ///
-    /// `start_idx >= range_end` means "no emit candidates in range" and maps to
-    /// an empty page rather than an error.
-    pub start_idx: usize,
 }
 
-/// Resolve shard bounds + cursor position for one enumeration page.
+/// Validate shard bounds and map them to indices via binary search.
 ///
-/// Shared behavior across connectors:
-/// 1. Budget deadline gate (`retryable` on expiry).
-/// 2. Bound validation (`permanent` on `start > end`).
-/// 3. Bound-to-index mapping via binary search.
-/// 4. Key-authoritative resume index from `cursor.last_key()`.
+/// This is the pure bound-resolution kernel shared by both page enumeration and
+/// split-point selection. It validates `start <= end` and converts byte bounds
+/// to half-open indices via [`lower_bound`].
 ///
-/// This helper intentionally does not read cursor tokens. Token trust differs
-/// by connector (fast-path in-memory vs advisory in filesystem), but key-based
-/// ordering is the shared correctness anchor.
-pub(crate) fn resolve_page_range<T: KeyedEntry>(
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` when `start > end`.
+pub(crate) fn resolve_bounds<T: KeyedEntry>(
     items: &[T],
     start: Option<&[u8]>,
     end: Option<&[u8]>,
-    cursor: &Cursor,
+) -> Result<ResolvedBounds, EnumerateError> {
+    if let (Some(s), Some(e)) = (start, end)
+        && s > e
+    {
+        return Err(EnumerateError::permanent("shard start key exceeds end key"));
+    }
+
+    let range_start = start.map_or(0, |bound| lower_bound(items, bound));
+    let range_end = end.map_or(items.len(), |bound| lower_bound(items, bound));
+
+    Ok(ResolvedBounds {
+        range_start,
+        range_end,
+    })
+}
+
+/// Validate shard bounds + budget deadline for one enumeration page.
+///
+/// Adds a deadline gate on top of [`resolve_bounds`]. Page-enumeration callers
+/// use this; split-point callers use [`resolve_bounds`] directly since split
+/// selection is a metadata-only operation.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::retryable` on budget deadline expiry, or
+/// `EnumerateError::permanent` when `start > end`.
+pub(crate) fn resolve_page_bounds<T: KeyedEntry>(
+    items: &[T],
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
     budgets: Budgets,
-) -> Result<ResolvedPageRange, EnumerateError> {
+) -> Result<ResolvedBounds, EnumerateError> {
     if budgets.is_expired_at(Instant::now()) {
         return Err(EnumerateError::retryable("budget deadline expired"));
     }
 
-    if let (Some(s), Some(e)) = (start, end)
-        && s > e
-    {
-        return Err(EnumerateError::permanent("shard start key exceeds end key"));
-    }
-
-    let range_start = start.map_or(0, |bound| lower_bound(items, bound));
-    let range_end = end.map_or(items.len(), |bound| lower_bound(items, bound));
-    let key_resume_idx = cursor.last_key().map_or(range_start, |last_key| {
-        upper_bound(items, last_key.as_bytes())
-    });
-    let start_idx = range_start.max(key_resume_idx);
-
-    Ok(ResolvedPageRange {
-        range_end,
-        key_resume_idx,
-        start_idx,
-    })
+    resolve_bounds(items, start, end)
 }
 
-/// Canonical split-window indices shared by split-point preambles.
+/// Key-authoritative cursor resume: first index past the last emitted key.
 ///
-/// Returned by [`resolve_split_range`]. The reduced shape (no `key_resume_idx`)
-/// reflects split selection needs: callers only need the post-resume window.
-pub(crate) struct SplitContext {
-    /// Exclusive upper bound index for the shard range.
-    pub range_end: usize,
-    /// Effective first index after cursor resume.
-    ///
-    /// As with paging, this is clamped to the shard start and may equal
-    /// `range_end` to represent "not enough items left to split".
-    pub start_idx: usize,
-}
-
-/// Resolve shard bounds + cursor position for split-point selection.
-///
-/// Mirrors [`resolve_page_range`] without deadline handling and without
-/// returning a separate resume index, because split-point callers only need the
-/// candidate window `[start_idx, range_end)`.
-pub(crate) fn resolve_split_range<T: KeyedEntry>(
+/// Returns the O(log N) `upper_bound` position for `cursor.last_key()`,
+/// clamped to `range_start` when no key is present. Callers use this as the
+/// floor for resume; connector-specific token logic may advance further but
+/// never behind this position.
+pub(crate) fn key_resume_start<T: KeyedEntry>(
     items: &[T],
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
     cursor: &Cursor,
-) -> Result<SplitContext, EnumerateError> {
-    if let (Some(s), Some(e)) = (start, end)
-        && s > e
-    {
-        return Err(EnumerateError::permanent("shard start key exceeds end key"));
-    }
-
-    let range_start = start.map_or(0, |bound| lower_bound(items, bound));
-    let range_end = end.map_or(items.len(), |bound| lower_bound(items, bound));
-    let resume_start = cursor.last_key().map_or(range_start, |last_key| {
-        upper_bound(items, last_key.as_bytes())
-    });
-    let start_idx = range_start.max(resume_start);
-
-    Ok(SplitContext {
-        range_end,
-        start_idx,
+    range_start: usize,
+) -> usize {
+    cursor.last_key().map_or(range_start, |last_key| {
+        upper_bound(items, last_key.as_bytes()).max(range_start)
     })
+}
+
+/// Check whether a split candidate advances past the cursor and stays below
+/// the upper shard bound.
+///
+/// Both connectors apply identical post-selection guards after choosing a
+/// byte-weighted split index. This helper centralizes the check so the guards
+/// stay in sync.
+pub(crate) fn is_valid_split_candidate(
+    candidate: &[u8],
+    cursor: &Cursor,
+    end: Option<&[u8]>,
+) -> bool {
+    let past_cursor = cursor
+        .last_key()
+        .is_none_or(|last| candidate > last.as_bytes());
+    let below_end = end.is_none_or(|upper| candidate < upper);
+    past_cursor && below_end
 }
 
 /// Decode the optional cursor token as an absolute next-index.
@@ -216,6 +207,11 @@ pub(crate) fn cursor_token_index(cursor: &Cursor) -> Option<usize> {
 /// big-endian token and attaches it to the cursor.
 /// The encoded value is the next absolute index (not the last emitted index),
 /// so token-capable connectors can resume at O(1) when token/key state agrees.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` when `next_idx` overflows `u64` or
+/// the encoded token bytes fail [`TokenBytes`] construction.
 pub(crate) fn build_next_cursor(
     last_key: ItemKey,
     next_idx: usize,
@@ -238,6 +234,12 @@ pub(crate) fn build_next_cursor(
 /// semantics centralized. If token emission is enabled and `staged_token` is
 /// present, the pooled token is reused directly to preserve pooled-byte tests.
 /// This avoids re-encoding/allocating a second token wrapper after staging.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` when `start_idx + item_count` overflows
+/// or when delegation to [`build_next_cursor`] fails (index overflow or token
+/// construction failure).
 pub(crate) fn build_next_cursor_from_staged(
     last_key: ItemKey,
     start_idx: usize,
