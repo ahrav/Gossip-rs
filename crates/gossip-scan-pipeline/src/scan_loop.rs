@@ -226,6 +226,26 @@ pub struct PageProcessingContext<'a> {
 }
 
 impl<'a> PageProcessingContext<'a> {
+    /// Build a context from its constituent borrowed parts.
+    #[must_use]
+    pub fn new(
+        spec: &'a ShardSpec,
+        cursor: &'a Cursor,
+        items: &'a [ScanItem],
+        next_cursor: &'a Cursor,
+        page_num: u64,
+        pages_completed: u64,
+    ) -> Self {
+        Self {
+            spec,
+            cursor,
+            items,
+            next_cursor,
+            page_num,
+            pages_completed,
+        }
+    }
+
     /// Shard spec for the current scan session.
     #[must_use]
     pub fn spec(&self) -> &'a ShardSpec {

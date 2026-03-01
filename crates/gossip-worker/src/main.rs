@@ -111,77 +111,39 @@ impl SharedCoreMode {
     }
 }
 
-/// Owned snapshot of a single connector item, extracted from the borrowed
-/// [`PageProcessingContext`] for use by the shared-core evaluator.
-///
-/// Each field mirrors a contract-level item property so that direct and
-/// connector-fed code paths can be compared on identical inputs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SharedCoreItemInput {
-    /// Opaque key that positions this item within its shard's key range.
-    item_key: Vec<u8>,
-    /// Provider-specific reference (e.g. object path, API cursor token).
-    item_ref: Vec<u8>,
-    /// Content-addressed identity (SHA-256) that survives renames and moves.
-    stable_item_id: [u8; 32],
-    /// Optional upstream size hint in bytes; `None` when the provider cannot
-    /// report size without fetching the full object.
-    size_hint: Option<u64>,
+// FNV-1a 64-bit constants (http://www.isthe.com/chongo/tech/comp/fnv/).
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+#[inline]
+fn fnv_mix_byte(sig: &mut u64, byte: u8) {
+    *sig ^= u64::from(byte);
+    *sig = sig.wrapping_mul(FNV_PRIME);
 }
 
-/// Owned snapshot of one page of connector results, ready for shared-core
-/// evaluation.
-///
-/// A "page" is a single batch of items returned by the connector for a
-/// shard.  The struct captures both the current and next cursor positions
-/// so the evaluator can verify pagination continuity.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SharedCorePageInput {
-    /// Inclusive lower bound of the shard's key range.
-    shard_start: Vec<u8>,
-    /// Exclusive upper bound of the shard's key range.
-    shard_end: Vec<u8>,
-    /// Last-key component of the cursor *before* this page was fetched.
-    cursor_last_key: Option<Vec<u8>>,
-    /// Opaque token component of the cursor *before* this page was fetched.
-    cursor_token: Option<Vec<u8>>,
-    /// Last-key component of the cursor *after* this page (next page start).
-    next_cursor_last_key: Option<Vec<u8>>,
-    /// Opaque token component of the cursor *after* this page.
-    next_cursor_token: Option<Vec<u8>>,
-    /// Items returned on this page, in connector-provided order.
-    items: Vec<SharedCoreItemInput>,
+#[inline]
+fn fnv_mix_u64(sig: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        fnv_mix_byte(sig, byte);
+    }
 }
 
-impl SharedCorePageInput {
-    /// Materialize an owned page snapshot from the borrowed processing context.
-    ///
-    /// Allocates because the shared-core evaluators need to outlive the
-    /// borrow scope of the scan-loop page callback.
-    fn from_context(ctx: PageProcessingContext<'_>) -> Self {
-        let items = ctx
-            .items()
-            .iter()
-            .map(|item| SharedCoreItemInput {
-                item_key: item.item_key().as_bytes().to_vec(),
-                item_ref: item.item_ref().as_bytes().to_vec(),
-                stable_item_id: *item.stable_item_id().as_bytes(),
-                size_hint: item.size_hint(),
-            })
-            .collect();
+#[inline]
+fn fnv_mix_bytes(sig: &mut u64, bytes: &[u8]) {
+    fnv_mix_u64(sig, bytes.len() as u64);
+    for byte in bytes {
+        fnv_mix_byte(sig, *byte);
+    }
+}
 
-        Self {
-            shard_start: ctx.spec().key_range_start().to_vec(),
-            shard_end: ctx.spec().key_range_end().to_vec(),
-            cursor_last_key: ctx.cursor().last_key().map(|key| key.as_bytes().to_vec()),
-            cursor_token: ctx.cursor().token().map(|tok| tok.as_bytes().to_vec()),
-            next_cursor_last_key: ctx
-                .next_cursor()
-                .last_key()
-                .map(|key| key.as_bytes().to_vec()),
-            next_cursor_token: ctx.next_cursor().token().map(|tok| tok.as_bytes().to_vec()),
-            items,
+#[inline]
+fn fnv_mix_opt_bytes(sig: &mut u64, bytes: Option<&[u8]>) {
+    match bytes {
+        Some(bytes) => {
+            fnv_mix_byte(sig, 1);
+            fnv_mix_bytes(sig, bytes);
         }
+        None => fnv_mix_byte(sig, 0),
     }
 }
 
@@ -204,81 +166,56 @@ struct SharedCorePageOutput {
 /// Today both adapters delegate to the same deterministic evaluator.
 /// They exist as separate functions so the shadow-mode comparison infra
 /// is in place when the real direct and connector paths diverge.
-fn run_direct_shared_core(input: &SharedCorePageInput) -> SharedCorePageOutput {
-    evaluate_shared_core_page(input)
+fn run_direct_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
+    evaluate_shared_core_page(ctx)
 }
 
 /// Adapter representing the connector-fed shared-core invocation.
 ///
 /// See [`run_direct_shared_core`] for why this is a separate function.
-fn run_connector_shared_core(input: &SharedCorePageInput) -> SharedCorePageOutput {
-    evaluate_shared_core_page(input)
+fn run_connector_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
+    evaluate_shared_core_page(ctx)
 }
 
 /// Deterministic stand-in for shared-core result identity used by shadow compare.
 ///
 /// Produces an FNV-1a fingerprint over all contract-safe page identity and
-/// item metadata. The hash is **order-sensitive**: shard boundaries, both
-/// cursor positions, and then items are mixed in sequence. This catches
-/// reordering bugs that a set-based comparison would miss.
+/// item metadata directly from the borrowed [`PageProcessingContext`],
+/// without materializing any owned copies. The hash is **order-sensitive**:
+/// shard boundaries, both cursor positions, and then items are mixed in
+/// sequence. This catches reordering bugs that a set-based comparison
+/// would miss.
 ///
 /// FNV-1a was chosen because it is simple, non-cryptographic, and adequate
 /// for equality testing in shadow mode. It is not used for security.
-fn evaluate_shared_core_page(input: &SharedCorePageInput) -> SharedCorePageOutput {
-    // FNV-1a 64-bit constants (http://www.isthe.com/chongo/tech/comp/fnv/).
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-
-    #[inline]
-    fn mix_byte(sig: &mut u64, byte: u8) {
-        *sig ^= u64::from(byte);
-        *sig = sig.wrapping_mul(FNV_PRIME);
-    }
-
-    #[inline]
-    fn mix_u64(sig: &mut u64, value: u64) {
-        for byte in value.to_le_bytes() {
-            mix_byte(sig, byte);
-        }
-    }
-
-    #[inline]
-    fn mix_bytes(sig: &mut u64, bytes: &[u8]) {
-        mix_u64(sig, bytes.len() as u64);
-        for byte in bytes {
-            mix_byte(sig, *byte);
-        }
-    }
-
-    #[inline]
-    fn mix_opt_bytes(sig: &mut u64, bytes: &Option<Vec<u8>>) {
-        match bytes {
-            Some(bytes) => {
-                mix_byte(sig, 1);
-                mix_bytes(sig, bytes);
-            }
-            None => mix_byte(sig, 0),
-        }
-    }
-
+fn evaluate_shared_core_page(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
     let mut signature = FNV_OFFSET;
-    mix_bytes(&mut signature, &input.shard_start);
-    mix_bytes(&mut signature, &input.shard_end);
-    mix_opt_bytes(&mut signature, &input.cursor_last_key);
-    mix_opt_bytes(&mut signature, &input.cursor_token);
-    mix_opt_bytes(&mut signature, &input.next_cursor_last_key);
-    mix_opt_bytes(&mut signature, &input.next_cursor_token);
+    fnv_mix_bytes(&mut signature, ctx.spec().key_range_start());
+    fnv_mix_bytes(&mut signature, ctx.spec().key_range_end());
+    fnv_mix_opt_bytes(
+        &mut signature,
+        ctx.cursor().last_key().map(|k| k.as_bytes()),
+    );
+    fnv_mix_opt_bytes(&mut signature, ctx.cursor().token().map(|t| t.as_bytes()));
+    fnv_mix_opt_bytes(
+        &mut signature,
+        ctx.next_cursor().last_key().map(|k| k.as_bytes()),
+    );
+    fnv_mix_opt_bytes(
+        &mut signature,
+        ctx.next_cursor().token().map(|t| t.as_bytes()),
+    );
 
-    for item in &input.items {
-        mix_bytes(&mut signature, &item.item_key);
-        mix_bytes(&mut signature, &item.item_ref);
-        mix_bytes(&mut signature, &item.stable_item_id);
-        mix_u64(&mut signature, item.size_hint.unwrap_or(u64::MAX));
+    for item in ctx.items() {
+        fnv_mix_bytes(&mut signature, item.item_key().as_bytes());
+        fnv_mix_bytes(&mut signature, item.item_ref().as_bytes());
+        fnv_mix_bytes(&mut signature, item.stable_item_id().as_bytes());
+        fnv_mix_u64(&mut signature, item.size_hint().unwrap_or(u64::MAX));
     }
 
     SharedCorePageOutput {
         signature,
-        item_count: input.items.len(),
+        item_count: ctx.items().len(),
     }
 }
 
@@ -304,21 +241,23 @@ impl ShadowComparisonStats {
     /// Run both shared-core evaluators on `context` and record timing and
     /// equality results.
     ///
+    /// Operates entirely on borrowed data from the [`PageProcessingContext`]
+    /// — no heap allocations per page.
+    ///
     /// Returns `Err` on the first mismatch so the scan loop can surface it
-    /// as a transient page-processing failure (retried up to the configured
-    /// max).
+    /// as a terminal page-processing failure. Hook failures are not retried
+    /// by the scan loop because shadow mismatches are deterministic (retrying
+    /// the same data produces the same result).
     fn process_page(
         &mut self,
         context: PageProcessingContext<'_>,
     ) -> Result<(), PageProcessingError> {
-        let input = SharedCorePageInput::from_context(context);
-
         let direct_start = std::time::Instant::now();
-        let direct_output = run_direct_shared_core(&input);
+        let direct_output = run_direct_shared_core(&context);
         self.direct_elapsed += direct_start.elapsed();
 
         let connector_start = std::time::Instant::now();
-        let connector_output = run_connector_shared_core(&input);
+        let connector_output = run_connector_shared_core(&context);
         self.connector_elapsed += connector_start.elapsed();
 
         self.pages_compared = self.pages_compared.saturating_add(1);
@@ -622,31 +561,38 @@ mod tests {
 
     #[test]
     fn shared_core_evaluators_are_parity_stable() {
-        let input = SharedCorePageInput {
-            shard_start: b"a".to_vec(),
-            shard_end: b"z".to_vec(),
-            cursor_last_key: Some(b"alpha".to_vec()),
-            cursor_token: Some(b"tok-a".to_vec()),
-            next_cursor_last_key: Some(b"bravo".to_vec()),
-            next_cursor_token: Some(b"tok-b".to_vec()),
-            items: vec![
-                SharedCoreItemInput {
-                    item_key: b"alpha".to_vec(),
-                    item_ref: b"ref-alpha".to_vec(),
-                    stable_item_id: [0x11; 32],
-                    size_hint: Some(12),
-                },
-                SharedCoreItemInput {
-                    item_key: b"bravo".to_vec(),
-                    item_ref: b"ref-bravo".to_vec(),
-                    stable_item_id: [0x22; 32],
-                    size_hint: Some(18),
-                },
-            ],
-        };
+        use gossip_contracts::connector::{Cursor, ItemRef, ScanItem, TokenBytes, VersionId};
+        use gossip_contracts::identity::{ObjectVersionId, StableItemId};
 
-        let direct = run_direct_shared_core(&input);
-        let connector = run_connector_shared_core(&input);
+        let spec = ShardSpec::with_range(b"a", b"z");
+        let cursor = Cursor::with_token(
+            ItemKey::try_from_slice(b"alpha").unwrap(),
+            TokenBytes::try_from_slice(b"tok-a").unwrap(),
+        );
+        let next_cursor = Cursor::with_token(
+            ItemKey::try_from_slice(b"bravo").unwrap(),
+            TokenBytes::try_from_slice(b"tok-b").unwrap(),
+        );
+        let items = [
+            ScanItem::new(
+                ItemKey::try_from_slice(b"alpha").unwrap(),
+                ItemRef::try_from_slice(b"ref-alpha").unwrap(),
+                StableItemId::from_bytes([0x11; 32]),
+                VersionId::Strong(ObjectVersionId::from_version_bytes(b"v1")),
+            )
+            .with_size_hint(12),
+            ScanItem::new(
+                ItemKey::try_from_slice(b"bravo").unwrap(),
+                ItemRef::try_from_slice(b"ref-bravo").unwrap(),
+                StableItemId::from_bytes([0x22; 32]),
+                VersionId::Strong(ObjectVersionId::from_version_bytes(b"v2")),
+            )
+            .with_size_hint(18),
+        ];
+
+        let ctx = PageProcessingContext::new(&spec, &cursor, &items, &next_cursor, 1, 0);
+        let direct = run_direct_shared_core(&ctx);
+        let connector = run_connector_shared_core(&ctx);
         assert_eq!(direct, connector);
         assert_eq!(direct.item_count, 2);
     }
