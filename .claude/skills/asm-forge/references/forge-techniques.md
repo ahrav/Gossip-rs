@@ -386,11 +386,11 @@ fn process(data: &[u8]) -> Result<(), Error> {
 ### Verify Inlining
 ```bash
 # Check if a function was inlined — it shouldn't appear as a separate symbol:
-cargo asm --lib -p scanner-rs 2>&1 | grep 'function_name'
+cargo asm --lib -p <crate> 2>&1 | grep 'function_name'
 # If it appears: not inlined. If absent: successfully inlined into callers.
 
 # To see where it was inlined, use --rust mode on the caller:
-cargo asm --lib -p scanner-rs --rust 'caller_function'
+cargo asm --lib -p <crate> --rust 'caller_function'
 # Inlined code will appear as interleaved source from the callee.
 ```
 
@@ -431,10 +431,10 @@ struct AlignedBuffer {
 ```bash
 # Verify SIMD instructions were emitted:
 # x86-64: look for v-prefixed instructions (AVX) or packed ops (SSE)
-cargo asm --lib -p scanner-rs 'function' | grep -E 'vmov|vpadd|vpcmp|vadd|vmul|vpshuf'
+cargo asm --lib -p <crate> 'function' | grep -E 'vmov|vpadd|vpcmp|vadd|vmul|vpshuf'
 
 # AArch64: look for NEON instructions (vector register operands)
-cargo asm --lib -p scanner-rs 'function' | grep -E '\.16b|\.8h|\.4s|\.2d|v[0-9]+\.'
+cargo asm --lib -p <crate> 'function' | grep -E '\.16b|\.8h|\.4s|\.2d|v[0-9]+\.'
 
 # If no SIMD instructions, check LLVM-IR for vectorization failure reasons:
 RUSTFLAGS="-C target-cpu=native -C llvm-args=-pass-remarks-missed=loop-vectorize" \
@@ -500,9 +500,9 @@ fn sum_timestamps(entries: &Entries) -> u64 {
 
 For every technique applied:
 
-1. **Before ASM**: `cargo asm --lib -p scanner-rs --rust 'fn' > /tmp/asm-before.s`
+1. **Before ASM**: `cargo asm --lib -p <crate> --rust 'fn' > /tmp/asm-before.s`
 2. **Apply change**
-3. **After ASM**: `cargo asm --lib -p scanner-rs --rust 'fn' > /tmp/asm-after.s`
+3. **After ASM**: `cargo asm --lib -p <crate> --rust 'fn' > /tmp/asm-after.s`
 4. **Diff**: `diff /tmp/asm-before.s /tmp/asm-after.s`
 5. **Benchmark**: `cargo bench --bench <name> -- --baseline forge-before`
 6. **Tests**: `cargo test` (ensure correctness preserved)

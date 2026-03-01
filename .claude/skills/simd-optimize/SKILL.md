@@ -60,9 +60,9 @@ apt install jq   # Linux
 
 Examples:
 ```
-/simd-optimize @src/engine/transform.rs "vectorize the base64 decode loop"
-/simd-optimize @src/lsm/set_associative_cache.rs "add AVX2 path for tag search"
-/simd-optimize @src/scanner/byte_search.rs "SIMD byte search across x86 and ARM"
+/simd-optimize @crates/gossip-stdx/src/byte_slab.rs "vectorize the slot search loop"
+/simd-optimize @crates/gossip-stdx/src/inline_vec.rs "add SIMD path for element search"
+/simd-optimize @crates/gossip-scan-pipeline/src/lib.rs "SIMD byte search across x86 and ARM"
 ```
 
 ## Workflow Overview
@@ -371,9 +371,10 @@ pub fn process(data: &[u8]) -> Result {
 
 When adding SIMD to this project, follow existing patterns:
 
-- `src/lsm/set_associative_cache.rs`: NEON + SSE2 tag matching with
-  `cfg(target_arch)` dispatch
-- `src/engine/transform.rs`: NEON + SSSE3 base64 decode with separate functions
+- Check `crates/gossip-stdx/src/` for data structures that may already use
+  unsafe pointer operations that could benefit from SIMD
+- Use `cfg(target_arch)` dispatch with separate functions per ISA
+- Follow the project's `// SAFETY:` comment convention for all unsafe blocks
 
 ## Phase 4: Validation
 

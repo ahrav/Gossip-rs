@@ -38,7 +38,7 @@ Get a high-level breakdown of where cycles are going: frontend stalls, backend s
 
 ```bash
 perf stat -e cpu_cycles,inst_retired,stall_frontend,stall_backend,stall_backend_mem,br_mis_pred_retired \
-  ./target/release/scanner-rs ../linux 2>&1
+  ./target/release/gossip-worker 2>&1
 ```
 
 **Derived metrics to compute:**
@@ -68,7 +68,7 @@ Record samples and identify which functions consume the most cycles.
 
 ```bash
 perf record -g --call-graph dwarf,32768 -F 4999 \
-  ./target/release/scanner-rs ../linux
+  ./target/release/gossip-worker
 ```
 
 Flags explained:
@@ -113,7 +113,7 @@ When topdown shows backend/memory stalls, measure the cache hierarchy.
 
 ```bash
 perf stat -e l1d_cache,l1d_cache_refill,l1d_cache_lmiss_rd,l2d_cache,l2d_cache_refill,l2d_cache_lmiss_rd,dtlb_walk,itlb_walk,mem_access \
-  ./target/release/scanner-rs ../linux 2>&1
+  ./target/release/gossip-worker 2>&1
 ```
 
 **Derived metrics:**
@@ -142,7 +142,7 @@ When topdown shows frontend stalls or branch misprediction issues.
 
 ```bash
 perf stat -e br_pred,br_mis_pred,br_retired,br_mis_pred_retired,inst_retired \
-  ./target/release/scanner-rs ../linux 2>&1
+  ./target/release/gossip-worker 2>&1
 ```
 
 **Derived metrics:**
@@ -157,7 +157,7 @@ To find which branches are mispredicting:
 
 ```bash
 perf record -e br_mis_pred_retired -c 1000 -g --call-graph dwarf \
-  ./target/release/scanner-rs ../linux
+  ./target/release/gossip-worker
 perf report --stdio --percent-limit=1.0 2>&1 | head -60
 ```
 
@@ -175,7 +175,7 @@ For a specific event:
 
 ```bash
 perf record -e l1d_cache_refill -c 10000 --call-graph dwarf \
-  ./target/release/scanner-rs ../linux
+  ./target/release/gossip-worker
 perf annotate --symbol=<function_name> --stdio 2>&1
 ```
 
@@ -196,7 +196,7 @@ Compare two builds at the hardware counter level to explain a Criterion regressi
 git stash push -m "changes"
 RUSTFLAGS="-C target-cpu=native -C debuginfo=2" cargo build --release
 perf stat -r 3 -e cpu_cycles,inst_retired,stall_frontend,stall_backend,stall_backend_mem,l1d_cache_refill,l2d_cache_refill,br_mis_pred_retired \
-  ./target/release/scanner-rs ../linux 2>&1 | tee /tmp/perf-baseline.txt
+  ./target/release/gossip-worker 2>&1 | tee /tmp/perf-baseline.txt
 ```
 
 #### Step 2: Changed counters
@@ -205,7 +205,7 @@ perf stat -r 3 -e cpu_cycles,inst_retired,stall_frontend,stall_backend,stall_bac
 git stash pop
 RUSTFLAGS="-C target-cpu=native -C debuginfo=2" cargo build --release
 perf stat -r 3 -e cpu_cycles,inst_retired,stall_frontend,stall_backend,stall_backend_mem,l1d_cache_refill,l2d_cache_refill,br_mis_pred_retired \
-  ./target/release/scanner-rs ../linux 2>&1 | tee /tmp/perf-after.txt
+  ./target/release/gossip-worker 2>&1 | tee /tmp/perf-after.txt
 ```
 
 #### Step 3: Diff analysis
@@ -224,13 +224,13 @@ For diagnosing contention in async/concurrent code paths.
 ```bash
 perf stat -e context-switches,cpu-migrations,page-faults \
   -e sdt_libpthread:mutex_entry,sdt_libpthread:mutex_acquired \
-  ./target/release/scanner-rs ../linux 2>&1
+  ./target/release/gossip-worker 2>&1
 ```
 
 For scheduling latency:
 
 ```bash
-perf sched record ./target/release/scanner-rs ../linux
+perf sched record ./target/release/gossip-worker
 perf sched latency --sort max 2>&1 | head -30
 ```
 
@@ -314,7 +314,7 @@ Report findings using this structure:
 
 | Rank | Symbol | Self % | Module | Likely Cause |
 |------|--------|--------|--------|--------------|
-| 1 | func_name | XX.X% | scanner_rs | [explanation] |
+| 1 | func_name | XX.X% | gossip_stdx | [explanation] |
 
 ### Cache Hierarchy (if relevant)
 

@@ -1,7 +1,7 @@
 # Cross-Platform SIMD Patterns Reference
 
 Side-by-side x86 (SSE2/SSSE3/SSE4.1/AVX2) and ARM (AArch64 NEON) implementations
-for the most common SIMD patterns encountered in scanner-rs. Every code example is
+for the most common SIMD patterns encountered in Rust codebases. Every code example is
 complete Rust with `#[target_feature]` and `unsafe`.
 
 Module paths: `core::arch::x86_64` on x86, `core::arch::aarch64` on ARM.

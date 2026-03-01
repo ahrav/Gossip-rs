@@ -182,7 +182,7 @@ RUSTFLAGS="-C target-cpu=native -C llvm-args=-pass-remarks-analysis=loop-vectori
   cargo build --release 2>&1 | grep -i 'vectorize\|remark'
 
 # Or check LLVM-IR directly:
-cargo asm --lib -p scanner-rs --llvm 'function_name'
+cargo asm --lib -p <crate> --llvm 'function_name'
 # Look for vector types: <16 x i8>, <4 x i32>, etc.
 ```
 

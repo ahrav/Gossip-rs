@@ -51,7 +51,7 @@ Fast mode reviewers:
 - Required: Correctness, Footguns
 - Optional: Simplification (only if plan introduces new flags/config/options,
   new abstractions, or extra plumbing)
-- Optional: Performance (only if plan touches hot loops / scanner hot paths or
+- Optional: Performance (only if plan touches hot loops / hot paths or
   claims performance impact)
 
 Goal: for small features, converge in **one** review pass with minimal,

@@ -5,8 +5,8 @@
 #   collect_asm.sh <package> <function_pattern> [output_dir]
 #
 # Examples:
-#   collect_asm.sh scanner-rs 'rule_repr::RuleCompiled'
-#   collect_asm.sh scanner-rs 'engine::core::Engine::scan' /tmp/forge
+#   collect_asm.sh gossip-stdx 'inline_vec::InlineVec'
+#   collect_asm.sh gossip-coordination 'coordinator::Coordinator::acquire' /tmp/forge
 #
 # Requires: cargo-show-asm (cargo install cargo-show-asm)
 #
@@ -60,7 +60,7 @@ echo "$RAW_MATCHES"
 echo ""
 
 # Extract just the function name from cargo asm listing format:
-#   1569 "scanner_rs::engine::rule_repr::PackedPatternsBuilder::build" [229]
+#   1569 "gossip_stdx::inline_vec::InlineVec<T,N>::push" [229]
 # We need just the part inside the quotes.
 MATCHES=$(echo "$RAW_MATCHES" | sed -n 's/.*"\(.*\)".*/\1/p')
 

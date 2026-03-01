@@ -5,23 +5,23 @@ description: Audit memory safety and security in unsafe code blocks, buffer hand
 
 # Security Reviewer
 
-Review unsafe code and security-sensitive operations in this secret scanning engine.
+Review unsafe code and security-sensitive operations in the gossip-rs codebase.
 
 ## When to Use
 
 - After modifying any `unsafe` block
 - When adding new parsing or decoding logic
-- Before merging changes to `src/async_io/` or buffer handling code
-- When implementing new transform chains
+- Before merging changes to data structure internals or buffer handling code
+- When implementing new protocol handling or serialization
 
 ## Critical Areas in This Codebase
 
 ### High-Risk Files
-- `src/runtime.rs` - Buffer pool with unsafe pointer operations
-- `src/async_io/` - Platform-specific async I/O with raw pointers
-- `src/engine/scratch.rs` - Scratch memory management
-- `src/engine/stream_decode.rs` - Streaming decoder state machine
-- `src/engine/buffer_scan.rs` - Buffer scanning with offsets
+- `crates/gossip-stdx/src/inline_vec.rs` - Stack-backed collection with unsafe pointer ops
+- `crates/gossip-stdx/src/ring_buffer.rs` - Fixed-capacity circular queue with unsafe
+- `crates/gossip-stdx/src/byte_slab.rs` - Pre-allocated byte pool with raw pointers
+- `crates/gossip-connectors/src/filesystem.rs` - Filesystem I/O with unsafe
+- `crates/gossip-coordination/src/lib.rs` - Coordination protocol internals
 
 ## Security Checklist
 

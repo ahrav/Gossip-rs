@@ -24,7 +24,7 @@ Arguments:
   function_path   Fully-qualified function path (e.g. mycrate::simd::process)
 
 Example:
-  $(basename "$0") scanner-rs scanner_rs::engine::core::process_batch
+  $(basename "$0") gossip-stdx gossip_stdx::inline_vec::InlineVec::push
 EOF
     exit 1
 }
