@@ -10,6 +10,9 @@ description = "Standalone scanner CLI in gossip-rs workspace"
 [dependencies]
 gossip-scanner-runtime.workspace = true
 
+[dev-dependencies]
+rstest.workspace = true
+
 [[bin]]
 name = "scanner-rs"
 path = "src/main.rs"

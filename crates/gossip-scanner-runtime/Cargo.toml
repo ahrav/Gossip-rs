@@ -13,4 +13,5 @@ gossip-engine.workspace = true
 gossip-connectors.workspace = true
 
 [dev-dependencies]
+rstest.workspace = true
 tempfile = "3"

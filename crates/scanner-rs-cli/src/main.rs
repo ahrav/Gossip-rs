@@ -1,8 +1,21 @@
-//! Standalone scanner CLI for the gossip-rs workspace.
+//! Standalone scanner CLI — a thin shell around [`gossip_scanner_runtime`].
 //!
-//! Command shape:
-//! - `scanner-rs scan fs --path <dir|file> [--execution-mode <direct|connector>]`
-//! - `scanner-rs scan git --repo <path> [--execution-mode <direct|connector>]`
+//! This binary owns only two concerns:
+//! 1. **Argument parsing** — hand-rolled to avoid a framework dependency.
+//! 2. **Process-exit policy** — maps runtime errors to stderr + exit code 2.
+//!
+//! All scan logic (enumeration, paging, dedup) lives in the runtime crate.
+//!
+//! # Command shape
+//!
+//! ```text
+//! scanner-rs scan fs  --path <dir|file>  [--execution-mode <direct|connector>]
+//! scanner-rs scan git --repo <path>      [--execution-mode <direct|connector>]
+//! ```
+//!
+//! Flags accept both `--flag value` and `--flag=value` forms. The first
+//! bare positional argument is treated as the path/repo value if no flag
+//! was given.
 
 use std::{
     ffi::OsString,
@@ -15,27 +28,38 @@ use gossip_scanner_runtime::{
     scan_git,
 };
 
+/// Result of argument parsing: either a runnable scan or a help string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParsedCommand {
+    /// A fully-resolved scan ready for execution.
     Run(ScanCommand),
+    /// A usage/help message to print to stdout (not an error).
     Help(String),
 }
 
+/// Validated scan parameters extracted from CLI arguments.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScanCommand {
     source: ScanSource,
     execution_mode: ExecutionMode,
 }
 
+/// Which source connector to use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScanSource {
+    /// Local filesystem directory or single file.
     Fs { path: PathBuf },
+    /// Git repository (tracked files only).
     Git { repo: PathBuf },
 }
 
+/// CLI-layer error carrying a human-readable message and an optional usage
+/// hint that is printed below the error on stderr.
 #[derive(Debug)]
 struct CliError {
     message: String,
+    /// When present, printed after a blank line to guide the user toward
+    /// correct invocation.
     usage: Option<String>,
 }
 
@@ -67,6 +91,9 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+/// Entry point.
+///
+/// Exit codes: 0 on success (including `--help`), 2 on any error.
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -78,6 +105,7 @@ fn main() {
     }
 }
 
+/// Parse arguments, dispatch the scan, and print the outcome summary.
 fn run() -> Result<(), CliError> {
     let parsed = parse_args(std::env::args_os())?;
     match parsed {
@@ -89,6 +117,7 @@ fn run() -> Result<(), CliError> {
     }
 }
 
+/// Build a runtime config from the parsed command and run the scan.
 fn execute_scan(command: ScanCommand) -> Result<(), CliError> {
     let outcome = match command.source {
         ScanSource::Fs { path } => {
@@ -112,10 +141,17 @@ fn execute_scan(command: ScanCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Wrap a runtime error into a [`CliError`] without attaching usage text
+/// (runtime errors are not argument-level mistakes).
 fn runtime_error_to_cli(error: ScanRuntimeError) -> CliError {
     CliError::message_only(error.to_string())
 }
 
+/// Three-level argument parser: `<exe> scan <source> [flags...]`.
+///
+/// Dispatches to [`parse_fs_args`] or [`parse_git_args`] once the source
+/// keyword is consumed. Returns [`ParsedCommand::Help`] for `--help` / `-h`
+/// at any level, or when invoked with no arguments.
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedCommand, CliError> {
     let mut args = args.into_iter();
     let exe = args.next().unwrap_or_else(|| OsString::from("scanner-rs"));
@@ -158,6 +194,11 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<ParsedCommand,
     }
 }
 
+/// Parse `scan fs` flags.
+///
+/// Accepts `--path <dir|file>` (required) and `--execution-mode <mode>`
+/// (optional, defaults to `direct`). A single bare positional argument is
+/// accepted as a shorthand for `--path`.
 fn parse_fs_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, CliError> {
     let usage = fs_usage(exe_name);
     let mut path: Option<PathBuf> = None;
@@ -249,6 +290,11 @@ fn parse_fs_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, Cli
     }))
 }
 
+/// Parse `scan git` flags.
+///
+/// Accepts `--repo <path>` (required) and `--execution-mode <mode>`
+/// (optional, defaults to `direct`). A single bare positional argument is
+/// accepted as a shorthand for `--repo`.
 fn parse_git_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, CliError> {
     let usage = git_usage(exe_name);
     let mut repo: Option<PathBuf> = None;
@@ -340,6 +386,8 @@ fn parse_git_args(exe_name: &str, args: &[OsString]) -> Result<ParsedCommand, Cl
     }))
 }
 
+/// Parse the `--execution-mode` value, attaching source-specific usage on
+/// failure.
 fn parse_execution_mode(
     value: &str,
     exe_name: &str,
@@ -357,6 +405,8 @@ fn parse_execution_mode(
         })
 }
 
+/// Extract the trailing filename component from `argv[0]` for use in usage
+/// strings. Falls back to `"scanner-rs"` if the path is empty.
 fn executable_name(exe: &OsString) -> String {
     Path::new(exe)
         .file_name()
@@ -385,77 +435,162 @@ fn git_usage(exe_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn argv(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
 
-    #[test]
-    fn top_help_mentions_fs_and_git_shapes() {
-        let parsed = parse_args(argv(&["scanner-rs", "--help"])).expect("parse");
+    // ── Help output ────────────────────────────────────────────────
+
+    #[rstest]
+    #[case::no_args(&["scanner-rs"], &["scan fs --path", "scan git --repo"])]
+    #[case::top_help(&["scanner-rs", "--help"], &["scan fs --path", "scan git --repo"])]
+    #[case::top_help_short(&["scanner-rs", "-h"], &["scan fs --path", "scan git --repo"])]
+    #[case::scan_help(&["scanner-rs", "scan", "--help"], &["scan fs --path", "scan git --repo"])]
+    #[case::scan_help_short(&["scanner-rs", "scan", "-h"], &["scan fs --path", "scan git --repo"])]
+    #[case::fs_help(&["scanner-rs", "scan", "fs", "--help"], &["--execution-mode"])]
+    #[case::fs_help_short(&["scanner-rs", "scan", "fs", "-h"], &["--execution-mode"])]
+    #[case::git_help(&["scanner-rs", "scan", "git", "--help"], &["--execution-mode"])]
+    #[case::git_help_short(&["scanner-rs", "scan", "git", "-h"], &["--execution-mode"])]
+    fn parse_help(#[case] args: &[&str], #[case] must_contain: &[&str]) {
+        let parsed = parse_args(argv(args)).expect("parse");
         let ParsedCommand::Help(text) = parsed else {
-            panic!("expected help output");
+            panic!("expected Help, got {parsed:?}");
         };
-        assert!(text.contains("scan fs --path"));
-        assert!(text.contains("scan git --repo"));
+        for needle in must_contain {
+            assert!(
+                text.contains(needle),
+                "help text should contain '{needle}'\ngot: {text}"
+            );
+        }
     }
 
-    #[test]
-    fn fs_help_includes_execution_mode_flag() {
-        let parsed = parse_args(argv(&["scanner-rs", "scan", "fs", "--help"])).expect("parse");
-        let ParsedCommand::Help(text) = parsed else {
-            panic!("expected fs help output");
-        };
-        assert!(text.contains("--execution-mode <mode>"));
-    }
+    // ── Successful fs parses ───────────────────────────────────────
 
-    #[test]
-    fn fs_defaults_execution_mode_to_direct() {
-        let parsed = parse_args(argv(&["scanner-rs", "scan", "fs", "--path", "."])).expect("parse");
-        let ParsedCommand::Run(command) = parsed else {
-            panic!("expected runnable command");
+    #[rstest]
+    #[case::flag_space(
+        &["scanner-rs", "scan", "fs", "--path", "."],
+        ExecutionMode::Direct, "."
+    )]
+    #[case::flag_equals(
+        &["scanner-rs", "scan", "fs", "--path=./src"],
+        ExecutionMode::Direct, "./src"
+    )]
+    #[case::positional(
+        &["scanner-rs", "scan", "fs", "."],
+        ExecutionMode::Direct, "."
+    )]
+    #[case::explicit_direct(
+        &["scanner-rs", "scan", "fs", "--path", ".", "--execution-mode", "direct"],
+        ExecutionMode::Direct, "."
+    )]
+    #[case::connector_mode(
+        &["scanner-rs", "scan", "fs", "--path", ".", "--execution-mode", "connector"],
+        ExecutionMode::Connector, "."
+    )]
+    #[case::connector_equals(
+        &["scanner-rs", "scan", "fs", "--path", ".", "--execution-mode=connector"],
+        ExecutionMode::Connector, "."
+    )]
+    fn parse_fs_run(
+        #[case] args: &[&str],
+        #[case] expected_mode: ExecutionMode,
+        #[case] expected_path: &str,
+    ) {
+        let parsed = parse_args(argv(args)).expect("parse");
+        let ParsedCommand::Run(cmd) = parsed else {
+            panic!("expected Run, got {parsed:?}");
         };
-        assert_eq!(command.execution_mode, ExecutionMode::Direct);
+        assert_eq!(cmd.execution_mode, expected_mode);
         assert_eq!(
-            command.source,
+            cmd.source,
             ScanSource::Fs {
-                path: PathBuf::from(".")
+                path: PathBuf::from(expected_path)
             }
         );
     }
 
-    #[test]
-    fn git_defaults_execution_mode_to_direct() {
-        let parsed =
-            parse_args(argv(&["scanner-rs", "scan", "git", "--repo", "."])).expect("parse");
-        let ParsedCommand::Run(command) = parsed else {
-            panic!("expected runnable command");
+    // ── Successful git parses ──────────────────────────────────────
+
+    #[rstest]
+    #[case::flag_space(
+        &["scanner-rs", "scan", "git", "--repo", "."],
+        ExecutionMode::Direct, "."
+    )]
+    #[case::flag_equals(
+        &["scanner-rs", "scan", "git", "--repo=./repo"],
+        ExecutionMode::Direct, "./repo"
+    )]
+    #[case::positional(
+        &["scanner-rs", "scan", "git", "."],
+        ExecutionMode::Direct, "."
+    )]
+    #[case::connector_mode(
+        &["scanner-rs", "scan", "git", "--repo", ".", "--execution-mode", "connector"],
+        ExecutionMode::Connector, "."
+    )]
+    #[case::explicit_direct_equals(
+        &["scanner-rs", "scan", "git", "--repo", ".", "--execution-mode=direct"],
+        ExecutionMode::Direct, "."
+    )]
+    fn parse_git_run(
+        #[case] args: &[&str],
+        #[case] expected_mode: ExecutionMode,
+        #[case] expected_repo: &str,
+    ) {
+        let parsed = parse_args(argv(args)).expect("parse");
+        let ParsedCommand::Run(cmd) = parsed else {
+            panic!("expected Run, got {parsed:?}");
         };
-        assert_eq!(command.execution_mode, ExecutionMode::Direct);
+        assert_eq!(cmd.execution_mode, expected_mode);
         assert_eq!(
-            command.source,
+            cmd.source,
             ScanSource::Git {
-                repo: PathBuf::from(".")
+                repo: PathBuf::from(expected_repo)
             }
         );
     }
 
-    #[test]
-    fn parser_accepts_connector_mode() {
-        let parsed = parse_args(argv(&[
-            "scanner-rs",
-            "scan",
-            "git",
-            "--repo",
-            ".",
-            "--execution-mode",
-            "connector",
-        ]))
-        .expect("parse");
-        let ParsedCommand::Run(command) = parsed else {
-            panic!("expected runnable command");
-        };
-        assert_eq!(command.execution_mode, ExecutionMode::Connector);
+    // ── Error cases ────────────────────────────────────────────────
+
+    #[rstest]
+    #[case::unknown_subcommand(&["scanner-rs", "bogus"], "expected 'scan'")]
+    #[case::missing_source(&["scanner-rs", "scan"], "missing scan source")]
+    #[case::unknown_source(&["scanner-rs", "scan", "bogus"], "unknown scan source")]
+    #[case::fs_missing_path(&["scanner-rs", "scan", "fs"], "missing --path")]
+    #[case::fs_path_equals_empty(&["scanner-rs", "scan", "fs", "--path="], "--path requires")]
+    #[case::fs_path_no_next(&["scanner-rs", "scan", "fs", "--path"], "--path requires")]
+    #[case::fs_unknown_flag(&["scanner-rs", "scan", "fs", "--bogus"], "unknown flag")]
+    #[case::fs_extra_positional(&["scanner-rs", "scan", "fs", ".", "extra"], "unexpected positional")]
+    #[case::fs_bad_mode(
+        &["scanner-rs", "scan", "fs", "--path", ".", "--execution-mode", "bogus"],
+        "invalid execution mode"
+    )]
+    #[case::fs_mode_no_next(
+        &["scanner-rs", "scan", "fs", "--path", ".", "--execution-mode"],
+        "--execution-mode requires"
+    )]
+    #[case::git_missing_repo(&["scanner-rs", "scan", "git"], "missing --repo")]
+    #[case::git_repo_equals_empty(&["scanner-rs", "scan", "git", "--repo="], "--repo requires")]
+    #[case::git_repo_no_next(&["scanner-rs", "scan", "git", "--repo"], "--repo requires")]
+    #[case::git_unknown_flag(&["scanner-rs", "scan", "git", "--bogus"], "unknown flag")]
+    #[case::git_extra_positional(
+        &["scanner-rs", "scan", "git", ".", "extra"],
+        "unexpected positional"
+    )]
+    #[case::git_bad_mode(
+        &["scanner-rs", "scan", "git", "--repo", ".", "--execution-mode", "bogus"],
+        "invalid execution mode"
+    )]
+    fn parse_errors(#[case] args: &[&str], #[case] expected_substring: &str) {
+        let err = parse_args(argv(args)).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(expected_substring),
+            "error '{msg}' should contain '{expected_substring}'"
+        );
     }
 }
