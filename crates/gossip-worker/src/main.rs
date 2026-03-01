@@ -192,7 +192,7 @@ impl From<ScanLoopError> for WorkerError {
     }
 }
 
-use gossip_stdx::{FNV_OFFSET, fnv_mix_bytes, fnv_mix_opt_bytes, fnv_mix_u64};
+use gossip_stdx::{FNV_OFFSET, fnv_mix_byte, fnv_mix_bytes, fnv_mix_opt_bytes, fnv_mix_u64};
 
 /// Result of evaluating one page through the shared-core path.
 ///
@@ -241,10 +241,12 @@ fn run_connector_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageO
 /// item metadata directly from the borrowed [`PageProcessingContext`],
 /// without materializing any owned copies. The mixing order is:
 ///
-/// 1. Shard key range boundaries (`key_range_start`, `key_range_end`)
-/// 2. Current cursor position (`last_key`, `token`)
-/// 3. Next cursor position (`last_key`, `token`)
-/// 4. Items in iteration order (`item_key`, `item_ref`, `stable_item_id`, `size_hint`)
+/// 1. Page number (`page_num`)
+/// 2. Shard key range boundaries (`key_range_start`, `key_range_end`)
+/// 3. Current cursor position (`last_key`, `token`)
+/// 4. Next cursor position (`last_key`, `token`)
+/// 5. Items in iteration order (`item_key`, `item_ref`, `stable_item_id`,
+///    `version` (domain-separated), `size_hint`)
 ///
 /// This order is **position-sensitive**: reordering items produces a
 /// different fingerprint, which catches ordering bugs that a set-based
@@ -254,12 +256,15 @@ fn run_connector_shared_core(ctx: &PageProcessingContext<'_>) -> SharedCorePageO
 ///
 /// Unlike the engine's `mix_page_item_signature`, this evaluator does **not**
 /// mix `item_bytes` / payload content into the signature. The worker's shadow
-/// mode compares structural metadata only — key, ref, stable_item_id, and
-/// size_hint — because payload bytes are not available in the
-/// `PageProcessingContext` at this layer. Once the connector adapter surfaces
-/// per-item content, the field set should converge with the engine.
+/// mode compares structural metadata only because payload bytes are not
+/// available in the `PageProcessingContext` at this layer. Once the connector
+/// adapter surfaces per-item content, the field set should converge with the
+/// engine.
 fn evaluate_shared_core_page(ctx: &PageProcessingContext<'_>) -> SharedCorePageOutput {
+    use gossip_contracts::connector::VersionId;
+
     let mut signature = FNV_OFFSET;
+    fnv_mix_u64(&mut signature, ctx.page_num());
     fnv_mix_bytes(&mut signature, ctx.spec().key_range_start());
     fnv_mix_bytes(&mut signature, ctx.spec().key_range_end());
     fnv_mix_opt_bytes(
@@ -280,6 +285,16 @@ fn evaluate_shared_core_page(ctx: &PageProcessingContext<'_>) -> SharedCorePageO
         fnv_mix_bytes(&mut signature, item.item_key().as_bytes());
         fnv_mix_bytes(&mut signature, item.item_ref().as_bytes());
         fnv_mix_bytes(&mut signature, item.stable_item_id().as_bytes());
+        match item.version() {
+            VersionId::Strong(v) => {
+                fnv_mix_byte(&mut signature, 1);
+                fnv_mix_bytes(&mut signature, v.as_bytes());
+            }
+            VersionId::Weak(v) => {
+                fnv_mix_byte(&mut signature, 2);
+                fnv_mix_bytes(&mut signature, v.as_bytes());
+            }
+        }
         fnv_mix_u64(&mut signature, item.size_hint().unwrap_or(u64::MAX));
     }
 

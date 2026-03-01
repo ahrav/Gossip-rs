@@ -430,15 +430,17 @@ impl ScannerCore {
 
 /// Derive the initial page signature from page-level context fields.
 ///
-/// The seed captures the shard key range boundaries and both the current
-/// and next cursors. This means any change in pagination state — even if
-/// the same items appear — produces a different page signature, which is
-/// the desired behavior for parity comparison between runtimes.
+/// The seed captures `page_num`, shard key range boundaries, and both the
+/// current and next cursors. This means any change in page identity or
+/// pagination state — even if the same items appear — produces a different
+/// page signature, which is the desired behavior for parity comparison
+/// between runtimes.
 ///
 /// Individual items are mixed into this seed later by [`mix_page_item_signature`].
 #[inline]
 fn page_signature_seed(context: PageScanContext<'_>) -> u64 {
     let mut signature = FNV_OFFSET;
+    fnv_mix_u64(&mut signature, context.page_num());
     fnv_mix_bytes(&mut signature, context.key_range_start());
     fnv_mix_bytes(&mut signature, context.key_range_end());
     fnv_mix_opt_bytes(
@@ -462,9 +464,12 @@ fn page_signature_seed(context: PageScanContext<'_>) -> u64 {
 
 /// Fold one item's structural fields into the running page signature.
 ///
-/// Covers `item_key`, `item_ref`, `stable_item_id`, `size_hint`, and
-/// payload — intentionally broader than [`finding_fingerprint`] so that
+/// Covers `item_key`, `item_ref`, `stable_item_id`, `version`, `size_hint`,
+/// and payload — intentionally broader than [`finding_fingerprint`] so that
 /// any metadata drift is detectable even when it doesn't affect dedup.
+///
+/// `version` is domain-separated with tag bytes `1` (strong) / `2` (weak),
+/// matching the scheme in [`finding_fingerprint`].
 ///
 /// `size_hint` is sentinel-encoded (`u64::MAX` for `None`) rather than
 /// using `fnv_mix_opt_bytes` because it is always a scalar, not a slice.
@@ -473,6 +478,16 @@ fn mix_page_item_signature(signature: &mut u64, item: &ScanItem, payload: &[u8])
     fnv_mix_bytes(signature, item.item_key().as_bytes());
     fnv_mix_bytes(signature, item.item_ref().as_bytes());
     fnv_mix_bytes(signature, item.stable_item_id().as_bytes());
+    match item.version() {
+        VersionId::Strong(v) => {
+            fnv_mix_byte(signature, 1);
+            fnv_mix_bytes(signature, v.as_bytes());
+        }
+        VersionId::Weak(v) => {
+            fnv_mix_byte(signature, 2);
+            fnv_mix_bytes(signature, v.as_bytes());
+        }
+    }
     fnv_mix_u64(signature, item.size_hint().unwrap_or(u64::MAX));
     fnv_mix_bytes(signature, payload);
 }
