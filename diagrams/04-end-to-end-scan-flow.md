@@ -60,16 +60,16 @@ sequenceDiagram
 
             note over W,CN: Step 3 — Enumerate Items
 
-            W->>CN: enumerate(shard_range, cursor, page_size)
+            W->>CN: enumerate_page(shard, cursor, budgets)
             activate CN
-            CN-->>W: Page(items[], next_cursor)
+            CN-->>W: EnumerationPage(items, next_cursor)
             deactivate CN
 
             loop For each item in page
 
                 note over W,ID: Step 4 — Derive StableItemId
 
-                W->>ID: StableItemId::derive(connector_tag, path)
+                W->>ID: ItemIdentityKey::new(tag, locator).stable_id()
                 activate ID
                 ID-->>W: StableItemId
                 deactivate ID
@@ -83,9 +83,9 @@ sequenceDiagram
 
                 note over W,CN: Step 6 — Read & Detect
 
-                W->>CN: read_item(item_key)
+                W->>CN: open(item_ref, budgets)
                 activate CN
-                CN-->>W: content
+                CN-->>W: Box&lt;dyn Read + Send&gt;
                 deactivate CN
                 W->>W: scan(content, policy) → findings[]
 
@@ -97,9 +97,9 @@ sequenceDiagram
                     ID-->>W: NormHash
                     W->>ID: SecretHash(keyed, tenant_scope)
                     ID-->>W: SecretHash
-                    W->>ID: FindingId::derive(tenant, item, rule, secret_hash)
+                    W->>ID: derive_finding_id(FindingIdInputs)
                     ID-->>W: FindingId
-                    W->>ID: OccurrenceId::derive(finding_id, version, byte_offset, byte_length)
+                    W->>ID: derive_occurrence_id(OccurrenceIdInputs)
                     ID-->>W: OccurrenceId
 
                     note over W: Step 8 — Accumulate
@@ -140,7 +140,7 @@ sequenceDiagram
 
     note over W,C: Step 12 — Mark Shard Complete
 
-    W->>C: complete(now, tenant, lease, final_cursor, op_id)
+    W->>C: session.complete(now, final_cursor, op_id)
     activate C
     C->>C: validate lease (5-check)<br/>transition Active → Done
     C-->>W: ack

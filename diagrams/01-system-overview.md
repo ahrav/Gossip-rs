@@ -117,10 +117,13 @@ graph LR
     coordination -->|"depends on"| stdx
     connectors -->|"depends on"| contracts
     engine -->|"depends on"| contracts
-    engine -->|"depends on"| coordination
-    engine -->|"depends on"| connectors
-    pipeline -->|"depends on"| engine
+    pipeline -->|"depends on"| contracts
+    pipeline -->|"depends on"| coordination
+    worker -->|"depends on"| contracts
+    worker -->|"depends on"| engine
     worker -->|"depends on"| pipeline
+    worker -->|"depends on"| connectors
+    worker -->|"depends on"| coordination
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style B3 fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
@@ -217,10 +220,11 @@ sequenceDiagram
 The crate graph compiles in four tiers. Tier 0 (`gossip-stdx`, `gossip-contracts`,
 and `gossip-frontier`) has no dependencies on higher-level crates and compiles
 first. `gossip-stdx` is a foundational utility crate depended on by contracts,
-frontier, and coordination. Tier 1 (`gossip-coordination` and `gossip-connectors`)
-compiles in parallel once Tier 0 finishes -- these two crates are independent by
-design. Tier 2 (`gossip-engine`, `gossip-scan-pipeline`) depends on everything
-below it, and Tier 3 (`gossip-worker`) is the final binary.
+frontier, and coordination. Tier 1 (`gossip-coordination`, `gossip-connectors`,
+and `gossip-engine`) compiles in parallel once Tier 0 finishes -- these crates
+depend only on `gossip-contracts` (and `gossip-stdx` for coordination). Tier 2
+(`gossip-scan-pipeline`) depends on `gossip-contracts` and `gossip-coordination`.
+Tier 3 (`gossip-worker`) is the final binary, depending on all five workspace crates.
 
 ```mermaid
 %% Diagram: build-dag
@@ -252,10 +256,13 @@ graph TD
     contracts --> coordination
     contracts --> connectors
     contracts --> engine
-    coordination --> engine
-    connectors --> engine
-    engine --> pipeline
+    contracts --> pipeline
+    coordination --> pipeline
+    contracts --> worker
+    engine --> worker
     pipeline --> worker
+    connectors --> worker
+    coordination --> worker
 
     style stdx fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style contracts fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
