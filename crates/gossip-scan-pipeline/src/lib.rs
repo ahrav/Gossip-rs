@@ -28,11 +28,14 @@
 //! - Reporting lease loss separately from mutation failures gives callers a clear
 //!   split between "reacquire and continue from last checkpoint" and
 //!   "coordination mutation failed; investigate backend error."
-//! - Chunking and detection-engine fan-out are handled externally, not in this crate.
+//! - Default behavior keeps chunking and detection-engine fan-out external.
+//!   Hook-enabled APIs provide an explicit per-page processing injection point.
 
 mod scan_loop;
 
 pub use scan_loop::{
-    DEFAULT_MAX_TRANSIENT_RETRIES, DEFAULT_RENEW_AT_FRACTION, LeaseLossCause, RenewalPolicy,
-    ScanLoopError, ScanLoopOutcome, run_scan_loop, run_scan_loop_with_policy,
+    DEFAULT_MAX_TRANSIENT_RETRIES, DEFAULT_RENEW_AT_FRACTION, LeaseLossCause,
+    PageProcessingContext, PageProcessingError, RenewalPolicy, ScanLoopError, ScanLoopOutcome,
+    run_scan_loop, run_scan_loop_with_page_processor, run_scan_loop_with_policy,
+    run_scan_loop_with_policy_and_page_processor,
 };

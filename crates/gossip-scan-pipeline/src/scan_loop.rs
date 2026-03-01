@@ -31,6 +31,11 @@
 //!     └────────┬───────────┘
 //!              │ Ok
 //!              ▼
+//!     ┌────────────────────┐
+//!     │ process_page_hook  │── Err ──► Error(PageProcessing)
+//!     └────────┬───────────┘
+//!              │ Ok
+//!              ▼
 //!        ┌──────────┐       ┌────────────────────────────────────┐
 //!        │  empty?  │──yes──►  deadline guard (now)              │
 //!        └────┬─────┘       │   ├── expired ──► LeaseLost       │
@@ -86,6 +91,10 @@
 //!   only after a successful checkpoint. A renewal failure therefore never
 //!   rolls back already-persisted progress, preserving forward-progress
 //!   guarantees even when lease loss is detected.
+//! - **SL8 — Process-before-persist ordering:** When using a page-processing
+//!   hook API, hook execution for a non-empty page runs after validation and
+//!   before checkpoint. Hook failure aborts the loop without persisting page
+//!   cursor progress.
 //!
 //! ## Design trade-offs
 //!
@@ -108,8 +117,12 @@
 //!   connector contract only surfaces a binary retryability class plus free-form
 //!   error text. The heuristic is conservative: unrecognized messages fall through
 //!   to [`ParkReason::Other`] rather than guessing a more specific category.
-//! - The loop does not process page items for detection. It only advances
-//!   coordination cursor state. Detection fan-out is composed externally.
+//! - The default APIs (`run_scan_loop`, `run_scan_loop_with_policy`) do not
+//!   process page items for detection. They only advance coordination cursor
+//!   state. Detection fan-out is composed externally. Hook-enabled APIs
+//!   (`run_scan_loop_with_page_processor`,
+//!   `run_scan_loop_with_policy_and_page_processor`) allow callers to inject
+//!   per-page processing before checkpoint.
 
 use std::fmt;
 
@@ -196,6 +209,92 @@ impl Default for RenewalPolicy {
         }
     }
 }
+
+/// Context passed to page-processing hooks in hook-enabled scan-loop APIs.
+///
+/// The context borrows the validated page boundary values for one non-empty
+/// page. Hook implementations can map these values into detection adapter
+/// inputs and must return before the loop can checkpoint cursor progress.
+#[derive(Clone, Copy, Debug)]
+pub struct PageProcessingContext<'a> {
+    spec: &'a ShardSpec,
+    cursor: &'a Cursor,
+    items: &'a [ScanItem],
+    next_cursor: &'a Cursor,
+    page_num: u64,
+    pages_completed: u64,
+}
+
+impl<'a> PageProcessingContext<'a> {
+    /// Shard spec for the current scan session.
+    #[must_use]
+    pub fn spec(&self) -> &'a ShardSpec {
+        self.spec
+    }
+
+    /// Connector cursor used to request the current page.
+    #[must_use]
+    pub fn cursor(&self) -> &'a Cursor {
+        self.cursor
+    }
+
+    /// Validated non-empty item slice for this page.
+    #[must_use]
+    pub fn items(&self) -> &'a [ScanItem] {
+        self.items
+    }
+
+    /// Validated continuation cursor produced by the connector for this page.
+    #[must_use]
+    pub fn next_cursor(&self) -> &'a Cursor {
+        self.next_cursor
+    }
+
+    /// Monotonic page counter within this scan-loop invocation (1-based).
+    #[must_use]
+    pub fn page_num(&self) -> u64 {
+        self.page_num
+    }
+
+    /// Number of checkpoints durably committed before this page.
+    #[must_use]
+    pub fn pages_completed(&self) -> u64 {
+        self.pages_completed
+    }
+}
+
+/// Error returned by a page-processing hook.
+///
+/// Hook implementations should return a concise, diagnostics-friendly message
+/// that can be logged and surfaced as a [`ScanLoopError::PageProcessing`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageProcessingError {
+    message: String,
+}
+
+impl PageProcessingError {
+    /// Build a hook failure from a human-readable message.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+
+    /// Return the hook failure message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for PageProcessingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PageProcessingError {}
 
 /// Diagnostic cause for [`ScanLoopOutcome::LeaseLost`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,6 +400,9 @@ pub enum ScanLoopError {
     /// invariant checks. The loop attempts to park the shard as `Poisoned`
     /// because malformed pages must never become durable cursor state.
     PageValidation(PageValidationError),
+    /// Caller-supplied page-processing hook failed after validation but before
+    /// checkpoint for a non-empty page.
+    PageProcessing(PageProcessingError),
     /// Connector enumeration call failed. Retryable errors may have been
     /// retried up to `max_transient_retries` times before reaching this point.
     /// Permanent errors are classified by message heuristic; the loop
@@ -334,6 +436,7 @@ impl fmt::Display for ScanLoopError {
             Self::InvalidShardSpec(e) => write!(f, "invalid shard spec: {e}"),
             Self::CursorBridge(e) => write!(f, "cursor bridge failed: {e}"),
             Self::PageValidation(e) => write!(f, "page validation failed: {e}"),
+            Self::PageProcessing(e) => write!(f, "page processing failed: {e}"),
             Self::Enumerate(e) => write!(f, "enumerate error: {e}"),
             Self::Checkpoint(e) => write!(f, "checkpoint failed: {e}"),
             Self::Complete(e) => write!(f, "complete failed: {e}"),
@@ -345,11 +448,21 @@ impl fmt::Display for ScanLoopError {
 }
 
 impl std::error::Error for ScanLoopError {
+    /// Return the underlying cause for error-chain traversal.
+    ///
+    /// For the `Park` variant the source is the original *trigger* error
+    /// (the connector or validation failure that prompted the park attempt),
+    /// not the [`ParkError`] from the failed coordination call. This keeps
+    /// `Error::source()` chains rooted at the operational cause: callers
+    /// traversing the chain see "connector auth failed" rather than
+    /// "park mutation rejected," and the `ParkError` is still accessible
+    /// via the `Park::source` field for diagnostics that need it.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidShardSpec(e) => Some(e),
             Self::CursorBridge(e) => Some(e),
             Self::PageValidation(e) => Some(e),
+            Self::PageProcessing(e) => Some(e),
             Self::Enumerate(e) => Some(e),
             Self::Checkpoint(e) => Some(e),
             Self::Complete(e) => Some(e),
@@ -383,10 +496,11 @@ impl fmt::Display for RedactedCursor<'_> {
 
 /// Compact redacted summary of first/last items in an enumerated page.
 ///
-/// Toxic fields ([`ItemKey`]) are rendered through their `Display` impl,
-/// which emits a stable hash digest rather than raw bytes. This keeps
-/// per-page tracing useful for debugging (key ordering, page boundaries)
-/// without leaking customer data into log sinks.
+/// Both toxic fields ([`ItemKey`] and [`ItemRef`]) are rendered through
+/// their `Display` impls (produced by `define_toxic_bytes!`), which emit
+/// a length + hash-prefix digest rather than raw bytes. This keeps
+/// per-page tracing useful for debugging (key ordering, page boundaries,
+/// item identity) without leaking customer data into log sinks.
 struct RedactedPageSample<'a> {
     first: Option<&'a ScanItem>,
     last: Option<&'a ScanItem>,
@@ -447,8 +561,8 @@ impl fmt::Display for RedactedPageSample<'_> {
 
 /// Run the connector enumeration loop with the default lease-renew policy.
 ///
-/// This is a convenience wrapper around [`run_scan_loop_with_policy`] using
-/// [`RenewalPolicy::default`] (renew at half-life).
+/// This is a convenience wrapper around [`run_scan_loop_with_page_processor`]
+/// using [`RenewalPolicy::default`] (renew at half-life) and a no-op hook.
 pub fn run_scan_loop<B, C, N>(
     session: WorkerSession<'_, B>,
     connector: &mut C,
@@ -462,7 +576,42 @@ where
     C: EnumerationConnector,
     N: FnMut() -> LogicalTime,
 {
-    run_scan_loop_with_policy(
+    run_scan_loop_with_page_processor(
+        session,
+        connector,
+        budgets,
+        max_transient_retries,
+        op_id_fn,
+        now_fn,
+        noop_page_processor,
+    )
+}
+
+#[inline]
+fn noop_page_processor(_: PageProcessingContext<'_>) -> Result<(), PageProcessingError> {
+    Ok(())
+}
+
+/// Run the scan loop with the default renew policy and a non-empty page hook.
+///
+/// The `page_processor` hook runs after page validation and before
+/// checkpoint/complete logic for each non-empty page.
+pub fn run_scan_loop_with_page_processor<B, C, N, P>(
+    session: WorkerSession<'_, B>,
+    connector: &mut C,
+    budgets: Budgets,
+    max_transient_retries: usize,
+    op_id_fn: impl FnMut() -> OpId,
+    now_fn: N,
+    page_processor: P,
+) -> ScanLoopOutcome
+where
+    B: CoordinationBackend,
+    C: EnumerationConnector,
+    N: FnMut() -> LogicalTime,
+    P: FnMut(PageProcessingContext<'_>) -> Result<(), PageProcessingError>,
+{
+    run_scan_loop_with_policy_and_page_processor(
         session,
         connector,
         budgets,
@@ -470,6 +619,36 @@ where
         max_transient_retries,
         op_id_fn,
         now_fn,
+        page_processor,
+    )
+}
+
+/// Run the scan loop with an explicit renew policy and no page-processing hook.
+///
+/// This preserves the historical scan-loop behavior (cursor progression only).
+pub fn run_scan_loop_with_policy<B, C, N>(
+    session: WorkerSession<'_, B>,
+    connector: &mut C,
+    budgets: Budgets,
+    renewal_policy: RenewalPolicy,
+    max_transient_retries: usize,
+    op_id_fn: impl FnMut() -> OpId,
+    now_fn: N,
+) -> ScanLoopOutcome
+where
+    B: CoordinationBackend,
+    C: EnumerationConnector,
+    N: FnMut() -> LogicalTime,
+{
+    run_scan_loop_with_policy_and_page_processor(
+        session,
+        connector,
+        budgets,
+        renewal_policy,
+        max_transient_retries,
+        op_id_fn,
+        now_fn,
+        noop_page_processor,
     )
 }
 
@@ -481,6 +660,10 @@ where
 /// [`ScanLoopOutcome`]. `Completed` and `Parked` consume the session via
 /// terminal transitions. `LeaseLost` reports lease loss without terminal
 /// mutation attempts. `Error` reports failed coordination mutations.
+///
+/// For non-empty pages, `page_processor` runs after `validate_page` and before
+/// checkpoint/complete logic. Hook errors abort with
+/// [`ScanLoopError::PageProcessing`] and do not persist page progress.
 ///
 /// ## Time injection contract
 ///
@@ -536,19 +719,30 @@ where
 /// | Lease renewal failure | Return `LeaseLost` |
 /// | Coordination checkpoint/complete failure | Return `Error` directly |
 /// | Park call failure | Return compound `Error::Park` |
+/// | Page-processing hook failure | Return `Error(PageProcessing)` |
 ///
 /// Note: `LeaseLost { pages_completed: 0 }` can occur from the pre-loop entry
 /// check, from the pre-checkpoint deadline guard firing on the first non-empty
 /// page, or from the pre-complete deadline guard on an initial empty page.
 #[tracing::instrument(
-    skip(session, connector, budgets, renewal_policy, max_transient_retries, op_id_fn, now_fn),
+    skip(
+        session,
+        connector,
+        budgets,
+        renewal_policy,
+        max_transient_retries,
+        op_id_fn,
+        now_fn,
+        page_processor
+    ),
     fields(
         shard_key = %session.shard_key(),
         tenant = %session.tenant(),
         worker = %session.worker(),
     )
 )]
-pub fn run_scan_loop_with_policy<B, C, N>(
+#[allow(clippy::too_many_arguments)] // Public orchestration surface keeps injected policies/time/op IDs explicit.
+pub fn run_scan_loop_with_policy_and_page_processor<B, C, N, P>(
     mut session: WorkerSession<'_, B>,
     connector: &mut C,
     budgets: Budgets,
@@ -556,11 +750,13 @@ pub fn run_scan_loop_with_policy<B, C, N>(
     max_transient_retries: usize,
     mut op_id_fn: impl FnMut() -> OpId,
     mut now_fn: N,
+    mut page_processor: P,
 ) -> ScanLoopOutcome
 where
     B: CoordinationBackend,
     C: EnumerationConnector,
     N: FnMut() -> LogicalTime,
+    P: FnMut(PageProcessingContext<'_>) -> Result<(), PageProcessingError>,
 {
     // -- Pre-loop bridging: coordination domain -> connector domain ----------
     // Both conversions are fallible because the session exposes borrowed byte
@@ -720,6 +916,29 @@ where
             );
         }
         tracing::debug!(page_num, "page validated");
+
+        if !page.items().is_empty() {
+            let context = PageProcessingContext {
+                spec: &spec,
+                cursor: &connector_cursor,
+                items: page.items(),
+                next_cursor: page.next_cursor(),
+                page_num,
+                pages_completed,
+            };
+            if let Err(error) = page_processor(context) {
+                tracing::error!(
+                    page_num,
+                    pages_completed,
+                    page_processing_error = %error,
+                    page_sample = %RedactedPageSample::from_items(page.items()),
+                    next_cursor = %RedactedCursor(page.next_cursor()),
+                    "page processing hook failed",
+                );
+                return ScanLoopOutcome::Error(ScanLoopError::PageProcessing(error));
+            }
+            tracing::debug!(page_num, pages_completed, "page processed by hook");
+        }
 
         // Check emptiness by reference before consuming the page for its
         // cursor, avoiding a clone of heap-allocated key and token fields.
@@ -910,6 +1129,11 @@ fn should_renew(
 
     let remaining = deadline.as_raw().saturating_sub(now.as_raw());
     let fraction = policy.effective_fraction();
+    // ceil() ensures a positive fraction always produces a non-zero
+    // threshold for large durations. The guard below catches the edge
+    // case where ceil() still rounds to 0 (very short durations with
+    // small fractions), so a caller who asks "renew at any positive
+    // fraction" is never silently ignored.
     let mut renew_threshold = ((observed_lease_duration as f64) * fraction).ceil() as u64;
     if renew_threshold == 0 && fraction > 0.0 {
         renew_threshold = 1;
