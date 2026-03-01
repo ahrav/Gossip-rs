@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use gossip_contracts::{
-    connector::{EnumerateError, ItemKey, ItemRef, PooledByteSlab, TokenBytes},
+    connector::{
+        ConnectorInputError, EnumerateError, ItemKey, ItemRef, MAX_ITEM_KEY_SIZE, PooledByteSlab,
+        TokenBytes,
+    },
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
 use gossip_stdx::{ByteSlab, ByteSlot};
@@ -30,23 +33,32 @@ pub(crate) fn derive_stable_item_id(tag: ConnectorTag, key: &ItemKey) -> StableI
     ItemIdentityKey::new(tag, key.as_bytes()).stable_id()
 }
 
-/// Decode a shard key-range bound where `[]` (empty) means unbounded.
+/// Validate a shard key-range bound where `[]` (empty) means unbounded.
 ///
 /// Empty bounds are treated as unbounded to match [`ShardSpec`] semantics.
-/// Non-empty bounds are validated via [`ItemKey::try_from_slice`]; invalid
-/// payloads produce a permanent error including `which` for diagnostics.
+/// Non-empty bounds are validated allocation-free against [`ItemKey`] size
+/// limits; malformed payloads produce a permanent error including `which` for
+/// diagnostics.
 ///
 /// [`ShardSpec`]: gossip_contracts::coordination::ShardSpec
-pub(crate) fn shard_bound(
-    bound: &[u8],
+pub(crate) fn borrowed_shard_bound<'a>(
+    bound: &'a [u8],
     which: &'static str,
-) -> Result<Option<ItemKey>, EnumerateError> {
+) -> Result<Option<&'a [u8]>, EnumerateError> {
     if bound.is_empty() {
         return Ok(None);
     }
-    ItemKey::try_from_slice(bound)
-        .map(Some)
-        .map_err(|err| EnumerateError::permanent(format!("invalid shard {which} bound: {err}")))
+    if bound.len() > MAX_ITEM_KEY_SIZE {
+        let err = ConnectorInputError::TooLarge {
+            field: "ItemKey",
+            size: bound.len(),
+            max: MAX_ITEM_KEY_SIZE,
+        };
+        return Err(EnumerateError::permanent(format!(
+            "invalid shard {which} bound: {err}"
+        )));
+    }
+    Ok(Some(bound))
 }
 
 /// Trait abstraction for entries that expose a key byte slice.
@@ -151,6 +163,26 @@ pub(crate) struct StagedPage {
     pub token: Option<TokenBytes>,
 }
 
+#[inline]
+fn stage_token_slot(
+    page_slab: &mut PooledByteSlab,
+    emit_token: bool,
+    start_idx: usize,
+    item_count: usize,
+) -> Result<Option<ByteSlot>, EnumerateError> {
+    if !emit_token {
+        return Ok(None);
+    }
+    let next_idx = start_idx
+        .checked_add(item_count)
+        .and_then(|sum| u64::try_from(sum).ok())
+        .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
+    let token_bytes = next_idx.to_be_bytes();
+    page_slab.allocate(&token_bytes).map(Some).map_err(|err| {
+        EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
+    })
+}
+
 /// Stage key/ref byte pairs into a page-local slab and materialize wrappers.
 ///
 /// Accepts an `ExactSizeIterator` of `(key_bytes, ref_bytes)` pairs. The
@@ -199,18 +231,7 @@ pub(crate) fn assemble_pooled_page<'a>(
     }
 
     // Phase 3: optionally stage continuation token.
-    let token_slot = if emit_token {
-        let next_idx = start_idx
-            .checked_add(staged.len())
-            .and_then(|sum| u64::try_from(sum).ok())
-            .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
-        let token_bytes = next_idx.to_be_bytes();
-        Some(page_slab.allocate(&token_bytes).map_err(|err| {
-            EnumerateError::permanent(format!("failed to stage token in page slab: {err}"))
-        })?)
-    } else {
-        None
-    };
+    let token_slot = stage_token_slot(&mut page_slab, emit_token, start_idx, staged.len())?;
 
     // Phase 4: wrap in Arc for shared read access, reconstruct wrappers.
     let slab = Arc::new(page_slab);
@@ -222,6 +243,76 @@ pub(crate) fn assemble_pooled_page<'a>(
             .map_err(|err| EnumerateError::permanent(format!("invalid staged item_ref: {err}")))?;
         wrappers.push((item_key, item_ref));
     }
+
+    let token = match token_slot {
+        Some(slot) => Some(
+            TokenBytes::try_from_slot(slot, Arc::clone(&slab))
+                .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?,
+        ),
+        None => None,
+    };
+
+    Ok(StagedPage { wrappers, token })
+}
+
+/// Stage key bytes once and materialize both key/ref wrappers from one slot.
+///
+/// Filesystem enumeration uses this path because `ItemRef` bytes are
+/// identical-by-construction to `ItemKey` bytes (encoded relative path).
+/// This avoids redundant per-item slot staging while preserving pooled wrapper
+/// behavior and shared continuation-token encoding.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` on slab capacity overflow, staging
+/// failure, wrapper reconstruction failure, or token-index overflow.
+pub(crate) fn assemble_pooled_page_shared_key_ref<'a>(
+    key_bytes: impl ExactSizeIterator<Item = &'a [u8]> + Clone,
+    emit_token: bool,
+    start_idx: usize,
+) -> Result<StagedPage, EnumerateError> {
+    let take = key_bytes.len();
+
+    // One slot per key; refs reuse the same slot bytes.
+    let slab_capacity = page_slab_capacity(
+        key_bytes
+            .clone()
+            .map(|k| k.len())
+            .chain(emit_token.then_some(std::mem::size_of::<u64>())),
+    )?;
+
+    let mut page_slab = PooledByteSlab::new(ByteSlab::with_capacity(slab_capacity));
+    let mut staged: Vec<ByteSlot> = Vec::with_capacity(take);
+    for (item_idx, key) in key_bytes.enumerate() {
+        let slot = page_slab.allocate(key).map_err(|err| {
+            EnumerateError::permanent(format!(
+                "failed to stage filesystem key/item_ref in page slab (item {item_idx}/{take}): {err}"
+            ))
+        })?;
+        staged.push(slot);
+    }
+
+    let token_slot = stage_token_slot(&mut page_slab, emit_token, start_idx, staged.len())?;
+
+    let slab = Arc::new(page_slab);
+    let mut wrappers = Vec::with_capacity(staged.len());
+    for slot in staged {
+        let item_key = ItemKey::try_from_slot(slot, Arc::clone(&slab))
+            .map_err(|err| EnumerateError::permanent(format!("invalid staged item key: {err}")))?;
+        let item_ref = ItemRef::try_from_slot(slot, Arc::clone(&slab))
+            .map_err(|err| EnumerateError::permanent(format!("invalid staged item_ref: {err}")))?;
+        debug_assert_eq!(
+            item_key.as_bytes().as_ptr(),
+            item_ref.as_bytes().as_ptr(),
+            "filesystem key/ref wrappers must share staged backing bytes"
+        );
+        wrappers.push((item_key, item_ref));
+    }
+    debug_assert_eq!(
+        wrappers.len(),
+        take,
+        "filesystem staged wrappers count must match selected entry count"
+    );
 
     let token = match token_slot {
         Some(slot) => Some(

@@ -1,8 +1,8 @@
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::TokenBytes;
 use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
+use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
@@ -30,6 +30,25 @@ fn collect_all(
         let page = connector
             .enumerate_page_range(start, end, &cursor, default_budgets())
             .unwrap();
+        if page.items().is_empty() {
+            break;
+        }
+        cursor = page.next_cursor().clone();
+        all.extend(page.into_parts().0);
+    }
+    all
+}
+
+/// Collect all items from a connector via the trait entrypoint.
+fn collect_all_via_shard(
+    connector: &mut InMemoryDeterministicConnector,
+    shard: &ShardSpec,
+    budgets: Budgets,
+) -> Vec<ScanItem> {
+    let mut all = Vec::new();
+    let mut cursor = Cursor::initial();
+    loop {
+        let page = connector.enumerate_page(shard, &cursor, budgets).unwrap();
         if page.items().is_empty() {
             break;
         }
@@ -683,6 +702,187 @@ fn choose_split_point_via_shard_spec() {
         .choose_split_point(&shard, &Cursor::initial(), default_budgets())
         .unwrap();
     assert!(split.is_some(), "should produce a split point");
+}
+
+#[test]
+fn enumerate_page_via_shard_spec_unbounded_bounds() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let shard = ShardSpec::try_with_range(b"", b"").unwrap();
+
+    let all = collect_all_via_shard(&mut c, &shard, small_page_budgets(2));
+    let keys: Vec<&[u8]> = all.iter().map(|item| item.item_key().as_bytes()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"a".as_slice(),
+            b"b".as_slice(),
+            b"c".as_slice(),
+            b"d".as_slice()
+        ]
+    );
+}
+
+#[test]
+fn enumerate_page_via_shard_spec_one_sided_unbounded_resumes() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+        make_item(b"e", b"5"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let shard = ShardSpec::try_with_range(b"c", b"").unwrap();
+    let budgets = small_page_budgets(2);
+
+    let page1 = c
+        .enumerate_page(&shard, &Cursor::initial(), budgets)
+        .expect("first page");
+    assert_eq!(page1.items().len(), 2);
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"c");
+    assert_eq!(page1.items()[1].item_key().as_bytes(), b"d");
+
+    let page2 = c
+        .enumerate_page(&shard, page1.next_cursor(), budgets)
+        .expect("second page");
+    assert_eq!(page2.items().len(), 1);
+    assert_eq!(page2.items()[0].item_key().as_bytes(), b"e");
+
+    let page3 = c
+        .enumerate_page(&shard, page2.next_cursor(), budgets)
+        .expect("terminal page");
+    assert!(
+        page3.items().is_empty(),
+        "resume should terminate without dupes"
+    );
+}
+
+#[test]
+fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+        make_item(b"e", b"5"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    let unbounded = ShardSpec::try_with_range(b"", b"").unwrap();
+    let split_unbounded = c
+        .choose_split_point(&unbounded, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert!(
+        split_unbounded.is_some(),
+        "unbounded split should produce a hint"
+    );
+
+    let one_sided = ShardSpec::try_with_range(b"c", b"").unwrap();
+    let split_one_sided = c
+        .choose_split_point(&one_sided, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(
+        split_one_sided
+            .expect("one-sided range should split")
+            .as_bytes(),
+        b"d",
+    );
+}
+
+#[test]
+fn enumerate_page_trait_and_range_paths_match_across_pages() {
+    let items = vec![
+        make_item(b"a", b"1"),
+        make_item(b"b", b"2"),
+        make_item(b"c", b"3"),
+        make_item(b"d", b"4"),
+        make_item(b"e", b"5"),
+    ];
+    let mut via_trait = InMemoryDeterministicConnector::new(TAG, items.clone());
+    let mut via_range = InMemoryDeterministicConnector::new(TAG, items);
+    let shard = ShardSpec::try_with_range(b"b", b"z").unwrap();
+    let start = make_key(b"b");
+    let end = make_key(b"z");
+    let budgets = small_page_budgets(2);
+
+    let mut cursor_trait = Cursor::initial();
+    let mut cursor_range = Cursor::initial();
+    loop {
+        let trait_page = via_trait
+            .enumerate_page(&shard, &cursor_trait, budgets)
+            .expect("trait enumerate_page");
+        let range_page = via_range
+            .enumerate_page_range(&start, &end, &cursor_range, budgets)
+            .expect("range enumerate_page");
+
+        assert_eq!(trait_page.items().len(), range_page.items().len());
+        for (left, right) in trait_page.items().iter().zip(range_page.items()) {
+            assert_eq!(left.item_key(), right.item_key());
+            assert_eq!(left.item_ref(), right.item_ref());
+            assert_eq!(left.stable_item_id(), right.stable_item_id());
+            assert_eq!(left.version(), right.version());
+        }
+        assert_eq!(
+            trait_page.next_cursor().last_key(),
+            range_page.next_cursor().last_key()
+        );
+        assert_eq!(
+            trait_page.next_cursor().token().map(TokenBytes::as_bytes),
+            range_page.next_cursor().token().map(TokenBytes::as_bytes)
+        );
+
+        if trait_page.items().is_empty() {
+            break;
+        }
+        cursor_trait = trait_page.next_cursor().clone();
+        cursor_range = range_page.next_cursor().clone();
+    }
+}
+
+#[test]
+fn trait_methods_reject_oversized_non_empty_bounds() {
+    let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    let oversized_start = ShardSpec::from_raw_parts(
+        vec![b'x'; MAX_ITEM_KEY_SIZE + 1].into_boxed_slice(),
+        Box::<[u8]>::default(),
+        Box::<[u8]>::default(),
+    );
+    let err = c
+        .enumerate_page(&oversized_start, &Cursor::initial(), default_budgets())
+        .expect_err("oversized non-empty start bound should fail");
+    assert!(
+        !err.is_retryable(),
+        "oversized non-empty start bound should be permanent"
+    );
+    assert!(
+        err.message().contains("invalid shard start bound"),
+        "error should identify malformed start bound"
+    );
+
+    let oversized_end = ShardSpec::from_raw_parts(
+        Box::<[u8]>::default(),
+        vec![b'y'; MAX_ITEM_KEY_SIZE + 1].into_boxed_slice(),
+        Box::<[u8]>::default(),
+    );
+    let err = c
+        .choose_split_point(&oversized_end, &Cursor::initial(), default_budgets())
+        .expect_err("oversized non-empty end bound should fail");
+    assert!(
+        !err.is_retryable(),
+        "oversized non-empty end bound should be permanent"
+    );
+    assert!(
+        err.message().contains("invalid shard end bound"),
+        "error should identify malformed end bound"
+    );
 }
 
 // ---------------------------------------------------------------

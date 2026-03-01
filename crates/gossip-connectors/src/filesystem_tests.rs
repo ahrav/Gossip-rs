@@ -3,6 +3,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
 use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
+use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
@@ -36,6 +37,25 @@ fn collect_all(
         let page = connector
             .enumerate_page_range(start, end, &cursor, default_budgets())
             .unwrap();
+        if page.items().is_empty() {
+            break;
+        }
+        cursor = page.next_cursor().clone();
+        all.extend(page.into_parts().0);
+    }
+    all
+}
+
+/// Collect all items from a connector via the trait entrypoint.
+fn collect_all_via_shard(
+    connector: &mut FilesystemConnector,
+    shard: &ShardSpec,
+    budgets: Budgets,
+) -> Vec<ScanItem> {
+    let mut all = Vec::new();
+    let mut cursor = Cursor::initial();
+    loop {
+        let page = connector.enumerate_page(shard, &cursor, budgets).unwrap();
         if page.items().is_empty() {
             break;
         }
@@ -200,6 +220,16 @@ fn enumerate_page_uses_pooled_toxic_wrappers() {
         assert!(
             item.item_ref().is_pooled(),
             "item_ref should be slab-backed"
+        );
+        assert_eq!(
+            item.item_key().as_bytes(),
+            item.item_ref().as_bytes(),
+            "filesystem key/ref bytes should be identical"
+        );
+        assert_eq!(
+            item.item_key().as_bytes().as_ptr(),
+            item.item_ref().as_bytes().as_ptr(),
+            "filesystem key/ref should share backing storage"
         );
     }
 
@@ -1025,6 +1055,187 @@ fn choose_split_point_via_shard_spec() {
         .choose_split_point(&shard, &Cursor::initial(), default_budgets())
         .unwrap();
     assert!(split.is_some(), "should produce a split point");
+}
+
+#[test]
+fn enumerate_page_via_shard_spec_unbounded_bounds() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let shard = ShardSpec::try_with_range(b"", b"").unwrap();
+
+    let all = collect_all_via_shard(&mut c, &shard, small_page_budgets(2));
+    let keys: Vec<&[u8]> = all.iter().map(|item| item.item_key().as_bytes()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"a.txt".as_slice(),
+            b"b.txt".as_slice(),
+            b"c.txt".as_slice(),
+            b"d.txt".as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn enumerate_page_via_shard_spec_one_sided_unbounded_resumes() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+        ("e.txt", b"5"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let shard = ShardSpec::try_with_range(b"c.txt", b"").unwrap();
+    let budgets = small_page_budgets(2);
+
+    let page1 = c
+        .enumerate_page(&shard, &Cursor::initial(), budgets)
+        .expect("first page");
+    assert_eq!(page1.items().len(), 2);
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"c.txt");
+    assert_eq!(page1.items()[1].item_key().as_bytes(), b"d.txt");
+
+    let page2 = c
+        .enumerate_page(&shard, page1.next_cursor(), budgets)
+        .expect("second page");
+    assert_eq!(page2.items().len(), 1);
+    assert_eq!(page2.items()[0].item_key().as_bytes(), b"e.txt");
+
+    let page3 = c
+        .enumerate_page(&shard, page2.next_cursor(), budgets)
+        .expect("terminal page");
+    assert!(
+        page3.items().is_empty(),
+        "resume should terminate without dupes"
+    );
+}
+
+#[test]
+fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+        ("e.txt", b"5"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let unbounded = ShardSpec::try_with_range(b"", b"").unwrap();
+    let split_unbounded = c
+        .choose_split_point(&unbounded, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert!(
+        split_unbounded.is_some(),
+        "unbounded split should produce a hint"
+    );
+
+    let one_sided = ShardSpec::try_with_range(b"c.txt", b"").unwrap();
+    let split_one_sided = c
+        .choose_split_point(&one_sided, &Cursor::initial(), default_budgets())
+        .unwrap();
+    assert_eq!(
+        split_one_sided
+            .expect("one-sided range should split")
+            .as_bytes(),
+        b"d.txt",
+    );
+}
+
+#[test]
+fn enumerate_page_trait_and_range_paths_match_across_pages() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+        ("e.txt", b"5"),
+    ]);
+    let mut via_trait = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut via_range = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let shard = ShardSpec::try_with_range(b"b.txt", b"z.txt").unwrap();
+    let start = make_key(b"b.txt");
+    let end = make_key(b"z.txt");
+    let budgets = small_page_budgets(2);
+
+    let mut cursor_trait = Cursor::initial();
+    let mut cursor_range = Cursor::initial();
+    loop {
+        let trait_page = via_trait
+            .enumerate_page(&shard, &cursor_trait, budgets)
+            .expect("trait enumerate_page");
+        let range_page = via_range
+            .enumerate_page_range(&start, &end, &cursor_range, budgets)
+            .expect("range enumerate_page");
+
+        assert_eq!(trait_page.items().len(), range_page.items().len());
+        for (left, right) in trait_page.items().iter().zip(range_page.items()) {
+            assert_eq!(left.item_key(), right.item_key());
+            assert_eq!(left.item_ref(), right.item_ref());
+            assert_eq!(left.stable_item_id(), right.stable_item_id());
+            assert_eq!(left.version(), right.version());
+        }
+        assert_eq!(
+            trait_page.next_cursor().last_key(),
+            range_page.next_cursor().last_key()
+        );
+        assert_eq!(
+            trait_page.next_cursor().token().map(TokenBytes::as_bytes),
+            range_page.next_cursor().token().map(TokenBytes::as_bytes)
+        );
+
+        if trait_page.items().is_empty() {
+            break;
+        }
+        cursor_trait = trait_page.next_cursor().clone();
+        cursor_range = range_page.next_cursor().clone();
+    }
+}
+
+#[test]
+fn trait_methods_reject_oversized_non_empty_bounds() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let oversized_start = ShardSpec::from_raw_parts(
+        vec![b'x'; MAX_ITEM_KEY_SIZE + 1].into_boxed_slice(),
+        Box::<[u8]>::default(),
+        Box::<[u8]>::default(),
+    );
+    let err = c
+        .enumerate_page(&oversized_start, &Cursor::initial(), default_budgets())
+        .expect_err("oversized non-empty start bound should fail");
+    assert!(
+        !err.is_retryable(),
+        "oversized non-empty start bound should be permanent"
+    );
+    assert!(
+        err.message().contains("invalid shard start bound"),
+        "error should identify malformed start bound"
+    );
+
+    let oversized_end = ShardSpec::from_raw_parts(
+        Box::<[u8]>::default(),
+        vec![b'y'; MAX_ITEM_KEY_SIZE + 1].into_boxed_slice(),
+        Box::<[u8]>::default(),
+    );
+    let err = c
+        .choose_split_point(&oversized_end, &Cursor::initial(), default_budgets())
+        .expect_err("oversized non-empty end bound should fail");
+    assert!(
+        !err.is_retryable(),
+        "oversized non-empty end bound should be permanent"
+    );
+    assert!(
+        err.message().contains("invalid shard end bound"),
+        "error should identify malformed end bound"
+    );
 }
 
 // ---------------------------------------------------------------

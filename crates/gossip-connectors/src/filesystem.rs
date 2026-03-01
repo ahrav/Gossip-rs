@@ -161,7 +161,7 @@ use gossip_contracts::{
 };
 
 use crate::common::{
-    self, derive_stable_item_id, lower_bound, parse_u64_be, shard_bound, upper_bound,
+    self, borrowed_shard_bound, derive_stable_item_id, lower_bound, parse_u64_be, upper_bound,
 };
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
@@ -417,7 +417,12 @@ impl FilesystemConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        self.enumerate_page_bounds(Some(start), Some(end), cursor, budgets)
+        self.enumerate_page_bounds(
+            Some(start.as_bytes()),
+            Some(end.as_bytes()),
+            cursor,
+            budgets,
+        )
     }
 
     /// Core page enumeration used by both shard-based and explicit-range APIs.
@@ -434,8 +439,8 @@ impl FilesystemConnector {
     ///   from validated in-memory index fields.
     fn enumerate_page_bounds(
         &mut self,
-        start: Option<&ItemKey>,
-        end: Option<&ItemKey>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
@@ -451,10 +456,8 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound.as_bytes()));
-        let range_end = end.map_or(self.files.len(), |bound| {
-            lower_bound(&self.files, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound));
+        let range_end = end.map_or(self.files.len(), |bound| lower_bound(&self.files, bound));
 
         let mut start_idx = range_start;
         if let Some(last_key) = cursor.last_key() {
@@ -482,13 +485,18 @@ impl FilesystemConnector {
         let page_files = &self.files[start_idx..(start_idx + take)];
 
         // Filesystem item refs mirror key bytes exactly.
-        let staged = common::assemble_pooled_page(
-            page_files
-                .iter()
-                .map(|file| (file.key.as_bytes(), file.key.as_bytes())),
+        let staged = common::assemble_pooled_page_shared_key_ref(
+            page_files.iter().map(|file| file.key.as_bytes()),
             self.emit_tokens,
             start_idx,
         )?;
+        if staged.wrappers.len() != page_files.len() {
+            return Err(EnumerateError::permanent(format!(
+                "filesystem staged wrapper count mismatch: wrappers={}, files={}",
+                staged.wrappers.len(),
+                page_files.len()
+            )));
+        }
 
         let mut out = Vec::with_capacity(staged.wrappers.len());
         for ((item_key, item_ref), file) in staged.wrappers.into_iter().zip(page_files) {
@@ -522,13 +530,13 @@ impl FilesystemConnector {
         end: &ItemKey,
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        self.choose_split_point_bounds(Some(start), Some(end), cursor, None)
+        self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor, None)
     }
 
     fn choose_split_point_bounds(
         &mut self,
-        start: Option<&ItemKey>,
-        end: Option<&ItemKey>,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         cursor: &Cursor,
         deadline: Option<Instant>,
     ) -> Result<Option<ItemKey>, EnumerateError> {
@@ -546,10 +554,8 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound.as_bytes()));
-        let range_end = end.map_or(self.files.len(), |bound| {
-            lower_bound(&self.files, bound.as_bytes())
-        });
+        let range_start = start.map_or(0, |bound| lower_bound(&self.files, bound));
+        let range_end = end.map_or(self.files.len(), |bound| lower_bound(&self.files, bound));
         let resume_start = cursor.last_key().map_or(range_start, |last| {
             upper_bound(&self.files, last.as_bytes())
         });
@@ -565,7 +571,7 @@ impl FilesystemConnector {
         if cursor.last_key().is_some_and(|last| candidate <= last) {
             return Ok(None);
         }
-        if end.is_some_and(|upper| candidate >= upper) {
+        if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
             return Ok(None);
         }
 
@@ -746,9 +752,9 @@ impl EnumerationConnector for FilesystemConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        let start = shard_bound(shard.key_range_start(), "start")?;
-        let end = shard_bound(shard.key_range_end(), "end")?;
-        self.enumerate_page_bounds(start.as_ref(), end.as_ref(), cursor, budgets)
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
     /// The first call may trigger a full filesystem walk; subsequent calls
@@ -759,9 +765,9 @@ impl EnumerationConnector for FilesystemConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        let start = shard_bound(shard.key_range_start(), "start")?;
-        let end = shard_bound(shard.key_range_end(), "end")?;
-        self.choose_split_point_bounds(start.as_ref(), end.as_ref(), cursor, budgets.deadline())
+        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
+        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
+        self.choose_split_point_bounds(start, end, cursor, budgets.deadline())
     }
 }
 
