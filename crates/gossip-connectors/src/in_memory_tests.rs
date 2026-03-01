@@ -1,6 +1,7 @@
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
+use gossip_contracts::connector::TokenBytes;
 use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
 use rstest::rstest;
 
@@ -240,6 +241,47 @@ fn single_item_enumeration_and_resume() {
         .enumerate_page_range(&start, &end, page.next_cursor(), default_budgets())
         .unwrap();
     assert!(page2.items().is_empty());
+}
+
+#[test]
+fn enumerate_page_uses_pooled_toxic_wrappers() {
+    let items = vec![
+        make_item(b"alpha", b"payload-a"),
+        make_item(b"bravo", b"payload-b"),
+    ];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+    let start = make_key(b"a");
+    let end = make_key(b"z");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    // Items emitted from a page should carry slot-backed wrappers.
+    assert!(
+        !page.items().is_empty(),
+        "fixture should produce a non-empty page"
+    );
+    for item in page.items() {
+        assert!(
+            item.item_key().is_pooled(),
+            "item_key should be slab-backed"
+        );
+        assert!(
+            item.item_ref().is_pooled(),
+            "item_ref should be slab-backed"
+        );
+    }
+
+    let next = page.next_cursor();
+    // The continuation cursor should share the same pooled backing as page items.
+    assert!(
+        next.last_key().is_some_and(|last_key| last_key.is_pooled()),
+        "next cursor key should share pooled storage"
+    );
+    assert!(
+        next.token().is_some_and(|token| token.is_pooled()),
+        "token should be slab-backed when emitted"
+    );
 }
 
 #[test]

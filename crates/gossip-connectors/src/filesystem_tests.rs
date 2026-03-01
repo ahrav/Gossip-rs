@@ -178,6 +178,44 @@ fn single_file_enumeration_and_resume() {
 }
 
 #[test]
+fn enumerate_page_uses_pooled_toxic_wrappers() {
+    let dir = create_test_dir(&[("alpha.txt", b"a"), ("bravo.txt", b"b")]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .unwrap();
+    // Filesystem pages should emit pooled wrappers for key/ref fields.
+    assert!(
+        !page.items().is_empty(),
+        "fixture should produce a non-empty page"
+    );
+    for item in page.items() {
+        assert!(
+            item.item_key().is_pooled(),
+            "item_key should be slab-backed"
+        );
+        assert!(
+            item.item_ref().is_pooled(),
+            "item_ref should be slab-backed"
+        );
+    }
+
+    let next = page.next_cursor();
+    // Cursor key/token remain pooled so resume can reuse page-local slab bytes.
+    assert!(
+        next.last_key().is_some_and(|last_key| last_key.is_pooled()),
+        "next cursor key should share pooled storage"
+    );
+    assert!(
+        next.token().is_some_and(|token| token.is_pooled()),
+        "token should be slab-backed when emitted"
+    );
+}
+
+#[test]
 fn expired_budget_returns_retryable_error() {
     let dir = create_test_dir(&[("key.txt", b"payload")]);
     let mut c = FilesystemConnector::new(dir.path());
@@ -393,23 +431,6 @@ fn open_reads_full_content() {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).unwrap();
     assert_eq!(buf, b"hello world");
-}
-
-#[test]
-fn open_budget_exceeded_returns_error() {
-    let dir = create_test_dir(&[("large.txt", b"large payload here")]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
-        .unwrap();
-    let item_ref = page.items()[0].item_ref().clone();
-
-    let small_budget = Budgets::try_new(100, 5, None).unwrap();
-    let result = c.open(&item_ref, small_budget);
-    assert!(result.is_err());
 }
 
 // ---------------------------------------------------------------

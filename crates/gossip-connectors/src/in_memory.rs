@@ -21,6 +21,18 @@
 //!    (domain-separated BLAKE3 of content bytes), [`ItemRef`] = big-endian
 //!    index. All items carry [`VersionId::Strong`] since content is immutable.
 //!
+//! # Pooled toxic-byte page assembly
+//!
+//! Enumeration stages item keys, item refs, and optional token bytes into a
+//! page-local [`gossip_stdx::ByteSlab`], then materializes wrappers with
+//! [`ItemKey::try_from_slot`], [`ItemRef::try_from_slot`], and token
+//! construction from slots. This incurs one copy per staged field but keeps
+//! wrapper cloning allocation-free in the HOT page-emission loop.
+//!
+//! The page's cursor and items share the same slab owner
+//! ([`gossip_contracts::connector::PooledByteSlab`]), so returning either one
+//! by value keeps pooled bytes valid until the last clone is dropped.
+//!
 //! # Unique key requirement
 //!
 //! The constructor **panics** if duplicate keys are present after sorting.
@@ -65,8 +77,7 @@ use std::{io, sync::Arc, time::Instant};
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, TokenBytes,
-        VersionId,
+        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
@@ -140,7 +151,7 @@ impl common::SizedEntry for PreparedItem {
 ///
 /// The connector is cheaply [`Clone`]able: internal prepared-item storage is
 /// shared via [`Arc`], so cloning costs only an atomic reference count bump
-/// plus two `Copy` fields. Trait methods take `&mut self` because the trait
+/// plus one `Copy` field. Trait methods take `&mut self` because the trait
 /// signatures require it, but no internal mutation occurs after construction.
 ///
 /// # Determinism contract
@@ -372,14 +383,25 @@ impl InMemoryDeterministicConnector {
         }
 
         // Phase 5: extract up to max_items consecutive items from precomputed
-        // metadata. No BLAKE3 hashing or fallible index conversions here.
+        // metadata via the shared staging helper. Trade-off: one per-page copy
+        // up front for allocation-free wrapper cloning afterward.
         let take = budgets.max_items().min(range_end - start_idx);
-        let mut out = Vec::with_capacity(take);
-        for item in &self.items[start_idx..start_idx + take] {
+        let page_items = &self.items[start_idx..start_idx + take];
+
+        let staged = common::assemble_pooled_page(
+            page_items
+                .iter()
+                .map(|item| (item.key.as_bytes(), item.item_ref.as_bytes())),
+            self.emit_tokens,
+            start_idx,
+        )?;
+
+        let mut out = Vec::with_capacity(staged.wrappers.len());
+        for ((item_key, item_ref), item) in staged.wrappers.into_iter().zip(page_items) {
             out.push(
                 ScanItem::new(
-                    item.key.clone(),
-                    item.item_ref.clone(),
+                    item_key,
+                    item_ref,
                     item.stable_item_id,
                     VersionId::Strong(item.version_id),
                 )
@@ -388,22 +410,17 @@ impl InMemoryDeterministicConnector {
         }
 
         // Build continuation cursor from the last emitted key.
-        let last_key = out
-            .last()
-            .expect("non-empty page must have a last key")
-            .item_key()
-            .clone();
-        let mut next_cursor = Cursor::with_last_key(last_key.clone());
-
-        if self.emit_tokens {
-            let next_idx = start_idx
-                .checked_add(out.len())
-                .and_then(|sum| u64::try_from(sum).ok())
-                .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
-            let token = TokenBytes::try_from_slice(&next_idx.to_be_bytes())
-                .map_err(|err| EnumerateError::permanent(format!("invalid token: {err}")))?;
-            next_cursor = Cursor::with_token(last_key, token);
-        }
+        // Defensive match: if `out` is unexpectedly empty (e.g., all staged
+        // items failed validation), return an empty page instead of panicking.
+        let last_key = match out.last() {
+            Some(item) => item.item_key().clone(),
+            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
+        };
+        let next_cursor = if let Some(token) = staged.token {
+            Cursor::with_token(last_key, token)
+        } else {
+            Cursor::with_last_key(last_key)
+        };
 
         Ok(EnumerationPage::new(out, next_cursor))
     }

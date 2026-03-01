@@ -27,6 +27,18 @@
 //!   [`VersionId`] is weak metadata-derived (`mtime`, `mtime_nsec`, `len`,
 //!   `inode`, `dev`) to avoid content hashing during index build.
 //!
+//! # Pooled toxic-byte page assembly
+//!
+//! Enumeration stages each page's key/ref/token bytes into a single page-local
+//! [`gossip_stdx::ByteSlab`], then constructs [`ItemKey`], [`ItemRef`], and
+//! optional token wrappers from slab slots. This front-loads one copy per field
+//! per page, but keeps wrapper cloning allocation-free in the HOT emit loop.
+//!
+//! Staging and wrapper reconstruction failures are reported as permanent
+//! `EnumerateError`s because page sizes are derived from already-validated
+//! contract values; failure indicates internal accounting/resource exhaustion,
+//! not external cursor drift.
+//!
 //! # Resume semantics
 //!
 //! Cursor progression is anchored on key ordering, not opaque tokens. The
@@ -115,8 +127,9 @@
 //! - Designed for single-threaded sequential page calls; the struct holds
 //!   mutable state (`index_state`, `files`) with no interior synchronization.
 //! - The file index is built once per connector instance. Directory mutations
-//!   after the first enumerate call are invisible; construct a new connector
-//!   to observe changes.
+//!   after the first indexing-triggering call (`enumerate_page`,
+//!   `choose_split_point`, `open`, or `read_range`) are invisible; construct a
+//!   new connector to observe changes.
 //! - Non-fatal walk issues (unreadable entries, symlinks, encoding failures)
 //!   are recorded in [`WalkWarning`]s (up to a configurable cap) rather than
 //!   aborting the entire index. Only root-directory failures are hard errors.
@@ -141,8 +154,7 @@ use std::{
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, TokenBytes,
-        VersionId,
+        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
@@ -408,6 +420,18 @@ impl FilesystemConnector {
         self.enumerate_page_bounds(Some(start), Some(end), cursor, budgets)
     }
 
+    /// Core page enumeration used by both shard-based and explicit-range APIs.
+    ///
+    /// The method resolves bounds via binary search, applies key-authoritative
+    /// resume semantics, then stages key/ref/token bytes in a page-local slab
+    /// for pooled toxic-byte wrappers.
+    ///
+    /// # Failure modes
+    ///
+    /// - Deadline expiry is retryable.
+    /// - Invalid shard ranges (`start > end`) are permanent.
+    /// - Slab sizing/staging failures are permanent because staged lengths come
+    ///   from validated in-memory index fields.
     fn enumerate_page_bounds(
         &mut self,
         start: Option<&ItemKey>,
@@ -455,35 +479,31 @@ impl FilesystemConnector {
         }
 
         let take = budgets.max_items().min(range_end - start_idx);
-        let mut out = Vec::with_capacity(take);
-        for file in &self.files[start_idx..(start_idx + take)] {
-            let item_ref = ItemRef::try_from_slice(file.key.as_bytes())
-                .map_err(|err| EnumerateError::permanent(format!("invalid item_ref: {err}")))?;
+        let page_files = &self.files[start_idx..(start_idx + take)];
+
+        // Filesystem item refs mirror key bytes exactly.
+        let staged = common::assemble_pooled_page(
+            page_files
+                .iter()
+                .map(|file| (file.key.as_bytes(), file.key.as_bytes())),
+            self.emit_tokens,
+            start_idx,
+        )?;
+
+        let mut out = Vec::with_capacity(staged.wrappers.len());
+        for ((item_key, item_ref), file) in staged.wrappers.into_iter().zip(page_files) {
             out.push(
-                ScanItem::new(
-                    file.key.clone(),
-                    item_ref,
-                    file.stable_item_id,
-                    file.version,
-                )
-                .with_size_hint(file.size),
+                ScanItem::new(item_key, item_ref, file.stable_item_id, file.version)
+                    .with_size_hint(file.size),
             );
         }
 
-        // Defensive: handle empty `out` even though `take >= 1` is guaranteed
-        // by `Budgets::max_items()` returning `NonZeroUsize` and the
-        // `start_idx < range_end` guard above.
-        let last_key = match out.last() {
-            Some(item) => item.item_key().clone(),
-            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
-        };
-        let next_cursor = if self.emit_tokens {
-            let next_idx = start_idx
-                .checked_add(out.len())
-                .and_then(|sum| u64::try_from(sum).ok())
-                .ok_or_else(|| EnumerateError::permanent("next index exceeds capacity"))?;
-            let token = TokenBytes::try_from_slice(&next_idx.to_be_bytes())
-                .map_err(|err| EnumerateError::permanent(format!("invalid token: {err}")))?;
+        let last_key = out
+            .last()
+            .expect("non-empty page must have a last key")
+            .item_key()
+            .clone();
+        let next_cursor = if let Some(token) = staged.token {
             Cursor::with_token(last_key, token)
         } else {
             Cursor::with_last_key(last_key)
@@ -750,20 +770,16 @@ impl EnumerationConnector for FilesystemConnector {
 // ---------------------------------------------------------------------------
 
 impl ReadConnector for FilesystemConnector {
+    /// Budget enforcement is left to the runtime layer (which wraps the
+    /// returned reader in a bounded adapter), consistent with the advisory
+    /// budget contract in [`ReadConnector`].
     fn open(
         &mut self,
         item_ref: &ItemRef,
-        budgets: Budgets,
+        _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
         self.verify_membership(item_ref)?;
-        let (file, metadata) = self.open_beneath_root(item_ref.as_bytes())?;
-        if metadata.len() > budgets.max_bytes() {
-            return Err(ReadError::permanent(format!(
-                "item size {} exceeds max_bytes budget {}",
-                metadata.len(),
-                budgets.max_bytes(),
-            )));
-        }
+        let (file, _metadata) = self.open_beneath_root(item_ref.as_bytes())?;
         clear_nonblock(&file)?;
         Ok(Box::new(file))
     }

@@ -9,6 +9,7 @@ description = "Source connectors: filesystem, git, SaaS integrations"
 
 [dependencies]
 gossip-contracts.workspace = true
+gossip-stdx.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

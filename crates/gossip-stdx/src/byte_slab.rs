@@ -112,7 +112,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Minimum allocation size in bytes. Prevents degenerate fragmentation
 /// from tiny allocations.
-const MIN_BLOCK: u32 = 16;
+///
+/// Exported so that downstream crates (e.g. `gossip-connectors`) can
+/// pre-size slab capacities with identical size-class rounding without
+/// duplicating the constant.
+pub const MIN_BLOCK: u32 = 16;
 
 /// Hard cap for free-list metadata entries (2^21 = ~2M entries).
 ///
@@ -863,6 +867,14 @@ impl ByteSlab {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.live_count == 0
+    }
+
+    /// Zero all bytes in the used region `[0..bump)`.
+    ///
+    /// Called before `clear()` by page-scoped slab owners to prevent
+    /// sensitive byte residue in freed heap memory.
+    pub fn zeroize_used(&mut self) {
+        self.buf[..self.bump as usize].fill(0);
     }
 
     /// Resets the slab to its initial state without releasing the backing

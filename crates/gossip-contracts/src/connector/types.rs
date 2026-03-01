@@ -27,8 +27,11 @@
 //! ## Core contract
 //!
 //! - Constructors enforce non-empty bytes and hard upper bounds.
-//! - Wrappers own bytes (`Box<[u8]>`) so validated values can cross boundaries
-//!   without borrowing caller memory.
+//! - Wrappers support both owned (`Box<[u8]>`) and pooled (`ByteSlot` +
+//!   `Arc<PooledByteSlab>`) storage so COLD/WARM paths stay simple while HOT
+//!   enumeration paths avoid per-item heap allocation.
+//!   Pooled values are page-scoped: key/ref/token wrappers cloned out of a page
+//!   keep that page slab alive until the last clone is dropped.
 //! - Formatting is always redacted (`len + short hash prefix`), so logs can be
 //!   correlated without leaking payload contents. The hash is a truncated
 //!   BLAKE3 digest prefix -- fast and deterministic, but intentionally short for
@@ -43,8 +46,11 @@
 use std::{
     fmt,
     num::{NonZeroU64, NonZeroUsize},
+    sync::Arc,
     time::Instant,
 };
+
+use gossip_stdx::{ByteSlab, ByteSlot};
 
 use crate::coordination::CursorUpdate;
 use crate::identity::{ObjectVersionId, StableItemId};
@@ -195,37 +201,191 @@ fn validate_toxic_bytes(
     Ok(())
 }
 
+/// Backing storage for toxic-byte wrappers.
+///
+/// `Owned` is the baseline COLD/WARM representation; `Pooled` is used by
+/// HOT-path page emission, where wrappers borrow bytes from a page-local slab.
+#[derive(Clone)]
+enum ToxicBytesStorage {
+    Owned(Box<[u8]>),
+    Pooled(PooledToxicBytes),
+}
+
+impl ToxicBytesStorage {
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Pooled(pooled) => pooled.as_bytes(),
+        }
+    }
+
+    #[inline]
+    fn is_pooled(&self) -> bool {
+        matches!(self, Self::Pooled(_))
+    }
+}
+
+/// Shared page-local slab owner for pooled toxic-byte wrappers.
+///
+/// Connectors use the two-phase API:
+/// 1. **Mutable phase:** call [`allocate`](Self::allocate) to stage byte fields.
+/// 2. **Shared phase:** wrap in `Arc` for shared read-only access
+///    via pooled toxic-byte wrappers.
+///
+/// The custom [`Drop`] implementation ensures safe cleanup: [`zeroize_used`]
+/// overwrites sensitive toxic-byte residue in the backing buffer, then
+/// [`clear`] resets the slab's live slot count to zero, satisfying
+/// `ByteSlab`'s debug leak assertion. This cleanup runs on all exit paths,
+/// including mid-loop staging failures that return early.
+///
+/// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
+/// [`clear`]: gossip_stdx::ByteSlab::clear
+pub struct PooledByteSlab {
+    slab: ByteSlab,
+}
+
+impl PooledByteSlab {
+    /// Wrap a page-local slab for staged allocation and later shared read access.
+    #[inline]
+    #[must_use]
+    pub fn new(slab: ByteSlab) -> Self {
+        Self { slab }
+    }
+
+    /// Stage bytes into the slab during page assembly.
+    ///
+    /// This is the mutable-phase API: connectors call `allocate` repeatedly
+    /// while building a page, then wrap the `PooledByteSlab` in an `Arc` for
+    /// shared read access.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SlabFull`] when the remaining slab capacity is insufficient
+    /// for the allocation. Callers should pre-size slabs to make staging
+    /// failures deterministic overflow signals rather than partial-progress
+    /// behavior.
+    ///
+    /// [`SlabFull`]: gossip_stdx::SlabFull
+    #[inline]
+    pub fn allocate(&mut self, bytes: &[u8]) -> Result<ByteSlot, gossip_stdx::SlabFull> {
+        self.slab.allocate(bytes)
+    }
+
+    #[inline]
+    fn get(&self, slot: ByteSlot) -> &[u8] {
+        self.slab.get(slot)
+    }
+}
+
+/// Debug format shows only metadata, never raw toxic-byte contents.
+///
+/// `live_count` is the number of active slots; `live_bytes` is the total
+/// size of all live allocations. These metrics help diagnose slab sizing
+/// and staging behavior without exposing sensitive payload data.
+impl fmt::Debug for PooledByteSlab {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PooledByteSlab")
+            .field("live_count", &self.slab.live_count())
+            .field("live_bytes", &self.slab.live_bytes())
+            .finish()
+    }
+}
+
+/// Clears sensitive toxic-byte data before the slab is dropped.
+///
+/// [`zeroize_used`] overwrites all bytes in the used region (`[0, bump)`)
+/// with zeros to prevent sensitive residue from lingering in heap memory
+/// after the page is freed. [`clear`] then resets the slab to initial state
+/// (bump, free-list, live counts, and owner id), satisfying `ByteSlab`'s
+/// debug assertion that no live slots remain at drop time and invalidating
+/// any stale slot handles. Both operations are required: zeroization
+/// protects data, clear maintains all slab invariants.
+///
+/// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
+/// [`clear`]: gossip_stdx::ByteSlab::clear
+impl Drop for PooledByteSlab {
+    fn drop(&mut self) {
+        // Safety reasoning: Arc guarantees this runs only when no
+        // PooledToxicBytes references remain, so no concurrent reads of slab
+        // slots are possible during zeroization or clear.
+        self.slab.zeroize_used();
+        self.slab.clear();
+    }
+}
+
+// PooledByteSlab is shared across threads via Arc in connector page emission.
+// ByteSlab's backing storage is a plain Vec<u8> with no interior mutability,
+// so Send + Sync hold automatically. This assertion guards against future
+// field additions that might break thread safety.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PooledByteSlab>();
+};
+
+/// Slab-backed toxic-byte storage handle.
+///
+/// `slot` indexes bytes inside `slab`; cloning this handle is allocation-free.
+/// Slot provenance is enforced by `ByteSlab`: a slot from another slab (or from
+/// before a `clear`) panics when resolved.
+#[derive(Clone)]
+struct PooledToxicBytes {
+    slot: ByteSlot,
+    slab: Arc<PooledByteSlab>,
+}
+
+impl PooledToxicBytes {
+    #[inline]
+    fn new(slot: ByteSlot, slab: Arc<PooledByteSlab>) -> Self {
+        Self { slot, slab }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        self.slab.get(self.slot)
+    }
+}
+
 /// Generates a toxic-byte wrapper struct with validated constructors and
 /// redacted formatting.
 ///
-/// Two public arms control whether `PartialOrd`/`Ord` are derived:
-/// - `ordered $name, max = $max` — includes ordering (for cursor keys).
-/// - `$name, max = $max` — unordered (for opaque handles and tokens).
+/// Two public arms control whether ordering traits are implemented:
+/// - `ordered $name, max = $max` — includes `PartialOrd` + `Ord` (cursor keys).
+/// - `$name, max = $max` — unordered (opaque handles and tokens).
 ///
 /// Both arms produce: struct, `try_from_vec`, `try_from_slice`, `as_bytes`,
-/// `len`, `into_bytes`, `AsRef<[u8]>`, and identical `Debug`/`Display`
-/// (redacted to `TypeName(len=N, hash=XXXXXXXX..)`).
+/// `len`, `AsRef<[u8]>`, `is_pooled`, and identical
+/// `Debug`/`Display` (redacted to `TypeName(len=N, hash=XXXXXXXX..)`).
 macro_rules! define_toxic_bytes {
-    // Ordered variant (includes PartialOrd, Ord).
     (
         $(#[$meta:meta])*
         ordered $name:ident, max = $max:expr
     ) => {
-        define_toxic_bytes!(@internal $(#[$meta])* [Clone, PartialEq, Eq, PartialOrd, Ord, Hash] $name, $max);
+        define_toxic_bytes!(@base $(#[$meta])* $name, $max);
+
+        impl ::core::cmp::PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<::core::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl ::core::cmp::Ord for $name {
+            fn cmp(&self, other: &Self) -> ::core::cmp::Ordering {
+                self.as_bytes().cmp(other.as_bytes())
+            }
+        }
     };
-    // Unordered variant.
     (
         $(#[$meta:meta])*
         $name:ident, max = $max:expr
     ) => {
-        define_toxic_bytes!(@internal $(#[$meta])* [Clone, PartialEq, Eq, Hash] $name, $max);
+        define_toxic_bytes!(@base $(#[$meta])* $name, $max);
     };
-    // Internal implementation arm — not intended for direct use.
-    (@internal $(#[$meta:meta])* [$($derive:ident),+] $name:ident, $max:expr) => {
+    (@base $(#[$meta:meta])* $name:ident, $max:expr) => {
         $(#[$meta])*
-        #[derive($($derive),+)]
+        #[derive(Clone)]
         #[allow(clippy::len_without_is_empty)]
-        pub struct $name(Box<[u8]>);
+        pub struct $name(ToxicBytesStorage);
 
         impl $name {
             /// Fallible constructor that takes ownership of caller-provided bytes.
@@ -239,7 +399,7 @@ macro_rules! define_toxic_bytes {
             /// [`ConnectorInputError::TooLarge`] if it exceeds the type's size limit.
             pub fn try_from_vec(bytes: Vec<u8>) -> Result<Self, ConnectorInputError> {
                 validate_toxic_bytes(stringify!($name), &bytes, $max)?;
-                Ok(Self(bytes.into_boxed_slice()))
+                Ok(Self(ToxicBytesStorage::Owned(bytes.into_boxed_slice())))
             }
 
             /// Fallible constructor from a borrowed slice.
@@ -254,14 +414,42 @@ macro_rules! define_toxic_bytes {
             /// [`ConnectorInputError::TooLarge`] if it exceeds the type's size limit.
             pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ConnectorInputError> {
                 validate_toxic_bytes(stringify!($name), bytes, $max)?;
-                Ok(Self(bytes.to_vec().into_boxed_slice()))
+                Ok(Self(ToxicBytesStorage::Owned(bytes.to_vec().into_boxed_slice())))
+            }
+
+            /// Fallible constructor from a slab slot.
+            ///
+            /// This is used by HOT enumeration paths that build page-local
+            /// slab-backed wrappers to avoid per-item heap allocation.
+            ///
+            /// # Errors
+            ///
+            /// Returns [`ConnectorInputError::Empty`] if the slot resolves to empty
+            /// bytes, or [`ConnectorInputError::TooLarge`] if it exceeds the type's
+            /// size limit.
+            ///
+            /// # Panics
+            ///
+            /// Panics if `slot` did not originate from `slab` (or became stale
+            /// after that slab was cleared). This indicates an internal page
+            /// assembly bug.
+            pub fn try_from_slot(
+                slot: ByteSlot,
+                slab: Arc<PooledByteSlab>,
+            ) -> Result<Self, ConnectorInputError> {
+                let pooled = PooledToxicBytes::new(slot, slab);
+                validate_toxic_bytes(stringify!($name), pooled.as_bytes(), $max)?;
+                Ok(Self(ToxicBytesStorage::Pooled(pooled)))
             }
 
             /// Returns the validated bytes.
+            ///
+            /// For pooled values, this borrows from the shared page slab with no
+            /// additional allocation.
             #[inline]
             #[must_use]
             pub fn as_bytes(&self) -> &[u8] {
-                &self.0
+                self.0.as_bytes()
             }
 
             /// Returns the byte length, which is always >= 1 because constructors
@@ -270,15 +458,20 @@ macro_rules! define_toxic_bytes {
             #[inline]
             #[must_use]
             pub fn len(&self) -> usize {
-                self.0.len()
+                self.as_bytes().len()
             }
 
-            /// Consumes the wrapper and returns the owned byte buffer.
+            /// Returns `true` if this wrapper is backed by a pooled slab slot.
+            ///
+            /// Primarily useful for tests/instrumentation that need to assert
+            /// HOT-path pooling behavior.
+            #[doc(hidden)]
             #[inline]
             #[must_use]
-            pub fn into_bytes(self) -> Box<[u8]> {
-                self.0
+            pub fn is_pooled(&self) -> bool {
+                self.0.is_pooled()
             }
+
         }
 
         impl AsRef<[u8]> for $name {
@@ -288,15 +481,29 @@ macro_rules! define_toxic_bytes {
             }
         }
 
+        impl ::core::cmp::PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.as_bytes() == other.as_bytes()
+            }
+        }
+
+        impl ::core::cmp::Eq for $name {}
+
+        impl ::core::hash::Hash for $name {
+            fn hash<H: ::core::hash::Hasher>(&self, state: &mut H) {
+                ::core::hash::Hash::hash(self.as_bytes(), state);
+            }
+        }
+
         impl ::core::fmt::Debug for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                fmt_toxic_bytes(f, stringify!($name), &self.0)
+                fmt_toxic_bytes(f, stringify!($name), self.as_bytes())
             }
         }
 
         impl ::core::fmt::Display for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                fmt_toxic_bytes(f, stringify!($name), &self.0)
+                fmt_toxic_bytes(f, stringify!($name), self.as_bytes())
             }
         }
     };
@@ -311,14 +518,14 @@ define_toxic_bytes! {
     ///
     /// ## Ordering
     ///
-    /// `Ord` is derived, giving bytewise lexicographic comparison. This matches the
-    /// cursor progression contract: advancing means moving to a strictly greater key.
+    /// `Ord` uses bytewise lexicographic comparison. This matches the cursor
+    /// progression contract: advancing means moving to a strictly greater key.
     ///
     /// ## Toxic-byte policy
     ///
     /// `Debug` and `Display` are redacted (length + hash prefix). Raw bytes can
     /// be borrowed through [`as_bytes`](Self::as_bytes) / [`AsRef<[u8]>`](AsRef),
-    /// or consumed via [`into_bytes`](Self::into_bytes).
+    /// or borrowed via [`AsRef<[u8]>`](AsRef).
     ordered ItemKey, max = MAX_ITEM_KEY_SIZE
 }
 
@@ -341,7 +548,7 @@ define_toxic_bytes! {
     ///
     /// `Debug` and `Display` are redacted (length + hash prefix). Raw bytes can
     /// be borrowed through [`as_bytes`](Self::as_bytes) / [`AsRef<[u8]>`](AsRef),
-    /// or consumed via [`into_bytes`](Self::into_bytes).
+    /// or borrowed via [`AsRef<[u8]>`](AsRef).
     ItemRef, max = MAX_ITEM_REF_SIZE
 }
 
@@ -364,7 +571,7 @@ define_toxic_bytes! {
     ///
     /// `Debug` and `Display` are redacted (length + hash prefix). Raw bytes can
     /// be borrowed through [`as_bytes`](Self::as_bytes) / [`AsRef<[u8]>`](AsRef),
-    /// or consumed via [`into_bytes`](Self::into_bytes).
+    /// or borrowed via [`AsRef<[u8]>`](AsRef).
     TokenBytes, max = MAX_TOKEN_SIZE
 }
 

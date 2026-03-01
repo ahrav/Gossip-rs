@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use gossip_stdx::ByteSlab;
 use rstest::rstest;
 
 use super::*;
@@ -173,6 +176,122 @@ fn constructors_reject_empty_values() {
             field: "TokenBytes"
         })
     );
+}
+
+#[test]
+fn pooled_constructor_roundtrips_without_heap_owned_storage() {
+    // One page-local slab supplies key/ref/token bytes for all wrappers.
+    let mut slab = ByteSlab::with_capacity(128);
+    let key_slot = slab.allocate(b"item-key").expect("allocate key");
+    let ref_slot = slab.allocate(b"item-ref").expect("allocate ref");
+    let token_slot = slab.allocate(b"token").expect("allocate token");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    let key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).expect("pooled key");
+    let iref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).expect("pooled item_ref");
+    let token = TokenBytes::try_from_slot(token_slot, Arc::clone(&shared)).expect("pooled token");
+
+    assert!(key.is_pooled());
+    assert!(iref.is_pooled());
+    assert!(token.is_pooled());
+    assert_eq!(key.as_bytes(), b"item-key");
+    assert_eq!(iref.as_bytes(), b"item-ref");
+    assert_eq!(token.as_bytes(), b"token");
+    assert!(
+        key.clone().is_pooled(),
+        "cloning pooled key should stay pooled"
+    );
+}
+
+#[test]
+fn pooled_wrapper_survives_slab_owner_drop() {
+    // Verify that cloning a pooled wrapper keeps the slab alive even after
+    // the original Arc reference is dropped. This exercises the Arc<PooledByteSlab>
+    // lifetime semantics that the HOT page-emission path relies on.
+    let mut slab = ByteSlab::with_capacity(128);
+    let key_slot = slab.allocate(b"survivor-key").expect("allocate key");
+    let ref_slot = slab.allocate(b"survivor-ref").expect("allocate ref");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    let key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).expect("pooled key");
+    let iref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).expect("pooled ref");
+
+    // Clone before dropping the original shared reference.
+    let key_clone = key.clone();
+    let iref_clone = iref.clone();
+    drop(key);
+    drop(iref);
+    drop(shared);
+
+    // Clones must still resolve correctly from the slab.
+    assert!(key_clone.is_pooled());
+    assert!(iref_clone.is_pooled());
+    assert_eq!(key_clone.as_bytes(), b"survivor-key");
+    assert_eq!(iref_clone.as_bytes(), b"survivor-ref");
+}
+
+#[test]
+fn pooled_constructor_rejects_empty_and_oversized_slots() {
+    // Slot-backed constructors must enforce the same non-empty/size bounds as
+    // vec/slice constructors.
+    let oversized_len = MAX_ITEM_KEY_SIZE + 1;
+    let mut slab = ByteSlab::with_capacity(oversized_len.next_power_of_two());
+    let oversized_bytes = vec![0xAB; oversized_len];
+    let oversized_slot = slab.allocate(&oversized_bytes).expect("allocate oversized");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    assert_eq!(
+        ItemKey::try_from_slot(gossip_stdx::ByteSlot::EMPTY, Arc::clone(&shared)),
+        Err(ConnectorInputError::Empty { field: "ItemKey" })
+    );
+    assert_eq!(
+        ItemKey::try_from_slot(oversized_slot, Arc::clone(&shared)),
+        Err(ConnectorInputError::TooLarge {
+            field: "ItemKey",
+            size: oversized_len,
+            max: MAX_ITEM_KEY_SIZE,
+        })
+    );
+}
+
+#[test]
+fn owned_and_pooled_satisfy_trait_consistency() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut slab = ByteSlab::with_capacity(128);
+    let key_slot = slab.allocate(b"shared-key").expect("allocate key");
+    let ref_slot = slab.allocate(b"shared-ref").expect("allocate ref");
+    let token_slot = slab.allocate(b"shared-token").expect("allocate token");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    let owned_key = ItemKey::try_from_slice(b"shared-key").unwrap();
+    let pooled_key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).unwrap();
+
+    let owned_ref = ItemRef::try_from_slice(b"shared-ref").unwrap();
+    let pooled_ref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).unwrap();
+
+    let owned_token = TokenBytes::try_from_slice(b"shared-token").unwrap();
+    let pooled_token = TokenBytes::try_from_slot(token_slot, Arc::clone(&shared)).unwrap();
+
+    // PartialEq: Owned == Pooled for identical bytes.
+    assert_eq!(owned_key, pooled_key);
+    assert_eq!(owned_ref, pooled_ref);
+    assert_eq!(owned_token, pooled_token);
+
+    // Hash: both variants produce the same hash.
+    fn hash_of(val: &impl Hash) -> u64 {
+        let mut h = DefaultHasher::new();
+        val.hash(&mut h);
+        h.finish()
+    }
+    assert_eq!(hash_of(&owned_key), hash_of(&pooled_key));
+    assert_eq!(hash_of(&owned_ref), hash_of(&pooled_ref));
+    assert_eq!(hash_of(&owned_token), hash_of(&pooled_token));
+
+    // Ord (ItemKey only — ItemRef/TokenBytes are unordered).
+    assert_eq!(owned_key.cmp(&pooled_key), std::cmp::Ordering::Equal);
+    assert_eq!(pooled_key.cmp(&owned_key), std::cmp::Ordering::Equal);
 }
 
 #[test]
