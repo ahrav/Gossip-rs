@@ -23,7 +23,7 @@ Run from the project root:
 
 ```bash
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-ARCHIVE="scanner-rs-full-${TIMESTAMP}.tar.gz"
+ARCHIVE="gossip-rs-full-${TIMESTAMP}.tar.gz"
 git ls-files -z \
   | grep -zZv -e '\.pack$' -e '\.bin$' -e '\.so$' -e '\.dylib$' -e '\.a$' -e 'perf\.data' \
   | tar czf "${ARCHIVE}" --null -T -

@@ -275,17 +275,18 @@ fuzz_target!(|data: &[u8]| {
 
 Before recommending consolidation, verify:
 
-- [ ] **Feature gates**: proptest requires `stdx-proptest`. If all tests move
-  behind a feature gate, keep at least one ungated unit test as baseline.
+- [ ] **Feature gates**: proptest is a direct dev-dependency (no feature gate for
+  tests). Some crates gate `Arbitrary` impls behind `test-support`. If moving
+  tests behind a feature gate, keep at least one ungated unit test as baseline.
 - [ ] **Regression tests**: Tests with bug references (`// Regression: GH-123`)
   should stay as individual tests even if technically consolidatable.
 - [ ] **Error path tests**: Tests verifying specific error messages or error
   variants may need individual tests if the exact error matters.
 - [ ] **Readability anchors**: Keep one simple example test per public function
   as documentation, even if a property test covers it.
-- [ ] **rstest availability**: rstest is a project standard. If not yet in
-  `[dev-dependencies]`, add `rstest = "0.23"` to Cargo.toml. This is expected
-  and should not be treated as a blocker.
+- [ ] **rstest availability**: rstest is a project standard (workspace dep `rstest = "0.25"`).
+  If not yet in a crate's `[dev-dependencies]`, add `rstest.workspace = true`. This is
+  expected and should not be treated as a blocker.
 
 ### Step 6: Produce Consolidation Plan
 
@@ -302,20 +303,22 @@ For each cluster, specify:
 
 ### Test locations in this codebase
 - Inline tests: `#[cfg(test)] mod tests { ... }` at bottom of source file
-- Separate test files: `src/stdx/*_tests.rs`, `src/engine/tests.rs`
-- Property tests: often in the same file, gated with `#[cfg(all(test, feature = "stdx-proptest"))]`
-- Kani proofs: `#[cfg(kani)] mod kani_proofs { ... }` or in `*_tests.rs`
-- Simulation tests: `tests/simulation/` directory
+- Sibling test files: `crates/*/src/*_tests.rs` (e.g., `ring_buffer_tests.rs`, `error_tests.rs`)
+- Property tests: in `#[cfg(test)]` modules using proptest (direct dev-dep, no feature gate)
+- Kani proofs: `#[cfg(kani)]` blocks in gossip-stdx
+- Simulation tests: `crates/gossip-coordination/src/sim/` (CoordinationSim harness + proptest state machine)
+- Fuzz targets: `crates/gossip-contracts/fuzz/` and `crates/gossip-stdx/fuzz/`
+- Integration tests: `crates/*/tests/` (e.g., `identity_smoke.rs`)
 
 ### Feature gates
-- Property tests: `stdx-proptest` feature
-- Kani proofs: `kani` feature
-- Simulation harnesses: `sim-harness`, `scheduler-sim`
+- `test-support`: Enables `Arbitrary` impls in gossip-contracts and sim infrastructure in gossip-coordination
+- `kani`: Enables Kani model checking proofs in gossip-stdx
 
 ### Dependencies
-- **rstest**: Project standard. Add `rstest = "0.23"` to `[dev-dependencies]`
-  if not already present. No feature gate needed.
-- **proptest**: Already available behind `stdx-proptest` feature
+- **rstest**: Project standard (workspace dep `rstest = "0.25"`). Add `rstest.workspace = true`
+  to crate-level `[dev-dependencies]` if not already present. No feature gate needed.
+- **proptest**: Direct dev-dependency in most crates. `Arbitrary` impls for shared types
+  gated behind `test-support` in gossip-contracts.
 - **cargo-fuzz**: External tool, no Cargo.toml change needed
 
 ## Output Format
@@ -372,7 +375,7 @@ proptest! {
 
 ### Dependency Changes
 
-- [ ] Add `rstest = "0.23"` to `[dev-dependencies]` (if rstest recommended)
+- [ ] Add `rstest.workspace = true` to `[dev-dependencies]` (if rstest recommended)
 - [ ] No new dependencies needed (if only proptest/fuzz)
 
 ### Migration Order

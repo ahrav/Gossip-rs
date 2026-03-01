@@ -88,23 +88,23 @@ Use the Task tool with `subagent_type=Bash` to collect assembly:
 
 ```bash
 # List available functions in a module (find exact symbol names)
-cargo asm --lib -p scanner-rs 2>&1 | grep '<module_path>'
+cargo asm --lib -p <crate> 2>&1 | grep '<module_path>'
 
 # Collect ASM for a specific function (Intel syntax, interleaved with Rust source)
-cargo asm --lib -p scanner-rs --rust '<full::path::to::function>' > /tmp/asm-before.s
+cargo asm --lib -p <crate> --rust '<full::path::to::function>' > /tmp/asm-before.s
 
 # For multiple functions, collect each:
-cargo asm --lib -p scanner-rs '<function_1>' > /tmp/asm-before-fn1.s
-cargo asm --lib -p scanner-rs '<function_2>' > /tmp/asm-before-fn2.s
+cargo asm --lib -p <crate> '<function_1>' > /tmp/asm-before-fn1.s
+cargo asm --lib -p <crate> '<function_2>' > /tmp/asm-before-fn2.s
 
 # If cargo-show-asm can't find the function, list candidates:
-cargo asm --lib -p scanner-rs 2>&1 | grep -i '<partial_name>'
+cargo asm --lib -p <crate> 2>&1 | grep -i '<partial_name>'
 
 # For LLVM-IR view (useful for understanding optimization decisions):
-cargo asm --lib -p scanner-rs --llvm '<function>' > /tmp/llvm-before.ll
+cargo asm --lib -p <crate> --llvm '<function>' > /tmp/llvm-before.ll
 
 # For MIR view (useful for understanding Rust-level optimizations):
-cargo asm --lib -p scanner-rs --mir '<function>' > /tmp/mir-before.mir
+cargo asm --lib -p <crate> --mir '<function>' > /tmp/mir-before.mir
 ```
 
 **ISA auto-detection**: `cargo-show-asm` emits native ISA by default:
@@ -125,11 +125,11 @@ cargo bench --bench <relevant_bench> -- --save-baseline forge-before
 cargo bench --features bench --bench <relevant_bench> -- --save-baseline forge-before
 ```
 
-**Benchmark selection guide for this project:**
-- `src/engine/` functions → `hotspots`, `scan`, `scanner_throughput`
-- `src/engine/rule_repr.rs` → `hotspots`, `rule_isolation`, `rule_scaling`
-- `src/stdx/` data structures → the corresponding bench (e.g., `ring_buffer`, `fixed_set`)
-- Validation code → `validator`, `offline_validation`
+**Benchmark selection guide for this project (workspace crates):**
+- `gossip-contracts` types → `cargo bench -p gossip-contracts --bench identity`
+- `gossip-coordination` logic → `cargo bench -p gossip-coordination --bench coordination`
+- `gossip-stdx` data structures → corresponding bench (e.g., `--bench inline_vec`, `--bench ring_buffer`, `--bench byte_slab`)
+- `gossip-scan-pipeline` → `cargo bench -p gossip-scan-pipeline --bench scan_loop`
 
 ### Agent C: Static Hotspot Analysis
 
@@ -293,7 +293,7 @@ Make the source modification. Keep it minimal and isolated.
 ### Step 2: Collect New ASM
 
 ```bash
-cargo asm --lib -p scanner-rs --rust '<function>' > /tmp/asm-after.s
+cargo asm --lib -p <crate> --rust '<function>' > /tmp/asm-after.s
 ```
 
 ### Step 3: Diff ASM
@@ -387,19 +387,19 @@ After completing the forge loop, produce:
 
 ```bash
 # List all functions in a module (grep for your target)
-cargo asm --lib -p scanner-rs 2>&1 | grep 'rule_repr'
+cargo asm --lib -p <crate> 2>&1 | grep 'inline_vec'
 
 # Show ASM with interleaved Rust source (best for audit)
-cargo asm --lib -p scanner-rs --rust 'scanner_rs::engine::rule_repr::RuleCompiled::matches'
+cargo asm --lib -p <crate> --rust 'gossip_stdx::inline_vec::InlineVec<T,N>::push'
 
 # Show only ASM (cleaner for diffing)
-cargo asm --lib -p scanner-rs 'scanner_rs::engine::rule_repr::RuleCompiled::matches'
+cargo asm --lib -p <crate> 'gossip_stdx::inline_vec::InlineVec<T,N>::push'
 
 # Show LLVM-IR (understand optimizer decisions)
-cargo asm --lib -p scanner-rs --llvm 'function_name'
+cargo asm --lib -p <crate> --llvm 'function_name'
 
 # Show MIR (understand Rust-level optimizations, monomorphization)
-cargo asm --lib -p scanner-rs --mir 'function_name'
+cargo asm --lib -p <crate> --mir 'function_name'
 
 # When function name is ambiguous, cargo-show-asm shows candidates
 # Pick the right monomorphization by examining the type parameters

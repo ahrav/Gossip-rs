@@ -5,7 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Detection engine: rules, regex, vectorscan matching"
+description = "Runtime-agnostic scanner core for deterministic page and stream evaluation"
 
 [dependencies]
+ahash = "0.8"
 gossip-contracts.workspace = true
+gossip-stdx.workspace = true
+
+[dev-dependencies]
+gossip-contracts = { workspace = true, features = ["test-support"] }
+proptest = "1.10"
+rstest = "0.25"

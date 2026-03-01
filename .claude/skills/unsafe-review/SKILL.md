@@ -236,17 +236,7 @@ Check whether each unsafe block is exercised under Miri:
 
 ```bash
 # Current Miri command (from CI):
-cargo +nightly miri test --lib -- \
-  --skip engine:: \
-  --skip git_scan:: \
-  --skip scheduler::affinity \
-  --skip scheduler::device_slots \
-  --skip scheduler::rusage \
-  --skip scheduler::local_fs_uring \
-  --skip scheduler::engine_impl \
-  --skip scheduler::parallel_scan \
-  --skip rules::yaml \
-  --skip archive::
+cargo +nightly miri test --workspace
 ```
 
 **Miri flags used** (from CI):
@@ -306,12 +296,9 @@ Check whether each unsafe block is reachable from a fuzz target:
 ls fuzz/fuzz_targets/
 ```
 
-**Current fuzz targets** (13):
-- `fuzz_b64_gate_determinism.rs`, `fuzz_b64_gate_differential.rs`, `fuzz_b64_gate_build_and_scan.rs`
-- `fuzz_anchor_soundness.rs`, `fuzz_tiger_chunking.rs`
-- `fuzz_pack_parse_delta.rs`, `fuzz_pack_delta_into.rs`, `fuzz_pack_inflate_stream.rs`, `fuzz_pack_exec.rs`
-- `fuzz_atomic_bitset.rs`, `fuzz_vs_cache_load.rs`
-- `fuzz_pyc_extract.rs`, `fuzz_java_class_extract.rs`
+**Current fuzz targets** (5, across two crates):
+- `gossip-contracts`: `fuzz_derivation_chain.rs`, `fuzz_item_identity_key.rs`
+- `gossip-stdx`: `fuzz_byte_slab.rs`, `fuzz_inline_vec.rs`, `fuzz_ring_buffer.rs`
 
 For each unsafe block:
 1. Is it reachable from any existing fuzz target?
@@ -543,7 +530,7 @@ path = "fuzz_targets/fuzz_<component>.rs"
 ### Property Test Template
 
 ```rust
-#[cfg(all(test, feature = "stdx-proptest"))]
+#[cfg(test)]
 mod prop_tests {
     use super::*;
     use proptest::prelude::*;
@@ -610,17 +597,13 @@ cargo +nightly fuzz run fuzz_target_name -- -max_total_time=30
 ```bash
 # All Miri tests (matching CI)
 MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-preemption-rate=0.1 -Zmiri-disable-isolation" \
-  cargo +nightly miri test --lib -- \
-    --skip engine:: --skip git_scan:: --skip scheduler::affinity \
-    --skip scheduler::device_slots --skip scheduler::rusage \
-    --skip scheduler::local_fs_uring --skip scheduler::engine_impl \
-    --skip scheduler::parallel_scan --skip rules::yaml --skip archive::
+  cargo +nightly miri test --workspace
 
 # All Kani proofs
 cargo kani --features kani
 
-# All property tests
-cargo test --features stdx-proptest
+# All property tests (proptest is a direct dev-dependency, no feature gate)
+cargo test --workspace
 ```
 
 ## Checklist (copy into PR)

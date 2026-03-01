@@ -159,8 +159,9 @@ should follow them:
   sentinel so callers don't invent their own.
 - **Const generics for granularity**: Compile-time selection via `<const G: usize>`
   prevents runtime branching on a configuration value.
-- **Feature-gated test tooling**: `#[cfg(feature = "sim-harness")]` ensures test
-  infrastructure can't accidentally leak into production builds.
+- **Feature-gated test tooling**: `#[cfg(feature = "test-support")]` ensures test
+  infrastructure (e.g., `Arbitrary` impls, sim harness) can't accidentally leak
+  into production builds.
 - **`debug_assert!` for internal invariants**: Zero-cost in release, catches
   contract violations during development.
 

@@ -58,18 +58,17 @@ Provide a summary table:
 
 ## Available Benchmarks
 
-The project has these benchmark files in `benches/`:
-- `scan.rs` - Core scanning performance
-- `scanner_throughput.rs` - End-to-end throughput
-- `vectorscan_overhead.rs` - Vectorscan integration overhead
-- `rule_isolation.rs` - Per-rule cost isolation
-- `hotspots.rs` - Known hot path benchmarks (requires `bench` feature)
-- `validator.rs` - Validation step benchmarks (requires `bench` feature)
-- Data structure benchmarks: `ring_buffer`, `fixed_set`, `fixed_vec`, `timing_wheel`, etc.
+Benchmarks are distributed across crates in `crates/*/benches/`:
+- `gossip-contracts`: `identity.rs` — Identity type construction and derivation
+- `gossip-coordination`: `coordination.rs` — Shard coordination operations
+- `gossip-coordination`: `sim.rs` — Simulation harness benchmarks
+- `gossip-scan-pipeline`: `scan_loop.rs` — Core scan loop throughput
+- `gossip-stdx`: `byte_slab.rs` — Byte slab pool allocation
+- `gossip-stdx`: `inline_vec.rs` — InlineVec operations
+- `gossip-stdx`: `ring_buffer.rs` — RingBuffer throughput
 
 ## Tips
 
-- Use `--bench <name>` to run specific benchmarks for faster iteration
-- The `hotspots` and `validator` benches require: `cargo bench --features bench`
-- For memory bandwidth tests, use `memory_bandwidth.rs`
+- Use `-p <crate> --bench <name>` to run specific benchmarks: `cargo bench -p gossip-stdx --bench inline_vec`
+- Run all benchmarks: `cargo bench --workspace`
 - Compare multiple runs to account for variance

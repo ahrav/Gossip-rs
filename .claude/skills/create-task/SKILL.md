@@ -122,7 +122,7 @@ For each result, classify the relationship:
 Based on your research, classify:
 - **files_affected**: count of files that will be modified
 - **modules_crossed**: count of distinct modules (top-level src/ directories)
-- **touches_hot_path**: true/false — does this touch engine/, scheduler/, or hot loop code?
+- **touches_hot_path**: true/false — does this touch engine/, coordination/, stdx/, or hot loop code?
 - **has_unsafe**: true/false — does affected code contain unsafe blocks?
 
 ## Output Format
@@ -262,7 +262,7 @@ Include these based on scope assessment:
 |---------|-------------|---------|
 | **Design Notes** | modules_crossed >= 2 or multiple valid approaches | Trade-offs, alternatives considered, rationale for chosen approach |
 | **Risk Analysis** | priority <= 1 or has_unsafe | What could go wrong, mitigation strategies, rollback plan |
-| **Performance Considerations** | touches engine/, stdx/, scheduler/ | Hot path impact, allocation concerns, benchmark expectations |
+| **Performance Considerations** | touches engine/, stdx/, coordination/ | Hot path impact, allocation concerns, benchmark expectations |
 | **Testing Strategy** | files_affected > 1 | What tests to add/modify, test types (unit, property, integration), coverage goals |
 
 Place conditional sections between "Code References" and "Related Work".

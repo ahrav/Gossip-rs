@@ -419,7 +419,11 @@ dependencies = [
 name = "gossip-engine"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "gossip-contracts",
+ "gossip-stdx",
+ "proptest",
+ "rstest",
 ]
 
 [[package]]
@@ -463,6 +467,7 @@ dependencies = [
  "gossip-coordination",
  "gossip-engine",
  "gossip-scan-pipeline",
+ "gossip-stdx",
  "tracing",
  "tracing-subscriber",
 ]

@@ -42,14 +42,14 @@ exact text matching.
 
 ```
 mcp__claude-context__search_code(
-  path="/Users/ahrav/Projects/Gossip-rs",
+  path="/Users/ahrav/Projects/gossip-rs",
   query="<descriptive natural language query>",
   limit=10
 )
 ```
 
 **Parameters:**
-- `path` — **Must be absolute.** Use `/Users/ahrav/Projects/Gossip-rs`.
+- `path` — **Must be absolute.** Use `/Users/ahrav/Projects/gossip-rs`.
 - `query` — Natural language description of what you are looking for. Be specific.
 - `limit` — Number of results (default 10, max 50). Start with 10, increase if needed.
 - `extensionFilter` — Optional file extension filter, e.g. `[".rs"]` for Rust only.
@@ -82,7 +82,7 @@ If the index is stale or search returns no results for queries that should match
 
 ```
 mcp__claude-context__index_codebase(
-  path="/Users/ahrav/Projects/Gossip-rs",
+  path="/Users/ahrav/Projects/gossip-rs",
   force=true
 )
 ```
