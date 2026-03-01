@@ -45,13 +45,16 @@ impl WorkerClock {
 
     fn now(&mut self) -> LogicalTime {
         let now = LogicalTime::from_raw(self.next_now);
-        self.next_now = self.next_now.saturating_add(1);
+        self.next_now = self.next_now.checked_add(1).expect("now counter overflow");
         now
     }
 
     fn op_id(&mut self) -> OpId {
         let op_id = OpId::from_raw(self.next_op_id);
-        self.next_op_id = self.next_op_id.saturating_add(1);
+        self.next_op_id = self
+            .next_op_id
+            .checked_add(1)
+            .expect("op_id counter overflow");
         op_id
     }
 }
@@ -131,6 +134,11 @@ fn run_placeholder_worker() -> Result<(), Box<dyn std::error::Error>> {
                 // Feed the scan loop from the same monotonic sources used for
                 // run setup/claiming so checkpoint and terminal op ordering is
                 // easy to audit in logs.
+                //
+                // Field-level borrows (`&mut clock.next_op_id`, `&mut clock.next_now`)
+                // are used instead of `clock.now()` / `clock.op_id()` because the
+                // closures capture disjoint fields. `&mut clock` would conflict with
+                // the `&mut coordinator` borrow held by `session`.
                 let next_op_id = &mut clock.next_op_id;
                 let next_now = &mut clock.next_now;
                 let outcome = run_scan_loop(
@@ -140,12 +148,14 @@ fn run_placeholder_worker() -> Result<(), Box<dyn std::error::Error>> {
                     DEFAULT_MAX_TRANSIENT_RETRIES,
                     || {
                         let op_id = OpId::from_raw(*next_op_id);
-                        *next_op_id = (*next_op_id).saturating_add(1);
+                        *next_op_id = (*next_op_id)
+                            .checked_add(1)
+                            .expect("op_id counter overflow");
                         op_id
                     },
                     || {
                         let now = LogicalTime::from_raw(*next_now);
-                        *next_now = (*next_now).saturating_add(1);
+                        *next_now = (*next_now).checked_add(1).expect("now counter overflow");
                         now
                     },
                 );

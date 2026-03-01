@@ -922,3 +922,176 @@ fn session_capacity_zero_when_all_leased() {
     assert!(session.capacity().is_saturated());
     assert!(session.capacity().earliest_deadline.is_some());
 }
+
+// ============================================================================
+// from_acquire_result tests
+//
+// These tests verify that `WorkerSession::from_acquire_result` correctly
+// bridges a claim-path `AcquireResultView` into a fully functional session
+// with the same identity, snapshot, and operational behavior as `new`.
+// ============================================================================
+
+/// Round-trip: claim → `from_acquire_result` → verify tenant, worker, spec,
+/// cursor, and capacity match the original acquisition.
+#[test]
+fn from_acquire_result_round_trip_identity() {
+    use crate::facade::ShardClaiming;
+
+    let (mut coord, _keys) = setup_coordinator(2);
+    let mut scratch = AcquireScratch::new();
+    let acquired = coord
+        .claim_next_available(
+            now(2),
+            test_tenant(),
+            test_run(),
+            test_worker(1),
+            &mut scratch,
+        )
+        .unwrap();
+
+    // Capture expected values from the view before it is consumed.
+    let expected_tenant = acquired.lease.tenant();
+    let expected_worker = acquired.lease.owner();
+    let expected_shard_key = acquired.lease.shard_key();
+    let expected_spec_start = acquired.snapshot.spec().key_range_start().to_vec();
+    let expected_spec_end = acquired.snapshot.spec().key_range_end().to_vec();
+    let expected_cursor_last_key = acquired.snapshot.cursor().last_key().map(|k| k.to_vec());
+    let expected_capacity = acquired.capacity;
+
+    let session = WorkerSession::from_acquire_result(&mut coord, acquired);
+
+    assert_eq!(session.tenant(), expected_tenant);
+    assert_eq!(session.worker(), expected_worker);
+    assert_eq!(session.shard_key(), expected_shard_key);
+    assert_eq!(
+        session.spec().key_range_start(),
+        expected_spec_start.as_slice()
+    );
+    assert_eq!(session.spec().key_range_end(), expected_spec_end.as_slice());
+    assert_eq!(
+        session.cursor().last_key(),
+        expected_cursor_last_key.as_deref()
+    );
+    assert_eq!(
+        session.capacity().available_count,
+        expected_capacity.available_count
+    );
+}
+
+/// Session built via `from_acquire_result` supports checkpoint → complete
+/// just like one built via `new`.
+#[test]
+fn from_acquire_result_checkpoint_then_complete() {
+    use crate::facade::ShardClaiming;
+
+    let (mut coord, _keys) = setup_coordinator(1);
+    let mut scratch = AcquireScratch::new();
+    let acquired = coord
+        .claim_next_available(
+            now(2),
+            test_tenant(),
+            test_run(),
+            test_worker(1),
+            &mut scratch,
+        )
+        .unwrap();
+
+    let mut session = WorkerSession::from_acquire_result(&mut coord, acquired);
+
+    // Checkpoint within the shard's range.
+    let cursor = CursorUpdate::new(&[0x10]);
+    let cp = session.checkpoint(now(3), &cursor, OpId::from_raw(5000));
+    assert!(cp.is_ok());
+    assert!(cp.unwrap().is_executed());
+
+    // Complete with the same cursor.
+    let result = session.complete(now(4), &cursor, OpId::from_raw(5001));
+    assert!(result.is_ok());
+}
+
+/// Cursor with token bytes is preserved through the `from_acquire_result`
+/// round-trip (checkpoint with token → expire → re-acquire via claim →
+/// `from_acquire_result` → verify token present).
+#[test]
+fn from_acquire_result_preserves_cursor_token() {
+    use crate::facade::ShardClaiming;
+
+    let (mut coord, keys) = setup_coordinator(1);
+
+    // Session 1: checkpoint with a token, then drop (simulated crash).
+    {
+        let mut s1 =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+        let cursor = CursorUpdate::with_token(&[0x15], b"my-token");
+        let _ = s1
+            .checkpoint(now(3), &cursor, OpId::from_raw(6000))
+            .unwrap();
+        // Drop without terminal op — lease expires at deadline.
+    }
+
+    // Session 2: re-acquire via claim after lease expiry, build session
+    // from the claim result.
+    let mut scratch = AcquireScratch::new();
+    let acquired = coord
+        .claim_next_available(
+            now(50),
+            test_tenant(),
+            test_run(),
+            test_worker(2),
+            &mut scratch,
+        )
+        .unwrap();
+
+    let session = WorkerSession::from_acquire_result(&mut coord, acquired);
+    assert_eq!(session.cursor().last_key(), Some(&[0x15u8][..]));
+    assert_eq!(session.cursor().token(), Some(b"my-token".as_slice()));
+}
+
+/// Spawned lineage is preserved through `from_acquire_result` after a
+/// prior session split_residual + crash + re-acquire.
+#[test]
+fn from_acquire_result_preserves_spawned_lineage() {
+    use crate::facade::ShardClaiming;
+
+    let (mut coord, keys) = setup_coordinator(1);
+
+    // Session 1: split_residual to create a child, then drop.
+    {
+        let mut s1 =
+            WorkerSession::new(&mut coord, now(2), test_tenant(), keys[0], test_worker(1)).unwrap();
+
+        let parent_new_spec = gossip_contracts::coordination::shard_spec::ShardSpec::with_range(
+            vec![0x00],
+            vec![0x20],
+        );
+        let residual_spec = gossip_contracts::coordination::shard_spec::ShardSpec::with_range(
+            vec![0x20],
+            vec![0x40],
+        );
+        let plan =
+            SplitResidualPlan::try_new(parent_new_spec.as_ref(), residual_spec.as_ref()).unwrap();
+        let r = s1
+            .split_residual(now(3), plan, OpId::from_raw(7000))
+            .unwrap();
+        assert!(r.is_executed());
+        // Drop without terminal op.
+    }
+
+    // Session 2: re-acquire via claim, build from result.
+    let mut scratch = AcquireScratch::new();
+    let acquired = coord
+        .claim_next_available(
+            now(50),
+            test_tenant(),
+            test_run(),
+            test_worker(2),
+            &mut scratch,
+        )
+        .unwrap();
+
+    let session = WorkerSession::from_acquire_result(&mut coord, acquired);
+
+    // The narrowed spec and spawned lineage should be preserved.
+    assert_eq!(session.spec().key_range_end(), &[0x20]);
+    assert_eq!(session.initial_snapshot().spawned().len(), 1);
+}

@@ -308,7 +308,8 @@ impl<'b, B: CoordinationBackend> WorkerSession<'b, B> {
     ///
     /// Panics (in all builds) if:
     /// - the borrowed snapshot contains an invalid shard spec, or
-    /// - the copied cursor `last_key` is empty.
+    /// - a present cursor `last_key` is zero-length (i.e., `Some` with an
+    ///   empty byte slice).
     ///
     /// Additional debug-only assertions verify that the acquired shard is
     /// non-terminal.

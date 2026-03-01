@@ -174,6 +174,10 @@ impl RenewalPolicy {
         if self.renew_at_fraction.is_finite() {
             self.renew_at_fraction.clamp(0.0, 1.0)
         } else {
+            tracing::warn!(
+                value = ?self.renew_at_fraction,
+                "non-finite renew_at_fraction, falling back to default",
+            );
             debug_assert!(
                 false,
                 "RenewalPolicy::renew_at_fraction is non-finite ({:?}), \
@@ -379,7 +383,10 @@ impl fmt::Display for RedactedCursor<'_> {
 
 /// Compact redacted summary of first/last items in an enumerated page.
 ///
-/// Keeps per-page tracing useful without logging the full item list.
+/// Toxic fields ([`ItemKey`]) are rendered through their `Display` impl,
+/// which emits a stable hash digest rather than raw bytes. This keeps
+/// per-page tracing useful for debugging (key ordering, page boundaries)
+/// without leaking customer data into log sinks.
 struct RedactedPageSample<'a> {
     first: Option<&'a ScanItem>,
     last: Option<&'a ScanItem>,
@@ -392,6 +399,23 @@ impl<'a> RedactedPageSample<'a> {
             first: items.first(),
             last: items.last(),
         }
+    }
+}
+
+/// Redacted `EnumerateError` formatter for tracing fields.
+///
+/// Logs only the error class and optional retry hint. The raw connector
+/// message is omitted because it may contain sensitive content (file paths,
+/// identifiers) that the connector embeds without sanitization.
+struct RedactedEnumerateError<'a>(&'a EnumerateError);
+
+impl fmt::Display for RedactedEnumerateError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "EnumerateError(class={}", self.0.class())?;
+        if let Some(retry_ms) = self.0.retry_after_ms() {
+            write!(f, ", retry_after_ms={retry_ms}")?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -475,9 +499,9 @@ where
 ///
 /// ## Operation-ID contract
 ///
-/// `op_id_fn` must yield fresh IDs for each coordination mutation attempted by
-/// this invocation (`checkpoint`, `complete`, `park`). Reusing an `OpId` with a
-/// different payload surfaces as backend idempotency conflicts.
+/// `op_id_fn` must yield a unique ID on each call. The loop invokes it once
+/// per coordination mutation (`checkpoint`, `complete`, `park`). Reusing an
+/// `OpId` with a different payload surfaces as backend idempotency conflicts.
 ///
 /// ## Retry-budget semantics
 ///
@@ -621,7 +645,7 @@ where
                             page_num,
                             transient_failures,
                             max_transient_retries,
-                            error = %error,
+                            error = %RedactedEnumerateError(&error),
                             "retryable enumerate error, retrying",
                         );
                         continue;
@@ -632,7 +656,7 @@ where
                         page_num,
                         transient_failures,
                         retry_after_ms = ?hint,
-                        error = %error,
+                        error = %RedactedEnumerateError(&error),
                         "retry budget exhausted, parking shard",
                     );
                     return park_and_return(
@@ -651,7 +675,7 @@ where
                     tracing::error!(
                         page_num,
                         retry_after_ms = ?hint,
-                        error = %error,
+                        error = %RedactedEnumerateError(&error),
                         "connector auth error, parking shard",
                     );
                 } else {
@@ -659,7 +683,7 @@ where
                         page_num,
                         reason = %reason,
                         retry_after_ms = ?hint,
-                        error = %error,
+                        error = %RedactedEnumerateError(&error),
                         "connector error, parking shard",
                     );
                 }
@@ -740,7 +764,15 @@ where
                     );
                     ScanLoopOutcome::Completed
                 }
-                Err(error) => ScanLoopOutcome::Error(ScanLoopError::Complete(error)),
+                Err(error) => {
+                    tracing::error!(
+                        page_num,
+                        pages_completed,
+                        error = %error,
+                        "complete failed",
+                    );
+                    ScanLoopOutcome::Error(ScanLoopError::Complete(error))
+                }
             };
         }
 
@@ -787,7 +819,15 @@ where
                     "checkpoint persisted",
                 );
             }
-            Err(error) => return ScanLoopOutcome::Error(ScanLoopError::Checkpoint(error)),
+            Err(error) => {
+                tracing::error!(
+                    page_num,
+                    pages_completed,
+                    error = %error,
+                    "checkpoint failed",
+                );
+                return ScanLoopOutcome::Error(ScanLoopError::Checkpoint(error));
+            }
         }
 
         // Second time sample — see the "two-sample" comment above

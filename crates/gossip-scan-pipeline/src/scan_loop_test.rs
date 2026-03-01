@@ -636,6 +636,61 @@ fn tracing_output_redacts_toxic_fields() {
     );
 }
 
+/// Connector error messages with sensitive content must not leak raw
+/// text into tracing output. The scan loop logs errors via
+/// `RedactedEnumerateError`, which emits only class and retry metadata.
+#[test]
+fn enumerate_error_redacts_connector_message_in_tracing() {
+    let mut coord = seeded_coordinator(40, CursorUpdate::initial());
+    let sensitive_path = "/etc/secret-credentials/api-keys.json";
+    let error_message = format!("readdir failed for {sensitive_path}: permission denied");
+
+    let connector_error = EnumerateError::permanent(&error_message);
+    let mut connector = ScriptedConnector::new(vec![Err(connector_error)]);
+
+    let session = acquire_session(&mut coord, 3, 1);
+    let mut op_ids = counter_op_ids(2000);
+    let mut tick = 4u64;
+
+    let buffer = SharedLogBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(buffer.clone())
+        .finish();
+
+    let _outcome = tracing::subscriber::with_default(subscriber, || {
+        run_scan_loop(
+            session,
+            &mut connector,
+            budgets(10),
+            DEFAULT_MAX_TRANSIENT_RETRIES,
+            &mut op_ids,
+            || {
+                let out = now(tick);
+                tick += 1;
+                out
+            },
+        )
+    });
+
+    let logs = buffer.as_string();
+    assert!(
+        !logs.contains(sensitive_path),
+        "raw connector path leaked in tracing output:\n{logs}"
+    );
+    assert!(
+        !logs.contains("readdir failed"),
+        "raw connector message leaked in tracing output:\n{logs}"
+    );
+    assert!(
+        logs.contains("EnumerateError(class="),
+        "expected redacted error class in tracing output:\n{logs}"
+    );
+}
+
 #[test]
 fn happy_path_completes_and_records_final_cursor() {
     let mut coord = seeded_coordinator(40, CursorUpdate::initial());
@@ -1685,4 +1740,91 @@ mod prop_tests {
             );
         }
     }
+}
+
+// ============================================================================
+// Redacted formatter unit tests
+//
+// These tests verify the Display output of `RedactedCursor` and
+// `RedactedPageSample`, including None-branch and empty/multi-item
+// edge cases that the scenario tests do not exercise.
+// ============================================================================
+
+/// `RedactedCursor` over an initial cursor (no last_key, no token) renders
+/// both fields as `None`.
+#[test]
+fn redacted_cursor_initial_shows_none_fields() {
+    let cursor = Cursor::initial();
+    let output = format!("{}", RedactedCursor(&cursor));
+    assert_eq!(output, "Cursor(last_key=None, token=None)");
+}
+
+/// `RedactedCursor` over a cursor with `last_key` but no token renders the
+/// key hash and `token=None`.
+#[test]
+fn redacted_cursor_key_only_shows_token_none() {
+    let cursor = Cursor::try_from_update(CursorUpdate::new(&[0x42])).unwrap();
+    let output = format!("{}", RedactedCursor(&cursor));
+    assert!(output.starts_with("Cursor(last_key="));
+    assert!(output.ends_with(", token=None)"));
+    // The key portion must not be "None" — it should be the hash Display.
+    assert!(!output.contains("last_key=None"));
+}
+
+/// `RedactedCursor` over a cursor with both key and token renders both
+/// as `Some(...)`.
+#[test]
+fn redacted_cursor_key_and_token_shows_both() {
+    let cursor = Cursor::try_from_update(CursorUpdate::with_token(&[0x42], b"tok")).unwrap();
+    let output = format!("{}", RedactedCursor(&cursor));
+    assert!(output.starts_with("Cursor(last_key="));
+    assert!(output.contains(", token=Some("));
+    assert!(output.ends_with(")"));
+    assert!(!output.contains("token=None"));
+}
+
+/// `RedactedPageSample` from an empty slice shows all fields as `None`.
+#[test]
+fn redacted_page_sample_empty_shows_none() {
+    let sample = RedactedPageSample::from_items(&[]);
+    let output = format!("{sample}");
+    assert_eq!(
+        output,
+        "PageSample(first_key=None, first_ref=None, last_key=None, last_ref=None)"
+    );
+}
+
+/// `RedactedPageSample` from a single item shows identical first and last.
+#[test]
+fn redacted_page_sample_single_item() {
+    let items = [make_scan_item(b"key1")];
+    let sample = RedactedPageSample::from_items(&items);
+    let output = format!("{sample}");
+    // With a single item, first and last should be the same.
+    assert!(output.starts_with("PageSample(first_key=Some("));
+    assert!(output.contains(", last_key=Some("));
+}
+
+/// `RedactedPageSample` with 3 items shows different first and last keys
+/// when the items have distinct keys.
+#[test]
+fn redacted_page_sample_multi_item_different_first_last() {
+    let items: Vec<ScanItem> = [b"alpha", b"bravo", b"delta"]
+        .iter()
+        .map(|k| make_scan_item(k.as_slice()))
+        .collect();
+    let sample = RedactedPageSample::from_items(&items);
+    let output = format!("{sample}");
+    assert!(output.starts_with("PageSample(first_key=Some("));
+    assert!(output.contains(", last_key=Some("));
+    // The first_key hash and last_key hash should differ because the keys differ.
+    let first_key_start = output.find("first_key=Some(").unwrap() + "first_key=Some(".len();
+    let first_key_end = output[first_key_start..].find(')').unwrap() + first_key_start;
+    let last_key_start = output.find("last_key=Some(").unwrap() + "last_key=Some(".len();
+    let last_key_end = output[last_key_start..].find(')').unwrap() + last_key_start;
+    assert_ne!(
+        &output[first_key_start..first_key_end],
+        &output[last_key_start..last_key_end],
+        "first and last keys should differ for items with distinct keys"
+    );
 }
