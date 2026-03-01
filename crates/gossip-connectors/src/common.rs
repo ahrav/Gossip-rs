@@ -1,4 +1,5 @@
-//! Shared connector utilities for shard-bound handling and pooled page assembly.
+//! Shared connector utilities: shard-bound validation, binary search,
+//! pooled page assembly, split-point selection, and identity derivation.
 
 use std::sync::Arc;
 
@@ -170,6 +171,16 @@ pub(crate) struct StagedPage {
     pub token: Option<TokenBytes>,
 }
 
+/// Allocate the continuation-token slot into the page slab.
+///
+/// When `emit_token` is true, encodes `start_idx + item_count` as a
+/// big-endian `u64` and stages it into `page_slab`. Returns `Ok(None)`
+/// when token emission is disabled.
+///
+/// # Errors
+///
+/// Returns `EnumerateError::permanent` on index overflow or slab
+/// allocation failure.
 #[inline]
 fn stage_token_slot(
     page_slab: &mut PooledByteSlab,
@@ -500,5 +511,55 @@ mod page_slab_tests {
         // 10 rounds to MIN_BLOCK (16). Total = 16, which is >= MIN_BLOCK.
         let cap = page_slab_capacity([0, 10]).unwrap();
         assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_shard_bound_tests {
+    use super::*;
+    use gossip_contracts::connector::MAX_ITEM_KEY_SIZE;
+
+    #[test]
+    fn empty_bound_returns_none() {
+        let result = borrowed_shard_bound(b"", "start").unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn valid_bound_returns_some() {
+        let result = borrowed_shard_bound(b"abc", "start").unwrap();
+        assert_eq!(result, Some(b"abc".as_slice()));
+    }
+
+    #[test]
+    fn exact_max_size_returns_some() {
+        let key = vec![b'x'; MAX_ITEM_KEY_SIZE];
+        let result = borrowed_shard_bound(&key, "end").unwrap();
+        assert_eq!(result, Some(key.as_slice()));
+    }
+
+    #[test]
+    fn oversized_bound_returns_permanent_error() {
+        let key = vec![b'x'; MAX_ITEM_KEY_SIZE + 1];
+        let err = borrowed_shard_bound(&key, "start").expect_err("should reject oversized bound");
+        assert!(!err.is_retryable(), "oversized bound should be permanent");
+    }
+
+    #[test]
+    fn error_message_contains_which_param() {
+        let key = vec![b'x'; MAX_ITEM_KEY_SIZE + 1];
+        let err = borrowed_shard_bound(&key, "start").unwrap_err();
+        assert!(
+            err.message().contains("start"),
+            "error should mention 'start': {}",
+            err.message()
+        );
+
+        let err = borrowed_shard_bound(&key, "end").unwrap_err();
+        assert!(
+            err.message().contains("end"),
+            "error should mention 'end': {}",
+            err.message()
+        );
     }
 }

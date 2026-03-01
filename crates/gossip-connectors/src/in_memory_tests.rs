@@ -885,6 +885,29 @@ fn trait_methods_reject_oversized_non_empty_bounds() {
     );
 }
 
+#[test]
+fn trait_methods_accept_exact_max_size_bound() {
+    let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
+    let mut c = InMemoryDeterministicConnector::new(TAG, items);
+
+    let exact_start = ShardSpec::from_raw_parts(
+        vec![b'x'; MAX_ITEM_KEY_SIZE].into_boxed_slice(),
+        Box::<[u8]>::default(),
+        Box::<[u8]>::default(),
+    );
+    // Exact-max-size bound must be accepted (boundary is `>`, not `>=`).
+    c.enumerate_page(&exact_start, &Cursor::initial(), default_budgets())
+        .expect("exact MAX_ITEM_KEY_SIZE start bound should be accepted");
+
+    let exact_end = ShardSpec::from_raw_parts(
+        Box::<[u8]>::default(),
+        vec![b'y'; MAX_ITEM_KEY_SIZE].into_boxed_slice(),
+        Box::<[u8]>::default(),
+    );
+    c.choose_split_point(&exact_end, &Cursor::initial(), default_budgets())
+        .expect("exact MAX_ITEM_KEY_SIZE end bound should be accepted");
+}
+
 // ---------------------------------------------------------------
 // Degenerate split point (F12)
 // ---------------------------------------------------------------

@@ -554,7 +554,10 @@ impl FilesystemConnector {
 
         let candidate = &self.files[split_idx].key;
 
-        if cursor.last_key().is_some_and(|last| candidate <= last) {
+        if cursor
+            .last_key()
+            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
+        {
             return Ok(None);
         }
         if end.is_some_and(|upper| candidate.as_bytes() >= upper) {
@@ -748,8 +751,6 @@ impl EnumerationConnector for FilesystemConnector {
 
     /// The first call may trigger a full filesystem walk; subsequent calls
     /// operate purely over the in-memory index.
-    ///
-    /// Bounds use the same borrowed validation path as `enumerate_page`.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,

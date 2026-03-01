@@ -1238,6 +1238,29 @@ fn trait_methods_reject_oversized_non_empty_bounds() {
     );
 }
 
+#[test]
+fn trait_methods_accept_exact_max_size_bound() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    let exact_start = ShardSpec::from_raw_parts(
+        vec![b'x'; MAX_ITEM_KEY_SIZE].into_boxed_slice(),
+        Box::<[u8]>::default(),
+        Box::<[u8]>::default(),
+    );
+    // Exact-max-size bound must be accepted (boundary is `>`, not `>=`).
+    c.enumerate_page(&exact_start, &Cursor::initial(), default_budgets())
+        .expect("exact MAX_ITEM_KEY_SIZE start bound should be accepted");
+
+    let exact_end = ShardSpec::from_raw_parts(
+        Box::<[u8]>::default(),
+        vec![b'y'; MAX_ITEM_KEY_SIZE].into_boxed_slice(),
+        Box::<[u8]>::default(),
+    );
+    c.choose_split_point(&exact_end, &Cursor::initial(), default_budgets())
+        .expect("exact MAX_ITEM_KEY_SIZE end bound should be accepted");
+}
+
 // ---------------------------------------------------------------
 // FD cache eviction
 // ---------------------------------------------------------------

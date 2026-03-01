@@ -470,7 +470,10 @@ impl InMemoryDeterministicConnector {
         let candidate = self.items[split_idx].key.clone();
 
         // Reject candidates that would not advance past the cursor.
-        if cursor.last_key().is_some_and(|last| &candidate <= last) {
+        if cursor
+            .last_key()
+            .is_some_and(|last| candidate.as_bytes() <= last.as_bytes())
+        {
             return Ok(None);
         }
         // Reject candidates at or beyond the upper bound.
@@ -525,9 +528,6 @@ impl EnumerationConnector for InMemoryDeterministicConnector {
 
     /// Budgets are accepted for trait conformance but not consumed: split-point
     /// selection is a metadata-only operation with no I/O or time-bounded work.
-    ///
-    /// As in `enumerate_page`, shard bounds are validated by
-    /// `borrowed_shard_bound` without allocating temporary keys.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
