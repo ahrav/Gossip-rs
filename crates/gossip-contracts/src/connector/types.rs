@@ -28,7 +28,7 @@
 //!
 //! - Constructors enforce non-empty bytes and hard upper bounds.
 //! - Wrappers support both owned (`Box<[u8]>`) and pooled (`ByteSlot` +
-//!   `Arc<ByteSlab>`) storage so COLD/WARM paths stay simple while HOT
+//!   `Arc<PooledByteSlab>`) storage so COLD/WARM paths stay simple while HOT
 //!   enumeration paths avoid per-item heap allocation.
 //!   Pooled values are page-scoped: key/ref/token wrappers cloned out of a page
 //!   keep that page slab alive until the last clone is dropped.
@@ -228,26 +228,35 @@ impl ToxicBytesStorage {
 
 /// Shared page-local slab owner for pooled toxic-byte wrappers.
 ///
-/// This wrapper exists to provide a custom `Drop` that clears all live slots
-/// before `ByteSlab` is dropped, satisfying `ByteSlab`'s debug leak assertion
-/// for page-scoped pooled usage.
+/// Connectors use the two-phase API:
+/// 1. **Mutable phase:** call [`allocate`](Self::allocate) to stage byte fields.
+/// 2. **Shared phase:** move into `Arc<PooledByteSlab>` for read-only access
+///    via pooled toxic-byte wrappers.
 ///
-/// Clearing in `Drop` trades per-slot teardown for one O(1) reset. That keeps
-/// page assembly simple and ensures stale `ByteSlot`s fail fast via owner-id
-/// checks if reused after page teardown.
+/// The custom [`Drop`] clears all live slots before the inner `ByteSlab` is
+/// dropped, satisfying its debug leak assertion. This is critical on the
+/// error path: if staging fails mid-loop, `Drop` still runs and resets
+/// `live_count` to zero.
 pub struct PooledByteSlab {
     slab: ByteSlab,
 }
 
 impl PooledByteSlab {
-    /// Wrap a fully-populated page-local slab for shared read access.
-    ///
-    /// Connectors allocate/stage bytes first, then call this once before
-    /// constructing pooled toxic-byte wrappers.
+    /// Wrap a page-local slab for staged allocation and later shared read access.
     #[inline]
     #[must_use]
     pub fn new(slab: ByteSlab) -> Self {
         Self { slab }
+    }
+
+    /// Stage bytes into the slab during page assembly.
+    ///
+    /// This is the mutable-phase API: connectors call `allocate` while
+    /// building a page, then move the `PooledByteSlab` into an `Arc` for
+    /// shared read access.
+    #[inline]
+    pub fn allocate(&mut self, bytes: &[u8]) -> Result<ByteSlot, gossip_stdx::SlabFull> {
+        self.slab.allocate(bytes)
     }
 
     #[inline]
@@ -256,8 +265,20 @@ impl PooledByteSlab {
     }
 }
 
+impl fmt::Debug for PooledByteSlab {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PooledByteSlab")
+            .field("live_count", &self.slab.live_count())
+            .field("live_bytes", &self.slab.live_bytes())
+            .finish()
+    }
+}
+
 impl Drop for PooledByteSlab {
     fn drop(&mut self) {
+        // Zero the used region of the backing buffer before releasing,
+        // preventing sensitive toxic-byte residue in freed heap memory.
+        self.slab.zeroize_used();
         self.slab.clear();
     }
 }
@@ -293,7 +314,7 @@ impl PooledToxicBytes {
 /// - `$name, max = $max` — unordered (opaque handles and tokens).
 ///
 /// Both arms produce: struct, `try_from_vec`, `try_from_slice`, `as_bytes`,
-/// `len`, `into_bytes`, `AsRef<[u8]>`, `is_pooled`, and identical
+/// `len`, `AsRef<[u8]>`, `is_pooled`, and identical
 /// `Debug`/`Display` (redacted to `TypeName(len=N, hash=XXXXXXXX..)`).
 macro_rules! define_toxic_bytes {
     (
@@ -404,23 +425,13 @@ macro_rules! define_toxic_bytes {
             ///
             /// Primarily useful for tests/instrumentation that need to assert
             /// HOT-path pooling behavior.
+            #[doc(hidden)]
             #[inline]
             #[must_use]
             pub fn is_pooled(&self) -> bool {
                 self.0.is_pooled()
             }
 
-            /// Consumes the wrapper and returns the owned byte buffer.
-            ///
-            /// For pooled values this performs one copy out of the page slab.
-            #[inline]
-            #[must_use]
-            pub fn into_bytes(self) -> Box<[u8]> {
-                match self.0 {
-                    ToxicBytesStorage::Owned(bytes) => bytes,
-                    ToxicBytesStorage::Pooled(pooled) => pooled.as_bytes().to_vec().into_boxed_slice(),
-                }
-            }
         }
 
         impl AsRef<[u8]> for $name {
@@ -474,7 +485,7 @@ define_toxic_bytes! {
     ///
     /// `Debug` and `Display` are redacted (length + hash prefix). Raw bytes can
     /// be borrowed through [`as_bytes`](Self::as_bytes) / [`AsRef<[u8]>`](AsRef),
-    /// or consumed via [`into_bytes`](Self::into_bytes).
+    /// or borrowed via [`AsRef<[u8]>`](AsRef).
     ordered ItemKey, max = MAX_ITEM_KEY_SIZE
 }
 
@@ -497,7 +508,7 @@ define_toxic_bytes! {
     ///
     /// `Debug` and `Display` are redacted (length + hash prefix). Raw bytes can
     /// be borrowed through [`as_bytes`](Self::as_bytes) / [`AsRef<[u8]>`](AsRef),
-    /// or consumed via [`into_bytes`](Self::into_bytes).
+    /// or borrowed via [`AsRef<[u8]>`](AsRef).
     ItemRef, max = MAX_ITEM_REF_SIZE
 }
 
@@ -520,7 +531,7 @@ define_toxic_bytes! {
     ///
     /// `Debug` and `Display` are redacted (length + hash prefix). Raw bytes can
     /// be borrowed through [`as_bytes`](Self::as_bytes) / [`AsRef<[u8]>`](AsRef),
-    /// or consumed via [`into_bytes`](Self::into_bytes).
+    /// or borrowed via [`AsRef<[u8]>`](AsRef).
     TokenBytes, max = MAX_TOKEN_SIZE
 }
 

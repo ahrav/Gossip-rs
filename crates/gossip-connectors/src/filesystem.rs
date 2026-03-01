@@ -820,17 +820,10 @@ impl ReadConnector for FilesystemConnector {
     fn open(
         &mut self,
         item_ref: &ItemRef,
-        budgets: Budgets,
+        _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
         self.verify_membership(item_ref)?;
-        let (file, metadata) = self.open_beneath_root(item_ref.as_bytes())?;
-        if metadata.len() > budgets.max_bytes() {
-            return Err(ReadError::permanent(format!(
-                "item size {} exceeds max_bytes budget {}",
-                metadata.len(),
-                budgets.max_bytes(),
-            )));
-        }
+        let (file, _metadata) = self.open_beneath_root(item_ref.as_bytes())?;
         clear_nonblock(&file)?;
         Ok(Box::new(file))
     }

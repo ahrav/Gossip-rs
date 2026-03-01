@@ -398,18 +398,20 @@ impl InMemoryDeterministicConnector {
                 .flat_map(|item| [item.key.len(), item.item_ref.len()])
                 .chain(self.emit_tokens.then_some(std::mem::size_of::<u64>())),
         )?;
-        let mut page_slab = ByteSlab::with_capacity(slab_capacity);
+        let mut page_slab = PooledByteSlab::new(ByteSlab::with_capacity(slab_capacity));
         let mut staged: Vec<(ByteSlot, ByteSlot, StableItemId, ObjectVersionId, u64)> =
             Vec::with_capacity(take);
-        for item in page_items {
+        for (item_idx, item) in page_items.iter().enumerate() {
             let key_slot = page_slab.allocate(item.key.as_bytes()).map_err(|err| {
-                EnumerateError::permanent(format!("failed to stage item key in page slab: {err}"))
+                EnumerateError::permanent(format!(
+                    "failed to stage item key in page slab (item {item_idx}/{take}): {err}"
+                ))
             })?;
             let item_ref_slot = page_slab
                 .allocate(item.item_ref.as_bytes())
                 .map_err(|err| {
                     EnumerateError::permanent(format!(
-                        "failed to stage item_ref in page slab: {err}"
+                        "failed to stage item_ref in page slab (item {item_idx}/{take}): {err}"
                     ))
                 })?;
             staged.push((
@@ -436,7 +438,7 @@ impl InMemoryDeterministicConnector {
 
         // Items and continuation cursor clone this Arc, so pooled bytes remain
         // valid for whichever value escapes the function.
-        let page_slab = Arc::new(PooledByteSlab::new(page_slab));
+        let page_slab = Arc::new(page_slab);
         let mut out = Vec::with_capacity(staged.len());
         for (key_slot, item_ref_slot, stable_item_id, version_id, size_hint) in staged {
             let item_key =
@@ -459,18 +461,20 @@ impl InMemoryDeterministicConnector {
         }
 
         // Build continuation cursor from the last emitted key.
-        let last_key = out
-            .last()
-            .expect("non-empty page must have a last key")
-            .item_key()
-            .clone();
-        let mut next_cursor = Cursor::with_last_key(last_key.clone());
-
-        if let Some(token_slot) = token_slot {
+        // Defensive match mirrors filesystem.rs: if `out` is unexpectedly
+        // empty (e.g., all staged items failed validation), return an
+        // empty page instead of panicking.
+        let last_key = match out.last() {
+            Some(item) => item.item_key().clone(),
+            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
+        };
+        let next_cursor = if let Some(token_slot) = token_slot {
             let token = TokenBytes::try_from_slot(token_slot, Arc::clone(&page_slab))
                 .map_err(|err| EnumerateError::permanent(format!("invalid staged token: {err}")))?;
-            next_cursor = Cursor::with_token(last_key, token);
-        }
+            Cursor::with_token(last_key, token)
+        } else {
+            Cursor::with_last_key(last_key)
+        };
 
         Ok(EnumerationPage::new(out, next_cursor))
     }

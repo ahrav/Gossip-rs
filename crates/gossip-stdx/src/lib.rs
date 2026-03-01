@@ -73,7 +73,7 @@ mod ring_buffer;
 ///
 /// See [`ByteSlab`] type-level docs for design details, memory layout
 /// diagrams, and invariants.
-pub use byte_slab::{ByteSlab, ByteSlot, SlabFull};
+pub use byte_slab::{ByteSlab, ByteSlot, MIN_BLOCK, SlabFull};
 
 /// Stack-first small vector backed by `[MaybeUninit<T>; N]`.
 ///

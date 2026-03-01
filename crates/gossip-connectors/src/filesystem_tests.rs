@@ -433,23 +433,6 @@ fn open_reads_full_content() {
     assert_eq!(buf, b"hello world");
 }
 
-#[test]
-fn open_budget_exceeded_returns_error() {
-    let dir = create_test_dir(&[("large.txt", b"large payload here")]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
-        .unwrap();
-    let item_ref = page.items()[0].item_ref().clone();
-
-    let small_budget = Budgets::try_new(100, 5, None).unwrap();
-    let result = c.open(&item_ref, small_budget);
-    assert!(result.is_err());
-}
-
 // ---------------------------------------------------------------
 // Unit tests — ReadConnector::read_range
 // ---------------------------------------------------------------

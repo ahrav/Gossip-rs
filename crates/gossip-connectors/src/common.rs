@@ -5,12 +5,6 @@ use gossip_contracts::{
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
 
-/// Must match `gossip_stdx::byte_slab::MIN_BLOCK` (16 bytes).
-///
-/// Keeping a local constant avoids exposing `gossip-stdx` internals from this
-/// module while preserving identical size-class rounding.
-const PAGE_SLAB_MIN_BLOCK: usize = 16;
-
 /// Parse an 8-byte big-endian `u64` from a byte slice.
 ///
 /// Returns `None` for non-8-byte payloads, letting callers decide whether to
@@ -90,7 +84,8 @@ fn page_slab_alloc_size(len: usize) -> Option<usize> {
     if len == 0 {
         return Some(0);
     }
-    len.max(PAGE_SLAB_MIN_BLOCK).checked_next_power_of_two()
+    len.max(gossip_stdx::MIN_BLOCK as usize)
+        .checked_next_power_of_two()
 }
 
 /// Compute exact slab capacity needed for a page's staged byte fields.
@@ -113,13 +108,18 @@ pub(crate) fn page_slab_capacity(
 ) -> Result<usize, EnumerateError> {
     let mut capacity = 0usize;
     for len in lengths {
-        let rounded = page_slab_alloc_size(len)
-            .ok_or_else(|| EnumerateError::permanent("page slab field size overflow"))?;
-        capacity = capacity
-            .checked_add(rounded)
-            .ok_or_else(|| EnumerateError::permanent("page slab capacity overflow"))?;
+        let rounded = page_slab_alloc_size(len).ok_or_else(|| {
+            EnumerateError::permanent(format!(
+                "page slab field size overflow: len={len} exceeds rounding domain"
+            ))
+        })?;
+        capacity = capacity.checked_add(rounded).ok_or_else(|| {
+            EnumerateError::permanent(format!(
+                "page slab capacity overflow: {capacity} + {rounded} exceeds usize::MAX"
+            ))
+        })?;
     }
-    let capacity = capacity.max(PAGE_SLAB_MIN_BLOCK);
+    let capacity = capacity.max(gossip_stdx::MIN_BLOCK as usize);
     if capacity > u32::MAX as usize {
         return Err(EnumerateError::permanent(
             "page slab capacity exceeds u32::MAX",
@@ -198,5 +198,72 @@ pub(crate) mod test_util {
 
     pub fn small_page_budgets(max_items: usize) -> Budgets {
         Budgets::try_new(max_items, u64::MAX, None).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod page_slab_tests {
+    use super::*;
+
+    #[test]
+    fn alloc_size_zero_returns_zero() {
+        assert_eq!(page_slab_alloc_size(0), Some(0));
+    }
+
+    #[test]
+    fn alloc_size_small_values_round_to_min_block() {
+        for n in 1..=gossip_stdx::MIN_BLOCK as usize {
+            assert_eq!(
+                page_slab_alloc_size(n),
+                Some(gossip_stdx::MIN_BLOCK as usize),
+                "page_slab_alloc_size({n}) should round to MIN_BLOCK"
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_size_power_of_two_identity() {
+        for &n in &[32, 64, 128, 256, 1024, 4096] {
+            assert_eq!(
+                page_slab_alloc_size(n),
+                Some(n),
+                "page_slab_alloc_size({n}) should be identity for power-of-two"
+            );
+        }
+    }
+
+    #[test]
+    fn alloc_size_rounds_up_non_power_of_two() {
+        assert_eq!(page_slab_alloc_size(17), Some(32));
+        assert_eq!(page_slab_alloc_size(33), Some(64));
+        assert_eq!(page_slab_alloc_size(100), Some(128));
+    }
+
+    #[test]
+    fn capacity_sums_rounded_fields() {
+        // Two fields of 10 bytes each: both round to 16, total = 32.
+        // Floor is MIN_BLOCK (16), so 32 >= 16 → result is 32.
+        let cap = page_slab_capacity([10, 10]).unwrap();
+        assert_eq!(cap, 32);
+    }
+
+    #[test]
+    fn capacity_enforces_min_block_floor() {
+        // Single zero-length field: rounded sum = 0, floor = MIN_BLOCK.
+        let cap = page_slab_capacity([0]).unwrap();
+        assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
+    }
+
+    #[test]
+    fn capacity_errors_on_overflow() {
+        // usize::MAX cannot be rounded to a power of two.
+        let result = page_slab_capacity([usize::MAX]);
+        assert!(result.is_err(), "expected overflow error for usize::MAX");
+    }
+
+    #[test]
+    fn capacity_empty_iterator_returns_min_block() {
+        let cap = page_slab_capacity(std::iter::empty()).unwrap();
+        assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
     }
 }

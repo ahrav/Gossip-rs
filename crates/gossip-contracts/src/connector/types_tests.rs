@@ -204,6 +204,33 @@ fn pooled_constructor_roundtrips_without_heap_owned_storage() {
 }
 
 #[test]
+fn pooled_wrapper_survives_slab_owner_drop() {
+    // Verify that cloning a pooled wrapper keeps the slab alive even after
+    // the original Arc reference is dropped. This exercises the Arc<PooledByteSlab>
+    // lifetime semantics that the HOT page-emission path relies on.
+    let mut slab = ByteSlab::with_capacity(128);
+    let key_slot = slab.allocate(b"survivor-key").expect("allocate key");
+    let ref_slot = slab.allocate(b"survivor-ref").expect("allocate ref");
+    let shared = Arc::new(PooledByteSlab::new(slab));
+
+    let key = ItemKey::try_from_slot(key_slot, Arc::clone(&shared)).expect("pooled key");
+    let iref = ItemRef::try_from_slot(ref_slot, Arc::clone(&shared)).expect("pooled ref");
+
+    // Clone before dropping the original shared reference.
+    let key_clone = key.clone();
+    let iref_clone = iref.clone();
+    drop(key);
+    drop(iref);
+    drop(shared);
+
+    // Clones must still resolve correctly from the slab.
+    assert!(key_clone.is_pooled());
+    assert!(iref_clone.is_pooled());
+    assert_eq!(key_clone.as_bytes(), b"survivor-key");
+    assert_eq!(iref_clone.as_bytes(), b"survivor-ref");
+}
+
+#[test]
 fn pooled_constructor_rejects_empty_and_oversized_slots() {
     // Slot-backed constructors must enforce the same non-empty/size bounds as
     // vec/slice constructors.
