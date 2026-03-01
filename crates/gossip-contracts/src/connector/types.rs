@@ -294,12 +294,13 @@ impl fmt::Debug for PooledByteSlab {
 
 /// Clears sensitive toxic-byte data before the slab is dropped.
 ///
-/// [`zeroize_used`] overwrites all allocated bytes with zeros to prevent
-/// sensitive residue from lingering in heap memory after the page is freed.
-/// [`clear`] then resets the slab's slot count to zero, satisfying
-/// `ByteSlab`'s debug assertion that no live slots remain at drop time.
-/// Both operations are required: zeroization protects data, clear
-/// maintains the slab invariant.
+/// [`zeroize_used`] overwrites all bytes in the used region (`[0, bump)`)
+/// with zeros to prevent sensitive residue from lingering in heap memory
+/// after the page is freed. [`clear`] then resets the slab to initial state
+/// (bump, free-list, live counts, and owner id), satisfying `ByteSlab`'s
+/// debug assertion that no live slots remain at drop time and invalidating
+/// any stale slot handles. Both operations are required: zeroization
+/// protects data, clear maintains all slab invariants.
 ///
 /// [`zeroize_used`]: gossip_stdx::ByteSlab::zeroize_used
 /// [`clear`]: gossip_stdx::ByteSlab::clear

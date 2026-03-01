@@ -91,7 +91,7 @@ fn page_slab_alloc_size(len: usize) -> Option<usize> {
         .checked_next_power_of_two()
 }
 
-/// Compute exact slab capacity needed for a page's staged byte fields.
+/// Compute slab capacity needed for a page's staged byte fields.
 ///
 /// Connectors pass all key/ref/token lengths for the page; this helper rounds
 /// each field to the same size classes used by `ByteSlab` and sums the result.
