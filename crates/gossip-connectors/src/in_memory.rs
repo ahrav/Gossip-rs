@@ -327,52 +327,41 @@ impl InMemoryDeterministicConnector {
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError> {
-        // Shared preamble keeps range math identical across connectors; the
-        // in-memory fast path below only refines `start_idx` when token state
-        // proves consistent with `last_key`.
-        let resolved = common::resolve_page_range(&self.items, start, end, cursor, budgets)?;
-        let mut start_idx = resolved.start_idx;
-        let token_idx = self
-            .emit_tokens
-            .then(|| common::cursor_token_index(cursor))
-            .flatten();
+        let bounds = common::resolve_page_bounds(&self.items, start, end, budgets)?;
+        let key_resume = common::key_resume_start(&self.items, cursor, bounds.range_start);
+        let mut start_idx = key_resume;
 
-        // Phase 4: advance past the cursor's last-emitted key.
+        // O(1) token fast path: when tokens are enabled and the cursor carries
+        // a well-formed token whose preceding item matches `last_key`, jump
+        // directly to the token index. On mismatch, fall back to the
+        // key-authoritative position computed above.
         if let Some(last_key) = cursor.last_key() {
-            // O(1) fast path: when tokens are enabled and the cursor carries a
-            // well-formed token, use the token index directly after validating
-            // that items[token_idx - 1].key matches last_key.
+            let token_idx = self
+                .emit_tokens
+                .then(|| common::cursor_token_index(cursor))
+                .flatten();
+
             if let Some(token_idx) = token_idx
                 && token_idx > 0
                 && token_idx <= self.items.len()
                 && self.items[token_idx - 1].key == *last_key
             {
                 start_idx = start_idx.max(token_idx);
-            }
 
-            // Fallback remains key-authoritative (`resolved.key_resume_idx`).
-            #[cfg(debug_assertions)]
-            if let Some(token_idx) = token_idx
-                && token_idx > 0
-                && token_idx <= self.items.len()
-            {
+                #[cfg(debug_assertions)]
                 debug_assert_eq!(
-                    token_idx, resolved.key_resume_idx,
+                    token_idx, key_resume,
                     "token index {token_idx} disagrees with \
-                     key-derived resume position {}",
-                    resolved.key_resume_idx
+                     key-derived resume position {key_resume}"
                 );
             }
         }
 
-        if start_idx >= resolved.range_end {
+        if start_idx >= bounds.range_end {
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
         }
 
-        // Phase 5: extract up to max_items consecutive items from precomputed
-        // metadata via the shared staging helper. Trade-off: one per-page copy
-        // up front for allocation-free wrapper cloning afterward.
-        let take = budgets.max_items().min(resolved.range_end - start_idx);
+        let take = budgets.max_items().min(bounds.range_end - start_idx);
         let page_items = &self.items[start_idx..start_idx + take];
 
         let staged = common::assemble_pooled_page(
@@ -428,8 +417,8 @@ impl InMemoryDeterministicConnector {
     /// would not advance past the cursor, or when it falls at or beyond the
     /// upper shard bound (which would produce an empty right shard).
     ///
-    /// Bound/cursor preamble logic is shared with filesystem via
-    /// [`common::resolve_split_range`], so both connectors enforce the same
+    /// Bound resolution is shared with filesystem via [`common::resolve_bounds`]
+    /// and [`common::key_resume_start`], so both connectors enforce the same
     /// split-eligibility window before applying connector-local heuristics.
     fn choose_split_point_bounds(
         &self,
