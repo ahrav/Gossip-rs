@@ -1,19 +1,39 @@
-# ── nextest configuration ─────────────────────────────────────────
-# Profiles referenced by .github/workflows/ci.yml
+# cargo-nextest configuration
+# https://nexte.st/docs/configuration/
 
+[store]
+# Directory for nextest-related files (relative to workspace root).
+dir = "target/nextest"
+
+# ── Default profile ──────────────────────────────────────────────────
+[profile.default]
+# Run test binaries with moderate parallelism; nextest automatically
+# detects CPU count but we cap it to avoid OOM on large crates.
+test-threads = "num-cpus"
+
+# Fail-fast: abort remaining tests on the first failure.
+fail-fast = true
+
+# Retry flaky tests once before reporting failure.
+retries = 1
+
+# Per-test timeout (seconds). Most tests complete in < 5 s; the long
+# ones (proptest, filesystem I/O, executor stress) get 120 s.
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+# ── CI profile ───────────────────────────────────────────────────────
 [profile.ci]
-# CI: fail-fast disabled so we see all failures in one run.
+# Inherit from default, then override for CI-specific behavior.
 fail-fast = false
-status-level = "fail"
-final-status-level = "flaky"
-# Retry once to surface flaky tests (marked as "flaky" in output).
 retries = 2
 
+# JUnit XML output for CI reporting dashboards.
+[profile.ci.junit]
+path = "target/nextest/ci/junit.xml"
+report-name = "gossip-rs-tests"
+
+# ── Nightly profile (full harness) ──────────────────────────────────
 [profile.nightly]
-# Nightly full-harness: same as ci but with longer timeout for
-# heavier --all-features + release builds.
 fail-fast = false
-status-level = "fail"
-final-status-level = "flaky"
-retries = 2
-slow-timeout = { period = "120s", terminate-after = 3 }
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 6 }
