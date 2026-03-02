@@ -408,10 +408,12 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
         });
     }
 
+    // Use --show-toplevel to resolve the actual repository root rather than
+    // --is-inside-work-tree, which succeeds for arbitrary subdirectories.
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
-        .args(["rev-parse", "--is-inside-work-tree"])
+        .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|error| ScanRuntimeError::Io {
             op: "git rev-parse",
@@ -426,11 +428,30 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
         });
     }
 
-    fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
+    let toplevel = PathBuf::from(std::str::from_utf8(&output.stdout).unwrap_or("").trim_end());
+    let canonical_input = fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
         op: "canonicalize",
         path: Some(path.to_path_buf()),
         error,
-    })
+    })?;
+    let canonical_toplevel = fs::canonicalize(&toplevel).map_err(|error| ScanRuntimeError::Io {
+        op: "canonicalize",
+        path: Some(toplevel.clone()),
+        error,
+    })?;
+
+    if canonical_input != canonical_toplevel {
+        return Err(ScanRuntimeError::InvalidPath {
+            source: "git",
+            path: path.to_path_buf(),
+            message: format!(
+                "path is inside a git repository but is not the repository root (root is '{}')",
+                canonical_toplevel.display()
+            ),
+        });
+    }
+
+    Ok(canonical_input)
 }
 
 fn available_workers() -> usize {

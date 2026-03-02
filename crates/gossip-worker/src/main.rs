@@ -298,5 +298,9 @@ mod tests {
 
         let report = run_worker(&cfg).expect("git worker run");
         assert!(report.0 >= 1);
+        assert!(
+            report.2 >= 1,
+            "git scan should emit findings for test fixture"
+        );
     }
 }
