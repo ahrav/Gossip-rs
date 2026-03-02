@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::{OfflineVerdict, ValidatorKind};
 use crate::rules::builtin_rules;
-use crate::{demo_tuning, AnchorPolicy, Engine, Finding};
+use crate::{AnchorPolicy, Engine, Finding, demo_tuning};
 use std::path::Path;
 use std::sync::OnceLock;
 
