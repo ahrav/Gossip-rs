@@ -43,6 +43,7 @@ tiger-harness = []
 sim-harness = ["perf-stats"]
 perf-counters = ["perf-stats"]
 test-support = []
+aegis-pure-rust = ["aegis/pure-rust"]  # Use pure-Rust AEGIS on machines without SHA3 NEON (clang < 14)
 
 [dev-dependencies]
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }

@@ -42,6 +42,7 @@ bench = []
 rocksdb = ["dep:rocksdb"]
 stdx-proptest = []
 sim-harness = ["scanner-scheduler/sim-harness"]
+aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
 
 [dev-dependencies]
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }

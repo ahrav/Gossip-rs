@@ -727,133 +727,85 @@ pub(crate) mod test_util {
 #[cfg(test)]
 mod page_slab_tests {
     use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
 
-    #[test]
-    fn alloc_size_zero_returns_zero() {
-        assert_eq!(page_slab_alloc_size(0), Some(0));
+    const MB: usize = gossip_stdx::MIN_BLOCK as usize;
+
+    // -- page_slab_alloc_size: (input → expected) mappings --
+
+    #[rstest]
+    #[case::zero(0, Some(0))]
+    #[case::one(1, Some(MB))]
+    #[case::min_block(MB, Some(MB))]
+    #[case::seventeen(17, Some(32))]
+    #[case::thirty_three(33, Some(64))]
+    #[case::hundred(100, Some(128))]
+    #[case::pow2_32(32, Some(32))]
+    #[case::pow2_64(64, Some(64))]
+    #[case::pow2_128(128, Some(128))]
+    #[case::pow2_256(256, Some(256))]
+    #[case::pow2_1024(1024, Some(1024))]
+    #[case::pow2_4096(4096, Some(4096))]
+    fn alloc_size_cases(#[case] input: usize, #[case] expected: Option<usize>) {
+        assert_eq!(page_slab_alloc_size(input), expected);
     }
 
-    #[test]
-    fn alloc_size_small_values_round_to_min_block() {
-        for n in 1..=gossip_stdx::MIN_BLOCK as usize {
-            assert_eq!(
-                page_slab_alloc_size(n),
-                Some(gossip_stdx::MIN_BLOCK as usize),
-                "page_slab_alloc_size({n}) should round to MIN_BLOCK"
-            );
+    proptest! {
+        /// For all values in `1..=MIN_BLOCK`, the rounded size is exactly
+        /// `MIN_BLOCK`. This replaces the former bounded loop with a
+        /// continuous-range property test.
+        #[test]
+        fn alloc_size_small_values_always_min_block(n in 1..=MB) {
+            prop_assert_eq!(page_slab_alloc_size(n), Some(MB));
         }
     }
 
-    #[test]
-    fn alloc_size_power_of_two_identity() {
-        for &n in &[32, 64, 128, 256, 1024, 4096] {
-            assert_eq!(
-                page_slab_alloc_size(n),
-                Some(n),
-                "page_slab_alloc_size({n}) should be identity for power-of-two"
-            );
-        }
+    // -- page_slab_capacity: ok cases --
+
+    #[rstest]
+    #[case::two_tens(&[10, 10], 32)]
+    #[case::single_zero(&[0], 0)]
+    #[case::empty_iter(&[], 0)]
+    #[case::mixed_zero_nonzero(&[0, 10], MB)]
+    #[case::triple_zero(&[0, 0, 0], 0)]
+    fn capacity_ok_cases(#[case] lengths: &[usize], #[case] expected: usize) {
+        let cap = page_slab_capacity(lengths.iter().copied()).unwrap();
+        assert_eq!(cap, expected);
     }
 
-    #[test]
-    fn alloc_size_rounds_up_non_power_of_two() {
-        assert_eq!(page_slab_alloc_size(17), Some(32));
-        assert_eq!(page_slab_alloc_size(33), Some(64));
-        assert_eq!(page_slab_alloc_size(100), Some(128));
+    // -- page_slab_capacity: error cases --
+
+    #[rstest]
+    #[case::single_usize_max(&[usize::MAX])]
+    #[case::sum_overflow(&[usize::MAX / 2 + 1, usize::MAX / 2 + 1])]
+    #[case::exceeds_u32_max(&[u32::MAX as usize + 1])]
+    fn capacity_error_cases(#[case] lengths: &[usize]) {
+        assert!(page_slab_capacity(lengths.iter().copied()).is_err());
     }
 
-    #[test]
-    fn capacity_sums_rounded_fields() {
-        // Two fields of 10 bytes each: both round to 16, total = 32.
-        // Floor is MIN_BLOCK (16), so 32 >= 16 → result is 32.
-        let cap = page_slab_capacity([10, 10]).unwrap();
-        assert_eq!(cap, 32);
-    }
-
-    #[test]
-    fn capacity_all_zero_returns_zero() {
-        // All zero-length fields produce a zero sum. ByteSlab returns EMPTY
-        // for zero-length allocations without consuming slab space, so a
-        // zero capacity avoids wasting a MIN_BLOCK-sized slab.
-        let cap = page_slab_capacity([0]).unwrap();
-        assert_eq!(cap, 0);
-    }
-
-    #[test]
-    fn capacity_errors_on_overflow() {
-        // usize::MAX cannot be rounded to a power of two.
-        let result = page_slab_capacity([usize::MAX]);
-        assert!(result.is_err(), "expected overflow error for usize::MAX");
-    }
-
-    #[test]
-    fn capacity_empty_iterator_returns_zero() {
-        // No fields at all → zero capacity.
-        let cap = page_slab_capacity(std::iter::empty::<usize>()).unwrap();
-        assert_eq!(cap, 0);
-    }
-
-    #[test]
-    fn capacity_mixed_zero_and_nonzero_applies_min_block() {
-        // One zero-length field + one 10-byte field: zero rounds to 0,
-        // 10 rounds to MIN_BLOCK (16). Total = 16, which is >= MIN_BLOCK.
-        let cap = page_slab_capacity([0, 10]).unwrap();
-        assert_eq!(cap, gossip_stdx::MIN_BLOCK as usize);
-    }
-
-    #[test]
-    fn capacity_sum_overflow() {
-        // Two fields that individually round fine but whose rounded sizes
-        // sum to more than usize::MAX.
-        let big = usize::MAX / 2 + 1; // rounds to a power of two
-        let result = page_slab_capacity([big, big]);
-        assert!(
-            result.is_err(),
-            "sum of two large rounded fields should overflow"
-        );
-    }
-
-    #[test]
-    fn capacity_exceeds_u32_max() {
-        // A single field whose rounded size exceeds u32::MAX.
-        // On 64-bit, (u32::MAX as usize) + 1 rounds up and exceeds the u32 cap.
-        let too_big = u32::MAX as usize + 1;
-        let result = page_slab_capacity([too_big]);
-        assert!(result.is_err(), "capacity exceeding u32::MAX should error");
-    }
-
+    /// Boundary test: 2^31 fits in u32, but two 2^31 fields sum to 2^32
+    /// which exceeds u32::MAX. This exercises both sides of the u32 cap
+    /// in one test and doesn't consolidate cleanly into either rstest group.
     #[test]
     fn capacity_at_u32_max_boundary() {
-        // The largest power-of-two that fits in u32: 2^31 = 2_147_483_648.
-        // Two such fields sum to 2^32 = 4_294_967_296 which exceeds u32::MAX.
         let half = 1usize << 31;
-        let single = page_slab_capacity([half]);
-        assert!(single.is_ok(), "single 2^31 field should fit in u32");
-
-        let double = page_slab_capacity([half, half]);
-        assert!(
-            double.is_err(),
-            "two 2^31 fields sum to 2^32, exceeding u32::MAX"
-        );
-    }
-
-    #[test]
-    fn capacity_multiple_zero_fields() {
-        // All fields zero → zero capacity (no slab needed).
-        let cap = page_slab_capacity([0, 0, 0]).unwrap();
-        assert_eq!(cap, 0);
+        assert!(page_slab_capacity([half]).is_ok());
+        assert!(page_slab_capacity([half, half]).is_err());
     }
 }
 
 /// Tests for byte-weighted split-point selection.
 ///
-/// These tests verify that `choose_split_index` selects correct split points
-/// across edge cases: empty/singleton ranges, zero-size fallback, weight
-/// concentration fallback, and clamping to guarantee non-empty shards on
-/// each side.
+/// Exact-value cases are consolidated into an rstest parameterized test.
+/// Inequality/range assertions remain as individual tests because their
+/// assertion style differs. A proptest verifies the clamping invariant
+/// over random size distributions.
 #[cfg(test)]
 mod choose_split_tests {
     use super::*;
+    use proptest::prelude::*;
+    use rstest::rstest;
 
     struct TestEntry {
         size: u64,
@@ -869,60 +821,29 @@ mod choose_split_tests {
         sizes.iter().map(|&size| TestEntry { size }).collect()
     }
 
-    #[test]
-    fn empty_range_returns_none() {
-        let items = entries(&[10, 20]);
-        // range_end == start_idx → zero items.
-        assert_eq!(choose_split_index(&items, 1, 1), None);
+    // -- Exact-value cases: identical assertion structure --
+
+    #[rstest]
+    #[case::empty_range(&[10, 20], 1, 1, None)]
+    #[case::single_item(&[10, 20, 30], 1, 2, None)]
+    #[case::two_items(&[10, 20], 0, 2, Some(1))]
+    #[case::all_zero_count_midpoint(&[0, 0, 0, 0], 0, 4, Some(2))]
+    #[case::first_heavy_count_fallback(&[100, 1, 1, 1], 0, 4, Some(2))]
+    #[case::middle_heavy_byte_weight(&[1, 1, 100, 1], 0, 4, Some(2))]
+    fn split_index_exact(
+        #[case] sizes: &[u64],
+        #[case] start: usize,
+        #[case] end: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let items = entries(sizes);
+        assert_eq!(choose_split_index(&items, start, end), expected);
     }
 
-    #[test]
-    fn single_item_returns_none() {
-        let items = entries(&[10, 20, 30]);
-        // range_end - start_idx == 1 → cannot split.
-        assert_eq!(choose_split_index(&items, 1, 2), None);
-    }
-
-    #[test]
-    fn two_items_returns_split() {
-        let items = entries(&[10, 20]);
-        // Minimal splittable range: must return Some.
-        let split = choose_split_index(&items, 0, 2);
-        assert_eq!(split, Some(1));
-    }
-
-    #[test]
-    fn all_zero_sizes_uses_count_midpoint() {
-        let items = entries(&[0, 0, 0, 0]);
-        // total_bytes == 0 → count midpoint at start_idx + len/2 = 0 + 2 = 2.
-        let split = choose_split_index(&items, 0, 4);
-        assert_eq!(split, Some(2));
-    }
-
-    #[test]
-    fn first_item_heavy_falls_back_to_count() {
-        // First item holds >50% weight → cumulative >= half at idx 0 → idx == start_idx.
-        // Triggers count-midpoint fallback.
-        let items = entries(&[100, 1, 1, 1]);
-        let split = choose_split_index(&items, 0, 4).unwrap();
-        // Count midpoint: 0 + (4 - 0) / 2 = 2.
-        assert_eq!(split, 2);
-    }
-
-    #[test]
-    fn byte_weight_splits_at_heavy_item() {
-        // Weight concentrated in the middle: [1, 1, 100, 1].
-        // total = 103, half = 51. cumulative: 1, 2, 102 → crosses at idx 2.
-        let items = entries(&[1, 1, 100, 1]);
-        let split = choose_split_index(&items, 0, 4).unwrap();
-        assert_eq!(split, 2);
-    }
+    // -- Inequality/range assertions: kept individual --
 
     #[test]
     fn clamp_prevents_empty_left_shard() {
-        // Two items where all weight is in the second: [0, 100].
-        // total = 100, half = 50. cumulative: 0, 100 → crosses at idx 1.
-        // But with only 2 items, clamped to max(start+1, ...) = 1.
         let items = entries(&[0, 100]);
         let split = choose_split_index(&items, 0, 2).unwrap();
         assert!(split >= 1, "split must leave at least one item on the left");
@@ -930,9 +851,6 @@ mod choose_split_tests {
 
     #[test]
     fn clamp_prevents_empty_right_shard() {
-        // All weight in the last item: [0, 0, 0, 100].
-        // total = 100, half = 50. cumulative crosses at idx 3 (the last).
-        // Clamped to min(split, range_end - 1) = 3.
         let items = entries(&[0, 0, 0, 100]);
         let split = choose_split_index(&items, 0, 4).unwrap();
         assert!(
@@ -943,11 +861,28 @@ mod choose_split_tests {
 
     #[test]
     fn nonzero_start_idx_offset() {
-        // Operate on items[2..5] → range of 3 items with sizes [10, 20, 30].
         let items = entries(&[99, 99, 10, 20, 30]);
         let split = choose_split_index(&items, 2, 5).unwrap();
-        // Must be in [3, 4] (start_idx+1 .. range_end-1).
         assert!((3..=4).contains(&split), "split {split} out of [3, 4]");
+    }
+
+    // -- Property: clamping invariant over random size distributions --
+
+    proptest! {
+        #[test]
+        fn split_index_bounds_invariant(
+            sizes in proptest::collection::vec(0..10_000u64, 0..20),
+        ) {
+            let items = entries(&sizes);
+            let len = items.len();
+            // Test the full range [0, len).
+            if let Some(split) = choose_split_index(&items, 0, len) {
+                prop_assert!(split >= 1, "split {split} must be >= start_idx + 1");
+                prop_assert!(split <= len - 1, "split {split} must be <= range_end - 1");
+            } else {
+                prop_assert!(len < 2, "None only when fewer than 2 items, got {len}");
+            }
+        }
     }
 }
 

@@ -50,6 +50,7 @@ sim-harness = [
     "scanner-engine/test-support",
 ]
 stdx-proptest = []
+aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
 
 [[example]]
 name = "gen_scheduler_corpus"

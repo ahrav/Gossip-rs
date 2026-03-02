@@ -7,6 +7,10 @@ license.workspace = true
 publish = false
 description = "Source connectors: filesystem, git, SaaS integrations"
 
+[features]
+default = []
+aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
+
 [dependencies]
 anyhow.workspace = true
 gossip-contracts.workspace = true
