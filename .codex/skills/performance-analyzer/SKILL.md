@@ -5,14 +5,14 @@ description: Analyze Rust code for performance issues, allocation hot spots, and
 
 # Performance Analyzer
 
-Analyze performance-critical code in this secret scanning engine.
+Analyze performance-critical code in the gossip-rs workspace (coordination, scanner engine, data structures).
 
 ## When to Use
 
-- After writing hot-path code (scanning, decoding, validation)
-- Before committing changes to `src/engine/` modules
+- After writing hot-path code (coordination, scanning, decoding, validation)
+- Before committing changes to `crates/scanner-engine/src/engine/` modules
 - When benchmark results show unexpected regressions
-- During optimization work on data structures in `src/stdx/`
+- During optimization work on data structures in `crates/gossip-stdx/src/`
 
 ## Analysis Checklist
 
@@ -76,6 +76,6 @@ Run these benchmarks to verify:
 
 ## Related Skills
 
-- `bench-compare` - Before/after measurement
-- `rust-hotspot-finder` - Systematic hotspot scanning
-- `perf-regression` - Full regression workflow
+- `/bench-compare` - Before/after measurement
+- `/asm-forge` - ASM-guided optimization
+- `/perf-regression` - Full regression workflow

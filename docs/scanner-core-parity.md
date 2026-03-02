@@ -1,59 +1,37 @@
-# Scanner Core Parity Fixtures
+# Scanner Core Parity
 
-This document tracks the phase-1 parity gate for migrated scanner core logic in
-`crates/gossip-engine`.
+This document tracks the parity gate for scanner core logic consolidated into
+`crates/scanner-engine`.
 
-## What Is Canonicalized
+## Runtime Integration Status
 
-`gossip_engine::canonicalize_stream_output` reduces `StreamScanOutput` into a
-fixture-stable shape:
+The unified execution model (v5.4) routes all scanning through a single path:
 
-- `page_summaries` in stream order (`page_num`, `signature`, `item_count`, `bytes_scanned`)
-- `findings` in emission order (`stable_item_id`, version strength/value,
-  `page_num`, `item_index`, `fingerprint`, `payload_bytes`)
+- `crates/gossip-scanner-runtime` provides typed `scan_fs` and `scan_git`
+  orchestration entrypoints backed by `ScanDriver`.
+- `crates/scanner-rs-cli` exposes the workspace `scanner-rs` binary with
+  `scan fs|git` shape and `--execution-mode` defaulting to `direct`.
+- `crates/gossip-scan-driver` defines the `ScanDriver` and `ScanSourceFactory`
+  traits that both CLI and distributed modes use.
+- `crates/scanner-engine` owns the detection pipeline: vectorscan prefilter,
+  regex, transform decode, offline validation, and finding emission.
 
-Keeping findings ordered means fixture checks fail on **ordering drift** and
-identity drift.
+Both CLI and distributed modes use the same `scanner-engine::Engine` instance
+for detection. The difference between modes is only where work comes from
+(CLI args vs coordinator) and where results go (JSONL vs distributed
+persistence).
 
-## Fixture Location
+## Throughput Policy
 
-- `crates/gossip-engine/tests/fixtures/phase1b_core_parity.json`
-
-The integration test
-`crates/gossip-engine/tests/fixture_parity.rs::migrated_core_matches_known_good_fixture`
-is the hard gate.
-
-## Throughput Policy Helper
-
-`gossip_engine::enforce_throughput_thresholds` encodes the migration policy
-used by later cutover phases:
+Migration cutover is gated by sustained parity and performance thresholds:
 
 - median absolute throughput delta <= `2.0%`
 - per-case absolute throughput delta <= `5.0%`
 
-`gossip_engine::throughput_delta_pct` and `gossip_engine::median` are companion
-utilities used by the same gate.
+## Historical Note
 
-## Runtime Integration Status
-
-Phase-2/3 runtime wiring now consumes `gossip-engine` directly in both
-standalone and worker paths:
-
-- `crates/gossip-scanner-runtime` provides typed `scan_fs_direct` and
-  `scan_git_direct` orchestration entrypoints.
-- `crates/scanner-rs-cli` exposes the workspace `scanner-rs` binary with
-  `scan fs|git` shape and `--execution-mode` defaulting to `direct`.
-- `crates/gossip-worker` page processing uses `ScannerCore` through
-  `run_scan_loop_with_page_processor`, replacing placeholder page-signature
-  hashing as the functional scan path.
-
-These paths intentionally keep connector mode explicit/gated until later
-phases complete durable runtime backends and parity gates.
-
-## Refresh Workflow
-
-1. Run fixture test in print mode:
-   `GOSSIP_ENGINE_PRINT_PARITY_FIXTURE=1 cargo test -p gossip-engine --test fixture_parity migrated_core_matches_known_good_fixture -- --nocapture`
-2. If behavior change is intentional, update the JSON fixture.
-3. Re-run:
-   `cargo test -p gossip-engine --test fixture_parity`
+The former `gossip-engine` crate provided a Phase 1 migration scaffold with
+deterministic page signatures, finding fingerprints, and fixture-based parity
+comparison (`canonicalize_stream_output`, `enforce_throughput_thresholds`).
+This was superseded by the v5.4 unified execution model which routes all
+scanning through `scanner-engine` directly.

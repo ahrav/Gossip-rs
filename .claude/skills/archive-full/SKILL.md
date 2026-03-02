@@ -1,21 +1,25 @@
 ---
 name: archive-full
-description: Use when the user wants to package all source code into a tar.gz archive for upload or checkpoint. Creates a comprehensive archive excluding binaries and build artifacts.
+description: Use when the user wants to package all source code into a tar.gz archive for upload or checkpoint. Creates a comprehensive archive of all workspace crates, docs, and config excluding binaries.
 ---
 
 # Archive Full Source
 
-Package all source code in the repo into a single `.tar.gz` archive, excluding binaries and build artifacts.
+Package all git-tracked files from the workspace into a single `.tar.gz` archive, excluding binaries.
 
 ## What's Included
 
-All git-tracked files except:
+All git-tracked files across the workspace, including:
+- `crates/*/src/**` and `crates/*/tests/**` - All crate source and tests
+- `Cargo.toml`, `Cargo.lock` - Workspace manifest and lockfile
+- `docs/`, `diagrams/`, `specs/` - Documentation and specifications
+- Config files (`.github/`, `.claude/`, etc.)
+
+## What's Excluded
+
 - Binary files (`*.pack`, `*.bin`, `*.so`, `*.dylib`, `*.a`)
-- Build artifacts (`target/`, `fuzz/target/`, `fuzz/artifacts/`, `fuzz/corpus/`)
-- Generated files (`mutants.out*/`, `proptest-regressions/`, `tests/failures/`)
-- OS files (`.DS_Store`)
-- Existing archives (`*.tar.*`)
 - Performance data (`perf.data`)
+- Build artifacts are not git-tracked and excluded automatically
 
 ## Workflow
 

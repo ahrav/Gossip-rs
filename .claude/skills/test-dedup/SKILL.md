@@ -110,12 +110,16 @@ For each **UPGRADE** test:
 - Simulation + Arbitrary impls: `test-support` feature
 - Kani proofs: `kani` feature
 - Property tests: no feature gate (proptest is a direct dev-dependency)
+- Scanner sim harnesses: `tiger-harness` (scanner-engine), `scheduler-sim` (scanner-scheduler)
+- Scanner bench scaffolding: `bench` feature in scanner-engine, scanner-scheduler
 
 ### What counts as "public API" in this project
 - Types/traits exported from each crate's `lib.rs`
 - `ShardSpec`, `ClaimTicket`, coordination protocol types in `gossip-contracts`
 - Data structures in `gossip-stdx` (`InlineVec`, `RingBuffer`, `ByteSlab`)
 - Anything used cross-crate (even if `pub(crate)` within a crate)
+- Scanner engine types: `Engine` trait, `RuleSpec`, `RuleCompiled` in `scanner-engine`
+- Scanner scheduler: parallel scan pipeline, task graph types in `scanner-scheduler`
 
 ## Output Format
 

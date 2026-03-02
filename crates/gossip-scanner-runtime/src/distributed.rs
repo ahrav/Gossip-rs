@@ -231,6 +231,11 @@ impl InMemoryCoordinator {
     }
 
     #[must_use]
+    pub fn core_events(&self) -> Vec<(String, StoredCoreEvent)> {
+        self.state.lock().expect("state lock").core_events.clone()
+    }
+
+    #[must_use]
     pub fn identity_records(&self) -> Vec<(String, IdentityChainRecord)> {
         self.state
             .lock()

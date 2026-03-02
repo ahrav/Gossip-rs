@@ -1,6 +1,7 @@
 ---
 name: jepsen-test
 description: Run Jepsen-style cluster tests using Maelstrom (lightweight) or full Jepsen (heavyweight) — validates correctness of the deployed gossip-rs system with real network behavior, complementing in-process DST
+user-invocable: true
 ---
 
 # Run Jepsen-Style Cluster Tests
@@ -61,13 +62,13 @@ change involves integration between multiple deployed components.
 ### Prerequisites
 
 1. Maelstrom binary installed (`brew install maelstrom` or from jepsen-io/maelstrom releases)
-2. A Maelstrom-compatible binary wrapper exists at `crates/gossip-worker/src/bin/maelstrom_gossip.rs`
+2. A Maelstrom-compatible binary wrapper exists (the main binary is `crates/gossip-worker/src/main.rs` — the Maelstrom wrapper would need to be added there or as a separate binary via `[[bin]]` in Cargo.toml)
 3. The gossip protocol implements the sans-IO pattern (from `/sim-scaffold` Type B)
 
 If the Maelstrom binary wrapper doesn't exist, guide creation:
 
 ```rust
-// crates/gossip-worker/src/bin/maelstrom_gossip.rs
+// crates/gossip-worker/src/main.rs (or a separate binary added via [[bin]] in Cargo.toml)
 //
 // Thin wrapper that adapts the sans-IO GossipProtocol to Maelstrom's
 // JSON stdin/stdout protocol.

@@ -5,23 +5,41 @@ description: Audit memory safety and security in unsafe code blocks, buffer hand
 
 # Security Reviewer
 
-Review unsafe code and security-sensitive operations in this secret scanning engine.
+Review unsafe code and security-sensitive operations in the gossip-rs codebase.
 
 ## When to Use
 
 - After modifying any `unsafe` block
 - When adding new parsing or decoding logic
-- Before merging changes to `src/async_io/` or buffer handling code
-- When implementing new transform chains
+- Before merging changes to data structure internals or buffer handling code
+- When implementing new protocol handling or serialization
 
 ## Critical Areas in This Codebase
 
 ### High-Risk Files
-- `src/runtime.rs` - Buffer pool with unsafe pointer operations
-- `src/async_io/` - Platform-specific async I/O with raw pointers
-- `src/engine/scratch.rs` - Scratch memory management
-- `src/engine/stream_decode.rs` - Streaming decoder state machine
-- `src/engine/buffer_scan.rs` - Buffer scanning with offsets
+- `crates/gossip-stdx/src/inline_vec.rs` - Stack-backed collection with unsafe pointer ops
+- `crates/gossip-stdx/src/ring_buffer.rs` - Fixed-capacity circular queue with unsafe
+- `crates/gossip-stdx/src/byte_slab.rs` - Pre-allocated byte pool with raw pointers
+- `crates/gossip-connectors/src/filesystem.rs` - Filesystem I/O with unsafe
+- `crates/gossip-coordination/src/lib.rs` - Coordination protocol internals
+
+### Scanner Engine High-Risk Files
+- `crates/scanner-engine/src/engine/hit_pool.rs` - Sorted hit pool with unsafe pointer ops
+- `crates/scanner-engine/src/engine/scratch.rs` - Reusable scratch memory with raw pointers
+- `crates/scanner-engine/src/engine/stream_decode.rs` - Streaming decoder with buffer manipulation
+- `crates/scanner-engine/src/engine/buffer_scan.rs` - Buffer scanning with unsafe slice ops
+- `crates/scanner-engine/src/engine/transform.rs` - Transform/decode pipeline (base64, etc.)
+- `crates/scanner-engine/src/engine/vectorscan_prefilter.rs` - FFI boundary with vectorscan
+- `crates/scanner-engine/src/scratch_memory.rs` - Scratch memory allocation with raw pointers
+- `crates/scanner-engine/src/lsm/set_associative_cache.rs` - Cache with SIMD tag matching
+- `crates/scanner-engine/src/engine/simd_classify.rs` - SIMD byte classification
+
+### Scanner Scheduler High-Risk Files
+- `crates/scanner-scheduler/src/runtime.rs` - Runtime with async I/O and unsafe
+- `crates/scanner-scheduler/src/scheduler/` - Work-stealing scheduler (48 files)
+
+### Scanner Git High-Risk Files
+- `crates/scanner-git/src/` - Git pack parsing, delta decoding (86 files with binary data handling)
 
 ## Security Checklist
 
@@ -88,5 +106,5 @@ For each `unsafe` block:
 ## Related Resources
 
 - `docs/kani-verification.md` - Existing Kani proofs
-- `test-strategy` - Choose appropriate verification approach
-- `run-fuzz` - Run fuzz targets for security testing
+- `/test-strategy` - Choose appropriate verification approach
+- `/run-fuzz` - Run fuzz targets for security testing

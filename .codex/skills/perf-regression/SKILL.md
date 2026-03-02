@@ -1,19 +1,23 @@
 ---
 name: perf-regression
 description: Performance regression testing workflow for hot path changes
+user-invocable: false
 ---
 
 # Performance Regression Workflow
 
-**IMPORTANT**: Follow this workflow before merging any feature that touches hot paths (`src/engine/`, regex changes, validation logic).
+**IMPORTANT**: Follow this workflow before merging any feature that touches hot paths in the gossip-rs workspace.
 
 ## When This Applies
 
 Invoke this skill when modifying:
-- `src/engine/` modules (scratch.rs, stream_decode.rs, work_items.rs)
-- Regex patterns or validation logic
-- Data structures in `src/stdx/`
-- Rule definitions in `default_rules.yaml` or `src/rules/`
+- Data structures in `crates/gossip-stdx/src/` (InlineVec, RingBuffer, ByteSlab)
+- Coordination protocol in `crates/gossip-coordination/src/`
+- Contract types in `crates/gossip-contracts/src/`
+- Scanner engine in `crates/scanner-engine/src/`
+- Scanner runtime in `crates/gossip-scanner-runtime/src/`
+- Scanner scheduler in `crates/scanner-scheduler/src/`
+- Git scan pipeline in `crates/scanner-git/src/`
 
 ## Workflow Steps
 
@@ -24,54 +28,56 @@ git stash push -m "feature-name"
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### 2. Run Baseline Scans (3x each)
+### 2. Run Baseline Benchmarks
+
+Save baselines for all relevant benchmark suites:
 
 ```bash
-for i in 1 2 3; do
-  ./target/release/scanner-rs ../gitleaks 2>&1 | tail -1
-  ./target/release/scanner-rs ../linux 2>&1 | tail -1
-  ./target/release/scanner-rs ../tigerbeetle 2>&1 | tail -1
-done
+# Run all workspace benchmarks
+cargo bench --workspace -- --save-baseline before
+
+# Or target specific crates:
+cargo bench -p gossip-stdx -- --save-baseline before
+cargo bench -p gossip-contracts -- --save-baseline before
+cargo bench -p gossip-coordination -- --save-baseline before
 ```
 
-Record average throughput for each repository.
-
-### 3. Run Baseline Benchmarks
-
-```bash
-cargo bench --bench scanner_throughput -- --save-baseline before
-cargo bench --bench vectorscan_overhead -- --save-baseline before
-```
-
-### 4. Restore Changes and Rebuild
+### 3. Restore Changes and Rebuild
 
 ```bash
 git stash pop
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### 5. Run Comparison Scans and Benchmarks
+### 4. Run Comparison Benchmarks
 
 ```bash
-# Same scan loop as step 2
-for i in 1 2 3; do
-  ./target/release/scanner-rs ../gitleaks 2>&1 | tail -1
-  ./target/release/scanner-rs ../linux 2>&1 | tail -1
-  ./target/release/scanner-rs ../tigerbeetle 2>&1 | tail -1
-done
+# Compare against baseline (all workspace benchmarks)
+cargo bench --workspace -- --baseline before
 
-# Compare against baseline
-cargo bench --bench scanner_throughput -- --baseline before
-cargo bench --bench vectorscan_overhead -- --baseline before
+# Or target specific crates:
+cargo bench -p gossip-stdx -- --baseline before
+cargo bench -p gossip-contracts -- --baseline before
+cargo bench -p gossip-coordination -- --baseline before
 ```
 
-### 6. Analyze Results
+### 5. Analyze Results
 
-Calculate average throughput delta per repository:
+Look for these patterns in Criterion output:
+- `Performance has improved` — Optimization successful
+- `Performance has regressed` — Changes hurt performance
+- `No change in performance` — Within noise threshold
 
-```
-% change = (after_throughput - baseline_throughput) / baseline_throughput * 100
-```
+## Available Benchmarks
+
+| Crate | Bench File | Measures |
+|-------|-----------|----------|
+| `gossip-contracts` | `identity.rs` | Identity type construction and derivation |
+| `gossip-coordination` | `coordination.rs` | Shard coordination operations |
+| `gossip-coordination` | `sim.rs` | Simulation harness benchmarks |
+| `gossip-stdx` | `byte_slab.rs` | Byte slab pool allocation |
+| `gossip-stdx` | `inline_vec.rs` | InlineVec operations |
+| `gossip-stdx` | `ring_buffer.rs` | RingBuffer throughput |
 
 ## Acceptance Criteria
 
@@ -85,8 +91,8 @@ Calculate average throughput delta per repository:
 ## PR Documentation
 
 Include in PR description:
-- Average throughput delta per test repository
 - Criterion benchmark comparison summary
+- Which crates/benchmarks were affected
 - Justification for any regression >2%
 
 ## Output Format
@@ -96,19 +102,24 @@ Report results as:
 ```markdown
 ## Performance Regression Results
 
-### Scan Throughput
-
-| Repository | Baseline | After | Delta |
-|------------|----------|-------|-------|
-| gitleaks | X MB/s | Y MB/s | +/-Z% |
-| linux | X MB/s | Y MB/s | +/-Z% |
-| tigerbeetle | X MB/s | Y MB/s | +/-Z% |
-
 ### Criterion Benchmarks
 
-[Paste relevant benchmark comparison output]
+| Crate | Benchmark | Baseline | After | Delta |
+|-------|-----------|----------|-------|-------|
+| gossip-stdx | inline_vec/push | X ns | Y ns | +/-Z% |
+| gossip-stdx | ring_buffer/enqueue | X ns | Y ns | +/-Z% |
+| gossip-stdx | byte_slab/alloc | X ns | Y ns | +/-Z% |
+| gossip-contracts | identity/derive | X ns | Y ns | +/-Z% |
+| gossip-coordination | coordination/acquire | X ns | Y ns | +/-Z% |
 
 ### Verdict
 
 [None/Minor/Moderate/Major] regression - [justification if >2%]
 ```
+
+## Related Skills
+
+- `/bench-compare` — Quick before/after benchmark comparison
+- `/asm-forge` — Assembly-guided optimization for hot functions
+- `/linux-perf-profile` — Hardware counter analysis for deeper investigation
+- `/performance-analyzer` — Static hotspot analysis for this project's patterns

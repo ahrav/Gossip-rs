@@ -159,8 +159,9 @@ should follow them:
   sentinel so callers don't invent their own.
 - **Const generics for granularity**: Compile-time selection via `<const G: usize>`
   prevents runtime branching on a configuration value.
-- **Feature-gated test tooling**: `#[cfg(feature = "sim-harness")]` ensures test
-  infrastructure can't accidentally leak into production builds.
+- **Feature-gated test tooling**: `#[cfg(feature = "test-support")]` ensures test
+  infrastructure (e.g., `Arbitrary` impls, sim harness) can't accidentally leak
+  into production builds.
 - **`debug_assert!` for internal invariants**: Zero-cost in release, catches
   contract violations during development.
 
@@ -205,9 +206,9 @@ When reviewing, check that new APIs are consistent with these existing patterns.
 
 ## Related Skills
 
-- `security-reviewer` - Complements this: security reviews focus on memory
+- `/security-reviewer` - Complements this: security reviews focus on memory
   safety; interface reviews focus on API misuse prevention
-- `test-strategy` - Property-based tests are powerful for validating that an
+- `/test-strategy` - Property-based tests are powerful for validating that an
   interface's invariants hold across all inputs
-- `doc-rigor` - If an interface passes this review, its docs should describe
+- `/doc-rigor` - If an interface passes this review, its docs should describe
   *why* the design prevents misuse, not just *how* to use it

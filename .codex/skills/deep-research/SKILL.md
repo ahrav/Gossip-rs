@@ -28,13 +28,13 @@ grounded in the codebase.
 - Straightforward CRUD features or wiring code
 - Problems with a single obvious solution
 - Tasks where you already have deep domain expertise and just need to code
-- Use `design-tournament` instead when the problem is well-understood but
+- Use `/design-tournament` instead when the problem is well-understood but
   multiple valid approaches exist
 
 ## Invocation
 
 ```
-deep-research <problem statement>
+/deep-research <problem statement>
 ```
 
 The `<problem statement>` should describe what you're trying to build or decide,
@@ -45,12 +45,13 @@ user for the problem statement before proceeding.
 
 ## Phase 1 — Research (3-5 Parallel Agents)
 
-Launch **5 research agents in parallel** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with
-`agent_type=default`. Each agent has a distinct research lens but
+Launch **5 research agents in parallel** using the Task tool with
+`subagent_type=general-purpose`. Each agent has a distinct research lens but
 receives the same problem statement. All agents explore the codebase for context
 AND search the web for external evidence.
 
-**All 5 agents MUST be launched in a single message** (one message, five `spawn_agent` calls) so they run concurrently.
+**All 5 agents MUST be launched in a single message** (one message, five Task
+tool calls) so they run concurrently.
 
 ### Research Agent Specialties
 
@@ -76,11 +77,11 @@ Every claim must have a source. Unsourced claims are worthless.
 
 ### Research Process
 
-1. **Understand the codebase context**: Use `rg --files`, `rg`, and targeted file reads to understand
+1. **Understand the codebase context**: Use Glob, Grep, and Read to understand
    the relevant parts of the codebase. What exists today? What constraints does
    the current architecture impose?
 
-2. **Search for external evidence**: Use `web.search_query` and `web.open` to find:
+2. **Search for external evidence**: Use WebSearch and WebFetch to find:
    - Academic papers and technical reports
    - Documentation from production systems that solve similar problems
    - RFCs, specifications, and formal descriptions
@@ -163,7 +164,7 @@ Search for the THEORETICAL foundations of this problem:
 - Mathematical models and invariants
 - Type-theoretic or formal methods approaches
 
-Start with `web.search_query` queries like:
+Start with WebSearch queries like:
 - "{problem keywords} algorithm formal proof"
 - "{problem keywords} paper OSDI SOSP VLDB SIGMOD"
 - "{problem keywords} correctness verification"
@@ -190,7 +191,7 @@ Search for how REAL SYSTEMS in production solve this problem:
 - Language runtimes (Go GC, Rust allocators, JVM internals)
 - Operating systems (Linux kernel, FreeBSD, Fuchsia)
 
-Start with `web.search_query` queries like:
+Start with WebSearch queries like:
 - "{problem keywords} implementation production"
 - "{system name} {problem keywords} design"
 - "{problem keywords} source code github"
@@ -218,7 +219,7 @@ Search for how this problem GOES WRONG:
 - Subtle bugs found in production (Jepsen reports, fuzzing results)
 - Memory safety issues in similar C/C++/Rust implementations
 
-Start with `web.search_query` queries like:
+Start with WebSearch queries like:
 - "{problem keywords} bug post-mortem"
 - "{problem keywords} vulnerability CVE"
 - "{problem keywords} performance regression"
@@ -248,7 +249,7 @@ Search for how this problem is solved IN RUST specifically:
 - Benchmarks comparing Rust implementations
 - Rust RFCs and compiler internals if relevant
 
-Start with `web.search_query` queries like:
+Start with WebSearch queries like:
 - "{problem keywords} rust crate"
 - "{problem keywords} rust implementation"
 - "{problem keywords} rust unsafe safe abstraction"
@@ -281,7 +282,7 @@ Search for how ENGINEERING ORGANIZATIONS approach this problem:
 - RFCs and design documents from relevant projects
 - Books and practitioner guides
 
-Start with `web.search_query` queries like:
+Start with WebSearch queries like:
 - "{problem keywords} engineering blog"
 - "{problem keywords} architecture design document"
 - "{problem keywords} conference talk"
@@ -308,8 +309,8 @@ out, proceed with the agents that succeeded (minimum 3 required for Phase 2).
 
 ## Phase 2 — Synthesize (Single Agent)
 
-Launch **1 synthesis agent** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with
-`agent_type=default`.
+Launch **1 synthesis agent** using the Task tool with
+`subagent_type=general-purpose`.
 
 ### Synthesizer Prompt
 
@@ -403,8 +404,8 @@ won't read the full report.
 
 ## Phase 3 — Integrate (Single Agent)
 
-Launch **1 integration agent** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with
-`agent_type=default`.
+Launch **1 integration agent** using the Task tool with
+`subagent_type=general-purpose`.
 
 This agent maps the synthesized research to a concrete implementation plan
 grounded in the actual codebase.
@@ -427,7 +428,7 @@ evidence-backed implementation plan.
 ### Step 1: Codebase Mapping
 
 Thoroughly explore the codebase to understand:
-- Current architecture and module structure (use `rg --files`, `rg`, and targeted file reads)
+- Current architecture and module structure (use Glob, Grep, Read)
 - Existing patterns and conventions
 - What infrastructure already exists that can be leveraged
 - What constraints the current architecture imposes
@@ -572,7 +573,7 @@ Default: 5 researchers + 1 synthesizer + 1 integrator (7 total agents).
 
 The user can reduce the research agents:
 ```
-deep-research 3 agents: <problem>
+/deep-research 3 agents: <problem>
 ```
 
 Enforce these limits:
@@ -589,7 +590,7 @@ Enforce these limits:
   research agents can examine the codebase for context.
 - For distributed systems problems, the Failure Modes agent (Agent 3) is
   critical — never reduce below 3 agents.
-- The output from this skill feeds naturally into `design-tournament` if you
+- The output from this skill feeds naturally into `/design-tournament` if you
   want to explore multiple implementation approaches after research.
 - For unsafe Rust, the Rust Ecosystem agent (Agent 4) is essential for finding
   established safe abstraction patterns.

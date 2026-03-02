@@ -27,8 +27,8 @@ This skill performs a comprehensive review of unsafe code, enforcing the project
 
 ```
 /unsafe-review                           # Audit all unsafe in the codebase
-/unsafe-review @src/engine/hit_pool.rs   # Audit specific file
-/unsafe-review @src/runtime.rs:450-530   # Audit specific line range
+/unsafe-review @crates/scanner-engine/src/engine/hit_pool.rs   # Audit specific file
+/unsafe-review @crates/scanner-scheduler/src/runtime.rs:450-530  # Audit specific line range
 ```
 
 ## Workflow Overview
@@ -381,7 +381,7 @@ Combine all phases into a final report. For each unsafe block, assign a verdict:
 
 ## Detailed Audit
 
-### File: src/engine/hit_pool.rs
+### File: crates/scanner-engine/src/engine/hit_pool.rs
 
 #### Block #1: line 172 — `get_unchecked` in sorted lookup
 
@@ -456,7 +456,7 @@ mod tests {
 - **Empty/zero-size inputs**: Catches null pointer dereference, zero-length slices
 - **Capacity boundaries**: Catches off-by-one in pointer arithmetic
 - **Aliasing patterns**: Catches mutable aliasing through raw pointers
-- **Drop order**: Catches use-after-free in pool/arena patterns (see `scratch_memory.rs:514`)
+- **Drop order**: Catches use-after-free in pool/arena patterns (see `crates/scanner-engine/src/scratch_memory.rs`)
 - **Thread interleaving**: Catches data races in atomic/lock-free structures (with loom)
 
 ### Kani Proof Template

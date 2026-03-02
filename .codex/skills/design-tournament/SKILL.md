@@ -19,7 +19,7 @@ and merge the findings into a confidence-weighted stack ranking.
 ## Invocation
 
 ```
-design-tournament <problem statement>
+/design-tournament <problem statement>
 ```
 
 The `<problem statement>` is the full description of what needs to be designed.
@@ -28,11 +28,12 @@ proceeding.
 
 ## Phase 1 — Diverge (Parallel Exploration)
 
-Launch **5 independent agents in parallel** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with
-`agent_type=default`. Every agent receives **identical instructions**
+Launch **5 independent agents in parallel** using the Task tool with
+`subagent_type=general-purpose`. Every agent receives **identical instructions**
 so that their outputs are independently generated with zero cross-contamination.
 
-**All 5 agents MUST be launched in a single message** (one message, five `spawn_agent` calls) so they run concurrently.
+**All 5 agents MUST be launched in a single message** (one message, five Task
+tool calls) so they run concurrently.
 
 ### Agent Prompt Template (identical for all 5)
 
@@ -79,7 +80,7 @@ do not assume anyone else's output exists.
 
 - Be specific and concrete — pseudocode or type signatures over hand-waving.
 - Do NOT hedge with "it depends" — commit to a design and defend it.
-- Explore the codebase if you need context (use `rg --files`, `rg`, and targeted file reads).
+- Explore the codebase if you need context (use Glob, Grep, Read).
 - Aim for depth over breadth. One well-defended design beats three sketches.
 
 ### Output Format
@@ -95,11 +96,12 @@ out, proceed with the agents that succeeded (minimum 3 required).
 
 ## Phase 2 — Converge (Parallel Ranking)
 
-Launch **2 independent ranking agents in parallel** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with
-`agent_type=default`. Both receive **identical instructions** and
+Launch **2 independent ranking agents in parallel** using the Task tool with
+`subagent_type=general-purpose`. Both receive **identical instructions** and
 the collected Phase 1 outputs.
 
-**Both rankers MUST be launched in a single message** (one message, two `spawn_agent` calls) so they run concurrently.
+**Both rankers MUST be launched in a single message** (one message, two Task
+tool calls) so they run concurrently.
 
 ### Ranker Prompt Template (identical for both)
 
@@ -238,7 +240,7 @@ Present the merged result to the user as:
 ## Configuration
 
 The default is 5 explorers + 2 rankers (7 total agents). If the user specifies
-a different count (e.g., `design-tournament 3 agents: ...`), respect it but
+a different count (e.g., `/design-tournament 3 agents: ...`), respect it but
 enforce these minimums:
 - Phase 1: at least 3 explorer agents
 - Phase 2: always exactly 2 ranking agents

@@ -1,9 +1,32 @@
-use std::{fs, path::Path, process::Command};
+//! Integration-leaning unit tests for runtime entry points and parity fixtures.
+//!
+//! These tests validate three contracts:
+//! - `ExecutionMode` parsing and mode routing behavior.
+//! - Baseline FS/Git scan behavior and budget validation.
+//! - JSONL parity against pinned scanner-rs fixtures and distributed-vs-CLI
+//!   finding-set parity on the same runtime corpus.
 
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{Arc, Mutex},
+};
+
+use gossip_contracts::{
+    connector::Cursor,
+    coordination::ShardSpec,
+    identity::{PolicyHash, TenantId, TenantSecretKey},
+};
+use gossip_scan_driver::{Assignment, AssignmentSource, ConnectorKind};
 use rstest::rstest;
+use scanner_scheduler::events::EventOutput;
 use tempfile::tempdir;
 
 use super::*;
+use crate::coordination_sink::StoredCoreEvent;
 
 fn run_git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -22,6 +45,8 @@ fn run_git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// Create a git fixture with optional tracked files and an initial commit when
+/// at least one file is provided.
 fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
     let dir = tempdir().expect("tempdir");
     run_git(dir.path(), &["init", "-q"]);
@@ -220,4 +245,191 @@ fn scan_git_rejects_subdirectory_of_repo() {
         "subdirectory of a repo should not be accepted as a git scan root; got {:?}",
         result,
     );
+}
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn snapshot(&self) -> Vec<u8> {
+        self.bytes.lock().expect("shared writer lock").clone()
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.bytes
+            .lock()
+            .map_err(|_| io::Error::other("shared writer lock poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn parity_path(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("parity")
+        .join(relative)
+}
+
+/// Run one filesystem assignment with the JSONL sink and return emitted bytes.
+fn run_fs_jsonl(path: &Path, mode: ExecutionMode) -> Vec<u8> {
+    let writer = SharedWriter::default();
+    let sink = event_sink::JsonlEventSink::new(writer.clone());
+    let commit = commit_sink::CliNoOpCommitSink;
+    let cancel = CancellationToken::new();
+
+    let outcome = scan_fs_with_runtime(
+        &FsScanConfig::new(path)
+            .with_execution_mode(mode)
+            .with_budgets(ScanBudgets::default()),
+        &sink,
+        &commit,
+        &cancel,
+    )
+    .expect("filesystem scan should succeed");
+    assert!(outcome.report.items_scanned >= 1);
+
+    sink.flush();
+    let mut output = writer.snapshot();
+    // `scan_fs_with_runtime` emits finding/progress events but no terminal
+    // summary record; parity canonicalization requires throughput on summary.
+    let summary = format!(
+        "{{\"type\":\"summary\",\"source\":\"fs\",\"status\":\"complete\",\"elapsed_ms\":0,\"bytes_scanned\":{},\"findings_emitted\":{},\"errors\":0,\"throughput_mib_s\":0.00}}\n",
+        outcome.report.bytes_scanned, outcome.report.findings_emitted
+    );
+    output.extend_from_slice(summary.as_bytes());
+    output
+}
+
+/// Convert distributed event paths into parity-comparable relative paths.
+fn normalize_distributed_path(path_bytes: &[u8], root: &Path) -> String {
+    let raw = std::str::from_utf8(path_bytes).expect("path should be utf8 for fixture");
+    let path = Path::new(raw);
+    match path.strip_prefix(root) {
+        Ok(stripped) => stripped.to_string_lossy().replace('\\', "/"),
+        Err(_) => raw.replace('\\', "/"),
+    }
+}
+
+#[test]
+fn parity_golden_has_pinned_scanner_rs_commit() {
+    let raw = fs::read_to_string(parity_path("golden/PINNED_COMMIT")).expect("pinned commit file");
+    let pinned = raw.trim();
+    assert_eq!(pinned.len(), 40, "pinned commit should be full SHA-1");
+    assert!(
+        pinned.chars().all(|ch| ch.is_ascii_hexdigit()),
+        "pinned commit should be hexadecimal"
+    );
+}
+
+#[test]
+fn scan_fs_direct_matches_scanner_rs_golden_findings() {
+    let corpus_root = parity_path("corpus/fs_golden");
+    let golden_jsonl = fs::read(parity_path("golden/fs_golden.jsonl")).expect("golden jsonl");
+
+    let actual_jsonl = run_fs_jsonl(&corpus_root, ExecutionMode::Direct);
+    let actual =
+        parity::canonicalize_jsonl_events_with_roots(&actual_jsonl, &[corpus_root.as_path()])
+            .expect("canonicalize runtime output");
+    let golden =
+        parity::canonicalize_jsonl_events(&golden_jsonl).expect("canonicalize golden output");
+
+    assert_eq!(actual.findings, golden.findings);
+    assert!(actual.throughput_mib_s.is_finite());
+}
+
+#[test]
+fn scan_fs_connector_matches_direct_canonical_findings() {
+    let corpus_root = parity_path("corpus/fs_runtime");
+
+    let direct_jsonl = run_fs_jsonl(&corpus_root, ExecutionMode::Direct);
+    let connector_jsonl = run_fs_jsonl(&corpus_root, ExecutionMode::Connector);
+
+    let direct =
+        parity::canonicalize_jsonl_events_with_roots(&direct_jsonl, &[corpus_root.as_path()])
+            .expect("canonicalize direct run");
+    let connector =
+        parity::canonicalize_jsonl_events_with_roots(&connector_jsonl, &[corpus_root.as_path()])
+            .expect("canonicalize connector run");
+
+    assert_eq!(direct.findings, connector.findings);
+}
+
+#[test]
+fn scan_fs_distributed_matches_cli_findings_for_fixture() {
+    let corpus_root = parity_path("corpus/fs_runtime");
+    let cli_jsonl = run_fs_jsonl(&corpus_root, ExecutionMode::Direct);
+    let cli_run =
+        parity::canonicalize_jsonl_events_with_roots(&cli_jsonl, &[corpus_root.as_path()])
+            .expect("canonicalize cli run");
+
+    let lease = distributed::ShardLease {
+        shard_id: "parity-shard".to_owned(),
+        assignment: Assignment {
+            job_id: "parity-job".to_owned(),
+            connector_kind: ConnectorKind::Filesystem,
+            connector_instance_id: corpus_root.display().to_string(),
+            policy_hash: PolicyHash::from_bytes([0x44; 32]),
+            shard_spec: ShardSpec::with_range([], []),
+            cursor: Cursor::initial(),
+            source: AssignmentSource::Filesystem {
+                root: corpus_root.clone(),
+            },
+        },
+        tenant_id: TenantId::from_bytes([0xA1; 32]),
+        tenant_secret_key: TenantSecretKey::from_bytes([0xB2; 32]),
+    };
+    let coordinator = distributed::InMemoryCoordinator::new(vec![lease]);
+    let report = distributed::run_worker(
+        &coordinator,
+        distributed::DistributedRuntimeConfig::default(),
+    )
+    .expect("run distributed worker");
+    assert_eq!(report.shards_scanned, 1);
+
+    let cli_findings: BTreeSet<(String, String, u64, u64)> = cli_run
+        .findings
+        .iter()
+        .map(|finding| {
+            (
+                finding.path.clone(),
+                finding.rule.clone(),
+                finding.start,
+                finding.end,
+            )
+        })
+        .collect();
+    assert!(
+        !cli_findings.is_empty(),
+        "distributed parity fixture should emit at least one finding"
+    );
+    let distributed_findings: BTreeSet<(String, String, u64, u64)> = coordinator
+        .core_events()
+        .into_iter()
+        .filter_map(|(_, event)| match event {
+            StoredCoreEvent::Finding {
+                object_path,
+                start,
+                end,
+                rule_name,
+                ..
+            } => Some((
+                normalize_distributed_path(&object_path, &corpus_root),
+                rule_name,
+                start,
+                end,
+            )),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(cli_findings, distributed_findings);
 }

@@ -17,7 +17,7 @@ maintain, review, and keep updated.
 - You notice copy-paste test bodies differing only in values
 - Before a PR when test files are growing faster than source files
 - After refactoring: old tests may cluster around the same behavior
-- During periodic test hygiene alongside `test-dedup`
+- During periodic test hygiene alongside `/test-dedup`
 
 ## Philosophy
 
@@ -33,16 +33,21 @@ The hierarchy of consolidation (prefer higher):
    holds for ALL valid inputs. One `proptest!` replaces unbounded unit tests.
    Maximum coverage, minimum code.
 
-2. **Parameterized test (rstest)** — When you have a finite, important set of
-   (input, expected) pairs and no general invariant. One `#[rstest]` with a
-   `#[case]` list replaces N identical test bodies.
+2. **Parameterized test (rstest)** — The **default choice** for any finite set
+   of (input, expected) pairs. One `#[rstest]` with `#[case]` attributes
+   replaces N identical test bodies. Each case runs as a named sub-test,
+   giving clear CI output on failure. **Always prefer rstest over table-driven
+   loops** — rstest gives you per-case names, per-case failures, and the
+   ability to `#[ignore]` individual cases.
 
-3. **Table-driven test** — When the inputs and outputs fit a simple table.
-   A `for` loop over a `Vec<(Input, Expected)>` inside a single `#[test]`.
-   Simpler than rstest if there's no need for individual test names.
-
-4. **Fuzz test** — When exploring adversarial or untrusted input spaces. One
+3. **Fuzz test** — When exploring adversarial or untrusted input spaces. One
    fuzz target can subsume hundreds of hand-crafted "weird input" tests.
+
+4. **Table-driven test** — A distant fallback. Only use when rstest is truly
+   inappropriate (e.g., dynamically generated case lists, cases loaded from a
+   file, or >50 cases where `#[case]` attributes become unwieldy). If you're
+   reaching for `let cases = [...]; for case in cases { ... }`, stop and
+   use rstest instead.
 
 5. **Individual unit tests** — The last resort. Only when each test truly
    exercises unique setup, distinct error paths, or documents a specific bug.
@@ -88,7 +93,7 @@ For each cluster, determine the best consolidation strategy:
   - "encoding never produces invalid UTF-8"
 
 **Is it a finite set of (input, expected) with no general property?**
-→ Parameterized test (rstest) or table-driven test. Examples:
+→ Parameterized test (rstest). Always rstest, not table-driven. Examples:
   - Known error codes mapping to messages
   - Specific file extensions mapping to MIME types
   - Configuration keys mapping to defaults
@@ -108,10 +113,10 @@ For each cluster, answer:
 | Question | If Yes | If No |
 |----------|--------|-------|
 | Can I state one invariant covering all cases? | proptest | Next question |
-| Are all test bodies structurally identical? | rstest or table-driven | Partial consolidation |
-| Do >3 tests share the same assertion pattern? | At minimum table-driven | Probably keep individual |
-| Would adding a new case require a new function? | Consolidate (adding cases should be trivial) | Fine as-is |
-| Do tests differ only in values, not in logic? | Strong consolidation candidate | Keep separate |
+| Are all test bodies structurally identical? | rstest | Partial consolidation |
+| Do >3 tests share the same assertion pattern? | rstest | Probably keep individual |
+| Would adding a new case require a new function? | Consolidate with rstest (adding a `#[case]` should be trivial) | Fine as-is |
+| Do tests differ only in values, not in logic? | Strong rstest candidate | Keep separate |
 
 ### Step 4: Choose the Right Tool
 
@@ -168,26 +173,83 @@ fn status_text_mapping(#[case] code: u16, #[case] expected: &str) {
 }
 ```
 
-#### Table-Driven — Best for simple mappings without rstest
+#### Parameterized (rstest) — Complex types and multi-field cases
 
-Use when: Cases are simple, no need for individual test names in output.
+rstest handles complex types well. Use `#[case]` even when cases involve
+structs, enums, booleans, or multi-field assertions.
 
 ```rust
-// AFTER: 1 table-driven test
+// BEFORE: 5 individual tests with complex setup
+#[test] fn gate_short_window() {
+    let spec = CharClassSpec { max_lower_pct: 95, min_window_len: 32 };
+    assert!(gate_passes(&[b'a'; 31], spec));
+}
+#[test] fn gate_all_lowercase() {
+    let spec = CharClassSpec { max_lower_pct: 95, min_window_len: 32 };
+    assert!(!gate_passes(&[b'a'; 40], spec));
+}
+#[test] fn gate_mixed_case() {
+    let spec = CharClassSpec { max_lower_pct: 95, min_window_len: 32 };
+    let mut window = vec![b'a'; 38];
+    window.extend_from_slice(b"AB");
+    assert!(gate_passes(&window, spec));
+}
+// ... 2 more ...
+
+// AFTER: 1 rstest with descriptive case names
+#[rstest]
+#[case::short_window_passes(&[b'a'; 31], 95, 32, true)]
+#[case::all_lowercase_rejected(&[b'a'; 40], 95, 32, false)]
+#[case::mixed_case_passes(&[b'a'; 35, b'A', b'B', b'C', b'D', b'E'], 95, 32, true)]
+#[case::at_threshold_rejected(&[b'a'; 39, b'A'], 95, 32, false)]
+#[case::high_threshold_passes(&[b'a'; 40], 100, 32, true)]
+fn char_class_gate(
+    #[case] window: &[u8],
+    #[case] max_lower_pct: u8,
+    #[case] min_window_len: usize,
+    #[case] expected: bool,
+) {
+    let spec = CharClassSpec { max_lower_pct, min_window_len };
+    assert_eq!(gate_passes(window, spec), expected);
+}
+```
+
+#### Table-Driven — Avoid; use rstest instead
+
+**Table-driven tests (`let cases = [...]; for case in cases`) are an anti-pattern
+in this codebase.** They have real downsides compared to rstest:
+
+- A failing case stops the loop — later cases don't run (no isolation)
+- No per-case test names in `cargo test` output
+- Cannot `#[ignore]` or filter individual cases
+- Failure messages require manual `"case={label}"` formatting
+
+The **only** situations where table-driven is acceptable:
+- Dynamically generated case lists (cases built at runtime)
+- Cases loaded from an external file
+- >50 cases where `#[case]` attribute lines become genuinely unwieldy
+
+```rust
+// ANTI-PATTERN — do NOT write this:
 #[test]
 fn status_text_cases() {
     let cases = [
         (200, "OK"),
         (201, "Created"),
         (400, "Bad Request"),
-        (404, "Not Found"),
-        (500, "Internal Server Error"),
-        (999, "Unknown"),
-        (0, "Unknown"),
     ];
     for (code, expected) in cases {
         assert_eq!(status_text(code), expected, "code={code}");
     }
+}
+
+// CORRECT — use rstest instead:
+#[rstest]
+#[case(200, "OK")]
+#[case(201, "Created")]
+#[case(400, "Bad Request")]
+fn status_text_mapping(#[case] code: u16, #[case] expected: &str) {
+    assert_eq!(status_text(code), expected);
 }
 ```
 
@@ -213,17 +275,18 @@ fuzz_target!(|data: &[u8]| {
 
 Before recommending consolidation, verify:
 
-- [ ] **Feature gates**: proptest requires `stdx-proptest`. If all tests move
-  behind a feature gate, keep at least one ungated unit test as baseline.
+- [ ] **Feature gates**: proptest is a direct dev-dependency (no feature gate for
+  tests). Some crates gate `Arbitrary` impls behind `test-support`. If moving
+  tests behind a feature gate, keep at least one ungated unit test as baseline.
 - [ ] **Regression tests**: Tests with bug references (`// Regression: GH-123`)
   should stay as individual tests even if technically consolidatable.
 - [ ] **Error path tests**: Tests verifying specific error messages or error
   variants may need individual tests if the exact error matters.
 - [ ] **Readability anchors**: Keep one simple example test per public function
   as documentation, even if a property test covers it.
-- [ ] **rstest availability**: This project does not currently use rstest.
-  If recommending it, note that `rstest = "0.23"` needs to be added to
-  `[dev-dependencies]` in Cargo.toml.
+- [ ] **rstest availability**: rstest is a project standard (workspace dep `rstest = "0.25"`).
+  If not yet in a crate's `[dev-dependencies]`, add `rstest.workspace = true`. This is
+  expected and should not be treated as a blocker.
 
 ### Step 6: Produce Consolidation Plan
 
@@ -240,19 +303,28 @@ For each cluster, specify:
 
 ### Test locations in this codebase
 - Inline tests: `#[cfg(test)] mod tests { ... }` at bottom of source file
-- Separate test files: `src/stdx/*_tests.rs`, `src/engine/tests.rs`
-- Property tests: often in the same file, gated with `#[cfg(all(test, feature = "stdx-proptest"))]`
-- Kani proofs: `#[cfg(kani)] mod kani_proofs { ... }` or in `*_tests.rs`
-- Simulation tests: `tests/simulation/` directory
+- Sibling test files: `crates/*/src/*_tests.rs` (e.g., `ring_buffer_tests.rs`, `error_tests.rs`)
+- Property tests: in `#[cfg(test)]` modules using proptest (direct dev-dep, no feature gate)
+- Kani proofs: `#[cfg(kani)]` blocks in gossip-stdx
+- Simulation tests: `crates/gossip-coordination/src/sim/` (CoordinationSim harness + proptest state machine)
+- Fuzz targets: `crates/gossip-contracts/fuzz/` and `crates/gossip-stdx/fuzz/`
+- Integration tests: `crates/*/tests/` (e.g., `identity_smoke.rs`)
+    - Scanner engine tests: `crates/scanner-engine/src/engine/tests.rs` and `*_tests.rs` companions
+    - Scanner integration tests: `crates/scanner-engine-integration-tests/tests/chunked_file_scans.rs`
 
 ### Feature gates
-- Property tests: `stdx-proptest` feature
-- Kani proofs: `kani` feature
-- Simulation harnesses: `sim-harness`, `scheduler-sim`
+- `test-support`: Enables `Arbitrary` impls in gossip-contracts and sim infrastructure in gossip-coordination
+- `kani`: Enables Kani model checking proofs in gossip-stdx
+- `tiger-harness`: Enables tiger harness in scanner-engine
+- `scheduler-sim`: Enables scheduler simulation in scanner-scheduler
+- `sim-harness`: Enables simulation harness in scanner-engine and scanner-scheduler
+- `bench`: Enables benchmark scaffolding in scanner-engine and scanner-scheduler
 
-### Dependencies to add if recommending new tools
-- **rstest**: Add `rstest = "0.23"` to `[dev-dependencies]` in Cargo.toml
-- **proptest**: Already available behind `stdx-proptest` feature
+### Dependencies
+- **rstest**: Project standard (workspace dep `rstest = "0.25"`). Add `rstest.workspace = true`
+  to crate-level `[dev-dependencies]` if not already present. No feature gate needed.
+- **proptest**: Direct dev-dependency in most crates. `Arbitrary` impls for shared types
+  gated behind `test-support` in gossip-contracts.
 - **cargo-fuzz**: External tool, no Cargo.toml change needed
 
 ## Output Format
@@ -309,14 +381,14 @@ proptest! {
 
 ### Dependency Changes
 
-- [ ] Add `rstest = "0.23"` to `[dev-dependencies]` (if rstest recommended)
+- [ ] Add `rstest.workspace = true` to `[dev-dependencies]` (if rstest recommended)
 - [ ] No new dependencies needed (if only proptest/fuzz)
 
 ### Migration Order
 
 1. Add proptest for Cluster 1 (highest value: 8 tests → 1)
 2. Add rstest for Cluster 3 (6 tests → 1 parameterized)
-3. Rewrite Cluster 5 as table-driven (4 tests → 1)
+3. Add rstest for Cluster 5 (4 tests → 1 parameterized)
 4. Run full test suite to verify no coverage loss
 5. Delete subsumed unit tests
 ```
@@ -335,11 +407,13 @@ proptest! {
 - The mapping is arbitrary (no mathematical relationship)
 - You want each case to appear as a named sub-test in output
 
-### When to prefer table-driven over rstest
-- Cases are simple value pairs
-- You don't need individual test names in CI output
-- You want to avoid adding a dependency
-- The table fits in <20 lines
+### When to prefer rstest over table-driven (almost always)
+- **Default to rstest for ALL finite case sets.** rstest gives you:
+  - Per-case test names in `cargo test` output (e.g., `status_text_mapping::case_3`)
+  - Independent execution — one failing case doesn't hide others
+  - `#[ignore]` on individual cases
+  - Native `cargo test --test-threads` parallelism per case
+- Table-driven is only acceptable for dynamically generated cases or >50 entries
 
 ### When to prefer fuzz over all else
 - The function processes untrusted/external input
@@ -366,5 +440,5 @@ proptest! {
 
 ## Related Skills
 
-- `test-dedup` — Remove tests subsumed by higher-level tests (complementary)
-- `test-strategy` — Decide what kind of test to write for new code
+- `/test-dedup` — Remove tests subsumed by higher-level tests (complementary)
+- `/test-strategy` — Decide what kind of test to write for new code

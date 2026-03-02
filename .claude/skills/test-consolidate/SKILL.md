@@ -309,10 +309,16 @@ For each cluster, specify:
 - Simulation tests: `crates/gossip-coordination/src/sim/` (CoordinationSim harness + proptest state machine)
 - Fuzz targets: `crates/gossip-contracts/fuzz/` and `crates/gossip-stdx/fuzz/`
 - Integration tests: `crates/*/tests/` (e.g., `identity_smoke.rs`)
+    - Scanner engine tests: `crates/scanner-engine/src/engine/tests.rs` and `*_tests.rs` companions
+    - Scanner integration tests: `crates/scanner-engine-integration-tests/tests/chunked_file_scans.rs`
 
 ### Feature gates
 - `test-support`: Enables `Arbitrary` impls in gossip-contracts and sim infrastructure in gossip-coordination
 - `kani`: Enables Kani model checking proofs in gossip-stdx
+- `tiger-harness`: Enables tiger harness in scanner-engine
+- `scheduler-sim`: Enables scheduler simulation in scanner-scheduler
+- `sim-harness`: Enables simulation harness in scanner-engine and scanner-scheduler
+- `bench`: Enables benchmark scaffolding in scanner-engine and scanner-scheduler
 
 ### Dependencies
 - **rstest**: Project standard (workspace dep `rstest = "0.25"`). Add `rstest.workspace = true`

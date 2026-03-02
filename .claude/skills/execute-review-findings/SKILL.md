@@ -204,9 +204,9 @@ For each task, list every file it will read or write:
 
 | Task | Writes | Reads |
 |------|--------|-------|
-| F1 | src/engine/core.rs | src/engine/mod.rs |
-| F2 | src/engine/scratch.rs | - |
-| F3 | src/engine/core.rs | src/api.rs |
+| F1 | crates/scanner-engine/src/engine/core.rs | crates/scanner-engine/src/engine/mod.rs |
+| F2 | crates/scanner-engine/src/engine/scratch.rs | - |
+| F3 | crates/scanner-engine/src/engine/core.rs | crates/scanner-engine/src/api.rs |
 
 ### Step 2: Identify Conflicts
 

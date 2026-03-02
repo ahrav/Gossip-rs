@@ -106,7 +106,7 @@ For the primary functions/types affected:
 
 ### Step 4: Find Reusable Patterns
 Check for existing utilities that could be reused (per duplication prevention rules):
-- Search `src/stdx/` for related helpers
+- Search `crates/gossip-stdx/src/` for related helpers
 - Check sibling modules for similar patterns
 - Note any existing abstractions that should be extended rather than duplicated
 
@@ -122,7 +122,7 @@ For each result, classify the relationship:
 Based on your research, classify:
 - **files_affected**: count of files that will be modified
 - **modules_crossed**: count of distinct modules (top-level src/ directories)
-- **touches_hot_path**: true/false — does this touch engine/, scheduler/, or hot loop code?
+- **touches_hot_path**: true/false — does this touch engine/, coordination/, stdx/, or hot loop code?
 - **has_unsafe**: true/false — does affected code contain unsafe blocks?
 
 ## Output Format
@@ -214,7 +214,7 @@ description (if `--quick`).
 {What exists today with code snippets and file:line references.}
 
 ```rust
-// src/engine/core.rs:142-158 — current boundary check
+// crates/scanner-engine/src/engine/core.rs:142-158 — current boundary check
 {actual code from research}
 ```
 
@@ -231,7 +231,7 @@ description (if `--quick`).
 {Existing patterns to mirror, with file:line refs. "None" if nothing specific.}
 
 ### Utilities to Reuse
-{From src/stdx/ or siblings. "None found" if nothing applies.}
+{From crates/gossip-stdx/src/ or siblings. "None found" if nothing applies.}
 
 ### Blast Radius
 {Callers, downstream effects, call sites needing updates.}
@@ -262,7 +262,7 @@ Include these based on scope assessment:
 |---------|-------------|---------|
 | **Design Notes** | modules_crossed >= 2 or multiple valid approaches | Trade-offs, alternatives considered, rationale for chosen approach |
 | **Risk Analysis** | priority <= 1 or has_unsafe | What could go wrong, mitigation strategies, rollback plan |
-| **Performance Considerations** | touches engine/, stdx/, scheduler/ | Hot path impact, allocation concerns, benchmark expectations |
+| **Performance Considerations** | touches engine/, stdx/, coordination/ | Hot path impact, allocation concerns, benchmark expectations |
 | **Testing Strategy** | files_affected > 1 | What tests to add/modify, test types (unit, property, integration), coverage goals |
 
 Place conditional sections between "Code References" and "Related Work".

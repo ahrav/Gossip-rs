@@ -95,10 +95,6 @@ Create one `bd create` per finding. Each task description must be **fully self-c
 
 ### Task Description Template (All Types)
 
-The template follows the project's Task Quality Standard. The orchestrator reads
-each affected file during Phase 2 to extract Current State and Code References
-inline (no Explore agent — keeps latency low for multi-finding workflow).
-
 ```
 ## Finding: {summary}
 
@@ -107,55 +103,16 @@ inline (no Explore agent — keeps latency low for multi-finding workflow).
 **Type**: {type}
 **Flagged by**: {specialists}
 
-### Context
-{Why this finding matters. What user/system impact does the current behavior have?
-What symptom or risk prompted it?}
-
-### Current State
-{The actual code at the finding location — 5-20 lines with file:line header.
-The orchestrator reads the affected file during Phase 2 to extract this.}
-
-```rust
-// {file}:{start_line}-{end_line} — {brief description of what this code does}
-{actual code extracted from reading the file}
-```
-
 ### Problem
 {detail — full finding including current behavior and why it matters}
 
-### Desired State
-{What the code should look like or how it should behave after the fix.
-Be specific: new return type, changed logic, added check, etc.}
-
 ### Resolution Steps
 {type-specific steps — see below}
-
-### Code References
-{Additional context beyond the primary finding location:
-- Callers of the affected function (with file:line)
-- Related functions that follow the pattern this fix should match
-- Test module location for the affected file
-Include 2-4 snippets, each 5-15 lines with file:line headers.}
-
-### Related Work
-{Run `bd search "{file path}" --limit 5` during Phase 2 task creation.
-List related open tasks.}
-
-| Task ID | Title | Relationship |
-|---------|-------|-------------|
-{Or "None found" — section must always be present.}
 
 ### Acceptance Criteria
 - [ ] {specific, verifiable conditions}
 - [ ] All existing tests pass: `cargo test`
 - [ ] Code compiles clean: `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings`
-
-### Pointers
-{Where to look for additional context:
-- Review source (which reviewer/skill produced this finding)
-- Test module path for the affected file
-- Adjacent files worth reading for patterns
-- Relevant documentation or design docs}
 ```
 
 ### Type-Specific Resolution Steps
@@ -247,9 +204,9 @@ For each task, list every file it will read or write:
 
 | Task | Writes | Reads |
 |------|--------|-------|
-| F1 | src/engine/core.rs | src/engine/mod.rs |
-| F2 | src/engine/scratch.rs | - |
-| F3 | src/engine/core.rs | src/api.rs |
+| F1 | crates/scanner-engine/src/engine/core.rs | crates/scanner-engine/src/engine/mod.rs |
+| F2 | crates/scanner-engine/src/engine/scratch.rs | - |
+| F3 | crates/scanner-engine/src/engine/core.rs | crates/scanner-engine/src/api.rs |
 
 ### Step 2: Identify Conflicts
 

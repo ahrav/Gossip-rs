@@ -49,10 +49,11 @@ Determine which files changed and classify each by **boundary**:
 | Boundary | Paths | DST Strictness |
 |----------|-------|----------------|
 | **Coordination core** | `gossip-coordination/src/{traits,in_memory,lease,record,split,cursor,error}.rs` | STRICT — all checklist items apply |
-| **Gossip protocol** | `gossip-coordination/src/gossip/` | STRICT — all checklist items apply |
+| **Gossip protocol** | `gossip-coordination/src/` (gossip module — not yet implemented) | STRICT — all checklist items apply |
 | **Coordination contracts** | `gossip-contracts/src/coordination/` | STRICT — type definitions must support DST |
-| **Pipeline** | `gossip-scan-pipeline/src/` | MODERATE — I/O boundaries must be trait-abstracted |
-| **Worker** | `gossip-worker/src/` | BOUNDARY — async allowed here, but coordination calls must go through traits |
+| **Pipeline (engine)** | `scanner-engine/src/` | MODERATE — I/O boundaries must be trait-abstracted |
+| **Pipeline (scheduler)** | `scanner-scheduler/src/` | MODERATE — I/O boundaries must be trait-abstracted |
+| **Worker** | `gossip-worker/src/main.rs` | BOUNDARY — async allowed here, but coordination calls must go through traits |
 | **Connectors** | `gossip-connectors/src/` | BOUNDARY — external I/O lives here |
 
 > **Note:** Type A coordination modules (from `/sim-scaffold`) fall under

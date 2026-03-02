@@ -70,7 +70,7 @@ The orchestrator (you, not a sub-agent) creates the initial plan.
 
 1. **Parse task** --- identify core objective, constraints, domain.
 2. **Explore codebase** --- use Glob, Grep, Read to find relevant files,
-   patterns, existing utilities. Check `src/stdx/` and neighboring modules
+   patterns, existing utilities. Check `crates/gossip-stdx/src/` and neighboring modules
    for duplication (per CLAUDE.md rules).
 3. **Write initial plan** to `~/.claude/plans/{YYYY-MM-DD}-{feature-slug}-v1.md`.
 
@@ -190,7 +190,7 @@ other three).
 ### Simplification
 - YAGNI: does the plan build things not yet needed?
 - Does the codebase already have utilities the plan reinvents? (search with
-  Glob/Grep, especially src/stdx/)
+  Glob/Grep, especially crates/gossip-stdx/src/)
 - Could fewer files, types, or steps achieve the same result?
 - Are there unnecessary abstraction layers or indirection?
 - Could an existing pattern be extended instead of building new?

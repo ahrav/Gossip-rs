@@ -13,9 +13,11 @@ user-invocable: false
 Invoke this skill when modifying:
 - Data structures in `crates/gossip-stdx/src/` (InlineVec, RingBuffer, ByteSlab)
 - Coordination protocol in `crates/gossip-coordination/src/`
-- Scan pipeline in `crates/gossip-scan-pipeline/src/`
 - Contract types in `crates/gossip-contracts/src/`
-- Engine core in `crates/gossip-engine/src/`
+- Scanner engine in `crates/scanner-engine/src/`
+- Scanner runtime in `crates/gossip-scanner-runtime/src/`
+- Scanner scheduler in `crates/scanner-scheduler/src/`
+- Git scan pipeline in `crates/scanner-git/src/`
 
 ## Workflow Steps
 
@@ -38,7 +40,6 @@ cargo bench --workspace -- --save-baseline before
 cargo bench -p gossip-stdx -- --save-baseline before
 cargo bench -p gossip-contracts -- --save-baseline before
 cargo bench -p gossip-coordination -- --save-baseline before
-cargo bench -p gossip-scan-pipeline -- --save-baseline before
 ```
 
 ### 3. Restore Changes and Rebuild
@@ -58,7 +59,6 @@ cargo bench --workspace -- --baseline before
 cargo bench -p gossip-stdx -- --baseline before
 cargo bench -p gossip-contracts -- --baseline before
 cargo bench -p gossip-coordination -- --baseline before
-cargo bench -p gossip-scan-pipeline -- --baseline before
 ```
 
 ### 5. Analyze Results
@@ -75,7 +75,6 @@ Look for these patterns in Criterion output:
 | `gossip-contracts` | `identity.rs` | Identity type construction and derivation |
 | `gossip-coordination` | `coordination.rs` | Shard coordination operations |
 | `gossip-coordination` | `sim.rs` | Simulation harness benchmarks |
-| `gossip-scan-pipeline` | `scan_loop.rs` | Core scan loop throughput |
 | `gossip-stdx` | `byte_slab.rs` | Byte slab pool allocation |
 | `gossip-stdx` | `inline_vec.rs` | InlineVec operations |
 | `gossip-stdx` | `ring_buffer.rs` | RingBuffer throughput |
@@ -123,4 +122,4 @@ Report results as:
 - `/bench-compare` — Quick before/after benchmark comparison
 - `/asm-forge` — Assembly-guided optimization for hot functions
 - `/linux-perf-profile` — Hardware counter analysis for deeper investigation
-- `/rust-hotspot-finder` — Identify hot functions before profiling
+- `/performance-analyzer` — Static hotspot analysis for this project's patterns
