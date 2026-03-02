@@ -42,3 +42,20 @@ pub fn proptest_cases(default: u32) -> u32 {
     }
     default.clamp(1, 4)
 }
+
+/// Return the proptest fuzz multiplier, respecting `PROPTEST_FUZZ_MULTIPLIER`.
+///
+/// Precedence:
+/// 1. Explicit `PROPTEST_FUZZ_MULTIPLIER` env override (clamped to >= 1).
+/// 2. CI environment — uses the caller-supplied `default` (clamped to >= 1).
+/// 3. Local development — returns 1 (minimal fuzzing for fast iteration).
+#[inline]
+pub fn proptest_fuzz_multiplier(default: u32) -> u32 {
+    if let Some(value) = env_u32("PROPTEST_FUZZ_MULTIPLIER") {
+        return value.max(1);
+    }
+    if is_ci() {
+        return default.max(1);
+    }
+    1
+}

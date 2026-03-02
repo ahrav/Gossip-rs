@@ -1315,7 +1315,8 @@ mod tests {
     /// the TOCTOU race between external spawn and join.
     ///
     /// The iteration count is env-overridable via `STRESS_ITERATIONS` (default
-    /// 100). CI sets this to 20 for fast feedback; nightly uses the full 100.
+    /// 100). CI overrides to 20 for fast feedback; local dev and nightly use
+    /// the full 100 (completes in < 1 s on modern hardware).
     #[test]
     fn concurrent_spawn_and_join_no_task_loss() {
         use std::thread;

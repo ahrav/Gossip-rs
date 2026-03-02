@@ -44,6 +44,7 @@ stdx-proptest = []
 sim-harness = ["scanner-scheduler/sim-harness"]
 
 [dev-dependencies]
+gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
 proptest = "1.10"
 rstest = "0.25"
 sha1 = "0.10"
