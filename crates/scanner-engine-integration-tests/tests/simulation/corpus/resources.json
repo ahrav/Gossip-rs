@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "seed": 212,
+  "case": {
+    "exec_cfg": {
+      "workers": 1,
+      "steal_tries": 2,
+      "seed": 212,
+      "wake_on_hoard_threshold": 32
+    },
+    "resources": [
+      {
+        "id": 0,
+        "total": 1
+      }
+    ],
+    "programs": [
+      {
+        "name": "resource_release",
+        "code": [
+          {
+            "TryAcquire": {
+              "res": 0,
+              "units": 1,
+              "ok": 1,
+              "fail": 3
+            }
+          },
+          {
+            "Release": {
+              "res": 0,
+              "units": 1
+            }
+          },
+          "Complete",
+          "Complete"
+        ]
+      },
+      {
+        "name": "resource_fail",
+        "code": [
+          {
+            "TryAcquire": {
+              "res": 0,
+              "units": 1,
+              "ok": 1,
+              "fail": 2
+            }
+          },
+          "Complete",
+          "Complete"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "tid": 0,
+        "program": 0,
+        "pc": 0
+      },
+      {
+        "tid": 1,
+        "program": 1,
+        "pc": 0
+      }
+    ],
+    "initial_runnable": [
+      0,
+      1,
+      0
+    ],
+    "external_events": [],
+    "max_steps": 20
+  },
+  "driver_choices": [],
+  "expected_trace_hash": 9761141915659358222,
+  "failure": {
+    "kind": "Timeout",
+    "step": 11,
+    "message": "corpus artifact"
+  }
+}

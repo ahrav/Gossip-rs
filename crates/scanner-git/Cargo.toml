@@ -41,6 +41,7 @@ git-perf = ["perf-stats", "scanner-engine/perf-counters"]
 bench = []
 rocksdb = ["dep:rocksdb"]
 stdx-proptest = []
+sim-harness = ["scanner-scheduler/sim-harness"]
 
 [dev-dependencies]
 proptest = "1.10"

@@ -1,0 +1,40 @@
+{
+  "config": {
+    "budgets": {},
+    "fairness_bound": 20,
+    "max_steps": 100,
+    "workers": 2
+  },
+  "program": {
+    "tasks": [
+      {
+        "code": [
+          {
+            "Sleep": {
+              "ticks": 2
+            }
+          },
+          {
+            "SignalEvent": {
+              "event": 1
+            }
+          },
+          "Complete"
+        ],
+        "name": "signaler"
+      },
+      {
+        "code": [
+          {
+            "WaitEvent": {
+              "event": 1
+            }
+          },
+          "Complete"
+        ],
+        "name": "waiter"
+      }
+    ]
+  },
+  "seed": 99
+}

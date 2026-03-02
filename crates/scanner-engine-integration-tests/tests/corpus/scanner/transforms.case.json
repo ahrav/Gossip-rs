@@ -1,0 +1,223 @@
+{
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "git_commit": null,
+  "run_config": {
+    "buffer_pool_cap": 6,
+    "chunk_size": 24,
+    "max_in_flight_objects": 12,
+    "max_steps": 0,
+    "max_transform_depth": 3,
+    "overlap": 512,
+    "scan_utf16_variants": false,
+    "stability_runs": 2,
+    "workers": 3
+  },
+  "scanner_pkg_version": "dev",
+  "scenario": {
+    "expected": [
+      {
+        "path": {
+          "bytes": [
+            116,
+            114,
+            97,
+            110,
+            115,
+            102,
+            111,
+            114,
+            109,
+            115,
+            46,
+            116,
+            120,
+            116
+          ]
+        },
+        "repr": "Base64",
+        "root_span": {
+          "end": 24,
+          "start": 6
+        },
+        "rule_id": 0
+      },
+      {
+        "path": {
+          "bytes": [
+            116,
+            114,
+            97,
+            110,
+            115,
+            102,
+            111,
+            114,
+            109,
+            115,
+            46,
+            116,
+            120,
+            116
+          ]
+        },
+        "repr": "UrlPercent",
+        "root_span": {
+          "end": 68,
+          "start": 29
+        },
+        "rule_id": 0
+      }
+    ],
+    "fs": {
+      "nodes": [
+        {
+          "File": {
+            "contents": [
+              115,
+              116,
+              97,
+              114,
+              116,
+              32,
+              86,
+              69,
+              57,
+              76,
+              77,
+              70,
+              57,
+              66,
+              81,
+              107,
+              78,
+              69,
+              82,
+              85,
+              90,
+              72,
+              83,
+              65,
+              32,
+              109,
+              105,
+              100,
+              32,
+              37,
+              53,
+              52,
+              37,
+              52,
+              70,
+              37,
+              52,
+              66,
+              37,
+              51,
+              48,
+              37,
+              53,
+              70,
+              37,
+              52,
+              49,
+              37,
+              52,
+              50,
+              37,
+              52,
+              51,
+              37,
+              52,
+              52,
+              37,
+              52,
+              53,
+              37,
+              52,
+              54,
+              37,
+              52,
+              55,
+              37,
+              52,
+              56,
+              32,
+              101,
+              110,
+              100
+            ],
+            "path": {
+              "bytes": [
+                116,
+                114,
+                97,
+                110,
+                115,
+                102,
+                111,
+                114,
+                109,
+                115,
+                46,
+                116,
+                120,
+                116
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "rules": [
+        {
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              48,
+              95
+            ]
+          ],
+          "name": "TOK0",
+          "radius": 64,
+          "regex": "TOK0_[A-Z0-9]{8}",
+          "rule_id": 0
+        },
+        {
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              49,
+              95
+            ]
+          ],
+          "name": "TOK1",
+          "radius": 64,
+          "regex": "TOK1_[A-Z0-9]{8}",
+          "rule_id": 1
+        }
+      ],
+      "schema_version": 1
+    },
+    "schema_version": 1
+  },
+  "scenario_seed": 2,
+  "schedule_seed": 2021,
+  "schema_version": 1,
+  "target": "local",
+  "trace": {
+    "full": null,
+    "ring": []
+  }
+}

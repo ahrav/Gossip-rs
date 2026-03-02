@@ -1,0 +1,48 @@
+{
+  "config": {
+    "budgets": {
+      "1": 1
+    },
+    "fairness_bound": 20,
+    "max_steps": 100,
+    "workers": 2
+  },
+  "program": {
+    "tasks": [
+      {
+        "code": [
+          {
+            "Acquire": {
+              "budget": 1
+            }
+          },
+          "Yield",
+          {
+            "Release": {
+              "budget": 1
+            }
+          },
+          "Complete"
+        ],
+        "name": "holder"
+      },
+      {
+        "code": [
+          {
+            "Acquire": {
+              "budget": 1
+            }
+          },
+          {
+            "Release": {
+              "budget": 1
+            }
+          },
+          "Complete"
+        ],
+        "name": "waiter"
+      }
+    ]
+  },
+  "seed": 7
+}

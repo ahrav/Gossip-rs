@@ -24,6 +24,8 @@
 //! # Feature gates
 //! - `rocksdb` enables the RocksDB persistence adapter.
 //! - `git-perf` enables performance counters for pack decode and scan stages.
+//! - `sim-harness` re-exports scheduler simulation modules to preserve
+//!   scanner-rs-era harness import paths during DST migration.
 //!
 //! # Invariants
 //! - Metadata stages (repo open through pack planning) do not read blob payloads.
@@ -146,6 +148,14 @@ pub mod spiller;
 pub mod start_set;
 #[cfg(test)]
 pub mod test_utils;
+#[cfg(feature = "sim-harness")]
+pub use scanner_scheduler::sim;
+#[cfg(feature = "sim-harness")]
+pub use scanner_scheduler::sim_archive;
+#[cfg(feature = "sim-harness")]
+pub use scanner_scheduler::sim_scanner;
+#[cfg(feature = "sim-harness")]
+pub mod sim_git_scan;
 pub mod tree_cache;
 pub mod tree_candidate;
 pub mod tree_delta_cache;

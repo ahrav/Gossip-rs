@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "scanner_pkg_version": "dev",
+  "git_commit": null,
+  "target": "local",
+  "scenario_seed": 4012,
+  "schedule_seed": 5012,
+  "run_config": {
+    "workers": 1,
+    "chunk_size": 5,
+    "overlap": 512,
+    "max_in_flight_objects": 10,
+    "buffer_pool_cap": 6,
+    "max_steps": 0,
+    "max_transform_depth": 0,
+    "scan_utf16_variants": false,
+    "stability_runs": 2
+  },
+  "scenario": {
+    "schema_version": 1,
+    "fs": {
+      "nodes": [
+        {
+          "File": {
+            "path": {
+              "bytes": [
+                99,
+                114,
+                108,
+                102,
+                95,
+                98,
+                111,
+                117,
+                110,
+                100,
+                97,
+                114,
+                121,
+                46,
+                116,
+                120,
+                116
+              ]
+            },
+            "contents": [
+              120,
+              120,
+              120,
+              120,
+              13,
+              10,
+              84,
+              79,
+              75,
+              48,
+              95,
+              67,
+              82,
+              76,
+              70,
+              66,
+              78,
+              68,
+              49,
+              121,
+              121,
+              121,
+              121
+            ]
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "schema_version": 1,
+      "rules": [
+        {
+          "rule_id": 0,
+          "name": "TOK0",
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              48,
+              95
+            ]
+          ],
+          "radius": 64,
+          "regex": "TOK0_[A-Z0-9]{8}"
+        }
+      ]
+    },
+    "expected": [
+      {
+        "path": {
+          "bytes": [
+            99,
+            114,
+            108,
+            102,
+            95,
+            98,
+            111,
+            117,
+            110,
+            100,
+            97,
+            114,
+            121,
+            46,
+            116,
+            120,
+            116
+          ]
+        },
+        "rule_id": 0,
+        "root_span": {
+          "start": 6,
+          "end": 19
+        },
+        "repr": "Raw"
+      }
+    ]
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "trace": {
+    "ring": [],
+    "full": null
+  }
+}

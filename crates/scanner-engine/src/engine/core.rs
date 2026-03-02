@@ -2012,13 +2012,16 @@ impl Engine {
         self.tuning.max_findings_per_chunk
     }
 
-    /// Returns the [`TransformId`] for the transform at position `idx` in the
-    /// engine's transform list.
+    /// Returns the [`TransformId`] at position `idx` in the engine transform list.
+    ///
+    /// This harness-only accessor is a migration compatibility shim used by
+    /// simulation code that inspects configured transform order without exposing
+    /// the full internal transform representation.
     ///
     /// # Panics
     /// Panics if `idx >= self.transforms.len()`.
     #[cfg(feature = "sim-harness")]
-    pub(crate) fn transform_id(&self, idx: usize) -> TransformId {
+    pub fn transform_id(&self, idx: usize) -> TransformId {
         self.transforms[idx].id
     }
 

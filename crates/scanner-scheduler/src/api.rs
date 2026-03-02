@@ -3,6 +3,9 @@
 //! Scheduler modules were originally written against `crate::api::*` in the
 //! scanner-rs monolith. Re-exporting here keeps extracted files unchanged
 //! while routing all real implementations through `scanner-engine`.
+//! This module is intentionally a thin shim and does not define scheduler-local
+//! API types.
 pub use scanner_engine::{
-    FileId, Finding, FindingRec, RuleSpec, TransformConfig, Tuning, ValidatorKind,
+    AnchorPolicy, DecodeStep, FileId, Finding, FindingRec, Gate, RuleSpec, STEP_ROOT, StepId,
+    TransformConfig, TransformId, TransformMode, Tuning, ValidatorKind,
 };

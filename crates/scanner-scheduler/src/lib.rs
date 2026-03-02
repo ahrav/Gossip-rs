@@ -7,6 +7,9 @@
 //! The scheduler event surface is split into git-free core events (`events`)
 //! and source tagging (`source_kind`) so downstream sinks can consume core
 //! progress/finding/summary output without git-type dependencies.
+//! The local [`api`] module is a compatibility shim that re-exports
+//! `scanner-engine` API types so migrated scheduler modules can keep their
+//! historical `crate::api::*` imports.
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
@@ -31,10 +34,24 @@ pub mod pool;
 pub mod runtime;
 pub mod scheduler;
 pub mod scratch_memory;
+// Keep simulation surfaces behind feature gates: they are for harness/testing
+// compatibility and are not part of the default runtime build.
+#[cfg(feature = "sim-harness")]
+pub mod sim;
+#[cfg(feature = "sim-harness")]
+pub mod sim_archive;
+#[cfg(feature = "sim-harness")]
+pub mod sim_scanner;
+#[cfg(any(test, feature = "scheduler-sim"))]
+pub mod sim_scheduler;
 pub mod source_kind;
 pub mod store;
 #[cfg(test)]
 pub mod test_utils;
+#[cfg(feature = "sim-harness")]
+pub mod demo {
+    pub use scanner_engine::demo_tuning;
+}
 
 #[cfg(feature = "b64-stats")]
 pub use scanner_engine::Base64DecodeStats;

@@ -11,6 +11,12 @@
 //! drive three independent I/O frontends (blocking FS, io_uring, connector
 //! pipeline), each tailored to a different deployment scenario.
 //!
+//! # Migration Compatibility
+//!
+//! Public module names and key re-exports intentionally preserve scanner-rs-era
+//! paths so DST simulation harnesses can migrate incrementally without changing
+//! scheduler semantics.
+//!
 //! # Architecture
 //!
 //! ```text
@@ -253,6 +259,10 @@ pub mod alloc;
 
 // Testing infrastructure
 pub mod failure;
+#[cfg(any(test, feature = "scheduler-sim"))]
+pub mod sim;
+#[cfg(any(test, feature = "scheduler-sim"))]
+pub mod sim_executor_harness;
 pub mod task_graph;
 
 // Resource control

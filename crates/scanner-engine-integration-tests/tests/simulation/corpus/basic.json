@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "seed": 161,
+  "case": {
+    "exec_cfg": {
+      "workers": 1,
+      "steal_tries": 2,
+      "seed": 161,
+      "wake_on_hoard_threshold": 32
+    },
+    "resources": [],
+    "programs": [
+      {
+        "name": "basic",
+        "code": [
+          {
+            "Yield": {
+              "placement": "Local"
+            }
+          },
+          "Complete"
+        ]
+      }
+    ],
+    "tasks": [
+      {
+        "tid": 0,
+        "program": 0,
+        "pc": 0
+      }
+    ],
+    "initial_runnable": [
+      0
+    ],
+    "external_events": [
+      {
+        "at_step": 3,
+        "event": "CloseGateJoin"
+      }
+    ],
+    "max_steps": 50
+  },
+  "driver_choices": [],
+  "expected_trace_hash": 9451434633293162043,
+  "failure": {
+    "kind": "Timeout",
+    "step": 11,
+    "message": "corpus artifact"
+  }
+}

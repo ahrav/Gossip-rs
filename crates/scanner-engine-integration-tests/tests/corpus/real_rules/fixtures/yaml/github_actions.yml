@@ -1,0 +1,12 @@
+# Fixture: GitHub Actions workflow with PAT
+name: CI
+on:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure
+        env:
+          GH_PAT: ghp_0123456789abcdefghijklmnopqrstuvwxyz
+        run: echo "configured"

@@ -1,0 +1,154 @@
+{
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "git_commit": null,
+  "run_config": {
+    "workers": 2,
+    "chunk_size": 17,
+    "overlap": 512,
+    "max_in_flight_objects": 10,
+    "buffer_pool_cap": 6,
+    "max_steps": 0,
+    "max_transform_depth": 0,
+    "scan_utf16_variants": true,
+    "stability_runs": 2
+  },
+  "scanner_pkg_version": "dev",
+  "scenario": {
+    "schema_version": 1,
+    "fs": {
+      "schema_version": 1,
+      "nodes": [
+        {
+          "File": {
+            "path": {
+              "bytes": [
+                117,
+                116,
+                102,
+                49,
+                54,
+                108,
+                101,
+                95,
+                109,
+                105,
+                115,
+                97,
+                108,
+                105,
+                103,
+                110,
+                101,
+                100,
+                46,
+                98,
+                105,
+                110
+              ]
+            },
+            "contents": [
+              120,
+              84,
+              0,
+              79,
+              0,
+              75,
+              0,
+              48,
+              0,
+              95,
+              0,
+              65,
+              0,
+              66,
+              0,
+              67,
+              0,
+              68,
+              0,
+              69,
+              0,
+              70,
+              0,
+              71,
+              0,
+              72,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "schema_version": 1,
+      "rules": [
+        {
+          "rule_id": 0,
+          "name": "TOK0",
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              48,
+              95
+            ]
+          ],
+          "radius": 64,
+          "regex": "TOK0_[A-Z0-9]{8}"
+        }
+      ]
+    },
+    "expected": [
+      {
+        "path": {
+          "bytes": [
+            117,
+            116,
+            102,
+            49,
+            54,
+            108,
+            101,
+            95,
+            109,
+            105,
+            115,
+            97,
+            108,
+            105,
+            103,
+            110,
+            101,
+            100,
+            46,
+            98,
+            105,
+            110
+          ]
+        },
+        "rule_id": 0,
+        "root_span": {
+          "start": 1,
+          "end": 27
+        },
+        "repr": "Utf16Le"
+      }
+    ]
+  },
+  "scenario_seed": 2016,
+  "schedule_seed": 3016,
+  "schema_version": 1,
+  "target": "local",
+  "trace": {
+    "ring": [],
+    "full": null
+  }
+}

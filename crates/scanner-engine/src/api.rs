@@ -26,6 +26,9 @@
 //!   allocation-free on the hot path.
 //! - Some budget caps are hard limits and can drop work when exceeded; tune for your
 //!   desired balance of throughput and completeness.
+//! - Harness-facing constructors/accessors are feature-gated (`test`,
+//!   `sim-harness`, `test-support`) as migration compatibility shims; production
+//!   semantics are unchanged.
 
 use crate::stdx::FixedVec;
 use regex::bytes::Regex;
@@ -64,11 +67,26 @@ pub struct StepId(pub(crate) u32);
 pub const MAX_DECODE_STEPS: usize = 8;
 
 /// Sentinel step id that marks the root of a provenance chain.
-pub(crate) const STEP_ROOT: StepId = StepId(u32::MAX);
+pub const STEP_ROOT: StepId = StepId(u32::MAX);
 
 impl Default for StepId {
     fn default() -> Self {
         STEP_ROOT
+    }
+}
+
+impl StepId {
+    /// Constructs a [`StepId`] from a raw decode-step arena index.
+    ///
+    /// This is a compatibility shim for migrated simulation/test harnesses that
+    /// need to reconstruct `StepId` values across crate boundaries.
+    ///
+    /// # Note
+    /// This constructor does not validate that `raw` exists in any arena; invalid
+    /// values fail later when used against a specific step arena.
+    #[cfg(any(test, feature = "sim-harness", feature = "test-support"))]
+    pub fn from_raw(raw: u32) -> Self {
+        Self(raw)
     }
 }
 

@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use super::executor::ExecutorConfig;
 use super::executor_core::{
-    in_flight, is_accepting, worker_step, ExecTraceEvent, IdleAction, IdleHooks, NoopTrace,
-    PopSource, TraceHooks, WorkerCtxLike, WorkerStepResult, ACCEPTING_BIT, COUNT_UNIT,
-    WAKE_ON_HOARD_THRESHOLD,
+    ACCEPTING_BIT, COUNT_UNIT, ExecTraceEvent, IdleAction, IdleHooks, NoopTrace, PopSource,
+    TraceHooks, WAKE_ON_HOARD_THRESHOLD, WorkerCtxLike, WorkerStepResult, in_flight, is_accepting,
+    worker_step,
 };
 use super::rng::XorShift64;
 

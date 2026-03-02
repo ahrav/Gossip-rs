@@ -1,0 +1,10 @@
+{
+  "lockfileVersion": 3,
+  "name": "fixture",
+  "packages": {
+    "node_modules/example": {
+      "resolved": "https://registry.example.com/example-1.0.0.tgz",
+      "version": "1.0.0"
+    }
+  }
+}

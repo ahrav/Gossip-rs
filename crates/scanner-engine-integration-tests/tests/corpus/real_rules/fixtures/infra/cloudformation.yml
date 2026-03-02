@@ -1,0 +1,5 @@
+# Fixture: CloudFormation parameters with GitHub token
+Parameters:
+  GitHubToken:
+    Type: String
+    Default: ghp_0123456789abcdefghijklmnopqrstuvwxyz

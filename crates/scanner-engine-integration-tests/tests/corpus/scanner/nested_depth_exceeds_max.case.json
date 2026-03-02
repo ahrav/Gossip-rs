@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "scanner_pkg_version": "dev",
+  "git_commit": null,
+  "target": "local",
+  "scenario_seed": 4006,
+  "schedule_seed": 5006,
+  "run_config": {
+    "workers": 1,
+    "chunk_size": 32,
+    "overlap": 512,
+    "max_in_flight_objects": 10,
+    "buffer_pool_cap": 6,
+    "max_steps": 0,
+    "max_transform_depth": 2,
+    "scan_utf16_variants": false,
+    "stability_runs": 2
+  },
+  "scenario": {
+    "schema_version": 1,
+    "fs": {
+      "nodes": [
+        {
+          "File": {
+            "path": {
+              "bytes": [
+                110,
+                101,
+                115,
+                116,
+                101,
+                100,
+                95,
+                100,
+                101,
+                112,
+                116,
+                104,
+                95,
+                101,
+                120,
+                99,
+                101,
+                101,
+                100,
+                115,
+                95,
+                109,
+                97,
+                120,
+                46,
+                116,
+                120,
+                116
+              ]
+            },
+            "contents": [
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              122,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              122,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              49,
+              74,
+              84,
+              65,
+              51,
+              74,
+              84,
+              65,
+              48,
+              74,
+              84,
+              65,
+              50,
+              74,
+              84,
+              65,
+              122,
+              74,
+              84,
+              65,
+              122
+            ]
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "schema_version": 1,
+      "rules": [
+        {
+          "rule_id": 0,
+          "name": "TOK0",
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              48,
+              95
+            ]
+          ],
+          "radius": 64,
+          "regex": "TOK0_[A-Z0-9]{8}"
+        }
+      ]
+    },
+    "expected": []
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "trace": {
+    "ring": [],
+    "full": null
+  }
+}
