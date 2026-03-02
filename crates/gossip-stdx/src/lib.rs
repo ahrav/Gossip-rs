@@ -55,15 +55,38 @@
 //! ```sh
 //! cargo +nightly miri test -p gossip-stdx
 //! ```
+//!
+//! # scanner-rs Compatibility Mapping
+//!
+//! During scanner-rs consolidation we intentionally avoid duplicate container
+//! implementations:
+//! - `scanner-rs::stdx::fixed_vec::FixedVec<T, N>` -> [`InlineVec<T, N>`]
+//! - `scanner-rs::stdx::ring_buffer::RingBuffer<T, N>` -> [`RingBuffer<T, N>`]
+//!
+//! New scanner-facing stdx modules are exposed both as root re-exports and via
+//! module paths to minimize migration churn.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+pub mod atomic_bitset;
+pub mod atomic_seen_sets;
+pub mod bitset;
+pub mod byte_ring;
 mod byte_slab;
+pub mod fastrange;
+pub mod fixed_set;
 pub mod fnv;
 mod inline_vec;
+pub mod perf_stats;
 mod ring_buffer;
+pub mod spsc;
+pub mod timing_wheel;
 
+pub use atomic_bitset::AtomicBitSet;
+pub use atomic_seen_sets::AtomicSeenSets;
+pub use bitset::{DynamicBitSet, DynamicBitSetIterator, words_for_bits};
+pub use byte_ring::ByteRing;
 /// Pre-allocated contiguous byte pool with hybrid bump + free-list allocator.
 ///
 /// - [`ByteSlab`]: the pool itself — allocate, deallocate, and read byte regions.
@@ -91,6 +114,8 @@ pub use fnv::{FNV_OFFSET, FNV_PRIME, fnv_mix_byte, fnv_mix_bytes, fnv_mix_opt_by
 /// most shards have few children and the inline path avoids allocation.
 pub use inline_vec::InlineVec;
 
+pub use fastrange::fast_range;
+pub use fixed_set::FixedSet128;
 /// Fixed-capacity ring buffer with stack-allocated storage and power-of-2
 /// bitwise indexing.
 ///
@@ -101,3 +126,5 @@ pub use inline_vec::InlineVec;
 /// - [`IntoIter`]: consuming iterator that yields owned elements in FIFO
 ///   order; remaining elements are dropped when the iterator is dropped.
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};
+pub use spsc::{OwnedSpscConsumer, OwnedSpscProducer, spsc_channel};
+pub use timing_wheel::{PushError, PushOutcome, TimingWheel};
