@@ -1,27 +1,22 @@
-//! Unified Secret Scanner CLI
+//! scanner-rs CLI binary.
 //!
-//! This binary delegates entirely to the scanner-rs engine from
-//! `scratch-scanner-rs`, providing identical behavior, findings, and
-//! performance to the standalone `scanner-rs` binary.
-//!
-//! Routes to filesystem or git scanning via subcommands:
-//!
-//! ```text
-//! scanner-rs scan fs --path <dir|file> [OPTIONS]
-//! scanner-rs scan git --repo <path>    [OPTIONS]
-//! ```
-//!
-//! See `scanner-rs scan fs --help` or `scanner-rs scan git --help` for
-//! source-specific options.
-//!
-//! # Exit Codes
-//!
-//! - `0`: Success (regardless of findings count)
-//! - `2`: Invalid arguments or scan error
+//! Process-exit policy is intentionally handled in this binary while
+//! `gossip-scanner-runtime` returns typed errors.
 
-use std::io;
-
-fn main() -> io::Result<()> {
-    let config = scanner_rs_lib::unified::cli::parse_args()?;
-    scanner_rs_lib::unified::orchestrator::run(config)
+fn main() {
+    match gossip_scanner_runtime::cli::parse_args() {
+        Ok(config) => {
+            if let Err(error) = gossip_scanner_runtime::cli::run(config) {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        Err(gossip_scanner_runtime::cli::CliError::HelpRequested(usage)) => {
+            println!("{usage}");
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
 }

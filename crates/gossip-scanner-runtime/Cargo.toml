@@ -14,6 +14,7 @@ gossip-scan-driver.workspace = true
 gossip-connectors.workspace = true
 scanner-engine.workspace = true
 scanner-scheduler.workspace = true
+scanner-git.workspace = true
 regex = "1.12"
 
 [dev-dependencies]

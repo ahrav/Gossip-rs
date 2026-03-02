@@ -759,6 +759,7 @@ dependencies = [
  "regex",
  "rstest",
  "scanner-engine",
+ "scanner-git",
  "scanner-scheduler",
  "tempfile",
 ]
@@ -1554,6 +1555,13 @@ dependencies = [
  "sha1",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "scanner-rs-cli"
+version = "0.1.0"
+dependencies = [
+ "gossip-scanner-runtime",
 ]
 
 [[package]]
