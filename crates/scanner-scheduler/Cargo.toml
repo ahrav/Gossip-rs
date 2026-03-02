@@ -45,6 +45,7 @@ sim-harness = ["perf-stats"]
 stdx-proptest = []
 
 [dev-dependencies]
+crc32fast = "1.4"
 gossip-connectors.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
 proptest = "1.10"
