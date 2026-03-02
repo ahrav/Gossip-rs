@@ -230,6 +230,23 @@ fn scan_git_direct_errors_for_missing_repo() {
     ));
 }
 
+#[test]
+fn scan_git_rejects_subdirectory_of_repo() {
+    let repo = create_test_repo(&[("sub/a.txt", b"password=alpha")]);
+    let subdir = repo.path().join("sub");
+    assert!(subdir.is_dir(), "subdirectory must exist");
+
+    // A subdirectory inside a git repo is not a repo root. Validation
+    // should reject it early rather than letting it through to a confusing
+    // runtime error from GitRepoPaths::resolve.
+    let result = scan_git_direct(&GitScanConfig::new(&subdir));
+    assert!(
+        result.is_err(),
+        "subdirectory of a repo should not be accepted as a git scan root; got {:?}",
+        result,
+    );
+}
+
 #[derive(Clone, Default)]
 struct SharedWriter {
     bytes: Arc<Mutex<Vec<u8>>>,

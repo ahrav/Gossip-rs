@@ -46,7 +46,7 @@ fn ceil_div_u64(x: u64, d: u64) -> u64 {
 }
 
 #[inline(always)]
-fn wheel_size_for(max_horizon_bytes: u64, g: u64) -> u64 {
+pub(crate) fn wheel_size_for(max_horizon_bytes: u64, g: u64) -> u64 {
     // Same sizing rule as the wheel:
     // W_required = ceil((max_horizon + (G-1))/G) + 1; W = next_pow2(W_required)
     let worst = max_horizon_bytes.saturating_add(g - 1);
@@ -139,6 +139,14 @@ impl<T: Copy> Model<T> {
             self.base = target_base;
         }
     }
+
+    /// Reset to initial state, mirroring `TimingWheel::reset()`.
+    pub fn reset(&mut self) {
+        self.map.clear();
+        self.len = 0;
+        self.now_bucket = 0;
+        self.base = 0;
+    }
 }
 
 // ============================================================================
@@ -159,7 +167,7 @@ mod proptests {
 
     #[derive(Clone, Debug)]
     struct OpSpec {
-        tag: u8, // 0=adv, 1=push_in_range, 2=push_too_far, 3=push_past
+        tag: u8, // 0=adv, 1=push_in_range, 2=push_too_far, 3=push_past, 4=reset, 5=push_extreme
         val: u32,
     }
 
@@ -180,7 +188,7 @@ mod proptests {
     }
 
     fn ops_strategy() -> impl Strategy<Value = Vec<OpSpec>> {
-        let op = (any::<u8>(), any::<u32>()).prop_map(|(t, v)| OpSpec { tag: t % 4, val: v });
+        let op = (any::<u8>(), any::<u32>()).prop_map(|(t, v)| OpSpec { tag: t % 6, val: v });
         proptest::collection::vec(op, 0..2000)
     }
 
@@ -226,6 +234,72 @@ mod proptests {
                     // between hi_end and now. The important invariant is that
                     // items never fire early and the model matches the wheel.
                     // The model match is already checked above.
+
+                    assert_eq!(wheel.len(), model.len());
+                    wheel.debug_validate();
+                }
+                4 => {
+                    // reset — both wheel and model return to initial state
+                    wheel.reset();
+                    model.reset();
+
+                    assert_eq!(wheel.len(), 0);
+                    assert_eq!(model.len(), 0);
+                    assert!(wheel.is_empty());
+
+                    // Reset rewinds time to 0.
+                    now = 0;
+                    wheel.debug_validate();
+                }
+                5 => {
+                    // push at extreme time — advance near u64::MAX then push.
+                    // This exercises the ceil/floor asymmetry at the u64 boundary.
+                    let g = G as u64;
+                    // Pick a target near u64::MAX, scaled back enough to fit the horizon.
+                    let wheel_size = super::wheel_size_for(max_horizon, g);
+                    if wheel_size < 2 || max_horizon == 0 {
+                        continue;
+                    }
+
+                    // Advance to put cursor near u64::MAX / G.
+                    let target_now = u64::MAX.saturating_sub(2 * g * wheel_size);
+                    if target_now <= now {
+                        // Can't go backward, skip.
+                        continue;
+                    }
+                    now = target_now;
+
+                    let mut out_w = Vec::new();
+                    let drained_w = wheel.advance_and_drain(now, |e| out_w.push(e));
+                    let mut out_m = Vec::new();
+                    model.advance_and_drain(now, &mut out_m);
+                    assert_eq!(drained_w, out_w.len());
+                    assert_eq!(out_w, out_m);
+                    assert_eq!(wheel.len(), model.len());
+
+                    // Now push at u64::MAX (or close to it).
+                    next_id = next_id.wrapping_add(1);
+                    let hi_end = u64::MAX - ((op.val as u64) % g);
+                    let ev = Ev {
+                        id: next_id,
+                        hi_end,
+                    };
+
+                    let rw = wheel.push(hi_end, ev);
+                    let rm = model.push(hi_end, ev);
+
+                    match (&rw, &rm) {
+                        (Ok(PushOutcome::Scheduled), Ok(MOutcome::Scheduled)) => {}
+                        (Ok(PushOutcome::Ready(a)), Ok(MOutcome::Ready(b))) => {
+                            assert_eq!(a, b)
+                        }
+                        (Err(e), Err(me)) => {
+                            assert_eq!(norm_err(e), norm_model_err(me));
+                        }
+                        (a, b) => {
+                            panic!("wheel/model mismatch at extreme: wheel={a:?} model={b:?}")
+                        }
+                    }
 
                     assert_eq!(wheel.len(), model.len());
                     wheel.debug_validate();
@@ -321,6 +395,15 @@ mod proptests {
         }
 
         #[test]
+        fn timing_wheel_prop_g2(
+            max_horizon in 0u16..512,
+            cap in 0usize..128,
+            ops in ops_strategy()
+        ) {
+            run_prop::<2>(max_horizon as u64, cap, ops);
+        }
+
+        #[test]
         fn timing_wheel_prop_g64(
             max_horizon in 0u16..4096,
             cap in 0usize..128,
@@ -337,7 +420,7 @@ mod proptests {
 
 #[cfg(feature = "stdx-proptest")]
 mod bitset_tests {
-    use crate::Bitset2;
+    use crate::timing_wheel::Bitset2;
     use proptest::prelude::*;
 
     proptest! {
@@ -397,7 +480,8 @@ mod bitset_tests {
 
 #[cfg(kani)]
 mod kani_proofs {
-    use crate::{Bitset2, PushError, PushOutcome, TimingWheel};
+    use crate::timing_wheel::Bitset2;
+    use crate::{PushError, PushOutcome, TimingWheel};
 
     // ========================================================================
     // TimingWheel Proofs
@@ -567,6 +651,89 @@ mod kani_proofs {
         // Should be able to push again from time 0
         let result = tw.push(8, 3);
         kani::assert(result.is_ok(), "should be able to push after reset");
+    }
+
+    /// Verifies reset clears all items at the u64::MAX boundary with G=2.
+    ///
+    /// This directly targets the bug: with G=2, `ceil(u64::MAX / 2) = 2^63`
+    /// but `floor(u64::MAX / 2) = 2^63 - 1`. The old `reset()` called
+    /// `advance_and_drain(u64::MAX)` which computed `now_bucket = 2^63 - 1`,
+    /// unable to drain items at bucket key `2^63`. The fix clears state
+    /// unconditionally instead.
+    ///
+    /// Bounded: wheel_size=4, cap=4, single push at u64::MAX boundary.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn verify_reset_g2_boundary() {
+        let mut tw: TimingWheel<u32, 2> = TimingWheel::new(4, 4);
+
+        // Advance to near the u64::MAX boundary.
+        // floor((u64::MAX - 6) / 2) puts cursor_abs near 2^63.
+        let advance_time = u64::MAX - 6;
+        tw.advance_and_drain(advance_time, |_| {});
+
+        // Push an item with hi_end near u64::MAX.
+        // key = ceil(u64::MAX / 2) = 2^63.
+        let result = tw.push(u64::MAX, 0xDEAD);
+        // If the push succeeds, reset must clear it.
+        if let Ok(PushOutcome::Scheduled) = result {
+            kani::assert(tw.len() == 1, "should have 1 item");
+
+            tw.reset();
+
+            kani::assert(
+                tw.len() == 0,
+                "len must be 0 after reset at u64::MAX boundary",
+            );
+            kani::assert(
+                tw.is_empty(),
+                "must be empty after reset at u64::MAX boundary",
+            );
+
+            // Verify a subsequent push at time 0 succeeds (cursor rewound).
+            let post = tw.push(2, 42);
+            kani::assert(post.is_ok(), "push after reset must succeed");
+        }
+    }
+
+    /// Verifies reset clears all items regardless of how many are present, with G=2.
+    ///
+    /// Pushes N symbolic items (0..=cap), drains some via advance, then
+    /// calls reset() and verifies `len == 0` and `is_empty()`. Finally pushes
+    /// again to verify no stale state causes collisions.
+    ///
+    /// Bounded: wheel_size=4, cap=4.
+    #[kani::proof]
+    #[kani::unwind(20)]
+    fn verify_reset_clears_all_g2() {
+        let mut tw: TimingWheel<u32, 2> = TimingWheel::new(4, 4);
+
+        // Push 0..=3 items (symbolic count).
+        let n: u32 = kani::any();
+        kani::assume(n <= 4);
+
+        for i in 0..n {
+            // hi_end in [1, 4] — all within horizon for a wheel with max_horizon=4.
+            let hi = (i as u64) + 1;
+            let _ = tw.push(hi, i);
+        }
+
+        // Drain some by advancing to a symbolic time.
+        let drain_to: u64 = kani::any();
+        kani::assume(drain_to <= 6);
+        tw.advance_and_drain(drain_to, |_| {});
+
+        // Reset must clear everything.
+        tw.reset();
+
+        kani::assert(tw.len() == 0, "len must be 0 after reset");
+        kani::assert(tw.is_empty(), "must be empty after reset");
+
+        // Push again to verify no collision with stale slot state.
+        let post = tw.push(2, 99);
+        kani::assert(post.is_ok(), "push after reset must succeed (no collision)");
+
+        tw.debug_validate();
     }
 
     // ========================================================================

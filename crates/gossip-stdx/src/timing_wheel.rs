@@ -600,16 +600,38 @@ impl<T: Copy, const G: u32> TimingWheel<T, G> {
 
     /// Reset to the initial empty state without reallocating.
     ///
-    /// All pending items are drained (callbacks discarded), the cursor rewinds
-    /// to bucket key 0, and the full node pool is returned to the free list.
+    /// All per-slot arrays, the occupancy bitmap, and the node pool are cleared
+    /// unconditionally. The cursor rewinds to bucket key 0.
     /// After this call the wheel accepts items starting from `hi_end = 0` again.
+    ///
+    /// This does **not** use `advance_and_drain` internally because that path
+    /// cannot reach bucket keys above `u64::MAX / G` when `G > 1` (the
+    /// `now_bucket = u64::MAX / G` ceiling leaves one unreachable key bucket).
+    /// Instead, we clear all state directly — which is also faster.
     pub fn reset(&mut self) {
-        if self.len != 0 || self.occ.any() {
-            self.advance_and_drain(u64::MAX, |_| {});
+        // Clear all per-slot state unconditionally.
+        self.head.fill(NONE_U32);
+        self.tail.fill(NONE_U32);
+        self.slot_key.fill(0);
+        self.occ.clear_all();
+
+        // Rebuild the free list from scratch (same logic as `new()`).
+        let cap = self.cap;
+        if cap > 0 {
+            for i in 0..cap - 1 {
+                self.next[i] = (i + 1) as u32;
+            }
+            self.next[cap - 1] = NONE_U32;
+            self.free_head = 0;
+        } else {
+            self.free_head = NONE_U32;
         }
+
+        // Reset cursor and counters.
         self.cursor_abs = 0;
         self.cursor_slot = 0;
         self.now_bucket = 0;
+        self.len = 0;
     }
 
     /// Push a window with right edge `hi_end` (exclusive).
@@ -1194,6 +1216,40 @@ mod tests {
             .unwrap();
         }
         assert_eq!(tw.len(), 64);
+    }
+
+    /// Verify reset() fully drains items when G > 1 and indices are near u64::MAX.
+    ///
+    /// With G=2, ceil(u64::MAX / 2) = 2^63, but floor(u64::MAX / 2) = 2^63 - 1.
+    /// When reset() calls advance_and_drain(u64::MAX), now_bucket = 2^63 - 1,
+    /// which cannot reach items at bucket key 2^63. This test verifies whether
+    /// the ring is left in a clean state after reset.
+    #[test]
+    fn reset_drains_all_items_with_granularity_2() {
+        // G=2: bucket key = ceil(hi_end / 2).
+        type TW2 = TimingWheel<u64, 2>;
+        // max_horizon = 8000 gives wheel_size = 4096 (next_pow2(ceil((8000+1)/2)+1) = 4096).
+        let mut tw = TW2::new(8000, 4);
+
+        // Advance to a time that puts cursor_abs near 2^63 - 4095.
+        // floor((u64::MAX - 8190) / 2) = 2^63 - 4096, so cursor_abs = 2^63 - 4095.
+        let advance_time = u64::MAX - 8190;
+        tw.advance_and_drain(advance_time, |_| {});
+
+        // Push an item with hi_end = u64::MAX.
+        // key = ceil(u64::MAX / 2) = 2^63.
+        // This key is within the horizon: 2^63 < cursor_abs + wheel_size = 2^63 + 1.
+        let result = tw.push(u64::MAX, 42u64);
+        assert!(result.is_ok(), "push should succeed: {result:?}");
+        assert_eq!(tw.len(), 1);
+
+        // Reset should drain everything and leave len == 0.
+        tw.reset();
+        assert_eq!(
+            tw.len(),
+            0,
+            "reset() failed to drain item at key 2^63 with G=2"
+        );
     }
 }
 

@@ -4,7 +4,7 @@
 //! `GitEvent` carries git-specific payloads and is only emitted by git-aware
 //! call sites. Sinks that need full fidelity can implement both traits.
 
-use crate::json_write::{write_f64, write_json_bytes, write_json_str, write_u64};
+use crate::json_write::{write_f64, write_i8, write_json_bytes, write_json_str, write_u64};
 use crate::source_kind::SourceKind;
 use std::sync::Mutex;
 
@@ -287,11 +287,6 @@ impl GitEventOutput for VecEventOutput {
             .expect("vec event sink mutex poisoned")
             .extend_from_slice(&line);
     }
-}
-
-#[inline]
-fn write_i8(buf: &mut Vec<u8>, value: i8) {
-    buf.extend_from_slice(value.to_string().as_bytes());
 }
 
 #[inline]

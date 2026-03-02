@@ -1497,7 +1497,7 @@ pub fn compile_trigger_plan(
 ///
 /// # Examples
 /// ```rust
-/// # use scanner_rs::regex2anchor::{AnchorDeriveConfig, derive_anchors_from_pattern};
+/// # use scanner_engine::regex2anchor::{AnchorDeriveConfig, derive_anchors_from_pattern};
 /// let cfg = AnchorDeriveConfig::default();
 /// let anchors = derive_anchors_from_pattern("foo[0-9]+bar", &cfg).unwrap();
 /// assert!(anchors.contains(&b"foo".to_vec()) || anchors.contains(&b"bar".to_vec()));
@@ -1535,7 +1535,7 @@ pub fn derive_anchors_from_pattern(
 ///
 /// # Examples
 /// ```rust
-/// # use scanner_rs::regex2anchor::{AnchorDeriveConfig, derive_anchors_as_strings};
+/// # use scanner_engine::regex2anchor::{AnchorDeriveConfig, derive_anchors_as_strings};
 /// let cfg = AnchorDeriveConfig::default();
 /// let anchors = derive_anchors_as_strings("api[_-]?key", &cfg).unwrap();
 /// assert!(anchors.iter().any(|s| s.contains("api")));
