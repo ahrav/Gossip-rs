@@ -43,8 +43,11 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
-#![allow(unsafe_op_in_unsafe_fn)]
-#![allow(clippy::all)]
+// Targeted clippy overrides for patterns used intentionally in this crate.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::type_complexity)]
 #![allow(rustdoc::broken_intra_doc_links)]
 #![allow(rustdoc::private_intra_doc_links)]
 #![allow(rustdoc::bare_urls)]

@@ -1016,6 +1016,22 @@ impl Drop for SchedulerPackWorkerRuntime {
     }
 }
 
+// Compile-time enforcement: borrowing fields must precede owning fields
+// in declaration order. Catches accidental field reordering that would
+// create use-after-free (the custom Drop impl drops borrowers first).
+const _: () = {
+    assert!(
+        std::mem::offset_of!(SchedulerPackWorkerRuntime, adapter)
+            < std::mem::offset_of!(SchedulerPackWorkerRuntime, _engine),
+        "adapter (borrower) must be declared before _engine (owner)"
+    );
+    assert!(
+        std::mem::offset_of!(SchedulerPackWorkerRuntime, external)
+            < std::mem::offset_of!(SchedulerPackWorkerRuntime, _midx_bytes),
+        "external (borrower) must be declared before _midx_bytes (owner)"
+    );
+};
+
 /// Scheduler execution representation for one plan's shardable decode order.
 #[derive(Clone)]
 enum SchedulerShardExecPlan {
