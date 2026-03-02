@@ -515,7 +515,6 @@ fn available_workers() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
-        .max(1)
 }
 
 #[cfg(test)]

@@ -362,6 +362,50 @@ mod tests {
         }
     }
 
+    fn git_lease(shard_id: &str, repo_root: &std::path::Path) -> ShardLease {
+        ShardLease {
+            shard_id: shard_id.to_owned(),
+            assignment: Assignment {
+                job_id: format!("job-{shard_id}"),
+                connector_kind: ConnectorKind::Git,
+                connector_instance_id: repo_root.display().to_string(),
+                policy_hash: PolicyHash::from_bytes([0x55; 32]),
+                shard_spec: ShardSpec::with_range([], []),
+                cursor: Cursor::initial(),
+                source: AssignmentSource::Git {
+                    repo_root: repo_root.to_path_buf(),
+                },
+            },
+            tenant_id: TenantId::from_bytes([0xAA; 32]),
+            tenant_secret_key: TenantSecretKey::from_bytes([0xBB; 32]),
+        }
+    }
+
+    /// Initialise a git repo at `dir` with one committed secret file.
+    fn init_git_repo_with_secret(dir: &std::path::Path) {
+        use std::process::Command;
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(dir.join("secret.txt"), "password=alpha-beta-gamma-delta")
+            .expect("write fixture");
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+    }
+
     #[test]
     fn run_worker_skips_done_shards_before_scan() {
         let dir = tempdir().expect("tempdir");
@@ -400,5 +444,41 @@ mod tests {
 
         let identities = coordinator.identity_records();
         assert!(!identities.is_empty());
+    }
+
+    /// Verifies that a git shard produces durable identity records before being
+    /// marked done. GitScanDriver currently ignores the commit sink, so any
+    /// findings discovered during a git scan are emitted as events but never
+    /// persisted through the identity chain. The shard is still marked done,
+    /// silently dropping findings.
+    ///
+    /// Known failure: `GitScanDriver::run` takes `_commit` (unused) in
+    /// `gossip-connectors/src/scan_driver.rs`. The fix belongs there —
+    /// wire a commit channel through the git scan path, matching what
+    /// `FsScanDriver` does with `forward_commits`.
+    #[test]
+    #[ignore = "GitScanDriver does not use commit sink — fix in gossip-connectors"]
+    fn git_shard_produces_identity_records_through_commit_sink() {
+        let dir = tempdir().expect("tempdir");
+        init_git_repo_with_secret(dir.path());
+
+        let coordinator = InMemoryCoordinator::new(vec![git_lease("git-1", dir.path())]);
+
+        let report =
+            run_worker(&coordinator, DistributedRuntimeConfig::default()).expect("run worker");
+        assert_eq!(report.shards_scanned, 1, "git shard should complete");
+
+        let done = coordinator.done_set();
+        assert!(done.contains("git-1"), "shard should be marked done");
+
+        // The critical assertion: identity records must be persisted before
+        // the shard is marked done. If GitScanDriver ignores the commit sink,
+        // this will be empty — findings are silently lost.
+        let identities = coordinator.identity_records();
+        assert!(
+            !identities.is_empty(),
+            "git shard marked done but no identity records were persisted — \
+             GitScanDriver ignores the commit sink, so findings are silently dropped"
+        );
     }
 }

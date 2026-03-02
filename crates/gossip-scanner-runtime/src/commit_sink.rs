@@ -249,4 +249,51 @@ mod tests {
         let progress = recorder.progress.lock().expect("progress lock");
         assert_eq!(progress.len(), 2);
     }
+
+    /// Calling `upsert_findings` without a prior `begin_item` is a protocol
+    /// violation. The current code silently falls back to `ItemMeta::default()`
+    /// via `unwrap_or_default()`, which means identity derivation uses an
+    /// item-key-based version ID instead of the connector-provided one. This
+    /// test documents that the violation is silently tolerated.
+    #[test]
+    fn upsert_without_begin_item_uses_default_metadata() {
+        let recorder = Arc::new(Recorder::default());
+        let sink = DurableCommitSink::new(
+            recorder.clone(),
+            "shard-b",
+            TenantId::from_bytes([0x11; 32]),
+            TenantSecretKey::from_bytes([0x22; 32]),
+            ConnectorTag::from_ascii(b"fs"),
+        );
+
+        let item_key = ItemKey::try_from_slice(b"path/to/other.txt").expect("item key");
+
+        // Deliberately skip begin_item — this is a protocol violation.
+        let result = sink.upsert_findings(
+            &item_key,
+            &FindingsBatch {
+                findings: vec![FindingRecord {
+                    rule_id: 5,
+                    start: 0,
+                    end: 10,
+                    norm_hash: [0x44; 32],
+                    confidence_score: 3,
+                }],
+            },
+        );
+
+        // Current behaviour: succeeds silently with default metadata.
+        // If we tighten the contract, this should return Err.
+        assert!(
+            result.is_ok(),
+            "upsert_findings without begin_item currently succeeds (uses default metadata)"
+        );
+
+        let identity = recorder.identity.lock().expect("identity lock");
+        assert_eq!(
+            identity.len(),
+            1,
+            "identity record should still be produced"
+        );
+    }
 }
