@@ -181,7 +181,7 @@ impl EngineContract {
     /// # Example
     ///
     /// ```
-    /// use scanner_rs::scheduler::contract::EngineContract;
+    /// use scanner_scheduler::scheduler::contract::EngineContract;
     ///
     /// // Engine with max 256-byte patterns
     /// let contract = EngineContract::bounded(256);
@@ -202,7 +202,7 @@ impl EngineContract {
     /// # Example
     ///
     /// ```
-    /// use scanner_rs::scheduler::contract::EngineContract;
+    /// use scanner_scheduler::scheduler::contract::EngineContract;
     ///
     /// // Engine with unbounded patterns (e.g., streaming base64 decoder)
     /// let contract = EngineContract::unbounded();
@@ -359,7 +359,7 @@ impl RunConfig {
     /// # Example
     ///
     /// ```
-    /// use scanner_rs::scheduler::contract::RunConfig;
+    /// use scanner_scheduler::scheduler::contract::RunConfig;
     ///
     /// // Reproducible run with fixed seed
     /// let config = RunConfig::new(42);

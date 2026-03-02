@@ -40,10 +40,15 @@ fn default_sim(seed: u64, level: FaultLevel) -> CoordinationSim {
 }
 
 /// Proptest config with 50 cases (1 under Miri for speed).
+///
+/// Respects `PROPTEST_CASES` env var: if set lower than 50, uses the env value.
 fn sim_proptest_config() -> proptest::test_runner::Config {
     let mut cfg = miri_proptest_config();
     if !cfg!(miri) {
-        cfg.cases = 50;
+        // miri_proptest_config() returns Config::default() outside Miri, which
+        // reads PROPTEST_CASES from the environment (e.g. PROPTEST_CASES=4 in CI).
+        // Take the minimum so the env var can reduce cases for fast PR runs.
+        cfg.cases = cfg.cases.min(50);
     }
     cfg
 }

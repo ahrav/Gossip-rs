@@ -213,6 +213,14 @@ fn normalize_path(path: String, roots: &[&Path]) -> String {
     let candidate = Path::new(&path);
     for root in roots {
         if let Ok(stripped) = candidate.strip_prefix(root) {
+            if stripped.as_os_str().is_empty() {
+                // Exact match (path == root): preserve the filename so that
+                // single-file scans retain file identity instead of collapsing
+                // to an empty string.
+                if let Some(name) = candidate.file_name() {
+                    return name.to_string_lossy().replace('\\', "/");
+                }
+            }
             return stripped.to_string_lossy().replace('\\', "/");
         }
     }
@@ -398,6 +406,19 @@ mod tests {
         let root = Path::new("/tmp/corpus/dir");
         let run = canonicalize_jsonl_events_with_roots(jsonl, &[root]).expect("canonicalize");
         assert_eq!(run.findings[0].path, "secret.txt");
+    }
+
+    #[test]
+    fn normalize_path_preserves_filename_when_path_equals_root() {
+        let jsonl = br#"{"path":"/tmp/secret.txt","rule_name":"generic-api-key","start":0,"end":41,"source":"fs","confidence_score":5}
+{"type":"summary","source":"fs","status":"complete","elapsed_ms":1,"bytes_scanned":41,"findings_emitted":1,"errors":0,"throughput_mib_s":0.00}
+"#;
+        let root = Path::new("/tmp/secret.txt");
+        let run = canonicalize_jsonl_events_with_roots(jsonl, &[root]).expect("canonicalize");
+        assert_eq!(
+            run.findings[0].path, "secret.txt",
+            "exact root match should fall back to basename, not empty string"
+        );
     }
 
     #[test]

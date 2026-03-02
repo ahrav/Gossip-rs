@@ -51,6 +51,10 @@ sim-harness = [
 ]
 stdx-proptest = []
 
+[[example]]
+name = "gen_scheduler_corpus"
+required-features = ["scheduler-sim"]
+
 [dev-dependencies]
 crc32fast = "1.4"
 gossip-connectors.workspace = true
