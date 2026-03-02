@@ -101,11 +101,11 @@ jobs:
 
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # ── Test ───────────────────────────────────────────────────────────
+  # ── Test (default features — fast, runs on every PR) ────────────────
   test:
     name: Test
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes, fmt]
     steps:
@@ -116,15 +116,50 @@ jobs:
           shared-key: stable-linux
           save-cache: "false"
 
-      - run: cargo test --all-features
+      - run: cargo test
 
-  # ── Test (release profile) ──────────────────────────────────────────
+  # ── Test (release, default features — fast, runs on every PR) ──────
   test-release:
     name: Test (release)
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     if: ${{ !cancelled() && needs.changes.outputs.rust == 'true' }}
     needs: [changes, fmt]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+          save-cache: "false"
+      - run: cargo test --release
+
+  # ── Test (all features — slow proptest suites, nightly only) ───────
+  test-all-features:
+    name: Test (all features)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+          save-cache: "false"
+
+      - run: cargo test --all-features
+
+  # ── Test (all features, release — nightly only) ────────────────────
+  test-all-features-release:
+    name: Test (all features, release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
