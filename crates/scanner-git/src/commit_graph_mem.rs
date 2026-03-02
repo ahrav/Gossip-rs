@@ -77,6 +77,11 @@ pub struct CommitGraphMem {
 
     // Optional per-commit identity IDs (when enrichment is enabled)
     identity_ids: Option<Vec<CommitIdentityIds>>,
+
+    /// Number of commits that could not be resolved by topological sort
+    /// (indicates cycles or broken parent chains in the commit graph).
+    /// Zero in well-formed repositories.
+    unresolved_commits: u32,
 }
 
 impl CommitGraphMem {
@@ -182,7 +187,8 @@ impl CommitGraphMem {
         // chain). Assigning gen=1 keeps the graph usable for traversal; the
         // (generation, oid) sort still produces a deterministic order, just
         // without meaningful generation semantics for these nodes.
-        if resolved_count != n {
+        let unresolved_commits = n.saturating_sub(resolved_count) as u32;
+        if unresolved_commits > 0 {
             for gen in &mut generations {
                 if *gen == 0 {
                     *gen = 1;
@@ -242,6 +248,7 @@ impl CommitGraphMem {
             parents: parents_flat,
             oid_to_pos,
             identity_ids: None,
+            unresolved_commits,
         })
     }
 
@@ -304,7 +311,19 @@ impl CommitGraphMem {
             parents: Vec::new(),
             oid_to_pos: HashMap::new(),
             identity_ids: None,
+            unresolved_commits: 0,
         }
+    }
+
+    /// Number of commits that could not be assigned a generation number
+    /// during topological sort. Non-zero indicates cycles or broken parent
+    /// chains in the commit graph (repository corruption).
+    ///
+    /// These commits are force-assigned generation 1, preserving
+    /// deterministic traversal ordering at the cost of generation
+    /// semantics accuracy.
+    pub fn unresolved_commits(&self) -> u32 {
+        self.unresolved_commits
     }
 
     /// Returns the root tree OID for the commit at `pos`.
@@ -657,6 +676,8 @@ mod tests {
         let pos_b = graph.lookup(&OidBytes::sha1([2; 20])).unwrap().unwrap();
         assert_eq!(graph.generation(pos_a), 1);
         assert_eq!(graph.generation(pos_b), 1);
+        // Both commits are in the cycle, so both are unresolved.
+        assert_eq!(graph.unresolved_commits(), 2);
     }
 
     #[test]
