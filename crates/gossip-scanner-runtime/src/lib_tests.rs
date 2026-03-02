@@ -7,7 +7,7 @@
 //!   finding-set parity on the same runtime corpus.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -26,6 +26,7 @@ use scanner_scheduler::events::EventOutput;
 use tempfile::tempdir;
 
 use super::*;
+use crate::coordination_sink::StoredCoreEvent;
 
 fn run_git(repo: &Path, args: &[&str]) {
     let output = Command::new("git")
@@ -291,9 +292,9 @@ fn run_fs_jsonl(path: &Path, mode: ExecutionMode) -> Vec<u8> {
     output
 }
 
-/// Convert distributed identity item keys into parity-comparable relative paths.
-fn normalize_item_key_path(item_key: &[u8], root: &Path) -> String {
-    let raw = std::str::from_utf8(item_key).expect("item key should be utf8 for fixture");
+/// Convert distributed event paths into parity-comparable relative paths.
+fn normalize_distributed_path(path_bytes: &[u8], root: &Path) -> String {
+    let raw = std::str::from_utf8(path_bytes).expect("path should be utf8 for fixture");
     let path = Path::new(raw);
     match path.strip_prefix(root) {
         Ok(stripped) => stripped.to_string_lossy().replace('\\', "/"),
@@ -346,7 +347,7 @@ fn scan_fs_connector_matches_direct_canonical_findings() {
 }
 
 #[test]
-fn scan_fs_distributed_matches_cli_spans_for_fixture() {
+fn scan_fs_distributed_matches_cli_findings_for_fixture() {
     let corpus_root = parity_path("corpus/fs_runtime");
     let cli_jsonl = run_fs_jsonl(&corpus_root, ExecutionMode::Direct);
     let cli_run =
@@ -377,40 +378,41 @@ fn scan_fs_distributed_matches_cli_spans_for_fixture() {
     .expect("run distributed worker");
     assert_eq!(report.shards_scanned, 1);
 
-    let cli_spans: BTreeSet<(String, u64, u64)> = cli_run
+    let cli_findings: BTreeSet<(String, String, u64, u64)> = cli_run
         .findings
         .iter()
-        .map(|finding| (finding.path.clone(), finding.start, finding.end))
-        .collect();
-    assert!(
-        !cli_spans.is_empty(),
-        "distributed parity fixture should emit at least one finding"
-    );
-    let distributed_spans: BTreeSet<(String, u64, u64)> = coordinator
-        .identity_records()
-        .into_iter()
-        .map(|(_, record)| {
+        .map(|finding| {
             (
-                normalize_item_key_path(&record.item_key, &corpus_root),
-                record.start,
-                record.end,
+                finding.path.clone(),
+                finding.rule.clone(),
+                finding.start,
+                finding.end,
             )
         })
         .collect();
-    let cli_path_counts = cli_spans.iter().fold(
-        BTreeMap::<String, usize>::new(),
-        |mut counts, (path, _, _)| {
-            *counts.entry(path.clone()).or_default() += 1;
-            counts
-        },
+    assert!(
+        !cli_findings.is_empty(),
+        "distributed parity fixture should emit at least one finding"
     );
-    let distributed_path_counts = distributed_spans.iter().fold(
-        BTreeMap::<String, usize>::new(),
-        |mut counts, (path, _, _)| {
-            *counts.entry(path.clone()).or_default() += 1;
-            counts
-        },
-    );
+    let distributed_findings: BTreeSet<(String, String, u64, u64)> = coordinator
+        .core_events()
+        .into_iter()
+        .filter_map(|(_, event)| match event {
+            StoredCoreEvent::Finding {
+                object_path,
+                start,
+                end,
+                rule_name,
+                ..
+            } => Some((
+                normalize_distributed_path(&object_path, &corpus_root),
+                rule_name,
+                start,
+                end,
+            )),
+            _ => None,
+        })
+        .collect();
 
-    assert_eq!(cli_path_counts, distributed_path_counts);
+    assert_eq!(cli_findings, distributed_findings);
 }
