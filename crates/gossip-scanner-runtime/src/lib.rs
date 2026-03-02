@@ -793,6 +793,10 @@ fn process_page_with_engine(
     Ok(())
 }
 
+/// Validate that a filesystem path exists and is either a directory or regular file.
+///
+/// Rejects paths that do not exist, and paths that are neither directories
+/// nor regular files (e.g. symlinks, block devices, named pipes).
 fn validate_fs_path(path: &Path) -> Result<(), ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
@@ -1102,12 +1106,20 @@ fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
 }
 
 /// Borrow path bytes on Unix (zero-copy), own them on non-Unix.
+///
+/// Avoids per-path allocation in git scan loops: on Unix, paths are already
+/// byte sequences and can be borrowed directly. On Windows, UTF-8 conversion
+/// requires allocation, but this is an acceptable fallback.
 #[cfg(unix)]
 fn path_bytes_cow(path: &Path) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
 }
 
 /// Borrow path bytes on Unix (zero-copy), own them on non-Unix.
+///
+/// Avoids per-path allocation in git scan loops: on Unix, paths are already
+/// byte sequences and can be borrowed directly. On Windows, UTF-8 conversion
+/// requires allocation, but this is an acceptable fallback.
 #[cfg(not(unix))]
 fn path_bytes_cow(path: &Path) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
