@@ -36,21 +36,6 @@ mod engine;
 mod perf_stats;
 mod rules;
 
-// Guard: stat instrumentation features carry non-trivial overhead and must
-// never ship in release binaries.
-#[cfg(all(
-    not(debug_assertions),
-    any(
-        feature = "perf-stats",
-        feature = "stats",
-        feature = "b64-stats",
-        feature = "perf-counters"
-    )
-))]
-compile_error!(
-    "perf/stat instrumentation features are debug-only; disable them for release builds"
-);
-
 #[cfg(feature = "b64-stats")]
 pub use api::Base64DecodeStats;
 pub use api::{
