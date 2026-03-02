@@ -4,7 +4,7 @@
 //! remain independent leaf crates.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -58,7 +58,10 @@ impl ScanSourceFactory for FilesystemScanSourceFactory {
     fn capabilities(&self) -> SourceCapabilities {
         SourceCapabilities {
             supports_checkpoint_hints: true,
-            supports_cooperative_cancel: true,
+            // parallel_scan_dir does not accept a cancellation token and has no
+            // mid-scan cancellation mechanism. The driver only checks the token
+            // before starting (pre-check), not during the scan.
+            supports_cooperative_cancel: false,
         }
     }
 }
@@ -170,7 +173,10 @@ impl ScanDriver for FsScanDriver {
             let scan_cfg = ParallelScanConfig {
                 workers: cfg.workers.max(1),
                 event_sink: Arc::new(ChannelEventOutput::new(event_tx.clone())),
-                store_producer: Some(Arc::new(ChannelStoreProducer::new(commit_tx.clone()))),
+                store_producer: Some(Arc::new(ChannelStoreProducer::new(
+                    commit_tx.clone(),
+                    self.root.clone(),
+                ))),
                 ..ParallelScanConfig::default()
             };
 
@@ -182,12 +188,11 @@ impl ScanDriver for FsScanDriver {
                 })?
             };
 
-            if report.stats.files_enqueued > 0 {
-                self.checkpoint_hint = Some(CursorUpdate {
-                    cursor: gossip_contracts::connector::Cursor::initial(),
-                    committed_items: report.stats.files_enqueued,
-                });
-            }
+            // Filesystem scans currently restart from the beginning on resume
+            // because `parallel_scan_dir` does not track per-item cursor state.
+            // A `CursorUpdate` with `Cursor::initial()` would be semantically
+            // wrong (it means "no progress"), so we leave the checkpoint as None.
+            // TODO: track last scanned file path to enable resumable FS scans.
 
             drop(event_tx);
             drop(commit_tx);
@@ -214,6 +219,14 @@ struct GitScanDriver {
 }
 
 impl ScanDriver for GitScanDriver {
+    /// Run the git scan driver.
+    ///
+    /// **Note:** The `commit` sink is intentionally unused. Git scans operate
+    /// on a commit-graph model (ref watermarks, seen-blob deduplication) that
+    /// does not map to the per-item begin/finish lifecycle of the commit sink.
+    /// Persistence for git findings is handled separately via the git scanner's
+    /// `PersistenceStore` (currently passed as `None` until git persistence is
+    /// integrated with the coordination backend).
     fn run(
         &mut self,
         engine: Arc<scanner_engine::Engine>,
@@ -268,6 +281,13 @@ struct InMemoryScanDriver {
 }
 
 impl ScanDriver for InMemoryScanDriver {
+    /// Run the in-memory scan driver.
+    ///
+    /// **Note:** The `engine` parameter is intentionally unused. This driver
+    /// is a test/harness adapter that exercises the commit-sink lifecycle
+    /// (begin_item / finish_item) and checkpoint machinery without running
+    /// the scanner engine. Tests that need engine integration should use
+    /// the filesystem or git drivers.
     fn run(
         &mut self,
         _engine: Arc<scanner_engine::Engine>,
@@ -299,6 +319,9 @@ impl ScanDriver for InMemoryScanDriver {
                     cursor: gossip_contracts::connector::Cursor::with_last_key(item.key.clone()),
                     committed_items: report.items_scanned,
                 });
+                // SourceKind::Fs is used because no InMemory variant exists in
+                // the scanner-scheduler crate. The `stage: "in-memory"` field
+                // disambiguates these events from actual filesystem progress.
                 out.emit_core(CoreEvent::Progress(ProgressEvent {
                     source: SourceKind::Fs,
                     stage: "in-memory",
@@ -366,19 +389,25 @@ impl GitEventOutput for ChannelGitEventOutput {
 #[derive(Clone, Debug)]
 struct ChannelStoreProducer {
     tx: Sender<CommitMessage>,
+    /// Scan root for normalizing scheduler paths to connector keyspace.
+    root: PathBuf,
 }
 
 impl ChannelStoreProducer {
-    fn new(tx: Sender<CommitMessage>) -> Self {
-        Self { tx }
+    fn new(tx: Sender<CommitMessage>, root: PathBuf) -> Self {
+        Self { tx, root }
     }
 }
 
 impl StoreProducer for ChannelStoreProducer {
     fn emit_fs_batch(&self, batch: FsFindingBatch<'_>) -> Result<(), FsStoreError> {
+        // Normalize the scheduler's absolute OS path to the connector's
+        // relative key encoding before forwarding through the channel.
+        let normalized_path = normalize_scheduler_path(&self.root, batch.object_path)
+            .map_err(|e| FsStoreError::backend(format!("path normalization failed: {e}")))?;
         self.tx
             .send(CommitMessage::Batch(OwnedFsFindingBatch {
-                object_path: batch.object_path.to_vec(),
+                object_path: normalized_path,
                 findings: batch.findings.to_vec(),
             }))
             .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
@@ -411,6 +440,13 @@ fn forward_events(out: &dyn EventOutput, rx: Receiver<OwnedCoreEvent>) {
     out.flush();
 }
 
+/// Forward commit messages from the channel to the commit sink.
+///
+/// On error, the first failure is captured but the loop continues draining
+/// the channel. This is intentional: breaking out of the loop on first error
+/// would leave messages in the channel, preventing sender threads from
+/// completing and causing the scoped thread join to deadlock. The first error
+/// is returned after the channel is fully drained.
 fn forward_commits(commit: &dyn CommitSink, rx: Receiver<CommitMessage>) -> Result<()> {
     let mut first_error: Option<anyhow::Error> = None;
 
@@ -433,6 +469,47 @@ fn forward_commits(commit: &dyn CommitSink, rx: Receiver<CommitMessage>) -> Resu
     } else {
         Ok(())
     }
+}
+
+/// Normalize an absolute OS path (from the scheduler) into the connector's
+/// relative `/`-separated key encoding.
+///
+/// The scheduler stores absolute OS-encoded paths in `FsFindingBatch.object_path`
+/// (via `task.path.as_os_str().as_encoded_bytes()`), but the filesystem connector
+/// encodes `ItemKey` values as root-relative `/`-separated byte strings (via
+/// `strip_prefix(root)` + `encode_rel_path` in `filesystem.rs`). This function
+/// bridges the two representations so commit-sink keys align with connector cursors.
+fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> Result<Vec<u8>> {
+    // SAFETY: The scheduler produced these bytes via
+    // `path.as_os_str().as_encoded_bytes()`, so they are valid platform-encoded
+    // bytes that round-trip correctly through `from_encoded_bytes_unchecked`.
+    let os_str = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(raw_bytes) };
+    let path = Path::new(os_str);
+    let rel = path.strip_prefix(root).with_context(|| {
+        format!(
+            "batch path '{}' is not under scan root '{}'",
+            path.display(),
+            root.display()
+        )
+    })?;
+
+    // Re-encode as `/`-separated relative bytes, matching the connector's
+    // `encode_rel_path` contract (only Normal components, joined with `/`).
+    let mut out = Vec::new();
+    for component in rel.components() {
+        let segment = match component {
+            std::path::Component::Normal(s) => s,
+            _ => bail!("path contains non-normal component: {}", rel.display()),
+        };
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(segment.as_encoded_bytes());
+    }
+    if out.is_empty() {
+        bail!("relative path encoded to empty key: {}", rel.display());
+    }
+    Ok(out)
 }
 
 fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> Result<()> {
@@ -715,6 +792,75 @@ fn from_hex_nibble(byte: u8) -> io::Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gossip_scan_driver::{CommitSink, FindingsBatch, ItemMeta};
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Spy commit sink that records the keys passed to each lifecycle call.
+    #[derive(Default)]
+    struct SpyCommitSink {
+        begin_keys: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl CommitSink for SpyCommitSink {
+        fn begin_item(&self, item_key: &ItemKey, _meta: &ItemMeta) -> Result<()> {
+            self.begin_keys
+                .lock()
+                .unwrap()
+                .push(item_key.as_bytes().to_vec());
+            Ok(())
+        }
+
+        fn upsert_findings(&self, _item_key: &ItemKey, _batch: &FindingsBatch) -> Result<()> {
+            Ok(())
+        }
+
+        fn finish_item(&self, _item_key: &ItemKey) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn normalize_scheduler_path_strips_root_prefix() {
+        let root = Path::new("/tmp/scan-root");
+        let normalized = normalize_scheduler_path(root, b"/tmp/scan-root/src/main.rs").unwrap();
+        assert_eq!(normalized, b"src/main.rs");
+    }
+
+    #[test]
+    fn normalize_scheduler_path_handles_nested_dirs() {
+        let root = Path::new("/data/scans");
+        let normalized =
+            normalize_scheduler_path(root, b"/data/scans/deep/nested/file.txt").unwrap();
+        assert_eq!(normalized, b"deep/nested/file.txt");
+    }
+
+    #[test]
+    fn normalize_scheduler_path_rejects_non_child() {
+        let root = Path::new("/tmp/scan-root");
+        let result = normalize_scheduler_path(root, b"/other/path/file.txt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn commit_batch_keys_use_relative_paths() {
+        // After normalization by ChannelStoreProducer, forward_commit_batch
+        // receives relative paths. Verify the full ItemKey creation works.
+        let batch = OwnedFsFindingBatch {
+            object_path: b"src/main.rs".to_vec(),
+            findings: vec![],
+        };
+
+        let spy = SpyCommitSink::default();
+        forward_commit_batch(&spy, batch).unwrap();
+
+        let keys = spy.begin_keys.lock().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0], b"src/main.rs",
+            "batch key must be a relative path in connector keyspace"
+        );
+    }
 
     #[test]
     fn decode_oid_hex_accepts_sha1() {

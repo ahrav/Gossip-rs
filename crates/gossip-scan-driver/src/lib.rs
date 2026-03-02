@@ -109,9 +109,20 @@ pub struct CursorUpdate {
 }
 
 /// Coarse source capability flags.
+///
+/// These flags tell the orchestration layer what a driver supports so it can
+/// adapt scheduling and lifecycle decisions accordingly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SourceCapabilities {
+    /// Whether the driver produces meaningful [`CursorUpdate`] values from
+    /// [`ScanDriver::checkpoint_hint`].
     pub supports_checkpoint_hints: bool,
+    /// Whether the driver checks the [`CancellationToken`] during execution
+    /// (not just before starting) and can stop mid-scan cooperatively.
+    ///
+    /// Set this to `true` only if the driver's `run` method polls
+    /// `cancel.is_cancelled()` at regular intervals during scanning.
+    /// A pre-check before starting does not count as cooperative cancel.
     pub supports_cooperative_cancel: bool,
 }
 
