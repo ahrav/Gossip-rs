@@ -2,8 +2,8 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
-use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
+use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
+use gossip_contracts::connector::{TokenBytes, MAX_ITEM_KEY_SIZE};
 use rstest::rstest;
 
 use super::*;
@@ -1384,7 +1384,13 @@ mod prop {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            ..ProptestConfig::default()
+        })]
 
         #[test]
         fn full_enum_yields_sorted_keys(files in file_set_strategy(20)) {

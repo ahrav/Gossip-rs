@@ -1,8 +1,9 @@
 use super::*;
 use crate::api::{OfflineVerdict, ValidatorKind};
 use crate::rules::builtin_rules;
-use crate::{AnchorPolicy, Engine, Finding, demo_tuning};
+use crate::{demo_tuning, AnchorPolicy, Engine, Finding};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Parse YAML → `RuleSpec` → `rulespec_to_yaml` → serialize → re-parse →
 /// assert `offline_validation` equality on each rule.
@@ -395,13 +396,24 @@ fn builtin_rule_by_name(rule_name: &str) -> RuleSpec {
 }
 
 fn scan_single_builtin_rule(rule_name: &str, hay: &[u8]) -> Vec<Finding> {
-    let rule = builtin_rule_by_name(rule_name);
-    let engine = Engine::new_with_anchor_policy(
-        vec![rule],
-        Vec::new(),
-        demo_tuning(),
-        AnchorPolicy::ManualOnly,
-    );
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    // Cache engines by rule name to avoid rebuilding Vectorscan databases
+    // for the same rule across multiple test cases.
+    static CACHE: OnceLock<Mutex<HashMap<String, Engine>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let mut map = cache.lock().unwrap();
+    let engine = map.entry(rule_name.to_owned()).or_insert_with(|| {
+        let rule = builtin_rule_by_name(rule_name);
+        Engine::new_with_anchor_policy(
+            vec![rule],
+            Vec::new(),
+            demo_tuning(),
+            AnchorPolicy::ManualOnly,
+        )
+    });
     let mut scratch = engine.new_scratch();
     let mut findings = Vec::with_capacity(16);
     engine.scan_chunk_materialized(hay, &mut scratch, &mut findings);

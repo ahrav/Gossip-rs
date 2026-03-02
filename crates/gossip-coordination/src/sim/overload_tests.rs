@@ -28,7 +28,8 @@ fn overload_sim(seed: u64, level: FaultLevel, cooldown: u64) -> CoordinationSim 
 fn sim_proptest_config() -> proptest::test_runner::Config {
     let mut cfg = miri_proptest_config();
     if !cfg!(miri) {
-        cfg.cases = 50;
+        // Respect PROPTEST_CASES env var (e.g. PROPTEST_CASES=4 in CI).
+        cfg.cases = cfg.cases.min(50);
     }
     cfg
 }

@@ -1,8 +1,8 @@
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
-use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
+use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
+use gossip_contracts::connector::{TokenBytes, MAX_ITEM_KEY_SIZE};
 use rstest::rstest;
 
 use super::*;
@@ -220,10 +220,9 @@ fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
     let bad_ref = ItemRef::try_from_slice(ref_bytes).unwrap();
     assert!(c.open(&bad_ref, default_budgets()).is_err());
     let mut buf = [0u8; 16];
-    assert!(
-        c.read_range(&bad_ref, 0, &mut buf, default_budgets())
-            .is_err()
-    );
+    assert!(c
+        .read_range(&bad_ref, 0, &mut buf, default_budgets())
+        .is_err());
 }
 
 // ---------------------------------------------------------------
@@ -959,7 +958,13 @@ mod prop {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            ..ProptestConfig::default()
+        })]
 
         #[test]
         fn full_enum_yields_sorted_input(items in item_vec_strategy(30)) {

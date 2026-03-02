@@ -12,7 +12,7 @@ use super::helpers::{decode_utf16be_to_vec, decode_utf16le_to_vec, extract_secre
 use super::hit_pool::{HitAccPool, SpanU32};
 #[cfg(feature = "stdx-proptest")]
 use super::rule_repr::EntropyCompiled;
-use super::rule_repr::{PackedPatterns, Variant, utf16be_bytes, utf16le_bytes};
+use super::rule_repr::{utf16be_bytes, utf16le_bytes, PackedPatterns, Variant};
 #[cfg(feature = "stdx-proptest")]
 use super::scratch::EntropyScratch;
 #[cfg(feature = "stdx-proptest")]
@@ -26,28 +26,28 @@ use super::transform::{
 use super::transform::{decode_to_vec, find_base64_spans_into};
 #[cfg(feature = "stdx-proptest")]
 use super::vectorscan_prefilter::{
-    VsStreamMatchCtx, VsStreamWindow, build_stream_match_ctx, gate_match_callback,
-    stream_match_callback,
+    build_stream_match_ctx, gate_match_callback, stream_match_callback, VsStreamMatchCtx,
+    VsStreamWindow,
 };
+use crate::api::confidence;
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::api::OfflineVerdict;
 use crate::api::Tuning;
-use crate::api::confidence;
 use crate::api::{
     AnchorPolicy, CharClassSpec, DecodeStep, EntropySpec, FileId, Finding, FindingRec, Gate,
-    LocalContextSpec, OfflineValidationSpec, RuleSpec, STEP_ROOT, TransformConfig, TransformId,
-    TransformMode, Utf16Endianness, ValidatorKind,
+    LocalContextSpec, OfflineValidationSpec, RuleSpec, TransformConfig, TransformId, TransformMode,
+    Utf16Endianness, ValidatorKind, STEP_ROOT,
 };
 use crate::demo::{demo_engine, demo_rules, demo_tuning};
-use crate::regex2anchor::{AnchorDeriveConfig, TriggerPlan, compile_trigger_plan};
+use crate::regex2anchor::{compile_trigger_plan, AnchorDeriveConfig, TriggerPlan};
 #[cfg(all(test, feature = "stdx-proptest"))]
 use crate::scratch_memory::ScratchVec;
-#[cfg(all(test, feature = "stdx-proptest"))]
-use crate::tiger_harness::{ChunkPattern, maybe_write_regression};
 use crate::tiger_harness::{
-    ChunkPlan, check_oracle_covered, correctness_engine, load_regressions_from_dir,
-    scan_chunked_records, scan_one_chunk_records,
+    check_oracle_covered, correctness_engine, load_regressions_from_dir, scan_chunked_records,
+    scan_one_chunk_records, ChunkPlan,
 };
+#[cfg(all(test, feature = "stdx-proptest"))]
+use crate::tiger_harness::{maybe_write_regression, ChunkPattern};
 #[cfg(feature = "stdx-proptest")]
 use memchr::memmem;
 #[cfg(feature = "stdx-proptest")]
@@ -59,7 +59,28 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// ---------------------------------------------------------------------------
+// Cached engine singletons — Vectorscan DB compilation is extremely expensive
+// (~40-60s per build). These let all tests share a single compiled engine
+// rather than each test building its own.
+// ---------------------------------------------------------------------------
+
+/// Returns a shared reference to a [`demo_engine()`] instance, building it
+/// on first access. All subsequent calls return the same engine.
+fn cached_demo_engine() -> &'static Engine {
+    static INSTANCE: OnceLock<Engine> = OnceLock::new();
+    INSTANCE.get_or_init(demo_engine)
+}
+
+/// Returns a shared reference to a [`correctness_engine()`] instance, building
+/// it on first access. All subsequent calls return the same engine.
+fn cached_correctness_engine() -> &'static Engine {
+    static INSTANCE: OnceLock<Engine> = OnceLock::new();
+    INSTANCE.get_or_init(correctness_engine)
+}
 
 #[cfg(feature = "stdx-proptest")]
 fn decoded_prefilter_hit(engine: &Engine, decoded: &[u8]) -> bool {
@@ -615,7 +636,7 @@ fn hash128_collision_resistant() {
 
 #[test]
 fn url_span_includes_prefix_and_finds_ghp() {
-    let eng = demo_engine();
+    let eng = cached_demo_engine();
     // ghp_ + 36 chars
     let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
     let url = token.replace("_", "%5F"); // ghp%5F...
@@ -627,7 +648,7 @@ fn url_span_includes_prefix_and_finds_ghp() {
 
 #[test]
 fn rules_hot_and_cold_have_equal_length() {
-    let eng = demo_engine();
+    let eng = cached_demo_engine();
     assert_eq!(
         eng.rules_hot.len(),
         eng.rules_cold.len(),
@@ -675,7 +696,7 @@ fn zero_hit_url_plus_to_space_still_scans_transforms() {
 
 #[test]
 fn base64_utf16_aws_key_is_detected() {
-    let eng = demo_engine();
+    let eng = cached_demo_engine();
 
     // Use a realistic (non-example) AWS key. The previous value
     // "AKIAIOSFODNN7EXAMPLE" is now correctly suppressed by the secret-bytes
@@ -878,10 +899,9 @@ fn value_suppressor_gate_is_compiled_and_indexed() {
         unpack_patterns(suppressor_gate),
         vec![b"EXAMPLE".to_vec(), b"DUMMY_TOKEN".to_vec()]
     );
-    assert!(
-        eng.value_suppressor_gate(super::rule_repr::NO_GATE)
-            .is_none()
-    );
+    assert!(eng
+        .value_suppressor_gate(super::rule_repr::NO_GATE)
+        .is_none());
 }
 
 #[test]
@@ -3120,7 +3140,7 @@ fn regression_slack_webhook_raw_match_not_suppressed() {
         202, 133, 250, 48, 156, 25, 0, 23, 244, 138, 247, 112, 101, 3, 36, 32, 205, 201, 250, 108,
         185, 208, 176, 133, 248, 42, 88, 101, 99, 109, 225, 208, 74, 34, 251, 14,
     ];
-    let engine = demo_engine();
+    let engine = cached_demo_engine();
     let findings = scan_chunk_findings(&engine, &buf);
     let has_raw = findings
         .iter()
@@ -3155,7 +3175,7 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
 
 #[test]
 fn nested_encoding_is_skipped_in_gated_mode() {
-    let eng = demo_engine();
+    let eng = cached_demo_engine();
 
     // URL-encoded underscore inside base64.
     let token = "ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
@@ -4581,7 +4601,7 @@ fn test_chunked_base64_drop_hint_covers_encoded_region() {
         125, 92, 5, 234, 167, 35, 124, 169, 105, 208, 92, 140, 88, 134, 246, 67, 154, 213, 42, 162,
     ];
 
-    let engine = demo_engine();
+    let engine = cached_demo_engine();
     let mut scratch = engine.new_scratch();
 
     let full = engine.scan_chunk_records(&buf, FileId(0), 0, &mut scratch);
@@ -4621,7 +4641,7 @@ mod engine_proptests {
 
         #[test]
         fn prop_engine_matches_reference(case in input_case_strategy()) {
-            let engine = demo_engine();
+            let engine = cached_demo_engine();
             let _ = case.rule_name;
             let rules = demo_rules();
 
@@ -4638,7 +4658,7 @@ mod engine_proptests {
 
         #[test]
         fn prop_chunked_matches_full(case in input_case_strategy(), chunk_size in 1usize..256) {
-            let engine = demo_engine();
+            let engine = cached_demo_engine();
             let _ = case.rule_name;
             let mut scratch = engine.new_scratch();
             let full = engine.scan_chunk_records(&case.buf, FileId(0), 0, &mut scratch);
@@ -4667,7 +4687,7 @@ mod engine_proptests {
             case in input_case_strategy(),
             seed in any::<u64>(),
         ) {
-            let engine = correctness_engine();
+            let engine = cached_correctness_engine();
             let _ = case.rule_name;
             let oracle = scan_one_chunk_records(&engine, &case.buf);
 
@@ -4738,7 +4758,7 @@ mod engine_proptests {
             chain in transform_chain_strategy(),
             seed in any::<u64>(),
         ) {
-            let engine = correctness_engine();
+            let engine = cached_correctness_engine();
             let overlap = engine.required_overlap();
 
             // Build an encoded secret instance with safe surrounding bytes so
@@ -4819,7 +4839,7 @@ fn tiger_regressions_replay() {
         return;
     }
 
-    let engine = correctness_engine();
+    let engine = cached_correctness_engine();
     for case in cases {
         let oracle = scan_one_chunk_records(&engine, &case.input);
         let chunked = scan_chunked_records(&engine, &case.input, case.plan.clone());
@@ -4844,7 +4864,7 @@ fn tiger_boundary_url_percent_adjacent_secret() {
     // compares oracle vs chunked — but the oracle itself was wrong (the raw
     // finding was also lost in single-chunk mode). This test validates the
     // oracle contains the raw finding AND that chunking doesn't regress it.
-    let engine = correctness_engine();
+    let engine = cached_correctness_engine();
 
     // Byte layout (same buffer as regression_slack_webhook_raw_match_not_suppressed):
     //   [0..39)   random non-ASCII prefix
@@ -4904,7 +4924,7 @@ fn tiger_boundary_percent_triplet_split() {
     // Explicitly split a `%AB` percent triplet so '%' ends a chunk and the
     // two hex digits begin the next chunk. This exercises URL-percent decoding
     // across chunk boundaries.
-    let engine = correctness_engine();
+    let engine = cached_correctness_engine();
     let overlap = engine.required_overlap();
 
     let token = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
@@ -5526,7 +5546,7 @@ fn nested_transform_dedupe_keeps_multiple_matches() {
 fn tiger_boundary_base64_padding_split() {
     // Ensure base64 '=' padding is split across the chunk boundary so the
     // decoder must carry padding state across chunks.
-    let engine = correctness_engine();
+    let engine = cached_correctness_engine();
     let overlap = engine.required_overlap();
 
     let token = b"ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8";
@@ -5750,7 +5770,7 @@ fn stream_nested_span_fallback_recovers() {
 fn tiger_boundary_utf16_odd_byte_split() {
     // Split a UTF-16LE encoded anchor on an odd byte boundary so the decoder
     // must reconstruct code units across chunks.
-    let engine = correctness_engine();
+    let engine = cached_correctness_engine();
     let overlap = engine.required_overlap();
 
     let token = b"AKIAIOSFODNN7ABCDEFG";
@@ -5801,7 +5821,7 @@ mod proptests {
             case_a in input_case_strategy(),
             case_b in input_case_strategy(),
         ) {
-            let engine = demo_engine();
+            let engine = cached_demo_engine();
             let mut scratch = engine.new_scratch();
             let mut out = Vec::new();
             let _ = case_a.rule_name;
@@ -6119,7 +6139,7 @@ fn build_valid_crc_token() -> Vec<u8> {
 fn build_invalid_crc_token() -> Vec<u8> {
     let prefix = b"tok_";
     let payload = b"XYzw5678"; // 8 bytes
-    // Use a deliberately wrong CRC (correct CRC + 1).
+                               // Use a deliberately wrong CRC (correct CRC + 1).
     let wrong_crc = crc32fast::hash(payload).wrapping_add(1);
     let mut checksum = [0u8; 6];
     base62_encode_u32_test(wrong_crc, &mut checksum);
