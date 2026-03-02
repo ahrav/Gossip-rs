@@ -1,104 +1,42 @@
-//! Scanner runtime orchestration for filesystem and git sources.
+//! Unified scanner runtime entrypoints backed by `ScanDriver`.
 //!
-//! This crate sits between source connectors (filesystem, git) and the
-//! [`ScannerCore`] engine. It owns the page-based scan loop: enumerate items
-//! from a source, chunk them into pages, feed each page through the engine,
-//! and aggregate results into a [`ScanAggregateStats`].
-//!
-//! # Architecture
+//! This crate keeps CLI/runtime-friendly config structs (`FsScanConfig`,
+//! `GitScanConfig`) while routing both execution modes through a single
+//! assignment-to-driver path:
 //!
 //! ```text
-//! ┌────────────┐     ┌──────────────────┐     ┌─────────────┐
-//! │ CLI / bin  │────▶│  scanner-runtime │────▶│ ScannerCore │
-//! └────────────┘     │                  │     └─────────────┘
-//!                    │  scan_fs()       │           ▲
-//!                    │  scan_git()      │           │
-//!                    │                  │     ┌─────┴───────┐
-//!                    │  page loop +     │     │ PageScan    │
-//!                    │  dedup state     │     │ Request/Out │
-//!                    └──────────────────┘     └─────────────┘
+//! config -> Assignment -> ScanSourceFactory -> ScanDriver::run
 //! ```
 //!
-//! # Execution modes
-//!
-//! Each scan function accepts an [`ExecutionMode`]:
-//!
-//! - **Direct** — the runtime reads source metadata itself (filesystem
-//!   `stat`, `git ls-files`) and synthesises [`ScanItem`]s in-process.
-//! - **Connector** — the runtime delegates enumeration to a connector that
-//!   implements [`EnumerationConnector`]. Filesystem connector mode runs
-//!   through the same scan-loop/page-hook seam used by worker execution.
-//!
-//! # Pagination model
-//!
-//! Sources may contain millions of items. The runtime pages through them
-//! with bounded memory using [`ScanBudgets`]:
-//!
-//! - **Direct directory path** — `scan_from_connector_pages` calls
-//!   `enumerate_page` in a cursor-advancing loop until an empty page
-//!   signals completion.
-//! - **Connector mode path (filesystem, git)** — uses
-//!   `run_scan_loop_with_page_processor` for worker-parity cursor progression
-//!   and page processing.
-//! - **Materialized path** — `scan_materialized_items_pages` chunks a
-//!   pre-collected `&[ScanItem]` into fixed-size slices, synthesising
-//!   cursors from each chunk's last key.
-//!
-//! Both paths thread a shared [`ScanDedupState`] across pages so the engine
-//! can suppress duplicate findings across page boundaries.
-//!
-//! # Error handling
-//!
-//! All public functions return `Result<ScanAggregateStats, ScanRuntimeError>`.
-//! Process-exit policy (exit codes, stderr formatting) lives in the binary
-//! crates, not here.
+//! The previous page-loop integration seam is intentionally removed.
 
-use std::{
-    fmt, fs, io,
-    path::{Component, Path, PathBuf},
-    process::Command,
-    time::UNIX_EPOCH,
-};
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
-#[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-
-use gossip_connectors::{
-    FILESYSTEM_CONNECTOR_TAG, FilesystemConnector, GIT_CONNECTOR_TAG, GitConnector,
-    path_buf_from_bytes,
-};
+use gossip_connectors::{FilesystemScanSourceFactory, GitScanSourceFactory};
 use gossip_contracts::{
-    connector::{
-        Budgets, ConnectorInputError, Cursor, EnumerateError, EnumerationConnector, ItemKey,
-        ItemRef, ScanItem, VersionId,
-    },
+    connector::{ConnectorInputError, Cursor},
     coordination::ShardSpec,
-    identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId},
+    identity::PolicyHash,
 };
-use gossip_coordination::{
-    AcquireError, CreateRunError, CursorSemantics, CursorUpdate, InMemoryCoordinator,
-    InitialShardInput, LogicalTime, OpId, RegisterShardsError, RunConfig, RunConfigError, RunId,
-    RunManagement, ShardId, ShardKey, TenantId, WorkerId, WorkerSession,
+use gossip_scan_driver::{
+    Assignment, AssignmentSource, CancellationToken, ConnectorKind, NoOpCommitSink,
+    ScanExecutionConfig, ScanReport, ScanSourceFactory,
 };
-use gossip_engine::{
-    PageScanContext, PageScanOutput, PageScanRequest, ScanAggregateStats, ScanDedupState,
-    ScannerCore, ScannerCoreError,
-};
-use gossip_scan_pipeline::{
-    DEFAULT_MAX_TRANSIENT_RETRIES, LeaseLossCause, PageProcessingContext, PageProcessingError,
-    ScanLoopError, ScanLoopOutcome, run_scan_loop_with_page_processor,
-};
+use regex::bytes::Regex;
+use scanner_scheduler::events::NullEventOutput;
 
-/// How the runtime acquires source items for scanning.
+/// How the runtime acquires source items.
 ///
-/// See the [module-level docs](self) for the architectural distinction.
+/// In unified execution mode this flag is retained for CLI compatibility and
+/// telemetry only; both variants route through the same scan-driver path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
-    /// The runtime reads the source directly (filesystem `stat` / `git ls-files`)
-    /// and constructs [`ScanItem`]s in-process.
     #[default]
     Direct,
-    /// The runtime delegates enumeration to an [`EnumerationConnector`].
     Connector,
 }
 
@@ -116,7 +54,7 @@ impl std::str::FromStr for ExecutionMode {
     }
 }
 
-/// Error returned when parsing [`ExecutionMode`] from CLI-style strings.
+/// Error returned when parsing [`ExecutionMode`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseExecutionModeError {
     raw: String,
@@ -134,17 +72,10 @@ impl fmt::Display for ParseExecutionModeError {
 
 impl std::error::Error for ParseExecutionModeError {}
 
-/// Per-page resource limits passed to connectors and used when chunking
-/// materialized item slices.
-///
-/// These caps prevent any single enumeration call from consuming unbounded
-/// memory. The defaults (256 items, 1 MB) are sized for interactive CLI
-/// usage; worker binaries may raise them for throughput.
+/// Runtime budgets for source scans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
-    /// Maximum items a single page may contain.
     pub max_items: usize,
-    /// Maximum bytes a connector may transfer in one enumerate/read call.
     pub max_bytes: u64,
 }
 
@@ -158,31 +89,33 @@ impl Default for ScanBudgets {
 }
 
 impl ScanBudgets {
-    /// Convert to the contract-level [`Budgets`] type, validating that both
-    /// limits are non-zero.
-    fn to_contract_budgets(self) -> Result<Budgets, ScanRuntimeError> {
-        Budgets::try_new(self.max_items, self.max_bytes, None).map_err(ScanRuntimeError::from)
+    fn to_execution_config(self) -> Result<ScanExecutionConfig, ScanRuntimeError> {
+        if self.max_items == 0 {
+            return Err(ScanRuntimeError::ConnectorInput(
+                ConnectorInputError::ZeroBudget { field: "max_items" },
+            ));
+        }
+        if self.max_bytes == 0 {
+            return Err(ScanRuntimeError::ConnectorInput(
+                ConnectorInputError::ZeroBudget { field: "max_bytes" },
+            ));
+        }
+        Ok(ScanExecutionConfig {
+            workers: available_workers(),
+            checkpoint_every_items: self.max_items as u64,
+        })
     }
 }
 
-/// Configuration for a filesystem scan.
-///
-/// Supports both directory trees (enumerated via [`FilesystemConnector`]) and
-/// single files (wrapped into a one-item page). Use the builder methods
-/// ([`with_execution_mode`](Self::with_execution_mode),
-/// [`with_budgets`](Self::with_budgets)) to override defaults.
+/// Filesystem scan config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsScanConfig {
-    /// Root directory or single file path to scan.
     pub path: PathBuf,
-    /// How items are acquired (see [`ExecutionMode`]).
     pub execution_mode: ExecutionMode,
-    /// Per-page resource limits.
     pub budgets: ScanBudgets,
 }
 
 impl FsScanConfig {
-    /// Build filesystem scan config with direct mode defaults.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -192,14 +125,12 @@ impl FsScanConfig {
         }
     }
 
-    /// Override execution mode.
     #[must_use]
     pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
         self.execution_mode = execution_mode;
         self
     }
 
-    /// Override budgets.
     #[must_use]
     pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
         self.budgets = budgets;
@@ -207,54 +138,30 @@ impl FsScanConfig {
     }
 }
 
-/// Configuration for a git-tracked-file scan.
-///
-/// The runtime shells out to `git ls-files -z` to discover tracked paths,
-/// then stats each file to build [`ScanItem`]s. Use the builder methods
-/// ([`with_execution_mode`](Self::with_execution_mode),
-/// [`with_budgets`](Self::with_budgets)) to override defaults.
+/// Git scan config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitScanConfig {
-    /// Repository working-tree path (must contain a `.git` directory
-    /// reachable by the `git` binary).
     pub repo: PathBuf,
-    /// How items are acquired (see [`ExecutionMode`]).
     pub execution_mode: ExecutionMode,
-    /// Per-page resource limits.
     pub budgets: ScanBudgets,
-    /// Upper bound on tracked files accepted from `git ls-files`.
-    /// `None` disables the limit. Defaults to 1,000,000.
-    pub max_tracked_files: Option<usize>,
 }
 
 impl GitScanConfig {
-    /// Build git scan config with direct mode defaults.
     #[must_use]
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         Self {
             repo: repo.into(),
             execution_mode: ExecutionMode::Direct,
             budgets: ScanBudgets::default(),
-            max_tracked_files: Some(1_000_000),
         }
     }
 
-    /// Override the maximum number of tracked files accepted.
-    /// Pass `None` to disable the limit.
-    #[must_use]
-    pub fn with_max_tracked_files(mut self, limit: Option<usize>) -> Self {
-        self.max_tracked_files = limit;
-        self
-    }
-
-    /// Override execution mode.
     #[must_use]
     pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
         self.execution_mode = execution_mode;
         self
     }
 
-    /// Override budgets.
     #[must_use]
     pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
         self.budgets = budgets;
@@ -262,133 +169,53 @@ impl GitScanConfig {
     }
 }
 
-/// Runtime-level scan orchestration errors.
+/// Runtime wiring errors for unified scan execution.
 #[derive(Debug)]
 pub enum ScanRuntimeError {
-    /// Connector-mode paths are intentionally gated until later phases.
-    UnsupportedExecutionMode {
-        source: &'static str,
-        mode: ExecutionMode,
-    },
-    /// Invalid or missing source path/repo.
     InvalidPath {
         source: &'static str,
         path: PathBuf,
         message: String,
     },
-    /// Contract-level input error (keys/cursors/budgets).
-    ConnectorInput(ConnectorInputError),
-    /// Connector enumeration failure.
-    Enumerate(EnumerateError),
-    /// Scanner-core page processing failure.
-    Scanner(ScannerCoreError),
-    /// Invalid run configuration for connector-mode scan-loop setup.
-    RunConfig(RunConfigError),
-    /// Creating ephemeral scan-loop run state failed.
-    CreateRun(CreateRunError),
-    /// Registering the single connector-mode shard failed.
-    RegisterShards(RegisterShardsError),
-    /// Acquiring a worker session for connector-mode execution failed.
-    Acquire(AcquireError),
-    /// Connector-mode scan loop terminated with a non-terminal error.
-    ScanLoop(Box<ScanLoopError>),
-    /// Connector-mode scan loop parked the shard instead of completing.
-    ScanLoopParked {
-        reason: gossip_coordination::ParkReason,
-        retry_after_ms: Option<u64>,
-    },
-    /// Connector-mode scan loop lost lease before terminal completion.
-    ScanLoopLeaseLost {
-        pages_completed: u64,
-        cause: LeaseLossCause,
-    },
-    /// Local I/O failure.
-    Io {
-        op: &'static str,
-        path: Option<PathBuf>,
-        error: io::Error,
-    },
-    /// `git` command failed (non-zero exit status).
     GitCommandFailed {
         repo: PathBuf,
         status_code: Option<i32>,
         stderr: String,
     },
-    /// Connector page returned non-empty items but did not advance cursor.
-    CursorStalled { page_num: u64 },
-    /// Git repository tracks more files than the configured limit.
-    TooManyTrackedFiles { count: usize, limit: usize },
+    Io {
+        op: &'static str,
+        path: Option<PathBuf>,
+        error: std::io::Error,
+    },
+    ConnectorInput(ConnectorInputError),
+    Driver(anyhow::Error),
 }
 
 impl fmt::Display for ScanRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedExecutionMode { source, mode } => {
-                write!(f, "{source} execution mode '{mode:?}' is not enabled yet")
-            }
             Self::InvalidPath {
                 source,
                 path,
                 message,
             } => {
-                write!(f, "invalid {source} path '{}': {message}", path.display())
-            }
-            Self::ConnectorInput(error) => write!(f, "connector input error: {error}"),
-            Self::Enumerate(error) => write!(f, "enumeration error: {error}"),
-            Self::Scanner(error) => write!(f, "scanner core error: {error}"),
-            Self::RunConfig(error) => write!(f, "connector-mode run config failed: {error}"),
-            Self::CreateRun(error) => write!(f, "connector-mode run creation failed: {error}"),
-            Self::RegisterShards(error) => {
-                write!(f, "connector-mode shard registration failed: {error}")
-            }
-            Self::Acquire(error) => write!(f, "connector-mode session acquire failed: {error}"),
-            Self::ScanLoop(error) => {
-                write!(f, "connector-mode scan loop failed: {}", error.as_ref())
-            }
-            Self::ScanLoopParked {
-                reason,
-                retry_after_ms,
-            } => {
-                write!(f, "connector-mode scan loop parked shard ({reason}")?;
-                if let Some(retry_after_ms) = retry_after_ms {
-                    write!(f, ", retry_after_ms={retry_after_ms}")?;
-                }
-                write!(f, ")")
-            }
-            Self::ScanLoopLeaseLost {
-                pages_completed,
-                cause,
-            } => write!(
-                f,
-                "connector-mode scan loop lost lease after {pages_completed} completed pages: {cause}"
-            ),
-            Self::Io { op, path, error } => {
-                if let Some(path) = path {
-                    write!(f, "{op} failed for '{}': {error}", path.display())
-                } else {
-                    write!(f, "{op} failed: {error}")
-                }
+                write!(f, "{source} path '{}' invalid: {message}", path.display())
             }
             Self::GitCommandFailed {
                 repo,
                 status_code,
                 stderr,
-            } => {
-                write!(
-                    f,
-                    "git ls-files failed in '{}' (status={status_code:?}): {}",
-                    repo.display(),
-                    stderr.trim()
-                )
-            }
-            Self::CursorStalled { page_num } => write!(
+            } => write!(
                 f,
-                "connector cursor did not advance on non-empty page {page_num}"
+                "git command failed for '{}' (status={status_code:?}): {stderr}",
+                repo.display()
             ),
-            Self::TooManyTrackedFiles { count, limit } => write!(
-                f,
-                "git repository tracks {count} files, exceeding limit of {limit}"
-            ),
+            Self::Io { op, path, error } => match path {
+                Some(path) => write!(f, "{op} failed for '{}': {error}", path.display()),
+                None => write!(f, "{op} failed: {error}"),
+            },
+            Self::ConnectorInput(error) => write!(f, "{error}"),
+            Self::Driver(error) => write!(f, "scan driver failed: {error}"),
         }
     }
 }
@@ -396,25 +223,10 @@ impl fmt::Display for ScanRuntimeError {
 impl std::error::Error for ScanRuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ConnectorInput(error) => Some(error),
-            Self::Enumerate(error) => Some(error),
-            Self::Scanner(error) => Some(error),
-            Self::RunConfig(error) => Some(error),
-            Self::CreateRun(error) => Some(error),
-            Self::RegisterShards(error) => Some(error),
-            Self::Acquire(error) => Some(error),
-            Self::ScanLoop(error) => Some(error.as_ref()),
             Self::Io { error, .. } => Some(error),
-            Self::UnsupportedExecutionMode { .. }
-            | Self::InvalidPath { .. }
-            | Self::GitCommandFailed { .. }
-            | Self::ScanLoopParked { .. }
-            | Self::CursorStalled { .. }
-            | Self::TooManyTrackedFiles { .. } => None,
-            Self::ScanLoopLeaseLost { cause, .. } => match cause {
-                LeaseLossCause::RenewFailed(e) => Some(e),
-                LeaseLossCause::DeadlineElapsed { .. } => None,
-            },
+            Self::ConnectorInput(error) => Some(error),
+            Self::Driver(error) => Some(error.as_ref()),
+            _ => None,
         }
     }
 }
@@ -425,53 +237,8 @@ impl From<ConnectorInputError> for ScanRuntimeError {
     }
 }
 
-impl From<EnumerateError> for ScanRuntimeError {
-    fn from(value: EnumerateError) -> Self {
-        Self::Enumerate(value)
-    }
-}
-
-impl From<ScannerCoreError> for ScanRuntimeError {
-    fn from(value: ScannerCoreError) -> Self {
-        Self::Scanner(value)
-    }
-}
-
-impl From<RunConfigError> for ScanRuntimeError {
-    fn from(value: RunConfigError) -> Self {
-        Self::RunConfig(value)
-    }
-}
-
-impl From<CreateRunError> for ScanRuntimeError {
-    fn from(value: CreateRunError) -> Self {
-        Self::CreateRun(value)
-    }
-}
-
-impl From<RegisterShardsError> for ScanRuntimeError {
-    fn from(value: RegisterShardsError) -> Self {
-        Self::RegisterShards(value)
-    }
-}
-
-impl From<AcquireError> for ScanRuntimeError {
-    fn from(value: AcquireError) -> Self {
-        Self::Acquire(value)
-    }
-}
-
-impl From<ScanLoopError> for ScanRuntimeError {
-    fn from(value: ScanLoopError) -> Self {
-        Self::ScanLoop(Box::new(value))
-    }
-}
-
 /// Top-level filesystem scan dispatcher.
-///
-/// Routes to [`scan_fs_direct`] or [`scan_fs_connector`] based on
-/// [`FsScanConfig::execution_mode`].
-pub fn scan_fs(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
+pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
         ExecutionMode::Connector => scan_fs_connector(config),
@@ -479,326 +246,131 @@ pub fn scan_fs(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeE
 }
 
 /// Top-level git scan dispatcher.
-///
-/// Routes to [`scan_git_direct`] or [`scan_git_connector`] based on
-/// [`GitScanConfig::execution_mode`].
-pub fn scan_git(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
+pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_git_direct(config),
         ExecutionMode::Connector => scan_git_connector(config),
     }
 }
 
-/// Direct-mode filesystem scan.
-///
-/// Two branches depending on the target path:
-///
-/// - **Directory** — wraps the path in a [`FilesystemConnector`] and drives
-///   it through the paginated connector loop (`scan_from_connector_pages`).
-/// - **Single file** — stats the file, builds one [`ScanItem`], and runs it
-///   through the materialized-items path as a single-item page.
-///
-/// Uses an unbounded shard range (`[]..[]`) so every item is in scope.
-pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    validate_fs_path(&config.path)?;
-
-    let scanner = ScannerCore::default();
-    let shard = ShardSpec::with_range([], []);
-
-    if config.path.is_dir() {
-        let budgets = config.budgets.to_contract_budgets()?;
-        let mut connector = FilesystemConnector::new(&config.path);
-        scan_from_connector_pages(&mut connector, &scanner, &shard, budgets)
-    } else {
-        let single_item = build_local_file_scan_item(&config.path, FILESYSTEM_CONNECTOR_TAG)?;
-        scan_materialized_items_pages(&[single_item], &scanner, &shard, config.budgets.max_items)
-    }
-}
-
-/// Direct-mode git scan.
-///
-/// Pipeline:
-/// 1. Shell out to `git ls-files -z` to collect tracked relative paths.
-/// 2. For each path that resolves to a regular file, stat it and build a
-///    [`ScanItem`] keyed by the relative path bytes.
-/// 3. Sort items by key so the scanner core sees them in deterministic order.
-/// 4. Page the sorted items through `scan_materialized_items_pages`.
-///
-/// Paths that no longer exist on disk (e.g. staged deletions) or that
-/// produce empty key bytes are silently skipped.
-pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    let canonical_repo = validate_git_repo_path(&config.repo)?;
-
-    let tracked_paths = list_git_tracked_paths(&config.repo, config.max_tracked_files)?;
-
-    let mut items = Vec::with_capacity(tracked_paths.len());
-    for rel_path in tracked_paths {
-        // Reject paths containing `..` to prevent directory traversal.
-        if rel_path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir))
-        {
-            continue;
-        }
-
-        let abs_path = canonical_repo.join(&rel_path);
-
-        // Check file type *before* canonicalize to narrow the TOCTOU window:
-        // symlink_metadata does not follow symlinks, so symlinks and
-        // non-regular files are rejected before we resolve the real path.
-        let metadata = match fs::symlink_metadata(&abs_path) {
-            Ok(m) => m,
-            Err(_) => continue, // file may have been deleted since ls-files
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-
-        // Verify the resolved path is still within the repo boundary.
-        let canonical_abs = match fs::canonicalize(&abs_path) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if !canonical_abs.starts_with(&canonical_repo) {
-            continue;
-        }
-
-        let key_bytes = path_bytes_cow(&rel_path);
-        if key_bytes.is_empty() {
-            continue;
-        }
-        let item = build_scan_item(
-            &key_bytes,
-            GIT_CONNECTOR_TAG,
-            &key_bytes,
-            metadata.len(),
-            metadata.modified().ok(),
-        )?;
-        items.push(item);
-    }
-
-    // Deterministic key order so page boundaries and dedup are reproducible.
-    items.sort_unstable_by(|left, right| left.item_key().cmp(right.item_key()));
-
-    let scanner = ScannerCore::default();
-    let shard = ShardSpec::with_range([], []);
-    scan_materialized_items_pages(&items, &scanner, &shard, config.budgets.max_items)
+/// Filesystem scan routed through the unified assignment/driver seam.
+pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    let canonical_path = validate_fs_path(&config.path)?;
+    let assignment = build_assignment(
+        ConnectorKind::Filesystem,
+        canonical_path.display().to_string(),
+        AssignmentSource::Filesystem {
+            root: canonical_path,
+        },
+    );
+    run_assignment(&FilesystemScanSourceFactory, &assignment, config.budgets)
 }
 
 /// Connector-mode filesystem scan.
 ///
-/// Directory scans use the same connector scan-loop + page-processor seam as
-/// worker execution (`run_scan_loop_with_page_processor`).
-///
-/// Single-file scans keep the direct-mode single-item path because
-/// [`FilesystemConnector`] is directory-rooted by design.
-///
-/// **Known divergence**: directory scans use a bounded `ShardSpec` (from
-/// `connector_mode_shard_spec`) while single-file scans use an unbounded
-/// `ShardSpec::with_range([], [])`. This means `PageScanContext::key_range_*`
-/// differs between the two input shapes within the same execution mode. The
-/// scanner core currently does not use key ranges for filtering, so this has
-/// no behavioral impact today.
-pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    validate_fs_path(&config.path)?;
+/// Unified model note: this currently executes identically to
+/// [`scan_fs_direct`], preserving one execution path.
+pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    scan_fs_direct(config)
+}
 
-    let scanner = ScannerCore::default();
-
-    if config.path.is_dir() {
-        let shard = connector_mode_shard_spec();
-        let budgets = config.budgets.to_contract_budgets()?;
-        let mut connector = FilesystemConnector::new(&config.path);
-        scan_from_connector_pages_with_pipeline(&mut connector, &scanner, &shard, budgets)
-    } else {
-        let shard = ShardSpec::with_range([], []);
-        let single_item = build_local_file_scan_item(&config.path, FILESYSTEM_CONNECTOR_TAG)?;
-        scan_materialized_items_pages(&[single_item], &scanner, &shard, config.budgets.max_items)
-    }
+/// Git scan routed through the unified assignment/driver seam.
+pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    let canonical_repo = validate_git_repo_path(&config.repo)?;
+    let assignment = build_assignment(
+        ConnectorKind::Git,
+        canonical_repo.display().to_string(),
+        AssignmentSource::Git {
+            repo_root: canonical_repo,
+        },
+    );
+    run_assignment(&GitScanSourceFactory, &assignment, config.budgets)
 }
 
 /// Connector-mode git scan.
 ///
-/// Uses the same worker-compatible scan-loop + page-processor seam as
-/// [`scan_fs_connector`] to preserve runtime and worker parity.
-///
-/// Enforces [`GitScanConfig::max_tracked_files`] before creating the
-/// connector, mirroring the same pre-check in [`scan_git_direct`].
-pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    validate_git_repo_path(&config.repo)?;
-
-    // Pre-flight check: enforce the tracked-file limit before building the
-    // connector, mirroring the same guard in `scan_git_direct`.
-    let _ = list_git_tracked_paths(&config.repo, config.max_tracked_files)?;
-
-    let scanner = ScannerCore::default();
-    let shard = connector_mode_shard_spec();
-    let budgets = config.budgets.to_contract_budgets()?;
-    let mut connector = GitConnector::new(&config.repo);
-    scan_from_connector_pages_with_pipeline(&mut connector, &scanner, &shard, budgets)
+/// Unified model note: this currently executes identically to
+/// [`scan_git_direct`], preserving one execution path.
+pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
+    scan_git_direct(config)
 }
 
-const CONNECTOR_MODE_LEASE_DURATION_TICKS: u64 = 60_000;
-const CONNECTOR_MODE_TENANT: TenantId = TenantId::from_bytes([0x52; 32]);
-const CONNECTOR_MODE_RUN: RunId = RunId::from_raw(1);
-const CONNECTOR_MODE_SHARD: ShardId = ShardId::from_raw(1);
-const CONNECTOR_MODE_WORKER: WorkerId = WorkerId::from_raw(1);
-
-/// Build a bounded shard range for standalone connector-mode scans.
-///
-/// Coordination manifest validation rejects unbounded shard ranges, so we use
-/// `[0x00, 0xff..ff)` as a practical "full keyspace" envelope for local scans.
-fn connector_mode_shard_spec() -> ShardSpec {
-    ShardSpec::with_range([0], vec![0xff; gossip_coordination::MAX_KEY_SIZE])
+fn run_assignment(
+    factory: &dyn ScanSourceFactory,
+    assignment: &Assignment,
+    budgets: ScanBudgets,
+) -> Result<ScanReport, ScanRuntimeError> {
+    let mut driver = factory
+        .driver_for_assignment(assignment)
+        .map_err(ScanRuntimeError::Driver)?;
+    let cfg = budgets.to_execution_config()?;
+    let out = NullEventOutput;
+    let commit = NoOpCommitSink;
+    let cancel = CancellationToken::new();
+    driver
+        .run(runtime_engine(), &cfg, &out, &commit, &cancel)
+        .map_err(ScanRuntimeError::Driver)
 }
 
-/// Seed one in-memory run/shard and acquire a session for scan-loop execution.
-///
-/// This preserves worker-level loop semantics (checkpoint/complete transitions)
-/// for standalone runtime execution without requiring external coordination
-/// infrastructure.
-fn create_runtime_worker_session<'a>(
-    coordinator: &'a mut InMemoryCoordinator,
-    shard: &ShardSpec,
-) -> Result<WorkerSession<'a, InMemoryCoordinator>, ScanRuntimeError> {
-    let run_config = RunConfig::try_new(
-        CursorSemantics::Completed,
-        CONNECTOR_MODE_LEASE_DURATION_TICKS,
-        None,
-    )?;
-    coordinator.create_run(
-        LogicalTime::from_raw(1),
-        CONNECTOR_MODE_TENANT,
-        CONNECTOR_MODE_RUN,
-        run_config,
-    )?;
-
-    let shard_inputs = [InitialShardInput::new(
-        CONNECTOR_MODE_SHARD,
-        shard.as_ref(),
-        CursorUpdate::initial(),
-    )];
-    let _ = coordinator.register_shards(
-        LogicalTime::from_raw(2),
-        CONNECTOR_MODE_TENANT,
-        CONNECTOR_MODE_RUN,
-        &shard_inputs,
-        OpId::from_raw(1),
-    )?;
-
-    WorkerSession::new(
-        coordinator,
-        LogicalTime::from_raw(3),
-        CONNECTOR_MODE_TENANT,
-        ShardKey::new(CONNECTOR_MODE_RUN, CONNECTOR_MODE_SHARD),
-        CONNECTOR_MODE_WORKER,
-    )
-    .map_err(ScanRuntimeError::from)
-}
-
-/// Run a connector through the worker-style scan loop with scanner-core page processing.
-fn scan_from_connector_pages_with_pipeline<C>(
-    connector: &mut C,
-    scanner: &ScannerCore,
-    shard: &ShardSpec,
-    budgets: Budgets,
-) -> Result<ScanAggregateStats, ScanRuntimeError>
-where
-    C: EnumerationConnector,
-{
-    let mut coordinator = InMemoryCoordinator::new(CONNECTOR_MODE_LEASE_DURATION_TICKS);
-    let session = create_runtime_worker_session(&mut coordinator, shard)?;
-
-    // Shard op log starts empty: register_shards writes to the run-level op
-    // log, not the shard's, so the first shard-level op can use raw ID 1.
-    let mut next_op_raw = 1u64;
-    let mut next_now_raw = 4u64;
-    let mut dedupe = ScanDedupState::default();
-    let mut outcome = ScanAggregateStats::default();
-
-    let mut page_output = PageScanOutput::default();
-
-    let scan_loop_outcome = run_scan_loop_with_page_processor(
-        session,
-        connector,
-        budgets,
-        DEFAULT_MAX_TRANSIENT_RETRIES,
-        || {
-            let out = OpId::from_raw(next_op_raw);
-            next_op_raw = next_op_raw.saturating_add(1);
-            out
-        },
-        || {
-            let out = LogicalTime::from_raw(next_now_raw);
-            next_now_raw = next_now_raw.saturating_add(1);
-            out
-        },
-        |context| {
-            process_page_with_engine(
-                scanner,
-                &mut dedupe,
-                &mut outcome,
-                &mut page_output,
-                context,
-            )
-        },
-    );
-
-    match scan_loop_outcome {
-        ScanLoopOutcome::Completed => Ok(outcome),
-        ScanLoopOutcome::Parked {
-            reason,
-            retry_after_ms,
-        } => Err(ScanRuntimeError::ScanLoopParked {
-            reason,
-            retry_after_ms,
-        }),
-        ScanLoopOutcome::LeaseLost {
-            pages_completed,
-            cause,
-        } => Err(ScanRuntimeError::ScanLoopLeaseLost {
-            pages_completed,
-            cause,
-        }),
-        ScanLoopOutcome::Error(error) => Err(ScanRuntimeError::ScanLoop(Box::new(error))),
+fn build_assignment(
+    connector_kind: ConnectorKind,
+    connector_instance_id: String,
+    source: AssignmentSource,
+) -> Assignment {
+    Assignment {
+        job_id: format!("runtime-{connector_instance_id}"),
+        connector_kind,
+        connector_instance_id,
+        policy_hash: PolicyHash::from_bytes([0x52; 32]),
+        shard_spec: ShardSpec::with_range([], []),
+        cursor: Cursor::initial(),
+        source,
     }
 }
 
-/// Worker-compatible page-processing adapter: map page context to scanner request.
-fn process_page_with_engine(
-    scanner: &ScannerCore,
-    dedupe: &mut ScanDedupState,
-    outcome: &mut ScanAggregateStats,
-    page_output: &mut PageScanOutput,
-    context: PageProcessingContext<'_>,
-) -> Result<(), PageProcessingError> {
-    let request = PageScanRequest::metadata_only(
-        PageScanContext::new(
-            context.spec().key_range_start(),
-            context.spec().key_range_end(),
-            context.cursor(),
-            context.next_cursor(),
-            context.page_num(),
-        ),
-        context.items(),
-    );
-
-    scanner
-        .scan_page_into(request, dedupe, page_output)
-        .map_err(|error| {
-            PageProcessingError::new(format!(
-                "scanner core failed on page {}: {error}",
-                context.page_num()
-            ))
-        })?;
-    outcome.record_page(page_output);
-    Ok(())
+fn runtime_engine() -> Arc<scanner_engine::Engine> {
+    static ENGINE: OnceLock<Arc<scanner_engine::Engine>> = OnceLock::new();
+    Arc::clone(ENGINE.get_or_init(|| Arc::new(build_runtime_engine())))
 }
 
-/// Validate that a filesystem path exists and is either a directory or regular file.
-///
-/// Rejects paths that do not exist, and paths that are neither directories
-/// nor regular files (e.g. symlinks, block devices, named pipes).
-fn validate_fs_path(path: &Path) -> Result<(), ScanRuntimeError> {
+fn build_runtime_engine() -> scanner_engine::Engine {
+    const ANCHORS: &[&[u8]] = &[b"SECRET", b"password", b"token"];
+    let rule = scanner_engine::RuleSpec {
+        name: "runtime-secret",
+        anchors: ANCHORS,
+        radius: 64,
+        validator: scanner_engine::ValidatorKind::None,
+        two_phase: None,
+        must_contain: None,
+        keywords_any: None,
+        value_suppressors_any: None,
+        entropy: None,
+        char_class: None,
+        local_context: None,
+        secret_group: None,
+        min_confidence: None,
+        offline_validation: None,
+        uuid_format_secret: false,
+        re: Regex::new(r"(?i)(secret|password|token)[A-Za-z0-9=_:+-]{4,}")
+            .expect("runtime regex must compile"),
+    };
+    let tuning = scanner_engine::Tuning {
+        merge_gap: 64,
+        max_windows_per_rule_variant: 64,
+        pressure_gap_start: 128,
+        max_anchor_hits_per_rule_variant: 256,
+        max_utf16_decoded_bytes_per_window: 4096,
+        max_transform_depth: 2,
+        max_total_decode_output_bytes: 1024 * 1024,
+        max_work_items: 64,
+        max_findings_per_chunk: 4096,
+        scan_utf16_variants: true,
+    };
+    let transforms: Vec<scanner_engine::TransformConfig> = Vec::new();
+    scanner_engine::Engine::new(vec![rule], transforms, tuning)
+}
+
+fn validate_fs_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
             source: "filesystem",
@@ -813,14 +385,13 @@ fn validate_fs_path(path: &Path) -> Result<(), ScanRuntimeError> {
             message: "path must be a directory or regular file".to_owned(),
         });
     }
-    Ok(())
+    fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
+        op: "canonicalize",
+        path: Some(path.to_path_buf()),
+        error,
+    })
 }
 
-/// Validate that `path` exists, is a directory, and return its canonical form.
-///
-/// Canonicalization resolves symlinks and `..` components in the repo root
-/// itself, producing a stable prefix for path-containment checks in the
-/// scan loop.
 fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     if !path.exists() {
         return Err(ScanRuntimeError::InvalidPath {
@@ -836,6 +407,25 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
             message: "repository path must be a directory".to_owned(),
         });
     }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|error| ScanRuntimeError::Io {
+            op: "git rev-parse",
+            path: Some(path.to_path_buf()),
+            error,
+        })?;
+    if !output.status.success() {
+        return Err(ScanRuntimeError::GitCommandFailed {
+            repo: path.to_path_buf(),
+            status_code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+
     fs::canonicalize(path).map_err(|error| ScanRuntimeError::Io {
         op: "canonicalize",
         path: Some(path.to_path_buf()),
@@ -843,266 +433,11 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     })
 }
 
-/// Collect git-tracked file paths via `git -C <repo> ls-files -z`.
-///
-/// The `-z` flag produces NUL-delimited output, which is essential for
-/// correct handling of filenames containing newlines or other special
-/// characters. Returned paths are relative to `repo`.
-///
-/// When `max_files` is `Some(n)`, the function counts NUL-separated
-/// entries *before* parsing bytes into [`PathBuf`]s. If the count
-/// exceeds `n`, [`ScanRuntimeError::TooManyTrackedFiles`] is returned
-/// without allocating the full path vector.
-fn list_git_tracked_paths(
-    repo: &Path,
-    max_files: Option<usize>,
-) -> Result<Vec<PathBuf>, ScanRuntimeError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("ls-files")
-        .arg("-z")
-        .arg("--")
-        .output()
-        .map_err(|error| ScanRuntimeError::Io {
-            op: "git ls-files",
-            path: Some(repo.to_path_buf()),
-            error,
-        })?;
-
-    if !output.status.success() {
-        return Err(ScanRuntimeError::GitCommandFailed {
-            repo: repo.to_path_buf(),
-            status_code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-
-    // Fast-fail: count NUL-separated entries with a cheap byte scan before
-    // allocating PathBufs. git ls-files -z terminates each entry with NUL,
-    // so the entry count equals the number of NUL bytes (ignoring trailing).
-    if let Some(max) = max_files {
-        let count = output.stdout.iter().filter(|&&b| b == 0).count();
-        if count > max {
-            return Err(ScanRuntimeError::TooManyTrackedFiles { count, limit: max });
-        }
-    }
-
-    let mut paths = Vec::new();
-    for entry in output.stdout.split(|byte| *byte == 0) {
-        if entry.is_empty() {
-            continue;
-        }
-        paths.push(path_buf_from_bytes(entry));
-    }
-    Ok(paths)
-}
-
-/// Drive a connector through its full pagination sequence.
-///
-/// Repeatedly calls [`EnumerationConnector::enumerate_page`] until an empty
-/// page is returned. Each non-empty page is fed to
-/// [`ScannerCore::scan_page_into`] so dedup state spans the entire
-/// source.
-///
-/// # Stall detection
-///
-/// If a non-empty page returns the same cursor it was called with, the loop
-/// would spin forever. This is caught and surfaced as
-/// [`ScanRuntimeError::CursorStalled`].
-fn scan_from_connector_pages<C>(
-    connector: &mut C,
-    scanner: &ScannerCore,
-    shard: &ShardSpec,
-    budgets: Budgets,
-) -> Result<ScanAggregateStats, ScanRuntimeError>
-where
-    C: EnumerationConnector,
-{
-    let mut cursor = Cursor::initial();
-    let mut dedupe = ScanDedupState::default();
-    let mut outcome = ScanAggregateStats::default();
-    let mut page_output = PageScanOutput::default();
-    let mut page_num = 1u64;
-
-    loop {
-        let page = connector
-            .enumerate_page(shard, &cursor, budgets)
-            .map_err(ScanRuntimeError::from)?;
-        if page.items().is_empty() {
-            break;
-        }
-
-        if *page.next_cursor() == cursor {
-            return Err(ScanRuntimeError::CursorStalled { page_num });
-        }
-
-        let context = PageScanContext::new(
-            shard.key_range_start(),
-            shard.key_range_end(),
-            &cursor,
-            page.next_cursor(),
-            page_num,
-        );
-        let request = PageScanRequest::metadata_only(context, page.items());
-        scanner.scan_page_into(request, &mut dedupe, &mut page_output)?;
-        outcome.record_page(&page_output);
-
-        cursor = page.into_next_cursor();
-        page_num = page_num.saturating_add(1);
-    }
-
-    Ok(outcome)
-}
-
-/// Page a pre-collected item slice through the scanner engine.
-///
-/// Used when items have already been materialised in memory (e.g. from
-/// `git ls-files` output or a single-file scan). The slice is split into
-/// chunks of `max_items_per_page`, and synthetic cursors are derived from
-/// each chunk's last [`ItemKey`] so the engine sees a well-formed page
-/// sequence.
-fn scan_materialized_items_pages(
-    items: &[ScanItem],
-    scanner: &ScannerCore,
-    shard: &ShardSpec,
-    max_items_per_page: usize,
-) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    if max_items_per_page == 0 {
-        return Err(ScanRuntimeError::ConnectorInput(
-            ConnectorInputError::ZeroBudget {
-                field: "max_items_per_page",
-            },
-        ));
-    }
-
-    let mut cursor = Cursor::initial();
-    let mut dedupe = ScanDedupState::with_capacity(items.len());
-    let mut outcome = ScanAggregateStats::default();
-    let mut page_output = PageScanOutput::default();
-
-    for (index, chunk) in items.chunks(max_items_per_page).enumerate() {
-        let page_num = (index as u64).saturating_add(1);
-        let last_key = chunk.last().expect("non-empty chunk").item_key().clone();
-        let next_cursor = Cursor::with_last_key(last_key);
-
-        let context = PageScanContext::new(
-            shard.key_range_start(),
-            shard.key_range_end(),
-            &cursor,
-            &next_cursor,
-            page_num,
-        );
-        let request = PageScanRequest::metadata_only(context, chunk);
-        scanner.scan_page_into(request, &mut dedupe, &mut page_output)?;
-        outcome.record_page(&page_output);
-        cursor = next_cursor;
-    }
-
-    Ok(outcome)
-}
-
-/// Build a [`ScanItem`] for a single local file by stat-ing it.
-///
-/// Uses `symlink_metadata` to avoid following symlinks — a symlink
-/// targeting a sensitive file outside the scan root would otherwise
-/// leak its metadata (size, mtime).
-fn build_local_file_scan_item(
-    path: &Path,
-    connector_tag: ConnectorTag,
-) -> Result<ScanItem, ScanRuntimeError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| ScanRuntimeError::Io {
-        op: "metadata",
-        path: Some(path.to_path_buf()),
-        error,
-    })?;
-    if metadata.is_symlink() {
-        return Err(ScanRuntimeError::InvalidPath {
-            source: "filesystem",
-            path: path.to_path_buf(),
-            message: "path is a symlink".to_owned(),
-        });
-    }
-    let key_bytes = path_bytes_cow(path);
-    build_scan_item(
-        &key_bytes,
-        connector_tag,
-        &key_bytes,
-        metadata.len(),
-        metadata.modified().ok(),
-    )
-}
-
-/// Construct a [`ScanItem`] from raw key bytes and filesystem metadata.
-///
-/// # Version fingerprint
-///
-/// Because local files lack a strong server-assigned version (ETag, S3
-/// version-id, etc.), we synthesise a *weak* version by hashing:
-///
-/// ```text
-/// version_material = prefix ‖ size_le64 ‖ mtime_nanos_le128
-/// ```
-///
-/// This means the dedup layer treats a file as "changed" when its size or
-/// modification time changes — a reasonable proxy for local sources.
-fn build_scan_item(
-    key_bytes: &[u8],
-    connector_tag: ConnectorTag,
-    version_material_prefix: &[u8],
-    size_hint: u64,
-    modified: Option<std::time::SystemTime>,
-) -> Result<ScanItem, ScanRuntimeError> {
-    let item_key = ItemKey::try_from_slice(key_bytes)?;
-    let item_ref = ItemRef::try_from_slice(key_bytes)?;
-    let stable_item_id = ItemIdentityKey::new(connector_tag, key_bytes).stable_id();
-
-    let modified_nanos = modified
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-
-    // 8 bytes for size_hint (u64 LE) + 16 bytes for modified_nanos (u128 LE).
-    const METADATA_LEN: usize = 8 + 16;
-    // Stack buffer covers paths up to 128 bytes (covers 99%+ of real paths).
-    const INLINE_CAP: usize = 128 + METADATA_LEN;
-    let total_len = version_material_prefix.len() + METADATA_LEN;
-
-    let version = if total_len <= INLINE_CAP {
-        let mut buf = [0u8; INLINE_CAP];
-        buf[..version_material_prefix.len()].copy_from_slice(version_material_prefix);
-        let off = version_material_prefix.len();
-        buf[off..off + 8].copy_from_slice(&size_hint.to_le_bytes());
-        buf[off + 8..off + METADATA_LEN].copy_from_slice(&modified_nanos.to_le_bytes());
-        VersionId::Weak(ObjectVersionId::from_version_bytes(&buf[..total_len]))
-    } else {
-        let mut vm = Vec::with_capacity(total_len);
-        vm.extend_from_slice(version_material_prefix);
-        vm.extend_from_slice(&size_hint.to_le_bytes());
-        vm.extend_from_slice(&modified_nanos.to_le_bytes());
-        VersionId::Weak(ObjectVersionId::from_version_bytes(&vm))
-    };
-    Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(size_hint))
-}
-
-/// Borrow path bytes on Unix (zero-copy), own them on non-Unix.
-///
-/// Avoids per-path allocation in git scan loops: on Unix, paths are already
-/// byte sequences and can be borrowed directly. On Windows, UTF-8 conversion
-/// requires allocation, but this is an acceptable fallback.
-#[cfg(unix)]
-fn path_bytes_cow(path: &Path) -> std::borrow::Cow<'_, [u8]> {
-    std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
-}
-
-/// Borrow path bytes on Unix (zero-copy), own them on non-Unix.
-///
-/// Avoids per-path allocation in git scan loops: on Unix, paths are already
-/// byte sequences and can be borrowed directly. On Windows, UTF-8 conversion
-/// requires allocation, but this is an acceptable fallback.
-#[cfg(not(unix))]
-fn path_bytes_cow(path: &Path) -> std::borrow::Cow<'_, [u8]> {
-    std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
+fn available_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .max(1)
 }
 
 #[cfg(test)]

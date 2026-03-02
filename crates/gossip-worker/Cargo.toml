@@ -5,13 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Binary: wires coordination + connectors + pipeline + sinks"
+description = "Binary: unified scan-driver worker entrypoint"
 
 [dependencies]
-gossip-contracts.workspace = true
-gossip-engine.workspace = true
-gossip-scan-pipeline.workspace = true
-gossip-connectors.workspace = true
-gossip-coordination.workspace = true
+gossip-scanner-runtime.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
