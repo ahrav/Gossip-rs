@@ -1,10 +1,55 @@
-use std::io::Write;
+use std::{io::Write, path::Path, process::Command};
 
 use gossip_contracts::connector::{ConnectorCapabilities, EnumerationPage};
 use rstest::rstest;
 use tempfile::tempdir;
 
 use super::*;
+
+fn run_git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git command failed: git -C {} {}\nstdout:{}\nstderr:{}",
+        repo.display(),
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn create_test_repo(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+    let dir = tempdir().expect("tempdir");
+    run_git(dir.path(), &["init", "-q"]);
+    run_git(
+        dir.path(),
+        &["config", "user.email", "scanner-runtime-tests@example.com"],
+    );
+    run_git(
+        dir.path(),
+        &["config", "user.name", "Scanner Runtime Tests"],
+    );
+
+    for (path, contents) in files {
+        let full = dir.path().join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("create parent directory");
+        }
+        fs::write(full, contents).expect("write fixture file");
+    }
+
+    if !files.is_empty() {
+        run_git(dir.path(), &["add", "."]);
+        run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
+    }
+
+    dir
+}
 
 // ── ExecutionMode parsing ──────────────────────────────────────
 
@@ -150,21 +195,55 @@ fn scan_fs_direct_and_connector_match_for_directory() {
     );
 }
 
-// ── Connector-mode gating (git only) ─────────────────────────────
+// ── Connector-mode git path ─────────────────────────────────────
 
 #[test]
-fn scan_git_connector_is_explicitly_gated() {
-    let dir = tempdir().expect("tempdir");
-    let error =
-        scan_git(&GitScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
-            .expect_err("connector mode should be gated");
-    assert!(matches!(
-        error,
-        ScanRuntimeError::UnsupportedExecutionMode {
-            source: "git",
-            mode: ExecutionMode::Connector,
-        }
-    ));
+fn scan_git_connector_scans_repo() {
+    let repo = create_test_repo(&[("a.txt", b"password=alpha"), ("b.txt", b"token=bravo")]);
+
+    let outcome = scan_git_connector(&GitScanConfig::new(repo.path())).expect("connector scan");
+    assert!(outcome.pages_scanned() >= 1);
+    assert!(outcome.items_scanned() >= 2);
+    assert!(outcome.findings_emitted() >= 2);
+}
+
+#[test]
+fn scan_git_direct_and_connector_match_for_repo() {
+    let repo = create_test_repo(&[("a.txt", b"password=alpha"), ("b.txt", b"token=bravo")]);
+
+    let budgets = ScanBudgets {
+        max_items: 1,
+        max_bytes: 1_000_000,
+    };
+    let direct =
+        scan_git(&GitScanConfig::new(repo.path()).with_budgets(budgets)).expect("direct outcome");
+    let connector = scan_git(
+        &GitScanConfig::new(repo.path())
+            .with_budgets(budgets)
+            .with_execution_mode(ExecutionMode::Connector),
+    )
+    .expect("connector outcome");
+
+    assert_eq!(
+        direct.pages_scanned(),
+        connector.pages_scanned(),
+        "page count mismatch"
+    );
+    assert_eq!(
+        direct.items_scanned(),
+        connector.items_scanned(),
+        "item count mismatch"
+    );
+    assert_eq!(
+        direct.findings_emitted(),
+        connector.findings_emitted(),
+        "finding count mismatch"
+    );
+    assert_eq!(
+        direct.diagnostics_emitted(),
+        connector.diagnostics_emitted(),
+        "diagnostic count mismatch"
+    );
 }
 
 // ── Git scan error paths ───────────────────────────────────────

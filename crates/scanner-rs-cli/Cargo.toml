@@ -1,14 +1,14 @@
 [package]
-name = "scanner-rs"
+name = "scanner-rs-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "Standalone scanner CLI in gossip-rs workspace"
+description = "Standalone scanner CLI — delegates to scanner-rs engine for real secret detection"
 
 [dependencies]
-gossip-scanner-runtime.workspace = true
+scanner-rs-lib.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

@@ -31,6 +31,9 @@ gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }
 gossip-frontier = { path = "crates/gossip-frontier" }
 
+# Scanner-rs engine (path dep to scratch-scanner-rs for real detection)
+scanner-rs-lib = { package = "scanner-rs", path = "../scratch-scanner-rs" }
+
 # External dev/test dependencies
 rstest = "0.25"
 proptest = "1.6"

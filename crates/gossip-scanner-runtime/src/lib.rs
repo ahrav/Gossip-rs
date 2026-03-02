@@ -28,7 +28,6 @@
 //! - **Connector** — the runtime delegates enumeration to a connector that
 //!   implements [`EnumerationConnector`]. Filesystem connector mode runs
 //!   through the same scan-loop/page-hook seam used by worker execution.
-//!   Git connector mode remains gated until Phase 4B.
 //!
 //! # Pagination model
 //!
@@ -38,7 +37,7 @@
 //! - **Direct directory path** — `scan_from_connector_pages` calls
 //!   `enumerate_page` in a cursor-advancing loop until an empty page
 //!   signals completion.
-//! - **Connector mode path (filesystem)** — uses
+//! - **Connector mode path (filesystem, git)** — uses
 //!   `run_scan_loop_with_page_processor` for worker-parity cursor progression
 //!   and page processing.
 //! - **Materialized path** — `scan_materialized_items_pages` chunks a
@@ -65,7 +64,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-use gossip_connectors::FilesystemConnector;
+use gossip_connectors::{FilesystemConnector, GitConnector};
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorInputError, Cursor, EnumerateError, EnumerationConnector, ItemKey,
@@ -107,9 +106,6 @@ pub enum ExecutionMode {
     #[default]
     Direct,
     /// The runtime delegates enumeration to an [`EnumerationConnector`].
-    ///
-    /// Filesystem sources are enabled in this mode. Git sources still return
-    /// [`ScanRuntimeError::UnsupportedExecutionMode`] until Phase 4B.
     Connector,
 }
 
@@ -637,13 +633,18 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanAggregateStats, Sc
     }
 }
 
-/// Connector-mode git entrypoint stub (explicitly gated until later phases).
+/// Connector-mode git scan.
+///
+/// Uses the same worker-compatible scan-loop + page-processor seam as
+/// [`scan_fs_connector`] to preserve runtime and worker parity.
 pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    let _ = config;
-    Err(ScanRuntimeError::UnsupportedExecutionMode {
-        source: "git",
-        mode: ExecutionMode::Connector,
-    })
+    validate_git_repo_path(&config.repo)?;
+
+    let scanner = ScannerCore::default();
+    let shard = connector_mode_shard_spec();
+    let budgets = config.budgets.to_contract_budgets()?;
+    let mut connector = GitConnector::new(&config.repo);
+    scan_from_connector_pages_with_pipeline(&mut connector, &scanner, &shard, budgets)
 }
 
 const CONNECTOR_MODE_LEASE_DURATION_TICKS: u64 = 60_000;

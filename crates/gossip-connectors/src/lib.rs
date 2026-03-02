@@ -15,8 +15,10 @@
 mod common;
 #[cfg(unix)]
 pub mod filesystem;
+pub mod git;
 pub mod in_memory;
 
 #[cfg(unix)]
 pub use filesystem::FilesystemConnector;
+pub use git::GitConnector;
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
