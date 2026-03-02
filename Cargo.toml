@@ -47,6 +47,10 @@ anyhow = "1.0"
 # Optimise third-party crates in dev/test builds so property tests,
 # regex matching, and vectorscan scanning run at near-release speed
 # while our own crates stay at opt-level 0 for fast incremental builds.
+#
+# This only affects the initial clean build (deps compile with -O1).
+# Incremental builds are unaffected because deps are cached and only
+# workspace crates recompile on source changes.
 [profile.dev.package."*"]
 opt-level = 1
 

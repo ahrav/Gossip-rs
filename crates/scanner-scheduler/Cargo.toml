@@ -59,6 +59,7 @@ required-features = ["scheduler-sim"]
 crc32fast = "1.4"
 gossip-connectors.workspace = true
 gossip-contracts = { workspace = true, features = ["test-support"] }
+gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
 proptest = "1.10"
 rstest = "0.25"
 tempfile = "3.10"

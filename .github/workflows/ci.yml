@@ -107,6 +107,7 @@ jobs:
     needs: [changes]
     env:
       PROPTEST_CASES: "4"
+      STRESS_ITERATIONS: "20"
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust

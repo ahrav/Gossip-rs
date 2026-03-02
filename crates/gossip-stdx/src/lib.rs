@@ -83,6 +83,9 @@ mod ring_buffer;
 pub mod spsc;
 pub mod timing_wheel;
 
+#[cfg(feature = "stdx-proptest")]
+pub mod test_support;
+
 pub use atomic_bitset::AtomicBitSet;
 pub use atomic_seen_sets::AtomicSeenSets;
 pub use bitset::{DynamicBitSet, DynamicBitSetIterator, words_for_bits};
