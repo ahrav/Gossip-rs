@@ -1,6 +1,6 @@
 use super::*;
 use crate::scheduler::engine_stub::MockRule;
-use crate::unified::events::VecEventSink;
+use crate::events::VecEventOutput;
 
 // ========================================================================
 // Mock Backend
@@ -184,7 +184,7 @@ fn remote_pipeline_finds_secret() {
             data: b"hello SECRET world".to_vec(),
         }],
     });
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let (report, _metrics) = scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
@@ -214,7 +214,7 @@ fn remote_pipeline_handles_boundary_spanning_secret() {
             data: data.to_vec(),
         }],
     });
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let cfg = RemoteConfig {
         chunk_size: 8,
@@ -248,7 +248,7 @@ fn remote_pipeline_handles_boundary_spanning_secret() {
 fn remote_pipeline_handles_empty_backend() {
     let engine = Arc::new(test_engine(16));
     let backend = Arc::new(MockBackend { objs: vec![] });
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let (report, _metrics) = scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
@@ -268,7 +268,7 @@ fn remote_pipeline_processes_multiple_objects() {
         .collect();
 
     let backend = Arc::new(MockBackend { objs });
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let (report, _metrics) = scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
@@ -305,7 +305,7 @@ fn remote_pipeline_uses_cross_rule_dedupe_winner_selection() {
             data: b"hello SECRET world".to_vec(),
         }],
     });
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let (_report, _metrics) = scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
@@ -330,7 +330,7 @@ fn remote_pipeline_retries_transient_failures() {
         fail_first_n: std::sync::atomic::AtomicU32::new(2), // Fail twice, succeed on third
     });
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let cfg = RemoteConfig {
         retry: RetryPolicy {
@@ -484,7 +484,7 @@ fn partial_reads_cause_object_failure() {
         bytes_per_read: 17,
     });
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let cfg = RemoteConfig {
         chunk_size: 64, // Larger than bytes_per_read
@@ -563,7 +563,7 @@ fn permanent_errors_cause_immediate_failure() {
         },
     });
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let (report, _metrics) = scan_remote(engine, backend, small_config(), sink.clone()).unwrap();
 
@@ -587,7 +587,7 @@ fn retryable_errors_exhaust_attempts() {
         fail_first_n: std::sync::atomic::AtomicU32::new(100), // More than max_attempts
     });
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let cfg = RemoteConfig {
         retry: RetryPolicy {

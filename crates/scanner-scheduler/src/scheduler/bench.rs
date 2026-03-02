@@ -10,7 +10,7 @@
 //!
 //! # Key Principles
 //!
-//! 1. **Quiet by default**: No path/content output (uses NullEventSink)
+//! 1. **Quiet by default**: No path/content output (uses NullEventOutput)
 //! 2. **Reproducible**: Fixed seeds, CPU pinning, warmup iterations
 //! 3. **CI-friendly**: Stable summary format for regression detection
 //! 4. **Payload-safe**: No sensitive data in output

@@ -2,13 +2,13 @@ use super::*;
 use crate::Engine;
 use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
 use crate::archive::PartialReason;
+use crate::events::VecEventOutput;
 use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
 use crate::scheduler::engine_trait::{
     EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
 };
 use crate::scheduler::local_fs_archive_ctx::{ArchiveEnd, apply_entry_budget_clamp};
 use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
-use crate::unified::events::VecEventSink;
 use regex::bytes::Regex;
 use std::fs;
 use std::io::Write;
@@ -30,7 +30,7 @@ fn test_engine() -> MockEngine {
     )
 }
 
-fn small_config_with_sink(sink: Arc<VecEventSink>) -> LocalConfig {
+fn small_config_with_sink(sink: Arc<VecEventOutput>) -> LocalConfig {
     LocalConfig {
         workers: 2,
         chunk_size: 64, // Tiny for testing
@@ -49,7 +49,7 @@ fn small_config_with_sink(sink: Arc<VecEventSink>) -> LocalConfig {
 }
 
 fn small_config() -> LocalConfig {
-    small_config_with_sink(Arc::new(VecEventSink::new()))
+    small_config_with_sink(Arc::new(VecEventOutput::new()))
 }
 
 fn real_test_tuning(max_findings_per_chunk: usize) -> Tuning {
@@ -217,7 +217,7 @@ fn zip_budget_clamp_charges_discarded_bytes() {
 #[test]
 fn scans_single_file_with_findings() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     // Create temp file with secret
     let mut tmp = NamedTempFile::new().unwrap();
@@ -242,7 +242,7 @@ fn scans_single_file_with_findings() {
 #[test]
 fn handles_empty_file() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let tmp = NamedTempFile::new().unwrap();
     let path = tmp.path().to_path_buf();
@@ -258,7 +258,7 @@ fn handles_empty_file() {
 #[test]
 fn enforces_max_file_size_at_open_time() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let mut tmp = NamedTempFile::new().unwrap();
     writeln!(tmp, "SECRETABCD1234").unwrap();
@@ -292,7 +292,7 @@ fn handles_no_files() {
 #[test]
 fn finds_boundary_spanning_secret() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     // Create file where SECRET spans chunk boundary
     // With chunk_size=64 and overlap=16, secret at position ~60 will span
@@ -327,7 +327,7 @@ fn finds_boundary_spanning_secret() {
 #[test]
 fn processes_multiple_files() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let mut files = Vec::new();
     let mut temps = Vec::new();
@@ -436,7 +436,7 @@ fn archive_detection_skips_when_enabled() {
 #[test]
 fn archive_extension_scans_when_disabled() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("sample.zip");
@@ -550,7 +550,7 @@ fn dedupe_works_for_finding_with_hash_carrier() {
 #[test]
 fn persistence_batches_emitted_for_regular_fs_loop() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let producer = Arc::new(InMemoryStoreProducer::default());
 
     let mut tmp = NamedTempFile::new().unwrap();
@@ -579,7 +579,7 @@ fn dropped_findings_roll_up_into_persistence_run_loss() {
         real_test_tuning(1), // force max-findings drops
     ));
     let producer = Arc::new(InMemoryStoreProducer::default());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let mut tmp = NamedTempFile::new().unwrap();
     tmp.write_all(b"SECRET12345678 and SECRETABCDEFGH").unwrap();
@@ -609,7 +609,7 @@ fn dropped_findings_roll_up_into_persistence_run_loss() {
 #[test]
 fn duplicate_only_drop_does_not_mark_persistence_incomplete() {
     let engine = Arc::new(DuplicateDropEngine);
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let producer = Arc::new(InMemoryStoreProducer::default());
 
     let mut tmp = NamedTempFile::new().unwrap();
@@ -647,7 +647,7 @@ fn duplicate_only_drop_does_not_mark_persistence_incomplete() {
 #[test]
 fn persistence_failure_does_not_inflate_io_errors() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let producer = Arc::new(FailingStoreProducer);
 
     let mut tmp = NamedTempFile::new().unwrap();
@@ -682,7 +682,7 @@ fn persistence_failure_does_not_inflate_io_errors() {
 #[test]
 fn run_loss_failure_does_not_inflate_io_errors() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let producer = Arc::new(EmitOnlyStoreProducer::new());
 
     let mut tmp = NamedTempFile::new().unwrap();
@@ -980,7 +980,7 @@ fn overlap_dedup_no_double_report() {
     // offset 50 spans [50..56]. In chunk 2 (overlap carry from [48..64]),
     // drop_prefix_findings(64) drops it since root_hint_end=56 < 64.
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let mut tmp = NamedTempFile::new().unwrap();
     let mut data = vec![b'x'; 50];
@@ -1009,7 +1009,7 @@ fn overlap_dedup_no_double_report() {
 fn file_exactly_chunk_size() {
     // File of exactly chunk_size bytes should be scanned in one chunk.
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let mut tmp = NamedTempFile::new().unwrap();
     // chunk_size=64 in small_config; place SECRET in the middle.
@@ -1040,7 +1040,7 @@ fn multiple_secrets_across_chunks_in_one_file() {
     // One file spanning 3+ chunks, each containing a SECRET well away
     // from overlap boundaries.
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     // chunk_size=64, overlap=16.
     // Place SECRETs at offsets 4, 100, and 196 — each solidly within
@@ -1081,7 +1081,7 @@ fn two_files_no_cross_contamination() {
     // Scan two files back-to-back and verify findings are correct for each.
     // Tests that per-worker scratch is properly cleared between files.
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let dir = TempDir::new().unwrap();
     let p1 = dir.path().join("first.txt");
@@ -1125,7 +1125,7 @@ fn two_files_no_cross_contamination() {
 #[test]
 fn persistence_emit_failure_increments_counters() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let producer = Arc::new(FailingStoreProducer);
 
     let mut tmp = NamedTempFile::new().unwrap();
@@ -1162,7 +1162,7 @@ fn persistence_emit_failure_increments_counters() {
 #[test]
 fn run_loss_record_failure_increments_counters_and_emits_diagnostic() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let producer = Arc::new(EmitOnlyStoreProducer::new());
 
     let mut tmp = NamedTempFile::new().unwrap();
@@ -1312,7 +1312,7 @@ fn stack_msg_sequential_writes_respect_boundary() {
 #[test]
 fn preloaded_first_chunk_overlap_carry_finds_boundary_secret() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     // chunk_size=100, overlap=16.  Place SECRET at position 97 so it
     // spans the boundary between the preloaded first chunk ([0..100))
@@ -1359,7 +1359,7 @@ fn preloaded_first_chunk_overlap_carry_finds_boundary_secret() {
 #[test]
 fn small_file_below_tar_block_len_scans_normally() {
     let engine = Arc::new(test_engine());
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("tiny.txt");

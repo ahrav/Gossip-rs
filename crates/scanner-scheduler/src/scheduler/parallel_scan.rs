@@ -299,8 +299,8 @@ pub struct ParallelScanConfig {
     /// Structured event sink for finding output.
     ///
     /// All findings are emitted as structured events through this sink.
-    /// Defaults to [`NullEventSink`](crate::unified::events::NullEventSink).
-    pub event_sink: Arc<dyn crate::unified::events::EventSink>,
+    /// Defaults to [`NullEventOutput`](crate::events::NullEventOutput).
+    pub event_sink: Arc<dyn crate::events::EventOutput>,
 
     /// Optional persistence producer for post-dedupe FS findings.
     ///
@@ -331,7 +331,7 @@ impl Default for ParallelScanConfig {
             },
             pin_threads: super::affinity::default_pin_threads(),
             skip_binary: true,
-            event_sink: Arc::new(crate::unified::events::NullEventSink),
+            event_sink: Arc::new(crate::events::NullEventOutput),
             store_producer: None,
         }
     }
@@ -353,7 +353,7 @@ impl std::fmt::Debug for ParallelScanConfig {
             .field("archive", &self.archive)
             .field("pin_threads", &self.pin_threads)
             .field("skip_binary", &self.skip_binary)
-            .field("event_sink", &"<dyn EventSink>")
+            .field("event_sink", &"<dyn EventOutput>")
             .field(
                 "store_producer",
                 &self.store_producer.as_ref().map(|_| "<dyn StoreProducer>"),
@@ -615,7 +615,7 @@ fn scan_single_file(
 mod tests {
     use super::*;
     use crate::api::{RuleSpec, TransformConfig, Tuning, ValidatorKind};
-    use crate::unified::events::VecEventSink;
+    use crate::events::VecEventOutput;
     #[cfg(all(feature = "connector-pipeline", unix))]
     use gossip_connectors::filesystem::FilesystemConnector;
     #[cfg(all(feature = "connector-pipeline", unix))]
@@ -704,16 +704,16 @@ mod tests {
             archive: ArchiveConfig::default(),
             pin_threads: false,
             skip_binary: true,
-            event_sink: Arc::new(crate::unified::events::NullEventSink),
+            event_sink: Arc::new(crate::events::NullEventOutput),
             store_producer: None,
         }
     }
 
-    /// Create a config with a `VecEventSink` for output assertions.
-    fn config_with_sink() -> (ParallelScanConfig, Arc<VecEventSink>) {
-        let sink = Arc::new(VecEventSink::new());
+    /// Create a config with a `VecEventOutput` for output assertions.
+    fn config_with_sink() -> (ParallelScanConfig, Arc<VecEventOutput>) {
+        let sink = Arc::new(VecEventOutput::new());
         let mut cfg = small_config();
-        cfg.event_sink = Arc::clone(&sink) as Arc<dyn crate::unified::events::EventSink>;
+        cfg.event_sink = Arc::clone(&sink) as Arc<dyn crate::events::EventOutput>;
         (cfg, sink)
     }
 

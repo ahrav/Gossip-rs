@@ -4,10 +4,9 @@
 //! executor, local filesystem scanning, archive expansion, and scheduling
 //! support primitives.
 //!
-//! Step 2a preserves behavior while introducing crate-local compatibility
-//! modules (`api`, `engine`, `unified::events`, `store`) so scheduler code
-//! compiles independently of scanner-rs monolith modules. Step 2b will replace
-//! the compatibility event surface with split core/git event contracts.
+//! The scheduler event surface is split into git-free core events (`events`)
+//! and source tagging (`source_kind`) so downstream sinks can consume core
+//! progress/finding/summary output without git-type dependencies.
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
@@ -22,18 +21,20 @@ pub mod api;
 pub mod archive;
 pub mod content_policy;
 pub mod engine;
+pub mod events;
 pub mod finding_output;
 pub mod git_scan;
+pub mod json_write;
 pub mod perf_stats;
 pub mod pipeline;
 pub mod pool;
 pub mod runtime;
 pub mod scheduler;
 pub mod scratch_memory;
+pub mod source_kind;
 pub mod store;
 #[cfg(test)]
 pub mod test_utils;
-pub mod unified;
 
 #[cfg(feature = "b64-stats")]
 pub use scanner_engine::Base64DecodeStats;

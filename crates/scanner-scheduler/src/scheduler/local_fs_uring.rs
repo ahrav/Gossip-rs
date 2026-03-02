@@ -15,7 +15,7 @@
 //!         │                        │                          │
 //!         ▼                        ▼                          ▼
 //!  ┌────────────────┐     ┌───────────────────┐     ┌───────────────────────┐
-//!  │ Archive Workers│     │ Extract Workers    │     │   EventSink           │
+//!  │ Archive Workers│     │ Extract Workers    │     │   EventOutput           │
 //!  │  (dedicated)   │     │  (dedicated)       │     │   (findings output)   │
 //!  └────────────────┘     └───────────────────┘     └───────────────────────┘
 //! ```
@@ -75,8 +75,8 @@ use crate::archive::scan::{
 };
 use crate::archive::{ArchiveConfig, ArchiveKind, ArchiveStats};
 use crate::content_policy::{self, ContentVerdict};
+use crate::events::EventOutput;
 use crate::perf_stats;
-use crate::unified::events::EventSink;
 
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
@@ -643,7 +643,7 @@ enum CpuTask {
 /// chunk's `drain_findings_into` to avoid cross-chunk finding accumulation.
 struct CpuScratch<E: ScanEngine> {
     engine: Arc<E>,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
     scratch: E::Scratch,
     pending: Vec<<E::Scratch as EngineScratch>::Finding>,
 }
@@ -709,7 +709,7 @@ struct UringArchiveSink<'a, E: ScanEngine> {
     engine: &'a E,
     scratch: &'a mut E::Scratch,
     pending: &'a mut Vec<<E::Scratch as EngineScratch>::Finding>,
-    event_sink: &'a dyn EventSink,
+    event_sink: &'a dyn EventOutput,
     display: Vec<u8>,
     container_file_id: FileId,
     next_entry_index: u32,
@@ -789,7 +789,7 @@ struct ArchiveWorkerStats {
 fn archive_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ArchiveWork>,
     engine: Arc<E>,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
     file_ids: Arc<FileIdAllocator>,
     cfg: ArchiveConfig,
 ) -> ArchiveWorkerStats {
@@ -946,7 +946,7 @@ struct ExtractWorkerStats {
 fn extract_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ExtractWork>,
     engine: Arc<E>,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 ) -> ExtractWorkerStats {
     use crate::content_policy::extract::{
         EXTRACT_INPUT_CAP, EXTRACT_OUTPUT_CAP, ExtractResult, JAR_ENTRY_CAP, extract_content,
@@ -2544,7 +2544,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 ) -> io::Result<(LocalFsSummary, UringIoStats, MetricsSnapshot)> {
     cfg.validate(engine.as_ref());
 

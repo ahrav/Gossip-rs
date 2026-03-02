@@ -3,7 +3,7 @@ use super::super::engine_trait::{EngineScratch, FindingRecord, FindingWithHash, 
 use super::super::{TsBufferPool, TsBufferPoolConfig};
 use super::*;
 use crate::api::FileId;
-use crate::unified::events::VecEventSink;
+use crate::events::VecEventOutput;
 use tempfile::tempdir;
 
 struct DuplicateDropEngine;
@@ -185,7 +185,7 @@ fn uring_finds_boundary_spanning_match() -> io::Result<()> {
     let content = b"xxxxSECRETyyyyyy";
     std::fs::write(&file_path, content)?;
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
 
     let cfg = LocalFsUringConfig {
         cpu_workers: 2,
@@ -282,7 +282,7 @@ fn uring_open_stat_parity_with_blocking() -> io::Result<()> {
         archive: ArchiveConfig::default(),
     };
 
-    let sink_blocking = Arc::new(VecEventSink::new());
+    let sink_blocking = Arc::new(VecEventOutput::new());
     let (_summary, _io_stats, _cpu_metrics) = scan_local_fs_uring(
         Arc::clone(&engine),
         &[dir.path().to_path_buf()],
@@ -291,7 +291,7 @@ fn uring_open_stat_parity_with_blocking() -> io::Result<()> {
     )?;
     let out_blocking = sink_blocking.take();
 
-    let sink_uring = Arc::new(VecEventSink::new());
+    let sink_uring = Arc::new(VecEventOutput::new());
     let mut uring_cfg = base_cfg;
     uring_cfg.open_stat_mode = OpenStatMode::UringPreferred;
     let (_summary, _io_stats, _cpu_metrics) = scan_local_fs_uring(
@@ -349,7 +349,7 @@ fn blocking_mode_skips_open_stat_ops() -> io::Result<()> {
         archive: ArchiveConfig::default(),
     };
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let (_summary, io_stats, _cpu_metrics) =
         scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
 
@@ -403,7 +403,7 @@ fn uring_binary_skipped_counted() -> io::Result<()> {
         },
     };
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let (_summary, io_stats, cpu_metrics) =
         scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink.clone())?;
 
@@ -456,7 +456,7 @@ fn uring_extract_path_counts_dropped_findings() -> io::Result<()> {
         },
     };
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let (_summary, _io_stats, cpu_metrics) =
         scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
 
@@ -500,7 +500,7 @@ fn uring_cross_rule_mode_uses_hash_aware_winner_pass() -> io::Result<()> {
         },
     };
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let (_summary, _io_stats, metrics) =
         scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
     assert_eq!(
@@ -553,7 +553,7 @@ fn extract_worker_uses_existing_fd_after_unlink() -> io::Result<()> {
     .map_err(|_| io::Error::other("failed to enqueue extraction work"))?;
     drop(tx);
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let stats = extract_worker_loop(rx, engine, sink.clone());
 
     assert_eq!(stats.files_extracted, 1, "expected extraction from open fd");
@@ -610,7 +610,7 @@ fn uring_archive_sniffed_counted() -> io::Result<()> {
         archive: ArchiveConfig::default(), // enabled=true by default
     };
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let (_summary, io_stats, _cpu_metrics) =
         scan_local_fs_uring(engine, &[dir.path().to_path_buf()], cfg, sink)?;
 
@@ -655,7 +655,7 @@ fn uring_sniff_detected_gzip_emits_findings() -> io::Result<()> {
     }
     std::fs::write(&file_path, &gz_bytes)?;
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let cfg = LocalFsUringConfig {
         cpu_workers: 2,
         io_threads: 1,
@@ -728,7 +728,7 @@ fn uring_extension_routed_archive_emits_findings() -> io::Result<()> {
     }
     std::fs::write(&file_path, &gz_bytes)?;
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let cfg = LocalFsUringConfig {
         cpu_workers: 2,
         io_threads: 1,
@@ -794,7 +794,7 @@ fn uring_sniff_detected_zip_emits_findings() -> io::Result<()> {
     let zip_bytes = build_minimal_zip("secret.txt", payload);
     std::fs::write(&file_path, &zip_bytes)?;
 
-    let sink = Arc::new(VecEventSink::new());
+    let sink = Arc::new(VecEventOutput::new());
     let cfg = LocalFsUringConfig {
         cpu_workers: 2,
         io_threads: 1,

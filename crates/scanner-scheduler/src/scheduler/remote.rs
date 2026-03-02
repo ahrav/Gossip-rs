@@ -52,7 +52,7 @@ use super::scan_helpers::{
 use super::ts_buffer_pool::{TsBufferHandle, TsBufferPool, TsBufferPoolConfig};
 use crate::perf_stats;
 use crate::scheduler::engine_stub::{FileId, FindingRec, MockEngine, ScanScratch, BUFFER_LEN_MAX};
-use crate::unified::events::EventSink;
+use crate::events::EventOutput;
 
 use crossbeam_channel as chan;
 
@@ -407,7 +407,7 @@ enum CpuTask {
 /// Per-CPU-worker scratch space.
 struct CpuScratch {
     engine: Arc<MockEngine>,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 
     scratch: ScanScratch,
     pending: Vec<FindingRec>,
@@ -789,7 +789,7 @@ fn io_worker_loop<B: RemoteBackend>(
 /// ```ignore
 /// let engine = Arc::new(MockEngine::new(rules, 16));
 /// let backend = Arc::new(MyS3Backend::new(bucket));
-/// let sink = Arc::new(scanner_rs::unified::events::VecEventSink::new());
+/// let sink = Arc::new(scanner_scheduler::events::VecEventOutput::new());
 ///
 /// let (report, metrics) = scan_remote(engine, backend, RemoteConfig::default(), sink)?;
 /// ```
@@ -797,7 +797,7 @@ pub fn scan_remote<B: RemoteBackend>(
     engine: Arc<MockEngine>,
     backend: Arc<B>,
     cfg: RemoteConfig,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 ) -> Result<(RemoteRunReport, MetricsSnapshot), RemoteRunError<B::Error>> {
     cfg.validate(&engine);
 
