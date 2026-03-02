@@ -989,7 +989,7 @@ impl CharClassSpec {
     }
 
     /// Append a deterministic encoding for policy hashing.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         out.push(self.max_lower_pct);
         push_u16_le(out, self.min_window_len);
     }
@@ -1475,7 +1475,7 @@ impl RuleSpec {
     /// (lists are sorted and deduplicated before serialization). Callers should
     /// treat this as an internal serialization format; any change to the encoding
     /// requires a policy-hash version bump in `src/git_scan/policy_hash.rs`.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         push_bytes_u32(out, self.name.as_bytes());
         encode_bytes_list(out, self.anchors);
         push_u64_le(out, self.radius as u64);
@@ -1531,7 +1531,7 @@ impl RuleSpec {
 
 impl TwoPhaseSpec {
     /// Encodes this two-phase configuration into canonical bytes.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         push_u64_le(out, self.seed_radius as u64);
         push_u64_le(out, self.full_radius as u64);
         encode_bytes_list(out, self.confirm_any);
@@ -1540,7 +1540,7 @@ impl TwoPhaseSpec {
 
 impl EntropySpec {
     /// Encodes this entropy configuration into canonical bytes.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         push_u32_le(out, self.min_bits_per_byte.to_bits());
         push_u64_le(out, self.min_len as u64);
         push_u64_le(out, self.max_len as u64);
@@ -1557,7 +1557,7 @@ impl EntropySpec {
 
 impl OfflineValidationSpec {
     /// Encodes this offline validation spec into canonical bytes.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         match self {
             Self::Crc32Base62 {
                 prefix_skip,
@@ -1581,7 +1581,7 @@ impl OfflineValidationSpec {
 
 impl ValidatorKind {
     /// Encodes this validator kind into canonical bytes.
-    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+    pub fn encode_policy(self, out: &mut Vec<u8>) {
         match self {
             ValidatorKind::None => out.push(0),
             ValidatorKind::AwsAccessKey => out.push(1),
@@ -1617,7 +1617,7 @@ impl ValidatorKind {
 
 impl TailCharset {
     /// Encodes this tail charset into a stable tag.
-    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+    pub fn encode_policy(self, out: &mut Vec<u8>) {
         let tag = match self {
             TailCharset::UpperAlnum => 1,
             TailCharset::Alnum => 2,
@@ -1633,7 +1633,7 @@ impl TailCharset {
 
 impl DelimAfter {
     /// Encodes this delimiter requirement into a stable tag.
-    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+    pub fn encode_policy(self, out: &mut Vec<u8>) {
         let tag = match self {
             DelimAfter::None => 0,
             DelimAfter::GitleaksTokenTerminator => 1,
@@ -1644,7 +1644,7 @@ impl DelimAfter {
 
 impl TransformConfig {
     /// Encodes this transform config into canonical bytes.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         self.id.encode_policy(out);
         self.mode.encode_policy(out);
         self.gate.encode_policy(out);
@@ -1679,7 +1679,7 @@ impl TransformId {
     }
 
     /// Encodes this transform id into a stable tag.
-    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+    pub fn encode_policy(self, out: &mut Vec<u8>) {
         let tag = match self {
             TransformId::UrlPercent => 1,
             TransformId::Base64 => 2,
@@ -1690,7 +1690,7 @@ impl TransformId {
 
 impl TransformMode {
     /// Encodes this transform mode into a stable tag.
-    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+    pub fn encode_policy(self, out: &mut Vec<u8>) {
         let tag = match self {
             TransformMode::Disabled => 0,
             TransformMode::Always => 1,
@@ -1702,7 +1702,7 @@ impl TransformMode {
 
 impl Gate {
     /// Encodes this gate policy into a stable tag.
-    pub(crate) fn encode_policy(self, out: &mut Vec<u8>) {
+    pub fn encode_policy(self, out: &mut Vec<u8>) {
         let tag = match self {
             Gate::None => 0,
             Gate::AnchorsInDecoded => 1,
@@ -1713,7 +1713,7 @@ impl Gate {
 
 impl Tuning {
     /// Encodes tuning into canonical bytes for policy hashing.
-    pub(crate) fn encode_policy(&self, out: &mut Vec<u8>) {
+    pub fn encode_policy(&self, out: &mut Vec<u8>) {
         push_u64_le(out, self.merge_gap as u64);
         push_u64_le(out, self.max_windows_per_rule_variant as u64);
         push_u64_le(out, self.pressure_gap_start as u64);

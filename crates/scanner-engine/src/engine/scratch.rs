@@ -1447,7 +1447,7 @@ impl ScanScratch {
     }
 
     /// Returns the normalized secret hashes aligned 1:1 with [`findings()`].
-    pub(crate) fn norm_hashes(&self) -> &[NormHash] {
+    pub fn norm_hashes(&self) -> &[NormHash] {
         self.norm_hash.as_slice()
     }
 
