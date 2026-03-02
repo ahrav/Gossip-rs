@@ -92,8 +92,8 @@ impl CommitWalkLimits {
             "heap entry limit exceeds commit-graph cap"
         );
         assert!(
-            self.max_parents_per_commit <= 4096,
-            "max parents per commit is unreasonably large"
+            self.max_parents_per_commit <= 255,
+            "max parents per commit exceeds u8 range (pipeline stores parent_idx as u8)"
         );
         assert!(
             self.max_new_ref_skip_checks <= 1_000_000,
@@ -125,8 +125,10 @@ impl CommitWalkLimits {
         if self.max_heap_entries > self.max_commits_in_graph {
             return Err("heap entry limit exceeds commit-graph cap");
         }
-        if self.max_parents_per_commit > 4096 {
-            return Err("max parents per commit is unreasonably large");
+        if self.max_parents_per_commit > 255 {
+            return Err(
+                "max parents per commit exceeds u8 range (pipeline stores parent_idx as u8)",
+            );
         }
         if self.max_new_ref_skip_checks > 1_000_000 {
             return Err("max new-ref skip checks is unreasonably large");
@@ -144,3 +146,32 @@ impl Default for CommitWalkLimits {
 const _: () = CommitWalkLimits::DEFAULT.validate();
 const _: () = CommitWalkLimits::RESTRICTIVE.validate();
 const _: () = assert!(std::mem::size_of::<CommitWalkLimits>() == 16);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_parent_limit_exceeding_u8_range() {
+        // The tree diff pipeline stores parent_idx as u8. Allowing
+        // max_parents_per_commit > 255 causes silent truncation in
+        // `run_diff_history` (idx as u8), aliasing distinct parent indices.
+        let limits = CommitWalkLimits {
+            max_parents_per_commit: 256,
+            ..CommitWalkLimits::DEFAULT
+        };
+        assert!(
+            limits.try_validate().is_err(),
+            "max_parents_per_commit=256 should be rejected since parent_idx is u8"
+        );
+    }
+
+    #[test]
+    fn accepts_parent_limit_at_u8_max() {
+        let limits = CommitWalkLimits {
+            max_parents_per_commit: 255,
+            ..CommitWalkLimits::DEFAULT
+        };
+        assert!(limits.try_validate().is_ok());
+    }
+}
