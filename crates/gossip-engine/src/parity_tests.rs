@@ -51,10 +51,26 @@ fn canonicalize_stream_output_preserves_emission_order() {
     );
 }
 
-#[test]
-fn throughput_delta_allows_zero_vs_zero() {
-    let delta = throughput_delta_pct(0.0, 0.0).expect("zero baseline/candidate should be stable");
-    assert_eq!(delta, 0.0);
+// ── Valid throughput delta calculations ──────────────────────────
+
+#[rstest::rstest]
+#[case::zero_vs_zero(0.0, 0.0, 0.0)]
+#[case::positive_10pct(100.0, 110.0, 10.0)]
+#[case::positive_20pct(100.0, 120.0, 20.0)]
+#[case::positive_50pct(50.0, 75.0, 50.0)]
+#[case::negative_10pct(100.0, 90.0, -10.0)]
+#[case::negative_20pct(100.0, 80.0, -20.0)]
+#[case::equal(200.0, 200.0, 0.0)]
+fn throughput_delta_pct_valid_inputs(
+    #[case] baseline: f64,
+    #[case] candidate: f64,
+    #[case] expected: f64,
+) {
+    let delta = throughput_delta_pct(baseline, candidate).expect("valid inputs");
+    assert!(
+        (delta - expected).abs() < 1e-10,
+        "throughput_delta_pct({baseline}, {candidate}) = {delta}, expected {expected}"
+    );
 }
 
 #[test]
@@ -85,16 +101,65 @@ fn throughput_thresholds_validate_per_case_and_median() {
 }
 
 #[test]
-fn median_handles_even_and_odd_input() {
-    assert_eq!(median(&[1.0, 3.0, 2.0]).expect("odd median"), 2.0);
-    assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]).expect("even median"), 2.5);
-}
-
-#[test]
 fn negative_candidate_throughput_is_rejected() {
     let err = throughput_delta_pct(100.0, -5.0).expect_err("negative candidate must be rejected");
     assert!(
         matches!(err, ThroughputError::NegativeCandidate { candidate } if candidate == -5.0),
         "expected NegativeCandidate, got {err:?}"
+    );
+}
+
+// ── NonFinite throughput rejection ──────────────────────────────
+
+#[rstest::rstest]
+#[case::nan_baseline(f64::NAN, 1.0, "baseline")]
+#[case::infinite_candidate(1.0, f64::INFINITY, "candidate")]
+fn throughput_delta_rejects_non_finite(
+    #[case] baseline: f64,
+    #[case] candidate: f64,
+    #[case] expected_label: &str,
+) {
+    let err = throughput_delta_pct(baseline, candidate).expect_err("non-finite input");
+    assert!(
+        matches!(err, ThroughputError::NonFinite { label, .. } if label == expected_label),
+        "expected NonFinite for {expected_label}, got {err:?}"
+    );
+}
+
+// ── Median valid inputs ─────────────────────────────────────────
+
+#[rstest::rstest]
+#[case::single_element(&[7.5], 7.5)]
+#[case::odd_count(&[1.0, 3.0, 2.0], 2.0)]
+#[case::even_count(&[1.0, 2.0, 3.0, 4.0], 2.5)]
+fn median_valid_inputs(#[case] values: &[f64], #[case] expected: f64) {
+    assert_eq!(median(values).expect("valid input"), expected);
+}
+
+#[test]
+fn median_empty_input_is_error() {
+    let err = median(&[]).expect_err("empty input");
+    assert!(
+        matches!(err, ThroughputError::EmptyInput),
+        "expected EmptyInput, got {err:?}"
+    );
+}
+
+// ── Median non-finite rejection ─────────────────────────────────
+
+#[rstest::rstest]
+#[case::nan(vec![1.0, f64::NAN, 3.0])]
+#[case::infinity(vec![1.0, f64::INFINITY])]
+fn median_rejects_non_finite(#[case] values: Vec<f64>) {
+    let err = median(&values).expect_err("non-finite input");
+    assert!(
+        matches!(
+            err,
+            ThroughputError::NonFinite {
+                label: "sample",
+                ..
+            }
+        ),
+        "expected NonFinite for sample, got {err:?}"
     );
 }

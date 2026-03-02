@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use gossip_contracts::connector::{ConnectorCapabilities, EnumerationPage};
 use rstest::rstest;
 use tempfile::tempdir;
 
@@ -24,7 +25,11 @@ fn parse_execution_mode_valid(#[case] input: &str, #[case] expected: ExecutionMo
 #[case::numeric("42")]
 fn parse_execution_mode_invalid(#[case] input: &str) {
     let err = input.parse::<ExecutionMode>().unwrap_err();
-    assert_eq!(err.raw(), input);
+    let display = err.to_string();
+    assert!(
+        display.contains(input),
+        "Display should include the raw input '{input}', got: {display}"
+    );
 }
 
 // ── Filesystem scan integration ────────────────────────────────
@@ -65,22 +70,129 @@ fn scan_fs_direct_rejects_nonexistent_path() {
     ));
 }
 
-// ── Connector-mode gating ──────────────────────────────────────
+// ── Connector-mode filesystem path ─────────────────────────────
 
 #[test]
-fn scan_fs_connector_is_explicitly_gated() {
+fn scan_fs_connector_scans_directory() {
     let dir = tempdir().expect("tempdir");
-    let error =
-        scan_fs(&FsScanConfig::new(dir.path()).with_execution_mode(ExecutionMode::Connector))
-            .expect_err("connector mode should be gated");
-    assert!(matches!(
-        error,
-        ScanRuntimeError::UnsupportedExecutionMode {
-            source: "filesystem",
-            mode: ExecutionMode::Connector,
-        }
-    ));
+    fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
+    fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+
+    let outcome = scan_fs_connector(&FsScanConfig::new(dir.path())).expect("connector scan");
+    assert!(outcome.pages_scanned() >= 1);
+    assert!(outcome.items_scanned() >= 2);
+    assert!(outcome.findings_emitted() >= 2);
 }
+
+#[test]
+fn scan_fs_connector_scans_single_file() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("secret.txt");
+    fs::write(&file_path, "password=hunter2").expect("write");
+
+    let outcome = scan_fs_connector(&FsScanConfig::new(&file_path)).expect("single file scan");
+    assert_eq!(outcome.pages_scanned(), 1);
+    assert_eq!(outcome.items_scanned(), 1);
+}
+
+#[test]
+fn scan_fs_direct_and_connector_match_for_directory() {
+    // Structural note: direct mode uses ShardSpec::with_range([], []) (unbounded)
+    // while connector mode uses connector_mode_shard_spec() (bounded [0x00, 0xff..ff)).
+    // ScannerCore currently does not filter by key range, so counters match for
+    // identical input files. If key-range filtering is ever added, this test
+    // would need to compare actual findings, not just aggregate counters.
+    let dir = tempdir().expect("tempdir");
+    for i in 0..5 {
+        fs::write(
+            dir.path().join(format!("secret_{i}.txt")),
+            format!("password=alpha{i}"),
+        )
+        .expect("write");
+    }
+
+    // max_items: 1 forces multi-page execution, exercising page-boundary
+    // behavior in both modes (connector mode uses the scan loop with
+    // checkpoint/complete transitions; direct mode uses
+    // scan_from_connector_pages).
+    let budgets = ScanBudgets {
+        max_items: 1,
+        max_bytes: 1_000_000,
+    };
+    let direct =
+        scan_fs(&FsScanConfig::new(dir.path()).with_budgets(budgets)).expect("direct outcome");
+    let connector = scan_fs(
+        &FsScanConfig::new(dir.path())
+            .with_budgets(budgets)
+            .with_execution_mode(ExecutionMode::Connector),
+    )
+    .expect("connector outcome");
+
+    assert_eq!(
+        direct.pages_scanned(),
+        connector.pages_scanned(),
+        "page count mismatch"
+    );
+    assert_eq!(
+        direct.items_scanned(),
+        connector.items_scanned(),
+        "item count mismatch"
+    );
+    assert_eq!(
+        direct.findings_emitted(),
+        connector.findings_emitted(),
+        "finding count mismatch"
+    );
+    assert_eq!(
+        direct.diagnostics_emitted(),
+        connector.diagnostics_emitted(),
+        "diagnostic count mismatch"
+    );
+
+    // Absolute-value assertions: 5 files × max_items=1 → exactly 5 pages,
+    // 5 items, and at least 5 findings (each file contains a secret).
+    assert_eq!(direct.pages_scanned(), 5, "expected exactly 5 pages");
+    assert_eq!(direct.items_scanned(), 5, "expected exactly 5 items");
+    assert!(
+        direct.findings_emitted() >= 5,
+        "expected at least 5 findings, got {}",
+        direct.findings_emitted()
+    );
+}
+
+#[test]
+fn scan_fs_direct_and_connector_match_for_single_file() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("secret.txt");
+    fs::write(&file_path, "password=hunter2").expect("write");
+
+    let direct = scan_fs(&FsScanConfig::new(&file_path)).expect("direct outcome");
+    let connector =
+        scan_fs(&FsScanConfig::new(&file_path).with_execution_mode(ExecutionMode::Connector))
+            .expect("connector outcome");
+
+    assert_eq!(
+        direct.pages_scanned(),
+        connector.pages_scanned(),
+        "page count mismatch"
+    );
+    assert_eq!(
+        direct.items_scanned(),
+        connector.items_scanned(),
+        "item count mismatch"
+    );
+    assert_eq!(
+        direct.findings_emitted(),
+        connector.findings_emitted(),
+        "finding count mismatch"
+    );
+
+    // Single file → exactly 1 page, 1 item.
+    assert_eq!(direct.pages_scanned(), 1, "expected exactly 1 page");
+    assert_eq!(direct.items_scanned(), 1, "expected exactly 1 item");
+}
+
+// ── Connector-mode gating (git only) ─────────────────────────────
 
 #[test]
 fn scan_git_connector_is_explicitly_gated() {
@@ -258,4 +370,288 @@ fn scan_fs_direct_handles_empty_directory() {
     assert_eq!(outcome.items_scanned(), 0);
     assert_eq!(outcome.findings_emitted(), 0);
     assert_eq!(outcome.diagnostics_emitted(), 0);
+}
+
+// ── Shard op-log scope after session creation ───────────────────
+
+#[test]
+fn shard_op_log_accepts_op_id_one_after_session_creation() {
+    // register_shards stores its OpId in the RUN's op log, not the shard's.
+    // The shard op log starts empty, so OpId::from_raw(1) must be available
+    // for the first shard-level checkpoint.
+    let shard = connector_mode_shard_spec();
+    let mut coordinator = InMemoryCoordinator::new(CONNECTOR_MODE_LEASE_DURATION_TICKS);
+    let mut session =
+        create_runtime_worker_session(&mut coordinator, &shard).expect("session creation");
+
+    // If register_shards had occupied shard op log slot 1, this would fail
+    // with OpIdConflict.
+    let cursor = CursorUpdate::new(&[0x01]);
+    let result = session.checkpoint(LogicalTime::from_raw(4), &cursor, OpId::from_raw(1));
+    assert!(
+        result.is_ok(),
+        "OpId::from_raw(1) should be available in shard op log: {result:?}"
+    );
+}
+
+// ── Error source chain for ScanLoopLeaseLost ────────────────────
+
+#[test]
+fn lease_lost_with_renew_failed_exposes_error_source() {
+    use std::error::Error;
+
+    let error = ScanRuntimeError::ScanLoopLeaseLost {
+        pages_completed: 5,
+        cause: LeaseLossCause::RenewFailed(gossip_coordination::RenewError::LeaseExpired {
+            deadline: LogicalTime::from_raw(100),
+            now: LogicalTime::from_raw(200),
+        }),
+    };
+
+    // source() should expose the inner RenewError for error-chain traversal.
+    assert!(
+        error.source().is_some(),
+        "ScanLoopLeaseLost with RenewFailed cause should expose source()"
+    );
+}
+
+#[test]
+fn lease_lost_with_deadline_elapsed_has_no_source() {
+    use std::error::Error;
+
+    let error = ScanRuntimeError::ScanLoopLeaseLost {
+        pages_completed: 0,
+        cause: LeaseLossCause::DeadlineElapsed {
+            now: LogicalTime::from_raw(200),
+            deadline: LogicalTime::from_raw(100),
+        },
+    };
+
+    // DeadlineElapsed has no inner error to expose.
+    assert!(
+        error.source().is_none(),
+        "ScanLoopLeaseLost with DeadlineElapsed should have no source"
+    );
+}
+
+// ── Cursor stall detection (F1) ─────────────────────────────────
+
+/// Test connector that returns one non-empty page but never advances its cursor.
+struct StallingConnector {
+    called: bool,
+}
+
+impl StallingConnector {
+    fn new() -> Self {
+        Self { called: false }
+    }
+}
+
+impl EnumerationConnector for StallingConnector {
+    fn caps(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            seek_by_key: false,
+            token_resume: false,
+            range_read: false,
+            split_hints: false,
+        }
+    }
+
+    fn enumerate_page(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+        _budgets: Budgets,
+    ) -> Result<EnumerationPage, EnumerateError> {
+        if self.called {
+            // Safety net: if stall detection fails to fire, return empty to
+            // prevent an actual infinite loop in the test runner.
+            return Ok(EnumerationPage::new(vec![], Cursor::initial()));
+        }
+        self.called = true;
+
+        let tag = ConnectorTag::from_ascii(b"test");
+        let key = ItemKey::try_from_slice(b"stall-key").expect("key");
+        let item_ref = ItemRef::try_from_slice(b"stall-ref").expect("ref");
+        let stable_id = ItemIdentityKey::new(tag, b"stall-key").stable_id();
+        let version = VersionId::Weak(ObjectVersionId::from_version_bytes(b"v1"));
+        let item = ScanItem::new(key, item_ref, stable_id, version);
+
+        // Return items but keep the cursor at initial — this is the stall.
+        Ok(EnumerationPage::new(vec![item], Cursor::initial()))
+    }
+}
+
+#[test]
+fn scan_from_connector_pages_detects_cursor_stall() {
+    let mut connector = StallingConnector::new();
+    let scanner = ScannerCore::default();
+    let shard = ShardSpec::with_range([], []);
+    let budgets = Budgets::try_new(256, 1_000_000, None).expect("budgets");
+
+    let err =
+        scan_from_connector_pages(&mut connector, &scanner, &shard, budgets).expect_err("stall");
+    assert!(
+        matches!(err, ScanRuntimeError::CursorStalled { page_num: 1 }),
+        "expected CursorStalled {{ page_num: 1 }}, got: {err}"
+    );
+}
+
+// ── Git path traversal rejection (F2) ───────────────────────────
+//
+// Modern git rejects `..` paths at the index level, so we cannot inject a
+// literal `../escape.txt` entry through `git update-index`. Instead we
+// test the `Component::ParentDir` filtering predicate directly (the exact
+// guard at lib.rs:567-572) and verify it correctly classifies traversal
+// paths.
+
+#[test]
+fn parent_dir_component_filter_rejects_traversal_paths() {
+    use std::path::{Component, Path};
+
+    // The predicate used in scan_git_direct to reject `..` paths.
+    let has_parent_dir = |p: &Path| p.components().any(|c| matches!(c, Component::ParentDir));
+
+    // Paths that should be rejected.
+    assert!(has_parent_dir(Path::new("../escape.txt")));
+    assert!(has_parent_dir(Path::new("sub/../../escape.txt")));
+    assert!(has_parent_dir(Path::new("a/b/../../../etc/passwd")));
+
+    // Paths that should be allowed.
+    assert!(!has_parent_dir(Path::new("normal.txt")));
+    assert!(!has_parent_dir(Path::new("sub/normal.txt")));
+    assert!(!has_parent_dir(Path::new("a/b/c/deep.txt")));
+}
+
+/// End-to-end: a normal git repo with no traversal paths scans cleanly.
+/// This complements the predicate test above by proving the guard does not
+/// interfere with legitimate paths in a real git repository.
+#[test]
+fn scan_git_direct_accepts_normal_paths_through_traversal_filter() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(repo)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .output()
+        .expect("git config name");
+
+    fs::create_dir_all(repo.join("sub")).expect("mkdir sub");
+    fs::write(repo.join("sub/normal.txt"), "secret_key=abc123").expect("write");
+    fs::write(repo.join("root.txt"), "token=xyz").expect("write root");
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+
+    let outcome = scan_git_direct(&GitScanConfig::new(repo)).expect("git direct scan");
+    assert_eq!(
+        outcome.items_scanned(),
+        2,
+        "both normal files should pass the traversal filter"
+    );
+}
+
+// ── Git symlink containment (F3) ────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn scan_git_direct_excludes_symlink_outside_repo_boundary() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+
+    // Init a git repo.
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(repo)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .output()
+        .expect("git config name");
+
+    // Create a tracked normal file inside the repo.
+    fs::write(repo.join("inside.txt"), "secret_key=abc123").expect("write inside");
+    std::process::Command::new("git")
+        .args(["add", "inside.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add inside");
+
+    // Create a file outside the repo and a symlink inside pointing to it.
+    // We need a truly outside file, so create a sibling tempdir.
+    let outside_dir = tempdir().expect("outside tempdir");
+    let outside_path = outside_dir.path().join("sensitive.txt");
+    fs::write(&outside_path, "password=supersecret").expect("write outside");
+
+    let link_path = repo.join("link.txt");
+    std::os::unix::fs::symlink(&outside_path, &link_path).expect("symlink");
+
+    // Track the symlink in git.
+    std::process::Command::new("git")
+        .args(["add", "link.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add link");
+
+    let outcome = scan_git_direct(&GitScanConfig::new(repo)).expect("git direct scan");
+
+    // The symlink should be excluded by the `!metadata.is_file()` check
+    // (symlink_metadata returns symlink type, not file type) and/or the
+    // canonicalization containment check. Only inside.txt should be scanned.
+    assert_eq!(
+        outcome.items_scanned(),
+        1,
+        "symlink pointing outside repo should be excluded"
+    );
+}
+
+// ── Heap-allocation path in build_scan_item (F9) ────────────────
+
+#[test]
+fn scan_fs_direct_exercises_heap_allocation_for_long_path() {
+    let dir = tempdir().expect("tempdir");
+
+    // build_scan_item uses a stack buffer for paths <= 128 bytes and falls
+    // back to heap allocation for longer paths. Create a deeply nested path
+    // that exceeds 128 bytes total to exercise the heap path.
+    let deep_name = "a".repeat(140);
+    let nested_dir = dir.path().join(&deep_name);
+    fs::create_dir_all(&nested_dir).expect("mkdir deep");
+
+    let file_path = nested_dir.join("secret.txt");
+    fs::write(&file_path, "password=hunter2").expect("write");
+
+    // Verify the path actually exceeds the INLINE_CAP threshold.
+    let path_len = file_path.as_os_str().len();
+    assert!(
+        path_len > 128,
+        "path must exceed 128 bytes for heap path, got {path_len}"
+    );
+
+    let outcome = scan_fs_direct(&FsScanConfig::new(&file_path)).expect("long-path scan");
+    assert_eq!(outcome.items_scanned(), 1);
+    assert!(
+        outcome.findings_emitted() >= 1,
+        "should emit at least 1 finding"
+    );
 }

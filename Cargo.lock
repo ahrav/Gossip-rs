@@ -458,7 +458,9 @@ version = "0.1.0"
 dependencies = [
  "gossip-connectors",
  "gossip-contracts",
+ "gossip-coordination",
  "gossip-engine",
+ "gossip-scan-pipeline",
  "rstest",
  "tempfile",
 ]
