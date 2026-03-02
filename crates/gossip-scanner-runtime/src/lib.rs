@@ -64,8 +64,8 @@ use std::{
 use std::os::unix::ffi::OsStrExt;
 
 use gossip_connectors::{
-    path_buf_from_bytes, FilesystemConnector, GitConnector, FILESYSTEM_CONNECTOR_TAG,
-    GIT_CONNECTOR_TAG,
+    FILESYSTEM_CONNECTOR_TAG, FilesystemConnector, GIT_CONNECTOR_TAG, GitConnector,
+    path_buf_from_bytes,
 };
 use gossip_contracts::{
     connector::{
@@ -85,8 +85,8 @@ use gossip_engine::{
     ScannerCore, ScannerCoreError,
 };
 use gossip_scan_pipeline::{
-    run_scan_loop_with_page_processor, LeaseLossCause, PageProcessingContext, PageProcessingError,
-    ScanLoopError, ScanLoopOutcome, DEFAULT_MAX_TRANSIENT_RETRIES,
+    DEFAULT_MAX_TRANSIENT_RETRIES, LeaseLossCause, PageProcessingContext, PageProcessingError,
+    ScanLoopError, ScanLoopOutcome, run_scan_loop_with_page_processor,
 };
 
 /// How the runtime acquires source items for scanning.
