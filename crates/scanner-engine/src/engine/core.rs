@@ -2006,6 +2006,12 @@ impl Engine {
             .saturating_add(self.max_prefilter_width.saturating_sub(1))
     }
 
+    /// Returns the per-chunk finding cap configured in [`Tuning`].
+    #[inline]
+    pub fn max_findings_per_chunk(&self) -> usize {
+        self.tuning.max_findings_per_chunk
+    }
+
     /// Returns the [`TransformId`] for the transform at position `idx` in the
     /// engine's transform list.
     ///
