@@ -569,7 +569,7 @@ mod proptest_soundness {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(1000))]
+        #![proptest_config(ProptestConfig::with_cases(crate::test_utils::proptest_cases(1000)))]
 
         #[test]
         fn test_soundness_invariant(test_re in arb_test_re()) {

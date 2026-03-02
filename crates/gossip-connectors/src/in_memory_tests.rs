@@ -959,7 +959,13 @@ mod prop {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64),
+            ..ProptestConfig::default()
+        })]
 
         #[test]
         fn full_enum_yields_sorted_input(items in item_vec_strategy(30)) {
