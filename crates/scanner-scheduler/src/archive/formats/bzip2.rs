@@ -107,8 +107,8 @@ mod tests {
     /// Compress → decompress via `Bzip2Stream`, verify byte-exact round-trip.
     #[test]
     fn read_round_trip() {
-        use bzip2::write::BzEncoder;
         use bzip2::Compression;
+        use bzip2::write::BzEncoder;
         use std::io::Write;
 
         let original = b"deterministic round-trip payload 0123456789";
@@ -133,8 +133,8 @@ mod tests {
     /// `total_compressed()` which must equal the compressed input length.
     #[test]
     fn take_compressed_delta_accounting() {
-        use bzip2::write::BzEncoder;
         use bzip2::Compression;
+        use bzip2::write::BzEncoder;
         use std::io::Write;
 
         let original: Vec<u8> = (0u8..=255).cycle().take(512).collect();
@@ -164,8 +164,8 @@ mod tests {
     /// position (all compressed bytes consumed).
     #[test]
     fn into_inner_recovers_reader() {
-        use bzip2::write::BzEncoder;
         use bzip2::Compression;
+        use bzip2::write::BzEncoder;
         use std::io::Write;
 
         let original = b"recover inner reader";
@@ -184,8 +184,8 @@ mod tests {
 
     #[test]
     fn decodes_all_concatenated_members() {
-        use bzip2::write::BzEncoder;
         use bzip2::Compression;
+        use bzip2::write::BzEncoder;
         use std::io::Write;
 
         // Create two independently-compressed bzip2 members and concatenate them.

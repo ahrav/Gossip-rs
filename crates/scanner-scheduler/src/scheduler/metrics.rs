@@ -258,11 +258,7 @@ fn bucket_index(v: u64) -> usize {
 /// Get the lower bound of a bucket.
 #[inline]
 fn bucket_lower_bound(bucket: usize) -> u64 {
-    if bucket == 0 {
-        0
-    } else {
-        1u64 << bucket
-    }
+    if bucket == 0 { 0 } else { 1u64 << bucket }
 }
 
 /// Per-worker local metrics.

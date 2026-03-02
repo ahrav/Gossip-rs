@@ -47,8 +47,8 @@
 //! | [`ArchiveEnd`] | Outcome enum: fully scanned, skipped, or partial |
 //! | [`ChunkScanResult`] | Loop-iteration carry state from `scan_and_emit_chunk` |
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::api::FileId;
 use crate::archive::formats::CompressedStream;
@@ -65,7 +65,7 @@ use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_bzip2::process_bzip2_file;
 use super::local_fs_gzip::process_gzip_file;
-use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
+use super::local_fs_owner::{FileTask, LocalScratch, emit_persistence_batch};
 use super::local_fs_tar::{process_tar_file, process_tarbz2_file, process_targz_file};
 use super::local_fs_zip::process_zip_file;
 use super::metrics::WorkerMetricsLocal;

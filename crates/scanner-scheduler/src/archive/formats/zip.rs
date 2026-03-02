@@ -989,7 +989,7 @@ mod tests {
 
         buf.clear();
         let store_len = cap; // store_len == capacity
-                             // SAFETY: `store_len == cap` (64); all bytes are filled immediately below.
+        // SAFETY: `store_len == cap` (64); all bytes are filled immediately below.
         unsafe {
             buf.set_len(store_len);
         }

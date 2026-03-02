@@ -7,15 +7,15 @@ use std::sync::atomic::Ordering;
 
 use crate::archive::formats::{ZipEntryMeta, ZipNext, ZipOpen};
 use crate::archive::path::apply_hash_suffix_truncation;
-use crate::archive::{ArchiveSkipReason, ChargeResult, PartialReason, DEFAULT_MAX_COMPONENTS};
+use crate::archive::{ArchiveSkipReason, ChargeResult, DEFAULT_MAX_COMPONENTS, PartialReason};
 
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_archive_ctx::{
-    alloc_virtual_file_id, budget_hit_to_archive_end, budget_hit_to_partial_reason, build_locator,
-    charge_discarded_bytes, ArchiveEnd, ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
+    ARCHIVE_STREAM_READ_MAX, ArchiveEnd, LOCATOR_LEN, alloc_virtual_file_id,
+    budget_hit_to_archive_end, budget_hit_to_partial_reason, build_locator, charge_discarded_bytes,
 };
-use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
+use super::local_fs_owner::{FileTask, LocalScratch, emit_persistence_batch};
 use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
 };

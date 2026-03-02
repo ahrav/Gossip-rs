@@ -53,8 +53,9 @@
 //! - **I/O completion integration**: the seam exists via [`ExecutorHandle::spawn()`].
 
 use super::executor_core::{
-    close_gate, in_flight, increment_count, is_accepting, worker_step, IdleAction, IdleHooks,
-    NoopTrace, WorkerCtxLike, WorkerStepResult, ACCEPTING_BIT, COUNT_UNIT, WAKE_ON_HOARD_THRESHOLD,
+    ACCEPTING_BIT, COUNT_UNIT, IdleAction, IdleHooks, NoopTrace, WAKE_ON_HOARD_THRESHOLD,
+    WorkerCtxLike, WorkerStepResult, close_gate, in_flight, increment_count, is_accepting,
+    worker_step,
 };
 use super::metrics::WorkerMetricsLocal;
 use super::rng::XorShift64;

@@ -1,5 +1,5 @@
-use super::{normalize_findings_for_diff, CollectedFindings};
-use crate::api::{FileId, FindingRec, StepId, TransformId, STEP_ROOT};
+use super::{CollectedFindings, normalize_findings_for_diff};
+use crate::api::{FileId, FindingRec, STEP_ROOT, StepId, TransformId};
 use crate::archive::ArchiveConfig;
 use crate::sim_scanner::generator::build_engine_from_suite;
 use crate::sim_scanner::scenario::{RuleSuiteSpec, RunConfig, SyntheticRuleSpec};
@@ -133,12 +133,16 @@ fn normalize_findings_for_diff_uses_normalized_end_for_coverage_filter() {
 
     let normalized = normalize_findings_for_diff(&engine, &findings);
     assert_eq!(normalized.len(), 2);
-    assert!(normalized
-        .iter()
-        .any(|key| key.span_start == 0 && key.span_end == 0));
-    assert!(normalized
-        .iter()
-        .any(|key| key.span_start != 0 || key.span_end != 0));
+    assert!(
+        normalized
+            .iter()
+            .any(|key| key.span_start == 0 && key.span_end == 0)
+    );
+    assert!(
+        normalized
+            .iter()
+            .any(|key| key.span_start != 0 || key.span_end != 0)
+    );
 }
 
 #[test]

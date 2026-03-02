@@ -125,11 +125,7 @@ fn tar_header(name: &[u8], size: u64, typeflag: u8) -> [u8; TAR_BLOCK] {
 
 fn tar_pad(size: usize) -> usize {
     let rem = size % TAR_BLOCK;
-    if rem == 0 {
-        0
-    } else {
-        TAR_BLOCK - rem
-    }
+    if rem == 0 { 0 } else { TAR_BLOCK - rem }
 }
 
 /// Build a tar archive from `(name, payload)` pairs.
@@ -202,8 +198,8 @@ fn scan_gz_bytes(
 }
 
 fn gzip_compress(data: &[u8]) -> Vec<u8> {
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write;
     let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
     enc.write_all(data).unwrap();
@@ -988,8 +984,8 @@ fn tar_timeout_mid_entry_delivers_partial() {
 // ── Bzip2 helpers ────────────────────────────────────────────────
 
 fn bzip2_compress(data: &[u8]) -> Vec<u8> {
-    use bzip2::write::BzEncoder;
     use bzip2::Compression;
+    use bzip2::write::BzEncoder;
     use std::io::Write;
     let mut enc = BzEncoder::new(Vec::new(), Compression::fast());
     enc.write_all(data).unwrap();

@@ -18,7 +18,7 @@
 use crate::archive::formats::tar::TAR_BLOCK_LEN;
 use crate::archive::util::write_u64_hex_lower;
 use crate::archive::{
-    ArchiveConfig, EntryPathCanonicalizer, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
+    ArchiveConfig, DEFAULT_MAX_COMPONENTS, EntryPathCanonicalizer, VirtualPathBuilder,
 };
 use crate::sim_scanner::scenario::{
     ArchiveCorruptionSpec, ArchiveEntrySpec, ArchiveFileSpec, ArchiveKindSpec, EntryKindSpec,
@@ -276,11 +276,7 @@ fn build_locator(kind: u8, value: u64) -> [u8; LOCATOR_LEN] {
 #[inline(always)]
 fn tar_pad(size: usize) -> usize {
     let rem = size % TAR_BLOCK_LEN;
-    if rem == 0 {
-        0
-    } else {
-        TAR_BLOCK_LEN - rem
-    }
+    if rem == 0 { 0 } else { TAR_BLOCK_LEN - rem }
 }
 
 #[cfg(test)]

@@ -560,8 +560,8 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     #[test]

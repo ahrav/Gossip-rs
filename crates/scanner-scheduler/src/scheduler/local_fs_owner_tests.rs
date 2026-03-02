@@ -1,4 +1,5 @@
 use super::*;
+use crate::Engine;
 use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
 use crate::archive::PartialReason;
 use crate::events::VecEventOutput;
@@ -6,9 +7,8 @@ use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
 use crate::scheduler::engine_trait::{
     EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
 };
-use crate::scheduler::local_fs_archive_ctx::{apply_entry_budget_clamp, ArchiveEnd};
+use crate::scheduler::local_fs_archive_ctx::{ArchiveEnd, apply_entry_budget_clamp};
 use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
-use crate::Engine;
 use regex::bytes::Regex;
 use std::fs;
 use std::io::Write;

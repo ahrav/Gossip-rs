@@ -411,8 +411,8 @@ where
 
 #[cfg(loom)]
 mod loom_tests {
-    use loom::sync::atomic::{AtomicUsize, Ordering};
     use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicUsize, Ordering};
     use loom::thread;
 
     // Replicate the constants from the parent module.

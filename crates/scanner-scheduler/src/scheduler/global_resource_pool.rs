@@ -803,8 +803,8 @@ mod tests {
 
     #[test]
     fn concurrent_acquisition() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
 
         let pool = GlobalResourcePool::new(test_config());

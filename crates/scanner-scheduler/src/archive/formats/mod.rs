@@ -10,10 +10,10 @@ pub mod gzip;
 pub mod tar;
 pub mod zip;
 
-pub use bzip2::{is_bzip2_magic, Bzip2Stream};
-pub use gzip::{is_gzip_magic, GzipStream};
-pub use tar::{is_ustar_header, TarCursor, TarInput, TarNext, TarRead};
-pub use zip::{is_zip_magic, ZipCursor, ZipEntryMeta, ZipEntryReader, ZipNext, ZipOpen, ZipSource};
+pub use bzip2::{Bzip2Stream, is_bzip2_magic};
+pub use gzip::{GzipStream, is_gzip_magic};
+pub use tar::{TarCursor, TarInput, TarNext, TarRead, is_ustar_header};
+pub use zip::{ZipCursor, ZipEntryMeta, ZipEntryReader, ZipNext, ZipOpen, ZipSource, is_zip_magic};
 
 /// Trait abstracting a compressed stream with byte-accounting.
 ///

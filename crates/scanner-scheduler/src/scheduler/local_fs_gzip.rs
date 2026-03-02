@@ -5,12 +5,12 @@
 use std::fs::File;
 
 use crate::archive::formats::GzipStream;
-use crate::archive::{ArchiveSkipReason, PartialReason, DEFAULT_MAX_COMPONENTS};
+use crate::archive::{ArchiveSkipReason, DEFAULT_MAX_COMPONENTS, PartialReason};
 
 use super::engine_trait::ScanEngine;
 use super::executor::WorkerCtx;
 use super::local_fs_archive_ctx::{
-    budget_hit_to_archive_end, scan_compressed_stream_nested, ArchiveEnd, ArchiveScanCtx,
+    ArchiveEnd, ArchiveScanCtx, budget_hit_to_archive_end, scan_compressed_stream_nested,
 };
 use super::local_fs_owner::{FileTask, LocalScratch};
 

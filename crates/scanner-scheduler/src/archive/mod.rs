@@ -20,21 +20,21 @@ pub(crate) mod util;
 
 pub use budget::{ArchiveBudgets, BudgetHit, ChargeResult};
 pub use config::{
-    ArchiveConfig, ArchiveConfigError, EncryptedPolicy, UnsupportedPolicy,
-    DEFAULT_WALL_CLOCK_SECS_PER_ROOT, MAX_WALL_CLOCK_SECS_PER_ROOT,
+    ArchiveConfig, ArchiveConfigError, DEFAULT_WALL_CLOCK_SECS_PER_ROOT, EncryptedPolicy,
+    MAX_WALL_CLOCK_SECS_PER_ROOT, UnsupportedPolicy,
 };
 pub use detect::{
-    detect_kind, detect_kind_from_name, detect_kind_from_name_bytes, detect_kind_from_path,
-    sniff_kind_from_header, ArchiveKind,
+    ArchiveKind, detect_kind, detect_kind_from_name, detect_kind_from_name_bytes,
+    detect_kind_from_path, sniff_kind_from_header,
 };
 pub use outcome::{
-    ArchiveSample, ArchiveSampleRing, ArchiveSkipReason, ArchiveStats, EntrySkipReason,
-    PartialReason, SampleKind, ARCHIVE_SAMPLE_MAX, ARCHIVE_SAMPLE_PATH_PREFIX_MAX,
+    ARCHIVE_SAMPLE_MAX, ARCHIVE_SAMPLE_PATH_PREFIX_MAX, ArchiveSample, ArchiveSampleRing,
+    ArchiveSkipReason, ArchiveStats, EntrySkipReason, PartialReason, SampleKind,
 };
 pub use path::{
-    CanonicalPath, EntryPathCanonicalizer, VirtualPath, VirtualPathBuilder, DEFAULT_MAX_COMPONENTS,
+    CanonicalPath, DEFAULT_MAX_COMPONENTS, EntryPathCanonicalizer, VirtualPath, VirtualPathBuilder,
 };
 pub use scan::{
-    scan_bzip2_stream, scan_gzip_stream, scan_tar_stream, scan_tarbz2_stream, scan_targz_stream,
-    scan_zip_source, ArchiveEnd, ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
+    ArchiveEnd, ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta, scan_bzip2_stream,
+    scan_gzip_stream, scan_tar_stream, scan_tarbz2_stream, scan_targz_stream, scan_zip_source,
 };

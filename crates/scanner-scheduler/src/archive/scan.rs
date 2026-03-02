@@ -101,8 +101,8 @@ use crate::archive::path::apply_hash_suffix_truncation;
 use crate::archive::util;
 use crate::archive::{
     ArchiveBudgets, ArchiveConfig, ArchiveKind, ArchiveSkipReason, ArchiveStats, BudgetHit,
-    ChargeResult, EntryPathCanonicalizer, EntrySkipReason, PartialReason, VirtualPathBuilder,
-    DEFAULT_MAX_COMPONENTS,
+    ChargeResult, DEFAULT_MAX_COMPONENTS, EntryPathCanonicalizer, EntrySkipReason, PartialReason,
+    VirtualPathBuilder,
 };
 
 /// Length of a locator suffix: `@` + kind byte + 16 hex digits.

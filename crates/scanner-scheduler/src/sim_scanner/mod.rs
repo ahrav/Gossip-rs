@@ -12,8 +12,8 @@ pub mod vpath_table;
 
 pub use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 pub use generator::{
-    build_engine_from_suite, generate_scenario, materialize_rules, synthetic_transforms,
-    synthetic_tuning, ScenarioGenConfig,
+    ScenarioGenConfig, build_engine_from_suite, generate_scenario, materialize_rules,
+    synthetic_transforms, synthetic_tuning,
 };
 pub use replay::replay_artifact;
 pub use runner::{FailureKind, FailureReport, RunOutcome, ScannerSimRunner};
