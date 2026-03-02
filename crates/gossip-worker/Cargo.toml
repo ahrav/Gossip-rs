@@ -7,6 +7,10 @@ license.workspace = true
 publish = false
 description = "Binary: unified scan-driver worker entrypoint"
 
+[features]
+default = []
+aegis-pure-rust = ["gossip-scanner-runtime/aegis-pure-rust"]
+
 [dependencies]
 gossip-scanner-runtime.workspace = true
 tracing.workspace = true
