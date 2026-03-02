@@ -162,13 +162,16 @@ use gossip_contracts::{
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
-use crate::common::{self, borrowed_shard_bound, derive_stable_item_id};
+use crate::common::{
+    self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
+    derive_stable_item_id,
+};
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
 ///
 /// All filesystem-sourced items share this tag so that identity hashes are
 /// disjoint from items produced by other connector types (in-memory, git, SaaS).
-const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
+pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
 
 // ---------------------------------------------------------------------------
 // WalkWarning
@@ -693,6 +696,7 @@ impl FilesystemConnector {
                 let comp = String::from_utf8_lossy(component);
                 return Err(classify_io_read_error(
                     &format!("openat component {}/{n} '{comp}'", i + 1),
+                    None,
                     &io::Error::last_os_error(),
                 ));
             }
@@ -705,7 +709,7 @@ impl FilesystemConnector {
         let file = fs::File::from(dir_fd.expect("path has at least one component"));
         let metadata = file
             .metadata()
-            .map_err(|e| classify_io_read_error("fstat", &e))?;
+            .map_err(|e| classify_io_read_error("fstat", None, &e))?;
         if !metadata.is_file() {
             return Err(ReadError::permanent("path is not a regular file"));
         }
@@ -809,60 +813,7 @@ impl ReadConnector for FilesystemConnector {
 
         let file = self.get_or_open_cached(item_ref)?;
         file.read_at(&mut dst[..allowed], offset)
-            .map_err(|err| classify_io_read_error("read_at", &err))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error classification
-// ---------------------------------------------------------------------------
-
-/// Returns `true` for I/O errors that are deterministically permanent.
-///
-/// # Permanent errors
-///
-/// - `NotFound`: file/directory doesn't exist
-/// - `PermissionDenied`: insufficient access rights
-/// - `InvalidInput`: malformed arguments
-/// - `InvalidFilename`: invalid path bytes
-/// - `NotADirectory` / `IsADirectory`: wrong path kind for the operation
-/// - `ELOOP`: symlink loop detected (POSIX-specific)
-///
-/// Other errors (for example `EAGAIN`, `EINTR`) are treated as transient and
-/// warrant retry.
-fn is_permanent_io_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::InvalidFilename
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::IsADirectory
-    ) || err.raw_os_error() == Some(libc::ELOOP)
-}
-
-/// Convert an I/O error to a `ReadError` with appropriate retryability.
-///
-/// Permanent errors (file not found, permission denied) become non-retryable.
-/// Transient errors (network hiccups, resource contention) become retryable.
-fn classify_io_read_error(op: &str, err: &io::Error) -> ReadError {
-    if is_permanent_io_error(err) {
-        ReadError::permanent(format!("{op} failed: {err}"))
-    } else {
-        ReadError::retryable(format!("{op} failed: {err}"))
-    }
-}
-
-/// Convert an I/O error to an `EnumerateError` with appropriate retryability.
-///
-/// Similar to `classify_io_read_error` but includes the failing path in the
-/// error message for better diagnostics during directory traversal.
-fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> EnumerateError {
-    if is_permanent_io_error(err) {
-        EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
-    } else {
-        EnumerateError::retryable(format!("{op} failed for {}: {err}", path.display()))
+            .map_err(|err| classify_io_read_error("read_at", None, &err))
     }
 }
 
@@ -1197,6 +1148,7 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     if flags < 0 {
         return Err(classify_io_read_error(
             "fcntl(F_GETFL)",
+            None,
             &io::Error::last_os_error(),
         ));
     }
@@ -1205,6 +1157,7 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
     if result < 0 {
         return Err(classify_io_read_error(
             "fcntl(F_SETFL)",
+            None,
             &io::Error::last_os_error(),
         ));
     }

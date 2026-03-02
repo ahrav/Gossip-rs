@@ -54,7 +54,6 @@
 //! crates, not here.
 
 use std::{
-    ffi::OsString,
     fmt, fs, io,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -62,9 +61,12 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 
-use gossip_connectors::{FilesystemConnector, GitConnector};
+use gossip_connectors::{
+    FILESYSTEM_CONNECTOR_TAG, FilesystemConnector, GIT_CONNECTOR_TAG, GitConnector,
+    path_buf_from_bytes,
+};
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorInputError, Cursor, EnumerateError, EnumerationConnector, ItemKey,
@@ -86,15 +88,6 @@ use gossip_scan_pipeline::{
     DEFAULT_MAX_TRANSIENT_RETRIES, LeaseLossCause, PageProcessingContext, PageProcessingError,
     ScanLoopError, ScanLoopOutcome, run_scan_loop_with_page_processor,
 };
-
-/// Connector identity tag for local-filesystem sources.
-///
-/// Embedded in every [`ScanItem`] so the engine can attribute findings back
-/// to the originating connector type.
-const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
-
-/// Connector identity tag for local-git sources.
-const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 
 /// How the runtime acquires source items for scanning.
 ///
@@ -1084,27 +1077,6 @@ fn build_scan_item(
         VersionId::Weak(ObjectVersionId::from_version_bytes(&vm))
     };
     Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(size_hint))
-}
-
-// ---------------------------------------------------------------------------
-// Platform-aware path ↔ byte conversions.
-//
-// On Unix, paths are arbitrary byte sequences and can be round-tripped
-// losslessly via `OsStr::as_bytes` / `OsString::from_vec`.
-//
-// On non-Unix (primarily Windows), we fall back to lossy UTF-8 conversion.
-// This is acceptable because git itself normalises paths to UTF-8 on
-// Windows, so data loss is unlikely in practice.
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
-}
-
-#[cfg(not(unix))]
-fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(unix)]

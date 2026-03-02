@@ -18,7 +18,8 @@ pub mod filesystem;
 pub mod git;
 pub mod in_memory;
 
+pub use common::path_buf_from_bytes;
 #[cfg(unix)]
-pub use filesystem::FilesystemConnector;
-pub use git::GitConnector;
+pub use filesystem::{FILESYSTEM_CONNECTOR_TAG, FilesystemConnector};
+pub use git::{GIT_CONNECTOR_TAG, GitConnector};
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};

@@ -220,12 +220,50 @@ fn choose_split_point_returns_candidate_for_multiple_items() {
     let mut connector = GitConnector::new(dir.path());
 
     let split = connector
-        .choose_split_point_range(&make_key(b"\x00"), &make_key(b"\xff"), &Cursor::initial())
+        .choose_split_point_range(
+            &make_key(b"\x00"),
+            &make_key(b"\xff"),
+            &Cursor::initial(),
+            None,
+        )
         .unwrap();
     assert!(
         split.is_some(),
         "expected split candidate for multi-item range"
     );
+}
+
+// ---------------------------------------------------------------
+// max_tracked_files tests
+// ---------------------------------------------------------------
+
+#[test]
+fn max_tracked_files_rejects_over_limit() {
+    let dir = create_test_repo(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let mut connector = GitConnector::new(dir.path()).with_max_tracked_files(2);
+
+    let result = connector.enumerate_page_range(
+        &make_key(b"\x00"),
+        &make_key(b"\xff"),
+        &Cursor::initial(),
+        default_budgets(),
+    );
+    let err = result.expect_err("should reject repos exceeding file limit");
+    assert!(!err.is_retryable(), "limit violation should be permanent");
+    assert!(
+        err.message().contains("exceeding limit of 2"),
+        "error should mention the limit: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn max_tracked_files_none_allows_unlimited() {
+    let dir = create_test_repo(&[("a.txt", b"a"), ("b.txt", b"b"), ("c.txt", b"c")]);
+    let mut connector = GitConnector::new(dir.path());
+
+    let items = collect_all(&mut connector, &make_key(b"\x00"), &make_key(b"\xff"));
+    assert_eq!(items.len(), 3);
 }
 
 // ---------------------------------------------------------------
@@ -340,4 +378,47 @@ fn deleted_file_during_indexing_is_skipped() {
     let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
 
     assert_eq!(keys, vec![b"keep.txt".as_slice()]);
+}
+
+/// A symlink pointing outside the repository must be excluded from
+/// enumeration even when git tracks it, to prevent data exfiltration.
+#[cfg(unix)]
+#[test]
+fn symlink_outside_repo_is_skipped() {
+    let outside = tempfile::tempdir().expect("create outside dir");
+    let secret = outside.path().join("secret.txt");
+    std::fs::write(&secret, b"sensitive data").expect("write secret");
+
+    let dir = create_test_repo(&[("legit.txt", b"ok")]);
+
+    // Create a symlink that escapes the repo root.
+    let link_path = dir.path().join("escape.txt");
+    std::os::unix::fs::symlink(&secret, &link_path).expect("create symlink");
+    run_git(dir.path(), &["add", "escape.txt"]);
+    run_git(dir.path(), &["commit", "-q", "-m", "add escape symlink"]);
+
+    let mut connector = GitConnector::new(dir.path());
+    let items = collect_all(&mut connector, &make_key(b"\x00"), &make_key(b"\xff"));
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
+
+    // Only the legitimate file should be enumerated.
+    assert_eq!(keys, vec![b"legit.txt".as_slice()]);
+}
+
+/// An item_ref that resolves outside the repository boundary at read
+/// time must return a permanent error, even if the index contains it.
+#[test]
+fn read_path_escaping_repo_returns_error() {
+    let dir = create_test_repo(&[("a.txt", b"a")]);
+    let mut connector = GitConnector::new(dir.path());
+
+    // Force indexing so the connector is ready.
+    let _ = collect_all(&mut connector, &make_key(b"\x00"), &make_key(b"\xff"));
+
+    // Fabricate a ref that does not exist in the index — the binary search
+    // in open_path_for_ref should reject it with a permanent error.
+    let bad_ref = ItemRef::try_from_slice(b"../../../etc/passwd").unwrap();
+    let result = connector.open(&bad_ref, default_budgets());
+    let err = result.err().expect("escape attempt should return error");
+    assert!(!err.is_retryable(), "escape attempt should be permanent");
 }

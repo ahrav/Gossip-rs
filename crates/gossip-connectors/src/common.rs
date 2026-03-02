@@ -1,12 +1,20 @@
 //! Shared connector utilities: shard-bound validation, binary search,
 //! pooled page assembly, split-point selection, and identity derivation.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, MAX_ITEM_KEY_SIZE,
-        PooledByteSlab, TokenBytes,
+        PooledByteSlab, ReadError, TokenBytes,
     },
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
@@ -597,6 +605,100 @@ pub(crate) fn choose_split_index<T: SizedEntry>(
 
     // Clamp to ensure at least one item on each side.
     Some(split_idx.max(start_idx + 1).min(range_end - 1))
+}
+
+// ---------------------------------------------------------------------------
+// I/O error classification
+// ---------------------------------------------------------------------------
+
+/// Returns `true` for I/O errors that are deterministically permanent.
+///
+/// Structural filesystem errors — missing files, permission denials, type
+/// mismatches, and symlink loops — will not resolve on retry. Everything
+/// else (interrupted, would-block, connection-reset, etc.) is assumed
+/// transient and therefore retryable.
+pub(crate) fn is_permanent_io_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::PermissionDenied
+            | io::ErrorKind::InvalidInput
+            | io::ErrorKind::InvalidFilename
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::IsADirectory
+    ) || is_symlink_loop(err)
+}
+
+/// Detect `ELOOP` (too many levels of symbolic links) on Unix.
+#[cfg(unix)]
+pub(crate) fn is_symlink_loop(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// Non-Unix stub: symlink loops cannot be detected via `raw_os_error`.
+#[cfg(not(unix))]
+pub(crate) fn is_symlink_loop(_err: &io::Error) -> bool {
+    false
+}
+
+/// Map an I/O error to an [`EnumerateError`], classifying permanence.
+///
+/// Includes the failing path in the error message for diagnostics.
+pub(crate) fn classify_io_enumerate_error(
+    op: &str,
+    path: &Path,
+    err: &io::Error,
+) -> EnumerateError {
+    if is_permanent_io_error(err) {
+        EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
+    } else {
+        EnumerateError::retryable(format!("{op} failed for {}: {err}", path.display()))
+    }
+}
+
+/// Map an I/O error to a [`ReadError`], classifying permanence.
+///
+/// When `path` is `Some`, the path is included in the message for
+/// diagnostics; when `None`, only the operation and error are reported.
+pub(crate) fn classify_io_read_error(op: &str, path: Option<&Path>, err: &io::Error) -> ReadError {
+    let msg = match path {
+        Some(p) => format!("{op} failed for {}: {err}", p.display()),
+        None => format!("{op} failed: {err}"),
+    };
+    if is_permanent_io_error(err) {
+        ReadError::permanent(msg)
+    } else {
+        ReadError::retryable(msg)
+    }
+}
+
+/// Bridge an [`EnumerateError`] into a [`ReadError`], preserving retryability.
+pub(crate) fn enumerate_error_to_read(error: EnumerateError) -> ReadError {
+    if error.is_retryable() {
+        ReadError::retryable(error.into_message())
+    } else {
+        ReadError::permanent(error.into_message())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform-aware path ↔ byte conversions
+// ---------------------------------------------------------------------------
+
+/// Convert raw path bytes to a [`PathBuf`] losslessly on Unix.
+#[cfg(unix)]
+pub fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+/// Convert raw path bytes to a [`PathBuf`] on non-Unix platforms.
+///
+/// Invalid UTF-8 sequences are replaced with U+FFFD. This is lossy but
+/// avoids panicking; in practice, non-UTF-8 paths are rare on platforms
+/// where this fallback applies (e.g., Windows).
+#[cfg(not(unix))]
+pub fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]

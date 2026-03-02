@@ -24,6 +24,19 @@
 //! yield identical versions only when both size and mtime agree. This is
 //! sufficient for change-detection but does not guarantee content identity.
 //!
+//! # Security model
+//!
+//! The connector defends against path traversal and symlink escapes in
+//! untrusted repositories using a three-layer approach:
+//!
+//! 1. The repo root is canonicalized at index time.
+//! 2. Each tracked path is rejected if it contains `..` components or
+//!    resolves outside the canonical repo root.
+//! 3. Only regular files are indexed (`symlink_metadata`); symlinks are
+//!    skipped regardless of target.
+//! 4. Read-time containment: `open_path_for_ref` re-canonicalizes and
+//!    checks the boundary before returning a path.
+//!
 //! # Error classification
 //!
 //! I/O errors are classified as *permanent* (not-found, permission-denied,
@@ -35,20 +48,17 @@
 //! # Platform behavior
 //!
 //! On Unix, git paths are converted to `OsString` losslessly via
-//! [`OsStringExt::from_vec`]. On non-Unix platforms, paths are decoded
-//! through [`String::from_utf8_lossy`], which replaces invalid UTF-8 with
+//! `OsStringExt::from_vec`. On non-Unix platforms, paths are decoded
+//! through `String::from_utf8_lossy`, which replaces invalid UTF-8 with
 //! U+FFFD — a lossy but safe fallback.
 
 use std::{
     fs,
     io::{self, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
     time::{Instant, UNIX_EPOCH},
 };
-
-#[cfg(unix)]
-use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
 use gossip_contracts::{
     connector::{
@@ -59,10 +69,13 @@ use gossip_contracts::{
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
-use crate::common::{self, borrowed_shard_bound, derive_stable_item_id};
+use crate::common::{
+    self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
+    derive_stable_item_id, enumerate_error_to_read, path_buf_from_bytes,
+};
 
 /// Connector tag used to domain-separate stable item identity derivation.
-const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
+pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 
 /// A single indexed file from `git ls-files`.
 ///
@@ -134,6 +147,9 @@ pub struct GitConnector {
     /// Whether pagination cursors include positional tokens for O(1)
     /// resume. Defaults to `true`; set to `false` for key-only cursors.
     emit_tokens: bool,
+    /// Optional upper bound on tracked files. When set, `ensure_indexed`
+    /// rejects repositories that exceed this limit with a permanent error.
+    max_tracked_files: Option<usize>,
     /// Lazy indexing state machine. See [`IndexState`].
     index_state: IndexState,
     /// Sorted snapshot of tracked files, populated by [`ensure_indexed`].
@@ -146,6 +162,7 @@ impl GitConnector {
         Self {
             repo: repo.into(),
             emit_tokens: true,
+            max_tracked_files: None,
             index_state: IndexState::NotIndexed,
             entries: Vec::new(),
         }
@@ -155,6 +172,14 @@ impl GitConnector {
     #[must_use]
     pub fn with_tokens(mut self, enabled: bool) -> Self {
         self.emit_tokens = enabled;
+        self
+    }
+
+    /// Set an upper bound on tracked files. Repositories exceeding this
+    /// limit will fail indexing with a permanent error.
+    #[must_use]
+    pub fn with_max_tracked_files(mut self, limit: usize) -> Self {
+        self.max_tracked_files = Some(limit);
         self
     }
 
@@ -189,8 +214,14 @@ impl GitConnector {
         start: &ItemKey,
         end: &ItemKey,
         cursor: &Cursor,
+        deadline: Option<Instant>,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor)
+        self.choose_split_point_bounds(
+            Some(start.as_bytes()),
+            Some(end.as_bytes()),
+            cursor,
+            deadline,
+        )
     }
 
     /// Lazily build the sorted file snapshot on first call.
@@ -198,6 +229,18 @@ impl GitConnector {
     /// Runs `git ls-files -z` in the repository, stats each tracked path,
     /// and populates `self.entries` in sorted key order. Subsequent calls
     /// are no-ops (indexed) or fast-fail (permanently failed).
+    ///
+    /// # Security hardening
+    ///
+    /// The repo root is canonicalized before any file operations so that
+    /// subsequent path joins resolve against the real filesystem path.
+    /// Each tracked path is then validated with a three-layer defense:
+    ///
+    /// 1. **Component filter** — paths containing `..` are rejected.
+    /// 2. **Canonicalize + containment** — the resolved absolute path
+    ///    must start with the canonicalized repo root.
+    /// 3. **Symlink rejection** — `symlink_metadata` ensures only
+    ///    regular files are indexed (symlinks are skipped).
     ///
     /// The `deadline` is checked both before shelling out and between
     /// per-file stat calls, so large repositories can be interrupted
@@ -218,10 +261,17 @@ impl GitConnector {
             return Err(EnumerateError::retryable("indexing deadline expired"));
         }
 
-        if !self.repo.exists() {
-            let msg = format!("repository path does not exist: {}", self.repo.display());
-            self.index_state = IndexState::Failed(msg.clone());
-            return Err(EnumerateError::permanent(msg));
+        // Canonicalize the repo root so all subsequent joins resolve against
+        // the real path. This also fails fast for non-existent paths.
+        match fs::canonicalize(&self.repo) {
+            Ok(canonical) => self.repo = canonical,
+            Err(err) => {
+                let e = classify_io_enumerate_error("canonicalize", &self.repo, &err);
+                if !e.is_retryable() {
+                    self.index_state = IndexState::Failed(e.message().to_owned());
+                }
+                return Err(e);
+            }
         }
         if !self.repo.is_dir() {
             let msg = format!(
@@ -242,6 +292,17 @@ impl GitConnector {
             }
         };
 
+        if let Some(max) = self.max_tracked_files
+            && tracked.len() > max
+        {
+            let msg = format!(
+                "repository tracks {} files, exceeding limit of {max}",
+                tracked.len()
+            );
+            self.index_state = IndexState::Failed(msg.clone());
+            return Err(EnumerateError::permanent(msg));
+        }
+
         let mut entries = Vec::with_capacity(tracked.len());
         for key_bytes in tracked {
             if deadline_expired(deadline) {
@@ -251,17 +312,35 @@ impl GitConnector {
                 continue;
             }
 
-            let abs_path = self.repo.join(path_buf_from_bytes(&key_bytes));
-            // Use symlink_metadata to avoid following symlinks — a tracked
-            // symlink must not be indexed since it could escape the repo root
-            // in untrusted repositories. Handling NotFound gracefully also
-            // closes the TOCTOU window between ls-files and stat.
+            let rel_path = path_buf_from_bytes(&key_bytes);
+            // Reject paths containing ".." to prevent directory traversal.
+            if rel_path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir))
+            {
+                continue;
+            }
+            let abs_path = self.repo.join(&rel_path);
+
+            // Canonicalize to verify the resolved path stays within the repo.
+            let canonical_abs = match fs::canonicalize(&abs_path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !canonical_abs.starts_with(&self.repo) {
+                continue;
+            }
+
+            // symlink_metadata avoids following symlinks — a tracked symlink
+            // must not be indexed since it could escape the repo root in
+            // untrusted repositories.
             let metadata = match fs::symlink_metadata(&abs_path) {
                 Ok(m) => m,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(classify_io_enumerate_error("metadata", &abs_path, &e)),
+                Err(error) => {
+                    return Err(classify_io_enumerate_error("metadata", &abs_path, &error));
+                }
             };
-            if !metadata.file_type().is_file() {
+            if !metadata.is_file() {
                 continue;
             }
             let entry = build_git_entry(&key_bytes, metadata.len(), metadata.modified().ok())?;
@@ -373,16 +452,14 @@ impl GitConnector {
     /// closest to the cumulative-size midpoint. The candidate is rejected
     /// if it does not advance past the current cursor or would land at or
     /// beyond the upper shard bound.
-    ///
-    /// Indexing uses no deadline here because split selection is a
-    /// metadata-only decision (no file I/O after the snapshot is built).
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         cursor: &Cursor,
+        deadline: Option<Instant>,
     ) -> Result<Option<ItemKey>, EnumerateError> {
-        self.ensure_indexed(None)?;
+        self.ensure_indexed(deadline)?;
 
         let bounds = common::resolve_bounds(&self.entries, start, end)?;
         let start_idx = common::key_resume_start(&self.entries, cursor, bounds.range_start);
@@ -403,9 +480,10 @@ impl GitConnector {
     /// Resolve an `ItemRef` to an absolute filesystem path.
     ///
     /// Ensures the index is built, then performs an O(log N) binary search
-    /// to verify the ref exists in the snapshot. This prevents reads of
-    /// files that were not present at index time (e.g., untracked or
-    /// newly created files).
+    /// to verify the ref exists in the snapshot. After resolution, the
+    /// path is canonicalized and checked against the repo boundary to
+    /// prevent read-time escapes (e.g., if a symlink was created between
+    /// indexing and reading).
     fn open_path_for_ref(&mut self, item_ref: &ItemRef) -> Result<PathBuf, ReadError> {
         self.ensure_indexed(None).map_err(enumerate_error_to_read)?;
 
@@ -414,7 +492,15 @@ impl GitConnector {
             .binary_search_by(|entry| entry.key.as_bytes().cmp(ref_bytes))
             .map_err(|_| ReadError::permanent("item_ref not found in index"))?;
 
-        Ok(self.repo.join(path_buf_from_bytes(ref_bytes)))
+        let abs_path = self.repo.join(path_buf_from_bytes(ref_bytes));
+        let canonical = fs::canonicalize(&abs_path)
+            .map_err(|error| classify_io_read_error("canonicalize", Some(&abs_path), &error))?;
+        if !canonical.starts_with(&self.repo) {
+            return Err(ReadError::permanent(
+                "resolved path escapes repository boundary",
+            ));
+        }
+        Ok(abs_path)
     }
 }
 
@@ -443,11 +529,11 @@ impl EnumerationConnector for GitConnector {
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
-        _budgets: Budgets,
+        budgets: Budgets,
     ) -> Result<Option<ItemKey>, EnumerateError> {
         let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
         let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
-        self.choose_split_point_bounds(start, end, cursor)
+        self.choose_split_point_bounds(start, end, cursor, budgets.deadline())
     }
 }
 
@@ -458,8 +544,8 @@ impl ReadConnector for GitConnector {
         _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
         let path = self.open_path_for_ref(item_ref)?;
-        let file =
-            fs::File::open(&path).map_err(|error| classify_io_read_error("open", &path, &error))?;
+        let file = fs::File::open(&path)
+            .map_err(|error| classify_io_read_error("open", Some(&path), &error))?;
         Ok(Box::new(file))
     }
 
@@ -481,12 +567,12 @@ impl ReadConnector for GitConnector {
         }
 
         let path = self.open_path_for_ref(item_ref)?;
-        let mut file =
-            fs::File::open(&path).map_err(|error| classify_io_read_error("open", &path, &error))?;
+        let mut file = fs::File::open(&path)
+            .map_err(|error| classify_io_read_error("open", Some(&path), &error))?;
         file.seek(SeekFrom::Start(offset))
-            .map_err(|error| classify_io_read_error("seek", &path, &error))?;
+            .map_err(|error| classify_io_read_error("seek", Some(&path), &error))?;
         file.read(&mut dst[..allowed])
-            .map_err(|error| classify_io_read_error("read", &path, &error))
+            .map_err(|error| classify_io_read_error("read", Some(&path), &error))
     }
 }
 
@@ -535,16 +621,29 @@ fn build_weak_version(
     size_hint: u64,
     modified: Option<std::time::SystemTime>,
 ) -> VersionId {
-    let mut version_material = Vec::with_capacity(key_bytes.len() + 32);
-    version_material.extend_from_slice(key_bytes);
-    version_material.extend_from_slice(&size_hint.to_le_bytes());
+    // Fixed metadata: 8 (size_hint) + 16 (mtime u128) = 24 bytes.
+    // Paths up to 128 bytes fit entirely on the stack (128 + 24 = 152).
+    const INLINE_CAP: usize = 152;
+    let total_len = key_bytes.len() + 24;
     let modified_nanos = modified
         .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    version_material.extend_from_slice(&modified_nanos.to_le_bytes());
 
-    VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material))
+    if total_len <= INLINE_CAP {
+        let mut buf = [0u8; INLINE_CAP];
+        buf[..key_bytes.len()].copy_from_slice(key_bytes);
+        buf[key_bytes.len()..key_bytes.len() + 8].copy_from_slice(&size_hint.to_le_bytes());
+        buf[key_bytes.len() + 8..key_bytes.len() + 24]
+            .copy_from_slice(&modified_nanos.to_le_bytes());
+        VersionId::Weak(ObjectVersionId::from_version_bytes(&buf[..total_len]))
+    } else {
+        let mut version_material = Vec::with_capacity(total_len);
+        version_material.extend_from_slice(key_bytes);
+        version_material.extend_from_slice(&size_hint.to_le_bytes());
+        version_material.extend_from_slice(&modified_nanos.to_le_bytes());
+        VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material))
+    }
 }
 
 /// Shell out to `git ls-files -z` and return NUL-split raw path entries.
@@ -562,6 +661,7 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<Vec<u8>>, EnumerateError> {
         .arg(repo)
         .arg("ls-files")
         .arg("-z")
+        .arg("--")
         .output()
         .map_err(|error| classify_io_enumerate_error("git ls-files", repo, &error))?;
 
@@ -584,85 +684,9 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<Vec<u8>>, EnumerateError> {
     Ok(paths)
 }
 
-/// Bridge an [`EnumerateError`] into a [`ReadError`], preserving retryability.
-///
-/// Used by [`ReadConnector`] methods that must call [`ensure_indexed`]
-/// (which speaks `EnumerateError`) before performing read I/O.
-fn enumerate_error_to_read(error: EnumerateError) -> ReadError {
-    if error.is_retryable() {
-        ReadError::retryable(error.into_message())
-    } else {
-        ReadError::permanent(error.into_message())
-    }
-}
-
 /// Returns `true` when a deadline is present and has already passed.
 fn deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|value| Instant::now() >= value)
-}
-
-/// Map an I/O error to an [`EnumerateError`], classifying permanence.
-fn classify_io_enumerate_error(op: &str, path: &Path, err: &io::Error) -> EnumerateError {
-    if is_permanent_io_error(err) {
-        EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
-    } else {
-        EnumerateError::retryable(format!("{op} failed for {}: {err}", path.display()))
-    }
-}
-
-/// Map an I/O error to a [`ReadError`], classifying permanence.
-fn classify_io_read_error(op: &str, path: &Path, err: &io::Error) -> ReadError {
-    if is_permanent_io_error(err) {
-        ReadError::permanent(format!("{op} failed for {}: {err}", path.display()))
-    } else {
-        ReadError::retryable(format!("{op} failed for {}: {err}", path.display()))
-    }
-}
-
-/// Decide whether an I/O error is permanent (won't resolve on retry).
-///
-/// The policy treats structural filesystem errors — missing files,
-/// permission denials, type mismatches, and symlink loops — as permanent.
-/// Everything else (interrupted, would-block, connection-reset, etc.) is
-/// assumed transient and therefore retryable.
-fn is_permanent_io_error(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::PermissionDenied
-            | io::ErrorKind::InvalidInput
-            | io::ErrorKind::InvalidFilename
-            | io::ErrorKind::NotADirectory
-            | io::ErrorKind::IsADirectory
-    ) || is_symlink_loop(err)
-}
-
-/// Detect `ELOOP` (too many levels of symbolic links) on Unix.
-#[cfg(unix)]
-fn is_symlink_loop(err: &io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ELOOP)
-}
-
-/// Non-Unix stub: symlink loops cannot be detected via `raw_os_error`.
-#[cfg(not(unix))]
-fn is_symlink_loop(_err: &io::Error) -> bool {
-    false
-}
-
-/// Convert raw git path bytes to a [`PathBuf`] losslessly on Unix.
-#[cfg(unix)]
-fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
-}
-
-/// Convert raw git path bytes to a [`PathBuf`] on non-Unix platforms.
-///
-/// Invalid UTF-8 sequences are replaced with U+FFFD. This is lossy but
-/// avoids panicking; in practice, non-UTF-8 paths are rare on platforms
-/// where this fallback applies (e.g., Windows).
-#[cfg(not(unix))]
-fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 #[cfg(test)]
