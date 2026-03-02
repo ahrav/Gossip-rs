@@ -7,8 +7,19 @@ license.workspace = true
 publish = false
 description = "Workspace integration tests for scanner-engine"
 
+[features]
+default = []
+sim-harness = ["scanner-scheduler/sim-harness", "scanner-git/sim-harness"]
+scheduler-sim = ["scanner-scheduler/scheduler-sim"]
+real-rules-harness = []
+
 [dev-dependencies]
 base64 = "0.22"
+blake3 = "1.5"
 regex = "1.12"
 scanner-engine = { workspace = true, features = ["test-support"] }
+scanner-git.workspace = true
+scanner-scheduler.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tempfile = "3.10"

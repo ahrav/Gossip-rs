@@ -1,0 +1,179 @@
+{
+  "failure": {
+    "kind": "Unimplemented",
+    "message": "corpus",
+    "step": 0
+  },
+  "fault_plan": {
+    "per_file": {}
+  },
+  "git_commit": null,
+  "run_config": {
+    "workers": 2,
+    "chunk_size": 64,
+    "overlap": 512,
+    "max_in_flight_objects": 10,
+    "buffer_pool_cap": 6,
+    "max_steps": 0,
+    "max_transform_depth": 2,
+    "scan_utf16_variants": false,
+    "stability_runs": 2
+  },
+  "scanner_pkg_version": "dev",
+  "scenario": {
+    "schema_version": 1,
+    "fs": {
+      "schema_version": 1,
+      "nodes": [
+        {
+          "File": {
+            "path": {
+              "bytes": [
+                117,
+                114,
+                108,
+                112,
+                101,
+                114,
+                99,
+                101,
+                110,
+                116,
+                95,
+                105,
+                110,
+                118,
+                97,
+                108,
+                105,
+                100,
+                95,
+                116,
+                97,
+                105,
+                108,
+                46,
+                116,
+                120,
+                116
+              ]
+            },
+            "contents": [
+              37,
+              53,
+              52,
+              37,
+              52,
+              70,
+              37,
+              52,
+              66,
+              37,
+              51,
+              48,
+              37,
+              53,
+              70,
+              37,
+              52,
+              49,
+              37,
+              52,
+              50,
+              37,
+              52,
+              51,
+              37,
+              52,
+              52,
+              37,
+              52,
+              53,
+              37,
+              52,
+              54,
+              37,
+              52,
+              55,
+              37,
+              52,
+              56,
+              37,
+              90,
+              90
+            ]
+          }
+        }
+      ]
+    },
+    "rule_suite": {
+      "schema_version": 1,
+      "rules": [
+        {
+          "rule_id": 0,
+          "name": "TOK0",
+          "anchors": [
+            [
+              84,
+              79,
+              75,
+              48,
+              95
+            ]
+          ],
+          "radius": 64,
+          "regex": "TOK0_[A-Z0-9]{8}"
+        }
+      ]
+    },
+    "expected": [
+      {
+        "path": {
+          "bytes": [
+            117,
+            114,
+            108,
+            112,
+            101,
+            114,
+            99,
+            101,
+            110,
+            116,
+            95,
+            105,
+            110,
+            118,
+            97,
+            108,
+            105,
+            100,
+            95,
+            116,
+            97,
+            105,
+            108,
+            46,
+            116,
+            120,
+            116
+          ]
+        },
+        "rule_id": 0,
+        "root_span": {
+          "start": 0,
+          "end": 39
+        },
+        "repr": "UrlPercent"
+      }
+    ]
+  },
+  "scenario_seed": 2014,
+  "schedule_seed": 3014,
+  "schema_version": 1,
+  "target": "local",
+  "trace": {
+    "ring": [],
+    "full": null
+  }
+}

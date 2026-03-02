@@ -23,6 +23,9 @@
 //! 3. Scan: the engine populates findings, work items, and decode steps.
 //! 4. Drain: [`ScanScratch::drain_findings`] or
 //!    [`ScanScratch::drain_findings_with_hashes`] extracts results.
+//!
+//! Test/simulation-only read accessors are feature-gated compatibility shims
+//! for migrated harness code and do not alter scan behavior.
 
 #[cfg(feature = "sim-harness")]
 use crate::api::StepId;
@@ -1332,8 +1335,10 @@ impl ScanScratch {
     /// Materialize decode steps for a finding into the scratch buffer.
     ///
     /// The returned slice is valid until the next call that materializes steps.
+    /// This accessor is kept for simulation-harness compatibility after the
+    /// scanner-rs extraction.
     #[cfg(feature = "sim-harness")]
-    pub(crate) fn materialize_decode_steps(&mut self, step_id: StepId) -> &[DecodeStep] {
+    pub fn materialize_decode_steps(&mut self, step_id: StepId) -> &[DecodeStep] {
         self.step_arena.materialize(step_id, &mut self.steps_buf);
         self.steps_buf.as_slice()
     }
@@ -1440,9 +1445,12 @@ impl ScanScratch {
         len - write_idx
     }
 
-    /// Returns the drop-boundary offsets aligned 1:1 with [`findings()`].
+    /// Returns drop-boundary offsets aligned 1:1 with [`findings()`].
+    ///
+    /// Exposed for tests/simulation harnesses that verify overlap-prefix
+    /// suppression behavior.
     #[cfg(any(test, feature = "sim-harness"))]
-    pub(crate) fn drop_hint_end(&self) -> &[u64] {
+    pub fn drop_hint_end(&self) -> &[u64] {
         self.drop_hint_end.as_slice()
     }
 
@@ -1473,7 +1481,7 @@ impl ScanScratch {
 
     /// Returns the number of findings removed by emit-time safelist checks.
     ///
-    /// Always returns 0 when the `perf-stats` feature is disabled.
+    /// Always returns 0 unless `perf-stats` and debug assertions are both enabled.
     pub fn safelist_suppressed(&self) -> usize {
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -1488,7 +1496,7 @@ impl ScanScratch {
 
     /// Returns the number of findings removed by the secret-bytes safelist.
     ///
-    /// Always returns 0 when the `perf-stats` feature is disabled.
+    /// Always returns 0 unless `perf-stats` and debug assertions are both enabled.
     pub fn secret_bytes_safelist_suppressed(&self) -> usize {
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -1503,7 +1511,7 @@ impl ScanScratch {
 
     /// Returns the number of findings removed by the UUID-format quick-reject.
     ///
-    /// Always returns 0 when the `perf-stats` feature is disabled.
+    /// Always returns 0 unless `perf-stats` and debug assertions are both enabled.
     pub fn uuid_format_suppressed(&self) -> usize {
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -1518,7 +1526,7 @@ impl ScanScratch {
 
     /// Returns the number of root findings removed by offline validation.
     ///
-    /// Always returns 0 when the `perf-stats` feature is disabled.
+    /// Always returns 0 unless `perf-stats` and debug assertions are both enabled.
     pub fn offline_suppressed(&self) -> usize {
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {
@@ -1534,7 +1542,7 @@ impl ScanScratch {
     /// Returns the number of findings removed by the per-rule confidence
     /// threshold.
     ///
-    /// Always returns 0 when the `perf-stats` feature is disabled.
+    /// Always returns 0 unless `perf-stats` and debug assertions are both enabled.
     pub fn confidence_suppressed(&self) -> usize {
         #[cfg(all(feature = "perf-stats", debug_assertions))]
         {

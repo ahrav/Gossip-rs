@@ -21,6 +21,7 @@ crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
 crossbeam-utils = "0.8"
+crc32fast = "1.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
 ignore = "0.4"
 libc = "0.2"
@@ -28,6 +29,8 @@ memchr = "2.8"
 num_cpus = "1.16"
 regex = "1.12"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -40,9 +43,17 @@ stats = ["perf-stats", "scanner-engine/stats"]
 b64-stats = ["stats", "scanner-engine/b64-stats"]
 bench = []
 connector-pipeline = []
-scheduler-sim = []
-sim-harness = ["perf-stats"]
+scheduler-sim = ["sim-harness"]
+sim-harness = [
+    "perf-stats",
+    "scanner-engine/sim-harness",
+    "scanner-engine/test-support",
+]
 stdx-proptest = []
+
+[[example]]
+name = "gen_scheduler_corpus"
+required-features = ["scheduler-sim"]
 
 [dev-dependencies]
 crc32fast = "1.4"

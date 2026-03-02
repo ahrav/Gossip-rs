@@ -2,6 +2,9 @@
 //!
 //! This crate owns the core detection pipeline extracted from scanner-rs,
 //! including rule loading, content policy, scan engine, and reusable scratch.
+//! Migration-compatibility shims (for example `stdx::FixedVec` and
+//! harness-gated re-exports) keep extracted scanner-rs modules building
+//! without changing runtime behavior.
 #![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_macros)]
@@ -12,8 +15,12 @@
 #![allow(rustdoc::bare_urls)]
 #![allow(rustdoc::redundant_explicit_links)]
 
+/// Compatibility prelude used by extracted scanner-rs modules.
+///
+/// Re-exports `gossip_stdx` and keeps the historical `FixedVec` alias name.
 pub mod stdx {
     pub use gossip_stdx::*;
+    /// Back-compat alias to `InlineVec` used by pre-extraction modules.
     pub type FixedVec<T, const N: usize> = gossip_stdx::InlineVec<T, N>;
 }
 
@@ -41,8 +48,9 @@ pub use api::Base64DecodeStats;
 pub use api::{
     AnchorPolicy, CharClassSpec, DecodeStep, DecodeSteps, DelimAfter, EntropySpec, FileId, Finding,
     FindingRec, Gate, LOCAL_CONTEXT_MAX_LOOKAROUND, LocalContextSpec, MAX_DECODE_STEPS,
-    OfflineValidationSpec, OfflineVerdict, RuleSpec, StepId, TailCharset, TransformConfig,
-    TransformId, TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness, ValidatorKind,
+    OfflineValidationSpec, OfflineVerdict, RuleSpec, STEP_ROOT, StepId, TailCharset,
+    TransformConfig, TransformId, TransformMode, Tuning, TwoPhaseSpec, Utf16Endianness,
+    ValidatorKind,
 };
 
 #[cfg(any(test, feature = "test-support"))]

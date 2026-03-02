@@ -1512,8 +1512,13 @@ name = "scanner-engine-integration-tests"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blake3",
  "regex",
  "scanner-engine",
+ "scanner-git",
+ "scanner-scheduler",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
@@ -1576,6 +1581,8 @@ dependencies = [
  "rstest",
  "scanner-engine",
  "serde",
+ "serde_json",
+ "sha2",
  "tempfile",
  "zip",
 ]
