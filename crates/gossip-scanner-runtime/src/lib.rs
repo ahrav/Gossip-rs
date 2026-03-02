@@ -637,8 +637,21 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanAggregateStats, Sc
 ///
 /// Uses the same worker-compatible scan-loop + page-processor seam as
 /// [`scan_fs_connector`] to preserve runtime and worker parity.
+///
+/// Enforces [`GitScanConfig::max_tracked_files`] before creating the
+/// connector, mirroring the same pre-check in [`scan_git_direct`].
 pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     validate_git_repo_path(&config.repo)?;
+
+    let tracked_paths = list_git_tracked_paths(&config.repo)?;
+    if let Some(max) = config.max_tracked_files
+        && tracked_paths.len() > max
+    {
+        return Err(ScanRuntimeError::TooManyTrackedFiles {
+            count: tracked_paths.len(),
+            limit: max,
+        });
+    }
 
     let scanner = ScannerCore::default();
     let shard = connector_mode_shard_spec();
@@ -890,7 +903,7 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<PathBuf>, ScanRuntimeError>
 ///
 /// Repeatedly calls [`EnumerationConnector::enumerate_page`] until an empty
 /// page is returned. Each non-empty page is fed to
-/// [`ScannerCore::scan_page_with_dedupe`] so dedup state spans the entire
+/// [`ScannerCore::scan_page_into`] so dedup state spans the entire
 /// source.
 ///
 /// # Stall detection

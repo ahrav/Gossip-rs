@@ -252,14 +252,18 @@ impl GitConnector {
             }
 
             let abs_path = self.repo.join(path_buf_from_bytes(&key_bytes));
-            // git ls-files can report submodule entries, symlinks to
-            // directories, or paths that were deleted in the working tree.
-            // Silently skip anything that isn't a regular file.
-            if !abs_path.is_file() {
+            // Use symlink_metadata to avoid following symlinks — a tracked
+            // symlink must not be indexed since it could escape the repo root
+            // in untrusted repositories. Handling NotFound gracefully also
+            // closes the TOCTOU window between ls-files and stat.
+            let metadata = match fs::symlink_metadata(&abs_path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(classify_io_enumerate_error("metadata", &abs_path, &e)),
+            };
+            if !metadata.file_type().is_file() {
                 continue;
             }
-            let metadata = fs::metadata(&abs_path)
-                .map_err(|error| classify_io_enumerate_error("metadata", &abs_path, &error))?;
             let entry = build_git_entry(&key_bytes, metadata.len(), metadata.modified().ok())?;
             entries.push(entry);
         }

@@ -321,38 +321,16 @@ fn scan_fs_direct_paginates_large_directories() {
 
 // ── Too-many-tracked-files limit (F3) ───────────────────────────
 
-#[test]
-fn scan_git_direct_rejects_too_many_tracked_files() {
-    let dir = tempdir().expect("tempdir");
-    let repo = dir.path();
+#[rstest]
+#[case::direct(ExecutionMode::Direct)]
+#[case::connector(ExecutionMode::Connector)]
+fn scan_git_rejects_too_many_tracked_files(#[case] mode: ExecutionMode) {
+    let repo = create_test_repo(&[("f0.txt", b"x"), ("f1.txt", b"x"), ("f2.txt", b"x")]);
 
-    std::process::Command::new("git")
-        .args(["init", "--initial-branch=main"])
-        .current_dir(repo)
-        .output()
-        .expect("git init");
-    std::process::Command::new("git")
-        .args(["config", "user.email", "test@test.com"])
-        .current_dir(repo)
-        .output()
-        .expect("git config email");
-    std::process::Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(repo)
-        .output()
-        .expect("git config name");
-
-    for i in 0..3 {
-        fs::write(repo.join(format!("f{i}.txt")), "x").expect("write");
-    }
-    std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(repo)
-        .output()
-        .expect("git add");
-
-    let config = GitScanConfig::new(repo).with_max_tracked_files(Some(2));
-    let error = scan_git_direct(&config).expect_err("should exceed limit");
+    let config = GitScanConfig::new(repo.path())
+        .with_max_tracked_files(Some(2))
+        .with_execution_mode(mode);
+    let error = scan_git(&config).expect_err("should exceed limit");
     assert!(
         matches!(
             error,

@@ -300,3 +300,44 @@ fn capabilities_match_token_setting(#[case] emit_tokens: bool) {
     assert!(caps.split_hints);
     assert_eq!(caps.token_resume, emit_tokens);
 }
+
+// ---------------------------------------------------------------
+// Symlink and TOCTOU tests
+// ---------------------------------------------------------------
+
+/// Tracked symlinks must be excluded from indexing to prevent
+/// directory-traversal reads in untrusted repositories.
+#[cfg(unix)]
+#[test]
+fn tracked_symlinks_are_excluded_from_index() {
+    let dir = create_test_repo(&[("target.txt", b"real content")]);
+
+    // Create a symlink tracked by git.
+    let link_path = dir.path().join("link.txt");
+    std::os::unix::fs::symlink("target.txt", &link_path).expect("create symlink");
+    run_git(dir.path(), &["add", "link.txt"]);
+    run_git(dir.path(), &["commit", "-q", "-m", "add symlink"]);
+
+    let mut connector = GitConnector::new(dir.path());
+    let items = collect_all(&mut connector, &make_key(b"\x00"), &make_key(b"\xff"));
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
+
+    // Only the real file should appear — the symlink must be skipped.
+    assert_eq!(keys, vec![b"target.txt".as_slice()]);
+}
+
+/// Files deleted between `git ls-files` and indexing should be
+/// silently skipped rather than causing a hard error.
+#[test]
+fn deleted_file_during_indexing_is_skipped() {
+    let dir = create_test_repo(&[("keep.txt", b"keep"), ("vanish.txt", b"gone")]);
+
+    // Remove the file from disk but leave it in git's index.
+    std::fs::remove_file(dir.path().join("vanish.txt")).expect("delete file");
+
+    let mut connector = GitConnector::new(dir.path());
+    let items = collect_all(&mut connector, &make_key(b"\x00"), &make_key(b"\xff"));
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
+
+    assert_eq!(keys, vec![b"keep.txt".as_slice()]);
+}
