@@ -26,11 +26,10 @@ fn is_ci() -> bool {
 ///
 /// # Examples
 ///
-/// ```
-/// # // Normally driven by env, but the function is pure when no env is set.
-/// // In local dev (no CI, no env override) with default=64 → returns 4
-/// // In CI with default=64 → returns 64
-/// // With PROPTEST_CASES=256 → returns 256
+/// ```text
+/// In local dev (no CI, no env override) with default=64 → returns 4
+/// In CI with default=64 → returns 64
+/// With PROPTEST_CASES=256 → returns 256
 /// ```
 #[inline]
 pub fn proptest_cases(default: u32) -> u32 {
