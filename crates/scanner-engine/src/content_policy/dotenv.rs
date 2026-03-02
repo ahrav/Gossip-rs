@@ -846,7 +846,7 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        #![proptest_config(ProptestConfig::with_cases(crate::test_utils::proptest_cases(512)))]
 
         /// Output length must never exceed the extraction budget.
         #[test]

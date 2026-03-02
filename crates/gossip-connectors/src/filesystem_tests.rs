@@ -1347,6 +1347,14 @@ mod prop {
     use proptest::prelude::*;
     use proptest::string::string_regex;
 
+    fn proptest_cases(default: u32) -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default)
+    }
+
     /// Strategy: generate a set of (path, content) pairs with unique paths.
     ///
     /// Paths use `[a-z0-9_]{1,8}` segments with 0-2 levels of nesting.
@@ -1384,13 +1392,7 @@ mod prop {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: std::env::var("PROPTEST_CASES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(64),
-            ..ProptestConfig::default()
-        })]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases(64)))]
 
         #[test]
         fn full_enum_yields_sorted_keys(files in file_set_strategy(20)) {
