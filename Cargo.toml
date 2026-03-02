@@ -10,6 +10,11 @@ members = [
     "crates/gossip-coordination",
     "crates/gossip-frontier",
     "crates/gossip-worker",
+]
+exclude = [
+    # Temporarily excluded: depends on ../scratch-scanner-rs (external sibling repo).
+    # Build standalone from crates/scanner-rs-cli/ when the external repo is present.
+    # Remove this exclude once scanning functionality is ported into this workspace.
     "crates/scanner-rs-cli",
 ]
 

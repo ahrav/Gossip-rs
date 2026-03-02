@@ -28,7 +28,6 @@
 //! - **Connector** — the runtime delegates enumeration to a connector that
 //!   implements [`EnumerationConnector`]. Filesystem connector mode runs
 //!   through the same scan-loop/page-hook seam used by worker execution.
-//!   Git connector mode remains gated until Phase 4B.
 //!
 //! # Pagination model
 //!
@@ -38,7 +37,7 @@
 //! - **Direct directory path** — `scan_from_connector_pages` calls
 //!   `enumerate_page` in a cursor-advancing loop until an empty page
 //!   signals completion.
-//! - **Connector mode path (filesystem)** — uses
+//! - **Connector mode path (filesystem, git)** — uses
 //!   `run_scan_loop_with_page_processor` for worker-parity cursor progression
 //!   and page processing.
 //! - **Materialized path** — `scan_materialized_items_pages` chunks a
@@ -55,7 +54,6 @@
 //! crates, not here.
 
 use std::{
-    ffi::OsString,
     fmt, fs, io,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -63,9 +61,12 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStrExt;
 
-use gossip_connectors::FilesystemConnector;
+use gossip_connectors::{
+    FILESYSTEM_CONNECTOR_TAG, FilesystemConnector, GIT_CONNECTOR_TAG, GitConnector,
+    path_buf_from_bytes,
+};
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorInputError, Cursor, EnumerateError, EnumerationConnector, ItemKey,
@@ -88,15 +89,6 @@ use gossip_scan_pipeline::{
     ScanLoopError, ScanLoopOutcome, run_scan_loop_with_page_processor,
 };
 
-/// Connector identity tag for local-filesystem sources.
-///
-/// Embedded in every [`ScanItem`] so the engine can attribute findings back
-/// to the originating connector type.
-const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
-
-/// Connector identity tag for local-git sources.
-const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
-
 /// How the runtime acquires source items for scanning.
 ///
 /// See the [module-level docs](self) for the architectural distinction.
@@ -107,9 +99,6 @@ pub enum ExecutionMode {
     #[default]
     Direct,
     /// The runtime delegates enumeration to an [`EnumerationConnector`].
-    ///
-    /// Filesystem sources are enabled in this mode. Git sources still return
-    /// [`ScanRuntimeError::UnsupportedExecutionMode`] until Phase 4B.
     Connector,
 }
 
@@ -627,13 +616,25 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanAggregateStats, Sc
     }
 }
 
-/// Connector-mode git entrypoint stub (explicitly gated until later phases).
+/// Connector-mode git scan.
+///
+/// Uses the same worker-compatible scan-loop + page-processor seam as
+/// [`scan_fs_connector`] to preserve runtime and worker parity.
+///
+/// Enforces [`GitScanConfig::max_tracked_files`] before creating the
+/// connector, mirroring the same pre-check in [`scan_git_direct`].
 pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
-    let _ = config;
-    Err(ScanRuntimeError::UnsupportedExecutionMode {
-        source: "git",
-        mode: ExecutionMode::Connector,
-    })
+    validate_git_repo_path(&config.repo)?;
+
+    // Pre-flight check: enforce the tracked-file limit before building the
+    // connector, mirroring the same guard in `scan_git_direct`.
+    let _ = list_git_tracked_paths(&config.repo, config.max_tracked_files)?;
+
+    let scanner = ScannerCore::default();
+    let shard = connector_mode_shard_spec();
+    let budgets = config.budgets.to_contract_budgets()?;
+    let mut connector = GitConnector::new(&config.repo);
+    scan_from_connector_pages_with_pipeline(&mut connector, &scanner, &shard, budgets)
 }
 
 const CONNECTOR_MODE_LEASE_DURATION_TICKS: u64 = 60_000;
@@ -901,7 +902,7 @@ fn list_git_tracked_paths(
 ///
 /// Repeatedly calls [`EnumerationConnector::enumerate_page`] until an empty
 /// page is returned. Each non-empty page is fed to
-/// [`ScannerCore::scan_page_with_dedupe`] so dedup state spans the entire
+/// [`ScannerCore::scan_page_into`] so dedup state spans the entire
 /// source.
 ///
 /// # Stall detection
@@ -1082,27 +1083,6 @@ fn build_scan_item(
         VersionId::Weak(ObjectVersionId::from_version_bytes(&vm))
     };
     Ok(ScanItem::new(item_key, item_ref, stable_item_id, version).with_size_hint(size_hint))
-}
-
-// ---------------------------------------------------------------------------
-// Platform-aware path ↔ byte conversions.
-//
-// On Unix, paths are arbitrary byte sequences and can be round-tripped
-// losslessly via `OsStr::as_bytes` / `OsString::from_vec`.
-//
-// On non-Unix (primarily Windows), we fall back to lossy UTF-8 conversion.
-// This is acceptable because git itself normalises paths to UTF-8 on
-// Windows, so data loss is unlikely in practice.
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsString::from_vec(bytes.to_vec()))
-}
-
-#[cfg(not(unix))]
-fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Borrow path bytes on Unix (zero-copy), own them on non-Unix.

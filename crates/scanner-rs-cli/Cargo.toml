@@ -1,17 +1,25 @@
 [package]
-name = "scanner-rs"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+name = "scanner-rs-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "MIT"
 publish = false
-description = "Standalone scanner CLI in gossip-rs workspace"
+description = "Standalone scanner CLI — delegates to scanner-rs engine for real secret detection"
+
+# NOTE: This crate is excluded from the workspace because it depends on
+# ../scratch-scanner-rs (an external sibling repo).  Build it standalone:
+#
+#     cargo build --manifest-path crates/scanner-rs-cli/Cargo.toml
+#
+# Once scanning functionality is ported into the workspace, this crate
+# should rejoin as a workspace member.
 
 [dependencies]
-gossip-scanner-runtime.workspace = true
+scanner-rs-lib = { package = "scanner-rs", path = "../../../scratch-scanner-rs" }
 
 [dev-dependencies]
-rstest.workspace = true
+rstest = "0.25"
 tempfile = "3"
 
 [[bin]]

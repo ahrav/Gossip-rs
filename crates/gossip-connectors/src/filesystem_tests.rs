@@ -1969,7 +1969,7 @@ fn zero_max_warnings_drops_all() {
 fn eloop_classified_as_permanent() {
     let err = io::Error::from_raw_os_error(libc::ELOOP);
     assert!(
-        super::is_permanent_io_error(&err),
+        crate::common::is_permanent_io_error(&err),
         "ELOOP should be permanent"
     );
 }
@@ -1978,7 +1978,7 @@ fn eloop_classified_as_permanent() {
 fn enotdir_classified_as_permanent() {
     let err = io::Error::from_raw_os_error(libc::ENOTDIR);
     assert!(
-        super::is_permanent_io_error(&err),
+        crate::common::is_permanent_io_error(&err),
         "ENOTDIR should be permanent"
     );
 }
@@ -1987,7 +1987,7 @@ fn enotdir_classified_as_permanent() {
 fn eisdir_classified_as_permanent() {
     let err = io::Error::from_raw_os_error(libc::EISDIR);
     assert!(
-        super::is_permanent_io_error(&err),
+        crate::common::is_permanent_io_error(&err),
         "EISDIR should be permanent"
     );
 }
@@ -1997,7 +1997,7 @@ fn transient_error_remains_retryable() {
     // EAGAIN / EWOULDBLOCK is transient.
     let err = io::Error::from_raw_os_error(libc::EAGAIN);
     assert!(
-        !super::is_permanent_io_error(&err),
+        !crate::common::is_permanent_io_error(&err),
         "EAGAIN should be retryable"
     );
 }
