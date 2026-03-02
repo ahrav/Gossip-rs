@@ -1347,13 +1347,7 @@ mod prop {
     use proptest::prelude::*;
     use proptest::string::string_regex;
 
-    fn proptest_cases(default: u32) -> u32 {
-        std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(default)
-    }
+    use gossip_stdx::test_support::proptest_cases;
 
     /// Strategy: generate a set of (path, content) pairs with unique paths.
     ///

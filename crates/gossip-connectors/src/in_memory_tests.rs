@@ -942,13 +942,7 @@ mod prop {
     use proptest::collection::vec as pvec;
     use proptest::prelude::*;
 
-    fn proptest_cases(default: u32) -> u32 {
-        std::env::var("PROPTEST_CASES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(default)
-    }
+    use gossip_stdx::test_support::proptest_cases;
 
     /// Strategy: generate 0..max_items unique keys as short byte strings.
     fn item_vec_strategy(max_items: usize) -> impl Strategy<Value = Vec<MemItem>> {

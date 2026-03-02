@@ -1314,8 +1314,9 @@ mod tests {
     /// This test validates that the combined atomic state correctly prevents
     /// the TOCTOU race between external spawn and join.
     ///
-    /// The iteration count is env-overridable via `STRESS_ITERATIONS` (default 20)
-    /// to keep CI fast while allowing thorough local/nightly runs.
+    /// The iteration count is env-overridable via `STRESS_ITERATIONS` (default
+    /// 100). CI overrides to 20 for fast feedback; local dev and nightly use
+    /// the full 100 (completes in < 1 s on modern hardware).
     #[test]
     fn concurrent_spawn_and_join_no_task_loss() {
         use std::thread;
@@ -1323,7 +1324,7 @@ mod tests {
         let iterations: usize = std::env::var("STRESS_ITERATIONS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
+            .unwrap_or(100);
 
         for iteration in 0..iterations {
             let counter = Arc::new(AtomicUsize::new(0));
