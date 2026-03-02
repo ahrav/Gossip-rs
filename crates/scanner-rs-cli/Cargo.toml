@@ -7,6 +7,10 @@ license.workspace = true
 publish = false
 description = "Standalone scanner CLI wired through gossip-scanner-runtime"
 
+[features]
+default = []
+aegis-pure-rust = ["gossip-scanner-runtime/aegis-pure-rust"]
+
 [dependencies]
 gossip-scanner-runtime.workspace = true
 

@@ -7,6 +7,16 @@ license.workspace = true
 publish = false
 description = "Runtime orchestration APIs for scanner-rs direct and connector execution modes"
 
+[features]
+default = []
+aegis-pure-rust = [
+    "scanner-engine/aegis-pure-rust",
+    "gossip-connectors/aegis-pure-rust",
+    "gossip-scan-driver/aegis-pure-rust",
+    "scanner-scheduler/aegis-pure-rust",
+    "scanner-git/aegis-pure-rust",
+]
+
 [dependencies]
 anyhow.workspace = true
 gossip-contracts.workspace = true

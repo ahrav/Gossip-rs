@@ -12,6 +12,11 @@ default = []
 sim-harness = ["scanner-scheduler/sim-harness", "scanner-git/sim-harness"]
 scheduler-sim = ["scanner-scheduler/scheduler-sim"]
 real-rules-harness = []
+aegis-pure-rust = [
+    "scanner-engine/aegis-pure-rust",
+    "scanner-scheduler/aegis-pure-rust",
+    "scanner-git/aegis-pure-rust",
+]
 
 [dev-dependencies]
 base64 = "0.22"
