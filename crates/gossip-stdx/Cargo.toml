@@ -12,13 +12,16 @@ description = "Shared low-level data structures for gossip-rs (may contain unsaf
 
 [features]
 kani = []
+stdx-proptest = []
+perf-stats = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(miri)'] }
 
 [lib]
 
 [dependencies]
+crossbeam-utils = "0.8"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
