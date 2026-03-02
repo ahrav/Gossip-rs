@@ -98,3 +98,54 @@ fn negative_candidate_throughput_is_rejected() {
         "expected NegativeCandidate, got {err:?}"
     );
 }
+
+// ── Concrete throughput delta calculations (F10) ────────────────
+
+#[rstest::rstest]
+#[case::positive_20pct(100.0, 120.0, 20.0)]
+#[case::negative_20pct(100.0, 80.0, -20.0)]
+#[case::equal(200.0, 200.0, 0.0)]
+#[case::positive_50pct(50.0, 75.0, 50.0)]
+fn throughput_delta_pct_concrete_values(
+    #[case] baseline: f64,
+    #[case] candidate: f64,
+    #[case] expected: f64,
+) {
+    let delta = throughput_delta_pct(baseline, candidate).expect("valid inputs");
+    assert!(
+        (delta - expected).abs() < 1e-10,
+        "throughput_delta_pct({baseline}, {candidate}) = {delta}, expected {expected}"
+    );
+}
+
+// ── NonFinite throughput rejection (F14) ────────────────────────
+
+#[test]
+fn throughput_delta_rejects_nan_baseline() {
+    let err = throughput_delta_pct(f64::NAN, 1.0).expect_err("NaN baseline");
+    assert!(
+        matches!(
+            err,
+            ThroughputError::NonFinite {
+                label: "baseline",
+                ..
+            }
+        ),
+        "expected NonFinite for baseline, got {err:?}"
+    );
+}
+
+#[test]
+fn throughput_delta_rejects_infinite_candidate() {
+    let err = throughput_delta_pct(1.0, f64::INFINITY).expect_err("infinite candidate");
+    assert!(
+        matches!(
+            err,
+            ThroughputError::NonFinite {
+                label: "candidate",
+                ..
+            }
+        ),
+        "expected NonFinite for candidate, got {err:?}"
+    );
+}

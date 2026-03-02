@@ -3,7 +3,7 @@
 //! This crate sits between source connectors (filesystem, git) and the
 //! [`ScannerCore`] engine. It owns the page-based scan loop: enumerate items
 //! from a source, chunk them into pages, feed each page through the engine,
-//! and aggregate results into a [`ScanOutcome`].
+//! and aggregate results into a [`ScanAggregateStats`].
 //!
 //! # Architecture
 //!
@@ -50,7 +50,7 @@
 //!
 //! # Error handling
 //!
-//! All public functions return `Result<ScanOutcome, ScanRuntimeError>`.
+//! All public functions return `Result<ScanAggregateStats, ScanRuntimeError>`.
 //! Process-exit policy (exit codes, stderr formatting) lives in the binary
 //! crates, not here.
 
@@ -80,8 +80,8 @@ use gossip_coordination::{
     RunManagement, ShardId, ShardKey, TenantId, WorkerId, WorkerSession,
 };
 use gossip_engine::{
-    PageScanContext, PageScanRequest, ScanAggregateStats, ScanDedupState, ScannerCore,
-    ScannerCoreError,
+    PageScanContext, PageScanOutput, PageScanRequest, ScanAggregateStats, ScanDedupState,
+    ScannerCore, ScannerCoreError,
 };
 use gossip_scan_pipeline::{
     DEFAULT_MAX_TRANSIENT_RETRIES, LeaseLossCause, PageProcessingContext, PageProcessingError,
@@ -133,14 +133,6 @@ pub struct ParseExecutionModeError {
     raw: String,
 }
 
-impl ParseExecutionModeError {
-    /// Original user-provided value.
-    #[must_use]
-    pub fn raw(&self) -> &str {
-        &self.raw
-    }
-}
-
 impl fmt::Display for ParseExecutionModeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -184,27 +176,6 @@ impl ScanBudgets {
     }
 }
 
-/// Shared builder methods present on both [`FsScanConfig`] and [`GitScanConfig`].
-macro_rules! impl_scan_config_builders {
-    ($ty:ty) => {
-        impl $ty {
-            /// Override execution mode.
-            #[must_use]
-            pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
-                self.execution_mode = execution_mode;
-                self
-            }
-
-            /// Override budgets.
-            #[must_use]
-            pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
-                self.budgets = budgets;
-                self
-            }
-        }
-    };
-}
-
 /// Configuration for a filesystem scan.
 ///
 /// Supports both directory trees (enumerated via [`FilesystemConnector`]) and
@@ -231,9 +202,21 @@ impl FsScanConfig {
             budgets: ScanBudgets::default(),
         }
     }
-}
 
-impl_scan_config_builders!(FsScanConfig);
+    /// Override execution mode.
+    #[must_use]
+    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
+    /// Override budgets.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+}
 
 /// Configuration for a git-tracked-file scan.
 ///
@@ -274,14 +257,21 @@ impl GitScanConfig {
         self.max_tracked_files = limit;
         self
     }
+
+    /// Override execution mode.
+    #[must_use]
+    pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
+        self.execution_mode = execution_mode;
+        self
+    }
+
+    /// Override budgets.
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
 }
-
-impl_scan_config_builders!(GitScanConfig);
-
-/// Aggregated counters produced by a completed scan.
-///
-/// Type alias for the shared [`ScanAggregateStats`] from gossip-engine.
-pub type ScanOutcome = ScanAggregateStats;
 
 /// Runtime-level scan orchestration errors.
 #[derive(Debug)]
@@ -492,7 +482,7 @@ impl From<ScanLoopError> for ScanRuntimeError {
 ///
 /// Routes to [`scan_fs_direct`] or [`scan_fs_connector`] based on
 /// [`FsScanConfig::execution_mode`].
-pub fn scan_fs(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
+pub fn scan_fs(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
         ExecutionMode::Connector => scan_fs_connector(config),
@@ -503,7 +493,7 @@ pub fn scan_fs(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
 ///
 /// Routes to [`scan_git_direct`] or [`scan_git_connector`] based on
 /// [`GitScanConfig::execution_mode`].
-pub fn scan_git(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
+pub fn scan_git(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_git_direct(config),
         ExecutionMode::Connector => scan_git_connector(config),
@@ -520,7 +510,7 @@ pub fn scan_git(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError>
 ///   through the materialized-items path as a single-item page.
 ///
 /// Uses an unbounded shard range (`[]..[]`) so every item is in scope.
-pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
+pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     validate_fs_path(&config.path)?;
 
     let scanner = ScannerCore::default();
@@ -547,7 +537,7 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeE
 ///
 /// Paths that no longer exist on disk (e.g. staged deletions) or that
 /// produce empty key bytes are silently skipped.
-pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
+pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     let canonical_repo = validate_git_repo_path(&config.repo)?;
 
     let tracked_paths = list_git_tracked_paths(&config.repo)?;
@@ -591,14 +581,17 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntim
             continue;
         }
 
+        #[cfg(unix)]
+        let key_bytes = path_bytes_ref(&rel_path);
+        #[cfg(not(unix))]
         let key_bytes = path_bytes(&rel_path);
         if key_bytes.is_empty() {
             continue;
         }
         let item = build_scan_item(
-            &key_bytes,
+            key_bytes,
             GIT_CONNECTOR_TAG,
-            &key_bytes,
+            key_bytes,
             metadata.len(),
             metadata.modified().ok(),
         )?;
@@ -627,7 +620,7 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntim
 /// differs between the two input shapes within the same execution mode. The
 /// scanner core currently does not use key ranges for filtering, so this has
 /// no behavioral impact today.
-pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
+pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     validate_fs_path(&config.path)?;
 
     let scanner = ScannerCore::default();
@@ -645,7 +638,7 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanOutcome, ScanRunti
 }
 
 /// Connector-mode git entrypoint stub (explicitly gated until later phases).
-pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
+pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     let _ = config;
     Err(ScanRuntimeError::UnsupportedExecutionMode {
         source: "git",
@@ -717,7 +710,7 @@ fn scan_from_connector_pages_with_pipeline<C>(
     scanner: &ScannerCore,
     shard: &ShardSpec,
     budgets: Budgets,
-) -> Result<ScanOutcome, ScanRuntimeError>
+) -> Result<ScanAggregateStats, ScanRuntimeError>
 where
     C: EnumerationConnector,
 {
@@ -729,7 +722,9 @@ where
     let mut next_op_raw = 1u64;
     let mut next_now_raw = 4u64;
     let mut dedupe = ScanDedupState::default();
-    let mut outcome = ScanOutcome::default();
+    let mut outcome = ScanAggregateStats::default();
+
+    let mut page_output = PageScanOutput::default();
 
     let scan_loop_outcome = run_scan_loop_with_page_processor(
         session,
@@ -746,7 +741,15 @@ where
             next_now_raw = next_now_raw.saturating_add(1);
             out
         },
-        |context| process_page_with_engine(scanner, &mut dedupe, &mut outcome, context),
+        |context| {
+            process_page_with_engine(
+                scanner,
+                &mut dedupe,
+                &mut outcome,
+                &mut page_output,
+                context,
+            )
+        },
     );
 
     match scan_loop_outcome {
@@ -773,7 +776,8 @@ where
 fn process_page_with_engine(
     scanner: &ScannerCore,
     dedupe: &mut ScanDedupState,
-    outcome: &mut ScanOutcome,
+    outcome: &mut ScanAggregateStats,
+    page_output: &mut PageScanOutput,
     context: PageProcessingContext<'_>,
 ) -> Result<(), PageProcessingError> {
     let request = PageScanRequest::metadata_only(
@@ -787,15 +791,15 @@ fn process_page_with_engine(
         context.items(),
     );
 
-    let output = scanner
-        .scan_page_with_dedupe(request, dedupe)
+    scanner
+        .scan_page_into(request, dedupe, page_output)
         .map_err(|error| {
             PageProcessingError::new(format!(
                 "scanner core failed on page {}: {error}",
                 context.page_num()
             ))
         })?;
-    outcome.record_page(&output);
+    outcome.record_page(page_output);
     Ok(())
 }
 
@@ -898,13 +902,14 @@ fn scan_from_connector_pages<C>(
     scanner: &ScannerCore,
     shard: &ShardSpec,
     budgets: Budgets,
-) -> Result<ScanOutcome, ScanRuntimeError>
+) -> Result<ScanAggregateStats, ScanRuntimeError>
 where
     C: EnumerationConnector,
 {
     let mut cursor = Cursor::initial();
     let mut dedupe = ScanDedupState::default();
-    let mut outcome = ScanOutcome::default();
+    let mut outcome = ScanAggregateStats::default();
+    let mut page_output = PageScanOutput::default();
     let mut page_num = 1u64;
 
     loop {
@@ -915,8 +920,7 @@ where
             break;
         }
 
-        let next_cursor = page.next_cursor().clone();
-        if next_cursor == cursor {
+        if *page.next_cursor() == cursor {
             return Err(ScanRuntimeError::CursorStalled { page_num });
         }
 
@@ -928,10 +932,10 @@ where
             page_num,
         );
         let request = PageScanRequest::metadata_only(context, page.items());
-        let output = scanner.scan_page_with_dedupe(request, &mut dedupe)?;
-        outcome.record_page(&output);
+        scanner.scan_page_into(request, &mut dedupe, &mut page_output)?;
+        outcome.record_page(&page_output);
 
-        cursor = next_cursor;
+        cursor = page.into_next_cursor();
         page_num = page_num.saturating_add(1);
     }
 
@@ -945,25 +949,24 @@ where
 /// chunks of `max_items_per_page`, and synthetic cursors are derived from
 /// each chunk's last [`ItemKey`] so the engine sees a well-formed page
 /// sequence.
-///
-/// The `max_bytes` budget is set to 1 (the contract minimum) because no
-/// actual byte transfer occurs — items are already in memory.
 fn scan_materialized_items_pages(
     items: &[ScanItem],
     scanner: &ScannerCore,
     shard: &ShardSpec,
     max_items_per_page: usize,
-) -> Result<ScanOutcome, ScanRuntimeError> {
-    let budgets = ScanBudgets {
-        max_items: max_items_per_page,
-        // No byte transfer — items are already materialised.
-        max_bytes: 1,
-    };
-    let _ = budgets.to_contract_budgets()?;
+) -> Result<ScanAggregateStats, ScanRuntimeError> {
+    if max_items_per_page == 0 {
+        return Err(ScanRuntimeError::ConnectorInput(
+            ConnectorInputError::ZeroBudget {
+                field: "max_items_per_page",
+            },
+        ));
+    }
 
     let mut cursor = Cursor::initial();
-    let mut dedupe = ScanDedupState::default();
-    let mut outcome = ScanOutcome::default();
+    let mut dedupe = ScanDedupState::with_capacity(items.len());
+    let mut outcome = ScanAggregateStats::default();
+    let mut page_output = PageScanOutput::default();
 
     for (index, chunk) in items.chunks(max_items_per_page).enumerate() {
         let page_num = (index as u64).saturating_add(1);
@@ -978,8 +981,8 @@ fn scan_materialized_items_pages(
             page_num,
         );
         let request = PageScanRequest::metadata_only(context, chunk);
-        let output = scanner.scan_page_with_dedupe(request, &mut dedupe)?;
-        outcome.record_page(&output);
+        scanner.scan_page_into(request, &mut dedupe, &mut page_output)?;
+        outcome.record_page(&page_output);
         cursor = next_cursor;
     }
 
@@ -1093,6 +1096,14 @@ fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
 #[cfg(unix)]
 fn path_bytes(path: &Path) -> Vec<u8> {
     path.as_os_str().as_bytes().to_vec()
+}
+
+/// Zero-copy path-to-bytes reference for Unix (avoids `Vec<u8>` allocation).
+///
+/// Use where the `Path` outlives the call and ownership transfer is not needed.
+#[cfg(unix)]
+fn path_bytes_ref(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
 }
 
 #[cfg(not(unix))]

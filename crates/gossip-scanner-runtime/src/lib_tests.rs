@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use gossip_contracts::connector::{ConnectorCapabilities, EnumerationPage};
 use rstest::rstest;
 use tempfile::tempdir;
 
@@ -24,7 +25,11 @@ fn parse_execution_mode_valid(#[case] input: &str, #[case] expected: ExecutionMo
 #[case::numeric("42")]
 fn parse_execution_mode_invalid(#[case] input: &str) {
     let err = input.parse::<ExecutionMode>().unwrap_err();
-    assert_eq!(err.raw(), input);
+    let display = err.to_string();
+    assert!(
+        display.contains(input),
+        "Display should include the raw input '{input}', got: {display}"
+    );
 }
 
 // ── Filesystem scan integration ────────────────────────────────
@@ -384,5 +389,227 @@ fn lease_lost_with_deadline_elapsed_has_no_source() {
     assert!(
         error.source().is_none(),
         "ScanLoopLeaseLost with DeadlineElapsed should have no source"
+    );
+}
+
+// ── Cursor stall detection (F1) ─────────────────────────────────
+
+/// Test connector that returns one non-empty page but never advances its cursor.
+struct StallingConnector {
+    called: bool,
+}
+
+impl StallingConnector {
+    fn new() -> Self {
+        Self { called: false }
+    }
+}
+
+impl EnumerationConnector for StallingConnector {
+    fn caps(&self) -> ConnectorCapabilities {
+        ConnectorCapabilities {
+            seek_by_key: false,
+            token_resume: false,
+            range_read: false,
+            split_hints: false,
+        }
+    }
+
+    fn enumerate_page(
+        &mut self,
+        _shard: &ShardSpec,
+        _cursor: &Cursor,
+        _budgets: Budgets,
+    ) -> Result<EnumerationPage, EnumerateError> {
+        if self.called {
+            // Safety net: if stall detection fails to fire, return empty to
+            // prevent an actual infinite loop in the test runner.
+            return Ok(EnumerationPage::new(vec![], Cursor::initial()));
+        }
+        self.called = true;
+
+        let tag = ConnectorTag::from_ascii(b"test");
+        let key = ItemKey::try_from_slice(b"stall-key").expect("key");
+        let item_ref = ItemRef::try_from_slice(b"stall-ref").expect("ref");
+        let stable_id = ItemIdentityKey::new(tag, b"stall-key").stable_id();
+        let version = VersionId::Weak(ObjectVersionId::from_version_bytes(b"v1"));
+        let item = ScanItem::new(key, item_ref, stable_id, version);
+
+        // Return items but keep the cursor at initial — this is the stall.
+        Ok(EnumerationPage::new(vec![item], Cursor::initial()))
+    }
+}
+
+#[test]
+fn scan_from_connector_pages_detects_cursor_stall() {
+    let mut connector = StallingConnector::new();
+    let scanner = ScannerCore::default();
+    let shard = ShardSpec::with_range([], []);
+    let budgets = Budgets::try_new(256, 1_000_000, None).expect("budgets");
+
+    let err =
+        scan_from_connector_pages(&mut connector, &scanner, &shard, budgets).expect_err("stall");
+    assert!(
+        matches!(err, ScanRuntimeError::CursorStalled { page_num: 1 }),
+        "expected CursorStalled {{ page_num: 1 }}, got: {err}"
+    );
+}
+
+// ── Git path traversal rejection (F2) ───────────────────────────
+//
+// Modern git rejects `..` paths at the index level, so we cannot inject a
+// literal `../escape.txt` entry through `git update-index`. Instead we
+// test the `Component::ParentDir` filtering predicate directly (the exact
+// guard at lib.rs:567-572) and verify it correctly classifies traversal
+// paths.
+
+#[test]
+fn parent_dir_component_filter_rejects_traversal_paths() {
+    use std::path::{Component, Path};
+
+    // The predicate used in scan_git_direct to reject `..` paths.
+    let has_parent_dir = |p: &Path| p.components().any(|c| matches!(c, Component::ParentDir));
+
+    // Paths that should be rejected.
+    assert!(has_parent_dir(Path::new("../escape.txt")));
+    assert!(has_parent_dir(Path::new("sub/../../escape.txt")));
+    assert!(has_parent_dir(Path::new("a/b/../../../etc/passwd")));
+
+    // Paths that should be allowed.
+    assert!(!has_parent_dir(Path::new("normal.txt")));
+    assert!(!has_parent_dir(Path::new("sub/normal.txt")));
+    assert!(!has_parent_dir(Path::new("a/b/c/deep.txt")));
+}
+
+/// End-to-end: a normal git repo with no traversal paths scans cleanly.
+/// This complements the predicate test above by proving the guard does not
+/// interfere with legitimate paths in a real git repository.
+#[test]
+fn scan_git_direct_accepts_normal_paths_through_traversal_filter() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(repo)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .output()
+        .expect("git config name");
+
+    fs::create_dir_all(repo.join("sub")).expect("mkdir sub");
+    fs::write(repo.join("sub/normal.txt"), "secret_key=abc123").expect("write");
+    fs::write(repo.join("root.txt"), "token=xyz").expect("write root");
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .output()
+        .expect("git add");
+
+    let outcome = scan_git_direct(&GitScanConfig::new(repo)).expect("git direct scan");
+    assert_eq!(
+        outcome.items_scanned(),
+        2,
+        "both normal files should pass the traversal filter"
+    );
+}
+
+// ── Git symlink containment (F3) ────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn scan_git_direct_excludes_symlink_outside_repo_boundary() {
+    let dir = tempdir().expect("tempdir");
+    let repo = dir.path();
+
+    // Init a git repo.
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(repo)
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(repo)
+        .output()
+        .expect("git config email");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .output()
+        .expect("git config name");
+
+    // Create a tracked normal file inside the repo.
+    fs::write(repo.join("inside.txt"), "secret_key=abc123").expect("write inside");
+    std::process::Command::new("git")
+        .args(["add", "inside.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add inside");
+
+    // Create a file outside the repo and a symlink inside pointing to it.
+    // We need a truly outside file, so create a sibling tempdir.
+    let outside_dir = tempdir().expect("outside tempdir");
+    let outside_path = outside_dir.path().join("sensitive.txt");
+    fs::write(&outside_path, "password=supersecret").expect("write outside");
+
+    let link_path = repo.join("link.txt");
+    std::os::unix::fs::symlink(&outside_path, &link_path).expect("symlink");
+
+    // Track the symlink in git.
+    std::process::Command::new("git")
+        .args(["add", "link.txt"])
+        .current_dir(repo)
+        .output()
+        .expect("git add link");
+
+    let outcome = scan_git_direct(&GitScanConfig::new(repo)).expect("git direct scan");
+
+    // The symlink should be excluded by the `!metadata.is_file()` check
+    // (symlink_metadata returns symlink type, not file type) and/or the
+    // canonicalization containment check. Only inside.txt should be scanned.
+    assert_eq!(
+        outcome.items_scanned(),
+        1,
+        "symlink pointing outside repo should be excluded"
+    );
+}
+
+// ── Heap-allocation path in build_scan_item (F9) ────────────────
+
+#[test]
+fn scan_fs_direct_exercises_heap_allocation_for_long_path() {
+    let dir = tempdir().expect("tempdir");
+
+    // build_scan_item uses a stack buffer for paths <= 128 bytes and falls
+    // back to heap allocation for longer paths. Create a deeply nested path
+    // that exceeds 128 bytes total to exercise the heap path.
+    let deep_name = "a".repeat(140);
+    let nested_dir = dir.path().join(&deep_name);
+    fs::create_dir_all(&nested_dir).expect("mkdir deep");
+
+    let file_path = nested_dir.join("secret.txt");
+    fs::write(&file_path, "password=hunter2").expect("write");
+
+    // Verify the path actually exceeds the INLINE_CAP threshold.
+    let path_len = file_path.as_os_str().len();
+    assert!(
+        path_len > 128,
+        "path must exceed 128 bytes for heap path, got {path_len}"
+    );
+
+    let outcome = scan_fs_direct(&FsScanConfig::new(&file_path)).expect("long-path scan");
+    assert_eq!(outcome.items_scanned(), 1);
+    assert!(
+        outcome.findings_emitted() >= 1,
+        "should emit at least 1 finding"
     );
 }
