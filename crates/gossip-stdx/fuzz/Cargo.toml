@@ -33,3 +33,8 @@ doc = false
 name = "fuzz_spsc"
 path = "fuzz_targets/fuzz_spsc.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_timing_wheel"
+path = "fuzz_targets/fuzz_timing_wheel.rs"
+doc = false

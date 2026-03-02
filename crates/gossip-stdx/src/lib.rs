@@ -126,5 +126,5 @@ pub use fixed_set::FixedSet128;
 /// - [`IntoIter`]: consuming iterator that yields owned elements in FIFO
 ///   order; remaining elements are dropped when the iterator is dropped.
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};
-pub use spsc::{OwnedSpscConsumer, OwnedSpscProducer, SpscConsumer, SpscProducer, spsc_channel};
-pub use timing_wheel::{Bitset2, PushError, PushOutcome, TimingWheel};
+pub use spsc::{OwnedSpscConsumer, OwnedSpscProducer, spsc_channel};
+pub use timing_wheel::{PushError, PushOutcome, TimingWheel};

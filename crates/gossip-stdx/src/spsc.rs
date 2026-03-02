@@ -704,6 +704,118 @@ mod tests {
 
         assert_eq!(drops.load(Ordering::Relaxed), count);
     }
+
+    /// Verify full detection works when indices are near u32::MAX.
+    #[test]
+    fn full_detected_near_u32_max_boundary() {
+        let ring = SpscRing::<u64, 4>::new();
+        let start = u32::MAX - 2; // 0xFFFF_FFFD
+
+        ring.head.store(start, Ordering::Relaxed);
+        ring.tail.store(start, Ordering::Relaxed);
+
+        let mut prod = SpscProducer {
+            ring: &ring,
+            cached_head: start,
+        };
+        let mut cons = SpscConsumer {
+            ring: &ring,
+            cached_tail: start,
+        };
+
+        // Fill to capacity — indices wrap through 0.
+        for i in 0..4u64 {
+            assert!(prod.try_push(i).is_ok(), "push {i} should succeed");
+        }
+        // Must detect full.
+        assert_eq!(prod.try_push(99), Err(99), "ring should be full");
+
+        // Pop all — FIFO must hold across the wrap.
+        for i in 0..4u64 {
+            assert_eq!(cons.try_pop(), Some(i), "FIFO violation at {i}");
+        }
+        assert_eq!(cons.try_pop(), None);
+    }
+
+    /// Verify empty detection works when indices are near u32::MAX.
+    #[test]
+    fn empty_detected_near_u32_max_boundary() {
+        let ring = SpscRing::<u64, 4>::new();
+        let start = u32::MAX - 1; // 0xFFFF_FFFE
+
+        ring.head.store(start, Ordering::Relaxed);
+        ring.tail.store(start, Ordering::Relaxed);
+
+        let mut prod = SpscProducer {
+            ring: &ring,
+            cached_head: start,
+        };
+        let mut cons = SpscConsumer {
+            ring: &ring,
+            cached_tail: start,
+        };
+
+        // Empty ring at near-MAX indices.
+        assert_eq!(cons.try_pop(), None, "empty ring should return None");
+
+        // Push one, pop one — crossing the u32 wrap boundary.
+        assert!(prod.try_push(42).is_ok());
+        assert_eq!(cons.try_pop(), Some(42));
+        assert_eq!(cons.try_pop(), None, "should be empty again");
+    }
+
+    /// Verify the cached-head staleness scenario cannot cause overwrite.
+    #[test]
+    fn stale_cached_head_still_detects_full() {
+        let ring = SpscRing::<u64, 4>::new();
+        let start = u32::MAX - 5;
+
+        ring.head.store(start, Ordering::Relaxed);
+        ring.tail.store(start, Ordering::Relaxed);
+
+        let mut prod = SpscProducer {
+            ring: &ring,
+            cached_head: start,
+        };
+        let mut cons = SpscConsumer {
+            ring: &ring,
+            cached_tail: start,
+        };
+
+        // Fill to capacity.
+        for i in 0..4u64 {
+            assert!(prod.try_push(i).is_ok());
+        }
+        // cached_head = start, actual head = start, tail = start+4
+
+        // Consumer drains all 4 — head advances to start+4, but
+        // producer's cached_head is still `start` (maximally stale).
+        for i in 0..4u64 {
+            assert_eq!(cons.try_pop(), Some(i));
+        }
+
+        // Fill again — tail goes to start+8, cached_head still = start.
+        // wrapping_sub(start+8, start) = 8 >= 4, so refresh triggers.
+        // After refresh, cached_head = start+4, and push succeeds.
+        for i in 10..14u64 {
+            assert!(
+                prod.try_push(i).is_ok(),
+                "push {i} should succeed after refresh"
+            );
+        }
+
+        // Must detect full again.
+        assert_eq!(
+            prod.try_push(99),
+            Err(99),
+            "should be full after second fill"
+        );
+
+        // FIFO preserved.
+        for i in 10..14u64 {
+            assert_eq!(cons.try_pop(), Some(i));
+        }
+    }
 }
 
 // ============================================================================
