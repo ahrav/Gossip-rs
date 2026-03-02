@@ -118,7 +118,73 @@ fn throughput_delta_pct_concrete_values(
     );
 }
 
-// ── NonFinite throughput rejection (F14) ────────────────────────
+// ── Normal throughput delta calculations ─────────────────────────
+
+#[test]
+fn throughput_delta_pct_normal_cases() {
+    let delta = throughput_delta_pct(100.0, 110.0).expect("100→110");
+    assert!(
+        (delta - 10.0).abs() < 1e-10,
+        "100→110 should be +10%, got {delta}"
+    );
+
+    let delta = throughput_delta_pct(100.0, 90.0).expect("100→90");
+    assert!(
+        (delta - (-10.0)).abs() < 1e-10,
+        "100→90 should be -10%, got {delta}"
+    );
+
+    let delta = throughput_delta_pct(42.0, 42.0).expect("42→42");
+    assert_eq!(delta, 0.0, "42→42 should be 0%");
+}
+
+// ── Median edge cases ───────────────────────────────────────────
+
+#[test]
+fn median_single_element() {
+    assert_eq!(median(&[7.5]).expect("single element"), 7.5);
+}
+
+#[test]
+fn median_empty_input_is_error() {
+    let err = median(&[]).expect_err("empty input");
+    assert!(
+        matches!(err, ThroughputError::EmptyInput),
+        "expected EmptyInput, got {err:?}"
+    );
+}
+
+#[test]
+fn median_nan_is_rejected() {
+    let err = median(&[1.0, f64::NAN, 3.0]).expect_err("NaN input");
+    assert!(
+        matches!(
+            err,
+            ThroughputError::NonFinite {
+                label: "sample",
+                ..
+            }
+        ),
+        "expected NonFinite for sample, got {err:?}"
+    );
+}
+
+#[test]
+fn median_infinity_is_rejected() {
+    let err = median(&[1.0, f64::INFINITY]).expect_err("infinite input");
+    assert!(
+        matches!(
+            err,
+            ThroughputError::NonFinite {
+                label: "sample",
+                ..
+            }
+        ),
+        "expected NonFinite for sample, got {err:?}"
+    );
+}
+
+// ── NonFinite throughput rejection ──────────────────────────────
 
 #[test]
 fn throughput_delta_rejects_nan_baseline() {

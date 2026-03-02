@@ -540,16 +540,7 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanAggregateStats, ScanR
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanAggregateStats, ScanRuntimeError> {
     let canonical_repo = validate_git_repo_path(&config.repo)?;
 
-    let tracked_paths = list_git_tracked_paths(&config.repo)?;
-
-    if let Some(max) = config.max_tracked_files
-        && tracked_paths.len() > max
-    {
-        return Err(ScanRuntimeError::TooManyTrackedFiles {
-            count: tracked_paths.len(),
-            limit: max,
-        });
-    }
+    let tracked_paths = list_git_tracked_paths(&config.repo, config.max_tracked_files)?;
 
     let mut items = Vec::with_capacity(tracked_paths.len());
     for rel_path in tracked_paths {
@@ -563,35 +554,34 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanAggregateStats, Sca
 
         let abs_path = canonical_repo.join(&rel_path);
 
-        // Verify the resolved path is still within the repo boundary.
-        let canonical_abs = match fs::canonicalize(&abs_path) {
-            Ok(p) => p,
-            Err(_) => continue, // file may have been deleted since ls-files
-        };
-        if !canonical_abs.starts_with(&canonical_repo) {
-            continue;
-        }
-
-        // Use symlink_metadata to avoid following symlinks.
+        // Check file type *before* canonicalize to narrow the TOCTOU window:
+        // symlink_metadata does not follow symlinks, so symlinks and
+        // non-regular files are rejected before we resolve the real path.
         let metadata = match fs::symlink_metadata(&abs_path) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => continue, // file may have been deleted since ls-files
         };
         if !metadata.is_file() {
             continue;
         }
 
-        #[cfg(unix)]
-        let key_bytes = path_bytes_ref(&rel_path);
-        #[cfg(not(unix))]
-        let key_bytes = path_bytes(&rel_path);
+        // Verify the resolved path is still within the repo boundary.
+        let canonical_abs = match fs::canonicalize(&abs_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !canonical_abs.starts_with(&canonical_repo) {
+            continue;
+        }
+
+        let key_bytes = path_bytes_cow(&rel_path);
         if key_bytes.is_empty() {
             continue;
         }
         let item = build_scan_item(
-            key_bytes,
+            &key_bytes,
             GIT_CONNECTOR_TAG,
-            key_bytes,
+            &key_bytes,
             metadata.len(),
             metadata.modified().ok(),
         )?;
@@ -853,7 +843,15 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
 /// The `-z` flag produces NUL-delimited output, which is essential for
 /// correct handling of filenames containing newlines or other special
 /// characters. Returned paths are relative to `repo`.
-fn list_git_tracked_paths(repo: &Path) -> Result<Vec<PathBuf>, ScanRuntimeError> {
+///
+/// When `max_files` is `Some(n)`, the function counts NUL-separated
+/// entries *before* parsing bytes into [`PathBuf`]s. If the count
+/// exceeds `n`, [`ScanRuntimeError::TooManyTrackedFiles`] is returned
+/// without allocating the full path vector.
+fn list_git_tracked_paths(
+    repo: &Path,
+    max_files: Option<usize>,
+) -> Result<Vec<PathBuf>, ScanRuntimeError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -873,6 +871,16 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<PathBuf>, ScanRuntimeError>
             status_code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
+    }
+
+    // Fast-fail: count NUL-separated entries with a cheap byte scan before
+    // allocating PathBufs. git ls-files -z terminates each entry with NUL,
+    // so the entry count equals the number of NUL bytes (ignoring trailing).
+    if let Some(max) = max_files {
+        let count = output.stdout.iter().filter(|&&b| b == 0).count();
+        if count > max {
+            return Err(ScanRuntimeError::TooManyTrackedFiles { count, limit: max });
+        }
     }
 
     let mut paths = Vec::new();
@@ -1010,7 +1018,7 @@ fn build_local_file_scan_item(
             message: "path is a symlink".to_owned(),
         });
     }
-    let key_bytes = path_bytes(path);
+    let key_bytes = path_bytes_cow(path);
     build_scan_item(
         &key_bytes,
         connector_tag,
@@ -1093,22 +1101,16 @@ fn path_buf_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
+/// Borrow path bytes on Unix (zero-copy), own them on non-Unix.
 #[cfg(unix)]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    path.as_os_str().as_bytes().to_vec()
+fn path_bytes_cow(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Borrowed(path.as_os_str().as_bytes())
 }
 
-/// Zero-copy path-to-bytes reference for Unix (avoids `Vec<u8>` allocation).
-///
-/// Use where the `Path` outlives the call and ownership transfer is not needed.
-#[cfg(unix)]
-fn path_bytes_ref(path: &Path) -> &[u8] {
-    path.as_os_str().as_bytes()
-}
-
+/// Borrow path bytes on Unix (zero-copy), own them on non-Unix.
 #[cfg(not(unix))]
-fn path_bytes(path: &Path) -> Vec<u8> {
-    path.to_string_lossy().into_owned().into_bytes()
+fn path_bytes_cow(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Owned(path.to_string_lossy().into_owned().into_bytes())
 }
 
 #[cfg(test)]

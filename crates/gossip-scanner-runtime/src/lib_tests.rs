@@ -148,6 +148,48 @@ fn scan_fs_direct_and_connector_match_for_directory() {
         connector.diagnostics_emitted(),
         "diagnostic count mismatch"
     );
+
+    // Absolute-value assertions: 5 files × max_items=1 → exactly 5 pages,
+    // 5 items, and at least 5 findings (each file contains a secret).
+    assert_eq!(direct.pages_scanned(), 5, "expected exactly 5 pages");
+    assert_eq!(direct.items_scanned(), 5, "expected exactly 5 items");
+    assert!(
+        direct.findings_emitted() >= 5,
+        "expected at least 5 findings, got {}",
+        direct.findings_emitted()
+    );
+}
+
+#[test]
+fn scan_fs_direct_and_connector_match_for_single_file() {
+    let dir = tempdir().expect("tempdir");
+    let file_path = dir.path().join("secret.txt");
+    fs::write(&file_path, "password=hunter2").expect("write");
+
+    let direct = scan_fs(&FsScanConfig::new(&file_path)).expect("direct outcome");
+    let connector =
+        scan_fs(&FsScanConfig::new(&file_path).with_execution_mode(ExecutionMode::Connector))
+            .expect("connector outcome");
+
+    assert_eq!(
+        direct.pages_scanned(),
+        connector.pages_scanned(),
+        "page count mismatch"
+    );
+    assert_eq!(
+        direct.items_scanned(),
+        connector.items_scanned(),
+        "item count mismatch"
+    );
+    assert_eq!(
+        direct.findings_emitted(),
+        connector.findings_emitted(),
+        "finding count mismatch"
+    );
+
+    // Single file → exactly 1 page, 1 item.
+    assert_eq!(direct.pages_scanned(), 1, "expected exactly 1 page");
+    assert_eq!(direct.items_scanned(), 1, "expected exactly 1 item");
 }
 
 // ── Connector-mode gating (git only) ─────────────────────────────
