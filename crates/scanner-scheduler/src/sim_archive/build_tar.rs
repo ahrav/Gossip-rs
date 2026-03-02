@@ -7,7 +7,7 @@
 use crate::archive::formats::tar::TAR_BLOCK_LEN;
 use crate::sim_scanner::scenario::{ArchiveEntrySpec, EntryKindSpec};
 
-use super::{EntryLocator, tar_entry_name, tar_pad};
+use super::{tar_entry_name, tar_pad, EntryLocator};
 
 /// Build deterministic tar bytes and entry locators.
 ///

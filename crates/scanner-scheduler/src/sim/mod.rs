@@ -28,6 +28,6 @@ pub use executor::{
 };
 pub use fault::{Corruption, FaultInjector, FaultPlan, FileFaultPlan, IoFault, ReadFault};
 pub use fs::{SimFileHandle, SimFs, SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
-pub use minimize::{MinimizerCfg, minimize_scanner_case};
+pub use minimize::{minimize_scanner_case, MinimizerCfg};
 pub use rng::SimRng;
 pub use trace::{TraceEvent, TraceRing};

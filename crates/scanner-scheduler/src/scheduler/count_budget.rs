@@ -329,7 +329,11 @@ impl CountPermit {
     /// Number of permits held by this guard.
     #[inline]
     pub fn count(&self) -> usize {
-        if self.active { self.n } else { 0 }
+        if self.active {
+            self.n
+        } else {
+            0
+        }
     }
 
     /// Intentionally leak these permits (don't release on drop).
@@ -500,7 +504,7 @@ mod tests {
 
         let leaked = p.forget();
         assert_eq!(leaked, 3); // Returns count of leaked permits
-        // Permits should NOT be released
+                               // Permits should NOT be released
         assert_eq!(b.available(), 2);
     }
 

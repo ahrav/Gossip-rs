@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::family::{Outcome, TokenFamily};
-use super::op::{MutOp, apply_ops};
+use super::op::{apply_ops, MutOp};
 use crate::sim::rng::SimRng;
 
 /// Surrounding context in which a mutated token is embedded.

@@ -6,12 +6,12 @@
 
 use std::io::Write;
 
-use flate2::Compression;
 use flate2::write::DeflateEncoder;
+use flate2::Compression;
 
 use crate::sim_scanner::scenario::{ArchiveEntrySpec, EntryCompressionSpec, EntryKindSpec};
 
-use super::{EntryLocator, zip_entry_name};
+use super::{zip_entry_name, EntryLocator};
 
 /// Build deterministic zip bytes and entry locators.
 ///

@@ -11,15 +11,15 @@ pub mod plan;
 pub mod plan_gen;
 
 pub use adapter::{
-    MutationCheckResult, MutationViolation, build_mutation_engine, build_mutation_scenario,
-    check_mutation_expectations,
+    build_mutation_engine, build_mutation_scenario, check_mutation_expectations,
+    MutationCheckResult, MutationViolation,
 };
 pub use encode::{
-    BASE62_CHARS, BASE64_STD, SecretRepr, TOKEN_ALPHABET, base62_encode_u32, base64_encode_std,
-    base64url_encode_nopad, encode_nested, encode_secret, encode_utf16, hex_nibble,
-    percent_encode_all,
+    base62_encode_u32, base64_encode_std, base64url_encode_nopad, encode_nested, encode_secret,
+    encode_utf16, hex_nibble, percent_encode_all, SecretRepr, BASE62_CHARS, BASE64_STD,
+    TOKEN_ALPHABET,
 };
 pub use family::{Outcome, TokenFamily};
-pub use op::{ApplyResult, MutOp, MutOpKind, apply_ops};
-pub use plan::{ContextWrap, GeneratedCase, MutationPlan, WrappedToken, execute_plan};
+pub use op::{apply_ops, ApplyResult, MutOp, MutOpKind};
+pub use plan::{execute_plan, ContextWrap, GeneratedCase, MutationPlan, WrappedToken};
 pub use plan_gen::{random_mutation_plan, random_mutation_plans_all_families};

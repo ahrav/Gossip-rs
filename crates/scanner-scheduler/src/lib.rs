@@ -42,7 +42,7 @@ pub mod sim;
 pub mod sim_archive;
 #[cfg(feature = "sim-harness")]
 pub mod sim_scanner;
-#[cfg(any(test, feature = "scheduler-sim"))]
+#[cfg(feature = "scheduler-sim")]
 pub mod sim_scheduler;
 pub mod source_kind;
 pub mod store;

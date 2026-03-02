@@ -15,14 +15,13 @@
 
 use regex::bytes::Regex;
 
-use crate::Engine;
 use crate::api::{
     AnchorPolicy, Gate, RuleSpec, TransformConfig, TransformId, TransformMode, Tuning,
     ValidatorKind,
 };
 use crate::archive::ArchiveConfig;
 use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
-use crate::sim::mutation::{TOKEN_ALPHABET, encode_secret};
+use crate::sim::mutation::{encode_secret, TOKEN_ALPHABET};
 use crate::sim::rng::SimRng;
 use crate::sim_archive::{entry_paths, materialize_archive};
 use crate::sim_scanner::scenario::{
@@ -30,6 +29,7 @@ use crate::sim_scanner::scenario::{
     ExpectedDisposition, ExpectedSecret, RuleSuiteSpec, RunConfig, Scenario, SecretRepr, SpanU32,
     SyntheticRuleSpec,
 };
+use crate::Engine;
 
 const DEFAULT_SCHEMA_VERSION: u32 = 1;
 

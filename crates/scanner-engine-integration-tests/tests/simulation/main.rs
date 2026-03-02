@@ -31,7 +31,7 @@ mod scanner_rs {
     pub use scanner_scheduler::sim_archive;
     #[cfg(feature = "sim-harness")]
     pub use scanner_scheduler::sim_scanner;
-    #[cfg(any(feature = "scheduler-sim", feature = "sim-harness"))]
+    #[cfg(feature = "scheduler-sim")]
     pub use scanner_scheduler::sim_scheduler;
 }
 

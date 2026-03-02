@@ -6,6 +6,6 @@
 //! This module is intentionally a thin shim and does not define scheduler-local
 //! API types.
 pub use scanner_engine::{
-    AnchorPolicy, DecodeStep, FileId, Finding, FindingRec, Gate, RuleSpec, STEP_ROOT, StepId,
-    TransformConfig, TransformId, TransformMode, Tuning, ValidatorKind,
+    AnchorPolicy, DecodeStep, FileId, Finding, FindingRec, Gate, RuleSpec, StepId, TransformConfig,
+    TransformId, TransformMode, Tuning, ValidatorKind, STEP_ROOT,
 };

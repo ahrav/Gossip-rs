@@ -70,8 +70,8 @@ use super::shared_core::scan_chunk_postprocess;
 use crate::api::FileId;
 use crate::archive::detect::detect_kind_from_path;
 use crate::archive::scan::{
-    ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta, scan_bzip2_stream, scan_gzip_stream,
-    scan_tar_stream, scan_tarbz2_stream, scan_targz_stream, scan_zip_source,
+    scan_bzip2_stream, scan_gzip_stream, scan_tar_stream, scan_tarbz2_stream, scan_targz_stream,
+    scan_zip_source, ArchiveEntrySink, ArchiveScratch, EntryChunk, EntryMeta,
 };
 use crate::archive::{ArchiveConfig, ArchiveKind, ArchiveStats};
 use crate::content_policy::{self, ContentVerdict};
@@ -81,7 +81,7 @@ use crate::perf_stats;
 use crossbeam_channel as chan;
 use crossbeam_queue::ArrayQueue;
 
-use io_uring::{IoUring, Probe, opcode, types};
+use io_uring::{opcode, types, IoUring, Probe};
 
 use std::collections::VecDeque;
 use std::ffi::CString;
@@ -90,8 +90,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 // ============================================================================
@@ -949,7 +949,7 @@ fn extract_worker_loop<E: ScanEngine>(
     event_sink: Arc<dyn EventOutput>,
 ) -> ExtractWorkerStats {
     use crate::content_policy::extract::{
-        EXTRACT_INPUT_CAP, EXTRACT_OUTPUT_CAP, ExtractResult, JAR_ENTRY_CAP, extract_content,
+        extract_content, ExtractResult, EXTRACT_INPUT_CAP, EXTRACT_OUTPUT_CAP, JAR_ENTRY_CAP,
     };
     use std::io::Read as _;
 

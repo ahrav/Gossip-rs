@@ -733,7 +733,11 @@ fn filename_extension(filename: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let ext = &filename[dot + 1..];
-    if ext.is_empty() { None } else { Some(ext) }
+    if ext.is_empty() {
+        None
+    } else {
+        Some(ext)
+    }
 }
 
 /// Returns true if `filename` matches a known lock file (case-insensitive

@@ -8,7 +8,7 @@ use std::fs::File;
 
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
-use super::local_fs_owner::{FileTask, LocalScratch, emit_persistence_batch};
+use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
 use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
 };
@@ -40,7 +40,7 @@ pub(super) fn extract_and_scan_file<E: ScanEngine>(
     path_bytes: &[u8],
     fmt: crate::content_policy::ExtractableFormat,
 ) {
-    use crate::content_policy::extract::{ExtractResult, extract_content};
+    use crate::content_policy::extract::{extract_content, ExtractResult};
     use std::io::{Read, Seek, SeekFrom};
 
     // Seek back to start — the first read may have advanced the position.

@@ -31,7 +31,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::ptr::{NonNull, copy_nonoverlapping};
+use std::ptr::{copy_nonoverlapping, NonNull};
 use std::rc::Rc;
 use std::slice;
 use std::sync::Arc;

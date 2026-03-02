@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::encode::{
-    BASE62_CHARS, base62_encode_u32, base64_encode_std, base64url_encode_nopad, percent_encode_all,
+    base62_encode_u32, base64_encode_std, base64url_encode_nopad, percent_encode_all, BASE62_CHARS,
 };
 use super::op::{MutOp, MutOpKind};
 use crate::sim::rng::SimRng;
@@ -595,16 +595,12 @@ mod tests {
 
     #[test]
     fn allowed_ops_includes_checksum_for_github() {
-        assert!(
-            TokenFamily::GithubFinegrainedPat
-                .allowed_ops()
-                .contains(&MutOpKind::ChecksumCorrupt)
-        );
-        assert!(
-            TokenFamily::GithubClassicPat
-                .allowed_ops()
-                .contains(&MutOpKind::ChecksumCorrupt)
-        );
+        assert!(TokenFamily::GithubFinegrainedPat
+            .allowed_ops()
+            .contains(&MutOpKind::ChecksumCorrupt));
+        assert!(TokenFamily::GithubClassicPat
+            .allowed_ops()
+            .contains(&MutOpKind::ChecksumCorrupt));
     }
 
     /// Verify that generated AWS keys have account IDs within the engine's

@@ -636,7 +636,7 @@ mod tests {
 
         let guard = AllocGuard::new();
         let _ = guard.finish(); // Consumes the guard
-        // Drop happens here - should not panic
+                                // Drop happens here - should not panic
     }
 
     #[test]

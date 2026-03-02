@@ -628,8 +628,8 @@ fn uring_archive_sniffed_counted() -> io::Result<()> {
 /// finding emission.
 #[test]
 fn uring_sniff_detected_gzip_emits_findings() -> io::Result<()> {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
 
     let engine = Arc::new(MockEngine::with_tuning(
         vec![MockRule {
@@ -701,8 +701,8 @@ fn uring_sniff_detected_gzip_emits_findings() -> io::Result<()> {
 /// and go directly to archive workers.
 #[test]
 fn uring_extension_routed_archive_emits_findings() -> io::Result<()> {
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
 
     let engine = Arc::new(MockEngine::with_tuning(
         vec![MockRule {

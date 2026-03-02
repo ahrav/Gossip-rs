@@ -43,7 +43,7 @@ stats = ["perf-stats", "scanner-engine/stats"]
 b64-stats = ["stats", "scanner-engine/b64-stats"]
 bench = []
 connector-pipeline = []
-scheduler-sim = []
+scheduler-sim = ["sim-harness"]
 sim-harness = [
     "perf-stats",
     "scanner-engine/sim-harness",

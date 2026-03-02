@@ -533,8 +533,8 @@ impl Drop for TsBufferHandle {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use std::thread;
 
     fn test_config() -> TsBufferPoolConfig {

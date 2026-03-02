@@ -75,7 +75,11 @@ pub fn set_current_worker_id(id: Option<usize>) {
 pub fn current_worker_id() -> Option<usize> {
     WORKER_ID.with(|c| {
         let v = c.get();
-        if v == NO_WORKER { None } else { Some(v) }
+        if v == NO_WORKER {
+            None
+        } else {
+            Some(v)
+        }
     })
 }
 

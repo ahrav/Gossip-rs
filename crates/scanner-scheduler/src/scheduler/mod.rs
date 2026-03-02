@@ -286,7 +286,7 @@ pub use rng::XorShift64;
 pub use count_budget::{CountBudget, CountPermit};
 pub use engine_impl::RealEngineScratch;
 pub use engine_stub::{
-    BUFFER_ALIGN, BUFFER_LEN_MAX, FileId, FindingRec, MockEngine, RuleId, ScanScratch,
+    FileId, FindingRec, MockEngine, RuleId, ScanScratch, BUFFER_ALIGN, BUFFER_LEN_MAX,
 };
 pub use engine_trait::{
     EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
@@ -298,10 +298,10 @@ pub use worker_id::{current_worker_id, set_current_worker_id};
 
 // Observability
 pub use affinity::{
-    CPU_SET_CAPACITY, CoreAssigner, CpuSet, allowed_cpus, first_allowed_cpu, num_cpus,
-    pin_current_thread_to_core, try_pin_to_core, try_pin_to_first_allowed,
+    allowed_cpus, first_allowed_cpu, num_cpus, pin_current_thread_to_core, try_pin_to_core,
+    try_pin_to_first_allowed, CoreAssigner, CpuSet, CPU_SET_CAPACITY,
 };
-pub use alloc::{AllocGuard, AllocStats, AllocStatsDelta, CountingAllocator, alloc_stats};
+pub use alloc::{alloc_stats, AllocGuard, AllocStats, AllocStatsDelta, CountingAllocator};
 
 // Testing infrastructure
 pub use failure::{
@@ -310,8 +310,8 @@ pub use failure::{
     RetryableReason,
 };
 pub use task_graph::{
-    CursorState, ENUM_BATCH_SIZE, EnumCursor, MAX_FETCH_SPAWNS_PER_ENUM, ObjectCtx,
-    ObjectDescriptor, ObjectFrontier, ObjectPermit, ObjectRef, Task, TaskMetrics,
+    CursorState, EnumCursor, ObjectCtx, ObjectDescriptor, ObjectFrontier, ObjectPermit, ObjectRef,
+    Task, TaskMetrics, ENUM_BATCH_SIZE, MAX_FETCH_SPAWNS_PER_ENUM,
 };
 
 // Resource control

@@ -10,19 +10,19 @@ use std::sync::atomic::Ordering;
 use crate::archive::formats::zip::LimitedRead;
 use crate::archive::formats::{Bzip2Stream, GzipStream, TarInput, TarNext, TarRead};
 use crate::archive::{
-    ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult, DEFAULT_MAX_COMPONENTS,
-    EntrySkipReason, PartialReason, detect_kind_from_name_bytes,
+    detect_kind_from_name_bytes, ArchiveKind, ArchiveSkipReason, BudgetHit, ChargeResult,
+    EntrySkipReason, PartialReason, DEFAULT_MAX_COMPONENTS,
 };
 
 use super::engine_trait::{EngineScratch, ScanEngine};
 use super::executor::WorkerCtx;
 use super::local_fs_archive_ctx::{
-    ARCHIVE_STREAM_READ_MAX, ArchiveEnd, ArchiveScanCtx, LOCATOR_LEN, alloc_virtual_file_id,
-    apply_entry_budget_clamp, budget_hit_to_archive_end, budget_hit_to_partial_reason,
-    build_locator, discard_remaining_payload, map_archive_skip_to_partial,
-    scan_compressed_stream_nested,
+    alloc_virtual_file_id, apply_entry_budget_clamp, budget_hit_to_archive_end,
+    budget_hit_to_partial_reason, build_locator, discard_remaining_payload,
+    map_archive_skip_to_partial, scan_compressed_stream_nested, ArchiveEnd, ArchiveScanCtx,
+    ARCHIVE_STREAM_READ_MAX, LOCATOR_LEN,
 };
-use super::local_fs_owner::{FileTask, LocalScratch, emit_persistence_batch};
+use super::local_fs_owner::{emit_persistence_batch, FileTask, LocalScratch};
 use super::scan_helpers::{
     account_effective_dropped_findings, apply_cross_rule_dedupe, emit_findings,
 };

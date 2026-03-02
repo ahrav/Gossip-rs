@@ -36,8 +36,8 @@
 //! - Deterministic tie-breaking built-in
 
 use std::cmp::Ordering;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 
 // ============================================================================
 // Finding Types

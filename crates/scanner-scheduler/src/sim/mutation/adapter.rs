@@ -34,7 +34,7 @@
 use crate::api::AnchorPolicy;
 use crate::sim::fs::{SimFsSpec, SimNodeSpec, SimPath, SimTypeHint};
 use crate::sim::mutation::family::{Outcome, TokenFamily};
-use crate::sim::mutation::plan::{GeneratedCase, MutationPlan, execute_plan};
+use crate::sim::mutation::plan::{execute_plan, GeneratedCase, MutationPlan};
 use crate::sim::rng::SimRng;
 use crate::sim_scanner::generator::{materialize_rules, synthetic_tuning};
 use crate::sim_scanner::scenario::{
