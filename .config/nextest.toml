@@ -1,0 +1,19 @@
+# ── nextest configuration ─────────────────────────────────────────
+# Profiles referenced by .github/workflows/ci.yml
+
+[profile.ci]
+# CI: fail-fast disabled so we see all failures in one run.
+fail-fast = false
+status-level = "fail"
+final-status-level = "flaky"
+# Retry once to surface flaky tests (marked as "flaky" in output).
+retries = 2
+
+[profile.nightly]
+# Nightly full-harness: same as ci but with longer timeout for
+# heavier --all-features + release builds.
+fail-fast = false
+status-level = "fail"
+final-status-level = "flaky"
+retries = 2
+slow-timeout = { period = "120s", terminate-after = 3 }
