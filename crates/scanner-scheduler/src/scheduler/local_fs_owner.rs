@@ -434,6 +434,26 @@ pub struct LocalReport {
     pub metrics: MetricsSnapshot,
 }
 
+/// Streaming progress counters for local scan scheduling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LocalProgress {
+    pub files_enqueued: u64,
+    pub bytes_enqueued: u64,
+}
+
+/// Progress callback surface for local scans.
+pub trait LocalProgressSink: Send + Sync + 'static {
+    fn on_progress(&self, progress: LocalProgress);
+}
+
+#[derive(Default)]
+struct NullLocalProgressSink;
+
+impl LocalProgressSink for NullLocalProgressSink {
+    #[inline]
+    fn on_progress(&self, _progress: LocalProgress) {}
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -1054,7 +1074,24 @@ fn read_some(file: &mut File, dst: &mut [u8]) -> io::Result<usize> {
 /// let engine = Arc::new(Engine::new(rules, transforms, tuning));
 /// let report = scan_local(engine, source, LocalConfig::default());
 /// ```
-pub fn scan_local<E, S>(engine: Arc<E>, mut source: S, cfg: LocalConfig) -> LocalReport
+pub fn scan_local<E, S>(engine: Arc<E>, source: S, cfg: LocalConfig) -> LocalReport
+where
+    E: ScanEngine,
+    S: FileSource,
+{
+    scan_local_with_progress(engine, source, cfg, Arc::new(NullLocalProgressSink))
+}
+
+/// Scan local files with blocking reads and an optional progress callback.
+///
+/// The callback is invoked from the discovery thread each time a file is
+/// admitted to the executor.
+pub fn scan_local_with_progress<E, S>(
+    engine: Arc<E>,
+    mut source: S,
+    cfg: LocalConfig,
+    progress_sink: Arc<dyn LocalProgressSink>,
+) -> LocalReport
 where
     E: ScanEngine,
     S: FileSource,
@@ -1191,6 +1228,10 @@ where
 
         stats.files_enqueued = stats.files_enqueued.saturating_add(1);
         stats.bytes_enqueued = stats.bytes_enqueued.saturating_add(file.size);
+        progress_sink.on_progress(LocalProgress {
+            files_enqueued: stats.files_enqueued,
+            bytes_enqueued: stats.bytes_enqueued,
+        });
 
         // Enqueue task
         let task = FileTask {

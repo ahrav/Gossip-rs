@@ -12,6 +12,7 @@ use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStorePro
 use regex::bytes::Regex;
 use std::fs;
 use std::io::Write;
+use std::sync::Mutex;
 use tempfile::{NamedTempFile, TempDir};
 
 fn test_engine() -> MockEngine {
@@ -177,6 +178,56 @@ fn assert_perf_u64(actual: u64, expected: u64) {
     } else {
         assert_eq!(actual, 0);
     }
+}
+
+#[derive(Default)]
+struct RecordingProgressSink {
+    calls: Mutex<Vec<LocalProgress>>,
+}
+
+impl LocalProgressSink for RecordingProgressSink {
+    fn on_progress(&self, progress: LocalProgress) {
+        self.calls
+            .lock()
+            .expect("progress sink mutex poisoned")
+            .push(progress);
+    }
+}
+
+#[test]
+fn scan_local_with_progress_reports_enqueued_counts() {
+    let engine = Arc::new(test_engine());
+    let dir = TempDir::new().expect("tempdir");
+    let file_a = dir.path().join("a.txt");
+    let file_b = dir.path().join("b.txt");
+    fs::write(&file_a, "SECRET1234").expect("write a");
+    fs::write(&file_b, "PASSWORD5678").expect("write b");
+
+    let source = VecFileSource::new(vec![
+        LocalFile {
+            path: file_a,
+            size: 10,
+        },
+        LocalFile {
+            path: file_b,
+            size: 12,
+        },
+    ]);
+
+    let progress = Arc::new(RecordingProgressSink::default());
+    let report = scan_local_with_progress(
+        engine,
+        source,
+        small_config(),
+        Arc::clone(&progress) as Arc<dyn LocalProgressSink>,
+    );
+
+    assert_eq!(report.stats.files_enqueued, 2);
+    let calls = progress.calls.lock().expect("progress sink mutex poisoned");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].files_enqueued, 1);
+    assert_eq!(calls[1].files_enqueued, 2);
+    assert!(calls[1].bytes_enqueued >= calls[0].bytes_enqueued);
 }
 
 #[test]

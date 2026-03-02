@@ -674,11 +674,17 @@ dependencies = [
 name = "gossip-connectors"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "crossbeam-channel",
  "gossip-contracts",
+ "gossip-scan-driver",
  "gossip-stdx",
  "libc",
  "proptest",
  "rstest",
+ "scanner-engine",
+ "scanner-git",
+ "scanner-scheduler",
  "tempfile",
 ]
 
@@ -733,6 +739,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-scan-driver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gossip-contracts",
+ "scanner-engine",
+ "scanner-scheduler",
+]
+
+[[package]]
 name = "gossip-scan-pipeline"
 version = "0.1.0"
 dependencies = [
@@ -754,8 +770,11 @@ dependencies = [
  "gossip-contracts",
  "gossip-coordination",
  "gossip-engine",
+ "gossip-scan-driver",
  "gossip-scan-pipeline",
  "rstest",
+ "scanner-engine",
+ "scanner-scheduler",
  "tempfile",
 ]
 

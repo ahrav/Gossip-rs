@@ -343,6 +343,10 @@ pub struct ConnectorCapabilities {
 
 /// Runtime contract for connector enumeration/listing operations.
 ///
+/// Deprecated surface: new unified execution paths should use
+/// `gossip_scan_driver::ScanSourceFactory` and `gossip_scan_driver::ScanDriver`.
+/// This trait remains supported for existing Phase III connector callers.
+///
 /// This trait is intentionally separate from [`ReadConnector`]: some backends
 /// can list metadata efficiently but have different cost/failure behavior for
 /// content reads. Keeping the surfaces split lets orchestration compose them
@@ -408,6 +412,10 @@ pub trait EnumerationConnector: Send {
 }
 
 /// Runtime contract for connector item reads.
+///
+/// Deprecated surface: new unified execution paths should use
+/// `gossip_scan_driver::ScanSourceFactory` and `gossip_scan_driver::ScanDriver`.
+/// This trait remains supported for existing Phase III connector callers.
 ///
 /// This surface is split from [`EnumerationConnector`] so orchestration can
 /// reason separately about metadata traversal and payload IO costs.

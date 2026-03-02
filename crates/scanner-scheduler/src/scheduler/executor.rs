@@ -270,6 +270,16 @@ impl<T: Send + 'static> ExecutorHandle<T> {
     pub fn is_accepting(&self) -> bool {
         is_accepting(self.shared.state.load(Ordering::Acquire))
     }
+
+    /// Cooperatively stop workers and reject future external spawns.
+    ///
+    /// This is an abandonment signal (for example on lease loss), not a
+    /// graceful drain request. In-flight tasks may be dropped.
+    #[inline]
+    pub fn shutdown(&self) {
+        close_gate(&self.shared.state);
+        self.shared.initiate_done();
+    }
 }
 
 // ============================================================================
@@ -868,6 +878,13 @@ impl<T: Send + 'static> Executor<T> {
         self.handle().spawn_batch(tasks)
     }
 
+    /// Cooperatively stop workers and reject future external spawns.
+    ///
+    /// This is equivalent to `self.handle().shutdown()`.
+    pub fn shutdown(&self) {
+        self.handle().shutdown();
+    }
+
     /// Stop accepting external spawns and wait for all work to complete.
     ///
     /// Returns aggregated metrics from all workers.
@@ -1168,6 +1185,17 @@ mod tests {
     #[test]
     fn join_without_tasks_returns_immediately() {
         let ex = Executor::<()>::new(test_config(2), |_wid| (), |_t, _ctx| {});
+        let metrics = ex.join();
+        assert_eq!(metrics.tasks_executed, 0);
+    }
+
+    #[test]
+    fn shutdown_rejects_future_spawns() {
+        let ex = Executor::<u32>::new(test_config(2), |_wid| (), |_task, _ctx| {});
+        let handle = ex.handle();
+        handle.shutdown();
+
+        assert!(handle.spawn(1).is_err());
         let metrics = ex.join();
         assert_eq!(metrics.tasks_executed, 0);
     }

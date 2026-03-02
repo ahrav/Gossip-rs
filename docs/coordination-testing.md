@@ -12,6 +12,12 @@ tests validate backend execution semantics using those shared planner surfaces.
 For protocol details see [boundary-2-coordination.md](boundary-2-coordination.md).
 For simulation architecture see [simulation-harness.md](simulation-harness.md).
 
+Step `gossip-rs-8r9.25` introduces a new unified execution seam in
+`crates/gossip-scan-driver/` (`Assignment -> ScanSourceFactory -> ScanDriver`).
+Coordination tests continue to validate protocol invariants independently of
+scan execution internals, while runtime integration tests should now exercise
+that assignment-to-driver boundary.
+
 ## Allocation Policy Scope (Tiered)
 
 Coordination follows a HOT/WARM/COLD allocation policy:

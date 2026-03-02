@@ -4,6 +4,12 @@ Deterministic simulation infrastructure for the coordination subsystem,
 inspired by FoundationDB's simulation framework, TigerBeetle's VOPR, and
 sled's simulation harness.
 
+Execution integration note: the runtime now has a dedicated scan-driver seam
+(`crates/gossip-scan-driver`) for translating shard assignments into
+source-specific execution backends. The simulation harness remains focused on
+coordination correctness and intentionally does not depend on scanner-engine
+or scheduler internals.
+
 ## Architecture
 
 The simulation is built in five layers, each composing the one below it:

@@ -974,7 +974,7 @@ mod prop {
             // Filter to range [start, end).
             let expected_keys: Vec<Vec<u8>> = expected_keys
                 .into_iter()
-                .filter(|k| k.as_slice() >= b"\x01" && k.as_slice() < b"\x80")
+                .filter(|k| k.as_slice() >= &b"\x01"[..] && k.as_slice() < &b"\x80"[..])
                 .collect();
 
             let mut c = InMemoryDeterministicConnector::new(TAG, items);
