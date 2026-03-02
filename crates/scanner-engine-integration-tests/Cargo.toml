@@ -1,0 +1,14 @@
+[package]
+name = "scanner-engine-integration-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Workspace integration tests for scanner-engine"
+
+[dev-dependencies]
+base64 = "0.22"
+regex = "1.12"
+scanner-engine = { workspace = true, features = ["test-support"] }
+tempfile = "3.10"
