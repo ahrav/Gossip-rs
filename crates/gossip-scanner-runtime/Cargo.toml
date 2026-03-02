@@ -9,10 +9,13 @@ description = "Runtime orchestration APIs for scanner-rs direct and connector ex
 
 [dependencies]
 gossip-contracts.workspace = true
+gossip-scan-driver.workspace = true
 gossip-engine.workspace = true
 gossip-connectors.workspace = true
 gossip-coordination.workspace = true
 gossip-scan-pipeline.workspace = true
+scanner-engine.workspace = true
+scanner-scheduler.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

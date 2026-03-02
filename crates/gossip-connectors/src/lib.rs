@@ -17,9 +17,13 @@ mod common;
 pub mod filesystem;
 pub mod git;
 pub mod in_memory;
+mod scan_driver;
 
 pub use common::path_buf_from_bytes;
 #[cfg(unix)]
 pub use filesystem::{FILESYSTEM_CONNECTOR_TAG, FilesystemConnector};
 pub use git::{GIT_CONNECTOR_TAG, GitConnector};
 pub use in_memory::{InMemoryDeterministicConnector, MemItem};
+pub use scan_driver::{
+    FilesystemScanSourceFactory, GitScanSourceFactory, InMemoryScanSourceFactory,
+};

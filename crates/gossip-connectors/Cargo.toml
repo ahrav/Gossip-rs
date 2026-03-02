@@ -8,8 +8,14 @@ publish = false
 description = "Source connectors: filesystem, git, SaaS integrations"
 
 [dependencies]
+anyhow.workspace = true
 gossip-contracts.workspace = true
+gossip-scan-driver.workspace = true
 gossip-stdx.workspace = true
+scanner-engine.workspace = true
+scanner-git.workspace = true
+scanner-scheduler.workspace = true
+crossbeam-channel = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
