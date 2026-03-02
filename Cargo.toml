@@ -4,6 +4,8 @@ members = [
     "crates/gossip-stdx",
     "crates/gossip-contracts",
     "crates/gossip-engine",
+    "crates/scanner-engine",
+    "crates/scanner-engine-integration-tests",
     "crates/gossip-scanner-runtime",
     "crates/gossip-scan-pipeline",
     "crates/gossip-connectors",
@@ -30,6 +32,7 @@ repository = "https://github.com/ahrav/gossip-rs"
 gossip-stdx = { path = "crates/gossip-stdx" }
 gossip-contracts = { path = "crates/gossip-contracts" }
 gossip-engine = { path = "crates/gossip-engine" }
+scanner-engine = { path = "crates/scanner-engine" }
 gossip-scanner-runtime = { path = "crates/gossip-scanner-runtime" }
 gossip-scan-pipeline = { path = "crates/gossip-scan-pipeline" }
 gossip-connectors = { path = "crates/gossip-connectors" }

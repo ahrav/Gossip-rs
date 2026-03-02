@@ -1,0 +1,4664 @@
+# ==========================================================================
+# Default detection rules for scanner-rs.
+#
+# Each entry defines a secret-detection rule compiled into the scan engine.
+# See docs/detection-rules.md for the full schema reference and authoring
+# guidelines, and src/rules/yaml.rs for the parser.
+#
+# Required fields:
+#   name      — Unique rule identifier (e.g. "github-pat").
+#   regex     — Pattern compiled into a regex::bytes::Regex.
+#   anchors   — Literal byte strings for Vectorscan pre-filter.
+#   radius    — Byte radius around an anchor match fed to the regex.
+#
+# Optional fields:
+#   must_contain           — Literal that must appear in the scan window.
+#   keywords_any           — At least one keyword must appear near the match.
+#   value_suppressors_any  — Substrings in extracted secret that suppress
+#                            the finding (e.g. "EXAMPLE", "PLACEHOLDER").
+#   entropy                — Shannon-entropy gate on extracted secret bytes.
+#     min_bits_per_byte    — Minimum bits of Shannon entropy per byte.
+#     min_entropy_bits_per_byte — Min-entropy (NIST SP 800-90B) floor;
+#                                  see "Min-entropy gate" section below.
+#     digit_penalty        — When true, subtract 1.2/log2(len) from Shannon
+#                             for all-digit entropy slices.
+#     min_len / max_len    — Length bounds for entropy measurement.
+#   two_phase              — Two-pass scan: seed_radius → confirm_any → full_radius.
+#   local_context          — Structural context checks (assignment, quoting, key names).
+#   offline_validation     — Offline structural check (checksum, format) on extracted
+#                            secret. See src/engine/offline_validate.rs for validators.
+#     type                 — Algorithm: crc32_base62, github_fine_grained_pat,
+#                            grafana_service_account, aws_access_key,
+#                            sentry_org_token, pypi_token, slack_token.
+#     prefix_skip          — (crc32_base62 only) Bytes to skip before payload.
+#     payload_len          — (crc32_base62 only) Payload length in base-62 digits.
+#     checksum_len         — (crc32_base62 only) Checksum length in base-62 digits.
+#   secret_group           — Capture group index when the secret is not the full match.
+#   uuid_format_secret     — When true, this rule captures UUID-format secrets;
+#                            the UUID quick-reject filter is bypassed so findings
+#                            with 8-4-4-4-12 hex values are kept.
+#
+# local_context sub-fields:
+#   lookbehind / lookahead           — Byte window before/after the match.
+#   require_same_line_assignment     — Secret must follow an assignment operator.
+#   require_quoted                   — Secret must appear inside quotes.
+#   key_names_any                    — At least one key name must appear nearby.
+#
+# Notes:
+# - Unknown fields are silently ignored by the parser.
+# - ValidatorKind is not expressible in YAML; it is set programmatically.
+# - Rules are tested by `cargo test` (yaml.rs round-trip + integration tests).
+#
+# --------------------------------------------------------------------------
+# Min-entropy gate (min_entropy_bits_per_byte)
+#
+# A second entropy check based on NIST SP 800-90B min-entropy [1]:
+#
+#     H_inf = log2(n) - log2(max_bin_count)
+#
+# Shannon entropy measures average information per byte; min-entropy
+# measures worst-case predictability by focusing on the single most
+# frequent byte value. By the Rényi entropy ordering theorem [2],
+# H_inf <= H_Shannon always holds, with equality only for perfectly
+# uniform distributions. This means min-entropy catches skewed byte
+# distributions (repeated substrings, character-frequency bias) that
+# pass Shannon checks — the gap grows with alphabet size, making this
+# gate especially effective for alphanumeric (k=36) tokens.
+#
+# Implementation cost: near-zero. max_bin_count is already computed in the
+# fused histogram pass (src/engine/helpers/entropy.rs). Adding this gate is
+# 1 table lookup + 1 subtraction + 1 comparison (~5 ns), evaluated
+# only for candidates that already pass Shannon (which rejects an
+# estimated 80-90% first).
+#
+# Threshold: 2.0 bits/byte
+#   Rejects strings where any single byte appears > n/4 times.
+#   For alphabets k >= 16 at token lengths n >= 32, the false-rejection
+#   probability for truly random tokens is negligible. At shorter lengths
+#   (n < 20) with small alphabets (k = 16), birthday collisions make
+#   the estimate unstable — such rules should not use this gate.
+#
+# Coverage tiers (97 rules with min-entropy gate):
+#
+#   Tier 0 (43 rules, original) — Hex-alphabet rules ([a-f0-9] patterns).
+#     Small alphabet (k=16) where single-character repetition is the
+#     dominant false-positive pattern.
+#
+#   Tier 1 (48 rules, added) — Keyword + alphanumeric, no checksum.
+#     Highest FP-risk category: match `keyword + [a-z0-9]{N}` with no
+#     prefix or checksum defense. Min-entropy provides a complementary
+#     statistical gate alongside Shannon and value suppressors.
+#
+#   Tier 2 (6 rules, added) — Prefix-structured alphanumeric, no checksum.
+#     Known prefix (e.g. "CLOJARS_", "lin_api_") but no checksum
+#     validator. Min-entropy adds a secondary defense layer.
+#
+# Rules excluded from min-entropy (and why):
+#   - Short hex (n<=17, k=16)   sidekiq-secret, sidekiq-sensitive-url.
+#                                At n=17, P(max_count >= 5) ~ 3.7% for
+#                                uniformly random tokens -- unacceptable FN.
+#   - entropy: null             Structural patterns, not random tokens.
+#   - offline_validation        Checksum already validates authenticity.
+#   - Numeric-only (k=10)       Alphabet too small; threshold 2.0 too
+#                                restrictive for base-10 tokens.
+#   - Intentional low-entropy   Tokens with fixed segments like
+#                                "AAAAAAAAAA" or "A{22}" by design.
+#   - Base64 / structured       Non-uniform byte distribution by design;
+#                                padding and encoding skew min-entropy.
+#   - High Shannon (>= 4.0)     Shannon already filters effectively.
+#   - Very short (< 20 chars)   Insufficient length for stable estimate.
+#
+# References:
+#   [1] NIST SP 800-90B §6.3, "Recommendation for the Entropy Sources
+#       Used for Random Bit Generation" (2018).
+#   [2] Rényi, A. "On Measures of Entropy and Information," Proc. 4th
+#       Berkeley Symposium on Math. Stat. and Prob. (1961), pp. 547-561.
+# --------------------------------------------------------------------------
+# ==========================================================================
+rules:
+- name: '1password-secret-key'
+  regex: \bA3-[A-Z0-9]{6}-(?:(?:[A-Z0-9]{11})|(?:[A-Z0-9]{6}-[A-Z0-9]{5}))-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}\b
+  anchors:
+  - a3-
+  - A3-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - a3-
+  - A3-
+  entropy:
+    min_bits_per_byte: 3.8
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: '1password-service-account-token'
+  regex: ops_eyJ[a-zA-Z0-9+/]{250,2048}={0,3}
+  anchors:
+  - ops_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ops_
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: adafruit-api-key
+  regex: (?i)[\w.-]{0,50}?(?:adafruit)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - adafruit
+  - ADAFRUIT
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - adafruit
+  - ADAFRUIT
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: adobe-client-id
+  regex: (?i)[\w.-]{0,50}?(?:adobe)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - adobe
+  - ADOBE
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - adobe
+  - ADOBE
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: adobe-client-secret
+  regex: \b(p8e-(?i)[a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - p8e-
+  - P8E-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - p8e-
+  - P8E-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: age-secret-key
+  regex: AGE-SECRET-KEY-1[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}
+  anchors:
+  - age-secret-key-1
+  - AGE-SECRET-KEY-1
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - age-secret-key-1
+  - AGE-SECRET-KEY-1
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: airtable-api-key
+  regex: (?i)[\w.-]{0,50}?(?:airtable)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{17})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - airtable
+  - AIRTABLE
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - airtable
+  - AIRTABLE
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: airtable-personnal-access-token
+  regex: \b(pat[[:alnum:]]{14}\.[a-f0-9]{64})\b
+  anchors:
+  - airtable
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - airtable
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: algolia-api-key
+  regex: (?i)[\w.-]{0,50}?(?:algolia)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - algolia
+  - ALGOLIA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - algolia
+  - ALGOLIA
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: alibaba-access-key-id
+  regex: \b(LTAI(?i)[a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - ltai
+  - LTAI
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ltai
+  - LTAI
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: alibaba-secret-key
+  regex: (?i)[\w.-]{0,50}?(?:alibaba)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{30})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - alibaba
+  - ALIBABA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - alibaba
+  - ALIBABA
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: anthropic-admin-api-key
+  regex: \b(sk-ant-admin01-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sk-ant-admin01
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sk-ant-admin01
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: anthropic-api-key
+  regex: \b(sk-ant-api03-[a-zA-Z0-9_\-]{93}AA)(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sk-ant-api03
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sk-ant-api03
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: artifactory-api-key
+  regex: \bAKCp[A-Za-z0-9]{69}\b
+  anchors:
+  - akcp
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - akcp
+  entropy:
+    min_bits_per_byte: 4.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: artifactory-reference-token
+  regex: \bcmVmd[A-Za-z0-9]{59}\b
+  anchors:
+  - cmvmd
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - cmvmd
+  entropy:
+    min_bits_per_byte: 4.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: asana-client-id
+  regex: (?i)[\w.-]{0,50}?(?:asana)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - asana
+  - ASANA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - asana
+  - ASANA
+  entropy:
+    min_bits_per_byte: 2.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: asana-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:asana)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - asana
+  - ASANA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - asana
+  - ASANA
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: atlassian-api-token
+  regex: (?i)[\w.-]{0,50}?(?:(?-i:ATLASSIAN|[Aa]tlassian)|(?-i:CONFLUENCE|[Cc]onfluence)|(?-i:JIRA|[Jj]ira))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20}[a-f0-9]{4})(?:[\x60'"\s;]|\\[nr]|$)|\b(ATATT3[A-Za-z0-9_\-=]{186})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - atlassian
+  - ATLASSIAN
+  - confluence
+  - CONFLUENCE
+  - jira
+  - JIRA
+  - atatt3
+  - ATATT3
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - atlassian
+  - ATLASSIAN
+  - confluence
+  - CONFLUENCE
+  - jira
+  - JIRA
+  - atatt3
+  - ATATT3
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "aaaaaa"
+  - "AAAAAA"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "your-"
+  - "YOUR-"
+  - "REPLACE_"
+  - "replace_"
+  - "INSERT_"
+  - "insert_"
+  - "fake_"
+  - "FAKE_"
+  - "_fake"
+  - "_FAKE"
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: authress-service-client-access-key
+  regex: \b((?:sc|ext|scauth|authress)_(?i)[a-z0-9]{5,30}\.[a-z0-9]{4,6}\.(?-i:acc)[_-][a-z0-9-]{10,32}\.[a-z0-9+/_=-]{30,120})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sc_
+  - SC_
+  - ext_
+  - EXT_
+  - scauth_
+  - SCAUTH_
+  - authress_
+  - AUTHRESS_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sc_
+  - SC_
+  - ext_
+  - EXT_
+  - scauth_
+  - SCAUTH_
+  - authress_
+  - AUTHRESS_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: aws-access-token
+  regex: \b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b
+  anchors:
+  - A3T
+  - AKIA
+  - ASIA
+  - ABIA
+  - ACCA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - A3T
+  - AKIA
+  - ASIA
+  - ABIA
+  - ACCA
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: aws_access_key
+  secret_group: null
+- name: aws-amazon-bedrock-api-key-long-lived
+  regex: \b(ABSK[A-Za-z0-9+/]{109,269}={0,2})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - absk
+  - ABSK
+  radius: 333
+  must_contain: null
+  keywords_any:
+  - absk
+  - ABSK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 269
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: aws-amazon-bedrock-api-key-short-lived
+  regex: bedrock-api-key-YmVkcm9jay5hbWF6b25hd3MuY29t
+  anchors:
+  - bedrock-api-key-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - bedrock-api-key-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: azure-ad-client-secret
+  regex: (?:^|[\\'"\x60\s>=:(,)])([a-zA-Z0-9_~.]{3}\dQ~[a-zA-Z0-9_~.-]{31,34})(?:$|[\\'"\x60\s<),])
+  anchors:
+  - '0Q~'
+  - '1Q~'
+  - '2Q~'
+  - '3Q~'
+  - '4Q~'
+  - '5Q~'
+  - '6Q~'
+  - '7Q~'
+  - '8Q~'
+  - '9Q~'
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - Q~
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: beamer-api-token
+  regex: (?i)[\w.-]{0,50}?(?:beamer)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(b_[a-z0-9=_\-]{44})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - beamer
+  - BEAMER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - beamer
+  - BEAMER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: bitbucket-client-id
+  regex: (?i)[\w.-]{0,50}?(?:bitbucket)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - bitbucket
+  - BITBUCKET
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - bitbucket
+  - BITBUCKET
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: bitbucket-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:bitbucket)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - bitbucket
+  - BITBUCKET
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - bitbucket
+  - BITBUCKET
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: bittrex-access-key
+  regex: (?i)[\w.-]{0,50}?(?:bittrex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - bittrex
+  - BITTREX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - bittrex
+  - BITTREX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: bittrex-secret-key
+  regex: (?i)[\w.-]{0,50}?(?:bittrex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - bittrex
+  - BITTREX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - bittrex
+  - BITTREX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: cisco-meraki-api-key
+  regex: '[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:(?-i:[Mm]eraki|MERAKI))(?:[ \t\w.-]{0,20})[\s''"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60''"\s=]{0,5}([0-9a-f]{40})(?:[\x60''"\s;]|\\[nr]|$)'
+  anchors:
+  - meraki
+  - MERAKI
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - meraki
+  - MERAKI
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: clickhouse-cloud-api-secret-key
+  regex: \b(4b1d[A-Za-z0-9]{38})\b
+  anchors:
+  - '4b1d'
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - '4b1d'
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: clojars-api-token
+  regex: (?i)CLOJARS_[a-z0-9]{60}
+  anchors:
+  - clojars_
+  - CLOJARS_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - clojars_
+  - CLOJARS_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: cloudflare-api-key
+  regex: (?i)[\w.-]{0,50}?(?:cloudflare)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - cloudflare
+  - CLOUDFLARE
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - cloudflare
+  - CLOUDFLARE
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: cloudflare-global-api-key
+  regex: (?i)[\w.-]{0,50}?(?:cloudflare)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{37})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - cloudflare
+  - CLOUDFLARE
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - cloudflare
+  - CLOUDFLARE
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: cloudflare-origin-ca-key
+  regex: \b(v1\.0-[a-f0-9]{24}-[a-f0-9]{146})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - cloudflare
+  - v1.0-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - cloudflare
+  - v1.0-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: codecov-access-token
+  regex: (?i)[\w.-]{0,50}?(?:codecov)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - codecov
+  - CODECOV
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - codecov
+  - CODECOV
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: cohere-api-token
+  regex: '[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:cohere|CO_API_KEY)(?:[ \t\w.-]{0,20})[\s''"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60''"\s=]{0,5}([a-zA-Z0-9]{40})(?:[\x60''"\s;]|\\[nr]|$)'
+  anchors:
+  - cohere
+  - co_api_key
+  - CO_API_KEY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - cohere
+  - co_api_key
+  - CO_API_KEY
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: coinbase-access-token
+  regex: (?i)[\w.-]{0,50}?(?:coinbase)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - coinbase
+  - COINBASE
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - coinbase
+  - COINBASE
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: confluent-access-token
+  regex: (?i)[\w.-]{0,50}?(?:confluent)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - confluent
+  - CONFLUENT
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - confluent
+  - CONFLUENT
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: confluent-secret-key
+  regex: (?i)[\w.-]{0,50}?(?:confluent)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - confluent
+  - CONFLUENT
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - confluent
+  - CONFLUENT
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: contentful-delivery-api-token
+  regex: (?i)[\w.-]{0,50}?(?:contentful)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{43})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - contentful
+  - CONTENTFUL
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - contentful
+  - CONTENTFUL
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: curl-auth-header
+  regex: \bcurl\b(?:.{0,2048}?|.{0,2048}?(?:[\r\n]{1,2}.{0,2048}?){1,5})[ \t\n\r](?:-H|--header)(?:=|[ \t]{0,5})(?:"(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))"|'(?i)(?:Authorization:[ \t]{0,5}(?:Basic[ \t]([a-z0-9+/]{8,}={0,3})|(?:Bearer|(?:Api-)?Token)[ \t]([\w=~@.+/-]{8,})|([\w=~@.+/-]{8,}))|(?:(?:X-(?:[a-z]+-)?)?(?:Api-?)?(?:Key|Token)):[ \t]{0,5}([\w=~@.+/-]{8,}))')(?:\B|\s|\z)
+  anchors:
+  - curl
+  - CURL
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - curl
+  - CURL
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "aaaaaa"
+  - "AAAAAA"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "your-"
+  - "YOUR-"
+  - "REPLACE_"
+  - "replace_"
+  - "INSERT_"
+  - "insert_"
+  - "fake_"
+  - "FAKE_"
+  - "_fake"
+  - "_FAKE"
+  - "<token>"
+  - "<TOKEN>"
+  - "<api_key>"
+  - "<API_KEY>"
+  - "<password>"
+  - "<PASSWORD>"
+  entropy:
+    min_bits_per_byte: 2.75
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: curl-auth-user
+  regex: \bcurl\b(?:.{0,2048}|.{0,2048}(?:[\r\n]{1,2}.{0,2048}){1,5})[ \t\n\r](?:-u|--user)(?:=|[ \t]{0,5})("(:[^"]{3,}|[^:"]{3,}:|[^:"]{3,}:[^"]{3,})"|'([^:']{3,}:[^']{3,})'|((?:"[^"]{3,}"|'[^']{3,}'|[\w$@.-]+):(?:"[^"]{3,}"|'[^']{3,}'|[\w${}@.-]+)))(?:\s|\z)
+  anchors:
+  - curl
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - curl
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "aaaaaa"
+  - "AAAAAA"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "your-"
+  - "YOUR-"
+  - "REPLACE_"
+  - "replace_"
+  - "INSERT_"
+  - "insert_"
+  - "fake_"
+  - "FAKE_"
+  - "_fake"
+  - "_FAKE"
+  - "user:password"
+  - "admin:admin"
+  - "user:pass"
+  - "username:password"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: databricks-api-token
+  regex: \b(dapi[a-f0-9]{32}(?:-\d)?)(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dapi
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dapi
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: datadog-access-token
+  regex: (?i)[\w.-]{0,50}?(?:datadog)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - datadog
+  - DATADOG
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - datadog
+  - DATADOG
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: defined-networking-api-token
+  regex: (?i)[\w.-]{0,50}?(?:dnkey)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(dnkey-[a-z0-9=_\-]{26}-[a-z0-9=_\-]{52})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dnkey
+  - DNKEY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dnkey
+  - DNKEY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: digitalocean-access-token
+  regex: \b(doo_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - doo_v1_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - doo_v1_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: digitalocean-pat
+  regex: \b(dop_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dop_v1_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dop_v1_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: digitalocean-refresh-token
+  regex: (?i)\b(dor_v1_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dor_v1_
+  - DOR_V1_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dor_v1_
+  - DOR_V1_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: discord-api-token
+  regex: (?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - discord
+  - DISCORD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - discord
+  - DISCORD
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: discord-client-id
+  regex: (?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{18})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - discord
+  - DISCORD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - discord
+  - DISCORD
+  entropy:
+    min_bits_per_byte: 2.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: discord-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:discord)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - discord
+  - DISCORD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - discord
+  - DISCORD
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: doppler-api-token
+  regex: dp\.pt\.(?i)[a-z0-9]{43}
+  anchors:
+  - dp.pt.
+  - DP.PT.
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dp.pt.
+  - DP.PT.
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: droneci-access-token
+  regex: (?i)[\w.-]{0,50}?(?:droneci)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - droneci
+  - DRONECI
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - droneci
+  - DRONECI
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: dropbox-api-token
+  regex: (?i)[\w.-]{0,50}?(?:dropbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{15})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dropbox
+  - DROPBOX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dropbox
+  - DROPBOX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 15
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: dropbox-long-lived-api-token
+  regex: (?i)[\w.-]{0,50}?(?:dropbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{11}(AAAAAAAAAA)[a-z0-9\-_=]{43})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dropbox
+  - DROPBOX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dropbox
+  - DROPBOX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: dropbox-short-lived-api-token
+  regex: (?i)[\w.-]{0,50}?(?:dropbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(sl\.[a-z0-9\-=_]{135})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - dropbox
+  - DROPBOX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dropbox
+  - DROPBOX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: duffel-api-token
+  regex: duffel_(?:test|live)_(?i)[a-z0-9_\-=]{43}
+  anchors:
+  - duffel_
+  - DUFFEL_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - duffel_
+  - DUFFEL_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: dynatrace-api-token
+  regex: dt0c01\.(?i)[a-z0-9]{24}\.[a-z0-9]{64}
+  anchors:
+  - dt0c01.
+  - DT0C01.
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - dt0c01.
+  - DT0C01.
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: easypost-api-token
+  regex: \bEZAK(?i)[a-z0-9]{54}\b
+  anchors:
+  - ezak
+  - EZAK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ezak
+  - EZAK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: easypost-test-api-token
+  regex: \bEZTK(?i)[a-z0-9]{54}\b
+  anchors:
+  - eztk
+  - EZTK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - eztk
+  - EZTK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: etsy-access-token
+  regex: (?i)[\w.-]{0,50}?(?:(?-i:ETSY|[Ee]tsy))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - etsy
+  - ETSY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - etsy
+  - ETSY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: facebook-access-token
+  regex: (?i)\b(\d{15,16}(\||%)[0-9a-z\-_]{27,40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - facebook
+  - FACEBOOK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - facebook
+  - FACEBOOK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: facebook-page-access-token
+  regex: \b(EAA[MC](?i)[a-z0-9]{100,})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - EAAM
+  - EAAC
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - EAAM
+  - EAAC
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: facebook-secret
+  regex: (?i)[\w.-]{0,50}?(?:facebook)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - facebook
+  - FACEBOOK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - facebook
+  - FACEBOOK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: fastly-api-token
+  regex: (?i)[\w.-]{0,50}?(?:fastly)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - fastly
+  - FASTLY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - fastly
+  - FASTLY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: finicity-api-token
+  regex: (?i)[\w.-]{0,50}?(?:finicity)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - finicity
+  - FINICITY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - finicity
+  - FINICITY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: finicity-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:finicity)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - finicity
+  - FINICITY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - finicity
+  - FINICITY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: finnhub-access-token
+  regex: (?i)[\w.-]{0,50}?(?:finnhub)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - finnhub
+  - FINNHUB
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - finnhub
+  - FINNHUB
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: flickr-access-token
+  regex: (?i)[\w.-]{0,50}?(?:flickr)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - flickr
+  - FLICKR
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - flickr
+  - FLICKR
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: flutterwave-encryption-key
+  regex: FLWSECK_TEST-(?i)[a-h0-9]{12}
+  anchors:
+  - flwseck_test
+  - FLWSECK_TEST
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - flwseck_test
+  - FLWSECK_TEST
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: flutterwave-public-key
+  regex: FLWPUBK_TEST-(?i)[a-h0-9]{32}-X
+  anchors:
+  - flwpubk_test
+  - FLWPUBK_TEST
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - flwpubk_test
+  - FLWPUBK_TEST
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: flutterwave-secret-key
+  regex: FLWSECK_TEST-(?i)[a-h0-9]{32}-X
+  anchors:
+  - flwseck_test
+  - FLWSECK_TEST
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - flwseck_test
+  - FLWSECK_TEST
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: flyio-access-token
+  regex: \b((?:fo1_[\w-]{43}|fm1[ar]_[a-zA-Z0-9+\/]{100,1024}={0,3}|fm2_[a-zA-Z0-9+\/]{100,1024}={0,3}))(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - fo1_
+  - fm1
+  - fm2_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - fo1_
+  - fm1
+  - fm2_
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: frameio-api-token
+  regex: fio-u-(?i)[a-z0-9\-_=]{64}
+  anchors:
+  - fio-u-
+  - FIO-U-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - fio-u-
+  - FIO-U-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: freemius-secret-key
+  regex: (?i)["']secret_key["']\s*=>\s*["'](sk_[\S]{29})["']
+  anchors:
+  - secret_key
+  - SECRET_KEY
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - secret_key
+  - SECRET_KEY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: freshbooks-access-token
+  regex: (?i)[\w.-]{0,50}?(?:freshbooks)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - freshbooks
+  - FRESHBOOKS
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - freshbooks
+  - FRESHBOOKS
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gcp-api-key
+  regex: \b(AIza[\w-]{35})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - aiza
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - aiza
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: generic-api-key
+  regex: (?i)[\w.-]{0,50}?(?:access|auth|(?-i:[Aa]pi|API)|credential|creds|key|passw(?:or)?d|secret|token)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([\w.=-]{10,150}|[a-z0-9][a-z0-9+/]{11,}={0,3})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - access
+  - ACCESS
+  - api
+  - API
+  - auth
+  - AUTH
+  - key
+  - KEY
+  - credential
+  - CREDENTIAL
+  - creds
+  - CREDS
+  - passwd
+  - PASSWD
+  - password
+  - PASSWORD
+  - secret
+  - SECRET
+  - token
+  - TOKEN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - access
+  - ACCESS
+  - api
+  - API
+  - auth
+  - AUTH
+  - key
+  - KEY
+  - credential
+  - CREDENTIAL
+  - creds
+  - CREDS
+  - passwd
+  - PASSWD
+  - password
+  - PASSWORD
+  - secret
+  - SECRET
+  - token
+  - TOKEN
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "aaaaaa"
+  - "AAAAAA"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "your-"
+  - "YOUR-"
+  - "REPLACE_"
+  - "replace_"
+  - "INSERT_"
+  - "insert_"
+  - "fake_"
+  - "FAKE_"
+  - "_fake"
+  - "_FAKE"
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+  # Stage 1 policy for this broad catch-all: emit only at confidence >= 5,
+  # requiring measured entropy alongside assignment-shape + keyword signals.
+  min_confidence: 5
+  two_phase: null
+  local_context:
+    lookbehind: 256
+    lookahead: 128
+    require_same_line_assignment: true
+    require_quoted: false
+    key_names_any:
+    - access
+    - ACCESS
+    - api
+    - API
+    - auth
+    - AUTH
+    - key
+    - KEY
+    - credential
+    - CREDENTIAL
+    - creds
+    - CREDS
+    - passwd
+    - PASSWD
+    - password
+    - PASSWORD
+    - secret
+    - SECRET
+    - token
+    - TOKEN
+  secret_group: null
+- name: github-app-token
+  regex: (?:ghu|ghs)_[0-9a-zA-Z]{36}
+  anchors:
+  - ghu_
+  - ghs_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ghu_
+  - ghs_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
+  secret_group: null
+- name: github-fine-grained-pat
+  regex: github_pat_\w{82}
+  anchors:
+  - github_pat_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - github_pat_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: github_fine_grained_pat
+  secret_group: null
+- name: github-oauth
+  regex: gho_[0-9a-zA-Z]{36}
+  anchors:
+  - gho_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - gho_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
+  secret_group: null
+- name: github-pat
+  regex: ghp_[0-9a-zA-Z]{36}
+  anchors:
+  - ghp_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ghp_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
+  secret_group: null
+- name: github-refresh-token
+  regex: ghr_[0-9a-zA-Z]{36}
+  anchors:
+  - ghr_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ghr_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
+  secret_group: null
+- name: gitlab-cicd-job-token
+  regex: glcbt-[0-9a-zA-Z]{1,5}_[0-9a-zA-Z_-]{20}
+  anchors:
+  - glcbt-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glcbt-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-deploy-token
+  regex: gldt-[0-9a-zA-Z_\-]{20}
+  anchors:
+  - gldt-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - gldt-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-feature-flag-client-token
+  regex: glffct-[0-9a-zA-Z_\-]{20}
+  anchors:
+  - glffct-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glffct-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-feed-token
+  regex: glft-[0-9a-zA-Z_\-]{20}
+  anchors:
+  - glft-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glft-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-incoming-mail-token
+  regex: glimt-[0-9a-zA-Z_\-]{25}
+  anchors:
+  - glimt-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glimt-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-kubernetes-agent-token
+  regex: glagent-[0-9a-zA-Z_\-]{50}
+  anchors:
+  - glagent-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glagent-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-oauth-app-secret
+  regex: gloas-[0-9a-zA-Z_\-]{64}
+  anchors:
+  - gloas-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - gloas-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-pat
+  regex: glpat-[\w-]{20}
+  anchors:
+  - glpat-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glpat-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-pat-routable
+  regex: \bglpat-[0-9a-zA-Z_-]{27,300}\.[0-9a-z]{2}[0-9a-z]{7}\b
+  anchors:
+  - glpat-
+  radius: 364
+  must_contain: null
+  keywords_any:
+  - glpat-
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 300
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-ptt
+  regex: glptt-[0-9a-f]{40}
+  anchors:
+  - glptt-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glptt-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-rrt
+  regex: GR1348941[\w-]{20}
+  anchors:
+  - gr1348941
+  - GR1348941
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - gr1348941
+  - GR1348941
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-runner-authentication-token
+  regex: glrt-[0-9a-zA-Z_\-]{20}
+  anchors:
+  - glrt-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glrt-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-runner-authentication-token-routable
+  regex: \bglrt-t\d_[0-9a-zA-Z_\-]{27,300}\.[0-9a-z]{2}[0-9a-z]{7}\b
+  anchors:
+  - glrt-
+  radius: 364
+  must_contain: null
+  keywords_any:
+  - glrt-
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 300
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-scim-token
+  regex: glsoat-[0-9a-zA-Z_\-]{20}
+  anchors:
+  - glsoat-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glsoat-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitlab-session-cookie
+  regex: _gitlab_session=[0-9a-z]{32}
+  anchors:
+  - _gitlab_session=
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - _gitlab_session=
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gitter-access-token
+  regex: (?i)[\w.-]{0,50}?(?:gitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - gitter
+  - GITTER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - gitter
+  - GITTER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: gocardless-api-token
+  regex: (?i)[\w.-]{0,50}?(?:gocardless)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(live_(?i)[a-z0-9\-_=]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - live_
+  - LIVE_
+  - gocardless
+  - GOCARDLESS
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - live_
+  - LIVE_
+  - gocardless
+  - GOCARDLESS
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: grafana-api-key
+  regex: (?i)\b(eyJrIjoi[A-Za-z0-9]{70,400}={0,3})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - eyjrijoi
+  - EYJRIJOI
+  radius: 464
+  must_contain: null
+  keywords_any:
+  - eyjrijoi
+  - EYJRIJOI
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 400
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: grafana-cloud-api-token
+  regex: (?i)\b(glc_[A-Za-z0-9+/]{32,400}={0,3})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - glc_
+  - GLC_
+  radius: 464
+  must_contain: null
+  keywords_any:
+  - glc_
+  - GLC_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 400
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: grafana-service-account-token
+  regex: (?i)\b(glsa_[A-Za-z0-9]{32}_[A-Fa-f0-9]{8})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - glsa_
+  - GLSA_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - glsa_
+  - GLSA_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: grafana_service_account
+  secret_group: null
+- name: harness-api-key
+  regex: (?:pat|sat)\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9]{24}\.[a-zA-Z0-9]{20}
+  anchors:
+  - pat.
+  - sat.
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pat.
+  - sat.
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: hashicorp-tf-api-token
+  regex: (?i)[a-z0-9]{14}\.(?-i:atlasv1)\.[a-z0-9\-_=]{60,70}
+  anchors:
+  - atlasv1
+  - ATLASV1
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - atlasv1
+  - ATLASV1
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: hashicorp-tf-password
+  regex: (?i)[\w.-]{0,50}?(?:administrator_login_password|password)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}("[a-z0-9=_\-]{8,20}")(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - administrator_login_password
+  - ADMINISTRATOR_LOGIN_PASSWORD
+  - password
+  - PASSWORD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - administrator_login_password
+  - ADMINISTRATOR_LOGIN_PASSWORD
+  - password
+  - PASSWORD
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "aaaaaa"
+  - "AAAAAA"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "Pa$$w0rd"
+  - "YOUR_"
+  - "your_"
+  - "your-"
+  - "YOUR-"
+  - "REPLACE_"
+  - "replace_"
+  - "INSERT_"
+  - "insert_"
+  - "fake_"
+  - "FAKE_"
+  - "_fake"
+  - "_FAKE"
+  - "admin123"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: heroku-api-key
+  regex: (?i)[\w.-]{0,50}?(?:heroku)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - heroku
+  - HEROKU
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - heroku
+  - HEROKU
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: heroku-api-key-v2
+  regex: \b((HRKU-AA[0-9a-zA-Z_-]{58}))(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - hrku-aa
+  - HRKU-AA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - hrku-aa
+  - HRKU-AA
+  # Prefix-structured token; skip placeholder suppressors for this strict format.
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: hubspot-api-key
+  regex: (?i)[\w.-]{0,50}?(?:hubspot)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - hubspot
+  - HUBSPOT
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - hubspot
+  - HUBSPOT
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: huggingface-access-token
+  regex: \b(hf_(?i:[a-z]{34}))(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - hf_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - hf_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: huggingface-organization-api-token
+  regex: \b(api_org_(?i:[a-z]{34}))(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - api_org_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - api_org_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: infracost-api-token
+  regex: \b(ico-[a-zA-Z0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - ico-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ico-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: intercom-api-key
+  regex: (?i)[\w.-]{0,50}?(?:intercom)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{60})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - intercom
+  - INTERCOM
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - intercom
+  - INTERCOM
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: intra42-client-secret
+  regex: \b(s-s4t2(?:ud|af)-(?i)[abcdef0123456789]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - intra
+  - INTRA
+  - s-s4t2ud-
+  - S-S4T2UD-
+  - s-s4t2af-
+  - S-S4T2AF-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - intra
+  - INTRA
+  - s-s4t2ud-
+  - S-S4T2UD-
+  - s-s4t2af-
+  - S-S4T2AF-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: jfrog-api-key
+  regex: (?i)[\w.-]{0,50}?(?:jfrog|artifactory|bintray|xray)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{73})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - jfrog
+  - JFROG
+  - artifactory
+  - ARTIFACTORY
+  - bintray
+  - BINTRAY
+  - xray
+  - XRAY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - jfrog
+  - JFROG
+  - artifactory
+  - ARTIFACTORY
+  - bintray
+  - BINTRAY
+  - xray
+  - XRAY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: jfrog-identity-token
+  regex: (?i)[\w.-]{0,50}?(?:jfrog|artifactory|bintray|xray)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - jfrog
+  - JFROG
+  - artifactory
+  - ARTIFACTORY
+  - bintray
+  - BINTRAY
+  - xray
+  - XRAY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - jfrog
+  - JFROG
+  - artifactory
+  - ARTIFACTORY
+  - bintray
+  - BINTRAY
+  - xray
+  - XRAY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: jwt
+  regex: \b(eyJ[a-zA-Z0-9]{16,}\.eyJ[a-zA-Z0-9\/\\_-]{16,}\.(?:[a-zA-Z0-9\/\\_-]{10,}={0,2})?)(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - eyJ
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - eyJ
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: jwt-base64
+  regex: \bZXlK(?:(?P<alg>aGJHY2lPaU)|(?P<apu>aGNIVWlPaU)|(?P<apv>aGNIWWlPaU)|(?P<aud>aGRXUWlPaU)|(?P<b64>aU5qUWlP)|(?P<crit>amNtbDBJanBi)|(?P<cty>amRIa2lPaU)|(?P<epk>bGNHc2lPbn)|(?P<enc>bGJtTWlPaU)|(?P<jku>cWEzVWlPaU)|(?P<jwk>cWQyc2lPb)|(?P<iss>cGMzTWlPaU)|(?P<iv>cGRpSTZJ)|(?P<kid>cmFXUWlP)|(?P<key_ops>clpYbGZiM0J6SWpwY)|(?P<kty>cmRIa2lPaUp)|(?P<nonce>dWIyNWpaU0k2)|(?P<p2c>d01tTWlP)|(?P<p2s>d01uTWlPaU)|(?P<ppt>d2NIUWlPaU)|(?P<sub>emRXSWlPaU)|(?P<svt>emRuUWlP)|(?P<tag>MFlXY2lPaU)|(?P<typ>MGVYQWlPaUp)|(?P<url>MWNtd2l)|(?P<use>MWMyVWlPaUp)|(?P<ver>MlpYSWlPaU)|(?P<version>MlpYSnphVzl1SWpv)|(?P<x>NElqb2)|(?P<x5c>NE5XTWlP)|(?P<x5t>NE5YUWlPaU)|(?P<x5ts256>NE5YUWpVekkxTmlJNkl)|(?P<x5u>NE5YVWlPaU)|(?P<zip>NmFYQWlPaU))[a-zA-Z0-9\/\\_+\-\r\n]{40,}={0,2}
+  anchors:
+  - zxlk
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - zxlk
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: kraken-access-token
+  regex: (?i)[\w.-]{0,50}?(?:kraken)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9\/=_\+\-]{80,90})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - kraken
+  - KRAKEN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - kraken
+  - KRAKEN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: kubernetes-secret-yaml
+  regex: (?i)(?:\bkind:[ \t]*["']?\bsecret\b["']?(?s:.){0,200}?\bdata:(?s:.){0,100}?\s+([\w.-]+:(?:[ \t]*(?:\||>[-+]?)\s+)?[ \t]*(?:["']?[a-z0-9+/]{10,}={0,3}["']?|\{\{[ \t\w"|$:=,.-]+}}|""|''))|\bdata:(?s:.){0,100}?\s+([\w.-]+:(?:[ \t]*(?:\||>[-+]?)\s+)?[ \t]*(?:["']?[a-z0-9+/]{10,}={0,3}["']?|\{\{[ \t\w"|$:=,.-]+}}|""|''))(?s:.){0,200}?\bkind:[ \t]*["']?\bsecret\b["']?)
+  anchors:
+  - secret
+  - SECRET
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - secret
+  - SECRET
+  entropy: null
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: kucoin-access-token
+  regex: (?i)[\w.-]{0,50}?(?:kucoin)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - kucoin
+  - KUCOIN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - kucoin
+  - KUCOIN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: kucoin-secret-key
+  regex: (?i)[\w.-]{0,50}?(?:kucoin)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - kucoin
+  - KUCOIN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - kucoin
+  - KUCOIN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: launchdarkly-access-token
+  regex: (?i)[\w.-]{0,50}?(?:launchdarkly)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - launchdarkly
+  - LAUNCHDARKLY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - launchdarkly
+  - LAUNCHDARKLY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: linear-api-key
+  regex: lin_api_(?i)[a-z0-9]{40}
+  anchors:
+  - lin_api_
+  - LIN_API_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - lin_api_
+  - LIN_API_
+  # Prefix-structured token; skip placeholder suppressors for this strict format.
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: linear-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:linear)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - linear
+  - LINEAR
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - linear
+  - LINEAR
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: linkedin-client-id
+  regex: (?i)[\w.-]{0,50}?(?:linked[_-]?in)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{14})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - linkedin
+  - LINKEDIN
+  - linked_in
+  - LINKED_IN
+  - linked-in
+  - LINKED-IN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - linkedin
+  - LINKEDIN
+  - linked_in
+  - LINKED_IN
+  - linked-in
+  - LINKED-IN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 14
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: linkedin-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:linked[_-]?in)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - linkedin
+  - LINKEDIN
+  - linked_in
+  - LINKED_IN
+  - linked-in
+  - LINKED-IN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - linkedin
+  - LINKEDIN
+  - linked_in
+  - LINKED_IN
+  - linked-in
+  - LINKED-IN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: lob-api-key
+  regex: (?i)[\w.-]{0,50}?(?:lob)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((live|test)_[a-f0-9]{35})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - test_
+  - TEST_
+  - live_
+  - LIVE_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - test_
+  - TEST_
+  - live_
+  - LIVE_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: lob-pub-api-key
+  regex: (?i)[\w.-]{0,50}?(?:lob)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((test|live)_pub_[a-f0-9]{31})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - test_pub
+  - TEST_PUB
+  - live_pub
+  - LIVE_PUB
+  - _pub
+  - _PUB
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - test_pub
+  - TEST_PUB
+  - live_pub
+  - LIVE_PUB
+  - _pub
+  - _PUB
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: looker-client-id
+  regex: (?i)[\w.-]{0,50}?(?:looker)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - looker
+  - LOOKER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - looker
+  - LOOKER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: looker-client-secret
+  regex: (?i)[\w.-]{0,50}?(?:looker)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - looker
+  - LOOKER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - looker
+  - LOOKER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: mailchimp-api-key
+  regex: (?i)[\w.-]{0,50}?(?:MailchimpSDK.initialize|mailchimp)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{32}-us\d\d)(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - mailchimp
+  - MAILCHIMP
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mailchimp
+  - MAILCHIMP
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: mailgun-private-api-token
+  regex: (?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(key-[a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - mailgun
+  - MAILGUN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mailgun
+  - MAILGUN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: mailgun-pub-key
+  regex: (?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(pubkey-[a-f0-9]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - mailgun
+  - MAILGUN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mailgun
+  - MAILGUN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: mailgun-signing-key
+  regex: (?i)[\w.-]{0,50}?(?:mailgun)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-h0-9]{32}-[a-h0-9]{8}-[a-h0-9]{8})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - mailgun
+  - MAILGUN
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mailgun
+  - MAILGUN
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: mapbox-api-token
+  regex: (?i)[\w.-]{0,50}?(?:mapbox)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(pk\.[a-z0-9]{60}\.[a-z0-9]{22})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - mapbox
+  - MAPBOX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mapbox
+  - MAPBOX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: mattermost-access-token
+  regex: (?i)[\w.-]{0,50}?(?:mattermost)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{26})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - mattermost
+  - MATTERMOST
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - mattermost
+  - MATTERMOST
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: maxmind-license-key
+  regex: \b([A-Za-z0-9]{6}_[A-Za-z0-9]{29}_mmk)(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - _mmk
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - _mmk
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: messagebird-api-token
+  regex: (?i)[\w.-]{0,50}?(?:message[_-]?bird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{25})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - messagebird
+  - MESSAGEBIRD
+  - message-bird
+  - MESSAGE-BIRD
+  - message_bird
+  - MESSAGE_BIRD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - messagebird
+  - MESSAGEBIRD
+  - message-bird
+  - MESSAGE-BIRD
+  - message_bird
+  - MESSAGE_BIRD
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: messagebird-client-id
+  regex: (?i)[\w.-]{0,50}?(?:message[_-]?bird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - messagebird
+  - MESSAGEBIRD
+  - message-bird
+  - MESSAGE-BIRD
+  - message_bird
+  - MESSAGE_BIRD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - messagebird
+  - MESSAGEBIRD
+  - message-bird
+  - MESSAGE-BIRD
+  - message_bird
+  - MESSAGE_BIRD
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: microsoft-teams-webhook
+  regex: https://[a-z0-9]+\.webhook\.office\.com/webhookb2/[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}@[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}/IncomingWebhook/[a-z0-9]{32}/[a-z0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}
+  anchors:
+  - webhook.office.com
+  - webhookb2
+  - incomingwebhook
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - webhook.office.com
+  - webhookb2
+  - incomingwebhook
+  entropy: null
+  two_phase: null
+  local_context: null
+  secret_group: 0
+- name: netlify-access-token
+  regex: (?i)[\w.-]{0,50}?(?:netlify)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{40,46})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - netlify
+  - NETLIFY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - netlify
+  - NETLIFY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: new-relic-browser-api-token
+  regex: (?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRJS-[a-f0-9]{19})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - nrjs-
+  - NRJS-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - nrjs-
+  - NRJS-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: new-relic-insert-key
+  regex: (?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRII-[a-z0-9-]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - nrii-
+  - NRII-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - nrii-
+  - NRII-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: new-relic-user-api-id
+  regex: (?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - new-relic
+  - NEW-RELIC
+  - newrelic
+  - NEWRELIC
+  - new_relic
+  - NEW_RELIC
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - new-relic
+  - NEW-RELIC
+  - newrelic
+  - NEWRELIC
+  - new_relic
+  - NEW_RELIC
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: new-relic-user-api-key
+  regex: (?i)[\w.-]{0,50}?(?:new-relic|newrelic|new_relic)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(NRAK-[a-z0-9]{27})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - nrak
+  - NRAK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - nrak
+  - NRAK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: notion-api-token
+  regex: \b(ntn_[0-9]{11}[A-Za-z0-9]{32}[A-Za-z0-9]{3})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - ntn_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - ntn_
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: npm-access-token
+  regex: (?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - npm_
+  - NPM_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - npm_
+  - NPM_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: crc32_base62
+    prefix_skip: 4
+    payload_len: 30
+    checksum_len: 6
+  secret_group: null
+- name: nuget-config-password
+  regex: (?i)<add key=\"(?:(?:ClearText)?Password)\"\s*value=\"(.{8,})\"\s*/>
+  anchors:
+  - <add key=
+  - <ADD KEY=
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - <add key=
+  - <ADD KEY=
+  entropy:
+    min_bits_per_byte: 1.0
+    min_len: 16
+    max_len: 512
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: nytimes-access-token
+  regex: (?i)[\w.-]{0,50}?(?:nytimes|new-york-times,|newyorktimes)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9=_\-]{32})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - nytimes
+  - NYTIMES
+  - new-york-times
+  - NEW-YORK-TIMES
+  - newyorktimes
+  - NEWYORKTIMES
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - nytimes
+  - NYTIMES
+  - new-york-times
+  - NEW-YORK-TIMES
+  - newyorktimes
+  - NEWYORKTIMES
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: octopus-deploy-api-key
+  regex: \b(API-[A-Z0-9]{26})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - api-
+  - API-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - api-
+  - API-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: okta-access-token
+  regex: '[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:(?-i:[Oo]kta|OKTA))(?:[ \t\w.-]{0,20})[\s''"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60''"\s=]{0,5}(00[\w=\-]{40})(?:[\x60''"\s;]|\\[nr]|$)'
+  anchors:
+  - okta
+  - OKTA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - okta
+  - OKTA
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: openai-api-key
+  regex: \b(sk-(?:proj|svcacct|admin)-(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})T3BlbkFJ(?:[A-Za-z0-9_-]{74}|[A-Za-z0-9_-]{58})\b|sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - t3blbkfj
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - t3blbkfj
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: openshift-user-token
+  regex: \b(sha256~[\w-]{43})(?:[^\w-]|\z)
+  anchors:
+  - sha256~
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sha256~
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: perplexity-api-key
+  regex: \b(pplx-[a-zA-Z0-9]{48})(?:[\x60'"\s;]|\\[nr]|$|\b)
+  anchors:
+  - pplx-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pplx-
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: pkcs12-file
+  regex: (?i)(?:^|\/)[^\/]+\.p(?:12|fx)$
+  anchors:
+  - '.p12'
+  - '.P12'
+  - '.pfx'
+  - '.PFX'
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - '.p12'
+  - '.P12'
+  - '.pfx'
+  - '.PFX'
+  entropy: null
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: plaid-api-token
+  regex: (?i)[\w.-]{0,50}?(?:plaid)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(access-(?:sandbox|development|production)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - plaid
+  - PLAID
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - plaid
+  - PLAID
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: plaid-client-id
+  regex: (?i)[\w.-]{0,50}?(?:plaid)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - plaid
+  - PLAID
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - plaid
+  - PLAID
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: plaid-secret-key
+  regex: (?i)[\w.-]{0,50}?(?:plaid)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{30})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - plaid
+  - PLAID
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - plaid
+  - PLAID
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: planetscale-api-token
+  regex: \b(pscale_tkn_(?i)[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - pscale_tkn_
+  - PSCALE_TKN_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pscale_tkn_
+  - PSCALE_TKN_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: planetscale-oauth-token
+  regex: \b(pscale_oauth_[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - pscale_oauth_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pscale_oauth_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: planetscale-password
+  regex: (?i)\b(pscale_pw_(?i)[\w=\.-]{32,64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - pscale_pw_
+  - PSCALE_PW_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pscale_pw_
+  - PSCALE_PW_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: postman-api-token
+  regex: \b(PMAK-(?i)[a-f0-9]{24}\-[a-f0-9]{34})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - pmak-
+  - PMAK-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pmak-
+  - PMAK-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: prefect-api-token
+  regex: \b(pnu_[a-zA-Z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - pnu_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pnu_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: private-key
+  regex: '(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----'
+  anchors:
+  - '-----begin'
+  - '-----BEGIN'
+  radius: 0
+  must_contain: null
+  keywords_any:
+  - '-----begin'
+  - '-----BEGIN'
+  entropy: null
+  two_phase:
+    seed_radius: 256
+    full_radius: 16384
+    confirm_any:
+    - PRIVATE KEY
+  local_context: null
+  secret_group: null
+- name: privateai-api-token
+  regex: '[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:private[_-]?ai)(?:[ \t\w.-]{0,20})[\s''"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60''"\s=]{0,5}([a-z0-9]{32})(?:[\x60''"\s;]|\\[nr]|$)'
+  anchors:
+  - privateai
+  - private_ai
+  - private-ai
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - privateai
+  - private_ai
+  - private-ai
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: pulumi-api-token
+  regex: \b(pul-[a-f0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - pul-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - pul-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: pypi-upload-token
+  regex: pypi-AgEIcHlwaS5vcmc[\w-]{50,1000}
+  anchors:
+  - pypi-ageichlwas5vcmc
+  radius: 1064
+  must_contain: null
+  keywords_any:
+  - pypi-ageichlwas5vcmc
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 1000
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: pypi_token
+  secret_group: null
+- name: rapidapi-access-token
+  regex: (?i)[\w.-]{0,50}?(?:rapidapi)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9_-]{50})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - rapidapi
+  - RAPIDAPI
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - rapidapi
+  - RAPIDAPI
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: readme-api-token
+  regex: \b(rdme_[a-z0-9]{70})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - rdme_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - rdme_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: rubygems-api-token
+  regex: \b(rubygems_[a-f0-9]{48})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - rubygems_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - rubygems_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: scalingo-api-token
+  regex: \b(tk-us-[\w-]{48})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - tk-us-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - tk-us-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sendbird-access-id
+  regex: (?i)[\w.-]{0,50}?(?:sendbird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sendbird
+  - SENDBIRD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sendbird
+  - SENDBIRD
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: sendbird-access-token
+  regex: (?i)[\w.-]{0,50}?(?:sendbird)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sendbird
+  - SENDBIRD
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sendbird
+  - SENDBIRD
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sendgrid-api-token
+  regex: \b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - SG.
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - SG.
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sendinblue-api-token
+  regex: \b(xkeysib-[a-f0-9]{64}\-(?i)[a-z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - xkeysib-
+  - XKEYSIB-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - xkeysib-
+  - XKEYSIB-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sentry-access-token
+  regex: (?i)[\w.-]{0,50}?(?:sentry)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sentry
+  - SENTRY
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sentry
+  - SENTRY
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+    digit_penalty: true
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sentry-org-token
+  regex: \bsntrys_eyJpYXQiO[a-zA-Z0-9+/]{10,200}(?:LCJyZWdpb25fdXJs|InJlZ2lvbl91cmwi|cmVnaW9uX3VybCI6)[a-zA-Z0-9+/]{10,200}={0,2}_[a-zA-Z0-9+/]{43}(?:[^a-zA-Z0-9+/]|\z)
+  anchors:
+  - sntrys_eyjpyxqio
+  radius: 264
+  must_contain: null
+  keywords_any:
+  - sntrys_eyjpyxqio
+  entropy:
+    min_bits_per_byte: 4.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: sentry_org_token
+  secret_group: null
+- name: sentry-user-token
+  regex: \b(sntryu_[a-f0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sntryu_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sntryu_
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: settlemint-application-access-token
+  regex: \b(sm_aat_[a-zA-Z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sm_aat
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sm_aat
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: settlemint-personal-access-token
+  regex: \b(sm_pat_[a-zA-Z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sm_pat
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sm_pat
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: settlemint-service-access-token
+  regex: \b(sm_sat_[a-zA-Z0-9]{16})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sm_sat
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sm_sat
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: shippo-api-token
+  regex: \b(shippo_(?:live|test)_[a-fA-F0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - shippo_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - shippo_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: shopify-access-token
+  regex: shpat_[a-fA-F0-9]{32}
+  anchors:
+  - shpat_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - shpat_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: shopify-custom-access-token
+  regex: shpca_[a-fA-F0-9]{32}
+  anchors:
+  - shpca_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - shpca_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: shopify-private-app-access-token
+  regex: shppa_[a-fA-F0-9]{32}
+  anchors:
+  - shppa_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - shppa_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: shopify-shared-secret
+  regex: shpss_[a-fA-F0-9]{32}
+  anchors:
+  - shpss_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - shpss_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sidekiq-secret
+  regex: (?i)[\w.-]{0,50}?(?:BUNDLE_ENTERPRISE__CONTRIBSYS__COM|BUNDLE_GEMS__CONTRIBSYS__COM)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-f0-9]{8}:[a-f0-9]{8})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - bundle_enterprise__contribsys__com
+  - BUNDLE_ENTERPRISE__CONTRIBSYS__COM
+  - bundle_gems__contribsys__com
+  - BUNDLE_GEMS__CONTRIBSYS__COM
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - bundle_enterprise__contribsys__com
+  - BUNDLE_ENTERPRISE__CONTRIBSYS__COM
+  - bundle_gems__contribsys__com
+  - BUNDLE_GEMS__CONTRIBSYS__COM
+  entropy:
+    min_bits_per_byte: 2.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sidekiq-sensitive-url
+  regex: (?i)\bhttps?://([a-f0-9]{8}:[a-f0-9]{8})@(?:gems.contribsys.com|enterprise.contribsys.com)(?:[\/|\#|\?|:]|$)
+  anchors:
+  - gems.contribsys.com
+  - GEMS.CONTRIBSYS.COM
+  - enterprise.contribsys.com
+  - ENTERPRISE.CONTRIBSYS.COM
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - gems.contribsys.com
+  - GEMS.CONTRIBSYS.COM
+  - enterprise.contribsys.com
+  - ENTERPRISE.CONTRIBSYS.COM
+  entropy:
+    min_bits_per_byte: 2.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: slack-app-token
+  regex: (?i)xapp-\d-[A-Z0-9]+-\d+-[a-z0-9]+
+  anchors:
+  - xapp
+  - XAPP
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - xapp
+  - XAPP
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 512
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-bot-token
+  regex: xoxb-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*
+  anchors:
+  - xoxb
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - xoxb
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-config-access-token
+  regex: (?i)xoxe.xox[bp]-\d-[A-Z0-9]{163,166}
+  anchors:
+  - xoxe.xoxb-
+  - XOXE.XOXB-
+  - xoxe.xoxp-
+  - XOXE.XOXP-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - xoxe.xoxb-
+  - XOXE.XOXB-
+  - xoxe.xoxp-
+  - XOXE.XOXP-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-config-refresh-token
+  regex: (?i)xoxe-\d-[A-Z0-9]{146}
+  anchors:
+  - xoxe-
+  - XOXE-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - xoxe-
+  - XOXE-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-legacy-bot-token
+  regex: xoxb-[0-9]{8,14}-[a-zA-Z0-9]{18,26}
+  anchors:
+  - xoxb
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - xoxb
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-legacy-token
+  regex: xox[os]-\d+-\d+-\d+-[a-fA-F\d]+
+  anchors:
+  - xoxo
+  - xoxs
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - xoxo
+  - xoxs
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 512
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-legacy-workspace-token
+  regex: xox[ar]-(?:\d-)?[0-9a-zA-Z]{8,48}
+  anchors:
+  - xoxa
+  - xoxr
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - xoxa
+  - xoxr
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-user-token
+  regex: xox[pe](?:-[0-9]{10,13}){3}-[a-zA-Z0-9-]{28,34}
+  anchors:
+  - xoxp-
+  - xoxe-
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - xoxp-
+  - xoxe-
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  offline_validation:
+    type: slack_token
+  secret_group: null
+- name: slack-webhook-url
+  regex: (?:https?://)?hooks.slack.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}
+  anchors:
+  - hooks.slack.com
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - hooks.slack.com
+  entropy: null
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: snyk-api-token
+  regex: (?i)[\w.-]{0,50}?(?:snyk[_.-]?(?:(?:api|oauth)[_.-]?)?(?:key|token))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - snyk
+  - SNYK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - snyk
+  - SNYK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: sonar-api-token
+  regex: (?i)[\w.-]{0,50}?(?:sonar[_.-]?(login|token))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}((?:squ_|sqp_|sqa_)?[a-z0-9=_\-]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sonar
+  - SONAR
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sonar
+  - SONAR
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # prefix-structured alphanum
+  two_phase: null
+  local_context: null
+  secret_group: 2
+- name: sourcegraph-access-token
+  regex: (?i)\b(sgp_(?:[a-fA-F0-9]{16}|local)_[a-fA-F0-9]{40}|sgp_[a-fA-F0-9]{40})\b(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sgp_
+  - SGP_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sgp_
+  - SGP_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: square-access-token
+  regex: \b((?:EAAA|sq0atp-)[\w-]{22,60})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sq0atp-
+  - eaaa
+  - EAAA
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sq0atp-
+  - eaaa
+  - EAAA
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: squarespace-access-token
+  regex: (?i)[\w.-]{0,50}?(?:squarespace)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - squarespace
+  - SQUARESPACE
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - squarespace
+  - SQUARESPACE
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+  uuid_format_secret: true
+- name: stripe-access-token
+  regex: \b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sk_test
+  - sk_live
+  - sk_prod
+  - rk_test
+  - rk_live
+  - rk_prod
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sk_test
+  - sk_live
+  - sk_prod
+  - rk_test
+  - rk_live
+  - rk_prod
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sumologic-access-id
+  regex: '[\w.-]{0,50}?(?i:[\w.-]{0,50}?(?:(?-i:[Ss]umo|SUMO))(?:[ \t\w.-]{0,20})[\s''"]{0,3})(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60''"\s=]{0,5}(su[a-zA-Z0-9]{12})(?:[\x60''"\s;]|\\[nr]|$)'
+  anchors:
+  - sumo
+  - SUMO
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sumo
+  - SUMO
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 14
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: sumologic-access-token
+  regex: (?i)[\w.-]{0,50}?(?:(?-i:[Ss]umo|SUMO))(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{64})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - sumo
+  - SUMO
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - sumo
+  - SUMO
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: telegram-bot-api-token
+  regex: (?i)[\w.-]{0,50}?(?:telegr)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{5,16}:(?-i:A)[a-z0-9_\-]{34})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - telegr
+  - TELEGR
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - telegr
+  - TELEGR
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: travisci-access-token
+  regex: (?i)[\w.-]{0,50}?(?:travis)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{22})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - travis
+  - TRAVIS
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - travis
+  - TRAVIS
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twilio-api-key
+  regex: SK[0-9a-fA-F]{32}
+  anchors:
+  - SK0
+  - SK1
+  - SK2
+  - SK3
+  - SK4
+  - SK5
+  - SK6
+  - SK7
+  - SK8
+  - SK9
+  - SKa
+  - SKb
+  - SKc
+  - SKd
+  - SKe
+  - SKf
+  - SKA
+  - SKB
+  - SKC
+  - SKD
+  - SKE
+  - SKF
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - SK
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twitch-api-token
+  regex: (?i)[\w.-]{0,50}?(?:twitch)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{30})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - twitch
+  - TWITCH
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - twitch
+  - TWITCH
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twitter-access-secret
+  regex: (?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{45})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - twitter
+  - TWITTER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - twitter
+  - TWITTER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twitter-access-token
+  regex: (?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([0-9]{15,25}-[a-zA-Z0-9]{20,40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - twitter
+  - TWITTER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - twitter
+  - TWITTER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twitter-api-key
+  regex: (?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{25})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - twitter
+  - TWITTER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - twitter
+  - TWITTER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twitter-api-secret
+  regex: (?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{50})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - twitter
+  - TWITTER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - twitter
+  - TWITTER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: twitter-bearer-token
+  regex: (?i)[\w.-]{0,50}?(?:twitter)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(A{22}[a-zA-Z0-9%]{80,100})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - twitter
+  - TWITTER
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - twitter
+  - TWITTER
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: typeform-api-token
+  regex: (?i)[\w.-]{0,50}?(?:typeform)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(tfp_[a-z0-9\-_\.=]{59})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - tfp_
+  - TFP_
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - tfp_
+  - TFP_
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: vault-batch-token
+  regex: \b(hvb\.[\w-]{138,300})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - hvb.
+  radius: 364
+  must_contain: null
+  keywords_any:
+  - hvb.
+  entropy:
+    min_bits_per_byte: 4.0
+    min_len: 16
+    max_len: 300
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: vault-service-token
+  regex: \b(hvs\.[\w-]{90,120})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - hvs.
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - hvs.
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: vault-service-token-legacy
+  regex: \b(s\.[a-zA-Z0-9]{24})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - vault
+  - VAULT
+  - Vault
+  radius: 512
+  must_contain: null
+  keywords_any:
+  - vault
+  - VAULT
+  - Vault
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+  two_phase:
+    seed_radius: 128
+    full_radius: 512
+    confirm_any:
+    - s.
+  local_context: null
+  secret_group: null
+- name: yandex-access-token
+  regex: (?i)[\w.-]{0,50}?(?:yandex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(t1\.[A-Z0-9a-z_-]+[=]{0,2}\.[A-Z0-9a-z_-]{86}[=]{0,2})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - yandex
+  - YANDEX
+  radius: 2048
+  must_contain: null
+  keywords_any:
+  - yandex
+  - YANDEX
+  entropy:
+    min_bits_per_byte: 3.5
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: yandex-api-key
+  regex: (?i)[\w.-]{0,50}?(?:yandex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(AQVN[A-Za-z0-9_\-]{35,38})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - yandex
+  - YANDEX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - yandex
+  - YANDEX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: yandex-aws-access-token
+  regex: (?i)[\w.-]{0,50}?(?:yandex)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}(YC[a-zA-Z0-9_\-]{38})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - yandex
+  - YANDEX
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - yandex
+  - YANDEX
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+  two_phase: null
+  local_context: null
+  secret_group: null
+- name: zendesk-secret-key
+  regex: (?i)[\w.-]{0,50}?(?:zendesk)(?:[ \t\w.-]{0,20})[\s'"]{0,3}(?:=|>|:{1,3}=|\|\||:|=>|\?=|,)[\x60'"\s=]{0,5}([a-z0-9]{40})(?:[\x60'"\s;]|\\[nr]|$)
+  anchors:
+  - zendesk
+  - ZENDESK
+  radius: 256
+  must_contain: null
+  keywords_any:
+  - zendesk
+  - ZENDESK
+  value_suppressors_any:
+  - "example"
+  - "EXAMPLE"
+  - "sample"
+  - "SAMPLE"
+  - "placeholder"
+  - "PLACEHOLDER"
+  - "changeme"
+  - "CHANGE_ME"
+  - "change_me"
+  - "xxxxxx"
+  - "XXXXXX"
+  - "000000"
+  - "abcdef"
+  - "123456"
+  - "dummy"
+  - "DUMMY"
+  - "redacted"
+  - "REDACTED"
+  - "YOUR_"
+  - "your_"
+  - "INSERT_"
+  - "insert_"
+  - "REPLACE_"
+  - "replace_"
+  - "fake_"
+  - "FAKE_"
+  - "test_"
+  - "TEST_"
+  entropy:
+    min_bits_per_byte: 3.0
+    min_len: 16
+    max_len: 256
+    min_entropy_bits_per_byte: 2.0  # keyword+alphanum, no checksum
+  two_phase: null
+  local_context: null
+  secret_group: null
