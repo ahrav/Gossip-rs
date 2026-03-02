@@ -1,14 +1,11 @@
 //! Unified scanner runtime entrypoints backed by `ScanDriver`.
 //!
-//! This crate keeps CLI/runtime-friendly config structs (`FsScanConfig`,
-//! `GitScanConfig`) while routing both execution modes through a single
-//! assignment-to-driver path:
+//! Both CLI and distributed execution paths route through the same
+//! assignment-to-driver seam:
 //!
 //! ```text
 //! config -> Assignment -> ScanSourceFactory -> ScanDriver::run
 //! ```
-//!
-//! The previous page-loop integration seam is intentionally removed.
 
 use std::fmt;
 use std::fs;
@@ -23,11 +20,17 @@ use gossip_contracts::{
     identity::PolicyHash,
 };
 use gossip_scan_driver::{
-    Assignment, AssignmentSource, CancellationToken, ConnectorKind, NoOpCommitSink,
-    ScanExecutionConfig, ScanReport, ScanSourceFactory,
+    Assignment, AssignmentSource, CancellationToken, CommitSink, ConnectorKind, CursorUpdate,
+    NoOpCommitSink, ScanExecutionConfig, ScanReport, ScanSourceFactory,
 };
 use regex::bytes::Regex;
-use scanner_scheduler::events::NullEventOutput;
+use scanner_scheduler::events::{EventOutput, NullEventOutput};
+
+pub mod cli;
+pub mod commit_sink;
+pub mod coordination_sink;
+pub mod distributed;
+pub mod event_sink;
 
 /// How the runtime acquires source items.
 ///
@@ -177,6 +180,7 @@ pub enum ScanRuntimeError {
         path: PathBuf,
         message: String,
     },
+    UnsupportedConnectorKind(ConnectorKind),
     GitCommandFailed {
         repo: PathBuf,
         status_code: Option<i32>,
@@ -200,6 +204,9 @@ impl fmt::Display for ScanRuntimeError {
                 message,
             } => {
                 write!(f, "{source} path '{}' invalid: {message}", path.display())
+            }
+            Self::UnsupportedConnectorKind(kind) => {
+                write!(f, "connector kind '{kind:?}' is not supported by runtime")
             }
             Self::GitCommandFailed {
                 repo,
@@ -237,6 +244,13 @@ impl From<ConnectorInputError> for ScanRuntimeError {
     }
 }
 
+/// Execution outcome for one assignment run.
+#[derive(Clone, Debug)]
+pub struct AssignmentOutcome {
+    pub report: ScanReport,
+    pub checkpoint_hint: Option<CursorUpdate>,
+}
+
 /// Top-level filesystem scan dispatcher.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
@@ -263,7 +277,12 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
             root: canonical_path,
         },
     );
-    run_assignment(&FilesystemScanSourceFactory, &assignment, config.budgets)
+
+    let out = NullEventOutput;
+    let commit = NoOpCommitSink;
+    let cancel = CancellationToken::new();
+    execute_assignment(&assignment, config.budgets, &out, &commit, &cancel)
+        .map(|outcome| outcome.report)
 }
 
 /// Connector-mode filesystem scan.
@@ -284,7 +303,12 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntime
             repo_root: canonical_repo,
         },
     );
-    run_assignment(&GitScanSourceFactory, &assignment, config.budgets)
+
+    let out = NullEventOutput;
+    let commit = NoOpCommitSink;
+    let cancel = CancellationToken::new();
+    execute_assignment(&assignment, config.budgets, &out, &commit, &cancel)
+        .map(|outcome| outcome.report)
 }
 
 /// Connector-mode git scan.
@@ -295,24 +319,78 @@ pub fn scan_git_connector(config: &GitScanConfig) -> Result<ScanReport, ScanRunt
     scan_git_direct(config)
 }
 
-fn run_assignment(
-    factory: &dyn ScanSourceFactory,
+pub(crate) fn scan_fs_with_runtime(
+    config: &FsScanConfig,
+    out: &dyn EventOutput,
+    commit: &dyn CommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    let canonical_path = validate_fs_path(&config.path)?;
+    let assignment = build_assignment(
+        ConnectorKind::Filesystem,
+        canonical_path.display().to_string(),
+        AssignmentSource::Filesystem {
+            root: canonical_path,
+        },
+    );
+    execute_assignment(&assignment, config.budgets, out, commit, cancel)
+}
+
+pub(crate) fn scan_git_with_runtime(
+    config: &GitScanConfig,
+    out: &dyn EventOutput,
+    commit: &dyn CommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    let canonical_repo = validate_git_repo_path(&config.repo)?;
+    let assignment = build_assignment(
+        ConnectorKind::Git,
+        canonical_repo.display().to_string(),
+        AssignmentSource::Git {
+            repo_root: canonical_repo,
+        },
+    );
+    execute_assignment(&assignment, config.budgets, out, commit, cancel)
+}
+
+pub(crate) fn execute_assignment(
     assignment: &Assignment,
     budgets: ScanBudgets,
-) -> Result<ScanReport, ScanRuntimeError> {
-    let mut driver = factory
-        .driver_for_assignment(assignment)
-        .map_err(ScanRuntimeError::Driver)?;
+    out: &dyn EventOutput,
+    commit: &dyn CommitSink,
+    cancel: &CancellationToken,
+) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    let mut driver = driver_for_assignment(assignment)?;
     let cfg = budgets.to_execution_config()?;
-    let out = NullEventOutput;
-    let commit = NoOpCommitSink;
-    let cancel = CancellationToken::new();
-    driver
-        .run(runtime_engine(), &cfg, &out, &commit, &cancel)
+    let report = driver
+        .run(runtime_engine(), &cfg, out, commit, cancel)
+        .map_err(ScanRuntimeError::Driver)?;
+
+    Ok(AssignmentOutcome {
+        report,
+        checkpoint_hint: driver.checkpoint_hint(),
+    })
+}
+
+fn driver_for_assignment(
+    assignment: &Assignment,
+) -> Result<Box<dyn gossip_scan_driver::ScanDriver>, ScanRuntimeError> {
+    let factory: &dyn ScanSourceFactory = match assignment.connector_kind {
+        ConnectorKind::Filesystem => &FilesystemScanSourceFactory,
+        ConnectorKind::Git => &GitScanSourceFactory,
+        ConnectorKind::InMemory => {
+            return Err(ScanRuntimeError::UnsupportedConnectorKind(
+                assignment.connector_kind,
+            ));
+        }
+    };
+
+    factory
+        .driver_for_assignment(assignment)
         .map_err(ScanRuntimeError::Driver)
 }
 
-fn build_assignment(
+pub(crate) fn build_assignment(
     connector_kind: ConnectorKind,
     connector_instance_id: String,
     source: AssignmentSource,
@@ -328,7 +406,7 @@ fn build_assignment(
     }
 }
 
-fn runtime_engine() -> Arc<scanner_engine::Engine> {
+pub(crate) fn runtime_engine() -> Arc<scanner_engine::Engine> {
     static ENGINE: OnceLock<Arc<scanner_engine::Engine>> = OnceLock::new();
     Arc::clone(ENGINE.get_or_init(|| Arc::new(build_runtime_engine())))
 }
