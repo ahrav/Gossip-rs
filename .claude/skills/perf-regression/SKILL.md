@@ -13,9 +13,9 @@ user-invocable: false
 Invoke this skill when modifying:
 - Data structures in `crates/gossip-stdx/src/` (InlineVec, RingBuffer, ByteSlab)
 - Coordination protocol in `crates/gossip-coordination/src/`
-- Scan pipeline in `crates/gossip-scan-pipeline/src/`
 - Contract types in `crates/gossip-contracts/src/`
-- Engine core in `crates/gossip-engine/src/`
+- Scanner engine in `crates/scanner-engine/src/`
+- Scanner runtime in `crates/gossip-scanner-runtime/src/`
 
 ## Workflow Steps
 

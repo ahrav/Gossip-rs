@@ -716,19 +716,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gossip-engine"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "gossip-contracts",
- "gossip-stdx",
- "proptest",
- "rstest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "gossip-frontier"
 version = "0.1.0"
 dependencies = [
@@ -761,6 +748,7 @@ dependencies = [
  "scanner-engine",
  "scanner-git",
  "scanner-scheduler",
+ "serde_json",
  "tempfile",
 ]
 
