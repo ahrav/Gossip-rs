@@ -92,10 +92,24 @@ fn scan_fs_connector_scans_single_file() {
 
 #[test]
 fn scan_fs_direct_and_connector_match_for_directory() {
+    // Structural note: direct mode uses ShardSpec::with_range([], []) (unbounded)
+    // while connector mode uses connector_mode_shard_spec() (bounded [0x00, 0xff..ff)).
+    // ScannerCore currently does not filter by key range, so counters match for
+    // identical input files. If key-range filtering is ever added, this test
+    // would need to compare actual findings, not just aggregate counters.
     let dir = tempdir().expect("tempdir");
-    fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
-    fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+    for i in 0..5 {
+        fs::write(
+            dir.path().join(format!("secret_{i}.txt")),
+            format!("password=alpha{i}"),
+        )
+        .expect("write");
+    }
 
+    // max_items: 1 forces multi-page execution, exercising page-boundary
+    // behavior in both modes (connector mode uses the scan loop with
+    // checkpoint/complete transitions; direct mode uses
+    // scan_from_connector_pages).
     let budgets = ScanBudgets {
         max_items: 1,
         max_bytes: 1_000_000,
@@ -108,7 +122,27 @@ fn scan_fs_direct_and_connector_match_for_directory() {
             .with_execution_mode(ExecutionMode::Connector),
     )
     .expect("connector outcome");
-    assert_eq!(direct, connector);
+
+    assert_eq!(
+        direct.pages_scanned(),
+        connector.pages_scanned(),
+        "page count mismatch"
+    );
+    assert_eq!(
+        direct.items_scanned(),
+        connector.items_scanned(),
+        "item count mismatch"
+    );
+    assert_eq!(
+        direct.findings_emitted(),
+        connector.findings_emitted(),
+        "finding count mismatch"
+    );
+    assert_eq!(
+        direct.diagnostics_emitted(),
+        connector.diagnostics_emitted(),
+        "diagnostic count mismatch"
+    );
 }
 
 // ── Connector-mode gating (git only) ─────────────────────────────
@@ -289,4 +323,66 @@ fn scan_fs_direct_handles_empty_directory() {
     assert_eq!(outcome.items_scanned(), 0);
     assert_eq!(outcome.findings_emitted(), 0);
     assert_eq!(outcome.diagnostics_emitted(), 0);
+}
+
+// ── Shard op-log scope after session creation ───────────────────
+
+#[test]
+fn shard_op_log_accepts_op_id_one_after_session_creation() {
+    // register_shards stores its OpId in the RUN's op log, not the shard's.
+    // The shard op log starts empty, so OpId::from_raw(1) must be available
+    // for the first shard-level checkpoint.
+    let shard = connector_mode_shard_spec();
+    let mut coordinator = InMemoryCoordinator::new(CONNECTOR_MODE_LEASE_DURATION_TICKS);
+    let mut session =
+        create_runtime_worker_session(&mut coordinator, &shard).expect("session creation");
+
+    // If register_shards had occupied shard op log slot 1, this would fail
+    // with OpIdConflict.
+    let cursor = CursorUpdate::new(&[0x01]);
+    let result = session.checkpoint(LogicalTime::from_raw(4), &cursor, OpId::from_raw(1));
+    assert!(
+        result.is_ok(),
+        "OpId::from_raw(1) should be available in shard op log: {result:?}"
+    );
+}
+
+// ── Error source chain for ScanLoopLeaseLost ────────────────────
+
+#[test]
+fn lease_lost_with_renew_failed_exposes_error_source() {
+    use std::error::Error;
+
+    let error = ScanRuntimeError::ScanLoopLeaseLost {
+        pages_completed: 5,
+        cause: LeaseLossCause::RenewFailed(gossip_coordination::RenewError::LeaseExpired {
+            deadline: LogicalTime::from_raw(100),
+            now: LogicalTime::from_raw(200),
+        }),
+    };
+
+    // source() should expose the inner RenewError for error-chain traversal.
+    assert!(
+        error.source().is_some(),
+        "ScanLoopLeaseLost with RenewFailed cause should expose source()"
+    );
+}
+
+#[test]
+fn lease_lost_with_deadline_elapsed_has_no_source() {
+    use std::error::Error;
+
+    let error = ScanRuntimeError::ScanLoopLeaseLost {
+        pages_completed: 0,
+        cause: LeaseLossCause::DeadlineElapsed {
+            now: LogicalTime::from_raw(200),
+            deadline: LogicalTime::from_raw(100),
+        },
+    };
+
+    // DeadlineElapsed has no inner error to expose.
+    assert!(
+        error.source().is_none(),
+        "ScanLoopLeaseLost with DeadlineElapsed should have no source"
+    );
 }

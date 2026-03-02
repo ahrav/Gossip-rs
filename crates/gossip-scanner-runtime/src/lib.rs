@@ -430,9 +430,12 @@ impl std::error::Error for ScanRuntimeError {
             | Self::InvalidPath { .. }
             | Self::GitCommandFailed { .. }
             | Self::ScanLoopParked { .. }
-            | Self::ScanLoopLeaseLost { .. }
             | Self::CursorStalled { .. }
             | Self::TooManyTrackedFiles { .. } => None,
+            Self::ScanLoopLeaseLost { cause, .. } => match cause {
+                LeaseLossCause::RenewFailed(e) => Some(e),
+                LeaseLossCause::DeadlineElapsed { .. } => None,
+            },
         }
     }
 }
@@ -617,6 +620,13 @@ pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanOutcome, ScanRuntim
 ///
 /// Single-file scans keep the direct-mode single-item path because
 /// [`FilesystemConnector`] is directory-rooted by design.
+///
+/// **Known divergence**: directory scans use a bounded `ShardSpec` (from
+/// `connector_mode_shard_spec`) while single-file scans use an unbounded
+/// `ShardSpec::with_range([], [])`. This means `PageScanContext::key_range_*`
+/// differs between the two input shapes within the same execution mode. The
+/// scanner core currently does not use key ranges for filtering, so this has
+/// no behavioral impact today.
 pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanOutcome, ScanRuntimeError> {
     validate_fs_path(&config.path)?;
 
@@ -714,7 +724,9 @@ where
     let mut coordinator = InMemoryCoordinator::new(CONNECTOR_MODE_LEASE_DURATION_TICKS);
     let session = create_runtime_worker_session(&mut coordinator, shard)?;
 
-    let mut next_op_raw = 2u64;
+    // Shard op log starts empty: register_shards writes to the run-level op
+    // log, not the shard's, so the first shard-level op can use raw ID 1.
+    let mut next_op_raw = 1u64;
     let mut next_now_raw = 4u64;
     let mut dedupe = ScanDedupState::default();
     let mut outcome = ScanOutcome::default();
