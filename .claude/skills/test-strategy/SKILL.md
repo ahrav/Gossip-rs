@@ -25,6 +25,8 @@ This project has a deterministic simulation harness for the coordination subsyst
 | Harness | Location | Feature | Scope | When to Add Cases |
 |---------|----------|---------|-------|-------------------|
 | **CoordinationSim** | `crates/gossip-coordination/src/sim/` | `test-support` | Coordination protocol invariants (S1–S9), lease management, shard lifecycle, fault injection (SunnyDay/Stormy/Radioactive), deterministic replay | Any change to coordination logic, shard state machines, lease acquisition, run lifecycle, or split handling |
+| **TigerHarness** | `crates/scanner-engine/src/tiger_harness.rs` | `tiger-harness` | Scanner engine deterministic test harness for detection pipeline validation | Any change to detection rules, transform pipeline, or scanner engine core |
+| **SchedulerSim** | `crates/scanner-scheduler/src/scheduler/sim.rs` | `scheduler-sim` | Scheduler simulation for work-stealing, chunking, and I/O orchestration validation | Any change to scheduler logic, parallel scan, task graph, or affinity |
 
 **Architecture**: The sim module has five layers:
 - **`mod.rs`** — `SimContext` (seeded PRNG + logical clock) and `FaultConfig`/`FaultLevel`
@@ -297,7 +299,9 @@ When analyzing code for test strategy, consider:
    - Property tests: proptest as dev-dep; `Arbitrary` impls gated behind `test-support` feature in gossip-contracts
    - Kani proofs: `#[cfg(kani)]` blocks in gossip-stdx
    - Fuzz targets: `crates/gossip-contracts/fuzz/` and `crates/gossip-stdx/fuzz/`
-   - Simulation tests: `crates/gossip-coordination/src/sim/` (CoordinationSim, proptest state machine, behavioral, overload)
+    - Simulation tests: `crates/gossip-coordination/src/sim/` (CoordinationSim, proptest state machine, behavioral, overload)
+    - Scanner sim harnesses: `crates/scanner-engine/src/tiger_harness.rs` (`tiger-harness` feature), `crates/scanner-scheduler/src/scheduler/sim.rs` (`scheduler-sim` feature)
+    - Scanner integration tests: `crates/scanner-engine-integration-tests/tests/`
    - Benchmarks: Criterion benchmarks in `crates/*/benches/`
    - Integration tests: `crates/*/tests/identity_smoke.rs` pattern
 
@@ -399,6 +403,9 @@ When analyzing code for test strategy, consider:
 | Bug fix | Unit test (regression) | Sim test if coordination-related |
 | Performance-critical loop | Kani (bounds) | Property tests |
 | Coordination protocol change | CoordinationSim | Proptest state machine |
+| Scanner engine / detection rules | TigerHarness + unit tests | Integration tests |
+| Scheduler / parallel scan logic | SchedulerSim | Unit tests for edge cases |
+| Git pack parsing / delta decode | Fuzz + Property tests | Unit tests |
 | Shard lifecycle / state machine | CoordinationSim (all fault levels) | Unit tests for edge cases |
 | Lease management | CoordinationSim (Stormy+) | Property tests for monotonicity |
 | Identity types / derivation | Fuzz tests | Property tests for roundtrip |

@@ -3,6 +3,11 @@
 //! The CLI uses this sink to stream findings and diagnostics as newline-delimited
 //! JSON records. The sink implements both scheduler core events and git-specific
 //! events so the runtime can pass one sink type through all scan modes.
+//!
+//! Encoding invariants:
+//! - Exactly one JSON object is emitted per line.
+//! - Finding records intentionally omit a `type` field for scanner-rs parity.
+//! - `BrokenPipe` is treated as success to support piped CLI output.
 
 use std::io::{self, BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
@@ -16,6 +21,7 @@ pub struct JsonlEventSink<W: Write + Send> {
 }
 
 impl<W: Write + Send> JsonlEventSink<W> {
+    /// Create a JSONL sink over `writer`.
     #[must_use]
     pub fn new(writer: W) -> Self {
         Self {
@@ -55,6 +61,7 @@ impl<W: Write + Send> GitEventOutput for JsonlEventSink<W> {
 }
 
 fn handle_io(result: io::Result<()>) -> io::Result<()> {
+    // CLI parity: downstream pipe closures are non-fatal.
     if let Err(error) = result {
         if error.kind() == ErrorKind::BrokenPipe {
             return Ok(());
@@ -67,6 +74,7 @@ fn handle_io(result: io::Result<()>) -> io::Result<()> {
 fn encode_core_event(event: CoreEvent<'_>, line: &mut Vec<u8>) {
     match event {
         CoreEvent::Finding(finding) => {
+            // Keep the record shape aligned with scanner-rs golden fixtures.
             line.push(b'{');
             push_key(line, b"path");
             write_json_bytes(line, finding.object_path);
@@ -232,6 +240,7 @@ fn write_u64(line: &mut Vec<u8>, value: u64) {
 }
 
 fn write_f64(line: &mut Vec<u8>, value: f64) {
+    // Summary throughput is rendered with fixed precision for stable fixtures.
     let rendered = if value.is_finite() {
         format!("{value:.2}")
     } else {
@@ -280,9 +289,23 @@ fn write_json_bytes(line: &mut Vec<u8>, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use super::*;
     use scanner_scheduler::events::{CoreEvent, FindingEvent};
     use scanner_scheduler::source_kind::SourceKind;
+
+    fn load_event_golden(name: &str) -> String {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("parity")
+            .join("golden")
+            .join("events")
+            .join(name);
+        String::from_utf8(fs::read(path).expect("event golden fixture"))
+            .expect("event golden fixture must be utf8")
+    }
 
     #[test]
     fn finding_record_is_encoded_without_norm_hash_or_rule_id() {
@@ -307,10 +330,7 @@ mod tests {
             .into_inner()
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
-        assert_eq!(
-            line,
-            "{\"path\":\"src/main.rs\",\"rule_name\":\"aws-access-key\",\"start\":10,\"end\":40,\"source\":\"fs\",\"confidence_score\":8}\n"
-        );
+        assert_eq!(line, load_event_golden("finding_fs.jsonl"));
     }
 
     #[test]
@@ -336,9 +356,6 @@ mod tests {
             .into_inner()
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
-        assert_eq!(
-            line,
-            "{\"path\":\"config/.env\",\"rule_name\":\"generic-secret\",\"start\":0,\"end\":32,\"source\":\"git\",\"confidence_score\":-4,\"commit_id\":3,\"change_kind\":\"add\"}\n"
-        );
+        assert_eq!(line, load_event_golden("finding_git.jsonl"));
     }
 }

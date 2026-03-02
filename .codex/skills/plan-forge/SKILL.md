@@ -70,9 +70,9 @@ The orchestrator (you, not a sub-agent) creates the initial plan.
 
 1. **Parse task** --- identify core objective, constraints, domain.
 2. **Explore codebase** --- use Glob, Grep, Read to find relevant files,
-   patterns, existing utilities. Check `src/stdx/` and neighboring modules
+   patterns, existing utilities. Check `crates/gossip-stdx/src/` and neighboring modules
    for duplication (per CLAUDE.md rules).
-3. **Write initial plan** to `~/.codex/plans/{YYYY-MM-DD}-{feature-slug}-v1.md`.
+3. **Write initial plan** to `~/.claude/plans/{YYYY-MM-DD}-{feature-slug}-v1.md`.
 
 ### Versioned Plan Files
 
@@ -80,9 +80,9 @@ Each revision writes a NEW file with an incremented version suffix. Prior
 versions are kept for reference and diffing.
 
 ```
-~/.codex/plans/2026-02-23-retry-logic-v1.md   <- Phase 0 output (initial)
-~/.codex/plans/2026-02-23-retry-logic-v2.md   <- After Round 1 revision
-~/.codex/plans/2026-02-23-retry-logic-v3.md   <- After Round 2 revision (final)
+~/.claude/plans/2026-02-23-retry-logic-v1.md   <- Phase 0 output (initial)
+~/.claude/plans/2026-02-23-retry-logic-v2.md   <- After Round 1 revision
+~/.claude/plans/2026-02-23-retry-logic-v3.md   <- After Round 2 revision (final)
 ```
 
 ### Plan File Template
@@ -190,7 +190,7 @@ other three).
 ### Simplification
 - YAGNI: does the plan build things not yet needed?
 - Does the codebase already have utilities the plan reinvents? (search with
-  Glob/Grep, especially src/stdx/)
+  Glob/Grep, especially crates/gossip-stdx/src/)
 - Could fewer files, types, or steps achieve the same result?
 - Are there unnecessary abstraction layers or indirection?
 - Could an existing pattern be extended instead of building new?
@@ -592,5 +592,5 @@ safety, provenance.
   plan with 4 specialist lenses instead of 2 generalist reviewers.
 - **For plans with `--focus=unsafe`**: Consider following up with `/unsafe-review`
   after implementation.
-- **Diff between versions**: Use `diff ~/.codex/plans/*-v1.md ~/.codex/plans/*-v2.md`
+- **Diff between versions**: Use `diff ~/.claude/plans/*-v1.md ~/.claude/plans/*-v2.md`
   to see exactly how the plan evolved through review rounds.

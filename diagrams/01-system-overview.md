@@ -77,10 +77,13 @@ avoids a circular dependency that would arise if shard algebra needed identity
 types and vice versa. Every other crate depends on `gossip-contracts`.
 
 `gossip-coordination` owns B2, `gossip-connectors` owns B4, and persistence
-contracts live within `gossip-contracts/src/persistence/`. `gossip-engine`
-houses the core scan engine, and `gossip-scan-pipeline` provides the pipeline
-orchestration. Finally, `gossip-worker` is the top-level binary crate that
-wires everything together at startup.
+contracts live within `gossip-contracts/src/persistence/`. Detection is owned by
+`scanner-engine`, with `scanner-scheduler` providing the executor and
+`scanner-git` handling git-specific scanning. `gossip-scan-driver` defines the
+`ScanDriver` and `ScanSourceFactory` traits that bridge detection with
+orchestration. `gossip-scanner-runtime` wires everything together into runnable
+scan pipelines for both the `scanner-rs` CLI binary and the distributed
+`gossip-worker` binary.
 
 ```mermaid
 %% Diagram: crate-mapping
@@ -99,9 +102,13 @@ graph LR
         frontier["gossip-frontier"]
         coordination["gossip-coordination"]
         connectors["gossip-connectors"]
-        engine["gossip-engine"]
-        pipeline["gossip-scan-pipeline"]
+        scan_driver["gossip-scan-driver"]
+        scanner_engine["scanner-engine"]
+        scanner_scheduler["scanner-scheduler"]
+        scanner_git["scanner-git"]
+        runtime["gossip-scanner-runtime"]
         worker["gossip-worker"]
+        cli["scanner-rs-cli"]
     end
 
     B1 -->|"contains"| contracts
@@ -116,14 +123,16 @@ graph LR
     coordination -->|"depends on"| contracts
     coordination -->|"depends on"| stdx
     connectors -->|"depends on"| contracts
-    engine -->|"depends on"| contracts
-    pipeline -->|"depends on"| contracts
-    pipeline -->|"depends on"| coordination
-    worker -->|"depends on"| contracts
-    worker -->|"depends on"| engine
-    worker -->|"depends on"| pipeline
-    worker -->|"depends on"| connectors
+    connectors -->|"depends on"| scan_driver
+    scan_driver -->|"depends on"| scanner_engine
+    scan_driver -->|"depends on"| scanner_scheduler
+    scanner_git -->|"depends on"| scanner_engine
+    runtime -->|"depends on"| scan_driver
+    runtime -->|"depends on"| connectors
+    runtime -->|"depends on"| contracts
+    worker -->|"depends on"| runtime
     worker -->|"depends on"| coordination
+    cli -->|"depends on"| runtime
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style B3 fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
@@ -136,9 +145,13 @@ graph LR
     style frontier fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style coordination fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style connectors fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style pipeline fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scan_driver fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scanner_engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scanner_scheduler fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scanner_git fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style runtime fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style worker fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style cli fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
 ---
@@ -220,11 +233,11 @@ sequenceDiagram
 The crate graph compiles in four tiers. Tier 0 (`gossip-stdx`, `gossip-contracts`,
 and `gossip-frontier`) has no dependencies on higher-level crates and compiles
 first. `gossip-stdx` is a foundational utility crate depended on by contracts,
-frontier, and coordination. Tier 1 (`gossip-coordination`, `gossip-connectors`,
-and `gossip-engine`) compiles in parallel once Tier 0 finishes -- these crates
-depend only on `gossip-contracts` (and `gossip-stdx` for coordination). Tier 2
-(`gossip-scan-pipeline`) depends on `gossip-contracts` and `gossip-coordination`.
-Tier 3 (`gossip-worker`) is the final binary, depending on all five workspace crates.
+frontier, and coordination. Tier 1 includes `gossip-coordination`,
+`gossip-connectors`, `scanner-engine`, `scanner-scheduler`, and `scanner-git` --
+these compile in parallel once Tier 0 finishes. Tier 2 includes `gossip-scan-driver`
+and `gossip-scanner-runtime`, which depend on Tier 1 crates. Tier 3
+(`gossip-worker`, `scanner-rs-cli`) are the final binaries.
 
 ```mermaid
 %% Diagram: build-dag
@@ -238,40 +251,51 @@ graph TD
     subgraph "Tier 1"
         coordination["gossip-coordination"]
         connectors["gossip-connectors"]
-        engine["gossip-engine"]
+        scanner_engine["scanner-engine"]
+        scanner_scheduler["scanner-scheduler"]
+        scanner_git["scanner-git"]
     end
 
     subgraph "Tier 2"
-        pipeline["gossip-scan-pipeline"]
+        scan_driver["gossip-scan-driver"]
+        runtime["gossip-scanner-runtime"]
     end
 
     subgraph "Tier 3"
         worker["gossip-worker"]
+        cli["scanner-rs-cli"]
     end
 
     stdx --> contracts
     stdx --> frontier
     stdx --> coordination
+    stdx --> scanner_engine
     contracts --> frontier
     contracts --> coordination
     contracts --> connectors
-    contracts --> engine
-    contracts --> pipeline
-    coordination --> pipeline
-    contracts --> worker
-    engine --> worker
-    pipeline --> worker
-    connectors --> worker
+    scanner_engine --> scan_driver
+    scanner_scheduler --> scan_driver
+    scan_driver --> connectors
+    scanner_engine --> scanner_git
+    scan_driver --> runtime
+    connectors --> runtime
+    contracts --> runtime
+    runtime --> worker
     coordination --> worker
+    runtime --> cli
 
     style stdx fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style contracts fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style frontier fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style coordination fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
     style connectors fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style pipeline fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scan_driver fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scanner_engine fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scanner_scheduler fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style scanner_git fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style runtime fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style worker fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style cli fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
 For the full type-annotated dependency DAG and tiered compilation analysis, see [Boundary Dependency Graph](02-boundary-dependency-graph.md).
@@ -299,5 +323,9 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | B2: Coordination | `crates/gossip-contracts/src/coordination/` (data types) + `crates/gossip-coordination/src/` (protocol) |
 | B4: Connector | `crates/gossip-contracts/src/connector/` + `crates/gossip-connectors/` |
 | B5: Persistence | `crates/gossip-contracts/src/persistence/` |
+| Detection engine | `crates/scanner-engine/` |
+| Scan driver traits | `crates/gossip-scan-driver/` |
+| Scanner runtime | `crates/gossip-scanner-runtime/` |
 | Worker binary | `crates/gossip-worker/` |
+| CLI binary | `crates/scanner-rs-cli/` |
 | Architecture prose | `00-prologue/03-architecture-at-a-glance.md` |

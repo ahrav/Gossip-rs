@@ -1,6 +1,7 @@
 ---
 name: asm-forge
 description: ASM-guided deep performance optimization. Collects assembly, audits codegen quality, applies targeted transforms, validates with benchmarks. Uses cargo-show-asm + Criterion as ground truth.
+user-invocable: true
 ---
 
 # ASM Forge — Assembly-Guided Performance Optimization
@@ -14,9 +15,9 @@ no cargo-culting `#[inline]` annotations.
 ## When to Use
 
 - Squeezing the last 5-30% out of hot functions where profiling shows the time is spent
-- After `rust-hotspot-finder` or `rust-perf-triage` identified a hot function
+- After `/performance-analyzer` or `/linux-perf-profile` identified a hot function
 - When you suspect the compiler is generating suboptimal code (bounds checks, spills, missed SIMD)
-- When `bench-compare` shows a regression and you need to understand *why* at the instruction level
+- When `/bench-compare` shows a regression and you need to understand *why* at the instruction level
 - Validating that a "clever" optimization actually improved codegen
 
 ## Prerequisites
@@ -38,7 +39,7 @@ cargo install cargo-show-asm
 rustup component add llvm-tools-preview
 
 # For instruction-level profiling on Linux
-# (optional, use linux-perf-profile skill instead)
+# (optional, use /linux-perf-profile skill instead)
 ```
 
 ### Build Configuration
@@ -54,7 +55,7 @@ The project's `Cargo.toml` already has `opt-level=3`, `lto="thin"`, `codegen-uni
 ## Workflow Overview
 
 ```
-asm-forge @file.rs "focus description"
+/asm-forge @file.rs "focus description"
     │
     ├─ Phase 0: Recon (3 parallel subagents)
     │   ├─ Agent A: Collect ASM for target functions
@@ -79,31 +80,31 @@ asm-forge @file.rs "focus description"
 
 ## Phase 0: Recon
 
-Launch three parallel subagents using Codex `spawn_agent` (use `worker` for shell-heavy tasks and `default` for analysis tasks).
+Launch three parallel subagents using the Task tool:
 
 ### Agent A: ASM Collection
 
-Use a `worker` subagent (or run directly if lightweight) to collect assembly:
+Use the Task tool with `subagent_type=Bash` to collect assembly:
 
 ```bash
 # List available functions in a module (find exact symbol names)
-cargo asm --lib -p scanner-rs 2>&1 | grep '<module_path>'
+cargo asm --lib -p <crate> 2>&1 | grep '<module_path>'
 
 # Collect ASM for a specific function (Intel syntax, interleaved with Rust source)
-cargo asm --lib -p scanner-rs --rust '<full::path::to::function>' > /tmp/asm-before.s
+cargo asm --lib -p <crate> --rust '<full::path::to::function>' > /tmp/asm-before.s
 
 # For multiple functions, collect each:
-cargo asm --lib -p scanner-rs '<function_1>' > /tmp/asm-before-fn1.s
-cargo asm --lib -p scanner-rs '<function_2>' > /tmp/asm-before-fn2.s
+cargo asm --lib -p <crate> '<function_1>' > /tmp/asm-before-fn1.s
+cargo asm --lib -p <crate> '<function_2>' > /tmp/asm-before-fn2.s
 
 # If cargo-show-asm can't find the function, list candidates:
-cargo asm --lib -p scanner-rs 2>&1 | grep -i '<partial_name>'
+cargo asm --lib -p <crate> 2>&1 | grep -i '<partial_name>'
 
 # For LLVM-IR view (useful for understanding optimization decisions):
-cargo asm --lib -p scanner-rs --llvm '<function>' > /tmp/llvm-before.ll
+cargo asm --lib -p <crate> --llvm '<function>' > /tmp/llvm-before.ll
 
 # For MIR view (useful for understanding Rust-level optimizations):
-cargo asm --lib -p scanner-rs --mir '<function>' > /tmp/mir-before.mir
+cargo asm --lib -p <crate> --mir '<function>' > /tmp/mir-before.mir
 ```
 
 **ISA auto-detection**: `cargo-show-asm` emits native ISA by default:
@@ -113,7 +114,7 @@ cargo asm --lib -p scanner-rs --mir '<function>' > /tmp/mir-before.mir
 
 ### Agent B: Benchmark Baseline
 
-Use a `worker` subagent (or run directly if lightweight):
+Use the Task tool with `subagent_type=Bash`:
 
 ```bash
 # Save baseline for the relevant benchmarks
@@ -124,15 +125,14 @@ cargo bench --bench <relevant_bench> -- --save-baseline forge-before
 cargo bench --features bench --bench <relevant_bench> -- --save-baseline forge-before
 ```
 
-**Benchmark selection guide for this project:**
-- `src/engine/` functions → `hotspots`, `scan`, `scanner_throughput`
-- `src/engine/rule_repr.rs` → `hotspots`, `rule_isolation`, `rule_scaling`
-- `src/stdx/` data structures → the corresponding bench (e.g., `ring_buffer`, `fixed_set`)
-- Validation code → `validator`, `offline_validation`
+**Benchmark selection guide for this project (workspace crates):**
+- `gossip-contracts` types → `cargo bench -p gossip-contracts --bench identity`
+- `gossip-coordination` logic → `cargo bench -p gossip-coordination --bench coordination`
+- `gossip-stdx` data structures → corresponding bench (e.g., `--bench inline_vec`, `--bench ring_buffer`, `--bench byte_slab`)
 
 ### Agent C: Static Hotspot Analysis
 
-Use a `default` subagent for reasoning-heavy analysis:
+Use the Task tool with `subagent_type=general-purpose`:
 
 Prompt: Read the target file(s) and identify performance-relevant patterns:
 - Loops with potential bounds checks
@@ -292,7 +292,7 @@ Make the source modification. Keep it minimal and isolated.
 ### Step 2: Collect New ASM
 
 ```bash
-cargo asm --lib -p scanner-rs --rust '<function>' > /tmp/asm-after.s
+cargo asm --lib -p <crate> --rust '<function>' > /tmp/asm-after.s
 ```
 
 ### Step 3: Diff ASM
@@ -332,7 +332,7 @@ cargo bench --features bench --bench <relevant_bench> -- --baseline forge-before
 | Yes | Yes | **Accept**. Update baseline: `cargo bench --bench <name> -- --save-baseline forge-before` |
 | Yes | No | Investigate. ASM looks better but real workload didn't benefit. Bottleneck is elsewhere. Consider reverting. |
 | No | Yes | Suspicious. Measurement noise? Re-run with more iterations. |
-| No | No | **Revert immediately**. Undo the edit in the file (or restore only the changed hunk) and re-run benchmark + ASM checks. |
+| No | No | **Revert immediately**. `git checkout -- <file>` |
 
 ### Iteration
 
@@ -386,19 +386,19 @@ After completing the forge loop, produce:
 
 ```bash
 # List all functions in a module (grep for your target)
-cargo asm --lib -p scanner-rs 2>&1 | grep 'rule_repr'
+cargo asm --lib -p <crate> 2>&1 | grep 'inline_vec'
 
 # Show ASM with interleaved Rust source (best for audit)
-cargo asm --lib -p scanner-rs --rust 'scanner_rs::engine::rule_repr::RuleCompiled::matches'
+cargo asm --lib -p <crate> --rust 'gossip_stdx::inline_vec::InlineVec<T,N>::push'
 
 # Show only ASM (cleaner for diffing)
-cargo asm --lib -p scanner-rs 'scanner_rs::engine::rule_repr::RuleCompiled::matches'
+cargo asm --lib -p <crate> 'gossip_stdx::inline_vec::InlineVec<T,N>::push'
 
 # Show LLVM-IR (understand optimizer decisions)
-cargo asm --lib -p scanner-rs --llvm 'function_name'
+cargo asm --lib -p <crate> --llvm 'function_name'
 
 # Show MIR (understand Rust-level optimizations, monomorphization)
-cargo asm --lib -p scanner-rs --mir 'function_name'
+cargo asm --lib -p <crate> --mir 'function_name'
 
 # When function name is ambiguous, cargo-show-asm shows candidates
 # Pick the right monomorphization by examining the type parameters
@@ -436,13 +436,11 @@ Stop forging when:
 - The function is dominated by unavoidable work (memory latency, I/O)
 - Further optimization requires algorithmic changes (different skill: refactoring)
 - You've exhausted the codegen-quality improvements and need hardware profiling
-  (escalate to `linux-perf-profile` on Linux)
+  (escalate to `/linux-perf-profile` on Linux)
 
 ## Related Skills
 
-- `rust-hotspot-finder` — Identifies which functions to forge (run first)
-- `rust-perf-triage` — Interprets profiling data when ASM alone isn't enough
-- `bench-compare` — Quick before/after benchmark comparison
-- `linux-perf-profile` — Hardware counter analysis on Linux (PMU, cache, TLB)
-- `perf-regression` — Full regression testing workflow before merging
-- `performance-analyzer` — Static analysis checklist for this project's patterns
+- `/performance-analyzer` — Static hotspot analysis for this project's patterns
+- `/linux-perf-profile` — Hardware counter analysis on Linux (PMU, cache, TLB)
+- `/bench-compare` — Quick before/after benchmark comparison
+- `/perf-regression` — Full regression testing workflow before merging

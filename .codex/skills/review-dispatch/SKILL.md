@@ -19,7 +19,7 @@ findings into one actionable report.
 ## Invocation
 
 ```
-review-dispatch [<files-or-diff>]
+/review-dispatch [<files-or-diff>]
 ```
 
 - With no argument: reviews the open PR for the current branch (via `gh pr diff`),
@@ -59,8 +59,8 @@ findings can be linked back to the PR.
 
 ## Phase 1 — Specialist Reviews (6 Parallel Agents)
 
-Launch **all 6 agents in a single message** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with
-`agent_type=default`. Each agent gets the same code but a different
+Launch **all 6 agents in a single message** using the Task tool with
+`subagent_type=general-purpose`. Each agent gets the same code but a different
 review lens.
 
 ### Common Preamble (included in every agent's prompt)
@@ -84,7 +84,7 @@ specialists are covering those.
 - Be concrete: cite file paths and line numbers for every finding.
 - Distinguish between "must fix" and "should fix" and "nit".
 - If you find nothing noteworthy, say so explicitly — do not invent issues.
-- Explore the broader codebase (`rg --files`, `rg`, and targeted file reads) when you need context to
+- Explore the broader codebase (Glob, Grep, Read) when you need context to
   judge whether something is a real issue or an intentional pattern.
 - For each finding, state the CURRENT behavior and the DESIRED behavior.
 
@@ -271,7 +271,8 @@ Severity guide:
 
 ## Phase 2 — Rank & Merge (Single Agent)
 
-After all 6 specialists complete, launch **1 ranking agent** using the Codex agent tools (`spawn_agent`, `send_input`, `wait`) with `agent_type=default`.
+After all 6 specialists complete, launch **1 ranking agent** using the Task
+tool with `subagent_type=general-purpose`.
 
 ### Ranker Prompt
 
@@ -397,15 +398,15 @@ Default: 6 specialists + 1 ranker (7 agents total). The user can disable
 specific specialists:
 
 ```
-review-dispatch --skip=docs,complexity   (run 4 specialists + 1 ranker)
+/review-dispatch --skip=docs,complexity   (run 4 specialists + 1 ranker)
 ```
 
 Minimum: at least 2 specialists must run. The ranker always runs.
 
 ## Tips
 
-- Pair with `design-tournament` for new code (design first, review after).
-- For performance-critical changes, also run `bench-compare` before and after.
+- Pair with `/design-tournament` for new code (design first, review after).
+- For performance-critical changes, also run `/bench-compare` before and after.
 - For unsafe code changes, the Safety specialist is essential — don't skip it.
 - If the diff is very large (>1000 lines), consider reviewing in logical chunks
   rather than all at once to keep agent context focused.

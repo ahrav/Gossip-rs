@@ -62,7 +62,6 @@ Benchmarks are distributed across crates in `crates/*/benches/`:
 - `gossip-contracts`: `identity.rs` — Identity type construction and derivation
 - `gossip-coordination`: `coordination.rs` — Shard coordination operations
 - `gossip-coordination`: `sim.rs` — Simulation harness benchmarks
-- `gossip-scan-pipeline`: `scan_loop.rs` — Core scan loop throughput
 - `gossip-stdx`: `byte_slab.rs` — Byte slab pool allocation
 - `gossip-stdx`: `inline_vec.rs` — InlineVec operations
 - `gossip-stdx`: `ring_buffer.rs` — RingBuffer throughput

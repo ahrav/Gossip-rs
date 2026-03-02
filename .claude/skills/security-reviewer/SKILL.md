@@ -23,6 +23,24 @@ Review unsafe code and security-sensitive operations in the gossip-rs codebase.
 - `crates/gossip-connectors/src/filesystem.rs` - Filesystem I/O with unsafe
 - `crates/gossip-coordination/src/lib.rs` - Coordination protocol internals
 
+### Scanner Engine High-Risk Files
+- `crates/scanner-engine/src/engine/hit_pool.rs` - Sorted hit pool with unsafe pointer ops
+- `crates/scanner-engine/src/engine/scratch.rs` - Reusable scratch memory with raw pointers
+- `crates/scanner-engine/src/engine/stream_decode.rs` - Streaming decoder with buffer manipulation
+- `crates/scanner-engine/src/engine/buffer_scan.rs` - Buffer scanning with unsafe slice ops
+- `crates/scanner-engine/src/engine/transform.rs` - Transform/decode pipeline (base64, etc.)
+- `crates/scanner-engine/src/engine/vectorscan_prefilter.rs` - FFI boundary with vectorscan
+- `crates/scanner-engine/src/scratch_memory.rs` - Scratch memory allocation with raw pointers
+- `crates/scanner-engine/src/lsm/set_associative_cache.rs` - Cache with SIMD tag matching
+- `crates/scanner-engine/src/engine/simd_classify.rs` - SIMD byte classification
+
+### Scanner Scheduler High-Risk Files
+- `crates/scanner-scheduler/src/runtime.rs` - Runtime with async I/O and unsafe
+- `crates/scanner-scheduler/src/scheduler/` - Work-stealing scheduler (48 files)
+
+### Scanner Git High-Risk Files
+- `crates/scanner-git/src/` - Git pack parsing, delta decoding (86 files with binary data handling)
+
 ## Security Checklist
 
 ### Memory Safety

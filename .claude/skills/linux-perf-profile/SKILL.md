@@ -129,7 +129,7 @@ perf stat -e l1d_cache,l1d_cache_refill,l1d_cache_lmiss_rd,l2d_cache,l2d_cache_r
 
 **Common patterns in this codebase:**
 
-- **High L1d misses** → check struct layout, false sharing in concurrent paths, random-access patterns in `TimingWheel` or `SetAssociativeCache`.
+- **High L1d misses** → check struct layout, false sharing in concurrent paths, random-access patterns in `TimingWheel` (`crates/gossip-stdx/src/timing_wheel.rs`) or `SetAssociativeCache` (`crates/scanner-engine/src/lsm/set_associative_cache.rs`).
 - **High L2 misses** → working set exceeds L2 (256KB/core on Graviton3). Consider data partitioning or reducing struct sizes.
 - **High dTLB walks** → large heap allocations scattered across pages. Consider hugepages or arena allocation.
 - **High iTLB walks** → code bloat from monomorphization or heavy inlining. Check generic instantiation count.
@@ -351,5 +351,4 @@ PMU data to source-level patterns. Reference specific lines/functions.]
 
 - `/bench-compare` — Criterion before/after measurement (use first to detect regressions)
 - `/perf-regression` — Full regression workflow with acceptance criteria
-- `/performance-analyzer` — Static code analysis for perf anti-patterns
-- `/rust-hotspot-finder` — Classify hotspots by risk before profiling
+- `/performance-analyzer` — Static hotspot analysis for this project's patterns

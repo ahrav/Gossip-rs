@@ -16,7 +16,7 @@ fallback chains, and validating correctness + performance.
 ## When to Use
 
 - Converting scalar loops to SIMD where profiling shows time is spent on data-parallel work
-- After `/rust-hotspot-finder` identified a loop-heavy hot function
+- After `/performance-analyzer` identified a loop-heavy hot function
 - When `/asm-forge` shows the compiler failed to auto-vectorize a loop
 - Adding SIMD support that works across x86-64 and AArch64
 - Evaluating whether to use explicit intrinsics vs helping the auto-vectorizer
@@ -62,7 +62,7 @@ Examples:
 ```
 /simd-optimize @crates/gossip-stdx/src/byte_slab.rs "vectorize the slot search loop"
 /simd-optimize @crates/gossip-stdx/src/inline_vec.rs "add SIMD path for element search"
-/simd-optimize @crates/gossip-scan-pipeline/src/lib.rs "SIMD byte search across x86 and ARM"
+/simd-optimize @crates/scanner-engine/src/engine/simd_classify.rs "SIMD byte classification across x86 and ARM"
 ```
 
 ## Workflow Overview
@@ -373,6 +373,8 @@ When adding SIMD to this project, follow existing patterns:
 
 - Check `crates/gossip-stdx/src/` for data structures that may already use
   unsafe pointer operations that could benefit from SIMD
+- Check `crates/scanner-engine/src/lsm/set_associative_cache.rs` and
+  `crates/scanner-engine/src/engine/simd_classify.rs` for existing SIMD patterns
 - Use `cfg(target_arch)` dispatch with separate functions per ISA
 - Follow the project's `// SAFETY:` comment convention for all unsafe blocks
 
@@ -504,8 +506,7 @@ Invoke `/deep-research` when:
 ## Related Skills
 
 - `/asm-forge` — Post-SIMD assembly audit (verify codegen quality)
-- `/rust-hotspot-finder` — Identify what functions to vectorize (run first)
+- `/performance-analyzer` — Static hotspot analysis; identify what functions to vectorize (run first)
 - `/bench-compare` — Quick before/after benchmark comparison
-- `/performance-analyzer` — Broader performance analysis
 - `/deep-research` — Research specific SIMD patterns not in references
 - `/linux-perf-profile` — Hardware counter analysis for SIMD bottlenecks

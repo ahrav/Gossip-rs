@@ -15,7 +15,7 @@ no cargo-culting `#[inline]` annotations.
 ## When to Use
 
 - Squeezing the last 5-30% out of hot functions where profiling shows the time is spent
-- After `/rust-hotspot-finder` or `/rust-perf-triage` identified a hot function
+- After `/performance-analyzer` or `/linux-perf-profile` identified a hot function
 - When you suspect the compiler is generating suboptimal code (bounds checks, spills, missed SIMD)
 - When `/bench-compare` shows a regression and you need to understand *why* at the instruction level
 - Validating that a "clever" optimization actually improved codegen
@@ -129,7 +129,6 @@ cargo bench --features bench --bench <relevant_bench> -- --save-baseline forge-b
 - `gossip-contracts` types → `cargo bench -p gossip-contracts --bench identity`
 - `gossip-coordination` logic → `cargo bench -p gossip-coordination --bench coordination`
 - `gossip-stdx` data structures → corresponding bench (e.g., `--bench inline_vec`, `--bench ring_buffer`, `--bench byte_slab`)
-- `gossip-scan-pipeline` → `cargo bench -p gossip-scan-pipeline --bench scan_loop`
 
 ### Agent C: Static Hotspot Analysis
 
@@ -441,9 +440,7 @@ Stop forging when:
 
 ## Related Skills
 
-- `/rust-hotspot-finder` — Identifies which functions to forge (run first)
-- `/rust-perf-triage` — Interprets profiling data when ASM alone isn't enough
-- `/bench-compare` — Quick before/after benchmark comparison
+- `/performance-analyzer` — Static hotspot analysis for this project's patterns
 - `/linux-perf-profile` — Hardware counter analysis on Linux (PMU, cache, TLB)
+- `/bench-compare` — Quick before/after benchmark comparison
 - `/perf-regression` — Full regression testing workflow before merging
-- `/performance-analyzer` — Static analysis checklist for this project's patterns

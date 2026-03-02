@@ -6,6 +6,9 @@
 //! ```text
 //! config -> Assignment -> ScanSourceFactory -> ScanDriver::run
 //! ```
+//!
+//! Parity invariant: `Direct` and `Connector` modes currently execute the same
+//! runtime path. The mode flag remains for CLI compatibility and telemetry.
 
 use std::fmt;
 use std::fs;
@@ -31,6 +34,7 @@ pub mod commit_sink;
 pub mod coordination_sink;
 pub mod distributed;
 pub mod event_sink;
+pub mod parity;
 
 /// How the runtime acquires source items.
 ///
@@ -78,7 +82,9 @@ impl std::error::Error for ParseExecutionModeError {}
 /// Runtime budgets for source scans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudgets {
+    /// Maximum items processed between checkpoints.
     pub max_items: usize,
+    /// Runtime-level byte budget knob (must be non-zero).
     pub max_bytes: u64,
 }
 
@@ -113,8 +119,11 @@ impl ScanBudgets {
 /// Filesystem scan config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FsScanConfig {
+    /// Filesystem root or file path to scan.
     pub path: PathBuf,
+    /// Retained for compatibility; both variants currently share one path.
     pub execution_mode: ExecutionMode,
+    /// Scan execution budget controls.
     pub budgets: ScanBudgets,
 }
 
@@ -144,8 +153,11 @@ impl FsScanConfig {
 /// Git scan config.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitScanConfig {
+    /// Repository root path to scan.
     pub repo: PathBuf,
+    /// Retained for compatibility; both variants currently share one path.
     pub execution_mode: ExecutionMode,
+    /// Scan execution budget controls.
     pub budgets: ScanBudgets,
 }
 
@@ -247,11 +259,15 @@ impl From<ConnectorInputError> for ScanRuntimeError {
 /// Execution outcome for one assignment run.
 #[derive(Clone, Debug)]
 pub struct AssignmentOutcome {
+    /// Scan-driver report for the assignment.
     pub report: ScanReport,
+    /// Driver-provided checkpoint hint to hand back to coordinators.
     pub checkpoint_hint: Option<CursorUpdate>,
 }
 
 /// Top-level filesystem scan dispatcher.
+///
+/// Both execution modes currently call the same unified scan path.
 pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_fs_direct(config),
@@ -260,6 +276,8 @@ pub fn scan_fs(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
 }
 
 /// Top-level git scan dispatcher.
+///
+/// Both execution modes currently call the same unified scan path.
 pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
     match config.execution_mode {
         ExecutionMode::Direct => scan_git_direct(config),
@@ -360,6 +378,7 @@ pub(crate) fn execute_assignment(
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
+    // Keep runtime entry points and distributed workers on one driver seam.
     let mut driver = driver_for_assignment(assignment)?;
     let cfg = budgets.to_execution_config()?;
     let report = driver

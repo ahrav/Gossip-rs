@@ -74,8 +74,8 @@ src/<module>/
 ```
 
 > **Prerequisite:** `LogicalTime` must be defined in
-> `gossip_contracts::coordination` before the scaffold compiles. If the
-> coordination contracts module is still a doc stub, define `LogicalTime`
+> `gossip_contracts::identity` before the scaffold compiles. If the
+> identity contracts module is still a doc stub, define `LogicalTime`
 > there first (or use a temporary type alias).
 
 **`state.rs` template:**
@@ -85,7 +85,7 @@ src/<module>/
 //!
 //! All types are plain data — no I/O, no time reads, no randomness.
 
-use gossip_contracts::coordination::LogicalTime;
+use gossip_contracts::identity::LogicalTime;
 
 /// The states this module can be in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +120,7 @@ pub enum Effect {
 //! No I/O, no clock reads, no randomness without explicit seed.
 
 use super::state::{Effect, Input, State};
-use gossip_contracts::coordination::LogicalTime;
+use gossip_contracts::identity::LogicalTime;
 
 /// Apply an input to the current state, producing a new state and effects.
 ///
@@ -161,7 +161,7 @@ use std::collections::BinaryHeap;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use gossip_contracts::coordination::LogicalTime;
+use gossip_contracts::identity::LogicalTime;
 
 use super::logic;
 use super::state::{Effect, Input, State};
@@ -396,7 +396,7 @@ src/<module>/
 
 use std::collections::VecDeque;
 
-use gossip_contracts::coordination::LogicalTime;
+use gossip_contracts::identity::LogicalTime;
 
 use super::messages::{GossipMessage, NodeId, Transmit};
 
@@ -490,7 +490,7 @@ use std::collections::BinaryHeap;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use gossip_contracts::coordination::LogicalTime;
+use gossip_contracts::identity::LogicalTime;
 
 use super::messages::{NodeId, Transmit};
 use super::protocol::{GossipProtocol, ProtocolConfig};

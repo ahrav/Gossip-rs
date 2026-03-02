@@ -50,7 +50,7 @@ Map each test to the **behavior** it exercises:
 |---|---|---|---|---|
 | Roundtrip encode/decode | `test_encode_basic`, `test_encode_empty` | `prop_roundtrip` | — | — |
 | Bounds never exceeded | `test_within_bounds` | `prop_bounds_hold` | `verify_bounds` | — |
-| Monotonic ordering | `test_sorted_output` | — | — | scanner_sim |
+| Monotonic ordering | `test_sorted_output` | — | — | coordination_sim |
 
 ### Step 3: Identify Redundancy
 
@@ -67,7 +67,7 @@ A unit test is **NOT redundant** if ANY of the following are true:
 - It is a regression test with a bug reference (e.g., `// Regression: GH-123`)
 - It is the only test demonstrating basic API usage for a public function
 - It tests error paths or panic conditions distinct from the property's happy-path focus
-- The property test is gated behind a feature flag (`stdx-proptest`) and the unit test provides baseline ungated coverage
+- The property test is gated behind a feature flag (`test-support`) and the unit test provides baseline ungated coverage
 
 ### Step 4: Classify Each Test
 
@@ -94,28 +94,32 @@ For each **MERGE** group:
 
 For each **UPGRADE** test:
 - Rewrite as a `proptest!` with appropriate generators
-- Gate under `#[cfg(all(test, feature = "stdx-proptest"))]`
+- Gate under `#[cfg(test)]` (proptest is a direct dev-dependency, no feature gate needed)
 - Delete the original unit test
 
 ## Project-Specific Conventions
 
 ### Test locations in this codebase
 - Inline tests: `#[cfg(test)] mod tests { ... }` at bottom of source file
-- Separate test files: `src/stdx/*_tests.rs`, `src/engine/tests.rs`
-- Property tests: often in the same file, gated with `#[cfg(all(test, feature = "stdx-proptest"))]`
-- Kani proofs: `#[cfg(kani)] mod kani_proofs { ... }` or in `*_tests.rs`
-- Simulation tests: `tests/simulation/` directory
+- Separate test files: sibling `*_tests.rs` files under `crates/*/src/`
+- Property tests: in the same `#[cfg(test)]` module (proptest is a direct dev-dependency)
+- Kani proofs: `#[cfg(kani)] mod kani_proofs { ... }` in `gossip-stdx`
+- Simulation tests: `crates/gossip-coordination/src/sim/` (CoordinationSim)
 
 ### Feature gates
-- Property tests: `stdx-proptest` feature
+- Simulation + Arbitrary impls: `test-support` feature
 - Kani proofs: `kani` feature
-- Simulation harnesses: `sim-harness`, `scheduler-sim`
+- Property tests: no feature gate (proptest is a direct dev-dependency)
+- Scanner sim harnesses: `tiger-harness` (scanner-engine), `scheduler-sim` (scanner-scheduler)
+- Scanner bench scaffolding: `bench` feature in scanner-engine, scanner-scheduler
 
 ### What counts as "public API" in this project
-- Functions/types exported from `src/lib.rs`
-- The `Engine` trait and its implementations
-- `RuleSpec`, `RuleCompiled`, scanning pipeline entry points
-- Anything used cross-module (even if `pub(crate)`)
+- Types/traits exported from each crate's `lib.rs`
+- `ShardSpec`, `ClaimTicket`, coordination protocol types in `gossip-contracts`
+- Data structures in `gossip-stdx` (`InlineVec`, `RingBuffer`, `ByteSlab`)
+- Anything used cross-crate (even if `pub(crate)` within a crate)
+- Scanner engine types: `Engine` trait, `RuleSpec`, `RuleCompiled` in `scanner-engine`
+- Scanner scheduler: parallel scan pipeline, task graph types in `scanner-scheduler`
 
 ## Output Format
 
@@ -168,11 +172,11 @@ Use your best judgment on borderline cases. Some guidelines:
 
 - **When in doubt, keep.** It's better to have a slightly redundant test than to lose coverage.
 - **A test that catches a different failure mode is not redundant** even if it tests the same function. A unit test that checks an error message string and a property test that checks the Result variant are testing different things.
-- **Don't remove the last ungated test.** If all property tests are behind `stdx-proptest`, keep at least one basic unit test ungated so `cargo test` (no features) still exercises the code.
-- **Simulation coverage counts.** If a Scanner Sim corpus case exercises the exact code path, that's real coverage — it can subsume unit tests just like property tests can.
+- **Don't remove the last ungated test.** If property tests are behind a feature gate (e.g., `test-support`), keep at least one basic unit test ungated so `cargo test` (no features) still exercises the code.
+- **Simulation coverage counts.** If a CoordinationSim test case exercises the exact code path, that's real coverage — it can subsume unit tests just like property tests can.
 - **Prefer fewer, stronger tests** over many weak ones. Five tests each asserting one field of a struct can become one test asserting the whole struct, or one property test.
 
 ## Related Skills
 
-- `test-strategy` — Decide what kind of test to write for new code
-- `security-reviewer` — Audit unsafe code (may affect test removal decisions)
+- `/test-strategy` — Decide what kind of test to write for new code
+- `/security-reviewer` — Audit unsafe code (may affect test removal decisions)

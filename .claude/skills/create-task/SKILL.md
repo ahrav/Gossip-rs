@@ -106,7 +106,7 @@ For the primary functions/types affected:
 
 ### Step 4: Find Reusable Patterns
 Check for existing utilities that could be reused (per duplication prevention rules):
-- Search `src/stdx/` for related helpers
+- Search `crates/gossip-stdx/src/` for related helpers
 - Check sibling modules for similar patterns
 - Note any existing abstractions that should be extended rather than duplicated
 
@@ -214,7 +214,7 @@ description (if `--quick`).
 {What exists today with code snippets and file:line references.}
 
 ```rust
-// src/engine/core.rs:142-158 — current boundary check
+// crates/scanner-engine/src/engine/core.rs:142-158 — current boundary check
 {actual code from research}
 ```
 
@@ -231,7 +231,7 @@ description (if `--quick`).
 {Existing patterns to mirror, with file:line refs. "None" if nothing specific.}
 
 ### Utilities to Reuse
-{From src/stdx/ or siblings. "None found" if nothing applies.}
+{From crates/gossip-stdx/src/ or siblings. "None found" if nothing applies.}
 
 ### Blast Radius
 {Callers, downstream effects, call sites needing updates.}

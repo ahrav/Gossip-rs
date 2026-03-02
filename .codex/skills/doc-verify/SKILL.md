@@ -1,6 +1,7 @@
 ---
 name: doc-verify
 description: Verify documentation accuracy against code reality and external claims — runs as a fresh agent after /doc-rigor to prevent confirmation bias
+user-invocable: true
 ---
 
 # Doc Verify
