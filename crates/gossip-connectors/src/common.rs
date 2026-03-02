@@ -878,7 +878,7 @@ mod choose_split_tests {
             // Test the full range [0, len).
             if let Some(split) = choose_split_index(&items, 0, len) {
                 prop_assert!(split >= 1, "split {split} must be >= start_idx + 1");
-                prop_assert!(split <= len - 1, "split {split} must be <= range_end - 1");
+                prop_assert!(split < len, "split {split} must be < range_end");
             } else {
                 prop_assert!(len < 2, "None only when fewer than 2 items, got {len}");
             }
