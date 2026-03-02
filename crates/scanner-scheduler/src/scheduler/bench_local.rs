@@ -47,7 +47,7 @@
 //! - `reset()` clones the file path list (~24KB for 1000 files). This happens
 //!   between iterations, not in the scan hot path.
 //! - Finding counts come from the `LocalReport` metrics, which track
-//!   `findings_emitted` via the structured `EventSink`.
+//!   `findings_emitted` via the structured `EventOutput`.
 //!
 //! # Usage
 //!
@@ -338,7 +338,7 @@ mod tests {
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
             skip_binary: true,
-            event_sink: Arc::new(crate::unified::events::NullEventSink),
+            event_sink: Arc::new(crate::events::NullEventOutput),
             store_producer: None,
         }
     }

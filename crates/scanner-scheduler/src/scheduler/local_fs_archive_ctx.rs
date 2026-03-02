@@ -235,7 +235,7 @@ pub(super) fn budget_hit_to_archive_end(hit: BudgetHit) -> ArchiveEnd {
 pub(super) struct ArchiveScanCtx<'a, E: ScanEngine> {
     pub(super) engine: &'a Arc<E>,
     pub(super) pool: &'a TsBufferPool,
-    pub(super) event_sink: &'a dyn crate::unified::events::EventSink,
+    pub(super) event_sink: &'a dyn crate::events::EventOutput,
     pub(super) store_producer: Option<&'a dyn StoreProducer>,
     pub(super) scan_scratch: &'a mut E::Scratch,
     /// Reusable findings drain buffer (cleared before each `drain_findings_into`).

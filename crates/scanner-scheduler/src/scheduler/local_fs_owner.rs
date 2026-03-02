@@ -145,8 +145,8 @@ pub struct LocalConfig {
 
     /// Structured event sink for finding output.
     ///
-    /// All findings are emitted as `ScanEvent::Finding` through this sink.
-    pub event_sink: Arc<dyn crate::unified::events::EventSink>,
+    /// All findings are emitted as `CoreEvent::Finding` through this sink.
+    pub event_sink: Arc<dyn crate::events::EventOutput>,
 
     /// Optional persistence producer for post-dedupe FS finding batches.
     pub store_producer: Option<Arc<dyn StoreProducer>>,
@@ -166,7 +166,7 @@ impl Default for LocalConfig {
             dedupe_within_chunk: true,
             archive: ArchiveConfig::default(),
             skip_binary: true,
-            event_sink: Arc::new(crate::unified::events::NullEventSink),
+            event_sink: Arc::new(crate::events::NullEventOutput),
             store_producer: None,
         }
     }
@@ -186,7 +186,7 @@ impl std::fmt::Debug for LocalConfig {
             .field("dedupe_within_chunk", &self.dedupe_within_chunk)
             .field("archive", &self.archive)
             .field("skip_binary", &self.skip_binary)
-            .field("event_sink", &"<dyn EventSink>")
+            .field("event_sink", &"<dyn EventOutput>")
             .field(
                 "store_producer",
                 &self.store_producer.as_ref().map(|_| "<dyn StoreProducer>"),
@@ -373,7 +373,7 @@ pub(super) struct LocalScratch<E: ScanEngine> {
     pub(super) abort_run: Arc<AtomicBool>,
 
     /// Structured event sink for finding output.
-    pub(super) event_sink: Arc<dyn crate::unified::events::EventSink>,
+    pub(super) event_sink: Arc<dyn crate::events::EventOutput>,
     /// Optional persistence producer for post-dedupe findings.
     pub(super) store_producer: Option<Arc<dyn StoreProducer>>,
 
@@ -542,7 +542,7 @@ fn build_persistence_batch<F: FindingWithHashRecord>(
 #[inline]
 pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
     store_producer: Option<&dyn StoreProducer>,
-    event_sink: &dyn crate::unified::events::EventSink,
+    event_sink: &dyn crate::events::EventOutput,
     path: &[u8],
     findings: &[F],
     persist_batch: &mut Vec<FsFindingRecord>,
@@ -579,8 +579,8 @@ pub(super) fn emit_persistence_batch<F: FindingWithHashRecord>(
             &mut msg,
             format_args!("fs persistence batch emit failed: {}", err.detail()),
         );
-        event_sink.emit(crate::unified::events::ScanEvent::Diagnostic(
-            crate::unified::events::DiagnosticEvent {
+        event_sink.emit_core(crate::events::CoreEvent::Diagnostic(
+            crate::events::DiagnosticEvent {
                 level: "error",
                 message: msg.as_str(),
             },
@@ -1237,8 +1237,8 @@ where
                 &mut msg,
                 format_args!("fs persistence run-loss recording failed: {}", err.detail()),
             );
-            run_event_sink.emit(crate::unified::events::ScanEvent::Diagnostic(
-                crate::unified::events::DiagnosticEvent {
+            run_event_sink.emit_core(crate::events::CoreEvent::Diagnostic(
+                crate::events::DiagnosticEvent {
                     level: "error",
                     message: msg.as_str(),
                 },

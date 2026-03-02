@@ -119,15 +119,15 @@ pub(super) fn account_effective_dropped_findings(
     metrics.findings_dropped = metrics.findings_dropped.saturating_add(effective);
 }
 
-/// Emit structured finding events via the [`EventSink`].
+/// Emit structured finding events via the [`EventOutput`].
 ///
-/// Emits one [`ScanEvent::Finding`] per finding record.
+/// Emits one [`CoreEvent::Finding`] per finding record.
 ///
-/// [`EventSink`]: crate::unified::events::EventSink
+/// [`EventOutput`]: crate::events::EventOutput
 #[inline]
 pub(super) fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
-    event_sink: &dyn crate::unified::events::EventSink,
+    event_sink: &dyn crate::events::EventOutput,
     path: &[u8],
     findings: &[F],
 ) {
@@ -136,9 +136,9 @@ pub(super) fn emit_findings<E: ScanEngine, F: FindingRecord>(
     }
 
     for rec in findings {
-        event_sink.emit(crate::unified::events::ScanEvent::Finding(
-            crate::unified::events::FindingEvent {
-                source: crate::unified::SourceKind::Fs,
+        event_sink.emit_core(crate::events::CoreEvent::Finding(
+            crate::events::FindingEvent {
+                source: crate::source_kind::SourceKind::Fs,
                 object_path: path,
                 start: rec.root_hint_start(),
                 end: rec.root_hint_end(),
