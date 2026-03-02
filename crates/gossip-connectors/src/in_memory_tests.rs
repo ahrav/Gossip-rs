@@ -942,6 +942,14 @@ mod prop {
     use proptest::collection::vec as pvec;
     use proptest::prelude::*;
 
+    fn proptest_cases(default: u32) -> u32 {
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(default)
+    }
+
     /// Strategy: generate 0..max_items unique keys as short byte strings.
     fn item_vec_strategy(max_items: usize) -> impl Strategy<Value = Vec<MemItem>> {
         pvec(pvec(1u8..=127u8, 1..8usize), 0..max_items).prop_map(|key_vecs| {
@@ -959,7 +967,7 @@ mod prop {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases(64)))]
 
         #[test]
         fn full_enum_yields_sorted_input(items in item_vec_strategy(30)) {

@@ -1096,10 +1096,9 @@ mod tests {
     // -----------------------------
 
     proptest! {
-        // Keep this fast enough for PRs.
-        // In CI/nightly, bump with: PROPTEST_CASES=... and/or run proptest with more cases.
+        // Keep this fast enough for PRs; env-overridable via PROPTEST_CASES.
         #![proptest_config(ProptestConfig {
-            cases: 128,
+            cases: crate::test_utils::proptest_cases(128),
             max_shrink_iters: 256,
             .. ProptestConfig::default()
         })]

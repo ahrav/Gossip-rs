@@ -907,7 +907,7 @@ mod prop_tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(crate::test_utils::proptest_cases(256)))]
 
         /// Same input always produces the same key.
         #[test]

@@ -115,9 +115,30 @@ jobs:
           shared-key: stable-linux
           save-cache: "false"
 
-      - run: >-
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Build tests
+        run: >-
+          cargo nextest run
+          --features test-support,perf-stats
+          --no-run
+          --profile ci
+
+      - name: Run tests
+        run: >-
+          cargo nextest run
+          --features test-support,perf-stats
+          --profile ci
+
+      # nextest does not run doctests; run them separately.
+      - name: Run doctests
+        run: >-
           cargo test
           --features test-support,perf-stats
+          --doc
 
   # ── Benchmark (compile check) ────────────────────────────────────
   bench:
@@ -224,8 +245,19 @@ jobs:
           shared-key: stable-linux
           save-cache: "false"
 
-      - run: cargo test --all-features
-      - run: cargo test --all-features --release
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@735e5933943122c5ac182670a935f54a949265c1 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run tests (debug)
+        run: cargo nextest run --all-features --profile nightly
+      - name: Run doctests (debug)
+        run: cargo test --all-features --doc
+      - name: Run tests (release)
+        run: cargo nextest run --all-features --release --profile nightly
+      - name: Run doctests (release)
+        run: cargo test --all-features --release --doc
 
   # ── Miri (nightly only) ────────────────────────────────────────────
   miri:
