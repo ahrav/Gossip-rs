@@ -749,29 +749,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "gossip-scan-pipeline"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "gossip-connectors",
- "gossip-contracts",
- "gossip-coordination",
- "proptest",
- "rstest",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "gossip-scanner-runtime"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gossip-connectors",
  "gossip-contracts",
- "gossip-coordination",
- "gossip-engine",
  "gossip-scan-driver",
- "gossip-scan-pipeline",
+ "regex",
  "rstest",
  "scanner-engine",
  "scanner-scheduler",
@@ -791,11 +776,8 @@ dependencies = [
 name = "gossip-worker"
 version = "0.1.0"
 dependencies = [
- "gossip-connectors",
- "gossip-contracts",
- "gossip-coordination",
- "gossip-engine",
- "gossip-scan-pipeline",
+ "gossip-scanner-runtime",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
