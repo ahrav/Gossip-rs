@@ -253,7 +253,7 @@ Filesystem scans have a concrete persistence backend in
   `--persist-findings` is enabled.
 
 For the full schema documentation, query APIs, and configuration,
-see [fs-persistence-pipeline.md § SQLite Backend](fs-persistence-pipeline.md#sqlite-backend).
+see [fs-persistence-pipeline.md](../scanner-scheduler/fs-persistence-pipeline.md).
 
 **Pressure Coalescing**: If windows exceed `max_windows_per_rule_variant` (16), the gap doubles until windows fit, or everything merges into one.
 
@@ -564,4 +564,4 @@ FindingRec {
 | Document | Description |
 |----------|-------------|
 | [Transform Chain](./transform-chain.md) | URL/Base64 transform gating and decode flow |
-| [Memory Management](./memory-management.md) | Buffer pools, scratch allocation, and memory budgets |
+| [Memory Management](../memory-management.md) | Buffer pools, scratch allocation, and memory budgets |

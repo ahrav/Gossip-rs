@@ -531,6 +531,13 @@ and `end_run()` derives the final run status and persists it to the database.
 
 ## Persistence Identity Types
 
+> **Status: Aspirational** — The types below (`StoreKeys`, `RunModeMetadata`,
+> `CorrelationMode`, `KeySource`, `IdentityFlags`, `VariantDiscriminant`,
+> `OccurrenceInput`) describe a planned persistence-layer identity system
+> that has not been implemented. For the **implemented** identity types, see
+> `crates/gossip-contracts/src/identity/` and
+> [boundary-1-identity-spine.md](gossip-contracts/boundary-1-identity-spine.md).
+
 ```mermaid
 classDiagram
     direction TB
@@ -601,9 +608,9 @@ classDiagram
     IdentityFlags --> IdentityError : validated by
 ```
 
-Verified against: `crates/scanner-scheduler/src/store.rs`.
+*Aspirational — not verified against live code. These types do not exist in `crates/scanner-scheduler/src/store.rs`.*
 
-**Identity derivation functions** (not shown as classes):
+**Identity derivation functions** *(aspirational API — not implemented)*:
 
 | Function | Input | Output | Key Used |
 |---|---|---|---|
@@ -611,7 +618,7 @@ Verified against: `crates/scanner-scheduler/src/store.rs`.
 | `secret_hash(norm_hash, keys)` | `[u8; 32]` | `SecretHash` (`[u8; 32]`) | `secret_key` |
 | `occurrence_id(input, keys)` | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`) | `identity_key` |
 
-See [persistence-identity.md](gossip-contracts/persistence-identity.md) for contract details and normalization rules.
+See [persistence-identity.md](gossip-contracts/persistence-identity.md) for contract details and normalization rules *(aspirational)*.
 
 ## Key Relationships Summary
 
@@ -629,9 +636,9 @@ See [persistence-identity.md](gossip-contracts/persistence-identity.md) for cont
 | `FindingRec` | references | `FileId` | Source file identifier |
 | `FindingRec` | references | `StepId` | Decode provenance chain |
 | `NodePoolType` | uses | `DynamicBitSet` | Free slot tracking |
-| `StoreKeys` | contains | `RunModeMetadata` | Run correlation semantics |
-| `OccurrenceInput` | references | `FindingRec` | Finding to hash |
-| `OccurrenceInput` | contains | `VariantDiscriminant` | UTF-16 variant discrimination |
+| `StoreKeys` | contains | `RunModeMetadata` | Run correlation semantics *(aspirational)* |
+| `OccurrenceInput` | references | `FindingRec` | Finding to hash *(aspirational)* |
+| `OccurrenceInput` | contains | `VariantDiscriminant` | UTF-16 variant discrimination *(aspirational)* |
 | `FsFindingBatch` | contains | `FsFindingRecord` | Post-dedupe findings per object |
 | `FsFindingRecord` | carries | `NormHash` | BLAKE3 digest for cross-run dedup |
 | `StoreProducer` | receives | `FsFindingBatch` | Per-object finding persistence |

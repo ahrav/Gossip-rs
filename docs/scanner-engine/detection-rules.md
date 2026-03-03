@@ -4,11 +4,11 @@ Representative view of the current built-in detection rules used by scanner-rs.
 
 ## Source of Truth
 
-- [crates/scanner-engine/default_rules.yaml](../crates/scanner-engine/default_rules.yaml)
-- [crates/scanner-engine/src/rules/yaml.rs](../crates/scanner-engine/src/rules/yaml.rs)
-- [crates/scanner-engine/src/rules/mod.rs](../crates/scanner-engine/src/rules/mod.rs)
-- [crates/scanner-engine/src/demo.rs](../crates/scanner-engine/src/demo.rs)
-- [crates/scanner-scheduler/src/scheduler/parallel_scan.rs](../crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
+- [crates/scanner-engine/default_rules.yaml](../../crates/scanner-engine/default_rules.yaml)
+- [crates/scanner-engine/src/rules/yaml.rs](../../crates/scanner-engine/src/rules/yaml.rs)
+- [crates/scanner-engine/src/rules/mod.rs](../../crates/scanner-engine/src/rules/mod.rs)
+- [crates/scanner-engine/src/demo.rs](../../crates/scanner-engine/src/demo.rs)
+- [crates/scanner-scheduler/src/scheduler/parallel_scan.rs](../../crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
 
 ## Current Snapshot
 

@@ -440,7 +440,7 @@ The core safety properties (mutual exclusion, zombie rejection, fence
 monotonicity, terminal irreversibility, split atomicity, and cursor
 monotonicity) are also verified exhaustively by the TLA+ model checker
 across all reachable states. See
-[specs/coordination/README.md](../specs/coordination/README.md) for the
+[specs/coordination/README.md](../../specs/coordination/README.md) for the
 specification, property mapping, and instructions for running TLC.
 
 ### Operational guidance

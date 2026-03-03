@@ -52,6 +52,7 @@ The crate provides four core capabilities:
 | `common.rs`        | Shared utilities: binary search, identity derivation, split-point selection |
 | `in_memory.rs`     | `InMemoryDeterministicConnector` -- deterministic in-memory fixture  |
 | `filesystem.rs`    | `FilesystemConnector` -- Unix-only filesystem connector             |
+| `scan_driver.rs`   | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
 
 ---
 
@@ -59,14 +60,21 @@ The crate provides four core capabilities:
 
 ```text
          ┌──────────────────────────────────────────────────┐
-         │  gossip-scan-pipeline                            │  drives connectors
-         │  (scan loop: enumerate → validate → checkpoint)  │  via traits
+         │  gossip-scanner-runtime                          │  scan_fs(), scan_git()
+         │  (top-level scan dispatchers)                    │  entry points
          └──────────────┬───────────────────────────────────┘
-                        │ uses EnumerationConnector + validate_page
+                        │ uses ScanSourceFactory + ScanDriver::run()
+                        ▼
+         ┌──────────────────────────────────────────────────┐
+         │  gossip-scan-driver (traits + types)             │  ScanDriver, ScanSourceFactory,
+         │                                                  │  Assignment, ScanExecutionConfig
+         └──────────────┬───────────────────────────────────┘
+                        │ implemented by
                         ▼
          ┌──────────────────────────────────────────────────┐
          │  gossip-connectors (Boundary 4 implementations)  │  FilesystemConnector,
-         │                                                  │  InMemoryDeterministicConnector
+         │  + scan_driver.rs (ScanSourceFactory impls)      │  InMemoryDeterministicConnector,
+         │                                                  │  Fs/Git/InMemoryScanSourceFactory
          └──────────────┬───────────────────────────────────┘
                         │ depends on
                         ▼
@@ -94,7 +102,9 @@ The crate provides four core capabilities:
 | Conformance testing             | `gossip-contracts::connector`      | `check_connector_conforms`, `ConformanceConfig`               |
 | Reference connectors            | `gossip-connectors`                | `FilesystemConnector`, `InMemoryDeterministicConnector`       |
 | Shared connector utilities      | `gossip-connectors::common`        | `lower_bound`, `upper_bound`, `choose_split_index`           |
-| Scan loop orchestration         | `gossip-scan-pipeline`             | `run_scan_loop`, page-level checkpoint/renew cycle            |
+| Scan driver traits              | `gossip-scan-driver`               | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`        |
+| Scan source factory impls       | `gossip-connectors::scan_driver`   | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
+| Scan runtime entry points       | `gossip-scanner-runtime`           | `scan_fs()`, `scan_git()`, execution-mode dispatch            |
 
 ### Dependency direction
 
@@ -106,9 +116,13 @@ value types. It must NOT depend on `gossip-coordination`,
   gossip-connectors ──► gossip-contracts
 ```
 
-`gossip-scan-pipeline` depends on both `gossip-contracts` and
-`gossip-coordination`, composing connector trait calls with coordination
-session management.
+`gossip-scan-driver` defines the `ScanDriver` and `ScanSourceFactory` traits
+that bridge assignments to source-specific execution backends.
+`gossip-connectors::scan_driver` provides concrete factory implementations
+(`FilesystemScanSourceFactory`, `GitScanSourceFactory`,
+`InMemoryScanSourceFactory`). `gossip-scanner-runtime` provides the top-level
+entry points (`scan_fs()`, `scan_git()`) that compose driver execution with
+engine and event infrastructure.
 
 ---
 
@@ -450,13 +464,34 @@ leading entry.
 
 ## 9. Scan Loop Integration
 
-The scan loop (`crates/gossip-scan-pipeline/src/scan_loop.rs`) drives
-one shard from its current cursor to completion by repeatedly calling
+> **Status: Aspirational** — The subsections below titled "Loop structure",
+> "Key scan-loop invariants", "Current scope", and "Retry and failure
+> handling" describe a planned `gossip-scan-pipeline` crate and its
+> `run_scan_loop` API which have **not been implemented**. The constants
+> `DEFAULT_MAX_TRANSIENT_RETRIES` and `DEFAULT_RENEW_AT_FRACTION` do not
+> exist in the codebase. The `connector-pipeline` feature flag referenced
+> elsewhere does not exist in any `Cargo.toml`.
+>
+> The **current** scan execution path is:
+>
+> - **`gossip-scan-driver`** — defines `ScanDriver::run()` and
+>   `ScanSourceFactory` traits
+>   (`crates/gossip-scan-driver/src/lib.rs`).
+> - **`gossip-connectors::scan_driver`** — provides
+>   `FilesystemScanSourceFactory`, `GitScanSourceFactory`, and
+>   `InMemoryScanSourceFactory`
+>   (`crates/gossip-connectors/src/scan_driver.rs`).
+> - **`gossip-scanner-runtime`** — provides `scan_fs()` and `scan_git()`
+>   top-level entry points
+>   (`crates/gossip-scanner-runtime/src/lib.rs`).
+
+The following describes the **planned** page-level scan loop that would
+drive one shard from its current cursor to completion by repeatedly calling
 `EnumerationConnector::enumerate_page` and validating each page via
 `validate_page` before checkpointing progress through the coordination
-backend.
+backend. None of the functions or constants below exist yet.
 
-### Loop structure
+### Loop structure (planned)
 
 ```text
 pre-loop: bridge ShardSpec + Cursor from coordination domain
@@ -469,13 +504,13 @@ enumerate_page(spec, cursor, budgets)
     └─ Err(permanent) ──► park (heuristic reason)
 ```
 
-### Key scan-loop invariants
+### Key scan-loop invariants (planned)
 
 - **SL1 -- Validate-before-persist:** pages are always validated before
   any checkpoint or complete call.
 - **SL2 -- Consecutive retry accounting:** transient-failure counter
-  resets to zero after every successful `enumerate_page`. The default
-  budget is `DEFAULT_MAX_TRANSIENT_RETRIES = 3`.
+  resets to zero after every successful `enumerate_page`. The planned
+  budget is `DEFAULT_MAX_TRANSIENT_RETRIES = 3` (not yet defined).
 - **SL3 -- Poisoned state never retried:** invalid spec bytes,
   unconvertible cursors, and failed validations are parked `Poisoned`
   immediately.
@@ -485,24 +520,25 @@ enumerate_page(spec, cursor, budgets)
   non-empty pages are processed after validation and before checkpoint.
   Hook failure aborts without persisting cursor progress for that page.
 
-### Current scope
+### Current scope (planned)
 
-Default APIs (`run_scan_loop`, `run_scan_loop_with_policy`) advance
-coordination cursor state only. They do **not** perform item reads,
-detection fan-out, or finding derivation.
+The planned default APIs (`run_scan_loop`, `run_scan_loop_with_policy`)
+would advance coordination cursor state only. They would **not** perform
+item reads, detection fan-out, or finding derivation.
 
-Hook-enabled APIs (`run_scan_loop_with_page_processor`,
-`run_scan_loop_with_policy_and_page_processor`) inject non-empty page
-processing before checkpoint for shadow-mode integration and adapter
-composition.
+The planned hook-enabled APIs (`run_scan_loop_with_page_processor`,
+`run_scan_loop_with_policy_and_page_processor`) would inject non-empty
+page processing before checkpoint for shadow-mode integration and
+adapter composition.
 
-### Retry and failure handling
+### Retry and failure handling (planned)
 
-Retry is a simple consecutive-failure counter (not a circuit breaker).
-When `transient_failures >= max_transient_retries`, the shard is parked
-with `ParkReason::TooManyErrors`. Permanent errors are parked with a
-heuristic-classified `ParkReason`. Lease renewal uses
-`DEFAULT_RENEW_AT_FRACTION = 0.5` (half-life trigger).
+The planned retry model is a simple consecutive-failure counter (not a
+circuit breaker). When `transient_failures >= max_transient_retries`,
+the shard would be parked with `ParkReason::TooManyErrors`. Permanent
+errors would be parked with a heuristic-classified `ParkReason`. Lease
+renewal would use `DEFAULT_RENEW_AT_FRACTION = 0.5` (half-life trigger).
+Neither constant exists in the codebase yet.
 
 ---
 

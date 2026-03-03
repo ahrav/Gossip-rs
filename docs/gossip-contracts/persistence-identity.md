@@ -1,5 +1,13 @@
 # Persistence Identity Contracts
 
+> **Status: Aspirational** — This document describes a planned persistence-layer
+> identity system that has not been implemented. The types (`StoreKeys`,
+> `RunModeMetadata`, `IdentityFlags`, `OccurrenceInput`, `VariantDiscriminant`)
+> do not exist in the codebase. For the **implemented** identity system, see
+> [boundary-1-identity-spine.md](boundary-1-identity-spine.md) which documents
+> `FindingIdInputs`, `OccurrenceIdInputs`, and the BLAKE3-based derivation chain
+> in `crates/gossip-contracts/src/identity/`.
+
 Deterministic, versioned identity contracts for persistence across all
 scanner sources. These contracts let the scanner answer "have I seen this
 exact finding before?" across runs without storing raw secret bytes.
@@ -437,5 +445,5 @@ domain strings.
 | [transform-chain.md](../scanner-engine/transform-chain.md) | Identity canonicalization link for transforms |
 | [memory-management.md](../memory-management.md) | Store key bootstrap memory notes |
 | [git-scanning.md](../scanner-git/git-scanning.md) | Git persistence pipeline (separate system) |
-| [data-types.md](../data-types.md) | StoreKeys, IdentityFlags, OccurrenceInput class diagrams |
+| [data-types.md](../data-types.md) | StoreKeys, IdentityFlags, OccurrenceInput class diagrams *(aspirational — these types are not implemented)* |
 | [architecture-overview.md](../architecture-overview.md) | Component table entries for Store Keys / Store Identity |

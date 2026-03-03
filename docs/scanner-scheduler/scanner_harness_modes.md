@@ -122,6 +122,9 @@ flowchart TD
 
 ## Mode 3: Direct-vs-Connector Parity Gate (Phase 1)
 
+> **Status: Not yet implemented** — This mode describes a planned test
+> gate. The files referenced below do not yet exist in the codebase.
+
 ### What it tests
 
 Mode 3 is a migration gate that validates parity between execution modes:
@@ -168,6 +171,11 @@ cargo test --features integration-tests --test integration execution_mode_parity
 ```
 
 ## Mode 4: FS Enumeration Conformance Matrix (Phase 4)
+
+> **Status: Not yet implemented** — This mode describes a planned
+> conformance test. The `connector-pipeline` feature flag and
+> `filesystem_enumeration_conformance_matrix_matches_connector` test
+> do not yet exist.
 
 ### What it tests
 

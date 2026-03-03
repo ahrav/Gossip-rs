@@ -590,7 +590,7 @@ simulation label because they were introduced by the TLA+ spec.
 
 ### Running the model checker
 
-See [specs/coordination/README.md](../specs/coordination/README.md) for
+See [specs/coordination/README.md](../../specs/coordination/README.md) for
 prerequisites, TLC commands, and mutation tests.
 
 ### Source files
