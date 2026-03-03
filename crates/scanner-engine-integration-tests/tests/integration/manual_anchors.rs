@@ -67,4 +67,11 @@ fn test_facebook_detection() {
     for h in hits {
         eprintln!("  - rule: {}", engine.rule_name(h.rule_id));
     }
+
+    // Verify the manual-anchor path detects the Facebook access token pattern.
+    assert!(
+        hits.iter()
+            .any(|h| engine.rule_name(h.rule_id).contains("facebook")),
+        "Should detect a facebook-related rule"
+    );
 }

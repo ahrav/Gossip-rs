@@ -62,7 +62,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(hex.len() / 2);
     let bytes = hex.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
+    while i + 1 < bytes.len() {
         let hi = (bytes[i] as char).to_digit(16).unwrap();
         let lo = (bytes[i + 1] as char).to_digit(16).unwrap();
         out.push(((hi << 4) | lo) as u8);

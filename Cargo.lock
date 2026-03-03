@@ -1547,7 +1547,6 @@ dependencies = [
  "crc32fast",
  "flate2",
  "gix-commitgraph",
- "gossip-scanner-runtime",
  "gossip-stdx",
  "memchr",
  "proptest",

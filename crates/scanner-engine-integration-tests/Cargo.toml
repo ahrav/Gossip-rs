@@ -33,7 +33,6 @@ blake3 = "1.5"
 crc32fast = "1.4"
 flate2 = "1.1"
 gix-commitgraph = "0.29"
-gossip-scanner-runtime = { path = "../gossip-scanner-runtime" }
 gossip-stdx.workspace = true
 memchr = "2.7"
 proptest.workspace = true
