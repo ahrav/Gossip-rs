@@ -532,20 +532,10 @@ pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> 
 
 /// Filesystem scan routed through the unified assignment/driver seam.
 pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let canonical_path = validate_fs_path(&config.path)?;
-    let assignment = build_assignment(
-        ConnectorKind::Filesystem,
-        canonical_path.display().to_string(),
-        AssignmentSource::Filesystem {
-            root: canonical_path,
-        },
-    );
-
     let out = NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
-    execute_assignment(&assignment, config.budgets, &out, None, &commit, &cancel)
-        .map(|outcome| outcome.report)
+    scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
 /// Connector-mode filesystem scan.
@@ -639,26 +629,6 @@ pub(crate) fn scan_git_with_runtime(
         transform_filter: config.transform_filter.clone(),
     };
     execute_assignment_with_config(&assignment, runtime, &engine, out, git_out, commit, cancel)
-}
-
-pub(crate) fn execute_assignment(
-    assignment: &Assignment,
-    budgets: ScanBudgets,
-    out: &dyn EventOutput,
-    git_out: Option<&dyn GitEventOutput>,
-    commit: &dyn CommitSink,
-    cancel: &CancellationToken,
-) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    let runtime = budgets.to_execution_config()?;
-    execute_assignment_with_config(
-        assignment,
-        runtime,
-        &RuntimeEngineConfig::default(),
-        out,
-        git_out,
-        commit,
-        cancel,
-    )
 }
 
 pub(crate) fn execute_assignment_with_config(
