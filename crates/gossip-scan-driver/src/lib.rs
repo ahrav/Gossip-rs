@@ -94,7 +94,7 @@ impl Default for FilesystemExecutionConfig {
         Self {
             skip_archives: false,
             skip_binary: true,
-            emit_findings_to_commit_sink: true,
+            emit_findings_to_commit_sink: false,
         }
     }
 }
