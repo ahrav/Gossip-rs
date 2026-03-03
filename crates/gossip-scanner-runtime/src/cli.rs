@@ -14,8 +14,8 @@ use scanner_scheduler::events::EventOutput;
 use crate::commit_sink::CliNoOpCommitSink;
 use crate::event_sink::{JsonEventSink, JsonlEventSink, SarifEventSink, TextEventSink};
 use crate::{
-    scan_fs_with_runtime, scan_git_with_runtime, AnchorMode, EventFormat, ExecutionMode,
-    FsScanConfig, GitScanConfig, ScanBudgets, ScanRuntimeError, TransformFilter,
+    AnchorMode, EventFormat, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets,
+    ScanRuntimeError, TransformFilter, scan_fs_with_runtime, scan_git_with_runtime,
 };
 
 /// CLI source command.
