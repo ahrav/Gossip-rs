@@ -179,15 +179,21 @@ impl ScanDriver for FsScanDriver {
             let (commit_tx, commit_rx) = unbounded();
             let commit_forwarder = scope.spawn(move || forward_commits(commit, commit_rx));
 
-            let scan_cfg = ParallelScanConfig {
+            let mut scan_cfg = ParallelScanConfig {
                 workers: cfg.workers.max(1),
                 event_sink: Arc::new(ChannelEventOutput::new(event_tx.clone())),
-                store_producer: Some(Arc::new(ChannelStoreProducer::new(
-                    commit_tx.clone(),
-                    self.root.clone(),
-                ))),
+                skip_binary: cfg.filesystem.skip_binary,
                 ..ParallelScanConfig::default()
             };
+            if cfg.filesystem.skip_archives {
+                scan_cfg.archive.enabled = false;
+            }
+            if cfg.filesystem.emit_findings_to_commit_sink {
+                scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::new(
+                    commit_tx.clone(),
+                    self.root.clone(),
+                )));
+            }
 
             let report = if cancel.is_cancelled() {
                 scanner_scheduler::scheduler::local_fs_owner::LocalReport::default()

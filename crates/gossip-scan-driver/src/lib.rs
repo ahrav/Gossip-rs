@@ -79,9 +79,31 @@ pub struct Assignment {
 
 /// Runtime knobs shared across driver implementations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilesystemExecutionConfig {
+    /// When true, archive expansion is disabled.
+    pub skip_archives: bool,
+    /// When true, binary-looking files are skipped.
+    pub skip_binary: bool,
+    /// When true, findings are forwarded through the commit sink bridge.
+    pub emit_findings_to_commit_sink: bool,
+}
+
+impl Default for FilesystemExecutionConfig {
+    fn default() -> Self {
+        Self {
+            skip_archives: false,
+            skip_binary: true,
+            emit_findings_to_commit_sink: true,
+        }
+    }
+}
+
+/// Runtime knobs shared across driver implementations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanExecutionConfig {
     pub workers: usize,
     pub checkpoint_every_items: u64,
+    pub filesystem: FilesystemExecutionConfig,
 }
 
 impl Default for ScanExecutionConfig {
@@ -89,6 +111,7 @@ impl Default for ScanExecutionConfig {
         Self {
             workers: 1,
             checkpoint_every_items: 1_000,
+            filesystem: FilesystemExecutionConfig::default(),
         }
     }
 }
