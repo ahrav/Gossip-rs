@@ -4,7 +4,7 @@
 //! boundary module may be referenced here. All four sibling modules depend on
 //! `identity`.
 //!
-//! For the full architecture design, see `docs/boundary-1-identity-spine.md`.
+//! For the full architecture design, see `docs/gossip-contracts/boundary-1-identity-spine.md`.
 //!
 //! **Key invariants:**
 //! - Collision-freedom — distinct values produce distinct canonical byte
@@ -30,12 +30,12 @@ mod golden;
 pub use canonical::CanonicalBytes;
 pub use coordination::{FenceEpoch, JobId, LogicalTime, OpId, RunId, ShardId, ShardKey, WorkerId};
 pub use finding::{
-    FindingId, FindingIdInputs, NormHash, OccurrenceId, OccurrenceIdInputs, RuleFingerprint,
-    SecretHash, derive_finding_id, derive_occurrence_id, key_secret_hash,
+    derive_finding_id, derive_occurrence_id, key_secret_hash, FindingId, FindingIdInputs, NormHash,
+    OccurrenceId, OccurrenceIdInputs, RuleFingerprint, SecretHash,
 };
 pub use hashing::{domain_hasher, finalize_32, finalize_64};
 pub use item::{ConnectorTag, IdentityInputError, ItemIdentityKey, ObjectVersionId, StableItemId};
 pub use policy::{
-    CURRENT_EVIDENCE_VERSION, CURRENT_VERSION, IdHashMode, PolicyHashInputs, compute_policy_hash,
+    compute_policy_hash, IdHashMode, PolicyHashInputs, CURRENT_EVIDENCE_VERSION, CURRENT_VERSION,
 };
 pub use types::{PolicyHash, TenantId, TenantSecretKey};

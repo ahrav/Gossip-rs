@@ -315,8 +315,8 @@ The policy hash is a canonical BLAKE3 identity over:
 ## Testing Harnesses
 
 The optional simulation harnesses provide deterministic simulation primitives and replayable traces
-for both scanner and scheduler testing. See `docs/scanner_test_harness_guide.md` and
-`docs/scheduler_test_harness_guide.md` for the full design and workflow.
+for both scanner and scheduler testing. See `docs/scanner-scheduler/scanner_test_harness_guide.md` and
+`docs/scanner-scheduler/scheduler_test_harness_guide.md` for the full design and workflow.
 
 ### Scanner Simulation Harness (`sim-harness` feature)
 

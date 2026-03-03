@@ -617,7 +617,7 @@ Verified against: `crates/scanner-scheduler/src/store/keys.rs`, `crates/scanner-
 | `secret_hash(norm_hash, keys)` | `[u8; 32]` | `SecretHash` (`[u8; 32]`) | `secret_key` |
 | `occurrence_id(input, keys)` | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`) | `identity_key` |
 
-See [persistence-identity.md](persistence-identity.md) for contract details and normalization rules.
+See [persistence-identity.md](gossip-contracts/persistence-identity.md) for contract details and normalization rules.
 
 ## Key Relationships Summary
 

@@ -7,11 +7,11 @@ monotonicity (S2), terminal irreversibility (S3), and eventual re-acquire
 (INV-L01) across all reachable states.
 
 For the protocol design see
-[boundary-2-coordination.md](../../docs/boundary-2-coordination.md).
+[boundary-2-coordination.md](../../docs/gossip-coordination/boundary-2-coordination.md).
 For implementation-level testing see
-[coordination-testing.md](../../docs/coordination-testing.md).
+[coordination-testing.md](../../docs/gossip-coordination/coordination-testing.md).
 For the simulation harness see
-[simulation-harness.md](../../docs/simulation-harness.md).
+[simulation-harness.md](../../docs/gossip-coordination/simulation-harness.md).
 
 ---
 

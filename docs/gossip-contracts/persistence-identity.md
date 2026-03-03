@@ -432,10 +432,10 @@ domain strings.
 
 | Document | Relevance |
 |---|---|
-| [fs-persistence-pipeline.md](fs-persistence-pipeline.md) | FS persistence pipeline (StoreProducer, SQLite backend, loss accounting) |
-| [detection-engine.md](detection-engine.md) | FindingRec output, norm_hash computation |
-| [transform-chain.md](transform-chain.md) | Identity canonicalization link for transforms |
-| [memory-management.md](memory-management.md) | Store key bootstrap memory notes |
-| [git-scanning.md](git-scanning.md) | Git persistence pipeline (separate system) |
-| [data-types.md](data-types.md) | StoreKeys, IdentityFlags, OccurrenceInput class diagrams |
-| [architecture-overview.md](architecture-overview.md) | Component table entries for Store Keys / Store Identity |
+| [fs-persistence-pipeline.md](../scanner-scheduler/fs-persistence-pipeline.md) | FS persistence pipeline (StoreProducer, SQLite backend, loss accounting) |
+| [detection-engine.md](../scanner-engine/detection-engine.md) | FindingRec output, norm_hash computation |
+| [transform-chain.md](../scanner-engine/transform-chain.md) | Identity canonicalization link for transforms |
+| [memory-management.md](../memory-management.md) | Store key bootstrap memory notes |
+| [git-scanning.md](../scanner-git/git-scanning.md) | Git persistence pipeline (separate system) |
+| [data-types.md](../data-types.md) | StoreKeys, IdentityFlags, OccurrenceInput class diagrams |
+| [architecture-overview.md](../architecture-overview.md) | Component table entries for Store Keys / Store Identity |

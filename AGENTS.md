@@ -17,7 +17,7 @@ After modifying Rust code, ALWAYS run these steps:
 
 1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
-3. If adding new components, update relevant docs: `docs/coordination-testing.md`, `docs/simulation-harness.md`, `docs/boundary-2-coordination.md`
+3. If adding new components, update relevant docs: `docs/gossip-coordination/coordination-testing.md`, `docs/gossip-coordination/simulation-harness.md`, `docs/gossip-coordination/boundary-2-coordination.md`
 
 <!-- zero-alloc-hot-path-v1 -->
 

@@ -478,9 +478,9 @@ The `SummaryEvent.status` field is set to `"partial"` when
 
 | Document | Relevance |
 |----------|-----------|
-| [persistence-identity.md](persistence-identity.md) | Identity contracts (RuleFingerprint, SecretHash, OccurrenceId) |
-| [pipeline-flow.md](pipeline-flow.md) | FS pipeline stages and buffer lifecycle |
+| [persistence-identity.md](../gossip-contracts/persistence-identity.md) | Identity contracts (RuleFingerprint, SecretHash, OccurrenceId) |
+| [pipeline-flow.md](../pipeline-flow.md) | FS pipeline stages and buffer lifecycle |
 | [scheduler-engine-abstraction.md](scheduler-engine-abstraction.md) | FindingWithHashRecord trait, EngineScratch changes |
 | [scheduler-engine-impl.md](scheduler-engine-impl.md) | Real engine adapter, drain_findings_with_hashes |
-| [architecture-overview.md](architecture-overview.md) | Component diagram and FS scan path |
-| [data-types.md](data-types.md) | Class diagrams for store::fs types |
+| [architecture-overview.md](../architecture-overview.md) | Component diagram and FS scan path |
+| [data-types.md](../data-types.md) | Class diagrams for store::fs types |

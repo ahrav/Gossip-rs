@@ -381,7 +381,7 @@ them.
 
 ## Source Code References
 
-- **Connector design doc**: `docs/boundary-4-connectors.md`
+- **Connector design doc**: `docs/gossip-connectors/boundary-4-connectors.md`
 - **Connector module**: `crates/gossip-connectors/`
 - **Connector trait**: `crates/gossip-contracts/src/connector/`
 - **Scan loop retry logic**: `crates/gossip-scan-pipeline/src/scan_loop.rs`

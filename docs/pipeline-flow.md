@@ -63,7 +63,7 @@ flowchart LR
   backend can decide whether the run is complete or partial
 - Errors from the producer are counted (`persistence_emit_failures`) but do not
   abort the scan — fail-soft semantics
-- See [fs-persistence-pipeline.md](fs-persistence-pipeline.md) for full details
+- See [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md) for full details
 
 `PipelineStats` in `crates/scanner-scheduler/src/pipeline.rs` includes `archive: ArchiveStats`, while
 the active scheduler report type is `LocalReport`/`MetricsSnapshot`.

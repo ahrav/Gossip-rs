@@ -38,7 +38,7 @@
 //!    edge-case arithmetic (e.g., zero-seed chunking) that would otherwise
 //!    panic silently.
 //!
-//! See `docs/coordination-testing.md` for the full tier breakdown.
+//! See `docs/gossip-coordination/coordination-testing.md` for the full tier breakdown.
 //!
 //! All `#[ignore]`'d tests are too slow for the default `cargo test` cycle.
 //! Run them explicitly:
@@ -57,8 +57,8 @@
 
 use std::collections::BTreeMap;
 
-use super::FaultLevel;
 use super::harness::{CoordinationSim, SimEventKind};
+use super::FaultLevel;
 
 /// Map a [`FaultLevel`] to the string accepted by `GOSSIP_SIM_FAULT`.
 fn fault_level_name(level: FaultLevel) -> &'static str {

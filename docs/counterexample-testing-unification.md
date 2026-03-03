@@ -560,9 +560,9 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
 
 | Document                               | Relevance                                        |
 |----------------------------------------|--------------------------------------------------|
-| `docs/scanner_harness_modes.md`        | Synthetic vs real-rules mode comparison          |
-| `docs/scanner_test_harness_guide.md`   | Synthetic harness usage guide                    |
-| `docs/git_simulation_harness_guide.md` | Git simulation harness guide                     |
-| `docs/detection-engine.md`             | Engine architecture (transform pipeline context) |
-| `docs/engine-transforms.md`            | Transform chain design (encoding context)        |
+| `docs/scanner-scheduler/scanner_harness_modes.md`        | Synthetic vs real-rules mode comparison          |
+| `docs/scanner-scheduler/scanner_test_harness_guide.md`   | Synthetic harness usage guide                    |
+| `docs/scanner-git/git_simulation_harness_guide.md` | Git simulation harness guide                     |
+| `docs/scanner-engine/detection-engine.md`             | Engine architecture (transform pipeline context) |
+| `docs/scanner-engine/engine-transforms.md`            | Transform chain design (encoding context)        |
 | `docs/kani-verification.md`            | Formal verification approach                     |
