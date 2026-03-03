@@ -296,16 +296,22 @@ jobs:
         run: cargo +nightly miri test -p gossip-frontier --all-features
 
       # FFI-heavy crates — Miri interprets Rust but cannot execute C/asm.
-      # Tests with FFI calls are gated behind #[cfg(not(miri))]; SIMD paths
-      # have #[cfg(miri)] scalar fallbacks.  Use aegis-pure-rust to avoid
-      # AES-NI / NEON intrinsics that Miri cannot interpret.
+      # Most scanner-engine tests call Vectorscan FFI (via demo_engine /
+      # cached_demo_engine → VsPrefilterDb::try_new → hs_compile_multi),
+      # which Miri cannot interpret.  Only run modules with pure-Rust logic
+      # and #[cfg(miri)] scalar fallbacks: simd_classify, offline_validate,
+      # and set_associative_cache.  Use aegis-pure-rust to avoid AES-NI /
+      # NEON intrinsics that Miri cannot interpret.
       - name: Miri — scanner-engine (pure-Rust paths)
         run: >-
           cargo +nightly miri test -p scanner-engine
           --features aegis-pure-rust,test-support
+          -- simd_classify offline_validate set_associative_cache
 
-      - name: Miri — scanner-git
-        run: cargo +nightly miri test -p scanner-git --features aegis-pure-rust
+      # scanner-git: all tests call Vectorscan FFI (via
+      # demo_engine_with_anchor_mode); no miri-safe test modules exist yet.
+      # TODO: add #[cfg(not(miri))] guards to engine_adapter_tests and
+      # introduce miri-safe unit tests for pure-Rust logic.
 
   # ── Kani (nightly only) ──────────────────────────────────────────────
   kani:
@@ -323,26 +329,26 @@ jobs:
       # Kani verifies all #[kani::proof] harnesses per crate.
       # 80 total proofs across 4 crates.
       - name: Kani — gossip-stdx (54 proofs)
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --package gossip-stdx --features kani
 
       - name: Kani — scanner-engine (15 proofs)
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --package scanner-engine --features kani
 
       - name: Kani — scanner-scheduler (9 proofs)
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --package scanner-scheduler --features kani
 
       - name: Kani — scanner-git (2 proofs)
-        uses: model-checking/kani-github-action@v1.1
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           args: --package scanner-git --features kani
 
-  # ── Loom (nightly only) ──────────────────────────────────────────────
+  # ── Loom (concurrency model checking) ────────────────────────────────
   loom:
     name: Loom Concurrency (Scheduled)
     runs-on: ubuntu-24.04
