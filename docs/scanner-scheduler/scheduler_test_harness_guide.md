@@ -63,12 +63,12 @@ A `SimCase` defines a complete simulation scenario in JSON. The harness loads th
 
 ### exec_cfg - Executor Configuration
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `workers` | usize | required | Number of simulated worker threads |
-| `steal_tries` | u32 | 4 | Steal attempts before parking |
-| `seed` | u64 | required | RNG seed for deterministic victim selection |
-| `wake_on_hoard_threshold` | u32 | 32 | Local spawns before waking a sibling worker |
+| Field                     | Type  | Default  | Description                                 |
+| ------------------------- | ----- | -------- | ------------------------------------------- |
+| `workers`                 | usize | required | Number of simulated worker threads          |
+| `steal_tries`             | u32   | 4        | Steal attempts before parking               |
+| `seed`                    | u64   | required | RNG seed for deterministic victim selection |
+| `wake_on_hoard_threshold` | u32   | 32       | Local spawns before waking a sibling worker |
 
 ```json
 "exec_cfg": {
@@ -175,27 +175,27 @@ Some corpus artifacts intentionally use other kinds (for example `"Panic"`).
 
 Each instruction executes atomically. After execution, the task either continues (new PC), blocks, or completes.
 
-| Instruction | Scanner Equivalent | JSON Syntax |
-|-------------|-------------------|-------------|
-| `Yield` | Async yield / reschedule self | `{ "Yield": { "placement": "Local" } }` |
-| `Spawn` | `ctx.spawn_local()` / `spawn_global()` | `{ "Spawn": { "program": 1, "placement": "Local" } }` |
-| `Sleep` | Timer-based wait / backoff | `{ "Sleep": { "ticks": 5 } }` |
-| `WaitIo` | Waiting for network/disk I/O | `{ "WaitIo": { "token": 7 } }` |
-| `TryAcquire` | ByteBudget / permit check | `{ "TryAcquire": { "res": 0, "units": 1, "ok": 2, "fail": 3 } }` |
-| `Release` | Return budget / permit | `{ "Release": { "res": 0, "units": 1 } }` |
-| `Jump` | Control flow (goto PC) | `{ "Jump": { "target": 0 } }` |
-| `Complete` | Task finishes normally | `"Complete"` |
-| `Panic` | Intentional crash (error path testing) | `"Panic"` |
+| Instruction  | Scanner Equivalent                     | JSON Syntax                                                      |
+| ------------ | -------------------------------------- | ---------------------------------------------------------------- |
+| `Yield`      | Async yield / reschedule self          | `{ "Yield": { "placement": "Local" } }`                          |
+| `Spawn`      | `ctx.spawn_local()` / `spawn_global()` | `{ "Spawn": { "program": 1, "placement": "Local" } }`            |
+| `Sleep`      | Timer-based wait / backoff             | `{ "Sleep": { "ticks": 5 } }`                                    |
+| `WaitIo`     | Waiting for network/disk I/O           | `{ "WaitIo": { "token": 7 } }`                                   |
+| `TryAcquire` | ByteBudget / permit check              | `{ "TryAcquire": { "res": 0, "units": 1, "ok": 2, "fail": 3 } }` |
+| `Release`    | Return budget / permit                 | `{ "Release": { "res": 0, "units": 1 } }`                        |
+| `Jump`       | Control flow (goto PC)                 | `{ "Jump": { "target": 0 } }`                                    |
+| `Complete`   | Task finishes normally                 | `"Complete"`                                                     |
+| `Panic`      | Intentional crash (error path testing) | `"Panic"`                                                        |
 
 ### Placement Options
 
 Used by `Yield` and `Spawn` to control where run-tokens are enqueued:
 
-| Placement | Queue | Semantics |
-|-----------|-------|-----------|
-| `Local` | Worker's local LIFO queue | Cache locality, same worker likely executes |
-| `Global` | Global FIFO injector | Fairness, any worker can pick up |
-| `External` | Global injector (gated) | Respects accepting gate; fails after `join()` |
+| Placement  | Queue                     | Semantics                                     |
+| ---------- | ------------------------- | --------------------------------------------- |
+| `Local`    | Worker's local LIFO queue | Cache locality, same worker likely executes   |
+| `Global`   | Global FIFO injector      | Fairness, any worker can pick up              |
+| `External` | Global injector (gated)   | Respects accepting gate; fails after `join()` |
 
 ### Instruction Details
 
@@ -450,23 +450,23 @@ cargo test --features scheduler-sim scheduler_sim_stress_smoke
 ```
 
 Environment variables:
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `SCHEDULER_SIM_STRESS_SEEDS` | 16 | Number of random cases to generate |
-| `SCHEDULER_SIM_STRESS_MAX_STEPS` | 80 | Maximum steps per case |
-| `SCHEDULER_SIM_STRESS_MAX_PROGRAMS` | 4 | Maximum programs per case |
-| `SCHEDULER_SIM_STRESS_MAX_TASKS` | 4 | Maximum initial tasks per case |
-| `SCHEDULER_SIM_STRESS_SEED_BASE` | 3490561775 (0xD00D_BEEF) | Base seed for RNG (env value is parsed as decimal) |
+| Variable                            | Default                  | Description                                        |
+| ----------------------------------- | ------------------------ | -------------------------------------------------- |
+| `SCHEDULER_SIM_STRESS_SEEDS`        | 16                       | Number of random cases to generate                 |
+| `SCHEDULER_SIM_STRESS_MAX_STEPS`    | 80                       | Maximum steps per case                             |
+| `SCHEDULER_SIM_STRESS_MAX_PROGRAMS` | 4                        | Maximum programs per case                          |
+| `SCHEDULER_SIM_STRESS_MAX_TASKS`    | 4                        | Maximum initial tasks per case                     |
+| `SCHEDULER_SIM_STRESS_SEED_BASE`    | 3490561775 (0xD00D_BEEF) | Base seed for RNG (env value is parsed as decimal) |
 
 ## Invariants Checked
 
 The harness validates these invariants on every step:
 
-| Invariant | Violation Kind | Meaning |
-|-----------|---------------|---------|
-| Resource bounds | `ResourceOverflow` | Released more units than acquired |
-| Gate consistency | `GateViolation` | Gate closed with zero in-flight but `done` not set |
-| Bounded starvation | `RunnableStarvation` | Runnable task not executed within bound |
+| Invariant          | Violation Kind       | Meaning                                            |
+| ------------------ | -------------------- | -------------------------------------------------- |
+| Resource bounds    | `ResourceOverflow`   | Released more units than acquired                  |
+| Gate consistency   | `GateViolation`      | Gate closed with zero in-flight but `done` not set |
+| Bounded starvation | `RunnableStarvation` | Runnable task not executed within bound            |
 
 Other `ViolationKind` variants exist in the enum (`InFlightMismatch`, `LostWakeup`, `IllegalUnblock`, etc.), but they are not emitted by the current oracle checks.
 

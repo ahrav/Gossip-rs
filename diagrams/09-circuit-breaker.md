@@ -101,10 +101,10 @@ stateDiagram-v2
 
 The three states correspond to three distinct behaviors from the caller's perspective:
 
-| State | Caller Experience | Source Load | Thread Impact |
-|:------|:------------------|:------------|:--------------|
-| Closed | Normal latency, normal errors | Full traffic | Workers block on I/O normally |
-| Open | Immediate `CircuitBreakerOpen` error | Zero traffic | Workers freed instantly |
+| State    | Caller Experience                    | Source Load    | Thread Impact                   |
+| :------- | :----------------------------------- | :------------- | :------------------------------ |
+| Closed   | Normal latency, normal errors        | Full traffic   | Workers block on I/O normally   |
+| Open     | Immediate `CircuitBreakerOpen` error | Zero traffic   | Workers freed instantly         |
 | HalfOpen | One probe in-flight, others rejected | Single request | One worker probes, others freed |
 
 Typical configuration thresholds:

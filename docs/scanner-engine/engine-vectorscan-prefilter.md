@@ -464,10 +464,10 @@ let saw_utf16 = db.scan_raw(haystack, &mut scan_scratch, &mut scratch)?;
 
 ## Coordinate Systems Summary
 
-| Database | Scan Input | Match Coords | Window Coords |
-|----------|-----------|--------------|---------------|
-| `VsPrefilterDb` (block) | Raw bytes | Raw-byte offsets | Raw-byte offsets |
-| `VsAnchorDb` (block) | Raw bytes | Raw-byte offsets | Raw-byte offsets |
-| `VsStreamDb` (stream) | Decoded stream | Decoded-byte offsets | Decoded-byte offsets |
-| `VsUtf16StreamDb` (stream) | Decoded UTF-16 stream | Decoded-byte offsets | Decoded-byte offsets + base_offset |
-| `VsGateDb` (stream) | Any decoded stream | N/A (presence only) | N/A |
+| Database                     | Scan Input            | Match Coords         | Window Coords                      |
+|------------------------------|-----------------------|----------------------|------------------------------------|
+| `VsPrefilterDb` (block)     | Raw bytes             | Raw-byte offsets     | Raw-byte offsets                   |
+| `VsAnchorDb` (block)        | Raw bytes             | Raw-byte offsets     | Raw-byte offsets                   |
+| `VsStreamDb` (stream)       | Decoded stream        | Decoded-byte offsets | Decoded-byte offsets               |
+| `VsUtf16StreamDb` (stream)  | Decoded UTF-16 stream | Decoded-byte offsets | Decoded-byte offsets + base_offset |
+| `VsGateDb` (stream)         | Any decoded stream    | N/A (presence only)  | N/A                                |

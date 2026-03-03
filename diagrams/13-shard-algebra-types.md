@@ -307,11 +307,11 @@ graph TD
 
 Wire sizes per variant:
 
-| Variant | Tag | Payload | Total |
-|:--------|:----|:--------|:------|
-| `Range` | `0x00` | (none) | 1 byte |
-| `Prefix` | `0x01` | `prefix_len:u32 BE` + `prefix_bytes` | 5 + N bytes |
-| `Manifest` | `0x02` | `manifest_id:u64 BE` + `start_row:u64 BE` + `end_row:u64 BE` | 25 bytes |
+| Variant    | Tag    | Payload                                                      | Total       |
+| :--------- | :----- | :----------------------------------------------------------- | :---------- |
+| `Range`    | `0x00` | (none)                                                       | 1 byte      |
+| `Prefix`   | `0x01` | `prefix_len:u32 BE` + `prefix_bytes`                         | 5 + N bytes |
+| `Manifest` | `0x02` | `manifest_id:u64 BE` + `start_row:u64 BE` + `end_row:u64 BE` | 25 bytes    |
 
 Source: `crates/gossip-frontier/src/hint.rs:57-60,170-194,330-335`
 
@@ -512,11 +512,11 @@ flowchart TD
 
 Propagation rules per variant:
 
-| Parent Hint | Validation | Result |
-|:------------|:-----------|:-------|
-| **Range** | None | `Range` (pass-through) |
-| **Prefix** | `child_start ≥ prefix`, `child_end ≤ prefix_successor(prefix)` | `Range` (demote) |
-| **Manifest** | Decode child keys as `ManifestRowKey`, verify `manifest_id` match and row containment | Narrowed `Manifest` |
+| Parent Hint  | Validation                                                                            | Result                 |
+| :----------- | :------------------------------------------------------------------------------------ | :--------------------- |
+| **Range**    | None                                                                                  | `Range` (pass-through) |
+| **Prefix**   | `child_start ≥ prefix`, `child_end ≤ prefix_successor(prefix)`                        | `Range` (demote)       |
+| **Manifest** | Decode child keys as `ManifestRowKey`, verify `manifest_id` match and row containment | Narrowed `Manifest`    |
 
 The Prefix → Range demotion is intentional: after splitting, child ranges are
 expressed as raw byte bounds, not prefix bounds. The prefix structure is no longer
@@ -528,24 +528,24 @@ Source: `crates/gossip-frontier/src/hint.rs:961-1025`
 
 ## Cross-References
 
-| Topic | Diagram File |
-|-------|-------------|
-| System overview and five-boundary architecture | [01-system-overview.md](01-system-overview.md) |
-| Boundary dependency graph | [02-boundary-dependency-graph.md](02-boundary-dependency-graph.md) |
-| Identity boundary deep-dive (B1 parallel) | [03-id-derivation-dag.md](03-id-derivation-dag.md) |
-| Split operations (split_replace, split_residual) | [12-split-operations.md](12-split-operations.md) |
-| Shard and run state machines | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
-| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) |
+| Topic                                            | Diagram File                                                             |
+| ------------------------------------------------ | ------------------------------------------------------------------------ |
+| System overview and five-boundary architecture   | [01-system-overview.md](01-system-overview.md)                           |
+| Boundary dependency graph                        | [02-boundary-dependency-graph.md](02-boundary-dependency-graph.md)       |
+| Identity boundary deep-dive (B1 parallel)        | [03-id-derivation-dag.md](03-id-derivation-dag.md)                       |
+| Split operations (split_replace, split_residual) | [12-split-operations.md](12-split-operations.md)                         |
+| Shard and run state machines                     | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
+| End-to-end scan flow                             | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md)                 |
 
 ## Source Code References
 
-| File | Purpose |
-|:-----|:--------|
-| `crates/gossip-contracts/src/coordination/shard_spec.rs` | `ShardSpec`, `ShardSpecRef`, `ShardArena`, `ShardSpecHandle`, `IntoShardSpecRef`, `validate_split_coverage()` |
-| `crates/gossip-contracts/src/coordination/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace_at_points()` |
-| `crates/gossip-frontier/src/key_encoding.rs` | `KeyEncoding` trait, `PathKey`, `ManifestRowKey`, `KeyBuf`, `prefix_successor()`, `byte_midpoint()`, `key_successor()` |
-| `crates/gossip-frontier/src/hint.rs` | `ShardHint`, `ShardMetadata`, `MetadataBuf`, `ShardSpecScratch`, `propagate_hint_on_split()`, `HintPropagationError` |
-| `crates/gossip-frontier/src/builder.rs` | `PreallocShardBuilder`, `split_range_by_boundaries()` |
-| `crates/gossip-contracts/src/connector/api.rs` | `EnumerationConnector`, `ConnectorCapabilities`, `choose_split_point()` |
-| `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` enumeration and split point selection |
-| `crates/gossip-connectors/src/in_memory.rs` | `InMemoryDeterministicConnector` enumeration and split point selection |
+| File                                                     | Purpose                                                                                                                |
+| :------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------- |
+| `crates/gossip-contracts/src/coordination/shard_spec.rs` | `ShardSpec`, `ShardSpecRef`, `ShardArena`, `ShardSpecHandle`, `IntoShardSpecRef`, `validate_split_coverage()`          |
+| `crates/gossip-contracts/src/coordination/split.rs`      | `SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace_at_points()`                                              |
+| `crates/gossip-frontier/src/key_encoding.rs`             | `KeyEncoding` trait, `PathKey`, `ManifestRowKey`, `KeyBuf`, `prefix_successor()`, `byte_midpoint()`, `key_successor()` |
+| `crates/gossip-frontier/src/hint.rs`                     | `ShardHint`, `ShardMetadata`, `MetadataBuf`, `ShardSpecScratch`, `propagate_hint_on_split()`, `HintPropagationError`   |
+| `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder`, `split_range_by_boundaries()`                                                                  |
+| `crates/gossip-contracts/src/connector/api.rs`           | `EnumerationConnector`, `ConnectorCapabilities`, `choose_split_point()`                                                |
+| `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` enumeration and split point selection                                                            |
+| `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` enumeration and split point selection                                                 |

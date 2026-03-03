@@ -530,17 +530,17 @@ scratch.push_finding_with_drop_hint(
 
 ### FindingRec Fields
 
-| Field | Type | Meaning |
-|-------|------|---------|
-| `file_id` | `FileId` | File identifier for finding source |
-| `rule_id` | `u32` | Rule that matched |
-| `span_start` | `u32` | Secret span start in decoded-stream or buffer |
-| `span_end` | `u32` | Secret span end (exclusive) |
-| `root_hint_start` | `u64` | Full match start (file offset for deduplication) |
-| `root_hint_end` | `u64` | Full match end (file offset for deduplication) |
-| `step_id` | `StepId` | Decode chain reference (enables span mapping) |
-| `dedupe_with_span` | `bool` | Whether `span_start`/`span_end` participate in dedupe |
-| `confidence_score` | `i8` | Additive 0–10 score computed from per-finding evidence (measured entropy pass, local keyword hit, assignment-shape signal, offline-valid signal) |
+| Field              | Type     | Meaning                                                                                                                                          |
+|--------------------|----------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| `file_id`          | `FileId` | File identifier for finding source                                                                                                               |
+| `rule_id`          | `u32`    | Rule that matched                                                                                                                                |
+| `span_start`       | `u32`    | Secret span start in decoded-stream or buffer                                                                                                    |
+| `span_end`         | `u32`    | Secret span end (exclusive)                                                                                                                      |
+| `root_hint_start`  | `u64`    | Full match start (file offset for deduplication)                                                                                                 |
+| `root_hint_end`    | `u64`    | Full match end (file offset for deduplication)                                                                                                   |
+| `step_id`          | `StepId` | Decode chain reference (enables span mapping)                                                                                                    |
+| `dedupe_with_span` | `bool`   | Whether `span_start`/`span_end` participate in dedupe                                                                                            |
+| `confidence_score` | `i8`     | Additive 0-10 score computed from per-finding evidence (measured entropy pass, local keyword hit, assignment-shape signal, offline-valid signal) |
 
 Keyword evidence is evaluated on a clamped local slice around the full regex
 match: `match_start.saturating_sub(32) .. min(match_end + 32, hay.len())`.

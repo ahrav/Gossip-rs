@@ -23,23 +23,23 @@ flowchart LR
 
 ## Pipeline Components
 
-| Component | Location | Purpose |
-| --- | --- | --- |
-| Preflight | `crates/scanner-git/src/preflight.rs` | Standalone metadata-only readiness check for commit-graph, MIDX, locks, and pack-count recommendations |
-| Repo Open | `crates/scanner-git/src/repo_open.rs` | Resolve repo layout, start set + watermarks, and artifact lock paths |
-| Artifact Acquire | `crates/scanner-git/src/artifact_acquire.rs` | Build MIDX + commit-graph in memory and capture artifact fingerprint |
-| Commit Walk | `crates/scanner-git/src/commit_walk.rs` | `(watermark, tip]` traversal and topo ordering |
-| Tree Diff | `crates/scanner-git/src/tree_diff.rs` | OID-only tree diffs that emit blob candidates |
-| Spill + Dedupe | `crates/scanner-git/src/spiller.rs` | Global dedupe + seen-blob filtering |
-| MIDX Mapping | `crates/scanner-git/src/mapping_bridge.rs` | Map unique blobs to pack offsets or loose fallback |
-| Pack Planning | `crates/scanner-git/src/pack_plan.rs` | Build per-pack decode plans with delta closure |
-| Pack Exec | `crates/scanner-git/src/runner_exec.rs`, `crates/scanner-git/src/pack_exec.rs` | Scheduler-driven pack execution and decode with bounded buffers |
-| Engine Adapter | `crates/scanner-git/src/engine_adapter.rs` | Overlap-safe chunked scanning with deterministic finding keys |
-| Finalize | `crates/scanner-git/src/finalize.rs` | Build write ops for blob_ctx, finding, seen_blob, and watermarks |
-| Persist | `crates/scanner-git/src/persist.rs` | Two-phase persistence (data ops then watermarks) |
-| ODB-Blob Pipeline | `crates/scanner-git/src/runner_odb_blob.rs` | Blob introduction + pack pipeline for ODB-blob mode |
-| Diff-History Pipeline | `crates/scanner-git/src/runner_diff_history.rs` | Tree-diff/spill/mapping + pack pipeline for diff-history mode |
-| Runner | `crates/scanner-git/src/runner.rs` | End-to-end orchestration of all stages |
+| Component             | Location                                                                       | Purpose                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| Preflight             | `crates/scanner-git/src/preflight.rs`                                          | Standalone metadata-only readiness check for commit-graph, MIDX, locks, and pack-count recommendations |
+| Repo Open             | `crates/scanner-git/src/repo_open.rs`                                          | Resolve repo layout, start set + watermarks, and artifact lock paths                                   |
+| Artifact Acquire      | `crates/scanner-git/src/artifact_acquire.rs`                                   | Build MIDX + commit-graph in memory and capture artifact fingerprint                                   |
+| Commit Walk           | `crates/scanner-git/src/commit_walk.rs`                                        | `(watermark, tip]` traversal and topo ordering                                                         |
+| Tree Diff             | `crates/scanner-git/src/tree_diff.rs`                                          | OID-only tree diffs that emit blob candidates                                                          |
+| Spill + Dedupe        | `crates/scanner-git/src/spiller.rs`                                            | Global dedupe + seen-blob filtering                                                                    |
+| MIDX Mapping          | `crates/scanner-git/src/mapping_bridge.rs`                                     | Map unique blobs to pack offsets or loose fallback                                                     |
+| Pack Planning         | `crates/scanner-git/src/pack_plan.rs`                                          | Build per-pack decode plans with delta closure                                                         |
+| Pack Exec             | `crates/scanner-git/src/runner_exec.rs`, `crates/scanner-git/src/pack_exec.rs` | Scheduler-driven pack execution and decode with bounded buffers                                        |
+| Engine Adapter        | `crates/scanner-git/src/engine_adapter.rs`                                     | Overlap-safe chunked scanning with deterministic finding keys                                          |
+| Finalize              | `crates/scanner-git/src/finalize.rs`                                           | Build write ops for blob_ctx, finding, seen_blob, and watermarks                                       |
+| Persist               | `crates/scanner-git/src/persist.rs`                                            | Two-phase persistence (data ops then watermarks)                                                       |
+| ODB-Blob Pipeline     | `crates/scanner-git/src/runner_odb_blob.rs`                                    | Blob introduction + pack pipeline for ODB-blob mode                                                    |
+| Diff-History Pipeline | `crates/scanner-git/src/runner_diff_history.rs`                                | Tree-diff/spill/mapping + pack pipeline for diff-history mode                                          |
+| Runner                | `crates/scanner-git/src/runner.rs`                                             | End-to-end orchestration of all stages                                                                 |
 
 ## Determinism and Safety Invariants
 

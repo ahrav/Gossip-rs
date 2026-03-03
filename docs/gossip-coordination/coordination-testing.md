@@ -84,7 +84,7 @@ logical time advanced via `now(t)`.
 ### Coverage areas
 
 | Area               | Example tests                                                                                                                             |
-|--------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | Acquire            | `acquire_basic`, `acquire_not_found`, `acquire_already_leased`, `acquire_after_lease_expiry`, `acquire_terminal_rejected`                 |
 | Renew              | `renew_basic`, `renew_stale_fence`                                                                                                        |
 | Checkpoint         | `checkpoint_basic`, `checkpoint_op_id_conflict`                                                                                           |
@@ -123,7 +123,7 @@ catch regressions where a fix for one invariant violates another.
 ### Group A: Cross-Cutting Invariant Interactions
 
 | Test                                               | Invariants composed                                                                                       |
-|----------------------------------------------------|-----------------------------------------------------------------------------------------------------------|
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | `fence_monotonicity_across_full_lifecycle`         | Fence monotonicity + lease expiry enables re-acquisition + checkpoint/complete do not mutate fence        |
 | `cursor_monotonicity_combined_with_split_residual` | Cursor bounds + split-residual spec narrowing + cursor preservation across splits                         |
 | `idempotency_before_lease_validation`              | OpId idempotency + terminal irreversibility + their priority ordering                                     |
@@ -135,7 +135,7 @@ catch regressions where a fix for one invariant violates another.
 Edge cases with zero or minimal coverage elsewhere.
 
 | Test                                              | Gap filled                                                                      |
-|---------------------------------------------------|---------------------------------------------------------------------------------|
+| ------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `cursor_semantics_dispatched_through_coordinator` | `CursorSemantics::Dispatched` propagation through acquire, checkpoint, complete |
 | `lease_deadline_at_exact_boundary`                | Half-open lease interval: `now < deadline` active, `now == deadline` expired    |
 | `split_coverage_key_range_partition`              | Split-replace children's key ranges form a contiguous, gap-free partition       |
@@ -148,7 +148,7 @@ Edge cases with zero or minimal coverage elsewhere.
 Run lifecycle state machine tests.
 
 | Test                                           | Property                                                |
-|------------------------------------------------|---------------------------------------------------------|
+| ---------------------------------------------- | ------------------------------------------------------- |
 | `run_terminal_irreversibility`                 | Done run rejects complete_run, fail_run, and cancel_run |
 | `register_shards_on_non_initializing_rejected` | Registration requires Initializing status               |
 | `run_completed_at_consistency`                 | `completed_at` is `Some` iff run is terminal            |
@@ -177,16 +177,16 @@ Multi-step workflow tests that exercise realistic end-to-end stories.
 Each scenario chains operations in production-realistic order, including
 state restoration across ownership transfers.
 
-| ID | Scenario                    | Core property                                                                                          |
-|----|-----------------------------|--------------------------------------------------------------------------------------------------------|
-| S1 | Full run lifecycle          | Baseline happy path: create_run → register → acquire → checkpoint×3 → complete (shard) → complete_run  |
-| S2 | Lease expiry + reacquire    | Cursor restoration across ownership transfer; stale writer fenced with `StaleFence`                    |
-| S3 | Split-replace + children    | Parent becomes `Split`; children are independently acquirable and completable by different workers     |
-| S4 | Double residual split chain | Iterative parent narrowing `[a,z)→[a,m)→[a,j)` with spawned list tracking; all three pieces complete   |
-| S5 | Op-log eviction boundary    | Evicted `OpId` treated as new (`Executed`); surviving `OpId` with wrong payload returns `OpIdConflict` |
-| S6 | Cancel from Initializing    | Early run termination blocks registration; idempotent replay; terminal irreversibility                 |
-| S7 | Worker self-recovery        | Same worker recovers from own lease expiry with cursor restoration and fence bump                      |
-| S8 | Claim contention            | 3 workers contend for 2 shards via `claim_next_available`; exactly 2 succeed, 1 gets `NoneAvailable`   |
+| ID  | Scenario                    | Core property                                                                                          |
+| --- | --------------------------- | ------------------------------------------------------------------------------------------------------ |
+| S1  | Full run lifecycle          | Baseline happy path: create_run → register → acquire → checkpoint×3 → complete (shard) → complete_run  |
+| S2  | Lease expiry + reacquire    | Cursor restoration across ownership transfer; stale writer fenced with `StaleFence`                    |
+| S3  | Split-replace + children    | Parent becomes `Split`; children are independently acquirable and completable by different workers     |
+| S4  | Double residual split chain | Iterative parent narrowing `[a,z)→[a,m)→[a,j)` with spawned list tracking; all three pieces complete   |
+| S5  | Op-log eviction boundary    | Evicted `OpId` treated as new (`Executed`); surviving `OpId` with wrong payload returns `OpIdConflict` |
+| S6  | Cancel from Initializing    | Early run termination blocks registration; idempotent replay; terminal irreversibility                 |
+| S7  | Worker self-recovery        | Same worker recovers from own lease expiry with cursor restoration and fence bump                      |
+| S8  | Claim contention            | 3 workers contend for 2 shards via `claim_next_available`; exactly 2 succeed, 1 gets `NoneAvailable`   |
 
 ---
 
@@ -197,7 +197,7 @@ state restoration across ownership transfers.
 Shared factory functions consumed by all three coordination test modules.
 
 | Function                                            | Returns                                                                                                                  |
-|-----------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------|
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `test_tenant()`                                     | `TenantId` from fixed bytes                                                                                              |
 | `test_run()`                                        | `RunId::from_raw(1)`                                                                                                     |
 | `test_shard()`                                      | `ShardId::from_raw(10)`                                                                                                  |
@@ -256,15 +256,15 @@ tests cover each `OverloadKind` under different fault levels, a deterministic
 replay test verifies seed stability, a D1 accuracy test validates availability
 reporting, and a proptest sweeps random seeds/kinds/rounds for safety.
 
-| Test | Config | Assertions |
-|------|--------|------------|
-| `test_overload_burst_claim_sunny` | seed=42, SunnyDay, 10 rounds | No violations, L1 liveness |
-| `test_overload_capacity_drop_stormy` | seed=77, Stormy, 8 rounds | No violations |
-| `test_overload_burst_shards_radioactive` (`#[ignore]`) | seed=9, Radioactive, 12 rounds | No violations |
-| `test_overload_deterministic_replay` | seed=123, Stormy, 12 rounds | Field-identical reports |
-| `test_d1_accuracy_sunny` | seed=7, SunnyDay, 10 rounds | D1 reported == ground truth |
-| `test_overload_zero_rounds_warmup_recovery_only` | seed=1, SunnyDay, 0 rounds | No violations, goodput == 0.0 |
-| `proptest_overload_safety` | 50 cases, Stormy, 0-6 rounds | No violations |
+| Test                                                   | Config                         | Assertions                    |
+| ------------------------------------------------------ | ------------------------------ | ----------------------------- |
+| `test_overload_burst_claim_sunny`                      | seed=42, SunnyDay, 10 rounds   | No violations, L1 liveness    |
+| `test_overload_capacity_drop_stormy`                   | seed=77, Stormy, 8 rounds      | No violations                 |
+| `test_overload_burst_shards_radioactive` (`#[ignore]`) | seed=9, Radioactive, 12 rounds | No violations                 |
+| `test_overload_deterministic_replay`                   | seed=123, Stormy, 12 rounds    | Field-identical reports       |
+| `test_d1_accuracy_sunny`                               | seed=7, SunnyDay, 10 rounds    | D1 reported == ground truth   |
+| `test_overload_zero_rounds_warmup_recovery_only`       | seed=1, SunnyDay, 0 rounds     | No violations, goodput == 0.0 |
+| `proptest_overload_safety`                             | 50 cases, Stormy, 0-6 rounds   | No violations                 |
 
 ### Behavioral Regression Tests (`sim_behavioral_tests.rs`)
 
@@ -272,13 +272,13 @@ Fixed-seed behavioral tests that pin safety properties without depending
 on exact PRNG-stream counts. A legitimate harness change that reorders
 random calls shifts counts but must not break behavioral assertions.
 
-| Test                                | Config                                             | Assertions                                                           |
-|-------------------------------------|----------------------------------------------------|----------------------------------------------------------------------|
-| `behavioral_seed_42_stormy`         | seed=42, Stormy, 3 workers, 5 shards, 700 ops      | No violations, converged, event coverage                             |
-| `behavioral_seed_99_sunny`          | seed=99, SunnyDay, 2 workers, 3 shards, 300 ops    | No violations, converged, event coverage                             |
-| `behavioral_seed_7_radioactive`     | seed=7, Radioactive, 4 workers, 8 shards, 1500 ops | No violations (convergence not asserted under aggressive faults)     |
-| `deterministic_replay_cross_config` | Runs each config twice                             | Field-identical reports (`event_counts`, `ops_executed`, `end_time`) |
-| `behavioral_cooldown_fires_under_simulation` | seed=42, SunnyDay, 8 workers, 20 shards, cooldown=99, 2000 ops | Cooldown throttling fires, `ClaimThrottled` event present |
+| Test                                         | Config                                                         | Assertions                                                           |
+| -------------------------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `behavioral_seed_42_stormy`                  | seed=42, Stormy, 3 workers, 5 shards, 700 ops                  | No violations, converged, event coverage                             |
+| `behavioral_seed_99_sunny`                   | seed=99, SunnyDay, 2 workers, 3 shards, 300 ops                | No violations, converged, event coverage                             |
+| `behavioral_seed_7_radioactive`              | seed=7, Radioactive, 4 workers, 8 shards, 1500 ops             | No violations (convergence not asserted under aggressive faults)     |
+| `deterministic_replay_cross_config`          | Runs each config twice                                         | Field-identical reports (`event_counts`, `ops_executed`, `end_time`) |
+| `behavioral_cooldown_fires_under_simulation` | seed=42, SunnyDay, 8 workers, 20 shards, cooldown=99, 2000 ops | Cooldown throttling fires, `ClaimThrottled` event present            |
 
 A compile-time `const` match block provides exhaustiveness enforcement:
 if a variant is added to `SimEventKind` without updating the match, the
@@ -386,11 +386,11 @@ after every step regardless of outcome. Expected rejection rate is ~45-55%
 for held-shard ops; rejections verify the coordinator's rejection path
 preserves safety.
 
-| Test | Config | Assertions |
-|------|--------|------------|
-| `prop_short_sequences_preserve_invariants` | SunnyDay, 256 cases, 5-50 ops | No violations (CI gate) |
-| `prop_safety_under_random_ops` (`#[ignore]`) | Stormy, 200 cases, 5-200 ops | No violations |
-| `prop_safety_across_fault_levels` (`#[ignore]`) | All levels, 100 cases, 5-200 ops | No violations |
+| Test                                            | Config                           | Assertions              |
+| ----------------------------------------------- | -------------------------------- | ----------------------- |
+| `prop_short_sequences_preserve_invariants`      | SunnyDay, 256 cases, 5-50 ops    | No violations (CI gate) |
+| `prop_safety_under_random_ops` (`#[ignore]`)    | Stormy, 200 cases, 5-200 ops     | No violations           |
+| `prop_safety_across_fault_levels` (`#[ignore]`) | All levels, 100 cases, 5-200 ops | No violations           |
 
 ```bash
 # CI-friendly (not ignored)
@@ -455,7 +455,7 @@ cargo test -p gossip-coordination multi_tenant -- --nocapture
 ### Environment variables
 
 | Variable           | Purpose                                               | Default  |
-|--------------------|-------------------------------------------------------|----------|
+| ------------------ | ----------------------------------------------------- | -------- |
 | `GOSSIP_SIM_SEEDS` | Number of seeds in the parallel sweep                 | 100      |
 | `GOSSIP_SIM_SEED`  | Single seed for failure reproduction (bypasses sweep) | —        |
 | `GOSSIP_SIM_FAULT` | Fault level: `sunny`, `stormy`, `radioactive`         | `stormy` |
@@ -486,7 +486,7 @@ platform.
 ## 8. Choosing the Right Tier
 
 | Signal                                                       | Tier                 |
-|--------------------------------------------------------------|----------------------|
+| ------------------------------------------------------------ | -------------------- |
 | Testing a single backend operation in isolation              | Tier 1 — Unit        |
 | Two or more invariants interact and must hold simultaneously | Tier 2 — Conformance |
 | Multi-step workflow or end-to-end user story                 | Tier 3 — Scenario    |
@@ -512,17 +512,17 @@ conformance, and scenario tests exercise these implicitly via
 `ShardRecord::assert_invariants()` (called on every mutation path), while
 the simulation validates them explicitly via `InvariantChecker::check_all()`.
 
-| Label | Name                    | Rule                                                                   |
-|-------|-------------------------|------------------------------------------------------------------------|
-| S1    | MutualExclusion         | At most one worker holds a non-expired lease per shard                 |
-| S2    | FenceMonotonicity       | `fence_epoch` never decreases for a given `(RunId, ShardId)`           |
-| S3    | TerminalIrreversibility | Terminal states (Done, Split, Parked) never revert to non-terminal     |
-| S4    | RecordInvariant         | `ShardRecord::assert_invariants()` does not panic                      |
-| S5    | CursorMonotonicity      | `cursor.last_key()` never decreases per shard                          |
-| S6    | CursorBounds            | Non-initial cursors remain within shard spec key range                 |
-| S7    | SplitCoverage           | Split-parent's spawned children exist and reference the correct parent |
-| S8    | RunTerminalIrreversibility | Terminal run states never revert                                     |
-| S9    | CooldownViolation       | A worker must not claim twice within cooldown interval                 |
+| Label | Name                       | Rule                                                                   |
+| ----- | -------------------------- | ---------------------------------------------------------------------- |
+| S1    | MutualExclusion            | At most one worker holds a non-expired lease per shard                 |
+| S2    | FenceMonotonicity          | `fence_epoch` never decreases for a given `(RunId, ShardId)`           |
+| S3    | TerminalIrreversibility    | Terminal states (Done, Split, Parked) never revert to non-terminal     |
+| S4    | RecordInvariant            | `ShardRecord::assert_invariants()` does not panic                      |
+| S5    | CursorMonotonicity         | `cursor.last_key()` never decreases per shard                          |
+| S6    | CursorBounds               | Non-initial cursors remain within shard spec key range                 |
+| S7    | SplitCoverage              | Split-parent's spawned children exist and reference the correct parent |
+| S8    | RunTerminalIrreversibility | Terminal run states never revert                                       |
+| S9    | CooldownViolation          | A worker must not claim twice within cooldown interval                 |
 
 Full invariant definitions and the checker implementation are in
 [simulation-harness.md](simulation-harness.md).
@@ -531,33 +531,33 @@ Full invariant definitions and the checker implementation are in
 
 ## 10. Source Files
 
-| File                                | Role                                                             |
-|-------------------------------------|------------------------------------------------------------------|
-| `crates/gossip-coordination/src/in_memory_tests.rs`     | Tier 1: unit tests + proptest property tests                     |
-| `crates/gossip-coordination/src/error_tests.rs`         | Tier 1: error type Display/source/Debug coverage                 |
-| `crates/gossip-coordination/src/record_tests.rs`        | Tier 1: `ShardRecord`, `ShardStatus`, `ParkReason`, `OpLogEntry` tests |
-| `crates/gossip-coordination/src/run_tests.rs`           | Tier 1: run lifecycle types, validation, and state machine tests |
-| `crates/gossip-coordination/src/facade_tests.rs`        | Tier 1: `CoordinationFacade`, `ShardClaiming`, claim algorithm tests |
-| `crates/gossip-coordination/src/session_tests.rs`       | Tier 1: `WorkerSession` RAII handle and delegation tests         |
-| `crates/gossip-coordination/src/in_memory_filter_tests.rs` | Tier 1: `ShardFilter` predicates for `list_shards_into`       |
-| `crates/gossip-coordination/src/in_memory_run_tests.rs` | Tier 1: `RunManagement` trait implementation tests               |
-| `crates/gossip-coordination/src/conformance_tests.rs`   | Tier 2: invariant-interaction tests (Groups A, B, C)             |
-| `crates/gossip-coordination/src/scenario_tests.rs`      | Tier 3: multi-step end-to-end workflows (S1–S9)                  |
-| `crates/gossip-coordination/src/test_fixtures.rs`       | Shared factory functions and seeded coordinator setup            |
-| `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay |
-| `crates/gossip-coordination/src/sim/mega_sim_tests.rs`               | Tier 4b: thread-parallel seed sweep + proptest sweeper           |
-| `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking      |
-| `crates/gossip-coordination/src/sim/harness.rs`                      | Simulation driver (`run` + `run_overload`)                       |
-| `crates/gossip-coordination/src/sim/harness_tests.rs`               | Harness unit and property tests for bookkeeping and op generation |
-| `crates/gossip-coordination/src/sim/invariants.rs`                   | External invariant checker (S1–S9)                               |
-| `crates/gossip-coordination/src/sim/invariants_tests.rs`            | Targeted unit tests for `InvariantChecker` edge cases            |
-| `crates/gossip-coordination/src/sim/overload.rs`                     | Overload scenario/reports and scripted op generators             |
-| `crates/gossip-coordination/src/sim/overload_tests.rs`              | Overload scenario tests: per-kind, replay, D1 accuracy, proptest |
-| `crates/gossip-coordination/src/sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions     |
-| `crates/gossip-coordination/src/sim/fault_injector.rs`              | Fault-injecting introspector for invariant checker validation    |
-| `crates/gossip-coordination/src/sim/worker.rs`                       | Simulated worker bookkeeping                                     |
-| `crates/gossip-coordination/src/sim/test_util.rs`                    | Shared test helpers: record builder, proptest strategies         |
-| `crates/gossip-coordination/src/sim/mod.rs`                          | SimContext (PRNG + clock), FaultConfig, FaultLevel               |
+| File                                                                 | Role                                                                   |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `crates/gossip-coordination/src/in_memory_tests.rs`                  | Tier 1: unit tests + proptest property tests                           |
+| `crates/gossip-coordination/src/error_tests.rs`                      | Tier 1: error type Display/source/Debug coverage                       |
+| `crates/gossip-coordination/src/record_tests.rs`                     | Tier 1: `ShardRecord`, `ShardStatus`, `ParkReason`, `OpLogEntry` tests |
+| `crates/gossip-coordination/src/run_tests.rs`                        | Tier 1: run lifecycle types, validation, and state machine tests       |
+| `crates/gossip-coordination/src/facade_tests.rs`                     | Tier 1: `CoordinationFacade`, `ShardClaiming`, claim algorithm tests   |
+| `crates/gossip-coordination/src/session_tests.rs`                    | Tier 1: `WorkerSession` RAII handle and delegation tests               |
+| `crates/gossip-coordination/src/in_memory_filter_tests.rs`           | Tier 1: `ShardFilter` predicates for `list_shards_into`                |
+| `crates/gossip-coordination/src/in_memory_run_tests.rs`              | Tier 1: `RunManagement` trait implementation tests                     |
+| `crates/gossip-coordination/src/conformance_tests.rs`                | Tier 2: invariant-interaction tests (Groups A, B, C)                   |
+| `crates/gossip-coordination/src/scenario_tests.rs`                   | Tier 3: multi-step end-to-end workflows (S1–S9)                        |
+| `crates/gossip-coordination/src/test_fixtures.rs`                    | Shared factory functions and seeded coordinator setup                  |
+| `crates/gossip-coordination/src/sim/sim_behavioral_tests.rs`         | Tier 4a: fixed-seed behavioral regression + deterministic replay       |
+| `crates/gossip-coordination/src/sim/mega_sim_tests.rs`               | Tier 4b: thread-parallel seed sweep + proptest sweeper                 |
+| `crates/gossip-coordination/src/sim/proptest_state_machine_tests.rs` | Tier 4c: proptest state machine tests with per-op shrinking            |
+| `crates/gossip-coordination/src/sim/harness.rs`                      | Simulation driver (`run` + `run_overload`)                             |
+| `crates/gossip-coordination/src/sim/harness_tests.rs`                | Harness unit and property tests for bookkeeping and op generation      |
+| `crates/gossip-coordination/src/sim/invariants.rs`                   | External invariant checker (S1–S9)                                     |
+| `crates/gossip-coordination/src/sim/invariants_tests.rs`             | Targeted unit tests for `InvariantChecker` edge cases                  |
+| `crates/gossip-coordination/src/sim/overload.rs`                     | Overload scenario/reports and scripted op generators                   |
+| `crates/gossip-coordination/src/sim/overload_tests.rs`               | Overload scenario tests: per-kind, replay, D1 accuracy, proptest       |
+| `crates/gossip-coordination/src/sim/backend.rs`                      | `SimIntrospection` and `SimulationBackend` trait definitions           |
+| `crates/gossip-coordination/src/sim/fault_injector.rs`               | Fault-injecting introspector for invariant checker validation          |
+| `crates/gossip-coordination/src/sim/worker.rs`                       | Simulated worker bookkeeping                                           |
+| `crates/gossip-coordination/src/sim/test_util.rs`                    | Shared test helpers: record builder, proptest strategies               |
+| `crates/gossip-coordination/src/sim/mod.rs`                          | SimContext (PRNG + clock), FaultConfig, FaultLevel                     |
 
 ---
 
@@ -570,19 +570,19 @@ properties hold regardless of timing, interleaving, or worker behavior.
 
 ### Invariant correspondence
 
-| TLA+ invariant | Sim label | Property |
-|----------------|-----------|----------|
-| `MutualExclusion` | S1 | At most one valid lease per shard |
-| `AlwaysFenceMonotonicity` | S2 | Fence epoch never decreases |
-| `AlwaysTerminalIrreversibility` | S3 | Done and Split never revert |
-| `TerminalUnleased` | S4 | Terminal shards hold no lease |
-| `CursorMonotonicity` | S5 | Cursor never decreases |
-| `AlwaysCursorNonRegression` | S5 | Cursor never decreases (action property) |
-| -- | S6 | CursorBounds (byte-key ranges not modeled in TLA+) |
-| `SplitAtomicity` | S7 | Split parent has non-empty spawned set |
-| `ChildImpliesParentSplit` | S7 | Child non-NotCreated implies parent Split |
-| `ZombieRejection` | -- | Stale-epoch worker cannot hold valid lease |
-| `Liveness` (INV-L01) | -- | Active unleased shard eventually leased |
+| TLA+ invariant                  | Sim label | Property                                           |
+| ------------------------------- | --------- | -------------------------------------------------- |
+| `MutualExclusion`               | S1        | At most one valid lease per shard                  |
+| `AlwaysFenceMonotonicity`       | S2        | Fence epoch never decreases                        |
+| `AlwaysTerminalIrreversibility` | S3        | Done and Split never revert                        |
+| `TerminalUnleased`              | S4        | Terminal shards hold no lease                      |
+| `CursorMonotonicity`            | S5        | Cursor never decreases                             |
+| `AlwaysCursorNonRegression`     | S5        | Cursor never decreases (action property)           |
+| --                              | S6        | CursorBounds (byte-key ranges not modeled in TLA+) |
+| `SplitAtomicity`                | S7        | Split parent has non-empty spawned set             |
+| `ChildImpliesParentSplit`       | S7        | Child non-NotCreated implies parent Split          |
+| `ZombieRejection`               | --        | Stale-epoch worker cannot hold valid lease         |
+| `Liveness` (INV-L01)            | --        | Active unleased shard eventually leased            |
 
 Gaps are intentional: S6 (CursorBounds) depends on byte-key ranges not
 present in the abstract model; ZombieRejection and Liveness have no
@@ -595,9 +595,9 @@ prerequisites, TLC commands, and mutation tests.
 
 ### Source files
 
-| File | Purpose |
-|------|---------|
-| `specs/coordination/ShardFencing.tla` | TLA+ specification |
-| `specs/coordination/ShardFencing.cfg` | Production safety config |
-| `specs/coordination/ShardFencing_liveness.cfg` | Liveness config |
-| `specs/coordination/run_mutations.sh` | Mutation test suite (8 mutations) |
+| File                                           | Purpose                           |
+| ---------------------------------------------- | --------------------------------- |
+| `specs/coordination/ShardFencing.tla`          | TLA+ specification                |
+| `specs/coordination/ShardFencing.cfg`          | Production safety config          |
+| `specs/coordination/ShardFencing_liveness.cfg` | Liveness config                   |
+| `specs/coordination/run_mutations.sh`          | Mutation test suite (8 mutations) |

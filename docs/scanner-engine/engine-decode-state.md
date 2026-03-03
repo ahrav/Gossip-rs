@@ -301,13 +301,13 @@ This atomically invalidates all references, preventing use-after-reset bugs.
 
 ## Performance Summary
 
-| Operation | Complexity | Allocation | Notes |
-|-----------|-----------|-----------|-------|
-| `StepArena::push` | O(1) | No | Append to ScratchVec |
-| `StepArena::materialize` | O(depth) | Temp (steps_buf) | Depth ≤ 8; no allocation if pre-sized |
-| `DecodeSlab::append_stream_decode` | O(decoded_len) | No (if in budget) | Streaming decode; budgets enforced |
-| `DecodeSlab::reset` | O(1) | No | Clears buffer; invalidates ranges |
-| Finding materialization | O(depth) | Caller-dependent | Provenance chain reconstructed once |
+| Operation                          | Complexity     | Allocation        | Notes                                  |
+|------------------------------------|----------------|-------------------|----------------------------------------|
+| `StepArena::push`                  | O(1)           | No                | Append to ScratchVec                   |
+| `StepArena::materialize`           | O(depth)       | Temp (steps_buf)  | Depth <= 8; no allocation if pre-sized |
+| `DecodeSlab::append_stream_decode` | O(decoded_len) | No (if in budget) | Streaming decode; budgets enforced     |
+| `DecodeSlab::reset`                | O(1)           | No                | Clears buffer; invalidates ranges      |
+| Finding materialization            | O(depth)       | Caller-dependent  | Provenance chain reconstructed once    |
 
 ## Design Rationale
 

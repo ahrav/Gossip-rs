@@ -95,12 +95,12 @@ sequenceDiagram
 
 Active filesystem defaults (high-level API):
 
-| Setting | Default | Source |
-|---------|---------|--------|
-| `ParallelScanConfig.chunk_size` | `256 KiB` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig.pool_buffers` | `workers * 4` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig.max_in_flight_objects` | `1024` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig.local_queue_cap` | `4` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
+| Setting                                    | Default       | Source                                                    |
+| ------------------------------------------ | ------------- | --------------------------------------------------------- |
+| `ParallelScanConfig.chunk_size`            | `256 KiB`     | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig.pool_buffers`          | `workers * 4` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig.max_in_flight_objects` | `1024`        | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
+| `ParallelScanConfig.local_queue_cap`       | `4`           | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
 
 `scan_local` memory bound is approximately:
 
@@ -108,17 +108,7 @@ Active filesystem defaults (high-level API):
 peak_buffer_bytes ~= pool_buffers * (chunk_size + engine.required_overlap())
 ```
 
-Legacy/shared pipeline constants still defined in `crates/scanner-scheduler/src/pipeline.rs`:
-
-| Constant | Value |
-|----------|-------|
-| `PIPE_FILE_RING_CAP` | `1024` |
-| `PIPE_CHUNK_RING_CAP` | `128` |
-| `PIPE_OUT_RING_CAP` | `8192` |
-| `PIPE_POOL_TARGET_BYTES` | `256 MiB` |
-| `PIPE_POOL_MIN` | `16` |
-
-For direct library usage, `crates/scanner-scheduler/src/runtime.rs` still provides a single-threaded
+For direct library usage, `crates/scanner-scheduler/src/runtime.rs` provides a single-threaded
 `ScannerRuntime` + `read_file_chunks(...)` path with `BufferPool`.
 
 ## Design Rationale (Current FS Path)

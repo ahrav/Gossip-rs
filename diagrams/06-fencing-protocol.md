@@ -263,13 +263,13 @@ graph TD
 
 The five checks correspond to five distinct categories of safety:
 
-| Check | Category | Error Variant | What It Prevents |
-|-------|----------|---------------|------------------|
-| 1 | Identity | `ShardNotFound` | Operating on a shard that does not exist or belongs to a different run |
-| 2 | Tenant isolation | `TenantMismatch` | Cross-tenant data access in multi-tenant deployments |
-| 3 | State validity | `ShardTerminal` | Mutations on shards in a terminal state (e.g., advancing cursor on a completed shard) |
-| 4 | Temporal ordering | `StaleFence` | Zombie workers writing to shards they no longer own (INV-S11, INV-S12) |
-| 5 | Owner identity | `StaleFence` | Identity mismatches when fence epochs agree (catches logic errors in lease-handoff) |
+| Check | Category          | Error Variant    | What It Prevents                                                                      |
+| ----- | ----------------- | ---------------- | ------------------------------------------------------------------------------------- |
+| 1     | Identity          | `ShardNotFound`  | Operating on a shard that does not exist or belongs to a different run                |
+| 2     | Tenant isolation  | `TenantMismatch` | Cross-tenant data access in multi-tenant deployments                                  |
+| 3     | State validity    | `ShardTerminal`  | Mutations on shards in a terminal state (e.g., advancing cursor on a completed shard) |
+| 4     | Temporal ordering | `StaleFence`     | Zombie workers writing to shards they no longer own (INV-S11, INV-S12)                |
+| 5     | Owner identity    | `StaleFence`     | Identity mismatches when fence epochs agree (catches logic errors in lease-handoff)   |
 
 The ordering is deliberate. Identity is checked first because there is no point
 validating a token for a shard that does not exist. Tenant isolation comes next because
@@ -287,14 +287,14 @@ The `validate_lease` function in `validation.rs` checks in strict priority order
 This ordering is a security invariant: tenant check first prevents cross-tenant
 enumeration via error messages.
 
-| Check | Order | Error Variant | Rationale |
-|-------|-------|---------------|-----------|
-| (0) ShardNotFound | Before validate_lease | `ShardNotFound` | Shard lookup precedes all validation |
-| (1) Tenant isolation | 1st in validate_lease | `TenantMismatch` | Security-first; never leak cross-tenant info |
-| (2) Terminal status | 2nd | `ShardTerminal` | Fast rejection of dead shards |
-| (3) Fence epoch | 3rd | `StaleFence` | Zombie fencing |
-| (4) Lease expiry | 4th | `LeaseExpired` | Time-based rejection |
-| (5) Owner divergence | 5th | `StaleFence` | Catches identity mismatches when fence epochs agree |
+| Check                | Order                 | Error Variant    | Rationale                                           |
+| -------------------- | --------------------- | ---------------- | --------------------------------------------------- |
+| (0) ShardNotFound    | Before validate_lease | `ShardNotFound`  | Shard lookup precedes all validation                |
+| (1) Tenant isolation | 1st in validate_lease | `TenantMismatch` | Security-first; never leak cross-tenant info        |
+| (2) Terminal status  | 2nd                   | `ShardTerminal`  | Fast rejection of dead shards                       |
+| (3) Fence epoch      | 3rd                   | `StaleFence`     | Zombie fencing                                      |
+| (4) Lease expiry     | 4th                   | `LeaseExpired`   | Time-based rejection                                |
+| (5) Owner divergence | 5th                   | `StaleFence`     | Catches identity mismatches when fence epochs agree |
 
 Additionally, `check_op_idempotency` runs BEFORE `validate_lease` on idempotent
 operations (checkpoint, complete, park, split_replace, split_residual). This ensures

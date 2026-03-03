@@ -42,12 +42,12 @@ behavior auditable.
 
 Suppression is split between rule-level secret filtering and engine-level safelist policy.
 
-| Control | Config Surface | Match Input | Stage |
-|-----------|---------------------|---------|--------|
-| `value_suppressors_any` | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes | Window validation post-match gate |
-| `offline_validation` | Per-rule YAML (`RuleSpec.offline_validation`) | Extracted secret bytes (root findings) | Inline emission-time gate (root-semantic findings) |
-| Global safelist | Engine policy (`SafelistFilter`) | Root-match context slice | Emit-time suppression on root emit paths |
-| UUID-format quick-reject | Per-rule YAML (`RuleSpec.uuid_format_secret`) | Extracted secret bytes | Emit-time suppression (structural UUID check, bypassed when flag is `true`) |
+| Control                  | Config Surface                                   | Match Input                            | Stage                                                                       |
+|--------------------------|--------------------------------------------------|----------------------------------------|-----------------------------------------------------------------------------|
+| `value_suppressors_any`  | Per-rule YAML (`RuleSpec.value_suppressors_any`) | Extracted secret bytes                 | Window validation post-match gate                                           |
+| `offline_validation`     | Per-rule YAML (`RuleSpec.offline_validation`)    | Extracted secret bytes (root findings) | Inline emission-time gate (root-semantic findings)                          |
+| Global safelist          | Engine policy (`SafelistFilter`)                 | Root-match context slice               | Emit-time suppression on root emit paths                                    |
+| UUID-format quick-reject | Per-rule YAML (`RuleSpec.uuid_format_secret`)    | Extracted secret bytes                 | Emit-time suppression (structural UUID check, bypassed when flag is `true`) |
 
 Examples:
 
@@ -117,21 +117,21 @@ mindmap
 
 ## Rule Table (Representative)
 
-| Rule Name | Category (doc-only) | Anchors | Radius | Two-Phase | Notes |
-|-----------|---------------------|---------|--------|-----------|-------|
-| `aws-access-token` | Cloud | A3T, AKIA, ASIA, ABIA, ACCA | 256 | No | AWS access key id variants |
-| `github-pat` | Source Control | ghp_ | 256 | No | GitHub personal access token |
-| `github-oauth` | Source Control | gho_ | 256 | No | GitHub OAuth token |
-| `github-app-token` | Source Control | ghu_, ghs_ | 256 | No | GitHub app token |
-| `gitlab-pat` | Source Control | glpat- | 256 | No | GitLab personal access token |
-| `slack-bot-token` | Communication | xoxb | 2048 | No | Slack bot token |
-| `slack-webhook-url` | Communication | hooks.slack.com | 256 | No | Slack incoming webhook URL |
-| `stripe-access-token` | Payment | sk_test, sk_live, sk_prod, rk_test, rk_live, rk_prod | 256 | No | Stripe API token |
-| `sendgrid-api-token` | Email | SG. | 256 | No | SendGrid API token |
-| `npm-access-token` | Package Managers | npm_, NPM_ | 256 | No | npm token |
-| `databricks-api-token` | Data Platforms | dapi | 256 | No | Databricks PAT |
-| `private-key` | Cryptographic | -----begin, -----BEGIN | 0 | Yes (`256`/`16384`) | PEM private key |
-| `vault-service-token-legacy` | Secrets Management | vault, VAULT, Vault | 512 | Yes (`128`/`512`) | Legacy Vault service token |
+| Rule Name                    | Category (doc-only) | Anchors                                               | Radius | Two-Phase           | Notes                        |
+|------------------------------|---------------------|-------------------------------------------------------|--------|---------------------|------------------------------|
+| `aws-access-token`           | Cloud               | A3T, AKIA, ASIA, ABIA, ACCA                           | 256    | No                  | AWS access key id variants   |
+| `github-pat`                 | Source Control      | ghp_                                                  | 256    | No                  | GitHub personal access token |
+| `github-oauth`               | Source Control      | gho_                                                  | 256    | No                  | GitHub OAuth token           |
+| `github-app-token`           | Source Control      | ghu_, ghs_                                            | 256    | No                  | GitHub app token             |
+| `gitlab-pat`                 | Source Control      | glpat-                                                | 256    | No                  | GitLab personal access token |
+| `slack-bot-token`            | Communication       | xoxb                                                  | 2048   | No                  | Slack bot token              |
+| `slack-webhook-url`          | Communication       | hooks.slack.com                                       | 256    | No                  | Slack incoming webhook URL   |
+| `stripe-access-token`        | Payment             | sk_test, sk_live, sk_prod, rk_test, rk_live, rk_prod  | 256    | No                  | Stripe API token             |
+| `sendgrid-api-token`         | Email               | SG.                                                   | 256    | No                  | SendGrid API token           |
+| `npm-access-token`           | Package Managers    | npm_, NPM_                                            | 256    | No                  | npm token                    |
+| `databricks-api-token`       | Data Platforms      | dapi                                                  | 256    | No                  | Databricks PAT               |
+| `private-key`                | Cryptographic       | -----begin, -----BEGIN                                | 0      | Yes (`256`/`16384`) | PEM private key              |
+| `vault-service-token-legacy` | Secrets Management  | vault, VAULT, Vault                                   | 512    | Yes (`128`/`512`)   | Legacy Vault service token   |
 
 ## Rule Anatomy
 
@@ -201,10 +201,10 @@ rules default to `ValidatorKind::None`.
 
 Current two-phase rules:
 
-| Rule | Seed Radius | Full Radius | Confirm Literals |
-|------|-------------|-------------|------------------|
-| `private-key` | 256 | 16384 | `PRIVATE KEY` |
-| `vault-service-token-legacy` | 128 | 512 | `s.` |
+| Rule                           | Seed Radius | Full Radius | Confirm Literals |
+|--------------------------------|-------------|-------------|------------------|
+| `private-key`                  | 256         | 16384       | `PRIVATE KEY`    |
+| `vault-service-token-legacy`   | 128         | 512         | `s.`             |
 
 ```mermaid
 sequenceDiagram
@@ -263,17 +263,17 @@ secondary scans.
 
 ## Regex Patterns (Representative, Exact)
 
-| Rule | Pattern |
-|------|---------|
-| `aws-access-token` | `\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b` |
-| `github-pat` | `ghp_[0-9a-zA-Z]{36}` |
-| `gitlab-pat` | `glpat-[\w-]{20}` |
-| `slack-webhook-url` | `(?:https?://)?hooks.slack.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}` |
-| `stripe-access-token` | `\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)` |
-| `sendgrid-api-token` | `\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;]|\\[nr]|$)` |
-| `npm-access-token` | `(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)` |
-| `databricks-api-token` | `\b(dapi[a-f0-9]{32}(?:-\d)?)(?:[\x60'"\s;]|\\[nr]|$)` |
-| `private-key` | `(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----` |
+| Rule                   | Pattern                                                                                        |
+|------------------------|------------------------------------------------------------------------------------------------|
+| `aws-access-token`     | `\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA)[A-Z2-7]{16})\b`                                        |
+| `github-pat`           | `ghp_[0-9a-zA-Z]{36}`                                                                          |
+| `gitlab-pat`           | `glpat-[\w-]{20}`                                                                              |
+| `slack-webhook-url`    | `(?:https?://)?hooks.slack.com/(?:services|workflows|triggers)/[A-Za-z0-9+/]{43,56}`           |
+| `stripe-access-token`  | `\b((?:sk|rk)_(?:test|live|prod)_[a-zA-Z0-9]{10,99})(?:[\x60'"\s;]|\\[nr]|$)`                  |
+| `sendgrid-api-token`   | `\b(SG\.(?i)[a-z0-9=_\-\.]{66})(?:[\x60'"\s;]|\\[nr]|$)`                                       |
+| `npm-access-token`     | `(?i)\b(npm_[a-z0-9]{36})(?:[\x60'"\s;]|\\[nr]|$)`                                             |
+| `databricks-api-token` | `\b(dapi[a-f0-9]{32}(?:-\d)?)(?:[\x60'"\s;]|\\[nr]|$)`                                         |
+| `private-key`          | `(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S-]{64,}?KEY(?: BLOCK)?-----`  |
 
 ## Adding New Rules
 

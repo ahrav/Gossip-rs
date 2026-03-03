@@ -20,10 +20,10 @@ emits). The consumer side (actual backend storage) is plugged in via the
 
 ## Relationship to Other Persistence Modules
 
-| Module | Scope | Purpose |
-|--------|-------|---------|
-| `crates/scanner-scheduler/src/store.rs` | FS persistence | Key bootstrap, identity contracts, `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
-| `crates/scanner-git/src/persist.rs` | Git persistence | Two-phase persist contract for Git blob scan results |
+| Module                                  | Scope           | Purpose                                                                                                         |
+| --------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------- |
+| `crates/scanner-scheduler/src/store.rs` | FS persistence  | Key bootstrap, identity contracts, `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
+| `crates/scanner-git/src/persist.rs`     | Git persistence | Two-phase persist contract for Git blob scan results                                                            |
 
 The identity contracts in `store.rs` define *how to compute stable IDs*
 for findings. The `StoreProducer` trait defines *how findings flow from
@@ -159,9 +159,9 @@ pub trait StoreProducer: Send + Sync + 'static {
 
 ### Implementations
 
-| Type | Purpose |
-|------|---------|
-| `NullStoreProducer` | Default no-op — CLI default, feature-off, benchmarks |
+| Type                    | Purpose                                              |
+| ----------------------- | ---------------------------------------------------- |
+| `NullStoreProducer`     | Default no-op — CLI default, feature-off, benchmarks |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
 
 > **Note:** SQLite persistence backend is not yet implemented. See `StoreProducer` trait in `store.rs`.
@@ -223,48 +223,48 @@ dimension tables, defined in `crates/scanner-scheduler/src/store.rs`:
 
 **Dimension tables:**
 
-| Table | Natural key | Purpose |
-|-------|-------------|---------|
-| `roots` | `root_id` (32-byte BLAKE3) | Scan target identity (FS path, git remote, etc.) |
-| `paths` | `path_id` (32-byte BLAKE3) | Canonical file path within a root |
-| `rules` | `rule_fingerprint` (32-byte BLAKE3) | Detection rule identity |
-| `secrets` | `secret_hash` (32-byte BLAKE3) | Normalized secret identity with aggregate counters |
+| Table     | Natural key                         | Purpose                                            |
+| --------- | ----------------------------------- | -------------------------------------------------- |
+| `roots`   | `root_id` (32-byte BLAKE3)          | Scan target identity (FS path, git remote, etc.)   |
+| `paths`   | `path_id` (32-byte BLAKE3)          | Canonical file path within a root                  |
+| `rules`   | `rule_fingerprint` (32-byte BLAKE3) | Detection rule identity                            |
+| `secrets` | `secret_hash` (32-byte BLAKE3)      | Normalized secret identity with aggregate counters |
 
 **Fact tables:**
 
-| Table | Keys | Purpose |
-|-------|------|---------|
-| `runs` | `run_pk` (auto-increment) | One row per scan execution, with timestamps, status, and counters |
-| `occurrences` | `occ_pk` (auto-increment) | One row per unique finding (path + rule + secret + offsets) |
+| Table         | Keys                      | Purpose                                                           |
+| ------------- | ------------------------- | ----------------------------------------------------------------- |
+| `runs`        | `run_pk` (auto-increment) | One row per scan execution, with timestamps, status, and counters |
+| `occurrences` | `occ_pk` (auto-increment) | One row per unique finding (path + rule + secret + offsets)       |
 
 **Junction tables (WITHOUT ROWID):**
 
-| Table | Composite PK | Purpose |
-|-------|-------------|---------|
-| `observations` | `(run_pk, occ_pk)` | Links runs to their observed occurrences (M:N) |
-| `run_rules` | `(run_pk, rule_pk)` | Tracks which rules were active in each run |
+| Table          | Composite PK        | Purpose                                        |
+| -------------- | ------------------- | ---------------------------------------------- |
+| `observations` | `(run_pk, occ_pk)`  | Links runs to their observed occurrences (M:N) |
+| `run_rules`    | `(run_pk, rule_pk)` | Tracks which rules were active in each run     |
 
 **Indexes:**
 
-| Index | Column(s) | Purpose |
-|-------|-----------|---------|
-| `idx_runs_root` | `runs(root_pk)` | Filter runs by root |
-| `idx_runs_status_started` | `runs(status, started_at DESC)` | Status-filtered run listing without temp sort |
-| `idx_secrets_occ_count` | `secrets(occurrence_count DESC)` | Ordered secret listing without temp sort |
-| `idx_occ_secret` | `occurrences(secret_pk)` | Secret-based occurrence lookup |
-| `idx_occ_rule` | `occurrences(rule_pk)` | Rule-based occurrence lookup |
-| `idx_obs_occ` | `observations(occ_pk)` | Occurrence → observation lookup |
-| `idx_paths_root` | `paths(root_pk)` | Path → root lookup |
+| Index                     | Column(s)                        | Purpose                                       |
+| ------------------------- | -------------------------------- | --------------------------------------------- |
+| `idx_runs_root`           | `runs(root_pk)`                  | Filter runs by root                           |
+| `idx_runs_status_started` | `runs(status, started_at DESC)`  | Status-filtered run listing without temp sort |
+| `idx_secrets_occ_count`   | `secrets(occurrence_count DESC)` | Ordered secret listing without temp sort      |
+| `idx_occ_secret`          | `occurrences(secret_pk)`         | Secret-based occurrence lookup                |
+| `idx_occ_rule`            | `occurrences(rule_pk)`           | Rule-based occurrence lookup                  |
+| `idx_obs_occ`             | `observations(occ_pk)`           | Occurrence → observation lookup               |
+| `idx_paths_root`          | `paths(root_pk)`                 | Path → root lookup                            |
 
 #### Connection Configuration
 
-| PRAGMA | Value | Rationale |
-|--------|-------|-----------|
-| `journal_mode` | WAL | Concurrent readers + single writer without blocking |
-| `synchronous` | NORMAL | Durability with WAL (fsync on checkpoint, not every commit) |
-| `foreign_keys` | ON | Enforce referential integrity at runtime |
-| `busy_timeout` | 5000ms | Retry on `SQLITE_BUSY` instead of failing immediately |
-| `cache_size` | -64000 | ~64 MB page cache (negative = KiB) |
+| PRAGMA         | Value  | Rationale                                                   |
+| -------------- | ------ | ----------------------------------------------------------- |
+| `journal_mode` | WAL    | Concurrent readers + single writer without blocking         |
+| `synchronous`  | NORMAL | Durability with WAL (fsync on checkpoint, not every commit) |
+| `foreign_keys` | ON     | Enforce referential integrity at runtime                    |
+| `busy_timeout` | 5000ms | Retry on `SQLITE_BUSY` instead of failing immediately       |
+| `cache_size`   | -64000 | ~64 MB page cache (negative = KiB)                          |
 
 Read-only connections (for CLI query commands) skip `journal_mode` and
 `synchronous` pragmas to avoid requiring write access.
@@ -298,13 +298,13 @@ The SQLite writer implements the `StoreProducer` trait:
 
 Run status is derived from `RunCounters` at `end_run` time:
 
-| Status code | Name | Condition |
-|-------------|------|-----------|
-| 0 | `InProgress` | Set at `open()`, before `end_run()` is called |
-| 1 | `Complete` | No drops, no emit failures, no coverage limits |
-| 2 | `CompleteWithCoverageLimits` | No drops/failures, but coverage caps applied |
-| 3 | `Incomplete` | Any dropped findings or emit failures |
-| 4 | `Failed` | Reserved for scan-level errors |
+| Status code | Name                         | Condition                                      |
+| ----------- | ---------------------------- | ---------------------------------------------- |
+| 0           | `InProgress`                 | Set at `open()`, before `end_run()` is called  |
+| 1           | `Complete`                   | No drops, no emit failures, no coverage limits |
+| 2           | `CompleteWithCoverageLimits` | No drops/failures, but coverage caps applied   |
+| 3           | `Incomplete`                 | Any dropped findings or emit failures          |
+| 4           | `Failed`                     | Reserved for scan-level errors                 |
 
 Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
@@ -312,13 +312,13 @@ Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
 Read-path queries in `crates/scanner-scheduler/src/store.rs`:
 
-| Function | CLI command | Description |
-|----------|------------|-------------|
-| `list_runs()` | `store list-runs` | List runs ordered by `started_at DESC`, optional status filter |
-| `list_findings()` | `store list-findings` | Findings for a run, with optional rule/path LIKE filters |
-| `diff_runs()` | `store diff` | Set-difference between two runs (new, resolved, unchanged count) |
-| `list_secrets()` | `store list-secrets` | Unique secrets ordered by occurrence count |
-| `resolve_run_pk()` | (internal) | Resolve hex prefix to `run_pk` (exact or LIKE match) |
+| Function           | CLI command           | Description                                                      |
+| ------------------ | --------------------- | ---------------------------------------------------------------- |
+| `list_runs()`      | `store list-runs`     | List runs ordered by `started_at DESC`, optional status filter   |
+| `list_findings()`  | `store list-findings` | Findings for a run, with optional rule/path LIKE filters         |
+| `diff_runs()`      | `store diff`          | Set-difference between two runs (new, resolved, unchanged count) |
+| `list_secrets()`   | `store list-secrets`  | Unique secrets ordered by occurrence count                       |
+| `resolve_run_pk()` | (internal)            | Resolve hex prefix to `run_pk` (exact or LIKE match)             |
 
 #### Schema Migration
 
@@ -331,11 +331,11 @@ are serialized via the busy timeout.
 
 The writer derives all 32-byte identifiers using BLAKE3 domain-separated hashes:
 
-| Identity | Domain prefix | Inputs |
-|----------|---------------|--------|
-| `rule_fingerprint` | `scanner.store.db.v1.rule_fingerprint` | `rule_id` |
-| `path_id` | `scanner.store.db.v1.path_id` | `root_id`, `canonical_path` |
-| `occurrence_id` | `scanner.store.db.v1.occurrence_id` | `path_id`, `rule_fingerprint`, `secret_hash`, byte offsets |
+| Identity           | Domain prefix                          | Inputs                                                     |
+| ------------------ | -------------------------------------- | ---------------------------------------------------------- |
+| `rule_fingerprint` | `scanner.store.db.v1.rule_fingerprint` | `rule_id`                                                  |
+| `path_id`          | `scanner.store.db.v1.path_id`          | `root_id`, `canonical_path`                                |
+| `occurrence_id`    | `scanner.store.db.v1.occurrence_id`    | `path_id`, `rule_fingerprint`, `secret_hash`, byte offsets |
 
 #### Thread Safety
 
@@ -373,9 +373,9 @@ Findings can be lost at two points, and both are tracked:
 
 Worker-level counters are aggregated into `MetricsSnapshot`:
 
-| Worker counter | Snapshot counter | Rollup |
-|----------------|-----------------|--------|
-| `findings_dropped` | `findings_dropped` | sum across workers |
+| Worker counter              | Snapshot counter            | Rollup             |
+| --------------------------- | --------------------------- | ------------------ |
+| `findings_dropped`          | `findings_dropped`          | sum across workers |
 | `persistence_emit_failures` | `persistence_emit_failures` | sum across workers |
 
 These feed into `LocalStats` and then into `FsRunLoss` at run end.
@@ -385,14 +385,14 @@ These feed into `LocalStats` and then into `FsRunLoss` at run end.
 The `emit_persistence_batch()` call is inserted at every scan site that
 produces findings:
 
-| Scan site | Function | File |
-|-----------|----------|------|
-| Plain file chunk loop | `process_file()` | `local_fs_owner.rs` |
-| Binary text extraction | `extract_and_scan_file()` | `local_fs_owner.rs` |
-| Top-level gzip | `process_gzip_file()` | `local_fs_owner.rs` |
-| Nested gzip stream | `scan_gzip_stream_nested()` | `local_fs_owner.rs` |
-| Tar entry stream | `scan_tar_stream_nested()` | `local_fs_owner.rs` |
-| Zip entry | `process_zip_file()` | `local_fs_owner.rs` |
+| Scan site              | Function                    | File                |
+| ---------------------- | --------------------------- | ------------------- |
+| Plain file chunk loop  | `process_file()`            | `local_fs_owner.rs` |
+| Binary text extraction | `extract_and_scan_file()`   | `local_fs_owner.rs` |
+| Top-level gzip         | `process_gzip_file()`       | `local_fs_owner.rs` |
+| Nested gzip stream     | `scan_gzip_stream_nested()` | `local_fs_owner.rs` |
+| Tar entry stream       | `scan_tar_stream_nested()`  | `local_fs_owner.rs` |
+| Zip entry              | `process_zip_file()`        | `local_fs_owner.rs` |
 
 ## Configuration and Wiring
 
@@ -409,8 +409,8 @@ writes to `findings.db` under the store root.
 
 #### Environment Variables
 
-| Variable | Purpose |
-|----------|---------|
+| Variable             | Purpose                                                                                                                |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `SCANNER_SECRET_KEY` | Stable secret key for BLAKE3-keyed identity hashes; if unset, an ephemeral key is generated (cross-run dedup disabled) |
 
 ### Wiring Path
@@ -471,11 +471,11 @@ The `SummaryEvent.status` field is set to `"partial"` when
 
 ## Related Documentation
 
-| Document | Relevance |
-|----------|-----------|
+| Document                                                               | Relevance                                                      |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------- |
 | [persistence-identity.md](../gossip-contracts/persistence-identity.md) | Identity contracts (RuleFingerprint, SecretHash, OccurrenceId) |
-| [pipeline-flow.md](../pipeline-flow.md) | FS pipeline stages and buffer lifecycle |
-| [scheduler-engine-abstraction.md](scheduler-engine-abstraction.md) | FindingWithHashRecord trait, EngineScratch changes |
-| [scheduler-engine-impl.md](scheduler-engine-impl.md) | Real engine adapter, drain_findings_with_hashes |
-| [architecture-overview.md](../architecture-overview.md) | Component diagram and FS scan path |
-| [data-types.md](../data-types.md) | Class diagrams for store::fs types |
+| [pipeline-flow.md](../pipeline-flow.md)                                | FS pipeline stages and buffer lifecycle                        |
+| [scheduler-engine-abstraction.md](scheduler-engine-abstraction.md)     | FindingWithHashRecord trait, EngineScratch changes             |
+| [scheduler-engine-impl.md](scheduler-engine-impl.md)                   | Real engine adapter, drain_findings_with_hashes                |
+| [architecture-overview.md](../architecture-overview.md)                | Component diagram and FS scan path                             |
+| [data-types.md](../data-types.md)                                      | Class diagrams for store::fs types                             |

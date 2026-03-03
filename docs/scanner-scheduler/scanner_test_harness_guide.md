@@ -57,20 +57,20 @@ DUMP_SIM_FAIL=1 cargo test --features sim-harness --test simulation scanner_rand
 
 Configuration for generating synthetic scanner scenarios.
 
-| Field              | Type                   | Default                | Description                                     |
-| ------------------ | ---------------------- | ---------------------- | ----------------------------------------------- |
-| `schema_version`   | u32                    | 1                      | Schema version for forward-compatible evolution |
-| `rule_count`       | u32                    | 2                      | Number of synthetic rules to generate           |
-| `file_count`       | u32                    | 2                      | Number of files to generate                     |
-| `secrets_per_file` | u32                    | 3                      | Secrets inserted per file                       |
-| `token_len`        | u32                    | 12                     | Random token length (appended to rule prefix)   |
-| `min_noise_len`    | u32                    | 8                      | Minimum padding bytes between secrets           |
-| `max_noise_len`    | u32                    | 32                     | Maximum padding bytes between secrets           |
-| `representations`  | `Vec<SecretRepr>`      | Raw, Base64, UrlPercent, Utf16Le, Utf16Be | Allowed secret encodings to choose from |
-| `archive_count`    | u32                    | 0                      | Number of archive files to generate             |
-| `archive_entries`  | u32                    | 2                      | Entries per generated archive                   |
-| `archive_kinds`    | `Vec<ArchiveKindSpec>` | tar, tar.gz, zip, gzip | Archive formats to include                      |
-| `archive`          | `ArchiveConfig`        | default                | Archive config used to compute virtual paths    |
+| Field              | Type                   | Default                                   | Description                                     |
+| ------------------ | ---------------------- | ----------------------------------------- | ----------------------------------------------- |
+| `schema_version`   | u32                    | 1                                         | Schema version for forward-compatible evolution |
+| `rule_count`       | u32                    | 2                                         | Number of synthetic rules to generate           |
+| `file_count`       | u32                    | 2                                         | Number of files to generate                     |
+| `secrets_per_file` | u32                    | 3                                         | Secrets inserted per file                       |
+| `token_len`        | u32                    | 12                                        | Random token length (appended to rule prefix)   |
+| `min_noise_len`    | u32                    | 8                                         | Minimum padding bytes between secrets           |
+| `max_noise_len`    | u32                    | 32                                        | Maximum padding bytes between secrets           |
+| `representations`  | `Vec<SecretRepr>`      | Raw, Base64, UrlPercent, Utf16Le, Utf16Be | Allowed secret encodings to choose from         |
+| `archive_count`    | u32                    | 0                                         | Number of archive files to generate             |
+| `archive_entries`  | u32                    | 2                                         | Entries per generated archive                   |
+| `archive_kinds`    | `Vec<ArchiveKindSpec>` | tar, tar.gz, zip, gzip                    | Archive formats to include                      |
+| `archive`          | `ArchiveConfig`        | default                                   | Archive config used to compute virtual paths    |
 
 **Example:**
 ```rust
@@ -100,7 +100,7 @@ Configuration for a single simulation run.
 | `overlap`               | u32           | required | Overlap bytes between chunks (must >= `engine.required_overlap()`) |
 | `max_in_flight_objects` | u32           | 16       | Maximum concurrent file operations                                 |
 | `buffer_pool_cap`       | u32           | 8        | Buffer pool capacity                                               |
-| `max_file_size`         | u64           | u64::MAX | Max file size to scan; oversized files are skipped                |
+| `max_file_size`         | u64           | u64::MAX | Max file size to scan; oversized files are skipped                 |
 | `max_steps`             | u64           | auto     | Simulation step limit (0 = auto-derived)                           |
 | `max_transform_depth`   | u32           | 3        | Maximum decode nesting depth                                       |
 | `scan_utf16_variants`   | bool          | true     | Enable UTF-16 LE/BE scanning                                       |
@@ -173,11 +173,11 @@ loading artifacts.
 
 ### IoFault Variants
 
-| Variant                   | Description                                             |
-| ------------------------- | ------------------------------------------------------- |
+| Variant                   | Description                                                        |
+| ------------------------- | ------------------------------------------------------------------ |
 | `ErrKind { kind }`        | Return an injected I/O error (`kind` is a numeric diagnostic code) |
-| `PartialRead { max_len }` | Return at most `max_len` bytes (short read)             |
-| `EIntrOnce`               | Single EINTR-style interruption                         |
+| `PartialRead { max_len }` | Return at most `max_len` bytes (short read)                        |
+| `EIntrOnce`               | Single EINTR-style interruption                                    |
 
 ### Corruption Variants
 
@@ -408,7 +408,7 @@ The minimizer applies deterministic shrink passes:
 
 | Variable                | Default | Description                                             |
 | ----------------------- | ------- | ------------------------------------------------------- |
-| `SCANNER_SIM_DUP_DEBUG` | unset   | Print duplicate-finding diagnostics on dedupe failures |
+| `SCANNER_SIM_DUP_DEBUG` | unset   | Print duplicate-finding diagnostics on dedupe failures  |
 | `SIM_TRACE_FULL`        | unset   | Capture full trace events in addition to the trace ring |
 
 ## Oracles Checked
@@ -423,7 +423,7 @@ The harness validates these invariants during and after each run:
 | **No Duplicates**      | End of run  | Emitted findings have unique normalized keys                                                                          |
 | **Ground Truth**       | End of run  | Expected secrets found (for fully-observed files), no unexpected findings                                             |
 | **Differential**       | End of run  | Chunked results match single-chunk reference scan (root findings; non-root only with `SCANNER_SIM_STRICT_NON_ROOT=1`) |
-| **Archive Outcomes**   | End of run  | Archive budgets and archive outcome counters remain internally consistent                                              |
+| **Archive Outcomes**   | End of run  | Archive budgets and archive outcome counters remain internally consistent                                             |
 | **Stability**          | Multi-run   | Same finding set across different schedule seeds                                                                      |
 
 ### Failure Kinds

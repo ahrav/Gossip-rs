@@ -576,16 +576,16 @@ fencing protocol.
 The following table summarizes each failure mode, its detection mechanism, the
 recovery path, and the worst-case impact:
 
-| Failure Mode | Detection | Recovery | Worst-Case Impact |
-|:-------------|:----------|:---------|:------------------|
-| Worker crash mid-page | Lease TTL expiry | New worker resumes from last committed cursor | One page re-processed |
-| Coordinator crash (persistent) | Worker timeouts on lease ops | Restart coordinator, rebuild from DB, release expired leases | Brief unavailability |
-| Coordinator crash (in-memory) | Worker timeouts on lease ops | Restart entire run from scratch | All in-flight progress lost |
-| Network partition (worker-coordinator) | Lease TTL expiry + commit timeout | Re-acquire shard with new fencing token after partition heals | One page re-processed |
-| Network partition (worker-source) | Consecutive timeouts → circuit breaker | Park shard, cooldown, probe, resume | Shard temporarily parked |
-| Source outage | Same as network partition with source | Same circuit breaker pattern | Affected connector paused |
-| Split-brain | Fencing token comparison (INV-S12) | Stale writer rejected immediately | No impact (prevented) |
-| Data corruption | Application-level integrity checks | Re-derive from source of truth, re-scan affected shards | Manual intervention required |
+| Failure Mode                           | Detection                              | Recovery                                                      | Worst-Case Impact            |
+| :------------------------------------- | :------------------------------------- | :------------------------------------------------------------ | :--------------------------- |
+| Worker crash mid-page                  | Lease TTL expiry                       | New worker resumes from last committed cursor                 | One page re-processed        |
+| Coordinator crash (persistent)         | Worker timeouts on lease ops           | Restart coordinator, rebuild from DB, release expired leases  | Brief unavailability         |
+| Coordinator crash (in-memory)          | Worker timeouts on lease ops           | Restart entire run from scratch                               | All in-flight progress lost  |
+| Network partition (worker-coordinator) | Lease TTL expiry + commit timeout      | Re-acquire shard with new fencing token after partition heals | One page re-processed        |
+| Network partition (worker-source)      | Consecutive timeouts → circuit breaker | Park shard, cooldown, probe, resume                           | Shard temporarily parked     |
+| Source outage                          | Same as network partition with source  | Same circuit breaker pattern                                  | Affected connector paused    |
+| Split-brain                            | Fencing token comparison (INV-S12)     | Stale writer rejected immediately                             | No impact (prevented)        |
+| Data corruption                        | Application-level integrity checks     | Re-derive from source of truth, re-scan affected shards       | Manual intervention required |
 
 Two observations stand out. First, lease TTL expiry is the universal detection
 mechanism for any failure involving a worker or the coordinator. The system does
@@ -618,13 +618,13 @@ skipped.
 
 ## Source Code References
 
-| Component | Path |
-|:----------|:-----|
-| Design specification | `08-cross-cutting/03-failure-modes-and-recovery.md` |
-| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/` |
-| Coordination protocol (lease, fencing, shard ops) | `crates/gossip-coordination/src/` |
-| Connector module (circuit breaker, source abstraction) | `crates/gossip-contracts/src/connector/` and `crates/gossip-connectors/` |
-| Shard record and state transitions | `crates/gossip-coordination/src/record.rs` |
-| Fencing validation logic | `crates/gossip-coordination/src/validation.rs` |
-| Lease management | `crates/gossip-coordination/src/lease.rs` |
-| Error types (StaleFence, AcquireError, etc.) | `crates/gossip-coordination/src/error.rs` |
+| Component                                                              | Path                                                                     |
+| :--------------------------------------------------------------------- | :----------------------------------------------------------------------- |
+| Design specification                                                   | `08-cross-cutting/03-failure-modes-and-recovery.md`                      |
+| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/`                              |
+| Coordination protocol (lease, fencing, shard ops)                      | `crates/gossip-coordination/src/`                                        |
+| Connector module (circuit breaker, source abstraction)                 | `crates/gossip-contracts/src/connector/` and `crates/gossip-connectors/` |
+| Shard record and state transitions                                     | `crates/gossip-coordination/src/record.rs`                               |
+| Fencing validation logic                                               | `crates/gossip-coordination/src/validation.rs`                           |
+| Lease management                                                       | `crates/gossip-coordination/src/lease.rs`                                |
+| Error types (StaleFence, AcquireError, etc.)                           | `crates/gossip-coordination/src/error.rs`                                |

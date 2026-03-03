@@ -28,19 +28,19 @@ macros.
 
 ### Source files
 
-| File           | Role                                                                                       |
-|----------------|--------------------------------------------------------------------------------------------|
-| `mod.rs`       | Module root, public re-exports                                                             |
-| `types.rs`     | `TenantId`, `PolicyHash`, `TenantSecretKey`                                                |
-| `canonical.rs` | `CanonicalBytes` trait + primitive impls                                                   |
-| `hashing.rs`   | `domain_hasher`, `finalize_32`                                                             |
-| `domain.rs`    | 13 domain-separation constants + `ALL` registry                                            |
-| `item.rs`      | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`                       |
-| `finding.rs`   | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId` + derivation fns  |
-| `policy.rs`    | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                    |
-| `macros.rs`    | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                             |
+| File              | Role                                                                                                                          |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `mod.rs`          | Module root, public re-exports                                                                                                |
+| `types.rs`        | `TenantId`, `PolicyHash`, `TenantSecretKey`                                                                                   |
+| `canonical.rs`    | `CanonicalBytes` trait + primitive impls                                                                                      |
+| `hashing.rs`      | `domain_hasher`, `finalize_32`                                                                                                |
+| `domain.rs`       | 13 domain-separation constants + `ALL` registry                                                                               |
+| `item.rs`         | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`                                                          |
+| `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId` + derivation fns                                     |
+| `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |
+| `macros.rs`       | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                                                                |
 | `coordination.rs` | `RunId`, `ShardId`, `WorkerId`, `OpId`, `JobId`, `FenceEpoch`, `LogicalTime`, `ShardKey` — 64-bit coordination identity types |
-| `golden.rs`    | Golden vector tests (7 derivations)                                                        |
+| `golden.rs`       | Golden vector tests (7 derivations)                                                                                           |
 
 ---
 
@@ -65,16 +65,16 @@ ItemIdentityKey ──> StableItemId ──────────────�
 
 ### Role of each type
 
-| Type              | Role                                                                                          |
-|-------------------|-----------------------------------------------------------------------------------------------|
-| `ItemIdentityKey` | Human-meaningful item identity: `ConnectorTag` (8 B) + opaque locator bytes                   |
+| Type              | Role                                                                                                  |
+| ----------------- | ----------------------------------------------------------------------------------------------------- |
+| `ItemIdentityKey` | Human-meaningful item identity: `ConnectorTag` (8 B) + opaque locator bytes                           |
 | `StableItemId`    | Fixed-width (32 B) content-addressed identity derived from `ItemIdentityKey` via `domain::ITEM_ID_V1` |
-| `NormHash`        | Normalized secret digest from the detection engine (tenant-agnostic)                          |
-| `SecretHash`      | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`            |
-| `RuleFingerprint` | Identity of the detection rule that matched                                                   |
-| `FindingId`       | Version-stable finding identity: `(TenantId, StableItemId, RuleFingerprint, SecretHash)`      |
-| `ObjectVersionId` | Version-specific content identity (commit SHA, S3 ETag, etc.)                                 |
-| `OccurrenceId`    | Version-specific occurrence: `(FindingId, ObjectVersionId, byte_offset, byte_length)`         |
+| `NormHash`        | Normalized secret digest from the detection engine (tenant-agnostic)                                  |
+| `SecretHash`      | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`                    |
+| `RuleFingerprint` | Identity of the detection rule that matched                                                           |
+| `FindingId`       | Version-stable finding identity: `(TenantId, StableItemId, RuleFingerprint, SecretHash)`              |
+| `ObjectVersionId` | Version-specific content identity (commit SHA, S3 ETag, etc.)                                         |
+| `OccurrenceId`    | Version-specific occurrence: `(FindingId, ObjectVersionId, byte_offset, byte_length)`                 |
 
 ### Why ObjectVersionId is excluded from FindingId
 
@@ -162,24 +162,24 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 
 ## 4. Type Reference Table
 
-| Type                   | Width            | Construction                                       | Domain Constant                        | Key Traits                              | Restricted?                                        |
-|------------------------|------------------|----------------------------------------------------|----------------------------------------|-----------------------------------------|----------------------------------------------------|
-| `TenantId`             | 32 B             | `from_bytes` (pub)                                 | --                                     | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `PolicyHash`           | 32 B             | `from_bytes` (pub)                                 | `POLICY_HASH_V2` (via `compute_...`)   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `TenantSecretKey`      | 32 B             | `from_bytes` (pub)                                 | --                                     | Clone Copy Eq (constant-time)           | Yes: no Ord, Hash, CanonicalBytes; redacted Debug  |
-| `ConnectorTag`         | 8 B              | `from_ascii` / `from_bytes`                        | --                                     | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `ItemIdentityKey`      | variable         | `new(connector, locator)`                          | --                                     | Clone Eq Hash CanonicalBytes            | No                                                 |
-| `StableItemId`         | 32 B             | derived via `ItemIdentityKey::stable_id()`         | `ITEM_ID_V1`                           | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `ObjectVersionId`      | 32 B             | `from_version_bytes` / `from_bytes`                | `OBJECT_VERSION_V1`                    | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `NormHash`             | 32 B             | `from_digest` / `from_bytes_internal` (pub(crate)) | --                                     | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                                |
-| `SecretHash`           | 32 B             | `from_bytes_internal` (pub(crate))                 | `SECRET_HASH_V1` (keyed mode)          | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                                |
-| `RuleFingerprint`      | 32 B             | `from_bytes` (pub)                                 | `RULE_FINGERPRINT_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `FindingId`            | 32 B             | `from_bytes` (pub)                                 | `FINDING_ID_V1`                        | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `OccurrenceId`         | 32 B             | `from_bytes` (pub)                                 | `OCCURRENCE_ID_V1`                     | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                 |
-| `IdHashMode`           | 1 B (`repr(u8)`) | `from_u8` / variant literal                        | --                                     | Clone Copy Debug Eq Hash CanonicalBytes | No                                                 |
-| `FindingIdInputs`      | 128 B            | struct literal                                     | --                                     | Clone Copy Debug Eq CanonicalBytes      | No                                                 |
-| `OccurrenceIdInputs`   | 80 B             | struct literal                                     | --                                     | Clone Copy Debug Eq CanonicalBytes      | No                                                 |
-| `PolicyHashInputs`     | 41 B             | struct literal                                     | --                                     | Clone Copy Debug Eq CanonicalBytes      | No                                                 |
+| Type                 | Width            | Construction                                       | Domain Constant                      | Key Traits                              | Restricted?                                       |
+| -------------------- | ---------------- | -------------------------------------------------- | ------------------------------------ | --------------------------------------- | ------------------------------------------------- |
+| `TenantId`           | 32 B             | `from_bytes` (pub)                                 | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `PolicyHash`         | 32 B             | `from_bytes` (pub)                                 | `POLICY_HASH_V2` (via `compute_...`) | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `TenantSecretKey`    | 32 B             | `from_bytes` (pub)                                 | --                                   | Clone Copy Eq (constant-time)           | Yes: no Ord, Hash, CanonicalBytes; redacted Debug |
+| `ConnectorTag`       | 8 B              | `from_ascii` / `from_bytes`                        | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `ItemIdentityKey`    | variable         | `new(connector, locator)`                          | --                                   | Clone Eq Hash CanonicalBytes            | No                                                |
+| `StableItemId`       | 32 B             | derived via `ItemIdentityKey::stable_id()`         | `ITEM_ID_V1`                         | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `ObjectVersionId`    | 32 B             | `from_version_bytes` / `from_bytes`                | `OBJECT_VERSION_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `NormHash`           | 32 B             | `from_digest` / `from_bytes_internal` (pub(crate)) | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
+| `SecretHash`         | 32 B             | `from_bytes_internal` (pub(crate))                 | `SECRET_HASH_V1` (keyed mode)        | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
+| `RuleFingerprint`    | 32 B             | `from_bytes` (pub)                                 | `RULE_FINGERPRINT_V1`                | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `FindingId`          | 32 B             | `from_bytes` (pub)                                 | `FINDING_ID_V1`                      | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `OccurrenceId`       | 32 B             | `from_bytes` (pub)                                 | `OCCURRENCE_ID_V1`                   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `IdHashMode`         | 1 B (`repr(u8)`) | `from_u8` / variant literal                        | --                                   | Clone Copy Debug Eq Hash CanonicalBytes | No                                                |
+| `FindingIdInputs`    | 128 B            | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
+| `OccurrenceIdInputs` | 80 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
+| `PolicyHashInputs`   | 41 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 
 ---
 
@@ -190,21 +190,21 @@ All 13 domain constants live in `domain.rs` and follow the naming convention
 
 ### Constants
 
-| Constant               | Value                                  | Subsystem    | Hash Mode    | Purpose                                              |
-|------------------------|----------------------------------------|--------------|--------------|------------------------------------------------------|
-| `SPLIT_ID_V1`          | `gossip/coord/v1/split-id`             | Coordination | derive-key   | Shard-ID derivation during split operations          |
-| `OP_PAYLOAD_V1`        | `gossip/coord/v1/op-payload`           | Coordination | derive-key   | Op-log payload hashing for idempotency               |
-| `FINDING_ID_V1`        | `gossip/finding/v1`                    | Identity     | derive-key   | `FindingId` derivation                               |
-| `OCCURRENCE_ID_V1`     | `gossip/occurrence/v1`                 | Identity     | derive-key   | `OccurrenceId` derivation                            |
-| `SECRET_HASH_V1`       | `gossip/secret-hash/v1`                | Identity     | **keyed**    | `SecretHash` keying (sole keyed-mode constant)       |
-| `ITEM_ID_V1`           | `gossip/item-id/v1`                    | Identity     | derive-key   | `StableItemId` derivation                            |
-| `OBJECT_VERSION_V1`    | `gossip/object-version/v1`             | Identity     | derive-key   | `ObjectVersionId` derivation                         |
-| `RULE_FINGERPRINT_V1`  | `gossip/rule/v1`                       | Identity     | derive-key   | `RuleFingerprint` derivation (registry placeholder)  |
-| `POLICY_HASH_V2`       | `gossip/policy-hash/v2`                | Policy       | derive-key   | `PolicyHash` derivation (v2: redesigned after spec)  |
-| `RULES_DIGEST_V1`      | `gossip/rules-digest/v1`               | Policy       | derive-key   | Content-addressed hash of the full rule set          |
-| `OVID_V1`              | `gossip/persistence/v1/ovid`           | Persistence  | derive-key   | OVID (Object-Version Identity) hash                  |
-| `DONE_LEDGER_KEY_V1`   | `gossip/persistence/v1/done-key`       | Persistence  | derive-key   | Done-ledger key derivation (reserved)                |
-| `TRIAGE_GROUP_KEY_V1`  | `gossip/persistence/v1/triage-group`   | Persistence  | derive-key   | `TriageGroupKey` derivation                          |
+| Constant              | Value                                | Subsystem    | Hash Mode  | Purpose                                             |
+| --------------------- | ------------------------------------ | ------------ | ---------- | --------------------------------------------------- |
+| `SPLIT_ID_V1`         | `gossip/coord/v1/split-id`           | Coordination | derive-key | Shard-ID derivation during split operations         |
+| `OP_PAYLOAD_V1`       | `gossip/coord/v1/op-payload`         | Coordination | derive-key | Op-log payload hashing for idempotency              |
+| `FINDING_ID_V1`       | `gossip/finding/v1`                  | Identity     | derive-key | `FindingId` derivation                              |
+| `OCCURRENCE_ID_V1`    | `gossip/occurrence/v1`               | Identity     | derive-key | `OccurrenceId` derivation                           |
+| `SECRET_HASH_V1`      | `gossip/secret-hash/v1`              | Identity     | **keyed**  | `SecretHash` keying (sole keyed-mode constant)      |
+| `ITEM_ID_V1`          | `gossip/item-id/v1`                  | Identity     | derive-key | `StableItemId` derivation                           |
+| `OBJECT_VERSION_V1`   | `gossip/object-version/v1`           | Identity     | derive-key | `ObjectVersionId` derivation                        |
+| `RULE_FINGERPRINT_V1` | `gossip/rule/v1`                     | Identity     | derive-key | `RuleFingerprint` derivation (registry placeholder) |
+| `POLICY_HASH_V2`      | `gossip/policy-hash/v2`              | Policy       | derive-key | `PolicyHash` derivation (v2: redesigned after spec) |
+| `RULES_DIGEST_V1`     | `gossip/rules-digest/v1`             | Policy       | derive-key | Content-addressed hash of the full rule set         |
+| `OVID_V1`             | `gossip/persistence/v1/ovid`         | Persistence  | derive-key | OVID (Object-Version Identity) hash                 |
+| `DONE_LEDGER_KEY_V1`  | `gossip/persistence/v1/done-key`     | Persistence  | derive-key | Done-ledger key derivation (reserved)               |
+| `TRIAGE_GROUP_KEY_V1` | `gossip/persistence/v1/triage-group` | Persistence  | derive-key | `TriageGroupKey` derivation                         |
 
 ### Uniqueness enforcement
 
@@ -223,45 +223,45 @@ All 13 domain constants live in `domain.rs` and follow the naming convention
 
 ## 6. Invariant-to-Test Matrix
 
-| #  | Invariant                                         | Enforcement                            | Test Name(s)                                                                                                                                              | Source File    |
-|----|---------------------------------------------------|----------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------|----------------|
-| 1  | CanonicalBytes collision-freedom (primitives)     | proptest                               | `u8_collision_free`, `u32_collision_free`, `u64_collision_free`, `slice_collision_free`, `fixed_32_collision_free`                                        | `canonical.rs` |
-| 2  | CanonicalBytes determinism (primitives)           | proptest                               | `u8_stable`, `u32_stable`, `u64_stable`, `slice_stable`, `fixed_32_stable`                                                                                | `canonical.rs` |
-| 3  | Variable-length prefix correctness                | unit test                              | `slice_length_prefixed`, `concatenation_unambiguous`                                                                                                      | `canonical.rs` |
-| 4  | Fixed-width encoding format                       | unit test                              | `u8_writes_single_byte`, `u32_is_little_endian`, `u64_is_little_endian`, `fixed_32_no_length_prefix`                                                      | `canonical.rs` |
-| 5  | Domain constant uniqueness                        | unit test                              | `no_duplicate_values`, `no_duplicate_names`                                                                                                               | `domain.rs`    |
-| 6  | Domain constant naming convention                 | unit test                              | `all_constants_follow_naming_convention`, `all_constants_are_printable_ascii`, `all_constants_have_reasonable_length`                                     | `domain.rs`    |
-| 7  | Domain constant registry coverage                 | compile-time (`ALL` array len) + unit  | `fixture_covers_all_constants`                                                                                                                            | `domain.rs`    |
-| 8  | `TenantId`/`PolicyHash` trait completeness        | compile-time trait bound               | `tenant_id_implements_required_traits`, `policy_hash_implements_required_traits`                                                                          | `types.rs`     |
-| 9  | `TenantSecretKey` trait restriction (no Ord/Hash) | compile-time omission                  | `tenant_secret_key_implements_required_traits`                                                                                                            | `types.rs`     |
-| 10 | `TenantSecretKey` Debug redaction                 | unit test                              | `tenant_secret_key_debug_is_redacted`                                                                                                                     | `types.rs`     |
-| 11 | `TenantSecretKey` constant-time equality          | `subtle::ConstantTimeEq` impl          | (manual impl)                                                                                                                                             | `types.rs`     |
-| 12 | `NormHash`/`SecretHash` Debug redaction           | unit test                              | `restricted_types_debug_is_redacted`                                                                                                                      | `finding.rs`   |
-| 13 | `key_secret_hash` purity                          | proptest                               | `key_secret_hash_is_pure`                                                                                                                                 | `finding.rs`   |
-| 14 | `key_secret_hash` collision-freedom               | proptest                               | `secret_hash_collision_free`                                                                                                                              | `finding.rs`   |
-| 15 | `FindingId` purity                                | proptest                               | `finding_id_is_pure`                                                                                                                                      | `finding.rs`   |
-| 16 | `FindingId` collision-freedom                     | proptest                               | `finding_id_collision_free`                                                                                                                               | `finding.rs`   |
-| 17 | `FindingId` per-field sensitivity                 | proptest                               | `finding_id_tenant_field_sensitivity`, `finding_id_item_field_sensitivity`, `finding_id_rule_field_sensitivity`, `finding_id_secret_field_sensitivity`    | `finding.rs`   |
-| 18 | `OccurrenceId` purity                             | proptest                               | `occurrence_id_is_pure`                                                                                                                                   | `finding.rs`   |
-| 19 | `OccurrenceId` collision-freedom                  | proptest                               | `occurrence_id_collision_free`                                                                                                                            | `finding.rs`   |
-| 20 | `OccurrenceId` per-field sensitivity              | proptest                               | `occurrence_id_finding_field_sensitivity`, `occurrence_id_version_field_sensitivity`, `occurrence_id_offset_field_sensitivity`, `occurrence_id_length_field_sensitivity` | `finding.rs`   |
-| 21 | `StableItemId` purity                             | proptest                               | `item_key_stable_id_is_pure`                                                                                                                              | `item.rs`      |
-| 22 | `StableItemId` collision-freedom                  | proptest                               | `item_key_stable_id_collision_free`                                                                                                                       | `item.rs`      |
-| 23 | `ObjectVersionId` purity                          | proptest                               | `object_version_id_is_pure`                                                                                                                               | `item.rs`      |
-| 24 | `ObjectVersionId` collision-freedom               | proptest                               | `object_version_id_collision_free`                                                                                                                        | `item.rs`      |
-| 25 | `ConnectorTag` input validation                   | unit test + proptest                   | `connector_tag_empty_panics`, `connector_tag_too_long_panics`, `from_ascii_rejects_non_graphic`, `connector_tag_from_ascii_pads_correctly`                | `item.rs`      |
-| 26 | `PolicyHash` purity                               | proptest                               | `compute_policy_hash_is_pure`                                                                                                                             | `policy.rs`    |
-| 27 | `PolicyHash` collision-freedom                    | proptest                               | `policy_hash_collision_free`                                                                                                                              | `policy.rs`    |
-| 28 | `PolicyHash` per-field sensitivity                | proptest                               | `policy_hash_version_field_sensitivity`, `id_hash_mode_field_sensitivity`, `evidence_hash_version_field_sensitivity`, `rules_digest_field_sensitivity`    | `policy.rs`    |
-| 29 | `IdHashMode` discriminant stability               | unit test                              | `id_hash_mode_discriminants_are_stable`, `id_hash_mode_roundtrip`, `id_hash_mode_unknown_returns_none`                                                    | `policy.rs`    |
-| 30 | Macro-generated types: traits, Debug, Canonical   | compile-time + unit + proptest         | `macro_types_implement_required_traits`, `pub_debug_shows_hex_prefix`, `restricted_debug_is_redacted`, `pub_canonical_bytes_stable` (and more)            | `macros.rs`    |
-| 31 | Golden vectors (7 derivations)                    | unit test                              | `stable_item_id_golden_value`, `object_version_id_golden_value`, `key_secret_hash_golden_value`, `derive_finding_id_golden_value`, `derive_occurrence_id_golden_value`, `compute_policy_hash_golden_value`, `finalize_64_golden_value` | `golden.rs`    |
-| 32 | Golden vector registry completeness               | unit test                              | `registry_is_complete`                                                                                                                                    | `golden.rs`    |
-| 33 | Full-chain determinism (composed)                 | proptest                               | `full_chain_item_to_occurrence_is_pure`                                                                                                                   | `golden.rs`    |
-| 34 | Full-chain collision-freedom (composed)           | proptest                               | `full_chain_collision_free`                                                                                                                               | `golden.rs`    |
-| 35 | Boundary u64 values in OccurrenceId               | unit test                              | `boundary_u64_occurrence_id`                                                                                                                              | `golden.rs`    |
-| 36 | `domain_hasher` matches `blake3::derive_key`      | unit test                              | `domain_hasher_matches_blake3_derive_key`                                                                                                                 | `hashing.rs`   |
-| 37 | Domain separation for random payloads             | proptest                               | `domain_separation_for_random_payload`                                                                                                                    | `hashing.rs`   |
+| #   | Invariant                                         | Enforcement                           | Test Name(s)                                                                                                                                                                                                                           | Source File    |
+| --- | ------------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
+| 1   | CanonicalBytes collision-freedom (primitives)     | proptest                              | `u8_collision_free`, `u32_collision_free`, `u64_collision_free`, `slice_collision_free`, `fixed_32_collision_free`                                                                                                                     | `canonical.rs` |
+| 2   | CanonicalBytes determinism (primitives)           | proptest                              | `u8_stable`, `u32_stable`, `u64_stable`, `slice_stable`, `fixed_32_stable`                                                                                                                                                             | `canonical.rs` |
+| 3   | Variable-length prefix correctness                | unit test                             | `slice_length_prefixed`, `concatenation_unambiguous`                                                                                                                                                                                   | `canonical.rs` |
+| 4   | Fixed-width encoding format                       | unit test                             | `u8_writes_single_byte`, `u32_is_little_endian`, `u64_is_little_endian`, `fixed_32_no_length_prefix`                                                                                                                                   | `canonical.rs` |
+| 5   | Domain constant uniqueness                        | unit test                             | `no_duplicate_values`, `no_duplicate_names`                                                                                                                                                                                            | `domain.rs`    |
+| 6   | Domain constant naming convention                 | unit test                             | `all_constants_follow_naming_convention`, `all_constants_are_printable_ascii`, `all_constants_have_reasonable_length`                                                                                                                  | `domain.rs`    |
+| 7   | Domain constant registry coverage                 | compile-time (`ALL` array len) + unit | `fixture_covers_all_constants`                                                                                                                                                                                                         | `domain.rs`    |
+| 8   | `TenantId`/`PolicyHash` trait completeness        | compile-time trait bound              | `tenant_id_implements_required_traits`, `policy_hash_implements_required_traits`                                                                                                                                                       | `types.rs`     |
+| 9   | `TenantSecretKey` trait restriction (no Ord/Hash) | compile-time omission                 | `tenant_secret_key_implements_required_traits`                                                                                                                                                                                         | `types.rs`     |
+| 10  | `TenantSecretKey` Debug redaction                 | unit test                             | `tenant_secret_key_debug_is_redacted`                                                                                                                                                                                                  | `types.rs`     |
+| 11  | `TenantSecretKey` constant-time equality          | `subtle::ConstantTimeEq` impl         | (manual impl)                                                                                                                                                                                                                          | `types.rs`     |
+| 12  | `NormHash`/`SecretHash` Debug redaction           | unit test                             | `restricted_types_debug_is_redacted`                                                                                                                                                                                                   | `finding.rs`   |
+| 13  | `key_secret_hash` purity                          | proptest                              | `key_secret_hash_is_pure`                                                                                                                                                                                                              | `finding.rs`   |
+| 14  | `key_secret_hash` collision-freedom               | proptest                              | `secret_hash_collision_free`                                                                                                                                                                                                           | `finding.rs`   |
+| 15  | `FindingId` purity                                | proptest                              | `finding_id_is_pure`                                                                                                                                                                                                                   | `finding.rs`   |
+| 16  | `FindingId` collision-freedom                     | proptest                              | `finding_id_collision_free`                                                                                                                                                                                                            | `finding.rs`   |
+| 17  | `FindingId` per-field sensitivity                 | proptest                              | `finding_id_tenant_field_sensitivity`, `finding_id_item_field_sensitivity`, `finding_id_rule_field_sensitivity`, `finding_id_secret_field_sensitivity`                                                                                 | `finding.rs`   |
+| 18  | `OccurrenceId` purity                             | proptest                              | `occurrence_id_is_pure`                                                                                                                                                                                                                | `finding.rs`   |
+| 19  | `OccurrenceId` collision-freedom                  | proptest                              | `occurrence_id_collision_free`                                                                                                                                                                                                         | `finding.rs`   |
+| 20  | `OccurrenceId` per-field sensitivity              | proptest                              | `occurrence_id_finding_field_sensitivity`, `occurrence_id_version_field_sensitivity`, `occurrence_id_offset_field_sensitivity`, `occurrence_id_length_field_sensitivity`                                                               | `finding.rs`   |
+| 21  | `StableItemId` purity                             | proptest                              | `item_key_stable_id_is_pure`                                                                                                                                                                                                           | `item.rs`      |
+| 22  | `StableItemId` collision-freedom                  | proptest                              | `item_key_stable_id_collision_free`                                                                                                                                                                                                    | `item.rs`      |
+| 23  | `ObjectVersionId` purity                          | proptest                              | `object_version_id_is_pure`                                                                                                                                                                                                            | `item.rs`      |
+| 24  | `ObjectVersionId` collision-freedom               | proptest                              | `object_version_id_collision_free`                                                                                                                                                                                                     | `item.rs`      |
+| 25  | `ConnectorTag` input validation                   | unit test + proptest                  | `connector_tag_empty_panics`, `connector_tag_too_long_panics`, `from_ascii_rejects_non_graphic`, `connector_tag_from_ascii_pads_correctly`                                                                                             | `item.rs`      |
+| 26  | `PolicyHash` purity                               | proptest                              | `compute_policy_hash_is_pure`                                                                                                                                                                                                          | `policy.rs`    |
+| 27  | `PolicyHash` collision-freedom                    | proptest                              | `policy_hash_collision_free`                                                                                                                                                                                                           | `policy.rs`    |
+| 28  | `PolicyHash` per-field sensitivity                | proptest                              | `policy_hash_version_field_sensitivity`, `id_hash_mode_field_sensitivity`, `evidence_hash_version_field_sensitivity`, `rules_digest_field_sensitivity`                                                                                 | `policy.rs`    |
+| 29  | `IdHashMode` discriminant stability               | unit test                             | `id_hash_mode_discriminants_are_stable`, `id_hash_mode_roundtrip`, `id_hash_mode_unknown_returns_none`                                                                                                                                 | `policy.rs`    |
+| 30  | Macro-generated types: traits, Debug, Canonical   | compile-time + unit + proptest        | `macro_types_implement_required_traits`, `pub_debug_shows_hex_prefix`, `restricted_debug_is_redacted`, `pub_canonical_bytes_stable` (and more)                                                                                         | `macros.rs`    |
+| 31  | Golden vectors (7 derivations)                    | unit test                             | `stable_item_id_golden_value`, `object_version_id_golden_value`, `key_secret_hash_golden_value`, `derive_finding_id_golden_value`, `derive_occurrence_id_golden_value`, `compute_policy_hash_golden_value`, `finalize_64_golden_value` | `golden.rs`    |
+| 32  | Golden vector registry completeness               | unit test                             | `registry_is_complete`                                                                                                                                                                                                                 | `golden.rs`    |
+| 33  | Full-chain determinism (composed)                 | proptest                              | `full_chain_item_to_occurrence_is_pure`                                                                                                                                                                                                | `golden.rs`    |
+| 34  | Full-chain collision-freedom (composed)           | proptest                              | `full_chain_collision_free`                                                                                                                                                                                                            | `golden.rs`    |
+| 35  | Boundary u64 values in OccurrenceId               | unit test                             | `boundary_u64_occurrence_id`                                                                                                                                                                                                           | `golden.rs`    |
+| 36  | `domain_hasher` matches `blake3::derive_key`      | unit test                             | `domain_hasher_matches_blake3_derive_key`                                                                                                                                                                                              | `hashing.rs`   |
+| 37  | Domain separation for random payloads             | proptest                              | `domain_separation_for_random_payload`                                                                                                                                                                                                 | `hashing.rs`   |
 
 ---
 
@@ -287,14 +287,14 @@ If a golden vector test fails, follow this 5-step protocol:
 
 ### Version-bump trigger conditions
 
-| Vector                         | Domain Constant      | Triggers                                    |
-|--------------------------------|----------------------|---------------------------------------------|
-| `STABLE_ITEM_ID_EXPECTED`      | `ITEM_ID_V1`         | `ItemIdentityKey` encoding or domain tag changes |
-| `OBJECT_VERSION_ID_EXPECTED`   | `OBJECT_VERSION_V1`  | `ObjectVersionId` encoding changes          |
-| `KEY_SECRET_HASH_EXPECTED`     | `SECRET_HASH_V1`     | Secret keying scheme changes                |
-| `FINDING_ID_EXPECTED`          | `FINDING_ID_V1`      | `FindingIdInputs` encoding changes          |
-| `OCCURRENCE_ID_EXPECTED`       | `OCCURRENCE_ID_V1`   | `OccurrenceIdInputs` encoding changes       |
-| `POLICY_HASH_EXPECTED`         | `POLICY_HASH_V2`     | `PolicyHashInputs` encoding changes         |
+| Vector                       | Domain Constant     | Triggers                                         |
+| ---------------------------- | ------------------- | ------------------------------------------------ |
+| `STABLE_ITEM_ID_EXPECTED`    | `ITEM_ID_V1`        | `ItemIdentityKey` encoding or domain tag changes |
+| `OBJECT_VERSION_ID_EXPECTED` | `OBJECT_VERSION_V1` | `ObjectVersionId` encoding changes               |
+| `KEY_SECRET_HASH_EXPECTED`   | `SECRET_HASH_V1`    | Secret keying scheme changes                     |
+| `FINDING_ID_EXPECTED`        | `FINDING_ID_V1`     | `FindingIdInputs` encoding changes               |
+| `OCCURRENCE_ID_EXPECTED`     | `OCCURRENCE_ID_V1`  | `OccurrenceIdInputs` encoding changes            |
+| `POLICY_HASH_EXPECTED`       | `POLICY_HASH_V2`    | `PolicyHashInputs` encoding changes              |
 
 ---
 
@@ -318,14 +318,14 @@ A version bump is required whenever any of these change:
 Version bumps cascade through the derivation chain. The table below shows
 which downstream IDs are invalidated when a given constant changes:
 
-| Changed Constant     | Directly Invalidated | Transitively Invalidated                 |
-|----------------------|----------------------|------------------------------------------|
-| `ITEM_ID_V1`         | `StableItemId`       | `FindingId` → `OccurrenceId`             |
-| `OBJECT_VERSION_V1`  | `ObjectVersionId`    | `OccurrenceId`                           |
-| `SECRET_HASH_V1`     | `SecretHash`         | `FindingId` → `OccurrenceId`             |
-| `FINDING_ID_V1`      | `FindingId`          | `OccurrenceId`                           |
-| `OCCURRENCE_ID_V1`   | `OccurrenceId`       | (leaf)                                   |
-| `POLICY_HASH_V2`     | `PolicyHash`         | (independent — triggers rescan via RunId)|
+| Changed Constant    | Directly Invalidated | Transitively Invalidated                  |
+| ------------------- | -------------------- | ----------------------------------------- |
+| `ITEM_ID_V1`        | `StableItemId`       | `FindingId` → `OccurrenceId`              |
+| `OBJECT_VERSION_V1` | `ObjectVersionId`    | `OccurrenceId`                            |
+| `SECRET_HASH_V1`    | `SecretHash`         | `FindingId` → `OccurrenceId`              |
+| `FINDING_ID_V1`     | `FindingId`          | `OccurrenceId`                            |
+| `OCCURRENCE_ID_V1`  | `OccurrenceId`       | (leaf)                                    |
+| `POLICY_HASH_V2`    | `PolicyHash`         | (independent — triggers rescan via RunId) |
 
 ### Dual-version coexistence
 

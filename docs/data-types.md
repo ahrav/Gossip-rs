@@ -20,6 +20,9 @@ classDiagram
         -Tuning tuning
         -Option~VsPrefilterDb~ vs
         -Option~VsAnchorDb~ vs_utf16
+        -Option~VsUtf16StreamDb~ vs_utf16_stream
+        -Option~VsStreamDb~ vs_stream
+        -Option~VsGateDb~ vs_gate
         -Option~Base64YaraGate~ b64_gate
         -SafelistFilter safelist
         -Vec~OfflineValidationSpec~ offline_validation_gates
@@ -440,7 +443,7 @@ classDiagram
 
     class OfflineValidationSpec {
         <<enumeration>>
-        Crc32Base62
+        Crc32Base62$lbrace$prefix_skip, payload_len, checksum_len$rbrace$
         GithubFinegrainedPat
         GrafanaServiceAccount
         AwsAccessKey
@@ -518,14 +521,14 @@ grouped per scanned object in `FsFindingBatch` and handed to the configured
 `StoreProducer`. At run end, `record_fs_run_loss()` captures drop/failure counters
 and `end_run()` derives the final run status and persists it to the database.
 
-| Type | Purpose |
-|------|---------|
-| `FsFindingRecord` | Post-dedupe, backend-agnostic finding with absolute byte offsets, `norm_hash`, and additive `confidence_score` (0–10) |
-| `FsFindingBatch` | Borrowed batch of findings for one scanned object (file or archive entry) |
-| `FsRunLoss` | Run-level loss accounting (dropped findings, emit failures, incomplete flag) |
-| `StoreProducer` | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`) |
-| `NullStoreProducer` | Default no-op for CLI / feature-off paths |
-| `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
+| Type                    | Purpose                                                                                                               |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `FsFindingRecord`       | Post-dedupe, backend-agnostic finding with absolute byte offsets, `norm_hash`, and additive `confidence_score` (0–10) |
+| `FsFindingBatch`        | Borrowed batch of findings for one scanned object (file or archive entry)                                             |
+| `FsRunLoss`             | Run-level loss accounting (dropped findings, emit failures, incomplete flag)                                          |
+| `StoreProducer`         | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`)                                             |
+| `NullStoreProducer`     | Default no-op for CLI / feature-off paths                                                                             |
+| `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics                                                                  |
 
 > **Note:** SQLite persistence backend is not yet implemented. See `StoreProducer` trait in `store.rs`.
 
@@ -612,34 +615,34 @@ classDiagram
 
 **Identity derivation functions** *(aspirational API — not implemented)*:
 
-| Function | Input | Output | Key Used |
-|---|---|---|---|
-| `rule_fingerprint(rule, keys)` | `RuleSpec` | `RuleFingerprint` (`[u8; 32]`) | _(unkeyed)_ |
-| `secret_hash(norm_hash, keys)` | `[u8; 32]` | `SecretHash` (`[u8; 32]`) | `secret_key` |
-| `occurrence_id(input, keys)` | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`) | `identity_key` |
+| Function                       | Input             | Output                         | Key Used       |
+| ------------------------------ | ----------------- | ------------------------------ | -------------- |
+| `rule_fingerprint(rule, keys)` | `RuleSpec`        | `RuleFingerprint` (`[u8; 32]`) | _(unkeyed)_    |
+| `secret_hash(norm_hash, keys)` | `[u8; 32]`        | `SecretHash` (`[u8; 32]`)      | `secret_key`   |
+| `occurrence_id(input, keys)`   | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`)    | `identity_key` |
 
 See [persistence-identity.md](gossip-contracts/persistence-identity.md) for contract details and normalization rules *(aspirational)*.
 
 ## Key Relationships Summary
 
-| Source | Relationship | Target | Description |
-|--------|--------------|--------|-------------|
-| `Engine` | contains | `RuleCompiled` | Compiled detection rules |
-| `Engine` | contains | `RuleCold` | Cold rule metadata (`name`, `min_confidence`) |
-| `Engine` | contains | `TransformConfig` | Transform configurations |
-| `Engine` | creates | `ScanScratch` | Per-scan scratch state |
-| `Engine` | contains | `OfflineValidationSpec` | Offline validation gate pool |
-| `RuleSpec` | optional | `OfflineValidationSpec` | Per-rule offline validation spec |
-| `ScannerRuntime` | owns | `BufferPool` | Buffer memory pool |
-| `FileTable` | produces | `FileId` | File metadata IDs |
-| `Chunk` | owns | `BufferHandle` | Buffer with RAII release |
-| `FindingRec` | references | `FileId` | Source file identifier |
-| `FindingRec` | references | `StepId` | Decode provenance chain |
-| `NodePoolType` | uses | `DynamicBitSet` | Free slot tracking |
-| `StoreKeys` | contains | `RunModeMetadata` | Run correlation semantics *(aspirational)* |
-| `OccurrenceInput` | references | `FindingRec` | Finding to hash *(aspirational)* |
-| `OccurrenceInput` | contains | `VariantDiscriminant` | UTF-16 variant discrimination *(aspirational)* |
-| `FsFindingBatch` | contains | `FsFindingRecord` | Post-dedupe findings per object |
-| `FsFindingRecord` | carries | `NormHash` | BLAKE3 digest for cross-run dedup |
-| `StoreProducer` | receives | `FsFindingBatch` | Per-object finding persistence |
-| `StoreProducer` | receives | `FsRunLoss` | Run-level loss accounting |
+| Source            | Relationship | Target                  | Description                                    |
+| ----------------- | ------------ | ----------------------- | ---------------------------------------------- |
+| `Engine`          | contains     | `RuleCompiled`          | Compiled detection rules                       |
+| `Engine`          | contains     | `RuleCold`              | Cold rule metadata (`name`, `min_confidence`)  |
+| `Engine`          | contains     | `TransformConfig`       | Transform configurations                       |
+| `Engine`          | creates      | `ScanScratch`           | Per-scan scratch state                         |
+| `Engine`          | contains     | `OfflineValidationSpec` | Offline validation gate pool                   |
+| `RuleSpec`        | optional     | `OfflineValidationSpec` | Per-rule offline validation spec               |
+| `ScannerRuntime`  | owns         | `BufferPool`            | Buffer memory pool                             |
+| `FileTable`       | produces     | `FileId`                | File metadata IDs                              |
+| `Chunk`           | owns         | `BufferHandle`          | Buffer with RAII release                       |
+| `FindingRec`      | references   | `FileId`                | Source file identifier                         |
+| `FindingRec`      | references   | `StepId`                | Decode provenance chain                        |
+| `NodePoolType`    | uses         | `DynamicBitSet`         | Free slot tracking                             |
+| `StoreKeys`       | contains     | `RunModeMetadata`       | Run correlation semantics *(aspirational)*     |
+| `OccurrenceInput` | references   | `FindingRec`            | Finding to hash *(aspirational)*               |
+| `OccurrenceInput` | contains     | `VariantDiscriminant`   | UTF-16 variant discrimination *(aspirational)* |
+| `FsFindingBatch`  | contains     | `FsFindingRecord`       | Post-dedupe findings per object                |
+| `FsFindingRecord` | carries      | `NormHash`              | BLAKE3 digest for cross-run dedup              |
+| `StoreProducer`   | receives     | `FsFindingBatch`        | Per-object finding persistence                 |
+| `StoreProducer`   | receives     | `FsRunLoss`             | Run-level loss accounting                      |

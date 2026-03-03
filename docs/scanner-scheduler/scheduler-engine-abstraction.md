@@ -67,6 +67,12 @@ collisions with real filesystem file IDs.
 
 **Contract**: Returns the rule name on success; returns `"<unknown-rule>"` for invalid IDs. Used for output formatting and reporting.
 
+#### `max_findings_per_chunk(&self) -> usize`
+
+**Purpose**: Returns the maximum number of findings retained per chunk scan.
+
+**Contract**: Default implementation returns `usize::MAX` (no limit). The real engine returns the configured `tuning.max_findings_per_chunk` value. Used by the scheduler for capacity planning and by `dropped_findings()` accounting.
+
 ---
 
 ## EngineScratch Trait
@@ -127,6 +133,12 @@ Specifies the finding type produced by this scratch. The bound was elevated from
 
 **Contract**: Default implementation returns 0. Used for run-level loss accounting in persistence backends via `FsRunLoss`.
 
+#### `pending_findings_len(&self) -> usize`
+
+**Purpose**: Returns the number of findings currently buffered in the scratch.
+
+**Contract**: Default implementation returns 0. Used by the scheduler to check if drain is needed before reuse.
+
 ---
 
 ## FindingRecord Trait
@@ -174,6 +186,18 @@ Specifies the finding type produced by this scratch. The bound was elevated from
 **Purpose**: Returns the end (exclusive) of the full match span.
 
 **Contract**: Typically `span_end >= root_hint_end` to capture the full matched region.
+
+#### `dedupe_with_span(&self) -> bool`
+
+**Purpose**: Returns whether span coordinates should contribute to within-chunk deduplication key computation.
+
+**Contract**: Default implementation returns `false`. When `true`, two findings at the same `root_hint` with different spans are considered distinct. Used by `push_finding_with_drop_hint` to decide whether span and UTF-16 endianness contribute to the dedupe identity.
+
+#### `confidence_score(&self) -> i8`
+
+**Purpose**: Returns the confidence score assigned to this finding.
+
+**Contract**: Default returns 0. Values map to enum-level confidence (High/Medium/Low). Used by persistence layers for prioritization and filtering.
 
 ### Deduplication Semantics
 
@@ -235,10 +259,10 @@ The engine computes a normalized hash of the matched secret at scan time (inside
 
 Both the real engine adapter and mock engine produce `FindingWithHash<F>` values:
 
-| Engine | `F` type | Hash source |
-|--------|----------|-------------|
+| Engine               | `F` type          | Hash source                                 |
+| -------------------- | ----------------- | ------------------------------------------- |
 | Real (`engine_impl`) | `api::FindingRec` | Engine-computed BLAKE3 of normalized secret |
-| Mock (`engine_stub`) | `FindingRec` | Deterministic placeholder hash |
+| Mock (`engine_stub`) | `FindingRec`      | Deterministic placeholder hash              |
 
 ---
 
@@ -264,15 +288,15 @@ Different engines can provide their own optimizations:
 
 The traits bridge type differences between implementations:
 
-| Aspect | Mock Engine | Real Engine |
-|--------|-------------|-------------|
-| Rule ID | `RuleId(u16)` | `u32` |
-| Span Offsets | `u64` | `u32` (exposed as `u64` via trait) |
-| Root Hint Offsets | `u64` | `u64` |
-| Finding Type | `FindingWithHash<FindingRec>` | `FindingWithHash<api::FindingRec>` |
-| Norm Hash | Deterministic placeholder | Engine-computed BLAKE3 |
-| File ID in finding record | Not stored | `FileId` |
-| Decode step/provenance | Not stored | `StepId` |
+| Aspect                    | Mock Engine                   | Real Engine                        |
+| ------------------------- | ----------------------------- | ---------------------------------- |
+| Rule ID                   | `RuleId(u16)`                 | `u32`                              |
+| Span Offsets              | `u64`                         | `u32` (exposed as `u64` via trait) |
+| Root Hint Offsets         | `u64`                         | `u64`                              |
+| Finding Type              | `FindingWithHash<FindingRec>` | `FindingWithHash<api::FindingRec>` |
+| Norm Hash                 | Deterministic placeholder     | Engine-computed BLAKE3             |
+| File ID in finding record | Not stored                    | `FileId`                           |
+| Decode step/provenance    | Not stored                    | `StepId`                           |
 
 The traits normalize these via their method signatures (all return `u32` for rule IDs, `u64` for offsets).
 

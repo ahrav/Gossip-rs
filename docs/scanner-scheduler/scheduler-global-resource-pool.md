@@ -78,12 +78,12 @@ Concurrent Jobs:
 
 ### Job Type: Git Repository Scan
 
-| Aspect | Value | Notes |
-|--------|-------|-------|
-| Scan Ring | 10-50 MB | Depends on commit graph depth and complexity |
-| Delta Cache | 25-100 MB | Pack file resolution; larger repos need more |
-| Spill Permission | Usually `true` | Candidate buffer may exceed memory, spill to disk |
-| Fairness | Best effort | No priority queue; backoff recommended for large jobs |
+| Aspect           | Value          | Notes                                                 |
+| ---------------- | -------------- | ----------------------------------------------------- |
+| Scan Ring        | 10-50 MB       | Depends on commit graph depth and complexity          |
+| Delta Cache      | 25-100 MB      | Pack file resolution; larger repos need more          |
+| Spill Permission | Usually `true` | Candidate buffer may exceed memory, spill to disk     |
+| Fairness         | Best effort    | No priority queue; backoff recommended for large jobs |
 
 **Configuration Example**:
 ```rust
@@ -96,10 +96,10 @@ let config = GlobalResourcePoolConfig {
 
 ### Job Type: Archive Extraction
 
-| Aspect | Value | Notes |
-|--------|-------|-------|
-| Scan Ring | File size | Size of largest file in archive |
-| Delta Cache | 0 | No delta resolution needed |
+| Aspect           | Value          | Notes                                |
+| ---------------- | -------------- | ------------------------------------ |
+| Scan Ring        | File size      | Size of largest file in archive      |
+| Delta Cache      | 0              | No delta resolution needed           |
 | Spill Permission | Depends on job | Only if extraction may exceed memory |
 
 **Zip note:** current ZIP scanning is file-backed random access and reuses
@@ -117,11 +117,11 @@ let request = FatJobRequest::archive(
 
 ### Job Type: Multi-File Container
 
-| Aspect | Value | Notes |
-|--------|-------|-------|
-| Scan Ring | Largest file size | Or sum if simultaneous extraction |
-| Delta Cache | 0 | Typically none for containers |
-| Spill Permission | `true` | Temp files for decompression |
+| Aspect           | Value             | Notes                             |
+| ---------------- | ----------------- | --------------------------------- |
+| Scan Ring        | Largest file size | Or sum if simultaneous extraction |
+| Delta Cache      | 0                 | Typically none for containers     |
+| Spill Permission | `true`            | Temp files for decompression      |
 
 ### Absence of Explicit Priorities
 
@@ -241,12 +241,12 @@ permit.spill_is_limited() // true only if Limited
 
 **Scenarios**:
 
-| Config | Request | Result | Semantics |
-|--------|---------|--------|-----------|
-| `spill_slots: Some(4)` | `needs_spill_slot: true` | `Limited` | Must acquire 1 of 4 slots |
-| `spill_slots: Some(4)` | `needs_spill_slot: false` | `NotRequested` | Spill disallowed |
-| `spill_slots: None` | `needs_spill_slot: true` | `Unlimited` | Spill allowed; no counting |
-| `spill_slots: None` | `needs_spill_slot: false` | `NotRequested` | Spill disallowed |
+| Config                 | Request                   | Result         | Semantics                  |
+| ---------------------- | ------------------------- | -------------- | -------------------------- |
+| `spill_slots: Some(4)` | `needs_spill_slot: true`  | `Limited`      | Must acquire 1 of 4 slots  |
+| `spill_slots: Some(4)` | `needs_spill_slot: false` | `NotRequested` | Spill disallowed           |
+| `spill_slots: None`    | `needs_spill_slot: true`  | `Unlimited`    | Spill allowed; no counting |
+| `spill_slots: None`    | `needs_spill_slot: false` | `NotRequested` | Spill disallowed           |
 
 ---
 
@@ -534,10 +534,10 @@ When permit is dropped:
 
 ### Operation Costs
 
-| Operation | Implementation | Cost |
-|-----------|----------------|------|
+| Operation                      | Implementation                                                                  | Cost                           |
+| ------------------------------ | ------------------------------------------------------------------------------- | ------------------------------ |
 | `try_acquire_fat_job_permit()` | Up to 3 atomic acquire attempts (scan ring + delta cache + optional spill slot) | O(1), typically 2-3 atomic ops |
-| Release via Drop | 2 byte-budget releases + optional spill-slot release | O(1), constant-time |
+| Release via Drop               | 2 byte-budget releases + optional spill-slot release                            | O(1), constant-time            |
 
 ### Scalability Notes
 

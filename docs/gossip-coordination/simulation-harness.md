@@ -73,17 +73,17 @@ platforms and prevent invalid probability construction.
 
 ## Invariant Table
 
-| Label | Name                    | Rule                                                                              |
-|-------|-------------------------|-----------------------------------------------------------------------------------|
-| S1    | MutualExclusion         | At most one worker holds a non-expired lease per shard.                           |
-| S2    | FenceMonotonicity       | `fence_epoch` never decreases for a given `(RunId, ShardId)`.                     |
-| S3    | TerminalIrreversibility | Terminal states (Done, Split, Parked) never revert, except Parked->Active (unpark) which requires a fence bump. |
-| S4    | RecordInvariant         | `ShardRecord::validate_invariants()` returns `Ok`.                                |
-| S5    | CursorMonotonicity      | `cursor.last_key()` never decreases per shard.                                    |
-| S6    | CursorBounds            | Non-initial cursors remain within shard spec key range.                           |
-| S7    | SplitCoverage           | Split-parent's spawned children exist and reference the correct parent.           |
-| S8    | RunTerminalIrreversibility | Terminal run states (Done, Failed, Cancelled) never revert.                    |
-| S9    | CooldownViolation          | A worker must not successfully claim twice within the configured cooldown.      |
+| Label | Name                       | Rule                                                                                                            |
+| ----- | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| S1    | MutualExclusion            | At most one worker holds a non-expired lease per shard.                                                         |
+| S2    | FenceMonotonicity          | `fence_epoch` never decreases for a given `(RunId, ShardId)`.                                                   |
+| S3    | TerminalIrreversibility    | Terminal states (Done, Split, Parked) never revert, except Parked->Active (unpark) which requires a fence bump. |
+| S4    | RecordInvariant            | `ShardRecord::validate_invariants()` returns `Ok`.                                                              |
+| S5    | CursorMonotonicity         | `cursor.last_key()` never decreases per shard.                                                                  |
+| S6    | CursorBounds               | Non-initial cursors remain within shard spec key range.                                                         |
+| S7    | SplitCoverage              | Split-parent's spawned children exist and reference the correct parent.                                         |
+| S8    | RunTerminalIrreversibility | Terminal run states (Done, Failed, Cancelled) never revert.                                                     |
+| S9    | CooldownViolation          | A worker must not successfully claim twice within the configured cooldown.                                      |
 
 All nine invariants are checked after
 every operation (both successful and rejected).
@@ -156,7 +156,7 @@ The overload report includes:
 ## Fault Injection Levels
 
 | Level       | Lease Expiry | Worker Pause | Time Jump | Use Case                |
-|-------------|--------------|--------------|-----------|-------------------------|
+| ----------- | ------------ | ------------ | --------- | ----------------------- |
 | SunnyDay    | 0%           | 0%           | 0%        | Happy-path correctness  |
 | Stormy      | 10%          | 5%           | 10%       | Moderate fault coverage |
 | Radioactive | 20%          | 10%          | 20%       | Stress/edge-case search |

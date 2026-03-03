@@ -36,23 +36,24 @@ The crate provides four core capabilities:
 
 #### Contract layer (`crates/gossip-contracts/src/connector/`)
 
-| File               | Role                                                                |
-|--------------------|---------------------------------------------------------------------|
-| `mod.rs`           | Module root, re-exports all public types from four sub-modules      |
-| `types.rs`         | Toxic-byte wrappers, `Cursor`, `ScanItem`, `EnumerationPage`, `Budgets` |
-| `api.rs`           | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`, traits |
-| `page_validator.rs`| `ToxicDigest`, `PageValidationError`, `validate_page`, `validate_page_range` |
-| `conformance.rs`   | `ConformanceConfig`, `ConformanceError`, `check_connector_conforms` |
+| File                | Role                                                                         |
+| ------------------- | ---------------------------------------------------------------------------- |
+| `mod.rs`            | Module root, re-exports all public types from four sub-modules               |
+| `types.rs`          | Toxic-byte wrappers, `Cursor`, `ScanItem`, `EnumerationPage`, `Budgets`      |
+| `api.rs`            | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities`, traits |
+| `page_validator.rs` | `ToxicDigest`, `PageValidationError`, `validate_page`, `validate_page_range` |
+| `conformance.rs`    | `ConformanceConfig`, `ConformanceError`, `check_connector_conforms`          |
 
 #### Implementation layer (`crates/gossip-connectors/`)
 
-| File               | Role                                                                |
-|--------------------|---------------------------------------------------------------------|
-| `lib.rs`           | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `MemItem` |
-| `common.rs`        | Shared utilities: binary search, identity derivation, split-point selection |
-| `in_memory.rs`     | `InMemoryDeterministicConnector` -- deterministic in-memory fixture  |
-| `filesystem.rs`    | `FilesystemConnector` -- Unix-only filesystem connector             |
-| `scan_driver.rs`   | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
+| File             | Role                                                                                                          |
+| ---------------- | ------------------------------------------------------------------------------------------------------------- |
+| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`        |
+| `common.rs`      | Shared utilities: binary search, identity derivation, split-point selection                                   |
+| `in_memory.rs`   | `InMemoryDeterministicConnector` -- deterministic in-memory fixture                                           |
+| `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
+| `git.rs`         | `GitConnector` -- Git repository connector with ref enumeration and blob reading                              |
+| `scan_driver.rs` | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
 
 ---
 
@@ -94,17 +95,17 @@ The crate provides four core capabilities:
 
 ### Ownership boundaries
 
-| Concern                         | Owner                              | Examples                                                     |
-|---------------------------------|------------------------------------|--------------------------------------------------------------|
-| Toxic-byte validation + paging  | `gossip-contracts::connector`      | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `Budgets`      |
-| Connector traits + error types  | `gossip-contracts::connector`      | `EnumerationConnector`, `ReadConnector`, `ErrorClass`         |
-| Page validation                 | `gossip-contracts::connector`      | `validate_page`, `validate_page_range`, `PageValidationError` |
-| Conformance testing             | `gossip-contracts::connector`      | `check_connector_conforms`, `ConformanceConfig`               |
-| Reference connectors            | `gossip-connectors`                | `FilesystemConnector`, `InMemoryDeterministicConnector`       |
-| Shared connector utilities      | `gossip-connectors::common`        | `lower_bound`, `upper_bound`, `choose_split_index`           |
-| Scan driver traits              | `gossip-scan-driver`               | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`        |
-| Scan source factory impls       | `gossip-connectors::scan_driver`   | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
-| Scan runtime entry points       | `gossip-scanner-runtime`           | `scan_fs()`, `scan_git()`, execution-mode dispatch            |
+| Concern                        | Owner                            | Examples                                                                           |
+| ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------- |
+| Toxic-byte validation + paging | `gossip-contracts::connector`    | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `Budgets`                            |
+| Connector traits + error types | `gossip-contracts::connector`    | `EnumerationConnector`, `ReadConnector`, `ErrorClass`                              |
+| Page validation                | `gossip-contracts::connector`    | `validate_page`, `validate_page_range`, `PageValidationError`                      |
+| Conformance testing            | `gossip-contracts::connector`    | `check_connector_conforms`, `ConformanceConfig`                                    |
+| Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `InMemoryDeterministicConnector`                            |
+| Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `choose_split_index`                                 |
+| Scan driver traits             | `gossip-scan-driver`             | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`                             |
+| Scan source factory impls      | `gossip-connectors::scan_driver` | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
+| Scan runtime entry points      | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch                                 |
 
 ### Dependency direction
 
@@ -136,11 +137,11 @@ All three wrappers are generated by the `define_toxic_bytes!` macro
 redacted `Debug`/`Display` (identical output: `TypeName(len=N, hash=XXXXXXXX..)`
 using first 4 bytes of BLAKE3).
 
-| Type         | Ordered? | Limit                  | Purpose                                   |
-|--------------|----------|------------------------|-------------------------------------------|
-| `ItemKey`    | Yes      | `MAX_ITEM_KEY_SIZE` (4,096 bytes) | Enumeration position for sharding and cursor progression |
-| `ItemRef`    | No       | `MAX_ITEM_REF_SIZE` (16,384 bytes) | Opaque connector handle for read/open     |
-| `TokenBytes` | No       | `MAX_TOKEN_SIZE` (16,384 bytes)    | Pagination/resume token round-tripped by coordinator |
+| Type         | Ordered? | Limit                              | Purpose                                                  |
+| ------------ | -------- | ---------------------------------- | -------------------------------------------------------- |
+| `ItemKey`    | Yes      | `MAX_ITEM_KEY_SIZE` (4,096 bytes)  | Enumeration position for sharding and cursor progression |
+| `ItemRef`    | No       | `MAX_ITEM_REF_SIZE` (16,384 bytes) | Opaque connector handle for read/open                    |
+| `TokenBytes` | No       | `MAX_TOKEN_SIZE` (16,384 bytes)    | Pagination/resume token round-tripped by coordinator     |
 
 `ItemKey` derives `Ord` for lexicographic comparison. `ItemRef` and
 `TokenBytes` do not -- they are looked up, not ranged.
@@ -269,12 +270,12 @@ No additional methods -- it is not an extension point.
 
 Feature-flag struct with four `bool` fields:
 
-| Field          | Meaning                                              |
-|----------------|------------------------------------------------------|
-| `seek_by_key`  | Can resume from an arbitrary key position            |
-| `token_resume` | Supports opaque token-based pagination               |
-| `range_read`   | Can serve byte-range reads                           |
-| `split_hints`  | Emits split hints alongside enumeration pages        |
+| Field          | Meaning                                       |
+| -------------- | --------------------------------------------- |
+| `seek_by_key`  | Can resume from an arbitrary key position     |
+| `token_resume` | Supports opaque token-based pagination        |
+| `range_read`   | Can serve byte-range reads                    |
+| `split_hints`  | Emits split hints alongside enumeration pages |
 
 `Default` is all-false (conservative "no features" profile).
 
@@ -295,11 +296,11 @@ Binary retry posture:
 
 Both generated by `define_connector_error!` with identical structure:
 
-| Field            | Type           | Purpose                             |
-|------------------|----------------|-------------------------------------|
-| `class`          | `ErrorClass`   | Binary retry posture                |
-| `message`        | `String`       | Connector-originated diagnostic text |
-| `retry_after_ms` | `Option<u64>`  | Advisory backoff hint               |
+| Field            | Type          | Purpose                              |
+| ---------------- | ------------- | ------------------------------------ |
+| `class`          | `ErrorClass`  | Binary retry posture                 |
+| `message`        | `String`      | Connector-originated diagnostic text |
+| `retry_after_ms` | `Option<u64>` | Advisory backoff hint                |
 
 Named constructors: `retryable(msg)`, `rate_limited(msg, ms)`,
 `permanent(msg)`. `Display` sanitizes control characters via
@@ -395,13 +396,13 @@ Four-phase cross-run verification:
 
 Strict-by-default knobs:
 
-| Field                    | Default                | Purpose                          |
-|--------------------------|------------------------|----------------------------------|
-| `max_pages`              | `NonZeroUsize`         | Upper bound on pages per run     |
-| `determinism`            | `Deterministic`        | Cross-run consistency expectation |
-| `resume_checks`          | Both enabled           | Token drop + corrupt perturbation |
-| `restart_points`         | `Auto(4)`              | Four evenly-spaced resume points |
-| `secret_scan`            | Enabled                | Scan `ItemRef` for secret patterns |
+| Field            | Default         | Purpose                            |
+| ---------------- | --------------- | ---------------------------------- |
+| `max_pages`      | `NonZeroUsize`  | Upper bound on pages per run       |
+| `determinism`    | `Deterministic` | Cross-run consistency expectation  |
+| `resume_checks`  | Both enabled    | Token drop + corrupt perturbation  |
+| `restart_points` | `Auto(4)`       | Four evenly-spaced resume points   |
+| `secret_scan`    | Enabled         | Scan `ItemRef` for secret patterns |
 
 ### ConformanceError (`conformance.rs`)
 
@@ -447,13 +448,13 @@ errors.
 
 ### Shared utilities (`common.rs`)
 
-| Function               | Purpose                                                  |
-|------------------------|----------------------------------------------------------|
-| `derive_stable_item_id`| BLAKE3 domain-separated identity from `ConnectorTag` + `ItemKey` |
-| `shard_bound`          | Decode shard key-range bound (empty = unbounded)         |
-| `lower_bound`          | Binary search: first index with key >= target            |
-| `upper_bound`          | Binary search: first index with key > target             |
-| `choose_split_index`   | Byte-weighted median split with count-balanced fallback  |
+| Function                | Purpose                                                          |
+| ----------------------- | ---------------------------------------------------------------- |
+| `derive_stable_item_id` | BLAKE3 domain-separated identity from `ConnectorTag` + `ItemKey` |
+| `shard_bound`           | Decode shard key-range bound (empty = unbounded)                 |
+| `lower_bound`           | Binary search: first index with key >= target                    |
+| `upper_bound`           | Binary search: first index with key > target                     |
+| `choose_split_index`    | Byte-weighted median split with count-balanced fallback          |
 
 Both connectors use `choose_split_index` (or its prefix-sum equivalent)
 for byte-weighted median split selection. Count-balanced midpoint is the
@@ -546,10 +547,10 @@ Neither constant exists in the codebase yet.
 
 ### What B4 imports
 
-| Boundary | Types imported                                               |
-|----------|--------------------------------------------------------------|
-| B1 (Identity) | `ConnectorTag`, `ItemIdentityKey`, `ObjectVersionId`, `StableItemId` |
-| B2 (Coordination data model) | `ShardSpec`, `CursorUpdate`                    |
+| Boundary                     | Types imported                                                       |
+| ---------------------------- | -------------------------------------------------------------------- |
+| B1 (Identity)                | `ConnectorTag`, `ItemIdentityKey`, `ObjectVersionId`, `StableItemId` |
+| B2 (Coordination data model) | `ShardSpec`, `CursorUpdate`                                          |
 
 ### What B4 does NOT depend on
 

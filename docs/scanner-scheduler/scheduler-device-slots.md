@@ -98,11 +98,11 @@ The device slots system implements **per-device admission control**:
 
 ### Acquisition Methods
 
-| Method | Behavior | Use Case |
-|--------|----------|----------|
-| `try_acquire(device)` | Non-blocking, returns `None` if full | Worker threads (re-queue on failure) |
-| `acquire(device)` | Blocking, waits for available slot | Discovery threads, initialization |
-| `try_acquire_for_path(path)` | Auto-detect device, then try_acquire | Convenience, but performs `stat(2)` |
+| Method                       | Behavior                             | Use Case                             |
+| ---------------------------- | ------------------------------------ | ------------------------------------ |
+| `try_acquire(device)`        | Non-blocking, returns `None` if full | Worker threads (re-queue on failure) |
+| `acquire(device)`            | Blocking, waits for available slot   | Discovery threads, initialization    |
+| `try_acquire_for_path(path)` | Auto-detect device, then try_acquire | Convenience, but performs `stat(2)`  |
 
 ### RAII Permits
 
@@ -154,12 +154,12 @@ Time │ Device Slots (limit: 3)  │ Queue                │ Action
 
 **Important distinction:**
 
-| Aspect | Device Slots | Doesn't Control |
-|--------|--------------|-----------------|
-| Concurrent jobs per device | ✓ Limited | Actual disk I/O timing |
-| Admission control | ✓ Yes | Page fault rates |
-| Per-device fairness | ✓ Yes | Page cache eviction |
-| | | Kernel scheduling |
+| Aspect                     | Device Slots | Doesn't Control        |
+| -------------------------- | ------------ | ---------------------- |
+| Concurrent jobs per device | ✓ Limited    | Actual disk I/O timing |
+| Admission control          | ✓ Yes        | Page fault rates       |
+| Per-device fairness        | ✓ Yes        | Page cache eviction    |
+|                            |              | Kernel scheduling      |
 
 Device slots are **advisory**—they limit concurrency but don't enforce hard I/O bandwidth limits. The kernel still makes final decisions about page cache management and I/O scheduling.
 
@@ -237,10 +237,10 @@ impl DeviceSlotsConfig {
 }
 ```
 
-| Method | Purpose |
-|--------|---------|
-| `uniform(n)` | Create config with `n` slots for all devices |
-| `with_device(device, n)` | Override slots for specific device |
+| Method                   | Purpose                                      |
+| ------------------------ | -------------------------------------------- |
+| `uniform(n)`             | Create config with `n` slots for all devices |
+| `with_device(device, n)` | Override slots for specific device           |
 
 **Validation:** Panics if any slot count is zero.
 
@@ -264,16 +264,16 @@ impl DeviceSlots {
 }
 ```
 
-| Method | Returns | Purpose |
-|--------|---------|---------|
-| `new()` | `Arc<Self>` | Create allocator with custom config |
-| `uniform()` | `Arc<Self>` | Create allocator with uniform slots |
-| `try_acquire()` | `Option<Permit>` | Non-blocking slot acquisition |
-| `acquire()` | `Permit` | Blocking slot acquisition |
-| `try_acquire_for_path()` | `Option<Permit>` | Auto-detect device + acquire |
-| `available()` | `Option<usize>` | Check free slots (or None if device never accessed) |
-| `total()` | `usize` | Get total slots for device |
-| `active_device_count()` | `usize` | Count devices with active budgets |
+| Method                   | Returns          | Purpose                                             |
+| ------------------------ | ---------------- | --------------------------------------------------- |
+| `new()`                  | `Arc<Self>`      | Create allocator with custom config                 |
+| `uniform()`              | `Arc<Self>`      | Create allocator with uniform slots                 |
+| `try_acquire()`          | `Option<Permit>` | Non-blocking slot acquisition                       |
+| `acquire()`              | `Permit`         | Blocking slot acquisition                           |
+| `try_acquire_for_path()` | `Option<Permit>` | Auto-detect device + acquire                        |
+| `available()`            | `Option<usize>`  | Check free slots (or None if device never accessed) |
+| `total()`                | `usize`          | Get total slots for device                          |
+| `active_device_count()`  | `usize`          | Count devices with active budgets                   |
 
 #### `DeviceSlotPermit`
 ```rust
@@ -304,12 +304,12 @@ impl DeviceId {
 }
 ```
 
-| Method | Platform | Returns |
-|--------|----------|---------|
-| `from_path()` | Unix: `st_dev`, Non-Unix: `UNKNOWN` | `DeviceId` |
-| `try_from_path()` | Unix: Result, Non-Unix: Always Ok | `Result` |
-| `from_raw()` | All | `DeviceId` (for testing) |
-| `is_unknown()` | All | `bool` |
+| Method            | Platform                            | Returns                  |
+| ----------------- | ----------------------------------- | ------------------------ |
+| `from_path()`     | Unix: `st_dev`, Non-Unix: `UNKNOWN` | `DeviceId`               |
+| `try_from_path()` | Unix: Result, Non-Unix: Always Ok   | `Result`                 |
+| `from_raw()`      | All                                 | `DeviceId` (for testing) |
+| `is_unknown()`    | All                                 | `bool`                   |
 
 ---
 

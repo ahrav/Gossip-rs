@@ -162,13 +162,13 @@ For persistence IDs (`crates/scanner-scheduler/src/store.rs`), transform-derived
 These rules intentionally mirror dedupe semantics in
 `ScanScratch::push_finding_with_drop_hint`.
 
-| Limit | Default | Purpose |
-|-------|---------|---------|
-| `max_transform_depth` | 3 | Maximum decode chain length |
-| `max_total_decode_output_bytes` | 512 KiB | Global decode output budget |
-| `max_work_items` | 256 | Maximum queued decoded buffers |
-| `max_spans_per_buffer` | 8 | Candidate spans per transform per buffer |
-| `max_decoded_bytes` | 64 KiB | Output limit per span decode |
+| Limit                           | Default | Purpose                                  |
+|---------------------------------|---------|------------------------------------------|
+| `max_transform_depth`           | 3       | Maximum decode chain length              |
+| `max_total_decode_output_bytes` | 512 KiB | Global decode output budget              |
+| `max_work_items`                | 256     | Maximum queued decoded buffers           |
+| `max_spans_per_buffer`          | 8       | Candidate spans per transform per buffer |
+| `max_decoded_bytes`             | 64 KiB  | Output limit per span decode             |
 
 ## Transform Types
 
@@ -332,22 +332,22 @@ fn materialize(&self, mut id: StepId, out: &mut ScratchVec<DecodeStep>) {
 
 ## Deduplication
 
-The `FixedSet128` provides O(1) hash-based deduplication with generation-based reset.
+The `FixedSet128` provides O(1) hash-based deduplication with epoch-based reset.
 Current layout in `crates/gossip-stdx/src/fixed_set.rs`:
 
 ```rust
 struct FixedSet128 {
-    slots: Vec<Slot128>, // Interleaved key + generation
-    cur: u32,           // Current generation
+    slots: Vec<Slot128>, // Interleaved key + epoch
+    cur: u32,           // Current epoch
     mask: usize,        // Capacity mask (power of 2)
 }
 
-// Reset is O(1) - just increment generation
+// Reset is O(1) - just increment epoch
 fn reset(&mut self) {
     self.cur = self.cur.wrapping_add(1);
     if self.cur == 0 {
         for slot in &mut self.slots {
-            slot.gen = 0; // Handle wraparound
+            slot.epoch = 0; // Handle wraparound
         }
         self.cur = 1;
     }

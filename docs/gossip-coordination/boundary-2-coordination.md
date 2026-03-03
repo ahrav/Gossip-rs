@@ -39,27 +39,27 @@ The module provides six core capabilities:
 
 ### Source files
 
-| File            | Role                                                                  |
-|-----------------|-----------------------------------------------------------------------|
-| `traits.rs`     | `CoordinationBackend` trait -- the semantic contract for all backends |
-| `record.rs`     | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`       |
-| `run.rs`        | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait          |
+| File                                      | Role                                                                                                                        |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `traits.rs`                               | `CoordinationBackend` trait -- the semantic contract for all backends                                                       |
+| `record.rs`                               | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`                                                             |
+| `run.rs`                                  | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait                                                                |
 | `gossip-contracts::coordination/split.rs` | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
-| `split_execution.rs` | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types |
-| `in_memory.rs`  | In-memory reference implementation (executable spec)                  |
-| `lease.rs`      | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`            |
-| `cursor.rs`     | `Cursor` type with monotonicity and bounds semantics                  |
-| `shard_spec.rs` | `ShardSpec` key-range type, `CursorSemantics`, split validation       |
-| `pooled.rs`     | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers |
-| `limits.rs`     | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`) |
-| `manifest.rs`   | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards` |
-| `error.rs`      | Shared `CoordError` and `IdempotentOutcome`                           |
-| `run_errors.rs` | Run-management error types                                            |
-| `validation.rs` | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency` |
-| `events.rs`     | `EventCollector`, `EventKind`, `StateTransitionEvent`                 |
-| `facade.rs`     | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                   |
-| `session.rs`    | `WorkerSession` ergonomic wrapper with move/borrow lifecycle          |
-| `lib.rs`        | Module root and public re-exports                                     |
+| `split_execution.rs`                      | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types                                |
+| `in_memory.rs`                            | In-memory reference implementation (executable spec)                                                                        |
+| `lease.rs`                                | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`                                                                  |
+| `cursor.rs`                               | `Cursor` type with monotonicity and bounds semantics                                                                        |
+| `shard_spec.rs`                           | `ShardSpec` key-range type, `CursorSemantics`, split validation                                                             |
+| `pooled.rs`                               | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers                                                        |
+| `limits.rs`                               | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)                                        |
+| `manifest.rs`                             | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`                                  |
+| `error.rs`                                | Shared `CoordError` and `IdempotentOutcome`                                                                                 |
+| `run_errors.rs`                           | Run-management error types                                                                                                  |
+| `validation.rs`                           | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                                                   |
+| `events.rs`                               | `EventCollector`, `EventKind`, `StateTransitionEvent`                                                                       |
+| `facade.rs`                               | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                                                                         |
+| `session.rs`                              | `WorkerSession` ergonomic wrapper with move/borrow lifecycle                                                                |
+| `lib.rs`                                  | Module root and public re-exports                                                                                           |
 
 ---
 
@@ -103,23 +103,23 @@ strategy that does not retire the parent.
 to durable storage. Compile-time assertions enforce the mapping:
 
 | Variant  | Discriminant | Terminal? |
-|----------|:------------:|:---------:|
-| `Active` | 0            | No        |
-| `Done`   | 1            | Yes       |
-| `Split`  | 2            | Yes       |
-| `Parked` | 3            | Yes       |
+| -------- | :----------: | :-------: |
+| `Active` |      0       |     No    |
+| `Done`   |      1       |    Yes    |
+| `Split`  |      2       |    Yes    |
+| `Parked` |      3       |    Yes    |
 
 ### ParkReason
 
 When a shard is parked, a `ParkReason` (`#[repr(u8)]`) is stored alongside:
 
 | Variant            | Discriminant | Meaning                                                     |
-|--------------------|:------------:|-------------------------------------------------------------|
-| `PermissionDenied` | 0            | Connector lacks access -- requires credential rotation      |
-| `NotFound`         | 1            | Scan target no longer exists                                |
-| `Poisoned`         | 2            | Internal inconsistency -- requires manual investigation     |
-| `TooManyErrors`    | 3            | Transient errors accumulated -- suitable for auto-retry     |
-| `Other`            | 4            | Catch-all; backend should log additional context separately |
+| ------------------ | :----------: | ----------------------------------------------------------- |
+| `PermissionDenied` |      0       | Connector lacks access -- requires credential rotation      |
+| `NotFound`         |      1       | Scan target no longer exists                                |
+| `Poisoned`         |      2       | Internal inconsistency -- requires manual investigation     |
+| `TooManyErrors`    |      3       | Transient errors accumulated -- suitable for auto-retry     |
+| `Other`            |      4       | Catch-all; backend should log additional context separately |
 
 The invariant `park_reason.is_some()` iff `status == Parked` is asserted on
 every state transition via `assert_invariants`.
@@ -190,7 +190,7 @@ constant, with per-operation tags prepended as a second domain-separation
 layer:
 
 | Operation        | Tag bytes           | Hashed fields                                 |
-|------------------|---------------------|-----------------------------------------------|
+| ---------------- | ------------------- | --------------------------------------------- |
 | `checkpoint`     | `b"checkpoint"`     | `Cursor` (via `CanonicalBytes`)               |
 | `complete`       | `b"complete"`       | `Cursor` (via `CanonicalBytes`)               |
 | `park`           | `b"park"`           | `ParkReason` (via `CanonicalBytes`)           |
@@ -203,7 +203,7 @@ cursor produce different hashes.
 ### Why RingBuffer
 
 | Data Structure    | Rejection Reason                                              |
-|-------------------|---------------------------------------------------------------|
+| ----------------- | ------------------------------------------------------------- |
 | `Vec`             | O(n) eviction via `remove(0)` -- slides all elements          |
 | `VecDeque`        | Heap-allocated -- violates zero-alloc hot-path requirement    |
 | `ArrayVec`        | No ring semantics -- eviction requires manual shift           |
@@ -235,12 +235,12 @@ validates shard manifests, and provides progress aggregation.
 `RunStatus` uses `#[repr(u8)]` with stable discriminants:
 
 | Variant        | Discriminant | Terminal? |
-|----------------|:------------:|:---------:|
-| `Initializing` | 0            | No        |
-| `Active`       | 1            | No        |
-| `Done`         | 2            | Yes       |
-| `Failed`       | 3            | Yes       |
-| `Cancelled`    | 4            | Yes       |
+| -------------- | :----------: | :-------: |
+| `Initializing` |      0       |     No    |
+| `Active`       |      1       |     No    |
+| `Done`         |      2       |    Yes    |
+| `Failed`       |      3       |    Yes    |
+| `Cancelled`    |      4       |    Yes    |
 
 ### Two-phase creation
 
@@ -270,16 +270,16 @@ Run creation is a two-phase process (D2.20):
 defines run-level and admin operations:
 
 | Method             | Description                           | Idempotent? | Lease-gated? |
-|--------------------|---------------------------------------|:-----------:|:------------:|
-| `create_run`       | Create run in Initializing status     | No          | No           |
-| `register_shards`  | Populate shards, transition to Active | Yes (OpId)  | No           |
-| `get_run`          | Return run record (read-only)         | N/A         | No           |
-| `get_run_progress` | Aggregate shard status counts         | N/A         | No           |
-| `list_shards`      | Return filtered shard summaries       | N/A         | No           |
-| `complete_run`     | Transition Active to Done             | Yes (OpId)  | No           |
-| `fail_run`         | Transition Active to Failed           | Yes (OpId)  | No           |
-| `cancel_run`       | Transition non-terminal to Cancelled  | Yes (OpId)  | No           |
-| `unpark_shard`     | Resume Parked shard to Active         | Yes (OpId)  | No           |
+| ------------------ | ------------------------------------- | :---------: | :----------: |
+| `create_run`       | Create run in Initializing status     |      No     |      No      |
+| `register_shards`  | Populate shards, transition to Active |  Yes (OpId) |      No      |
+| `get_run`          | Return run record (read-only)         |     N/A     |      No      |
+| `get_run_progress` | Aggregate shard status counts         |     N/A     |      No      |
+| `list_shards`      | Return filtered shard summaries       |     N/A     |      No      |
+| `complete_run`     | Transition Active to Done             |  Yes (OpId) |      No      |
+| `fail_run`         | Transition Active to Failed           |  Yes (OpId) |      No      |
+| `cancel_run`       | Transition non-terminal to Cancelled  |  Yes (OpId) |      No      |
+| `unpark_shard`     | Resume Parked shard to Active         |  Yes (OpId) |      No      |
 
 Admin operations (`unpark`, `cancel`) are **not** lease-gated (D2.21) -- they
 are coordinator-level actions that do not require a worker to hold a lease.
@@ -344,9 +344,9 @@ number of derived shards per run is bounded.
 ### Constants
 
 | Constant                | Value | Purpose                                            |
-|-------------------------|:-----:|----------------------------------------------------|
-| `MAX_SPLIT_CHILDREN`    | 256   | Maximum children in a single split-replace         |
-| `MAX_SPAWNED_PER_SHARD` | 1024  | Maximum cumulative children + residuals per parent |
+| ----------------------- | :---: | -------------------------------------------------- |
+| `MAX_SPLIT_CHILDREN`    |  256  | Maximum children in a single split-replace         |
+| `MAX_SPAWNED_PER_SHARD` |  1024 | Maximum cumulative children + residuals per parent |
 
 Compile-time assertion: `MAX_SPLIT_CHILDREN <= MAX_SPAWNED_PER_SHARD`.
 
@@ -420,18 +420,18 @@ Every mutation path calls `ShardRecord::assert_invariants()` before returning.
 
 ### The 10 ShardRecord invariants
 
-| #  | Invariant                                               | Check                                                                 |
-|----|---------------------------------------------------------|-----------------------------------------------------------------------|
-| 1  | `park_reason.is_some()` iff `status == Parked`          | Status-reason consistency                                             |
-| 2  | _(structural)_                                          | `Option<LeaseHolder>` makes paired-ness implicit                      |
-| 3  | Terminal shards must not hold a lease                   | `status.is_terminal()` implies `lease.is_none()`                      |
-| 4  | `fence_epoch >= FenceEpoch::INITIAL`                    | Fence epoch minimum (>= 1)                                            |
-| 5  | `op_log.len() <= OP_LOG_CAP`                            | Op-log bounded (defense-in-depth; `RingBuffer` enforces structurally) |
-| 6  | `status == Split` implies `!spawned.is_empty()`         | Split shards must have children                                       |
-| 7  | `parent.is_some()` iff `shard.is_derived()`             | Biconditional: bit 63 set iff has parent                              |
-| 8  | All entries in `spawned` satisfy `is_derived() == true` | Spawned children must be derived                                      |
-| 9  | Op-log entries have unique `OpId` values                | No duplicate idempotency keys                                         |
-| 10 | `spawned.len() <= MAX_SPAWNED_PER_SHARD`                | Spawned count bounded at 1024                                         |
+| #   | Invariant                                               | Check                                                                 |
+| --- | ------------------------------------------------------- | --------------------------------------------------------------------- |
+| 1   | `park_reason.is_some()` iff `status == Parked`          | Status-reason consistency                                             |
+| 2   | _(structural)_                                          | `Option<LeaseHolder>` makes paired-ness implicit                      |
+| 3   | Terminal shards must not hold a lease                   | `status.is_terminal()` implies `lease.is_none()`                      |
+| 4   | `fence_epoch >= FenceEpoch::INITIAL`                    | Fence epoch minimum (>= 1)                                            |
+| 5   | `op_log.len() <= OP_LOG_CAP`                            | Op-log bounded (defense-in-depth; `RingBuffer` enforces structurally) |
+| 6   | `status == Split` implies `!spawned.is_empty()`         | Split shards must have children                                       |
+| 7   | `parent.is_some()` iff `shard.is_derived()`             | Biconditional: bit 63 set iff has parent                              |
+| 8   | All entries in `spawned` satisfy `is_derived() == true` | Spawned children must be derived                                      |
+| 9   | Op-log entries have unique `OpId` values                | No duplicate idempotency keys                                         |
+| 10  | `spawned.len() <= MAX_SPAWNED_PER_SHARD`                | Spawned count bounded at 1024                                         |
 
 INV-9 is O(n^2) where n <= 16 (at most 120 comparisons) -- dominated by
 the per-transition persistence cost.
@@ -456,15 +456,15 @@ failing operation was not persisted), but the root cause must be investigated.
 The core trait with 7 operations that every backend (in-memory, FoundationDB,
 PostgreSQL, deterministic simulator) must implement:
 
-| Operation             | Signature                                          | Terminal?    | Idempotent? | Lease-gated? |
-|-----------------------|----------------------------------------------------|:------------:|:-----------:|:------------:|
-| `acquire_and_restore_into` | `(now, tenant, key, worker) -> (Lease, Snapshot)`  | No           | No          | No           |
-| `renew`               | `(now, tenant, lease) -> new_deadline`             | No           | No          | Yes          |
-| `checkpoint`          | `(now, tenant, lease, cursor, op_id) -> ()`        | No           | Yes (OpId)  | Yes          |
-| `complete`            | `(now, tenant, lease, cursor, op_id) -> ()`        | Yes (Done)   | Yes (OpId)  | Yes          |
-| `park_shard`          | `(now, tenant, lease, reason, op_id) -> ()`        | Yes (Parked) | Yes (OpId)  | Yes          |
-| `split_replace`       | `(now, tenant, lease, plan, op_id) -> child_ids`   | Yes (Split)  | Yes (OpId)  | Yes          |
-| `split_residual`      | `(now, tenant, lease, plan, op_id) -> residual_id` | No           | Yes (OpId)  | Yes          |
+| Operation                  | Signature                                          |  Terminal?   | Idempotent? | Lease-gated? |
+| -------------------------- | -------------------------------------------------- | :----------: | :---------: | :----------: |
+| `acquire_and_restore_into` | `(now, tenant, key, worker) -> (Lease, Snapshot)`  |      No      |      No     |      No      |
+| `renew`                    | `(now, tenant, lease) -> new_deadline`             |      No      |      No     |     Yes      |
+| `checkpoint`               | `(now, tenant, lease, cursor, op_id) -> ()`        |      No      |  Yes (OpId) |     Yes      |
+| `complete`                 | `(now, tenant, lease, cursor, op_id) -> ()`        |  Yes (Done)  |  Yes (OpId) |     Yes      |
+| `park_shard`               | `(now, tenant, lease, reason, op_id) -> ()`        | Yes (Parked) |  Yes (OpId) |     Yes      |
+| `split_replace`            | `(now, tenant, lease, plan, op_id) -> child_ids`   | Yes (Split)  |  Yes (OpId) |     Yes      |
+| `split_residual`           | `(now, tenant, lease, plan, op_id) -> residual_id` |      No      |  Yes (OpId) |     Yes      |
 
 ### Operation semantics
 
@@ -543,14 +543,14 @@ representation and the owned `Cursor` at API boundaries.
 
 ### Monotonicity rules
 
-| old.last_key | new.last_key             | Verdict                     |
-|:------------:|:------------------------:|-----------------------------|
-| `None`       | `None`                   | OK -- no-op checkpoint      |
-| `None`       | `Some(k)`                | OK -- first progress        |
-| `Some(a)`    | `Some(b)` where `b >= a` | OK -- forward progress      |
-| `Some(a)`    | `Some(a)`                | OK -- idempotent retry      |
-| `Some(_)`    | `None`                   | **REJECT** -- reset to none |
-| `Some(a)`    | `Some(b)` where `b < a`  | **REJECT** -- regression    |
+| old.last_key |       new.last_key       | Verdict                     |
+| :----------: | :----------------------: | --------------------------- |
+|    `None`    |          `None`          | OK -- no-op checkpoint      |
+|    `None`    |        `Some(k)`         | OK -- first progress        |
+|  `Some(a)`   | `Some(b)` where `b >= a` | OK -- forward progress      |
+|  `Some(a)`   |        `Some(a)`         | OK -- idempotent retry      |
+|  `Some(_)`   |          `None`          | **REJECT** -- reset to none |
+|  `Some(a)`   | `Some(b)` where `b < a`  | **REJECT** -- regression    |
 
 ### CursorSemantics
 
@@ -581,7 +581,7 @@ half-open `[start, end)` byte-key ranges.
 ## 10. Design Decisions
 
 | ID    | Decision                                                                          |
-|-------|-----------------------------------------------------------------------------------|
+| ----- | --------------------------------------------------------------------------------- |
 | D2.1  | Two-layer `(last_key, token)` cursor structure                                    |
 | D2.2  | ShardSpec has half-open key range `[start, end)` with lex-ordered byte boundaries |
 | D2.3  | Cursor monotonicity is a hard safety invariant                                    |
@@ -592,10 +592,10 @@ half-open `[start, end)` byte-key ranges.
 | D2.8  | Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`                  |
 | D2.10 | Derived shard IDs have bit 63 set                                                 |
 | D2.11 | ShardRecord is self-contained (no back-references to RunConfig)                   |
-| D2.12 | ShardSnapshotView excludes lease, fence, op_log, tenant, park_reason               |
+| D2.12 | ShardSnapshotView excludes lease, fence, op_log, tenant, park_reason              |
 | D2.13 | Trait is synchronous (returns `Result`, not futures)                              |
 | D2.14 | Lease-gated operations take `(TenantId, Lease)`                                   |
-| D2.15 | `acquire_and_restore_into` is the only non-lease operation                             |
+| D2.15 | `acquire_and_restore_into` is the only non-lease operation                        |
 | D2.16 | Error types are operation-specific enums via `From<CoordError>`                   |
 | D2.17 | `now: LogicalTime` passed explicitly (deterministic simulation)                   |
 | D2.18 | `RunRecord` is the authoritative run record                                       |
@@ -627,15 +627,15 @@ variants (no wildcard `_` catch-all), so adding a new `CoordError` variant
 triggers a compile error in every `From` impl, forcing a conscious routing
 decision.
 
-| Operation             | Error Type           | OpIdConflict? | Cursor Variants? | Split Variants? |
-|-----------------------|----------------------|:-------------:|:----------------:|:---------------:|
-| `acquire_and_restore_into` | `AcquireError`       | No            | No               | No              |
-| `renew`               | `RenewError`         | No            | No               | No              |
-| `checkpoint`          | `CheckpointError`    | Yes           | Yes              | No              |
-| `complete`            | `CompleteError`      | Yes           | Yes              | No              |
-| `park_shard`          | `ParkError`          | Yes           | No               | No              |
-| `split_replace`       | `SplitReplaceError`  | Yes           | No               | Yes             |
-| `split_residual`      | `SplitResidualError` | Yes           | No               | Yes             |
+| Operation                  | Error Type           | OpIdConflict? | Cursor Variants? | Split Variants? |
+| -------------------------- | -------------------- | :-----------: | :--------------: | :-------------: |
+| `acquire_and_restore_into` | `AcquireError`       |       No      |        No        |        No       |
+| `renew`                    | `RenewError`         |       No      |        No        |        No       |
+| `checkpoint`               | `CheckpointError`    |      Yes      |       Yes        |        No       |
+| `complete`                 | `CompleteError`      |      Yes      |       Yes        |        No       |
+| `park_shard`               | `ParkError`          |      Yes      |        No        |        No       |
+| `split_replace`            | `SplitReplaceError`  |      Yes      |        No        |       Yes       |
+| `split_residual`           | `SplitResidualError` |      Yes      |        No        |       Yes       |
 
 ### IdempotentOutcome
 

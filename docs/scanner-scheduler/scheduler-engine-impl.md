@@ -27,12 +27,12 @@ This decoupling allows:
 
 ### Type Mapping
 
-| Concept | Scheduler Trait | Real Engine Type | Wrapper |
-|---------|-----------------|------------------|---------|
-| Finding | `FindingRecord` | `crate::api::FindingRec` | Direct impl (no wrapper) |
+| Concept      | Scheduler Trait         | Real Engine Type                 | Wrapper                   |
+| ------------ | ----------------------- | -------------------------------- | ------------------------- |
+| Finding      | `FindingRecord`         | `crate::api::FindingRec`         | Direct impl (no wrapper)  |
 | Finding+Hash | `FindingWithHashRecord` | `FindingWithHash<ApiFindingRec>` | `FindingWithHash` carrier |
-| Scratch | `EngineScratch` | `crate::engine::ScanScratch` | `RealEngineScratch` |
-| Engine | `ScanEngine` | `crate::engine::Engine` | Direct impl |
+| Scratch      | `EngineScratch`         | `crate::engine::ScanScratch`     | `RealEngineScratch`       |
+| Engine       | `ScanEngine`            | `crate::engine::Engine`          | Direct impl               |
 
 ### Implementation Strategy
 
@@ -171,13 +171,13 @@ This module is a classic **Adapter** pattern (also called **Wrapper**):
 
 ### Impedance Mismatches Resolved
 
-| Problem | Solution |
-|---------|----------|
-| Trait needs `&mut Self::Scratch` in `clear()`, but engine reset methods need `&Engine` | Lazy reset pattern |
-| Finding types differ slightly (u32 vs u16 for rule_id) | Type conversion in trait impl |
-| Engine returns `ScanScratch`, trait expects `RealEngineScratch` | `RealEngineScratch::new()` wrapper |
-| Findings need extraction from engine scratch | `drain_findings_into()` buffer pattern |
-| Findings and hashes stored in parallel vectors in engine scratch | `drain_findings_with_hashes()` + zip into `FindingWithHash` carriers |
+| Problem                                                                                | Solution                                                             |
+| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Trait needs `&mut Self::Scratch` in `clear()`, but engine reset methods need `&Engine` | Lazy reset pattern                                                   |
+| Finding types differ slightly (u32 vs u16 for rule_id)                                 | Type conversion in trait impl                                        |
+| Engine returns `ScanScratch`, trait expects `RealEngineScratch`                        | `RealEngineScratch::new()` wrapper                                   |
+| Findings need extraction from engine scratch                                           | `drain_findings_into()` buffer pattern                               |
+| Findings and hashes stored in parallel vectors in engine scratch                       | `drain_findings_with_hashes()` + zip into `FindingWithHash` carriers |
 
 ### Benefits of This Approach
 
@@ -318,14 +318,14 @@ fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
 
 ### How They Differ
 
-| Aspect | `engine_impl.rs` (Real) | `engine_stub.rs` (Mock) |
-|--------|----------------------|----------------------|
-| **Engine Type** | `crate::engine::Engine` | `MockEngine` |
-| **Scratch Type** | `RealEngineScratch` wrapping `ScanScratch` | `ScanScratch` directly |
-| **Finding Type** | `crate::api::FindingRec` (u32 spans) | `FindingRec` (u64 spans) |
-| **Scanning** | Vectorscan regex engine with anchors, transforms, validators | Simple substring search |
-| **Performance** | Highly optimized, Vectorscan-backed | Slow but deterministic |
-| **Use Case** | Production scanning | Testing scheduler logic |
+| Aspect           | `engine_impl.rs` (Real)                                      | `engine_stub.rs` (Mock)  |
+| ---------------- | ------------------------------------------------------------ | ------------------------ |
+| **Engine Type**  | `crate::engine::Engine`                                      | `MockEngine`             |
+| **Scratch Type** | `RealEngineScratch` wrapping `ScanScratch`                   | `ScanScratch` directly   |
+| **Finding Type** | `crate::api::FindingRec` (u32 spans)                         | `FindingRec` (u64 spans) |
+| **Scanning**     | Vectorscan regex engine with anchors, transforms, validators | Simple substring search  |
+| **Performance**  | Highly optimized, Vectorscan-backed                          | Slow but deterministic   |
+| **Use Case**     | Production scanning                                          | Testing scheduler logic  |
 
 ### Parallel Implementations
 

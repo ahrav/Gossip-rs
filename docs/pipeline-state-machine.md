@@ -113,15 +113,15 @@ driven by source exhaustion + `join()` + executor in-flight drain.
 
 ## Current Names and Constants
 
-| Symbol / Type | Value / Meaning | Location |
-| --- | --- | --- |
-| `ParallelScanConfig::default().chunk_size` | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig::default().pool_buffers` | `workers * 4` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig::default().max_in_flight_objects` | `1024` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `LocalConfig::default().chunk_size` | `64 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
-| `LocalConfig::default().max_in_flight_objects` | `256` | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
-| `ARCHIVE_STREAM_READ_MAX` | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
-| `ACCEPTING_BIT` / `COUNT_UNIT` | `1` / `2` | `crates/scanner-scheduler/src/scheduler/executor_core.rs` |
+| Symbol / Type                                         | Value / Meaning    | Location                                                   |
+| ----------------------------------------------------- | ------------------ | ---------------------------------------------------------- |
+| `ParallelScanConfig::default().chunk_size`            | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`  |
+| `ParallelScanConfig::default().pool_buffers`          | `workers * 4`      | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`  |
+| `ParallelScanConfig::default().max_in_flight_objects` | `1024`             | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`  |
+| `LocalConfig::default().chunk_size`                   | `64 * 1024` bytes  | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
+| `LocalConfig::default().max_in_flight_objects`        | `256`              | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
+| `ARCHIVE_STREAM_READ_MAX`                             | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/local_fs_archive_ctx.rs` |
+| `ACCEPTING_BIT` / `COUNT_UNIT`                        | `1` / `2`          | `crates/scanner-scheduler/src/scheduler/executor_core.rs`  |
 
 ## Metrics and Summary Wiring
 

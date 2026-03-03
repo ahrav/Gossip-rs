@@ -38,13 +38,13 @@ The identity contracts are deliberately source-neutral. Every input to the
 three derivation functions is either engine-provided (and therefore
 source-independent) or caller-provided via a generic byte slice:
 
-| Input | Type | Source-specific? |
-|---|---|---|
-| `object_key` | `&[u8]` | No — caller provides any stable byte ID |
-| `FindingRec` fields | buffer offsets (`u32`/`u64`) | No — engine produces these for all sources |
-| `norm_hash` | `[u8; 32]` | No — engine computes this on the hot path for every source |
-| `StoreKeys` | env var + KDF | No — per-process, not per-source |
-| `VariantDiscriminant` | encoding variant | No — engine-level concept |
+| Input                 | Type                         | Source-specific?                                           |
+| --------------------- | ---------------------------- | ---------------------------------------------------------- |
+| `object_key`          | `&[u8]`                      | No — caller provides any stable byte ID                    |
+| `FindingRec` fields   | buffer offsets (`u32`/`u64`) | No — engine produces these for all sources                 |
+| `norm_hash`           | `[u8; 32]`                   | No — engine computes this on the hot path for every source |
+| `StoreKeys`           | env var + KDF                | No — per-process, not per-source                           |
+| `VariantDiscriminant` | encoding variant             | No — engine-level concept                                  |
 
 The `object_key` field is the source abstraction point. Its doc comment
 reads "stable object identity bytes **(e.g.** a canonical repo-relative
@@ -52,13 +52,13 @@ path)" — the "e.g." is intentional. Any stable byte representation works.
 
 ### How Each Source Provides object_key
 
-| Source | Example `object_key` | Stability guarantee |
-|---|---|---|
+| Source     | Example `object_key`                   | Stability guarantee               |
+| ---------- | -------------------------------------- | --------------------------------- |
 | Filesystem | `fs:crates/scanner-rs-cli/src/main.rs` | Repo-relative path (not absolute) |
-| Git | `git:<repo-id>:<blob-oid>` | Blob OID is content-addressed |
-| S3 | `s3://<bucket>/<key>@<version-id>` | Version ID is immutable |
-| Archive | `tar:<archive-path>:<entry-path>` | Entry path within archive |
-| Log | `log:<source-id>:<line-range>` | Source + position |
+| Git        | `git:<repo-id>:<blob-oid>`             | Blob OID is content-addressed     |
+| S3         | `s3://<bucket>/<key>@<version-id>`     | Version ID is immutable           |
+| Archive    | `tar:<archive-path>:<entry-path>`      | Entry path within archive         |
+| Log        | `log:<source-id>:<line-range>`         | Source + position                 |
 
 **Collision safety**: `object_key` values must be globally unambiguous across
 sources. Using a scheme prefix (e.g. `fs:`, `git:`, `s3:`) prevents
@@ -95,14 +95,14 @@ currently targets FS scanning (Phases B-E) but can serve Git and other
 sources. The two systems share the same `norm_hash` concept (BLAKE3 of
 secret bytes) but differ in scope:
 
-| Aspect | Git persistence | Store identity contracts |
-|---|---|---|
-| Location | `crates/scanner-git/src/persist.rs` | `crates/scanner-scheduler/src/store/` |
-| Finding key | `(start, end, rule_id, norm_hash)` | `occurrence_id` (32-byte keyed hash) |
-| Key material | None (hashes are unkeyed) | `SCANNER_SECRET_KEY` with KDF |
-| Cross-run correlation | Via ref watermarks + seen-blob store | Via persistent key identity |
-| Secret protection | `norm_hash` is unkeyed BLAKE3 | `secret_hash` is keyed BLAKE3 |
-| Source scope | Git only | Any source |
+| Aspect                | Git persistence                      | Store identity contracts              |
+| --------------------- | ------------------------------------ | ------------------------------------- |
+| Location              | `crates/scanner-git/src/persist.rs`  | `crates/scanner-scheduler/src/store/` |
+| Finding key           | `(start, end, rule_id, norm_hash)`   | `occurrence_id` (32-byte keyed hash)  |
+| Key material          | None (hashes are unkeyed)            | `SCANNER_SECRET_KEY` with KDF         |
+| Cross-run correlation | Via ref watermarks + seen-blob store | Via persistent key identity           |
+| Secret protection     | `norm_hash` is unkeyed BLAKE3        | `secret_hash` is keyed BLAKE3         |
+| Source scope          | Git only                             | Any source                            |
 
 The `occurrence_id` contract is a strict superset of Git's current dedup
 key. Git could adopt `occurrence_id` to gain keyed hashing and stronger
@@ -163,10 +163,10 @@ same root material. This avoids the need for HKDF or a separate KDF library.
 
 ### Persistent vs. Ephemeral Mode
 
-| Mode | When | Cross-run correlation | Use case |
-|---|---|---|---|
-| **Persistent** | `SCANNER_SECRET_KEY` set and valid | Yes | Production: suppression, dedup, tracking |
-| **Ephemeral** | Env var missing or invalid | No (process-local only) | CI/one-shot scans, development |
+| Mode           | When                               | Cross-run correlation   | Use case                                 |
+| -------------- | ---------------------------------- | ----------------------- | ---------------------------------------- |
+| **Persistent** | `SCANNER_SECRET_KEY` set and valid | Yes                     | Production: suppression, dedup, tracking |
+| **Ephemeral**  | Env var missing or invalid         | No (process-local only) | CI/one-shot scans, development           |
 
 `RunModeMetadata` is attached to `StoreKeys` so downstream consumers can
 check `is_persistent()` and avoid assuming cross-run correlation when
@@ -362,11 +362,11 @@ LE or BE re-encodings of the same region. Each encoding produces a distinct
 finding that must hash to a distinct occurrence ID. The `VariantDiscriminant`
 is included in the canonical payload:
 
-| Value | Meaning |
-|---|---|
-| `0` | No UTF-16 variant (root or non-UTF16 transform) |
-| `1` | UTF-16 little-endian |
-| `2` | UTF-16 big-endian |
+| Value | Meaning                                         |
+| ----- | ----------------------------------------------- |
+| `0`   | No UTF-16 variant (root or non-UTF16 transform) |
+| `1`   | UTF-16 little-endian                            |
+| `2`   | UTF-16 big-endian                               |
 
 **Invariant**: root-step findings (`step_id == STEP_ROOT`) must always use
 variant `None`. A root finding with a UTF-16 variant is rejected as a caller
@@ -414,11 +414,11 @@ old and new hashes can never collide silently.
 
 ## Domain Separation Summary
 
-| Contract | Domain String | Key |
-|---|---|---|
-| Rule fingerprint | `scanner.store.identity.v1.rule_fingerprint` | _(unkeyed)_ |
-| Secret hash | `scanner.store.identity.v1.secret_hash` | `secret_key` |
-| Occurrence ID | `scanner.store.identity.v1.occurrence_id` | `identity_key` |
+| Contract         | Domain String                                | Key            |
+| ---------------- | -------------------------------------------- | -------------- |
+| Rule fingerprint | `scanner.store.identity.v1.rule_fingerprint` | _(unkeyed)_    |
+| Secret hash      | `scanner.store.identity.v1.secret_hash`      | `secret_key`   |
+| Occurrence ID    | `scanner.store.identity.v1.occurrence_id`    | `identity_key` |
 
 Domain separation ensures identical byte payloads in different contexts
 produce distinct hashes. For example, a rule fingerprint and an occurrence
@@ -438,12 +438,12 @@ domain strings.
 
 ## Related Documentation
 
-| Document | Relevance |
-|---|---|
-| [fs-persistence-pipeline.md](../scanner-scheduler/fs-persistence-pipeline.md) | FS persistence pipeline (StoreProducer, SQLite backend, loss accounting) |
-| [detection-engine.md](../scanner-engine/detection-engine.md) | FindingRec output, norm_hash computation |
-| [transform-chain.md](../scanner-engine/transform-chain.md) | Identity canonicalization link for transforms |
-| [memory-management.md](../memory-management.md) | Store key bootstrap memory notes |
-| [git-scanning.md](../scanner-git/git-scanning.md) | Git persistence pipeline (separate system) |
-| [data-types.md](../data-types.md) | StoreKeys, IdentityFlags, OccurrenceInput class diagrams *(aspirational — these types are not implemented)* |
-| [architecture-overview.md](../architecture-overview.md) | Component table entries for Store Keys / Store Identity |
+| Document                                                                      | Relevance                                                                                                   |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| [fs-persistence-pipeline.md](../scanner-scheduler/fs-persistence-pipeline.md) | FS persistence pipeline (StoreProducer, SQLite backend, loss accounting)                                    |
+| [detection-engine.md](../scanner-engine/detection-engine.md)                  | FindingRec output, norm_hash computation                                                                    |
+| [transform-chain.md](../scanner-engine/transform-chain.md)                    | Identity canonicalization link for transforms                                                               |
+| [memory-management.md](../memory-management.md)                               | Store key bootstrap memory notes                                                                            |
+| [git-scanning.md](../scanner-git/git-scanning.md)                             | Git persistence pipeline (separate system)                                                                  |
+| [data-types.md](../data-types.md)                                             | StoreKeys, IdentityFlags, OccurrenceInput class diagrams *(aspirational — these types are not implemented)* |
+| [architecture-overview.md](../architecture-overview.md)                       | Component table entries for Store Keys / Store Identity                                                     |

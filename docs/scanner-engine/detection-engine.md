@@ -217,21 +217,17 @@ The hash is stored in a scratch sidecar aligned with `FindingRec` indices and
 is used by Git persistence as part of the deterministic finding key
 `(start, end, rule_id, norm_hash)`. No raw secret bytes are stored.
 
-## FS Persistence Identity Contracts
+## FS Persistence
 
-Filesystem persistence now has a separate identity contract in `crates/scanner-scheduler/src/store/`:
+Filesystem persistence is handled by `crates/scanner-scheduler/src/store.rs` which
+defines the `StoreProducer` trait, `FsFindingRecord`, `FsFindingBatch`, and `FsRunLoss`
+types. See [fs-persistence-pipeline.md](../scanner-scheduler/fs-persistence-pipeline.md)
+for the full pipeline documentation.
 
-- `store::keys` bootstraps root key material from `SCANNER_SECRET_KEY`
-  (base64, 32 bytes) with ephemeral fallback metadata.
-- `store::identity::rule_fingerprint` hashes canonical `RuleSpec::encode_policy`
-  bytes using a versioned keyed domain.
-- `store::identity::secret_hash` applies a keyed hash to existing `norm_hash`
-  bytes (no hot-path raw-secret rehash rewrite).
-- `store::identity::occurrence_id` reuses dedupe semantics from
-  `push_finding_with_drop_hint`: transform root-hint end normalization for
-  base64 padding tolerance, span contribution only when dedupe includes span
-  (`step_id == STEP_ROOT` or `dedupe_with_span`), and UTF-16 LE/BE variant
-  discrimination.
+Identity chain derivation (norm_hash -> secret_hash -> finding_id -> occurrence_id)
+is implemented in `crates/gossip-scanner-runtime/src/commit_sink.rs` via
+`DurableCommitSink`. See [gossip-scanner-runtime.md](../gossip-scanner-runtime.md)
+for details.
 
 ## SQLite Persistence Backend
 
@@ -408,18 +404,18 @@ These gates are designed to be **local and bounded**:
 
 ## Tuning Parameters
 
-| Parameter | Default | Purpose |
-|-----------|---------|---------|
-| `merge_gap` | 64 | Merge adjacent windows within this byte gap |
-| `max_windows_per_rule_variant` | 16 | Max windows per (rule, variant) before pressure coalescing |
-| `pressure_gap_start` | 128 | Starting gap for pressure coalescing |
-| `max_anchor_hits_per_rule_variant` | 2048 | Cap on anchor hits before collapsing |
-| `max_utf16_decoded_bytes_per_window` | 64 KiB | UTF-16 decode output limit per window |
-| `max_transform_depth` | 3 | Max nested decode steps (root + transforms) |
-| `max_total_decode_output_bytes` | 512 KiB | Global decoded output budget per scan |
-| `max_work_items` | 256 | Cap on queued decode work items per scan |
-| `max_findings_per_chunk` | 8192 | Final cap on findings per chunk after suppression |
-| `scan_utf16_variants` | true | Enable UTF-16 anchor variants |
+| Parameter                            | Default | Purpose                                                    |
+|--------------------------------------|---------|------------------------------------------------------------|
+| `merge_gap`                          | 64      | Merge adjacent windows within this byte gap                |
+| `max_windows_per_rule_variant`       | 16      | Max windows per (rule, variant) before pressure coalescing |
+| `pressure_gap_start`                 | 128     | Starting gap for pressure coalescing                       |
+| `max_anchor_hits_per_rule_variant`   | 2048    | Cap on anchor hits before collapsing                       |
+| `max_utf16_decoded_bytes_per_window` | 64 KiB  | UTF-16 decode output limit per window                      |
+| `max_transform_depth`                | 3       | Max nested decode steps (root + transforms)                |
+| `max_total_decode_output_bytes`      | 512 KiB | Global decoded output budget per scan                      |
+| `max_work_items`                     | 256     | Cap on queued decode work items per scan                   |
+| `max_findings_per_chunk`             | 8192    | Final cap on findings per chunk after suppression          |
+| `scan_utf16_variants`                | true    | Enable UTF-16 anchor variants                              |
 
 Derived (non-config) limits used by streaming decode:
 - `pending_window_horizon_bytes = (max_window_diameter_bytes / 2) + STREAM_DECODE_CHUNK_BYTES`
@@ -561,7 +557,7 @@ FindingRec {
 
 ## Related Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Transform Chain](./transform-chain.md) | URL/Base64 transform gating and decode flow |
+| Document                                     | Description                                          |
+|----------------------------------------------|------------------------------------------------------|
+| [Transform Chain](./transform-chain.md)      | URL/Base64 transform gating and decode flow          |
 | [Memory Management](../memory-management.md) | Buffer pools, scratch allocation, and memory budgets |

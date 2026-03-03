@@ -89,13 +89,13 @@ Key observations from the source code:
 
 **`ParkReason` variants** (from `record.rs`):
 
-| Variant | Discriminant | Meaning |
-|---------|-------------|---------|
-| `PermissionDenied` | 0 | Source denied access -- credential rotation or access grant needed |
-| `NotFound` | 1 | Source no longer exists (deleted repo, removed file) |
-| `Poisoned` | 2 | Shard data internally inconsistent -- manual investigation required |
-| `TooManyErrors` | 3 | Circuit breaker tripped -- may resolve on its own |
-| `Other` | 4 | Catch-all for uncategorized reasons |
+| Variant            | Discriminant | Meaning                                                             |
+| ------------------ | ------------ | ------------------------------------------------------------------- |
+| `PermissionDenied` | 0            | Source denied access -- credential rotation or access grant needed  |
+| `NotFound`         | 1            | Source no longer exists (deleted repo, removed file)                |
+| `Poisoned`         | 2            | Shard data internally inconsistent -- manual investigation required |
+| `TooManyErrors`    | 3            | Circuit breaker tripped -- may resolve on its own                   |
+| `Other`            | 4            | Catch-all for uncategorized reasons                                 |
 
 ---
 
@@ -248,12 +248,12 @@ machine and indicates whether the transition is valid. Only transitions FROM
 `Active` are permitted. Terminal states reject all outgoing transitions via
 `assert_transition_legal()`.
 
-| From \ To  | Active          | Done              | Split              | Parked            |
-|:-----------|:----------------|:------------------|:-------------------|:------------------|
-| **Active** | ownership change | `complete`  | `split_replace`    | `park`      |
-| **Done**   | ILLEGAL         | --                | ILLEGAL            | ILLEGAL           |
-| **Split**  | ILLEGAL         | ILLEGAL           | --                 | ILLEGAL           |
-| **Parked** | admin unpark*   | ILLEGAL           | ILLEGAL            | --                |
+| From \ To  | Active           | Done       | Split           | Parked  |
+| :--------- | :--------------- | :--------- | :-------------- | :------ |
+| **Active** | ownership change | `complete` | `split_replace` | `park`  |
+| **Done**   | ILLEGAL          | --         | ILLEGAL         | ILLEGAL |
+| **Split**  | ILLEGAL          | ILLEGAL    | --              | ILLEGAL |
+| **Parked** | admin unpark*    | ILLEGAL    | ILLEGAL         | --      |
 
 \* Unparking (`Parked` -> `Active`) is an **out-of-band admin operation** that
 bumps the fence epoch. It is not part of the coordination protocol's
@@ -317,16 +317,16 @@ graph LR
 
 Each illegal transition maps to a specific error type in the codebase:
 
-| Illegal Transition | Error Returned | Why Forbidden |
-|:-------------------|:---------------|:--------------|
-| `Done -> Active` | `AcquireError::ShardTerminal` | Terminal states are irreversible. `is_terminal()` returns `true`. |
-| `Split -> Active` | `AcquireError::ShardTerminal` | Same as above. Split shards have spawned children. |
-| `Parked -> Active` | `AcquireError::ShardTerminal` | Same. Admin unpark is separate from the protocol. |
-| `Done -> Split` | `SplitReplaceError::ShardTerminal` | Cannot split a completed shard. No status to transition from. |
-| `Split -> Done` | `CompleteError::ShardTerminal` | Cannot complete an already-split shard. |
-| `Done -> Parked` | `ParkError::ShardTerminal` | Cannot park a completed shard. It is already terminal. |
-| `Active -> Active` (different worker, live lease) | `AcquireError::AlreadyLeased` | Single-writer invariant. Only one lease per shard at a time. |
-| `Active -> Done` (without lease) | `CompleteError::StaleFence` or `LeaseExpired` | Must hold a valid lease to mutate. The fencing token protocol rejects zombies. |
+| Illegal Transition                                | Error Returned                                | Why Forbidden                                                                  |
+| :------------------------------------------------ | :-------------------------------------------- | :----------------------------------------------------------------------------- |
+| `Done -> Active`                                  | `AcquireError::ShardTerminal`                 | Terminal states are irreversible. `is_terminal()` returns `true`.              |
+| `Split -> Active`                                 | `AcquireError::ShardTerminal`                 | Same as above. Split shards have spawned children.                             |
+| `Parked -> Active`                                | `AcquireError::ShardTerminal`                 | Same. Admin unpark is separate from the protocol.                              |
+| `Done -> Split`                                   | `SplitReplaceError::ShardTerminal`            | Cannot split a completed shard. No status to transition from.                  |
+| `Split -> Done`                                   | `CompleteError::ShardTerminal`                | Cannot complete an already-split shard.                                        |
+| `Done -> Parked`                                  | `ParkError::ShardTerminal`                    | Cannot park a completed shard. It is already terminal.                         |
+| `Active -> Active` (different worker, live lease) | `AcquireError::AlreadyLeased`                 | Single-writer invariant. Only one lease per shard at a time.                   |
+| `Active -> Done` (without lease)                  | `CompleteError::StaleFence` or `LeaseExpired` | Must hold a valid lease to mutate. The fencing token protocol rejects zombies. |
 
 The backend's enforcement strategy is layered:
 
@@ -345,10 +345,10 @@ The backend's enforcement strategy is layered:
 
 ## Source Code References
 
-| File | Purpose |
-|:-----|:--------|
+| File                                       | Purpose                                                                                      |
+| :----------------------------------------- | :------------------------------------------------------------------------------------------- |
 | `crates/gossip-coordination/src/record.rs` | `ShardStatus` enum, `ShardRecord` struct, `assert_transition_legal()`, `assert_invariants()` |
-| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend` trait defining all shard operations |
-| `crates/gossip-coordination/src/error.rs` | `CoordError`, `AcquireError`, `CompleteError`, `SplitError`, `ParkError` |
-| `crates/gossip-coordination/src/lease.rs` | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind` |
-| `crates/gossip-coordination/src/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()` |
+| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend` trait defining all shard operations                                    |
+| `crates/gossip-coordination/src/error.rs`  | `CoordError`, `AcquireError`, `CompleteError`, `SplitError`, `ParkError`                     |
+| `crates/gossip-coordination/src/lease.rs`  | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`                                               |
+| `crates/gossip-coordination/src/split.rs`  | `SplitReplacePlan`, `SplitResidualPlan`, `derive_split_shard_id()`                           |

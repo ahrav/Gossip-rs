@@ -355,7 +355,7 @@ CountBudget::release(1)
 - **Clone cost**: Atomic refcount increment (no allocation)
 
 ### Task Enum
-- **Size**: 56 bytes in current unit tests (`task_size_is_reasonable`); asserted `<= 128` bytes
+- **Size**: asserted `<= 128` bytes in unit tests (`task_size_is_reasonable`)
 - **Variants**:
   ```rust
   enum Task {
@@ -368,12 +368,12 @@ CountBudget::release(1)
 - **Advantage**: Introspectable for metrics; no heap indirection vs boxed closure
 
 ### ObjectDescriptor
-- **Size**: 48 bytes in current unit tests (`object_descriptor_size_is_reasonable`); asserted `<= 64` bytes
+- **Size**: asserted `<= 64` bytes in unit tests (`object_descriptor_size_is_reasonable`)
 - **Role**: Metadata about discovered object
 - **Fields**:
   - `path: PathBuf` - filesystem or URI path
   - `size_hint: u64` - discovered size (may differ from actual)
-  - `object_id: ObjectId` - run-scoped unique ID
+  - `object_id: ObjectId` - run-scoped unique ID (`{ source: SourceId(u32), idx: u32 }`)
   - `source_id: SourceId` - which source this came from
 
 ### ObjectFrontier
@@ -418,13 +418,13 @@ CountBudget::release(1)
 
 ## Performance Characteristics
 
-| Operation | Behavior | Notes |
-|-----------|----------|-------|
-| Task dispatch (match variant + call) | Enum pattern match | No task boxing in the task graph model |
-| ObjectRef clone | Atomic refcount increment | Cheap `Arc::clone`, no object metadata copy |
-| Frontier `try_acquire` | Lock + immediate return | `None` at capacity, no blocking wait |
-| Frontier `acquire` | Lock + condvar wait | Blocking API for non-executor producers |
-| Frontier permit drop | RAII release on drop | Returns one slot to `CountBudget` |
+| Operation                            | Behavior                  | Notes                                       |
+| ------------------------------------ | ------------------------- | ------------------------------------------- |
+| Task dispatch (match variant + call) | Enum pattern match        | No task boxing in the task graph model      |
+| ObjectRef clone                      | Atomic refcount increment | Cheap `Arc::clone`, no object metadata copy |
+| Frontier `try_acquire`               | Lock + immediate return   | `None` at capacity, no blocking wait        |
+| Frontier `acquire`                   | Lock + condvar wait       | Blocking API for non-executor producers     |
+| Frontier permit drop                 | RAII release on drop      | Returns one slot to `CountBudget`           |
 
 **Memory Layout**:
 - Task enum: 56 bytes in current unit tests (asserted `<= 128`)

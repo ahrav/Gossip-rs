@@ -185,11 +185,11 @@ release_box(buf) {
 
 Configuration trade-offs:
 
-| Configuration | Consequence |
-|---------------|-------------|
-| `total_buffers < workers * local_queue_cap` | Workers cannot all fill their local caches simultaneously; global becomes bottleneck |
-| `total_buffers == workers * local_queue_cap` | Tight sizing; non-worker threads must always steal |
-| `total_buffers > workers * local_queue_cap` | Healthy global reserve; non-worker threads rarely steal |
+| Configuration                                | Consequence                                                                          |
+| -------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `total_buffers < workers * local_queue_cap`  | Workers cannot all fill their local caches simultaneously; global becomes bottleneck |
+| `total_buffers == workers * local_queue_cap` | Tight sizing; non-worker threads must always steal                                   |
+| `total_buffers > workers * local_queue_cap`  | Healthy global reserve; non-worker threads rarely steal                              |
 
 **Recommended sizing:**
 - `buffer_len`: Match your I/O chunk size (e.g., 64KB for file scanning)
@@ -365,13 +365,13 @@ pub struct TsBufferPool {
 
 **Key methods:**
 
-| Method | Purpose |
-|--------|---------|
-| `new(cfg)` | Create pool; allocates all buffers upfront |
-| `try_acquire()` → `Option<TsBufferHandle>` | Non-blocking; returns `None` only if exhausted |
-| `acquire()` → `TsBufferHandle` | Panics if exhausted (use after backpressure gating) |
-| `buffer_len()` | Query buffer size |
-| `workers()` | Query worker count |
+| Method                                     | Purpose                                             |
+| ------------------------------------------ | --------------------------------------------------- |
+| `new(cfg)`                                 | Create pool; allocates all buffers upfront          |
+| `try_acquire()` → `Option<TsBufferHandle>` | Non-blocking; returns `None` only if exhausted      |
+| `acquire()` → `TsBufferHandle`             | Panics if exhausted (use after backpressure gating) |
+| `buffer_len()`                             | Query buffer size                                   |
+| `workers()`                                | Query worker count                                  |
 
 **Example usage:**
 ```rust
@@ -407,13 +407,13 @@ pub struct TsBufferHandle {
 
 **Key methods:**
 
-| Method | Purpose |
-|--------|---------|
-| `as_slice(&self) → &[u8]` | View full buffer (not just filled bytes) |
-| `as_mut_slice(&mut self) → &mut [u8]` | Mutable access |
-| `len() → usize` | Buffer size |
-| `clear(&mut self)` | Zero-fill (for sensitive data) |
-| `ptr_usize() → usize` | Buffer address as int (debugging) |
+| Method                                | Purpose                                  |
+| ------------------------------------- | ---------------------------------------- |
+| `as_slice(&self) → &[u8]`             | View full buffer (not just filled bytes) |
+| `as_mut_slice(&mut self) → &mut [u8]` | Mutable access                           |
+| `len() → usize`                       | Buffer size                              |
+| `clear(&mut self)`                    | Zero-fill (for sensitive data)           |
+| `ptr_usize() → usize`                 | Buffer address as int (debugging)        |
 
 **Important caveat:**
 
@@ -472,12 +472,12 @@ Benchmark (single-threaded, 1M operations):
 
 ### Scaling with Contention
 
-| Scenario | Path | Latency |
-|----------|------|---------|
-| Worker thread, local hit | Local pop (TLS) | ~5-10ns |
-| Worker thread, local miss | Global pop (CAS) | ~20-50ns |
-| Non-worker thread | Global pop (CAS) | ~20-50ns |
-| All queues empty | Steal scan (O(workers)) | ~100-500ns |
+| Scenario                  | Path                    | Latency    |
+| ------------------------- | ----------------------- | ---------- |
+| Worker thread, local hit  | Local pop (TLS)         | ~5-10ns    |
+| Worker thread, local miss | Global pop (CAS)        | ~20-50ns   |
+| Non-worker thread         | Global pop (CAS)        | ~20-50ns   |
+| All queues empty          | Steal scan (O(workers)) | ~100-500ns |
 
 ### False Sharing Prevention
 

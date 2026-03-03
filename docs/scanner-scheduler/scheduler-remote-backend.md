@@ -58,13 +58,13 @@ Three layers of backpressure:
 
 ### Key Design Decisions
 
-| Decision | Rationale |
-|----------|-----------|
-| **Separate I/O and CPU threads** | Network latency doesn't block scanning. I/O can queue work while CPU workers are busy. |
-| **GlobalOnly buffer pool** | I/O threads acquire, CPU workers release. Simplifies coordination—no per-thread caching. |
-| **ObjectToken via Arc** | Each object's in-flight permit lives until all its chunks complete. Automatic release on last chunk done. |
-| **Bounded object queue** | Provides discovery backpressure without additional mechanisms. |
-| **Dedupe within chunk only** | Cross-chunk deduplication would require global state. Per-chunk dedup prevents most redundancy from overlap. |
+| Decision                         | Rationale                                                                                                    |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| **Separate I/O and CPU threads** | Network latency doesn't block scanning. I/O can queue work while CPU workers are busy.                       |
+| **GlobalOnly buffer pool**       | I/O threads acquire, CPU workers release. Simplifies coordination—no per-thread caching.                     |
+| **ObjectToken via Arc**          | Each object's in-flight permit lives until all its chunks complete. Automatic release on last chunk done.    |
+| **Bounded object queue**         | Provides discovery backpressure without additional mechanisms.                                               |
+| **Dedupe within chunk only**     | Cross-chunk deduplication would require global state. Per-chunk dedup prevents most redundancy from overlap. |
 
 ---
 
@@ -292,12 +292,12 @@ pub fn scan_remote<B: RemoteBackend>(
 
 ### Internal Types
 
-| Type | Purpose |
-|------|---------|
-| `ObjectToken` | Holds in-flight permit and file metadata. Released when last Arc drops (all chunks done). |
-| `ObjectWork<H>` | Sent from discovery to I/O threads. Contains object handle, size, and token. |
-| `CpuTask` | Task sent to CPU executor. Wraps buffer, offset, and findings info. |
-| `CpuScratch` | Per-worker state: engine, event sink, scanning scratch space. |
+| Type            | Purpose                                                                                   |
+| --------------- | ----------------------------------------------------------------------------------------- |
+| `ObjectToken`   | Holds in-flight permit and file metadata. Released when last Arc drops (all chunks done). |
+| `ObjectWork<H>` | Sent from discovery to I/O threads. Contains object handle, size, and token.              |
+| `CpuTask`       | Task sent to CPU executor. Wraps buffer, offset, and findings info.                       |
+| `CpuScratch`    | Per-worker state: engine, event sink, scanning scratch space.                             |
 
 ### Public Functions
 
@@ -445,19 +445,19 @@ When set, workers stop quickly; any already-enqueued CPU scan tasks may still fi
 
 ### Key Test Cases
 
-| Test | Coverage |
-|------|----------|
-| `remote_pipeline_finds_secret` | Basic end-to-end scanning |
-| `remote_pipeline_handles_boundary_spanning_secret` | Overlap handling |
-| `remote_pipeline_handles_empty_backend` | Edge case: no objects |
-| `remote_pipeline_processes_multiple_objects` | Parallelism, multiple files |
-| `remote_pipeline_retries_transient_failures` | Retry logic with backoff |
-| `backoff_respects_max_delay` | Exponential cap at max_delay |
-| `backoff_applies_jitter` | Jitter within expected range |
-| `config_validation_rejects_invalid` | Buffer size constraints |
-| `partial_reads_cause_object_failure` | Contract violation detection |
-| `permanent_errors_cause_immediate_failure` | No-retry classification |
-| `retryable_errors_exhaust_attempts` | Retry exhaustion |
+| Test                                               | Coverage                     |
+| -------------------------------------------------- | ---------------------------- |
+| `remote_pipeline_finds_secret`                     | Basic end-to-end scanning    |
+| `remote_pipeline_handles_boundary_spanning_secret` | Overlap handling             |
+| `remote_pipeline_handles_empty_backend`            | Edge case: no objects        |
+| `remote_pipeline_processes_multiple_objects`       | Parallelism, multiple files  |
+| `remote_pipeline_retries_transient_failures`       | Retry logic with backoff     |
+| `backoff_respects_max_delay`                       | Exponential cap at max_delay |
+| `backoff_applies_jitter`                           | Jitter within expected range |
+| `config_validation_rejects_invalid`                | Buffer size constraints      |
+| `partial_reads_cause_object_failure`               | Contract violation detection |
+| `permanent_errors_cause_immediate_failure`         | No-retry classification      |
+| `retryable_errors_exhaust_attempts`                | Retry exhaustion             |
 
 ---
 

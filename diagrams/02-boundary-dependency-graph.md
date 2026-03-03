@@ -265,26 +265,26 @@ without pulling in all of `gossip-contracts`.
 
 ## Cross-References
 
-| Topic | Diagram File |
-|-------|-------------|
-| System overview and five-boundary architecture | [01-system-overview.md](01-system-overview.md) |
-| Identity boundary deep-dive | [03-id-derivation-dag.md](03-id-derivation-dag.md) |
-| Shard algebra operations | [12-split-operations.md](12-split-operations.md) |
-| Coordination protocol | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
-| Connector lifecycle | [09-circuit-breaker.md](09-circuit-breaker.md) |
-| Persistence guarantees | [08-pagecommit-typestate.md](08-pagecommit-typestate.md) |
+| Topic                                          | Diagram File                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------------ |
+| System overview and five-boundary architecture | [01-system-overview.md](01-system-overview.md)                           |
+| Identity boundary deep-dive                    | [03-id-derivation-dag.md](03-id-derivation-dag.md)                       |
+| Shard algebra operations                       | [12-split-operations.md](12-split-operations.md)                         |
+| Coordination protocol                          | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
+| Connector lifecycle                            | [09-circuit-breaker.md](09-circuit-breaker.md)                           |
+| Persistence guarantees                         | [08-pagecommit-typestate.md](08-pagecommit-typestate.md)                 |
 
 ## Source Code References
 
-| Reference | Location |
-|-----------|----------|
-| Architecture prose (source) | `08-cross-cutting/01-boundary-dependency-graph.md` |
-| B1 Identity contracts | `crates/gossip-contracts/src/identity/` |
-| B3 Shard Algebra | `crates/gossip-frontier/src/` |
-| B2 Coordination data types | `crates/gossip-contracts/src/coordination/` (shard_spec, cursor, pooled, manifest, limits) |
-| B2 Coordination protocol | `crates/gossip-coordination/src/` (traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
-| B4 Connector contracts | `crates/gossip-contracts/src/connector/` |
-| B5 Persistence contracts | `crates/gossip-contracts/src/persistence/` |
-| Cargo workspace manifest | `Cargo.toml` (root) |
-| gossip-contracts manifest | `crates/gossip-contracts/Cargo.toml` |
-| gossip-coordination manifest | `crates/gossip-coordination/Cargo.toml` |
+| Reference                    | Location                                                                                                                     |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| Architecture prose (source)  | `08-cross-cutting/01-boundary-dependency-graph.md`                                                                           |
+| B1 Identity contracts        | `crates/gossip-contracts/src/identity/`                                                                                      |
+| B3 Shard Algebra             | `crates/gossip-frontier/src/`                                                                                                |
+| B2 Coordination data types   | `crates/gossip-contracts/src/coordination/` (shard_spec, cursor, pooled, manifest, limits)                                   |
+| B2 Coordination protocol     | `crates/gossip-coordination/src/` (traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
+| B4 Connector contracts       | `crates/gossip-contracts/src/connector/`                                                                                     |
+| B5 Persistence contracts     | `crates/gossip-contracts/src/persistence/`                                                                                   |
+| Cargo workspace manifest     | `Cargo.toml` (root)                                                                                                          |
+| gossip-contracts manifest    | `crates/gossip-contracts/Cargo.toml`                                                                                         |
+| gossip-coordination manifest | `crates/gossip-coordination/Cargo.toml`                                                                                      |

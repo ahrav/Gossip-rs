@@ -321,11 +321,11 @@ The module enforces runtime limits to prevent pathological input from causing un
 
 **Per-scan limits** (configured via `TransformConfig`):
 
-| Budget | Field | Default | Purpose |
-|--------|-------|---------|---------|
-| Minimum span size | `min_len` | Configurable | Skip trivial spans |
-| Maximum span size | `max_encoded_len` | Configurable | Cap scan depth; splits long runs |
-| Maximum spans per buffer | `max_spans_per_buffer` | Configurable | Stop after N spans found |
+| Budget                   | Field                  | Default      | Purpose                          |
+|--------------------------|------------------------|--------------|----------------------------------|
+| Minimum span size        | `min_len`              | Configurable | Skip trivial spans               |
+| Maximum span size        | `max_encoded_len`      | Configurable | Cap scan depth; splits long runs |
+| Maximum spans per buffer | `max_spans_per_buffer` | Configurable | Stop after N spans found         |
 
 **Run Splitting**
 
@@ -662,13 +662,13 @@ pub struct TransformConfig {
 
 ## Performance Characteristics
 
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| Span finding | O(N) single-pass | N = input buffer size |
-| Byte classification | O(1) | Lookup table |
-| URL decoding | O(N) | Single pass, O(1) memory |
-| Base64 decoding | O(N) | Single pass, O(1) memory |
-| Output buffering | O(K) | K = output buffer size (16 KiB) |
+| Operation           | Complexity       | Notes                           |
+|---------------------|------------------|---------------------------------|
+| Span finding        | O(N) single-pass | N = input buffer size           |
+| Byte classification | O(1)             | Lookup table                    |
+| URL decoding        | O(N)             | Single pass, O(1) memory        |
+| Base64 decoding     | O(N)             | Single pass, O(1) memory        |
+| Output buffering    | O(K)             | K = output buffer size (16 KiB) |
 
 **Memory Usage:**
 

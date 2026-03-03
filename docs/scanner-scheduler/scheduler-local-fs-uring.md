@@ -56,13 +56,13 @@ Traditional Blocking Reads:       io_uring Approach:
 
 ### When to Use Each Backend
 
-| Scenario | Backend | Reason |
-|----------|---------|--------|
-| Everything in page cache | `local_fs_owner.rs` (`scan_local`) | Syscall overhead dominates; kernel optimizations (hugepages, prefetch) shine |
-| Tiny files | `local_fs_owner.rs` (`scan_local`) | Context-switch overhead > I/O latency |
-| Cold storage (NVMe, network) | `io_uring` | Kernel can parallelize; reduces thread count & context switches |
-| High concurrency (many files) | `io_uring` | I/O rings can sustain high fan-out without matching blocking thread counts |
-| Latency-sensitive | `io_uring` | Bounded by device, not thread scheduling |
+| Scenario                      | Backend                            | Reason                                                                       |
+| ----------------------------- | ---------------------------------- | ---------------------------------------------------------------------------- |
+| Everything in page cache      | `local_fs_owner.rs` (`scan_local`) | Syscall overhead dominates; kernel optimizations (hugepages, prefetch) shine |
+| Tiny files                    | `local_fs_owner.rs` (`scan_local`) | Context-switch overhead > I/O latency                                        |
+| Cold storage (NVMe, network)  | `io_uring`                         | Kernel can parallelize; reduces thread count & context switches              |
+| High concurrency (many files) | `io_uring`                         | I/O rings can sustain high fan-out without matching blocking thread counts   |
+| Latency-sensitive             | `io_uring`                         | Bounded by device, not thread scheduling                                     |
 
 **Guidance**: Profile both backends on your actual workload. io_uring wins most on cold storage at high concurrency; blocking is simpler and sometimes faster on hot data.
 
@@ -225,11 +225,11 @@ Default sizing: ring_entries=256, io_depth=128
 Invariant: io_depth <= ring_entries - 1
 ```
 
-| Parameter | Meaning | Tuning |
-|-----------|---------|--------|
-| `ring_entries` | Total SQ+CQ capacity | Larger = more concurrent ops, more kernel memory |
-| `io_depth` | Max simultaneous reads per I/O thread | Tradeoff: higher = more parallelism, but diminishing returns |
-| In-flight ops | Dynamically tracked; capped at `io_depth` | Prevents SQ overflow and kernel saturation |
+| Parameter      | Meaning                                   | Tuning                                                       |
+| -------------- | ----------------------------------------- | ------------------------------------------------------------ |
+| `ring_entries` | Total SQ+CQ capacity                      | Larger = more concurrent ops, more kernel memory             |
+| `io_depth`     | Max simultaneous reads per I/O thread     | Tradeoff: higher = more parallelism, but diminishing returns |
+| In-flight ops  | Dynamically tracked; capped at `io_depth` | Prevents SQ overflow and kernel saturation                   |
 
 ## Integration with Scheduler
 
@@ -531,16 +531,16 @@ pub fn validate<E: ScanEngine>(&self, engine: &E) {
 
 ### Sizing Guidelines
 
-| Parameter | Guidance | Example |
-|-----------|----------|---------|
-| `cpu_workers` | Match CPU cores for CPU-bound scanning; increase if I/O ops block on CPU | 8–16 |
-| `io_threads` | 1–4 per NUMA node; io_uring thread scales well | 4 |
-| `ring_entries` | 256–1024; larger allows more concurrent ops but uses more kernel memory | 256 |
-| `io_depth` | 64–256; tradeoff between parallelism and latency | 128 |
-| `chunk_size` | 64–256 KiB; larger reduces syscalls but increases memory per file | 256 KiB |
-| `max_in_flight_files` | 100–1000; bounds discovery depth and memory | 512 |
-| `file_queue_cap` | 64–256; bounded channel size to avoid unbounded discovery | 256 |
-| `pool_buffers` | Must be >= `io_threads * io_depth`; recommend 2x for CPU pipeline headroom | 256–512 |
+| Parameter             | Guidance                                                                   | Example |
+| --------------------- | -------------------------------------------------------------------------- | ------- |
+| `cpu_workers`         | Match CPU cores for CPU-bound scanning; increase if I/O ops block on CPU   | 8–16    |
+| `io_threads`          | 1–4 per NUMA node; io_uring thread scales well                             | 4       |
+| `ring_entries`        | 256–1024; larger allows more concurrent ops but uses more kernel memory    | 256     |
+| `io_depth`            | 64–256; tradeoff between parallelism and latency                           | 128     |
+| `chunk_size`          | 64–256 KiB; larger reduces syscalls but increases memory per file          | 256 KiB |
+| `max_in_flight_files` | 100–1000; bounds discovery depth and memory                                | 512     |
+| `file_queue_cap`      | 64–256; bounded channel size to avoid unbounded discovery                  | 256     |
+| `pool_buffers`        | Must be >= `io_threads * io_depth`; recommend 2x for CPU pipeline headroom | 256–512 |
 
 ### Buffer Pool Configuration
 
@@ -1344,12 +1344,12 @@ io_uring provides **latency isolation**:
 
 ### Scalability
 
-| Workload | Bottleneck | Optimization |
-|----------|-----------|--------------|
-| CPU-bound (large files) | CPU time | Increase `cpu_workers` |
-| I/O-bound (many small files) | I/O throughput | Increase `io_depth` or `io_threads` |
-| Memory-constrained | Buffer pool | Reduce `pool_buffers` or `chunk_size` |
-| Discovery-constrained | File enumeration | Increase discovery thread priority or parallelize walk |
+| Workload                     | Bottleneck       | Optimization                                           |
+| ---------------------------- | ---------------- | ------------------------------------------------------ |
+| CPU-bound (large files)      | CPU time         | Increase `cpu_workers`                                 |
+| I/O-bound (many small files) | I/O throughput   | Increase `io_depth` or `io_threads`                    |
+| Memory-constrained           | Buffer pool      | Reduce `pool_buffers` or `chunk_size`                  |
+| Discovery-constrained        | File enumeration | Increase discovery thread priority or parallelize walk |
 
 ## Future Improvements
 
