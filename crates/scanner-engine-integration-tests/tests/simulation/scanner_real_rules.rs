@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::scanner_rs::scheduler::local_fs_owner::{
-    scan_local, LocalConfig, LocalFile, VecFileSource,
+    LocalConfig, LocalFile, VecFileSource, scan_local,
 };
 use crate::scanner_rs::unified::events::VecEventSink;
-use crate::scanner_rs::{demo_transforms, demo_tuning, Engine};
+use crate::scanner_rs::{Engine, demo_transforms, demo_tuning};
 
 /// Root of the fixture corpus relative to the workspace.
 const CORPUS_DIR: &str = "tests/corpus/real_rules/fixtures";

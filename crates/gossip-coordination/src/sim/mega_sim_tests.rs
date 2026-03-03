@@ -57,8 +57,8 @@
 
 use std::collections::BTreeMap;
 
-use super::harness::{CoordinationSim, SimEventKind};
 use super::FaultLevel;
+use super::harness::{CoordinationSim, SimEventKind};
 
 /// Map a [`FaultLevel`] to the string accepted by `GOSSIP_SIM_FAULT`.
 fn fault_level_name(level: FaultLevel) -> &'static str {

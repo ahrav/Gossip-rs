@@ -47,10 +47,10 @@
 //! 5. Update the [`registry_is_complete`] test assertion.
 
 use super::{
-    compute_policy_hash, derive_finding_id, derive_occurrence_id, domain_hasher, finalize_64,
-    key_secret_hash, ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey,
-    NormHash, ObjectVersionId, OccurrenceId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint,
-    SecretHash, StableItemId, TenantId, TenantSecretKey,
+    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey, NormHash,
+    ObjectVersionId, OccurrenceId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint,
+    SecretHash, StableItemId, TenantId, TenantSecretKey, compute_policy_hash, derive_finding_id,
+    derive_occurrence_id, domain_hasher, finalize_64, key_secret_hash,
 };
 
 // ============================================================================

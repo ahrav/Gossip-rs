@@ -24,7 +24,7 @@
 use blake3::Hasher;
 
 use super::canonical::CanonicalBytes;
-use super::hashing::{derive_from_cached, POLICY_HASH_HASHER};
+use super::hashing::{POLICY_HASH_HASHER, derive_from_cached};
 use super::types::PolicyHash;
 
 /// Selects the identity-hashing mode for secret derivation.

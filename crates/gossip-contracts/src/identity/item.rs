@@ -32,7 +32,7 @@ use blake3::Hasher;
 use core::fmt;
 
 use super::canonical::CanonicalBytes;
-use super::hashing::{finalize_32, ITEM_ID_HASHER, OBJECT_VERSION_HASHER};
+use super::hashing::{ITEM_ID_HASHER, OBJECT_VERSION_HASHER, finalize_32};
 
 // ---------------------------------------------------------------------------
 // IdentityInputError — validation errors for identity constructors

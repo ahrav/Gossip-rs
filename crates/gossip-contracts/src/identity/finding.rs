@@ -39,7 +39,7 @@ use blake3::Hasher;
 
 use super::canonical::CanonicalBytes;
 use super::domain;
-use super::hashing::{derive_from_cached, finalize_32, FINDING_HASHER, OCCURRENCE_HASHER};
+use super::hashing::{FINDING_HASHER, OCCURRENCE_HASHER, derive_from_cached, finalize_32};
 use super::item::{ObjectVersionId, StableItemId};
 use super::types::{TenantId, TenantSecretKey};
 
