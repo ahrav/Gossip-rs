@@ -39,7 +39,7 @@ The `scheduler_sim_replay_corpus` test asserts coverage completeness.
 
 ## Adding a New Test Case
 
-1. **Create the JSON file** following the schema in [scheduler_test_harness_guide.md](../../../docs/scheduler_test_harness_guide.md)
+1. **Create the JSON file** following the schema in [scheduler_test_harness_guide.md](../../../../../docs/scanner-scheduler/scheduler_test_harness_guide.md)
 
 2. **Run the corpus test** (it will fail with a hash mismatch):
    ```bash

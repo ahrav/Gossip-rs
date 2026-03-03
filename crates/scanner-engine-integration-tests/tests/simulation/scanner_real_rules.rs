@@ -17,16 +17,16 @@
 //!     scanner_real_rules::update_baseline --ignored --nocapture
 //! ```
 //!
-//! See `docs/real_rules_harness_plan.md` for design rationale.
+//! See `docs/scanner-scheduler/scanner_harness_modes.md` for design rationale.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::scanner_rs::scheduler::local_fs_owner::{
-    LocalConfig, LocalFile, VecFileSource, scan_local,
+    scan_local, LocalConfig, LocalFile, VecFileSource,
 };
 use crate::scanner_rs::unified::events::VecEventSink;
-use crate::scanner_rs::{Engine, demo_transforms, demo_tuning};
+use crate::scanner_rs::{demo_transforms, demo_tuning, Engine};
 
 /// Root of the fixture corpus relative to the workspace.
 const CORPUS_DIR: &str = "tests/corpus/real_rules/fixtures";

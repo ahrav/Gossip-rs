@@ -309,7 +309,7 @@ impl CoordinatorRuntimeConfig {
 /// Planning-only configuration for memory budget estimation (test-only).
 ///
 /// Models expected memory needs from deployment-level parameters using a
-/// static formula. See `docs/memory-budget-audit.md`.
+/// static formula. See `docs/memory-management.md`.
 ///
 /// This configuration does not configure runtime behavior and is not
 /// runtime-enforced. Coordinator construction uses
