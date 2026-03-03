@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use gossip_contracts::{
     connector::ItemKey,
     identity::{
-        ConnectorTag, FindingIdInputs, IdentityInputError, ItemIdentityKey, NormHash,
-        ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId, TenantSecretKey,
-        derive_finding_id, derive_occurrence_id, key_secret_hash,
+        derive_finding_id, derive_occurrence_id, key_secret_hash, ConnectorTag, FindingIdInputs,
+        IdentityInputError, ItemIdentityKey, NormHash, ObjectVersionId, OccurrenceIdInputs,
+        RuleFingerprint, TenantId, TenantSecretKey,
     },
 };
 use gossip_scan_driver::{CommitSink, FindingRecord, FindingsBatch, ItemMeta};
