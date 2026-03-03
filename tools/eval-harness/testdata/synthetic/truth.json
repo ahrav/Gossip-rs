@@ -1,0 +1,23 @@
+[
+  {
+    "path": "src/config.py",
+    "line_start": 10,
+    "line_end": 10,
+    "label": "positive",
+    "rule": "aws-access-key"
+  },
+  {
+    "path": "src/config.py",
+    "line_start": 15,
+    "line_end": 16,
+    "label": "negative",
+    "rule": "generic-api-key"
+  },
+  {
+    "path": "tests/test_utils.py",
+    "line_start": 5,
+    "line_end": 5,
+    "label": "placeholder",
+    "rule": "password"
+  }
+]

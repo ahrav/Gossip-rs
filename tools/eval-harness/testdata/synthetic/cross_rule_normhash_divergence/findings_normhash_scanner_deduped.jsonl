@@ -1,0 +1,4 @@
+{"type":"finding","path":"normhash.py","start":58,"end":74,"rule":"aws-access-key","confidence_score":8}
+{"type":"finding","path":"normhash.py","start":58,"end":74,"rule":"generic-secret","confidence_score":4}
+{"type":"finding","path":"normhash.py","start":100,"end":116,"rule":"generic-api-key","confidence_score":6}
+{"type":"finding","path":"normhash.py","start":133,"end":149,"rule":"hex-token","confidence_score":7}

@@ -1,0 +1,6 @@
+{"type":"finding","path":"creds.py","start":44,"end":64,"rule":"aws-access-key","confidence_score":8}
+{"type":"finding","path":"creds.py","start":78,"end":106,"rule":"generic-api-key","confidence_score":5}
+{"type":"finding","path":"config.py","start":42,"end":62,"rule":"aws-access-key","confidence_score":8}
+{"type":"finding","path":"creds.py","start":165,"end":181,"rule":"hex-token","confidence_score":6}
+{"type":"finding","path":"creds.py","start":116,"end":136,"rule":"aws-prefix","confidence_score":6}
+{"type":"finding","path":"creds.py","start":116,"end":152,"rule":"aws-extended","confidence_score":5}

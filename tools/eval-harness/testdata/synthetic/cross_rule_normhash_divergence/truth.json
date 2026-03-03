@@ -1,0 +1,7 @@
+[
+  {"path": "normhash.py", "line_start": 2, "line_end": 2, "label": "positive", "rule": "aws-access-key"},
+  {"path": "normhash.py", "line_start": 2, "line_end": 2, "label": "negative", "rule": "generic-secret"},
+  {"path": "normhash.py", "line_start": 3, "line_end": 3, "label": "positive", "rule": "generic-api-key"},
+  {"path": "normhash.py", "line_start": 3, "line_end": 3, "label": "negative", "rule": "github-pat"},
+  {"path": "normhash.py", "line_start": 4, "line_end": 4, "label": "positive", "rule": "hex-token"}
+]

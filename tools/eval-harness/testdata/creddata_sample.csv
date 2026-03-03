@@ -1,0 +1,16 @@
+Id,FileID,Domain,RepoName,FilePath,LineStart,LineEnd,GroundTruth,ValueStart,ValueEnd,CryptographyKey,PredefinedPattern,Category
+1,file001,github,test-repo,src/config.py,10,10,T,15,45,N,N,Password
+2,file002,github,test-repo,src/auth.py,25,30,T,5,40,N,Y,Token
+3,file003,github,test-repo,src/db.py,1,1,F,0,0,N,N,Password
+4,file004,github,test-repo,src/utils.py,50,55,T,10,30,Y,N,Key
+5,file005,github,test-repo,src/main.py,-1,-1,T,0,0,N,N,Password
+6,file006,github,test-repo,src/test.py,5,5,X,0,0,N,N,Token
+7,file007,github,test-repo,src/deploy.sh,100,105,T,20,60,N,N,AWS Multi
+8,file008,github,test-repo,src/secrets.yaml,3,7,F,0,0,N,Y,Key
+9,file009,github,test-repo,,10,10,T,5,15,N,N,Password
+10,file010,github,test-repo,src/handler.py,0,0,T,0,0,N,N,Token
+11,file011,github,test-repo,src/api.py,15,20,Q,0,0,N,N,Password
+12,file012,github,test-repo,"src/path with spaces/config.py",8,8,T,10,30,N,N,Key
+13,file013,github,test-repo,src/cli.py,42,42,T,0,0,N,N,Password
+14,file014,github,test-repo,src/service.py,200,200,F,0,0,N,N,Token
+15,file015,github,test-repo,src/worker.py,10,5,T,0,0,N,N,Key
