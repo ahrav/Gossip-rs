@@ -271,6 +271,8 @@ impl FsScanConfig {
 pub struct GitScanConfig {
     /// Repository root path to scan.
     pub repo: PathBuf,
+    /// Number of worker threads to use.
+    pub workers: usize,
     /// Retained for compatibility; both variants currently share one path.
     pub execution_mode: ExecutionMode,
     /// Scan execution budget controls.
@@ -282,9 +284,16 @@ impl GitScanConfig {
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         Self {
             repo: repo.into(),
+            workers: available_workers(),
             execution_mode: ExecutionMode::Direct,
             budgets: ScanBudgets::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
     }
 
     #[must_use]
@@ -411,20 +420,10 @@ pub fn scan_git(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> 
 
 /// Filesystem scan routed through the unified assignment/driver seam.
 pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let canonical_path = validate_fs_path(&config.path)?;
-    let assignment = build_assignment(
-        ConnectorKind::Filesystem,
-        canonical_path.display().to_string(),
-        AssignmentSource::Filesystem {
-            root: canonical_path,
-        },
-    );
-
     let out = NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
-    execute_assignment(&assignment, config.budgets, &out, &commit, &cancel)
-        .map(|outcome| outcome.report)
+    scan_fs_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
 /// Connector-mode filesystem scan.
@@ -437,20 +436,10 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
 
 /// Git scan routed through the unified assignment/driver seam.
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let canonical_repo = validate_git_repo_path(&config.repo)?;
-    let assignment = build_assignment(
-        ConnectorKind::Git,
-        canonical_repo.display().to_string(),
-        AssignmentSource::Git {
-            repo_root: canonical_repo,
-        },
-    );
-
     let out = NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
-    execute_assignment(&assignment, config.budgets, &out, &commit, &cancel)
-        .map(|outcome| outcome.report)
+    scan_git_with_runtime(config, &out, &commit, &cancel).map(|outcome| outcome.report)
 }
 
 /// Connector-mode git scan.
@@ -504,7 +493,9 @@ pub(crate) fn scan_git_with_runtime(
             repo_root: canonical_repo,
         },
     );
-    let runtime = config.budgets.to_execution_config()?;
+    let runtime = config
+        .budgets
+        .to_execution_config_with_workers(config.workers)?;
     execute_assignment_with_config(
         &assignment,
         runtime,

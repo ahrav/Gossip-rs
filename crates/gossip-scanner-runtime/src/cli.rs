@@ -490,7 +490,12 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
             scan_git_with_runtime(
                 &GitScanConfig::new(repo)
                     .with_execution_mode(config.execution_mode)
-                    .with_budgets(config.budgets),
+                    .with_budgets(config.budgets)
+                    .with_workers(config.workers.unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|count| count.get())
+                            .unwrap_or(1)
+                    })),
                 sink.as_ref(),
                 &commit,
                 &cancel,

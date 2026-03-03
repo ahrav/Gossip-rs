@@ -178,6 +178,7 @@ impl<W: Write + Send> GitEventOutput for TextEventSink<W> {
 pub struct JsonEventSink<W: Write + Send> {
     writer: Mutex<BufWriter<W>>,
     first: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl<W: Write + Send> JsonEventSink<W> {
@@ -188,6 +189,7 @@ impl<W: Write + Send> JsonEventSink<W> {
         Self {
             writer: Mutex::new(BufWriter::new(writer)),
             first: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -216,6 +218,9 @@ impl<W: Write + Send> EventOutput for JsonEventSink<W> {
     }
 
     fn flush(&self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let Ok(mut guard) = self.writer.lock() else {
             return;
         };
@@ -236,6 +241,7 @@ impl<W: Write + Send> GitEventOutput for JsonEventSink<W> {
 pub struct SarifEventSink<W: Write + Send> {
     writer: Mutex<BufWriter<W>>,
     first: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl<W: Write + Send> SarifEventSink<W> {
@@ -252,6 +258,7 @@ impl<W: Write + Send> SarifEventSink<W> {
         Self {
             writer: Mutex::new(BufWriter::new(writer)),
             first: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
         }
     }
 }
@@ -276,6 +283,9 @@ impl<W: Write + Send> EventOutput for SarifEventSink<W> {
     }
 
     fn flush(&self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let Ok(mut guard) = self.writer.lock() else {
             return;
         };
@@ -679,6 +689,37 @@ mod tests {
     }
 
     #[test]
+    fn json_sink_double_flush_produces_valid_json() {
+        let sink = JsonEventSink::new(Vec::<u8>::new());
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 1,
+            end: 2,
+            rule_id: 1,
+            rule_name: "rule",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 3,
+        }));
+        // Simulate the double-flush that occurs in production:
+        // forward_events() flushes when the channel closes, then cli::run()
+        // calls sink.flush() again.
+        sink.flush();
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("double flush must still produce valid JSON");
+        assert!(value.as_array().is_some());
+    }
+
+    #[test]
     fn sarif_sink_emits_valid_document() {
         let sink = SarifEventSink::new(Vec::<u8>::new());
         sink.emit_core(CoreEvent::Finding(FindingEvent {
@@ -707,5 +748,34 @@ mod tests {
             value["runs"][0]["results"][0]["ruleId"],
             serde_json::Value::String("aws-access-key".to_owned())
         );
+    }
+
+    #[test]
+    fn sarif_sink_double_flush_produces_valid_document() {
+        let sink = SarifEventSink::new(Vec::<u8>::new());
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 10,
+            end: 20,
+            rule_id: 2,
+            rule_name: "aws-access-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 7,
+        }));
+        // Simulate double-flush from forward_events + cli::run.
+        sink.flush();
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("double flush must still produce valid SARIF");
+        assert_eq!(value["version"], "2.1.0");
     }
 }
