@@ -17,7 +17,7 @@
 //!     scanner_real_rules::update_baseline --ignored --nocapture
 //! ```
 //!
-//! See `docs/real_rules_harness_plan.md` for design rationale.
+//! See `docs/scanner-scheduler/scanner_harness_modes.md` for design rationale.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

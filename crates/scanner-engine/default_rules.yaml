@@ -2,7 +2,7 @@
 # Default detection rules for scanner-rs.
 #
 # Each entry defines a secret-detection rule compiled into the scan engine.
-# See docs/detection-rules.md for the full schema reference and authoring
+# See docs/scanner-engine/detection-rules.md for the full schema reference and authoring
 # guidelines, and src/rules/yaml.rs for the parser.
 #
 # Required fields:

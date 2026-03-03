@@ -304,28 +304,28 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 
 ## Cross-References
 
-| Topic | Diagram File |
-|-------|-------------|
-| Identity boundary deep-dive | [03-id-derivation-dag.md](03-id-derivation-dag.md) |
-| Shard algebra deep-dive | [13-shard-algebra-types.md](13-shard-algebra-types.md) |
-| Shard algebra operations | [12-split-operations.md](12-split-operations.md) |
-| Coordination protocol | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
-| Connector lifecycle | [09-circuit-breaker.md](09-circuit-breaker.md) |
-| Persistence guarantees | [08-pagecommit-typestate.md](08-pagecommit-typestate.md) |
+| Topic                       | Diagram File                                                             |
+| --------------------------- | ------------------------------------------------------------------------ |
+| Identity boundary deep-dive | [03-id-derivation-dag.md](03-id-derivation-dag.md)                       |
+| Shard algebra deep-dive     | [13-shard-algebra-types.md](13-shard-algebra-types.md)                   |
+| Shard algebra operations    | [12-split-operations.md](12-split-operations.md)                         |
+| Coordination protocol       | [05-shard-and-run-state-machines.md](05-shard-and-run-state-machines.md) |
+| Connector lifecycle         | [09-circuit-breaker.md](09-circuit-breaker.md)                           |
+| Persistence guarantees      | [08-pagecommit-typestate.md](08-pagecommit-typestate.md)                 |
 
 ## Source Code References
 
-| Boundary | Primary Source |
-|----------|---------------|
-| B1: Identity | `crates/gossip-contracts/src/identity/` |
-| B3: Shard Algebra | `crates/gossip-contracts/src/coordination/shard_spec.rs` (data model) + `crates/gossip-frontier/src/` (key encoding, hints, builder) |
-| Shared utilities | `crates/gossip-stdx/` |
-| B2: Coordination | `crates/gossip-contracts/src/coordination/` (data types) + `crates/gossip-coordination/src/` (protocol) |
-| B4: Connector | `crates/gossip-contracts/src/connector/` + `crates/gossip-connectors/` |
-| B5: Persistence | `crates/gossip-contracts/src/persistence/` |
-| Detection engine | `crates/scanner-engine/` |
-| Scan driver traits | `crates/gossip-scan-driver/` |
-| Scanner runtime | `crates/gossip-scanner-runtime/` |
-| Worker binary | `crates/gossip-worker/` |
-| CLI binary | `crates/scanner-rs-cli/` |
-| Architecture prose | `00-prologue/03-architecture-at-a-glance.md` |
+| Boundary           | Primary Source                                                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| B1: Identity       | `crates/gossip-contracts/src/identity/`                                                                                              |
+| B3: Shard Algebra  | `crates/gossip-contracts/src/coordination/shard_spec.rs` (data model) + `crates/gossip-frontier/src/` (key encoding, hints, builder) |
+| Shared utilities   | `crates/gossip-stdx/`                                                                                                                |
+| B2: Coordination   | `crates/gossip-contracts/src/coordination/` (data types) + `crates/gossip-coordination/src/` (protocol)                              |
+| B4: Connector      | `crates/gossip-contracts/src/connector/` + `crates/gossip-connectors/`                                                               |
+| B5: Persistence    | `crates/gossip-contracts/src/persistence/`                                                                                           |
+| Detection engine   | `crates/scanner-engine/`                                                                                                             |
+| Scan driver traits | `crates/gossip-scan-driver/`                                                                                                         |
+| Scanner runtime    | `crates/gossip-scanner-runtime/`                                                                                                     |
+| Worker binary      | `crates/gossip-worker/`                                                                                                              |
+| CLI binary         | `crates/scanner-rs-cli/`                                                                                                             |
+| Architecture prose | `00-prologue/03-architecture-at-a-glance.md`                                                                                         |

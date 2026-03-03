@@ -268,13 +268,13 @@ graph TD
 
 In this example:
 
-| Shard | Range | State | Terminal? | Notes |
-|:------|:------|:------|:----------|:------|
-| S0 | [0x00, 0xFF] | Split | Yes | Root, replaced by S0-L and S0-R |
-| S0-L | [0x00, 0x80] | Split | Yes | Itself split into S0-LL and S0-LR |
-| S0-R | [0x80, 0xFF] | Done | Yes | Leaf -- scanned successfully |
-| S0-LL | [0x00, 0x40] | Done | Yes | Leaf -- scanned successfully |
-| S0-LR | [0x40, 0x80] | Done | Yes | Leaf -- scanned successfully |
+| Shard | Range        | State | Terminal? | Notes                             |
+| :---- | :----------- | :---- | :-------- | :-------------------------------- |
+| S0    | [0x00, 0xFF] | Split | Yes       | Root, replaced by S0-L and S0-R   |
+| S0-L  | [0x00, 0x80] | Split | Yes       | Itself split into S0-LL and S0-LR |
+| S0-R  | [0x80, 0xFF] | Done  | Yes       | Leaf -- scanned successfully      |
+| S0-LL | [0x00, 0x40] | Done  | Yes       | Leaf -- scanned successfully      |
+| S0-LR | [0x40, 0x80] | Done  | Yes       | Leaf -- scanned successfully      |
 
 All five shards are terminal. The three leaves (S0-R, S0-LL, S0-LR) are
 `Done`, and the two interior nodes (S0, S0-L) are `Split`. Coverage is
@@ -406,14 +406,14 @@ overwhelm the coordinator's shard tracking.
 
 ## Source Code References
 
-| File | Purpose |
-|:-----|:--------|
-| `crates/gossip-contracts/src/coordination/split.rs` | `SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace_at_points()` |
-| `crates/gossip-coordination/src/split_execution.rs` | `derive_split_shard_id()`, `DerivedShardKind`, payload hash |
+| File                                                     | Purpose                                                                      |
+| :------------------------------------------------------- | :--------------------------------------------------------------------------- |
+| `crates/gossip-contracts/src/coordination/split.rs`      | `SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace_at_points()`    |
+| `crates/gossip-coordination/src/split_execution.rs`      | `derive_split_shard_id()`, `DerivedShardKind`, payload hash                  |
 | `crates/gossip-contracts/src/coordination/shard_spec.rs` | `validate_split_coverage()`, `validate_split_coverage_bounds()`, `ShardSpec` |
-| `crates/gossip-coordination/src/error.rs` | `SplitError::SplitInvalid(SplitValidationError)` |
-| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend::split_replace()`, `split_residual()` |
-| `crates/gossip-coordination/src/record.rs` | `ShardStatus::Split`, `ShardRecord` |
-| `crates/gossip-frontier/src/hint.rs` | `propagate_hint_on_split()` |
-| `crates/gossip-frontier/src/builder.rs` | `PreallocShardBuilder::split_range_by_boundaries()` |
-| `crates/gossip-contracts/src/connector/api.rs` | `EnumerationConnector::choose_split_point()` |
+| `crates/gossip-coordination/src/error.rs`                | `SplitError::SplitInvalid(SplitValidationError)`                             |
+| `crates/gossip-coordination/src/traits.rs`               | `CoordinationBackend::split_replace()`, `split_residual()`                   |
+| `crates/gossip-coordination/src/record.rs`               | `ShardStatus::Split`, `ShardRecord`                                          |
+| `crates/gossip-frontier/src/hint.rs`                     | `propagate_hint_on_split()`                                                  |
+| `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder::split_range_by_boundaries()`                          |
+| `crates/gossip-contracts/src/connector/api.rs`           | `EnumerationConnector::choose_split_point()`                                 |

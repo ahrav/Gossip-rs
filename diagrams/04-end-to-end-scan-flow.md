@@ -377,19 +377,19 @@ it was committed in a previous page's transaction.
 
 ## Cross-References
 
-| Diagram | Related Document |
-|---------|-----------------|
-| Full 13-step sequence | [ID Derivation DAG](./03-id-derivation-dag.md) — details steps 4 and 7 |
-| Full 13-step sequence | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) — details steps 2, 12, and 13 |
-| Simplified overview | [PageCommit Typestate](./08-pagecommit-typestate.md) — details steps 8, 9 |
-| Atomic commit boundary | [PageCommit Typestate](./08-pagecommit-typestate.md) — the Sealed-to-Committed transition |
+| Diagram                | Related Document                                                                                   |
+| ---------------------- | -------------------------------------------------------------------------------------------------- |
+| Full 13-step sequence  | [ID Derivation DAG](./03-id-derivation-dag.md) — details steps 4 and 7                             |
+| Full 13-step sequence  | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) — details steps 2, 12, and 13 |
+| Simplified overview    | [PageCommit Typestate](./08-pagecommit-typestate.md) — details steps 8, 9                          |
+| Atomic commit boundary | [PageCommit Typestate](./08-pagecommit-typestate.md) — the Sealed-to-Committed transition          |
 
 ## Source Code References
 
-| Component | Path |
-|-----------|------|
-| Identity derivation (StableItemId, FindingId, NormHash) | `crates/gossip-contracts/src/identity/` |
-| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/` |
-| Coordination protocol (run creation, shard assignment, completion) | `crates/gossip-coordination/src/` |
-| Persistence (done-ledger, findings sink, op-log) | `crates/gossip-contracts/src/persistence/` |
-| Design specification | `08-cross-cutting/02-data-flow-end-to-end.md` |
+| Component                                                              | Path                                          |
+| ---------------------------------------------------------------------- | --------------------------------------------- |
+| Identity derivation (StableItemId, FindingId, NormHash)                | `crates/gossip-contracts/src/identity/`       |
+| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/`   |
+| Coordination protocol (run creation, shard assignment, completion)     | `crates/gossip-coordination/src/`             |
+| Persistence (done-ledger, findings sink, op-log)                       | `crates/gossip-contracts/src/persistence/`    |
+| Design specification                                                   | `08-cross-cutting/02-data-flow-end-to-end.md` |

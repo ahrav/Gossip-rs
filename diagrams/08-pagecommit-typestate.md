@@ -92,11 +92,11 @@ stateDiagram-v2
 
 The three states correspond to three phases of a page commit:
 
-| State | Type Parameter | Available Methods | Semantics |
-|:------|:---------------|:------------------|:----------|
-| **Accumulating** | `PageCommit<Accumulating>` | `add_finding()`, `add_done_key()`, `seal()` | Collecting results from the current page scan |
-| **Sealed** | `PageCommit<Sealed>` | `commit()` | Collection complete, ready for atomic persistence |
-| **Committed** | `PageCommit<Committed>` | `next_cursor()`, `findings()`, `done_keys()` | Write succeeded, results are immutable and extractable |
+| State            | Type Parameter             | Available Methods                            | Semantics                                              |
+| :--------------- | :------------------------- | :------------------------------------------- | :----------------------------------------------------- |
+| **Accumulating** | `PageCommit<Accumulating>` | `add_finding()`, `add_done_key()`, `seal()`  | Collecting results from the current page scan          |
+| **Sealed**       | `PageCommit<Sealed>`       | `commit()`                                   | Collection complete, ready for atomic persistence      |
+| **Committed**    | `PageCommit<Committed>`    | `next_cursor()`, `findings()`, `done_keys()` | Write succeeded, results are immutable and extractable |
 
 ---
 
@@ -203,12 +203,12 @@ graph TD
 
 The failure analysis summarized:
 
-| Scenario | Done-Ledger | Findings | Cursor | Outcome | Severity |
-|:---------|:------------|:---------|:-------|:--------|:---------|
-| 1 | OK | FAIL | FAIL | Items marked done but findings lost | **FALSE NEGATIVES** (worst case) |
-| 2 | FAIL | OK | FAIL | Duplicates on re-scan | Acceptable (idempotent dedup) |
-| 3 | FAIL | FAIL | OK | Page skipped on resume | **FALSE NEGATIVES** (worst case) |
-| Atomic | All or none | All or none | All or none | Consistent state guaranteed | **Safe** |
+| Scenario | Done-Ledger | Findings    | Cursor      | Outcome                             | Severity                         |
+| :------- | :---------- | :---------- | :---------- | :---------------------------------- | :------------------------------- |
+| 1        | OK          | FAIL        | FAIL        | Items marked done but findings lost | **FALSE NEGATIVES** (worst case) |
+| 2        | FAIL        | OK          | FAIL        | Duplicates on re-scan               | Acceptable (idempotent dedup)    |
+| 3        | FAIL        | FAIL        | OK          | Page skipped on resume              | **FALSE NEGATIVES** (worst case) |
+| Atomic   | All or none | All or none | All or none | Consistent state guaranteed         | **Safe**                         |
 
 False negatives are the worst possible failure for a secret scanner. A false
 positive (duplicate finding) wastes human time but is ultimately harmless. A

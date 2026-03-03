@@ -7,7 +7,7 @@ Verified against:
 `crates/scanner-engine/src/engine/offline_validate.rs`, `crates/scanner-engine/src/scratch_memory.rs`,
 `crates/scanner-scheduler/src/runtime.rs`, `crates/scanner-scheduler/src/pipeline.rs`,
 `crates/scanner-engine/src/pool/node_pool.rs`, `crates/gossip-stdx/src/{bitset,ring_buffer}.rs`,
-`crates/scanner-scheduler/src/store/keys.rs`, `crates/scanner-scheduler/src/store/identity.rs`, and `crates/scanner-scheduler/src/store/fs.rs`.
+`crates/scanner-scheduler/src/store.rs`.
 
 ```mermaid
 classDiagram
@@ -20,6 +20,9 @@ classDiagram
         -Tuning tuning
         -Option~VsPrefilterDb~ vs
         -Option~VsAnchorDb~ vs_utf16
+        -Option~VsUtf16StreamDb~ vs_utf16_stream
+        -Option~VsStreamDb~ vs_stream
+        -Option~VsGateDb~ vs_gate
         -Option~Base64YaraGate~ b64_gate
         -SafelistFilter safelist
         -Vec~OfflineValidationSpec~ offline_validation_gates
@@ -440,7 +443,7 @@ classDiagram
 
     class OfflineValidationSpec {
         <<enumeration>>
-        Crc32Base62
+        Crc32Base62$lbrace$prefix_skip, payload_len, checksum_len$rbrace$
         GithubFinegrainedPat
         GrafanaServiceAccount
         AwsAccessKey
@@ -502,22 +505,15 @@ classDiagram
         +losses() Vec
     }
 
-    class SqliteStoreProducer {
-        -Mutex~WriterState~ state
-        +open(config) Result
-        +run_pk() Result~i64~
-    }
-
     FsFindingBatch --> FsFindingRecord : contains
     FsFindingRecord --> NormHash : carries
     StoreProducer <|.. NullStoreProducer : implements
     StoreProducer <|.. InMemoryStoreProducer : implements
-    StoreProducer <|.. SqliteStoreProducer : implements
     StoreProducer ..> FsFindingBatch : receives
     StoreProducer ..> FsRunLoss : receives
 ```
 
-Verified against: `crates/scanner-scheduler/src/store/fs.rs`, `crates/scanner-scheduler/src/store/db/writer.rs`.
+Verified against: `crates/scanner-scheduler/src/store.rs`.
 
 **Data flow**: After within-chunk dedup, the scheduler's `build_persistence_batch()`
 converts `FindingWithHash<F>` carriers into `FsFindingRecord` values. These are
@@ -525,17 +521,25 @@ grouped per scanned object in `FsFindingBatch` and handed to the configured
 `StoreProducer`. At run end, `record_fs_run_loss()` captures drop/failure counters
 and `end_run()` derives the final run status and persists it to the database.
 
-| Type | Purpose |
-|------|---------|
-| `FsFindingRecord` | Post-dedupe, backend-agnostic finding with absolute byte offsets, `norm_hash`, and additive `confidence_score` (0–10) |
-| `FsFindingBatch` | Borrowed batch of findings for one scanned object (file or archive entry) |
-| `FsRunLoss` | Run-level loss accounting (dropped findings, emit failures, incomplete flag) |
-| `StoreProducer` | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`) |
-| `NullStoreProducer` | Default no-op for CLI / feature-off paths |
-| `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
-| `SqliteStoreProducer` | Default FS backend: SQLite star-schema with WAL mode, per-batch transactions, and in-memory rule cache |
+| Type                    | Purpose                                                                                                               |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `FsFindingRecord`       | Post-dedupe, backend-agnostic finding with absolute byte offsets, `norm_hash`, and additive `confidence_score` (0–10) |
+| `FsFindingBatch`        | Borrowed batch of findings for one scanned object (file or archive entry)                                             |
+| `FsRunLoss`             | Run-level loss accounting (dropped findings, emit failures, incomplete flag)                                          |
+| `StoreProducer`         | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`)                                             |
+| `NullStoreProducer`     | Default no-op for CLI / feature-off paths                                                                             |
+| `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics                                                                  |
+
+> **Note:** SQLite persistence backend is not yet implemented. See `StoreProducer` trait in `store.rs`.
 
 ## Persistence Identity Types
+
+> **Status: Aspirational** — The types below (`StoreKeys`, `RunModeMetadata`,
+> `CorrelationMode`, `KeySource`, `IdentityFlags`, `VariantDiscriminant`,
+> `OccurrenceInput`) describe a planned persistence-layer identity system
+> that has not been implemented. For the **implemented** identity types, see
+> `crates/gossip-contracts/src/identity/` and
+> [boundary-1-identity-spine.md](gossip-contracts/boundary-1-identity-spine.md).
 
 ```mermaid
 classDiagram
@@ -607,38 +611,38 @@ classDiagram
     IdentityFlags --> IdentityError : validated by
 ```
 
-Verified against: `crates/scanner-scheduler/src/store/keys.rs`, `crates/scanner-scheduler/src/store/identity.rs`.
+*Aspirational — not verified against live code. These types do not exist in `crates/scanner-scheduler/src/store.rs`.*
 
-**Identity derivation functions** (not shown as classes):
+**Identity derivation functions** *(aspirational API — not implemented)*:
 
-| Function | Input | Output | Key Used |
-|---|---|---|---|
-| `rule_fingerprint(rule, keys)` | `RuleSpec` | `RuleFingerprint` (`[u8; 32]`) | _(unkeyed)_ |
-| `secret_hash(norm_hash, keys)` | `[u8; 32]` | `SecretHash` (`[u8; 32]`) | `secret_key` |
-| `occurrence_id(input, keys)` | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`) | `identity_key` |
+| Function                       | Input             | Output                         | Key Used       |
+| ------------------------------ | ----------------- | ------------------------------ | -------------- |
+| `rule_fingerprint(rule, keys)` | `RuleSpec`        | `RuleFingerprint` (`[u8; 32]`) | _(unkeyed)_    |
+| `secret_hash(norm_hash, keys)` | `[u8; 32]`        | `SecretHash` (`[u8; 32]`)      | `secret_key`   |
+| `occurrence_id(input, keys)`   | `OccurrenceInput` | `OccurrenceId` (`[u8; 32]`)    | `identity_key` |
 
-See [persistence-identity.md](persistence-identity.md) for contract details and normalization rules.
+See [persistence-identity.md](gossip-contracts/persistence-identity.md) for contract details and normalization rules *(aspirational)*.
 
 ## Key Relationships Summary
 
-| Source | Relationship | Target | Description |
-|--------|--------------|--------|-------------|
-| `Engine` | contains | `RuleCompiled` | Compiled detection rules |
-| `Engine` | contains | `RuleCold` | Cold rule metadata (`name`, `min_confidence`) |
-| `Engine` | contains | `TransformConfig` | Transform configurations |
-| `Engine` | creates | `ScanScratch` | Per-scan scratch state |
-| `Engine` | contains | `OfflineValidationSpec` | Offline validation gate pool |
-| `RuleSpec` | optional | `OfflineValidationSpec` | Per-rule offline validation spec |
-| `ScannerRuntime` | owns | `BufferPool` | Buffer memory pool |
-| `FileTable` | produces | `FileId` | File metadata IDs |
-| `Chunk` | owns | `BufferHandle` | Buffer with RAII release |
-| `FindingRec` | references | `FileId` | Source file identifier |
-| `FindingRec` | references | `StepId` | Decode provenance chain |
-| `NodePoolType` | uses | `DynamicBitSet` | Free slot tracking |
-| `StoreKeys` | contains | `RunModeMetadata` | Run correlation semantics |
-| `OccurrenceInput` | references | `FindingRec` | Finding to hash |
-| `OccurrenceInput` | contains | `VariantDiscriminant` | UTF-16 variant discrimination |
-| `FsFindingBatch` | contains | `FsFindingRecord` | Post-dedupe findings per object |
-| `FsFindingRecord` | carries | `NormHash` | BLAKE3 digest for cross-run dedup |
-| `StoreProducer` | receives | `FsFindingBatch` | Per-object finding persistence |
-| `StoreProducer` | receives | `FsRunLoss` | Run-level loss accounting |
+| Source            | Relationship | Target                  | Description                                    |
+| ----------------- | ------------ | ----------------------- | ---------------------------------------------- |
+| `Engine`          | contains     | `RuleCompiled`          | Compiled detection rules                       |
+| `Engine`          | contains     | `RuleCold`              | Cold rule metadata (`name`, `min_confidence`)  |
+| `Engine`          | contains     | `TransformConfig`       | Transform configurations                       |
+| `Engine`          | creates      | `ScanScratch`           | Per-scan scratch state                         |
+| `Engine`          | contains     | `OfflineValidationSpec` | Offline validation gate pool                   |
+| `RuleSpec`        | optional     | `OfflineValidationSpec` | Per-rule offline validation spec               |
+| `ScannerRuntime`  | owns         | `BufferPool`            | Buffer memory pool                             |
+| `FileTable`       | produces     | `FileId`                | File metadata IDs                              |
+| `Chunk`           | owns         | `BufferHandle`          | Buffer with RAII release                       |
+| `FindingRec`      | references   | `FileId`                | Source file identifier                         |
+| `FindingRec`      | references   | `StepId`                | Decode provenance chain                        |
+| `NodePoolType`    | uses         | `DynamicBitSet`         | Free slot tracking                             |
+| `StoreKeys`       | contains     | `RunModeMetadata`       | Run correlation semantics *(aspirational)*     |
+| `OccurrenceInput` | references   | `FindingRec`            | Finding to hash *(aspirational)*               |
+| `OccurrenceInput` | contains     | `VariantDiscriminant`   | UTF-16 variant discrimination *(aspirational)* |
+| `FsFindingBatch`  | contains     | `FsFindingRecord`       | Post-dedupe findings per object                |
+| `FsFindingRecord` | carries      | `NormHash`              | BLAKE3 digest for cross-run dedup              |
+| `StoreProducer`   | receives     | `FsFindingBatch`        | Per-object finding persistence                 |
+| `StoreProducer`   | receives     | `FsRunLoss`             | Run-level loss accounting                      |

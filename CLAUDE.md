@@ -407,7 +407,7 @@ directories. The `design-doc-scope-check.sh` hook fires automatically when editi
 ## Architecture References
 
 - `diagrams/` — 12 Mermaid diagram files covering all 5 boundaries (start with `diagrams/00-README.md`)
-- `docs/coordination-testing.md` — Test tier breakdown and cargo test commands
-- `docs/simulation-harness.md` — Simulation architecture, invariants S1–S7, fault levels
-- `docs/boundary-2-coordination.md` — Coordination protocol specification
-- `docs/boundary-1-identity-spine.md` — Identity type hierarchy
+- `docs/gossip-coordination/coordination-testing.md` — Test tier breakdown and cargo test commands
+- `docs/gossip-coordination/simulation-harness.md` — Simulation architecture, invariants S1–S7, fault levels
+- `docs/gossip-coordination/boundary-2-coordination.md` — Coordination protocol specification
+- `docs/gossip-contracts/boundary-1-identity-spine.md` — Identity type hierarchy

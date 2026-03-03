@@ -20,7 +20,7 @@ Use the harness after modifying detection rules, before releases, in CI pipeline
 The harness lives in `tools/eval-harness/` as a standalone crate with its own `Cargo.toml`. It depends on `scanner-rs` for the engine and path normalization utilities.
 
 | Module              | Role                                                                                                   |
-|---------------------|--------------------------------------------------------------------------------------------------------|
+| ------------------- | ------------------------------------------------------------------------------------------------------ |
 | `main.rs`           | CLI entry point, subcommand dispatch, pipeline orchestration                                           |
 | `types.rs`          | Core domain types: `NormalizedFinding`, `TruthItem`, `TruthLabel`, `ClassifiedFinding`, `FindingClass` |
 | `creddata.rs`       | CredData CSV truth loader                                                                              |
@@ -92,7 +92,7 @@ Greedy matching is required for valid PRC-AUC: it produces nested TP sets across
 ### Metrics Computed
 
 | Metric                 | Description                                                                                                       |
-|------------------------|-------------------------------------------------------------------------------------------------------------------|
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | Average Precision (AP) | Step-function AP with tie collapsing (matches sklearn's `average_precision_score`)                                |
 | Precision              | TP / (TP + FP)                                                                                                    |
 | Recall                 | TP / (TP + FN)                                                                                                    |
@@ -171,18 +171,18 @@ the lexicographically smaller rule name.
 ### Exit Codes
 
 | Code | Meaning                                                          |
-|------|------------------------------------------------------------------|
+| ---- | ---------------------------------------------------------------- |
 | 0    | Pass or Warn — metrics meet thresholds (or no baseline provided) |
 | 1    | Block — regression detected against `--baseline` report          |
 | 2    | Argument or runtime error                                        |
 
 ## Choosing a Dataset
 
-| Dataset        | Granularity                   | Best For                                                                         | Corpus Size                            |
-|----------------|-------------------------------|----------------------------------------------------------------------------------|-----------------------------------------|
-| **CredData**   | Position-based (file + lines) | Comprehensive accuracy measurement, release benchmarks, cross-scanner comparison | 73,842 annotations from 297 real repos |
-| **Synthetic**  | Position-based (file + lines) | Rule development iteration, CI regression gates for specific secret types        | Hand-crafted, typically 10–100 items   |
-| **LeakyRepo**  | Count-based (file + total)    | Corpora with count-only annotations, no positional ground truth available        | Varies                                 |
+| Dataset       | Granularity                   | Best For                                                                         | Corpus Size                            |
+| ------------- | ----------------------------- | -------------------------------------------------------------------------------- | -------------------------------------- |
+| **CredData**  | Position-based (file + lines) | Comprehensive accuracy measurement, release benchmarks, cross-scanner comparison | 73,842 annotations from 297 real repos |
+| **Synthetic** | Position-based (file + lines) | Rule development iteration, CI regression gates for specific secret types        | Hand-crafted, typically 10–100 items   |
+| **LeakyRepo** | Count-based (file + total)    | Corpora with count-only annotations, no positional ground truth available        | Varies                                 |
 
 - **CredData** is the standard benchmark for secret scanners. Use it for measuring overall scanner quality and comparing against published results from other tools. Large and real-world, but requires downloading source files (~11,000 files from GitHub).
 - **Synthetic** manifests give precise control over what's tested. Each item specifies an exact file, line range, label, and rule. Use for fast, deterministic regression detection on specific rules during development.
@@ -245,13 +245,13 @@ CredData/
 
 Each CSV in `meta/` has 13 PascalCase columns. The harness uses 5:
 
-| Column        | Type    | Description                                                                                  |
-|---------------|---------|----------------------------------------------------------------------------------------------|
-| `FilePath`    | string  | Relative path starting with `data/` (e.g., `data/00408ef6/src/config.py`)                    |
-| `LineStart`   | integer | 1-indexed inclusive start line, or -1 for unknown location                                   |
-| `LineEnd`     | integer | 1-indexed inclusive end line, or -1 for unknown location                                     |
-| `GroundTruth` | string  | `T` (true positive), `F` (false positive), or `X` (excluded from scoring)                    |
-| `Category`    | string  | CredSweeper rule name (e.g., `Password`, `Token`, `AWS Multi`); used for per-rule breakdown  |
+| Column        | Type    | Description                                                                                 |
+| ------------- | ------- | ------------------------------------------------------------------------------------------- |
+| `FilePath`    | string  | Relative path starting with `data/` (e.g., `data/00408ef6/src/config.py`)                   |
+| `LineStart`   | integer | 1-indexed inclusive start line, or -1 for unknown location                                  |
+| `LineEnd`     | integer | 1-indexed inclusive end line, or -1 for unknown location                                    |
+| `GroundTruth` | string  | `T` (true positive), `F` (false positive), or `X` (excluded from scoring)                   |
+| `Category`    | string  | CredSweeper rule name (e.g., `Password`, `Token`, `AWS Multi`); used for per-rule breakdown |
 
 Rows with `GroundTruth = X` are loaded as `Placeholder` labels and excluded from precision/recall calculation. Rows with `LineStart = -1` or `LineEnd = -1` (unknown location) are skipped during loading.
 
@@ -316,13 +316,13 @@ also records machine-readable comparability metadata in the regression JSON.
 
 Samsung published cross-scanner benchmarks on CredData (results may vary by CredData version and scanner configuration):
 
-| Scanner            | Precision | Recall |
-|--------------------|-----------|--------|
-| CredSweeper (ML)   | 91.7%     | 80.8%  |
-| Gitleaks           | 52.6%     | 24.4%  |
-| truffleHog (v2)    | 25.0%     | 0.9%   |
-| truffleHog3 (v3)   | 15.0%     | 54.7%  |
-| detect-secrets     | 14.2%     | 38.1%  |
+| Scanner          | Precision | Recall |
+| ---------------- | --------- | ------ |
+| CredSweeper (ML) | 91.7%     | 80.8%  |
+| Gitleaks         | 52.6%     | 24.4%  |
+| truffleHog (v2)  | 25.0%     | 0.9%   |
+| truffleHog3 (v3) | 15.0%     | 54.7%  |
+| detect-secrets   | 14.2%     | 38.1%  |
 
 CredSweeper's numbers include ML-based filtering and were evaluated on combined training and test data, so its metrics reflect partial evaluation on its own training set. Other scanners primarily use pattern-based detection (regex and entropy). scanner-rs results will depend on the current ruleset.
 
@@ -360,7 +360,7 @@ The manifest is a JSON array of objects:
 ```
 
 | Field        | Type    | Required | Description                                                 |
-|--------------|---------|----------|-------------------------------------------------------------|
+| ------------ | ------- | -------- | ----------------------------------------------------------- |
 | `path`       | string  | yes      | File path relative to `--corpus-root`                       |
 | `line_start` | integer | yes      | 1-indexed inclusive start line                              |
 | `line_end`   | integer | yes      | 1-indexed inclusive end line                                |
@@ -418,7 +418,7 @@ src/app/config.py,1,0
 ```
 
 | Column          | Type    | Description                                                              |
-|-----------------|---------|--------------------------------------------------------------------------|
+| --------------- | ------- | ------------------------------------------------------------------------ |
 | file path       | string  | Relative to `--corpus-root`; may contain commas (parsed via right-split) |
 | num_risk        | integer | Count of high-risk secrets                                               |
 | num_informative | integer | Count of informative secrets                                             |
@@ -477,7 +477,7 @@ Secret scanning typically prioritizes recall (missed secrets are dangerous) over
 When a `--baseline` is provided, the harness compares current metrics against the baseline:
 
 | Verdict   | Meaning                                  | Default Threshold                             |
-|-----------|------------------------------------------|-----------------------------------------------|
+| --------- | ---------------------------------------- | --------------------------------------------- |
 | **Pass**  | No meaningful regression detected        | AP drop < 0.5pp AND precision drop < 0.5pp    |
 | **Warn**  | Small regression detected (non-blocking) | AP drop 0.5pp–2pp OR precision drop 0.5pp–2pp |
 | **Block** | Significant regression detected          | AP drop ≥ 2pp OR precision drop ≥ 2pp         |

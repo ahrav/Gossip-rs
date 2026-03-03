@@ -101,10 +101,10 @@ stateDiagram-v2
 
 The three states correspond to three distinct behaviors from the caller's perspective:
 
-| State | Caller Experience | Source Load | Thread Impact |
-|:------|:------------------|:------------|:--------------|
-| Closed | Normal latency, normal errors | Full traffic | Workers block on I/O normally |
-| Open | Immediate `CircuitBreakerOpen` error | Zero traffic | Workers freed instantly |
+| State    | Caller Experience                    | Source Load    | Thread Impact                   |
+| :------- | :----------------------------------- | :------------- | :------------------------------ |
+| Closed   | Normal latency, normal errors        | Full traffic   | Workers block on I/O normally   |
+| Open     | Immediate `CircuitBreakerOpen` error | Zero traffic   | Workers freed instantly         |
 | HalfOpen | One probe in-flight, others rejected | Single request | One worker probes, others freed |
 
 Typical configuration thresholds:
@@ -381,7 +381,7 @@ them.
 
 ## Source Code References
 
-- **Connector design doc**: `docs/boundary-4-connectors.md`
+- **Connector design doc**: `docs/gossip-connectors/boundary-4-connectors.md`
 - **Connector module**: `crates/gossip-connectors/`
 - **Connector trait**: `crates/gossip-contracts/src/connector/`
 - **Scan loop retry logic**: `crates/gossip-scan-pipeline/src/scan_loop.rs`

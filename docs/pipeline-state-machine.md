@@ -2,7 +2,7 @@
 
 Current filesystem scanning uses the scheduler path:
 
-`unified::orchestrator::run` -> `parallel_scan_dir` -> `scan_local` -> `Executor<FileTask>`.
+`parallel_scan_dir` -> `scan_local` -> `Executor<FileTask>`.
 
 The older single-thread `pump()` ring model (`file_ring`, `chunk_ring`,
 `out_ring`) is not present in current `src/` code.
@@ -12,10 +12,10 @@ The older single-thread `pump()` ring model (`file_ring`, `chunk_ring`,
 ```mermaid
 stateDiagram-v2
     [*] --> OrchestratorRun: run(config)
-    OrchestratorRun --> FsPath: SourceConfig::Fs
-    OrchestratorRun --> GitPath: SourceConfig::Git
+    OrchestratorRun --> FsPath: SourceKind::Fs
+    OrchestratorRun --> GitPath: SourceKind::Git
 
-    FsPath --> BuildEngine: run_fs()
+    FsPath --> BuildEngine: scan_fs() / parallel_scan_dir()
     BuildEngine --> BuildSink
     BuildSink --> ParallelScanDir: parallel_scan_dir(...)
 
@@ -113,21 +113,21 @@ driven by source exhaustion + `join()` + executor in-flight drain.
 
 ## Current Names and Constants
 
-| Symbol / Type | Value / Meaning | Location |
-| --- | --- | --- |
-| `ParallelScanConfig::default().chunk_size` | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig::default().pool_buffers` | `workers * 4` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `ParallelScanConfig::default().max_in_flight_objects` | `1024` | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
-| `LocalConfig::default().chunk_size` | `64 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
-| `LocalConfig::default().max_in_flight_objects` | `256` | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
-| `ARCHIVE_STREAM_READ_MAX` | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
-| `ACCEPTING_BIT` / `COUNT_UNIT` | `1` / `2` | `crates/scanner-scheduler/src/scheduler/executor_core.rs` |
+| Symbol / Type                                         | Value / Meaning    | Location                                                   |
+| ----------------------------------------------------- | ------------------ | ---------------------------------------------------------- |
+| `ParallelScanConfig::default().chunk_size`            | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`  |
+| `ParallelScanConfig::default().pool_buffers`          | `workers * 4`      | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`  |
+| `ParallelScanConfig::default().max_in_flight_objects` | `1024`             | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`  |
+| `LocalConfig::default().chunk_size`                   | `64 * 1024` bytes  | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
+| `LocalConfig::default().max_in_flight_objects`        | `256`              | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` |
+| `ARCHIVE_STREAM_READ_MAX`                             | `256 * 1024` bytes | `crates/scanner-scheduler/src/scheduler/local_fs_archive_ctx.rs` |
+| `ACCEPTING_BIT` / `COUNT_UNIT`                        | `1` / `2`          | `crates/scanner-scheduler/src/scheduler/executor_core.rs`  |
 
 ## Metrics and Summary Wiring
 
 - `scan_local(...)` returns `LocalReport { stats: LocalStats, metrics: MetricsSnapshot }`.
 - `stats.io_errors` is set from `metrics.io_errors` at the end of `scan_local`.
-- `run_fs(...)` emits `SummaryEvent` using:
+- `scan_fs(...)` / `parallel_scan_dir(...)` emits `SummaryEvent` using:
   - `report.metrics.bytes_scanned`
   - `report.metrics.findings_emitted`
   - `report.stats.io_errors`
@@ -135,7 +135,7 @@ driven by source exhaustion + `join()` + executor in-flight drain.
 
 ## Source of Truth (Paths)
 
-- `crates/scanner-scheduler/src/unified/orchestrator.rs`
+- `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 - `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 - `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`
 - `crates/scanner-scheduler/src/scheduler/executor.rs`

@@ -38,7 +38,7 @@
 //!    edge-case arithmetic (e.g., zero-seed chunking) that would otherwise
 //!    panic silently.
 //!
-//! See `docs/coordination-testing.md` for the full tier breakdown.
+//! See `docs/gossip-coordination/coordination-testing.md` for the full tier breakdown.
 //!
 //! All `#[ignore]`'d tests are too slow for the default `cargo test` cycle.
 //! Run them explicitly:

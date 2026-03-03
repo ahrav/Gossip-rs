@@ -173,12 +173,12 @@ re-acquisition.
 
 Key timing properties:
 
-| Parameter | Value | Purpose |
-|:----------|:------|:--------|
-| `LEASE_DURATION` | Configurable (e.g., 30s) | Total time before lease expires |
-| Renewal interval | `LEASE_DURATION / 2` | Proactive heartbeat frequency |
-| Safety margin | `LEASE_DURATION / 2` | Time buffer if one renewal fails |
-| Expiry action | Shard lease released (Active, unleased) | Enables reallocation to another worker |
+| Parameter        | Value                                   | Purpose                                |
+| :--------------- | :-------------------------------------- | :------------------------------------- |
+| `LEASE_DURATION` | Configurable (e.g., 30s)                | Total time before lease expires        |
+| Renewal interval | `LEASE_DURATION / 2`                    | Proactive heartbeat frequency          |
+| Safety margin    | `LEASE_DURATION / 2`                    | Time buffer if one renewal fails       |
+| Expiry action    | Shard lease released (Active, unleased) | Enables reallocation to another worker |
 
 > **Note:** Lease renewal is explicit and synchronous via `WorkerSession::renew(&mut self, now)`.
 > There is no automatic background heartbeat — the worker must actively call `renew` before
@@ -328,13 +328,13 @@ graph LR
 
 The monotonicity rules are exhaustive:
 
-| Transition | Valid? | Reason |
-|:-----------|:-------|:-------|
-| `None` -> `Some(x)` | Yes | Initial cursor advancement from shard start |
-| `Some(x)` -> `Some(y)` where `y > x` | Yes | Normal forward progress |
-| `Some(x)` -> `Some(y)` where `y < x` | **No** | Backward movement -- would rescan processed keys |
-| `Some(x)` -> `Some(x)` | Yes | Idempotent retry -- same cursor is accepted (>=) |
-| `Some(x)` -> `None` | **No** | Regression to initial state -- would replay entire shard |
+| Transition                           | Valid? | Reason                                                   |
+| :----------------------------------- | :----- | :------------------------------------------------------- |
+| `None` -> `Some(x)`                  | Yes    | Initial cursor advancement from shard start              |
+| `Some(x)` -> `Some(y)` where `y > x` | Yes    | Normal forward progress                                  |
+| `Some(x)` -> `Some(y)` where `y < x` | **No** | Backward movement -- would rescan processed keys         |
+| `Some(x)` -> `Some(x)`               | Yes    | Idempotent retry -- same cursor is accepted (>=)         |
+| `Some(x)` -> `None`                  | **No** | Regression to initial state -- would replay entire shard |
 
 Non-strict monotonicity: `new_cursor >= old_cursor` always. Resubmitting the
 same cursor value is accepted (the comparison uses `>=`, not `>`), which allows
@@ -393,9 +393,9 @@ Key design properties:
 
 ### `CapacityHint` fields
 
-| Field | Type | Meaning |
-|:------|:-----|:--------|
-| `available_count` | `u32` | Number of Active, unleased shards in the run at operation time |
+| Field               | Type                  | Meaning                                                                                |
+| :------------------ | :-------------------- | :------------------------------------------------------------------------------------- |
+| `available_count`   | `u32`                 | Number of Active, unleased shards in the run at operation time                         |
 | `earliest_deadline` | `Option<LogicalTime>` | Soonest lease expiry among Active leased shards; `None` if no active shards are leased |
 
 Helper methods: `CapacityHint::ZERO` (sentinel when capacity is unknown),
@@ -547,15 +547,15 @@ but they are computed independently at different abstraction levels.
 
 ## Source Code References
 
-| File | Purpose |
-|:-----|:--------|
-| `04-boundary-2-coordination/09-worker-session.md` | Worker session design document covering claim, scan, and completion phases |
-| `04-boundary-2-coordination/04-cursor-monotonicity.md` | Cursor monotonicity invariant specification and proof sketch |
-| `crates/gossip-contracts/src/coordination/` | Coordination data types (shard_spec, cursor, pooled, manifest, limits) |
-| `crates/gossip-coordination/src/` | Coordination protocol (lease, fencing, session, facade, traits, record, error, etc.) |
-| `crates/gossip-coordination/src/lease.rs` | `Lease` and `LeaseHolder` types |
-| `crates/gossip-coordination/src/record.rs` | `ShardRecord` with lease state and cursor position |
-| `crates/gossip-coordination/src/traits.rs` | `CoordinationBackend` trait defining `acquire_and_restore`, `checkpoint`, `complete` |
-| `crates/gossip-coordination/src/error.rs` | `CapacityHint`, `AcquireResultView`, `RenewResult` types |
-| `crates/gossip-coordination/src/facade.rs` | `ClaimError::NoneAvailable { earliest_deadline }`, `default_claim_next_available` retry loop |
-| `crates/gossip-coordination/src/session.rs` | `WorkerSession` with `capacity` field and `capacity()` accessor |
+| File                                                   | Purpose                                                                                      |
+| :----------------------------------------------------- | :------------------------------------------------------------------------------------------- |
+| `04-boundary-2-coordination/09-worker-session.md`      | Worker session design document covering claim, scan, and completion phases                   |
+| `04-boundary-2-coordination/04-cursor-monotonicity.md` | Cursor monotonicity invariant specification and proof sketch                                 |
+| `crates/gossip-contracts/src/coordination/`            | Coordination data types (shard_spec, cursor, pooled, manifest, limits)                       |
+| `crates/gossip-coordination/src/`                      | Coordination protocol (lease, fencing, session, facade, traits, record, error, etc.)         |
+| `crates/gossip-coordination/src/lease.rs`              | `Lease` and `LeaseHolder` types                                                              |
+| `crates/gossip-coordination/src/record.rs`             | `ShardRecord` with lease state and cursor position                                           |
+| `crates/gossip-coordination/src/traits.rs`             | `CoordinationBackend` trait defining `acquire_and_restore`, `checkpoint`, `complete`         |
+| `crates/gossip-coordination/src/error.rs`              | `CapacityHint`, `AcquireResultView`, `RenewResult` types                                     |
+| `crates/gossip-coordination/src/facade.rs`             | `ClaimError::NoneAvailable { earliest_deadline }`, `default_claim_next_available` retry loop |
+| `crates/gossip-coordination/src/session.rs`            | `WorkerSession` with `capacity` field and `capacity()` accessor                              |

@@ -467,23 +467,23 @@ the keyed hash construction.
 
 ## Cross-References
 
-| Topic | Diagram File |
-|-------|-------------|
-| ID derivation DAG (full 15-type hierarchy) | [03-id-derivation-dag.md](03-id-derivation-dag.md) |
+| Topic                                            | Diagram File                                                    |
+| ------------------------------------------------ | --------------------------------------------------------------- |
+| ID derivation DAG (full 15-type hierarchy)       | [03-id-derivation-dag.md](03-id-derivation-dag.md)              |
 | Secret identity chain (BLAKE3 keyed mode detail) | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 3 |
-| Finding identity chain (FindingId derivation) | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 4 |
-| 5-check validation preamble (full flow) | [06-fencing-protocol.md](06-fencing-protocol.md) -- Diagram 1 |
-| Fencing decision tree (all error paths) | [06-fencing-protocol.md](06-fencing-protocol.md) -- Diagram 4 |
-| Five-boundary architecture (B1, B2 placement) | [01-system-overview.md](01-system-overview.md) |
+| Finding identity chain (FindingId derivation)    | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 4 |
+| 5-check validation preamble (full flow)          | [06-fencing-protocol.md](06-fencing-protocol.md) -- Diagram 1   |
+| Fencing decision tree (all error paths)          | [06-fencing-protocol.md](06-fencing-protocol.md) -- Diagram 4   |
+| Five-boundary architecture (B1, B2 placement)    | [01-system-overview.md](01-system-overview.md)                  |
 
 ## Source Code References
 
-| File | Purpose |
-|------|---------|
-| `08-cross-cutting/04-tenant-isolation.md` | Deep-dive prose document on tenant isolation design |
+| File                                              | Purpose                                                                               |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `08-cross-cutting/04-tenant-isolation.md`         | Deep-dive prose document on tenant isolation design                                   |
 | `crates/gossip-contracts/src/identity/finding.rs` | `SecretHash`, `FindingId` types; `key_secret_hash()`, `derive_finding_id()` functions |
-| `crates/gossip-contracts/src/identity/types.rs` | `TenantId`, `TenantSecretKey` root types; restricted trait surface |
-| `crates/gossip-contracts/src/identity/domain.rs` | Domain-separation constants (`SECRET_HASH_V1`, `FINDING_ID_V1`) |
-| `crates/gossip-contracts/src/identity/` | Full identity boundary (B1) implementation |
-| `crates/gossip-contracts/src/coordination/` | Coordination data types (shard_spec, cursor, pooled, manifest, limits) |
-| `crates/gossip-coordination/src/` | Coordination protocol (B2) with 5-check validation preamble |
+| `crates/gossip-contracts/src/identity/types.rs`   | `TenantId`, `TenantSecretKey` root types; restricted trait surface                    |
+| `crates/gossip-contracts/src/identity/domain.rs`  | Domain-separation constants (`SECRET_HASH_V1`, `FINDING_ID_V1`)                       |
+| `crates/gossip-contracts/src/identity/`           | Full identity boundary (B1) implementation                                            |
+| `crates/gossip-contracts/src/coordination/`       | Coordination data types (shard_spec, cursor, pooled, manifest, limits)                |
+| `crates/gossip-coordination/src/`                 | Coordination protocol (B2) with 5-check validation preamble                           |

@@ -86,10 +86,9 @@ so backends must copy or serialize before returning. This is off the hot
 chunk-scanning path (occurs once per scanned object, after all chunks are
 processed).
 
-With the SQLite backend (`crates/scanner-scheduler/src/store/db/writer.rs`), each worker calls
-`emit_fs_batch` on the shared `SqliteStoreProducer`. A `Mutex` serializes
-writes; each batch runs inside a `BEGIN IMMEDIATE … COMMIT` transaction.
-WAL mode enables concurrent readers without blocking the writer.
+With the configured `StoreProducer` (`crates/scanner-scheduler/src/store.rs`), each worker calls
+`emit_fs_batch` on the shared producer instance. The concrete backend
+serializes writes as needed (e.g., per-batch transactions).
 
 These caps bound persistence-side memory independently of engine scanning
 budgets.
@@ -104,24 +103,14 @@ Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --noc
 
 ## Unified Event Output Memory Notes
 
-The unified scanner writes findings through a streaming `EventSink`
-(`crates/scanner-scheduler/src/unified/events.rs`) instead of building a run-global stdout buffer.
+The unified scanner writes findings through a streaming `EventOutput`
+(`crates/scanner-scheduler/src/events.rs`) instead of building a run-global stdout buffer.
 This keeps output-path memory bounded to sink/writer buffers plus per-worker
 scratch vectors.
 
 Git scanning still retains per-run metadata required for finalize/persist
 (`ScannedBlobs`), but finding emission to stdout is streamed.
 
-## Store Key Bootstrap Memory Notes
-
-`crates/scanner-scheduler/src/store/keys.rs` runs key bootstrap once at startup:
-
-- Persistent mode decodes `SCANNER_SECRET_KEY` (base64, 32 bytes).
-- Missing/invalid input uses an ephemeral fallback key.
-- Three subkeys are derived (`identity`, `secret`, `metadata`) and reused.
-
-This flow is intentionally off the scan hot path and does not introduce
-per-finding or per-chunk allocations in engine loops.
 ---
 
 ## Git Tree Loading Budgets
@@ -248,15 +237,15 @@ When parallel blob introduction is enabled, the memory model changes:
 - **Per-worker budget division**: global budgets are divided by
   `worker_count` with floor/cap clamping to avoid undersized allocations:
 
-  | Budget | Division | Floor | Cap |
-  | --- | --- | --- | --- |
-  | `max_tree_cache_bytes` | `÷ workers` | 4 MiB | — |
-  | `max_tree_delta_cache_bytes` | `÷ workers` | 4 MiB | — |
-  | `max_tree_spill_bytes` | `÷ workers` | 64 MiB | — |
-  | `max_tree_bytes_in_flight` | `÷ workers` | 64 MiB | — |
-  | `max_packed_candidates` | `÷ workers` | 1024 | original cap |
-  | `max_loose_candidates` | `÷ workers` (ceil) | 0 | original cap |
-  | `path_arena_capacity` | `÷ workers` | 64 KiB | original cap |
+| Budget                       | Division           | Floor  | Cap          |
+| ---------------------------- | ------------------ | ------ | ------------ |
+| `max_tree_cache_bytes`       | `÷ workers`        | 4 MiB  | —            |
+| `max_tree_delta_cache_bytes` | `÷ workers`        | 4 MiB  | —            |
+| `max_tree_spill_bytes`       | `÷ workers`        | 64 MiB | —            |
+| `max_tree_bytes_in_flight`   | `÷ workers`        | 64 MiB | —            |
+| `max_packed_candidates`      | `÷ workers`        | 1024   | original cap |
+| `max_loose_candidates`       | `÷ workers` (ceil) | 0      | original cap |
+| `path_arena_capacity`        | `÷ workers`        | 64 KiB | original cap |
 
 - **Post-merge global cap re-validation**: after worker results are
   concatenated, `merge_worker_results` enforces the original global caps:
@@ -513,18 +502,14 @@ The pool is deliberately large and aligned:
 - **Predictable reclamation**: `BufferHandle` is RAII; dropping the chunk is the
   only way to return a buffer. This makes lifecycle bugs easy to spot.
 
-To reduce memory footprint, tune pipeline `chunk_size` and
-`PIPE_POOL_TARGET_BYTES` based on workload.
+To reduce memory footprint, tune pipeline `chunk_size` and pool buffer count
+based on workload.
 
 ## Constants
 
 ```rust
 pub const BUFFER_LEN_MAX: usize = 8 * 1024 * 1024;  // 8MiB per buffer
 pub const BUFFER_ALIGN: usize = 4096;               // 4KB alignment
-
-pub const PIPE_CHUNK_RING_CAP: usize = 128;         // Max chunks in flight
-pub const PIPE_POOL_TARGET_BYTES: usize = 256 * 1024 * 1024;
-pub const PIPE_POOL_MIN: usize = 16;
 ```
 
 ## Chunk Structure

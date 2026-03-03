@@ -327,25 +327,25 @@ This two-level design means operators never need to re-triage findings just beca
 
 ## Cross-References
 
-| Concept | Related Section |
-|---------|----------------|
-| Domain separation constants | `domain.rs` -- authoritative registry of all `"gossip/..."` tags |
-| `CanonicalBytes` trait | Ensures deterministic serialization before hashing (INV-S01) |
-| `define_id_32!` / `define_id_32_restricted!` | Macros that generate 32-byte wrapper types with standard traits |
-| Shard algebra split ID | Uses `SPLIT_ID_V1` from the same domain registry (B2: Coordination) |
-| Policy-driven rescan | `PolicyHash` change forces new `RunId` and full rescan |
-| Triage group key | `TRIAGE_GROUP_KEY_V1` groups findings by `(tenant, item)` for persistence |
-| Boundary dependency graph (which boundaries consume which ID types) | [02-boundary-dependency-graph.md](02-boundary-dependency-graph.md) |
-| End-to-end scan flow (StableItemId in step 4, FindingId in step 7) | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) |
-| Tenant isolation (SecretHash keyed-mode derivation, cross-tenant unlinkability) | [11-tenant-isolation.md](11-tenant-isolation.md) |
-| Split operations (SPLIT_ID_V1 domain separator for child shard IDs) | [12-split-operations.md](12-split-operations.md) |
+| Concept                                                                         | Related Section                                                           |
+| ------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Domain separation constants                                                     | `domain.rs` -- authoritative registry of all `"gossip/..."` tags          |
+| `CanonicalBytes` trait                                                          | Ensures deterministic serialization before hashing (INV-S01)              |
+| `define_id_32!` / `define_id_32_restricted!`                                    | Macros that generate 32-byte wrapper types with standard traits           |
+| Shard algebra split ID                                                          | Uses `SPLIT_ID_V1` from the same domain registry (B2: Coordination)       |
+| Policy-driven rescan                                                            | `PolicyHash` change forces new `RunId` and full rescan                    |
+| Triage group key                                                                | `TRIAGE_GROUP_KEY_V1` groups findings by `(tenant, item)` for persistence |
+| Boundary dependency graph (which boundaries consume which ID types)             | [02-boundary-dependency-graph.md](02-boundary-dependency-graph.md)        |
+| End-to-end scan flow (StableItemId in step 4, FindingId in step 7)              | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md)                  |
+| Tenant isolation (SecretHash keyed-mode derivation, cross-tenant unlinkability) | [11-tenant-isolation.md](11-tenant-isolation.md)                          |
+| Split operations (SPLIT_ID_V1 domain separator for child shard IDs)             | [12-split-operations.md](12-split-operations.md)                          |
 
 ## Source Code References
 
-| File | Purpose |
-|------|---------|
+| File                                              | Purpose                                                                                                                                   |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/gossip-contracts/src/identity/finding.rs` | `SecretHash`, `FindingId`, `OccurrenceId` types and derivation functions (`key_secret_hash`, `derive_finding_id`, `derive_occurrence_id`) |
-| `crates/gossip-contracts/src/identity/item.rs` | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId` types and derivation |
-| `crates/gossip-contracts/src/identity/policy.rs` | `PolicyHashInputs`, `IdHashMode`, `compute_policy_hash` derivation |
-| `crates/gossip-contracts/src/identity/types.rs` | Root types: `TenantId`, `TenantSecretKey`, `PolicyHash` |
-| `crates/gossip-contracts/src/identity/domain.rs` | All domain-separation constants (`ITEM_ID_V1`, `FINDING_ID_V1`, etc.) |
+| `crates/gossip-contracts/src/identity/item.rs`    | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId` types and derivation                                                 |
+| `crates/gossip-contracts/src/identity/policy.rs`  | `PolicyHashInputs`, `IdHashMode`, `compute_policy_hash` derivation                                                                        |
+| `crates/gossip-contracts/src/identity/types.rs`   | Root types: `TenantId`, `TenantSecretKey`, `PolicyHash`                                                                                   |
+| `crates/gossip-contracts/src/identity/domain.rs`  | All domain-separation constants (`ITEM_ID_V1`, `FINDING_ID_V1`, etc.)                                                                     |

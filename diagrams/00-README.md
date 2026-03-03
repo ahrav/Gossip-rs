@@ -8,14 +8,14 @@ The diagrams cover the five architectural boundaries (Identity, Coordination, Sh
 
 Every diagram in this suite uses a consistent color scheme to identify which architectural boundary owns each component:
 
-| Boundary | Role | Fill | Light Fill | Stroke | Mnemonic |
-|----------|------|------|------------|--------|----------|
-| **B1: Identity** | Content-addressed IDs, hashing | `#3B82F6` | `#DBEAFE` | `#1E40AF` | Blue — the foundation everything builds on |
-| **B2: Coordination** | Leases, fencing, state machines | `#22C55E` | `#DCFCE7` | `#166534` | Green — the "go" signal for work distribution |
-| **B3: Shard Algebra** | Key ranges, splits, coverage | `#F97316` | `#FFF7ED` | `#9A3412` | Orange — partitioning and boundaries |
-| **B4: Connector** | External APIs, circuit breakers | `#EF4444` | `#FEE2E2` | `#991B1B` | Red — external I/O, highest risk |
-| **B5: Persistence** | Done-ledger, findings, commits | `#8B5CF6` | `#EDE9FE` | `#5B21B6` | Purple — durable storage |
-| **Worker / Cross-cutting** | Orchestration, error handling | `#6B7280` | `#F3F4F6` | `#374151` | Grey — glue between boundaries |
+| Boundary                   | Role                            | Fill      | Light Fill | Stroke    | Mnemonic                                      |
+| -------------------------- | ------------------------------- | --------- | ---------- | --------- | --------------------------------------------- |
+| **B1: Identity**           | Content-addressed IDs, hashing  | `#3B82F6` | `#DBEAFE`  | `#1E40AF` | Blue — the foundation everything builds on    |
+| **B2: Coordination**       | Leases, fencing, state machines | `#22C55E` | `#DCFCE7`  | `#166534` | Green — the "go" signal for work distribution |
+| **B3: Shard Algebra**      | Key ranges, splits, coverage    | `#F97316` | `#FFF7ED`  | `#9A3412` | Orange — partitioning and boundaries          |
+| **B4: Connector**          | External APIs, circuit breakers | `#EF4444` | `#FEE2E2`  | `#991B1B` | Red — external I/O, highest risk              |
+| **B5: Persistence**        | Done-ledger, findings, commits  | `#8B5CF6` | `#EDE9FE`  | `#5B21B6` | Purple — durable storage                      |
+| **Worker / Cross-cutting** | Orchestration, error handling   | `#6B7280` | `#F3F4F6`  | `#374151` | Grey — glue between boundaries                |
 
 ### Visual Conventions
 
@@ -113,34 +113,34 @@ graph TD
 
 ## File Index
 
-| # | File | Diagrams | Primary Boundary | Key Concepts |
-|---|------|----------|-----------------|--------------|
-| 00 | `00-README.md` | 1 | All | Index, color legend, reading order |
-| 01 | `01-system-overview.md` | 4 | All | 5-boundary model, crate mapping, scan flow, build DAG |
-| 02 | `02-boundary-dependency-graph.md` | 3 | B1, All | Type-annotated DAG, tiered compilation, anti-patterns |
-| 03 | `03-id-derivation-dag.md` | 6 | B1 | 15-type hierarchy, item/secret/finding/occurrence chains |
-| 04 | `04-end-to-end-scan-flow.md` | 3 | All | 13-step sequence, atomic commit boundary |
-| 05 | `05-shard-and-run-state-machines.md` | 4 | B2 | Shard SM, run SM, splits lifecycle, illegal transitions |
-| 06 | `06-fencing-protocol.md` | 4 | B2 | 5-check validation, zombie resolution, decision tree |
-| 07 | `07-lease-lifecycle.md` | 7 | B2 | Acquisition, renewal timeline, cursor monotonicity, capacity piggybacking |
-| 08 | `08-pagecommit-typestate.md` | 4 | B5 | Typestate SM, partial write failures, compile-time safety |
-| 09 | `09-circuit-breaker.md` | 4 | B4 | CB state machine, cascade prevention, per-connector isolation |
-| 10 | `10-failure-modes-and-recovery.md` | 6 | All | Worker crash, coordinator crash, partitions, split-brain |
-| 11 | `11-tenant-isolation.md` | 5 | B1, B2 | 3 isolation layers, correlation attack, TenantSecretKey |
-| 12 | `12-split-operations.md` | 5 | B2, B3 | split_replace, split_residual, coverage validation |
-| 13 | `13-shard-algebra-types.md` | 7 | B3 | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration |
-| | **Total** | **63** | | |
+| #   | File                                 | Diagrams | Primary Boundary | Key Concepts                                                              |
+| --- | ------------------------------------ | -------- | ---------------- | ------------------------------------------------------------------------- |
+| 00  | `00-README.md`                       | 1        | All              | Index, color legend, reading order                                        |
+| 01  | `01-system-overview.md`              | 4        | All              | 5-boundary model, crate mapping, scan flow, build DAG                     |
+| 02  | `02-boundary-dependency-graph.md`    | 3        | B1, All          | Type-annotated DAG, tiered compilation, anti-patterns                     |
+| 03  | `03-id-derivation-dag.md`            | 6        | B1               | 15-type hierarchy, item/secret/finding/occurrence chains                  |
+| 04  | `04-end-to-end-scan-flow.md`         | 3        | All              | 13-step sequence, atomic commit boundary                                  |
+| 05  | `05-shard-and-run-state-machines.md` | 4        | B2               | Shard SM, run SM, splits lifecycle, illegal transitions                   |
+| 06  | `06-fencing-protocol.md`             | 4        | B2               | 5-check validation, zombie resolution, decision tree                      |
+| 07  | `07-lease-lifecycle.md`              | 7        | B2               | Acquisition, renewal timeline, cursor monotonicity, capacity piggybacking |
+| 08  | `08-pagecommit-typestate.md`         | 4        | B5               | Typestate SM, partial write failures, compile-time safety                 |
+| 09  | `09-circuit-breaker.md`              | 4        | B4               | CB state machine, cascade prevention, per-connector isolation             |
+| 10  | `10-failure-modes-and-recovery.md`   | 6        | All              | Worker crash, coordinator crash, partitions, split-brain                  |
+| 11  | `11-tenant-isolation.md`             | 5        | B1, B2           | 3 isolation layers, correlation attack, TenantSecretKey                   |
+| 12  | `12-split-operations.md`             | 5        | B2, B3           | split_replace, split_residual, coverage validation                        |
+| 13  | `13-shard-algebra-types.md`          | 7        | B3               | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration    |
+|     | **Total**                            | **63**   |                  |                                                                           |
 
 ## Implementation Status Legend
 
 Diagrams in this suite mix implemented components and pending designs. The following
 markers indicate implementation status:
 
-| Marker | Meaning |
-|--------|---------|
-| **(implemented)** | Type/method exists in source, tested, exercised by in-memory backend |
-| **(contract spec)** | Trait/typestate defined in contracts crate; in-memory backend exercises it; durable backend pending |
-| **(domain tag — struct pending)** | Domain constant exists in `identity/domain.rs`; corresponding struct not yet defined |
+| Marker                            | Meaning                                                                                             |
+| --------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **(implemented)**                 | Type/method exists in source, tested, exercised by in-memory backend                                |
+| **(contract spec)**               | Trait/typestate defined in contracts crate; in-memory backend exercises it; durable backend pending |
+| **(domain tag — struct pending)** | Domain constant exists in `identity/domain.rs`; corresponding struct not yet defined                |
 
 ## Administrative Operations
 
@@ -160,35 +160,35 @@ The three terminal states have different finality:
 
 These diagrams are derived from the [gossip-rs-learning-guide](https://github.com/ahrav/gossip-rs-learning-guide):
 
-| Diagram File | Learning Guide Source |
-|-------------|---------------------|
-| `01-system-overview.md` | `00-prologue/03-architecture-at-a-glance.md` |
-| `02-boundary-dependency-graph.md` | `08-cross-cutting/01-boundary-dependency-graph.md` |
-| `03-id-derivation-dag.md` | `02-boundary-1-identity-spine/04-id-type-hierarchy.md`, `06-secret-and-finding-identity.md` |
-| `04-end-to-end-scan-flow.md` | `08-cross-cutting/02-data-flow-end-to-end.md` |
-| `05-shard-and-run-state-machines.md` | `04-boundary-2-coordination/02-shard-state-machine.md` |
-| `06-fencing-protocol.md` | `04-boundary-2-coordination/03-fencing-protocol-deep-dive.md` |
-| `07-lease-lifecycle.md` | `04-boundary-2-coordination/09-worker-session.md`, `04-cursor-monotonicity.md` |
-| `08-pagecommit-typestate.md` | `07-boundary-5-persistence/04-commit-protocol-typestate.md` |
-| `09-circuit-breaker.md` | `06-boundary-4-connector/04-circuit-breaker.md` |
-| `10-failure-modes-and-recovery.md` | `08-cross-cutting/03-failure-modes-and-recovery.md` |
-| `11-tenant-isolation.md` | `08-cross-cutting/04-tenant-isolation.md` |
-| `12-split-operations.md` | `04-boundary-2-coordination/06-split-operations.md` |
-| `13-shard-algebra-types.md` | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
+| Diagram File                         | Learning Guide Source                                                                                                                                                                       |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `01-system-overview.md`              | `00-prologue/03-architecture-at-a-glance.md`                                                                                                                                                |
+| `02-boundary-dependency-graph.md`    | `08-cross-cutting/01-boundary-dependency-graph.md`                                                                                                                                          |
+| `03-id-derivation-dag.md`            | `02-boundary-1-identity-spine/04-id-type-hierarchy.md`, `06-secret-and-finding-identity.md`                                                                                                 |
+| `04-end-to-end-scan-flow.md`         | `08-cross-cutting/02-data-flow-end-to-end.md`                                                                                                                                               |
+| `05-shard-and-run-state-machines.md` | `04-boundary-2-coordination/02-shard-state-machine.md`                                                                                                                                      |
+| `06-fencing-protocol.md`             | `04-boundary-2-coordination/03-fencing-protocol-deep-dive.md`                                                                                                                               |
+| `07-lease-lifecycle.md`              | `04-boundary-2-coordination/09-worker-session.md`, `04-cursor-monotonicity.md`                                                                                                              |
+| `08-pagecommit-typestate.md`         | `07-boundary-5-persistence/04-commit-protocol-typestate.md`                                                                                                                                 |
+| `09-circuit-breaker.md`              | `06-boundary-4-connector/04-circuit-breaker.md`                                                                                                                                             |
+| `10-failure-modes-and-recovery.md`   | `08-cross-cutting/03-failure-modes-and-recovery.md`                                                                                                                                         |
+| `11-tenant-isolation.md`             | `08-cross-cutting/04-tenant-isolation.md`                                                                                                                                                   |
+| `12-split-operations.md`             | `04-boundary-2-coordination/06-split-operations.md`                                                                                                                                         |
+| `13-shard-algebra-types.md`          | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
 
 ## Source Code References
 
 The diagrams reference source code in the main [gossip-rs](https://github.com/ahrav/gossip-rs) repository:
 
-| Crate | Path | Boundaries |
-|-------|------|------------|
-| `gossip-contracts` | `crates/gossip-contracts/src/identity/` | B1: Identity |
-| `gossip-frontier` | `crates/gossip-frontier/src/` | B3: Shard Algebra |
-| `gossip-contracts` | `crates/gossip-contracts/src/coordination/` | B2: Coordination (data types: shard_spec, cursor, pooled, manifest, limits) |
-| `gossip-coordination` | `crates/gossip-coordination/src/` | B2: Coordination (protocol: traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
-| `gossip-contracts` | `crates/gossip-contracts/src/connector/` | B4: Connector |
-| `gossip-connectors` | `crates/gossip-connectors/` | B4: Connector (crate) |
-| `gossip-contracts` | `crates/gossip-contracts/src/persistence/` | B5: Persistence |
+| Crate                 | Path                                        | Boundaries                                                                                                            |
+| --------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `gossip-contracts`    | `crates/gossip-contracts/src/identity/`     | B1: Identity                                                                                                          |
+| `gossip-frontier`     | `crates/gossip-frontier/src/`               | B3: Shard Algebra                                                                                                     |
+| `gossip-contracts`    | `crates/gossip-contracts/src/coordination/` | B2: Coordination (data types: shard_spec, cursor, pooled, manifest, limits)                                           |
+| `gossip-coordination` | `crates/gossip-coordination/src/`           | B2: Coordination (protocol: traits, record, lease, error, run, split, validation, session, facade, events, in_memory) |
+| `gossip-contracts`    | `crates/gossip-contracts/src/connector/`    | B4: Connector                                                                                                         |
+| `gossip-connectors`   | `crates/gossip-connectors/`                 | B4: Connector (crate)                                                                                                 |
+| `gossip-contracts`    | `crates/gossip-contracts/src/persistence/`  | B5: Persistence                                                                                                       |
 
 ## Rendering
 

@@ -4,7 +4,7 @@
 //! boundary module may be referenced here. All four sibling modules depend on
 //! `identity`.
 //!
-//! For the full architecture design, see `docs/boundary-1-identity-spine.md`.
+//! For the full architecture design, see `docs/gossip-contracts/boundary-1-identity-spine.md`.
 //!
 //! **Key invariants:**
 //! - Collision-freedom — distinct values produce distinct canonical byte
