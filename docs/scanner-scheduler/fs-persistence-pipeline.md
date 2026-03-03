@@ -9,7 +9,7 @@ FS scan loops into a persistence backend.
 ## Purpose
 
 The detection engine emits findings during scanning, but those findings are
-transient — they flow through the `EventSink` to stdout and are gone. The
+transient — they flow through the `EventOutput` to stdout and are gone. The
 FS persistence pipeline adds a **durable write path** so post-dedupe findings
 are persisted to a SQLite database for cross-run deduplication, diff analysis,
 tracking, and reporting.
@@ -22,20 +22,14 @@ emits). The consumer side (actual backend storage) is plugged in via the
 
 | Module | Scope | Purpose |
 |--------|-------|---------|
-| `crates/scanner-scheduler/src/store/fs.rs` | FS persistence producer | Write-side trait + data types for FS scan findings |
-| `crates/scanner-scheduler/src/store/db/schema.rs` | SQLite schema | Star-schema DDL with dimension tables (roots, paths, rules, secrets) and fact tables (runs, occurrences, observations) |
-| `crates/scanner-scheduler/src/store/db/writer.rs` | SQLite writer | Single-writer producer with WAL mode, per-batch transactions, and in-memory rule cache |
-| `crates/scanner-scheduler/src/store/db/query.rs` | SQLite queries | Read-path queries for list-runs, list-findings, diff, and list-secrets CLI commands |
-| `crates/scanner-scheduler/src/store/identity.rs` | Identity contracts | Stable `RuleFingerprint`, `SecretHash`, `OccurrenceId` derivation |
-| `crates/scanner-scheduler/src/store/keys.rs` | Key bootstrap | `SCANNER_SECRET_KEY` KDF for keyed identity hashes |
+| `crates/scanner-scheduler/src/store.rs` | FS persistence | Key bootstrap, identity contracts, `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
 | `crates/scanner-git/src/persist.rs` | Git persistence | Two-phase persist contract for Git blob scan results |
 
-The identity contracts (`identity.rs`) define *how to compute stable IDs*
-for findings. The FS persistence pipeline (`fs.rs`) defines *how findings
-flow from scan workers into a backend*. The SQLite backend (`db/writer.rs`)
-uses the pipeline to receive `FsFindingRecord` batches and computes
-deterministic identifiers (occurrence IDs, rule fingerprints, path IDs) via
-BLAKE3 domain-separated hashes before storing them.
+The identity contracts in `store.rs` define *how to compute stable IDs*
+for findings. The `StoreProducer` trait defines *how findings flow from
+scan workers into a backend*. Concrete producers receive `FsFindingRecord`
+batches and compute deterministic identifiers (occurrence IDs, rule
+fingerprints, path IDs) via BLAKE3 domain-separated hashes before storing them.
 
 ## Data Flow
 
@@ -61,7 +55,7 @@ BLAKE3 domain-separated hashes before storing them.
                      │   │                     │                                   │
                      │   ▼                     ▼                                   │
                      │  emit_findings()   emit_persistence_batch()                 │
-                     │  (EventSink)            │                                   │
+                     │  (EventOutput)            │                                   │
                      │                         │  build_persistence_batch()        │
                      │                         │  converts to FsFindingRecord[]    │
                      │                         │  wraps in FsFindingBatch          │
@@ -167,14 +161,15 @@ pub trait StoreProducer: Send + Sync + 'static {
 
 | Type | Purpose |
 |------|---------|
-| `SqliteStoreProducer` | Default FS backend: SQLite star-schema with WAL mode, per-batch transactions, and in-memory rule cache |
 | `NullStoreProducer` | Default no-op — CLI default, feature-off, benchmarks |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
+
+> **Note:** SQLite persistence backend is not yet implemented. See `StoreProducer` trait in `store.rs`.
 
 ### SQLite Backend
 
 When `--persist-findings` is enabled for FS scans, the orchestrator wires
-`SqliteStoreProducer` as the persistence backend.
+a `StoreProducer` implementation as the persistence backend.
 
 #### Store Root Resolution
 
@@ -200,7 +195,7 @@ paths, secrets) are deduplicated via `INSERT OR IGNORE` on their natural keys.
 #### Star Schema
 
 The schema follows a star-schema layout with two fact tables and four
-dimension tables, defined in `crates/scanner-scheduler/src/store/db/schema.rs`:
+dimension tables, defined in `crates/scanner-scheduler/src/store.rs`:
 
 ```text
                   ┌──────────┐
@@ -276,7 +271,7 @@ Read-only connections (for CLI query commands) skip `journal_mode` and
 
 #### Write Path
 
-`SqliteStoreProducer` implements the `StoreProducer` trait:
+The SQLite writer implements the `StoreProducer` trait:
 
 1. **`open(config)`** — Opens (or creates) the database, applies schema
    migrations via `PRAGMA user_version`, resolves or inserts the root
@@ -315,7 +310,7 @@ Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
 #### Query Path
 
-Read-path queries in `crates/scanner-scheduler/src/store/db/query.rs`:
+Read-path queries in `crates/scanner-scheduler/src/store.rs`:
 
 | Function | CLI command | Description |
 |----------|------------|-------------|
@@ -409,7 +404,7 @@ scanner scan fs --path=/some/dir --persist-findings
 
 The `--persist-findings` flag sets `FsScanConfig.persist_findings = true`,
 which causes the orchestrator to wire a `StoreProducer` into the
-`ParallelScanConfig`. The default producer is `SqliteStoreProducer`, which
+`ParallelScanConfig`. The default producer is the SQLite writer, which
 writes to `findings.db` under the store root.
 
 #### Environment Variables
@@ -427,8 +422,8 @@ CLI --persist-findings
 FsScanConfig { persist_findings: true }
   │
   ▼
-run_fs() in orchestrator.rs
-  │  creates Arc<SqliteStoreProducer>
+scan_fs() / parallel_scan_dir() in scheduler
+  │  creates Arc<dyn StoreProducer>
   ▼
 ParallelScanConfig { store_producer: Some(Arc<dyn StoreProducer>) }
   │

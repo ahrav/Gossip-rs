@@ -183,10 +183,10 @@ chunking invariance without re-materializing full blobs in the scanner.
 Detection semantics are unchanged by unified CLI routing. The same engine
 outputs are now emitted as structured events:
 
-- Filesystem path: findings are emitted via `EventSink` from owner-compute
+- Filesystem path: findings are emitted via `EventOutput` from owner-compute
   scheduler workers (`crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`), where each worker
   performs both file I/O and scanning with worker-local scratch.
-- Git path: `EngineAdapter` emits `ScanEvent::Finding` during blob scanning.
+- Git path: `EngineAdapter` emits `CoreEvent::Finding` during blob scanning.
 
 ## Git Tree Diff Streaming
 
@@ -236,7 +236,7 @@ Filesystem persistence now has a separate identity contract in `crates/scanner-s
 ## SQLite Persistence Backend
 
 Filesystem scans have a concrete persistence backend in
-`crates/scanner-scheduler/src/store/db/`:
+`crates/scanner-scheduler/src/store.rs`:
 
 - `store::db::schema` defines a star-schema with dimension tables (`roots`,
   `paths`, `rules`, `secrets`) and fact tables (`runs`, `occurrences`,
@@ -359,7 +359,7 @@ Selection detail:
   lazily on the first NUL byte; if the UTF-16 stream DB is unavailable, the
   engine falls back to a post-stream UTF-16 block scan.
 
-See `docs/transform-chain.md` for diagrams and the gating sequence.
+See `docs/scanner-engine/transform-chain.md` for diagrams and the gating sequence.
 
 ## Keyword + Local Context + Entropy + Value Suppressor Gates
 

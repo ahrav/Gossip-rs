@@ -1,12 +1,12 @@
 # Pipeline Flow
 
-The active `scan fs` pipeline is orchestrated in `crates/scanner-scheduler/src/unified/orchestrator.rs`
+The active `scan fs` pipeline is orchestrated in `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 and executed by the scheduler in `crates/scanner-scheduler/src/scheduler/`. It does not use
 `file_ring/chunk_ring/out_ring` stage queues in the current filesystem path.
 
 ```mermaid
 flowchart LR
-    Path["Path / root"] --> Orch["run_fs()"]
+    Path["Path / root"] --> Orch["parallel_scan_dir()"]
     Orch --> PScan["parallel_scan_dir()"]
 
     PScan --> Walker["IterWalker::next_file()"]
@@ -18,7 +18,7 @@ flowchart LR
     Detect -->|archive| Arch["dispatch_archive_scan()"]
     Detect -->|regular file| ChunkLoop["Sequential read + overlap carry"]
     ChunkLoop --> Engine["Engine::scan_chunk_into()"]
-    Engine --> Emit["ScanEvent::Finding via EventSink"]
+    Engine --> Emit["CoreEvent::Finding via EventOutput"]
     Engine --> Persist["emit_persistence_batch()<br/>via StoreProducer"]
 
     Pool["TsBufferPool"] -.->|"acquire()"| ChunkLoop
@@ -30,10 +30,10 @@ flowchart LR
 
 ## Stage Details
 
-### Orchestration (`crates/scanner-scheduler/src/unified/orchestrator.rs`)
-- Entry point: `run_fs(...)`
+### Orchestration (`crates/scanner-scheduler/src/scheduler/parallel_scan.rs`)
+- Entry point: `parallel_scan_dir(...)`
 - Builds engine and event sink, then calls `parallel_scan_dir(...)`
-- Emits final `ScanEvent::Summary` and flushes the sink
+- Emits final `CoreEvent::Summary` and flushes the sink
 
 ### Discovery (`crates/scanner-scheduler/src/scheduler/parallel_scan.rs`)
 - `IterWalker` performs single-threaded filesystem discovery
@@ -48,11 +48,11 @@ flowchart LR
   - Binary skip/extract gate (content-policy based)
   - Sequential read with overlap carry (`copy_within` tail -> head)
   - `Engine::scan_chunk_into(...)` + `drop_prefix_findings(...)`
-  - Optional within-chunk dedupe (includes `norm_hash` in dedup key) + `ScanEvent::Finding` emission
+  - Optional within-chunk dedupe (includes `norm_hash` in dedup key) + `CoreEvent::Finding` emission
   - `build_persistence_batch()` + `emit_persistence_batch()` via `StoreProducer` (when configured)
 
 ### Output
-- Findings are emitted directly through `EventSink` (JSONL/Text/JSON/SARIF)
+- Findings are emitted directly through `EventOutput` (JSONL/Text/JSON/SARIF)
 - No filesystem-path `OutputStage` queue in the scheduler flow
 
 ### Persistence (Optional)
@@ -76,7 +76,7 @@ sequenceDiagram
     participant Worker as process_file()
     participant File as std::fs::File
     participant Engine as Engine
-    participant Sink as EventSink
+    participant Sink as EventOutput
     participant Store as StoreProducer
 
     Worker->>Pool: acquire()
@@ -86,7 +86,7 @@ sequenceDiagram
         Worker->>Engine: scan_chunk_into(data, file_id, base_offset, scratch)
         Worker->>Worker: drop_prefix_findings + optional dedupe
         Worker->>Store: emit_persistence_batch(path, findings)
-        Worker->>Sink: emit ScanEvent::Finding
+        Worker->>Sink: emit CoreEvent::Finding
     end
     Worker->>Pool: TsBufferHandle::drop()
 ```

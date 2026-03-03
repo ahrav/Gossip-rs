@@ -2,7 +2,7 @@
 
 Current filesystem scanning uses the scheduler path:
 
-`unified::orchestrator::run` -> `parallel_scan_dir` -> `scan_local` -> `Executor<FileTask>`.
+`parallel_scan_dir` -> `scan_local` -> `Executor<FileTask>`.
 
 The older single-thread `pump()` ring model (`file_ring`, `chunk_ring`,
 `out_ring`) is not present in current `src/` code.
@@ -12,10 +12,10 @@ The older single-thread `pump()` ring model (`file_ring`, `chunk_ring`,
 ```mermaid
 stateDiagram-v2
     [*] --> OrchestratorRun: run(config)
-    OrchestratorRun --> FsPath: SourceConfig::Fs
-    OrchestratorRun --> GitPath: SourceConfig::Git
+    OrchestratorRun --> FsPath: SourceKind::Fs
+    OrchestratorRun --> GitPath: SourceKind::Git
 
-    FsPath --> BuildEngine: run_fs()
+    FsPath --> BuildEngine: scan_fs() / parallel_scan_dir()
     BuildEngine --> BuildSink
     BuildSink --> ParallelScanDir: parallel_scan_dir(...)
 
@@ -127,7 +127,7 @@ driven by source exhaustion + `join()` + executor in-flight drain.
 
 - `scan_local(...)` returns `LocalReport { stats: LocalStats, metrics: MetricsSnapshot }`.
 - `stats.io_errors` is set from `metrics.io_errors` at the end of `scan_local`.
-- `run_fs(...)` emits `SummaryEvent` using:
+- `scan_fs(...)` / `parallel_scan_dir(...)` emits `SummaryEvent` using:
   - `report.metrics.bytes_scanned`
   - `report.metrics.findings_emitted`
   - `report.stats.io_errors`
@@ -135,7 +135,7 @@ driven by source exhaustion + `join()` + executor in-flight drain.
 
 ## Source of Truth (Paths)
 
-- `crates/scanner-scheduler/src/unified/orchestrator.rs`
+- `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 - `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 - `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`
 - `crates/scanner-scheduler/src/scheduler/executor.rs`

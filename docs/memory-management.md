@@ -86,10 +86,9 @@ so backends must copy or serialize before returning. This is off the hot
 chunk-scanning path (occurs once per scanned object, after all chunks are
 processed).
 
-With the SQLite backend (`crates/scanner-scheduler/src/store/db/writer.rs`), each worker calls
-`emit_fs_batch` on the shared `SqliteStoreProducer`. A `Mutex` serializes
-writes; each batch runs inside a `BEGIN IMMEDIATE … COMMIT` transaction.
-WAL mode enables concurrent readers without blocking the writer.
+With the configured `StoreProducer` (`crates/scanner-scheduler/src/store.rs`), each worker calls
+`emit_fs_batch` on the shared producer instance. The concrete backend
+serializes writes as needed (e.g., per-batch transactions).
 
 These caps bound persistence-side memory independently of engine scanning
 budgets.
@@ -104,8 +103,8 @@ Run diagnostic tests to verify: `cargo test --test diagnostic -- --ignored --noc
 
 ## Unified Event Output Memory Notes
 
-The unified scanner writes findings through a streaming `EventSink`
-(`crates/scanner-scheduler/src/unified/events.rs`) instead of building a run-global stdout buffer.
+The unified scanner writes findings through a streaming `EventOutput`
+(`crates/scanner-scheduler/src/events.rs`) instead of building a run-global stdout buffer.
 This keeps output-path memory bounded to sink/writer buffers plus per-worker
 scratch vectors.
 
@@ -114,7 +113,7 @@ Git scanning still retains per-run metadata required for finalize/persist
 
 ## Store Key Bootstrap Memory Notes
 
-`crates/scanner-scheduler/src/store/keys.rs` runs key bootstrap once at startup:
+`crates/scanner-scheduler/src/store.rs` runs key bootstrap once at startup:
 
 - Persistent mode decodes `SCANNER_SECRET_KEY` (base64, 32 bytes).
 - Missing/invalid input uses an ephemeral fallback key.

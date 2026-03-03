@@ -16,15 +16,15 @@ synthetic harness usage. See `detection-rules.md` and
 
 | Component | Location | Purpose |
 |---|---|---|
-| Synthetic scenario generator | `src/sim_scanner/generator.rs` | Build deterministic in-memory files, rules, and expected spans from a seed |
+| Synthetic scenario generator | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Build deterministic in-memory files, rules, and expected spans from a seed |
 | Random sim harness | `tests/simulation/scanner_random.rs` | Seeded stress testing of engine invariants under faults and chunking |
 | Corpus replay harness | `tests/simulation/scanner_corpus.rs` | Replay minimized regression artifacts |
 | Additional synthetic coverage | `tests/simulation/scanner_archive_*.rs`, `tests/simulation/scanner_discovery.rs`, `tests/simulation/scanner_max_file_size.rs`, `tests/simulation/scanner_budget_invariance.rs` | Archive, discovery fallback, and size or budget invariants |
 | Real rules harness | `tests/simulation/scanner_real_rules.rs` | Scan curated fixtures with production rules and compare normalized findings to a golden baseline |
 | Real rules fixtures | `tests/corpus/real_rules/fixtures/` | Curated synthetic, non-sensitive fixture corpus |
 | Real rules baseline | `tests/corpus/real_rules/expected/findings.json` | Golden findings snapshot for mode-2 regression |
-| Real ruleset source | `default_rules.yaml` (embedded via `src/rules/mod.rs`) | Production detection rules used by `demo_rules()` |
-| Harness guide | `docs/scanner_test_harness_guide.md` | How to run and debug synthetic scanner simulations |
+| Real ruleset source | `default_rules.yaml` (embedded via `crates/scanner-engine/src/rules/mod.rs`) | Production detection rules used by `demo_rules()` |
+| Harness guide | `docs/scanner-scheduler/scanner_test_harness_guide.md` | How to run and debug synthetic scanner simulations |
 
 ## Mode 1: Synthetic Engine Stress (Current)
 
@@ -151,8 +151,8 @@ to reduce startup jitter before threshold evaluation.
 
 Phase-6 defaulting decisions additionally require sustained-green policy
 evaluation across CI windows; see
-`docs/migration-defaulting-closeout.md` and
-`tools/migration-parity/sustained_green_gate.py`.
+the migration-defaulting closeout process (not yet documented) and
+a sustained-green gate script (not yet implemented).
 
 ### Commands
 
@@ -186,7 +186,7 @@ The matrix validates:
 | Ordering | full connector listing | Deterministic key-sorted order |
 
 The implementation lives in
-`src/scheduler/parallel_scan.rs` as
+`crates/scanner-scheduler/src/scheduler/parallel_scan.rs` as
 `filesystem_enumeration_conformance_matrix_matches_connector` and is gated
 behind `connector-pipeline` because it exercises the real connector crate.
 

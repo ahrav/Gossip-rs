@@ -137,7 +137,7 @@ See `crates/scanner-scheduler/src/archive/` for archive-specific invariants and 
 ## Unified Scanner Output Integration
 
 Transform findings produced by the engine flow through the unified event
-contract (`ScanEvent::Finding`) in both filesystem and git scan modes. The
+contract (`CoreEvent::Finding`) in both filesystem and git scan modes. The
 decode/transform decision logic and budgets in this document are unchanged;
 only emission/reporting wiring changed.
 
@@ -146,13 +146,13 @@ For filesystem scans, this emission happens from owner-compute workers in
 with worker-local reusable state).
 
 When `--persist-findings` is enabled, the same post-dedupe finding set is also
-persisted to the SQLite backend (`crates/scanner-scheduler/src/store/db/writer.rs`) within per-batch
+persisted via the configured `StoreProducer` (`crates/scanner-scheduler/src/store.rs`) within per-batch
 transactions. This keeps transform-derived and root findings consistent between
 stdout events and persistent database output.
 
 ### Identity Canonicalization Link
 
-For persistence IDs (`crates/scanner-scheduler/src/store/identity.rs`), transform-derived findings use:
+For persistence IDs (`crates/scanner-scheduler/src/store.rs`), transform-derived findings use:
 
 - Root-hint end normalization tolerant to base64 padding variance (`min..min+3`).
 - Span contribution when dedupe includes span (`step_id == STEP_ROOT` or
@@ -290,7 +290,7 @@ sequenceDiagram
 fire precisely when `decoded_offset >= hi`. This avoids both early firing
 (incomplete window) and excessive latency.
 
-See `docs/detection-engine.md` for TimingWheel data structure details.
+See `docs/scanner-engine/detection-engine.md` for TimingWheel data structure details.
 
 ## StepArena Provenance
 

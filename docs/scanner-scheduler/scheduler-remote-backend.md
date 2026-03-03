@@ -269,7 +269,7 @@ pub fn scan_remote<B: RemoteBackend>(
     engine: Arc<MockEngine>,
     backend: Arc<B>,
     cfg: RemoteConfig,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 ) -> Result<(RemoteRunReport, MetricsSnapshot), RemoteRunError<B::Error>>
 ```
 

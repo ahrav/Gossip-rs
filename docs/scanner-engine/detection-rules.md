@@ -8,7 +8,7 @@ Representative view of the current built-in detection rules used by scanner-rs.
 - [crates/scanner-engine/src/rules/yaml.rs](../crates/scanner-engine/src/rules/yaml.rs)
 - [crates/scanner-engine/src/rules/mod.rs](../crates/scanner-engine/src/rules/mod.rs)
 - [crates/scanner-engine/src/demo.rs](../crates/scanner-engine/src/demo.rs)
-- [crates/scanner-scheduler/src/unified/orchestrator.rs](../crates/scanner-scheduler/src/unified/orchestrator.rs)
+- [crates/scanner-scheduler/src/scheduler/parallel_scan.rs](../crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
 
 ## Current Snapshot
 

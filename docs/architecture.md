@@ -10,7 +10,7 @@ reusable scratch buffers so large scans do not trigger per-chunk allocations.
 
 ```
 scanner-rs scan fs
-  -> run_fs (crates/scanner-scheduler/src/unified/orchestrator.rs)
+  -> scan_fs (gossip-scanner-runtime) / parallel_scan_dir (crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
   -> parallel_scan_dir (crates/scanner-scheduler/src/scheduler/parallel_scan.rs)
   -> IterWalker (single-threaded discovery)
   -> scan_local (crates/scanner-scheduler/src/scheduler/local_fs_owner.rs)
@@ -18,14 +18,14 @@ scanner-rs scan fs
        -> read chunk + overlap with TsBufferPool
        -> Engine::scan_chunk_into(...)
        -> drop_prefix_findings(...) for overlap dedupe
-       -> emit ScanEvent::Finding via EventSink
+       -> emit CoreEvent::Finding via EventOutput
 ```
 
 - `IterWalker` yields `LocalFile` values; `scan_local` assigns monotonic
   `FileId` values as work is enqueued.
 - Workers do both file I/O and scanning in the same stage (no separate
   `ReaderStage`/`OutputStage` handoff in this path).
-- Findings are written through `EventSink` implementations
+- Findings are written through `EventOutput` implementations
   (JSONL/Text/JSON/SARIF), and a final summary event is emitted by the
   orchestrator.
 

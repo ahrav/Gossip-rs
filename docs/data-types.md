@@ -7,7 +7,7 @@ Verified against:
 `crates/scanner-engine/src/engine/offline_validate.rs`, `crates/scanner-engine/src/scratch_memory.rs`,
 `crates/scanner-scheduler/src/runtime.rs`, `crates/scanner-scheduler/src/pipeline.rs`,
 `crates/scanner-engine/src/pool/node_pool.rs`, `crates/gossip-stdx/src/{bitset,ring_buffer}.rs`,
-`crates/scanner-scheduler/src/store/keys.rs`, `crates/scanner-scheduler/src/store/identity.rs`, and `crates/scanner-scheduler/src/store/fs.rs`.
+`crates/scanner-scheduler/src/store.rs`.
 
 ```mermaid
 classDiagram
@@ -502,22 +502,15 @@ classDiagram
         +losses() Vec
     }
 
-    class SqliteStoreProducer {
-        -Mutex~WriterState~ state
-        +open(config) Result
-        +run_pk() Result~i64~
-    }
-
     FsFindingBatch --> FsFindingRecord : contains
     FsFindingRecord --> NormHash : carries
     StoreProducer <|.. NullStoreProducer : implements
     StoreProducer <|.. InMemoryStoreProducer : implements
-    StoreProducer <|.. SqliteStoreProducer : implements
     StoreProducer ..> FsFindingBatch : receives
     StoreProducer ..> FsRunLoss : receives
 ```
 
-Verified against: `crates/scanner-scheduler/src/store/fs.rs`, `crates/scanner-scheduler/src/store/db/writer.rs`.
+Verified against: `crates/scanner-scheduler/src/store.rs`.
 
 **Data flow**: After within-chunk dedup, the scheduler's `build_persistence_batch()`
 converts `FindingWithHash<F>` carriers into `FsFindingRecord` values. These are
@@ -533,7 +526,8 @@ and `end_run()` derives the final run status and persists it to the database.
 | `StoreProducer` | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`) |
 | `NullStoreProducer` | Default no-op for CLI / feature-off paths |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics |
-| `SqliteStoreProducer` | Default FS backend: SQLite star-schema with WAL mode, per-batch transactions, and in-memory rule cache |
+
+> **Note:** SQLite persistence backend is not yet implemented. See `StoreProducer` trait in `store.rs`.
 
 ## Persistence Identity Types
 
@@ -607,7 +601,7 @@ classDiagram
     IdentityFlags --> IdentityError : validated by
 ```
 
-Verified against: `crates/scanner-scheduler/src/store/keys.rs`, `crates/scanner-scheduler/src/store/identity.rs`.
+Verified against: `crates/scanner-scheduler/src/store.rs`.
 
 **Identity derivation functions** (not shown as classes):
 

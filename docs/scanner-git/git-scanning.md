@@ -208,5 +208,5 @@ Several buffer reuse patterns eliminate per-object allocation on hot paths:
 ## Related Docs
 
 - `docs/architecture-overview.md`
-- `docs/detection-engine.md`
-- `docs/git_simulation_harness_guide.md`
+- `docs/scanner-engine/detection-engine.md`
+- `docs/scanner-git/git_simulation_harness_guide.md`

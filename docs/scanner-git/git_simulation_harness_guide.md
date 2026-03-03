@@ -142,4 +142,4 @@ cases before adding them to the corpus.
 ## Related Docs
 
 - `docs/architecture-overview.md`
-- `docs/scanner_test_harness_guide.md`
+- `docs/scanner-scheduler/scanner_test_harness_guide.md`

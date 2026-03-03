@@ -4,7 +4,7 @@ Deterministic, versioned identity contracts for persistence across all
 scanner sources. These contracts let the scanner answer "have I seen this
 exact finding before?" across runs without storing raw secret bytes.
 
-**Source**: `crates/scanner-scheduler/src/store/keys.rs`, `crates/scanner-scheduler/src/store/identity.rs`
+**Source**: `crates/scanner-scheduler/src/store.rs`
 
 ## Purpose
 
@@ -69,7 +69,7 @@ Zero changes to `identity.rs` or `keys.rs` are required.
 
 ### SourceKind and Occurrence ID
 
-The codebase has `SourceKind { Fs, Git }` in `crates/scanner-scheduler/src/unified/mod.rs` for event
+The codebase has `SourceKind { Fs, Git }` in `crates/scanner-scheduler/src/source_kind.rs` for event
 routing. This enum is **not** part of the `occurrence_id` payload. Source
 identity flows through the `object_key`, not a separate discriminator field.
 This is intentional: adding a `SourceKind` field to the canonical payload

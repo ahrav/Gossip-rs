@@ -6,8 +6,7 @@ High-level C4-style component diagram showing the gossip-rs secret scanning engi
 graph TB
     subgraph CLI["CLI Layer"]
         Main["main.rs<br/>Entry Point"]
-        UCLI["unified/cli.rs<br/>Subcommand Parser"]
-        Orch["unified/orchestrator.rs<br/>Source Dispatcher"]
+        Orch["scheduler/parallel_scan.rs<br/>Source Dispatcher"]
     end
 
     subgraph Core["Core Engine"]
@@ -22,7 +21,7 @@ graph TB
         PScan["parallel_scan_dir()<br/>High-level FS entry"]
         Walker["IterWalker<br/>File Discovery"]
         Scanner["scan_local()<br/>Owner-Compute Scan"]
-        Events["EventSink<br/>JSONL/Text/JSON/SARIF"]
+        Events["EventOutput<br/>JSONL/Text/JSON/SARIF"]
         StoreProd["StoreProducer<br/>FS Persistence"]
     end
 
@@ -50,8 +49,7 @@ graph TB
         TimingWheel["TimingWheel&lt;PendingWindow, 1&gt;<br/>Window Expiration Scheduler"]
     end
 
-    Main --> UCLI
-    UCLI --> Orch
+    Main --> Orch
 
     Orch --> |"scan fs"| PScan
     Orch --> |"scan git"| GitRunner
@@ -97,10 +95,9 @@ graph TB
 
 | Component | Location | Purpose |
 | ------------------- | ------------------------------ | -------------------------------------------------------------------- |
-| **CLI Layer**       | `crates/scanner-rs-cli/src/main.rs`                  | Entry point that delegates to unified scan routing                   |
-| **Unified CLI**     | `crates/scanner-scheduler/src/unified/cli.rs`           | Subcommand parser for `scan fs|git` and source-specific flags        |
-| **Unified Orchestrator** | `crates/scanner-scheduler/src/unified/orchestrator.rs` | Dispatches sources and wires structured event sinks               |
-| **Unified Events**  | `crates/scanner-scheduler/src/unified/events.rs`        | Structured `ScanEvent` model and JSONL sink                          |
+| **CLI Layer**       | `crates/scanner-rs-cli/src/main.rs`                  | Entry point that delegates to scan routing                   |
+| **Scan Dispatcher** | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` | Dispatches sources and wires structured event sinks               |
+| **Events**          | `crates/scanner-scheduler/src/events.rs`                | Structured `CoreEvent` model and JSONL sink                          |
 | **parallel_scan_dir** | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` | High-level FS scan entrypoint (walker + scheduler wiring)         |
 | **FS Owner-Compute Scheduler** | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` | Round-robin file dispatch with per-worker owned I/O+scan state |
 | **Engine**          | `crates/scanner-engine/src/engine/core.rs`           | Compiled scanning engine with anchor patterns, rules, and transforms |
@@ -114,7 +111,7 @@ graph TB
 | **Archive Core**    | `crates/scanner-scheduler/src/archive/` (`scan.rs`, `budget.rs`, `path.rs`, `formats/*`) | Archive scanning config, budgets, outcomes, path canonicalization, and sink-driven scan core |
 | **IterWalker**      | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` | Recursive file traversal with gitignore/hidden-file controls      |
 | **scan_local**      | `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs` | Worker-owned I/O + scanning with overlap dedupe                   |
-| **EventSink**       | `crates/scanner-scheduler/src/unified/events.rs`        | Thread-safe structured event emission to stdout sinks                |
+| **EventOutput**     | `crates/scanner-scheduler/src/events.rs`                | Thread-safe structured event emission to stdout sinks                |
 | **BufferPool**      | `crates/scanner-scheduler/src/runtime.rs:518`           | Fixed-capacity aligned buffer pool (single-threaded runtime path)    |
 | **TsBufferPool**    | `crates/scanner-scheduler/src/scheduler/ts_buffer_pool.rs` | Thread-safe buffer pool used by scheduler workers                 |
 | **NodePoolType**    | `crates/scanner-engine/src/pool/node_pool.rs:49`     | Generic pre-allocated node pool                                      |
@@ -163,16 +160,7 @@ graph TB
 | **Git Scan Runner** | `crates/scanner-git/src/runner.rs` | End-to-end orchestration across all Git scan stages |
 | **WorkItems**       | `crates/scanner-git/src/work_items.rs`  | SoA candidate metadata tables for sorting without moving structs    |
 | **Policy Hash**     | `crates/scanner-git/src/policy_hash.rs`  | Canonical BLAKE3 identity over rules, transforms, and tuning         |
-| **Store Keys**      | `crates/scanner-scheduler/src/store/keys.rs`            | `SCANNER_SECRET_KEY` bootstrap, subkey derivation, and run correlation mode metadata |
-| **Store Identity**  | `crates/scanner-scheduler/src/store/identity.rs`        | Versioned `rule_fingerprint` / `secret_hash` / `occurrence_id` contracts for FS persistence |
-| **StoreProducer**   | `crates/scanner-scheduler/src/store/fs.rs`              | Write-side trait for FS finding persistence; scheduler calls `emit_fs_batch` per object |
-| **SQLite Schema**   | `crates/scanner-scheduler/src/store/db/schema.rs`       | SQLite star-schema with findings, runs, occurrences, and dimension tables (roots, paths, rules, secrets) |
-| **SQLite Writer**   | `crates/scanner-scheduler/src/store/db/writer.rs`       | Single-writer SQLite producer with WAL mode, per-batch transactions, and in-memory rule cache |
-| **FsFindingRecord** | `crates/scanner-scheduler/src/store/fs.rs`              | Backend-agnostic post-dedupe finding record with `norm_hash` |
-| **FsFindingBatch**  | `crates/scanner-scheduler/src/store/fs.rs`              | Borrowed batch grouping findings for a single scanned object |
-| **FsRunLoss**       | `crates/scanner-scheduler/src/store/fs.rs`              | Run-level drop/failure accounting for persistence completeness |
-| **NullStoreProducer** | `crates/scanner-scheduler/src/store/fs.rs`            | No-op producer for CLI default and feature-off paths |
-| **InMemoryStoreProducer** | `crates/scanner-scheduler/src/store/fs.rs`        | In-memory collector for tests and diagnostics |
+| **Store**           | `crates/scanner-scheduler/src/store.rs`                 | Key bootstrap, identity contracts, `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
 
 
 ## Archive Scanning Notes
@@ -372,7 +360,7 @@ Scheduler harness code lives in `crates/scanner-scheduler/src/scheduler/sim_exec
 2. **Dispatch**: Unified orchestrator routes to `parallel_scan_dir` or `run_git_scan`
 3. **FS Discovery**: `IterWalker` discovers files and `scan_local` assigns work to workers
 4. **Scanning**: Workers read overlap-aware chunks, run `Engine`, dedupe overlap findings, and apply cross-rule winner selection (keeping the highest-confidence rule per location)
-5. **Output**: Findings stream through `EventSink` implementations to stdout
+5. **Output**: Findings stream through `EventOutput` implementations to stdout
 6. **Persistence**: When enabled (`--persist-findings`), post-dedupe findings are emitted
    to a `StoreProducer` backend (default: SQLite star-schema with WAL mode);
    run-level loss accounting is recorded at scan end

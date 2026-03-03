@@ -24,7 +24,7 @@ The scanner test harness validates the **detection engine's correctness under ad
 The scheduler harness tests work distribution policy (stealing, parking, resource accounting). The scanner harness tests detection logic (chunking, overlap, transforms, faults). They share `SimExecutor` infrastructure but validate different invariants.
 
 **Related Git simulation harness:**
-Git scanning has its own deterministic harness with a repo model, pack simulation, and replay corpus. See `docs/git_simulation_harness_guide.md` for usage and corpus layout.
+Git scanning has its own deterministic harness with a repo model, pack simulation, and replay corpus. See `docs/scanner-git/git_simulation_harness_guide.md` for usage and corpus layout.
 
 ## Quick Start
 

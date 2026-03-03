@@ -18,11 +18,11 @@ deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
 | 2   | Simulation tests        | `tests/simulation/` (13 `.rs` files)       | ~3,059  | `sim-harness` etc.   | System-level behavior (scheduling, chunking, faults)        |
 | 3   | Corpus replay — scanner | `tests/corpus/scanner/` (71 `.case.json`)  | N/A     | `sim-harness`        | Deterministic regression replay                             |
 | 4   | Corpus replay — git     | `tests/corpus/git_scan/` (11 `.case.json`) | N/A     | `sim-harness`        | Git deterministic regression replay                         |
-| 5   | Scanner sim module      | `src/sim_scanner/` (7 files)               | ~3,550  | `sim-harness`        | Scenario generation, runner, oracles                        |
-| 6   | Git sim module          | `src/sim_git_scan/` (18 files)             | ~4,171  | `sim-harness`        | Git repo model generation, stage pipeline                   |
-| 7   | Shared sim infra        | `src/sim/` (9 files)                       | ~1,745  | `sim-harness`        | RNG, fault injection, minimization, executor                |
-| 8   | Offline validators      | `src/engine/offline_validate.rs`           | 1,877   | None                 | Structural token validation                                 |
-| 9   | YAML unit tests         | `src/rules/yaml_unit_tests.rs`             | 2,262   | None                 | Rule parsing/scanning roundtrip                             |
+| 5   | Scanner sim module      | `crates/scanner-scheduler/src/sim_scanner/` (7 files)               | ~3,550  | `sim-harness`        | Scenario generation, runner, oracles                        |
+| 6   | Git sim module          | `crates/scanner-git/src/sim_git_scan/` (18 files)             | ~4,171  | `sim-harness`        | Git repo model generation, stage pipeline                   |
+| 7   | Shared sim infra        | `crates/scanner-scheduler/src/sim/` (9 files)                       | ~1,745  | `sim-harness`        | RNG, fault injection, minimization, executor                |
+| 8   | Offline validators      | `crates/scanner-engine/src/engine/offline_validate.rs`           | 1,877   | None                 | Structural token validation                                 |
+| 9   | YAML unit tests         | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`             | 2,262   | None                 | Rule parsing/scanning roundtrip                             |
 | 10  | Integration tests       | `tests/integration/` (26 files)            | ~10,276 | `integration-tests`  | Handcrafted regression tests                                |
 | 11  | Fuzz targets            | `fuzz/fuzz_targets/` (19 targets)          | Varies  | Nightly              | Coverage-guided mutation                                    |
 | 12  | Real-rules harness      | `tests/simulation/scanner_real_rules.rs`   | 278     | `real-rules-harness` | Golden baseline comparison                                  |
@@ -62,7 +62,7 @@ gate.
 
 ### 1.4 Scanner Sim Module
 
-Seven source files in `src/sim_scanner/`. The generator (`generator.rs`, 605
+Seven source files in `crates/scanner-scheduler/src/sim_scanner/`. The generator (`generator.rs`, 605
 lines) builds deterministic in-memory filesystems with embedded secrets. The
 runner (`runner.rs`, 2,412 lines) implements the chunked-scanning event loop
 with seven oracles: termination, monotonic progress, overlap dedup, duplicate
@@ -71,7 +71,7 @@ replay, and virtual path tables round out the module.
 
 ### 1.5 Git Sim Module
 
-Eighteen source files in `src/sim_git_scan/`. The generator builds synthetic
+Eighteen source files in `crates/scanner-git/src/sim_git_scan/`. The generator builds synthetic
 git repository models (commit graphs, tree entries, pack files). The runner
 (`runner.rs`, 1,506 lines) executes a five-stage pipeline (`RepoOpen →
 CommitWalk → TreeDiff → PackExec → Finalize`) and validates output shape
@@ -81,7 +81,7 @@ injection, and persistence.
 
 ### 1.6 Shared Sim Infra
 
-Nine files in `src/sim/`: `rng.rs` (deterministic xorshift64*), `fault.rs`
+Nine files in `crates/scanner-scheduler/src/sim/`: `rng.rs` (deterministic xorshift64*), `fault.rs`
 (path-keyed fault plans), `fs.rs` (in-memory filesystem), `executor.rs`
 (deterministic task scheduler), `trace.rs` (bounded ring trace), `clock.rs`
 (simulated clock), `artifact.rs` (reproduction artifacts), and `minimize.rs`
@@ -89,14 +89,14 @@ Nine files in `src/sim/`: `rng.rs` (deterministic xorshift64*), `fault.rs`
 
 ### 1.7 Offline Validators
 
-`src/engine/offline_validate.rs` (1,877 lines) provides structural token
+`crates/scanner-engine/src/engine/offline_validate.rs` (1,877 lines) provides structural token
 validation: length checks, charset constraints, checksum verification, and
 entropy gates. Thirty-nine `#[test]` functions with hand-authored test
 vectors. No mutation — vectors are static byte slices.
 
 ### 1.8 YAML Unit Tests
 
-`src/rules/yaml_unit_tests.rs` (2,262 lines) tests rule parsing and single-rule
+`crates/scanner-engine/src/rules/yaml_unit_tests.rs` (2,262 lines) tests rule parsing and single-rule
 scanning via roundtrip assertions. Each test constructs a rule from YAML,
 compiles it, and scans a test string. No mutation — inputs are string literals.
 
@@ -150,7 +150,7 @@ post-startup allocation behavior and unfilterable rule analysis. Gated behind
 | Representation selection    | `generator.rs:494-503` | —        | —        | —               | —                  | —                    |
 | Token generation            | `generator.rs:467-476` | —        | —        | —               | —                  | —                    |
 
-**Key finding**: encoding functions in `src/sim_scanner/generator.rs` (lines
+**Key finding**: encoding functions in `crates/scanner-scheduler/src/sim_scanner/generator.rs` (lines
 494–589) are the ONLY place systematic secret transforms happen. No near-miss
 mutation operators exist anywhere in the codebase. Fuzz targets apply
 coverage-guided byte mutation but without semantic awareness of token structure.
@@ -159,11 +159,11 @@ coverage-guided byte mutation but without semantic awareness of token structure.
 
 | Component         | Scanner Sim                                  | Git Sim                                               | Shared?                              |
 |-------------------|----------------------------------------------|-------------------------------------------------------|--------------------------------------|
-| Deterministic RNG | `sim/rng.rs:SimRng`                          | Same                                                  | **Yes** — already in `src/sim/`      |
+| Deterministic RNG | `sim/rng.rs:SimRng`                          | Same                                                  | **Yes** — already in `crates/scanner-scheduler/src/sim/`      |
 | Fault plan        | `sim/fault.rs:FaultPlan` (path-keyed)        | `sim_git_scan/fault.rs:GitFaultPlan` (resource-keyed) | **No** — domain-specific keying      |
 | Minimizer         | `sim/minimize.rs` (greedy shrink, 777 lines) | `sim_git_scan/minimize.rs` (graph-aware, 408 lines)   | **No** — different shrink strategies |
 | Trace ring        | `sim/trace.rs`                               | `sim_git_scan/trace.rs`                               | **No** — different event types       |
-| Executor          | `sim/executor.rs:SimExecutor`                | Same                                                  | **Yes** — already in `src/sim/`      |
+| Executor          | `sim/executor.rs:SimExecutor`                | Same                                                  | **Yes** — already in `crates/scanner-scheduler/src/sim/`      |
 | Artifact format   | `sim/artifact.rs:ReproArtifact`              | `sim_git_scan/artifact.rs:GitReproArtifact`           | **No** — different payload shapes    |
 
 Encoding/decoding is domain-independent (byte transforms on secrets). Infrastructure
@@ -241,27 +241,27 @@ fixtures are ever introduced:
 
 | Current Component       | Location                                    | Purpose                      | Action             | Target                          | Rationale                                              |
 |-------------------------|---------------------------------------------|------------------------------|--------------------|---------------------------------|--------------------------------------------------------|
-| `encode_secret()`       | `generator.rs:494-503`                      | Dispatch raw→representation  | **Migrate**        | `src/sim/mutation.rs`           | Domain-independent; reusable by git sim and real-rules |
-| `base64_encode_std()`   | `generator.rs:536-564`                      | Base64 standard encoding     | **Migrate**        | `src/sim/mutation.rs`           | Pure byte transform                                    |
-| `percent_encode_all()`  | `generator.rs:525-533`                      | URL percent encoding         | **Migrate**        | `src/sim/mutation.rs`           | Pure byte transform                                    |
-| `encode_utf16()`        | `generator.rs:575-589`                      | UTF-16 LE/BE widening        | **Migrate**        | `src/sim/mutation.rs`           | Pure byte transform                                    |
-| `encode_nested()`       | `generator.rs:508-522`                      | Alternating layer nesting    | **Migrate**        | `src/sim/mutation.rs`           | Pure byte transform                                    |
-| `hex_nibble()`          | `generator.rs:566-572`                      | Nibble→hex helper            | **Migrate**        | `src/sim/mutation.rs`           | Dependency of `percent_encode_all`                     |
-| `SecretRepr`            | `scenario.rs:96-104`                        | Encoding representation enum | **Migrate**        | `src/sim/mutation.rs`           | Domain-independent type                                |
-| `make_token()`          | `generator.rs:467-476`                      | Rule prefix + random tail    | **Keep**           | `src/sim_scanner/generator.rs`  | Scanner-specific format (SIM{id}_...)                  |
-| `generate_scenario()`   | `sim_scanner/generator.rs`                  | Full scanner scenario        | **Keep**           | `src/sim_scanner/generator.rs`  | Domain-specific orchestration                          |
-| `generate_scenario()`   | `sim_git_scan/generator.rs`                 | Full git scenario            | **Keep**           | `src/sim_git_scan/generator.rs` | Domain-specific orchestration                          |
-| `SimRng`                | `sim/rng.rs`                                | Deterministic RNG            | **No change**      | Already in `src/sim/`           | Already correct location                               |
-| `SimExecutor`           | `sim/executor.rs`                           | Deterministic scheduler      | **No change**      | Already in `src/sim/`           | Already correct location                               |
-| `FaultPlan`             | `sim/fault.rs`                              | Scanner fault injection      | **Keep**           | `src/sim/fault.rs`              | Path-keyed, scanner-specific                           |
-| `GitFaultPlan`          | `sim_git_scan/fault.rs`                     | Git fault injection          | **Keep**           | `src/sim_git_scan/fault.rs`     | Resource-keyed, git-specific                           |
-| Scanner minimizer       | `sim/minimize.rs` (777 lines)               | Greedy shrink passes         | **Keep**           | `src/sim/minimize.rs`           | Domain-specific shrink logic                           |
-| Git minimizer           | `sim_git_scan/minimize.rs` (408 lines)      | Graph-aware shrink           | **Keep**           | `src/sim_git_scan/minimize.rs`  | Graph-aware, git-specific                              |
+| `encode_secret()`       | `generator.rs:494-503`                      | Dispatch raw→representation  | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Domain-independent; reusable by git sim and real-rules |
+| `base64_encode_std()`   | `generator.rs:536-564`                      | Base64 standard encoding     | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Pure byte transform                                    |
+| `percent_encode_all()`  | `generator.rs:525-533`                      | URL percent encoding         | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Pure byte transform                                    |
+| `encode_utf16()`        | `generator.rs:575-589`                      | UTF-16 LE/BE widening        | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Pure byte transform                                    |
+| `encode_nested()`       | `generator.rs:508-522`                      | Alternating layer nesting    | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Pure byte transform                                    |
+| `hex_nibble()`          | `generator.rs:566-572`                      | Nibble→hex helper            | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Dependency of `percent_encode_all`                     |
+| `SecretRepr`            | `scenario.rs:96-104`                        | Encoding representation enum | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`           | Domain-independent type                                |
+| `make_token()`          | `generator.rs:467-476`                      | Rule prefix + random tail    | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs`  | Scanner-specific format (SIM{id}_...)                  |
+| `generate_scenario()`   | `sim_scanner/generator.rs`                  | Full scanner scenario        | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs`  | Domain-specific orchestration                          |
+| `generate_scenario()`   | `sim_git_scan/generator.rs`                 | Full git scenario            | **Keep**           | `crates/scanner-git/src/sim_git_scan/generator.rs` | Domain-specific orchestration                          |
+| `SimRng`                | `sim/rng.rs`                                | Deterministic RNG            | **No change**      | Already in `crates/scanner-scheduler/src/sim/`           | Already correct location                               |
+| `SimExecutor`           | `sim/executor.rs`                           | Deterministic scheduler      | **No change**      | Already in `crates/scanner-scheduler/src/sim/`           | Already correct location                               |
+| `FaultPlan`             | `sim/fault.rs`                              | Scanner fault injection      | **Keep**           | `crates/scanner-scheduler/src/sim/fault.rs`              | Path-keyed, scanner-specific                           |
+| `GitFaultPlan`          | `sim_git_scan/fault.rs`                     | Git fault injection          | **Keep**           | `crates/scanner-git/src/sim_git_scan/fault.rs`     | Resource-keyed, git-specific                           |
+| Scanner minimizer       | `sim/minimize.rs` (777 lines)               | Greedy shrink passes         | **Keep**           | `crates/scanner-scheduler/src/sim/minimize.rs`           | Domain-specific shrink logic                           |
+| Git minimizer           | `sim_git_scan/minimize.rs` (408 lines)      | Graph-aware shrink           | **Keep**           | `crates/scanner-git/src/sim_git_scan/minimize.rs`  | Graph-aware, git-specific                              |
 | Scanner corpus          | `tests/corpus/scanner/` (72 cases)          | Regression replay            | **Keep**           | Same                            | Canonical fast gate                                    |
 | Git corpus              | `tests/corpus/git_scan/` (12 cases)         | Regression replay            | **Keep**           | Same                            | Canonical fast gate                                    |
-| Near-miss operators     | **DO NOT EXIST**                            | —                            | **Create**         | `src/sim/mutation.rs`           | Core new capability                                    |
+| Near-miss operators     | **DO NOT EXIST**                            | —                            | **Create**         | `crates/scanner-scheduler/src/sim/mutation.rs`           | Core new capability                                    |
 | Property tests          | `tests/property/` (19 files)                | Math invariants              | **Keep**           | Same                            | Different abstraction layer                            |
-| Offline validator tests | `src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors | Add near-miss vectors in Phase 3                       |
+| Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors | Add near-miss vectors in Phase 3                       |
 | Integration tests       | `tests/integration/` (26 files)             | Handcrafted regression       | **Keep**           | Same                            | Clear, readable, stable                                |
 | Real-rules fixtures     | `tests/corpus/real_rules/`                  | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures       | Add near-miss fixtures in Phase 3                      |
 | Fuzz targets            | `fuzz/fuzz_targets/` (19 targets)           | Coverage-guided              | **Keep**           | Same                            | Complementary discovery mechanism                      |
@@ -300,7 +300,7 @@ thread-locals, no ambient configuration.
 algorithm and constants are frozen. Any change to the RNG breaks all
 corpus artifacts and requires a full re-minimization pass.
 
-Reference implementation (`src/sim/rng.rs:22-29`):
+Reference implementation (`crates/scanner-scheduler/src/sim/rng.rs:22-29`):
 ```rust
 pub fn next_u64(&mut self) -> u64 {
     let mut x = self.state;
@@ -384,7 +384,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ### Phase 1: Extract Shared Mutation Core (`scratch-gs8l.2`)
 
-- Create `src/sim/mutation.rs` with migrated encoding functions and the
+- Create `crates/scanner-scheduler/src/sim/mutation.rs` with migrated encoding functions and the
   `SecretRepr` enum.
 - Add near-miss mutation operators: `Truncate`, `CharsetDegrade`,
   `BoundaryShift`, `EntropyReduce`, `ChecksumCorrupt`, `PrefixMangle`.
@@ -480,7 +480,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 **Rollback**: Each phase is independently revertible.
 
-- Phase 1: revert `src/sim/mutation.rs` creation, restore inline functions in
+- Phase 1: revert `crates/scanner-scheduler/src/sim/mutation.rs` creation, restore inline functions in
   `generator.rs`. No corpus changes.
 - Phase 2: remove `near_miss_count` from config, remove new oracle check.
   Corpus additions are additive and can be deleted.
@@ -542,18 +542,18 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
 
 | File                                     | Relevance                                                            |
 |------------------------------------------|----------------------------------------------------------------------|
-| `src/sim_scanner/generator.rs`           | Encoding functions (lines 494–589), token generation (lines 467–476) |
-| `src/sim_scanner/scenario.rs`            | `SecretRepr` enum (lines 96–104), `ExpectedDisposition`              |
-| `src/sim_scanner/runner.rs`              | Scanner oracles (7), chunked scanning event loop                     |
-| `src/sim_git_scan/runner.rs`             | Git stage pipeline, output-shape validation                          |
-| `src/sim_git_scan/fault.rs`              | `GitFaultPlan`, `GitResourceId` (resource-keyed)                     |
-| `src/sim/rng.rs`                         | `SimRng` xorshift64* implementation                                  |
-| `src/sim/fault.rs`                       | `FaultPlan` (path-keyed)                                             |
-| `src/sim/minimize.rs`                    | Scanner minimizer (greedy shrink passes)                             |
-| `src/sim_git_scan/minimize.rs`           | Git minimizer (graph-aware shrink)                                   |
-| `src/sim/executor.rs`                    | `SimExecutor` deterministic scheduler                                |
-| `src/engine/offline_validate.rs`         | Structural token validators                                          |
-| `src/rules/yaml_unit_tests.rs`           | Rule parsing/scanning roundtrip                                      |
+| `crates/scanner-scheduler/src/sim_scanner/generator.rs`           | Encoding functions (lines 494–589), token generation (lines 467–476) |
+| `crates/scanner-scheduler/src/sim_scanner/scenario.rs`            | `SecretRepr` enum (lines 96–104), `ExpectedDisposition`              |
+| `crates/scanner-scheduler/src/sim_scanner/runner.rs`              | Scanner oracles (7), chunked scanning event loop                     |
+| `crates/scanner-git/src/sim_git_scan/runner.rs`             | Git stage pipeline, output-shape validation                          |
+| `crates/scanner-git/src/sim_git_scan/fault.rs`              | `GitFaultPlan`, `GitResourceId` (resource-keyed)                     |
+| `crates/scanner-scheduler/src/sim/rng.rs`                         | `SimRng` xorshift64* implementation                                  |
+| `crates/scanner-scheduler/src/sim/fault.rs`                       | `FaultPlan` (path-keyed)                                             |
+| `crates/scanner-scheduler/src/sim/minimize.rs`                    | Scanner minimizer (greedy shrink passes)                             |
+| `crates/scanner-git/src/sim_git_scan/minimize.rs`           | Git minimizer (graph-aware shrink)                                   |
+| `crates/scanner-scheduler/src/sim/executor.rs`                    | `SimExecutor` deterministic scheduler                                |
+| `crates/scanner-engine/src/engine/offline_validate.rs`         | Structural token validators                                          |
+| `crates/scanner-engine/src/rules/yaml_unit_tests.rs`           | Rule parsing/scanning roundtrip                                      |
 | `tests/simulation/scanner_real_rules.rs` | Real-rules golden baseline harness                                   |
 
 ### Documentation

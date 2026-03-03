@@ -111,7 +111,7 @@ flowchart TB
     end
 
     subgraph Output["Output"]
-        Sink["EventSink<br/>(JSONL events)"]
+        Sink["EventOutput<br/>(JSONL events)"]
     end
 
     Source --> Walk
@@ -981,7 +981,7 @@ pub fn scan_local_fs_uring<E: ScanEngine>(
     engine: Arc<E>,
     roots: &[PathBuf],
     cfg: LocalFsUringConfig,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 ) -> io::Result<(LocalFsSummary, UringIoStats, MetricsSnapshot)>;
 ```
 
@@ -1075,7 +1075,7 @@ struct UringArchiveSink<'a, E: ScanEngine> {
     engine: &'a E,
     scratch: &'a mut E::Scratch,
     pending: &'a mut Vec<Finding>,
-    event_sink: &'a dyn EventSink,
+    event_sink: &'a dyn EventOutput,
     display: Vec<u8>,               // Current entry display path
     container_file_id: FileId,      // ID of the archive file itself
     next_entry_index: u32,          // Monotonic index for deterministic entry IDs
@@ -1107,7 +1107,7 @@ fn io_worker_loop<E: ScanEngine>(
 fn archive_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ArchiveWork>,
     engine: Arc<E>,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
     file_ids: Arc<FileIdAllocator>,     // Allocator for per-entry FileIds
     cfg: ArchiveConfig,
 ) -> ArchiveWorkerStats;
@@ -1116,7 +1116,7 @@ fn archive_worker_loop<E: ScanEngine>(
 fn extract_worker_loop<E: ScanEngine>(
     rx: chan::Receiver<ExtractWork>,
     engine: Arc<E>,
-    event_sink: Arc<dyn EventSink>,
+    event_sink: Arc<dyn EventOutput>,
 ) -> ExtractWorkerStats;
 
 // Discovery DFS walk
@@ -1150,7 +1150,7 @@ fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScra
 // Emit findings as structured events
 fn emit_findings<E: ScanEngine, F: FindingRecord>(
     engine: &E,
-    event_sink: &dyn EventSink,
+    event_sink: &dyn EventOutput,
     display: &[u8],
     recs: &[F],
 );
@@ -1162,7 +1162,7 @@ fn emit_findings<E: ScanEngine, F: FindingRecord>(
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::unified::events::VecEventSink;
+use crate::events::VecEventOutput;
 
 // Setup
 let engine = Arc::new(MockEngine::default());
@@ -1184,7 +1184,7 @@ let cfg = LocalFsUringConfig {
     seed: 1,
     dedupe_within_chunk: true,
 };
-let sink = Arc::new(VecEventSink::new());
+let sink = Arc::new(VecEventOutput::new());
 
 // Validate
 cfg.validate(&engine);
