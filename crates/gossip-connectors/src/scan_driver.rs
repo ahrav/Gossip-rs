@@ -104,6 +104,10 @@ pub struct InMemoryScanSourceFactory {
 }
 
 impl InMemoryScanSourceFactory {
+    /// Create a new factory for the given dataset.
+    ///
+    /// Items are sorted by key so the driver produces deterministic scan order
+    /// regardless of the caller's insertion order.
     #[must_use]
     pub fn new(dataset_id: impl Into<String>, mut items: Vec<MemItem>) -> Self {
         items.sort_by(|left, right| left.key.cmp(&right.key));
@@ -148,6 +152,11 @@ impl ScanSourceFactory for InMemoryScanSourceFactory {
     }
 }
 
+/// Filesystem scan driver backed by [`parallel_scan_dir`].
+///
+/// Spawns scoped threads for event and commit forwarding so the scheduler's
+/// channel-based sinks are bridged to the [`EventOutput`] / [`CommitSink`]
+/// interfaces expected by the coordination layer.
 #[derive(Debug)]
 struct FsScanDriver {
     root: PathBuf,
@@ -213,6 +222,10 @@ impl ScanDriver for FsScanDriver {
     }
 }
 
+/// Git scan driver backed by [`run_git_scan`].
+///
+/// Resolves refs via the `git` CLI ([`CliRefResolver`]) and treats every ref
+/// as unseen ([`EmptyWatermarkStore`]), performing a full scan on each run.
 #[derive(Debug)]
 struct GitScanDriver {
     repo_root: PathBuf,
@@ -274,6 +287,11 @@ impl ScanDriver for GitScanDriver {
     }
 }
 
+/// In-memory scan driver for tests and harnesses.
+///
+/// Iterates pre-loaded items sequentially, driving the commit-sink lifecycle
+/// (begin/finish) and emitting checkpoint hints at configured intervals.
+/// Does not invoke the scanner engine.
 #[derive(Debug)]
 struct InMemoryScanDriver {
     items: Arc<[MemItem]>,
@@ -340,6 +358,8 @@ impl ScanDriver for InMemoryScanDriver {
     }
 }
 
+/// [`EventOutput`] adapter that serializes events into a channel as
+/// [`OwnedCoreEvent`] values for cross-thread forwarding.
 #[derive(Clone, Debug)]
 struct ChannelEventOutput {
     tx: Sender<OwnedCoreEvent>,
@@ -359,6 +379,8 @@ impl EventOutput for ChannelEventOutput {
     fn flush(&self) {}
 }
 
+/// Git-aware event output that forwards core events through a channel and
+/// silently discards git-specific events (commit metadata, ref updates).
 #[derive(Clone, Debug)]
 struct ChannelGitEventOutput {
     inner: ChannelEventOutput,
@@ -386,10 +408,13 @@ impl GitEventOutput for ChannelGitEventOutput {
     fn emit_git(&self, _event: GitEvent<'_>) {}
 }
 
+/// [`StoreProducer`] adapter that normalizes scheduler paths to the connector's
+/// relative key encoding and forwards batches through a channel.
 #[derive(Clone, Debug)]
 struct ChannelStoreProducer {
     tx: Sender<CommitMessage>,
-    /// Scan root for normalizing scheduler paths to connector keyspace.
+    /// Scan root used to strip the absolute prefix from scheduler paths,
+    /// yielding `/`-separated relative keys matching the connector keyspace.
     root: PathBuf,
 }
 
@@ -426,6 +451,8 @@ impl StoreProducer for ChannelStoreProducer {
     }
 }
 
+/// Messages forwarded from the scheduler's [`StoreProducer`] to the
+/// coordination layer's [`CommitSink`] via a crossbeam channel.
 #[derive(Debug)]
 enum CommitMessage {
     Batch(OwnedFsFindingBatch),
@@ -433,6 +460,8 @@ enum CommitMessage {
     EndRun(bool),
 }
 
+/// Drain owned events from `rx` and re-emit them into `out` as borrowed
+/// [`CoreEvent`] values, flushing when the channel closes.
 fn forward_events(out: &dyn EventOutput, rx: Receiver<OwnedCoreEvent>) {
     while let Ok(event) = rx.recv() {
         event.emit_into(out);
@@ -512,6 +541,8 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Map a scheduler [`OwnedFsFindingBatch`] to the [`CommitSink`] lifecycle:
+/// `begin_item` → `upsert_findings` (if any) → `finish_item`.
 fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> Result<()> {
     let item_key = ItemKey::try_from_slice(&batch.object_path)
         .map_err(|error| anyhow!("invalid item key from scheduler batch: {error}"))?;
@@ -536,6 +567,8 @@ fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> 
     Ok(())
 }
 
+/// Convert a git scanner result into the generic [`ScanReport`] used by
+/// the coordination layer.
 fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
     let metrics = result.0.common_metrics;
     ScanReport {
@@ -545,6 +578,11 @@ fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
     }
 }
 
+/// Owned mirror of [`CoreEvent`] for sending across thread boundaries.
+///
+/// `CoreEvent` borrows strings/slices from the scanner, so it cannot outlive
+/// the emitting thread. This enum clones the borrowed fields into owned
+/// storage so events can be forwarded through a channel to a consumer thread.
 #[derive(Debug)]
 enum OwnedCoreEvent {
     Finding {
@@ -677,10 +715,16 @@ impl OwnedCoreEvent {
     }
 }
 
+/// Join a scoped thread handle, converting panics into an `anyhow` error
+/// tagged with the thread's name for diagnostics.
 fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>, thread_name: &str) -> Result<T> {
     handle.join().map_err(|_| anyhow!("{thread_name} panicked"))
 }
 
+/// Resolves git refs by shelling out to `git for-each-ref`.
+///
+/// Requires `git` on `$PATH`. Returns all refs under `refs/heads`,
+/// `refs/remotes`, and `refs/tags` as `(refname, oid)` pairs.
 #[derive(Clone, Debug)]
 struct CliRefResolver {
     repo_root: PathBuf,
@@ -737,6 +781,8 @@ impl StartSetResolver for CliRefResolver {
     }
 }
 
+/// No-op watermark store that reports all refs as previously unseen,
+/// causing the git scanner to perform a full scan on every run.
 #[derive(Clone, Copy, Debug, Default)]
 struct EmptyWatermarkStore;
 
@@ -752,6 +798,11 @@ impl RefWatermarkStore for EmptyWatermarkStore {
     }
 }
 
+/// Decode a hex-encoded object ID into raw bytes.
+///
+/// Accepts both SHA-1 (40 hex chars → 20 bytes) and SHA-256 (64 hex chars →
+/// 32 bytes). Returns `InvalidData` for odd-length input or unrecognised
+/// lengths.
 fn decode_oid_hex(hex: &str) -> io::Result<OidBytes> {
     let trimmed = hex.trim();
     if !trimmed.len().is_multiple_of(2) {
