@@ -23,7 +23,7 @@ parity testing infrastructure.
 | `src/distributed.rs` | Distributed worker loop (`run_worker`), `DistributedCoordinator` trait, `ShardLease`, done-ledger gating, `InMemoryCoordinator` test harness |
 | `src/event_sink.rs` | Output format sinks: `JsonlEventSink`, `TextEventSink`, `JsonEventSink`, `SarifEventSink`; hand-rolled JSON encoding with broken-pipe tolerance |
 | `src/parity.rs` | JSONL parity testing: `canonicalize_jsonl_events` parses scanner output into `CanonicalFinding` tuples with commit-meta joining, path normalization, and sorted deterministic comparison |
-| `Cargo.toml` | Dependencies: `gossip-contracts`, `gossip-scan-driver`, `gossip-connectors`, `scanner-engine`, `scanner-scheduler`, `scanner-git`, `regex`, `serde_json` |
+| `Cargo.toml` | Dependencies: `anyhow`, `gossip-contracts`, `gossip-scan-driver`, `gossip-connectors`, `scanner-engine`, `scanner-scheduler`, `scanner-git`, `regex`, `serde_json` |
 
 ---
 
