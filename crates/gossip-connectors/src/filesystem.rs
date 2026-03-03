@@ -1231,6 +1231,17 @@ fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
 /// Compares `(dev, ino)` from `fstat(root_fd)` against `stat(root_path)`.
 /// Returns an error if they mismatch, indicating the root directory was
 /// replaced between `open_dir_fd` and the walk (rename, bind mount, etc.).
+///
+/// # Error classification
+///
+/// The returned `io::Error` uses `ErrorKind::Other`, which
+/// `is_permanent_io_error` does **not** recognize as permanent. This is
+/// intentional: a directory swap is a transient environmental condition
+/// (race with an external rename/mount), not a permanent attribute of the
+/// path itself.  Retryable classification keeps `index_state` as
+/// `NotIndexed`, allowing the caller to re-canonicalize and re-open on
+/// the next attempt — at which point the fd and path will agree (or the
+/// path will have vanished, producing a different permanent error).
 fn verify_root_identity(root_fd: &OwnedFd, root_path: &Path) -> Result<(), io::Error> {
     let (fd_dev, fd_ino) = fd_dev_ino(root_fd)?;
     let path_meta = fs::metadata(root_path)?;
