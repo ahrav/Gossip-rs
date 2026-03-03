@@ -55,6 +55,7 @@
 use std::{
     fs,
     io::{self, Read, Seek, SeekFrom},
+    os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     process::Command,
     time::{Instant, UNIX_EPOCH},
@@ -63,7 +64,8 @@ use std::{
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
+        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, ToxicDigest,
+        VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
@@ -274,10 +276,8 @@ impl GitConnector {
             }
         }
         if !self.repo.is_dir() {
-            let msg = format!(
-                "repository path must be a directory: {}",
-                self.repo.display()
-            );
+            let digest = ToxicDigest::of_bytes(self.repo.as_os_str().as_bytes());
+            let msg = format!("repository path must be a directory: ({digest})");
             self.index_state = IndexState::Failed(msg.clone());
             return Err(EnumerateError::permanent(msg));
         }
@@ -666,9 +666,9 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<Vec<u8>>, EnumerateError> {
         .map_err(|error| classify_io_enumerate_error("git ls-files", repo, &error))?;
 
     if !output.status.success() {
+        let digest = ToxicDigest::of_bytes(repo.as_os_str().as_bytes());
         return Err(EnumerateError::permanent(format!(
-            "git ls-files failed in '{}' (status={:?}): {}",
-            repo.display(),
+            "git ls-files failed in ({digest}) (status={:?}): {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         )));

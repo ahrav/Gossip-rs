@@ -93,10 +93,11 @@
 //!
 //! # Budget enforcement
 //!
-//! - **Deadline**: The walk checks the deadline once per directory during
-//!   indexing. If the deadline expires mid-walk, a retryable error is returned
-//!   and the incomplete index is discarded. Post-indexing operations
-//!   (enumeration, split) also check the deadline before proceeding.
+//! - **Deadline**: The walk checks the deadline once per directory and every
+//!   512 entries within a directory during indexing. If the deadline expires
+//!   mid-walk, a retryable error is returned and the incomplete index is
+//!   discarded. Post-indexing operations (enumeration, split) also check the
+//!   deadline before proceeding.
 //! - **`max_items`**: Honored as a hard cap on page size during enumeration.
 //!   `Budgets` stores `max_items` as `NonZeroUsize` so zero-item pages from
 //!   budget capping are unrepresentable.
@@ -156,7 +157,8 @@ use std::{
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
+        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, ToxicDigest,
+        VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
@@ -184,10 +186,13 @@ pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fs
 /// errors, symlinks, encoding failures, or other non-fatal conditions.
 /// Warning storage is capped; see
 /// [`FilesystemConnector::overflow_warning_count`].
+///
+/// The path is stored as a [`ToxicDigest`] rather than a raw [`PathBuf`]
+/// so that filesystem paths never leak into log-visible diagnostics.
 #[derive(Debug)]
 pub struct WalkWarning {
-    /// Path of the entry that triggered the warning.
-    pub path: PathBuf,
+    /// Redacted digest of the path that triggered the warning.
+    pub path_digest: ToxicDigest,
     /// Human-readable description of why the entry was skipped.
     pub message: String,
 }
@@ -195,14 +200,14 @@ pub struct WalkWarning {
 impl WalkWarning {
     fn io(path: &Path, op: &str, err: &io::Error) -> Self {
         Self {
-            path: path.to_path_buf(),
+            path_digest: ToxicDigest::of_bytes(path.as_os_str().as_bytes()),
             message: format!("{op} failed: {err}"),
         }
     }
 
     fn skipped(path: &Path, reason: &str) -> Self {
         Self {
-            path: path.to_path_buf(),
+            path_digest: ToxicDigest::of_bytes(path.as_os_str().as_bytes()),
             message: reason.to_owned(),
         }
     }
@@ -359,6 +364,17 @@ impl FilesystemConnector {
         // Open root as a directory fd for openat-based reads.
         let root_fd = open_dir_fd(&self.root).map_err(|err| {
             let e = classify_io_enumerate_error("open_root_dir", &self.root, &err);
+            if !e.is_retryable() {
+                self.index_state = IndexState::Failed(e.message().to_owned());
+            }
+            e
+        })?;
+
+        // Verify the opened fd still refers to the same directory we
+        // canonicalized. A mismatch indicates the root was replaced
+        // (rename + symlink, bind-mount swap, etc.) between steps.
+        verify_root_identity(&root_fd, &self.root).map_err(|err| {
+            let e = classify_io_enumerate_error("verify_root_identity", &self.root, &err);
             if !e.is_retryable() {
                 self.index_state = IndexState::Failed(e.message().to_owned());
             }
@@ -693,9 +709,8 @@ impl FilesystemConnector {
             // is wrapped in `OwnedFd` for close-on-drop.
             let raw = unsafe { libc::openat(parent_raw, c_ptr, flags) };
             if raw < 0 {
-                let comp = String::from_utf8_lossy(component);
                 return Err(classify_io_read_error(
-                    &format!("openat component {}/{n} '{comp}'", i + 1),
+                    &format!("openat component {}/{n}", i + 1),
                     None,
                     &io::Error::last_os_error(),
                 ));
@@ -867,6 +882,13 @@ fn walk_dir_collect_files(
         }
     }
 
+    /// Entries between intra-directory deadline checks during the walk.
+    ///
+    /// Balances responsiveness against `Instant::now()` syscall overhead.
+    /// A directory with millions of entries will check the deadline every
+    /// 512 entries rather than only at the start of the directory.
+    const DEADLINE_CHECK_INTERVAL: usize = 512;
+
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
     while let Some((dir, depth)) = stack.pop() {
@@ -894,7 +916,19 @@ fn walk_dir_collect_files(
             }
         };
 
+        let mut entries_since_check: usize = 0;
         for entry_result in reader {
+            // Intra-directory deadline check every DEADLINE_CHECK_INTERVAL
+            // entries to bound latency in directories with millions of entries.
+            entries_since_check += 1;
+            if entries_since_check >= DEADLINE_CHECK_INTERVAL {
+                entries_since_check = 0;
+                if let Some(dl) = deadline
+                    && Instant::now() >= dl
+                {
+                    return Err(EnumerateError::retryable("indexing deadline expired"));
+                }
+            }
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(err) => {
@@ -1054,8 +1088,8 @@ fn encode_rel_path(rel: &Path) -> Result<Vec<u8>, EnumerateError> {
             std::path::Component::Normal(segment) => segment,
             _ => {
                 return Err(EnumerateError::permanent(format!(
-                    "path contains non-normal component: {}",
-                    rel.display()
+                    "path contains non-normal component ({})",
+                    ToxicDigest::of_bytes(rel.as_os_str().as_bytes())
                 )));
             }
         };
@@ -1171,6 +1205,42 @@ fn clear_nonblock(file: &fs::File) -> Result<(), ReadError> {
 /// and appends the terminator.
 fn path_to_cstring(path: &Path) -> Result<CString, std::ffi::NulError> {
     CString::new(path.as_os_str().as_bytes())
+}
+
+/// Extract `(dev, ino)` from an open file descriptor via `fstat`.
+///
+/// Used to verify that a directory fd matches the expected path identity,
+/// closing the TOCTOU window between `open_dir_fd` and the walk.
+fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` on a valid fd, writing into an uninitialized stat buffer.
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fstat` succeeded, so the buffer is initialized.
+    let stat = unsafe { stat.assume_init() };
+    // Use `as u64` to be portable across platforms where st_dev/st_ino
+    // may be narrower types, while allowing clippy to elide no-op casts.
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stat.st_dev as u64, stat.st_ino as u64))
+}
+
+/// Verify that the opened root fd still refers to the same directory as
+/// the canonicalized path.
+///
+/// Compares `(dev, ino)` from `fstat(root_fd)` against `stat(root_path)`.
+/// Returns an error if they mismatch, indicating the root directory was
+/// replaced between `open_dir_fd` and the walk (rename, bind mount, etc.).
+fn verify_root_identity(root_fd: &OwnedFd, root_path: &Path) -> Result<(), io::Error> {
+    let (fd_dev, fd_ino) = fd_dev_ino(root_fd)?;
+    let path_meta = fs::metadata(root_path)?;
+    let (path_dev, path_ino) = (path_meta.dev(), path_meta.ino());
+    if fd_dev != path_dev || fd_ino != path_ino {
+        return Err(io::Error::other(
+            "root directory changed between open and walk (dev/ino mismatch); retry with a fresh connector",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

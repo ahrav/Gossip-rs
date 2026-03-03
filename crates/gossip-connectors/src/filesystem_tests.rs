@@ -2,8 +2,8 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
-use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
+use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
+use gossip_contracts::connector::{TokenBytes, MAX_ITEM_KEY_SIZE};
 use rstest::rstest;
 
 use super::*;
@@ -2427,4 +2427,129 @@ fn expired_deadline_after_successful_indexing_returns_retryable() {
         result.unwrap_err().is_retryable(),
         "deadline expiry should be a retryable error"
     );
+}
+
+// ---------------------------------------------------------------
+// Telemetry safety tests (Phase VI)
+// ---------------------------------------------------------------
+
+#[test]
+fn error_messages_do_not_leak_filenames() {
+    // Create a file with a "canary" secret in the filename.
+    let canary = "CANARY_SECRET_abc123";
+    let dir = create_test_dir(&[(&format!("{canary}.txt"), b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index successfully, then delete the file to provoke a read error.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    fs::remove_file(dir.path().join(format!("{canary}.txt"))).unwrap();
+
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("deleted file should fail"),
+    };
+    assert!(
+        !err.message().contains(canary),
+        "error message must not contain the raw filename canary; got: {}",
+        err.message(),
+    );
+}
+
+#[test]
+fn walk_warnings_do_not_leak_paths() {
+    let canary = "SECRET_TOKEN_xyz789";
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    std::os::unix::fs::symlink("target", dir.path().join(canary)).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+
+    // WalkWarning should store a ToxicDigest, not a raw PathBuf.
+    for w in c.walk_warnings() {
+        let debug_str = format!("{w:?}");
+        assert!(
+            !debug_str.contains(canary),
+            "walk warning Debug output must not contain the raw path canary; got: {debug_str}",
+        );
+    }
+}
+
+#[test]
+fn enumerate_error_for_nonexistent_root_does_not_leak_path() {
+    let canary = "CANARY_ROOT_PATH_secret42";
+    let nonexistent = format!("/tmp/{canary}/does/not/exist");
+    let mut c = FilesystemConnector::new(&nonexistent);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let err = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .expect_err("nonexistent root should fail");
+    assert!(
+        !err.message().contains(canary),
+        "enumerate error must not contain the raw root path canary; got: {}",
+        err.message(),
+    );
+}
+
+// ---------------------------------------------------------------
+// Intra-directory deadline granularity test
+// ---------------------------------------------------------------
+
+#[test]
+fn deadline_expires_within_single_large_directory() {
+    // Create a directory with enough files that the intra-directory
+    // deadline check (every 512 entries) should trigger.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    for i in 0..1024 {
+        fs::write(dir.path().join(format!("f{i:04}.txt")), b"x").unwrap();
+    }
+
+    // Use a deadline that's already expired -- the intra-directory check
+    // should catch it within 512 entries rather than only after the
+    // directory's ReadDir iterator is fully consumed.
+    let expired =
+        Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
+    assert!(
+        result.is_err(),
+        "expired deadline should abort within a large directory"
+    );
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline error should be retryable"
+    );
+}
+
+// ---------------------------------------------------------------
+// Root identity verification test
+// ---------------------------------------------------------------
+
+#[test]
+fn root_fd_identity_check_passes_for_stable_directory() {
+    // Verify that fd_dev_ino + verify_root_identity succeed for a
+    // normal temporary directory (no races, no swaps).
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Indexing triggers canonicalize + open_dir_fd + verify_root_identity.
+    // If verify_root_identity fails, enumerate would return an error.
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .expect("indexing should succeed on a stable directory");
+    assert_eq!(page.items().len(), 1);
 }

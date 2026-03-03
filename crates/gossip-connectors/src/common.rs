@@ -14,7 +14,7 @@ use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, MAX_ITEM_KEY_SIZE,
-        PooledByteSlab, ReadError, TokenBytes,
+        PooledByteSlab, ReadError, TokenBytes, ToxicDigest,
     },
     identity::{ConnectorTag, ItemIdentityKey, StableItemId},
 };
@@ -643,32 +643,51 @@ pub(crate) fn is_symlink_loop(_err: &io::Error) -> bool {
 
 /// Map an I/O error to an [`EnumerateError`], classifying permanence.
 ///
-/// Includes the failing path in the error message for diagnostics.
+/// The path is redacted through [`ToxicDigest`] so that raw filesystem
+/// paths never appear in error messages that could reach logs or traces.
 pub(crate) fn classify_io_enumerate_error(
     op: &str,
     path: &Path,
     err: &io::Error,
 ) -> EnumerateError {
+    let digest = path_digest(path);
     if is_permanent_io_error(err) {
-        EnumerateError::permanent(format!("{op} failed for {}: {err}", path.display()))
+        EnumerateError::permanent(format!("{op} failed for ({digest}): {err}"))
     } else {
-        EnumerateError::retryable(format!("{op} failed for {}: {err}", path.display()))
+        EnumerateError::retryable(format!("{op} failed for ({digest}): {err}"))
     }
 }
 
 /// Map an I/O error to a [`ReadError`], classifying permanence.
 ///
-/// When `path` is `Some`, the path is included in the message for
-/// diagnostics; when `None`, only the operation and error are reported.
+/// When `path` is `Some`, a [`ToxicDigest`] of the path is included in
+/// the message for log-safe diagnostics; when `None`, only the operation
+/// and error are reported.
 pub(crate) fn classify_io_read_error(op: &str, path: Option<&Path>, err: &io::Error) -> ReadError {
     let msg = match path {
-        Some(p) => format!("{op} failed for {}: {err}", p.display()),
+        Some(p) => format!("{op} failed for ({digest}): {err}", digest = path_digest(p)),
         None => format!("{op} failed: {err}"),
     };
     if is_permanent_io_error(err) {
         ReadError::permanent(msg)
     } else {
         ReadError::retryable(msg)
+    }
+}
+
+/// Compute a [`ToxicDigest`] of raw path bytes for log-safe diagnostics.
+///
+/// On Unix, this digests the raw `OsStr` bytes (which may be non-UTF-8).
+/// On non-Unix platforms, this uses the lossy UTF-8 representation.
+fn path_digest(path: &Path) -> ToxicDigest {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        ToxicDigest::of_bytes(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        ToxicDigest::of_bytes(path.to_string_lossy().as_bytes())
     }
 }
 
