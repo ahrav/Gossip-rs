@@ -6,8 +6,8 @@ and executed by the scheduler in `crates/scanner-scheduler/src/scheduler/`. It d
 
 ```mermaid
 flowchart LR
-    Path["Path / root"] --> Orch["parallel_scan_dir()"]
-    Orch --> PScan["parallel_scan_dir()"]
+    Path["Path / root"] --> Orch["parallel_scan_dir()<br/>(entry + setup)"]
+    Orch --> PScan["scan_local()<br/>(discovery + dispatch)"]
 
     PScan --> Walker["IterWalker::next_file()"]
     Walker --> Budget["CountBudget<br/>(max_in_flight_objects)"]
@@ -32,7 +32,7 @@ flowchart LR
 
 ### Orchestration (`crates/scanner-scheduler/src/scheduler/parallel_scan.rs`)
 - Entry point: `parallel_scan_dir(...)`
-- Builds engine and event sink, then calls `parallel_scan_dir(...)`
+- Validates root, builds `IterWalker`, then calls `scan_local(...)`
 - Emits final `CoreEvent::Summary` and flushes the sink
 
 ### Discovery (`crates/scanner-scheduler/src/scheduler/parallel_scan.rs`)

@@ -12,7 +12,7 @@ Deterministic, versioned identity contracts for persistence across all
 scanner sources. These contracts let the scanner answer "have I seen this
 exact finding before?" across runs without storing raw secret bytes.
 
-**Source**: `crates/scanner-scheduler/src/store.rs`
+**Planned source**: `crates/scanner-scheduler/src/store.rs` *(not yet implemented)*
 
 ## Purpose
 
