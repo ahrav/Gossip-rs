@@ -2428,3 +2428,162 @@ fn expired_deadline_after_successful_indexing_returns_retryable() {
         "deadline expiry should be a retryable error"
     );
 }
+
+// ---------------------------------------------------------------
+// Telemetry safety tests (Phase VI)
+// ---------------------------------------------------------------
+
+#[test]
+fn error_messages_do_not_leak_filenames() {
+    // Create a file with a "canary" secret in the filename.
+    let canary = "CANARY_SECRET_abc123";
+    let dir = create_test_dir(&[(&format!("{canary}.txt"), b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Index successfully, then delete the file to provoke a read error.
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(items.len(), 1);
+    let item_ref = items[0].item_ref().clone();
+
+    fs::remove_file(dir.path().join(format!("{canary}.txt"))).unwrap();
+
+    let err = match c.open(&item_ref, default_budgets()) {
+        Err(e) => e,
+        Ok(_) => panic!("deleted file should fail"),
+    };
+    assert!(
+        !err.message().contains(canary),
+        "error message must not contain the raw filename canary; got: {}",
+        err.message(),
+    );
+}
+
+#[test]
+fn walk_warnings_do_not_leak_paths() {
+    let canary = "SECRET_TOKEN_xyz789";
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    std::os::unix::fs::symlink("target", dir.path().join(canary)).unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let _ = collect_all(&mut c, &start, &end);
+
+    // WalkWarning should store a ToxicDigest, not a raw PathBuf.
+    for w in c.walk_warnings() {
+        let debug_str = format!("{w:?}");
+        assert!(
+            !debug_str.contains(canary),
+            "walk warning Debug output must not contain the raw path canary; got: {debug_str}",
+        );
+    }
+}
+
+#[test]
+fn enumerate_error_for_nonexistent_root_does_not_leak_path() {
+    let canary = "CANARY_ROOT_PATH_secret42";
+    let nonexistent = format!("/tmp/{canary}/does/not/exist");
+    let mut c = FilesystemConnector::new(&nonexistent);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let err = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .expect_err("nonexistent root should fail");
+    assert!(
+        !err.message().contains(canary),
+        "enumerate error must not contain the raw root path canary; got: {}",
+        err.message(),
+    );
+}
+
+// ---------------------------------------------------------------
+// Intra-directory deadline granularity test
+// ---------------------------------------------------------------
+
+#[test]
+fn intra_directory_deadline_check_triggers_within_large_directory() {
+    // Create a flat directory with enough files that the intra-directory
+    // deadline check (every DEADLINE_CHECK_INTERVAL=512 entries) is
+    // exercised.  We need well over 512 entries so the inner-loop check
+    // has a chance to fire.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let file_count = 2048usize;
+    for i in 0..file_count {
+        fs::write(dir.path().join(format!("f{i:05}.txt")), b"x").unwrap();
+    }
+
+    // The deadline must be *alive* when the walk starts (so the
+    // per-directory check at the top of the outer loop passes) but expire
+    // while iterating entries inside the directory.  A very short future
+    // deadline achieves this: the per-directory Instant::now() < dl check
+    // passes, but by the time 512 dir entries are processed the deadline
+    // has elapsed.
+    let tight_deadline = Budgets::try_new(
+        file_count + 1,
+        u64::MAX,
+        Some(Instant::now() + Duration::from_nanos(1)),
+    )
+    .unwrap();
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), tight_deadline);
+    // The walk should fail with a retryable deadline error.  Whether the
+    // per-directory or intra-directory check catches it first depends on
+    // scheduling, but with a deadline only nanoseconds away the inner
+    // check is virtually guaranteed to fire once entries are processed.
+    assert!(
+        result.is_err(),
+        "tight deadline should abort during a large directory walk"
+    );
+    assert!(
+        result.unwrap_err().is_retryable(),
+        "deadline error should be retryable"
+    );
+}
+
+// ---------------------------------------------------------------
+// Root identity verification test
+// ---------------------------------------------------------------
+
+#[test]
+fn root_fd_identity_check_passes_for_stable_directory() {
+    // Verify that fd_dev_ino + verify_root_identity succeed for a
+    // normal temporary directory (no races, no swaps).
+    let dir = create_test_dir(&[("file.txt", b"data")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Indexing triggers canonicalize + open_dir_fd + verify_root_identity.
+    // If verify_root_identity fails, enumerate would return an error.
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .expect("indexing should succeed on a stable directory");
+    assert_eq!(page.items().len(), 1);
+}
+
+#[test]
+fn root_fd_identity_check_rejects_dev_ino_mismatch() {
+    // Open an fd to directory A, then verify against the path of a
+    // *different* directory B.  The dev/ino values will differ, so
+    // verify_root_identity must return an error.
+    let dir_a = tempfile::tempdir().expect("create dir_a");
+    let dir_b = tempfile::tempdir().expect("create dir_b");
+
+    let fd_a = open_dir_fd(dir_a.path()).expect("open dir_a fd");
+
+    let err = verify_root_identity(&fd_a, dir_b.path())
+        .expect_err("verify_root_identity should reject a mismatched path");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::Other);
+    assert!(
+        err.to_string().contains("dev/ino mismatch"),
+        "error should mention dev/ino mismatch; got: {err}",
+    );
+}

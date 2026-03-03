@@ -274,10 +274,8 @@ impl GitConnector {
             }
         }
         if !self.repo.is_dir() {
-            let msg = format!(
-                "repository path must be a directory: {}",
-                self.repo.display()
-            );
+            let digest = common::path_digest(&self.repo);
+            let msg = format!("repository path must be a directory: ({digest})");
             self.index_state = IndexState::Failed(msg.clone());
             return Err(EnumerateError::permanent(msg));
         }
@@ -666,9 +664,9 @@ fn list_git_tracked_paths(repo: &Path) -> Result<Vec<Vec<u8>>, EnumerateError> {
         .map_err(|error| classify_io_enumerate_error("git ls-files", repo, &error))?;
 
     if !output.status.success() {
+        let digest = common::path_digest(repo);
         return Err(EnumerateError::permanent(format!(
-            "git ls-files failed in '{}' (status={:?}): {}",
-            repo.display(),
+            "git ls-files failed in ({digest}) (status={:?}): {}",
             output.status.code(),
             String::from_utf8_lossy(&output.stderr).trim()
         )));
