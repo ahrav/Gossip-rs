@@ -85,3 +85,7 @@ pub use engine::{
 pub use engine::{Engine, NormHash, ScanScratch};
 #[cfg(feature = "tiger-harness")]
 pub use engine::{fuzz_classify_window, fuzz_offline_validate};
+pub use rules::{
+    RulesError, builtin_rules, builtin_rules_hash64, default_rules_path, load_rules_from_content,
+    read_rules_text, rules_content_hash64,
+};

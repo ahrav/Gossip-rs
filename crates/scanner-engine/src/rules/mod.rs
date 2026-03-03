@@ -59,7 +59,7 @@ pub(crate) fn build_regex(pattern: &str) -> Result<Regex, String> {
 
 /// Errors that can occur when loading rules from an external file.
 #[derive(Debug)]
-pub(crate) enum RulesError {
+pub enum RulesError {
     /// I/O error reading the rules file.
     Io(std::io::Error),
     /// YAML parsing error.
@@ -119,7 +119,7 @@ impl std::error::Error for RulesError {
 ///
 /// This is separated from parsing so callers can compute provenance metadata
 /// (for example, content hashes) and then parse exactly the same bytes.
-pub(crate) fn read_rules_text(path: &Path) -> Result<String, RulesError> {
+pub fn read_rules_text(path: &Path) -> Result<String, RulesError> {
     let content = std::fs::read_to_string(path).map_err(RulesError::Io)?;
     Ok(content)
 }
@@ -138,7 +138,7 @@ pub(crate) fn load_rules(path: &Path) -> Result<Vec<RuleSpec>, RulesError> {
 ///
 /// This is used by callers that need to hash/log the exact bytes first, then
 /// parse and validate those same bytes without re-reading from disk.
-pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
+pub fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, RulesError> {
     let rules = yaml::parse_yaml_rules(content)?;
     if rules.is_empty() {
         return Err(RulesError::NoRules);
@@ -186,7 +186,7 @@ pub(crate) fn load_rules_from_content(content: &str) -> Result<Vec<RuleSpec>, Ru
 /// directory is intentionally excluded because this tool scans untrusted
 /// repositories — loading a `default_rules.yaml` planted inside a repo
 /// would let an attacker suppress detections or crash the scanner.
-pub(crate) fn default_rules_path() -> Option<PathBuf> {
+pub fn default_rules_path() -> Option<PathBuf> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -214,7 +214,7 @@ const RULE_CONTENT_HASHER: ahash::RandomState = ahash::RandomState::with_seeds(
 ///
 /// This is a non-cryptographic hash intended for provenance logs.
 #[inline]
-pub(crate) fn rules_content_hash64(bytes: &[u8]) -> u64 {
+pub fn rules_content_hash64(bytes: &[u8]) -> u64 {
     RULE_CONTENT_HASHER.hash_one(bytes)
 }
 
@@ -222,7 +222,7 @@ pub(crate) fn rules_content_hash64(bytes: &[u8]) -> u64 {
 ///
 /// Suitable for startup provenance logs when using the compile-time fallback.
 #[inline]
-pub(crate) fn builtin_rules_hash64() -> u64 {
+pub fn builtin_rules_hash64() -> u64 {
     rules_content_hash64(BUILTIN_RULES_YAML.as_bytes())
 }
 
@@ -234,7 +234,7 @@ pub(crate) fn builtin_rules_hash64() -> u64 {
 ///
 /// Panics if embedded YAML is invalid or empty, because that indicates a
 /// build-time packaging/programming error, not runtime user input.
-pub(crate) fn builtin_rules() -> Vec<RuleSpec> {
+pub fn builtin_rules() -> Vec<RuleSpec> {
     static BUILTIN: OnceLock<Vec<RuleSpec>> = OnceLock::new();
     BUILTIN
         .get_or_init(|| {

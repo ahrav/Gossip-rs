@@ -17,7 +17,7 @@ use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink, IdentityChainRecord,
     StoredCoreEvent, StoredGitEvent,
 };
-use crate::{ScanBudgets, ScanRuntimeError, execute_assignment};
+use crate::{RuntimeEngineConfig, ScanBudgets, ScanRuntimeError, execute_assignment_with_config};
 
 /// Lease payload consumed by the distributed runtime.
 #[derive(Clone, Debug)]
@@ -132,9 +132,21 @@ pub fn run_worker(
         );
         let cancel = CancellationToken::new();
 
-        let outcome =
-            execute_assignment(&lease.assignment, config.budgets, &sink, &commit, &cancel)
-                .map_err(DistributedRuntimeError::Runtime)?;
+        // Build execution config with commit-sink persistence enabled so
+        // findings flow through the DurableCommitSink for identity derivation.
+        let mut runtime = config.budgets.to_execution_config()?;
+        runtime.filesystem.emit_findings_to_commit_sink = true;
+
+        let outcome = execute_assignment_with_config(
+            &lease.assignment,
+            runtime,
+            &RuntimeEngineConfig::default(),
+            &sink,
+            Some(&sink),
+            &commit,
+            &cancel,
+        )
+        .map_err(DistributedRuntimeError::Runtime)?;
 
         coordinator
             .complete_shard(&lease, outcome.checkpoint_hint, outcome.report)

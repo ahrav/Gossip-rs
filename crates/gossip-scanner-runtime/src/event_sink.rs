@@ -11,6 +11,7 @@
 
 use std::io::{self, BufWriter, ErrorKind, Write};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
@@ -58,6 +59,245 @@ impl<W: Write + Send> GitEventOutput for JsonlEventSink<W> {
     fn emit_git(&self, event: GitEvent<'_>) {
         self.write_line(|line| encode_git_event(event, line));
     }
+}
+
+/// Human-readable text event sink.
+pub struct TextEventSink<W: Write + Send> {
+    writer: Mutex<BufWriter<W>>,
+    verbose: bool,
+}
+
+impl<W: Write + Send> TextEventSink<W> {
+    /// Create a text sink over `writer`.
+    #[must_use]
+    pub fn new(writer: W, verbose: bool) -> Self {
+        Self {
+            writer: Mutex::new(BufWriter::new(writer)),
+            verbose,
+        }
+    }
+}
+
+impl<W: Write + Send> EventOutput for TextEventSink<W> {
+    fn emit_core(&self, event: CoreEvent<'_>) {
+        let mut line = Vec::with_capacity(256);
+        match event {
+            CoreEvent::Finding(finding) => {
+                if self.verbose {
+                    line.extend_from_slice(b"--- finding ---\n");
+                    line.extend_from_slice(b"  rule:   ");
+                    line.extend_from_slice(finding.rule_name.as_bytes());
+                    line.push(b'\n');
+                    line.extend_from_slice(b"  path:   ");
+                    line.extend_from_slice(sanitize_path(finding.object_path).as_bytes());
+                    line.push(b'\n');
+                    line.extend_from_slice(b"  range:  ");
+                    write_u64(&mut line, finding.start);
+                    line.push(b'-');
+                    write_u64(&mut line, finding.end);
+                    line.push(b'\n');
+                    line.extend_from_slice(b"  source: ");
+                    line.extend_from_slice(finding.source.as_str().as_bytes());
+                    line.push(b'\n');
+                } else {
+                    line.extend_from_slice(sanitize_path(finding.object_path).as_bytes());
+                    line.push(b':');
+                    write_u64(&mut line, finding.start);
+                    line.push(b'-');
+                    write_u64(&mut line, finding.end);
+                    line.extend_from_slice(b"  ");
+                    line.extend_from_slice(finding.rule_name.as_bytes());
+                    line.extend_from_slice(b"  (");
+                    line.extend_from_slice(finding.source.as_str().as_bytes());
+                    line.extend_from_slice(b")\n");
+                }
+            }
+            CoreEvent::Progress(progress) => {
+                if self.verbose {
+                    line.extend_from_slice(b"[progress] ");
+                    line.extend_from_slice(progress.source.as_str().as_bytes());
+                    line.extend_from_slice(b" | ");
+                    line.extend_from_slice(progress.stage.as_bytes());
+                    line.extend_from_slice(b" | objects=");
+                    write_u64(&mut line, progress.objects_scanned);
+                    line.extend_from_slice(b" bytes=");
+                    write_u64(&mut line, progress.bytes_scanned);
+                    line.extend_from_slice(b" findings=");
+                    write_u64(&mut line, progress.findings_emitted);
+                    line.push(b'\n');
+                }
+            }
+            CoreEvent::Summary(summary) => {
+                line.extend_from_slice(b"[summary] ");
+                line.extend_from_slice(summary.source.as_str().as_bytes());
+                line.extend_from_slice(b" | ");
+                line.extend_from_slice(summary.status.as_bytes());
+                line.extend_from_slice(b" | elapsed=");
+                write_u64(&mut line, summary.elapsed_ms);
+                line.extend_from_slice(b"ms bytes=");
+                write_u64(&mut line, summary.bytes_scanned);
+                line.extend_from_slice(b" findings=");
+                write_u64(&mut line, summary.findings_emitted);
+                line.extend_from_slice(b" errors=");
+                write_u64(&mut line, summary.errors);
+                line.extend_from_slice(b" throughput=");
+                write_f64(&mut line, summary.throughput_mib_s);
+                line.extend_from_slice(b" MiB/s\n");
+            }
+            CoreEvent::Diagnostic(diagnostic) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[{}] {}",
+                    diagnostic.level,
+                    diagnostic.message
+                );
+            }
+        }
+        if line.is_empty() {
+            return;
+        }
+        let Ok(mut guard) = self.writer.lock() else {
+            return;
+        };
+        let _ = handle_io(guard.write_all(&line));
+    }
+
+    fn flush(&self) {
+        let Ok(mut guard) = self.writer.lock() else {
+            return;
+        };
+        let _ = handle_io(guard.flush());
+    }
+}
+
+impl<W: Write + Send> GitEventOutput for TextEventSink<W> {
+    fn emit_git(&self, _event: GitEvent<'_>) {}
+}
+
+/// Streaming JSON array sink.
+pub struct JsonEventSink<W: Write + Send> {
+    writer: Mutex<BufWriter<W>>,
+    first: AtomicBool,
+    closed: AtomicBool,
+}
+
+impl<W: Write + Send> JsonEventSink<W> {
+    /// Create a JSON sink over `writer`.
+    #[must_use]
+    pub fn new(mut writer: W) -> Self {
+        let _ = writer.write_all(b"[");
+        Self {
+            writer: Mutex::new(BufWriter::new(writer)),
+            first: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn write_element(&self, encode: impl FnOnce(&mut Vec<u8>)) {
+        let mut element = Vec::with_capacity(256);
+        encode(&mut element);
+
+        let Ok(mut guard) = self.writer.lock() else {
+            return;
+        };
+        let sep: &[u8] = if self.first.swap(false, Ordering::Relaxed) {
+            b"\n"
+        } else {
+            b",\n"
+        };
+        if handle_io(guard.write_all(sep)).is_err() {
+            return;
+        }
+        let _ = handle_io(guard.write_all(&element));
+    }
+}
+
+impl<W: Write + Send> EventOutput for JsonEventSink<W> {
+    fn emit_core(&self, event: CoreEvent<'_>) {
+        self.write_element(|line| encode_core_event(event, line));
+    }
+
+    fn flush(&self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut guard) = self.writer.lock() else {
+            return;
+        };
+        if handle_io(guard.write_all(b"\n]\n")).is_err() {
+            return;
+        }
+        let _ = handle_io(guard.flush());
+    }
+}
+
+impl<W: Write + Send> GitEventOutput for JsonEventSink<W> {
+    fn emit_git(&self, event: GitEvent<'_>) {
+        self.write_element(|line| encode_git_event(event, line));
+    }
+}
+
+/// SARIF 2.1.0 sink.
+pub struct SarifEventSink<W: Write + Send> {
+    writer: Mutex<BufWriter<W>>,
+    first: AtomicBool,
+    closed: AtomicBool,
+}
+
+impl<W: Write + Send> SarifEventSink<W> {
+    /// Create a SARIF sink over `writer`.
+    #[must_use]
+    pub fn new(mut writer: W) -> Self {
+        let version = env!("CARGO_PKG_VERSION");
+        let _ = write!(
+            writer,
+            "{{\"version\":\"2.1.0\",\"$schema\":\"https://schemastore.azurewebsites.net/schemas/json/sarif-2.1.0.json\",\
+             \"runs\":[{{\"tool\":{{\"driver\":{{\"name\":\"scanner-rs\",\
+             \"version\":\"{version}\"}}}},\"results\":["
+        );
+        Self {
+            writer: Mutex::new(BufWriter::new(writer)),
+            first: AtomicBool::new(true),
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<W: Write + Send> EventOutput for SarifEventSink<W> {
+    fn emit_core(&self, event: CoreEvent<'_>) {
+        let finding = match event {
+            CoreEvent::Finding(finding) => finding,
+            _ => return,
+        };
+
+        let mut result = Vec::with_capacity(256);
+        encode_sarif_result(&finding, &mut result);
+
+        let Ok(mut guard) = self.writer.lock() else {
+            return;
+        };
+        if !self.first.swap(false, Ordering::Relaxed) && handle_io(guard.write_all(b",")).is_err() {
+            return;
+        }
+        let _ = handle_io(guard.write_all(&result));
+    }
+
+    fn flush(&self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut guard) = self.writer.lock() else {
+            return;
+        };
+        if handle_io(guard.write_all(b"]}]}\n")).is_err() {
+            return;
+        }
+        let _ = handle_io(guard.flush());
+    }
+}
+
+impl<W: Write + Send> GitEventOutput for SarifEventSink<W> {
+    fn emit_git(&self, _event: GitEvent<'_>) {}
 }
 
 fn handle_io(result: io::Result<()>) -> io::Result<()> {
@@ -225,6 +465,42 @@ fn encode_git_event(event: GitEvent<'_>, line: &mut Vec<u8>) {
     }
 }
 
+fn encode_sarif_result(finding: &scanner_scheduler::events::FindingEvent<'_>, line: &mut Vec<u8>) {
+    line.extend_from_slice(b"{\"ruleId\":");
+    write_json_str(line, finding.rule_name);
+    line.extend_from_slice(b",\"message\":{\"text\":");
+    let message = format!("Secret matched rule {}", finding.rule_name);
+    write_json_str(line, &message);
+    line.extend_from_slice(
+        b"},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":",
+    );
+    write_json_bytes(line, finding.object_path);
+    line.extend_from_slice(b"},\"region\":{\"byteOffset\":");
+    write_u64(line, finding.start);
+    line.extend_from_slice(b",\"byteLength\":");
+    write_u64(line, finding.end.saturating_sub(finding.start));
+    line.extend_from_slice(b"}}}],\"rank\":");
+    let rank = ((finding.confidence_score.max(0) as f64) / 10.0) * 100.0;
+    write_f64(line, rank.min(100.0));
+    line.push(b'}');
+}
+
+fn sanitize_path(path: &[u8]) -> String {
+    let text = String::from_utf8_lossy(path);
+    if !text.chars().any(char::is_control) {
+        return text.into_owned();
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            escaped.push_str(&format!("\\u{{{:04x}}}", ch as u32));
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 fn push_key(line: &mut Vec<u8>, key: &[u8]) {
     line.push(b'"');
     line.extend_from_slice(key);
@@ -357,5 +633,149 @@ mod tests {
             .expect("vec writer");
         let line = String::from_utf8(output).expect("valid utf8 output");
         assert_eq!(line, load_event_golden("finding_git.jsonl"));
+    }
+
+    #[test]
+    fn text_sink_writes_compact_finding_lines() {
+        let sink = TextEventSink::new(Vec::<u8>::new(), false);
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 5,
+            end: 12,
+            rule_id: 1,
+            rule_name: "rule",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 0,
+        }));
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let text = String::from_utf8(output).expect("valid utf8 output");
+        assert_eq!(text, "src/main.rs:5-12  rule  (fs)\n");
+    }
+
+    #[test]
+    fn json_sink_emits_valid_json_array() {
+        let sink = JsonEventSink::new(Vec::<u8>::new());
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 1,
+            end: 2,
+            rule_id: 1,
+            rule_name: "rule",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 3,
+        }));
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("valid JSON array payload");
+        assert!(value.as_array().is_some());
+    }
+
+    #[test]
+    fn json_sink_double_flush_produces_valid_json() {
+        let sink = JsonEventSink::new(Vec::<u8>::new());
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 1,
+            end: 2,
+            rule_id: 1,
+            rule_name: "rule",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 3,
+        }));
+        // Simulate the double-flush that occurs in production:
+        // forward_events() flushes when the channel closes, then cli::run()
+        // calls sink.flush() again.
+        sink.flush();
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("double flush must still produce valid JSON");
+        assert!(value.as_array().is_some());
+    }
+
+    #[test]
+    fn sarif_sink_emits_valid_document() {
+        let sink = SarifEventSink::new(Vec::<u8>::new());
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 10,
+            end: 20,
+            rule_id: 2,
+            rule_name: "aws-access-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 7,
+        }));
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("valid SARIF JSON payload");
+        assert_eq!(value["version"], "2.1.0");
+        assert_eq!(
+            value["runs"][0]["results"][0]["ruleId"],
+            serde_json::Value::String("aws-access-key".to_owned())
+        );
+    }
+
+    #[test]
+    fn sarif_sink_double_flush_produces_valid_document() {
+        let sink = SarifEventSink::new(Vec::<u8>::new());
+        sink.emit_core(CoreEvent::Finding(FindingEvent {
+            source: SourceKind::Fs,
+            object_path: b"src/main.rs",
+            start: 10,
+            end: 20,
+            rule_id: 2,
+            rule_name: "aws-access-key",
+            commit_id: None,
+            change_kind: None,
+            confidence_score: 7,
+        }));
+        // Simulate double-flush from forward_events + cli::run.
+        sink.flush();
+        sink.flush();
+
+        let output = sink
+            .writer
+            .into_inner()
+            .expect("lock not poisoned")
+            .into_inner()
+            .expect("vec writer");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output).expect("double flush must still produce valid SARIF");
+        assert_eq!(value["version"], "2.1.0");
     }
 }

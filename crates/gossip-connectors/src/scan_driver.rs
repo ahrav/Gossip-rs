@@ -13,13 +13,13 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use gossip_contracts::connector::ItemKey;
 use gossip_scan_driver::{
     Assignment, AssignmentSource, CommitSink, ConnectorKind, CursorUpdate, FindingRecord,
-    FindingsBatch, ItemMeta, ScanDriver, ScanExecutionConfig, ScanReport, ScanSourceFactory,
-    SourceCapabilities,
+    FindingsBatch, GitDebugLevel, ItemMeta, ScanDriver, ScanExecutionConfig, ScanReport,
+    ScanSourceFactory, SourceCapabilities,
 };
 use scanner_git::{
-    EventSink as GitEventSink, GitEvent, GitEventOutput, GitRepoPaths, GitScanConfig,
-    GitScanResult, NeverSeenStore, OidBytes, RefWatermarkStore, RepoOpenError, StartSetId,
-    StartSetResolver, run_git_scan,
+    CommitIdentityIds, CommitMetaEvent, EventSink as GitEventSink, GitEvent, GitEventOutput,
+    GitRepoPaths, GitScanConfig, GitScanResult, IdentityDictionaryEvent, NeverSeenStore, OidBytes,
+    RefWatermarkStore, RepoOpenError, StartSetId, StartSetResolver, run_git_scan,
 };
 use scanner_scheduler::events::{
     CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, ProgressEvent, SummaryEvent,
@@ -85,6 +85,7 @@ impl ScanSourceFactory for GitScanSourceFactory {
 
         Ok(Box::new(GitScanDriver {
             repo_root: repo_root.clone(),
+            debug_output: None,
         }))
     }
 
@@ -169,25 +170,32 @@ impl ScanDriver for FsScanDriver {
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
         out: &dyn EventOutput,
+        _git_out: Option<&dyn GitEventOutput>,
         commit: &dyn CommitSink,
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
             let (event_tx, event_rx) = unbounded();
-            let event_forwarder = scope.spawn(move || forward_events(out, event_rx));
+            let event_forwarder = scope.spawn(move || forward_events(out, None, event_rx));
 
             let (commit_tx, commit_rx) = unbounded();
             let commit_forwarder = scope.spawn(move || forward_commits(commit, commit_rx));
 
-            let scan_cfg = ParallelScanConfig {
+            let mut scan_cfg = ParallelScanConfig {
                 workers: cfg.workers.max(1),
                 event_sink: Arc::new(ChannelEventOutput::new(event_tx.clone())),
-                store_producer: Some(Arc::new(ChannelStoreProducer::new(
-                    commit_tx.clone(),
-                    self.root.clone(),
-                ))),
+                skip_binary: cfg.filesystem.skip_binary,
                 ..ParallelScanConfig::default()
             };
+            if cfg.filesystem.skip_archives {
+                scan_cfg.archive.enabled = false;
+            }
+            if cfg.filesystem.emit_findings_to_commit_sink {
+                scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::new(
+                    commit_tx.clone(),
+                    self.root.clone(),
+                )));
+            }
 
             let report = if cancel.is_cancelled() {
                 scanner_scheduler::scheduler::local_fs_owner::LocalReport::default()
@@ -229,6 +237,7 @@ impl ScanDriver for FsScanDriver {
 #[derive(Debug)]
 struct GitScanDriver {
     repo_root: PathBuf,
+    debug_output: Option<String>,
 }
 
 impl ScanDriver for GitScanDriver {
@@ -245,24 +254,23 @@ impl ScanDriver for GitScanDriver {
         engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
         out: &dyn EventOutput,
+        git_out: Option<&dyn GitEventOutput>,
         _commit: &dyn CommitSink,
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
+        self.debug_output = None;
         if cancel.is_cancelled() {
             return Ok(ScanReport::default());
         }
 
         std::thread::scope(|scope| -> Result<ScanReport> {
             let (event_tx, event_rx) = unbounded();
-            let event_forwarder = scope.spawn(move || forward_events(out, event_rx));
+            let event_forwarder = scope.spawn(move || forward_events(out, git_out, event_rx));
 
             let git_sink: Arc<dyn GitEventSink> =
                 Arc::new(ChannelGitEventOutput::new(event_tx.clone()));
 
-            let git_cfg = GitScanConfig {
-                pack_exec_workers: cfg.workers.max(1),
-                ..GitScanConfig::default()
-            };
+            let git_cfg = build_git_scan_config(cfg)?;
 
             let resolver = CliRefResolver::new(self.repo_root.clone());
             let watermarks = EmptyWatermarkStore;
@@ -279,11 +287,16 @@ impl ScanDriver for GitScanDriver {
             )
             .with_context(|| format!("git scan failed for {}", self.repo_root.display()))?;
 
+            self.debug_output = format_git_debug_output(&result.0, cfg.git.debug_level);
             drop(event_tx);
             join_scoped(event_forwarder, "event forwarder thread")?;
 
             Ok(git_report_to_scan_report(result))
         })
+    }
+
+    fn debug_output(&self) -> Option<String> {
+        self.debug_output.clone()
     }
 }
 
@@ -311,6 +324,7 @@ impl ScanDriver for InMemoryScanDriver {
         _engine: Arc<scanner_engine::Engine>,
         cfg: &ScanExecutionConfig,
         out: &dyn EventOutput,
+        _git_out: Option<&dyn GitEventOutput>,
         commit: &dyn CommitSink,
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
@@ -359,35 +373,37 @@ impl ScanDriver for InMemoryScanDriver {
 }
 
 /// [`EventOutput`] adapter that serializes events into a channel as
-/// [`OwnedCoreEvent`] values for cross-thread forwarding.
+/// owned event values for cross-thread forwarding.
 #[derive(Clone, Debug)]
 struct ChannelEventOutput {
-    tx: Sender<OwnedCoreEvent>,
+    tx: Sender<OwnedDriverEvent>,
 }
 
 impl ChannelEventOutput {
-    fn new(tx: Sender<OwnedCoreEvent>) -> Self {
+    fn new(tx: Sender<OwnedDriverEvent>) -> Self {
         Self { tx }
     }
 }
 
 impl EventOutput for ChannelEventOutput {
     fn emit_core(&self, event: CoreEvent<'_>) {
-        let _ = self.tx.send(OwnedCoreEvent::from_core(event));
+        let _ = self
+            .tx
+            .send(OwnedDriverEvent::Core(OwnedCoreEvent::from_core(event)));
     }
 
     fn flush(&self) {}
 }
 
-/// Git-aware event output that forwards core events through a channel and
-/// silently discards git-specific events (commit metadata, ref updates).
+/// Git-aware event output that forwards both core and git events through
+/// a channel for cross-thread emission into runtime sinks.
 #[derive(Clone, Debug)]
 struct ChannelGitEventOutput {
     inner: ChannelEventOutput,
 }
 
 impl ChannelGitEventOutput {
-    fn new(tx: Sender<OwnedCoreEvent>) -> Self {
+    fn new(tx: Sender<OwnedDriverEvent>) -> Self {
         Self {
             inner: ChannelEventOutput::new(tx),
         }
@@ -405,7 +421,12 @@ impl EventOutput for ChannelGitEventOutput {
 }
 
 impl GitEventOutput for ChannelGitEventOutput {
-    fn emit_git(&self, _event: GitEvent<'_>) {}
+    fn emit_git(&self, event: GitEvent<'_>) {
+        let _ = self
+            .inner
+            .tx
+            .send(OwnedDriverEvent::Git(OwnedGitEvent::from_git(event)));
+    }
 }
 
 /// [`StoreProducer`] adapter that normalizes scheduler paths to the connector's
@@ -461,12 +482,26 @@ enum CommitMessage {
 }
 
 /// Drain owned events from `rx` and re-emit them into `out` as borrowed
-/// [`CoreEvent`] values, flushing when the channel closes.
-fn forward_events(out: &dyn EventOutput, rx: Receiver<OwnedCoreEvent>) {
+/// event values, flushing when the channel closes.
+fn forward_events(
+    out: &dyn EventOutput,
+    git_out: Option<&dyn GitEventOutput>,
+    rx: Receiver<OwnedDriverEvent>,
+) {
     while let Ok(event) = rx.recv() {
-        event.emit_into(out);
+        match event {
+            OwnedDriverEvent::Core(core) => core.emit_into(out),
+            OwnedDriverEvent::Git(git) => {
+                if let Some(sink) = git_out {
+                    git.emit_into(sink);
+                }
+            }
+        }
     }
     out.flush();
+    if let Some(sink) = git_out {
+        sink.flush();
+    }
 }
 
 /// Forward commit messages from the channel to the commit sink.
@@ -576,6 +611,164 @@ fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
         bytes_scanned: metrics.bytes_scanned,
         findings_emitted: metrics.findings_emitted,
     }
+}
+
+/// Owned mirror of driver events for channel forwarding.
+#[derive(Debug)]
+enum OwnedDriverEvent {
+    Core(OwnedCoreEvent),
+    Git(OwnedGitEvent),
+}
+
+/// Convert runtime-level execution knobs into the low-level git runner config.
+///
+/// Runtime options use MiB units for CLI ergonomics; this function performs
+/// checked MiB->byte conversion and applies sane worker fallbacks.
+fn build_git_scan_config(cfg: &ScanExecutionConfig) -> Result<GitScanConfig> {
+    const MIB: u32 = 1024 * 1024;
+
+    fn mebibytes_to_u32_bytes(value_mb: u32, label: &str) -> Result<u32> {
+        if value_mb == 0 {
+            bail!("{label} must be >= 1 MiB");
+        }
+        value_mb
+            .checked_mul(MIB)
+            .ok_or_else(|| anyhow!("{label} exceeds supported size"))
+    }
+
+    fn mebibytes_to_usize_bytes(value_mb: u32, label: &str) -> Result<usize> {
+        usize::try_from(mebibytes_to_u32_bytes(value_mb, label)?)
+            .map_err(|_| anyhow!("{label} exceeds platform usize"))
+    }
+
+    let mut git_cfg = GitScanConfig {
+        repo_id: cfg.git.repo_id,
+        scan_mode: cfg.git.scan_mode,
+        merge_diff_mode: cfg.git.merge_diff_mode,
+        pack_exec_workers: cfg
+            .git
+            .pack_exec_workers
+            .unwrap_or_else(|| cfg.workers.max(1))
+            .max(1),
+        enrich_identities: cfg.git.enrich_identities,
+        ..GitScanConfig::default()
+    };
+    git_cfg.engine_adapter.scan_binary = cfg.git.scan_binary;
+
+    if let Some(value_mb) = cfg.git.tree_delta_cache_mb {
+        git_cfg.tree_diff.max_tree_delta_cache_bytes =
+            mebibytes_to_u32_bytes(value_mb, "x-tree-delta-cache-mb")?;
+    }
+    if let Some(value_mb) = cfg.git.engine_chunk_mb {
+        git_cfg.engine_adapter.chunk_bytes =
+            mebibytes_to_usize_bytes(value_mb, "x-engine-chunk-mb")?;
+    }
+
+    Ok(git_cfg)
+}
+
+/// Build stderr-oriented debug output for `--debug` / `--debug=perf`.
+fn format_git_debug_output(
+    report: &scanner_git::GitScanReport,
+    level: GitDebugLevel,
+) -> Option<String> {
+    if matches!(level, GitDebugLevel::Off) {
+        return None;
+    }
+
+    fn push_line<T: std::fmt::Display>(out: &mut String, key: &str, value: T) {
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&value.to_string());
+        out.push('\n');
+    }
+
+    let mut out = String::new();
+    push_line(
+        &mut out,
+        "git_debug.level",
+        match level {
+            GitDebugLevel::Off => "off",
+            GitDebugLevel::Stats => "stats",
+            GitDebugLevel::Perf => "perf",
+        },
+    );
+    push_line(
+        &mut out,
+        "git.objects_scanned",
+        report.common_metrics.objects_scanned,
+    );
+    push_line(
+        &mut out,
+        "git.bytes_scanned",
+        report.common_metrics.bytes_scanned,
+    );
+    push_line(
+        &mut out,
+        "git.findings_emitted",
+        report.common_metrics.findings_emitted,
+    );
+    push_line(
+        &mut out,
+        "stage.tree_diff.nanos",
+        report.stage_nanos.tree_diff,
+    );
+    push_line(
+        &mut out,
+        "stage.commit_plan.nanos",
+        report.stage_nanos.commit_plan,
+    );
+    push_line(
+        &mut out,
+        "stage.blob_intro.nanos",
+        report.stage_nanos.blob_intro,
+    );
+    push_line(&mut out, "stage.spill.nanos", report.stage_nanos.spill);
+    push_line(
+        &mut out,
+        "stage.pack_collect.nanos",
+        report.stage_nanos.pack_collect,
+    );
+    push_line(&mut out, "stage.mapping.nanos", report.stage_nanos.mapping);
+    push_line(
+        &mut out,
+        "stage.pack_plan.nanos",
+        report.stage_nanos.pack_plan,
+    );
+    push_line(
+        &mut out,
+        "stage.pack_exec.nanos",
+        report.stage_nanos.pack_exec,
+    );
+    push_line(
+        &mut out,
+        "stage.loose_scan.nanos",
+        report.stage_nanos.loose_scan,
+    );
+    push_line(&mut out, "stage.scan.nanos", report.stage_nanos.scan);
+
+    if matches!(level, GitDebugLevel::Perf) {
+        out.push_str(&report.format_metrics());
+        for (index, pack_report) in report.pack_exec_reports.iter().enumerate() {
+            push_line(
+                &mut out,
+                &format!("pack_exec.{index}.cache_lookup_nanos"),
+                pack_report.stats.cache_lookup_nanos,
+            );
+            push_line(
+                &mut out,
+                &format!("pack_exec.{index}.fallback_resolve_nanos"),
+                pack_report.stats.fallback_resolve_nanos,
+            );
+            push_line(
+                &mut out,
+                &format!("pack_exec.{index}.sink_emit_nanos"),
+                pack_report.stats.sink_emit_nanos,
+            );
+        }
+    }
+
+    Some(out)
 }
 
 /// Owned mirror of [`CoreEvent`] for sending across thread boundaries.
@@ -710,6 +903,60 @@ impl OwnedCoreEvent {
             })),
             Self::Diagnostic { level, message } => {
                 out.emit_core(CoreEvent::Diagnostic(DiagnosticEvent { level, message }))
+            }
+        }
+    }
+}
+
+/// Owned mirror of [`GitEvent`] for sending across thread boundaries.
+#[derive(Debug)]
+enum OwnedGitEvent {
+    CommitMeta {
+        commit_id: u32,
+        commit_oid: OidBytes,
+        timestamp: u64,
+        identity: Option<CommitIdentityIds>,
+    },
+    IdentityDictionary {
+        id: u32,
+        value: Vec<u8>,
+    },
+}
+
+impl OwnedGitEvent {
+    fn from_git(event: GitEvent<'_>) -> Self {
+        match event {
+            GitEvent::CommitMeta(meta) => Self::CommitMeta {
+                commit_id: meta.commit_id,
+                commit_oid: meta.commit_oid,
+                timestamp: meta.timestamp,
+                identity: meta.identity,
+            },
+            GitEvent::IdentityDictionary(entry) => Self::IdentityDictionary {
+                id: entry.id,
+                value: entry.value.to_vec(),
+            },
+        }
+    }
+
+    fn emit_into(&self, out: &dyn GitEventOutput) {
+        match self {
+            Self::CommitMeta {
+                commit_id,
+                commit_oid,
+                timestamp,
+                identity,
+            } => out.emit_git(GitEvent::CommitMeta(CommitMetaEvent {
+                commit_id: *commit_id,
+                commit_oid: *commit_oid,
+                timestamp: *timestamp,
+                identity: *identity,
+            })),
+            Self::IdentityDictionary { id, value } => {
+                out.emit_git(GitEvent::IdentityDictionary(IdentityDictionaryEvent {
+                    id: *id,
+                    value,
+                }))
             }
         }
     }
@@ -911,6 +1158,55 @@ mod tests {
             keys[0], b"src/main.rs",
             "batch key must be a relative path in connector keyspace"
         );
+    }
+
+    #[test]
+    fn build_git_scan_config_maps_runtime_git_knobs() {
+        let cfg = ScanExecutionConfig {
+            workers: 3,
+            git: gossip_scan_driver::GitExecutionConfig {
+                repo_id: 42,
+                scan_mode: scanner_git::GitScanMode::DiffHistory,
+                merge_diff_mode: scanner_git::MergeDiffMode::FirstParentOnly,
+                pack_exec_workers: Some(5),
+                scan_binary: true,
+                enrich_identities: true,
+                debug_level: GitDebugLevel::Perf,
+                tree_delta_cache_mb: Some(256),
+                engine_chunk_mb: Some(4),
+            },
+            ..ScanExecutionConfig::default()
+        };
+
+        let git_cfg = build_git_scan_config(&cfg).expect("build git config");
+        assert_eq!(git_cfg.repo_id, 42);
+        assert_eq!(git_cfg.scan_mode, scanner_git::GitScanMode::DiffHistory);
+        assert_eq!(
+            git_cfg.merge_diff_mode,
+            scanner_git::MergeDiffMode::FirstParentOnly
+        );
+        assert_eq!(git_cfg.pack_exec_workers, 5);
+        assert!(git_cfg.engine_adapter.scan_binary);
+        assert!(git_cfg.enrich_identities);
+        assert_eq!(
+            git_cfg.tree_diff.max_tree_delta_cache_bytes,
+            256 * 1024 * 1024
+        );
+        assert_eq!(git_cfg.engine_adapter.chunk_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn build_git_scan_config_uses_shared_worker_fallback() {
+        let cfg = ScanExecutionConfig {
+            workers: 7,
+            git: gossip_scan_driver::GitExecutionConfig {
+                pack_exec_workers: None,
+                ..gossip_scan_driver::GitExecutionConfig::default()
+            },
+            ..ScanExecutionConfig::default()
+        };
+        let git_cfg = build_git_scan_config(&cfg).expect("build git config");
+        assert_eq!(git_cfg.pack_exec_workers, 7);
     }
 
     #[test]
