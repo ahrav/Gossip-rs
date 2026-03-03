@@ -93,25 +93,21 @@ fuzz_target!(|data: &[u8]| {
             }
         }
 
-        // 3b. Expected = exact - 1: should get LimitExceeded if exact > 0 and
-        //     the stream actually produces `exact` bytes.
+        // 3b. Expected = exact - 1: the stream decompresses to `exact` bytes,
+        //     so inflate_stream must fail when given a shorter expected size.
         if exact > 0 {
             let mut under_out = Vec::new();
             let under_result = inflate_stream(zlib_data, exact - 1, |chunk| {
                 under_out.extend_from_slice(chunk);
                 Ok(())
             });
-            // Must not succeed -- the stream produces `exact` bytes but we only
-            // allowed `exact - 1`.
-            if under_result.is_ok() {
-                // This can only happen if the stream actually produced fewer
-                // bytes than `exact - 1`, which contradicts the inflate_limited
-                // result. That would be a bug.
-                assert!(
-                    under_out.len() < exact,
-                    "under-sized expected succeeded but produced same or more bytes"
-                );
-            }
+            assert!(
+                under_result.is_err(),
+                "inflate_stream(expected={}) succeeded, but inflate_limited produced {} bytes \
+                 — the two functions disagree",
+                exact - 1,
+                exact,
+            );
         }
 
         // 3c. Expected = exact + 1: the stream produces exactly `exact` bytes,
@@ -133,10 +129,11 @@ fuzz_target!(|data: &[u8]| {
 
     // --- 4. Callback error propagation ---
     //
-    // Use the third byte (data[2]) to derive an error threshold. The callback
-    // will return an error after accumulating more than `threshold` output bytes,
-    // exercising the early-abort path in inflate_stream.
-    let error_threshold = (data[2] as usize) % 256;
+    // Derive an error threshold from the third byte. Note: this is also the
+    // first byte of zlib_data, so the threshold is correlated with the zlib
+    // header. This is acceptable — the fuzzer still explores both code paths,
+    // just with non-uniform probability.
+    let error_threshold = data[2] as usize;
     let mut error_bytes = 0usize;
     let cb_result = inflate_stream(zlib_data, MAX_OUT, |chunk| {
         error_bytes = error_bytes.saturating_add(chunk.len());

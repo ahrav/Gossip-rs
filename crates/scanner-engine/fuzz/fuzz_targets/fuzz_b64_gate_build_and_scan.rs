@@ -121,7 +121,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let min_len = (data[0] & 0x0f) as usize;
-    let anchor_count = (data[1] % 5) as usize; // 0..4
+    let anchor_count = (data[1] % 5) as usize; // 0..=4
     let mut idx = 2usize;
 
     let mut anchors: Vec<Vec<u8>> = Vec::new();
@@ -129,7 +129,7 @@ fuzz_target!(|data: &[u8]| {
         if idx >= data.len() {
             break;
         }
-        let len = (data[idx] % 33) as usize; // 0..32
+        let len = (data[idx] % 33) as usize; // 0..=32
         idx += 1;
         if idx + len > data.len() {
             break;

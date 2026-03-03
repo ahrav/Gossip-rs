@@ -1567,4 +1567,31 @@ mod tests {
             "data_start should point to compressed delta bytes"
         );
     }
+
+    #[test]
+    fn inflate_stream_undersized_expected_always_errors() {
+        // Verifies: when inflate_limited produces `exact` bytes, calling
+        // inflate_stream with expected = exact - 1 must return an error.
+        let original = b"test data for under-size check";
+        let compressed = zlib_compress(original);
+
+        // Step 1: establish the true output length via inflate_limited.
+        let mut limited_out = Vec::new();
+        inflate_limited(&compressed, &mut limited_out, 1024).expect("inflate_limited");
+        let exact = limited_out.len();
+        assert!(exact > 0);
+
+        // Step 2: inflate_stream with exact - 1 must fail.
+        let mut under_out = Vec::new();
+        let result = inflate_stream(&compressed, exact - 1, |chunk| {
+            under_out.extend_from_slice(chunk);
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "inflate_stream(expected={}) should fail when data decompresses to {} bytes",
+            exact - 1,
+            exact,
+        );
+    }
 }

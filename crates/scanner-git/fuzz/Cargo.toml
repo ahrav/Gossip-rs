@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
 scanner-git = { path = ".." }
+tempfile = "3"
 
 [[bin]]
 name = "fuzz_pack_exec"

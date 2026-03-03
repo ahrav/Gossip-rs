@@ -299,7 +299,8 @@ fuzz_target!(|data: &[u8]| {
     let mut sink = NullSink;
     // Minimal byte arena (candidates all use ByteRef(0,0) -> empty path).
     let paths = ByteArena::with_capacity(1);
-    let spill_dir = std::env::temp_dir();
+    let spill_dir_handle = tempfile::tempdir().expect("failed to create spill tempdir");
+    let spill_dir = spill_dir_handle.path();
 
     let _ = execute_pack_plan(
         plan,
