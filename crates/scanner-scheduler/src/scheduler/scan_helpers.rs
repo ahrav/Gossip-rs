@@ -2,9 +2,9 @@
 //!
 //! These functions handle cross-rule finding deduplication, effective-drop
 //! accounting, and structured finding emission. They are factored out of
-//! [`local_fs_owner`](super::local_fs_owner) so that the connector pipeline,
-//! io_uring path, remote scanner, and archive processors can reuse them
-//! without coupling to the local-filesystem scheduler.
+//! [`local_fs_owner`](super::local_fs_owner) so that the io_uring path,
+//! remote scanner, and archive processors can reuse them without coupling
+//! to the local-filesystem scheduler.
 
 use super::engine_trait::{FindingRecord, FindingWithHashRecord, ScanEngine};
 use super::metrics::WorkerMetricsLocal;

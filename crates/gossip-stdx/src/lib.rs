@@ -130,4 +130,4 @@ pub use fixed_set::FixedSet128;
 ///   order; remaining elements are dropped when the iterator is dropped.
 pub use ring_buffer::{IntoIter, Iter, RingBuffer};
 pub use spsc::{OwnedSpscConsumer, OwnedSpscProducer, spsc_channel};
-pub use timing_wheel::{PushError, PushOutcome, TimingWheel};
+pub use timing_wheel::{Bitset2, PushError, PushOutcome, TimingWheel};

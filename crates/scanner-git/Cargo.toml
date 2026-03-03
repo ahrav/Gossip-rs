@@ -46,8 +46,54 @@ sim-harness = ["scanner-scheduler/sim-harness"]
 aegis-pure-rust = ["scanner-engine/aegis-pure-rust"]
 
 [dev-dependencies]
+criterion = "0.5"
 gossip-stdx = { workspace = true, features = ["stdx-proptest"] }
 proptest = "1.10"
 rstest = "0.25"
+scanner-engine = { workspace = true, features = ["test-support"] }
+scanner-scheduler.workspace = true
 sha1 = "0.10"
 tempfile = "3.10"
+
+[[bench]]
+name = "commit_graph_generation"
+harness = false
+
+[[bench]]
+name = "git_scan_parse"
+harness = false
+
+[[bench]]
+name = "git_scan_perf"
+harness = false
+
+[[bench]]
+name = "identity_enrichment"
+harness = false
+
+[[bench]]
+name = "midx_build_scaling"
+harness = false
+
+[[bench]]
+name = "object_store_iterative_delta"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "pack_inflate_perf"
+harness = false
+
+[[bench]]
+name = "path_policy"
+harness = false
+
+[[bench]]
+name = "runner_exec_locality"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "runner_exec_strategy"
+harness = false
+required-features = ["bench"]

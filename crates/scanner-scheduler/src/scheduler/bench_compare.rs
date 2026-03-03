@@ -358,11 +358,7 @@ impl BenchComparison {
 fn safe_pct_change(baseline: f64, current: f64, has_invalid: &mut bool) -> f64 {
     if !baseline.is_finite() || baseline == 0.0 {
         *has_invalid = true;
-        if current == 0.0 {
-            0.0
-        } else {
-            f64::INFINITY
-        }
+        if current == 0.0 { 0.0 } else { f64::INFINITY }
     } else {
         ((current - baseline) / baseline) * 100.0
     }

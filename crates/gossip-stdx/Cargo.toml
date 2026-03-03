@@ -39,3 +39,19 @@ harness = false
 [[bench]]
 name = "byte_slab"
 harness = false
+
+[[bench]]
+name = "bitset_fixedset"
+harness = false
+
+[[bench]]
+name = "fixed_set"
+harness = false
+
+[[bench]]
+name = "fixed_vec"
+harness = false
+
+[[bench]]
+name = "timing_wheel"
+harness = false
