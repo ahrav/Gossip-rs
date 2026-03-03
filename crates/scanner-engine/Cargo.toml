@@ -33,6 +33,7 @@ zip = { version = "0.6", default-features = false, features = ["deflate"] }
 
 [features]
 default = []
+kani = []
 stdx-proptest = []
 kgram-gate = []
 perf-stats = []
