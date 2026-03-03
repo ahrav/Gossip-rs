@@ -53,7 +53,9 @@ page-count queries return meaningful results. Use the `sqlite3` CLI:
 
 ```bash
 sqlite3 /tmp/scanner_review.db < <(cat <<'SQL'
--- Paste DDL from crates/scanner-scheduler/src/store.rs, then INSERT synthetic rows.
+-- Extract DDL from the persistence backend (not yet in-tree as raw SQL).
+-- Check crates/scanner-scheduler/src/store.rs for producer contracts and
+-- search for CREATE TABLE statements in the codebase, then INSERT synthetic rows.
 SQL
 )
 ```
@@ -142,7 +144,7 @@ SQL
 
 ### Phase 3 — Index Analysis
 
-For every query in `crates/scanner-scheduler/src/store.rs` and related modules`, run
+For every query in `crates/scanner-scheduler/src/store.rs` and related modules, run
 EXPLAIN QUERY PLAN and verify the planner uses the expected index.
 
 #### Process
@@ -374,6 +376,6 @@ Check for:
 
 ## Related Skills
 
-- `performance-analyzer` — Profile Rust code around DB operations
-- `test-strategy` — Choose between unit, property, and fuzz tests for DB layer
-- `security-reviewer` — Audit SQL injection risks in dynamic query construction
+- `/performance-analyzer` — Profile Rust code around DB operations
+- `/test-strategy` — Choose between unit, property, and fuzz tests for DB layer
+- `/security-reviewer` — Audit SQL injection risks in dynamic query construction

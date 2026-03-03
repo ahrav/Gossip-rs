@@ -3,10 +3,8 @@
 Write-side plumbing that carries post-dedupe findings from the scheduler's
 FS scan loops into a persistence backend.
 
-**Source**: `crates/scanner-scheduler/src/store/fs.rs`, `crates/scanner-scheduler/src/store/db/schema.rs`,
-`crates/scanner-scheduler/src/store/db/writer.rs`, `crates/scanner-scheduler/src/store/db/query.rs`,
-`crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`, `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`,
-`crates/scanner-scheduler/src/unified/orchestrator.rs`
+**Source**: `crates/scanner-scheduler/src/store.rs`,
+`crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`, `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 
 ## Purpose
 

@@ -204,7 +204,7 @@ Inherits all constraints from `FindingRecord` (`Clone`, `Send`, `'static`).
 
 #### `norm_hash(&self) -> &NormHash`
 
-**Purpose**: Returns the BLAKE3 digest of the normalized (whitespace-collapsed, case-folded) secret value.
+**Purpose**: Returns the BLAKE3 digest of the raw secret bytes extracted after gate validation.
 
 **Semantics**: Two findings with the same `norm_hash` matched the same logical secret, even if their byte spans differ due to surrounding context or transform chains.
 

@@ -1,6 +1,6 @@
 # Architecture Overview
 
-High-level C4-style component diagram showing the scanner-rs secret scanning engine architecture.
+High-level C4-style component diagram showing the gossip-rs secret scanning engine architecture.
 
 ```mermaid
 graph TB

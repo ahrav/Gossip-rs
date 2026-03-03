@@ -21,17 +21,17 @@ and maintains zero allocations during the hot path. Memory scales with worker co
 
 ### Memory Breakdown by Worker Count
 
-| Workers | Per-Worker | Buffer Pool | **Total** |
-| ------- | ---------- | ----------- | --------- |
-| 4       | 75.3 MiB   | 5.0 MiB     | ~80 MiB   |
-| 8       | 150.5 MiB  | 10.0 MiB    | ~161 MiB  |
-| 12      | 225.8 MiB  | 15.0 MiB    | ~241 MiB  |
-| 16      | 301.1 MiB  | 20.0 MiB    | ~321 MiB  |
+| Workers | Workers Total | Buffer Pool | **Total** |
+| ------- | ------------- | ----------- | --------- |
+| 4       | 75.3 MiB      | 5.0 MiB     | ~80 MiB   |
+| 8       | 150.5 MiB     | 10.0 MiB    | ~161 MiB  |
+| 12      | 225.8 MiB     | 15.0 MiB    | ~241 MiB  |
+| 16      | 301.1 MiB     | 20.0 MiB    | ~321 MiB  |
 
 These figures are from the diagnostic sizing model (`223` builtin rules,
 `max_anchor_hits_per_rule_variant = 2048`, and a `64 KiB` overlap estimate).
 
-### Per-Worker Allocation (~19.1 MiB each)
+### Per-Worker Allocation (~18.8 MiB each)
 
 | Component                           | Size      | % of Total |
 | ----------------------------------- | --------- | ---------- |
