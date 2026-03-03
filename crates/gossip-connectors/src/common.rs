@@ -679,7 +679,7 @@ pub(crate) fn classify_io_read_error(op: &str, path: Option<&Path>, err: &io::Er
 ///
 /// On Unix, this digests the raw `OsStr` bytes (which may be non-UTF-8).
 /// On non-Unix platforms, this uses the lossy UTF-8 representation.
-fn path_digest(path: &Path) -> ToxicDigest {
+pub(crate) fn path_digest(path: &Path) -> ToxicDigest {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
