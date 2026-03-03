@@ -12,6 +12,8 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | Coordination work   | [boundary-2-coordination.md](gossip-coordination/boundary-2-coordination.md) → [coordination-testing.md](gossip-coordination/coordination-testing.md)       |
 | Scheduler work      | [scheduler-engine-abstraction.md](scanner-scheduler/scheduler-engine-abstraction.md) → [scheduler-task-graph.md](scanner-scheduler/scheduler-task-graph.md) |
 | Runtime / CLI work  | [gossip-scanner-runtime.md](gossip-scanner-runtime.md) → [gossip-scan-driver.md](gossip-scan-driver.md)                                                     |
+| Worker binary       | [gossip-worker.md](gossip-worker.md)                                                                                                                         |
+| CLI binary          | [scanner-rs-cli.md](scanner-rs-cli.md)                                                                                                                       |
 | Shard algebra       | [shard-algebra.md](gossip-frontier/shard-algebra.md)                                                                                                        |
 | Data structures     | [gossip-stdx.md](gossip-stdx.md)                                                                                                                            |
 | Testing             | [simulation-harness.md](gossip-coordination/simulation-harness.md) → [counterexample-testing-unification.md](counterexample-testing-unification.md)         |
@@ -28,6 +30,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [pipeline-flow.md](pipeline-flow.md)                   | Pipeline execution flow          | Discovery, executor model, backpressure                |
 | [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Reverse pump order, stall detection                    |
 | [git-scanning.md](scanner-git/git-scanning.md)         | End-to-end Git scanning pipeline | Pipeline stages, persistence contract, ODB-blob mode   |
+| [git-pack-execution.md](scanner-git/git-pack-execution.md) | Git packfile internals       | Pack parsing, delta resolution, blob introduction, caching |
 
 ---
 
@@ -49,6 +52,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | ---------------------------------------------------------------------- | ------------------------------------------------------------ |
 | [coordination-testing.md](gossip-coordination/coordination-testing.md) | Four-tier coordination testing strategy                      |
 | [simulation-harness.md](gossip-coordination/simulation-harness.md)     | Deterministic simulation infrastructure (FoundationDB-style) |
+| [coordination-error-model.md](gossip-coordination/coordination-error-model.md) | Error hierarchy, validation pipeline, lease/fence semantics  |
 
 ---
 
@@ -72,6 +76,16 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [engine-stream-decode.md](scanner-engine/engine-stream-decode.md) | `crates/scanner-engine/src/engine/stream_decode.rs` | Streaming decode, ring buffer, timing wheel integration         |
 | [engine-decode-state.md](scanner-engine/engine-decode-state.md)   | `crates/scanner-engine/src/engine/decode_state.rs`  | Decode step arena, provenance tracking, parent-linked chains    |
 
+### Engine Internals & Policy
+
+| Document                                                                                | Module                                                    | Description                                                        |
+| --------------------------------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------------ |
+| [engine-api-types.md](scanner-engine/engine-api-types.md)                               | `crates/scanner-engine/src/api.rs`                        | Public API types: RuleSpec, FindingRec, Tuning, gates, transforms  |
+| [engine-offline-validation.md](scanner-engine/engine-offline-validation.md)             | `crates/scanner-engine/src/engine/offline_validate.rs`    | Offline structural validators: CRC32, AWS, GitHub PAT, JWT, Slack  |
+| [regex-to-anchor-extraction.md](scanner-engine/regex-to-anchor-extraction.md)           | `crates/scanner-engine/src/regex2anchor.rs`               | Regex AST → literal anchor extraction for Vectorscan prefiltering  |
+| [engine-internals.md](scanner-engine/engine-internals.md)                               | `crates/scanner-engine/src/engine/{scratch,hit_pool,...}` | ScanScratch layout, HitAccPool, VsDbCache, compiled rule repr      |
+| [content-policy-and-caching.md](scanner-engine/content-policy-and-caching.md)           | `crates/scanner-engine/src/{content_policy,b64_yara,...}` | Content type detection, YARA base64 gate, set-associative cache    |
+
 ---
 
 ## 4. Scheduler Subsystem
@@ -93,6 +107,8 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [scheduler-ts-buffer-pool.md](scanner-scheduler/scheduler-ts-buffer-pool.md)             | `crates/scanner-scheduler/src/scheduler/ts_buffer_pool.rs`       | Thread-safe buffer recycling, work-conserving stealing |
 | [scheduler-device-slots.md](scanner-scheduler/scheduler-device-slots.md)                 | `crates/scanner-scheduler/src/scheduler/device_slots.rs`         | Per-device I/O concurrency limits, backpressure        |
 | [scheduler-global-resource-pool.md](scanner-scheduler/scheduler-global-resource-pool.md) | `crates/scanner-scheduler/src/scheduler/global_resource_pool.rs` | Centralized permits, SLAs, memory management           |
+| [scheduler-executor.md](scanner-scheduler/scheduler-executor.md)                         | `crates/scanner-scheduler/src/scheduler/executor.rs`             | Work-stealing CPU executor, task lifecycle, shutdown    |
+| [archive-scanning.md](scanner-scheduler/archive-scanning.md)                             | `crates/scanner-scheduler/src/archive/`                          | Archive parsing (tar/gzip/bzip2/zip), budget enforcement |
 
 ---
 
@@ -125,6 +141,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [scanner_test_harness_guide.md](scanner-scheduler/scanner_test_harness_guide.md)     | Scanner simulation harness    | Corpus replay, random stress, deterministic oracles    |
 | [scheduler_test_harness_guide.md](scanner-scheduler/scheduler_test_harness_guide.md) | Scheduler simulation harness  | Work-stealing policy checks, deterministic replay      |
 | [git_simulation_harness_guide.md](scanner-git/git_simulation_harness_guide.md)       | Git simulation harness        | Stage model, fault injection, corpus replay            |
+| [simulation-framework.md](scanner-scheduler/simulation-framework.md)                 | Scanner simulation framework  | SimClock, fault injection, mutation testing, minimization |
 
 ### Evaluation & Accuracy
 
@@ -148,6 +165,8 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | -------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------- |
 | [gossip-scanner-runtime.md](gossip-scanner-runtime.md)         | `crates/gossip-scanner-runtime/` | Runtime orchestration: CLI, distributed mode, output sinks    |
 | [gossip-scan-driver.md](gossip-scan-driver.md)                 | `crates/gossip-scan-driver/`     | Scan driver abstraction: Assignment, ScanSourceFactory, ScanDriver |
+| [gossip-worker.md](gossip-worker.md)                           | `crates/gossip-worker/`          | Distributed worker binary: CLI, scan dispatch, tracing        |
+| [scanner-rs-cli.md](scanner-rs-cli.md)                         | `crates/scanner-rs-cli/`         | Standalone CLI binary: argument parsing, output formats       |
 | [shard-algebra.md](gossip-frontier/shard-algebra.md)           | `crates/gossip-frontier/`        | Shard algebra: key encoding, range arithmetic, hint framing   |
 | [gossip-stdx.md](gossip-stdx.md)                               | `crates/gossip-stdx/`            | Shared data structures: ByteSlab, InlineVec, RingBuffer, TimingWheel, etc. |
 
@@ -184,6 +203,16 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Debug memory issues                 | [memory-management.md](memory-management.md)                                                                                                                  |
 | Add transform support               | [engine-transforms.md](scanner-engine/engine-transforms.md) → [transform-chain.md](scanner-engine/transform-chain.md)                                         |
 | Understand window validation        | [engine-window-validation.md](scanner-engine/engine-window-validation.md)                                                                                     |
+| Understand offline validation       | [engine-offline-validation.md](scanner-engine/engine-offline-validation.md)                                                                                   |
+| Understand engine internals         | [engine-internals.md](scanner-engine/engine-internals.md)                                                                                                     |
+| Understand the API surface          | [engine-api-types.md](scanner-engine/engine-api-types.md)                                                                                                     |
+| Understand anchor extraction        | [regex-to-anchor-extraction.md](scanner-engine/regex-to-anchor-extraction.md)                                                                                 |
+| Understand content detection        | [content-policy-and-caching.md](scanner-engine/content-policy-and-caching.md)                                                                                 |
+| Understand the work-stealing executor | [scheduler-executor.md](scanner-scheduler/scheduler-executor.md)                                                                                            |
+| Understand archive scanning         | [archive-scanning.md](scanner-scheduler/archive-scanning.md)                                                                                                  |
+| Understand git pack internals       | [git-pack-execution.md](scanner-git/git-pack-execution.md)                                                                                                    |
+| Understand coordination errors      | [coordination-error-model.md](gossip-coordination/coordination-error-model.md)                                                                                |
+| Understand scanner simulation       | [simulation-framework.md](scanner-scheduler/simulation-framework.md)                                                                                          |
 | Understand FS persistence           | [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md)                                                                                    |
 | Understand persistence identity     | [persistence-identity.md](gossip-contracts/persistence-identity.md)                                                                                           |
 | Measure scanner accuracy            | [eval-harness.md](eval-harness.md)                                                                                                                            |
@@ -191,6 +220,8 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Understand Kani proofs              | [kani-verification.md](kani-verification.md)                                                                                                                  |
 | Understand the scan driver seam     | [gossip-scan-driver.md](gossip-scan-driver.md)                                                                                                                |
 | Work on scanner runtime / CLI       | [gossip-scanner-runtime.md](gossip-scanner-runtime.md)                                                                                                        |
+| Understand the worker binary        | [gossip-worker.md](gossip-worker.md)                                                                                                                          |
+| Understand the CLI binary           | [scanner-rs-cli.md](scanner-rs-cli.md)                                                                                                                        |
 | Understand shard key encoding       | [shard-algebra.md](gossip-frontier/shard-algebra.md)                                                                                                          |
 | Find the right data structure       | [gossip-stdx.md](gossip-stdx.md)                                                                                                                              |
 

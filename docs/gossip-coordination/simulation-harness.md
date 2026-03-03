@@ -78,7 +78,7 @@ platforms and prevent invalid probability construction.
 | S1    | MutualExclusion            | At most one worker holds a non-expired lease per shard.                                                         |
 | S2    | FenceMonotonicity          | `fence_epoch` never decreases for a given `(RunId, ShardId)`.                                                   |
 | S3    | TerminalIrreversibility    | Terminal states (Done, Split, Parked) never revert, except Parked->Active (unpark) which requires a fence bump. |
-| S4    | RecordInvariant            | `ShardRecord::validate_invariants()` returns `Ok`.                                                              |
+| S4    | RecordInvariant            | `SimIntrospection::validate_record_invariants()` returns `Ok` (delegates to `ShardRecord::validate_invariants()` with backend-owned storage context). |
 | S5    | CursorMonotonicity         | `cursor.last_key()` never decreases per shard.                                                                  |
 | S6    | CursorBounds               | Non-initial cursors remain within shard spec key range.                                                         |
 | S7    | SplitCoverage              | Split-parent's spawned children exist and reference the correct parent.                                         |

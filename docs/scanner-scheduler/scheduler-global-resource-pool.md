@@ -536,7 +536,7 @@ When permit is dropped:
 
 | Operation                      | Implementation                                                                  | Cost                           |
 | ------------------------------ | ------------------------------------------------------------------------------- | ------------------------------ |
-| `try_acquire_fat_job_permit()` | Up to 3 atomic acquire attempts (scan ring + delta cache + optional spill slot) | O(1), typically 2-3 atomic ops |
+| `try_acquire_fat_job_permit()` | 2 lock-free atomic CAS operations (byte budgets) + optional Mutex-guarded spill slot check | O(1), constant-time            |
 | Release via Drop               | 2 byte-budget releases + optional spill-slot release                            | O(1), constant-time            |
 
 ### Scalability Notes

@@ -22,14 +22,13 @@ emits). The consumer side (actual backend storage) is plugged in via the
 
 | Module                                  | Scope           | Purpose                                                                                                         |
 | --------------------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------- |
-| `crates/scanner-scheduler/src/store.rs` | FS persistence  | Key bootstrap, identity contracts, `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
+| `crates/scanner-scheduler/src/store.rs` | FS persistence  | `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
 | `crates/scanner-git/src/persist.rs`     | Git persistence | Two-phase persist contract for Git blob scan results                                                            |
 
-The identity contracts in `store.rs` define *how to compute stable IDs*
-for findings. The `StoreProducer` trait defines *how findings flow from
+The `StoreProducer` trait in `store.rs` defines *how findings flow from
 scan workers into a backend*. Concrete producers receive `FsFindingRecord`
-batches and compute deterministic identifiers (occurrence IDs, rule
-fingerprints, path IDs) via BLAKE3 domain-separated hashes before storing them.
+batches. Identity chain derivation (stable finding IDs, occurrence IDs,
+rule fingerprints) is handled by `DurableCommitSink` in `gossip-scanner-runtime`.
 
 ## Data Flow
 
@@ -41,11 +40,11 @@ fingerprints, path IDs) via BLAKE3 domain-separated hashes before storing them.
   ──────────────────►│──────────┬──────────────────────────────────────────────────►│
                      │          │                                                   │
                      │          ▼                                                   │
-                     │   drain_findings_with_hashes()                               │
+                     │   drop_prefix_findings()      (cross-chunk overlap dedupe)   │
                      │          │                                                   │
                      │          │  Vec<FindingWithHash<F>>                          │
                      │          ▼                                                   │
-                     │   drop_prefix_findings()      (cross-chunk overlap dedupe)   │
+                     │   drain_findings_into()                                      │
                      │          │                                                   │
                      │          ▼                                                   │
                      │   apply_cross_rule_dedupe()    (cross-rule winner dedupe)    │
@@ -64,8 +63,8 @@ fingerprints, path IDs) via BLAKE3 domain-separated hashes before storing them.
                      │                         │                                   │
                      │           ┌─────────────┼──────────────┬─────────────┐      │
                      │           ▼             ▼              ▼             ▼      │
-                     │   SqliteStoreProd  InMemoryProd  NullProducer   (custom)    │
-                     │    (findings.db)    (test/diag)    (discard)                │
+                      │   SqliteStoreProd  InMemoryProd  NullProducer   (custom)    │
+                      │    (planned)        (test/diag)    (discard)                │
                      └─────────────────────────────────────────────────────────────┘
 
                      At run end:
@@ -166,7 +165,11 @@ pub trait StoreProducer: Send + Sync + 'static {
 
 > **Note:** SQLite persistence backend is not yet implemented. See `StoreProducer` trait in `store.rs`.
 
-### SQLite Backend
+### SQLite Backend (Design Specification -- Not Yet Implemented)
+
+The following describes the planned SQLite persistence backend. None of the
+code described in this section exists yet. It is retained as the design
+specification for the eventual implementation.
 
 When `--persist-findings` is enabled for FS scans, the orchestrator wires
 a `StoreProducer` implementation as the persistence backend.
@@ -449,8 +452,12 @@ producer instance.
 The cross-rule dedupe function `apply_cross_rule_dedupe()` includes
 `norm_hash` in the dedup key:
 
-**Before**: `(rule_id, root_hint_start, root_hint_end, span_start, span_end)`
-**After**: `(rule_id, root_hint_start, root_hint_end, span_start, span_end, norm_hash)`
+**Before**: `(root_hint_start, root_hint_end, span_start, span_end)`
+**After**: `(root_hint_start, root_hint_end, span_projection, norm_hash)` where `span_projection` is `(span_start, span_end)` when `dedupe_with_span()` is `true`, or `(0, 0)` otherwise.
+
+Note: `rule_id` is intentionally excluded from the dedup key — the purpose
+of cross-rule dedup is to collapse duplicate matches across different rules,
+keeping only the highest-confidence winner.
 
 This ensures two findings at the same byte span but with different
 normalized secret hashes are preserved (not incorrectly collapsed). This

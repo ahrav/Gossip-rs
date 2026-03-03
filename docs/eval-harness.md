@@ -34,6 +34,7 @@ The harness lives in `tools/eval-harness/` as a standalone crate with its own `C
 | `provenance.rs`     | BLAKE3 corpus/binary/ruleset hashing for reproducibility                                               |
 | `regression.rs`     | Baseline comparison with CI overlap gating and two-tier verdicts                                       |
 | `report.rs`         | Report assembly, JSON/table rendering, error book generation                                           |
+| `pipeline.rs`       | `DedupMode`, `EvalPipelineConfig` — cross-rule dedup configuration for evaluation runs                 |
 | `lib.rs`            | Module re-exports                                                                                      |
 
 ### Data Flow

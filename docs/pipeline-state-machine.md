@@ -136,7 +136,6 @@ driven by source exhaustion + `join()` + executor in-flight drain.
 ## Source of Truth (Paths)
 
 - `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
-- `crates/scanner-scheduler/src/scheduler/parallel_scan.rs`
 - `crates/scanner-scheduler/src/scheduler/local_fs_owner.rs`
 - `crates/scanner-scheduler/src/scheduler/executor.rs`
 - `crates/scanner-scheduler/src/scheduler/executor_core.rs`

@@ -102,8 +102,8 @@ cargo test --features sim-harness --test simulation git_scan_random
 cargo test --features sim-harness --test simulation git_scan_corpus
 ```
 
-Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
-artifacts to `tests/failures/` for triage and minimization.
+Corpus cases live in `crates/scanner-engine-integration-tests/tests/corpus/git_scan/*.case.json`. Replay failures emit
+artifacts to `crates/scanner-engine-integration-tests/tests/failures/` for triage and minimization.
 
 Optional knobs for random runs:
 
@@ -112,7 +112,7 @@ Optional knobs for random runs:
 - `SIM_GIT_SCENARIO_COMMITS`, `SIM_GIT_SCENARIO_REFS`, `SIM_GIT_SCENARIO_BLOBS_PER_TREE`
 - `SIM_GIT_RUN_WORKERS`, `SIM_GIT_RUN_WORKERS_MIN`, `SIM_GIT_RUN_WORKERS_MAX`
 - `SIM_GIT_RUN_MAX_STEPS`, `SIM_GIT_RUN_STABILITY_RUNS`, `SIM_GIT_RUN_TRACE_CAP`
-- `GIT_SIM_WRITE_FAIL=1` (write failing artifacts to `tests/failures/`)
+- `GIT_SIM_WRITE_FAIL=1` (write failing artifacts to `crates/scanner-engine-integration-tests/tests/failures/`)
 
 ## CI Expectations
 

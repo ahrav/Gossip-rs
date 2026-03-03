@@ -36,7 +36,7 @@ This decoupling allows:
 
 ### Implementation Strategy
 
-**For `FindingRecord` (lines 46-71)**:
+**For `FindingRecord`**:
 ```rust
 impl FindingRecord for ApiFindingRec {
     fn rule_id(&self) -> u32 { self.rule_id }
@@ -50,7 +50,7 @@ impl FindingRecord for ApiFindingRec {
 
 This is straightforward because `FindingRec` fields map directly to trait methods. The `span_start/end` conversion from `u32` to `u64` handles the real engine's compact representation.
 
-**For `ScanEngine` (lines 181-208)**:
+**For `ScanEngine`**:
 ```rust
 impl ScanEngine for Engine {
     type Scratch = RealEngineScratch;
@@ -58,7 +58,7 @@ impl ScanEngine for Engine {
     fn required_overlap(&self) -> usize { self.required_overlap() }
     fn new_scratch(&self) -> Self::Scratch {
         let scratch = self.new_scratch();
-        RealEngineScratch::new(scratch, self.tuning.max_findings_per_chunk)
+        RealEngineScratch::new(scratch, Engine::max_findings_per_chunk(self))
     }
     fn scan_chunk_into(&self, data, file_id, base_offset, scratch) {
         self.scan_chunk_into(data, file_id, base_offset, scratch.inner_mut())
@@ -95,14 +95,14 @@ pub trait EngineScratch {
 
 ### The Solution: Lazy Reset Pattern
 
-Instead of fighting the design, the module implements a **lazy reset** approach (lines 28-36, 148-154):
+Instead of fighting the design, the module implements a **lazy reset** approach:
 
-1. **In `RealEngineScratch::clear()`** (line 147-154):
+1. **In `RealEngineScratch::clear()`**:
    - Only clear the temporary `findings_buf` (our local drain buffer)
    - Do NOT reset the underlying engine scratch state
    - This is a no-op for the real scratch's internal state
 
-2. **In `Engine::scan_chunk_into()`** (line 194-203):
+2. **In `Engine::scan_chunk_into()`**:
    - The real engine owns scratch lifecycle internally (capacity validation + per-scan state reset on scan path)
    - This happens in the real engine code, not in the trait adapter
    - The engine has the `&Engine` reference needed for its reset methods
@@ -190,7 +190,7 @@ This module is a classic **Adapter** pattern (also called **Wrapper**):
 
 ## 5. Key Structures
 
-### `RealEngineScratch` (lines 94-149)
+### `RealEngineScratch`
 
 ```rust
 pub struct RealEngineScratch {
@@ -246,7 +246,7 @@ Maps directly to the `FindingRecord` trait methods.
 
 ### Buffered Findings Extraction
 
-**The Pattern** (lines 168-197):
+**The Pattern**:
 
 ```rust
 fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
@@ -284,7 +284,7 @@ fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
 
 ### Thread-Local Scratch Benefits
 
-**Key insight** (lines 100-127): Each worker gets its own `RealEngineScratch`
+**Key insight**: Each worker gets its own `RealEngineScratch`
 
 **Advantages**:
 - No lock contention (scratch is never shared)
@@ -292,7 +292,7 @@ fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
 - CPU-friendly access patterns (thread-local memory)
 - Pattern state stays in L3 cache
 
-**Safety note** (lines 100-127):
+**Safety note**:
 - Raw pointers in `VsScratch` (Vectorscan handles) are `!Send` by default
 - But they're safe to transfer once (at worker startup) because:
   - Each scratch pinned to exactly one thread
@@ -387,14 +387,14 @@ This is the power of the adapter pattern.
 
 ## 8. Testing
 
-The module includes tests (lines 214-296) that verify:
+The module includes tests that verify:
 
-**`real_engine_implements_scan_engine()` (lines 251-271)**:
+**`real_engine_implements_scan_engine()`**:
 - Trait methods work through the adapter
 - Findings are correctly extracted
 - Rule names resolve properly
 
-**`drop_prefix_findings_works()` (lines 274-295)**:
+**`drop_prefix_findings_works()`**:
 - Overlap deduplication works
 - Findings in the overlap region are dropped
 

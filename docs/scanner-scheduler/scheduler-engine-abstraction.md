@@ -71,7 +71,7 @@ collisions with real filesystem file IDs.
 
 **Purpose**: Returns the maximum number of findings retained per chunk scan.
 
-**Contract**: Default implementation returns `usize::MAX` (no limit). The real engine returns the configured `tuning.max_findings_per_chunk` value. Used by the scheduler for capacity planning and by `dropped_findings()` accounting.
+**Contract**: Required method (no default). The real engine returns the configured `tuning.max_findings_per_chunk` value; the mock engine returns the capacity set at construction. Used by the scheduler for capacity planning and by `dropped_findings()` accounting.
 
 ---
 
@@ -191,13 +191,13 @@ Specifies the finding type produced by this scratch. The bound was elevated from
 
 **Purpose**: Returns whether span coordinates should contribute to within-chunk deduplication key computation.
 
-**Contract**: Default implementation returns `false`. When `true`, two findings at the same `root_hint` with different spans are considered distinct. Used by `push_finding_with_drop_hint` to decide whether span and UTF-16 endianness contribute to the dedupe identity.
+**Contract**: Required method (no default). When `true`, two findings at the same `root_hint` with different spans are considered distinct. When `false`, span coordinates are zeroed in the dedup key, collapsing different spans to the same identity. Used by `push_finding_with_drop_hint` to decide whether span and UTF-16 endianness contribute to the dedupe identity.
 
 #### `confidence_score(&self) -> i8`
 
 **Purpose**: Returns the confidence score assigned to this finding.
 
-**Contract**: Default returns 0. Values map to enum-level confidence (High/Medium/Low). Used by persistence layers for prioritization and filtering.
+**Contract**: Required method (no default). Values map to enum-level confidence (High/Medium/Low). Used by persistence layers for prioritization and filtering.
 
 ### Deduplication Semantics
 
@@ -208,7 +208,8 @@ Findings use a two-level deduplication strategy:
    - Prevents reporting the same finding multiple times across overlapping chunks
 
 2. **Within-Chunk Uniqueness** (`span` + `norm_hash` fields):
-   - Two findings with the same `root_hint` but different spans are distinct
+   - When `dedupe_with_span()` returns `true`, two findings with the same `root_hint` but different spans are distinct
+   - When `dedupe_with_span()` returns `false`, span coordinates are zeroed in the dedup key, so only `root_hint` + `norm_hash` matter
    - Two findings at the same span but with different `norm_hash` values are preserved (different secrets at the same location)
    - Allows multiple matches or transformed variants of the same secret
 

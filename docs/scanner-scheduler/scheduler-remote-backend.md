@@ -238,6 +238,7 @@ pub struct RemoteConfig {
     pub max_object_time: Option<Duration>, // e.g., 30 seconds
     pub seed: u64,                      // PRNG seed
     pub dedupe_within_chunk: bool,      // Per-chunk dedup
+    pub pin_threads: bool,              // Pin to cores (Linux only, no-op elsewhere)
 }
 ```
 

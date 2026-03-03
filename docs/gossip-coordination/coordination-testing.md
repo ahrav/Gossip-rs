@@ -600,4 +600,4 @@ prerequisites, TLC commands, and mutation tests.
 | `specs/coordination/ShardFencing.tla`          | TLA+ specification                |
 | `specs/coordination/ShardFencing.cfg`          | Production safety config          |
 | `specs/coordination/ShardFencing_liveness.cfg` | Liveness config                   |
-| `specs/coordination/run_mutations.sh`          | Mutation test suite (8 mutations) |
+| `specs/coordination/run_mutations.sh`          | Mutation test suite (14 mutations) |
