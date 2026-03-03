@@ -17,7 +17,7 @@ use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, CoordinationEventSink, IdentityChainRecord,
     StoredCoreEvent, StoredGitEvent,
 };
-use crate::{RuntimeEngineConfig, ScanBudgets, ScanRuntimeError, execute_assignment_with_config};
+use crate::{execute_assignment_with_config, RuntimeEngineConfig, ScanBudgets, ScanRuntimeError};
 
 /// Lease payload consumed by the distributed runtime.
 #[derive(Clone, Debug)]
