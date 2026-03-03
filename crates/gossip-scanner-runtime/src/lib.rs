@@ -108,7 +108,7 @@ pub enum TransformFilter {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RuntimeEngineConfig {
+pub(crate) struct RuntimeEngineConfig {
     anchor_mode: AnchorMode,
     decode_depth: Option<usize>,
     rules_file: Option<PathBuf>,
@@ -155,7 +155,7 @@ impl ScanBudgets {
         })
     }
 
-    fn to_execution_config(self) -> Result<ScanExecutionConfig, ScanRuntimeError> {
+    pub(crate) fn to_execution_config(self) -> Result<ScanExecutionConfig, ScanRuntimeError> {
         self.to_execution_config_with_workers(available_workers())
     }
 }
@@ -506,25 +506,7 @@ pub(crate) fn scan_git_with_runtime(
     )
 }
 
-pub(crate) fn execute_assignment(
-    assignment: &Assignment,
-    budgets: ScanBudgets,
-    out: &dyn EventOutput,
-    commit: &dyn CommitSink,
-    cancel: &CancellationToken,
-) -> Result<AssignmentOutcome, ScanRuntimeError> {
-    let runtime = budgets.to_execution_config()?;
-    execute_assignment_with_config(
-        assignment,
-        runtime,
-        &RuntimeEngineConfig::default(),
-        out,
-        commit,
-        cancel,
-    )
-}
-
-fn execute_assignment_with_config(
+pub(crate) fn execute_assignment_with_config(
     assignment: &Assignment,
     config: ScanExecutionConfig,
     engine_config: &RuntimeEngineConfig,
