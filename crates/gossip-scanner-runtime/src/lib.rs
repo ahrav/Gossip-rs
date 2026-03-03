@@ -24,10 +24,12 @@ use gossip_contracts::{
 };
 use gossip_scan_driver::{
     Assignment, AssignmentSource, CancellationToken, CommitSink, ConnectorKind, CursorUpdate,
-    NoOpCommitSink, ScanExecutionConfig, ScanReport, ScanSourceFactory,
+    GitDebugLevel, GitExecutionConfig, NoOpCommitSink, ScanExecutionConfig, ScanReport,
+    ScanSourceFactory,
 };
 use regex::bytes::Regex;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformId, TransformMode};
+use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::events::{EventOutput, NullEventOutput};
 
 pub mod cli;
@@ -271,6 +273,32 @@ impl FsScanConfig {
 pub struct GitScanConfig {
     /// Repository root path to scan.
     pub repo: PathBuf,
+    /// Number of pack-exec worker threads.
+    pub workers: usize,
+    /// Optional transform decode depth override.
+    pub decode_depth: Option<usize>,
+    /// When true, binary blobs are scanned.
+    pub scan_binary: bool,
+    /// Git debug output level.
+    pub debug_level: GitDebugLevel,
+    /// When true, enrich commit metadata with identity dictionary IDs.
+    pub enrich_identities: bool,
+    /// Anchor extraction policy for rule matching.
+    pub anchor_mode: AnchorMode,
+    /// Optional external rules file path.
+    pub rules_file: Option<PathBuf>,
+    /// Transform decoder filter.
+    pub transform_filter: TransformFilter,
+    /// Stable repository identifier used in persistence keys.
+    pub repo_id: u64,
+    /// Git scan mode (diff-history vs ODB-blob fast path).
+    pub scan_mode: GitScanMode,
+    /// Merge-diff strategy for merge commits.
+    pub merge_mode: MergeDiffMode,
+    /// Optional tree delta cache size override in MiB.
+    pub tree_delta_cache_mb: Option<u32>,
+    /// Optional engine chunk size override in MiB.
+    pub engine_chunk_mb: Option<u32>,
     /// Retained for compatibility; both variants currently share one path.
     pub execution_mode: ExecutionMode,
     /// Scan execution budget controls.
@@ -282,9 +310,100 @@ impl GitScanConfig {
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         Self {
             repo: repo.into(),
+            workers: available_workers(),
+            decode_depth: None,
+            scan_binary: false,
+            debug_level: GitDebugLevel::Off,
+            enrich_identities: false,
+            anchor_mode: AnchorMode::Manual,
+            rules_file: None,
+            transform_filter: TransformFilter::All,
+            repo_id: 1,
+            scan_mode: GitScanMode::OdbBlobFast,
+            merge_mode: MergeDiffMode::AllParents,
+            tree_delta_cache_mb: None,
+            engine_chunk_mb: None,
             execution_mode: ExecutionMode::Direct,
             budgets: ScanBudgets::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
+    }
+
+    #[must_use]
+    pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
+        self.decode_depth = decode_depth;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
+        self.scan_binary = scan_binary;
+        self
+    }
+
+    #[must_use]
+    pub fn with_debug_level(mut self, debug_level: GitDebugLevel) -> Self {
+        self.debug_level = debug_level;
+        self
+    }
+
+    #[must_use]
+    pub fn with_enrich_identities(mut self, enrich_identities: bool) -> Self {
+        self.enrich_identities = enrich_identities;
+        self
+    }
+
+    #[must_use]
+    pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
+        self.anchor_mode = anchor_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
+        self.rules_file = rules_file;
+        self
+    }
+
+    #[must_use]
+    pub fn with_transform_filter(mut self, transform_filter: TransformFilter) -> Self {
+        self.transform_filter = transform_filter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_repo_id(mut self, repo_id: u64) -> Self {
+        self.repo_id = repo_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scan_mode(mut self, scan_mode: GitScanMode) -> Self {
+        self.scan_mode = scan_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_merge_mode(mut self, merge_mode: MergeDiffMode) -> Self {
+        self.merge_mode = merge_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_tree_delta_cache_mb(mut self, tree_delta_cache_mb: Option<u32>) -> Self {
+        self.tree_delta_cache_mb = tree_delta_cache_mb;
+        self
+    }
+
+    #[must_use]
+    pub fn with_engine_chunk_mb(mut self, engine_chunk_mb: Option<u32>) -> Self {
+        self.engine_chunk_mb = engine_chunk_mb;
+        self
     }
 
     #[must_use]
@@ -387,6 +506,8 @@ pub struct AssignmentOutcome {
     pub report: ScanReport,
     /// Driver-provided checkpoint hint to hand back to coordinators.
     pub checkpoint_hint: Option<CursorUpdate>,
+    /// Optional driver-generated debug diagnostics (for CLI stderr output).
+    pub debug_output: Option<String>,
 }
 
 /// Top-level filesystem scan dispatcher.
@@ -423,7 +544,7 @@ pub fn scan_fs_direct(config: &FsScanConfig) -> Result<ScanReport, ScanRuntimeEr
     let out = NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
-    execute_assignment(&assignment, config.budgets, &out, &commit, &cancel)
+    execute_assignment(&assignment, config.budgets, &out, None, &commit, &cancel)
         .map(|outcome| outcome.report)
 }
 
@@ -437,20 +558,10 @@ pub fn scan_fs_connector(config: &FsScanConfig) -> Result<ScanReport, ScanRuntim
 
 /// Git scan routed through the unified assignment/driver seam.
 pub fn scan_git_direct(config: &GitScanConfig) -> Result<ScanReport, ScanRuntimeError> {
-    let canonical_repo = validate_git_repo_path(&config.repo)?;
-    let assignment = build_assignment(
-        ConnectorKind::Git,
-        canonical_repo.display().to_string(),
-        AssignmentSource::Git {
-            repo_root: canonical_repo,
-        },
-    );
-
     let out = NullEventOutput;
     let commit = NoOpCommitSink;
     let cancel = CancellationToken::new();
-    execute_assignment(&assignment, config.budgets, &out, &commit, &cancel)
-        .map(|outcome| outcome.report)
+    scan_git_with_runtime(config, &out, None, &commit, &cancel).map(|outcome| outcome.report)
 }
 
 /// Connector-mode git scan.
@@ -487,12 +598,13 @@ pub(crate) fn scan_fs_with_runtime(
         rules_file: config.rules_file.clone(),
         transform_filter: config.transform_filter.clone(),
     };
-    execute_assignment_with_config(&assignment, runtime, &engine, out, commit, cancel)
+    execute_assignment_with_config(&assignment, runtime, &engine, out, None, commit, cancel)
 }
 
 pub(crate) fn scan_git_with_runtime(
     config: &GitScanConfig,
     out: &dyn EventOutput,
+    git_out: Option<&dyn GitEventOutput>,
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
@@ -504,21 +616,36 @@ pub(crate) fn scan_git_with_runtime(
             repo_root: canonical_repo,
         },
     );
-    let runtime = config.budgets.to_execution_config()?;
-    execute_assignment_with_config(
-        &assignment,
-        runtime,
-        &RuntimeEngineConfig::default(),
-        out,
-        commit,
-        cancel,
-    )
+    let mut runtime = config
+        .budgets
+        .to_execution_config_with_workers(config.workers)?;
+    // Keep git execution tuning centralized in the shared ScanExecutionConfig
+    // so both CLI and distributed worker paths hit identical driver behavior.
+    runtime.git = GitExecutionConfig {
+        repo_id: config.repo_id,
+        scan_mode: config.scan_mode,
+        merge_diff_mode: config.merge_mode,
+        pack_exec_workers: Some(config.workers),
+        scan_binary: config.scan_binary,
+        enrich_identities: config.enrich_identities,
+        debug_level: config.debug_level,
+        tree_delta_cache_mb: config.tree_delta_cache_mb,
+        engine_chunk_mb: config.engine_chunk_mb,
+    };
+    let engine = RuntimeEngineConfig {
+        anchor_mode: config.anchor_mode,
+        decode_depth: config.decode_depth,
+        rules_file: config.rules_file.clone(),
+        transform_filter: config.transform_filter.clone(),
+    };
+    execute_assignment_with_config(&assignment, runtime, &engine, out, git_out, commit, cancel)
 }
 
 pub(crate) fn execute_assignment(
     assignment: &Assignment,
     budgets: ScanBudgets,
     out: &dyn EventOutput,
+    git_out: Option<&dyn GitEventOutput>,
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
@@ -528,6 +655,7 @@ pub(crate) fn execute_assignment(
         runtime,
         &RuntimeEngineConfig::default(),
         out,
+        git_out,
         commit,
         cancel,
     )
@@ -538,18 +666,27 @@ fn execute_assignment_with_config(
     config: ScanExecutionConfig,
     engine_config: &RuntimeEngineConfig,
     out: &dyn EventOutput,
+    git_out: Option<&dyn GitEventOutput>,
     commit: &dyn CommitSink,
     cancel: &CancellationToken,
 ) -> Result<AssignmentOutcome, ScanRuntimeError> {
     // Keep runtime entry points and distributed workers on one driver seam.
     let mut driver = driver_for_assignment(assignment)?;
     let report = driver
-        .run(runtime_engine(engine_config)?, &config, out, commit, cancel)
+        .run(
+            runtime_engine(engine_config)?,
+            &config,
+            out,
+            git_out,
+            commit,
+            cancel,
+        )
         .map_err(ScanRuntimeError::Driver)?;
 
     Ok(AssignmentOutcome {
         report,
         checkpoint_hint: driver.checkpoint_hint(),
+        debug_output: driver.debug_output(),
     })
 }
 

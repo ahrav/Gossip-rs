@@ -132,9 +132,15 @@ pub fn run_worker(
         );
         let cancel = CancellationToken::new();
 
-        let outcome =
-            execute_assignment(&lease.assignment, config.budgets, &sink, &commit, &cancel)
-                .map_err(DistributedRuntimeError::Runtime)?;
+        let outcome = execute_assignment(
+            &lease.assignment,
+            config.budgets,
+            &sink,
+            Some(&sink),
+            &commit,
+            &cancel,
+        )
+        .map_err(DistributedRuntimeError::Runtime)?;
 
         coordinator
             .complete_shard(&lease, outcome.checkpoint_hint, outcome.report)
