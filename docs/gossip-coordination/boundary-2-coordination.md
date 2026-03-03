@@ -456,10 +456,10 @@ failing operation was not persisted), but the root cause must be investigated.
 The core trait with 7 operations that every backend (in-memory, FoundationDB,
 PostgreSQL, deterministic simulator) must implement:
 
-| Operation                  | Signature                                          |  Terminal?   | Idempotent? | Lease-gated? |
-| -------------------------- | -------------------------------------------------- | :----------: | :---------: | :----------: |
-| `acquire_and_restore_into` | `(now, tenant, key, worker) -> (Lease, Snapshot)`  |      No      |      No     |      No      |
-| `renew`                    | `(now, tenant, lease) -> new_deadline`             |      No      |      No     |     Yes      |
+| Operation                  | Signature (simplified)                                     |  Terminal?   | Idempotent? | Lease-gated? |
+| -------------------------- | ---------------------------------------------------------- | :----------: | :---------: | :----------: |
+| `acquire_and_restore_into` | `(now, tenant, key, worker, &mut AcquireScratch) -> Result<AcquireResultView, AcquireError>`  |      No      |      No     |      No      |
+| `renew`                    | `(now, tenant, lease) -> Result<RenewResult, RenewError>`  |      No      |      No     |     Yes      |
 | `checkpoint`               | `(now, tenant, lease, cursor, op_id) -> ()`        |      No      |  Yes (OpId) |     Yes      |
 | `complete`                 | `(now, tenant, lease, cursor, op_id) -> ()`        |  Yes (Done)  |  Yes (OpId) |     Yes      |
 | `park_shard`               | `(now, tenant, lease, reason, op_id) -> ()`        | Yes (Parked) |  Yes (OpId) |     Yes      |
@@ -470,11 +470,14 @@ PostgreSQL, deterministic simulator) must implement:
 
 **`acquire_and_restore_into`** -- the entry point for a worker to start or resume
 scanning. Verifies the shard is Active and unleased (or lease expired),
-increments `fence_epoch`, grants a new lease, and returns a `ShardSnapshot`
-with the shard's last checkpointed cursor. NOT idempotent: each successful
-call increments the fence epoch.
+increments `fence_epoch`, grants a new lease, and populates a caller-owned
+`AcquireScratch` buffer with the shard's last checkpointed cursor. Returns an
+`AcquireResultView` containing `lease`, `snapshot`, and `capacity: CapacityHint`.
+The scratch parameter is a key zero-alloc design choice (see allocation policy).
+NOT idempotent: each successful call increments the fence epoch.
 
 **`renew`** -- extends the lease deadline without modifying shard progress.
+Returns `RenewResult` containing `new_deadline` and `capacity: CapacityHint`.
 The fence epoch does NOT change. Not idempotent via OpId; duplicate calls
 simply extend the deadline further (harmless).
 
@@ -590,9 +593,10 @@ half-open `[start, end)` byte-key ranges.
 | D2.6  | ShardStatus: exactly 4 states (Active, Done, Split, Parked)                       |
 | D2.7  | `park_reason.is_some()` iff `status == Parked`                                    |
 | D2.8  | Payload hashes use domain-separated BLAKE3 with `CanonicalBytes`                  |
+| D2.9  | `AcquireScratch` + `AcquireResultView` enable zero-alloc acquire path             |
 | D2.10 | Derived shard IDs have bit 63 set                                                 |
 | D2.11 | ShardRecord is self-contained (no back-references to RunConfig)                   |
-| D2.12 | ShardSnapshotView excludes lease, fence, op_log, tenant, park_reason              |
+| D2.12 | ShardSnapshotView excludes lease, fence, op_log, tenant, park_reason, run, shard  |
 | D2.13 | Trait is synchronous (returns `Result`, not futures)                              |
 | D2.14 | Lease-gated operations take `(TenantId, Lease)`                                   |
 | D2.15 | `acquire_and_restore_into` is the only non-lease operation                        |
@@ -636,6 +640,9 @@ decision.
 | `park_shard`               | `ParkError`          |      Yes      |        No        |        No       |
 | `split_replace`            | `SplitReplaceError`  |      Yes      |        No        |       Yes       |
 | `split_residual`           | `SplitResidualError` |      Yes      |        No        |       Yes       |
+
+> **Note**: `SplitReplaceError` and `SplitResidualError` are type aliases for
+> the same underlying `SplitError` enum. They share identical variant sets.
 
 ### IdempotentOutcome
 

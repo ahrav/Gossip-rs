@@ -102,7 +102,7 @@ compiles it, and scans a test string. No mutation — inputs are string literals
 
 ### 1.9 Integration Tests
 
-Twenty-six files in `tests/integration/` covering handcrafted regression
+Twenty-two files in `crates/scanner-engine-integration-tests/tests/integration/` covering handcrafted regression
 scenarios. Each file targets a specific behavior area (chunking, dedup,
 transforms, multi-rule interaction). Gated behind `integration-tests`. Inputs
 are manually constructed byte sequences. Clear, readable, but labor-intensive to
@@ -110,7 +110,7 @@ extend.
 
 ### 1.10 Fuzz Targets
 
-Nineteen targets in `fuzz/fuzz_targets/` using `cargo-fuzz`/libFuzzer.
+Twenty-four targets across 4 crates (`scanner-engine`, `scanner-git`, `gossip-stdx`, `gossip-contracts`) in per-crate `fuzz/fuzz_targets/` using `cargo-fuzz`/libFuzzer.
 Coverage-guided mutation across anchor soundness, base64 gate ops, pack parsing,
 offline validators, SIMD classification, text sanitization, and more. Run on
 nightly; not in CI default gate.
@@ -125,12 +125,12 @@ at `tests/corpus/real_rules/fixtures/` with production rules from
 
 ### 1.12 Smoke Tests
 
-Three files in `tests/smoke/` providing end-to-end sanity checks for the
+One file in `crates/scanner-engine-integration-tests/tests/smoke/` providing end-to-end sanity checks for the
 scanner and git-scan pipelines. Fast, minimal, gated behind `smoke-tests`.
 
 ### 1.13 Diagnostic Tests
 
-Four files in `tests/diagnostic/` checking runtime properties like
+Three files in `crates/scanner-engine-integration-tests/tests/diagnostic/` checking runtime properties like
 post-startup allocation behavior and unfilterable rule analysis. Gated behind
 `diagnostic-tests`.
 
@@ -257,14 +257,14 @@ fixtures are ever introduced:
 | `GitFaultPlan`          | `sim_git_scan/fault.rs`                                           | Git fault injection          | **Keep**           | `crates/scanner-git/src/sim_git_scan/fault.rs`          | Resource-keyed, git-specific                           |
 | Scanner minimizer       | `sim/minimize.rs` (777 lines)                                     | Greedy shrink passes         | **Keep**           | `crates/scanner-scheduler/src/sim/minimize.rs`          | Domain-specific shrink logic                           |
 | Git minimizer           | `sim_git_scan/minimize.rs` (408 lines)                            | Graph-aware shrink           | **Keep**           | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Graph-aware, git-specific                              |
-| Scanner corpus          | `tests/corpus/scanner/` (72 cases)                                | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
-| Git corpus              | `tests/corpus/git_scan/` (12 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
+| Scanner corpus          | `tests/corpus/scanner/` (71 cases)                                | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
+| Git corpus              | `tests/corpus/git_scan/` (11 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
 | Near-miss operators     | **DO NOT EXIST**                                                  | —                            | **Create**         | `crates/scanner-scheduler/src/sim/mutation.rs`          | Core new capability                                    |
-| Property tests          | `tests/property/` (19 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
+| Property tests          | `tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
 | Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in Phase 3                       |
-| Integration tests       | `tests/integration/` (26 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
+| Integration tests       | `tests/integration/` (22 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
 | Real-rules fixtures     | `tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
-| Fuzz targets            | `fuzz/fuzz_targets/` (19 targets)                                 | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
+| Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (24 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
 
 ---
 

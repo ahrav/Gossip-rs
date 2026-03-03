@@ -114,11 +114,11 @@ graph TB
 | **EventOutput**                | `crates/scanner-scheduler/src/events.rs`                                                 | Thread-safe structured event emission to stdout sinks                                                           |
 | **BufferPool**                 | `crates/scanner-scheduler/src/runtime.rs`                                                | Fixed-capacity aligned buffer pool (single-threaded runtime path)                                               |
 | **TsBufferPool**               | `crates/scanner-scheduler/src/scheduler/ts_buffer_pool.rs`                               | Thread-safe buffer pool used by scheduler workers                                                               |
-| **NodePoolType**               | `crates/scanner-engine/src/pool/node_pool.rs:49`                                         | Generic pre-allocated node pool                                                                                 |
-| **RingBuffer**                 | `crates/gossip-stdx/src/ring_buffer.rs:45`                                               | Fixed-capacity SPSC queue                                                                                       |
-| **DynamicBitSet**              | `crates/gossip-stdx/src/bitset.rs:51`                                                    | Runtime-sized bitset for pool tracking                                                                          |
+| **NodePoolType**               | `crates/scanner-engine/src/pool/node_pool.rs`                                            | Generic pre-allocated node pool                                                                                 |
+| **RingBuffer**                 | `crates/gossip-stdx/src/ring_buffer.rs`                                                  | Fixed-capacity SPSC queue                                                                                       |
+| **DynamicBitSet**              | `crates/gossip-stdx/src/bitset.rs`                                                       | Runtime-sized bitset for pool tracking                                                                          |
 | **ScanScratch**                | `crates/scanner-engine/src/engine/scratch.rs`                                            | Per-scan reusable scratch state                                                                                 |
-| **TimingWheel**                | `crates/gossip-stdx/src/timing_wheel.rs:479`                                             | Hashed timing wheel for window expiration scheduling                                                            |
+| **TimingWheel**                | `crates/gossip-stdx/src/timing_wheel.rs`                                                 | Hashed timing wheel for window expiration scheduling                                                            |
 | **Git Preflight**              | `crates/scanner-git/src/preflight.rs`                                                    | Maintenance readiness check for commit-graph, MIDX, and pack count                                              |
 | **ArtifactStatus**             | `crates/scanner-git/src/preflight.rs`                                                    | `Ready` vs `NeedsMaintenance` flag produced by Git preflight                                                    |
 | **Repo Open**                  | `crates/scanner-git/src/repo_open.rs`                                                    | Repo discovery, object format detection, start set resolution, watermark load                                   |
@@ -160,7 +160,7 @@ graph TB
 | **Git Scan Runner**            | `crates/scanner-git/src/runner.rs`                                                       | End-to-end orchestration across all Git scan stages                                                             |
 | **WorkItems**                  | `crates/scanner-git/src/work_items.rs`                                                   | SoA candidate metadata tables for sorting without moving structs                                                |
 | **Policy Hash**                | `crates/scanner-git/src/policy_hash.rs`                                                  | Canonical BLAKE3 identity over rules, transforms, and tuning                                                    |
-| **Store**                      | `crates/scanner-scheduler/src/store.rs`                                                  | Key bootstrap, identity contracts, `StoreProducer` trait, finding/batch/loss types, and built-in producer impls |
+| **Store**                      | `crates/scanner-scheduler/src/store.rs`                                                  | `StoreProducer` trait, finding/batch/loss types, and built-in producer impls                                    |
 
 
 ## Archive Scanning Notes
