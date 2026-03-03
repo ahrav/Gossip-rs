@@ -34,7 +34,7 @@
 //! - Throughput regressions: bytes/s decrease visible in p95
 //! - Unexpected allocations: can integrate with alloc stats
 
-use super::rusage::{rusage_self, ProcUsage, ProcUsageDelta};
+use super::rusage::{ProcUsage, ProcUsageDelta, rusage_self};
 use std::time::{Duration, Instant};
 
 // ============================================================================

@@ -1552,6 +1552,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "crc32fast",
+ "criterion",
  "gossip-stdx",
  "libc",
  "memchr",
@@ -1597,6 +1598,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "crc32fast",
+ "criterion",
  "flate2",
  "gix-commitgraph",
  "gossip-stdx",
@@ -1630,6 +1632,7 @@ version = "0.1.0"
 dependencies = [
  "bzip2",
  "crc32fast",
+ "criterion",
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-queue",

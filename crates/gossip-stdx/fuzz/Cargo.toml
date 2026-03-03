@@ -38,3 +38,8 @@ doc = false
 name = "fuzz_timing_wheel"
 path = "fuzz_targets/fuzz_timing_wheel.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_atomic_bitset"
+path = "fuzz_targets/fuzz_atomic_bitset.rs"
+doc = false

@@ -1,0 +1,11 @@
+[
+  {"path": "creds.py", "line_start": 2, "line_end": 2, "label": "positive", "rule": "aws-access-key"},
+  {"path": "creds.py", "line_start": 2, "line_end": 2, "label": "negative", "rule": "generic-secret"},
+  {"path": "creds.py", "line_start": 3, "line_end": 3, "label": "positive", "rule": "generic-api-key"},
+  {"path": "creds.py", "line_start": 3, "line_end": 3, "label": "negative", "rule": "github-pat"},
+  {"path": "creds.py", "line_start": 4, "line_end": 4, "label": "positive", "rule": "aws-prefix"},
+  {"path": "creds.py", "line_start": 4, "line_end": 4, "label": "positive", "rule": "aws-extended"},
+  {"path": "creds.py", "line_start": 5, "line_end": 5, "label": "positive", "rule": "hex-token"},
+  {"path": "config.py", "line_start": 2, "line_end": 2, "label": "positive", "rule": "aws-access-key"},
+  {"path": "config.py", "line_start": 2, "line_end": 2, "label": "negative", "rule": "generic-secret"}
+]

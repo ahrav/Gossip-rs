@@ -2,9 +2,8 @@
 //!
 //! This module is the behavior-preserving core used by every I/O backend:
 //! blocking filesystem reads ([`local_fs_owner`](super::local_fs_owner)),
-//! io_uring ([`local_fs_uring`](super::local_fs_uring)), archive entry
-//! streams ([`local_fs_archive_ctx`](super::local_fs_archive_ctx)), and
-//! the connector pipeline ([`connector_pipeline`](super::connector_pipeline)).
+//! io_uring ([`local_fs_uring`](super::local_fs_uring)), and archive entry
+//! streams ([`local_fs_archive_ctx`](super::local_fs_archive_ctx)).
 //!
 //! Centralizing here guarantees that all paths execute the same post-scan
 //! pipeline — any divergence in finding semantics would be a correctness bug.

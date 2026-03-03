@@ -79,7 +79,6 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
-//! | [`connector_pipeline`] | Connector-first scheduler entrypoint for enumerate/read/scan workflows |
 //! | [`local_fs_owner`] | Local filesystem scheduler internals |
 //! | [`parallel_scan`] | High-level directory scanner surface |
 //! | [`local_fs_uring`] | Linux io_uring async I/O scheduler (Linux-only) |
@@ -215,7 +214,6 @@
 //! - **Core**: [`Executor`], [`ExecutorConfig`], [`WorkerCtx`], [`ByteBudget`],
 //!   [`TokenBudget`], [`ChunkParams`], [`RunConfig`], [`Limits`]
 //! - **Supporting**: [`CountBudget`], [`TsBufferPool`], [`WorkerFindingsBuffer`]
-//! - **Connector pipeline**: [`scan_connector`], [`ConnectorConfig`], [`ConnectorSource`], [`ProgressSink`]
 //! - **Advanced**: [`affinity`] functions, [`failure`] types, [`sim`] harness
 
 // Core scheduling
@@ -256,6 +254,13 @@ pub(crate) mod shared_core;
 // Observability
 pub mod affinity;
 pub mod alloc;
+#[cfg(feature = "bench")]
+pub mod bench;
+#[cfg(feature = "bench")]
+pub mod bench_compare;
+
+#[cfg(feature = "bench")]
+pub mod rusage;
 
 // Testing infrastructure
 pub mod failure;
