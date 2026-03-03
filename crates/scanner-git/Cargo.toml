@@ -35,6 +35,7 @@ sha2 = "0.10"
 
 [features]
 default = []
+kani = []
 perf-stats = []
 stats = ["perf-stats"]
 git-perf = ["perf-stats", "scanner-engine/perf-counters"]

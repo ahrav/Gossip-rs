@@ -282,7 +282,30 @@ jobs:
           components: miri
           shared-key: nightly-linux-miri
 
-      - run: cargo +nightly miri test -p gossip-stdx --all-features
+      # Pure-Rust crates — run full test suites under Miri.
+      - name: Miri — gossip-stdx
+        run: cargo +nightly miri test -p gossip-stdx --all-features
+
+      - name: Miri — gossip-contracts
+        run: cargo +nightly miri test -p gossip-contracts --all-features
+
+      - name: Miri — gossip-coordination
+        run: cargo +nightly miri test -p gossip-coordination --all-features
+
+      - name: Miri — gossip-frontier
+        run: cargo +nightly miri test -p gossip-frontier --all-features
+
+      # FFI-heavy crates — Miri interprets Rust but cannot execute C/asm.
+      # Tests with FFI calls are gated behind #[cfg(not(miri))]; SIMD paths
+      # have #[cfg(miri)] scalar fallbacks.  Use aegis-pure-rust to avoid
+      # AES-NI / NEON intrinsics that Miri cannot interpret.
+      - name: Miri — scanner-engine (pure-Rust paths)
+        run: >-
+          cargo +nightly miri test -p scanner-engine
+          --features aegis-pure-rust,test-support
+
+      - name: Miri — scanner-git
+        run: cargo +nightly miri test -p scanner-git --features aegis-pure-rust
 
   # ── Kani (nightly only) ──────────────────────────────────────────────
   kani:
@@ -296,15 +319,91 @@ jobs:
       RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: model-checking/kani-github-action@v1.1
+
+      # Kani verifies all #[kani::proof] harnesses per crate.
+      # 80 total proofs across 4 crates.
+      - name: Kani — gossip-stdx (54 proofs)
+        uses: model-checking/kani-github-action@v1.1
         with:
           args: --package gossip-stdx --features kani
+
+      - name: Kani — scanner-engine (15 proofs)
+        uses: model-checking/kani-github-action@v1.1
+        with:
+          args: --package scanner-engine --features kani
+
+      - name: Kani — scanner-scheduler (9 proofs)
+        uses: model-checking/kani-github-action@v1.1
+        with:
+          args: --package scanner-scheduler --features kani
+
+      - name: Kani — scanner-git (2 proofs)
+        uses: model-checking/kani-github-action@v1.1
+        with:
+          args: --package scanner-git --features kani
+
+  # ── Loom (nightly only) ──────────────────────────────────────────────
+  loom:
+    name: Loom Concurrency (Scheduled)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: stable
+          shared-key: stable-linux
+          save-cache: "false"
+
+      # Loom exhaustively explores thread interleavings.
+      # 12 loom::model tests across 2 crates (gossip-stdx, scanner-scheduler).
+      - name: Loom — gossip-stdx (8 tests)
+        run: >-
+          RUSTFLAGS="--cfg loom" cargo test --lib
+          -p gossip-stdx -- loom_tests
+
+      - name: Loom — scanner-scheduler (4 tests)
+        run: >-
+          RUSTFLAGS="--cfg loom" cargo test --lib
+          -p scanner-scheduler -- loom_tests
+
+  # ── ASAN (nightly only) ─────────────────────────────────────────────
+  asan:
+    name: ASAN (Scheduled, Nightly)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: nightly
+          components: rust-src
+          shared-key: nightly-linux-asan
+
+      # AddressSanitizer targets SIMD and offline validation modules in
+      # scanner-engine where unsafe pointer arithmetic is concentrated.
+      - name: ASAN — scanner-engine (simd_classify + offline_validate)
+        run: >-
+          RUSTFLAGS="-Zsanitizer=address" cargo +nightly test
+          -Zbuild-std --target x86_64-unknown-linux-gnu
+          -p scanner-engine --lib
+          -- engine::simd_classify engine::offline_validate
 
   # ── Nightly Summary ───────────────────────────────────────────────
   nightly-summary:
     name: Nightly Summary
     if: always() && github.event_name == 'schedule'
-    needs: [test-full-harness, miri, kani]
+    needs: [test-full-harness, miri, kani, loom, asan]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
