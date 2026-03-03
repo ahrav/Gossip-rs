@@ -10,19 +10,19 @@ This document records two complementary scanner test modes:
 The goal is to keep engine correctness and ruleset quality concerns separated
 while making the trade-offs explicit. See `scanner_test_harness_guide.md` for
 synthetic harness usage. See `detection-rules.md` and
-`tests/corpus/real_rules/README.md` for real-rules context.
+`crates/scanner-engine-integration-tests/tests/corpus/real_rules/README.md` for real-rules context.
 
 ## Component Map
 
 | Component                     | Location                                                                                                                                                                       | Purpose                                                                                          |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ |
 | Synthetic scenario generator  | `crates/scanner-scheduler/src/sim_scanner/generator.rs`                                                                                                                        | Build deterministic in-memory files, rules, and expected spans from a seed                       |
-| Random sim harness            | `tests/simulation/scanner_random.rs`                                                                                                                                           | Seeded stress testing of engine invariants under faults and chunking                             |
-| Corpus replay harness         | `tests/simulation/scanner_corpus.rs`                                                                                                                                           | Replay minimized regression artifacts                                                            |
-| Additional synthetic coverage | `tests/simulation/scanner_archive_*.rs`, `tests/simulation/scanner_discovery.rs`, `tests/simulation/scanner_max_file_size.rs`, `tests/simulation/scanner_budget_invariance.rs` | Archive, discovery fallback, and size or budget invariants                                       |
-| Real rules harness            | `tests/simulation/scanner_real_rules.rs`                                                                                                                                       | Scan curated fixtures with production rules and compare normalized findings to a golden baseline |
-| Real rules fixtures           | `tests/corpus/real_rules/fixtures/`                                                                                                                                            | Curated synthetic, non-sensitive fixture corpus                                                  |
-| Real rules baseline           | `tests/corpus/real_rules/expected/findings.json`                                                                                                                               | Golden findings snapshot for mode-2 regression                                                   |
+| Random sim harness            | `crates/scanner-engine-integration-tests/tests/simulation/scanner_random.rs`                                                                           | Seeded stress testing of engine invariants under faults and chunking                             |
+| Corpus replay harness         | `crates/scanner-engine-integration-tests/tests/simulation/scanner_corpus.rs`                                                                           | Replay minimized regression artifacts                                                            |
+| Additional synthetic coverage | `crates/scanner-engine-integration-tests/tests/simulation/scanner_archive_*.rs`, `crates/scanner-engine-integration-tests/tests/simulation/scanner_discovery.rs`, `crates/scanner-engine-integration-tests/tests/simulation/scanner_max_file_size.rs`, `crates/scanner-engine-integration-tests/tests/simulation/scanner_budget_invariance.rs` | Archive, discovery fallback, and size or budget invariants                                       |
+| Real rules harness            | `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`                                                                       | Scan curated fixtures with production rules and compare normalized findings to a golden baseline |
+| Real rules fixtures           | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/fixtures/`                                                                            | Curated synthetic, non-sensitive fixture corpus                                                  |
+| Real rules baseline           | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/expected/findings.json`                                                               | Golden findings snapshot for mode-2 regression                                                   |
 | Real ruleset source           | `default_rules.yaml` (embedded via `crates/scanner-engine/src/rules/mod.rs`)                                                                                                   | Production detection rules used by `demo_rules()`                                                |
 | Harness guide                 | `docs/scanner-scheduler/scanner_test_harness_guide.md`                                                                                                                         | How to run and debug synthetic scanner simulations                                               |
 
@@ -88,7 +88,7 @@ fixture corpus and golden snapshot comparison:
 
 ### Verified constants and baseline paths
 
-Current implementation in `tests/simulation/scanner_real_rules.rs` uses:
+Current implementation in `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs` uses:
 - `CORPUS_DIR = "tests/corpus/real_rules/fixtures"`
 - `BASELINE_PATH = "tests/corpus/real_rules/expected/findings.json"`
 - `LocalConfig { workers: 2, chunk_size: 64 * 1024, pool_buffers: 8, .. }`
@@ -142,7 +142,7 @@ The canonical identity tuple is:
 
 ### Reduced matrix and CI gate
 
-The integration gate lives in `tests/integration/execution_mode_parity.rs` and
+The integration gate lives in `crates/scanner-engine-integration-tests/tests/integration/execution_mode_parity.rs` and
 is scheduled in CI as job `execution-mode-parity`. The matrix currently covers:
 - FS flat fixture
 - FS nested fixture

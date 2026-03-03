@@ -280,6 +280,8 @@ defines run-level and admin operations:
 | `fail_run`         | Transition Active to Failed           |  Yes (OpId) |      No      |
 | `cancel_run`       | Transition non-terminal to Cancelled  |  Yes (OpId) |      No      |
 | `unpark_shard`     | Resume Parked shard to Active         |  Yes (OpId) |      No      |
+| `create_run_with_shards` | Convenience: create + register  |  Yes (OpId) |      No      |
+| `collect_claim_candidates_into` | Hot-path claim candidate scan | N/A     |      No      |
 
 Admin operations (`unpark`, `cancel`) are **not** lease-gated (D2.21) -- they
 are coordinator-level actions that do not require a worker to hold a lease.
@@ -523,26 +525,28 @@ Every backend implementation must maintain these invariants:
 
 ## 9. Cursor Semantics
 
-The `Cursor` type is a two-layer progress marker:
+The coordination layer uses `CursorUpdate<'a>` — a borrowed cursor view:
 
 ```text
 ┌──────────────────────────────────────────────────────┐
-│ last_key: Option<Box<[u8]>>                          │
+│ last_key: Option<&'a [u8]>                           │
 │   → coordinator-visible, lex-comparable              │
 │   → represents the last item key fully processed     │
 ├──────────────────────────────────────────────────────┤
-│ token: Option<Box<[u8]>>                             │
+│ token: Option<&'a [u8]>                              │
 │   → connector-opaque resume state                    │
 │   → pagination cursor, continuation token, etc.      │
 └──────────────────────────────────────────────────────┘
 ```
 
-The `Cursor` type is the API-boundary representation used across
-`CoordinationBackend` trait methods. Internally, the in-memory coordinator
-stores cursor fields as `PooledCursor` — a pair of `Option<ByteSlot>` handles
-into a shared `ByteSlab` — eliminating per-checkpoint heap allocations on the
-hot path. The `to_cursor` / `from_cursor` methods convert between the pooled
-representation and the owned `Cursor` at API boundaries.
+`CursorUpdate<'a>` is a borrowed view used across `CoordinationBackend`
+trait methods. Internally, the in-memory coordinator stores cursor fields as
+`PooledCursor` — a pair of `Option<ByteSlot>` handles into a shared
+`ByteSlab` — eliminating per-checkpoint heap allocations on the hot path.
+The `PooledCursor::from_update` and `PooledCursor::last_key(slab)` methods
+convert between the pooled representation and borrowed views at API
+boundaries. The connector boundary uses the owned `connector::Cursor` type,
+which converts to/from `CursorUpdate`.
 
 ### Monotonicity rules
 
@@ -622,6 +626,11 @@ A shared `CoordError` enum with 12 variants provides the building blocks for
 all operation-specific errors. Variants cover tenant isolation, fencing, lease
 expiry, terminal status, OpId conflicts, cursor violations, split validation
 failures, and missing checkpoint keys.
+
+> **Note**: `CheckpointError`, `CompleteError`, and `SplitError` also carry a
+> `ResourceExhausted(SlabFull)` variant from `From<SlabFull>` impls. This
+> variant is not routed through `CoordError` — it originates directly from
+> `ByteSlab` allocation failures on the pooled storage path.
 
 ### Operation-specific narrowing
 

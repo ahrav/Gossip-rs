@@ -387,14 +387,14 @@ This is the power of the adapter pattern.
 
 ## 8. Testing
 
-The module includes tests (lines 214-296) that verify:
+The module includes tests that verify:
 
-**`real_engine_implements_scan_engine()` (lines 251-271)**:
+**`real_engine_implements_scan_engine()`**:
 - Trait methods work through the adapter
 - Findings are correctly extracted
 - Rule names resolve properly
 
-**`drop_prefix_findings_works()` (lines 274-295)**:
+**`drop_prefix_findings_works()`**:
 - Overlap deduplication works
 - Findings in the overlap region are dropped
 

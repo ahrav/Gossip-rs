@@ -152,15 +152,26 @@ stdout events and persistent database output.
 
 ### Identity Canonicalization Link
 
-For persistence IDs (`crates/scanner-scheduler/src/store.rs`), transform-derived findings use:
+Engine-level within-chunk dedup (`ScanScratch::push_finding_with_drop_hint` in
+`crates/scanner-engine/src/engine/scratch.rs`) builds a 32-byte `DedupKey` per
+finding. Span coordinates contribute when `step_id == STEP_ROOT` **or**
+`dedupe_with_span` is true — root-level findings always include the span, while
+transform-derived findings include it only when root-span mapping is unavailable
+(to avoid collapsing distinct matches that share a coarse root hint window).
+Additional canonicalization applied at this stage:
 
 - Root-hint end normalization tolerant to base64 padding variance (`min..min+3`).
-- Span contribution when dedupe includes span (`step_id == STEP_ROOT` or
-  `dedupe_with_span`).
-- UTF-16 LE/BE variant discriminator carried into `occurrence_id`.
+- UTF-16 LE/BE variant discriminator packed into `rule_id_with_variant`.
 
-These rules intentionally mirror dedupe semantics in
-`ScanScratch::push_finding_with_drop_hint`.
+The scheduler applies a separate **cross-rule** dedup pass
+(`dedupe_findings_cross_rule` in
+`crates/scanner-scheduler/src/scheduler/scan_helpers.rs`) that collapses
+findings sharing the same `(root_hint_start, root_hint_end, span_projection,
+norm_hash)` tuple across different rules. At this stage, span coordinates
+contribute based on `dedupe_with_span` alone — there is no additional
+`step_id == STEP_ROOT` check because `rule_id` is intentionally excluded
+from the key (the goal is to pick the highest-confidence winner among rules
+that matched the same location).
 
 | Limit                           | Default | Purpose                                  |
 |---------------------------------|---------|------------------------------------------|

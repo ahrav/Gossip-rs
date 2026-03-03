@@ -410,7 +410,7 @@ Archive worker count defaults to `max(cpu_workers / 4, 1)` when archives are ena
 
 Archives are detected at two points:
 
-1. **Discovery time** (extension-based): Files with known extensions (`.tar`, `.gz`, `.tar.gz`, `.zip`) are routed directly to archive workers during directory traversal via `detect_kind_from_path()`, bypassing I/O threads entirely.
+1. **Discovery time** (extension-based): Files with known extensions (`.tar`, `.gz`, `.tar.gz`, `.zip`, `.bz2`, `.tar.bz2`) are routed directly to archive workers during directory traversal via `detect_kind_from_path()`, bypassing I/O threads entirely.
 
 2. **First-chunk classification** (content-based): Files without archive extensions but with archive magic bytes in their content are detected by I/O threads after the first read completes and routed to archive workers via `ArchiveWork`.
 
@@ -419,7 +419,7 @@ Archives are detected at two points:
 Each archive worker runs `archive_worker_loop`, which:
 1. Receives `ArchiveWork` from the bounded channel.
 2. Re-opens the file (the I/O thread dropped its fd after routing).
-3. Dispatches to the appropriate scanner: `scan_gzip_stream`, `scan_tar_stream`, `scan_targz_stream`, or `scan_zip_source`.
+3. Dispatches to the appropriate scanner: `scan_gzip_stream`, `scan_tar_stream`, `scan_targz_stream`, `scan_zip_source`, `scan_bzip2_stream`, or `scan_tarbz2_stream`.
 4. Uses `UringArchiveSink` to forward decompressed entry chunks to the scan engine, following the same `scan_chunk_into → drop_prefix_findings → drain → dedupe → emit` pattern as regular CPU tasks.
 5. Drops the `FileToken` when done, releasing the `CountPermit` and unblocking discovery.
 
@@ -971,6 +971,9 @@ pub struct UringIoStats {
     pub short_reads: u64,          // File truncation between reads
     pub binary_skipped: u64,       // Files skipped as binary (first-chunk)
     pub archives_sniffed: u64,     // Files routed to archive workers (content-based)
+    pub archives_send_failed: u64, // Archive sends failed (channel closed)
+    pub extractions_routed: u64,   // Files routed to extraction workers
+    pub bytes_enqueued: u64,       // Total authoritative file bytes from statx
 }
 ```
 
@@ -1183,6 +1186,9 @@ let cfg = LocalFsUringConfig {
     max_file_size: Some(100 * 1024 * 1024),  // 100 MB max
     seed: 1,
     dedupe_within_chunk: true,
+    pin_threads: false,
+    skip_binary: true,
+    archive: ArchiveConfig::default(),
 };
 let sink = Arc::new(VecEventOutput::new());
 

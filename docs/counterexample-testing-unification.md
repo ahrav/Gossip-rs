@@ -55,7 +55,7 @@ behind `sim-harness`.
 ### 1.3 Corpus Replay
 
 Seventy-one scanner `.case.json` files and eleven git-scan `.case.json` files
-in `tests/corpus/`. Each case is a serialized scenario + fault plan + schedule
+in `crates/scanner-engine-integration-tests/tests/corpus/`. Each case is a serialized scenario + fault plan + schedule
 seed that deterministically replays in milliseconds. New failures discovered by
 random simulation are minimized and added here. This is the fastest regression
 gate.
@@ -117,10 +117,10 @@ nightly; not in CI default gate.
 
 ### 1.11 Real-Rules Harness
 
-`tests/simulation/scanner_real_rules.rs` (278 lines) scans curated fixtures
-at `tests/corpus/real_rules/fixtures/` with production rules from
+`crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs` (278 lines) scans curated fixtures
+at `crates/scanner-engine-integration-tests/tests/corpus/real_rules/fixtures/` with production rules from
 `default_rules.yaml` and compares findings against a golden baseline at
-`tests/corpus/real_rules/expected/findings.json`. Gated behind
+`crates/scanner-engine-integration-tests/tests/corpus/real_rules/expected/findings.json`. Gated behind
 `real-rules-harness`. Fixtures are hand-authored; no mutation generation.
 
 ### 1.12 Smoke Tests
@@ -241,13 +241,13 @@ fixtures are ever introduced:
 
 | Current Component       | Location                                                          | Purpose                      | Action             | Target                                                  | Rationale                                              |
 | ----------------------- | ----------------------------------------------------------------- | ---------------------------- | ------------------ | ------------------------------------------------------- | ------------------------------------------------------ |
-| `encode_secret()`       | `generator.rs:494-503`                                            | Dispatch raw→representation  | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Domain-independent; reusable by git sim and real-rules |
-| `base64_encode_std()`   | `generator.rs:536-564`                                            | Base64 standard encoding     | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Pure byte transform                                    |
-| `percent_encode_all()`  | `generator.rs:525-533`                                            | URL percent encoding         | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Pure byte transform                                    |
-| `encode_utf16()`        | `generator.rs:575-589`                                            | UTF-16 LE/BE widening        | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Pure byte transform                                    |
-| `encode_nested()`       | `generator.rs:508-522`                                            | Alternating layer nesting    | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Pure byte transform                                    |
-| `hex_nibble()`          | `generator.rs:566-572`                                            | Nibble→hex helper            | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Dependency of `percent_encode_all`                     |
-| `SecretRepr`            | `scenario.rs:96-104`                                              | Encoding representation enum | **Migrate**        | `crates/scanner-scheduler/src/sim/mutation.rs`          | Domain-independent type                                |
+| `encode_secret()`       | `generator.rs:494-503`                                            | Dispatch raw→representation  | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent; reusable by git sim and real-rules |
+| `base64_encode_std()`   | `generator.rs:536-564`                                            | Base64 standard encoding     | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `percent_encode_all()`  | `generator.rs:525-533`                                            | URL percent encoding         | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_utf16()`        | `generator.rs:575-589`                                            | UTF-16 LE/BE widening        | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `encode_nested()`       | `generator.rs:508-522`                                            | Alternating layer nesting    | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Pure byte transform                                    |
+| `hex_nibble()`          | `generator.rs:566-572`                                            | Nibble→hex helper            | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Dependency of `percent_encode_all`                     |
+| `SecretRepr`            | `scenario.rs:96-104`                                              | Encoding representation enum | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/encode.rs`   | Domain-independent type                                |
 | `make_token()`          | `generator.rs:467-476`                                            | Rule prefix + random tail    | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Scanner-specific format (SIM{id}_...)                  |
 | `generate_scenario()`   | `sim_scanner/generator.rs`                                        | Full scanner scenario        | **Keep**           | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | Domain-specific orchestration                          |
 | `generate_scenario()`   | `sim_git_scan/generator.rs`                                       | Full git scenario            | **Keep**           | `crates/scanner-git/src/sim_git_scan/generator.rs`      | Domain-specific orchestration                          |
@@ -257,13 +257,13 @@ fixtures are ever introduced:
 | `GitFaultPlan`          | `sim_git_scan/fault.rs`                                           | Git fault injection          | **Keep**           | `crates/scanner-git/src/sim_git_scan/fault.rs`          | Resource-keyed, git-specific                           |
 | Scanner minimizer       | `sim/minimize.rs` (777 lines)                                     | Greedy shrink passes         | **Keep**           | `crates/scanner-scheduler/src/sim/minimize.rs`          | Domain-specific shrink logic                           |
 | Git minimizer           | `sim_git_scan/minimize.rs` (408 lines)                            | Graph-aware shrink           | **Keep**           | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Graph-aware, git-specific                              |
-| Scanner corpus          | `tests/corpus/scanner/` (71 cases)                                | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
-| Git corpus              | `tests/corpus/git_scan/` (11 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
-| Near-miss operators     | **DO NOT EXIST**                                                  | —                            | **Create**         | `crates/scanner-scheduler/src/sim/mutation.rs`          | Core new capability                                    |
-| Property tests          | `tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
+| Scanner corpus          | `crates/scanner-engine-integration-tests/tests/corpus/scanner/` (71 cases)                                | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
+| Git corpus              | `crates/scanner-engine-integration-tests/tests/corpus/git_scan/` (11 cases)                               | Regression replay            | **Keep**           | Same                                                    | Canonical fast gate                                    |
+| Near-miss operators     | `crates/scanner-scheduler/src/sim/mutation/op.rs`                 | Near-miss mutation ops       | **Done** (Phase 1) | `crates/scanner-scheduler/src/sim/mutation/op.rs`       | Core new capability                                    |
+| Property tests          | `crates/scanner-engine-integration-tests/tests/property/` (20 files)                                      | Math invariants              | **Keep**           | Same                                                    | Different abstraction layer                            |
 | Offline validator tests | `crates/scanner-engine/src/engine/offline_validate.rs` (39 tests) | Validator vectors            | **Keep + Augment** | Same + mutation-derived vectors                         | Add near-miss vectors in Phase 3                       |
-| Integration tests       | `tests/integration/` (22 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
-| Real-rules fixtures     | `tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
+| Integration tests       | `crates/scanner-engine-integration-tests/tests/integration/` (22 files)                                   | Handcrafted regression       | **Keep**           | Same                                                    | Clear, readable, stable                                |
+| Real-rules fixtures     | `crates/scanner-engine-integration-tests/tests/corpus/real_rules/`                                        | Curated corpus               | **Keep + Augment** | Same + near-miss fixtures                               | Add near-miss fixtures in Phase 3                      |
 | Fuzz targets            | Per-crate `fuzz/fuzz_targets/` (24 targets)                       | Coverage-guided              | **Keep**           | Same                                                    | Complementary discovery mechanism                      |
 
 ---
@@ -278,8 +278,8 @@ The shared mutation core must satisfy a strict deterministic contract.
 Inputs:
   family:       TokenFamily       — structural category of the secret
   base_seed:    u64               — seed for deterministic RNG
-  op_seq:       Vec<MutationOp>   — ordered mutation/encoding pipeline
-  context_wrap: Option<ContextWrap> — surrounding context (e.g. JSON key, YAML value)
+  ops:          Vec<MutOp>        — ordered mutation/encoding pipeline
+  context:      ContextWrap       — surrounding context (e.g. JSON field, YAML value)
 
 Outputs:
   mutated_bytes:    Vec<u8>       — final byte sequence
@@ -288,7 +288,7 @@ Outputs:
 
 ### 5.2 Invariants
 
-**DETERMINISM**: Given identical `(family, base_seed, op_seq, context_wrap)`,
+**DETERMINISM**: Given identical `(family, base_seed, ops, context)`,
 the output is byte-for-byte identical across runs, platforms, and Rust
 versions. No `HashMap` iteration, no system randomness, no floating point.
 
@@ -324,37 +324,22 @@ beyond the output buffer.
 **SERIALIZATION**: All types derive `serde::Serialize` and
 `serde::Deserialize`. Corpus artifacts round-trip through JSON without loss.
 
-### 5.3 Proposed Types
+### 5.3 Types (Implemented)
+
+The types below reflect the actual implementation in
+`crates/scanner-scheduler/src/sim/mutation/`.
 
 ```rust
+// -- family.rs --
+
 /// Token structural family. Determines which mutation operators are valid.
 enum TokenFamily {
-    GenericAlphanumeric,
-    HexEncoded,
-    Base62Crc,
-    GitHubPat,
     AwsAccessKey,
-    // Extend per rule family
-}
-
-/// Individual mutation/encoding operation.
-enum MutationOp {
-    /// Truncate to N bytes.
-    Truncate { len: usize },
-    /// Replace chars outside target charset with ASCII fallback.
-    CharsetDegrade { target_charset: Charset },
-    /// Shift a positional boundary by delta bytes.
-    BoundaryShift { boundary: Boundary, delta: i32 },
-    /// Reduce Shannon entropy below detection threshold.
-    EntropyReduce { target_bits: f32 },
-    /// Corrupt an embedded checksum.
-    ChecksumCorrupt,
-    /// Mangle a known prefix (e.g. "ghp_" → "ghx_").
-    PrefixMangle,
-    /// Apply an encoding transform.
-    Encode { repr: SecretRepr },
-    /// Apply nested encoding layers.
-    Nest { depth: u8 },
+    GithubFinegrainedPat,
+    GithubClassicPat,
+    JwtLike,
+    Base64Blob,
+    UrlEncodedBlob,
 }
 
 /// Expected detection outcome.
@@ -363,17 +348,49 @@ enum Outcome {
     MustNotMatch,
     MayMatch,
 }
+
+// -- op.rs --
+
+/// Individual mutation operation (fully specified parameters).
+enum MutOp {
+    Truncate { len: usize },
+    CharsetViolate { positions: Vec<usize>, replacement: u8 },
+    PrefixMangle { replacement: Vec<u8> },
+    ChecksumCorrupt,
+    EntropyReduce { repeat_byte: u8, count: usize },
+    Encode { repr: SecretRepr },
+    Extend { suffix: Vec<u8> },
+}
+
+/// Fieldless discriminant mirror of MutOp for allowed-ops declarations.
+enum MutOpKind {
+    Truncate, CharsetViolate, PrefixMangle, ChecksumCorrupt,
+    EntropyReduce, Encode, Extend,
+}
+
+// -- encode.rs --
+
+/// Encoding layer applied to a secret before it appears in a file.
+enum SecretRepr {
+    Raw,
+    Base64,
+    UrlPercent,
+    Utf16Le,
+    Utf16Be,
+    Nested { depth: u8 },
+}
 ```
 
 ### 5.4 Worked Example: AWS Access Key Near-Miss
 
-An AWS access key has the form `AKIA[A-Z0-9]{16}`. A `CharsetDegrade`
+An AWS access key has the form `AKIA[A-Z2-7]{16}`. A `CharsetViolate`
 near-miss:
 
 1. Start: `AKIAIOSFODNN7EXAMPLE` (valid, `MustMatch`)
-2. Apply `CharsetDegrade { target_charset: Lowercase }`:
-   Replace uppercase chars with lowercase → `akiaiosfodnn7example`
-3. Result: lowercase string no longer matches `AKIA[A-Z0-9]{16}` → `MustNotMatch`
+2. Apply `CharsetViolate { positions: [0, 1, 2, ...], replacement: b'a' }`:
+   Replace bytes at specified positions with lowercase `a` →
+   `aaaaiosfodnn7example`
+3. Result: lowercase characters no longer match `AKIA[A-Z2-7]{16}` → `MustNotMatch`
 
 The mutation is deterministic (no RNG needed for this op), produces a
 structurally similar but invalid token, and has a clear expected outcome.
@@ -382,12 +399,29 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ## 6. Phase-by-Phase Rollout
 
-### Phase 1: Extract Shared Mutation Core (`scratch-gs8l.2`)
+### Phase 1: Extract Shared Mutation Core (`scratch-gs8l.2`) — **Completed**
 
-- Create `crates/scanner-scheduler/src/sim/mutation.rs` with migrated encoding functions and the
-  `SecretRepr` enum.
-- Add near-miss mutation operators: `Truncate`, `CharsetDegrade`,
-  `BoundaryShift`, `EntropyReduce`, `ChecksumCorrupt`, `PrefixMangle`.
+- Created `crates/scanner-scheduler/src/sim/mutation/` as a submodule directory
+  with 7 files:
+  - `mod.rs` — public re-exports
+  - `op.rs` — `MutOp` / `MutOpKind` enums, `apply_ops` pipeline with
+    `MAX_OUTPUT_BYTES` safety guard
+  - `family.rs` — `TokenFamily` (6 variants: `AwsAccessKey`,
+    `GithubFinegrainedPat`, `GithubClassicPat`, `JwtLike`, `Base64Blob`,
+    `UrlEncodedBlob`) with `gen_valid`, `allowed_ops`, and `expectation`
+    oracle; `Outcome` enum
+  - `encode.rs` — `SecretRepr` enum, migrated encoding functions
+    (`base64_encode_std`, `percent_encode_all`, `encode_utf16`,
+    `encode_nested`, `base64url_encode_nopad`, `hex_nibble`,
+    `encode_secret`)
+  - `plan.rs` — `MutationPlan`, `GeneratedCase`, `ContextWrap`,
+    `WrappedToken`, `execute_plan` pipeline
+  - `plan_gen.rs` — `random_mutation_plan`,
+    `random_mutation_plans_all_families` for sim-harness integration
+  - `adapter.rs` — `build_mutation_scenario`, `build_mutation_engine`,
+    `check_mutation_expectations` two-oracle adapter for `ScannerSimRunner`
+- Near-miss mutation operators implemented: `Truncate`, `CharsetViolate`,
+  `PrefixMangle`, `ChecksumCorrupt`, `EntropyReduce`, `Encode`, `Extend`.
 - Thin shims in `sim_scanner/generator.rs` delegate to the shared module.
 - All existing corpus artifacts and tests pass unchanged.
 - Acceptance: `cargo test --features sim-harness` passes with zero delta.
@@ -403,7 +437,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ### Phase 3: Augment Real-Rules Fixtures and Offline Validators
 
-- Generate near-miss fixtures for `tests/corpus/real_rules/fixtures/` using
+- Generate near-miss fixtures for `crates/scanner-engine-integration-tests/tests/corpus/real_rules/fixtures/` using
   the mutation core. Commit as static files.
 - Add mutation-derived vectors to `offline_validate.rs` tests — particularly
   for charset, length, and checksum boundary conditions.
@@ -411,7 +445,7 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 ### Phase 4 (Optional): Proptest Strategies + Fuzz Target
 
-- Create `proptest` strategies that compose `MutationOp` sequences.
+- Create `proptest` strategies that compose `MutOp` sequences.
 - Property: for any seed and op sequence, the output is deterministic.
 - Property: encoding-only op sequences produce `MustMatch` outcomes.
 - New fuzz target: `fuzz_mutation_pipeline.rs` for coverage-guided mutation
@@ -474,13 +508,13 @@ structurally similar but invalid token, and has a clear expected outcome.
 
 | Risk                          | Likelihood | Impact                      | Mitigation                                                                                                                                                      |
 | ----------------------------- | ---------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Serde compatibility break     | Low        | High (all corpus artifacts) | Variant names for `SecretRepr` unchanged during migration. `MutationOp` is new, no existing artifacts to break. Add serde roundtrip test in Phase 1.            |
+| Serde compatibility break     | Low        | High (all corpus artifacts) | Variant names for `SecretRepr` unchanged during migration. `MutOp` is new, no existing artifacts to break. Add serde roundtrip test in Phase 1.            |
 | False failures from near-miss | Medium     | Medium (CI noise)           | `near_miss_count` defaults to 0; existing tests unaffected. Near-miss tests are additive. New failures are always minimized before corpus addition.             |
-| Kitchen-sink module           | Medium     | Low (maintenance)           | 500-line split threshold: if `mutation.rs` exceeds 500 lines, factor encoding and near-miss ops into submodules (`mutation/encode.rs`, `mutation/nearmiss.rs`). |
+| Kitchen-sink module           | Medium     | Low (maintenance)           | Exceeded 500-line threshold; factored into submodule directory `mutation/` with 7 files (`mod.rs`, `op.rs`, `family.rs`, `encode.rs`, `plan.rs`, `plan_gen.rs`, `adapter.rs`). |
 
 **Rollback**: Each phase is independently revertible.
 
-- Phase 1: revert `crates/scanner-scheduler/src/sim/mutation.rs` creation, restore inline functions in
+- Phase 1: **Completed.** Revert by removing `crates/scanner-scheduler/src/sim/mutation/` directory, restoring inline functions in
   `generator.rs`. No corpus changes.
 - Phase 2: remove `near_miss_count` from config, remove new oracle check.
   Corpus additions are additive and can be deleted.
@@ -552,9 +586,10 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored
 | `crates/scanner-scheduler/src/sim/minimize.rs`          | Scanner minimizer (greedy shrink passes)                             |
 | `crates/scanner-git/src/sim_git_scan/minimize.rs`       | Git minimizer (graph-aware shrink)                                   |
 | `crates/scanner-scheduler/src/sim/executor.rs`          | `SimExecutor` deterministic scheduler                                |
+| `crates/scanner-scheduler/src/sim/mutation/`            | Shared mutation core (Phase 1 output): 7 files                       |
 | `crates/scanner-engine/src/engine/offline_validate.rs`  | Structural token validators                                          |
 | `crates/scanner-engine/src/rules/yaml_unit_tests.rs`    | Rule parsing/scanning roundtrip                                      |
-| `tests/simulation/scanner_real_rules.rs`                | Real-rules golden baseline harness                                   |
+| `crates/scanner-engine-integration-tests/tests/simulation/scanner_real_rules.rs`                | Real-rules golden baseline harness                                   |
 
 ### Documentation
 

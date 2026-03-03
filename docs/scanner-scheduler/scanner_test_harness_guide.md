@@ -50,8 +50,8 @@ DUMP_SIM_FAIL=1 cargo test --features sim-harness --test simulation scanner_rand
 ```
 
 **Key paths:**
-- **Corpus**: `tests/corpus/scanner/*.case.json` - regression tests replayed on every run
-- **Random tests**: `tests/simulation/scanner_random.rs` - bounded random scenario generation
+- **Corpus**: `crates/scanner-engine-integration-tests/tests/corpus/scanner/*.case.json` - regression tests replayed on every run
+- **Random tests**: `crates/scanner-engine-integration-tests/tests/simulation/scanner_random.rs` - bounded random scenario generation
 
 ## ScenarioGenConfig Reference
 
@@ -69,7 +69,7 @@ Configuration for generating synthetic scanner scenarios.
 | `representations`  | `Vec<SecretRepr>`      | Raw, Base64, UrlPercent, Utf16Le, Utf16Be | Allowed secret encodings to choose from         |
 | `archive_count`    | u32                    | 0                                         | Number of archive files to generate             |
 | `archive_entries`  | u32                    | 2                                         | Entries per generated archive                   |
-| `archive_kinds`    | `Vec<ArchiveKindSpec>` | tar, tar.gz, zip, gzip                    | Archive formats to include                      |
+| `archive_kinds`    | `Vec<ArchiveKindSpec>` | Tar, TarGz, TarBz2, Zip, Gzip, Bzip2     | Archive formats to include                      |
 | `archive`          | `ArchiveConfig`        | default                                   | Archive config used to compute virtual paths    |
 
 **Example:**
@@ -91,7 +91,7 @@ let scenario = generate_scenario(42, &gen_cfg)?;
 
 Configuration for a single simulation run.
 
-`RunConfig` does not implement `Default`; values below are the defaults used by `tests/simulation/scanner_random.rs`.
+`RunConfig` does not implement `Default`; values below are the defaults used by `crates/scanner-engine-integration-tests/tests/simulation/scanner_random.rs`.
 
 | Field                   | Type          | Default  | Description                                                        |
 | ----------------------- | ------------- | -------- | ------------------------------------------------------------------ |
@@ -334,7 +334,7 @@ Clamp `overlap` to `engine.required_overlap()` before running (as shown in Scena
 
 1. Run simulation and capture failure artifact (or construct manually)
 2. Minimize with `minimize_scanner_case()` if needed
-3. Copy minimized artifact to `tests/corpus/scanner/<name>.case.json`
+3. Copy minimized artifact to `crates/scanner-engine-integration-tests/tests/corpus/scanner/<name>.case.json`
 4. Verify replay passes:
    ```bash
    cargo test --features sim-harness --test simulation scanner_corpus
@@ -371,7 +371,7 @@ The minimizer applies deterministic shrink passes:
 | `SIM_SCANNER_SEED_COUNT`      | 25      | Number of seeds to test                                                   |
 | `SIM_SCANNER_DEEP`            | false   | Enable larger scenarios and more faults                                   |
 | `DUMP_SIM_FAIL`               | unset   | Print failure details on panic                                            |
-| `SCANNER_SIM_WRITE_FAIL`      | unset   | Write failing artifacts to `tests/failures/scanner_seed_<seed>.case.json` |
+| `SCANNER_SIM_WRITE_FAIL`      | unset   | Write failing artifacts to `crates/scanner-engine-integration-tests/tests/failures/scanner_seed_<seed>.case.json` |
 | `SCANNER_SIM_STRICT_NON_ROOT` | unset   | Enforce differential checks for non-root (transform) findings             |
 
 **Scenario overrides:**

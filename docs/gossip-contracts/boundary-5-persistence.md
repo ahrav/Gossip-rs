@@ -1,5 +1,17 @@
 # Boundary 5 - Persistence Architecture
 
+> **Status: Design spec + partial implementation.**
+> The Rust trait surface (`DoneLedger`, `FindingsSink`, `PageCommit<S>`,
+> and supporting types) is defined in staged artifacts under
+> `tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs` and
+> documented in the module doc at
+> `crates/gossip-contracts/src/persistence/mod.rs`.
+> The external storage backends (etcd, ScyllaDB, PostgreSQL) described
+> in sections 2–4 are **aspirational design targets** — no production
+> backend implementations exist yet. The coordination backend trait
+> lives in `gossip-coordination` as `CoordinationBackend`
+> (`crates/gossip-coordination/src/traits.rs`).
+
 Boundary 5 defines the durable storage plan for three subsystems:
 
 - Coordination state (runs, shards, leases, fences, cursors, split state)
@@ -8,7 +20,7 @@ Boundary 5 defines the durable storage plan for three subsystems:
 
 This is the normative reference for production persistence backends behind:
 
-- Coordination: `CoordinationStore` + `PageCommit<S>` (worker commit protocol)
+- Coordination: `CoordinationBackend` (trait in `gossip-coordination/src/traits.rs`) + `PageCommit<S>` (worker commit protocol)
 - Done-ledger: `DoneLedger`
 - Findings: `FindingsSink`
 
@@ -21,9 +33,56 @@ Non-negotiables (project-wide):
 
 ---
 
-## 0. Summary of decisions
+## Implemented Rust types
 
-### Storage topology (recommended)
+The persistence boundary's trait surface and data types are defined in staged
+artifacts (`tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`). The
+module doc lives at `crates/gossip-contracts/src/persistence/mod.rs`. No
+production backend implementations exist yet; only in-memory test doubles
+(behind `test-support` feature flag).
+
+### Traits
+
+| Trait | Purpose | Key methods |
+|-------|---------|-------------|
+| `DoneLedger` | Dedupe index: "was this object-version scanned under this policy?" | `batch_get(&self, &DoneLedgerGetBatch, LogicalTime) -> Result<DoneLedgerGetResult, DoneLedgerGetError>`, `batch_upsert(&self, &DoneLedgerUpsertBatch, ShardId, FenceEpoch, LogicalTime) -> Result<(), DoneLedgerUpsertError>` |
+| `FindingsSink` | Triage/query plane: findings + occurrences persistence | `upsert_findings(&self, &FindingsUpsertBatch, ShardId, FenceEpoch, LogicalTime) -> Result<FindingsUpsertResult, FindingsUpsertError>` |
+| `CoordinationBackend` | Shard lifecycle: acquire, checkpoint, complete, park, split (lives in `gossip-coordination/src/traits.rs`, not in this module) | `acquire_and_restore_into`, `checkpoint`, `complete`, `park_shard`, `split_residual`, `split_replace` |
+
+### Typestate machine
+
+| Type | Purpose |
+|------|---------|
+| `PageCommit<S>` | Compile-time enforcement of the commit protocol ordering: findings flush → done-ledger upsert → cursor checkpoint. State parameter `S` transitions through `Pending` → `FindingsFlushed` → `LedgerCommitted` → `CommitProof`. |
+
+### Data types
+
+| Type | Purpose |
+|------|---------|
+| `DoneLedgerKey` | Composite lookup key: `(TenantId, PolicyHash, OvidHash)` — 96-byte fixed-width. |
+| `OvidHash` | Content-addressed Object-Version Identity digest (BLAKE3, 32 bytes). Derived from `OvidInputs` via `derive_ovid_hash`. |
+| `DoneLedgerStatus` | Scan outcome enum with monotonic join-semilattice semantics: `NotSeen < Failed < Scanned`. |
+| `DoneLedgerEntry` | Stored entry: status + metadata (scanned_at, run_id, shard_id). |
+| `DoneLedgerLookup` | Query result per key: `NotSeen` or `Found(DoneLedgerEntry)`. |
+| `DoneLedgerGetBatch` / `DoneLedgerGetResult` | Batch query request/response containers. |
+| `DoneLedgerUpsertItem` / `DoneLedgerUpsertBatch` | Batch upsert request containers. |
+| `FindingRecord` | Detection finding with content-addressed `FindingId`, tenant, rule, secret hash, location (never raw secrets). |
+| `OccurrenceRecord` | Version-specific sighting of a finding: byte offset/length, version_id, shard provenance. |
+| `FindingsUpsertBatch` | Capacity-bounded batch of findings + occurrences for atomic upsert. |
+| `FindingsUpsertResult` | Upsert outcome counts: inserted vs. deduplicated for findings and occurrences. |
+
+### Test doubles (`test-support` feature)
+
+| Type | Implements | Notes |
+|------|-----------|-------|
+| `InMemoryDoneLedger` | `DoneLedger` | `HashMap`-backed. Tracks fence watermarks per shard. Not thread-safe. |
+| `InMemoryFindingsSink` | `FindingsSink` | `HashMap`-backed. First-write-wins dedup. Not thread-safe. |
+
+---
+
+## 0. Summary of decisions (design targets)
+
+### Storage topology (recommended — not yet implemented)
 
 | Subsystem                                               | Store          | Why                                                                                                                              |
 | ------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------- |
@@ -57,7 +116,7 @@ Checkpoint write math (sanity):
 
 ---
 
-## 2. Coordination persistence (etcd)
+## 2. Coordination persistence (etcd) — design target
 
 ### 2.1 Why etcd
 
@@ -211,7 +270,7 @@ Not allowed:
 
 ---
 
-## 3. Done-ledger persistence (ScyllaDB)
+## 3. Done-ledger persistence (ScyllaDB) — design target
 
 ### 3.1 What the done-ledger guarantees
 
@@ -320,7 +379,7 @@ Pick one per deployment and document it as a configuration.
 
 ---
 
-## 4. Findings persistence (PostgreSQL)
+## 4. Findings persistence (PostgreSQL) — design target
 
 ### 4.1 Requirements
 

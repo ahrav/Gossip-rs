@@ -23,6 +23,7 @@ parity testing infrastructure.
 | `src/distributed.rs` | Distributed worker loop (`run_worker`), `DistributedCoordinator` trait, `ShardLease`, done-ledger gating, `InMemoryCoordinator` test harness |
 | `src/event_sink.rs` | Output format sinks: `JsonlEventSink`, `TextEventSink`, `JsonEventSink`, `SarifEventSink`; hand-rolled JSON encoding with broken-pipe tolerance |
 | `src/parity.rs` | JSONL parity testing: `canonicalize_jsonl_events` parses scanner output into `CanonicalFinding` tuples with commit-meta joining, path normalization, and sorted deterministic comparison |
+| `src/lib_tests.rs` | Unit and integration tests for core wiring: execution mode parsing, FS/git scan dispatch, budget validation, direct/connector parity |
 | `Cargo.toml` | Dependencies: `anyhow`, `gossip-contracts`, `gossip-scan-driver`, `gossip-connectors`, `scanner-engine`, `scanner-scheduler`, `scanner-git`, `regex`, `serde_json` |
 
 ---
@@ -206,8 +207,8 @@ Flat error enum covering all runtime wiring failures:
 | `InvalidPath { source, path, message }` | Path validation failure (does not exist, not a directory, not repo root) |
 | `UnsupportedConnectorKind(ConnectorKind)` | `InMemory` connector requested at runtime |
 | `GitCommandFailed { repo, status_code, stderr }` | `git rev-parse --show-toplevel` failure |
-| `Io { op, path, error }` | Filesystem canonicalization or git command spawn failure |
-| `RulesConfig { path, message }` | Rules file read or parse error |
+| `Io { op, path: Option<PathBuf>, error }` | Filesystem canonicalization or git command spawn failure (`path` is `None` for non-path I/O such as process spawn) |
+| `RulesConfig { path: Option<PathBuf>, message }` | Rules file read or parse error (`path` is `None` when no file was specified) |
 | `ConnectorInput(ConnectorInputError)` | Zero-budget or invalid connector input |
 | `Driver(anyhow::Error)` | Scan driver execution failure |
 

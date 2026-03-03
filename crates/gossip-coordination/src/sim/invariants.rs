@@ -28,7 +28,7 @@
 //! | S1 | **MutualExclusion** | cross-shard | At most one worker holds a checker-active lease (`deadline >= now`) per shard. |
 //! | S2 | **FenceMonotonicity** | temporal | `fence_epoch` never decreases for a given `(RunId, ShardId)`. |
 //! | S3 | **TerminalIrreversibility** | temporal | Terminal states (`Done`, `Split`, `Parked`) never revert, except `Parked`->`Active` (unpark) which requires a fence bump. |
-//! | S4 | **RecordInvariant** | structural | `ShardRecord::validate_invariants()` returns `Ok`. |
+//! | S4 | **RecordInvariant** | structural | `SimIntrospection::validate_record_invariants()` returns `Ok` (delegates to `ShardRecord::validate_invariants()` with backend storage context). |
 //! | S5 | **CursorMonotonicity** | temporal | `cursor.last_key()` never decreases per shard. |
 //! | S6 | **CursorBounds** | structural | Non-initial cursors remain within shard spec range. |
 //! | S7 | **SplitCoverage** | referential | Split-parent's spawned children exist and reference the parent. |

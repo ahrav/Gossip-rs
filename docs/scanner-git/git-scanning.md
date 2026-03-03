@@ -92,8 +92,8 @@ mode) and pack execution introduce parallelism:
   worker owns its own `PackCache` and `EngineAdapter`, and outputs are
   reassembled in deterministic plan/shard order.
 - **Auto-sized pack worker width** applies when the CLI omits `--workers`.
-  The orchestrator probes `git count-objects -v` (`in-pack`) and chooses
-  `pack_exec_workers` by tier:
+  The function `auto_pack_exec_workers_for_in_pack` receives the in-pack
+  object count and selects `pack_exec_workers` by tier:
   - `< 100,000` in-pack objects: `1x` logical cores
   - `< 2,000,000` in-pack objects: `3x` logical cores
   - `>= 2,000,000` in-pack objects: `6x` logical cores
@@ -136,8 +136,8 @@ cargo test --features sim-harness --test simulation git_scan_corpus
 cargo test --features sim-harness --test simulation git_scan_random
 ```
 
-Corpus cases live in `tests/corpus/git_scan/*.case.json`. Replay failures emit
-artifacts to `tests/failures/` for triage and minimization.
+Corpus cases live in `crates/scanner-engine-integration-tests/tests/corpus/git_scan/*.case.json`. Replay failures emit
+artifacts to `crates/scanner-engine-integration-tests/tests/failures/` for triage and minimization.
 
 ## Performance Architecture
 

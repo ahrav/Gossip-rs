@@ -40,11 +40,11 @@ rule fingerprints) is handled by `DurableCommitSink` in `gossip-scanner-runtime`
   ──────────────────►│──────────┬──────────────────────────────────────────────────►│
                      │          │                                                   │
                      │          ▼                                                   │
-                     │   drain_findings_with_hashes()                               │
+                     │   drop_prefix_findings()      (cross-chunk overlap dedupe)   │
                      │          │                                                   │
                      │          │  Vec<FindingWithHash<F>>                          │
                      │          ▼                                                   │
-                     │   drop_prefix_findings()      (cross-chunk overlap dedupe)   │
+                     │   drain_findings_into()                                      │
                      │          │                                                   │
                      │          ▼                                                   │
                      │   apply_cross_rule_dedupe()    (cross-rule winner dedupe)    │
@@ -63,8 +63,8 @@ rule fingerprints) is handled by `DurableCommitSink` in `gossip-scanner-runtime`
                      │                         │                                   │
                      │           ┌─────────────┼──────────────┬─────────────┐      │
                      │           ▼             ▼              ▼             ▼      │
-                     │   SqliteStoreProd  InMemoryProd  NullProducer   (custom)    │
-                     │    (findings.db)    (test/diag)    (discard)                │
+                      │   SqliteStoreProd  InMemoryProd  NullProducer   (custom)    │
+                      │    (planned)        (test/diag)    (discard)                │
                      └─────────────────────────────────────────────────────────────┘
 
                      At run end:
