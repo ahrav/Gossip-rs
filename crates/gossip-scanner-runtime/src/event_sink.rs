@@ -10,8 +10,8 @@
 //! - `BrokenPipe` is treated as success to support piped CLI output.
 
 use std::io::{self, BufWriter, ErrorKind, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use scanner_git::{GitEvent, GitEventOutput};
 use scanner_scheduler::events::{CoreEvent, EventOutput};
