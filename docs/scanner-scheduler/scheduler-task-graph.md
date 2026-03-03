@@ -427,8 +427,8 @@ CountBudget::release(1)
 | Frontier permit drop                 | RAII release on drop      | Returns one slot to `CountBudget`           |
 
 **Memory Layout**:
-- Task enum: 56 bytes in current unit tests (asserted `<= 128`)
-- ObjectDescriptor: 48 bytes in current unit tests (asserted `<= 64`)
+- Task enum: asserted `<= 128` bytes
+- ObjectDescriptor: asserted `<= 64` bytes
 - ObjectRef: 8 bytes (just Arc pointer)
 
 ---
