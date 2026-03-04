@@ -27,7 +27,7 @@
 //!   `git_dir` and shared `common_dir` so worktree-specific refs (like HEAD)
 //!   resolve correctly while shared refs (branches, tags) are still visible.
 //! - **Annotated tags**: resolved OIDs are peeled through tag objects to the
-//!   underlying commit. The fast path reads peeled OIDs from `packed-refs`
+//!   underlying non-tag object. The fast path reads peeled OIDs from `packed-refs`
 //!   (`^` lines); the slow path decompresses loose tag objects and follows
 //!   the `object` header. Nested tags are followed up to a depth limit.
 
@@ -410,7 +410,7 @@ fn try_packed_peel(
     };
 
     // `object` is `Some` only for annotated tags that have a `^` peel line.
-    // When present, it's the fully-peeled commit OID.
+    // When present, it's the fully-peeled non-tag OID (typically a commit).
     match packed_ref.object {
         Some(_) => Ok(Some(oid_from_hash(packed_ref.object().as_bytes()))),
         None => Ok(None),
@@ -443,7 +443,7 @@ fn peel_loose_tag_chain(
 ///
 /// Returns `Ok(None)` if the object file does not exist or is not a tag.
 /// The loose object format is: `zlib(<type> <size>\0<body>)`.
-/// For tags, the body starts with `object <40-hex>\n...`.
+/// For tags, the body starts with `object <40-or-64-hex>\n...`.
 fn try_read_loose_tag_target(
     oid: &OidBytes,
     objects_dir: &Path,
