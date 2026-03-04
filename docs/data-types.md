@@ -484,7 +484,7 @@ classDiagram
     class FsRunLoss {
         +u64 dropped_findings
         +u64 persistence_emit_failures
-        +bool incomplete
+        +incomplete() bool
     }
 
     class StoreProducer {
@@ -525,7 +525,7 @@ and `end_run()` derives the final run status and persists it to the database.
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `FsFindingRecord`       | Post-dedupe, backend-agnostic finding with absolute byte offsets, `norm_hash`, and additive `confidence_score` (0–10) |
 | `FsFindingBatch`        | Borrowed batch of findings for one scanned object (file or archive entry)                                             |
-| `FsRunLoss`             | Run-level loss accounting (dropped findings, emit failures, incomplete flag)                                          |
+| `FsRunLoss`             | Run-level loss accounting (dropped findings, emit failures); `incomplete()` is a computed method, not a stored field  |
 | `StoreProducer`         | `Send + Sync` trait for FS finding persistence (`Arc<dyn StoreProducer>`)                                             |
 | `NullStoreProducer`     | Default no-op for CLI / feature-off paths                                                                             |
 | `InMemoryStoreProducer` | Collects batches in memory for tests and diagnostics                                                                  |

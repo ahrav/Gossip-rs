@@ -533,9 +533,9 @@ pub enum IdempotentOutcome<T> {
 
 Methods: `into_inner()`, `is_replay()`, `is_executed()`, `map()`, `as_ref()`.
 
-Used by: checkpoint/complete return `IdempotentOutcome<()>`, split_replace
-returns `IdempotentOutcome<SplitReplaceResult>`, split_residual returns
-`IdempotentOutcome<SplitResidualResult>`.
+Used by: checkpoint/complete/park_shard return `IdempotentOutcome<()>`,
+split_replace returns `IdempotentOutcome<SplitReplaceResult>`, split_residual
+returns `IdempotentOutcome<SplitResidualResult>`.
 
 ---
 

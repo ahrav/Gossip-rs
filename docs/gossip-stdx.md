@@ -323,6 +323,12 @@ guaranteed to never fire early; they may fire up to `G-1` bytes late.
 
 **Thread safety**: Not synchronized. Single-threaded usage assumed.
 
+**Safety**: One `unsafe` block in `advance_and_drain` for
+`MaybeUninit::assume_init_read`. Sound because the node was initialized via
+`alloc_node` and `T: Copy` prevents double-drop. `debug_validate()` method
+walks all slots + free list asserting every node is either free or used exactly
+once. Validated with unit tests, property-based tests, and Kani proofs.
+
 ---
 
 ### spsc_channel / OwnedSpscProducer / OwnedSpscConsumer
@@ -352,6 +358,13 @@ on apparent-full/apparent-empty. Head and tail live on separate cache lines
 
 **Thread safety**: `Send` (not `Sync` by design). Each handle must be used
 from exactly one thread (enforced by `&mut self`). Can be moved across threads.
+
+**Safety**: Uses raw `*const SpscRing` pointers instead of `&SpscRing` to
+avoid Stacked Borrows violations when producer and consumer access disjoint
+slots concurrently. Ownership via `Box::into_raw` + `Arc<OwnedSpscInner>`.
+Validated with unit tests, property-based tests (FIFO invariant), loom
+exhaustive concurrency tests, and 8 Kani formal verification proofs (slot
+bounds, FIFO, full/empty, wrapping near `u32::MAX`, batch bounds, drop).
 
 ---
 

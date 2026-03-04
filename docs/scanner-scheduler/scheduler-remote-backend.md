@@ -274,6 +274,10 @@ pub fn scan_remote<B: RemoteBackend>(
 ) -> Result<(RemoteRunReport, MetricsSnapshot), RemoteRunError<B::Error>>
 ```
 
+> **Note:** The `engine` parameter is currently hardcoded to `Arc<MockEngine>`
+> rather than being generic over `ScanEngine`. This is a known limitation; the
+> function is test-ready but not yet production-generic.
+
 **Execution flow:**
 
 1. Validate config (thread counts, buffer sizes, chunk constraints)

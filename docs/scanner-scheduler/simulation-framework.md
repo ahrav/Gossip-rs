@@ -255,7 +255,7 @@ Source: `crates/scanner-scheduler/src/sim/mutation/adapter.rs:139-231`
 
 **Stability mode**: When `run_config.stability_runs > 1`, the runner replays the same scenario under additional schedule seeds and compares normalized finding sets. A mismatch produces a `StabilityMismatch` failure.
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:127-582`
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:138-2442`
 
 ### Failure Kinds
 
@@ -267,7 +267,7 @@ Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:127-582`
 | `OracleMismatch` | Ground-truth, differential, or archive oracle failed |
 | `StabilityMismatch` | Different schedules produced different finding sets |
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:78-92`
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:79-92`
 
 ### Oracles
 
@@ -283,7 +283,7 @@ The runner applies these correctness checks after a successful run:
 
 **Mutation oracle** (`check_mutation_expectations`) — post-scan check for mutation test cases. For each case, computes the expected token span and checks whether any finding from the same file with the correct rule_id intersects that span. `MustMatch` not found is a violation (false negative). `MustNotMatch` but found is silently tolerated (context wrappers can extend regex matches).
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:567-582` (dispatch), `crates/scanner-scheduler/src/sim/mutation/adapter.rs:283-341` (mutation oracle)
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:567-2442` (dispatch + oracle impls), `crates/scanner-scheduler/src/sim/mutation/adapter.rs:283-341` (mutation oracle)
 
 ### Invariant Codes
 
@@ -505,7 +505,7 @@ The scheduler simulation harness (separate from the scanner simulation) uses add
 | random_mutation_plan, random_mutation_plans_all_families | `crates/scanner-scheduler/src/sim/mutation/plan_gen.rs` | 52-83 |
 | build_mutation_scenario, check_mutation_expectations | `crates/scanner-scheduler/src/sim/mutation/adapter.rs` | 139-341 |
 | Scenario, RunConfig, ExpectedSecret | `crates/scanner-scheduler/src/sim_scanner/scenario.rs` | 13-231 |
-| generate_scenario, ScenarioGenConfig | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | 37-281 |
-| ScannerSimRunner, RunOutcome, FailureKind | `crates/scanner-scheduler/src/sim_scanner/runner.rs` | 62-582 |
+| generate_scenario, ScenarioGenConfig | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | 38-524 |
+| ScannerSimRunner, RunOutcome, FailureKind | `crates/scanner-scheduler/src/sim_scanner/runner.rs` | 62-2442 |
 | replay_artifact | `crates/scanner-scheduler/src/sim_scanner/replay.rs` | 12-27 |
 | VirtualPathTable | `crates/scanner-scheduler/src/sim_scanner/vpath_table.rs` | 24-110 |

@@ -12,7 +12,7 @@ lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
-The module provides six core capabilities:
+The module provides seven core capabilities:
 
 - **Shard lifecycle state machine** -- a four-state automaton (`Active`,
   `Done`, `Split`, `Parked`) with terminal state enforcement and

@@ -28,7 +28,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [architecture.md](architecture.md)                     | Data flow                        | Walker → Reader → Scanner → Output, transform worklist |
 | [data-types.md](data-types.md)                         | Class diagrams                   | Key type relationships across crates                   |
 | [pipeline-flow.md](pipeline-flow.md)                   | Pipeline execution flow          | Discovery, executor model, backpressure                |
-| [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Reverse pump order, stall detection                    |
+| [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Executor termination, `scan_local` states, worker tasks |
 | [git-scanning.md](scanner-git/git-scanning.md)         | End-to-end Git scanning pipeline | Pipeline stages, persistence contract, ODB-blob mode   |
 | [git-pack-execution.md](scanner-git/git-pack-execution.md) | Git packfile internals       | Pack parsing, delta resolution, blob introduction, caching |
 | [git-object-store.md](scanner-git/git-object-store.md) | Git object storage layer         | OID indexing, pack/loose unification, delta resolution     |
