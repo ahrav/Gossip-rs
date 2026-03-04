@@ -19,7 +19,7 @@ use gossip_scan_driver::{
 use scanner_git::{
     CommitIdentityIds, CommitMetaEvent, EventSink as GitEventSink, GitEvent, GitEventOutput,
     GitRepoPaths, GitScanConfig, GitScanResult, IdentityDictionaryEvent, NeverSeenStore, OidBytes,
-    RefWatermarkStore, RepoOpenError, StartSetId, StartSetResolver, run_git_scan,
+    RefWatermarkStore, RepoOpenError, StartSetConfig, StartSetResolver, run_git_scan,
 };
 use scanner_scheduler::events::{
     CoreEvent, DiagnosticEvent, EventOutput, FindingEvent, ProgressEvent, SummaryEvent,
@@ -234,7 +234,7 @@ impl ScanDriver for FsScanDriver {
 
 /// Git scan driver backed by [`run_git_scan`].
 ///
-/// Resolves refs via the `git` CLI ([`CliRefResolver`]) and treats every ref
+/// Resolves refs via the `git` CLI ([`GitCliResolver`]) and treats every ref
 /// as unseen ([`EmptyWatermarkStore`]), performing a full scan on each run.
 #[derive(Debug)]
 struct GitScanDriver {
@@ -274,7 +274,8 @@ impl ScanDriver for GitScanDriver {
 
             let git_cfg = build_git_scan_config(cfg)?;
 
-            let resolver = CliRefResolver::new(self.repo_root.clone());
+            let resolver =
+                GitCliResolver::new(self.repo_root.clone(), StartSetConfig::DefaultBranchOnly);
             let watermarks = EmptyWatermarkStore;
             let seen = NeverSeenStore;
             let result = run_git_scan(
@@ -975,68 +976,39 @@ fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>, thread_name: &st
     handle.join().map_err(|_| anyhow!("{thread_name} panicked"))
 }
 
-/// Resolves the default branch tip by shelling out to `git`.
+/// Resolves the start set by invoking `git` in the target repository.
 ///
-/// Matches the reference scanner's `GitCliResolver` with
-/// `StartSetConfig::DefaultBranchOnly`: resolve just the default branch
-/// (via `symbolic-ref HEAD`), falling back to detached `HEAD`.
+/// Supported configs: `DefaultBranchOnly` and `ExplicitRefs`. All other
+/// start-set modes return an error to keep the CLI lightweight.
 ///
-/// Requires `git` on `$PATH`.
-#[derive(Clone, Debug)]
-struct CliRefResolver {
-    repo_root: PathBuf,
+/// Requires `git` on PATH; command failures surface as `RepoOpenError::Io`.
+struct GitCliResolver {
+    repo: PathBuf,
+    start_set: StartSetConfig,
 }
 
-impl CliRefResolver {
-    fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root }
+impl GitCliResolver {
+    fn new(repo: PathBuf, start_set: StartSetConfig) -> Self {
+        Self { repo, start_set }
     }
 }
 
-impl StartSetResolver for CliRefResolver {
+impl StartSetResolver for GitCliResolver {
     fn resolve(&self, _paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-        // Try symbolic-ref first to find the default branch name.
-        let symbolic = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_root)
-            .args(["symbolic-ref", "--quiet", "HEAD"])
-            .output()
-            .map_err(RepoOpenError::io)?;
-
-        let ref_name = if symbolic.status.success() {
-            String::from_utf8_lossy(&symbolic.stdout).trim().to_string()
-        } else {
-            // Detached HEAD — use literal "HEAD".
-            "HEAD".to_string()
-        };
-
-        // Resolve the ref to a commit OID.
-        let rev_parse = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo_root)
-            .args(["rev-parse", &ref_name])
-            .output()
-            .map_err(RepoOpenError::io)?;
-
-        if !rev_parse.status.success() {
-            // Unborn branch: symbolic-ref succeeded (HEAD points at
-            // refs/heads/<branch>) but the branch has no commits yet.
-            // Return an empty start set so the scanner performs a valid
-            // zero-object scan — matching the old for-each-ref behavior.
-            return Ok(Vec::new());
+        match &self.start_set {
+            StartSetConfig::DefaultBranchOnly => resolve_default_branch(&self.repo),
+            StartSetConfig::ExplicitRefs { refs } => resolve_explicit_refs(&self.repo, refs),
+            _ => Err(RepoOpenError::io(io::Error::other(
+                "start set config not supported by git_scan CLI",
+            ))),
         }
-
-        let tip_hex = String::from_utf8_lossy(&rev_parse.stdout)
-            .trim()
-            .to_string();
-        let oid = decode_oid_hex(&tip_hex).map_err(RepoOpenError::io)?;
-        Ok(vec![(ref_name.into_bytes(), oid)])
     }
 }
 
-/// No-op watermark store that reports all refs as previously unseen,
-/// causing the git scanner to perform a full scan on every run.
-#[derive(Clone, Copy, Debug, Default)]
+/// Watermark store that always returns `None`.
+///
+/// Forces the runner to treat all refs as unwatermarked and scan
+/// full history every run.
 struct EmptyWatermarkStore;
 
 impl RefWatermarkStore for EmptyWatermarkStore {
@@ -1044,53 +1016,88 @@ impl RefWatermarkStore for EmptyWatermarkStore {
         &self,
         _repo_id: u64,
         _policy_hash: [u8; 32],
-        _start_set_id: StartSetId,
+        _start_set_id: [u8; 32],
         ref_names: &[&[u8]],
     ) -> Result<Vec<Option<OidBytes>>, RepoOpenError> {
         Ok(vec![None; ref_names.len()])
     }
 }
 
-/// Decode a hex-encoded object ID into raw bytes.
+/// Run `git` in `repo` and return trimmed UTF-8 stdout.
 ///
-/// Accepts both SHA-1 (40 hex chars → 20 bytes) and SHA-256 (64 hex chars →
-/// 32 bytes). Returns `InvalidData` for odd-length input or unrecognised
-/// lengths.
-fn decode_oid_hex(hex: &str) -> io::Result<OidBytes> {
-    let trimmed = hex.trim();
-    if !trimmed.len().is_multiple_of(2) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("OID hex has odd length: {}", trimmed.len()),
-        ));
+/// Output is lossy UTF-8 with leading and trailing whitespace removed.
+/// Both stdout and stderr are captured; only stdout is used.
+fn run_git(repo: &PathBuf, args: &[&str]) -> io::Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!("git command failed: {:?}", args)));
     }
-
-    let mut bytes = Vec::with_capacity(trimmed.len() / 2);
-    let mut chars = trimmed.as_bytes().chunks_exact(2);
-    for pair in &mut chars {
-        let hi = from_hex_nibble(pair[0])?;
-        let lo = from_hex_nibble(pair[1])?;
-        bytes.push((hi << 4) | lo);
-    }
-
-    OidBytes::try_from_slice(&bytes).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("OID must be 20 or 32 bytes, got {}", bytes.len()),
-        )
-    })
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn from_hex_nibble(byte: u8) -> io::Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid hex nibble: {}", byte as char),
-        )),
+/// Resolve the default-branch tip, falling back to detached `HEAD`.
+///
+/// Uses `symbolic-ref --quiet HEAD` to find the default branch; if that
+/// fails, falls back to `HEAD`.
+fn resolve_default_branch(repo: &PathBuf) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
+    let head_ref = run_git(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok();
+    if let Some(ref_name) = head_ref {
+        let tip_hex = run_git(repo, &["rev-parse", &ref_name]).map_err(RepoOpenError::io)?;
+        let oid = oid_from_hex(&tip_hex)?;
+        return Ok(vec![(ref_name.into_bytes(), oid)]);
     }
+
+    // Detached HEAD fallback.
+    let tip_hex = run_git(repo, &["rev-parse", "HEAD"]).map_err(RepoOpenError::io)?;
+    let oid = oid_from_hex(&tip_hex)?;
+    Ok(vec![(b"HEAD".to_vec(), oid)])
+}
+
+/// Resolve the tip OIDs for explicitly provided ref names.
+///
+/// Each ref is passed to `git rev-parse`; missing refs surface as errors.
+fn resolve_explicit_refs(
+    repo: &PathBuf,
+    refs: &[Vec<u8>],
+) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
+    let mut out = Vec::with_capacity(refs.len());
+    for r in refs {
+        let name = String::from_utf8_lossy(r);
+        let tip_hex = run_git(repo, &["rev-parse", name.as_ref()]).map_err(RepoOpenError::io)?;
+        let oid = oid_from_hex(&tip_hex)?;
+        out.push((r.clone(), oid));
+    }
+    Ok(out)
+}
+
+/// Decode a hex-encoded OID into raw bytes.
+///
+/// The input must have an even number of hex digits.
+fn oid_from_hex(hex: &str) -> Result<OidBytes, RepoOpenError> {
+    let hex = hex.trim();
+    if !hex.len().is_multiple_of(2) {
+        return Err(RepoOpenError::io(io::Error::other(
+            "invalid OID hex length",
+        )));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let hi = (bytes[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| RepoOpenError::io(io::Error::other("invalid OID hex")))?;
+        let lo = (bytes[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| RepoOpenError::io(io::Error::other("invalid OID hex")))?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(OidBytes::from_slice(&out))
 }
 
 #[cfg(test)]
@@ -1216,15 +1223,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_oid_hex_accepts_sha1() {
-        let oid = decode_oid_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    fn oid_from_hex_accepts_sha1() {
+        let oid = oid_from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
         assert_eq!(oid.len(), 20);
     }
 
     #[test]
-    fn decode_oid_hex_rejects_bad_length() {
-        let err = decode_oid_hex("abc").unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    fn oid_from_hex_rejects_bad_length() {
+        assert!(oid_from_hex("abc").is_err());
     }
 
     #[test]
