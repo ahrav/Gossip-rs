@@ -286,10 +286,25 @@ pub struct ScanReport {
     /// Non-fatal errors encountered during scanning (I/O errors, read
     /// failures, etc.). Does **not** include items that were intentionally
     /// skipped by classification filters (binary, extension, lock-file).
-    ///
-    /// **Note:** The git driver currently reports `0` because per-pack-exec
-    /// errors are not yet aggregated into this counter.
     pub errors: u64,
+    /// Items skipped because they were classified as binary by content probe.
+    pub binary_skipped: u64,
+    /// Items skipped pre-open because extension matched binary skip table.
+    pub ext_skipped: u64,
+    /// Items skipped pre-open because filename matched lock-file table.
+    pub lock_skipped: u64,
+    /// Items scanned via extracted text from known binary container formats.
+    pub binary_extracted: u64,
+    /// Findings dropped by engine caps during scan.
+    pub dropped_findings: u64,
+    /// Persistence batch emission failures observed by the driver.
+    pub persist_emit_failures: u64,
+    /// Whether persistence loss counters indicate an incomplete run.
+    pub persist_incomplete: bool,
+    /// Aggregate scan-loop time in nanoseconds.
+    pub scan_ns: u64,
+    /// Aggregate persistence emission time in nanoseconds.
+    pub persist_ns: u64,
 }
 
 /// Incremental progress checkpoint produced by [`ScanDriver::checkpoint_hint`].

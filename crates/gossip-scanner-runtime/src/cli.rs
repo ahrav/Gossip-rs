@@ -15,9 +15,8 @@ use scanner_scheduler::source_kind::SourceKind;
 use crate::commit_sink::CliNoOpCommitSink;
 use crate::event_sink::{JsonEventSink, JsonlEventSink, SarifEventSink, TextEventSink};
 use crate::{
-    AnchorMode, EventFormat, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets,
-    ScanRuntimeError, TransformFilter, available_workers, scan_fs_with_runtime,
-    scan_git_with_runtime,
+    available_workers, scan_fs_with_runtime, scan_git_with_runtime, AnchorMode, EventFormat,
+    ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets, ScanRuntimeError, TransformFilter,
 };
 
 /// CLI source command.
@@ -44,6 +43,8 @@ pub struct CliConfig {
     pub event_format: EventFormat,
     /// When true, text output includes extra detail.
     pub verbose: bool,
+    /// When true, extended timing/debug metrics are appended to the summary.
+    pub summary_debug: bool,
     /// Optional external rules file path override.
     pub rules_file: Option<PathBuf>,
     /// Transform decoder filter.
@@ -150,6 +151,7 @@ where
     let mut null_sink = false;
     let mut event_format = EventFormat::Jsonl;
     let mut verbose = false;
+    let mut summary_debug = false;
     let mut rules_file: Option<PathBuf> = None;
     let mut transform_filter = TransformFilter::All;
     let mut workers: Option<usize> = None;
@@ -349,16 +351,22 @@ where
             continue;
         }
 
-        // Git-specific public and hidden (`--x-*`) knobs. Hidden flags are
-        // intentionally parsed for parity but excluded from usage text.
-        if source_kind == "git" {
-            if let Some(value) = arg.strip_prefix("--debug=") {
+        if let Some(value) = arg.strip_prefix("--debug=") {
+            if source_kind == "git" {
                 debug_level = parse_debug_level(value, &source_kind)?;
+                summary_debug = true;
                 i += 1;
                 continue;
             }
+            return Err(CliError::Usage(format!(
+                "error: --debug does not accept a value for 'scan fs'\n\n{}",
+                source_usage(&source_kind)
+            )));
+        }
 
-            if arg == "--debug" {
+        if arg == "--debug" {
+            summary_debug = true;
+            if source_kind == "git" {
                 if let Some(value) = args.get(i + 1) {
                     let next = value.to_string_lossy();
                     if let Some(parsed) = parse_debug_level_token(next.as_ref()) {
@@ -368,10 +376,22 @@ where
                     }
                 }
                 debug_level = promote_debug_level(debug_level, GitDebugLevel::Stats);
-                i += 1;
-                continue;
+            } else if let Some(value) = args.get(i + 1) {
+                let next = value.to_string_lossy();
+                if parse_debug_level_token(next.as_ref()).is_some() {
+                    return Err(CliError::Usage(format!(
+                        "error: --debug does not accept a value for 'scan fs'\n\n{}",
+                        source_usage(&source_kind)
+                    )));
+                }
             }
+            i += 1;
+            continue;
+        }
 
+        // Git-specific public and hidden (`--x-*`) knobs. Hidden flags are
+        // intentionally parsed for parity but excluded from usage text.
+        if source_kind == "git" {
             if let Some(value) = arg.strip_prefix("--x-repo-id=") {
                 git_repo_id = parse_u64(value, "--x-repo-id", &source_kind)?;
                 i += 1;
@@ -657,6 +677,7 @@ where
         null_sink,
         event_format,
         verbose,
+        summary_debug,
         rules_file,
         transform_filter,
         workers,
@@ -688,7 +709,6 @@ where
 /// errors=0
 /// elapsed_ms=3071
 /// throughput_mib_s=493.61
-/// workers=12
 /// ```
 pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError> {
     let sink = build_event_sink(config.event_format, config.verbose, config.null_sink);
@@ -721,6 +741,7 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
     };
 
     let wall_start = std::time::Instant::now();
+    let summary_debug = config.summary_debug;
 
     let report = match config.source {
         CliSource::Fs { path } => {
@@ -775,7 +796,13 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
     core_sink.flush();
     let elapsed = wall_start.elapsed();
 
-    print_scan_summary(&report, elapsed, effective_workers, source_kind);
+    print_scan_summary(
+        &report,
+        elapsed,
+        effective_workers,
+        source_kind,
+        summary_debug,
+    );
 
     Ok(report)
 }
@@ -789,7 +816,20 @@ fn print_scan_summary(
     elapsed: std::time::Duration,
     workers: usize,
     source_kind: SourceKind,
+    summary_debug: bool,
 ) {
+    use std::io::Write;
+    let rendered = render_scan_summary(report, elapsed, workers, source_kind, summary_debug);
+    let _ = io::stderr().write_all(rendered.as_bytes());
+}
+
+fn render_scan_summary(
+    report: &gossip_scan_driver::ScanReport,
+    elapsed: std::time::Duration,
+    workers: usize,
+    source_kind: SourceKind,
+    summary_debug: bool,
+) -> String {
     let elapsed_ms = elapsed.as_millis() as u64;
     let elapsed_secs = elapsed.as_secs_f64();
     let throughput_mib_s = if elapsed_secs > 0.0 {
@@ -800,10 +840,7 @@ fn print_scan_summary(
 
     let human_bytes = format_human_bytes(report.bytes_scanned);
 
-    // Use write_all to stderr to minimise the chance of interleaving
-    // with concurrent stderr writers.
-    use std::io::Write;
-    let mut buf = String::with_capacity(256);
+    let mut buf = String::with_capacity(if summary_debug { 512 } else { 256 });
     use std::fmt::Write as FmtWrite;
     let items_label = match source_kind {
         SourceKind::Git => "objects",
@@ -813,16 +850,46 @@ fn print_scan_summary(
     let _ = writeln!(buf, "chunks={}", report.chunks_scanned);
     let _ = writeln!(buf, "bytes={} ({human_bytes})", report.bytes_scanned);
     let _ = writeln!(buf, "findings={}", report.findings_emitted);
-    // Git scans do not yet aggregate per-pack-exec errors into a single
-    // counter, so omit the line rather than printing a misleading zero.
-    if source_kind == SourceKind::Fs {
-        let _ = writeln!(buf, "errors={}", report.errors);
-    }
+    let _ = writeln!(buf, "errors={}", report.errors);
     let _ = writeln!(buf, "elapsed_ms={elapsed_ms}");
     let _ = writeln!(buf, "throughput_mib_s={throughput_mib_s:.2}");
-    let _ = writeln!(buf, "workers={workers}");
-
-    let _ = io::stderr().write_all(buf.as_bytes());
+    if summary_debug {
+        let scan_ms = report.scan_ns / 1_000_000;
+        let persist_ms = if source_kind == SourceKind::Fs {
+            report.persist_ns / 1_000_000
+        } else {
+            0
+        };
+        // Subtract both scan and persist so the three components are additive:
+        // init_ms + scan_ms + persist_ms ≈ elapsed_ms.
+        let init_ms = elapsed_ms
+            .saturating_sub(scan_ms)
+            .saturating_sub(persist_ms);
+        let _ = writeln!(buf, "workers={workers}");
+        let _ = writeln!(buf, "binary_skipped={}", report.binary_skipped);
+        let _ = writeln!(buf, "ext_skipped={}", report.ext_skipped);
+        let _ = writeln!(buf, "lock_skipped={}", report.lock_skipped);
+        let _ = writeln!(buf, "binary_extracted={}", report.binary_extracted);
+        if source_kind == SourceKind::Fs {
+            let _ = writeln!(buf, "dropped_findings={}", report.dropped_findings);
+            let _ = writeln!(
+                buf,
+                "persist_emit_failures={}",
+                report.persist_emit_failures
+            );
+            let _ = writeln!(
+                buf,
+                "persist_incomplete={}",
+                if report.persist_incomplete { 1 } else { 0 }
+            );
+        }
+        let _ = writeln!(buf, "init_ms={init_ms}");
+        let _ = writeln!(buf, "scan_ms={scan_ms}");
+        if source_kind == SourceKind::Fs {
+            let _ = writeln!(buf, "persist_ms={persist_ms}");
+        }
+    }
+    buf
 }
 
 /// Format byte counts using binary IEC units (KiB, MiB, GiB, ...).
@@ -1103,6 +1170,7 @@ fn source_usage(source: &str) -> String {
             "  --event-format=jsonl|text|json|sarif Output format (default: jsonl)",
             "  --null-sink                       Drop all emitted events",
             "  --verbose                         Verbose text output",
+            "  --debug                           Extended scan summary metrics to stderr",
             "  --help, -h                        Show this help",
         ]
         .join("\n"),
@@ -1118,8 +1186,8 @@ fn source_usage(source: &str) -> String {
             "  --decode-depth=<N>                Max decode depth (default: engine default)",
             "  --scan-binary                     Scan binary blobs [default: skip]",
             "  --skip-binary                     Skip binary blobs (undo --scan-binary)",
-            "  --debug                           Stage stats to stderr",
-            "  --debug=perf                      Stage stats + per-pack timing to stderr",
+            "  --debug                           Stage stats + extended summary metrics to stderr",
+            "  --debug=perf                      Stage stats + per-pack timing + extended summary metrics to stderr",
             "  --enrich-identities               Emit identity dictionary + enriched commit metadata",
             "  --anchors=manual|derived          Anchor mode (default: manual)",
             "  --rules=<path>                    YAML rules file override",
@@ -1135,230 +1203,5 @@ fn source_usage(source: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_fs_cli_config_supports_extended_flags() {
-        let cfg = parse_args_from([
-            "scan".into(),
-            "fs".into(),
-            "--path".into(),
-            "/tmp/workdir".into(),
-            "--execution-mode=connector".into(),
-            "--max-items=12".into(),
-            "--max-bytes=4096".into(),
-            "--workers".into(),
-            "2".into(),
-            "--decode-depth=1".into(),
-            "--skip-archives".into(),
-            "--scan-binary".into(),
-            "--persist-findings".into(),
-            "--anchors=derived".into(),
-            "--event-format=text".into(),
-            "--verbose".into(),
-            "--null-sink".into(),
-            "--transforms=none".into(),
-            "--rules=/tmp/custom.yaml".into(),
-        ])
-        .expect("parse fs config");
-
-        assert_eq!(
-            cfg,
-            CliConfig {
-                source: CliSource::Fs {
-                    path: PathBuf::from("/tmp/workdir"),
-                },
-                execution_mode: ExecutionMode::Connector,
-                budgets: ScanBudgets {
-                    max_items: 12,
-                    max_bytes: 4096,
-                },
-                null_sink: true,
-                event_format: EventFormat::Text,
-                verbose: true,
-                rules_file: Some(PathBuf::from("/tmp/custom.yaml")),
-                transform_filter: TransformFilter::None,
-                workers: Some(2),
-                decode_depth: Some(1),
-                skip_archives: true,
-                scan_binary: true,
-                persist_findings: true,
-                anchor_mode: AnchorMode::Derived,
-                debug_level: GitDebugLevel::Off,
-                enrich_identities: false,
-                git_repo_id: 1,
-                git_scan_mode: GitScanMode::OdbBlobFast,
-                git_merge_mode: MergeDiffMode::AllParents,
-                git_tree_delta_cache_mb: None,
-                git_engine_chunk_mb: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_transforms_csv_variant() {
-        let cfg = parse_args_from([
-            "scan".into(),
-            "fs".into(),
-            "--path=/tmp/workdir".into(),
-            "--transforms=url,base64,url".into(),
-        ])
-        .expect("parse fs config");
-
-        assert_eq!(
-            cfg.transform_filter,
-            TransformFilter::Only(vec![TransformId::UrlPercent, TransformId::Base64])
-        );
-    }
-
-    #[test]
-    fn parse_git_cli_config_with_positional_repo() {
-        let cfg = parse_args_from([
-            "scan".into(),
-            "git".into(),
-            "/tmp/repo".into(),
-            "--execution-mode".into(),
-            "direct".into(),
-            "--event-format=json".into(),
-        ])
-        .expect("parse git config");
-
-        assert_eq!(
-            cfg,
-            CliConfig {
-                source: CliSource::Git {
-                    repo: PathBuf::from("/tmp/repo"),
-                },
-                execution_mode: ExecutionMode::Direct,
-                budgets: ScanBudgets::default(),
-                null_sink: false,
-                event_format: EventFormat::Json,
-                verbose: false,
-                rules_file: None,
-                transform_filter: TransformFilter::All,
-                workers: None,
-                decode_depth: None,
-                skip_archives: false,
-                scan_binary: false,
-                persist_findings: false,
-                anchor_mode: AnchorMode::Manual,
-                debug_level: GitDebugLevel::Off,
-                enrich_identities: false,
-                git_repo_id: 1,
-                git_scan_mode: GitScanMode::OdbBlobFast,
-                git_merge_mode: MergeDiffMode::AllParents,
-                git_tree_delta_cache_mb: None,
-                git_engine_chunk_mb: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_git_cli_config_supports_extended_flags() {
-        let cfg = parse_args_from([
-            "scan".into(),
-            "git".into(),
-            "--repo".into(),
-            "/tmp/repo".into(),
-            "--execution-mode=connector".into(),
-            "--max-items=12".into(),
-            "--max-bytes=4096".into(),
-            "--x-pack-exec-workers=9".into(),
-            "--workers".into(),
-            "2".into(),
-            "--decode-depth".into(),
-            "1".into(),
-            "--scan-binary".into(),
-            "--debug=perf".into(),
-            "--debug".into(),
-            "--enrich-identities".into(),
-            "--anchors=derived".into(),
-            "--event-format=text".into(),
-            "--verbose".into(),
-            "--null-sink".into(),
-            "--transforms=none".into(),
-            "--rules=/tmp/custom.yaml".into(),
-            "--x-repo-id=42".into(),
-            "--x-mode=diff".into(),
-            "--x-merge=first-parent".into(),
-            "--x-tree-delta-cache-mb=256".into(),
-            "--x-engine-chunk-mb=4".into(),
-        ])
-        .expect("parse git config");
-
-        assert_eq!(
-            cfg,
-            CliConfig {
-                source: CliSource::Git {
-                    repo: PathBuf::from("/tmp/repo"),
-                },
-                execution_mode: ExecutionMode::Connector,
-                budgets: ScanBudgets {
-                    max_items: 12,
-                    max_bytes: 4096,
-                },
-                null_sink: true,
-                event_format: EventFormat::Text,
-                verbose: true,
-                rules_file: Some(PathBuf::from("/tmp/custom.yaml")),
-                transform_filter: TransformFilter::None,
-                workers: Some(2),
-                decode_depth: Some(1),
-                skip_archives: false,
-                scan_binary: true,
-                persist_findings: false,
-                anchor_mode: AnchorMode::Derived,
-                debug_level: GitDebugLevel::Perf,
-                enrich_identities: true,
-                git_repo_id: 42,
-                git_scan_mode: GitScanMode::DiffHistory,
-                git_merge_mode: MergeDiffMode::FirstParentOnly,
-                git_tree_delta_cache_mb: Some(256),
-                git_engine_chunk_mb: Some(4),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_git_x_pack_exec_workers_sets_workers_when_public_workers_missing() {
-        let cfg = parse_args_from([
-            "scan".into(),
-            "git".into(),
-            "--repo=/tmp/repo".into(),
-            "--x-pack-exec-workers=7".into(),
-        ])
-        .expect("parse git config");
-
-        assert_eq!(cfg.workers, Some(7));
-    }
-
-    #[test]
-    fn parse_git_debug_space_value_sets_perf_level() {
-        let cfg = parse_args_from([
-            "scan".into(),
-            "git".into(),
-            "--repo=/tmp/repo".into(),
-            "--debug".into(),
-            "perf".into(),
-        ])
-        .expect("parse git config");
-
-        assert_eq!(cfg.debug_level, GitDebugLevel::Perf);
-    }
-
-    #[test]
-    fn git_help_text_omits_hidden_x_flags() {
-        let usage = source_usage("git");
-        assert!(usage.contains("--debug"));
-        assert!(usage.contains("--enrich-identities"));
-        assert!(!usage.contains("--x-mode"));
-        assert!(!usage.contains("--x-repo-id"));
-    }
-
-    #[test]
-    fn parse_help_returns_help_error() {
-        let err = parse_args_from(["--help".into()]).expect_err("expected help result");
-        assert!(matches!(err, CliError::HelpRequested(_)));
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

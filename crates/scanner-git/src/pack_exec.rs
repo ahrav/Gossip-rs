@@ -243,6 +243,21 @@ pub enum SkipReason {
     NotBlob,
 }
 
+impl SkipReason {
+    /// Returns whether this skip reason represents a pack-exec error.
+    ///
+    /// `NotBlob` is an expected type-classification outcome, not an error.
+    ///
+    /// `ExternalBaseMissing` (provider returned `None`) is treated as an
+    /// error because all external bases should be resolvable by the time
+    /// pack-exec runs — a missing base indicates a pack integrity problem
+    /// or an incomplete MIDX, not a soft cache miss.
+    #[inline]
+    pub const fn is_error(&self) -> bool {
+        !matches!(self, Self::NotBlob)
+    }
+}
+
 /// Record of a skipped offset.
 ///
 /// A single offset may appear multiple times if multiple candidates map to
@@ -4124,6 +4139,17 @@ mod tests {
         assert_perf_u32(report.stats.emitted_candidates, 0);
         assert_eq!(report.skips.len(), 1);
         assert!(matches!(report.skips[0].reason, SkipReason::NotBlob));
+        assert!(!report.skips[0].reason.is_error());
+    }
+
+    #[test]
+    fn skip_reason_classifies_error_variants() {
+        assert!(SkipReason::PackParse(PackParseError::BadSignature).is_error());
+        assert!(SkipReason::ExternalBaseError {
+            detail: "oops".to_string(),
+        }
+        .is_error());
+        assert!(!SkipReason::NotBlob.is_error());
     }
 
     #[test]

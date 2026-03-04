@@ -195,6 +195,7 @@ impl ScanDriver for FsScanDriver {
                 )));
             }
 
+            let scan_start = std::time::Instant::now();
             let report = if cancel.is_cancelled() {
                 scanner_scheduler::scheduler::local_fs_owner::LocalReport::default()
             } else {
@@ -202,6 +203,7 @@ impl ScanDriver for FsScanDriver {
                     format!("filesystem scan failed for {}", self.root.display())
                 })?
             };
+            let scan_elapsed = scan_start.elapsed();
 
             // Filesystem scans currently restart from the beginning on resume
             // because `parallel_scan_dir` does not track per-item cursor state.
@@ -221,6 +223,15 @@ impl ScanDriver for FsScanDriver {
                 chunks_scanned: report.metrics.chunks_scanned,
                 findings_emitted: report.metrics.findings_emitted,
                 errors: report.metrics.io_errors,
+                binary_skipped: report.metrics.binary_skipped,
+                ext_skipped: report.metrics.ext_skipped,
+                lock_skipped: report.metrics.lock_skipped,
+                binary_extracted: report.metrics.binary_extracted,
+                dropped_findings: report.stats.dropped_findings,
+                persist_emit_failures: report.stats.persistence_emit_failures,
+                persist_incomplete: report.stats.persistence_incomplete,
+                scan_ns: u64::try_from(scan_elapsed.as_nanos()).unwrap_or(u64::MAX),
+                persist_ns: report.metrics.persist_ns,
             })
         })
     }
@@ -275,6 +286,7 @@ impl ScanDriver for GitScanDriver {
             let resolver = NativeRefResolver::new(StartSetConfig::DefaultBranchOnly);
             let watermarks = EmptyWatermarkStore;
             let seen = NeverSeenStore;
+            let scan_start = std::time::Instant::now();
             let result = run_git_scan(
                 &self.repo_root,
                 engine,
@@ -286,12 +298,13 @@ impl ScanDriver for GitScanDriver {
                 git_sink,
             )
             .with_context(|| format!("git scan failed for {}", self.repo_root.display()))?;
+            let scan_elapsed = scan_start.elapsed();
 
             self.debug_output = format_git_debug_output(&result.0, cfg.git.debug_level);
             drop(event_tx);
             join_scoped(event_forwarder, "event forwarder thread")?;
 
-            Ok(git_report_to_scan_report(result))
+            Ok(git_report_to_scan_report(result, scan_elapsed))
         })
     }
 
@@ -604,17 +617,37 @@ fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> 
 
 /// Convert a git scanner result into the generic [`ScanReport`] used by
 /// the coordination layer.
-fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
-    let metrics = result.0.common_metrics;
+fn git_report_to_scan_report(
+    result: GitScanResult,
+    scan_elapsed: std::time::Duration,
+) -> ScanReport {
+    let report = result.0;
+    let metrics = report.common_metrics;
+    // Prefer the stage-level timer when available; fall back to the
+    // wall-clock duration around `run_git_scan`. The fallback may include
+    // internal setup (repo open, MIDX parse) not captured by the stage
+    // timer, so the two sources are not directly comparable if
+    // `stage_nanos.scan` starts being populated mid-process.
+    let scan_ns = if report.stage_nanos.scan > 0 {
+        report.stage_nanos.scan
+    } else {
+        u64::try_from(scan_elapsed.as_nanos()).unwrap_or(u64::MAX)
+    };
     ScanReport {
         items_scanned: metrics.objects_scanned,
         bytes_scanned: metrics.bytes_scanned,
         chunks_scanned: metrics.chunks_scanned,
         findings_emitted: metrics.findings_emitted,
-        // Git scan errors are tracked per-pack-exec and not aggregated into
-        // a single counter in `GitScanCommonMetrics`. Leave at zero for now;
-        // a follow-up can surface pack-exec error totals here.
-        errors: 0,
+        errors: metrics.errors,
+        binary_skipped: metrics.binary_skipped,
+        ext_skipped: metrics.ext_skipped,
+        lock_skipped: metrics.lock_skipped,
+        binary_extracted: metrics.binary_extracted,
+        dropped_findings: 0,
+        persist_emit_failures: 0,
+        persist_incomplete: false,
+        scan_ns,
+        persist_ns: 0,
     }
 }
 
@@ -713,44 +746,56 @@ fn format_git_debug_output(
         "git.findings_emitted",
         report.common_metrics.findings_emitted,
     );
-    push_line(
-        &mut out,
-        "stage.tree_diff.nanos",
-        report.stage_nanos.tree_diff,
-    );
-    push_line(
-        &mut out,
-        "stage.commit_plan.nanos",
-        report.stage_nanos.commit_plan,
-    );
-    push_line(
-        &mut out,
-        "stage.blob_intro.nanos",
-        report.stage_nanos.blob_intro,
-    );
-    push_line(&mut out, "stage.spill.nanos", report.stage_nanos.spill);
-    push_line(
-        &mut out,
-        "stage.pack_collect.nanos",
-        report.stage_nanos.pack_collect,
-    );
-    push_line(&mut out, "stage.mapping.nanos", report.stage_nanos.mapping);
-    push_line(
-        &mut out,
-        "stage.pack_plan.nanos",
-        report.stage_nanos.pack_plan,
-    );
-    push_line(
-        &mut out,
-        "stage.pack_exec.nanos",
-        report.stage_nanos.pack_exec,
-    );
-    push_line(
-        &mut out,
-        "stage.loose_scan.nanos",
-        report.stage_nanos.loose_scan,
-    );
-    push_line(&mut out, "stage.scan.nanos", report.stage_nanos.scan);
+    let has_stage_nanos = report.stage_nanos.tree_diff > 0
+        || report.stage_nanos.commit_plan > 0
+        || report.stage_nanos.blob_intro > 0
+        || report.stage_nanos.spill > 0
+        || report.stage_nanos.pack_collect > 0
+        || report.stage_nanos.mapping > 0
+        || report.stage_nanos.pack_plan > 0
+        || report.stage_nanos.pack_exec > 0
+        || report.stage_nanos.loose_scan > 0
+        || report.stage_nanos.scan > 0;
+    if has_stage_nanos {
+        push_line(
+            &mut out,
+            "stage.tree_diff.nanos",
+            report.stage_nanos.tree_diff,
+        );
+        push_line(
+            &mut out,
+            "stage.commit_plan.nanos",
+            report.stage_nanos.commit_plan,
+        );
+        push_line(
+            &mut out,
+            "stage.blob_intro.nanos",
+            report.stage_nanos.blob_intro,
+        );
+        push_line(&mut out, "stage.spill.nanos", report.stage_nanos.spill);
+        push_line(
+            &mut out,
+            "stage.pack_collect.nanos",
+            report.stage_nanos.pack_collect,
+        );
+        push_line(&mut out, "stage.mapping.nanos", report.stage_nanos.mapping);
+        push_line(
+            &mut out,
+            "stage.pack_plan.nanos",
+            report.stage_nanos.pack_plan,
+        );
+        push_line(
+            &mut out,
+            "stage.pack_exec.nanos",
+            report.stage_nanos.pack_exec,
+        );
+        push_line(
+            &mut out,
+            "stage.loose_scan.nanos",
+            report.stage_nanos.loose_scan,
+        );
+        push_line(&mut out, "stage.scan.nanos", report.stage_nanos.scan);
+    }
 
     if matches!(level, GitDebugLevel::Perf) {
         out.push_str(&report.format_metrics());
