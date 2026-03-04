@@ -648,6 +648,20 @@ where
 }
 
 /// Run one CLI scan and stream findings to stdout.
+///
+/// A compact summary is always printed to stderr after the scan completes,
+/// matching the output format of the standalone scanner-rs binary:
+///
+/// ```text
+/// files=92128
+/// chunks=90486
+/// bytes=1531929485 (1.43 GiB)
+/// findings=786
+/// errors=0
+/// elapsed_ms=3071
+/// throughput_mib_s=493.61
+/// workers=12
+/// ```
 pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError> {
     let sink = build_event_sink(config.event_format, config.verbose, config.null_sink);
     let core_sink: &dyn EventOutput = sink.as_ref();
@@ -655,17 +669,21 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
     let commit = CliNoOpCommitSink;
     let cancel = CancellationToken::new();
 
+    let workers = config.workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1)
+    });
+
+    let wall_start = std::time::Instant::now();
+
     let report = match config.source {
         CliSource::Fs { path } => {
             scan_fs_with_runtime(
                 &FsScanConfig::new(path)
                     .with_execution_mode(config.execution_mode)
                     .with_budgets(config.budgets)
-                    .with_workers(config.workers.unwrap_or_else(|| {
-                        std::thread::available_parallelism()
-                            .map(|count| count.get())
-                            .unwrap_or(1)
-                    }))
+                    .with_workers(workers)
                     .with_decode_depth(config.decode_depth)
                     .with_skip_archives(config.skip_archives)
                     .with_scan_binary(config.scan_binary)
@@ -682,11 +700,7 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
         CliSource::Git { repo } => {
             let outcome = scan_git_with_runtime(
                 &GitScanConfig::new(repo)
-                    .with_workers(config.workers.unwrap_or_else(|| {
-                        std::thread::available_parallelism()
-                            .map(|count| count.get())
-                            .unwrap_or(1)
-                    }))
+                    .with_workers(workers)
                     .with_execution_mode(config.execution_mode)
                     .with_budgets(config.budgets)
                     .with_decode_depth(config.decode_depth)
@@ -713,8 +727,49 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
         }
     };
 
+    let elapsed = wall_start.elapsed();
     core_sink.flush();
+
+    print_scan_summary(&report, elapsed, workers);
+
     Ok(report)
+}
+
+/// Print a compact `key=value` summary to stderr.
+///
+/// This always runs — stderr is separate from the findings stream (stdout),
+/// so downstream pipe consumers are unaffected.
+fn print_scan_summary(
+    report: &gossip_scan_driver::ScanReport,
+    elapsed: std::time::Duration,
+    workers: usize,
+) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let elapsed_secs = elapsed.as_secs_f64();
+    let throughput_mib_s = if elapsed_secs > 0.0 {
+        (report.bytes_scanned as f64) / (1024.0 * 1024.0) / elapsed_secs
+    } else {
+        0.0
+    };
+
+    let gib = report.bytes_scanned as f64 / (1024.0 * 1024.0 * 1024.0);
+
+    // Use write_all to stderr to avoid interleaving with other output.
+    // The buffer is small enough that a single write_all is atomic on all
+    // platforms we target (POSIX guarantees atomicity for writes <= PIPE_BUF).
+    use std::io::Write;
+    let mut buf = String::with_capacity(256);
+    use std::fmt::Write as FmtWrite;
+    let _ = writeln!(buf, "files={}", report.items_scanned);
+    let _ = writeln!(buf, "chunks={}", report.chunks_scanned);
+    let _ = writeln!(buf, "bytes={} ({gib:.2} GiB)", report.bytes_scanned);
+    let _ = writeln!(buf, "findings={}", report.findings_emitted);
+    let _ = writeln!(buf, "errors={}", report.errors);
+    let _ = writeln!(buf, "elapsed_ms={elapsed_ms}");
+    let _ = writeln!(buf, "throughput_mib_s={throughput_mib_s:.2}");
+    let _ = writeln!(buf, "workers={workers}");
+
+    let _ = io::stderr().write_all(buf.as_bytes());
 }
 
 trait CliEventSink: EventOutput + GitEventOutput {}

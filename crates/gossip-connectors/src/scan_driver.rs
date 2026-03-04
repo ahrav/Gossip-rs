@@ -220,7 +220,9 @@ impl ScanDriver for FsScanDriver {
             Ok(ScanReport {
                 items_scanned: report.stats.files_enqueued,
                 bytes_scanned: report.metrics.bytes_scanned,
+                chunks_scanned: report.metrics.chunks_scanned,
                 findings_emitted: report.metrics.findings_emitted,
+                errors: report.metrics.io_errors,
             })
         })
     }
@@ -609,7 +611,12 @@ fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
     ScanReport {
         items_scanned: metrics.objects_scanned,
         bytes_scanned: metrics.bytes_scanned,
+        chunks_scanned: metrics.chunks_scanned,
         findings_emitted: metrics.findings_emitted,
+        // Git scan errors are tracked per-pack-exec and not aggregated into
+        // a single counter in `GitScanCommonMetrics`. Leave at zero for now;
+        // a follow-up can surface pack-exec error totals here.
+        errors: 0,
     }
 }
 

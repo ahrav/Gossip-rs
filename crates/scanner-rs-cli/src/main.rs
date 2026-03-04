@@ -8,6 +8,12 @@ fn main() {
         Ok(config) => {
             if let Err(error) = gossip_scanner_runtime::cli::run(config) {
                 eprintln!("{error}");
+                // Print full error chain for debugging.
+                let mut source: Option<&dyn std::error::Error> = std::error::Error::source(&error);
+                while let Some(cause) = source {
+                    eprintln!("  caused by: {cause}");
+                    source = std::error::Error::source(cause);
+                }
                 std::process::exit(2);
             }
         }

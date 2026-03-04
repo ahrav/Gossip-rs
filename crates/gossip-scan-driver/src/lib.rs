@@ -1,15 +1,44 @@
 //! Unified scan-driver boundary for source-specific execution backends.
 //!
-//! This crate defines the one-path execution seam used by both CLI and
-//! distributed scanner runtimes:
+//! This crate is the integration seam between scan orchestration (CLI,
+//! distributed runtime, coordination layer) and source-specific backends
+//! (filesystem, git, in-memory). It defines the shared vocabulary — types,
+//! traits, and config — without containing any implementation logic. Concrete
+//! drivers live in downstream crates (`gossip-connectors`, `gossip-scanner-runtime`).
+//!
+//! # Execution flow
 //!
 //! ```text
-//! Assignment -> ScanSourceFactory -> ScanDriver::run()
-//!                         \-> shared scanner scheduler + scanner engine
+//! Assignment ─► ScanSourceFactory::driver_for_assignment()
+//!                        │
+//!                        ▼
+//!               Box<dyn ScanDriver>
+//!                        │
+//!          ┌─────────────┼───────────────────┐
+//!          │             run()                │
+//!          │  Engine + Config + EventOutput   │
+//!          │  + CommitSink + CancellationToken│
+//!          │             │                    │
+//!          │             ▼                    │
+//!          │        ScanReport                │
+//!          └─────────────────────────────────-┘
 //! ```
 //!
-//! The goal is to keep the contracts crate lightweight while still exposing
-//! a shared integration boundary for filesystem, git, and future sources.
+//! # Why a separate crate?
+//!
+//! `gossip-contracts` defines coordination-layer data (shards, cursors,
+//! identities). Scan-driver concerns — engines, event sinks, finding batches,
+//! cancellation — are orthogonal. Splitting them keeps `gossip-contracts` a
+//! lightweight leaf crate and avoids pulling scanner dependencies into the
+//! coordination graph.
+//!
+//! # Consumers
+//!
+//! | Crate | Role |
+//! |-------|------|
+//! | `gossip-connectors` | Implements [`ScanDriver`] for FS, Git, and in-memory sources |
+//! | `gossip-scanner-runtime` | Builds [`Assignment`]s and calls [`ScanSourceFactory`] |
+//! | `gossip-coordination` | Reads [`ScanReport`] and [`SourceCapabilities`] for bookkeeping |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,8 +53,17 @@ use scanner_scheduler::events::EventOutput;
 
 /// Cooperative cancellation token for long-running scans.
 ///
-/// Drivers are expected to check this token at source-specific scheduling
-/// boundaries (for example between batch submissions).
+/// Shared via [`Arc`] so the caller can signal cancellation from any thread
+/// while the driver is running. Drivers are expected to poll [`is_cancelled`]
+/// at source-specific scheduling boundaries (e.g., between batch submissions
+/// or after each item). A driver that honours mid-scan cancellation should
+/// declare [`SourceCapabilities::supports_cooperative_cancel`] `= true`.
+///
+/// Uses `Release`/`Acquire` ordering to ensure that any state written before
+/// [`cancel`] is visible to the driver after it observes cancellation.
+///
+/// [`is_cancelled`]: CancellationToken::is_cancelled
+/// [`cancel`]: CancellationToken::cancel
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -50,42 +88,76 @@ impl CancellationToken {
     }
 }
 
-/// Connector/source family for an assignment.
+/// Discriminant for the source backend that will execute an [`Assignment`].
+///
+/// Each variant has a corresponding [`AssignmentSource`] payload and a
+/// [`ScanSourceFactory`] implementation that knows how to construct the
+/// matching driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectorKind {
+    /// Local or mounted filesystem walk.
     Filesystem,
+    /// Git repository scan (commit-graph traversal or ODB blob fast-path).
     Git,
+    /// Pre-loaded in-memory dataset for tests and evaluation harnesses.
     InMemory,
 }
 
-/// Source-specific assignment payload.
+/// Source-specific payload carried by an [`Assignment`].
+///
+/// Must be consistent with [`Assignment::connector_kind`] — a factory will
+/// reject the assignment if the variant does not match the expected kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AssignmentSource {
+    /// Root directory to walk for filesystem scans.
     Filesystem { root: PathBuf },
+    /// Repository root (the directory containing `.git/`) for git scans.
     Git { repo_root: PathBuf },
+    /// Logical dataset identifier for in-memory test harnesses.
     InMemory { dataset_id: String },
 }
 
-/// Work assignment translated by a [`ScanSourceFactory`] into a driver.
+/// Work unit dispatched to a [`ScanSourceFactory`] to produce a driver.
+///
+/// In distributed mode, assignments are constructed by the coordination layer
+/// from shard claims. In CLI / direct mode, the runtime synthesises a
+/// single-shard assignment with a placeholder job ID and initial cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assignment {
+    /// Unique identifier for the parent scan job (used for logging and
+    /// tracing, not for deduplication).
     pub job_id: String,
+    /// Backend that should execute this assignment.
     pub connector_kind: ConnectorKind,
+    /// Opaque identifier for the specific connector instance (e.g., a
+    /// repository URL hash or filesystem mount point identifier).
     pub connector_instance_id: String,
+    /// Hash of the detection policy active when this assignment was created.
+    /// Drivers do not interpret it — it flows through to the engine.
     pub policy_hash: PolicyHash,
+    /// Key-range shard that scopes this assignment within the connector's
+    /// total keyspace.
     pub shard_spec: ShardSpec,
+    /// Resumption cursor from the last successful checkpoint, or
+    /// [`Cursor::initial()`] for a fresh scan.
     pub cursor: Cursor,
+    /// Source-specific payload (filesystem root, repo path, etc.).
     pub source: AssignmentSource,
 }
 
-/// Runtime knobs shared across driver implementations.
+/// Filesystem-specific runtime knobs.
+///
+/// Embedded in [`ScanExecutionConfig::filesystem`] and forwarded to the
+/// `parallel_scan_dir` scheduler by the filesystem driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilesystemExecutionConfig {
-    /// When true, archive expansion is disabled.
+    /// Disable archive (zip/tar/gz) expansion during the walk.
     pub skip_archives: bool,
-    /// When true, binary-looking files are skipped.
+    /// Skip files classified as binary by content-type sniffing (default: `true`).
     pub skip_binary: bool,
-    /// When true, findings are forwarded through the commit sink bridge.
+    /// Forward engine findings through the [`CommitSink`] bridge so the
+    /// coordination layer can persist per-item identity chains. Only
+    /// meaningful in distributed mode — CLI mode uses [`NoOpCommitSink`].
     pub emit_findings_to_commit_sink: bool,
 }
 
@@ -99,12 +171,23 @@ impl Default for FilesystemExecutionConfig {
     }
 }
 
-/// Runtime knobs shared across driver implementations.
+/// Top-level runtime configuration passed to every [`ScanDriver::run`] call.
+///
+/// Contains cross-cutting knobs (worker count, checkpoint interval) plus
+/// embedded source-specific sections. Drivers read the section that matches
+/// their backend and ignore the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanExecutionConfig {
+    /// Number of scanner worker threads. Interpreted as a hint — some
+    /// drivers cap or override it (see [`GitExecutionConfig::pack_exec_workers`]).
     pub workers: usize,
+    /// Emit a progress / checkpoint event after this many items. The
+    /// coordination layer uses these events to track incremental progress
+    /// and build resumption cursors.
     pub checkpoint_every_items: u64,
+    /// Filesystem-specific overrides.
     pub filesystem: FilesystemExecutionConfig,
+    /// Git-specific overrides.
     pub git: GitExecutionConfig,
 }
 
@@ -119,16 +202,25 @@ impl Default for ScanExecutionConfig {
     }
 }
 
-/// Git-specific debug output level.
+/// Diagnostic verbosity for git scan debug output.
+///
+/// Returned via [`ScanDriver::debug_output`] and printed to stderr by the
+/// CLI after the scan completes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GitDebugLevel {
+    /// No diagnostic output (default).
     #[default]
     Off,
+    /// High-level aggregate statistics (ref counts, blob totals).
     Stats,
+    /// Detailed per-phase timing and pack-exec performance counters.
     Perf,
 }
 
-/// Runtime knobs shared across git driver implementations.
+/// Git-specific runtime knobs.
+///
+/// Embedded in [`ScanExecutionConfig::git`] and forwarded to the
+/// `run_git_scan` entry point by the git driver.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GitExecutionConfig {
     /// Stable repository identifier used to namespace persisted keys.
@@ -169,18 +261,42 @@ impl Default for GitExecutionConfig {
     }
 }
 
-/// Generic run report from a driver.
+/// Aggregate counters returned by [`ScanDriver::run`] after a scan completes.
+///
+/// Used for coordination-layer bookkeeping (shard progress, error budgets)
+/// and CLI summary output. Throughput and elapsed time are intentionally
+/// omitted — callers derive those from wall-clock measurement because
+/// drivers may spend time outside the scan loop (engine init, path
+/// validation, ref resolution) that the coordination layer should not
+/// account for.
+///
+/// All counters saturate at `u64::MAX` rather than wrapping.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanReport {
+    /// Total items (files / blobs) processed.
     pub items_scanned: u64,
+    /// Total payload bytes scanned.
     pub bytes_scanned: u64,
+    /// Total chunk windows scanned across all items.
+    pub chunks_scanned: u64,
+    /// Findings emitted to the event stream.
     pub findings_emitted: u64,
+    /// Non-fatal errors encountered during scanning (I/O errors, read
+    /// failures, etc.). Does **not** include items that were intentionally
+    /// skipped by classification filters (binary, extension, lock-file).
+    pub errors: u64,
 }
 
-/// Source-provided checkpoint hint in assignment keyspace order.
+/// Incremental progress checkpoint produced by [`ScanDriver::checkpoint_hint`].
+///
+/// The coordination layer uses this to build resumption cursors so a
+/// restarted scan can skip already-committed items. Not all drivers support
+/// checkpointing — see [`SourceCapabilities::supports_checkpoint_hints`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorUpdate {
+    /// Cursor pointing just past the last fully committed item.
     pub cursor: Cursor,
+    /// Running count of items committed up to this cursor position.
     pub committed_items: u64,
 }
 
@@ -202,37 +318,86 @@ pub struct SourceCapabilities {
     pub supports_cooperative_cancel: bool,
 }
 
-/// Metadata associated with one committed item.
+/// Per-item metadata passed to [`CommitSink::begin_item`].
+///
+/// Carries optional connector-provided context that the sink may use
+/// when persisting identity chains (e.g., a version ID from a versioned
+/// object store).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ItemMeta {
+    /// Connector-assigned version for the item snapshot being scanned,
+    /// if the source supports versioned objects. `None` for unversioned
+    /// sources (plain filesystem).
     pub version: Option<VersionId>,
+    /// Approximate byte length of the item payload, if known before
+    /// scanning. Used for progress estimation, not for correctness.
     pub size_hint: Option<u64>,
 }
 
-/// Finding record used by commit sinks.
+/// Compact finding record forwarded through the [`CommitSink`] bridge.
+///
+/// Carries the minimal set of fields the coordination layer needs to
+/// derive the full identity chain (`norm_hash → secret_hash → finding_id
+/// → occurrence_id`). Richer per-finding details (matched text, transform
+/// path) travel through the [`EventOutput`] stream instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingRecord {
+    /// Numeric identifier of the detection rule that matched.
     pub rule_id: u32,
+    /// Byte offset of the match start within the item payload.
     pub start: u64,
+    /// Byte offset one past the match end (exclusive).
     pub end: u64,
+    /// BLAKE3 digest of the normalised secret bytes. Two findings with
+    /// the same `norm_hash` matched the same logical secret regardless of
+    /// surrounding context or transform chain.
     pub norm_hash: [u8; 32],
+    /// Additive confidence score from gate signals (Phase 1 range: 0–10).
+    /// Does **not** participate in dedup — two findings at the same span
+    /// with different scores still deduplicate normally.
     pub confidence_score: i8,
 }
 
-/// Batch of findings for one item.
+/// All findings for a single item, passed to [`CommitSink::upsert_findings`].
+///
+/// An empty batch is valid — it signals that the item was scanned
+/// successfully but produced no matches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FindingsBatch {
     pub findings: Vec<FindingRecord>,
 }
 
-/// Per-item commit lifecycle sink.
+/// Per-item commit lifecycle sink for persisting scan results.
+///
+/// Drivers call the three methods in strict order for each item:
+///
+/// 1. [`begin_item`] — register the item and its metadata.
+/// 2. [`upsert_findings`] — zero or more calls with finding batches.
+/// 3. [`finish_item`] — mark the item as fully scanned.
+///
+/// In distributed mode the sink derives identity chains and records
+/// progress for the coordination layer. In CLI mode, [`NoOpCommitSink`]
+/// discards all calls.
+///
+/// [`begin_item`]: CommitSink::begin_item
+/// [`upsert_findings`]: CommitSink::upsert_findings
+/// [`finish_item`]: CommitSink::finish_item
 pub trait CommitSink: Send + Sync {
+    /// Open a new item transaction. Must be called before any findings
+    /// are upserted for this key.
     fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()>;
+
+    /// Record one batch of findings for an in-progress item. May be
+    /// called multiple times if findings arrive incrementally.
     fn upsert_findings(&self, item_key: &ItemKey, batch: &FindingsBatch) -> Result<()>;
+
+    /// Close the item transaction. After this call, no further findings
+    /// may be upserted for this key within the current scan.
     fn finish_item(&self, item_key: &ItemKey) -> Result<()>;
 }
 
-/// No-op sink used by CLI mode.
+/// No-op [`CommitSink`] for CLI and direct-mode scans where per-item
+/// persistence is not needed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoOpCommitSink;
 
@@ -251,7 +416,36 @@ impl CommitSink for NoOpCommitSink {
 }
 
 /// Source-specific execution backend.
+///
+/// Implementors own the scan loop for one source type. The runtime provides
+/// a shared [`Engine`](scanner_engine::Engine), configuration, output sinks,
+/// and a cancellation token; the driver orchestrates source-specific I/O
+/// (directory walk, git pack traversal, etc.) and returns aggregate counters
+/// in a [`ScanReport`].
+///
+/// # Implementors
+///
+/// - `FsScanDriver` — filesystem walk via `parallel_scan_dir`
+/// - `GitScanDriver` — git repository via `run_git_scan`
+/// - `InMemoryScanDriver` — pre-loaded dataset for tests
 pub trait ScanDriver: Send {
+    /// Execute the scan and return aggregate counters.
+    ///
+    /// # Parameters
+    ///
+    /// - `engine` — compiled detection rules shared across workers.
+    /// - `cfg` — runtime knobs (workers, checkpoint interval, source config).
+    /// - `out` — event sink for findings, progress, and diagnostics.
+    /// - `git_out` — optional git-specific event sink (ignored by non-git drivers).
+    /// - `commit` — per-item lifecycle sink for persistence (see [`CommitSink`]).
+    /// - `cancel` — cooperative cancellation token; drivers that support it
+    ///   poll [`CancellationToken::is_cancelled`] at regular intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` for fatal failures (repository not found, engine init
+    /// failure). Non-fatal per-item errors (I/O, read failures) are counted
+    /// in [`ScanReport::errors`] and do not abort the scan.
     fn run(
         &mut self,
         engine: Arc<scanner_engine::Engine>,
@@ -262,18 +456,44 @@ pub trait ScanDriver: Send {
         cancel: &CancellationToken,
     ) -> Result<ScanReport>;
 
+    /// Return the latest incremental progress checkpoint, if available.
+    ///
+    /// The coordination layer polls this after the scan completes (or is
+    /// cancelled) to persist a resumption cursor. Returns `None` when the
+    /// driver does not support checkpointing or has not yet committed any
+    /// items.
     fn checkpoint_hint(&self) -> Option<CursorUpdate> {
         None
     }
 
+    /// Optional human-readable debug diagnostics generated during the scan.
+    ///
+    /// Used by the git driver to surface ref-resolution stats and pack-exec
+    /// timing. The CLI prints this to stderr after the scan completes.
     fn debug_output(&self) -> Option<String> {
         None
     }
 }
 
-/// Factory that maps assignments to source-specific drivers.
+/// Factory that maps [`Assignment`]s to source-specific [`ScanDriver`]s.
+///
+/// The runtime selects a factory based on [`Assignment::connector_kind`],
+/// then calls [`driver_for_assignment`] to obtain a boxed driver ready
+/// to execute.
+///
+/// [`driver_for_assignment`]: ScanSourceFactory::driver_for_assignment
 pub trait ScanSourceFactory: Send {
+    /// Construct a driver for the given assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the assignment's connector kind or source payload
+    /// does not match this factory (kind mismatch), or if the source cannot
+    /// be opened (e.g., path does not exist).
     fn driver_for_assignment(&self, assignment: &Assignment) -> Result<Box<dyn ScanDriver>>;
 
+    /// Declare what optional lifecycle features this factory's drivers
+    /// support. The orchestration layer reads these flags to decide whether
+    /// to poll for checkpoints or attempt cooperative cancellation.
     fn capabilities(&self) -> SourceCapabilities;
 }
