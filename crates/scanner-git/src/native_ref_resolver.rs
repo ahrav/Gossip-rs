@@ -97,6 +97,10 @@ impl StartSetResolver for NativeRefResolver {
         let packed_snapshot = store
             .cached_packed_buffer()
             .map_err(|err| gix_error("open packed refs", err))?;
+        // Unwrap the triple indirection: `Option<&SharedBufferSnapshot>` where
+        // `SharedBufferSnapshot` derefs to `&Buffer` which derefs to the inner
+        // packed-refs data. The result is `Option<&packed::Buffer>` expected by
+        // all downstream lookup functions.
         let packed = packed_snapshot.as_ref().map(|snapshot| &***snapshot);
 
         match &self.start_set {
@@ -121,11 +125,18 @@ impl StartSetResolver for NativeRefResolver {
     }
 }
 
+/// Controls how [`resolve_tip`] handles a symbolic ref whose target does not
+/// exist (e.g. `HEAD -> refs/heads/main` when `refs/heads/main` has no object).
+///
+/// The two modes partition callers into "best-effort" (wildcard iteration,
+/// unborn HEAD) and "strict" (explicit user-supplied ref names) categories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MissingSymbolicTarget {
-    /// Treat a missing symbolic target as an empty start set (used for unborn HEAD).
+    /// Treat a missing symbolic target as an empty start set (used for unborn
+    /// HEAD and dangling refs during wildcard iteration).
     ReturnEmpty,
-    /// Surface missing symbolic targets as hard errors.
+    /// Surface missing symbolic targets as hard errors (used for
+    /// `ExplicitRefs` where the caller specifically requested the ref).
     Error,
 }
 
@@ -233,12 +244,12 @@ fn collect_matching_refs(
     let mut out = Vec::new();
     for entry in iter {
         let mut reference = entry.map_err(|err| gix_error("iterate refs", err))?;
-        // Capture the name before following symbolic refs — the filter operates
-        // on the reference's own name, not the target it may point to.
-        let ref_name = reference.name.as_bstr().to_vec();
-        if !matches(&ref_name) {
+        // Filter on the borrowed name before allocating — avoids a heap
+        // allocation for every ref in repos with thousands of non-matching refs.
+        if !matches(reference.name.as_bstr().as_ref()) {
             continue;
         }
+        let ref_name = reference.name.as_bstr().to_vec();
         // Wildcard iteration tolerates dangling symbolic refs: skip them
         // instead of aborting the entire resolve.
         let Some(tip) = resolve_tip(
@@ -494,6 +505,9 @@ fn try_read_loose_tag_target(
 }
 
 /// Encode an OID as lowercase hex for loose-object path construction.
+///
+/// The resulting string is split by the caller as `XX` / `YYY...` to form the
+/// git loose object path `$GIT_DIR/objects/XX/YYY...`.
 fn oid_to_hex(oid: &OidBytes) -> String {
     let mut out = String::with_capacity(oid.len() as usize * 2);
     for &b in oid.as_slice() {
@@ -542,6 +556,9 @@ fn gix_store_options(
     })
 }
 
+/// Map the crate-level [`ObjectFormat`] enum to the `gix_hash::Kind` that
+/// `gix_ref` uses to size OID fields in packed-refs parsing and ref store
+/// operations.
 fn map_object_format(format: ObjectFormat) -> gix_hash::Kind {
     match format {
         ObjectFormat::Sha1 => gix_hash::Kind::Sha1,
@@ -549,11 +566,17 @@ fn map_object_format(format: ObjectFormat) -> gix_hash::Kind {
     }
 }
 
+/// Copy raw hash bytes into a stack-allocated [`OidBytes`].
+///
+/// Accepts either 20-byte (SHA-1) or 32-byte (SHA-256) slices; `OidBytes`
+/// stores the length alongside the data.
 #[inline]
 fn oid_from_hash(bytes: &[u8]) -> OidBytes {
     OidBytes::from_slice(bytes)
 }
 
+/// Wrap a `gix_ref` error into [`RepoOpenError`] with a human-readable
+/// `context` prefix (e.g. `"resolve HEAD"`, `"iterate refs"`).
 fn gix_error(context: &str, err: impl std::fmt::Display) -> RepoOpenError {
     RepoOpenError::io(io::Error::other(format!("{context}: {err}")))
 }
