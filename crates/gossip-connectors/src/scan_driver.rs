@@ -975,7 +975,7 @@ fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>, thread_name: &st
     handle.join().map_err(|_| anyhow!("{thread_name} panicked"))
 }
 
-/// Resolves git refs by shelling out to `git for-each-ref`.
+/// Resolves the default branch tip by shelling out to `git`.
 ///
 /// Matches the reference scanner's `GitCliResolver` with
 /// `StartSetConfig::DefaultBranchOnly`: resolve just the default branch
