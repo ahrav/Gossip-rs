@@ -1042,17 +1042,25 @@ fn run_git(repo: &PathBuf, args: &[&str]) -> io::Result<String> {
 /// Resolve the default-branch tip, falling back to detached `HEAD`.
 ///
 /// Uses `symbolic-ref --quiet HEAD` to find the default branch; if that
-/// fails, falls back to `HEAD`.
+/// fails, falls back to `HEAD`. Returns an empty start set for unborn
+/// branches (newly initialized repos with no commits).
 fn resolve_default_branch(repo: &PathBuf) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
     let head_ref = run_git(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok();
     if let Some(ref_name) = head_ref {
-        let tip_hex = run_git(repo, &["rev-parse", &ref_name]).map_err(RepoOpenError::io)?;
+        // `rev-parse` fails when the branch is unborn (no commits yet).
+        // Return an empty start set so the scanner sees zero objects.
+        let Ok(tip_hex) = run_git(repo, &["rev-parse", &ref_name]) else {
+            return Ok(Vec::new());
+        };
         let oid = oid_from_hex(&tip_hex)?;
         return Ok(vec![(ref_name.into_bytes(), oid)]);
     }
 
-    // Detached HEAD fallback.
-    let tip_hex = run_git(repo, &["rev-parse", "HEAD"]).map_err(RepoOpenError::io)?;
+    // Detached HEAD fallback — also returns empty for unborn repos where
+    // `symbolic-ref` itself failed (uncommon, but possible on bare init).
+    let Ok(tip_hex) = run_git(repo, &["rev-parse", "HEAD"]) else {
+        return Ok(Vec::new());
+    };
     let oid = oid_from_hex(&tip_hex)?;
     Ok(vec![(b"HEAD".to_vec(), oid)])
 }
@@ -1220,6 +1228,28 @@ mod tests {
         };
         let git_cfg = build_git_scan_config(&cfg).expect("build git config");
         assert_eq!(git_cfg.pack_exec_workers, 7);
+    }
+
+    #[test]
+    fn resolve_default_branch_returns_empty_for_unborn_branch() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let repo = tmp.path().to_path_buf();
+        // `git init` creates a repo with an unborn default branch (no commits).
+        let status = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .arg(tmp.path())
+            .output()
+            .expect("git init");
+        assert!(status.status.success(), "git init must succeed");
+
+        // symbolic-ref succeeds on the unborn branch, but rev-parse fails.
+        // The function must return an empty start set, not propagate the error.
+        let result = resolve_default_branch(&repo);
+        assert!(result.is_ok(), "unborn branch must not error: {result:?}");
+        assert!(
+            result.unwrap().is_empty(),
+            "unborn branch must produce an empty start set"
+        );
     }
 
     #[test]
