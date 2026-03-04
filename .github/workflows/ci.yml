@@ -165,15 +165,12 @@ jobs:
     timeout-minutes: 15
     if: ${{ always() && !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.rust == 'true') }}
     needs: [changes]
-    env:
-      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y libboost-dev
-      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+      - uses: ./.github/actions/setup-rust
         with:
           toolchain: "1.93"
+          shared-key: msrv-linux
       - run: cargo check --all-features
 
   # ── Docs ───────────────────────────────────────────────────────────

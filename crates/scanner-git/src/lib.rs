@@ -106,6 +106,7 @@ pub mod midx_build;
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
+pub mod native_ref_resolver;
 pub mod object_id;
 pub mod object_store;
 pub mod oid_index;
@@ -177,6 +178,7 @@ pub use artifact_acquire::{
 pub use limits::RepoOpenLimits;
 pub use midx::MidxView;
 pub use midx_build::{build_midx_bytes, MidxBuildError, MidxBuildLimits};
+pub use native_ref_resolver::NativeRefResolver;
 pub use object_id::{ObjectFormat, OidBytes};
 pub use preflight::{
     preflight, ArtifactPaths, ArtifactStatus, PreflightMaintenance, PreflightReport,

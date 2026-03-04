@@ -558,7 +558,7 @@ fn lock_path(path: &Path) -> PathBuf {
 /// - Reads the first existing config path
 /// - Ignores comments and blank lines
 /// - Does not parse sections or handle multi-line values
-fn detect_object_format(
+pub(crate) fn detect_object_format(
     paths: &GitRepoPaths,
     limits: &RepoOpenLimits,
 ) -> Result<ObjectFormat, RepoOpenError> {
