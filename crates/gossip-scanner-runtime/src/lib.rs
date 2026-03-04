@@ -27,7 +27,6 @@ use gossip_scan_driver::{
     GitDebugLevel, GitExecutionConfig, NoOpCommitSink, ScanExecutionConfig, ScanReport,
     ScanSourceFactory,
 };
-use regex::bytes::Regex;
 use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformId, TransformMode};
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::events::{EventOutput, NullEventOutput};
@@ -729,47 +728,74 @@ fn build_runtime_engine(
     ))
 }
 
+/// Load scan rules using the reference scanner's 3-tier resolution:
+///
+/// 1. Explicit `--rules=<path>` override
+/// 2. `default_rules.yaml` adjacent to the binary executable
+/// 3. Compile-time embedded fallback (223 rules from `default_rules.yaml`)
+///
+/// Emits provenance info to stderr so operators can verify which rules are
+/// active.
 fn load_runtime_rules(
     rules_file: Option<&Path>,
 ) -> Result<Vec<scanner_engine::RuleSpec>, ScanRuntimeError> {
-    let Some(path) = rules_file else {
-        return Ok(default_runtime_rules());
-    };
-
-    let content =
-        scanner_engine::read_rules_text(path).map_err(|error| ScanRuntimeError::RulesConfig {
-            path: Some(path.to_path_buf()),
-            message: error.to_string(),
+    // 1. Explicit override.
+    if let Some(path) = rules_file {
+        let content = scanner_engine::read_rules_text(path).map_err(|error| {
+            ScanRuntimeError::RulesConfig {
+                path: Some(path.to_path_buf()),
+                message: error.to_string(),
+            }
         })?;
-    scanner_engine::load_rules_from_content(&content).map_err(|error| {
-        ScanRuntimeError::RulesConfig {
-            path: Some(path.to_path_buf()),
-            message: error.to_string(),
-        }
-    })
-}
+        let rules = scanner_engine::load_rules_from_content(&content).map_err(|error| {
+            ScanRuntimeError::RulesConfig {
+                path: Some(path.to_path_buf()),
+                message: error.to_string(),
+            }
+        })?;
+        let hash = scanner_engine::rules_content_hash64(content.as_bytes());
+        eprintln!(
+            "info: using rules from {} ({} rules, rule_hash: {hash:016x})",
+            path.display(),
+            rules.len(),
+        );
+        return Ok(rules);
+    }
 
-fn default_runtime_rules() -> Vec<scanner_engine::RuleSpec> {
-    const ANCHORS: &[&[u8]] = &[b"SECRET", b"password", b"token"];
-    vec![scanner_engine::RuleSpec {
-        name: "runtime-secret",
-        anchors: ANCHORS,
-        radius: 64,
-        validator: scanner_engine::ValidatorKind::None,
-        two_phase: None,
-        must_contain: None,
-        keywords_any: None,
-        value_suppressors_any: None,
-        entropy: None,
-        char_class: None,
-        local_context: None,
-        secret_group: None,
-        min_confidence: None,
-        offline_validation: None,
-        uuid_format_secret: false,
-        re: Regex::new(r"(?i)(secret|password|token)[A-Za-z0-9=_:+-]{4,}")
-            .expect("runtime regex must compile"),
-    }]
+    // 2. Default candidate adjacent to binary.
+    if let Some(default_path) = scanner_engine::default_rules_path()
+        && default_path.is_file()
+    {
+        let content = scanner_engine::read_rules_text(&default_path).map_err(|error| {
+            ScanRuntimeError::RulesConfig {
+                path: Some(default_path.clone()),
+                message: error.to_string(),
+            }
+        })?;
+        let rules = scanner_engine::load_rules_from_content(&content).map_err(|error| {
+            ScanRuntimeError::RulesConfig {
+                path: Some(default_path.clone()),
+                message: error.to_string(),
+            }
+        })?;
+        let hash = scanner_engine::rules_content_hash64(content.as_bytes());
+        eprintln!(
+            "info: using {} ({} rules, source: default_rules.yaml, rule_hash: {hash:016x})",
+            default_path.display(),
+            rules.len(),
+        );
+        return Ok(rules);
+    }
+
+    // 3. Compile-time embedded fallback.
+    let rules = scanner_engine::builtin_rules();
+    let hash = scanner_engine::builtin_rules_hash64();
+    eprintln!("info: no default_rules.yaml next to binary; using compiled-in rules");
+    eprintln!(
+        "info: using compiled-in rule set ({} rules, source: built-in, rule_hash: {hash:016x})",
+        rules.len(),
+    );
+    Ok(rules)
 }
 
 fn default_runtime_transforms() -> Vec<TransformConfig> {
@@ -912,7 +938,7 @@ fn validate_git_repo_path(path: &Path) -> Result<PathBuf, ScanRuntimeError> {
     Ok(canonical_input)
 }
 
-fn available_workers() -> usize {
+pub(crate) fn available_workers() -> usize {
     std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1)
