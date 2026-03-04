@@ -855,7 +855,16 @@ fn render_scan_summary(
     let _ = writeln!(buf, "throughput_mib_s={throughput_mib_s:.2}");
     if summary_debug {
         let scan_ms = report.scan_ns / 1_000_000;
-        let init_ms = elapsed_ms.saturating_sub(scan_ms);
+        let persist_ms = if source_kind == SourceKind::Fs {
+            report.persist_ns / 1_000_000
+        } else {
+            0
+        };
+        // Subtract both scan and persist so the three components are additive:
+        // init_ms + scan_ms + persist_ms ≈ elapsed_ms.
+        let init_ms = elapsed_ms
+            .saturating_sub(scan_ms)
+            .saturating_sub(persist_ms);
         let _ = writeln!(buf, "workers={workers}");
         let _ = writeln!(buf, "binary_skipped={}", report.binary_skipped);
         let _ = writeln!(buf, "ext_skipped={}", report.ext_skipped);
@@ -877,7 +886,7 @@ fn render_scan_summary(
         let _ = writeln!(buf, "init_ms={init_ms}");
         let _ = writeln!(buf, "scan_ms={scan_ms}");
         if source_kind == SourceKind::Fs {
-            let _ = writeln!(buf, "persist_ms={}", report.persist_ns / 1_000_000);
+            let _ = writeln!(buf, "persist_ms={persist_ms}");
         }
     }
     buf
@@ -1506,12 +1515,54 @@ mod tests {
             "dropped_findings=5",
             "persist_emit_failures=6",
             "persist_incomplete=1",
-            "init_ms=9",
+            "init_ms=7",
             "scan_ms=11",
             "persist_ms=2",
         ] {
             assert!(summary.contains(key), "missing key: {key}");
         }
+    }
+
+    #[test]
+    fn fs_debug_timing_components_sum_to_elapsed() {
+        // When scan_ns and persist_ns are both non-zero, the debug output
+        // shows init_ms, scan_ms, and persist_ms. These three components
+        // must be non-overlapping and sum to elapsed_ms exactly.
+        let report = gossip_scan_driver::ScanReport {
+            items_scanned: 1,
+            bytes_scanned: 100,
+            chunks_scanned: 1,
+            findings_emitted: 0,
+            errors: 0,
+            scan_ns: 11_000_000,   // 11ms
+            persist_ns: 2_000_000, // 2ms
+            ..gossip_scan_driver::ScanReport::default()
+        };
+        let elapsed = std::time::Duration::from_millis(20);
+        let summary = render_scan_summary(&report, elapsed, 4, SourceKind::Fs, true);
+
+        // Parse the three timing components from the summary output.
+        let parse_val = |key: &str| -> u64 {
+            summary
+                .lines()
+                .find(|l| l.starts_with(key))
+                .unwrap_or_else(|| panic!("missing key: {key}"))
+                .strip_prefix(key)
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let init_ms = parse_val("init_ms=");
+        let scan_ms = parse_val("scan_ms=");
+        let persist_ms = parse_val("persist_ms=");
+        let elapsed_ms = 20u64;
+
+        assert_eq!(
+            init_ms + scan_ms + persist_ms,
+            elapsed_ms,
+            "timing components must sum to elapsed: init={init_ms} + scan={scan_ms} + persist={persist_ms} = {} != {elapsed_ms}",
+            init_ms + scan_ms + persist_ms,
+        );
     }
 
     #[test]

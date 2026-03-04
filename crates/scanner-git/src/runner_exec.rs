@@ -1343,11 +1343,19 @@ fn scheduler_pack_task_output(
     }
 }
 
-#[inline(always)]
+/// Count unique offsets with an error-class skip reason.
+///
+/// A single offset may appear multiple times in `skips` when multiple
+/// candidates map to the same offset and are all skipped (see
+/// [`SkipRecord`](crate::pack_exec::SkipRecord) docs). To avoid inflating
+/// the user-visible error counter, we deduplicate by offset so one
+/// corrupted pack entry counts as one error regardless of how many
+/// candidates mapped to it.
 fn count_pack_exec_skip_errors(skips: &[SkipRecord]) -> u64 {
+    let mut seen = std::collections::HashSet::new();
     let mut errors = 0u64;
     for skip in skips {
-        if skip.reason.is_error() {
+        if skip.reason.is_error() && seen.insert(skip.offset) {
             errors = errors.saturating_add(1);
         }
     }

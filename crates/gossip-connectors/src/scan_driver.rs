@@ -195,6 +195,7 @@ impl ScanDriver for FsScanDriver {
                 )));
             }
 
+            let scan_start = std::time::Instant::now();
             let report = if cancel.is_cancelled() {
                 scanner_scheduler::scheduler::local_fs_owner::LocalReport::default()
             } else {
@@ -202,6 +203,7 @@ impl ScanDriver for FsScanDriver {
                     format!("filesystem scan failed for {}", self.root.display())
                 })?
             };
+            let scan_elapsed = scan_start.elapsed();
 
             // Filesystem scans currently restart from the beginning on resume
             // because `parallel_scan_dir` does not track per-item cursor state.
@@ -228,7 +230,7 @@ impl ScanDriver for FsScanDriver {
                 dropped_findings: report.stats.dropped_findings,
                 persist_emit_failures: report.stats.persistence_emit_failures,
                 persist_incomplete: report.stats.persistence_incomplete,
-                scan_ns: report.metrics.duration_ns,
+                scan_ns: u64::try_from(scan_elapsed.as_nanos()).unwrap_or(u64::MAX),
                 persist_ns: report.metrics.persist_ns,
             })
         })
@@ -621,6 +623,11 @@ fn git_report_to_scan_report(
 ) -> ScanReport {
     let report = result.0;
     let metrics = report.common_metrics;
+    // Prefer the stage-level timer when available; fall back to the
+    // wall-clock duration around `run_git_scan`. The fallback may include
+    // internal setup (repo open, MIDX parse) not captured by the stage
+    // timer, so the two sources are not directly comparable if
+    // `stage_nanos.scan` starts being populated mid-process.
     let scan_ns = if report.stage_nanos.scan > 0 {
         report.stage_nanos.scan
     } else {

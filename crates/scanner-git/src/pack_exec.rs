@@ -247,6 +247,11 @@ impl SkipReason {
     /// Returns whether this skip reason represents a pack-exec error.
     ///
     /// `NotBlob` is an expected type-classification outcome, not an error.
+    ///
+    /// `ExternalBaseMissing` (provider returned `None`) is treated as an
+    /// error because all external bases should be resolvable by the time
+    /// pack-exec runs — a missing base indicates a pack integrity problem
+    /// or an incomplete MIDX, not a soft cache miss.
     #[inline]
     pub const fn is_error(&self) -> bool {
         !matches!(self, Self::NotBlob)
