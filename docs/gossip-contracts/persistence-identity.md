@@ -89,22 +89,22 @@ are already unambiguous.
 
 ## Relationship to Git Persistence
 
-> **Note:** The paths referenced below (`crates/scanner-git/src/persist.rs`,
-> `crates/scanner-scheduler/src/store/`) are from the planned design and
-> do not exist in the gossip-rs workspace.  For the **implemented**
-> identity system, see
+> **Note:** `crates/scanner-git/src/persist.rs` is the **implemented** Git
+> persistence module. The store path (`crates/scanner-scheduler/src/store/`)
+> referenced below is from the planned design and does not yet exist in the
+> gossip-rs workspace.  For the broader identity system, see
 > [boundary-1-identity-spine.md](boundary-1-identity-spine.md).
 
-The planned Git persistence pipeline would use `(start, end, rule_id,
-norm_hash)` as finding keys and write through a two-phase contract (data
-ops then watermarks).
+The Git persistence pipeline (`crates/scanner-git/src/persist.rs`) uses
+`(start, end, rule_id, norm_hash)` as finding keys and writes through a
+two-phase contract (data ops then watermarks).
 
 The planned store module would be a **separate, parallel identity system**
 targeting FS scanning (Phases B-E) but extensible to Git and other
-sources. The two systems would share the same `norm_hash` concept (BLAKE3
+sources. The two systems share the same `norm_hash` concept (BLAKE3
 of secret bytes) but differ in scope:
 
-| Aspect                | Git persistence (planned)            | Store identity contracts (planned)    |
+| Aspect                | Git persistence (implemented)        | Store identity contracts (planned)    |
 | --------------------- | ------------------------------------ | ------------------------------------- |
 | Finding key           | `(start, end, rule_id, norm_hash)`   | `occurrence_id` (32-byte keyed hash)  |
 | Key material          | None (hashes are unkeyed)            | `SCANNER_SECRET_KEY` with KDF         |
