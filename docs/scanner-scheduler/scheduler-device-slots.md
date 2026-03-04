@@ -189,28 +189,30 @@ Current status: this module defines the contract and API, but scheduler backends
 - Use explicit read tokens through I/O engine
 - Scheduler controls connection concurrency and bytes-in-flight
 
-### I/O Model Enum (Planned -- Not Yet Implemented)
+### I/O Model Enum
 
-> **Note:** The `IoModel` enum and scheduler decision logic below describe
-> the planned integration design. This type does not exist in the codebase
-> yet. It is retained as a design specification for future implementation.
+> **Source of truth:** `device_slots.rs:506-545`
+
+The `IoModel` enum determines which resource limits apply to a given source:
 
 ```rust
 pub enum IoModel {
-    /// Explicit reads through scheduler's I/O stage
+    /// Explicit reads through scheduler's I/O stage.
+    /// Does NOT use device slots; uses read tokens instead.
     ExplicitReads,
 
-    /// Mmap-based I/O with implicit page faults
+    /// Mmap-based I/O with implicit page faults.
+    /// Uses device slots for concurrency control; does NOT use read tokens.
     MmapImplicit,
 }
 
 impl IoModel {
-    pub fn uses_device_slots(&self) -> bool { }
-    pub fn uses_read_tokens(&self) -> bool { }
+    pub fn uses_device_slots(&self) -> bool { matches!(self, IoModel::MmapImplicit) }
+    pub fn uses_read_tokens(&self) -> bool { matches!(self, IoModel::ExplicitReads) }
 }
 ```
 
-**Planned Scheduler Decision Logic:**
+**Scheduler Decision Logic:**
 ```rust
 let io_model = source.io_model();
 if io_model.uses_device_slots() {

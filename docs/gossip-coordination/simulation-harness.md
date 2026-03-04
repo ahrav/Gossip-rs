@@ -262,4 +262,9 @@ submodules that are part of the crate's public API.
 | `InvariantChecker`      | Runs all safety/liveness invariants in a single pass over coordinator state |
 | `InvariantViolation`    | Enum of all detectable violations (S1-S9 safety, L1 liveness, D1 diagnostics) |
 | `SplitCoverageDetail`   | Detail record for S7 (split coverage) violations, containing parent/child spec information |
+
+### Overload Scenarios (`sim/overload.rs`)
+
+| Type                    | Purpose                                                    |
+| ----------------------- | ---------------------------------------------------------- |
 | `GoodputTracker`        | Tracks completion ratio during overload rounds for goodput reporting |

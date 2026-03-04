@@ -343,7 +343,7 @@ stores. On x86-64 TSO these compile to plain `MOV` instructions.
 - `tail: CachePadded<AtomicU32>` — producer's write index
 
 **Key methods**:
-- `spsc_channel::<T, N>() -> (OwnedSpscProducer, OwnedSpscConsumer)` — creates a channel
+- `spsc_channel::<T: Send + 'static, const N: usize>() -> (OwnedSpscProducer<T, N>, OwnedSpscConsumer<T, N>)` — creates a channel
 - `OwnedSpscProducer::try_push(T) -> Result<(), T>` — returns `Err(value)` if full
 - `OwnedSpscConsumer::try_pop() -> Option<T>` — returns `None` if empty
 - `OwnedSpscConsumer::try_pop_batch(&mut [MaybeUninit<T>]) -> usize` — batch drain

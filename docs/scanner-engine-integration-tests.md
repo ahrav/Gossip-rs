@@ -18,6 +18,11 @@ crates/scanner-engine-integration-tests/
     diagnostic/                       # 2 tests: anchor derivation diagnostics
     smoke/                            # Deferred (awaiting CLI binary name)
     corpus/                           # JSON replay artifacts + fixture files
+      scanner/                        # Scanner case files
+      scanner_mutation/               # Mutation testing corpus
+      git_scan/                       # Git scan case files
+      real_rules/                     # Real-rules baseline fixtures
+      scheduler/                      # Scheduler case files
     regression/                       # Git pack regression corpus
     proptest-regressions/             # Saved proptest regression seeds
 ```

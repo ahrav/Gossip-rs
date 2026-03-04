@@ -142,7 +142,8 @@ classDiagram
     }
 
     class NormHash {
-        [u8; 32]
+        <<type alias>>
+        pub type NormHash = [u8; 32]
         BLAKE3 normalized secret digest
     }
 
