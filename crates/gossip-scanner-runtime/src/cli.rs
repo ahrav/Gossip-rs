@@ -10,12 +10,14 @@ use gossip_scan_driver::GitDebugLevel;
 use scanner_engine::TransformId;
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode, NullEventSink};
 use scanner_scheduler::events::EventOutput;
+use scanner_scheduler::source_kind::SourceKind;
 
 use crate::commit_sink::CliNoOpCommitSink;
 use crate::event_sink::{JsonEventSink, JsonlEventSink, SarifEventSink, TextEventSink};
 use crate::{
     AnchorMode, EventFormat, ExecutionMode, FsScanConfig, GitScanConfig, ScanBudgets,
-    ScanRuntimeError, TransformFilter, scan_fs_with_runtime, scan_git_with_runtime,
+    ScanRuntimeError, TransformFilter, available_workers, scan_fs_with_runtime,
+    scan_git_with_runtime,
 };
 
 /// CLI source command.
@@ -674,6 +676,20 @@ where
 }
 
 /// Run one CLI scan and stream findings to stdout.
+///
+/// A compact summary is always printed to stderr after the scan completes,
+/// matching the output format of the standalone scanner-rs binary:
+///
+/// ```text
+/// files=92128
+/// chunks=90486
+/// bytes=1531929485 (1.43 GiB)
+/// findings=786
+/// errors=0
+/// elapsed_ms=3071
+/// throughput_mib_s=493.61
+/// workers=12
+/// ```
 pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError> {
     let sink = build_event_sink(config.event_format, config.verbose, config.null_sink);
     let core_sink: &dyn EventOutput = sink.as_ref();
@@ -681,17 +697,38 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
     let commit = CliNoOpCommitSink;
     let cancel = CancellationToken::new();
 
+    let base_workers = config.workers.unwrap_or_else(available_workers);
+
+    let source_kind = match &config.source {
+        CliSource::Fs { .. } => SourceKind::Fs,
+        CliSource::Git { .. } => SourceKind::Git,
+    };
+
+    // Auto-size pack-exec workers *before* the timing window so the probe
+    // subprocess does not inflate elapsed/throughput numbers.
+    let effective_workers = match &config.source {
+        CliSource::Fs { .. } => base_workers,
+        CliSource::Git { repo } => {
+            if config.workers.is_some() {
+                base_workers
+            } else {
+                probe_in_pack_object_count(repo)
+                    .ok()
+                    .map(scanner_git::auto_pack_exec_workers_for_in_pack)
+                    .unwrap_or(base_workers)
+            }
+        }
+    };
+
+    let wall_start = std::time::Instant::now();
+
     let report = match config.source {
         CliSource::Fs { path } => {
             scan_fs_with_runtime(
                 &FsScanConfig::new(path)
                     .with_execution_mode(config.execution_mode)
                     .with_budgets(config.budgets)
-                    .with_workers(config.workers.unwrap_or_else(|| {
-                        std::thread::available_parallelism()
-                            .map(|count| count.get())
-                            .unwrap_or(1)
-                    }))
+                    .with_workers(base_workers)
                     .with_decode_depth(config.decode_depth)
                     .with_skip_archives(config.skip_archives)
                     .with_scan_binary(config.scan_binary)
@@ -705,14 +742,10 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
             )?
             .report
         }
-        CliSource::Git { repo } => {
+        CliSource::Git { ref repo } => {
             let outcome = scan_git_with_runtime(
-                &GitScanConfig::new(repo)
-                    .with_workers(config.workers.unwrap_or_else(|| {
-                        std::thread::available_parallelism()
-                            .map(|count| count.get())
-                            .unwrap_or(1)
-                    }))
+                &GitScanConfig::new(repo.clone())
+                    .with_workers(effective_workers)
                     .with_execution_mode(config.execution_mode)
                     .with_budgets(config.budgets)
                     .with_decode_depth(config.decode_depth)
@@ -740,7 +773,72 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
     };
 
     core_sink.flush();
+    let elapsed = wall_start.elapsed();
+
+    print_scan_summary(&report, elapsed, effective_workers, source_kind);
+
     Ok(report)
+}
+
+/// Print a compact `key=value` summary to stderr.
+///
+/// Field order is stable for scripted parsing. Git scans use `objects=`
+/// instead of `files=` to match the reference scanner output.
+fn print_scan_summary(
+    report: &gossip_scan_driver::ScanReport,
+    elapsed: std::time::Duration,
+    workers: usize,
+    source_kind: SourceKind,
+) {
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let elapsed_secs = elapsed.as_secs_f64();
+    let throughput_mib_s = if elapsed_secs > 0.0 {
+        (report.bytes_scanned as f64) / (1024.0 * 1024.0) / elapsed_secs
+    } else {
+        0.0
+    };
+
+    let human_bytes = format_human_bytes(report.bytes_scanned);
+
+    // Use write_all to stderr to minimise the chance of interleaving
+    // with concurrent stderr writers.
+    use std::io::Write;
+    let mut buf = String::with_capacity(256);
+    use std::fmt::Write as FmtWrite;
+    let items_label = match source_kind {
+        SourceKind::Git => "objects",
+        SourceKind::Fs => "files",
+    };
+    let _ = writeln!(buf, "{items_label}={}", report.items_scanned);
+    let _ = writeln!(buf, "chunks={}", report.chunks_scanned);
+    let _ = writeln!(buf, "bytes={} ({human_bytes})", report.bytes_scanned);
+    let _ = writeln!(buf, "findings={}", report.findings_emitted);
+    // Git scans do not yet aggregate per-pack-exec errors into a single
+    // counter, so omit the line rather than printing a misleading zero.
+    if source_kind == SourceKind::Fs {
+        let _ = writeln!(buf, "errors={}", report.errors);
+    }
+    let _ = writeln!(buf, "elapsed_ms={elapsed_ms}");
+    let _ = writeln!(buf, "throughput_mib_s={throughput_mib_s:.2}");
+    let _ = writeln!(buf, "workers={workers}");
+
+    let _ = io::stderr().write_all(buf.as_bytes());
+}
+
+/// Format byte counts using binary IEC units (KiB, MiB, GiB, ...).
+fn format_human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let mut value = bytes as f64;
+    for unit in &UNITS[1..] {
+        value /= 1024.0;
+        if value < 1024.0 {
+            return format!("{value:.2}{unit}");
+        }
+    }
+    format!("{value:.2}PiB")
 }
 
 trait CliEventSink: EventOutput + GitEventOutput {}
@@ -753,6 +851,7 @@ fn build_event_sink(
     null_sink: bool,
 ) -> Box<dyn CliEventSink> {
     if null_sink {
+        eprintln!("info: --null-sink enabled; findings will not be written to stdout");
         return Box::new(NullEventSink);
     }
     match event_format {
@@ -936,6 +1035,36 @@ fn strip_os_prefix<'a>(arg: &'a OsStr, prefix: &str) -> Option<&'a OsStr> {
     } else {
         None
     }
+}
+
+/// Return `in-pack` object count for the repository.
+///
+/// This probe is advisory and used only for worker auto-sizing. Callers
+/// should fall back to deterministic defaults when it fails.
+fn probe_in_pack_object_count(repo_root: &std::path::Path) -> io::Result<u64> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["count-objects", "-v"])
+        .output()
+        .map_err(|e| io::Error::other(format!("failed to run git count-objects: {e}")))?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "git count-objects failed with status {}",
+            output.status
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_in_pack_object_count(&stdout)
+        .ok_or_else(|| io::Error::other("missing in-pack entry in git count-objects output"))
+}
+
+/// Parse `in-pack` object count from `git count-objects -v` output.
+fn parse_in_pack_object_count(text: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("in-pack:")?;
+        rest.trim().parse::<u64>().ok()
+    })
 }
 
 fn is_help_flag(flag: &OsString) -> bool {

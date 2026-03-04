@@ -269,7 +269,9 @@ mod tests {
     #[test]
     fn run_worker_scans_filesystem_path() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), "password=alpha").expect("write fixture");
+        // Secret must be ≥16 high-entropy chars to trigger builtin rules.
+        fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
+            .expect("write fixture");
 
         let cfg = WorkerConfig {
             source: WorkerSource::Fs,
@@ -286,7 +288,7 @@ mod tests {
     fn run_worker_scans_git_repo_path() {
         let dir = tempdir().expect("tempdir");
         create_git_repo(dir.path());
-        fs::write(dir.path().join("secret.txt"), "token=alpha").expect("write fixture");
+        fs::write(dir.path().join("secret.txt"), "token=aB3dE5fG7hJ9kL1m").expect("write fixture");
         run_git(dir.path(), &["add", "."]);
         run_git(dir.path(), &["commit", "-q", "-m", "fixture"]);
 

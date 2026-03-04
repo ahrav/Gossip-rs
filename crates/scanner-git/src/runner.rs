@@ -296,7 +296,7 @@ pub(crate) fn pack_exec_worker_multiplier_for_in_pack(in_pack_objects: u64) -> u
 
 /// Auto-size pack-exec workers from repository `in-pack` size and detected cores.
 #[inline(always)]
-pub(crate) fn auto_pack_exec_workers_for_in_pack(in_pack_objects: u64) -> usize {
+pub fn auto_pack_exec_workers_for_in_pack(in_pack_objects: u64) -> usize {
     auto_pack_exec_workers_for_in_pack_with_cores(in_pack_objects, detected_parallelism())
 }
 

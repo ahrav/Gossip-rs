@@ -459,7 +459,9 @@ mod tests {
     #[test]
     fn run_worker_persists_identity_chain_and_marks_done() {
         let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join("secret.txt"), "password=alpha").expect("write fixture");
+        // Secret must be ≥16 high-entropy chars to trigger builtin rules.
+        fs::write(dir.path().join("secret.txt"), "password=xK9mP2qL7wN4vR8t")
+            .expect("write fixture");
 
         let coordinator = InMemoryCoordinator::new(vec![fs_lease("shard-2", dir.path())]);
 
