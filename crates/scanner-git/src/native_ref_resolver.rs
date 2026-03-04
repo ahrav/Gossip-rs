@@ -26,9 +26,15 @@
 //! - **Linked worktrees**: the ref store is opened with both per-worktree
 //!   `git_dir` and shared `common_dir` so worktree-specific refs (like HEAD)
 //!   resolve correctly while shared refs (branches, tags) are still visible.
+//! - **Annotated tags**: resolved OIDs are peeled through tag objects to the
+//!   underlying commit. The fast path reads peeled OIDs from `packed-refs`
+//!   (`^` lines); the slow path decompresses loose tag objects and follows
+//!   the `object` header. Nested tags are followed up to a depth limit.
 
-use std::io;
+use std::io::{self, Read as _};
+use std::path::Path;
 
+use flate2::bufread::ZlibDecoder;
 use gix_ref::bstr::ByteSlice;
 use gix_ref::file::ReferenceExt;
 
@@ -51,13 +57,24 @@ const REFS_REMOTES_PREFIX: &[u8] = b"refs/remotes/";
 #[derive(Clone, Debug)]
 pub struct NativeRefResolver {
     start_set: StartSetConfig,
+    limits: RepoOpenLimits,
 }
 
 impl NativeRefResolver {
     /// Create a resolver for the given start-set configuration.
     #[must_use]
     pub fn new(start_set: StartSetConfig) -> Self {
-        Self { start_set }
+        Self {
+            start_set,
+            limits: RepoOpenLimits::default(),
+        }
+    }
+
+    /// Create a resolver that uses the provided repo-open limits for config
+    /// file reads.
+    #[must_use]
+    pub fn with_limits(start_set: StartSetConfig, limits: RepoOpenLimits) -> Self {
+        Self { start_set, limits }
     }
 }
 
@@ -74,7 +91,7 @@ impl StartSetResolver for NativeRefResolver {
     /// packed-refs file is corrupt, or (for `ExplicitRefs`) a requested ref
     /// does not exist.
     fn resolve(&self, paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-        let store = open_ref_store(paths)?;
+        let store = open_ref_store(paths, &self.limits)?;
         // Snapshot packed-refs once so every lookup within this call sees a
         // consistent view, even if `git pack-refs` runs concurrently.
         let packed_snapshot = store
@@ -83,17 +100,19 @@ impl StartSetResolver for NativeRefResolver {
         let packed = packed_snapshot.as_ref().map(|snapshot| &***snapshot);
 
         match &self.start_set {
-            StartSetConfig::DefaultBranchOnly => resolve_default_branch(&store, packed),
-            StartSetConfig::ExplicitRefs { refs } => resolve_explicit_refs(&store, packed, refs),
+            StartSetConfig::DefaultBranchOnly => resolve_default_branch(&store, packed, paths),
+            StartSetConfig::ExplicitRefs { refs } => {
+                resolve_explicit_refs(&store, packed, refs, paths)
+            }
             StartSetConfig::AllRemoteBranches { remote } => {
-                collect_matching_refs(&store, packed, |name| {
+                collect_matching_refs(&store, packed, paths, |name| {
                     remote_matches(name, remote.as_deref())
                 })
             }
             StartSetConfig::BranchesAndTags {
                 include_remote_branches,
                 remote,
-            } => collect_matching_refs(&store, packed, |name| {
+            } => collect_matching_refs(&store, packed, paths, |name| {
                 name.starts_with(REFS_HEADS_PREFIX)
                     || name.starts_with(REFS_TAGS_PREFIX)
                     || (*include_remote_branches && remote_matches(name, remote.as_deref()))
@@ -123,6 +142,7 @@ enum MissingSymbolicTarget {
 fn resolve_default_branch(
     store: &gix_ref::file::Store,
     packed: Option<&gix_ref::packed::Buffer>,
+    paths: &GitRepoPaths,
 ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
     let Some(mut head) = store
         .try_find("HEAD")
@@ -137,7 +157,13 @@ fn resolve_default_branch(
         return Ok(Vec::new());
     };
 
-    Ok(vec![(head.name.as_bstr().to_vec(), tip)])
+    // Note: `resolve_tip` may have followed a symbolic chain via
+    // `follow_to_object_packed`, which mutates `head.name` in place to
+    // the final resolved name (e.g. `HEAD` becomes `refs/heads/main`).
+    // This is intentional — for symbolic HEAD we return the branch name.
+    let ref_name = head.name.as_bstr().to_vec();
+    let tip = peel_to_non_tag(tip, &ref_name, packed, paths)?;
+    Ok(vec![(ref_name, tip)])
 }
 
 /// Look up each explicitly-named ref and resolve its tip OID.
@@ -152,6 +178,7 @@ fn resolve_explicit_refs(
     store: &gix_ref::file::Store,
     packed: Option<&gix_ref::packed::Buffer>,
     refs: &[Vec<u8>],
+    paths: &GitRepoPaths,
 ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
     let mut out = Vec::with_capacity(refs.len());
 
@@ -172,6 +199,7 @@ fn resolve_explicit_refs(
                 String::from_utf8_lossy(requested_name)
             ))));
         };
+        let tip = peel_to_non_tag(tip, requested_name, packed, paths)?;
         // Preserve the configured ref name to keep watermark keys stable for explicit selectors.
         out.push((requested_name.clone(), tip));
     }
@@ -186,11 +214,15 @@ fn resolve_explicit_refs(
 /// time. The ref name is captured *before* symbolic-ref resolution so the
 /// output names match what the caller's filter saw.
 ///
-/// A dangling symbolic ref in this path is a hard error (unlike
-/// `resolve_default_branch`, where unborn HEAD is tolerated).
+/// Dangling symbolic refs (e.g. a stale `refs/remotes/origin/HEAD` whose
+/// target was renamed) are silently skipped rather than aborting the entire
+/// resolve. This mirrors `resolve_default_branch`'s tolerance for unborn
+/// HEAD and avoids hard-failing on repos with common stale remote HEAD
+/// tracking entries.
 fn collect_matching_refs(
     store: &gix_ref::file::Store,
     packed: Option<&gix_ref::packed::Buffer>,
+    paths: &GitRepoPaths,
     matches: impl Fn(&[u8]) -> bool,
 ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
     let platform = store.iter().map_err(|err| gix_error("iterate refs", err))?;
@@ -207,13 +239,18 @@ fn collect_matching_refs(
         if !matches(&ref_name) {
             continue;
         }
-        let Some(tip) = resolve_tip(&mut reference, store, packed, MissingSymbolicTarget::Error)?
+        // Wildcard iteration tolerates dangling symbolic refs: skip them
+        // instead of aborting the entire resolve.
+        let Some(tip) = resolve_tip(
+            &mut reference,
+            store,
+            packed,
+            MissingSymbolicTarget::ReturnEmpty,
+        )?
         else {
-            return Err(RepoOpenError::io(io::Error::other(format!(
-                "reference has no reachable tip: {}",
-                String::from_utf8_lossy(&ref_name)
-            ))));
+            continue;
         };
+        let tip = peel_to_non_tag(tip, &ref_name, packed, paths)?;
         out.push((ref_name, tip));
     }
 
@@ -277,13 +314,205 @@ fn remote_matches(name: &[u8], remote: Option<&[u8]>) -> bool {
     }
 }
 
+/// Maximum peel depth to prevent infinite loops from corrupted or adversarial
+/// tag chains.
+///
+/// Every major git implementation (git, libgit2, gitoxide, JGit, go-git) uses
+/// unbounded loops for tag peeling, relying on content-addressing to prevent
+/// cycles. We add an explicit depth limit because our scanner reads untrusted
+/// repos without a persistent parsed-object cache for implicit cycle detection.
+///
+/// Real-world tag chains are almost always depth 1 (tag -> commit), very rarely
+/// depth 2. Depth 3+ is essentially unheard of. The value 10 matches libgit2's
+/// `MAX_NESTING_LEVEL` for symbolic-ref resolution (the closest analogue) and
+/// provides a 5x margin over any legitimate use case.
+///
+/// Evidence: git `SYMREF_MAXDEPTH=5` (refs-internal.h), libgit2
+/// `DEFAULT_NESTING_LEVEL=5` / `MAX_NESTING_LEVEL=10` (refdb.c:3-4).
+const MAX_TAG_PEEL_DEPTH: u8 = 10;
+
+/// Maximum decompressed bytes to read when checking if a loose object is a tag.
+///
+/// The target OID we need sits in the first ~48-72 bytes of the tag body
+/// (`object <hex-oid>\n`). The full tag header (object + type + tag name +
+/// tagger) is always under 275 bytes. However, we must decompress enough zlib
+/// data to reach the header through the git object framing (`tag <size>\0`).
+///
+/// Typical annotated tags (including GPG/SSH signatures) are 200-2000 bytes.
+/// The largest legitimate tags (RSA-4096 signature + long release notes) reach
+/// ~4 KiB. The 8 KiB limit provides a 2-4x margin over legitimate maximums
+/// while defending against decompression bombs and multi-megabyte tag messages
+/// in adversarial repos.
+///
+/// Evidence: tag format spec (git tag.c:parse_tag_buffer), RSA-4096 armored
+/// signatures ~800-1000 bytes, JGit uses 5 MiB as its general object cache
+/// limit (RevWalk.java getCachedBytes).
+const MAX_LOOSE_TAG_BYTES: usize = 8 * 1024;
+
+/// Peel an OID through any tag objects to reach the underlying non-tag object.
+///
+/// Two resolution strategies are attempted in order:
+///
+/// 1. **Packed-refs peel entry** — the `packed-refs` file stores peeled OIDs
+///    for annotated tags as `^` lines. When the ref is found in `packed` with
+///    a peeled entry, return that OID directly. No object store access needed.
+///
+/// 2. **Loose object chain** — for tags not in packed-refs (e.g. freshly
+///    created), read the loose object from `$GIT_DIR/objects/XX/YYY...`,
+///    decompress it, check the header for `tag` type, and extract the
+///    `object <hex>` target. Repeat up to [`MAX_TAG_PEEL_DEPTH`] for nested
+///    tags.
+fn peel_to_non_tag(
+    oid: OidBytes,
+    ref_name: &[u8],
+    packed: Option<&gix_ref::packed::Buffer>,
+    paths: &GitRepoPaths,
+) -> Result<OidBytes, RepoOpenError> {
+    // Fast path: check packed-refs for a pre-computed peeled OID.
+    if let Some(peeled) = try_packed_peel(ref_name, packed)? {
+        return Ok(peeled);
+    }
+
+    // Slow path: read loose objects and follow the tag chain.
+    peel_loose_tag_chain(oid, paths)
+}
+
+/// Look up `ref_name` in the packed-refs buffer and return the peeled OID
+/// if the entry has one (the `^` line in packed-refs).
+///
+/// Returns `Ok(None)` when the ref is not in packed-refs or has no peel entry
+/// (i.e. is not an annotated tag).
+fn try_packed_peel(
+    ref_name: &[u8],
+    packed: Option<&gix_ref::packed::Buffer>,
+) -> Result<Option<OidBytes>, RepoOpenError> {
+    let Some(packed_buf) = packed else {
+        return Ok(None);
+    };
+
+    let found = packed_buf
+        .try_find(ref_name.as_bstr())
+        .map_err(|err| gix_error("packed-refs lookup for peel", err))?;
+
+    let Some(packed_ref) = found else {
+        return Ok(None);
+    };
+
+    // `object` is `Some` only for annotated tags that have a `^` peel line.
+    // When present, it's the fully-peeled commit OID.
+    match packed_ref.object {
+        Some(_) => Ok(Some(oid_from_hash(packed_ref.object().as_bytes()))),
+        None => Ok(None),
+    }
+}
+
+/// Follow a chain of loose tag objects until we reach a non-tag object.
+///
+/// Each iteration reads a single loose object, checks if it is a `tag`, and
+/// if so extracts the `object <hex>` target. The loop terminates when:
+/// - The object is not a tag (return current OID).
+/// - The loose object file does not exist (assume non-tag; return current OID).
+/// - [`MAX_TAG_PEEL_DEPTH`] is exceeded (return error).
+fn peel_loose_tag_chain(
+    mut oid: OidBytes,
+    paths: &GitRepoPaths,
+) -> Result<OidBytes, RepoOpenError> {
+    for _ in 0..MAX_TAG_PEEL_DEPTH {
+        match try_read_loose_tag_target(&oid, &paths.objects_dir)? {
+            Some(target) => oid = target,
+            None => return Ok(oid),
+        }
+    }
+    Err(RepoOpenError::io(io::Error::other(
+        "tag peel depth exceeded — possible cycle in tag chain",
+    )))
+}
+
+/// Read a single loose object and, if it is a tag, return the target OID.
+///
+/// Returns `Ok(None)` if the object file does not exist or is not a tag.
+/// The loose object format is: `zlib(<type> <size>\0<body>)`.
+/// For tags, the body starts with `object <40-hex>\n...`.
+fn try_read_loose_tag_target(
+    oid: &OidBytes,
+    objects_dir: &Path,
+) -> Result<Option<OidBytes>, RepoOpenError> {
+    let hex = oid_to_hex(oid);
+    let (dir, file) = hex.split_at(2);
+    let path = objects_dir.join(dir).join(file);
+
+    let compressed = match std::fs::read(&path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(RepoOpenError::io(err)),
+    };
+
+    let mut decoder = ZlibDecoder::new(&compressed[..]);
+    let mut buf = vec![0u8; MAX_LOOSE_TAG_BYTES];
+    let mut total = 0;
+    loop {
+        match decoder.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total >= MAX_LOOSE_TAG_BYTES {
+                    break;
+                }
+            }
+            Err(err) => return Err(RepoOpenError::io(err)),
+        }
+    }
+    let decompressed = &buf[..total];
+
+    // Parse header: "<type> <size>\0"
+    let Some(nul_pos) = decompressed.iter().position(|&b| b == 0) else {
+        return Ok(None);
+    };
+    let header = &decompressed[..nul_pos];
+
+    // Check if it's a tag object.
+    if !header.starts_with(b"tag ") {
+        return Ok(None);
+    }
+
+    // Parse body for "object <40-or-64-hex>\n".
+    let body = &decompressed[nul_pos + 1..];
+    let Some(rest) = body.strip_prefix(b"object ") else {
+        return Err(RepoOpenError::io(io::Error::other(
+            "malformed tag object: missing 'object' field",
+        )));
+    };
+    let Some(lf_pos) = rest.iter().position(|&b| b == b'\n') else {
+        return Err(RepoOpenError::io(io::Error::other(
+            "malformed tag object: unterminated 'object' line",
+        )));
+    };
+    let hex_target = &rest[..lf_pos];
+    let target_id = gix_hash::ObjectId::from_hex(hex_target)
+        .map_err(|err| RepoOpenError::io(io::Error::other(format!("bad tag target hex: {err}"))))?;
+    Ok(Some(oid_from_hash(target_id.as_bytes())))
+}
+
+/// Encode an OID as lowercase hex for loose-object path construction.
+fn oid_to_hex(oid: &OidBytes) -> String {
+    let mut out = String::with_capacity(oid.len() as usize * 2);
+    for &b in oid.as_slice() {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Open a `gix_ref::file::Store` appropriate for the repository layout.
 ///
 /// Linked worktrees have a per-worktree `git_dir` (containing `HEAD` and
 /// worktree-specific refs) plus a shared `common_dir` (containing branches,
 /// tags, and packed-refs). Normal repos and bare repos only need `git_dir`.
-fn open_ref_store(paths: &GitRepoPaths) -> Result<gix_ref::file::Store, RepoOpenError> {
-    let options = gix_store_options(paths)?;
+fn open_ref_store(
+    paths: &GitRepoPaths,
+    limits: &RepoOpenLimits,
+) -> Result<gix_ref::file::Store, RepoOpenError> {
+    let options = gix_store_options(paths, limits)?;
     Ok(if paths.is_linked_worktree() {
         gix_ref::file::Store::for_linked_worktree(
             paths.git_dir.clone(),
@@ -300,8 +529,11 @@ fn open_ref_store(paths: &GitRepoPaths) -> Result<gix_ref::file::Store, RepoOpen
 /// Reflogs are disabled because the scanner is read-only and never creates
 /// refs. `precompose_unicode` is left off because ref names are treated as
 /// opaque bytes throughout the scan pipeline.
-fn gix_store_options(paths: &GitRepoPaths) -> Result<gix_ref::store::init::Options, RepoOpenError> {
-    let object_hash = map_object_format(detect_object_format(paths, &RepoOpenLimits::default())?);
+fn gix_store_options(
+    paths: &GitRepoPaths,
+    limits: &RepoOpenLimits,
+) -> Result<gix_ref::store::init::Options, RepoOpenError> {
+    let object_hash = map_object_format(detect_object_format(paths, limits)?);
     Ok(gix_ref::store::init::Options {
         write_reflog: gix_ref::store::WriteReflog::Disable,
         object_hash,
@@ -371,11 +603,22 @@ mod tests {
             .to_owned()
     }
 
-    fn resolve_default(repo: &Path) -> Vec<(Vec<u8>, OidBytes)> {
-        let resolver = NativeRefResolver::new(StartSetConfig::DefaultBranchOnly);
+    fn resolve_with(repo: &Path, config: StartSetConfig) -> Vec<(Vec<u8>, OidBytes)> {
+        try_resolve_with(repo, config).expect("resolve")
+    }
+
+    fn try_resolve_with(
+        repo: &Path,
+        config: StartSetConfig,
+    ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
+        let resolver = NativeRefResolver::new(config);
         let paths = GitRepoPaths::resolve::<RepoOpenError, _>(repo, &RepoOpenLimits::default())
             .expect("resolve paths");
-        resolver.resolve(&paths).expect("resolve default branch")
+        resolver.resolve(&paths)
+    }
+
+    fn resolve_default(repo: &Path) -> Vec<(Vec<u8>, OidBytes)> {
+        resolve_with(repo, StartSetConfig::DefaultBranchOnly)
     }
 
     fn parse_oid(hex: &str) -> OidBytes {
@@ -463,5 +706,339 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(remote_matches(name, remote), expected);
+    }
+
+    // -- ExplicitRefs ---------------------------------------------------
+
+    #[test]
+    fn explicit_refs_resolves_named_branches_and_tags() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        git(&repo, &["branch", "feature-a"]);
+        git(&repo, &["tag", "v0.1"]);
+
+        let resolved = resolve_with(
+            &repo,
+            StartSetConfig::ExplicitRefs {
+                refs: vec![
+                    b"refs/heads/main".to_vec(),
+                    b"refs/heads/feature-a".to_vec(),
+                    b"refs/tags/v0.1".to_vec(),
+                ],
+            },
+        );
+
+        assert_eq!(resolved.len(), 3);
+        let commit_oid = parse_oid(&git(&repo, &["rev-parse", "HEAD"]));
+        for (_, oid) in &resolved {
+            assert_eq!(*oid, commit_oid);
+        }
+    }
+
+    #[test]
+    fn explicit_refs_errors_on_missing_ref() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+
+        let result = try_resolve_with(
+            &repo,
+            StartSetConfig::ExplicitRefs {
+                refs: vec![b"refs/heads/no-such-branch".to_vec()],
+            },
+        );
+
+        assert!(result.is_err());
+    }
+
+    // -- AllRemoteBranches ----------------------------------------------
+
+    #[test]
+    fn all_remote_branches_with_remote_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        let oid = git(&repo, &["rev-parse", "HEAD"]);
+
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &oid]);
+        git(&repo, &["update-ref", "refs/remotes/upstream/main", &oid]);
+
+        let resolved = resolve_with(
+            &repo,
+            StartSetConfig::AllRemoteBranches {
+                remote: Some(b"origin".to_vec()),
+            },
+        );
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, b"refs/remotes/origin/main".to_vec());
+    }
+
+    #[test]
+    fn all_remote_branches_without_filter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        let oid = git(&repo, &["rev-parse", "HEAD"]);
+
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &oid]);
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/develop", &oid],
+        );
+
+        let resolved = resolve_with(&repo, StartSetConfig::AllRemoteBranches { remote: None });
+
+        assert_eq!(resolved.len(), 2);
+        let names: Vec<&[u8]> = resolved.iter().map(|(n, _)| n.as_slice()).collect();
+        assert!(names.contains(&b"refs/remotes/origin/main".as_slice()));
+        assert!(names.contains(&b"refs/remotes/upstream/develop".as_slice()));
+    }
+
+    // -- BranchesAndTags ------------------------------------------------
+
+    #[test]
+    fn branches_and_tags_includes_remotes_when_enabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        let oid = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["tag", "v0.1"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &oid]);
+
+        let resolved = resolve_with(
+            &repo,
+            StartSetConfig::BranchesAndTags {
+                include_remote_branches: true,
+                remote: None,
+            },
+        );
+
+        let names: Vec<&[u8]> = resolved.iter().map(|(n, _)| n.as_slice()).collect();
+        assert!(names.contains(&b"refs/heads/main".as_slice()));
+        assert!(names.contains(&b"refs/tags/v0.1".as_slice()));
+        assert!(names.contains(&b"refs/remotes/origin/main".as_slice()));
+    }
+
+    #[test]
+    fn branches_and_tags_excludes_remotes_when_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        let oid = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["tag", "v0.1"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &oid]);
+
+        let resolved = resolve_with(
+            &repo,
+            StartSetConfig::BranchesAndTags {
+                include_remote_branches: false,
+                remote: None,
+            },
+        );
+
+        let names: Vec<&[u8]> = resolved.iter().map(|(n, _)| n.as_slice()).collect();
+        assert!(names.contains(&b"refs/heads/main".as_slice()));
+        assert!(names.contains(&b"refs/tags/v0.1".as_slice()));
+        assert!(
+            !names.iter().any(|n| n.starts_with(b"refs/remotes/")),
+            "remote refs should be excluded"
+        );
+    }
+
+    // -- Worktrees and bare repos ---------------------------------------
+
+    #[test]
+    fn resolves_refs_in_linked_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+        git(&repo, &["branch", "wt-branch"]);
+
+        let wt_dir = tmp.path().join("worktree");
+        git(
+            &repo,
+            &["worktree", "add", wt_dir.to_str().unwrap(), "wt-branch"],
+        );
+
+        let wt_paths =
+            GitRepoPaths::resolve::<RepoOpenError, _>(&wt_dir, &RepoOpenLimits::default())
+                .expect("resolve worktree paths");
+        assert!(wt_paths.is_linked_worktree());
+
+        let resolved = resolve_with(&wt_dir, StartSetConfig::DefaultBranchOnly);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, b"refs/heads/wt-branch".to_vec());
+    }
+
+    #[test]
+    fn resolves_refs_in_bare_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = init_repo(&tmp);
+        git(&source, &["commit", "--allow-empty", "-m", "first"]);
+
+        let bare_dir = tmp.path().join("bare.git");
+        git(
+            &source,
+            &[
+                "clone",
+                "--bare",
+                source.to_str().unwrap(),
+                bare_dir.to_str().unwrap(),
+            ],
+        );
+
+        let commit_oid = git(&bare_dir, &["rev-parse", "refs/heads/main"]);
+        let resolved = resolve_with(&bare_dir, StartSetConfig::DefaultBranchOnly);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].1, parse_oid(&commit_oid));
+    }
+
+    // -- Error paths ----------------------------------------------------
+
+    #[test]
+    fn dangling_symbolic_ref_skipped_in_wildcard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "first"]);
+
+        // Create a symbolic ref pointing at a non-existent target.
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/heads/dangling",
+                "refs/heads/no-such-branch",
+            ],
+        );
+
+        // Wildcard iteration should skip dangling refs, not abort.
+        let resolved = resolve_with(
+            &repo,
+            StartSetConfig::BranchesAndTags {
+                include_remote_branches: false,
+                remote: None,
+            },
+        );
+
+        assert!(!resolved.is_empty(), "should still resolve valid branches");
+        assert!(
+            !resolved.iter().any(|(n, _)| n == b"refs/heads/dangling"),
+            "dangling symbolic ref should be skipped"
+        );
+    }
+
+    // -- Tag peeling ----------------------------------------------------
+
+    #[test]
+    fn annotated_tag_resolves_to_commit_oid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+        let commit_oid = git(&repo, &["rev-parse", "HEAD"]);
+
+        // Create an annotated tag — its object is a tag object, not the commit.
+        git(&repo, &["tag", "-a", "v1.0", "-m", "release v1.0"]);
+        let tag_object_oid = git(&repo, &["rev-parse", "refs/tags/v1.0"]);
+        // Sanity: annotated tags have a distinct tag object OID.
+        assert_ne!(
+            tag_object_oid, commit_oid,
+            "annotated tag should have a different OID than the commit"
+        );
+
+        let resolved = resolve_with(
+            &repo,
+            StartSetConfig::BranchesAndTags {
+                include_remote_branches: false,
+                remote: None,
+            },
+        );
+
+        // Find the tag entry in the resolved set.
+        let tag_entry = resolved
+            .iter()
+            .find(|(name, _)| name == b"refs/tags/v1.0")
+            .expect("tag ref should be in resolved set");
+
+        // The trait contract requires that tips are commit OIDs, not tag object OIDs.
+        assert_eq!(
+            tag_entry.1,
+            parse_oid(&commit_oid),
+            "annotated tag should be peeled to the underlying commit OID"
+        );
+    }
+
+    // -- dangling symbolic refs -----------------------------------------
+
+    #[test]
+    fn dangling_remote_head_skipped_in_wildcard_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+        git(&repo, &["remote", "add", "origin", "."]);
+        git(&repo, &["fetch", "origin"]);
+
+        // Simulate a stale remote HEAD by pointing it at a nonexistent branch.
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/renamed-main",
+            ],
+        );
+
+        let resolver = NativeRefResolver::new(StartSetConfig::AllRemoteBranches {
+            remote: Some(b"origin".to_vec()),
+        });
+        let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&repo, &RepoOpenLimits::default())
+            .expect("resolve paths");
+        let resolved = resolver.resolve(&paths).expect("should skip dangling ref");
+        assert!(
+            !resolved.is_empty(),
+            "should still resolve valid remote-tracking branches"
+        );
+        assert!(
+            !resolved
+                .iter()
+                .any(|(n, _)| n == b"refs/remotes/origin/HEAD"),
+            "dangling symbolic ref should be skipped"
+        );
+    }
+
+    // -- config size limits ---------------------------------------------
+
+    #[test]
+    fn resolver_respects_caller_config_size_limits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = init_repo(&tmp);
+        git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+
+        let config_path = repo.join(".git").join("config");
+        let original = std::fs::read_to_string(&config_path).expect("read config");
+        let padding = "\n# ".to_owned() + &"x".repeat(200 * 1024) + "\n";
+        std::fs::write(&config_path, original + &padding).expect("write padded config");
+
+        let resolver_default = NativeRefResolver::new(StartSetConfig::DefaultBranchOnly);
+        let paths = GitRepoPaths::resolve::<RepoOpenError, _>(&repo, &RepoOpenLimits::default())
+            .expect("resolve paths");
+        let result = resolver_default.resolve(&paths);
+        assert!(
+            result.is_err(),
+            "expected FileTooLarge with default limits, but got: {:?}",
+            result
+        );
+
+        let custom_limits = RepoOpenLimits {
+            max_config_file_bytes: 512 * 1024,
+            ..RepoOpenLimits::default()
+        };
+        let resolver_custom =
+            NativeRefResolver::with_limits(StartSetConfig::DefaultBranchOnly, custom_limits);
+        let resolved = resolver_custom
+            .resolve(&paths)
+            .expect("resolver with custom limits should succeed for config within those limits");
+        assert_eq!(resolved.len(), 1);
     }
 }
