@@ -142,6 +142,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [scheduler_test_harness_guide.md](scanner-scheduler/scheduler_test_harness_guide.md) | Scheduler simulation harness  | Work-stealing policy checks, deterministic replay      |
 | [git_simulation_harness_guide.md](scanner-git/git_simulation_harness_guide.md)       | Git simulation harness        | Stage model, fault injection, corpus replay            |
 | [simulation-framework.md](scanner-scheduler/simulation-framework.md)                 | Scanner simulation framework  | SimClock, fault injection, mutation testing, minimization |
+| [scanner-engine-integration-tests.md](scanner-engine-integration-tests.md)           | Integration test crate        | Test binaries, corpora, feature gates, runner instructions |
 
 ### Evaluation & Accuracy
 
@@ -217,6 +218,7 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Understand persistence identity     | [persistence-identity.md](gossip-contracts/persistence-identity.md)                                                                                           |
 | Measure scanner accuracy            | [eval-harness.md](eval-harness.md)                                                                                                                            |
 | Write simulation tests              | [simulation-harness.md](gossip-coordination/simulation-harness.md) → [counterexample-testing-unification.md](counterexample-testing-unification.md)           |
+| Run integration/property tests      | [scanner-engine-integration-tests.md](scanner-engine-integration-tests.md)                                                                                    |
 | Understand Kani proofs              | [kani-verification.md](kani-verification.md)                                                                                                                  |
 | Understand the scan driver seam     | [gossip-scan-driver.md](gossip-scan-driver.md)                                                                                                                |
 | Work on scanner runtime / CLI       | [gossip-scanner-runtime.md](gossip-scanner-runtime.md)                                                                                                        |

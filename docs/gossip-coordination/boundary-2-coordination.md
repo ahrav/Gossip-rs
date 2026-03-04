@@ -49,11 +49,6 @@ The module provides six core capabilities:
 | `split_execution.rs` | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types     |
 | `in_memory.rs`       | In-memory reference implementation (executable spec)                                             |
 | `lease.rs`           | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`                                       |
-| `cursor.rs`          | `Cursor` type with monotonicity and bounds semantics                                             |
-| `shard_spec.rs`      | `ShardSpec` key-range type, `CursorSemantics`, split validation                                  |
-| `pooled.rs`          | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers                             |
-| `limits.rs`          | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)             |
-| `manifest.rs`        | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`       |
 | `error.rs`           | Shared `CoordError` and `IdempotentOutcome`                                                      |
 | `run_errors.rs`      | Run-management error types                                                                       |
 | `validation.rs`      | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                        |
@@ -64,9 +59,14 @@ The module provides six core capabilities:
 
 #### `gossip-contracts` crate (`crates/gossip-contracts/src/coordination/`)
 
-| File       | Role                                                                                                                       |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `split.rs` | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
+| File           | Role                                                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `cursor.rs`    | `Cursor` type with monotonicity and bounds semantics                                                                       |
+| `shard_spec.rs`| `ShardSpec` key-range type, `CursorSemantics`, split validation                                                            |
+| `pooled.rs`    | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers                                                       |
+| `limits.rs`    | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)                                       |
+| `manifest.rs`  | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`                                 |
+| `split.rs`     | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
 
 ---
 

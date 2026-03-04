@@ -162,6 +162,42 @@ graph TB
 | **Policy Hash**                | `crates/scanner-git/src/policy_hash.rs`                                                  | Canonical BLAKE3 identity over rules, transforms, and tuning                                                    |
 | **Store**                      | `crates/scanner-scheduler/src/store.rs`                                                  | `StoreProducer` trait, finding/batch/loss types, and built-in producer impls                                    |
 
+## Distributed Coordination Layer
+
+The architecture includes a full distributed coordination stack for shard-based
+scanning. These crates are layered so that shared data-model types sit at the
+leaf and runtime/binary crates depend inward.
+
+```text
+gossip-contracts  (data model leaf -- identity, shard spec, connector types)
+    │
+    ├──► gossip-frontier       (shard algebra -- key encoding, range arithmetic, builder)
+    ├──► gossip-coordination   (protocol -- state machine, lease/fence, in-memory backend)
+    ├──► gossip-connectors     (source impls -- filesystem, git, in-memory connectors)
+    └──► gossip-scan-driver    (driver boundary -- Assignment → ScanSourceFactory → ScanDriver)
+              │
+              └──► gossip-scanner-runtime  (unified runtime -- scan_fs / scan_git dispatchers)
+                        │
+                        └──► gossip-worker  (binary -- CLI entry, tracing, exit codes)
+```
+
+| Component                          | Location                                                                  | Purpose                                                                                                    |
+| ---------------------------------- | ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| **gossip-contracts**               | `crates/gossip-contracts/src/`                                            | Shared contract types: identity spine (BLAKE3 derivation chain), shard data model, connector boundary types |
+| **Identity Module**                | `crates/gossip-contracts/src/identity/`                                   | `TenantId`, `WorkerId`, `ShardId`, `RunId`, `OpId`, `FenceEpoch`, `SecretHash`, domain separation registry |
+| **Coordination Contracts**         | `crates/gossip-contracts/src/coordination/`                               | `ShardSpec`, `Cursor`, `CursorSemantics`, `PooledShardSpec`, `PooledCursor`, capacity limits, manifest     |
+| **Connector Contracts**            | `crates/gossip-contracts/src/connector/`                                  | `EnumerationConnector`, `ReadConnector` traits, `ItemKey`, `ScanItem`, `EnumerationPage`, `Budgets`        |
+| **gossip-frontier**                | `crates/gossip-frontier/src/`                                             | Shard algebra: byte-order-preserving key encoding, range arithmetic, hint metadata, `PreallocShardBuilder`  |
+| **gossip-coordination**            | `crates/gossip-coordination/src/`                                         | Coordination protocol: `CoordinationBackend` trait (7 operations), `InMemoryCoordinator`, `WorkerSession`  |
+| **CoordinationBackend**            | `crates/gossip-coordination/src/traits.rs`                                | Trait defining acquire, renew, checkpoint, complete, park, split_replace, split_residual                    |
+| **InMemoryCoordinator**            | `crates/gossip-coordination/src/in_memory.rs`                             | Reference backend implementation (executable spec for testing and simulation)                               |
+| **gossip-connectors**              | `crates/gossip-connectors/src/`                                           | Concrete connector implementations: `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
+| **ScanSourceFactory impls**        | `crates/gossip-connectors/src/scan_driver.rs`                             | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory`                         |
+| **gossip-scan-driver**             | `crates/gossip-scan-driver/src/lib.rs`                                    | `ScanDriver` + `ScanSourceFactory` traits, `Assignment`, `CommitSink`, execution configs                   |
+| **gossip-scanner-runtime**         | `crates/gossip-scanner-runtime/src/lib.rs`                                | Unified runtime: `scan_fs()`, `scan_git()` entry points; `ExecutionMode` (Direct/Connector) routing        |
+| **Distributed Coordinator**        | `crates/gossip-scanner-runtime/src/distributed.rs`                        | `DistributedCoordinator` trait, `ShardLease`, distributed run loop                                         |
+| **gossip-worker**                  | `crates/gossip-worker/src/main.rs`                                        | Binary: CLI arg parsing, tracing init, dispatches to `scan_fs`/`scan_git` via runtime                      |
+
 
 ## Archive Scanning Notes
 

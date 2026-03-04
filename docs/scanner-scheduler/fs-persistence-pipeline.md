@@ -388,14 +388,14 @@ These feed into `LocalStats` and then into `FsRunLoss` at run end.
 The `emit_persistence_batch()` call is inserted at every scan site that
 produces findings:
 
-| Scan site              | Function                    | File                |
-| ---------------------- | --------------------------- | ------------------- |
-| Plain file chunk loop  | `process_file()`            | `local_fs_owner.rs` |
-| Binary text extraction | `extract_and_scan_file()`   | `local_fs_owner.rs` |
-| Top-level gzip         | `process_gzip_file()`       | `local_fs_owner.rs` |
-| Nested gzip stream     | `scan_gzip_stream_nested()` | `local_fs_owner.rs` |
-| Tar entry stream       | `scan_tar_stream_nested()`  | `local_fs_owner.rs` |
-| Zip entry              | `process_zip_file()`        | `local_fs_owner.rs` |
+| Scan site              | Function                    | File                  |
+| ---------------------- | --------------------------- | --------------------- |
+| Plain file chunk loop  | `process_file()`            | `local_fs_owner.rs`   |
+| Binary text extraction | `extract_and_scan_file()`   | `local_fs_extract.rs` |
+| Top-level gzip         | `process_gzip_file()`       | `local_fs_gzip.rs`    |
+| Nested gzip stream     | `scan_gzip_stream_nested()` | `local_fs_gzip.rs`    |
+| Tar entry stream       | `scan_tar_stream_nested()`  | `local_fs_tar.rs`     |
+| Zip entry              | `process_zip_file()`        | `local_fs_zip.rs`     |
 
 ## Configuration and Wiring
 
