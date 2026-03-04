@@ -205,6 +205,36 @@ fn single_file_enumeration_and_resume() {
 }
 
 #[test]
+fn cold_resume_with_new_instance_skips_to_cursor_last_key() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let budgets = small_page_budgets(2);
+
+    let mut first = FilesystemConnector::new(dir.path());
+    let page1 = first
+        .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
+        .expect("first page should enumerate");
+    assert_eq!(page1.items().len(), 2);
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"a.txt");
+    assert_eq!(page1.items()[1].item_key().as_bytes(), b"b.txt");
+
+    // New connector instance resumes from only the persisted cursor key.
+    let mut resumed = FilesystemConnector::new(dir.path());
+    let page2 = resumed
+        .enumerate_page_range(&start, &end, page1.next_cursor(), budgets)
+        .expect("cold-resume page should enumerate");
+    assert_eq!(page2.items().len(), 2);
+    assert_eq!(page2.items()[0].item_key().as_bytes(), b"c.txt");
+    assert_eq!(page2.items()[1].item_key().as_bytes(), b"d.txt");
+}
+
+#[test]
 fn enumerate_page_uses_pooled_toxic_wrappers() {
     let dir = create_test_dir(&[("alpha.txt", b"a"), ("bravo.txt", b"b")]);
     let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
@@ -408,7 +438,7 @@ fn split_point_cursor_past_midpoint_returns_none() {
 }
 
 #[test]
-fn split_point_valid_returns_key_between_bounds() {
+fn split_point_returns_none_when_disabled_even_with_many_items() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -422,9 +452,10 @@ fn split_point_valid_returns_key_between_bounds() {
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
         .unwrap();
-    let split = split.expect("should produce a split point");
-    assert!(split > make_key(b"\x00"));
-    assert!(split < make_key(b"\xff"));
+    assert!(
+        split.is_none(),
+        "split hints are disabled for streaming walk"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -439,13 +470,13 @@ fn caps_reflect_token_setting() {
     assert!(!c_default.caps().token_resume);
     assert!(c_default.caps().seek_by_key);
     assert!(c_default.caps().range_read);
-    assert!(c_default.caps().split_hints);
+    assert!(!c_default.caps().split_hints);
 
     let c_with = FilesystemConnector::new(dir.path()).with_tokens(true);
     assert!(c_with.caps().token_resume);
     assert!(c_with.caps().seek_by_key);
     assert!(c_with.caps().range_read);
-    assert!(c_with.caps().split_hints);
+    assert!(!c_with.caps().split_hints);
 }
 
 // ---------------------------------------------------------------
@@ -684,22 +715,23 @@ fn empty_subdirectory_is_skipped() {
 }
 
 #[test]
-fn mutations_after_first_enumerate_invisible() {
+fn mutations_visible_after_restarting_from_initial_cursor() {
     let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
-    // First enumerate triggers indexing.
+    // First enumerate drains the current walk.
     let all1 = collect_all(&mut c, &start, &end);
     assert_eq!(all1.len(), 2);
 
     // Mutate directory after indexing.
     fs::write(dir.path().join("c.txt"), b"3").unwrap();
 
-    // Second enumerate on same connector still sees only original files.
+    // Restarting from the initial cursor rebuilds walk state and sees
+    // filesystem changes.
     let all2 = collect_all(&mut c, &start, &end);
-    assert_eq!(all2.len(), 2);
+    assert_eq!(all2.len(), 3);
 }
 
 #[test]
@@ -945,7 +977,7 @@ fn unreadable_subdir_is_skipped_with_warning() {
 // ---------------------------------------------------------------
 
 #[test]
-fn byte_weighted_split_balances_by_size() {
+fn split_hint_disabled_for_byte_weighted_fixture() {
     let dir = create_test_dir(&[
         ("a.txt", &[0u8; 500] as &[u8]),
         ("b.txt", &[0u8; 500]),
@@ -959,21 +991,15 @@ fn byte_weighted_split_balances_by_size() {
 
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap()
-        .expect("should have a split point");
-
-    // Count-balanced would split at c.txt (index 2, 5/2=2).
-    // Byte-weighted: cumulative at a.txt (500) < half (501),
-    // cumulative at b.txt (1000) >= half -> split_idx = 1.
-    assert_eq!(
-        split.as_bytes(),
-        b"b.txt",
-        "byte-weighted split should balance by file size, not count"
+        .unwrap();
+    assert!(
+        split.is_none(),
+        "split hints are disabled for streaming walk"
     );
 }
 
 #[test]
-fn byte_weighted_split_falls_back_for_zero_size() {
+fn split_hint_disabled_for_zero_size_fixture() {
     let dir = create_test_dir(&[
         ("a.txt", b""),
         ("b.txt", b""),
@@ -986,14 +1012,10 @@ fn byte_weighted_split_falls_back_for_zero_size() {
 
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap()
-        .expect("should have a split point");
-
-    // Count-balanced: 4/2 = 2 -> files[2].key = "c.txt".
-    assert_eq!(
-        split.as_bytes(),
-        b"c.txt",
-        "zero-size fallback should use count-balanced median"
+        .unwrap();
+    assert!(
+        split.is_none(),
+        "split hints are disabled for streaming walk"
     );
 }
 
@@ -1094,7 +1116,10 @@ fn choose_split_point_via_shard_spec() {
     let split = c
         .choose_split_point(&shard, &Cursor::initial(), default_budgets())
         .unwrap();
-    assert!(split.is_some(), "should produce a split point");
+    assert!(
+        split.is_none(),
+        "split hints are disabled for streaming walk"
+    );
 }
 
 #[test]
@@ -1171,21 +1196,13 @@ fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
     let split_unbounded = c
         .choose_split_point(&unbounded, &Cursor::initial(), default_budgets())
         .unwrap();
-    assert!(
-        split_unbounded.is_some(),
-        "unbounded split should produce a hint"
-    );
+    assert!(split_unbounded.is_none());
 
     let one_sided = ShardSpec::try_with_range(b"c.txt", b"").unwrap();
     let split_one_sided = c
         .choose_split_point(&one_sided, &Cursor::initial(), default_budgets())
         .unwrap();
-    assert_eq!(
-        split_one_sided
-            .expect("one-sided range should split")
-            .as_bytes(),
-        b"d.txt",
-    );
+    assert!(split_one_sided.is_none());
 }
 
 #[test]
@@ -1367,7 +1384,7 @@ fn cached_fd_has_clear_nonblock_after_read_range() {
         .cached_file
         .as_ref()
         .expect("cached_file should be populated after read_range");
-    let fd = cached.1.as_raw_fd();
+    let fd = cached.file.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     assert!(flags >= 0, "fcntl(F_GETFL) failed");
     assert_eq!(
@@ -1488,19 +1505,15 @@ mod prop {
         }
 
         #[test]
-        fn split_point_strictly_between_cursor_and_end(
-            files in file_set_strategy(20),
-        ) {
+        fn split_point_disabled_for_property_inputs(files in file_set_strategy(20)) {
             let start = make_key(b"\x00");
             let end = make_key(b"\xff");
             let (_dir, mut c) = make_connector(&files);
 
-            if let Ok(Some(split)) = c.choose_split_point_range(
-                &start, &end, &Cursor::initial(),
-            ) {
-                prop_assert!(split > start);
-                prop_assert!(split < end);
-            }
+            let split = c
+                .choose_split_point_range(&start, &end, &Cursor::initial())
+                .expect("split lookup should not error");
+            prop_assert!(split.is_none());
         }
 
         #[test]
@@ -1905,34 +1918,34 @@ fn very_long_filename_is_indexed() {
 }
 
 // ---------------------------------------------------------------
-// Membership enforcement tests
+// Read membership semantics tests
 // ---------------------------------------------------------------
 
 #[test]
-fn read_rejects_non_indexed_item_ref() {
+fn read_accepts_existing_item_ref_even_if_not_preenumerated() {
     let dir = create_test_dir(&[("a.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
-    // Trigger indexing.
+    // Drain initial walk state.
     let _ = collect_all(&mut c, &start, &end);
 
-    // Create a new file after indexing.
+    // Create a new file after the initial enumeration.
     fs::write(dir.path().join("b.txt"), b"post-index").unwrap();
 
-    // Attempt to read the non-indexed file.
+    // openat-based read membership should accept any confined path that exists.
     let bad_ref = ItemRef::try_from_slice(b"b.txt").unwrap();
-    let result = c.open(&bad_ref, default_budgets());
-    let err = result.err().expect("should reject item_ref not in index");
-    assert!(
-        !err.is_retryable(),
-        "membership rejection should be permanent"
-    );
+    let mut reader = c
+        .open(&bad_ref, default_budgets())
+        .expect("existing file should be readable even if not pre-enumerated");
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"post-index");
 }
 
 #[test]
-fn read_range_rejects_non_indexed_item_ref() {
+fn read_range_rejects_absent_item_ref() {
     let dir = create_test_dir(&[("a.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
@@ -1943,7 +1956,7 @@ fn read_range_rejects_non_indexed_item_ref() {
     let bad_ref = ItemRef::try_from_slice(b"nonexistent.txt").unwrap();
     let mut buf = [0u8; 32];
     let result = c.read_range(&bad_ref, 0, &mut buf, default_budgets());
-    assert!(result.is_err(), "should reject item_ref not in index");
+    assert!(result.is_err(), "non-existent item_ref should fail");
 }
 
 #[rstest]
@@ -1976,7 +1989,7 @@ fn open_without_prior_enumerate_triggers_lazy_indexing() {
     let mut c = FilesystemConnector::new(dir.path());
 
     // A valid ItemRef that exists on disk should succeed even without
-    // prior enumeration — lazy indexing satisfies the ReadConnector
+    // prior enumeration — lazy root setup satisfies the ReadConnector
     // affinity contract for compatible instances.
     let item_ref = ItemRef::try_from_slice(b"file.txt").unwrap();
     let mut reader = match c.open(&item_ref, default_budgets()) {
@@ -1993,16 +2006,16 @@ fn open_without_enumerate_rejects_absent_item_ref() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
 
-    // An ItemRef for a file that does not exist should still fail
-    // after lazy indexing because membership enforcement rejects it.
+    // An ItemRef for a file that does not exist should fail with the
+    // underlying openat ENOENT classification.
     let item_ref = ItemRef::try_from_slice(b"no_such_file.txt").unwrap();
     let err = match c.open(&item_ref, default_budgets()) {
         Err(e) => e,
         Ok(_) => panic!("absent item_ref should be rejected"),
     };
     assert!(
-        err.message().contains("not found in index"),
-        "error should indicate item_ref not found, got: {}",
+        err.message().contains("No such file or directory"),
+        "error should indicate ENOENT from openat, got: {}",
         err.message()
     );
 }
@@ -2137,8 +2150,8 @@ fn deadline_expiry_allows_retry_with_fresh_deadline() {
     let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
     assert!(result.is_err());
 
-    // Retryable deadline failures must not memoize `IndexState::Failed`.
-    // A subsequent call with a fresh budget should rebuild and succeed.
+    // Retryable deadline failures must not latch a permanent connector failure.
+    // A subsequent call with a fresh budget should initialize and succeed.
     let page = c
         .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
         .unwrap();
@@ -2317,13 +2330,11 @@ fn permissions_removed_after_indexing_returns_permanent_error() {
 }
 
 // ---------------------------------------------------------------
-// Prefix-sum split consistency test
+// Split-hint disabled consistency test
 // ---------------------------------------------------------------
 
 #[test]
-fn prefix_sum_split_matches_linear_scan() {
-    // Verify that the prefix-sum-based split produces the same result as the
-    // linear-scan in common::choose_split_index for various file configurations.
+fn split_hint_disabled_across_file_size_distributions() {
     let configs: &[&[(&str, &[u8])]] = &[
         &[
             ("a.txt", &[0u8; 100] as &[u8]),
@@ -2348,22 +2359,12 @@ fn prefix_sum_split_matches_linear_scan() {
         let mut c = FilesystemConnector::new(dir.path());
         let start = make_key(b"\x00");
         let end = make_key(b"\xff");
-
-        // Trigger indexing.
-        let _ = collect_all(&mut c, &start, &end);
-
-        // Prefix-sum split.
-        let ps_split = c
+        let split = c
             .choose_split_point_range(&start, &end, &Cursor::initial())
             .unwrap();
-
-        // Linear-scan split via common::choose_split_index.
-        let linear_idx = common::choose_split_index(&c.files, 0, c.files.len());
-        let linear_split = linear_idx.map(|idx| c.files[idx].key.clone());
-
         assert_eq!(
-            ps_split, linear_split,
-            "config {i}: prefix-sum split should match linear scan"
+            split, None,
+            "config {i}: split hints should remain disabled"
         );
     }
 }
