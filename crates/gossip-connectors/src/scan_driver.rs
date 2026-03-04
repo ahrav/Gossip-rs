@@ -977,8 +977,11 @@ fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>, thread_name: &st
 
 /// Resolves git refs by shelling out to `git for-each-ref`.
 ///
-/// Requires `git` on `$PATH`. Returns all refs under `refs/heads`,
-/// `refs/remotes`, and `refs/tags` as `(refname, oid)` pairs.
+/// Matches the reference scanner's `GitCliResolver` with
+/// `StartSetConfig::DefaultBranchOnly`: resolve just the default branch
+/// (via `symbolic-ref HEAD`), falling back to detached `HEAD`.
+///
+/// Requires `git` on `$PATH`.
 #[derive(Clone, Debug)]
 struct CliRefResolver {
     repo_root: PathBuf,
@@ -992,46 +995,43 @@ impl CliRefResolver {
 
 impl StartSetResolver for CliRefResolver {
     fn resolve(&self, _paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-        let output = Command::new("git")
+        // Try symbolic-ref first to find the default branch name.
+        let symbolic = Command::new("git")
             .arg("-C")
             .arg(&self.repo_root)
-            .args([
-                "for-each-ref",
-                "--format=%(refname)%00%(objectname)",
-                "refs/heads",
-                "refs/remotes",
-                "refs/tags",
-            ])
+            .args(["symbolic-ref", "--quiet", "HEAD"])
             .output()
             .map_err(RepoOpenError::io)?;
 
-        if !output.status.success() {
+        let ref_name = if symbolic.status.success() {
+            String::from_utf8_lossy(&symbolic.stdout).trim().to_string()
+        } else {
+            // Detached HEAD — use literal "HEAD".
+            "HEAD".to_string()
+        };
+
+        // Resolve the ref to a commit OID.
+        let rev_parse = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", &ref_name])
+            .output()
+            .map_err(RepoOpenError::io)?;
+
+        if !rev_parse.status.success() {
             return Err(RepoOpenError::io(io::Error::other(format!(
-                "git for-each-ref failed for {}: {}",
+                "git rev-parse '{}' failed for {}: {}",
+                ref_name,
                 self.repo_root.display(),
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&rev_parse.stderr)
             ))));
         }
 
-        let text = String::from_utf8(output.stdout).map_err(|error| {
-            RepoOpenError::io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("git for-each-ref emitted invalid UTF-8: {error}"),
-            ))
-        })?;
-
-        let mut refs = Vec::new();
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let Some((name, oid_hex)) = line.split_once('\0') else {
-                continue;
-            };
-            let oid = decode_oid_hex(oid_hex).map_err(RepoOpenError::io)?;
-            refs.push((name.as_bytes().to_vec(), oid));
-        }
-        Ok(refs)
+        let tip_hex = String::from_utf8_lossy(&rev_parse.stdout)
+            .trim()
+            .to_string();
+        let oid = decode_oid_hex(&tip_hex).map_err(RepoOpenError::io)?;
+        Ok(vec![(ref_name.into_bytes(), oid)])
     }
 }
 

@@ -37,8 +37,7 @@
 //! | Crate | Role |
 //! |-------|------|
 //! | `gossip-connectors` | Implements [`ScanDriver`] for FS, Git, and in-memory sources |
-//! | `gossip-scanner-runtime` | Builds [`Assignment`]s and calls [`ScanSourceFactory`] |
-//! | `gossip-coordination` | Reads [`ScanReport`] and [`SourceCapabilities`] for bookkeeping |
+//! | `gossip-scanner-runtime` | Builds [`Assignment`]s, calls [`ScanSourceFactory`], and bridges [`ScanReport`] to the coordination layer via `distributed.rs` |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -270,7 +269,10 @@ impl Default for GitExecutionConfig {
 /// validation, ref resolution) that the coordination layer should not
 /// account for.
 ///
-/// All counters saturate at `u64::MAX` rather than wrapping.
+/// Counter overflow semantics depend on the backend: the in-memory driver
+/// uses saturating arithmetic, while the filesystem and git drivers inherit
+/// the aggregation strategy of their upstream metrics (currently wrapping).
+/// In practice, overflow is not expected for single-scan values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanReport {
     /// Total items (files / blobs) processed.
@@ -284,6 +286,9 @@ pub struct ScanReport {
     /// Non-fatal errors encountered during scanning (I/O errors, read
     /// failures, etc.). Does **not** include items that were intentionally
     /// skipped by classification filters (binary, extension, lock-file).
+    ///
+    /// **Note:** The git driver currently reports `0` because per-pack-exec
+    /// errors are not yet aggregated into this counter.
     pub errors: u64,
 }
 
@@ -377,7 +382,8 @@ pub struct FindingsBatch {
 ///
 /// In distributed mode the sink derives identity chains and records
 /// progress for the coordination layer. In CLI mode, [`NoOpCommitSink`]
-/// discards all calls.
+/// discards all calls. The git driver currently ignores the sink
+/// entirely — git findings flow only through the [`EventOutput`] stream.
 ///
 /// [`begin_item`]: CommitSink::begin_item
 /// [`upsert_findings`]: CommitSink::upsert_findings
