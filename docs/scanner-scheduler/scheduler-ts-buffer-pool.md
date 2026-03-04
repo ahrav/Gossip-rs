@@ -157,8 +157,11 @@ try_acquire() {
 ```
 
 Current wiring note: the worker-local fast path requires threads to set
-`worker_id` TLS (`set_current_worker_id(Some(id))`). No current scheduler
-path calls this, so production routing is typically global pop then steal.
+`worker_id` TLS (`set_current_worker_id(Some(id))`). The function is defined
+and exported from `scheduler/worker_id.rs` but no production call site
+currently invokes it, so production routing is typically global pop then
+steal. Any future executor or backend that calls `set_current_worker_id`
+for its worker threads will automatically activate the per-worker fast path.
 
 ### Release Routing
 

@@ -244,7 +244,7 @@ workers by repository size tier:
 
 Workers are capped at `MAX_PACK_EXEC_WORKERS` (128, `runner.rs:264`) to
 prevent excessive per-worker memory (Decompress ~37 KiB, scratch buffers,
-PackCache 4 MiB floor each).
+PackCache 32 MiB floor each).
 
 ### Scheduler dispatch
 

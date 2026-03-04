@@ -189,7 +189,11 @@ Current status: this module defines the contract and API, but scheduler backends
 - Use explicit read tokens through I/O engine
 - Scheduler controls connection concurrency and bytes-in-flight
 
-### I/O Model Enum
+### I/O Model Enum (Planned -- Not Yet Implemented)
+
+> **Note:** The `IoModel` enum and scheduler decision logic below describe
+> the planned integration design. This type does not exist in the codebase
+> yet. It is retained as a design specification for future implementation.
 
 ```rust
 pub enum IoModel {
@@ -206,7 +210,7 @@ impl IoModel {
 }
 ```
 
-**Scheduler Decision Logic:**
+**Planned Scheduler Decision Logic:**
 ```rust
 let io_model = source.io_model();
 if io_model.uses_device_slots() {

@@ -15,7 +15,7 @@ deliverable of the Counterexample Testing Unification epic (`scratch-gs8l`).
 | #   | Area                    | Location                                               | LOC     | Feature Gate         | Tests What                                                  |
 | --- | ----------------------- | ------------------------------------------------------ | ------- | -------------------- | ----------------------------------------------------------- |
 | 1   | Property tests          | `crates/scanner-engine-integration-tests/tests/property/` (20 files)                           | ~5,032  | `property-tests`     | Mathematical invariants (soundness, determinism, roundtrip) |
-| 2   | Simulation tests        | `crates/scanner-engine-integration-tests/tests/simulation/` (16 `.rs` files)                   | ~3,059  | `sim-harness` etc.   | System-level behavior (scheduling, chunking, faults)        |
+| 2   | Simulation tests        | `crates/scanner-engine-integration-tests/tests/simulation/` (15 `.rs` files)                   | ~3,059  | `sim-harness` etc.   | System-level behavior (scheduling, chunking, faults)        |
 | 3   | Corpus replay --- scanner | `crates/scanner-engine-integration-tests/tests/corpus/scanner/` (71 `.case.json`)              | N/A     | `sim-harness`        | Deterministic regression replay                             |
 | 4   | Corpus replay --- git     | `crates/scanner-engine-integration-tests/tests/corpus/git_scan/` (11 `.case.json`)             | N/A     | `sim-harness`        | Git deterministic regression replay                         |
 | 5   | Scanner sim module      | `crates/scanner-scheduler/src/sim_scanner/` (7 files)  | ~3,550  | `sim-harness`        | Scenario generation, runner, oracles                        |

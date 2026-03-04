@@ -311,9 +311,10 @@ Run status is derived from `RunCounters` at `end_run` time:
 
 Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
-#### Query Path
+#### Query Path (Planned -- Not Yet Implemented)
 
-Read-path queries in `crates/scanner-scheduler/src/store.rs`:
+> **Note:** The following query functions do not exist in `store.rs` yet.
+> They describe the planned read-path API for the SQLite backend.
 
 | Function           | CLI command           | Description                                                      |
 | ------------------ | --------------------- | ---------------------------------------------------------------- |

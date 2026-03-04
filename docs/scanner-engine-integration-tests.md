@@ -187,8 +187,9 @@ verification).
 
 ### Real Rules Corpus (`tests/corpus/real_rules/`)
 
-30 fixture files across 12 categories (env, json, yaml, source, encoding, etc.)
-with a golden `expected/findings.json` baseline. All tokens are synthetic.
+30 fixture files across 13 categories (boundary, doc, encoding, env, infra, ini,
+json, logs, multiline, noise, source, toml, yaml) with a golden
+`expected/findings.json` baseline. All tokens are synthetic.
 
 ### Git Pack Regression (`tests/regression/git_packs/`)
 
