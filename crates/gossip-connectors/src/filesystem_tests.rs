@@ -1,3 +1,10 @@
+//! Filesystem connector behavior and regression tests.
+//!
+//! The highest-risk logic is the per-directory sorted walker: it must produce
+//! global byte-sorted keys without whole-tree buffering, while still honoring
+//! depth limits and deadline checks. The ordering, stress, and deadline tests
+//! below document those invariants and guard walker regressions.
+
 use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
@@ -615,6 +622,8 @@ fn nested_dirs_sorted_by_full_path_key() {
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
+    // Interleaved fixture: traversal-by-discovery would be unstable here.
+    // The walker must match a global lexicographic sort of encoded path keys.
     let all = collect_all(&mut c, &start, &end);
     let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
     assert_eq!(
@@ -624,6 +633,37 @@ fn nested_dirs_sorted_by_full_path_key() {
             b"a/z.txt".as_slice(),
             b"b/a.txt".as_slice(),
             b"c.txt".as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn directory_file_prefix_order_matches_git_tree_sort_rules() {
+    let dir = create_test_dir(&[
+        ("src/inside.txt", b"1"),
+        ("src-utils.txt", b"2"),
+        ("a/inside.txt", b"3"),
+        ("aa.txt", b"4"),
+        ("z/inside.txt", b"5"),
+        ("z.txt", b"6"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Regression guard for trailing-separator ordering:
+    // `src-utils.txt` must sort before `src/...` because directories compare as `name/`.
+    let all = collect_all(&mut c, &start, &end);
+    let keys: Vec<&[u8]> = all.iter().map(|item| item.item_key().as_bytes()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"a/inside.txt".as_slice(),
+            b"aa.txt".as_slice(),
+            b"src-utils.txt".as_slice(),
+            b"src/inside.txt".as_slice(),
+            b"z.txt".as_slice(),
+            b"z/inside.txt".as_slice(),
         ]
     );
 }
@@ -1353,7 +1393,7 @@ mod prop {
     ///
     /// Paths use `[a-z0-9_]{1,8}` segments with 0-2 levels of nesting.
     fn file_set_strategy(max_files: usize) -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
-        let segment = "[a-z0-9_]{1,8}";
+        let segment = "[a-z0-9_-]{1,8}";
         let path = string_regex(&format!(
             "{segment}(\\.txt|/{segment}\\.txt|/{segment}/{segment}\\.txt)"
         ))
@@ -1404,6 +1444,29 @@ mod prop {
             for w in keys.windows(2) {
                 prop_assert!(w[0] < w[1], "keys not strictly ascending: {:?} >= {:?}", w[0], w[1]);
             }
+        }
+
+        #[test]
+        fn full_enum_matches_global_sort(files in file_set_strategy(20)) {
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let (_dir, mut c) = make_connector(&files);
+
+            let actual: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect();
+
+            // Global sort is the reference oracle for walker correctness.
+            // If per-directory sorting composes incorrectly, this diverges.
+            let mut expected: Vec<Vec<u8>> = files
+                .iter()
+                .map(|(path, _)| path.as_bytes().to_vec())
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+
+            prop_assert_eq!(actual, expected);
         }
 
         #[test]
@@ -1655,6 +1718,37 @@ fn walk_depth_zero_indexes_only_root_files() {
     let all = collect_all(&mut c, &start, &end);
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].item_key().as_bytes(), b"top.txt");
+}
+
+#[test]
+fn walk_stress_wide_directory_tree() {
+    // Flat, high-breadth tree: regression guard for walkers that accumulate a
+    // whole frontier/sibling queue. The per-directory frame design should keep
+    // state bounded to active stack frames plus one buffered directory.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sibling_dirs = 8_192usize;
+    for i in 0..sibling_dirs {
+        let subdir = dir.path().join(format!("d{i:05}"));
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("f.txt"), b"x").unwrap();
+    }
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_depth(1);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), sibling_dirs, "all leaf files should be indexed");
+    assert!(
+        all.iter()
+            .any(|item| item.item_key().as_bytes() == b"d00000/f.txt"),
+        "expected first sibling leaf file"
+    );
+    assert!(
+        all.iter()
+            .any(|item| item.item_key().as_bytes() == b"d08191/f.txt"),
+        "expected last sibling leaf file"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -2033,7 +2127,7 @@ fn deadline_expires_during_walk_returns_retryable() {
 fn deadline_expiry_allows_retry_with_fresh_deadline() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
 
-    // First call with expired deadline fails.
+    // First call with an expired deadline fails retryably.
     let expired =
         Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
     let mut c = FilesystemConnector::new(dir.path());
@@ -2043,7 +2137,8 @@ fn deadline_expiry_allows_retry_with_fresh_deadline() {
     let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
     assert!(result.is_err());
 
-    // Second call with no deadline succeeds.
+    // Retryable deadline failures must not memoize `IndexState::Failed`.
+    // A subsequent call with a fresh budget should rebuild and succeed.
     let page = c
         .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
         .unwrap();
@@ -2506,22 +2601,17 @@ fn enumerate_error_for_nonexistent_root_does_not_leak_path() {
 
 #[test]
 fn intra_directory_deadline_check_triggers_within_large_directory() {
-    // Create a flat directory with enough files that the intra-directory
-    // deadline check (every DEADLINE_CHECK_INTERVAL=512 entries) is
-    // exercised.  We need well over 512 entries so the inner-loop check
-    // has a chance to fire.
+    // Single-directory fixture with enough entries to exercise the 512-entry
+    // deadline cadence while polling one frame (no fd-cap spill path needed).
     let dir = tempfile::tempdir().expect("create tempdir");
     let file_count = 2048usize;
     for i in 0..file_count {
         fs::write(dir.path().join(format!("f{i:05}.txt")), b"x").unwrap();
     }
 
-    // The deadline must be *alive* when the walk starts (so the
-    // per-directory check at the top of the outer loop passes) but expire
-    // while iterating entries inside the directory.  A very short future
-    // deadline achieves this: the per-directory Instant::now() < dl check
-    // passes, but by the time 512 dir entries are processed the deadline
-    // has elapsed.
+    // Keep the deadline live at walk start, but short enough to expire while
+    // draining one large frame. This confirms we do not defer budget checks
+    // until "directory complete" when per-directory buffering is large.
     let tight_deadline = Budgets::try_new(
         file_count + 1,
         u64::MAX,
@@ -2533,10 +2623,8 @@ fn intra_directory_deadline_check_triggers_within_large_directory() {
     let end = make_key(b"\xff");
 
     let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), tight_deadline);
-    // The walk should fail with a retryable deadline error.  Whether the
-    // per-directory or intra-directory check catches it first depends on
-    // scheduling, but with a deadline only nanoseconds away the inner
-    // check is virtually guaranteed to fire once entries are processed.
+    // The walk should fail with a retryable deadline error regardless of which
+    // checkpoint (per-directory vs 512-entry cadence) trips first.
     assert!(
         result.is_err(),
         "tight deadline should abort during a large directory walk"

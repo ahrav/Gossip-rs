@@ -8,21 +8,25 @@
 //! # Algorithm
 //!
 //! 1. **Lazy indexing** -- The first enumerate, split, or read call walks the
-//!    root using an explicit stack (no recursion), collecting regular files
-//!    only. Symlinks are skipped. This allows a fresh connector instance to
-//!    read [`ItemRef`]s obtained from a compatible instance over the same root
+//!    root using an explicit depth-first stack (no recursion). Each directory
+//!    is eagerly buffered, sorted, and drained before moving to siblings.
+//!    Symlinks are skipped. This allows a fresh connector instance to read
+//!    [`ItemRef`]s obtained from a compatible instance over the same root
 //!    without requiring explicit enumeration first.
 //! 2. **Canonical path encoding** -- Each relative path is encoded to raw bytes
 //!    with `/` separators and reused for both [`ItemKey`] and [`ItemRef`].
-//! 3. **Deterministic serving** -- Entries are globally sorted by key, then
-//!    pagination and split hints resolve bounds via binary search.
+//! 3. **Deterministic serving** -- Per-directory sorting plus DFS yields
+//!    globally sorted keys, then pagination and split hints resolve bounds via
+//!    binary search.
 //!
 //! # Determinism and trade-offs
 //!
 //! - Enumeration order is stable for a fixed directory snapshot because the
-//!   collected entries are globally sorted by key bytes.
+//!   walk emits keys in global byte-sorted order.
 //! - Indexing is one-shot per connector instance (`ensure_indexed`); this favors
 //!   deterministic page progression over live directory updates.
+//! - Walker memory is bounded by stack depth and per-directory entry buffers
+//!   (`O(depth × max_dir_entries)`), not total file count.
 //! - [`StableItemId`] uses the standard connector-tag + key derivation, while
 //!   [`VersionId`] is weak metadata-derived (`mtime`, `mtime_nsec`, `len`,
 //!   `inode`, `dev`) to avoid content hashing during index build.
@@ -93,10 +97,11 @@
 //!
 //! # Budget enforcement
 //!
-//! - **Deadline**: The walk checks the deadline once per directory and every
-//!   512 entries within a directory during indexing. If the deadline expires
-//!   mid-walk, a retryable error is returned and the incomplete index is
-//!   discarded. Post-indexing operations (enumeration, split) also check the
+//! - **Deadline**: During indexing, the walk checks the deadline before
+//!   `read_dir(root)`, before descending into each directory, and every 512
+//!   entries while buffering or draining directory contents. If the deadline
+//!   expires mid-walk, a retryable error is returned and the incomplete index
+//!   is discarded. Post-indexing operations (enumeration, split) also check the
 //!   deadline before proceeding.
 //! - **`max_items`**: Honored as a hard cap on page size during enumeration.
 //!   `Budgets` stores `max_items` as `NonZeroUsize` so zero-item pages from
@@ -135,14 +140,16 @@
 //!   new connector to observe changes.
 //! - Non-fatal walk issues (unreadable entries, symlinks, encoding failures)
 //!   are recorded in [`WalkWarning`]s (up to a configurable cap) rather than
-//!   aborting the entire index. Only root-directory failures are hard errors.
-//!   Use [`overflow_warning_count`](FilesystemConnector::overflow_warning_count)
-//!   to detect whether warnings were dropped.
+//!   aborting the entire index. Root-directory `read_dir` failure and deadline
+//!   expiry are the walk's hard-error exits. Use
+//!   [`overflow_warning_count`](FilesystemConnector::overflow_warning_count) to
+//!   detect whether warnings were dropped.
 //! - [`ItemRef`] values are the raw relative-path bytes of each file and are
 //!   stable for a given directory snapshot, unlike the positional indices used
 //!   by the in-memory connector.
 
 use std::{
+    collections::VecDeque,
     ffi::CString,
     fs, io,
     os::unix::{
@@ -394,10 +401,9 @@ impl FilesystemConnector {
             &mut warnings,
         ) {
             Ok(()) => {
-                files.sort_unstable_by(|left, right| left.key.cmp(&right.key));
                 debug_assert!(
-                    files.windows(2).all(|w| w[0].key != w[1].key),
-                    "filesystem walk produced duplicate keys after encoding"
+                    files.windows(2).all(|w| w[0].key < w[1].key),
+                    "filesystem walk must produce strictly ascending keys"
                 );
 
                 // Build prefix sums for O(log n) byte-weighted split selection.
@@ -840,16 +846,29 @@ impl ReadConnector for FilesystemConnector {
 ///
 /// # Algorithm
 ///
-/// Uses an explicit stack to avoid recursion and traverses each directory's
-/// entries in filesystem-provided order. A final global sort by encoded key
-/// enforces deterministic output ordering. Symlinks are skipped (logged as
-/// warnings) to avoid cycles and ensure deterministic membership.
+/// Uses a depth-first stack of per-directory buffered entries. Each directory
+/// is read eagerly, sorted in-place using Git-style tree ordering (directories
+/// compare as `name/`, files as `name`), then drained during DFS traversal.
+/// This yields globally sorted file keys without requiring a post-walk global
+/// sort over all files. Symlinks are skipped (logged as warnings) to avoid
+/// cycles and ensure deterministic membership.
+///
+/// # Correctness invariants
+///
+/// - Every frame's `entries` queue is sorted exactly once, then drained
+///   front-to-back without reinsertion.
+/// - Parent frames pause while a child frame is active, so all keys under a
+///   directory prefix are emitted as one contiguous run.
+/// - `current_path` always names the directory represented by `stack.last()`;
+///   descent pushes one component, and frame pop removes exactly one component.
+///   This keeps warning paths and `strip_prefix(root)` aligned with traversal
+///   state.
 ///
 /// # Trade-offs
 ///
 /// - **No recursion**: Explicit stack prevents stack overflow on deep trees
-/// - **Post-walk sort**: Keep traversal simple, then sort collected files by
-///   encoded key to guarantee deterministic final order
+/// - **Per-directory sort**: Trades a bounded per-frame buffer for globally
+///   sorted output (`O(depth × max_dir_entries)` state)
 /// - **Skip symlinks**: Avoids cycles and non-deterministic resolution
 /// - **Regular files only**: Devices, FIFOs, sockets are skipped
 /// - **Depth limit**: Prevents infinite traversal of cyclic bind mounts
@@ -889,183 +908,368 @@ fn walk_dir_collect_files(
     /// 512 entries rather than only at the start of the directory.
     const DEADLINE_CHECK_INTERVAL: usize = 512;
 
-    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    struct BufferedDirEntry {
+        name: std::ffi::OsString,
+        file_type: fs::FileType,
+    }
 
-    while let Some((dir, depth)) = stack.pop() {
-        // Periodic deadline check: once per directory.
+    struct WalkFrame {
+        /// Directory component relative to parent (`None` for root frame).
+        component: Option<std::ffi::OsString>,
+        depth: usize,
+        /// Yielded-entry count since the last deadline check.
+        entries_since_check: usize,
+        /// Sorted remaining entries for this directory.
+        entries: VecDeque<BufferedDirEntry>,
+    }
+
+    #[inline]
+    fn check_deadline(deadline: Option<Instant>) -> Result<(), EnumerateError> {
         if let Some(dl) = deadline
             && Instant::now() >= dl
         {
             return Err(EnumerateError::retryable("indexing deadline expired"));
         }
+        Ok(())
+    }
 
-        let is_root = dir == root;
-        let reader = match fs::read_dir(&dir) {
-            Ok(r) => r,
-            Err(err) => {
-                if is_root {
-                    return Err(classify_io_enumerate_error("read_dir", &dir, &err));
+    #[inline]
+    fn bump_entry_counter(
+        frame: &mut WalkFrame,
+        deadline: Option<Instant>,
+    ) -> Result<(), EnumerateError> {
+        frame.entries_since_check += 1;
+        if frame.entries_since_check >= DEADLINE_CHECK_INTERVAL {
+            frame.entries_since_check = 0;
+            check_deadline(deadline)?;
+        }
+        Ok(())
+    }
+
+    /// Compare two byte slices lexicographically, treating directory names as
+    /// if they had a virtual trailing `/` byte for ordering.
+    ///
+    /// This mirrors Git tree ordering (`name` vs `name/`) and is the key
+    /// comparator that makes local per-directory sorting equivalent to sorting
+    /// fully encoded relative paths globally.
+    #[inline]
+    fn cmp_with_trailing_sep(
+        left: &[u8],
+        left_is_dir: bool,
+        right: &[u8],
+        right_is_dir: bool,
+    ) -> std::cmp::Ordering {
+        let mut idx = 0usize;
+        loop {
+            let left_byte = if idx < left.len() {
+                Some(left[idx])
+            } else if idx == left.len() && left_is_dir {
+                Some(b'/')
+            } else {
+                None
+            };
+            let right_byte = if idx < right.len() {
+                Some(right[idx])
+            } else if idx == right.len() && right_is_dir {
+                Some(b'/')
+            } else {
+                None
+            };
+
+            match (left_byte, right_byte) {
+                (Some(l), Some(r)) => match l.cmp(&r) {
+                    std::cmp::Ordering::Equal => idx += 1,
+                    non_eq => return non_eq,
+                },
+                (None, None) => return std::cmp::Ordering::Equal,
+                (None, Some(_)) => return std::cmp::Ordering::Less,
+                (Some(_), None) => return std::cmp::Ordering::Greater,
+            }
+        }
+    }
+
+    #[inline]
+    fn cmp_dir_entry(left: &BufferedDirEntry, right: &BufferedDirEntry) -> std::cmp::Ordering {
+        cmp_with_trailing_sep(
+            left.name.as_bytes(),
+            left.file_type.is_dir(),
+            right.name.as_bytes(),
+            right.file_type.is_dir(),
+        )
+    }
+
+    /// Eagerly read and sort one directory frame before DFS descent.
+    ///
+    /// `readdir(3)` order is filesystem-defined and unstable, so deterministic
+    /// output requires sorting each directory's entries before we consume any of
+    /// them. Buffering one directory at a time keeps memory bounded by current
+    /// frame width while avoiding a whole-tree global sort.
+    fn read_dir_sorted_entries(
+        reader: fs::ReadDir,
+        dir_path: &Path,
+        deadline: Option<Instant>,
+        max_warnings: usize,
+        overflow_count: &mut usize,
+        warnings: &mut Vec<WalkWarning>,
+    ) -> Result<VecDeque<BufferedDirEntry>, EnumerateError> {
+        let mut buffered = Vec::new();
+        let mut entries_since_check = 0usize;
+        for entry_result in reader {
+            entries_since_check += 1;
+            if entries_since_check >= DEADLINE_CHECK_INTERVAL {
+                entries_since_check = 0;
+                check_deadline(deadline)?;
+            }
+
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    push_warning(
+                        warnings,
+                        max_warnings,
+                        overflow_count,
+                        WalkWarning::io(dir_path, "read_dir entry", &err),
+                    );
+                    continue;
                 }
-                push_warning(
-                    warnings,
-                    max_warnings,
-                    overflow_count,
-                    WalkWarning::io(&dir, "read_dir", &err),
-                );
+            };
+
+            let name = entry.file_name();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    let mut entry_path = dir_path.to_path_buf();
+                    entry_path.push(&name);
+                    push_warning(
+                        warnings,
+                        max_warnings,
+                        overflow_count,
+                        WalkWarning::io(&entry_path, "file_type", &err),
+                    );
+                    continue;
+                }
+            };
+            buffered.push(BufferedDirEntry { name, file_type });
+        }
+        // `cmp_dir_entry` enforces Git-style tree order (`name` vs `name/`).
+        buffered.sort_unstable_by(cmp_dir_entry);
+        Ok(VecDeque::from(buffered))
+    }
+
+    #[inline]
+    fn poll_frame(
+        frame: &mut WalkFrame,
+        deadline: Option<Instant>,
+    ) -> Result<Option<BufferedDirEntry>, EnumerateError> {
+        let Some(entry) = frame.entries.pop_front() else {
+            return Ok(None);
+        };
+        bump_entry_counter(frame, deadline)?;
+        Ok(Some(entry))
+    }
+
+    // Periodic deadline check: once per directory (root first).
+    check_deadline(deadline)?;
+    let root_reader =
+        fs::read_dir(root).map_err(|err| classify_io_enumerate_error("read_dir", root, &err))?;
+    let root_entries = read_dir_sorted_entries(
+        root_reader,
+        root,
+        deadline,
+        max_warnings,
+        overflow_count,
+        warnings,
+    )?;
+
+    let mut stack = vec![WalkFrame {
+        component: None,
+        depth: 0,
+        entries_since_check: 0,
+        entries: root_entries,
+    }];
+    // Invariant: this always matches the absolute path of `stack.last()`.
+    // We mutate this in lock-step with frame push/pop (never out of band)
+    // so warnings, depth checks, and `strip_prefix(root)` all observe the
+    // same traversal state.
+    let mut current_path = root.to_path_buf();
+
+    while !stack.is_empty() {
+        let maybe_entry = {
+            let frame = stack.last_mut().expect("non-empty walk stack");
+            poll_frame(frame, deadline)?
+        };
+
+        let entry = match maybe_entry {
+            Some(entry) => entry,
+            None => {
+                let popped = stack.pop().expect("non-empty walk stack");
+                // Root has no component; non-root frames contribute exactly one
+                // path segment that must be removed when the frame is exhausted.
+                if popped.component.is_some() {
+                    let _ = current_path.pop();
+                }
                 continue;
             }
         };
 
-        let mut entries_since_check: usize = 0;
-        for entry_result in reader {
-            // Intra-directory deadline check every DEADLINE_CHECK_INTERVAL
-            // entries to bound latency in directories with millions of entries.
-            entries_since_check += 1;
-            if entries_since_check >= DEADLINE_CHECK_INTERVAL {
-                entries_since_check = 0;
-                if let Some(dl) = deadline
-                    && Instant::now() >= dl
-                {
-                    return Err(EnumerateError::retryable("indexing deadline expired"));
-                }
-            }
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(err) => {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::io(&dir, "read_dir entry", &err),
-                    );
-                    continue;
-                }
-            };
+        let depth = stack
+            .last()
+            .expect("active frame must exist when entry is produced")
+            .depth;
 
-            let path = entry.path();
+        // Reuse a single mutable path buffer for all entry processing.
+        current_path.push(&entry.name);
 
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(err) => {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::io(&path, "file_type", &err),
-                    );
-                    continue;
-                }
-            };
-
-            if file_type.is_symlink() {
-                push_warning(
-                    warnings,
-                    max_warnings,
-                    overflow_count,
-                    WalkWarning::skipped(&path, "symlink"),
-                );
-                continue;
-            }
-
-            if file_type.is_dir() {
-                if depth < max_depth {
-                    stack.push((path, depth + 1));
-                } else {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::skipped(&path, "exceeded maximum walk depth"),
-                    );
-                }
-                continue;
-            }
-
-            if !file_type.is_file() {
-                push_warning(
-                    warnings,
-                    max_warnings,
-                    overflow_count,
-                    WalkWarning::skipped(&path, "special file (not regular)"),
-                );
-                continue;
-            }
-
-            let metadata = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(err) => {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::io(&path, "metadata", &err),
-                    );
-                    continue;
-                }
-            };
-
-            if !metadata.is_file() {
-                push_warning(
-                    warnings,
-                    max_warnings,
-                    overflow_count,
-                    WalkWarning::skipped(&path, "file type changed between readdir and stat"),
-                );
-                continue;
-            }
-
-            let rel = match path.strip_prefix(root) {
-                Ok(r) => r,
-                Err(_) => {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::skipped(&path, "path escaped connector root"),
-                    );
-                    continue;
-                }
-            };
-
-            let rel_bytes = match encode_rel_path(rel) {
-                Ok(b) => b,
-                Err(err) => {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::skipped(
-                            &path,
-                            &format!("path encoding failed: {}", err.message()),
-                        ),
-                    );
-                    continue;
-                }
-            };
-
-            let key = match ItemKey::try_from_vec(rel_bytes) {
-                Ok(k) => k,
-                Err(err) => {
-                    push_warning(
-                        warnings,
-                        max_warnings,
-                        overflow_count,
-                        WalkWarning::skipped(&path, &format!("invalid file key: {err}")),
-                    );
-                    continue;
-                }
-            };
-
-            let stable_item_id = derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, &key);
-            let version = VersionId::Weak(derive_fs_version_id(&metadata));
-
-            out.push(FileEntry {
-                key,
-                stable_item_id,
-                version,
-                size: metadata.len(),
-            });
+        if entry.file_type.is_symlink() {
+            push_warning(
+                warnings,
+                max_warnings,
+                overflow_count,
+                WalkWarning::skipped(&current_path, "symlink"),
+            );
+            let _ = current_path.pop();
+            continue;
         }
+
+        if entry.file_type.is_dir() {
+            if depth < max_depth {
+                // Periodic deadline check: once per directory before entering.
+                check_deadline(deadline)?;
+                match fs::read_dir(&current_path) {
+                    Ok(reader) => {
+                        let child_entries = read_dir_sorted_entries(
+                            reader,
+                            &current_path,
+                            deadline,
+                            max_warnings,
+                            overflow_count,
+                            warnings,
+                        )?;
+                        stack.push(WalkFrame {
+                            component: Some(entry.name),
+                            depth: depth + 1,
+                            entries_since_check: 0,
+                            entries: child_entries,
+                        });
+                        // Keep `current_path` pointing at the child directory
+                        // while its frame is active; parent siblings resume
+                        // only after the child frame drains.
+                        continue;
+                    }
+                    Err(err) => {
+                        push_warning(
+                            warnings,
+                            max_warnings,
+                            overflow_count,
+                            WalkWarning::io(&current_path, "read_dir", &err),
+                        );
+                    }
+                }
+            } else {
+                push_warning(
+                    warnings,
+                    max_warnings,
+                    overflow_count,
+                    WalkWarning::skipped(&current_path, "exceeded maximum walk depth"),
+                );
+            }
+
+            let _ = current_path.pop();
+            continue;
+        }
+
+        if !entry.file_type.is_file() {
+            push_warning(
+                warnings,
+                max_warnings,
+                overflow_count,
+                WalkWarning::skipped(&current_path, "special file (not regular)"),
+            );
+            let _ = current_path.pop();
+            continue;
+        }
+
+        let metadata = match fs::symlink_metadata(&current_path) {
+            Ok(m) => m,
+            Err(err) => {
+                push_warning(
+                    warnings,
+                    max_warnings,
+                    overflow_count,
+                    WalkWarning::io(&current_path, "metadata", &err),
+                );
+                let _ = current_path.pop();
+                continue;
+            }
+        };
+
+        if !metadata.is_file() {
+            push_warning(
+                warnings,
+                max_warnings,
+                overflow_count,
+                WalkWarning::skipped(&current_path, "file type changed between readdir and stat"),
+            );
+            let _ = current_path.pop();
+            continue;
+        }
+
+        let rel = match current_path.strip_prefix(root) {
+            Ok(r) => r,
+            Err(_) => {
+                push_warning(
+                    warnings,
+                    max_warnings,
+                    overflow_count,
+                    WalkWarning::skipped(&current_path, "path escaped connector root"),
+                );
+                let _ = current_path.pop();
+                continue;
+            }
+        };
+
+        let rel_bytes = match encode_rel_path(rel) {
+            Ok(b) => b,
+            Err(err) => {
+                push_warning(
+                    warnings,
+                    max_warnings,
+                    overflow_count,
+                    WalkWarning::skipped(
+                        &current_path,
+                        &format!("path encoding failed: {}", err.message()),
+                    ),
+                );
+                let _ = current_path.pop();
+                continue;
+            }
+        };
+
+        let key = match ItemKey::try_from_vec(rel_bytes) {
+            Ok(k) => k,
+            Err(err) => {
+                push_warning(
+                    warnings,
+                    max_warnings,
+                    overflow_count,
+                    WalkWarning::skipped(&current_path, &format!("invalid file key: {err}")),
+                );
+                let _ = current_path.pop();
+                continue;
+            }
+        };
+
+        let stable_item_id = derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, &key);
+        let version = VersionId::Weak(derive_fs_version_id(&metadata));
+
+        out.push(FileEntry {
+            key,
+            stable_item_id,
+            version,
+            size: metadata.len(),
+        });
+
+        let _ = current_path.pop();
     }
 
     Ok(())
