@@ -7,20 +7,19 @@
 //! Warmup iterations are discarded; the summary reports median and MAD.
 
 use std::env;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
 use scanner_engine::{demo_rules, demo_transforms};
 use scanner_git::policy_hash;
+use scanner_git::NativeRefResolver;
 use scanner_git::NullEventSink;
 use scanner_git::OidBytes;
 use scanner_git::{demo_tuning, AnchorMode, AnchorPolicy, Engine};
 use scanner_git::{
     run_git_scan, GitScanConfig, GitScanError, GitScanResult, MergeDiffMode, NeverSeenStore,
-    RefWatermarkStore, RepoOpenError, StartSetConfig, StartSetResolver,
+    RefWatermarkStore, RepoOpenError, StartSetConfig,
 };
 
 #[derive(Debug)]
@@ -32,27 +31,6 @@ struct BenchConfig {
     merge_mode: MergeDiffMode,
     anchor_mode: AnchorMode,
     max_transform_depth: Option<usize>,
-}
-
-/// Resolves the start set by invoking `git` in the target repository.
-struct GitCliResolver {
-    repo: PathBuf,
-    start_set: StartSetConfig,
-}
-
-impl StartSetResolver for GitCliResolver {
-    fn resolve(
-        &self,
-        _paths: &scanner_git::GitRepoPaths,
-    ) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-        match &self.start_set {
-            StartSetConfig::DefaultBranchOnly => resolve_default_branch(&self.repo),
-            StartSetConfig::ExplicitRefs { refs } => resolve_explicit_refs(&self.repo, refs),
-            _ => Err(RepoOpenError::io(std::io::Error::other(
-                "start set config not supported by git_scan bench",
-            ))),
-        }
-    }
 }
 
 /// Watermark store that always returns `None`.
@@ -240,7 +218,7 @@ fn run_git_scan_once(
     repo: &Path,
     scan_config: &GitScanConfig,
     engine: &Arc<Engine>,
-    resolver: &GitCliResolver,
+    resolver: &NativeRefResolver,
 ) -> Result<IterSample, GitScanError> {
     let seen_store = NeverSeenStore;
     let watermark_store = EmptyWatermarkStore;
@@ -322,10 +300,7 @@ fn main() {
     });
 
     let start_set = StartSetConfig::DefaultBranchOnly;
-    let resolver = GitCliResolver {
-        repo: cfg.repo.clone(),
-        start_set: start_set.clone(),
-    };
+    let resolver = NativeRefResolver::new(start_set.clone());
     let scan_config = GitScanConfig {
         repo_id: 1,
         merge_diff_mode: cfg.merge_mode,
@@ -388,67 +363,4 @@ fn main() {
         wall_median / 1_000_000,
         wall_mad / 1_000_000
     );
-}
-
-fn resolve_default_branch(repo: &Path) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-    let name = run_git(repo, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-    if name == "HEAD" {
-        let tip_hex = run_git(repo, &["rev-parse", "HEAD"])?;
-        let oid = oid_from_hex(&tip_hex)?;
-        return Ok(vec![(b"HEAD".to_vec(), oid)]);
-    }
-    resolve_explicit_refs(repo, &[name.into_bytes()])
-}
-
-fn resolve_explicit_refs(
-    repo: &Path,
-    refs: &[Vec<u8>],
-) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-    let mut out = Vec::with_capacity(refs.len());
-    for name in refs {
-        let name_str = String::from_utf8_lossy(name);
-        let tip_hex = run_git(repo, &["rev-parse", &name_str])?;
-        let oid = oid_from_hex(&tip_hex)?;
-        out.push((name.clone(), oid));
-    }
-    Ok(out)
-}
-
-fn run_git(repo: &Path, args: &[&str]) -> Result<String, RepoOpenError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .map_err(RepoOpenError::io)?;
-    if !output.status.success() {
-        return Err(RepoOpenError::io(io::Error::other(format!(
-            "git command failed: {:?}",
-            args
-        ))));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn oid_from_hex(hex: &str) -> Result<OidBytes, RepoOpenError> {
-    let hex = hex.trim();
-    if !hex.len().is_multiple_of(2) {
-        return Err(RepoOpenError::io(io::Error::other(
-            "invalid OID hex length",
-        )));
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let hi = (bytes[i] as char)
-            .to_digit(16)
-            .ok_or_else(|| RepoOpenError::io(io::Error::other("invalid OID hex")))?;
-        let lo = (bytes[i + 1] as char)
-            .to_digit(16)
-            .ok_or_else(|| RepoOpenError::io(io::Error::other("invalid OID hex")))?;
-        out.push(((hi << 4) | lo) as u8);
-        i += 2;
-    }
-    Ok(OidBytes::from_slice(&out))
 }

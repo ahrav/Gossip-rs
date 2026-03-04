@@ -312,6 +312,73 @@ fn merge_shard_outputs_missing_slot_is_typed() {
 }
 
 #[test]
+fn count_pack_exec_skip_errors_counts_only_error_reasons() {
+    let skips = vec![
+        SkipRecord {
+            offset: 11,
+            reason: crate::pack_exec::SkipReason::NotBlob,
+        },
+        SkipRecord {
+            offset: 12,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        },
+        SkipRecord {
+            offset: 13,
+            reason: crate::pack_exec::SkipReason::ExternalBaseMissing {
+                oid: OidBytes::default(),
+            },
+        },
+    ];
+
+    assert_eq!(count_pack_exec_skip_errors(&skips), 2);
+}
+
+#[test]
+fn count_pack_exec_skip_errors_deduplicates_by_offset() {
+    // When multiple candidates map to the same offset and are all skipped
+    // with error-class reasons, the error count should reflect unique broken
+    // offsets, not the total number of skip events.
+    let skips = vec![
+        // Three candidates all mapping to offset 100 — one corrupted pack entry.
+        SkipRecord {
+            offset: 100,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        },
+        SkipRecord {
+            offset: 100,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        },
+        SkipRecord {
+            offset: 100,
+            reason: crate::pack_exec::SkipReason::PackParse(
+                crate::pack_inflate::PackParseError::Truncated,
+            ),
+        },
+        // One candidate at offset 200 — a different broken entry.
+        SkipRecord {
+            offset: 200,
+            reason: crate::pack_exec::SkipReason::ExternalBaseMissing {
+                oid: OidBytes::default(),
+            },
+        },
+        // Non-error skip — should not count.
+        SkipRecord {
+            offset: 300,
+            reason: crate::pack_exec::SkipReason::NotBlob,
+        },
+    ];
+
+    // Two unique broken offsets (100, 200), not 4 skip events.
+    assert_eq!(count_pack_exec_skip_errors(&skips), 2);
+}
+
+#[test]
 fn auto_tree_delta_cache_bytes_small_repo() {
     let bytes = auto_tree_delta_cache_bytes(3_000, 128 * 1024 * 1024);
     assert_eq!(bytes, 8 * 1024 * 1024, "small repos clamp to floor");
