@@ -134,10 +134,12 @@
 //!
 //! - Designed for single-threaded sequential page calls; the struct holds
 //!   mutable state (`index_state`, `files`) with no interior synchronization.
-//! - The file index is built once per connector instance. Directory mutations
-//!   after the first indexing-triggering call (`enumerate_page`,
-//!   `choose_split_point`, `open`, or `read_range`) are invisible; construct a
-//!   new connector to observe changes.
+//! - The file index is built once per connector instance. Enumeration
+//!   membership/order are snapshot-like after the first indexing-triggering
+//!   call (`enumerate_page`, `choose_split_point`, `open`, or `read_range`).
+//!   Reads still reopen by path from that frozen index, so replacements or
+//!   deletions at indexed paths can still be observed during `open`/`read_range`.
+//!   Construct a new connector to rebuild membership after directory mutations.
 //! - Non-fatal walk issues (unreadable entries, symlinks, encoding failures)
 //!   are recorded in [`WalkWarning`]s (up to a configurable cap) rather than
 //!   aborting the entire index. Root-directory `read_dir` failure and deadline
