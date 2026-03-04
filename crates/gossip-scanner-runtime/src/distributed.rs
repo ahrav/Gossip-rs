@@ -22,9 +22,13 @@ use crate::{RuntimeEngineConfig, ScanBudgets, ScanRuntimeError, execute_assignme
 /// Lease payload consumed by the distributed runtime.
 #[derive(Clone, Debug)]
 pub struct ShardLease {
+    /// Unique shard identifier used for done-ledger tracking.
     pub shard_id: String,
+    /// Scan assignment to execute for this shard.
     pub assignment: Assignment,
+    /// Tenant owning this shard, used for identity derivation.
     pub tenant_id: TenantId,
+    /// Tenant secret key used for secret hash derivation.
     pub tenant_secret_key: TenantSecretKey,
 }
 
@@ -52,21 +56,27 @@ pub trait DistributedCoordinator: Send + Sync {
 /// Runtime config for distributed scans.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRuntimeConfig {
+    /// Scan execution budget controls applied to every shard assignment.
     pub budgets: ScanBudgets,
 }
 
 /// Summary report from one distributed run loop.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DistributedRunReport {
+    /// Total number of leases dequeued from the coordinator (including skips).
     pub leases_seen: u64,
+    /// Number of shards that were actually scanned.
     pub shards_scanned: u64,
+    /// Number of shards skipped because the done-ledger already marked them complete.
     pub shards_skipped_done: u64,
 }
 
 /// Distributed runtime error.
 #[derive(Debug)]
 pub enum DistributedRuntimeError {
+    /// The coordinator returned an error (acquire, release, or complete).
     Coordinator(AnyError),
+    /// The scan runtime failed while executing an assignment.
     Runtime(ScanRuntimeError),
 }
 
@@ -195,6 +205,7 @@ struct CompletedShard {
 }
 
 impl InMemoryCoordinator {
+    /// Creates a coordinator pre-loaded with the given lease queue.
     #[must_use]
     pub fn new(leases: Vec<ShardLease>) -> Self {
         let mut queue = VecDeque::new();
@@ -207,6 +218,7 @@ impl InMemoryCoordinator {
         }
     }
 
+    /// Marks `shard_id` as done in the done-ledger so it will be skipped during scanning.
     pub fn mark_done(&self, shard_id: impl Into<String>) {
         self.state
             .lock()
@@ -215,16 +227,19 @@ impl InMemoryCoordinator {
             .insert(shard_id.into());
     }
 
+    /// Returns a snapshot of all shard IDs currently in the done-ledger.
     #[must_use]
     pub fn done_set(&self) -> HashSet<String> {
         self.state.lock().expect("state lock").done.clone()
     }
 
+    /// Returns the shard IDs that were released without being completed.
     #[must_use]
     pub fn released_shards(&self) -> Vec<String> {
         self.state.lock().expect("state lock").released.clone()
     }
 
+    /// Returns all completed shards as `(shard_id, checkpoint, report)` tuples.
     #[must_use]
     pub fn completed_shards(&self) -> Vec<(String, Option<CursorUpdate>, ScanReport)> {
         self.state
@@ -242,11 +257,13 @@ impl InMemoryCoordinator {
             .collect()
     }
 
+    /// Returns all recorded core events as `(shard_id, event)` pairs.
     #[must_use]
     pub fn core_events(&self) -> Vec<(String, StoredCoreEvent)> {
         self.state.lock().expect("state lock").core_events.clone()
     }
 
+    /// Returns all recorded identity chain records as `(shard_id, record)` pairs.
     #[must_use]
     pub fn identity_records(&self) -> Vec<(String, IdentityChainRecord)> {
         self.state

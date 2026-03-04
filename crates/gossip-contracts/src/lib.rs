@@ -50,10 +50,14 @@ pub use blake3;
 // ---------------------------------------------------------------------------
 
 pub mod connector;
+/// Defines the shard data model: key ranges, cursors, split planning, and pooled wrappers.
 pub mod coordination;
+/// Provides content-addressed identity types, canonical encoding, and domain-separated hashing.
 pub mod identity;
+/// Defines done-ledger, findings-sink traits, and the commit protocol typestate.
 pub mod persistence;
 
+/// Shared test helpers (proptest config, canonical digest, shard strategies).
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_util;
 

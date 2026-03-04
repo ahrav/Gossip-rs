@@ -24,15 +24,23 @@ pub mod stdx {
     pub type FixedVec<T, const N: usize> = gossip_stdx::InlineVec<T, N>;
 }
 
+/// Implements YARA-style base64 gate for prefiltering anchor permutations.
 pub mod b64_yara_gate;
+/// Provides content classification for binary-aware scanning decisions.
 pub mod content_policy;
+/// Provides set-associative cache for LSM-style lookups.
 pub mod lsm;
+/// Provides optional performance counters for git scanning instrumentation.
 pub mod perf_counters;
+/// Provides node pool utilities used by the scanner engine.
 pub mod pool;
+/// Extracts literal anchors from regex patterns for fast prefiltering.
 pub mod regex2anchor;
+/// Provides page-aligned, fixed-capacity scratch storage for hot paths.
 pub mod scratch_memory;
 #[cfg(test)]
 pub mod test_utils;
+/// Implements tiger-style deterministic simulation harness for chunked scanning.
 #[cfg(any(test, feature = "tiger-harness", feature = "test-support"))]
 pub mod tiger_harness;
 

@@ -33,13 +33,14 @@ Non-negotiables (project-wide):
 
 ---
 
-## Implemented Rust types
+## Planned Rust types
 
-The persistence boundary's trait surface and data types are defined in staged
-artifacts (`tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`). The
-module doc lives at `crates/gossip-contracts/src/persistence/mod.rs`. No
-production backend implementations exist yet; only in-memory test doubles
-(behind `test-support` feature flag).
+> **Note:** The types below are design-time artifacts defined in staged
+> files (`tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`). They
+> do not exist as compiled code in any workspace crate. The module doc
+> placeholder lives at `crates/gossip-contracts/src/persistence/mod.rs`.
+> No production backend implementations exist yet; only in-memory test
+> doubles (behind `test-support` feature flag).
 
 ### Traits
 

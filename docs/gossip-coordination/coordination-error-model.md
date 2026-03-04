@@ -383,7 +383,7 @@ Varies by operation:
 ### Cursor validation -- `validate_cursor_update_pooled` (validation.rs:209-262)
 
 Operates entirely on borrowed slices to avoid materializing owned cursor/spec
-values on the checkpoint hot path. Checks four properties in order:
+values on the checkpoint hot path. Checks five properties in order:
 
 1. **Key presence** (validation.rs:216-218) -- `new_cursor.last_key()` must
    be `Some`. A checkpoint with no key represents no progress.

@@ -77,74 +77,136 @@ macro_rules! perf_let {
 }
 pub(crate) use perf_let;
 
+/// Provides a debug-only allocation guard toggle for hot-path assertions.
 pub mod alloc_guard;
+/// Builds in-memory MIDX and commit-graph artifacts from pack index files.
 pub mod artifact_acquire;
+/// Implements blob introduction walk for ODB-blob scan mode.
 pub mod blob_introducer;
+/// Provides temporary spill files for oversized blob payloads.
 pub mod blob_spill;
+/// Provides an append-only byte arena for interning file paths.
 pub mod byte_arena;
+/// Defines a minimal read-only byte container for Git artifact data.
 pub mod bytes;
 pub(crate) mod cache_common;
+/// Provides commit-graph indexing helpers for attribution-first ODB scans.
 pub mod commit_graph;
+/// Implements an in-memory commit graph built from loaded commit objects.
 pub mod commit_graph_mem;
+/// Implements BFS commit loading for in-memory commit graph construction.
 pub mod commit_loader;
+/// Provides a parser for Git commit objects (tree OID, parents, timestamp).
 pub mod commit_parse;
+/// Implements commit traversal and topological ordering for Git scanning.
 pub mod commit_walk;
+/// Defines hard caps and tunables for commit-graph traversal.
 pub mod commit_walk_limits;
 #[cfg(test)]
 pub(crate) mod delta_test_helpers;
+/// Bridges decoded blob bytes into the scan engine with overlap-safe chunking.
 pub mod engine_adapter;
+/// Defines stage-specific error types for Git scanning.
 pub mod errors;
+/// Defines the structured event surface for git scan output.
 pub mod events;
+/// Transforms scan results into stably ordered persistence write operations.
 pub mod finalize;
+/// Provides a deduplicating byte interner for identity strings.
 pub mod identity_intern;
+/// Implements zero-copy extraction of author/committer identity from commits.
 pub mod identity_parse;
+/// Provides JSON write helpers for git event sinks.
 pub mod json_write;
+/// Defines hard caps and tunables for repo discovery and open.
 pub mod limits;
+/// Maps unique blobs to pack/loose candidates via MIDX lookup.
 pub mod mapping_bridge;
+/// Implements a zero-copy multi-pack index (MIDX) parser.
 pub mod midx;
+/// Builds MIDX byte buffers in-memory using k-way merge of pack indexes.
 pub mod midx_build;
+/// Defines error types for multi-pack index parsing and lookup.
 pub mod midx_error;
 #[cfg(test)]
 pub(crate) mod midx_test_builder;
+/// Defines fixed-size, zero-heap object ID types for SHA-1 and SHA-256.
 pub mod object_id;
+/// Provides a pack/loose-backed object store for tree payload loading.
 pub mod object_store;
+/// Implements a fixed-capacity OID hash table for fast MIDX index lookups.
 pub mod oid_index;
+/// Implements a tiered set-associative cache for decoded pack objects.
 pub mod pack_cache;
+/// Defines pack and loose candidate output types for scan planning.
 pub mod pack_candidates;
+/// Provides pack decode primitives for bounded object inflation.
 pub mod pack_decode;
+/// Implements Git delta application with explicit output caps.
 pub mod pack_delta;
+/// Implements the pack plan executor with bounded decode and skip tracking.
 pub mod pack_exec;
+/// Implements a zero-copy parser for Git pack index (`.idx`) v2 files.
 pub mod pack_idx;
+/// Provides bounded inflate helpers and delta encoding for pack objects.
 pub mod pack_inflate;
+/// Provides pack I/O utilities for cross-pack REF delta base resolution.
 pub mod pack_io;
+/// Builds per-pack decode plans from candidate blobs and delta dependencies.
 pub mod pack_plan;
+/// Defines pack plan model types: candidates, delta deps, and execution order.
 pub mod pack_plan_model;
+/// Provides a pack byte reader abstraction for deterministic I/O.
 pub mod pack_reader;
+/// Implements a path policy classifier for tree diff candidates.
 pub mod path_policy;
 mod perf_stats;
+/// Defines the write-only persistence store contract and helpers.
 pub mod persist;
+/// Provides RocksDB-backed persistence adapters (feature-gated).
 pub mod persist_rocksdb;
+/// Implements a deterministic policy hash for scan configuration identity.
 pub mod policy_hash;
+/// Implements maintenance preflight checks for Git repository scanning.
 pub mod preflight;
+/// Defines error types for Git scanning preflight.
 pub mod preflight_error;
+/// Defines hard caps and tunables for Git maintenance preflight.
 pub mod preflight_limits;
+/// Implements repository path resolution and layout detection.
 pub mod repo;
+/// Implements repository discovery, open, and start set resolution.
 pub mod repo_open;
 pub(crate) mod repo_paths;
+/// Defines the spill run file format and canonical record encoding.
 pub mod run_format;
+/// Implements a spill run reader with strict validation.
 pub mod run_reader;
+/// Implements a spill run writer for stable on-disk encoding.
 pub mod run_writer;
+/// Provides end-to-end Git scan runner types, config, and mode dispatcher.
 pub mod runner;
+/// Implements the diff-history scan pipeline with tree diff and spill stages.
 pub mod runner_diff_history;
+/// Provides shared pack execution helpers for both scan mode pipelines.
 pub mod runner_exec;
+/// Implements the ODB-blob fast-path scan pipeline.
 pub mod runner_odb_blob;
+/// Defines the seen-blob store interface for dedupe filtering.
 pub mod seen_store;
+/// Implements snapshot commit planning (scan tips without history walk).
 pub mod snapshot_plan;
+/// Provides an append-only, mmap-backed spill arena for tree payloads.
 pub mod spill_arena;
+/// Implements spill chunk storage with in-chunk dedupe and canonical ordering.
 pub mod spill_chunk;
+/// Defines hard caps and tunables for spill and dedupe operations.
 pub mod spill_limits;
+/// Implements k-way merge of sorted spill runs with duplicate removal.
 pub mod spill_merge;
+/// Implements the spill orchestrator for candidate collection and dedup.
 pub mod spiller;
+/// Defines start set configuration and deterministic identity hashing.
 pub mod start_set;
 #[cfg(test)]
 pub mod test_utils;
@@ -154,18 +216,30 @@ pub use scanner_scheduler::sim;
 pub use scanner_scheduler::sim_archive;
 #[cfg(feature = "sim-harness")]
 pub use scanner_scheduler::sim_scanner;
+/// Provides a deterministic Git simulation harness for replayable testing.
 #[cfg(feature = "sim-harness")]
 pub mod sim_git_scan;
+/// Implements a set-associative cache for tree object bytes.
 pub mod tree_cache;
+/// Defines candidate buffer types for tree diff output with interned paths.
 pub mod tree_candidate;
+/// Implements a set-associative cache for tree delta base bytes.
 pub mod tree_delta_cache;
+/// Implements the OID-only tree diff walker with explicit depth limits.
 pub mod tree_diff;
+/// Defines hard caps and tunables for tree diff and candidate collection.
 pub mod tree_diff_limits;
+/// Provides streaming zero-allocation Git tree entry parsing.
 pub mod tree_entry;
+/// Implements Git tree entry ordering (mode-aware name comparison).
 pub mod tree_order;
+/// Provides a streaming tree entry parser backed by a fixed-size buffer.
 pub mod tree_stream;
+/// Defines unique blob output types and dedup sink traits.
 pub mod unique_blob;
+/// Provides key building for watermark batch queries without per-key alloc.
 pub mod watermark_keys;
+/// Implements work item SoA tables with preallocated radix-sort scratch.
 pub mod work_items;
 
 pub use alloc_guard::{enabled as alloc_guard_enabled, set_enabled as set_alloc_guard_enabled};

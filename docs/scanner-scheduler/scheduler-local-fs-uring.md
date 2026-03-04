@@ -510,7 +510,7 @@ pub fn validate<E: ScanEngine>(&self, engine: &E) {
     // Buffer sizing
     let overlap = engine.required_overlap();
     let buf_len = overlap.saturating_add(self.chunk_size);
-    assert!(buf_len <= BUFFER_LEN_MAX);  // 4 MiB limit
+    assert!(buf_len <= BUFFER_LEN_MAX);  // 8 MiB limit
 
     // io_depth must fit in ring
     let max_depth = (self.ring_entries as usize).saturating_sub(1);

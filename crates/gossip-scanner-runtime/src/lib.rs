@@ -32,11 +32,17 @@ use scanner_engine::{AnchorPolicy, Gate, TransformConfig, TransformId, Transform
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::events::{EventOutput, NullEventOutput};
 
+/// Provides CLI entrypoint wiring, argument parsing, and scan dispatch.
 pub mod cli;
+/// Implements commit sink adapters for finding persistence in scan pipelines.
 pub mod commit_sink;
+/// Implements coordination-backed event sinks for distributed scans.
 pub mod coordination_sink;
+/// Provides the distributed runtime entrypoint with coordinator-backed sinks.
 pub mod distributed;
+/// Implements JSONL, JSON, text, and SARIF event sinks for scan output.
 pub mod event_sink;
+/// Provides JSONL parity helpers for cross-scanner validation.
 pub mod parity;
 
 /// How the runtime acquires source items.
@@ -45,8 +51,10 @@ pub mod parity;
 /// telemetry only; both variants route through the same scan-driver path.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
+    /// Scan source items directly from the local filesystem or repository.
     #[default]
     Direct,
+    /// Scan through the connector abstraction layer.
     Connector,
 }
 
@@ -85,27 +93,36 @@ impl std::error::Error for ParseExecutionModeError {}
 /// Anchor extraction mode for rule planning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AnchorMode {
+    /// Use manually specified anchors from rule definitions. Default.
     #[default]
     Manual,
+    /// Derive anchors automatically from rule patterns.
     Derived,
 }
 
 /// CLI-selectable event output format.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EventFormat {
+    /// Newline-delimited JSON (one object per line). Default.
     #[default]
     Jsonl,
+    /// Human-readable plain text.
     Text,
+    /// Streaming JSON array.
     Json,
+    /// SARIF 2.1.0 document.
     Sarif,
 }
 
 /// Controls which transform decoders are enabled in the runtime engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum TransformFilter {
+    /// Enable all built-in transform decoders. Default.
     #[default]
     All,
+    /// Disable all transform decoders.
     None,
+    /// Enable only the specified transform decoders.
     Only(Vec<TransformId>),
 }
 
@@ -190,6 +207,11 @@ pub struct FsScanConfig {
 }
 
 impl FsScanConfig {
+    /// Creates a filesystem scan config for `path` with default settings.
+    ///
+    /// Defaults: worker count from available parallelism, no decode depth limit,
+    /// archives enabled, binary files skipped, findings not persisted, manual
+    /// anchors, all transforms, direct execution mode, and default budgets.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -207,60 +229,70 @@ impl FsScanConfig {
         }
     }
 
+    /// Sets the number of worker threads. Clamped to a minimum of 1.
     #[must_use]
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = workers.max(1);
         self
     }
 
+    /// Sets the maximum transform decode depth. `None` uses the engine default (3).
     #[must_use]
     pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
         self.decode_depth = decode_depth;
         self
     }
 
+    /// Enables or disables archive expansion during scanning.
     #[must_use]
     pub fn with_skip_archives(mut self, skip_archives: bool) -> Self {
         self.skip_archives = skip_archives;
         self
     }
 
+    /// Enables or disables scanning of binary files. Default is `false` (skip binary).
     #[must_use]
     pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
         self.scan_binary = scan_binary;
         self
     }
 
+    /// Enables or disables finding persistence via the commit sink bridge.
     #[must_use]
     pub fn with_persist_findings(mut self, persist_findings: bool) -> Self {
         self.persist_findings = persist_findings;
         self
     }
 
+    /// Sets the anchor extraction policy for rule matching.
     #[must_use]
     pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
         self.anchor_mode = anchor_mode;
         self
     }
 
+    /// Sets an external rules file path, replacing the built-in default rules.
     #[must_use]
     pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
         self.rules_file = rules_file;
         self
     }
 
+    /// Sets the transform decoder filter. See [`TransformFilter`] for options.
     #[must_use]
     pub fn with_transform_filter(mut self, transform_filter: TransformFilter) -> Self {
         self.transform_filter = transform_filter;
         self
     }
 
+    /// Sets the execution mode. Both modes currently share one scan path.
     #[must_use]
     pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
         self.execution_mode = execution_mode;
         self
     }
 
+    /// Sets the scan execution budgets. See [`ScanBudgets`] for defaults.
     #[must_use]
     pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
         self.budgets = budgets;
@@ -306,6 +338,12 @@ pub struct GitScanConfig {
 }
 
 impl GitScanConfig {
+    /// Creates a git scan config for `repo` with default settings.
+    ///
+    /// Defaults: worker count from available parallelism, no decode depth limit,
+    /// binary blobs skipped, debug off, identity enrichment off, manual anchors,
+    /// all transforms, `repo_id = 1`, `OdbBlobFast` scan mode, `AllParents`
+    /// merge mode, direct execution, and default budgets.
     #[must_use]
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         Self {
@@ -328,90 +366,105 @@ impl GitScanConfig {
         }
     }
 
+    /// Sets the number of pack-exec worker threads. Clamped to a minimum of 1.
     #[must_use]
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = workers.max(1);
         self
     }
 
+    /// Sets the maximum transform decode depth. `None` uses the engine default (3).
     #[must_use]
     pub fn with_decode_depth(mut self, decode_depth: Option<usize>) -> Self {
         self.decode_depth = decode_depth;
         self
     }
 
+    /// Enables or disables scanning of binary blobs. Default is `false` (skip binary).
     #[must_use]
     pub fn with_scan_binary(mut self, scan_binary: bool) -> Self {
         self.scan_binary = scan_binary;
         self
     }
 
+    /// Sets the git debug output level. Default is [`GitDebugLevel::Off`].
     #[must_use]
     pub fn with_debug_level(mut self, debug_level: GitDebugLevel) -> Self {
         self.debug_level = debug_level;
         self
     }
 
+    /// Enables or disables commit metadata enrichment with identity dictionary IDs.
     #[must_use]
     pub fn with_enrich_identities(mut self, enrich_identities: bool) -> Self {
         self.enrich_identities = enrich_identities;
         self
     }
 
+    /// Sets the anchor extraction policy for rule matching.
     #[must_use]
     pub fn with_anchor_mode(mut self, anchor_mode: AnchorMode) -> Self {
         self.anchor_mode = anchor_mode;
         self
     }
 
+    /// Sets an external rules file path, replacing the built-in default rules.
     #[must_use]
     pub fn with_rules_file(mut self, rules_file: Option<PathBuf>) -> Self {
         self.rules_file = rules_file;
         self
     }
 
+    /// Sets the transform decoder filter. See [`TransformFilter`] for options.
     #[must_use]
     pub fn with_transform_filter(mut self, transform_filter: TransformFilter) -> Self {
         self.transform_filter = transform_filter;
         self
     }
 
+    /// Sets the stable repository identifier used in persistence keys. Default is `1`.
     #[must_use]
     pub fn with_repo_id(mut self, repo_id: u64) -> Self {
         self.repo_id = repo_id;
         self
     }
 
+    /// Sets the git scan strategy. Default is [`GitScanMode::OdbBlobFast`].
     #[must_use]
     pub fn with_scan_mode(mut self, scan_mode: GitScanMode) -> Self {
         self.scan_mode = scan_mode;
         self
     }
 
+    /// Sets the merge-diff strategy for merge commits. Default is [`MergeDiffMode::AllParents`].
     #[must_use]
     pub fn with_merge_mode(mut self, merge_mode: MergeDiffMode) -> Self {
         self.merge_mode = merge_mode;
         self
     }
 
+    /// Sets the tree delta cache size in MiB. `None` uses the driver default.
     #[must_use]
     pub fn with_tree_delta_cache_mb(mut self, tree_delta_cache_mb: Option<u32>) -> Self {
         self.tree_delta_cache_mb = tree_delta_cache_mb;
         self
     }
 
+    /// Sets the engine chunk size in MiB. `None` uses the driver default.
     #[must_use]
     pub fn with_engine_chunk_mb(mut self, engine_chunk_mb: Option<u32>) -> Self {
         self.engine_chunk_mb = engine_chunk_mb;
         self
     }
 
+    /// Sets the execution mode. Both modes currently share one scan path.
     #[must_use]
     pub fn with_execution_mode(mut self, execution_mode: ExecutionMode) -> Self {
         self.execution_mode = execution_mode;
         self
     }
 
+    /// Sets the scan execution budgets. See [`ScanBudgets`] for defaults.
     #[must_use]
     pub fn with_budgets(mut self, budgets: ScanBudgets) -> Self {
         self.budgets = budgets;
@@ -422,27 +475,45 @@ impl GitScanConfig {
 /// Runtime wiring errors for unified scan execution.
 #[derive(Debug)]
 pub enum ScanRuntimeError {
+    /// A scan target path failed validation (does not exist, wrong type, etc.).
     InvalidPath {
+        /// Which subsystem originated the path (`"filesystem"` or `"git"`).
         source: &'static str,
+        /// The path that failed validation.
         path: PathBuf,
+        /// Human-readable reason for the failure.
         message: String,
     },
+    /// The connector kind is not supported by this runtime (e.g. `InMemory`).
     UnsupportedConnectorKind(ConnectorKind),
+    /// A `git` subprocess exited with a non-zero status.
     GitCommandFailed {
+        /// Repository path the command was invoked against.
         repo: PathBuf,
+        /// Process exit code, if available.
         status_code: Option<i32>,
+        /// Captured stderr output from the git process.
         stderr: String,
     },
+    /// An I/O operation failed during runtime setup.
     Io {
+        /// Short description of the operation (e.g. `"canonicalize"`).
         op: &'static str,
+        /// Associated file path, when applicable.
         path: Option<PathBuf>,
+        /// Underlying I/O error.
         error: std::io::Error,
     },
+    /// The external rules configuration file could not be loaded or parsed.
     RulesConfig {
+        /// Path to the rules file, if one was specified.
         path: Option<PathBuf>,
+        /// Human-readable parse or load error.
         message: String,
     },
+    /// A connector input parameter was invalid (e.g. zero budget).
     ConnectorInput(ConnectorInputError),
+    /// The scan driver returned an error during execution.
     Driver(anyhow::Error),
 }
 

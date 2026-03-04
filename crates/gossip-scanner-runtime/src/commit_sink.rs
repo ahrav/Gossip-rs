@@ -21,6 +21,7 @@ use crate::coordination_sink::{
     CommitProgressRecord, CoordinationEventRecorder, IdentityChainRecord,
 };
 
+/// Re-export of the no-op commit sink for CLI use where findings are not persisted.
 pub use gossip_scan_driver::NoOpCommitSink as CliNoOpCommitSink;
 
 /// Durable commit sink used by distributed mode.
@@ -43,6 +44,10 @@ pub struct DurableCommitSink {
 }
 
 impl DurableCommitSink {
+    /// Creates a durable commit sink bound to `shard_id`.
+    ///
+    /// All identity derivation uses the provided `tenant_id`, `tenant_secret_key`,
+    /// and `connector_tag`. Derived records are persisted through `recorder`.
     #[must_use]
     pub fn new(
         recorder: std::sync::Arc<dyn CoordinationEventRecorder>,

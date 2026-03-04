@@ -164,6 +164,7 @@ pub use record::SpawnedList;
 mod conformance_tests;
 #[cfg(test)]
 mod scenario_tests;
+/// Shared test fixtures: tenant/run/shard factories and seeded coordinators.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_fixtures;
 

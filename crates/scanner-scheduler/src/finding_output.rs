@@ -8,6 +8,10 @@ pub use crate::store::{
     NullStoreProducer, OwnedFsFindingBatch, StoreProducer,
 };
 
+/// Migration alias for [`StoreProducer`].
+///
+/// Allows downstream crates to reference the finding-output contract
+/// without coupling to the internal `StoreProducer` name.
 pub trait FindingOutput: StoreProducer {}
 
 impl<T: StoreProducer + ?Sized> FindingOutput for T {}
