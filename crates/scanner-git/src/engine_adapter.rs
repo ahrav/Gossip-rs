@@ -260,6 +260,8 @@ pub struct GitScanCommonMetrics {
     pub lock_skipped: u64,
     /// Blobs scanned via extracted text from binary formats.
     pub binary_extracted: u64,
+    /// Pack-exec error-category skips (all skip reasons except `NotBlob`).
+    pub errors: u64,
 }
 
 impl GitScanCommonMetrics {
@@ -275,6 +277,7 @@ impl GitScanCommonMetrics {
         self.ext_skipped = self.ext_skipped.saturating_add(other.ext_skipped);
         self.lock_skipped = self.lock_skipped.saturating_add(other.lock_skipped);
         self.binary_extracted = self.binary_extracted.saturating_add(other.binary_extracted);
+        self.errors = self.errors.saturating_add(other.errors);
     }
 }
 

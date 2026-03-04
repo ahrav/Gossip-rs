@@ -1331,13 +1331,27 @@ fn scheduler_pack_task_output(
     adapter: &mut EngineAdapter<'_>,
     report: PackExecReport,
 ) -> SchedulerPackExecOutput {
-    let common_metrics = adapter.take_metrics();
+    let mut common_metrics = adapter.take_metrics();
+    common_metrics.errors = common_metrics
+        .errors
+        .saturating_add(count_pack_exec_skip_errors(report.skips.as_slice()));
     SchedulerPackExecOutput {
         report,
         scanned: adapter.take_results(),
         skipped: Vec::new(),
         common_metrics,
     }
+}
+
+#[inline(always)]
+fn count_pack_exec_skip_errors(skips: &[SkipRecord]) -> u64 {
+    let mut errors = 0u64;
+    for skip in skips {
+        if skip.reason.is_error() {
+            errors = errors.saturating_add(1);
+        }
+    }
+    errors
 }
 
 /// Execute a single scheduler-dispatched pack task (plan or shard).

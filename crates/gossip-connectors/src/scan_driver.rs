@@ -221,6 +221,15 @@ impl ScanDriver for FsScanDriver {
                 chunks_scanned: report.metrics.chunks_scanned,
                 findings_emitted: report.metrics.findings_emitted,
                 errors: report.metrics.io_errors,
+                binary_skipped: report.metrics.binary_skipped,
+                ext_skipped: report.metrics.ext_skipped,
+                lock_skipped: report.metrics.lock_skipped,
+                binary_extracted: report.metrics.binary_extracted,
+                dropped_findings: report.stats.dropped_findings,
+                persist_emit_failures: report.stats.persistence_emit_failures,
+                persist_incomplete: report.stats.persistence_incomplete,
+                scan_ns: report.metrics.duration_ns,
+                persist_ns: report.metrics.persist_ns,
             })
         })
     }
@@ -605,16 +614,23 @@ fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> 
 /// Convert a git scanner result into the generic [`ScanReport`] used by
 /// the coordination layer.
 fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
-    let metrics = result.0.common_metrics;
+    let report = result.0;
+    let metrics = report.common_metrics;
     ScanReport {
         items_scanned: metrics.objects_scanned,
         bytes_scanned: metrics.bytes_scanned,
         chunks_scanned: metrics.chunks_scanned,
         findings_emitted: metrics.findings_emitted,
-        // Git scan errors are tracked per-pack-exec and not aggregated into
-        // a single counter in `GitScanCommonMetrics`. Leave at zero for now;
-        // a follow-up can surface pack-exec error totals here.
-        errors: 0,
+        errors: metrics.errors,
+        binary_skipped: metrics.binary_skipped,
+        ext_skipped: metrics.ext_skipped,
+        lock_skipped: metrics.lock_skipped,
+        binary_extracted: metrics.binary_extracted,
+        dropped_findings: 0,
+        persist_emit_failures: 0,
+        persist_incomplete: false,
+        scan_ns: report.stage_nanos.scan,
+        persist_ns: 0,
     }
 }
 
