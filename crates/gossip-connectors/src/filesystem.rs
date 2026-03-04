@@ -70,7 +70,8 @@
 //! # Symlink handling
 //!
 //! Symlinks are **skipped** during the directory walk. [`std::fs::DirEntry::file_type`]
-//! (backed by `d_type` on Unix) classifies each entry without following links.
+//! classifies each entry without following links; on many Unix platforms this
+//! is `d_type`-backed.
 //! Symlinks to files and symlinks to directories are both skipped and recorded
 //! in [`FilesystemConnector::walk_warnings`]. This prevents symlink-cycle
 //! hangs, root-escape via symlink targets, and snapshot inconsistency from
