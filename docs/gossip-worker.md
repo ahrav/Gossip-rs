@@ -7,7 +7,7 @@ gossip-rs secret scanning system. It is one of two top-level binaries in
 the workspace (the other being `scanner-rs-cli`), sitting at **Tier 3** of
 the build DAG.
 
-The binary is intentionally minimal (~306 lines including tests). It accepts
+The binary is intentionally minimal (including tests). It accepts
 a scan source type, a target path, and an execution mode, then delegates all
 scanning logic to `gossip-scanner-runtime`. It owns only CLI argument
 parsing, process lifecycle (exit codes), and tracing initialization.
@@ -34,7 +34,7 @@ shard leases from a coordinator (the `DistributedCoordinator` trait and
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Entire crate: CLI parsing, scan dispatch, tracing, error handling, tests (~306 lines) |
+| `src/main.rs` | Entire crate: CLI parsing, scan dispatch, tracing, error handling, tests |
 | `Cargo.toml` | Manifest: depends on `gossip-scanner-runtime`, `tracing`, `tracing-subscriber` |
 
 There is no `lib.rs` -- this is a pure binary crate with no public API.

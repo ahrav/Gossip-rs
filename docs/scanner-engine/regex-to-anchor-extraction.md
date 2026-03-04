@@ -27,9 +27,9 @@ If this invariant is violated, the scanner produces **false negatives** (missed 
 
 Key corollaries:
 
-- Patterns that can match the empty string are **always** rejected (`regex2anchor.rs:1446-1452`). An empty match has no bytes for an anchor to match against.
-- Anchors are never filtered by length post-derivation for alternations. If an alternation branch produces a short anchor, the entire set is rejected as `OnlyWeakAnchors` rather than silently dropping the short branch (`regex2anchor.rs:1310-1311`).
-- Information is only ever **weakened**, never strengthened, as it propagates up the HIR tree (`regex2anchor.rs:506`).
+- Patterns that can match the empty string are **always** rejected (`regex2anchor.rs`). An empty match has no bytes for an anchor to match against.
+- Anchors are never filtered by length post-derivation for alternations. If an alternation branch produces a short anchor, the entire set is rejected as `OnlyWeakAnchors` rather than silently dropping the short branch (`regex2anchor.rs`).
+- Information is only ever **weakened**, never strengthened, as it propagates up the HIR tree (`regex2anchor.rs`).
 
 ## Algorithm
 
@@ -69,13 +69,13 @@ Regex string
 
 ### Step 1: Parse to HIR
 
-The module uses `regex-syntax::ParserBuilder` to parse the pattern into a High-level Intermediate Representation (HIR). The `AnchorDeriveConfig::utf8` flag controls whether UTF-8 or byte-oriented parsing is used — this must match the regex engine that will perform the final match (`regex2anchor.rs:1439-1444`).
+The module uses `regex-syntax::ParserBuilder` to parse the pattern into a High-level Intermediate Representation (HIR). The `AnchorDeriveConfig::utf8` flag controls whether UTF-8 or byte-oriented parsing is used — this must match the regex engine that will perform the final match (`regex2anchor.rs`).
 
 HIR handles flags (`(?i)`, `(?-u)`), case folding, and character class normalization. For example, `(?i:ab)` is lowered to `[aA][bB]`, which the analyzer handles as two character classes without needing case folding logic.
 
 ### Step 2: Analyze the HIR
 
-The `analyze` function (`regex2anchor.rs:512-550`) performs structural induction on each HIR node, returning an `Info` value that tracks:
+The `analyze` function (`regex2anchor.rs`) performs structural induction on each HIR node, returning an `Info` value that tracks:
 
 - **`exact`**: An explicit, finite set of byte strings the node can match (or `None` if the set is too large or unbounded).
 - **`pf`**: A `Prefilter` summary (a required substring or set of substrings) that must appear in any match.
@@ -84,42 +84,42 @@ Each HIR node type has specific analysis rules:
 
 | HIR Node | Analysis Rule | Reference |
 |---|---|---|
-| `Empty` | Exact set `{b""}` | `regex2anchor.rs:514-517` |
-| `Literal(bytes)` | Exact singleton `{bytes}` | `regex2anchor.rs:519-521` |
-| `Class` | Expand to exact set if small ASCII/byte; otherwise `All` | `regex2anchor.rs:524-531` |
-| `Look` | Treated as empty (zero-width; consumes no bytes) | `regex2anchor.rs:534-536` |
-| `Repetition` | Delegated to `analyze_repetition` | `regex2anchor.rs:539` |
-| `Capture` | Transparent; analyze inner sub-expression | `regex2anchor.rs:541-543` |
-| `Concat` | Delegated to `analyze_concat` | `regex2anchor.rs:546` |
-| `Alternation` | Delegated to `analyze_alternation` | `regex2anchor.rs:548` |
+| `Empty` | Exact set `{b""}` | `regex2anchor.rs` |
+| `Literal(bytes)` | Exact singleton `{bytes}` | `regex2anchor.rs` |
+| `Class` | Expand to exact set if small ASCII/byte; otherwise `All` | `regex2anchor.rs` |
+| `Look` | Treated as empty (zero-width; consumes no bytes) | `regex2anchor.rs` |
+| `Repetition` | Delegated to `analyze_repetition` | `regex2anchor.rs` |
+| `Capture` | Transparent; analyze inner sub-expression | `regex2anchor.rs` |
+| `Concat` | Delegated to `analyze_concat` | `regex2anchor.rs` |
+| `Alternation` | Delegated to `analyze_alternation` | `regex2anchor.rs` |
 
 ### Step 3: Combine Child Info
 
-**Concatenation** (`analyze_concat`, `regex2anchor.rs:801-856`):
+**Concatenation** (`analyze_concat`, `regex2anchor.rs`):
 
 1. Try full cross-product of all children's exact sets. If the result fits within config caps, return the exact set.
-2. Otherwise, find the best **contiguous exact window** via `best_exact_window_prefilter` — this searches every contiguous run of children with exact sets, cross-products them, and picks the highest-scoring window (`regex2anchor.rs:714-787`).
+2. Otherwise, find the best **contiguous exact window** via `best_exact_window_prefilter` — this searches every contiguous run of children with exact sets, cross-products them, and picks the highest-scoring window (`regex2anchor.rs`).
 3. Fall back to the single most selective child prefilter.
 
-**Alternation** (`analyze_alternation`, `regex2anchor.rs:867-926`):
+**Alternation** (`analyze_alternation`, `regex2anchor.rs`):
 
 1. If all branches have exact sets, union them into one exact set.
 2. Otherwise, collect all branch anchors into an `AnyOf` set. If any branch is `All` (unanchorable) or can match the empty string, the entire alternation degrades to `All`.
 
-**Repetition** (`analyze_repetition`, `regex2anchor.rs:560-621`):
+**Repetition** (`analyze_repetition`, `regex2anchor.rs`):
 
 - `min == 0`: Required substrings may disappear. Special cases: `{0}` returns exact `{b""}`, and `?` (max=1) returns `{b""} ∪ sub_exact`. Otherwise degrades to `All`.
 - `min > 0`: Cross-product the sub's exact set `min` times. For exact repetition (`max == min`), the result stays exact. For open-ended repetition, the mandatory `min` copies produce a prefilter.
 
 ### Step 4: Choose Anchors and Build Trigger Plan
 
-`choose_anchors` (`regex2anchor.rs:1297-1343`) enforces global constraints on the final `Info`:
+`choose_anchors` (`regex2anchor.rs`) enforces global constraints on the final `Info`:
 
 - Empty strings in the exact set yield `Unanchorable`.
 - Any anchor shorter than `min_anchor_len` yields `OnlyWeakAnchors` (no partial filtering — that would be unsound).
 - Empty `AnyOf` sets yield `Unanchorable`.
 
-`compile_trigger_plan` (`regex2anchor.rs:1435-1491`) orchestrates the full pipeline:
+`compile_trigger_plan` (`regex2anchor.rs`) orchestrates the full pipeline:
 
 1. Reject empty-matching patterns upfront.
 2. Attempt anchor derivation (fastest gate).
@@ -128,7 +128,7 @@ Each HIR node type has specific analysis rules:
 
 ## Key Types
 
-### `AnchorDeriveConfig` (`regex2anchor.rs:81-111`)
+### `AnchorDeriveConfig` (`regex2anchor.rs`)
 
 Configuration controlling all derivation limits:
 
@@ -143,14 +143,14 @@ Configuration controlling all derivation limits:
 | `max_kgram_set` | 4096 | Maximum k-gram enumeration count (feature-gated) |
 | `max_kgram_alphabet` | 32 | Maximum per-position alphabet for k-grams (feature-gated) |
 
-### `Info` (`regex2anchor.rs:294-300`)
+### `Info` (`regex2anchor.rs`)
 
 Internal per-node summary. Not public — used only during HIR traversal:
 
 - `exact: Option<Vec<Vec<u8>>>` — Finite set of byte strings the node can match, or `None`.
 - `pf: Prefilter` — A prefilter summary preserved when `exact` is unavailable.
 
-### `Prefilter` (`regex2anchor.rs:152-160`)
+### `Prefilter` (`regex2anchor.rs`)
 
 ```rust
 pub enum Prefilter {
@@ -160,7 +160,7 @@ pub enum Prefilter {
 }
 ```
 
-### `TriggerPlan` (`regex2anchor.rs:173-188`)
+### `TriggerPlan` (`regex2anchor.rs`)
 
 The output of `compile_trigger_plan`:
 
@@ -168,7 +168,7 @@ The output of `compile_trigger_plan`:
 - **`Residue { gate }`** — Conservative ASCII-only gate (run-length or k-gram) when anchors are unavailable.
 - **`Unfilterable { reason }`** — No safe gate exists; caller must run the full regex.
 
-### `AnchorDeriveError` (`regex2anchor.rs:137-144`)
+### `AnchorDeriveError` (`regex2anchor.rs`)
 
 ```rust
 pub enum AnchorDeriveError {
@@ -178,7 +178,7 @@ pub enum AnchorDeriveError {
 }
 ```
 
-### `ResidueGatePlan` (`regex2anchor.rs:212-220`)
+### `ResidueGatePlan` (`regex2anchor.rs`)
 
 Fallback gate when anchors are unavailable:
 
@@ -186,11 +186,11 @@ Fallback gate when anchors are unavailable:
 - **`KGrams(KGramGate)`** — Enumerated prefix k-grams (feature-gated via `kgram-gate`).
 - **`Or(Vec<ResidueGatePlan>)`** — Logical OR for alternations.
 
-### `RunLengthGate` (`regex2anchor.rs:244-260`)
+### `RunLengthGate` (`regex2anchor.rs`)
 
 A 256-bit byte mask with min/max run length, optional ASCII word boundary, and optional UTF-16 variant scanning.
 
-### `KGramGate` (`regex2anchor.rs:267-274`)
+### `KGramGate` (`regex2anchor.rs`)
 
 K-length prefix grams packed as `u64` values (little-endian for k <= 8, FNV-1a hash for k > 8). Feature-gated behind `kgram-gate`.
 
@@ -274,7 +274,7 @@ Pattern `(?i)foo`:
 
 Pattern `"api" [_-] "key" "=" [0-9]+`:
 
-The algorithm searches every contiguous window of exact children, computes the cross-product for each window, and selects the best by a scoring heuristic. The detailed example in the code (`regex2anchor.rs:674-712`) shows how `["api_key=", "api-key="]` (score 63) beats the single-child fallback of `"api"` or `"key"` (score 24).
+The algorithm searches every contiguous window of exact children, computes the cross-product for each window, and selects the best by a scoring heuristic. The detailed example in the code (`regex2anchor.rs`) shows how `["api_key=", "api-key="]` (score 63) beats the single-child fallback of `"api"` or `"key"` (score 24).
 
 ### Repetition with Character Classes
 
@@ -297,15 +297,15 @@ Pattern `[abc][def][ghi]` with `max_exact_set=64`:
 Pattern `foo\d+bar`:
 
 - `compile_trigger_plan` extracts anchors (e.g., `"foo"` or `"bar"`) and then calls `collect_confirm_all_literals` to find mandatory fixed-literal islands from the top-level concatenation.
-- Both `"foo"` and `"bar"` are mandatory islands. The one chosen as the primary anchor is excluded from `confirm_all`; the other is kept as an AND filter to reduce false positive candidate windows (`regex2anchor.rs:1459-1460`).
+- Both `"foo"` and `"bar"` are mandatory islands. The one chosen as the primary anchor is excluded    from `confirm_all`; the other is kept as an AND filter to reduce false positive candidate windows (`regex2anchor.rs`).
 
 ## Integration: From Anchors to Vectorscan
 
 Anchors flow from `regex2anchor` into the engine via `core.rs`:
 
-1. **Rule compilation** (`core.rs:615`): `compile_trigger_plan(rule.re, &derive_cfg)` is called for each rule.
+1. **Rule compilation** (`core.rs`): `compile_trigger_plan(rule.re, &derive_cfg)` is called for each rule.
 
-2. **Anchor registration** (`core.rs:630-673`): For `TriggerPlan::Anchored`, each anchor is registered as:
+2. **Anchor registration** (`core.rs`): For `TriggerPlan::Anchored`, each anchor is registered as:
    - A raw-byte pattern (Variant::Raw)
    - A UTF-16LE encoded pattern (Variant::Utf16Le)
    - A UTF-16BE encoded pattern (Variant::Utf16Be)
@@ -314,7 +314,7 @@ Anchors flow from `regex2anchor` into the engine via `core.rs`:
 
 4. **Runtime scanning**: Vectorscan reports anchor hits via callbacks. Each hit seeds a candidate window using the anchor's position plus configurable seed radius. Only these windows are passed to the full regex engine.
 
-5. **Residue/Unfilterable handling** (`core.rs:675-691`): Rules with `Residue` or `Unfilterable` plans fall back to manual anchor patterns (if provided by the rule author) or are flagged as unfilterable.
+5. **Residue/Unfilterable handling** (`core.rs`): Rules with `Residue` or `Unfilterable` plans fall back to manual anchor patterns (if provided by the rule author) or are flagged as unfilterable.
 
 ```
 ┌──────────────┐    ┌──────────────────┐    ┌───────────────────┐
@@ -348,7 +348,7 @@ Anchors flow from `regex2anchor` into the engine via `core.rs`:
 
 ## Scoring Heuristic
 
-When multiple anchor candidates exist (e.g., in concatenation), the algorithm selects the most selective option using a scoring heuristic (`regex2anchor.rs:654-657`):
+When multiple anchor candidates exist (e.g., in concatenation), the algorithm selects the most selective option using a scoring heuristic (`regex2anchor.rs`):
 
 ```
 score = min_len * 8 - ceil_log2(set_size)
@@ -359,13 +359,13 @@ score = min_len * 8 - ceil_log2(set_size)
 - Example: min_len=4, set_size=16 → score = 32 - 4 = 28.
 - This favors a small set of longer anchors over a large set of short ones.
 
-Tie-breaking (`regex2anchor.rs:768-770`): when scores are equal, prefer higher `min_len`, then fewer set elements, then higher `max_len`.
+Tie-breaking (`regex2anchor.rs`): when scores are equal, prefer higher `min_len`, then fewer set elements, then higher `max_len`.
 
 ## Residue Gates
 
 When anchors are unavailable, the algorithm attempts conservative fallback gates:
 
-### Run-Length Gate (`regex2anchor.rs:979-1022`)
+### Run-Length Gate (`regex2anchor.rs`)
 
 Applies to patterns that reduce to a single consuming ASCII atom (literal or class) with optional repetition and word boundaries. The gate specifies:
 
@@ -376,11 +376,11 @@ Applies to patterns that reduce to a single consuming ASCII atom (literal or cla
 
 Example: `[A-F0-9]{4}` → RunLengthGate with hex byte mask, min=4, max=4.
 
-### K-Gram Gate (`regex2anchor.rs:1092-1163`, feature-gated)
+### K-Gram Gate (`regex2anchor.rs`, feature-gated)
 
 Enumerates all possible k-length prefixes of the pattern. Each position contributes an ASCII alphabet; the cross-product of alphabets produces k-gram hashes stored for fast membership checking. Only applies when the prefix is fixed-length and enumerable.
 
-### Alternation Residue (`regex2anchor.rs:954-964`)
+### Alternation Residue (`regex2anchor.rs`)
 
 For alternations where individual branches have residue gates, an `Or(Vec<ResidueGatePlan>)` is produced. All branch gates must exist; if any branch has no gate, the entire plan fails.
 
@@ -388,22 +388,22 @@ For alternations where individual branches have residue gates, an `Or(Vec<Residu
 
 ### Unit Tests (`regex2anchor_tests.rs`)
 
-756 lines of targeted tests covering:
+Targeted tests covering:
 
-- Basic functionality: literals, concatenation, alternation, repetition, character classes (`regex2anchor_tests.rs:44-212`)
-- Bug-hunting tests for specific failure modes: min-anchor-length post-filtering, optional prefix handling, cross-product overflow, empty alternation branches, Unicode vs. bytes (`regex2anchor_tests.rs:218-486`)
-- Property-based tests using proptest with correlated pattern/haystack pairs (`regex2anchor_tests.rs:492-633`)
-- Real-world pattern tests: AWS access keys, GitHub tokens, JWTs, Slack tokens (`regex2anchor_tests.rs:670-756`)
+- Basic functionality: literals, concatenation, alternation, repetition, character classes (`regex2anchor_tests.rs`)
+- Bug-hunting tests for specific failure modes: min-anchor-length post-filtering, optional prefix handling, cross-product overflow, empty alternation branches, Unicode vs. bytes (`regex2anchor_tests.rs`)
+- Property-based tests using proptest with correlated pattern/haystack pairs (`regex2anchor_tests.rs`)
+- Real-world pattern tests: AWS access keys, GitHub tokens, JWTs, Slack tokens (`regex2anchor_tests.rs`)
 
 ### Soundness Property Tests (`regex2anchor_soundness.rs`)
 
-1,068 lines of exhaustive and property-based soundness verification:
+Exhaustive and property-based soundness verification:
 
-- **Exhaustive domain tests** (`regex2anchor_soundness.rs:284-338`): Enumerate all strings of length 0..6 over alphabet `{a,b,c,d}` (5,461 strings). For each pattern, verify that every regex match contains at least one anchor.
-- **Property-based tests** (`regex2anchor_soundness.rs:436-590`): 250-500 cases with simple and complex generated patterns, tested against exhaustive small domains and random byte haystacks.
-- **Metamorphic tests** (`regex2anchor_soundness.rs:490-543`): Verify that wrapping a pattern in a capture group does not change the derived anchors.
+- **Exhaustive domain tests** (`regex2anchor_soundness.rs`): Enumerate all strings of length 0..6 over alphabet `{a,b,c,d}` (5,461 strings). For each pattern, verify that every regex match contains at least one anchor.
+- **Property-based tests** (`regex2anchor_soundness.rs`): 250-500 cases with simple and complex generated patterns, tested against exhaustive small domains and random byte haystacks.
+- **Metamorphic tests** (`regex2anchor_soundness.rs`): Verify that wrapping a pattern in a capture group does not change the derived anchors.
 - **Edge case tests**: nested alternations, repetition bounds, concatenation with classes, case-insensitive flags, byte-mode hex escapes, NUL bytes, class expansion limits, exact set size limits.
-- **TriggerPlan tests** (`regex2anchor_soundness.rs:916-1068`): Verify that `compile_trigger_plan` produces the correct plan type (Anchored, Residue, Unfilterable) for various patterns, including run-length gates, OR gates for alternations, and k-gram gates (feature-gated).
+- **TriggerPlan tests** (`regex2anchor_soundness.rs`): Verify that `compile_trigger_plan` produces the correct plan type (Anchored, Residue, Unfilterable) for various patterns, including run-length gates, OR gates for alternations, and k-gram gates (feature-gated).
 
 ### Verification Approach
 
@@ -420,32 +420,32 @@ This provides a mathematical proof of correctness over the bounded domain and st
 
 ## Source of Truth
 
-| Component | File | Lines |
-|---|---|---|
-| Module implementation | `crates/scanner-engine/src/regex2anchor.rs` | 1-1556 |
-| `AnchorDeriveConfig` | `crates/scanner-engine/src/regex2anchor.rs` | 81-126 |
-| `AnchorDeriveError` | `crates/scanner-engine/src/regex2anchor.rs` | 137-144 |
-| `Prefilter` enum | `crates/scanner-engine/src/regex2anchor.rs` | 152-160 |
-| `TriggerPlan` enum | `crates/scanner-engine/src/regex2anchor.rs` | 173-188 |
-| `UnfilterableReason` | `crates/scanner-engine/src/regex2anchor.rs` | 196-205 |
-| `ResidueGatePlan` / `RunLengthGate` / `KGramGate` | `crates/scanner-engine/src/regex2anchor.rs` | 212-285 |
-| `Info` (internal) | `crates/scanner-engine/src/regex2anchor.rs` | 294-332 |
-| `class_to_small_byte_set` | `crates/scanner-engine/src/regex2anchor.rs` | 343-372 |
-| `cross_product` | `crates/scanner-engine/src/regex2anchor.rs` | 479-499 |
-| `analyze` (core HIR dispatch) | `crates/scanner-engine/src/regex2anchor.rs` | 512-550 |
-| `analyze_repetition` | `crates/scanner-engine/src/regex2anchor.rs` | 560-621 |
-| `best_exact_window_prefilter` | `crates/scanner-engine/src/regex2anchor.rs` | 714-787 |
-| `analyze_concat` | `crates/scanner-engine/src/regex2anchor.rs` | 801-856 |
-| `analyze_alternation` | `crates/scanner-engine/src/regex2anchor.rs` | 867-926 |
-| `derive_residue_gate_plan` | `crates/scanner-engine/src/regex2anchor.rs` | 951-968 |
-| `derive_run_length_gate` | `crates/scanner-engine/src/regex2anchor.rs` | 979-1022 |
-| `extract_core_with_boundary` | `crates/scanner-engine/src/regex2anchor.rs` | 1033-1081 |
-| `derive_kgram_gate` (feature-gated) | `crates/scanner-engine/src/regex2anchor.rs` | 1092-1163 |
-| `choose_anchors` | `crates/scanner-engine/src/regex2anchor.rs` | 1297-1343 |
-| `collect_confirm_all_literals` | `crates/scanner-engine/src/regex2anchor.rs` | 1364-1419 |
-| `compile_trigger_plan` (public entry) | `crates/scanner-engine/src/regex2anchor.rs` | 1435-1491 |
-| `derive_anchors_from_pattern` (public entry) | `crates/scanner-engine/src/regex2anchor.rs` | 1513-1528 |
-| Engine integration (caller) | `crates/scanner-engine/src/engine/core.rs` | 615-692 |
-| Vectorscan prefilter module | `crates/scanner-engine/src/engine/vectorscan_prefilter.rs` | — |
-| Unit tests | `crates/scanner-engine/src/regex2anchor_tests.rs` | 1-756 |
-| Soundness property tests | `crates/scanner-engine-integration-tests/tests/property/regex2anchor_soundness.rs` | 1-1068 |
+| Component | File |
+|---|---|
+| Module implementation | `crates/scanner-engine/src/regex2anchor.rs` |
+| `AnchorDeriveConfig` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `AnchorDeriveError` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `Prefilter` enum | `crates/scanner-engine/src/regex2anchor.rs` |
+| `TriggerPlan` enum | `crates/scanner-engine/src/regex2anchor.rs` |
+| `UnfilterableReason` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `ResidueGatePlan` / `RunLengthGate` / `KGramGate` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `Info` (internal) | `crates/scanner-engine/src/regex2anchor.rs` |
+| `class_to_small_byte_set` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `cross_product` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `analyze` (core HIR dispatch) | `crates/scanner-engine/src/regex2anchor.rs` |
+| `analyze_repetition` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `best_exact_window_prefilter` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `analyze_concat` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `analyze_alternation` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `derive_residue_gate_plan` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `derive_run_length_gate` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `extract_core_with_boundary` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `derive_kgram_gate` (feature-gated) | `crates/scanner-engine/src/regex2anchor.rs` |
+| `choose_anchors` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `collect_confirm_all_literals` | `crates/scanner-engine/src/regex2anchor.rs` |
+| `compile_trigger_plan` (public entry) | `crates/scanner-engine/src/regex2anchor.rs` |
+| `derive_anchors_from_pattern` (public entry) | `crates/scanner-engine/src/regex2anchor.rs` |
+| Engine integration (caller) | `crates/scanner-engine/src/engine/core.rs` |
+| Vectorscan prefilter module | `crates/scanner-engine/src/engine/vectorscan_prefilter.rs` |
+| Unit tests | `crates/scanner-engine/src/regex2anchor_tests.rs` |
+| Soundness property tests | `crates/scanner-engine-integration-tests/tests/property/regex2anchor_soundness.rs` |

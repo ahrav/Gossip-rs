@@ -36,7 +36,7 @@ occurs *after* safelist suppression but *before* confidence scoring and the
 
 ## Verdict Hierarchy
 
-Every validator returns one of three outcomes defined in `api.rs:1104`:
+Every validator returns one of three outcomes defined in `api.rs`:
 
 | Verdict         | Meaning                                                        | Finding disposition                                  |
 |-----------------|----------------------------------------------------------------|------------------------------------------------------|
@@ -47,19 +47,19 @@ Every validator returns one of three outcomes defined in `api.rs:1104`:
 The `suppresses_on_invalid()` method on `OfflineValidationSpec` is a per-spec
 policy flag. Currently all variants return `true` — invalid verdicts suppress
 the finding. The match arm is kept explicit so adding a new variant forces a
-compile-time decision (`api.rs:1080–1091`).
+compile-time decision (`api.rs`).
 
 ---
 
 ## Key Types
 
-### `OfflineValidationSpec` (enum, `api.rs:1026`)
+### `OfflineValidationSpec` (enum, `api.rs`)
 
 The spec enum carried on `RuleSpec.offline_validation`. Each variant encodes a
 self-contained check with the per-rule geometry needed to locate
 checksum/payload fields. At engine build time, specs are pooled into
 `Engine::offline_validation_gates` and referenced by index from
-`RuleCompiled::offline_validation` (`rule_repr.rs:605`).
+`RuleCompiled::offline_validation` (`rule_repr.rs`).
 
 ```rust
 pub enum OfflineValidationSpec {
@@ -73,17 +73,17 @@ pub enum OfflineValidationSpec {
 }
 ```
 
-**Invariants** (enforced by `assert_valid`, `api.rs:1053`):
+**Invariants** (enforced by `assert_valid`, `api.rs`):
 - `Crc32Base62`: `payload_len > 0`, `checksum_len > 0`, `checksum_len <= 6`.
 - Unit variants: always valid.
 
-### `OfflineVerdict` (enum, `api.rs:1104`)
+### `OfflineVerdict` (enum, `api.rs`)
 
 ```rust
 pub enum OfflineVerdict { Valid, Invalid, Indeterminate }
 ```
 
-### `validate` (dispatch function, `offline_validate.rs:79`)
+### `validate` (dispatch function, `offline_validate.rs`)
 
 ```rust
 pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVerdict
@@ -91,7 +91,7 @@ pub(crate) fn validate(spec: OfflineValidationSpec, secret: &[u8]) -> OfflineVer
 
 Top-level dispatch: matches on the spec variant and delegates to the
 appropriate validator function. Called by `compute_offline_verdict` in
-`window_validate.rs:1816`.
+`window_validate.rs`.
 
 ---
 
@@ -111,10 +111,10 @@ Offline validation is Gate 14 in the window validation pipeline (see
 
 ### Call Chain
 
-1. **`apply_emit_time_policy`** (`window_validate.rs:1775–1788`):
+1. **`apply_emit_time_policy`** (`window_validate.rs`):
    Calls `compute_offline_verdict()` on the extracted secret bytes.
 
-2. **`compute_offline_verdict`** (`window_validate.rs:1816–1827`):
+2. **`compute_offline_verdict`** (`window_validate.rs`):
    - Returns `None` if `parent_step_id != STEP_ROOT` (transform-derived findings
      are not validated).
    - Looks up the rule's `offline_validation` pool index via
@@ -126,7 +126,7 @@ Offline validation is Gate 14 in the window validation pipeline (see
    incremented.
 
 4. **Confidence scoring**: If the verdict is `Valid`, the finding receives
-   `+5` to its confidence score (`confidence::OFFLINE_VALID`, `api.rs:1142`).
+    `+5` to its confidence score (`confidence::OFFLINE_VALID`, `api.rs`).
    `Invalid` and `Indeterminate` contribute `0`.
 
 ### Scope Restrictions
@@ -140,7 +140,7 @@ Offline validation is Gate 14 in the window validation pipeline (see
 
 ### Engine Build-Time Pooling
 
-At engine construction (`core.rs:448–483`), each rule's
+At engine construction (`core.rs`), each rule's
 `OfflineValidationSpec` is pushed into `Engine::offline_validation_gates` (a
 `Vec<OfflineValidationSpec>`). The rule's `RuleCompiled::offline_validation`
 field stores the pool index (or `NO_GATE = u32::MAX` when absent). At scan
@@ -152,7 +152,7 @@ time, `Engine::offline_validation_gate(idx)` dereferences the index.
 
 ### 1. `Crc32Base62` — Generic CRC-32 + Base-62 Checksum
 
-**Function**: `validate_crc32_base62` (`offline_validate.rs:164`)
+**Function**: `validate_crc32_base62` (`offline_validate.rs`)
 
 **Token layout**: `[prefix_skip bytes][payload_len bytes][checksum_len bytes]`
 
@@ -182,7 +182,7 @@ is computed over `payload_len` bytes starting at offset `prefix_skip`.
 
 ### 2. `GithubFinegrainedPat` — GitHub Fine-Grained Personal Access Token
 
-**Function**: `validate_github_fine_grained_pat` (`offline_validate.rs:213`)
+**Function**: `validate_github_fine_grained_pat` (`offline_validate.rs`)
 
 **Token format**: `github_pat_<76 body chars><6 char CRC-32 base-62>` (93 bytes total).
 
@@ -202,7 +202,7 @@ the prefix.
 **False positives rejected**: Random 93-character strings that happen to match
 the `github_pat_` regex but have an invalid checksum.
 
-**Constants** (`offline_validate.rs:201–205`):
+**Constants** (`offline_validate.rs`):
 - `GH_PAT_PREFIX`: `b"github_pat_"` (11 bytes)
 - `GH_PAT_TOTAL_LEN`: 93
 - `GH_PAT_CHECKSUM_LEN`: 6
@@ -211,7 +211,7 @@ the `github_pat_` regex but have an invalid checksum.
 
 ### 3. `GrafanaServiceAccount` — Grafana Service-Account Token
 
-**Function**: `validate_grafana_service_account` (`offline_validate.rs:256`)
+**Function**: `validate_grafana_service_account` (`offline_validate.rs`)
 
 **Token format**: `glsa_<32 alphanumeric>_<8 hex CRC-32>` (46 bytes total).
 
@@ -228,7 +228,7 @@ separator position, minimum length.
 **False positives rejected**: Tokens with corrupted random segments or
 checksum fields.
 
-**Constants** (`offline_validate.rs:243–249`):
+**Constants** (`offline_validate.rs`):
 - `GLSA_PREFIX`: `b"glsa_"` (5 bytes)
 - `GLSA_MIN_LEN`: 46
 - `GLSA_RANDOM_LEN`: 32
@@ -238,7 +238,7 @@ checksum fields.
 
 ### 4. `AwsAccessKey` — AWS Access Key ID
 
-**Function**: `validate_aws_access_key` (`offline_validate.rs:352`)
+**Function**: `validate_aws_access_key` (`offline_validate.rs`)
 
 **Token format**: `(AKIA|ASIA|ABIA|ACCA|A3T[A-Z0-9])[A-Z2-7]{16}` (20 bytes).
 
@@ -252,7 +252,7 @@ checksum fields.
 
 **Structural properties validated**:
 - Known prefix (validated via single `u32` load + comparison tree for
-  branch-free prefix matching, `offline_validate.rs:361–373`).
+  branch-free prefix matching, `offline_validate.rs`).
 - Base-32 charset compliance.
 - Account ID range check on decoded bits.
 
@@ -261,7 +261,7 @@ checksum fields.
   letters or digits outside `[2-7]`.
 - Keys with structurally impossible account IDs (> 12 decimal digits).
 
-**Account ID extraction** (`decode_aws_account_id`, `offline_validate.rs:410`):
+**Account ID extraction** (`decode_aws_account_id`, `offline_validate.rs`):
 The 16 base-32 chars encode 80 bits (10 bytes). The account ID occupies bits
 1–40 (0-indexed from MSB, skipping the top flag bit). The extraction masks
 off the flag bit and packs 40 contiguous bits into a `u64`.
@@ -276,7 +276,7 @@ off the flag bit and packs 40 contiguous bits into a `u64`.
 
 ### 5. `SentryOrgToken` — Sentry Org Auth Token
 
-**Function**: `validate_sentry_org_token` (`offline_validate.rs:467`)
+**Function**: `validate_sentry_org_token` (`offline_validate.rs`)
 
 **Token format**: `sntrys_<base64-payload>_<43 base64 signature>`.
 
@@ -286,7 +286,7 @@ off the flag bit and packs 40 contiguous bits into a `u64`.
    43-character signature.
 3. The 43-byte signature contains only valid base64 data characters (not padding
    or invalid bytes) — verified via branchless OR-accumulation
-   (`offline_validate.rs:490–496`).
+    (`offline_validate.rs`).
 4. The base64 payload decodes successfully and its decoded bytes start with
    `{"iat":` (JSON payload with an `iat` field).
 
@@ -300,7 +300,7 @@ off the flag bit and packs 40 contiguous bits into a `u64`.
   characters.
 - Tokens whose payload does not decode to JSON with an `iat` field.
 
-**Two-phase decode** (`base64_decoded_starts_with`, `offline_validate.rs:599`):
+**Two-phase decode** (`base64_decoded_starts_with`, `offline_validate.rs`):
 - **Phase 1**: Branchless validity scan over ALL input bytes using the
   `v & (v >> 7)` trick to distinguish `0xFF` (invalid) from `0xFE` (padding)
   and valid values (0–63).
@@ -319,7 +319,7 @@ off the flag bit and packs 40 contiguous bits into a `u64`.
 
 ### 6. `PyPiToken` — PyPI Upload Token (Macaroon V2)
 
-**Function**: `validate_pypi_token` (`offline_validate.rs:709`)
+**Function**: `validate_pypi_token` (`offline_validate.rs`)
 
 **Token format**: `pypi-<base64url-encoded macaroon body>`.
 
@@ -329,7 +329,7 @@ off the flag bit and packs 40 contiguous bits into a `u64`.
 3. The first 16 base64url characters after the prefix decode to exactly 12 bytes.
 4. Those 12 decoded bytes match the known macaroon V2 header for `pypi.org`.
 
-**Expected header** (`PYPI_HEADER`, `offline_validate.rs:686`):
+**Expected header** (`PYPI_HEADER`, `offline_validate.rs`):
 ```text
 Offset  Hex   Meaning
 0       0x02  Macaroon V2 version
@@ -350,7 +350,7 @@ Offset  Hex   Meaning
 - Tokens whose decoded body has a different macaroon version, location, or
   field structure.
 
-**Constants** (`offline_validate.rs:674–696`):
+**Constants** (`offline_validate.rs`):
 - `PYPI_PREFIX`: `b"pypi-"` (5 bytes)
 - `PYPI_B64URL_HEADER_CHARS`: 16
 - `PYPI_MIN_LEN`: 21
@@ -359,7 +359,7 @@ Offset  Hex   Meaning
 
 ### 7. `SlackToken` — Slack API Token
 
-**Function**: `validate_slack_token` (`offline_validate.rs:841`)
+**Function**: `validate_slack_token` (`offline_validate.rs`)
 
 Slack tokens are a family of formats sharing the `xox*-` prefix convention.
 The validator dispatches on prefix to seven sub-validators, each enforcing
@@ -381,7 +381,7 @@ format-specific segment counts, character classes, and length ranges.
 
 **Dispatch ordering**: Compound prefixes (`xoxe.xoxb-`, `xoxe.xoxp-`) are
 checked first (10-byte prefix) to avoid misrouting through the simpler `xoxe-`
-path (`offline_validate.rs:847–858`).
+path (`offline_validate.rs`).
 
 **Structural properties validated** (per sub-format):
 - Segment count (split on `-`).
@@ -405,31 +405,31 @@ path (`offline_validate.rs:847–858`).
 
 #### Sub-Validators
 
-**`validate_slack_config_access`** (`offline_validate.rs:897`):
+**`validate_slack_config_access`** (`offline_validate.rs`):
 Format: `{1 digit}-{163–166 uppercase+digit body}`. Validates the leading
 single-digit segment and the body length and character class.
 
-**`validate_slack_xoxb`** (`offline_validate.rs:953`):
+**`validate_slack_xoxb`** (`offline_validate.rs`):
 Tries current format first (3+ segments with two 10–13 digit segments and an
 alphanumeric+hyphen tail), then falls back to legacy format (2 segments: 8–14
 digits, 18–26 alphanumeric). Returns `Indeterminate` if neither matches.
 
-**`validate_slack_user_token`** (`offline_validate.rs:998`):
+**`validate_slack_user_token`** (`offline_validate.rs`):
 Format: three numeric segments (10–13 digits each) followed by an
 alphanumeric+hyphen tail (28–34 characters). Also used by `validate_slack_xoxe`
 for user/enterprise tokens.
 
-**`validate_slack_xoxe`** (`offline_validate.rs:1025`):
+**`validate_slack_xoxe`** (`offline_validate.rs`):
 Disambiguates by first segment length: 1 digit → config refresh token (146
 uppercase+digit body); 10–13 digits → delegates to `validate_slack_user_token`.
 
-**`validate_slack_xapp`** (`offline_validate.rs:923`):
+**`validate_slack_xapp`** (`offline_validate.rs`):
 Format: 4 segments — single digit, uppercase+digits, digits, lowercase+digits.
 
-**`validate_slack_legacy`** (`offline_validate.rs:1061`):
+**`validate_slack_legacy`** (`offline_validate.rs`):
 Format: three digit-only segments followed by a hex segment.
 
-**`validate_slack_legacy_workspace`** (`offline_validate.rs:1087`):
+**`validate_slack_legacy_workspace`** (`offline_validate.rs`):
 Format: optional leading `{digit}-` followed by 8–48 alphanumeric characters.
 
 ---
@@ -441,10 +441,10 @@ decode loops:
 
 | Table             | Location                     | Valid range | Invalid | Padding |
 |-------------------|------------------------------|-------------|---------|---------|
-| `BASE62_LUT`      | `offline_validate.rs:103`    | 0–61        | `0xFF`  | —       |
-| `HEX_LUT`         | `offline_validate.rs:291`    | 0–15        | `0xFF`  | —       |
-| `BASE64_LUT`      | `offline_validate.rs:524`    | 0–63        | `0xFF`  | `0xFE`  |
-| `BASE64URL_LUT`   | `offline_validate.rs:555`    | 0–63        | `0xFF`  | —       |
+| `BASE62_LUT`      | `offline_validate.rs`        | 0–61        | `0xFF`  | —       |
+| `HEX_LUT`         | `offline_validate.rs`        | 0–15        | `0xFF`  | —       |
+| `BASE64_LUT`      | `offline_validate.rs`        | 0–63        | `0xFF`  | `0xFE`  |
+| `BASE64URL_LUT`   | `offline_validate.rs`        | 0–63        | `0xFF`  | —       |
 
 **Convention**: Valid values never set bit 7. Invalid bytes map to `0xFF`
 (bit 7 set). Base64 padding (`=`) maps to `0xFE` (bit 7 set, bit 0 clear).
@@ -455,7 +455,7 @@ per-character branches, giving the CPU a straight-line body that the
 out-of-order engine can pipeline without misprediction stalls.
 
 ```rust
-// Example: base62_decode_u32 (offline_validate.rs:138)
+// Example: base62_decode_u32 (offline_validate.rs)
 let mut acc: u64 = 0;
 let mut invalid: u8 = 0;
 for &b in bytes {
@@ -487,39 +487,17 @@ All validators use stack-local buffers for decoding:
 - AWS base-32 decode uses `[u8; 10]`.
 - PyPI base64url decode uses `[u8; 12]`.
 - Sentry base64 decode uses inline `u32` accumulator with early prefix check.
-- Slack validators use `splitn_stack::<N>` (`offline_validate.rs:804`), a
+- Slack validators use `splitn_stack::<N>` (`offline_validate.rs`), a
   stack-local array-based split that avoids `Vec` allocation.
-
-### Short-Circuit Ordering
-
-Each validator checks cheaply-verifiable properties first:
-1. Length check (single comparison).
-2. Prefix check (byte comparison or `u32` load).
-3. Separator/structure check.
-4. Charset/decode check (branchless loop).
-5. Final integrity check (CRC comparison, header match, range check).
-
-### `all_bytes` Helper
-
-The `all_bytes` function (`offline_validate.rs:767`) uses OR-accumulation to
-minimize branches during character class validation:
-
-```rust
-fn all_bytes(seg: &[u8], pred: fn(u8) -> bool) -> bool {
-    let mut bad: u8 = 0;
-    for &b in seg { bad |= !pred(b) as u8; }
-    bad == 0
-}
-```
 
 ### Bench Hooks
 
 Feature-gated (`bench`) public functions are provided for benchmarking
 individual validators without going through the dispatch layer:
-- `bench_offline_validate_aws_access_key` (`offline_validate.rs:1117`)
-- `bench_offline_validate_sentry_org_token` (`offline_validate.rs:1124`)
-- `bench_offline_validate_pypi_token` (`offline_validate.rs:1129`)
-- `bench_offline_validate_slack_token` (`offline_validate.rs:1136`)
+- `bench_offline_validate_aws_access_key` (`offline_validate.rs`)
+- `bench_offline_validate_sentry_org_token` (`offline_validate.rs`)
+- `bench_offline_validate_pypi_token` (`offline_validate.rs`)
+- `bench_offline_validate_slack_token` (`offline_validate.rs`)
 
 ---
 
@@ -527,25 +505,25 @@ individual validators without going through the dispatch layer:
 
 ### Step 1: Define the Spec Variant
 
-Add a new variant to `OfflineValidationSpec` in `api.rs:1026`. If the check
+Add a new variant to `OfflineValidationSpec` in `api.rs`. If the check
 requires per-rule parameters, add fields to the variant; otherwise use a unit
 variant.
 
 ### Step 2: Update `assert_valid`
 
 Add invariant checks for the new variant in `OfflineValidationSpec::assert_valid`
-(`api.rs:1053`). At minimum, ensure the variant arm exists (the match is
+(`api.rs`). At minimum, ensure the variant arm exists (the match is
 exhaustive).
 
 ### Step 3: Update `suppresses_on_invalid`
 
 Add the variant to `OfflineValidationSpec::suppresses_on_invalid`
-(`api.rs:1080`). Decide whether an `Invalid` verdict should suppress the
+(`api.rs`). Decide whether an `Invalid` verdict should suppress the
 finding or keep it for manual review.
 
 ### Step 4: Update `encode_policy`
 
-Add the variant to `OfflineValidationSpec::encode_policy` (`api.rs:1578`)
+Add the variant to `OfflineValidationSpec::encode_policy` (`api.rs`)
 with a unique tag byte. This ensures the policy hash changes when the
 validator is added, invalidating cached scan results.
 
@@ -560,7 +538,7 @@ Add a `validate_<name>(secret: &[u8]) -> OfflineVerdict` function in
 
 ### Step 6: Wire the Dispatch
 
-Add a match arm to `validate()` (`offline_validate.rs:79`) that calls the
+Add a match arm to `validate()` (`offline_validate.rs`) that calls the
 new validator.
 
 ### Step 7: Add Tests
@@ -578,7 +556,7 @@ rule definitions parsed by `rules/yaml.rs`).
 
 ## Testing
 
-### Unit Tests (`offline_validate.rs:1147`)
+### Unit Tests (`offline_validate.rs`)
 
 Comprehensive test coverage for every validator:
 
@@ -599,7 +577,7 @@ Comprehensive test coverage for every validator:
 | `pypi_*`                          | Valid token, invalid body char, literal edge cases              |
 | `slack_token_cases`               | Table-driven tests for all Slack sub-formats                   |
 
-### Property-Based Tests (`offline_validate.rs:1797`, feature `stdx-proptest`)
+### Property-Based Tests (`offline_validate.rs`, feature `stdx-proptest`)
 
 - `crc32_base62_roundtrip_valid`: Random 10-byte payloads always `Valid`.
 - `github_pat_roundtrip_valid`: Random 76-byte bodies always `Valid`.
@@ -610,62 +588,62 @@ Comprehensive test coverage for every validator:
 
 End-to-end tests that verify offline validation interacts correctly with the
 window validation pipeline:
-- `offline_validation_suppresses_invalid_crc_token` (line 2613)
-- `offline_validation_keeps_valid_crc_token` (line 2633)
-- `offline_validation_does_not_affect_rules_without_gate` (line 2653)
-- `offline_validation_indeterminate_keeps_finding` (line 2673)
-- `offline_validation_mixed_rules_selective_suppression` (line 2696)
-- `offline_validation_suppresses_invalid_root_finding` (line 6175)
-- `offline_validation_keeps_valid_root_finding` (line 6211)
-- `offline_validation_does_not_suppress_non_root_findings` (line 6301)
-- `offline_validation_suppresses_invalid_utf16_root_finding` (line 6348)
-- `offline_validation_keeps_valid_utf16_root_finding` (line 6372)
-- `offline_validation_utf16_root_counts_suppressed` (line 6395)
-- `offline_validation_suppresses_invalid_utf16be_root_finding` (line 6416)
+- `offline_validation_suppresses_invalid_crc_token`
+- `offline_validation_keeps_valid_crc_token`
+- `offline_validation_does_not_affect_rules_without_gate`
+- `offline_validation_indeterminate_keeps_finding`
+- `offline_validation_mixed_rules_selective_suppression`
+- `offline_validation_suppresses_invalid_root_finding`
+- `offline_validation_keeps_valid_root_finding`
+- `offline_validation_does_not_suppress_non_root_findings`
+- `offline_validation_suppresses_invalid_utf16_root_finding`
+- `offline_validation_keeps_valid_utf16_root_finding`
+- `offline_validation_utf16_root_counts_suppressed`
+- `offline_validation_suppresses_invalid_utf16be_root_finding`
 
 ---
 
 ## Source of Truth
 
-| Component                          | File                                                    | Lines       |
-|------------------------------------|---------------------------------------------------------|-------------|
-| `OfflineValidationSpec` enum       | `crates/scanner-engine/src/api.rs`                      | 1026–1049   |
-| `OfflineValidationSpec::assert_valid` | `crates/scanner-engine/src/api.rs`                   | 1053–1074   |
-| `suppresses_on_invalid`            | `crates/scanner-engine/src/api.rs`                      | 1080–1091   |
-| `OfflineVerdict` enum              | `crates/scanner-engine/src/api.rs`                      | 1104–1114   |
-| `confidence::OFFLINE_VALID`        | `crates/scanner-engine/src/api.rs`                      | 1142        |
-| `encode_policy` (spec)             | `crates/scanner-engine/src/api.rs`                      | 1578–1598   |
-| `validate` (dispatch)              | `crates/scanner-engine/src/engine/offline_validate.rs`  | 79–93       |
-| `BASE62_LUT`                       | `crates/scanner-engine/src/engine/offline_validate.rs`  | 103–118     |
-| `base62_decode_u32`                | `crates/scanner-engine/src/engine/offline_validate.rs`  | 138–150     |
-| `validate_crc32_base62`            | `crates/scanner-engine/src/engine/offline_validate.rs`  | 164–194     |
-| `validate_github_fine_grained_pat` | `crates/scanner-engine/src/engine/offline_validate.rs`  | 213–236     |
-| `validate_grafana_service_account` | `crates/scanner-engine/src/engine/offline_validate.rs`  | 256–285     |
-| `HEX_LUT`                          | `crates/scanner-engine/src/engine/offline_validate.rs`  | 291–306     |
-| `hex_decode_u32`                   | `crates/scanner-engine/src/engine/offline_validate.rs`  | 317–332     |
-| `validate_aws_access_key`          | `crates/scanner-engine/src/engine/offline_validate.rs`  | 352–392     |
-| `decode_aws_account_id`            | `crates/scanner-engine/src/engine/offline_validate.rs`  | 410–449     |
-| `validate_sentry_org_token`        | `crates/scanner-engine/src/engine/offline_validate.rs`  | 467–513     |
-| `BASE64_LUT`                       | `crates/scanner-engine/src/engine/offline_validate.rs`  | 524–545     |
-| `BASE64URL_LUT`                    | `crates/scanner-engine/src/engine/offline_validate.rs`  | 555–574     |
-| `base64_decoded_starts_with`       | `crates/scanner-engine/src/engine/offline_validate.rs`  | 599–667     |
-| `validate_pypi_token`              | `crates/scanner-engine/src/engine/offline_validate.rs`  | 709–753     |
-| `validate_slack_token`             | `crates/scanner-engine/src/engine/offline_validate.rs`  | 841–892     |
-| `validate_slack_config_access`     | `crates/scanner-engine/src/engine/offline_validate.rs`  | 897–918     |
-| `validate_slack_xapp`              | `crates/scanner-engine/src/engine/offline_validate.rs`  | 923–947     |
-| `validate_slack_xoxb`              | `crates/scanner-engine/src/engine/offline_validate.rs`  | 953–990     |
-| `validate_slack_user_token`        | `crates/scanner-engine/src/engine/offline_validate.rs`  | 998–1019    |
-| `validate_slack_xoxe`              | `crates/scanner-engine/src/engine/offline_validate.rs`  | 1025–1056   |
-| `validate_slack_legacy`            | `crates/scanner-engine/src/engine/offline_validate.rs`  | 1061–1082   |
-| `validate_slack_legacy_workspace`  | `crates/scanner-engine/src/engine/offline_validate.rs`  | 1087–1108   |
-| `splitn_stack`                     | `crates/scanner-engine/src/engine/offline_validate.rs`  | 804–818     |
-| `all_bytes`                        | `crates/scanner-engine/src/engine/offline_validate.rs`  | 767–773     |
-| `compute_offline_verdict`          | `crates/scanner-engine/src/engine/window_validate.rs`   | 1816–1827   |
-| `apply_emit_time_policy` (offline) | `crates/scanner-engine/src/engine/window_validate.rs`   | 1775–1788   |
-| `offline_validation_gate` (pool)   | `crates/scanner-engine/src/engine/core.rs`              | 1221–1225   |
-| `offline_validation_gates` (vec)   | `crates/scanner-engine/src/engine/core.rs`              | 276         |
-| `RuleCompiled::offline_validation` | `crates/scanner-engine/src/engine/rule_repr.rs`         | 605         |
-| `scratch.offline_suppressed`       | `crates/scanner-engine/src/engine/scratch.rs`           | 633         |
-| Unit tests                         | `crates/scanner-engine/src/engine/offline_validate.rs`  | 1147–1794   |
-| Property-based tests               | `crates/scanner-engine/src/engine/offline_validate.rs`  | 1797–1877   |
-| Integration tests                  | `crates/scanner-engine/src/engine/tests.rs`             | 2517+, 6161+|
+| Component                          | File                                                    |
+|------------------------------------|---------------------------------------------------------|
+| `OfflineValidationSpec` enum       | `crates/scanner-engine/src/api.rs`                      |
+| `OfflineValidationSpec::assert_valid` | `crates/scanner-engine/src/api.rs`                   |
+| `suppresses_on_invalid`            | `crates/scanner-engine/src/api.rs`                      |
+| `OfflineVerdict` enum              | `crates/scanner-engine/src/api.rs`                      |
+| `confidence::OFFLINE_VALID`        | `crates/scanner-engine/src/api.rs`                      |
+| `encode_policy` (spec)             | `crates/scanner-engine/src/api.rs`                      |
+| `validate` (dispatch)              | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `BASE62_LUT`                       | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `base62_decode_u32`                | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_crc32_base62`            | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_github_fine_grained_pat` | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_grafana_service_account` | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `HEX_LUT`                          | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `hex_decode_u32`                   | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_aws_access_key`          | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `decode_aws_account_id`            | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_sentry_org_token`        | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `BASE64_LUT`                       | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `BASE64URL_LUT`                    | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `base64_decoded_starts_with`       | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_pypi_token`              | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_token`             | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_config_access`     | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_xapp`              | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_xoxb`              | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_user_token`        | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_xoxe`              | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_legacy`            | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `validate_slack_legacy_workspace`  | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `splitn_stack`                     | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `all_bytes`                        | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| `compute_offline_verdict`          | `crates/scanner-engine/src/engine/window_validate.rs`   |
+| `apply_emit_time_policy` (offline) | `crates/scanner-engine/src/engine/window_validate.rs`   |
+| `offline_validation_gate` (pool)   | `crates/scanner-engine/src/engine/core.rs`              |
+| `offline_validation_gates` (vec)   | `crates/scanner-engine/src/engine/core.rs`              |
+| `RuleCompiled::offline_validation` | `crates/scanner-engine/src/engine/rule_repr.rs`         |
+| `scratch.offline_suppressed`       | `crates/scanner-engine/src/engine/scratch.rs`           |
+| Unit tests                         | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| Property-based tests               | `crates/scanner-engine/src/engine/offline_validate.rs`  |
+| Integration tests                  | `crates/scanner-engine/src/engine/tests.rs`             |

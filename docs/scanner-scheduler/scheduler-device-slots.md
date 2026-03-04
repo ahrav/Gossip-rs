@@ -191,7 +191,7 @@ Current status: this module defines the contract and API, but scheduler backends
 
 ### I/O Model Enum
 
-> **Source of truth:** `device_slots.rs:506-545`
+> **Source of truth:** `device_slots.rs`
 
 The `IoModel` enum determines which resource limits apply to a given source:
 

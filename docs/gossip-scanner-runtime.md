@@ -24,6 +24,7 @@ parity testing infrastructure.
 | `src/event_sink.rs` | Output format sinks: `JsonlEventSink`, `TextEventSink`, `JsonEventSink`, `SarifEventSink`; hand-rolled JSON encoding with broken-pipe tolerance |
 | `src/parity.rs` | JSONL parity testing: `canonicalize_jsonl_events` parses scanner output into `CanonicalFinding` tuples with commit-meta joining, path normalization, and sorted deterministic comparison |
 | `src/lib_tests.rs` | Unit and integration tests for core wiring: execution mode parsing, FS/git scan dispatch, budget validation, direct/connector parity |
+| `src/cli_tests.rs` | Unit tests for CLI argument parsing: flag combinations, default values, error cases |
 | `Cargo.toml` | Dependencies: `anyhow`, `gossip-contracts`, `gossip-scan-driver`, `gossip-connectors`, `scanner-engine`, `scanner-scheduler`, `scanner-git`, `regex`, `serde_json` |
 
 ---
@@ -103,7 +104,7 @@ execute the same unified scan path.
 
 ### ParseExecutionModeError
 
-> **Source:** `src/lib.rs:76-79`
+> **Source:** `src/lib.rs`
 
 ```rust
 pub struct ParseExecutionModeError {
@@ -236,7 +237,7 @@ Flat error enum covering all runtime wiring failures:
 
 #### CliSource
 
-> **Source:** `src/cli.rs:22-28`
+> **Source:** `src/cli.rs`
 
 ```rust
 pub enum CliSource {
@@ -252,7 +253,7 @@ or `scan_git_with_runtime`.
 
 #### CliError
 
-> **Source:** `src/cli.rs:78-86`
+> **Source:** `src/cli.rs`
 
 ```rust
 pub enum CliError {
@@ -316,7 +317,7 @@ The `cli::run` function:
 
 #### DistributedRuntimeConfig
 
-> **Source:** `src/distributed.rs:57-61`
+> **Source:** `src/distributed.rs`
 
 ```rust
 pub struct DistributedRuntimeConfig {
@@ -333,7 +334,7 @@ distributed persistence. Implements `Default` (all default budgets:
 
 #### DistributedRuntimeError
 
-> **Source:** `src/distributed.rs:74-81`
+> **Source:** `src/distributed.rs`
 
 ```rust
 pub enum DistributedRuntimeError {
@@ -565,7 +566,7 @@ recording remains best-effort telemetry.
 
 ### CoordinationEventSink
 
-> **Source:** `src/coordination_sink.rs:122-125`
+> **Source:** `src/coordination_sink.rs`
 
 ```rust
 pub struct CoordinationEventSink {
@@ -637,7 +638,7 @@ scanner implementations.
 
 ### CanonicalizeError
 
-> **Source:** `src/parity.rs:61-80`
+> **Source:** `src/parity.rs`
 
 ```rust
 pub enum CanonicalizeError {

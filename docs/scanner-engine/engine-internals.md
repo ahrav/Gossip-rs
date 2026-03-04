@@ -613,34 +613,34 @@ Readers must never observe partial writes. Write-to-tmp + rename is atomic on PO
 
 ## Source of Truth
 
-| Module | File | Lines | Purpose |
-|--------|------|-------|---------|
-| ScanScratch | `crates/scanner-engine/src/engine/scratch.rs` | 1–1791 | Per-scan scratch state, dedup, drain |
-| DedupKey | `crates/scanner-engine/src/engine/scratch.rs` | 61–71 | Finding deduplication key |
-| EntropyScratch | `crates/scanner-engine/src/engine/scratch.rs` | 130–133 | Entropy histogram |
-| RootSpanMapCtx | `crates/scanner-engine/src/engine/scratch.rs` | 154–166 | Decoded→root coordinate mapping |
-| CachelineBoundary | `crates/scanner-engine/src/engine/scratch.rs` | 396–398 | Hot/cold region separator |
-| HitAccPool | `crates/scanner-engine/src/engine/hit_pool.rs` | 152–168 | Hit accumulator pool (raw pointers) |
-| SpanU32 | `crates/scanner-engine/src/engine/hit_pool.rs` | 37–42 | Compact span with anchor hint |
-| PairMeta | `crates/scanner-engine/src/engine/hit_pool.rs` | 93–100 | Per-pair collocated metadata |
-| VsDbCache | `crates/scanner-engine/src/engine/vs_cache.rs` | 84–87 | On-disk Vectorscan DB cache |
-| CacheKeyInput | `crates/scanner-engine/src/engine/vs_cache.rs` | 58–71 | Cache key computation inputs |
-| RuleCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | 587–606 | Hot compiled rule (iterated per window) |
-| RuleCold | `crates/scanner-engine/src/engine/rule_repr.rs` | 672–682 | Cold rule metadata (per emission) |
-| Variant | `crates/scanner-engine/src/engine/rule_repr.rs` | 96–100 | Encoding variant (Raw/Utf16Le/Utf16Be) |
-| Target | `crates/scanner-engine/src/engine/rule_repr.rs` | 164–165 | Packed (rule_id, variant) fanout entry |
-| PackedPatterns | `crates/scanner-engine/src/engine/rule_repr.rs` | 226–229 | Contiguous pattern storage |
-| TwoPhaseCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | 346–355 | Two-phase seed→confirm→expand gate |
-| KeywordsCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | 368–374 | Keyword ANY gate |
-| ConfirmAllCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | 402–405 | Mandatory literal ALL gate |
-| EntropyCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | 424–453 | Entropy gate parameters |
-| CharClassCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | 473–485 | Character-class distribution gate |
-| NO_GATE | `crates/scanner-engine/src/engine/rule_repr.rs` | 494 | Sentinel for absent gate (`u32::MAX`) |
-| CompiledGates | `crates/scanner-engine/src/engine/rule_repr.rs` | 768–776 | Transient gate bag from compile_rule |
-| compile_rule | `crates/scanner-engine/src/engine/rule_repr.rs` | 804–907 | Rule compilation entry point |
-| compile_confirm_all | `crates/scanner-engine/src/engine/rule_repr.rs` | 925–954 | Confirm-all gate compilation |
-| map_to_patterns | `crates/scanner-engine/src/engine/rule_repr.rs` | 1016–1043 | Anchor dedup map → flat arrays |
-| derive_min_confidence | `crates/scanner-engine/src/engine/rule_repr.rs` | 723–736 | Confidence threshold derivation |
+| Module | File | Purpose |
+|--------|------|---------|
+| ScanScratch | `crates/scanner-engine/src/engine/scratch.rs` | Per-scan scratch state, dedup, drain |
+| DedupKey | `crates/scanner-engine/src/engine/scratch.rs` | Finding deduplication key |
+| EntropyScratch | `crates/scanner-engine/src/engine/scratch.rs` | Entropy histogram |
+| RootSpanMapCtx | `crates/scanner-engine/src/engine/scratch.rs` | Decoded→root coordinate mapping |
+| CachelineBoundary | `crates/scanner-engine/src/engine/scratch.rs` | Hot/cold region separator |
+| HitAccPool | `crates/scanner-engine/src/engine/hit_pool.rs` | Hit accumulator pool (raw pointers) |
+| SpanU32 | `crates/scanner-engine/src/engine/hit_pool.rs` | Compact span with anchor hint |
+| PairMeta | `crates/scanner-engine/src/engine/hit_pool.rs` | Per-pair collocated metadata |
+| VsDbCache | `crates/scanner-engine/src/engine/vs_cache.rs` | On-disk Vectorscan DB cache |
+| CacheKeyInput | `crates/scanner-engine/src/engine/vs_cache.rs` | Cache key computation inputs |
+| RuleCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | Hot compiled rule (iterated per window) |
+| RuleCold | `crates/scanner-engine/src/engine/rule_repr.rs` | Cold rule metadata (per emission) |
+| Variant | `crates/scanner-engine/src/engine/rule_repr.rs` | Encoding variant (Raw/Utf16Le/Utf16Be) |
+| Target | `crates/scanner-engine/src/engine/rule_repr.rs` | Packed (rule_id, variant) fanout entry |
+| PackedPatterns | `crates/scanner-engine/src/engine/rule_repr.rs` | Contiguous pattern storage |
+| TwoPhaseCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | Two-phase seed→confirm→expand gate |
+| KeywordsCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | Keyword ANY gate |
+| ConfirmAllCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | Mandatory literal ALL gate |
+| EntropyCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | Entropy gate parameters |
+| CharClassCompiled | `crates/scanner-engine/src/engine/rule_repr.rs` | Character-class distribution gate |
+| NO_GATE | `crates/scanner-engine/src/engine/rule_repr.rs` | Sentinel for absent gate (`u32::MAX`) |
+| CompiledGates | `crates/scanner-engine/src/engine/rule_repr.rs` | Transient gate bag from compile_rule |
+| compile_rule | `crates/scanner-engine/src/engine/rule_repr.rs` | Rule compilation entry point |
+| compile_confirm_all | `crates/scanner-engine/src/engine/rule_repr.rs` | Confirm-all gate compilation |
+| map_to_patterns | `crates/scanner-engine/src/engine/rule_repr.rs` | Anchor dedup map → flat arrays |
+| derive_min_confidence | `crates/scanner-engine/src/engine/rule_repr.rs` | Confidence threshold derivation |
 
 ## Related Modules
 

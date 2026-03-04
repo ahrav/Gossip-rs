@@ -447,24 +447,24 @@ The cache is **not thread-safe**. Interior mutability (`UnsafeCell`, `Cell`) is 
 
 ## Source of Truth
 
-| Component | File | Key Lines |
-|-----------|------|-----------|
-| Content classification | `content_policy/mod.rs` | `classify_content`: 94–116, `is_likely_binary`: 71–77, `ContentVerdict`: 29–37, `ExtractableFormat`: 41–52, `CHECK_LEN`: 26 |
-| Extraction framework | `content_policy/extract.rs` | `Extractor` trait: 57–66, `extract_content`: 75–91, `ExtractResult`: 21–28, capacity constants: 31–35 |
-| DotEnv extractor | `content_policy/dotenv.rs` | `DotEnvExtractor`: 66, `extract` impl: 96–131, `parse_double_quoted`: 301–377, `parse_single_quoted`: 254–289, `MAX_MULTILINE_LINES`: 59 |
-| Ipynb extractor | `content_policy/ipynb.rs` | `IpynbExtractor`: 50, `extract` impl: 67–96, `Notebook`/`Cell` structs: 56–65 |
-| Java class extractor | `content_policy/java_class.rs` | `JavaClassExtractor`: 36, `extract` impl: 59–134, constant tags: 41–57, `MAGIC`: 38 |
-| JAR/WAR extractor | `content_policy/jar_war.rs` | `JarWarExtractor`: 43, `extract` impl: 52–112, budget constants: 46–50 |
-| Pyc extractor | `content_policy/pyc.rs` | `PycExtractor`: 62, `extract` impl: 103–314, type codes: 65–96, header logic: 116–117 |
-| Base64 gate | `b64_yara_gate.rs` | `Base64YaraGate`: 123–128, `build`: 141–169, `hits`: 184–188, `hits_anywhere`: 203–233, `scan_with_state`: 250–314, `yara_base64_perm`: 327–381 |
-| Gate config/policies | `b64_yara_gate.rs` | `PaddingPolicy`: 46–52, `WhitespacePolicy`: 56–61, `Base64YaraGateConfig`: 68–81, `GateState`: 102–117 |
-| Dense automaton | `b64_yara_gate.rs` | `Ac64`: 538–647, `build_from_base64_patterns`: 551–631, `next_state`: 634–636, input LUT: 470–503 |
-| Set-associative cache | `lsm/set_associative_cache.rs` | `SetAssociativeCache`: 470–522, `init`: 613–735, `get_index`: 756–777, `upsert`: 820–886, `search`: 921–944, `search_tags` (SIMD): 949–1015 |
-| Cache context trait | `lsm/set_associative_cache.rs` | `SetAssociativeCacheContext`: 93–105, `Tag` trait: 57–63 |
-| Packed int array | `lsm/set_associative_cache.rs` | `PackedUnsignedIntegerArray`: 162–264, `get`: 236–243, `set`: 253–263 |
-| Aligned buffer | `lsm/set_associative_cache.rs` | `AlignedBuf`: 278–416, `new_uninit`: 292–313, `Drop`: 408–416 |
-| Cache metrics | `lsm/set_associative_cache.rs` | `Metrics`: 113–148 |
-| Engine integration | `engine/core.rs` | `b64_gate` field: 315, gate build: 717–722 |
+| Component | File |
+|-----------|------|
+| Content classification | `content_policy/mod.rs` |
+| Extraction framework | `content_policy/extract.rs` |
+| DotEnv extractor | `content_policy/dotenv.rs` |
+| Ipynb extractor | `content_policy/ipynb.rs` |
+| Java class extractor | `content_policy/java_class.rs` |
+| JAR/WAR extractor | `content_policy/jar_war.rs` |
+| Pyc extractor | `content_policy/pyc.rs` |
+| Base64 gate | `b64_yara_gate.rs` |
+| Gate config/policies | `b64_yara_gate.rs` |
+| Dense automaton | `b64_yara_gate.rs` |
+| Set-associative cache | `lsm/set_associative_cache.rs` |
+| Cache context trait | `lsm/set_associative_cache.rs` |
+| Packed int array | `lsm/set_associative_cache.rs` |
+| Aligned buffer | `lsm/set_associative_cache.rs` |
+| Cache metrics | `lsm/set_associative_cache.rs` |
+| Engine integration | `engine/core.rs` |
 
 ## Related Modules
 

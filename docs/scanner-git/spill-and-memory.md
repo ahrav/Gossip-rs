@@ -27,82 +27,82 @@ For repositories where candidates fit in a single chunk, no disk I/O occurs.
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `Spiller` | `spiller.rs:68` | Top-level orchestrator. Owns the chunk, run file list, and spill directory. Single-threaded. Consumes itself on `finalize`. |
-| `SpillStats` | `spiller.rs:48` | Statistics from spill + seen filtering: candidates received, unique blobs, run count, spill bytes, seen/emitted counts. |
-| `SpillLimits` | `spill_limits.rs:14` | Hard caps for chunk size, run count, spill bytes, path length, and seen-store batching. 32-byte fixed layout. |
-| `BatchBuffer` | `spiller.rs:527` | Internal bounded buffer for seen-store batch queries. Stores sorted OIDs and interned paths. |
+| `Spiller` | `spiller.rs` | Top-level orchestrator. Owns the chunk, run file list, and spill directory. Single-threaded. Consumes itself on `finalize`. |
+| `SpillStats` | `spiller.rs` | Statistics from spill + seen filtering: candidates received, unique blobs, run count, spill bytes, seen/emitted counts. |
+| `SpillLimits` | `spill_limits.rs` | Hard caps for chunk size, run count, spill bytes, path length, and seen-store batching. 32-byte fixed layout. |
+| `BatchBuffer` | `spiller.rs` | Internal bounded buffer for seen-store batch queries. Stores sorted OIDs and interned paths. |
 
 ### Chunk Storage
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `CandidateChunk` | `spill_chunk.rs:37` | Bounded in-memory candidate buffer with a `ByteArena` for paths. Supports sort, exact-match dedup, and per-OID canonical reduction. |
-| `ResolvedIter` | `spill_chunk.rs:230` | Iterator over resolved candidates with path bytes borrowed from the chunk's arena. |
+| `CandidateChunk` | `spill_chunk.rs` | Bounded in-memory candidate buffer with a `ByteArena` for paths. Supports sort, exact-match dedup, and per-OID canonical reduction. |
+| `ResolvedIter` | `spill_chunk.rs` | Iterator over resolved candidates with path bytes borrowed from the chunk's arena. |
 
 ### Run File Format
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `RunHeader` | `run_format.rs:36` | 12-byte header: magic `SRUN`, version (1), OID length (20 or 32), record count. Big-endian encoding. |
-| `RunContext` | `run_format.rs:109` | Per-record context: `commit_id`, `parent_idx`, `change_kind`, `ctx_flags`, `cand_flags`. |
-| `RunRecord` | `run_format.rs:126` | Single spill record: OID + context + raw path bytes. Implements canonical `Ord`. |
-| `RunWriter` | `run_writer.rs:14` | Writes sorted `RunRecord`s to a buffered output with header enforcement. |
-| `RunReader` | `run_reader.rs:17` | Reads `RunRecord`s from a run file with max-path-length validation. |
+| `RunHeader` | `run_format.rs` | 12-byte header: magic `SRUN`, version (1), OID length (20 or 32), record count. Big-endian encoding. |
+| `RunContext` | `run_format.rs` | Per-record context: `commit_id`, `parent_idx`, `change_kind`, `ctx_flags`, `cand_flags`. |
+| `RunRecord` | `run_format.rs` | Single spill record: OID + context + raw path bytes. Implements canonical `Ord`. |
+| `RunWriter` | `run_writer.rs` | Writes sorted `RunRecord`s to a buffered output with header enforcement. |
+| `RunReader` | `run_reader.rs` | Reads `RunRecord`s from a run file with max-path-length validation. |
 
 ### External Sort / Merge
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `RunMerger` | `spill_merge.rs:27` | K-way merge reader. Uses a `BinaryHeap` min-heap with per-cursor scratch records. Deduplicates by comparing against the last emitted key. |
-| `merge_all` | `spill_merge.rs:230` | Convenience function that merges runs fully into memory (tests/small repos). |
-| `validate_headers` | `spill_merge.rs:243` | Validates consistent OID length across run headers. |
+| `RunMerger` | `spill_merge.rs` | K-way merge reader. Uses a `BinaryHeap` min-heap with per-cursor scratch records. Deduplicates by comparing against the last emitted key. |
+| `merge_all` | `spill_merge.rs` | Convenience function that merges runs fully into memory (tests/small repos). |
+| `validate_headers` | `spill_merge.rs` | Validates consistent OID length across run headers. |
 
 ### Arena Allocation
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `ByteArena` | `byte_arena.rs:104` | Bump allocator for variable-length byte sequences. Hard `u32` capacity limit (~4 GiB). Pre-allocation capped at 1 MiB. |
-| `ByteRef` | `byte_arena.rs:37` | 8-byte copyable handle (offset `u32` + length `u16`). Offset-based, so `Vec` reallocation does not invalidate references. |
+| `ByteArena` | `byte_arena.rs` | Bump allocator for variable-length byte sequences. Hard `u32` capacity limit (~4 GiB). Pre-allocation capped at 1 MiB. |
+| `ByteRef` | `byte_arena.rs` | 8-byte copyable handle (offset `u32` + length `u16`). Offset-based, so `Vec` reallocation does not invalidate references. |
 
 ### Spill Arena (Memory-Mapped)
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `SpillArena` | `spill_arena.rs:130` | Append-only mmap-backed arena for tree payloads. Dual-mapping: `MmapMut` writer + `Arc<Mmap>` reader. Single-writer design. |
-| `SpillSlice` | `spill_arena.rs:42` | Reference to spilled bytes. Holds `Arc<Mmap>` so it outlives the arena. |
-| `SpillArenaError` | `spill_arena.rs:78` | IO errors or out-of-space conditions. |
-| `SpillIndex` | `object_store.rs:141` | Open-addressing hash table for spilled tree payloads. Power-of-two sized (64..1,048,576 slots), linear probing, no tombstones. Best-effort: once full, new spills are not indexed. |
-| `SpillIndexEntry` | `object_store.rs:95` | Fixed slot: OID key (up to 32 bytes), spill offset, and length. `key_len == 0` marks empty. |
+| `SpillArena` | `spill_arena.rs` | Append-only mmap-backed arena for tree payloads. Dual-mapping: `MmapMut` writer + `Arc<Mmap>` reader. Single-writer design. |
+| `SpillSlice` | `spill_arena.rs` | Reference to spilled bytes. Holds `Arc<Mmap>` so it outlives the arena. |
+| `SpillArenaError` | `spill_arena.rs` | IO errors or out-of-space conditions. |
+| `SpillIndex` | `object_store.rs` | Open-addressing hash table for spilled tree payloads. Power-of-two sized (64..1,048,576 slots), linear probing, no tombstones. Best-effort: once full, new spills are not indexed. |
+| `SpillIndexEntry` | `object_store.rs` | Fixed slot: OID key (up to 32 bytes), spill offset, and length. `key_len == 0` marks empty. |
 
 ### Blob Spill
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `BlobSpill` | `blob_spill.rs:28` | Fixed-size mmap-backed spill file for oversized blob payloads. Dual-mapping strategy. File deleted on drop (best-effort). |
-| `BlobSpillWriter` | `blob_spill.rs:93` | Sequential append-only writer. Must write exactly `len` bytes before `finish`. |
+| `BlobSpill` | `blob_spill.rs` | Fixed-size mmap-backed spill file for oversized blob payloads. Dual-mapping strategy. File deleted on drop (best-effort). |
+| `BlobSpillWriter` | `blob_spill.rs` | Sequential append-only writer. Must write exactly `len` bytes before `finish`. |
 
 ### Blob Introduction
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `BlobIntroducer` | `blob_introducer.rs:515` | Serial blob introduction walker. Traverses commits in topo order, discovers each unique blob exactly once via `SeenSets` (packed) and `LooseOidSet` (loose). |
-| `BlobIntroWorker` | `blob_introducer.rs:851` | Parallel worker variant. Shares `AtomicSeenSets` for lock-free dedup. Each worker owns its own `ObjectStore` and `PackCandidateCollector`. |
-| `SeenSets` | `blob_introducer.rs:74` | Three independent `DynamicBitSet` bitmaps (trees, blobs, blobs_excluded) keyed by MIDX index. Non-atomic; used by the serial path. |
-| `LooseOidSet` | `blob_introducer.rs:187` | Fixed-capacity open-addressing hash set for loose OIDs not in the MIDX. Linear probing, 70% load factor, power-of-two sizing. One-byte tag for early rejection. |
-| `BlobIntroStats` | `blob_introducer.rs:274` | Counters: commits visited, trees loaded, tree bytes, peak in-flight, blobs emitted, subtrees skipped, max depth. |
-| `ParallelIntroResult` | `blob_introducer.rs:1099` | Merged output from parallel workers: packed/loose candidates, merged path arena, aggregated stats. |
+| `BlobIntroducer` | `blob_introducer.rs` | Serial blob introduction walker. Traverses commits in topo order, discovers each unique blob exactly once via `SeenSets` (packed) and `LooseOidSet` (loose). |
+| `BlobIntroWorker` | `blob_introducer.rs` | Parallel worker variant. Shares `AtomicSeenSets` for lock-free dedup. Each worker owns its own `ObjectStore` and `PackCandidateCollector`. |
+| `SeenSets` | `blob_introducer.rs` | Three independent `DynamicBitSet` bitmaps (trees, blobs, blobs_excluded) keyed by MIDX index. Non-atomic; used by the serial path. |
+| `LooseOidSet` | `blob_introducer.rs` | Fixed-capacity open-addressing hash set for loose OIDs not in the MIDX. Linear probing, 70% load factor, power-of-two sizing. One-byte tag for early rejection. |
+| `BlobIntroStats` | `blob_introducer.rs` | Counters: commits visited, trees loaded, tree bytes, peak in-flight, blobs emitted, subtrees skipped, max depth. |
+| `ParallelIntroResult` | `blob_introducer.rs` | Merged output from parallel workers: packed/loose candidates, merged path arena, aggregated stats. |
 
 ### Seen Store and Sink Traits
 
 | Type | Location | Description |
 |------|----------|-------------|
-| `SeenBlobStore` (trait) | `seen_store.rs:20` | Batch query interface for seen-blob filtering. Returns one bool per OID; inputs expected sorted. |
-| `NeverSeenStore` | `seen_store.rs:27` | Marks all blobs unseen (full-scan mode). |
-| `AlwaysSeenStore` | `seen_store.rs:37` | Marks all blobs seen (testing). |
-| `InMemorySeenStore` | `seen_store.rs:49` | `HashSet`-backed store for tests. |
-| `UniqueBlobSink` (trait) | `unique_blob.rs:30` | Receives unique, unseen blobs. Path `ByteRef` is valid only for the `emit` call duration. |
-| `UniqueBlob` | `unique_blob.rs:17` | OID + canonical `CandidateContext` with path reference. |
-| `CollectingUniqueBlobSink` | `unique_blob.rs:44` | Test sink that stores blobs with owned path copies. |
+| `SeenBlobStore` (trait) | `seen_store.rs` | Batch query interface for seen-blob filtering. Returns one bool per OID; inputs expected sorted. |
+| `NeverSeenStore` | `seen_store.rs` | Marks all blobs unseen (full-scan mode). |
+| `AlwaysSeenStore` | `seen_store.rs` | Marks all blobs seen (testing). |
+| `InMemorySeenStore` | `seen_store.rs` | `HashSet`-backed store for tests. |
+| `UniqueBlobSink` (trait) | `unique_blob.rs` | Receives unique, unseen blobs. Path `ByteRef` is valid only for the `emit` call duration. |
+| `UniqueBlob` | `unique_blob.rs` | OID + canonical `CandidateContext` with path reference. |
+| `CollectingUniqueBlobSink` | `unique_blob.rs` | Test sink that stores blobs with owned path copies. |
 
 ## External Sort
 
@@ -112,10 +112,10 @@ The spill subsystem implements an external merge sort over blob candidates.
 
 When `Spiller::push` fills the in-memory `CandidateChunk` (exceeding
 `SpillLimits::max_chunk_candidates` or `max_chunk_path_bytes`), the spiller
-calls `spill_chunk` (`spiller.rs:164`):
+calls `spill_chunk` (`spiller.rs`):
 
 1. The chunk is sorted by canonical key and deduped (`CandidateChunk::sort_and_dedupe`,
-   `spill_chunk.rs:145`).
+   `spill_chunk.rs`).
 2. Dedup runs two passes: exact-match dedup on the full key, then per-OID
    reduction that keeps only the most canonical candidate for each distinct
    OID (lowest commit id, then path, then context fields).
@@ -127,24 +127,24 @@ calls `spill_chunk` (`spiller.rs:164`):
 
 Records are ordered by: OID, path bytes (raw, not arena offset), commit id,
 parent index, change kind, context flags, candidate flags. This ordering is
-defined in `compare_candidates` (`spill_chunk.rs:258`) and
-`RunRecord::cmp_canonical` (`run_format.rs:139`).
+defined in `compare_candidates` (`spill_chunk.rs`) and
+`RunRecord::cmp_canonical` (`run_format.rs`).
 
 Canonical **selection** for a given OID (which context wins) uses a different
 priority: commit id (lowest wins), then path bytes, parent index, change
 kind, context flags, candidate flags — implemented in `is_more_canonical`
-(`spiller.rs:490`).
+(`spiller.rs`).
 
 ### K-Way Merge
 
-`RunMerger` (`spill_merge.rs:27`) merges sorted run files into a single
+`RunMerger` (`spill_merge.rs`) merges sorted run files into a single
 sorted stream:
 
 1. Each run file is opened as a `RunReader` wrapped in a `BufReader` (256 KB
-   buffer, `spiller.rs:39`).
+   buffer, `spiller.rs`).
 2. The merger creates one `RunCursor` per reader and seeds a `BinaryHeap`
    (min-heap via reversed `Ord`) with the first record from each cursor.
-3. On each `next_unique` call (`spill_merge.rs:102`):
+3. On each `next_unique` call (`spill_merge.rs`):
    - The smallest item is popped from the heap.
    - If it matches the last emitted key, it is skipped (dedupe).
    - Otherwise it is emitted and the cursor that produced it is advanced.
@@ -156,12 +156,12 @@ sorted stream:
 
 ### Finalize
 
-`Spiller::finalize` (`spiller.rs:213`) consumes the spiller:
+`Spiller::finalize` (`spiller.rs`) consumes the spiller:
 
 - **No runs on disk**: the in-memory chunk is sorted, deduped, and processed
-  directly (`process_chunk_only`, `spiller.rs:247`).
+   directly (`process_chunk_only`, `spiller.rs`).
 - **Runs on disk**: the final chunk is spilled, then all runs are merged
-  (`process_with_merge`, `spiller.rs:309`).
+   (`process_with_merge`, `spiller.rs`).
 
 In both paths, unique OIDs are batched for seen-store queries (`BatchBuffer`
 with `seen_batch_max_oids` and `seen_batch_max_path_bytes` limits). Unseen
@@ -172,7 +172,7 @@ after finalize (also deleted on drop as a safety net).
 
 ### ByteArena
 
-`ByteArena` (`byte_arena.rs:104`) is a bump allocator for variable-length
+`ByteArena` (`byte_arena.rs`) is a bump allocator for variable-length
 byte sequences, primarily used to intern file paths. Key properties:
 
 - **Append-only**: bytes are not removed; references stay valid until an
@@ -182,15 +182,15 @@ byte sequences, primarily used to intern file paths. Key properties:
   invalidate them.
 - **No deduplication**: repeated inserts store repeated bytes.
 - **Hard capacity**: bounded at creation by a `u32` limit. Pre-allocation is
-  capped at 1 MiB (`PREALLOC_MAX_BYTES`, `byte_arena.rs:111`) to avoid large
+   capped at 1 MiB (`PREALLOC_MAX_BYTES`, `byte_arena.rs`) to avoid large
   upfront reservations on small repos.
 - **Complexity**: `intern` is O(n) in inserted length (memcpy); `get` is O(1).
-- **Arena merging**: `append_arena` (`byte_arena.rs:221`) copies another
+- **Arena merging**: `append_arena` (`byte_arena.rs`) copies another
   arena's bytes and returns the base offset for rebasing `ByteRef` handles.
 
 ### SpillArena
 
-`SpillArena` (`spill_arena.rs:130`) is a memory-mapped, append-only arena
+`SpillArena` (`spill_arena.rs`) is a memory-mapped, append-only arena
 for tree payloads that exceed the in-memory cache. Key properties:
 
 - **Dual-mapping**: `MmapMut` for writes, `Arc<Mmap>` for reads. Kernel
@@ -200,14 +200,14 @@ for tree payloads that exceed the in-memory cache. Key properties:
 - **SpillSlice**: returned handles hold an `Arc<Mmap>`, decoupling their
   lifetime from the arena itself.
 - **Sequential access hints**: on Linux, `posix_fadvise(SEQUENTIAL)` and
-  `madvise(SEQUENTIAL)` are issued (`spill_arena.rs:268`).
+   `madvise(SEQUENTIAL)` are issued (`spill_arena.rs`).
 - **Unique file naming**: PID + timestamp + monotonic counter
-  (`SPILL_COUNTER`, `spill_arena.rs:228`) prevent collisions during parallel
+   (`SPILL_COUNTER`, `spill_arena.rs`) prevent collisions during parallel
   blob introduction.
 
 ### SpillIndex
 
-`SpillIndex` (`object_store.rs:141`) is a fixed-size open-addressing hash
+`SpillIndex` (`object_store.rs`) is a fixed-size open-addressing hash
 table that maps OIDs to spill arena offsets/lengths:
 
 - Power-of-two sized (64..1,048,576 slots).
@@ -225,14 +225,14 @@ lists for downstream pipeline stages.
 
 ### Serial Path
 
-`BlobIntroducer` (`blob_introducer.rs:515`) processes all commits
+`BlobIntroducer` (`blob_introducer.rs`) processes all commits
 sequentially:
 
 1. For each commit, the root tree OID is resolved.
 2. The tree is walked depth-first using an explicit stack of `TreeFrame`s
-   (`blob_introducer.rs:488`).
+   (`blob_introducer.rs`).
 3. **Packed objects** (present in MIDX) are deduped via `SeenSets`
-   (`blob_introducer.rs:74`) — three independent `DynamicBitSet` bitmaps
+   (`blob_introducer.rs`) — three independent `DynamicBitSet` bitmaps
    keyed by MIDX index:
    - `trees` — skip entire subtrees when the tree OID is already visited.
    - `blobs` — track emitted blob candidates.
@@ -240,17 +240,17 @@ sequentially:
      separate so an excluded path does not suppress a legitimate non-excluded
      emit for the same OID.
 4. **Loose objects** (not in MIDX) are deduped via `LooseOidSet`
-   (`blob_introducer.rs:187`), a fixed-capacity open-addressing hash set
+   (`blob_introducer.rs`), a fixed-capacity open-addressing hash set
    with 70% load factor and one-byte tag for early rejection. Hashing uses
-   `hash_oid` (`blob_introducer.rs:810`): XOR of head/tail 8 bytes + Stafford
+   `hash_oid` (`blob_introducer.rs`): XOR of head/tail 8 bytes + Stafford
    variant 13 finalizer.
-5. Tree payloads are loaded via `TreeCursor` (`blob_introducer.rs:444`),
+5. Tree payloads are loaded via `TreeCursor` (`blob_introducer.rs`),
    which selects buffered (small trees below `stream_threshold`) vs streaming
    (large or spilled trees) parsing to keep the in-flight byte budget bounded.
 
 ### Parallel Path
 
-`introduce_parallel` (`blob_introducer.rs:1126`) spawns multiple
+`introduce_parallel` (`blob_introducer.rs`) spawns multiple
 `BlobIntroWorker`s via `std::thread::scope`:
 
 1. The commit plan is pre-partitioned into ~4x `worker_count` chunks.
@@ -262,10 +262,10 @@ sequentially:
 5. Workers check an `AtomicBool` abort flag every 4096 tree entries for
    responsiveness.
 6. After all workers finish, results are merged
-   (`merge_worker_results`, `blob_introducer.rs:1330`):
+   (`merge_worker_results`, `blob_introducer.rs`):
    - Path arenas are concatenated with offset rebasing.
    - Loose candidates are deduplicated by OID with deterministic context
-     tie-breakers (`dedup_loose_by_oid`, `blob_introducer.rs:1443`).
+      tie-breakers (`dedup_loose_by_oid`, `blob_introducer.rs`).
    - Global packed/loose caps are re-validated.
    - Stats use saturating sums for counters, max for peaks.
 
@@ -275,13 +275,13 @@ that first claims a blob determines its context (race-winner). The blob
 
 ## Blob Spill
 
-`BlobSpill` (`blob_spill.rs:28`) handles oversized individual blob payloads
+`BlobSpill` (`blob_spill.rs`) handles oversized individual blob payloads
 that should not be held entirely in memory:
 
 - Fixed-size mmap-backed file created under the spill directory.
 - Dual-mapping strategy (same as `SpillArena`): `MmapMut` writer, `Arc<Mmap>`
   reader.
-- `BlobSpillWriter` (`blob_spill.rs:93`) fills the file sequentially and
+- `BlobSpillWriter` (`blob_spill.rs`) fills the file sequentially and
   enforces that exactly `len` bytes are written before `finish`.
 - The spill file is deleted on drop (best-effort via `fs::remove_file`).
 - Unique naming uses the same PID + timestamp + monotonic counter pattern.
@@ -292,7 +292,7 @@ Memory usage is controlled at multiple levels through explicit configuration
 structs. All limits are enforced at runtime; violations produce errors (not
 panics) so the scan can degrade gracefully.
 
-### SpillLimits (`spill_limits.rs:14`)
+### SpillLimits (`spill_limits.rs`)
 
 Controls candidate chunk and run management:
 
@@ -306,10 +306,10 @@ Controls candidate chunk and run management:
 | `seen_batch_max_oids` | 8,192 | 1M | OIDs per seen-store batch query |
 | `seen_batch_max_path_bytes` | 512 KB | 64 MB | Path arena per batch |
 
-A `RESTRICTIVE` preset (`spill_limits.rs:69`) is provided for tests (e.g.,
+A `RESTRICTIVE` preset (`spill_limits.rs`) is provided for tests (e.g.,
 16K candidates, 512 MB spill, 16 runs).
 
-### TreeDiffLimits (`tree_diff_limits.rs:31`)
+### TreeDiffLimits (`tree_diff_limits.rs`)
 
 Controls tree loading and candidate collection during blob introduction:
 
@@ -326,7 +326,7 @@ Controls tree loading and candidate collection during blob introduction:
 ### Parallel Worker Budget Division
 
 In parallel blob introduction (`introduce_parallel`,
-`blob_introducer.rs:1126`), global budgets are divided by `worker_count`
+`blob_introducer.rs`), global budgets are divided by `worker_count`
 with per-worker floors:
 
 | Budget | Division | Floor |
@@ -346,46 +346,46 @@ are approximate.
 
 | Check | Location | Consequence |
 |-------|----------|-------------|
-| Chunk candidate overflow | `spiller.rs:138` | Spill current chunk, retry push |
-| Spill run limit | `spiller.rs:168` | `SpillError::SpillRunLimitExceeded` |
-| Spill byte limit | `spiller.rs:195` | `SpillError::SpillBytesExceeded` |
-| Path too long | `spill_chunk.rs:112` | `SpillError::PathTooLong` |
-| Arena overflow | `byte_arena.rs:138` | `intern` returns `None` |
-| SpillArena out of space | `spill_arena.rs:187` | `SpillArenaError::OutOfSpace` |
-| Tree bytes in-flight | `blob_introducer.rs:658` | `TreeDiffError::TreeBytesBudgetExceeded` |
-| Max tree depth | `blob_introducer.rs:646` | `TreeDiffError::MaxTreeDepthExceeded` |
-| Loose candidate cap | `blob_introducer.rs:237` | `TreeDiffError::CandidateLimitExceeded` |
-| Seen response mismatch | `spiller.rs:440` | `SpillError::SeenResponseMismatch` |
-| OID length mismatch | `spill_merge.rs:60` | `SpillError::OidLengthMismatch` |
+| Chunk candidate overflow | `spiller.rs` | Spill current chunk, retry push |
+| Spill run limit | `spiller.rs` | `SpillError::SpillRunLimitExceeded` |
+| Spill byte limit | `spiller.rs` | `SpillError::SpillBytesExceeded` |
+| Path too long | `spill_chunk.rs` | `SpillError::PathTooLong` |
+| Arena overflow | `byte_arena.rs` | `intern` returns `None` |
+| SpillArena out of space | `spill_arena.rs` | `SpillArenaError::OutOfSpace` |
+| Tree bytes in-flight | `blob_introducer.rs` | `TreeDiffError::TreeBytesBudgetExceeded` |
+| Max tree depth | `blob_introducer.rs` | `TreeDiffError::MaxTreeDepthExceeded` |
+| Loose candidate cap | `blob_introducer.rs` | `TreeDiffError::CandidateLimitExceeded` |
+| Seen response mismatch | `spiller.rs` | `SpillError::SeenResponseMismatch` |
+| OID length mismatch | `spill_merge.rs` | `SpillError::OidLengthMismatch` |
 
 ## Source of Truth
 
-| Concept | Source File | Line Range |
-|---------|-------------|------------|
-| Spill orchestrator | `crates/scanner-git/src/spiller.rs` | 68–470 |
-| Spill statistics | `crates/scanner-git/src/spiller.rs` | 48–61 |
-| Batch seen-store buffer | `crates/scanner-git/src/spiller.rs` | 527–635 |
-| Candidate chunk | `crates/scanner-git/src/spill_chunk.rs` | 37–225 |
-| Canonical ordering | `crates/scanner-git/src/spill_chunk.rs` | 258–268 |
-| Per-OID canonical reduction | `crates/scanner-git/src/spill_chunk.rs` | 154–184 |
-| K-way merge | `crates/scanner-git/src/spill_merge.rs` | 27–141 |
-| Run file format | `crates/scanner-git/src/run_format.rs` | 1–189 |
-| Run writer | `crates/scanner-git/src/run_writer.rs` | 14–125 |
-| Run reader | `crates/scanner-git/src/run_reader.rs` | 17–150 |
-| Spill limits | `crates/scanner-git/src/spill_limits.rs` | 14–188 |
-| Byte arena | `crates/scanner-git/src/byte_arena.rs` | 37–238 |
-| Spill arena (mmap) | `crates/scanner-git/src/spill_arena.rs` | 42–222 |
-| Spill index (hash table) | `crates/scanner-git/src/object_store.rs` | 89–165 |
-| Blob spill | `crates/scanner-git/src/blob_spill.rs` | 28–152 |
-| Serial blob introducer | `crates/scanner-git/src/blob_introducer.rs` | 515–788 |
-| Parallel blob introduction | `crates/scanner-git/src/blob_introducer.rs` | 1126–1317 |
-| Worker result merge | `crates/scanner-git/src/blob_introducer.rs` | 1330–1420 |
-| Seen sets (non-atomic) | `crates/scanner-git/src/blob_introducer.rs` | 74–151 |
-| Loose OID hash set | `crates/scanner-git/src/blob_introducer.rs` | 187–270 |
-| Blob intro stats | `crates/scanner-git/src/blob_introducer.rs` | 274–289 |
-| Seen-blob store trait | `crates/scanner-git/src/seen_store.rs` | 20–23 |
-| Unique blob sink trait | `crates/scanner-git/src/unique_blob.rs` | 30–38 |
-| Tree diff limits | `crates/scanner-git/src/tree_diff_limits.rs` | 31–95 |
+| Concept | Source File |
+|---------|-------------|
+| Spill orchestrator | `crates/scanner-git/src/spiller.rs` |
+| Spill statistics | `crates/scanner-git/src/spiller.rs` |
+| Batch seen-store buffer | `crates/scanner-git/src/spiller.rs` |
+| Candidate chunk | `crates/scanner-git/src/spill_chunk.rs` |
+| Canonical ordering | `crates/scanner-git/src/spill_chunk.rs` |
+| Per-OID canonical reduction | `crates/scanner-git/src/spill_chunk.rs` |
+| K-way merge | `crates/scanner-git/src/spill_merge.rs` |
+| Run file format | `crates/scanner-git/src/run_format.rs` |
+| Run writer | `crates/scanner-git/src/run_writer.rs` |
+| Run reader | `crates/scanner-git/src/run_reader.rs` |
+| Spill limits | `crates/scanner-git/src/spill_limits.rs` |
+| Byte arena | `crates/scanner-git/src/byte_arena.rs` |
+| Spill arena (mmap) | `crates/scanner-git/src/spill_arena.rs` |
+| Spill index (hash table) | `crates/scanner-git/src/object_store.rs` |
+| Blob spill | `crates/scanner-git/src/blob_spill.rs` |
+| Serial blob introducer | `crates/scanner-git/src/blob_introducer.rs` |
+| Parallel blob introduction | `crates/scanner-git/src/blob_introducer.rs` |
+| Worker result merge | `crates/scanner-git/src/blob_introducer.rs` |
+| Seen sets (non-atomic) | `crates/scanner-git/src/blob_introducer.rs` |
+| Loose OID hash set | `crates/scanner-git/src/blob_introducer.rs` |
+| Blob intro stats | `crates/scanner-git/src/blob_introducer.rs` |
+| Seen-blob store trait | `crates/scanner-git/src/seen_store.rs` |
+| Unique blob sink trait | `crates/scanner-git/src/unique_blob.rs` |
+| Tree diff limits | `crates/scanner-git/src/tree_diff_limits.rs` |
 
 ## Related Docs
 

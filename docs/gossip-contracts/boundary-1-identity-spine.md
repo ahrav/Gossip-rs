@@ -420,6 +420,70 @@ entanglement throughout the derivation API.
 
 ---
 
+## 10. Coordination Time and Fencing Types
+
+The `coordination.rs` module defines protocol-critical newtypes for time
+and fencing.  These types enforce invariants that prevent split-brain
+behaviour and immortal leases.
+
+### FenceEpoch
+
+Monotonically increasing epoch for leader fencing.  Prevents stale leaders
+from mutating shard state after a new leader has been elected.  The epoch
+is incremented on every leader transition; operations bearing an outdated
+epoch are rejected.
+
+| Constant / Method | Description |
+|---|---|
+| `ZERO` | Sentinel: "no epoch assigned" (pre-registration state) |
+| `INITIAL` | First valid epoch (value 1); shard records start here after creation |
+| `from_raw(u64)` | Construct from a raw integer |
+| `as_raw(&self) -> u64` | Return the inner value |
+| `is_assigned(&self) -> bool` | `true` if not `ZERO` |
+| `increment(&self) -> Self` | Advance by one. **Panics** at `u64::MAX` — `saturating_add` would silently produce duplicate epochs, breaking mutual exclusion |
+
+`FenceEpoch` implements `CanonicalBytes` (8-byte LE, no length prefix).
+Compile-time assertions verify `ZERO.as_raw() == 0` and
+`INITIAL.as_raw() == 1`.
+
+> Design reference: Kleppmann, "How to do distributed locking" (2016);
+> Hochstein, "Fencing Tokens" FizzBee formal model (2025).
+
+### LogicalTime
+
+Monotonic logical clock for lease expiration and ordering.  This is
+**not** wall-clock time — it is an abstract counter used for lease
+expiration, Lamport timestamps, and deterministic simulation clocks.
+
+| Constant / Method | Description |
+|---|---|
+| `ZERO` | Origin of time; operations require `now > ZERO` |
+| `from_raw(u64)` | Construct from a raw integer |
+| `as_raw(&self) -> u64` | Return the inner value |
+| `checked_add(&self, duration: u64) -> Option<Self>` | Advance time by `duration`.  Returns `None` on overflow to prevent immortal leases |
+
+`LogicalTime` implements `CanonicalBytes` (8-byte LE, no length prefix).
+
+> Design reference: Gray & Cheriton, "Leases: An Efficient Fault-Tolerant
+> Mechanism for Distributed File Cache Consistency" (SOSP 1989).
+
+### ShardId::is_derived
+
+`ShardId::is_derived()` returns `true` when bit 63 is set, marking the
+shard as having been produced by `derive_split_shard_id` (in
+`gossip-coordination`).  Root shards (externally assigned) have bit 63
+clear.  This single-bit tag lets any layer distinguish root from split
+shards without querying the coordinator.
+
+### TenantSecretKey::is_valid
+
+`TenantSecretKey::is_valid()` returns `true` if the key is not all-zeros.
+An all-zero key provides no tenant isolation and should be rejected during
+provisioning.  This is a necessary but not sufficient entropy check;
+production provisioning should use cryptographically random key material.
+
+---
+
 ## 11. Fallible Constructors and IdentityInputError
 
 Several identity types provide both panicking constructors (for trusted internal

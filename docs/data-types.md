@@ -2,7 +2,7 @@
 
 Class diagram showing the key types in scanner-rs and their relationships.
 Verified against:
-`crates/scanner-engine/src/api.rs`, `crates/scanner-engine/src/engine/core.rs`, `crates/scanner-engine/src/engine/rule_repr.rs`,
+`crates/scanner-engine/src/api.rs` (includes `FindingRec`, `RuleSpec`, `OfflineValidationSpec`), `crates/scanner-engine/src/engine/core.rs`, `crates/scanner-engine/src/engine/rule_repr.rs`,
 `crates/scanner-engine/src/engine/scratch.rs`, `crates/scanner-engine/src/engine/hit_pool.rs`, `crates/scanner-engine/src/engine/safelist.rs`,
 `crates/scanner-engine/src/engine/offline_validate.rs`, `crates/scanner-engine/src/scratch_memory.rs`,
 `crates/scanner-scheduler/src/runtime.rs`, `crates/scanner-scheduler/src/pipeline.rs`,
