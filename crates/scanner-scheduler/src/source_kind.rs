@@ -2,6 +2,10 @@
 
 use std::fmt;
 
+/// Discriminant for the origin of scanned content.
+///
+/// Used in event payloads and progress reporting to distinguish filesystem
+/// scans from git-history scans.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceKind {
     /// Local filesystem source.
@@ -11,6 +15,7 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
+    /// Return the lowercase wire-format label (`"fs"` or `"git"`).
     #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {

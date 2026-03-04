@@ -28,9 +28,15 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [architecture.md](architecture.md)                     | Data flow                        | Walker → Reader → Scanner → Output, transform worklist |
 | [data-types.md](data-types.md)                         | Class diagrams                   | Key type relationships across crates                   |
 | [pipeline-flow.md](pipeline-flow.md)                   | Pipeline execution flow          | Discovery, executor model, backpressure                |
-| [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Reverse pump order, stall detection                    |
+| [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Executor termination, `scan_local` states, worker tasks |
 | [git-scanning.md](scanner-git/git-scanning.md)         | End-to-end Git scanning pipeline | Pipeline stages, persistence contract, ODB-blob mode   |
 | [git-pack-execution.md](scanner-git/git-pack-execution.md) | Git packfile internals       | Pack parsing, delta resolution, blob introduction, caching |
+| [git-object-store.md](scanner-git/git-object-store.md) | Git object storage layer         | OID indexing, pack/loose unification, delta resolution     |
+| [commit-walking.md](scanner-git/commit-walking.md)     | Commit graph traversal           | Two-frontier walk, generation ordering, topo sort          |
+| [runner-orchestration.md](scanner-git/runner-orchestration.md) | Scan runner lifecycle      | Engine adapter, scheduling, finalization                   |
+| [tree-diffing.md](scanner-git/tree-diffing.md)         | Tree diff algorithm              | Merge-walk, canonical ordering, caching, streaming         |
+| [spill-and-memory.md](scanner-git/spill-and-memory.md) | Spill & memory management        | External sort, arenas, blob introduction, memory budgets   |
+| [pack-internals.md](scanner-git/pack-internals.md)     | Pack file low-level internals    | Index lookup, delta chains, inflation, caching, planning   |
 
 ---
 
@@ -142,6 +148,7 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [scheduler_test_harness_guide.md](scanner-scheduler/scheduler_test_harness_guide.md) | Scheduler simulation harness  | Work-stealing policy checks, deterministic replay      |
 | [git_simulation_harness_guide.md](scanner-git/git_simulation_harness_guide.md)       | Git simulation harness        | Stage model, fault injection, corpus replay            |
 | [simulation-framework.md](scanner-scheduler/simulation-framework.md)                 | Scanner simulation framework  | SimClock, fault injection, mutation testing, minimization |
+| [scanner-engine-integration-tests.md](scanner-engine-integration-tests.md)           | Integration test crate        | Test binaries, corpora, feature gates, runner instructions |
 
 ### Evaluation & Accuracy
 
@@ -210,13 +217,19 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Understand content detection        | [content-policy-and-caching.md](scanner-engine/content-policy-and-caching.md)                                                                                 |
 | Understand the work-stealing executor | [scheduler-executor.md](scanner-scheduler/scheduler-executor.md)                                                                                            |
 | Understand archive scanning         | [archive-scanning.md](scanner-scheduler/archive-scanning.md)                                                                                                  |
-| Understand git pack internals       | [git-pack-execution.md](scanner-git/git-pack-execution.md)                                                                                                    |
+| Understand git pack internals       | [git-pack-execution.md](scanner-git/git-pack-execution.md) → [pack-internals.md](scanner-git/pack-internals.md)                                              |
+| Understand git object storage       | [git-object-store.md](scanner-git/git-object-store.md)                                                                                                        |
+| Understand commit graph walking     | [commit-walking.md](scanner-git/commit-walking.md)                                                                                                            |
+| Understand git scan orchestration   | [runner-orchestration.md](scanner-git/runner-orchestration.md)                                                                                                |
+| Understand tree diffing             | [tree-diffing.md](scanner-git/tree-diffing.md)                                                                                                                |
+| Understand spill/memory management  | [spill-and-memory.md](scanner-git/spill-and-memory.md)                                                                                                        |
 | Understand coordination errors      | [coordination-error-model.md](gossip-coordination/coordination-error-model.md)                                                                                |
 | Understand scanner simulation       | [simulation-framework.md](scanner-scheduler/simulation-framework.md)                                                                                          |
 | Understand FS persistence           | [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md)                                                                                    |
 | Understand persistence identity     | [persistence-identity.md](gossip-contracts/persistence-identity.md)                                                                                           |
 | Measure scanner accuracy            | [eval-harness.md](eval-harness.md)                                                                                                                            |
 | Write simulation tests              | [simulation-harness.md](gossip-coordination/simulation-harness.md) → [counterexample-testing-unification.md](counterexample-testing-unification.md)           |
+| Run integration/property tests      | [scanner-engine-integration-tests.md](scanner-engine-integration-tests.md)                                                                                    |
 | Understand Kani proofs              | [kani-verification.md](kani-verification.md)                                                                                                                  |
 | Understand the scan driver seam     | [gossip-scan-driver.md](gossip-scan-driver.md)                                                                                                                |
 | Work on scanner runtime / CLI       | [gossip-scanner-runtime.md](gossip-scanner-runtime.md)                                                                                                        |

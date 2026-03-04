@@ -1,11 +1,13 @@
 //! Shared JSON write helpers for event encoding paths.
 
+/// Write a byte slice as a JSON-escaped string, using lossy UTF-8 conversion.
 #[inline]
 pub fn write_json_bytes(buf: &mut Vec<u8>, value: &[u8]) {
     let text = String::from_utf8_lossy(value);
     write_json_str(buf, &text);
 }
 
+/// Write a string as a JSON-quoted value, escaping control characters per RFC 8259 §7.
 #[inline]
 pub fn write_json_str(buf: &mut Vec<u8>, value: &str) {
     buf.push(b'"');
@@ -31,11 +33,13 @@ pub fn write_json_str(buf: &mut Vec<u8>, value: &str) {
     buf.push(b'"');
 }
 
+/// Write a `u64` as its decimal ASCII representation.
 #[inline]
 pub fn write_u64(buf: &mut Vec<u8>, value: u64) {
     buf.extend_from_slice(value.to_string().as_bytes());
 }
 
+/// Write an `i8` as its decimal ASCII representation without heap allocation.
 #[inline]
 pub fn write_i8(buf: &mut Vec<u8>, value: i8) {
     // Stack buffer avoids heap allocation. i8 is at most 4 chars ("-128").
@@ -59,6 +63,7 @@ pub fn write_i8(buf: &mut Vec<u8>, value: i8) {
     buf.extend_from_slice(&tmp[pos..]);
 }
 
+/// Write an `f64` as its decimal ASCII representation.
 #[inline]
 pub fn write_f64(buf: &mut Vec<u8>, value: f64) {
     buf.extend_from_slice(value.to_string().as_bytes());
@@ -70,21 +75,25 @@ pub struct BufCursor<'a> {
 }
 
 impl<'a> BufCursor<'a> {
+    /// Wrap an existing byte buffer as a cursor.
     #[inline]
     pub fn new(buf: &'a mut Vec<u8>) -> Self {
         Self { buf }
     }
 
+    /// Append a single byte to the buffer.
     #[inline]
     pub fn push_byte(&mut self, byte: u8) {
         self.buf.push(byte);
     }
 
+    /// Append a byte slice to the buffer.
     #[inline]
     pub fn push_bytes(&mut self, bytes: &[u8]) {
         self.buf.extend_from_slice(bytes);
     }
 
+    /// Consume the cursor and return the underlying buffer.
     #[inline]
     pub fn into_inner(self) -> &'a mut Vec<u8> {
         self.buf

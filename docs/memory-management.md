@@ -381,10 +381,10 @@ flowchart TB
         IncAvail["available += 1"]
     end
 
-    subgraph Usage["Buffer Usage"]
-        Reader["ReaderStage"]
+    subgraph Usage["Buffer Usage (unified single-thread model)"]
+        Worker["Worker (read + scan)"]
         Chunk["Chunk { buf: BufferHandle }"]
-        Scanner["ScanStage"]
+        Process["scan_file_sync"]
     end
 
     PoolInit --> NodeInit
@@ -402,10 +402,10 @@ flowchart TB
     UnsetBit --> CalcPtr
     CalcPtr --> Handle
 
-    Handle --> Reader
-    Reader --> Chunk
-    Chunk --> Scanner
-    Scanner --> Drop
+    Handle --> Worker
+    Worker --> Chunk
+    Chunk --> Process
+    Process --> Drop
 
     Drop --> ValidatePtr
     ValidatePtr --> CalcIdx
@@ -577,25 +577,25 @@ fits within the configured limits or it skips work.
 ```mermaid
 sequenceDiagram
     participant File as File
-    participant Reader as FileReader
+    participant Scan as scan_file_sync
     participant Tail as tail: Vec<u8>
     participant Buf as BufferHandle
 
-    Note over Reader: Chunk 1 (offset=0)
+    Note over Scan: Chunk 1 (offset=0)
     File->>Buf: read 1MB
     Buf->>Tail: copy last `overlap` bytes
-    Reader->>Pipeline: emit Chunk { prefix_len: 0 }
+    Scan->>Scan: process Chunk { prefix_len: 0 }
 
-    Note over Reader: Chunk 2 (offset=1MB)
+    Note over Scan: Chunk 2 (offset=1MB)
     Tail->>Buf: copy to buf[0..overlap]
     File->>Buf: read 1MB at buf[overlap..]
     Buf->>Tail: copy last `overlap` bytes
-    Reader->>Pipeline: emit Chunk { prefix_len: overlap }
+    Scan->>Scan: process Chunk { prefix_len: overlap }
 
-    Note over Reader: Pattern spanning chunks
-    Note over Reader: Original: [....PATTERN....]
-    Note over Reader: Chunk 1:  [....PATT]
-    Note over Reader: Chunk 2:  [PATTERN....] (prefix has PATT)
+    Note over Scan: Pattern spanning chunks
+    Note over Scan: Original: [....PATTERN....]
+    Note over Scan: Chunk 1:  [....PATT]
+    Note over Scan: Chunk 2:  [PATTERN....] (prefix has PATT)
 ```
 
 The overlap ensures patterns that span chunk boundaries are detected:

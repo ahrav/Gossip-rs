@@ -33,9 +33,9 @@ macros.
 | `mod.rs`          | Module root, public re-exports                                                                                                |
 | `types.rs`        | `TenantId`, `PolicyHash`, `TenantSecretKey`                                                                                   |
 | `canonical.rs`    | `CanonicalBytes` trait + primitive impls                                                                                      |
-| `hashing.rs`      | `domain_hasher`, `finalize_32`                                                                                                |
+| `hashing.rs`      | `domain_hasher`, `finalize_32`, `finalize_64`, `derive_from_cached`                           |
 | `domain.rs`       | 13 domain-separation constants + `ALL` registry                                                                               |
-| `item.rs`         | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`                                                          |
+| `item.rs`         | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`, `IdentityInputError`    |
 | `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId` + derivation fns                                     |
 | `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |
 | `macros.rs`       | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                                                                |
@@ -171,7 +171,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `ItemIdentityKey`    | variable         | `new(connector, locator)`                          | --                                   | Clone Eq Hash CanonicalBytes            | No                                                |
 | `StableItemId`       | 32 B             | derived via `ItemIdentityKey::stable_id()`         | `ITEM_ID_V1`                         | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `ObjectVersionId`    | 32 B             | `from_version_bytes` / `from_bytes`                | `OBJECT_VERSION_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
-| `NormHash`           | 32 B             | `from_digest` / `from_bytes_internal` (pub(crate)) | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
+| `NormHash`           | 32 B             | `from_digest` (pub) / `from_bytes_internal` (pub(crate)) | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
 | `SecretHash`         | 32 B             | `from_bytes_internal` (pub(crate))                 | `SECRET_HASH_V1` (keyed mode)        | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
 | `RuleFingerprint`    | 32 B             | `from_bytes` (pub)                                 | `RULE_FINGERPRINT_V1`                | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `FindingId`          | 32 B             | `from_bytes` (pub)                                 | `FINDING_ID_V1`                      | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
@@ -417,3 +417,76 @@ type-level documentation in `types.rs` for the full rationale. In short:
 Rust forbids `Drop` on `Copy` types, and the current threat model does not
 justify the complexity of a `!Copy` key wrapper with borrow-lifetime
 entanglement throughout the derivation API.
+
+---
+
+## 11. Fallible Constructors and IdentityInputError
+
+Several identity types provide both panicking constructors (for trusted internal
+code) and fallible `try_*` constructors (for external/untrusted input). The
+fallible constructors return `IdentityInputError` (defined in `item.rs`).
+
+### IdentityInputError
+
+```rust
+pub enum IdentityInputError {
+    /// Connector tag is empty.
+    EmptyTag,
+    /// Connector tag exceeds 8 bytes.
+    TagTooLong(usize),
+    /// Connector tag contains a non-ASCII-graphic byte at the given index.
+    NonGraphicByte { index: usize, byte: u8 },
+    /// Item locator is empty.
+    EmptyLocator,
+    /// Version bytes are empty.
+    EmptyVersionBytes,
+}
+```
+
+All variants are self-describing leaf errors with no inner `source`. The type
+implements `Display`, `Debug`, `Clone`, `PartialEq`, `Eq`, and
+`std::error::Error`.
+
+### Fallible constructors
+
+| Type              | Method                      | Returns                                     |
+| ----------------- | --------------------------- | ------------------------------------------- |
+| `ConnectorTag`    | `try_from_ascii(&[u8])`     | `Result<Self, IdentityInputError>`          |
+| `ItemIdentityKey` | `try_new(tag, &[u8])`       | `Result<Self, IdentityInputError>`          |
+| `ObjectVersionId` | `try_from_version_bytes(&[u8])` | `Result<Self, IdentityInputError>`      |
+
+The panicking equivalents (`from_ascii`, `new`, `from_version_bytes`) remain
+available for trusted internal code where input validation is already guaranteed
+by the caller.
+
+---
+
+## 12. Additional Hashing Helpers
+
+### `finalize_64` (`hashing.rs`)
+
+Truncates the BLAKE3 output to 64 bits (first 8 bytes, little-endian `u64`).
+Used for op-log payload hashes and split shard ID derivation where 64-bit
+collision resistance is sufficient. Birthday collision bound is approximately
+2^32 (~4.3 billion) values.
+
+```rust
+pub fn finalize_64(hasher: &Hasher) -> u64
+```
+
+### `derive_from_cached` (`hashing.rs`)
+
+Hot-path helper that clones a pre-initialized `LazyLock<Hasher>` static,
+feeds `CanonicalBytes` inputs, and returns a 32-byte digest. Avoids
+re-running the BLAKE3 key-schedule setup on every call.
+
+```rust
+pub fn derive_from_cached<T: CanonicalBytes>(base: &Hasher, inputs: &T) -> [u8; 32]
+```
+
+### Policy version constants (`policy.rs`)
+
+| Constant                   | Value | Purpose                                      |
+| -------------------------- | ----- | -------------------------------------------- |
+| `CURRENT_VERSION`          | `1`   | Current identity derivation scheme version   |
+| `CURRENT_EVIDENCE_VERSION` | `1`   | Current evidence encoding version            |

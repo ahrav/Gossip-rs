@@ -69,20 +69,30 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 
+/// Provides a lock-free atomic bitset with test-and-set for concurrent dedup.
 pub mod atomic_bitset;
+/// Provides composite concurrent dedup tracker for git object traversal.
 pub mod atomic_seen_sets;
+/// Provides a heap-allocated dynamic bitset for runtime-determined sizes.
 pub mod bitset;
+/// Implements a byte ring buffer keyed by absolute stream offsets.
 pub mod byte_ring;
 mod byte_slab;
+/// Implements fast range reduction via multiply-high (no division).
 pub mod fastrange;
+/// Provides fixed-capacity dedupe sets with O(1) reset via generation counters.
 pub mod fixed_set;
+/// Provides FNV-1a 64-bit hashing helpers for deterministic fingerprinting.
 pub mod fnv;
 mod inline_vec;
+/// Provides small arithmetic helpers for scan-time performance counters.
 pub mod perf_stats;
 mod ring_buffer;
 pub mod spsc;
+/// Implements a hashed timing wheel with FIFO buckets and bitmap occupancy.
 pub mod timing_wheel;
 
+/// Shared proptest configuration helpers for consistent test case counts.
 #[cfg(feature = "stdx-proptest")]
 pub mod test_support;
 

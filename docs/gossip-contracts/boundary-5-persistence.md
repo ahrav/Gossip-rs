@@ -1,16 +1,18 @@
 # Boundary 5 - Persistence Architecture
 
-> **Status: Design spec + partial implementation.**
-> The Rust trait surface (`DoneLedger`, `FindingsSink`, `PageCommit<S>`,
-> and supporting types) is defined in staged artifacts under
-> `tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs` and
-> documented in the module doc at
-> `crates/gossip-contracts/src/persistence/mod.rs`.
-> The external storage backends (etcd, ScyllaDB, PostgreSQL) described
-> in sections 2–4 are **aspirational design targets** — no production
-> backend implementations exist yet. The coordination backend trait
-> lives in `gossip-coordination` as `CoordinationBackend`
-> (`crates/gossip-coordination/src/traits.rs`).
+> **Status: Design specification only.**
+> The Rust types below (`DoneLedger`, `FindingsSink`, `PageCommit<S>`,
+> and supporting types) are described in doc comments at
+> `crates/gossip-contracts/src/persistence/mod.rs` (24 lines) and in
+> staged design artifacts under
+> `tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`.
+> **No compiled Rust trait definitions or implementations exist yet.**
+> The module doc placeholder describes the planned boundary, but the
+> types are not defined as code. The external storage backends (etcd,
+> ScyllaDB, PostgreSQL) described in sections 2-4 are **aspirational
+> design targets** -- no production backend implementations exist yet.
+> The coordination backend trait lives in `gossip-coordination` as
+> `CoordinationBackend` (`crates/gossip-coordination/src/traits.rs`).
 
 Boundary 5 defines the durable storage plan for three subsystems:
 
@@ -33,13 +35,14 @@ Non-negotiables (project-wide):
 
 ---
 
-## Implemented Rust types
+## Planned Rust types
 
-The persistence boundary's trait surface and data types are defined in staged
-artifacts (`tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`). The
-module doc lives at `crates/gossip-contracts/src/persistence/mod.rs`. No
-production backend implementations exist yet; only in-memory test doubles
-(behind `test-support` feature flag).
+> **Note:** The types below are design-time artifacts defined in staged
+> files (`tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`). They
+> do not exist as compiled code in any workspace crate. The module doc
+> placeholder lives at `crates/gossip-contracts/src/persistence/mod.rs`.
+> No production backend implementations exist yet; only in-memory test
+> doubles (behind `test-support` feature flag).
 
 ### Traits
 
@@ -71,7 +74,10 @@ production backend implementations exist yet; only in-memory test doubles
 | `FindingsUpsertBatch` | Capacity-bounded batch of findings + occurrences for atomic upsert. |
 | `FindingsUpsertResult` | Upsert outcome counts: inserted vs. deduplicated for findings and occurrences. |
 
-### Test doubles (`test-support` feature)
+### Test doubles (`test-support` feature) — Planned
+
+> **Note:** These test double types are described in design artifacts but
+> do not exist as compiled Rust code yet.
 
 | Type | Implements | Notes |
 |------|-----------|-------|

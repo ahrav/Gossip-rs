@@ -177,9 +177,36 @@ metadata (`size_hint`, `content_hints`, `location`). All fields are
 private with accessor methods. Builder-style `with_*` methods set
 optional fields.
 
+`version` is a `VersionId` enum (`gossip-contracts/src/connector/types.rs:720`)
+with two variants:
+
+- `Strong(ObjectVersionId)` -- reliable immutability signal (e.g., content-hash).
+- `Weak(ObjectVersionId)` -- best-effort version (e.g., mtime-derived).
+
+`object_version_id()` extracts the inner `ObjectVersionId` regardless of
+strength. `is_strong()` lets callers gate trust-sensitive decisions.
+
+`ContentHints` (`gossip-contracts/src/connector/types.rs:758`) carries
+advisory `media_type` and `encoding` strings, both optional and size-bounded.
+Empty strings are normalized to `None`.
+
+`Location` (`gossip-contracts/src/connector/types.rs:834`) pairs a required
+`display` string with an optional `url`, both size-bounded. Provides
+human-readable provenance safe for logs and UI.
+
 `EnumerationPage` (`types.rs`) pairs `items: Vec<ScanItem>` with
 `next_cursor: Cursor`. Fields are private; accessors are `items()`,
 `next_cursor()`, `into_parts()`, and `into_next_cursor()`.
+
+### PooledByteSlab
+
+`PooledByteSlab` (`gossip-contracts/src/connector/types.rs:244`) wraps a
+`ByteSlab` for staged byte allocation during connector page assembly.
+Two-phase usage: connectors call `allocate()` repeatedly in a mutable phase,
+then wrap the slab in `Arc` for shared read access via `get()`.
+
+On `Drop`, it calls `zeroize_used()` and `clear()` to scrub secret material,
+including mid-loop staging failures that return early.
 
 ### Budgets
 

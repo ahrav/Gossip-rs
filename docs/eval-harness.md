@@ -17,7 +17,7 @@ Use the harness after modifying detection rules, before releases, in CI pipeline
 
 ### Module Map
 
-The harness lives in `tools/eval-harness/` as a standalone crate with its own `Cargo.toml`. It depends on `scanner-rs` for the engine and path normalization utilities.
+The harness lives in `tools/eval-harness/` as a standalone crate with its own `Cargo.toml`. It depends on `scanner-engine` for the detection engine, `scanner-scheduler` for pipeline types, and `scanner-git` for git scanning utilities.
 
 | Module              | Role                                                                                                   |
 | ------------------- | ------------------------------------------------------------------------------------------------------ |
@@ -155,7 +155,7 @@ eval-harness leaky-repo \
 Position-based subcommands (`creddata`, `synthetic`) accept findings from two mutually exclusive sources:
 
 - **`--findings <path>`** — Pre-computed JSONL from a previous scanner run. Finding lines use scanner wire fields: `type: "finding"`, `path`, `start`, `end`, `rule`, and optional `confidence_score`.
-- **`--scan-corpus <dir>`** — Live-scan a directory using the embedded `scanner_rs::demo_engine()` with the default ruleset. Findings are collected via an in-memory event sink and re-parsed through the same JSONL path. Intended for quick iteration during rule development on small-to-medium corpora.
+- **`--scan-corpus <dir>`** — Live-scan a directory using the embedded `scanner_engine::demo_engine()` with the default ruleset. Findings are collected via an in-memory event sink and re-parsed through the same JSONL path. Intended for quick iteration during rule development on small-to-medium corpora.
 
 The `leaky-repo` subcommand only supports `--findings` (no live scan).
 

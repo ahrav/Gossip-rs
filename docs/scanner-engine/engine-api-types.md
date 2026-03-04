@@ -520,7 +520,7 @@ Types with `encode_policy`:
 
 ## Re-exports
 
-`lib.rs` (line 48–54) re-exports the following from `api.rs` as public API:
+`lib.rs` (line 56–62) re-exports the following from `api.rs` as public API:
 
 ```
 AnchorPolicy, CharClassSpec, DecodeStep, DecodeSteps, DelimAfter,
@@ -532,7 +532,7 @@ TwoPhaseSpec, Utf16Endianness, ValidatorKind
 ```
 
 `Base64DecodeStats` is re-exported conditionally under the `b64-stats` feature
-(line 47).
+(line 55).
 
 ## Gate Evaluation Pipeline
 
@@ -544,7 +544,9 @@ Anchor hit
   ├─ ValidatorKind fast path (if non-None) ──→ emit or fall through
   │
   ├─ must_contain (byte substring pre-check)
+  ├─ confirm_all (multi-literal AND gate from regex literal islands)
   ├─ keywords_any (window keyword gate)
+  ├─ assignment_shape (pre-regex structural check)
   ├─ char_class (pre-regex lowercase-dominated rejection)
   │
   ├─ Regex evaluation

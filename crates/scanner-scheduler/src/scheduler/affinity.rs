@@ -49,6 +49,7 @@ pub const CPU_SET_CAPACITY: usize = {
     std::mem::size_of::<libc::cpu_set_t>() * 8
 };
 
+/// Maximum number of CPUs supported by the affinity API (non-Linux fallback).
 #[cfg(not(target_os = "linux"))]
 pub const CPU_SET_CAPACITY: usize = 1024; // Reasonable default
 

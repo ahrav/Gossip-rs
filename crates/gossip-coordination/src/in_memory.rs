@@ -142,7 +142,17 @@ const INITIAL_CAPACITY_SMALL: usize = 8;
 const INITIAL_CAPACITY_MEDIUM: usize = 16;
 
 // ---- Shard/tenant limit defaults ----
+
+/// Default maximum number of shards a single tenant may own across all runs.
+///
+/// Prevents one tenant from monopolizing coordinator resources. Used as the
+/// default for [`CoordinatorRuntimeConfig::max_shards_per_tenant`].
 pub const DEFAULT_MAX_SHARDS_PER_TENANT: usize = 100_000;
+
+/// Default global maximum shard count across all tenants.
+///
+/// Hard upper bound to prevent unbounded memory growth (CWE-400). Used as
+/// the default for [`CoordinatorRuntimeConfig::max_total_shards`].
 pub const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
 
 // ---- Memory budget planning constants (test-only) ----
@@ -152,8 +162,18 @@ pub const DEFAULT_MAX_TOTAL_SHARDS: usize = 1_000_000;
 // fixed (non-slab) size of each record struct. Overhead constants model
 // per-entry HashMap bucket/key metadata. All are validated by
 // `memory_budget_constants_match_struct_sizes` in tests.
+
+/// Estimated fixed (non-slab) byte size of a [`ShardRecord`] for memory budget planning.
+///
+/// Validated against the actual struct layout by
+/// `memory_budget_constants_match_struct_sizes` in tests.
 #[cfg(any(test, feature = "test-support"))]
 pub const SHARD_RECORD_PLANNING_BYTES: usize = 728;
+
+/// Estimated fixed byte size of a [`RunRecord`] for memory budget planning.
+///
+/// Validated against the actual struct layout by
+/// `memory_budget_constants_match_struct_sizes` in tests.
 #[cfg(any(test, feature = "test-support"))]
 pub const RUN_RECORD_PLANNING_BYTES: usize = 512;
 #[cfg(any(test, feature = "test-support"))]

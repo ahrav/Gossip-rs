@@ -101,6 +101,22 @@ pub enum ExecutionMode {
 Retained for CLI compatibility and telemetry. Both variants currently
 execute the same unified scan path.
 
+### ParseExecutionModeError
+
+> **Source:** `src/lib.rs:76-79`
+
+```rust
+pub struct ParseExecutionModeError {
+    raw: String, // private
+}
+```
+
+Error returned by `ExecutionMode`'s `FromStr` implementation when the
+input is neither `"direct"` nor `"connector"`. `Display` formats as
+`"invalid execution mode '<raw>' (expected 'direct' or 'connector')"`.
+Used in CLI `--execution-mode` parsing, where it is mapped to
+`CliError::Usage`.
+
 ### AnchorMode
 
 ```rust
@@ -218,6 +234,40 @@ Flat error enum covering all runtime wiring failures:
 
 ### CLI mode (`src/cli.rs`)
 
+#### CliSource
+
+> **Source:** `src/cli.rs:22-28`
+
+```rust
+pub enum CliSource {
+    Fs { path: PathBuf },
+    Git { repo: PathBuf },
+}
+```
+
+Populated by `parse_args_from()` based on whether the user passed
+`scan fs --path <path>` or `scan git --repo <path>`. Consumed by
+`cli::run()` via pattern matching to dispatch to `scan_fs_with_runtime`
+or `scan_git_with_runtime`.
+
+#### CliError
+
+> **Source:** `src/cli.rs:78-86`
+
+```rust
+pub enum CliError {
+    HelpRequested(String),
+    Usage(String),
+    Runtime(ScanRuntimeError),
+}
+```
+
+Error type for both `parse_args()` and `cli::run()`. `HelpRequested`
+and `Usage` are produced during argument parsing; `Runtime` wraps
+`ScanRuntimeError` from scan execution (via `From` conversion).
+Callers can distinguish help-requested from real errors to set
+appropriate exit codes.
+
 The CLI entrypoint parses `scanner-rs scan {fs|git}` commands with flag
 and positional arguments. The parser is hand-rolled (no clap dependency)
 to keep the binary small and startup fast.
@@ -263,6 +313,39 @@ The `cli::run` function:
 4. Flushes the event sink and returns the `ScanReport`.
 
 ### Distributed mode (`src/distributed.rs`)
+
+#### DistributedRuntimeConfig
+
+> **Source:** `src/distributed.rs:57-61`
+
+```rust
+pub struct DistributedRuntimeConfig {
+    pub budgets: ScanBudgets,
+}
+```
+
+Runtime configuration for distributed scans. Passed as the second
+argument to `run_worker()`. The `budgets` field is converted to
+`ScanExecutionConfig` via `to_execution_config()` inside the worker
+loop, with `emit_findings_to_commit_sink` forced to `true` for
+distributed persistence. Implements `Default` (all default budgets:
+`max_items=256`, `max_bytes=1_000_000`).
+
+#### DistributedRuntimeError
+
+> **Source:** `src/distributed.rs:74-81`
+
+```rust
+pub enum DistributedRuntimeError {
+    Coordinator(AnyError),
+    Runtime(ScanRuntimeError),
+}
+```
+
+Error type returned by `run_worker()`. `Coordinator` wraps errors from
+coordinator operations (acquire, release, complete, mark-done).
+`Runtime` wraps `ScanRuntimeError` from scan execution. Implements
+`Display`, `Error` (with `source()`), and `From<ScanRuntimeError>`.
 
 The distributed worker loop processes shards from a coordinator:
 
@@ -480,6 +563,29 @@ recording remains best-effort telemetry.
 
 ## 9. Coordination Event Types (`src/coordination_sink.rs`)
 
+### CoordinationEventSink
+
+> **Source:** `src/coordination_sink.rs:122-125`
+
+```rust
+pub struct CoordinationEventSink {
+    shard_id: String,                           // private
+    recorder: Arc<dyn CoordinationEventRecorder>, // private
+}
+```
+
+Distributed event sink that bridges scan-driver output to the
+coordinator recorder. Implements both `EventOutput` (core events) and
+`GitEventOutput` (git-specific events). Constructed inside the worker
+loop via `CoordinationEventSink::new(recorder, shard_id)` and passed
+as both `out` and `git_out` to `execute_assignment_with_config`.
+
+Each event variant is converted from its borrowed form (`CoreEvent`,
+`GitEvent`) into the corresponding owned form (`StoredCoreEvent`,
+`StoredGitEvent`) before forwarding to the recorder. Recorder failures
+are intentionally non-fatal (silently discarded) -- event emission is
+best-effort telemetry.
+
 ### StoredCoreEvent
 
 Owned representation of scheduler core events, persisted by distributed
@@ -528,6 +634,27 @@ The parity module enables deterministic comparison between gossip-rs
 and scanner-rs output. It canonicalizes JSONL event streams into sorted
 finding tuples, abstracting over format differences between the two
 scanner implementations.
+
+### CanonicalizeError
+
+> **Source:** `src/parity.rs:61-80`
+
+```rust
+pub enum CanonicalizeError {
+    Json { line: usize, source: serde_json::Error },
+    MissingField { line: usize, field: &'static str },
+    InvalidFieldType { line: usize, field: &'static str, expected: &'static str },
+    MissingCommitMeta { commit_id: u32 },
+    MissingSummaryThroughput,
+}
+```
+
+Error type returned by `canonicalize_jsonl_events()` and
+`canonicalize_jsonl_events_with_roots()`. Covers JSON parse failures,
+missing or mistyped fields in individual records, commit metadata
+join failures (git finding references a `commit_id` without a matching
+`commit_meta` event), and missing summary throughput. Implements
+`Display` and `Error`.
 
 ### Canonicalization rules
 

@@ -3152,6 +3152,9 @@ fn regression_slack_webhook_raw_match_not_suppressed() {
 #[test]
 fn anchor_policy_falls_back_to_manual_on_unfilterable() {
     const MANUAL: &[&[u8]] = &[b"Z"];
+    // `[A-Za-z]{1,}` now derives a residue run-length gate, so it is no
+    // longer classified as unfilterable.  Manual anchors are still emitted
+    // because the residue path calls `add_manual` for Vectorscan matching.
     let rule = RuleSpec {
         radius: 0,
         ..base_rule(
@@ -3167,7 +3170,8 @@ fn anchor_policy_falls_back_to_manual_on_unfilterable() {
         let stats = eng.anchor_plan_stats();
         assert_eq!(stats.manual_rules, 1);
         assert_eq!(stats.derived_rules, 0);
-        assert_eq!(stats.unfilterable_rules, 1);
+        assert_eq!(stats.residue_rules, 1);
+        assert_eq!(stats.unfilterable_rules, 0);
     }
 
     let hits = scan_chunk_findings(&eng, b"Z");

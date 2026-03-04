@@ -89,9 +89,9 @@ flowchart TB
     LocalCtx --> Safelist
     Safelist --> SecretSafelist
     SecretSafelist --> OfflineVal
-    OfflineVal --> Cap
-    Cap --> ConfScore["compute_confidence_score()<br/>(additive 0–10 from per-finding evidence)"]
-    ConfScore --> FindingRec
+    OfflineVal --> ConfScore["compute_confidence_score()<br/>(additive 0–10 from per-finding evidence)"]
+    ConfScore --> MinConf["min_confidence gate<br/>(per-rule threshold)"]
+    MinConf --> FindingRec
 
     style Input fill:#e3f2fd
     style AnchorScan fill:#fff3e0

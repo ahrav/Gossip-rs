@@ -1046,7 +1046,14 @@ fn run_git(repo: &PathBuf, args: &[&str]) -> io::Result<String> {
 fn resolve_default_branch(repo: &PathBuf) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
     let head_ref = run_git(repo, &["symbolic-ref", "--quiet", "HEAD"]).ok();
     if let Some(ref_name) = head_ref {
-        let tip_hex = run_git(repo, &["rev-parse", &ref_name]).map_err(RepoOpenError::io)?;
+        // rev-parse fails when the ref is unborn (e.g. freshly-initialised
+        // repo with no commits).  Return an empty start set instead of an
+        // error so callers can distinguish "no commits yet" from a real
+        // failure.
+        let tip_hex = match run_git(repo, &["rev-parse", &ref_name]) {
+            Ok(h) => h,
+            Err(_) => return Ok(Vec::new()),
+        };
         let oid = oid_from_hex(&tip_hex)?;
         return Ok(vec![(ref_name.into_bytes(), oid)]);
     }
@@ -1247,7 +1254,8 @@ mod tests {
             .expect("git init");
         assert!(status.status.success(), "git init failed");
 
-        let resolver = CliRefResolver::new(tmp.path().to_path_buf());
+        let resolver =
+            GitCliResolver::new(tmp.path().to_path_buf(), StartSetConfig::DefaultBranchOnly);
         // Build a minimal GitRepoPaths — resolve() ignores it anyway.
         let paths = scanner_git::GitRepoPaths {
             kind: scanner_git::RepoKind::Worktree,

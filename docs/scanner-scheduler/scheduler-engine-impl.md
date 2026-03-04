@@ -253,19 +253,29 @@ fn drain_findings_into(&mut self, out: &mut Vec<Self::Finding>) {
     self.findings_buf.clear();
     self.norm_hash_buf.clear();
     let pending = self.scratch.pending_findings_len();
-    // Ensure capacity for both buffers
-    if self.findings_buf.capacity() < pending {
-        self.findings_buf.reserve(pending);
-    }
-    if self.norm_hash_buf.capacity() < pending {
-        self.norm_hash_buf.reserve(pending);
-    }
-    // Drain findings and hashes into separate buffers
+
+    // Buffers were pre-sized to max_findings_per_chunk at startup.
+    // The engine enforces this cap, so pending must fit.  Allocating
+    // here would violate the zero-alloc-after-init invariant.
+    debug_assert!(self.findings_buf.capacity() >= pending,
+        "findings_buf capacity < pending; engine exceeded max_findings_per_chunk");
+    debug_assert!(self.norm_hash_buf.capacity() >= pending,
+        "norm_hash_buf capacity < pending; engine exceeded max_findings_per_chunk");
+
+    // Drain findings and hashes into separate staging buffers
     self.scratch.drain_findings_with_hashes(
         &mut self.findings_buf, &mut self.norm_hash_buf,
     );
+
+    debug_assert_eq!(self.findings_buf.len(), self.norm_hash_buf.len(),
+        "finding/hash drain length mismatch");
+
+    // `out` is the per-worker pending vec, pre-sized at worker init.
+    // After clear() by the caller, capacity is guaranteed sufficient.
+    debug_assert!(out.capacity() - out.len() >= self.findings_buf.len(),
+        "output vec remaining capacity < drained findings");
+
     // Zip and append as FindingWithHash carriers
-    out.reserve(self.findings_buf.len());
     for (finding, norm_hash) in self.findings_buf.drain(..)
         .zip(self.norm_hash_buf.drain(..))
     {
