@@ -678,11 +678,27 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
         CliSource::Git { .. } => SourceKind::Git,
     };
 
+    // Auto-size pack-exec workers *before* the timing window so the probe
+    // subprocess does not inflate elapsed/throughput numbers.
+    let effective_workers = match &config.source {
+        CliSource::Fs { .. } => base_workers,
+        CliSource::Git { repo } => {
+            if config.workers.is_some() {
+                base_workers
+            } else {
+                probe_in_pack_object_count(repo)
+                    .ok()
+                    .map(scanner_git::auto_pack_exec_workers_for_in_pack)
+                    .unwrap_or(base_workers)
+            }
+        }
+    };
+
     let wall_start = std::time::Instant::now();
 
-    let (report, effective_workers) = match config.source {
+    let report = match config.source {
         CliSource::Fs { path } => {
-            let r = scan_fs_with_runtime(
+            scan_fs_with_runtime(
                 &FsScanConfig::new(path)
                     .with_execution_mode(config.execution_mode)
                     .with_budgets(config.budgets)
@@ -698,25 +714,12 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
                 &commit,
                 &cancel,
             )?
-            .report;
-            (r, base_workers)
+            .report
         }
         CliSource::Git { ref repo } => {
-            // Auto-size pack-exec workers from repository size when the
-            // CLI did not provide an explicit --workers value. Matches
-            // the reference scanner's probe_in_pack_object_count logic.
-            let workers = if config.workers.is_some() {
-                base_workers
-            } else {
-                probe_in_pack_object_count(repo)
-                    .ok()
-                    .map(scanner_git::auto_pack_exec_workers_for_in_pack)
-                    .unwrap_or(base_workers)
-            };
-
             let outcome = scan_git_with_runtime(
                 &GitScanConfig::new(repo.clone())
-                    .with_workers(workers)
+                    .with_workers(effective_workers)
                     .with_execution_mode(config.execution_mode)
                     .with_budgets(config.budgets)
                     .with_decode_depth(config.decode_depth)
@@ -739,12 +742,12 @@ pub fn run(config: CliConfig) -> Result<gossip_scan_driver::ScanReport, CliError
             if let Some(debug_output) = outcome.debug_output.as_deref() {
                 eprint!("{debug_output}");
             }
-            (outcome.report, workers)
+            outcome.report
         }
     };
 
-    let elapsed = wall_start.elapsed();
     core_sink.flush();
+    let elapsed = wall_start.elapsed();
 
     print_scan_summary(&report, elapsed, effective_workers, source_kind);
 
@@ -771,9 +774,8 @@ fn print_scan_summary(
 
     let human_bytes = format_human_bytes(report.bytes_scanned);
 
-    // Use write_all to stderr to avoid interleaving with other output.
-    // The buffer is small enough that a single write_all is atomic on all
-    // platforms we target (POSIX guarantees atomicity for writes <= PIPE_BUF).
+    // Use write_all to stderr to minimise the chance of interleaving
+    // with concurrent stderr writers.
     use std::io::Write;
     let mut buf = String::with_capacity(256);
     use std::fmt::Write as FmtWrite;
@@ -785,7 +787,11 @@ fn print_scan_summary(
     let _ = writeln!(buf, "chunks={}", report.chunks_scanned);
     let _ = writeln!(buf, "bytes={} ({human_bytes})", report.bytes_scanned);
     let _ = writeln!(buf, "findings={}", report.findings_emitted);
-    let _ = writeln!(buf, "errors={}", report.errors);
+    // Git scans do not yet aggregate per-pack-exec errors into a single
+    // counter, so omit the line rather than printing a misleading zero.
+    if source_kind == SourceKind::Fs {
+        let _ = writeln!(buf, "errors={}", report.errors);
+    }
     let _ = writeln!(buf, "elapsed_ms={elapsed_ms}");
     let _ = writeln!(buf, "throughput_mib_s={throughput_mib_s:.2}");
     let _ = writeln!(buf, "workers={workers}");

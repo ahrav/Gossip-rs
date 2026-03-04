@@ -763,28 +763,33 @@ fn load_runtime_rules(
     }
 
     // 2. Default candidate adjacent to binary.
-    if let Some(default_path) = scanner_engine::default_rules_path()
-        && default_path.is_file()
-    {
-        let content = scanner_engine::read_rules_text(&default_path).map_err(|error| {
-            ScanRuntimeError::RulesConfig {
-                path: Some(default_path.clone()),
-                message: error.to_string(),
-            }
-        })?;
-        let rules = scanner_engine::load_rules_from_content(&content).map_err(|error| {
-            ScanRuntimeError::RulesConfig {
-                path: Some(default_path.clone()),
-                message: error.to_string(),
-            }
-        })?;
-        let hash = scanner_engine::rules_content_hash64(content.as_bytes());
-        eprintln!(
-            "info: using {} ({} rules, source: default_rules.yaml, rule_hash: {hash:016x})",
-            default_path.display(),
-            rules.len(),
-        );
-        return Ok(rules);
+    if let Some(default_path) = scanner_engine::default_rules_path() {
+        if default_path.exists() && !default_path.is_file() {
+            eprintln!(
+                "warn: {} exists but is not a regular file; falling back to built-in rules",
+                default_path.display()
+            );
+        } else if default_path.is_file() {
+            let content = scanner_engine::read_rules_text(&default_path).map_err(|error| {
+                ScanRuntimeError::RulesConfig {
+                    path: Some(default_path.clone()),
+                    message: error.to_string(),
+                }
+            })?;
+            let rules = scanner_engine::load_rules_from_content(&content).map_err(|error| {
+                ScanRuntimeError::RulesConfig {
+                    path: Some(default_path.clone()),
+                    message: error.to_string(),
+                }
+            })?;
+            let hash = scanner_engine::rules_content_hash64(content.as_bytes());
+            eprintln!(
+                "info: using {} ({} rules, source: default_rules.yaml, rule_hash: {hash:016x})",
+                default_path.display(),
+                rules.len(),
+            );
+            return Ok(rules);
+        }
     }
 
     // 3. Compile-time embedded fallback.

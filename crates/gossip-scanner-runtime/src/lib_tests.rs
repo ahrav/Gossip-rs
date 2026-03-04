@@ -102,8 +102,10 @@ fn parse_execution_mode_invalid(#[case] input: &str) {
 #[test]
 fn scan_fs_direct_scans_directory() {
     let dir = tempdir().expect("tempdir");
-    fs::write(dir.path().join("a.txt"), "password=alpha").expect("write a");
-    fs::write(dir.path().join("b.txt"), "token=bravo").expect("write b");
+    // Secrets must be ≥16 chars with ≥3.5 bits/byte entropy to pass the
+    // builtin `generic-api-key` rule's entropy + min_confidence gates.
+    fs::write(dir.path().join("a.txt"), "password=xK9mP2qL7wN4vR8t").expect("write a");
+    fs::write(dir.path().join("b.txt"), "token=aB3dE5fG7hJ9kL1m").expect("write b");
 
     let outcome = scan_fs_direct(&FsScanConfig::new(dir.path())).expect("fs direct scan");
     assert!(outcome.items_scanned >= 2);
@@ -113,10 +115,12 @@ fn scan_fs_direct_scans_directory() {
 #[test]
 fn scan_fs_connector_matches_direct_for_directory() {
     let dir = tempdir().expect("tempdir");
-    for i in 0..6 {
+    // Each value must be ≥16 high-entropy chars to trigger builtin rules.
+    let suffixes = ["Qr4Tz", "Wn8Xp", "Jv6Hg", "Ym3Bk", "Lf5Ds", "Ct7Nw"];
+    for (i, sfx) in suffixes.iter().enumerate() {
         fs::write(
             dir.path().join(format!("secret_{i}.txt")),
-            format!("password=alpha{i}"),
+            format!("password=xK9mP2qL7w{sfx}vR8t"),
         )
         .expect("write fixture file");
     }
@@ -177,7 +181,10 @@ fn scan_fs_direct_rejects_nonexistent_path() {
 
 #[test]
 fn scan_git_direct_scans_repo() {
-    let repo = create_test_repo(&[("a.txt", b"password=alpha"), ("b.txt", b"token=bravo")]);
+    let repo = create_test_repo(&[
+        ("a.txt", b"password=xK9mP2qL7wN4vR8t"),
+        ("b.txt", b"token=aB3dE5fG7hJ9kL1m"),
+    ]);
 
     let outcome = scan_git_direct(&GitScanConfig::new(repo.path())).expect("git direct scan");
     assert!(outcome.items_scanned >= 2);
@@ -186,7 +193,10 @@ fn scan_git_direct_scans_repo() {
 
 #[test]
 fn scan_git_connector_matches_direct_for_repo() {
-    let repo = create_test_repo(&[("a.txt", b"password=alpha"), ("b.txt", b"token=bravo")]);
+    let repo = create_test_repo(&[
+        ("a.txt", b"password=xK9mP2qL7wN4vR8t"),
+        ("b.txt", b"token=aB3dE5fG7hJ9kL1m"),
+    ]);
     let budgets = ScanBudgets {
         max_items: 1,
         max_bytes: 1_000_000,
