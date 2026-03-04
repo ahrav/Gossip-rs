@@ -2676,3 +2676,127 @@ fn root_fd_identity_check_rejects_dev_ino_mismatch() {
         "error should mention dev/ino mismatch; got: {err}",
     );
 }
+
+// ---------------------------------------------------------------
+// Bug verification: exhausted walk with no files should not
+// prevent a second range from producing results
+// ---------------------------------------------------------------
+
+#[test]
+fn exhausted_empty_range_does_not_block_subsequent_populated_range() {
+    // Files exist only in the [a, d) range.
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    // First call: range [z, ~) — no files match, walk exhausts.
+    let empty_start = make_key(b"z");
+    let empty_end = make_key(b"\xff");
+    let page = c
+        .enumerate_page_range(
+            &empty_start,
+            &empty_end,
+            &Cursor::initial(),
+            default_budgets(),
+        )
+        .expect("empty range should not error");
+    assert!(page.items().is_empty(), "no files match [z, 0xff) range");
+
+    // Second call: range [\x00, \xff) — files exist, should be returned.
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(
+        items.len(),
+        3,
+        "second range should find all 3 files; got {}",
+        items.len()
+    );
+    assert_eq!(items[0].item_key().as_bytes(), b"a.txt");
+    assert_eq!(items[1].item_key().as_bytes(), b"b.txt");
+    assert_eq!(items[2].item_key().as_bytes(), b"c.txt");
+}
+
+// ---------------------------------------------------------------
+// Bug verification: current_path must be clean after deadline
+// error during directory descent
+// ---------------------------------------------------------------
+
+#[test]
+fn deadline_during_directory_descent_does_not_corrupt_subsequent_walk() {
+    // Create a deep directory structure: root/deep/nested/file.txt
+    // plus a root-level file that sorts after the directory.
+    let dir = create_test_dir(&[("deep/nested/file.txt", b"inner"), ("z_root.txt", b"root")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Use a very tight deadline that may expire during directory descent.
+    // Even if the deadline doesn't trigger during next_file's directory
+    // processing, the retry must still produce correct results.
+    let tight_deadline = Budgets::try_new(
+        100,
+        u64::MAX,
+        Some(Instant::now() + Duration::from_nanos(1)),
+    )
+    .unwrap();
+
+    // First attempt: may succeed or fail with retryable error.
+    let _result = c.enumerate_page_range(&start, &end, &Cursor::initial(), tight_deadline);
+    // We don't care whether this succeeds or fails — only that a retry works.
+
+    // Retry with a generous deadline: must produce correct, uncorrupted keys.
+    let items = collect_all(&mut c, &start, &end);
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
+    assert_eq!(
+        keys,
+        vec![b"deep/nested/file.txt".as_slice(), b"z_root.txt"],
+        "retry after deadline error must produce correct paths, not corrupted ones"
+    );
+}
+
+// ---------------------------------------------------------------
+// Bug verification: cold-resume token index reflects total items
+// emitted, not just the current page
+// ---------------------------------------------------------------
+
+#[test]
+fn cold_resume_token_index_reflects_prior_emission_count() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let budgets = small_page_budgets(2);
+
+    // Page 1: emit items 0,1 (a.txt, b.txt) with tokens enabled.
+    let mut first = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let page1 = first
+        .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
+        .expect("first page");
+    assert_eq!(page1.items().len(), 2);
+
+    // Cold resume: new connector, resume from page1's cursor.
+    let mut resumed = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let page2 = resumed
+        .enumerate_page_range(&start, &end, page1.next_cursor(), budgets)
+        .expect("cold-resume page");
+    assert_eq!(page2.items().len(), 2);
+    assert_eq!(page2.items()[0].item_key().as_bytes(), b"c.txt");
+
+    // The token should encode next_idx = 4 (items 0..4 total).
+    // If emitted_count wasn't carried across cold resume, the token
+    // would incorrectly encode 2 (only current page items).
+    if let Some(token) = page2.next_cursor().token() {
+        let token_bytes = token.as_bytes();
+        if token_bytes.len() == 8 {
+            let encoded_idx = u64::from_be_bytes(token_bytes.try_into().unwrap());
+            assert_eq!(
+                encoded_idx, 4,
+                "cold-resume token should encode total emitted count (4), not just current page count"
+            );
+        }
+    }
+}

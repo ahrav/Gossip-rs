@@ -14,8 +14,11 @@
 //! - a mutable path buffer for the active frame,
 //! - cursor-alignment metadata (`last_emitted_key`, `pending`, `exhausted`).
 //!
-//! This keeps memory bounded by traversal shape (`O(depth × max_dir_entries)`)
-//! instead of total file count.
+//! This keeps memory proportional to `O(Σ entries_per_active_dir)` — the sum
+//! of entry counts in the directories currently on the DFS stack — instead of
+//! total file count. The improvement is significant for deep, balanced trees
+//! but degrades toward full-tree buffering for flat hierarchies with very
+//! large directories.
 //!
 //! # Ordering and resume
 //!
@@ -346,9 +349,14 @@ impl FilesystemConnector {
     }
 
     /// Compare resume authority (`last_key`) between in-memory state and cursor.
+    ///
+    /// An exhausted walk that never emitted any key (`last_emitted_key == None`)
+    /// must NOT match an initial cursor (`last_key == None`), because the caller
+    /// may be starting a different range and needs a fresh walk. Without this
+    /// guard, reusing a connector across ranges silently drops results.
     fn cursor_matches_state(state: &WalkState, cursor: &Cursor) -> bool {
         match (state.last_emitted_key.as_ref(), cursor.last_key()) {
-            (None, None) => true,
+            (None, None) => !state.exhausted,
             (Some(state_key), Some(cursor_key)) => state_key.as_bytes() == cursor_key.as_bytes(),
             _ => false,
         }
@@ -359,6 +367,11 @@ impl FilesystemConnector {
     /// On mismatch we rewind to root, then stream forward until the first key
     /// strictly greater than `cursor.last_key()`. That key is staged in
     /// `WalkState::pending` so the next page emits it without re-traversal.
+    ///
+    /// Skipped entries are counted so that `emitted_count` reflects the total
+    /// number of items emitted across all pages, including those from previous
+    /// connector instances. This ensures opaque resume tokens encode correct
+    /// global indices after cold resume.
     fn align_walk_to_cursor(
         &mut self,
         cursor: &Cursor,
@@ -373,6 +386,7 @@ impl FilesystemConnector {
         ) {
             self.reset_walk_state(deadline)?;
             if let Some(last_key) = cursor.last_key() {
+                let mut skipped: usize = 0;
                 loop {
                     let next = {
                         let state = self
@@ -399,12 +413,14 @@ impl FilesystemConnector {
                         state.pending = Some(file);
                         break;
                     }
+                    skipped += 1;
                 }
 
                 let state = self
                     .walk_state
                     .as_mut()
                     .expect("walk state must exist while aligning cursor");
+                state.emitted_count = skipped;
                 state.last_emitted_key = Some(last_key.clone());
             }
         }
@@ -1091,17 +1107,26 @@ impl WalkState {
 
             if entry.file_type.is_dir() {
                 if depth < max_depth {
-                    check_walk_deadline(deadline)?;
+                    if let Err(e) = check_walk_deadline(deadline) {
+                        let _ = self.current_path.pop();
+                        return Err(e);
+                    }
                     match fs::read_dir(&self.current_path) {
                         Ok(reader) => {
-                            let child_entries = read_dir_sorted_entries(
+                            let child_entries = match read_dir_sorted_entries(
                                 reader,
                                 &self.current_path,
                                 deadline,
                                 max_warnings,
                                 overflow_count,
                                 warnings,
-                            )?;
+                            ) {
+                                Ok(entries) => entries,
+                                Err(e) => {
+                                    let _ = self.current_path.pop();
+                                    return Err(e);
+                                }
+                            };
                             self.stack.push(WalkFrame {
                                 component: Some(entry.name),
                                 depth: depth + 1,
