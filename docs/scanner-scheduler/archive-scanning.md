@@ -25,7 +25,7 @@ The architecture emphasizes:
 
 ### Format Detection
 
-Detection uses a two-phase algorithm (`archive/detect.rs:151`):
+Detection uses a two-phase algorithm (`archive/detect.rs`):
 
 1. **Extension-based** (`detect_kind_from_path` / `detect_kind_from_name_bytes`): pure byte-suffix match using case-insensitive ASCII comparison (`| 0x20`). Single-byte dispatch on the last character gives O(1) common-case rejection. Extension detection always takes precedence — this is the only way to distinguish `.tar.gz` from plain `.gz`.
 
@@ -48,7 +48,7 @@ The combined function `detect_kind` tries extension first, then falls back to ma
 
 Archive scanning integrates at two levels:
 
-**Blocking path** (`scheduler/local_fs_owner.rs`): the worker thread handles archives inline via `dispatch_archive_scan()` (`scheduler/local_fs_archive_ctx.rs:125`), which routes to format-specific handlers (`local_fs_gzip.rs`, `local_fs_bzip2.rs`, `local_fs_tar.rs`, `local_fs_zip.rs`). Blocking workers process one file at a time, so decompression blocking is acceptable.
+**Blocking path** (`scheduler/local_fs_owner.rs`): the worker thread handles archives inline via `dispatch_archive_scan()` (`scheduler/local_fs_archive_ctx.rs`), which routes to format-specific handlers (`local_fs_gzip.rs`, `local_fs_bzip2.rs`, `local_fs_tar.rs`, `local_fs_zip.rs`). Blocking workers process one file at a time, so decompression blocking is acceptable.
 
 **io_uring path** (`scheduler/local_fs_uring.rs`): archives are offloaded to dedicated archive worker threads to avoid stalling the io_uring completion loop. Detection happens at two points:
 - Discovery time: files with known archive extensions are routed directly to the archive channel
@@ -58,7 +58,7 @@ Both paths use the same archive subsystem types (`ArchiveConfig`, `ArchiveBudget
 
 ### Sink-Driven Entry Interface
 
-The archive scan core (`archive/scan.rs`) drives an `ArchiveEntrySink` trait (`scan.rs:206`) that decouples parsing from downstream processing:
+The archive scan core (`archive/scan.rs`) drives an `ArchiveEntrySink` trait (`scan.rs`) that decouples parsing from downstream processing:
 
 ```
 on_entry_start(&meta)        // exactly once per entry
@@ -68,7 +68,7 @@ on_entry_start(&meta)        // exactly once per entry
 on_entry_end()               // exactly once, even on truncation
 ```
 
-The `start`/`end` pair is always balanced. The io_uring path implements `ArchiveEntrySink` via `UringArchiveSink`, which calls `scan_chunk_into → drop_prefix_findings → dedupe → emit`. The blocking path uses `ArchiveScanCtx::scan_and_emit_chunk` (`local_fs_archive_ctx.rs:324`).
+The `start`/`end` pair is always balanced. The io_uring path implements `ArchiveEntrySink` via `UringArchiveSink`, which calls `scan_chunk_into → drop_prefix_findings → dedupe → emit`. The blocking path uses `ArchiveScanCtx::scan_and_emit_chunk` (`local_fs_archive_ctx.rs`).
 
 ## Budget Enforcement
 
@@ -99,11 +99,11 @@ When charging decompressed output, the tightest remaining allowance across all t
 | Inflation ratio | `max_inflation_ratio` | 128x | Per entry + per archive |
 | Wall-clock deadline | `max_wall_clock_secs_per_root` | `None` (opt-in) | Per root |
 
-The nesting invariant `entry <= archive <= root` is enforced by `ArchiveConfig::validate()` (`config.rs:364`).
+The nesting invariant `entry <= archive <= root` is enforced by `ArchiveConfig::validate()` (`config.rs`).
 
 ### Inflation Ratio Enforcement
 
-Ratio tracking runs at both archive and entry scopes to prevent a credit-accumulation attack. Per-entry ratio is tracked independently: `entry_out <= entry_in * R`. This prevents a pattern where many small well-compressed entries build up archive-level headroom that a single malicious entry later exploits (`budget.rs:28–30`).
+Ratio tracking runs at both archive and entry scopes to prevent a credit-accumulation attack. Per-entry ratio is tracked independently: `entry_out <= entry_in * R`. This prevents a pattern where many small well-compressed entries build up archive-level headroom that a single malicious entry later exploits (`budget.rs`).
 
 When compressed input is zero (unknown), the ratio check is skipped to avoid false positives. The `remaining_decompressed_allowance_with_ratio_probe(true)` method applies a conservative 1-byte compressed-input assumption to cap the first read.
 
@@ -124,7 +124,7 @@ reset()                        // arm deadline, zero root counters
 
 ### Budget Hit Classification
 
-`BudgetHit` variants are ordered by increasing blast radius (`budget.rs:89`):
+`BudgetHit` variants are ordered by increasing blast radius (`budget.rs`):
 
 | Variant | Scope | Effect |
 |---------|-------|--------|
@@ -149,7 +149,7 @@ In test/sim-harness builds, a deterministic countdown (`set_deadline_check_count
 
 ### Configuration
 
-**`ArchiveConfig`** (`config.rs:108`) — shared archive scanning configuration. All limits are hard bounds. Archives are treated as hostile input.
+**`ArchiveConfig`** (`config.rs`) — shared archive scanning configuration. All limits are hard bounds. Archives are treated as hostile input.
 
 | Field | Type | Purpose |
 |-------|------|---------|
@@ -167,77 +167,77 @@ In test/sim-harness builds, a deterministic countdown (`set_deadline_check_count
 | `encrypted_policy` | `EncryptedPolicy` | How to handle encrypted content |
 | `unsupported_policy` | `UnsupportedPolicy` | How to handle unsupported formats |
 
-**`EncryptedPolicy`** / **`UnsupportedPolicy`** (`config.rs:70`, `config.rs:87`) — escalation ladders from `SkipWithTelemetry` → `FailArchive` → `FailRun`.
+**`EncryptedPolicy`** / **`UnsupportedPolicy`** (`config.rs`) — escalation ladders from `SkipWithTelemetry` → `FailArchive` → `FailRun`.
 
 ### Budget Tracking
 
-**`ArchiveBudgets`** (`budget.rs:140`) — deterministic budget tracker. Holds immutable caps from config and mutable counters. A fixed-size frame stack tracks per-archive state without allocation.
+**`ArchiveBudgets`** (`budget.rs`) — deterministic budget tracker. Holds immutable caps from config and mutable counters. A fixed-size frame stack tracks per-archive state without allocation.
 
-**`ArchiveFrame`** (`budget.rs:204`) — per-archive accounting frame (48 bytes, `#[repr(C)]`). Tracks `entries_seen`, `entries_scanned`, `metadata_bytes`, `compressed_in`, `decompressed_out`, `entry_compressed_in`, and `entry_decompressed_out`. Entry-open state uses a `u64::MAX` sentinel instead of a separate bool to avoid 7 bytes of padding.
+**`ArchiveFrame`** (`budget.rs`) — per-archive accounting frame (48 bytes, `#[repr(C)]`). Tracks `entries_seen`, `entries_scanned`, `metadata_bytes`, `compressed_in`, `decompressed_out`, `entry_compressed_in`, and `entry_decompressed_out`. Entry-open state uses a `u64::MAX` sentinel instead of a separate bool to avoid 7 bytes of padding.
 
-**`BudgetHit`** (`budget.rs:90`) — classification of which budget was the binding constraint.
+**`BudgetHit`** (`budget.rs`) — classification of which budget was the binding constraint.
 
-**`ChargeResult`** (`budget.rs:107`) — result of charging a byte quantity: `Ok` (full amount fits) or `Clamp { allowed, hit }` (partial).
+**`ChargeResult`** (`budget.rs`) — result of charging a byte quantity: `Ok` (full amount fits) or `Clamp { allowed, hit }` (partial).
 
 ### Format Detection
 
-**`ArchiveKind`** (`detect.rs:53`) — `#[repr(u8)]` enum: `Gzip(0)`, `Tar(1)`, `Zip(2)`, `TarGz(3)`, `Bzip2(4)`, `TarBz2(5)`. The `is_container()` method distinguishes multi-entry formats from single-stream formats.
+**`ArchiveKind`** (`detect.rs`) — `#[repr(u8)]` enum: `Gzip(0)`, `Tar(1)`, `Zip(2)`, `TarGz(3)`, `Bzip2(4)`, `TarBz2(5)`. The `is_container()` method distinguishes multi-entry formats from single-stream formats.
 
 ### Scan Core
 
-**`ArchiveEntrySink`** (`scan.rs:206`) — trait decoupling archive parsing from downstream. Methods: `on_entry_start`, `on_entry_chunk`, `on_entry_end`.
+**`ArchiveEntrySink`** (`scan.rs`) — trait decoupling archive parsing from downstream. Methods: `on_entry_start`, `on_entry_chunk`, `on_entry_end`.
 
-**`EntryMeta`** (`scan.rs:143`) — metadata for a single entry: `display_path`, `size_hint`, `flags`.
+**`EntryMeta`** (`scan.rs`) — metadata for a single entry: `display_path`, `size_hint`, `flags`.
 
-**`EntryChunk`** (`scan.rs:169`) — one iteration of the sliding-window read loop: `data` (overlap prefix + new bytes), `base_offset`, `new_bytes_start`, `new_bytes_len`.
+**`EntryChunk`** (`scan.rs`) — one iteration of the sliding-window read loop: `data` (overlap prefix + new bytes), `base_offset`, `new_bytes_start`, `new_bytes_len`.
 
-**`ArchiveScratch<Z>`** (`scan.rs:234`) — reusable scratch state. Contains `EntryPathCanonicalizer`, per-depth `VirtualPathBuilder`s, `ArchiveBudgets`, per-depth `TarCursor`s, `ZipCursor`, gzip header/name buffers, and the `stream_buf`. Preallocated to `max_archive_depth + 2` depth slots.
+**`ArchiveScratch<Z>`** (`scan.rs`) — reusable scratch state. Contains `EntryPathCanonicalizer`, per-depth `VirtualPathBuilder`s, `ArchiveBudgets`, per-depth `TarCursor`s, `ZipCursor`, gzip header/name buffers, and the `stream_buf`. Preallocated to `max_archive_depth + 2` depth slots.
 
-**`ArchiveScanCtx`** (`scan.rs:356`, crate-private) — borrow-split view that decomposes `ArchiveScratch` into independent mutable borrows for recursive nesting via `split_first_mut`. Not part of the public API.
+**`ArchiveScanCtx`** (`scan.rs`, crate-private) — borrow-split view that decomposes `ArchiveScratch` into independent mutable borrows for recursive nesting via `split_first_mut`. Not part of the public API.
 
-**`ArchiveEnd`** (`scan.rs:133`) — terminal outcome: `Scanned`, `Skipped(ArchiveSkipReason)`, `Partial(PartialReason)`.
+**`ArchiveEnd`** (`scan.rs`) — terminal outcome: `Scanned`, `Skipped(ArchiveSkipReason)`, `Partial(PartialReason)`.
 
 ### Outcome Taxonomy
 
-**`ArchiveSkipReason`** (`outcome.rs:58`) — 14 variants for why an entire archive was skipped before any payload bytes were scanned. `#[repr(u8)]` with stable discriminants used as array indices.
+**`ArchiveSkipReason`** (`outcome.rs`) — 14 variants for why an entire archive was skipped before any payload bytes were scanned. `#[repr(u8)]` with stable discriminants used as array indices.
 
-**`EntrySkipReason`** (`outcome.rs:132`) — 10 variants for why a specific entry was skipped. Entry skips do not abort the archive.
+**`EntrySkipReason`** (`outcome.rs`) — 10 variants for why a specific entry was skipped. Entry skips do not abort the archive.
 
-**`PartialReason`** (`outcome.rs:218`) — 12 variants for why an archive was only partially scanned. Partial outcomes retain results for bytes already processed.
+**`PartialReason`** (`outcome.rs`) — 12 variants for why an archive was only partially scanned. Partial outcomes retain results for bytes already processed.
 
-**`ArchiveStats`** (`outcome.rs:498`) — per-worker aggregate with scalar counters, per-reason breakdown arrays, and a bounded sample ring (`ArchiveSampleRing`). All `record_*` methods are gated behind `cfg!(all(feature = "perf-stats", debug_assertions))` for zero production overhead.
+**`ArchiveStats`** (`outcome.rs`) — per-worker aggregate with scalar counters, per-reason breakdown arrays, and a bounded sample ring (`ArchiveSampleRing`). All `record_*` methods are gated behind `cfg!(all(feature = "perf-stats", debug_assertions))` for zero production overhead.
 
 ### Virtual Paths
 
-**`EntryPathCanonicalizer`** (`path.rs:104`) — sanitizes raw archive entry names into bounded, printable-ASCII display bytes. Resolves `.`/`..`, escapes non-printable bytes as `%HH`, enforces length and component caps.
+**`EntryPathCanonicalizer`** (`path.rs`) — sanitizes raw archive entry names into bounded, printable-ASCII display bytes. Resolves `.`/`..`, escapes non-printable bytes as `%HH`, enforces length and component caps.
 
-**`VirtualPathBuilder`** (`path.rs:313`) — joins parent and entry display paths with `::` separator. Truncation appends `~#<16-hex-digit>` FNV-1a hash suffix.
+**`VirtualPathBuilder`** (`path.rs`) — joins parent and entry display paths with `::` separator. Truncation appends `~#<16-hex-digit>` FNV-1a hash suffix.
 
-**`CanonicalPath`** (`path.rs:63`) — result of canonicalization: `bytes`, `had_traversal`, `truncated`, `component_cap_exceeded`, `hash64`.
+**`CanonicalPath`** (`path.rs`) — result of canonicalization: `bytes`, `had_traversal`, `truncated`, `component_cap_exceeded`, `hash64`.
 
-**`VirtualPath`** (`path.rs:82`) — result of virtual path construction: `bytes`, `truncated`, `hash64`.
+**`VirtualPath`** (`path.rs`) — result of virtual path construction: `bytes`, `truncated`, `hash64`.
 
 ### Format-Specific Types
 
-**`GzipStream<R>`** (`formats/gzip.rs:101`) — streaming gzip decoder wrapping `flate2::MultiGzDecoder<CountedRead<R>>`. Handles concatenated members. Reports compressed-byte deltas via `take_compressed_delta()`.
+**`GzipStream<R>`** (`formats/gzip.rs`) — streaming gzip decoder wrapping `flate2::MultiGzDecoder<CountedRead<R>>`. Handles concatenated members. Reports compressed-byte deltas via `take_compressed_delta()`.
 
-**`Bzip2Stream<R>`** (`formats/bzip2.rs:35`) — streaming bzip2 decoder wrapping `bzip2::MultiBzDecoder<CountedRead<R>>`. Same delta-reporting interface as `GzipStream`.
+**`Bzip2Stream<R>`** (`formats/bzip2.rs`) — streaming bzip2 decoder wrapping `bzip2::MultiBzDecoder<CountedRead<R>>`. Same delta-reporting interface as `GzipStream`.
 
-**`CompressedStream`** trait (`formats/mod.rs:23`) — abstracts `GzipStream` and `Bzip2Stream` for generic scanning functions.
+**`CompressedStream`** trait (`formats/mod.rs`) — abstracts `GzipStream` and `Bzip2Stream` for generic scanning functions.
 
-**`TarCursor`** (`formats/tar.rs:188`) — stateful tar header parser. Walks 512-byte header blocks, handles GNU longname (`L`) and PAX extended-header (`x`/`g`) records internally, yields `TarEntryMeta`. Zero allocation after startup.
+**`TarCursor`** (`formats/tar.rs`) — stateful tar header parser. Walks 512-byte header blocks, handles GNU longname (`L`) and PAX extended-header (`x`/`g`) records internally, yields `TarEntryMeta`. Zero allocation after startup.
 
-**`TarRead`** trait (`formats/tar.rs:99`) — `Read` + optional `take_compressed_delta()` for compressed-byte accounting.
+**`TarRead`** trait (`formats/tar.rs`) — `Read` + optional `take_compressed_delta()` for compressed-byte accounting.
 
-**`ZipCursor<R>`** (`formats/zip.rs:173`) — streaming cursor over a zip central directory. Parses EOCD, iterates CDFH entries, validates bounds. Supports Zip32 only; Zip64 sentinel values trigger `UnsupportedFeature`.
+**`ZipCursor<R>`** (`formats/zip.rs`) — streaming cursor over a zip central directory. Parses EOCD, iterates CDFH entries, validates bounds. Supports Zip32 only; Zip64 sentinel values trigger `UnsupportedFeature`.
 
-**`ZipSource`** trait (`formats/zip.rs:39`) — `Read + Seek` source with `len()` and `try_clone()`. Implemented for `File`, `Cursor<Arc<[u8]>>`, `Cursor<Vec<u8>>`.
+**`ZipSource`** trait (`formats/zip.rs`) — `Read + Seek` source with `len()` and `try_clone()`. Implemented for `File`, `Cursor<Arc<[u8]>>`, `Cursor<Vec<u8>>`.
 
-**`ZipEntryReader`** (`formats/zip.rs:713`) — decompressed entry reader: `Stored(CountedRead<LimitedRead>)` or `Deflate(DeflateDecoder<CountedRead<LimitedRead>>)`.
+**`ZipEntryReader`** (`formats/zip.rs`) — decompressed entry reader: `Stored(CountedRead<LimitedRead>)` or `Deflate(DeflateDecoder<CountedRead<LimitedRead>>)`.
 
-**`LimitedRead`** (`formats/zip.rs:739`) — bounds reads to a fixed byte count (compressed entry size).
+**`LimitedRead`** (`formats/zip.rs`) — bounds reads to a fixed byte count (compressed entry size).
 
-**`CountedRead`** (`util.rs:28`) — `Read` wrapper that counts bytes consumed, driving inflation-ratio enforcement.
+**`CountedRead`** (`util.rs`) — `Read` wrapper that counts bytes consumed, driving inflation-ratio enforcement.
 
 ## Data Flow
 
@@ -469,20 +469,20 @@ The bounded `ArchiveSampleRing` (32 samples, 192-byte path prefix each) captures
 
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
-| `ARCHIVE_STREAM_READ_MAX` | 256 KiB | `scan.rs:115` | Upper bound on single decompressed read |
-| `LOCATOR_LEN` | 18 bytes | `scan.rs:109` | `@` + kind + 16 hex digits |
-| `TAR_BLOCK_LEN` | 512 bytes | `formats/tar.rs:41` | Tar header/data block size |
-| `USTAR_MAGIC_OFFSET` | 257 | `formats/tar.rs:44` | Offset of `"ustar"` magic in tar header |
-| `EOCD_MIN_LEN` | 22 bytes | `formats/zip.rs:111` | Minimum end-of-central-directory size |
-| `EOCD_SEARCH_MAX` | 66 KiB | `formats/zip.rs:112` | Backward search window for EOCD |
-| `CDFH_LEN` | 46 bytes | `formats/zip.rs:115` | Central directory fixed header length |
-| `LFH_LEN` | 30 bytes | `formats/zip.rs:117` | Local file header fixed length |
-| `DEFAULT_MAX_COMPONENTS` | 256 | `path.rs:44` | Max path components during canonicalization |
-| `TRUNC_SUFFIX_LEN` | 18 bytes | `path.rs:47` | `~#` + 16 hex digits |
-| `ARCHIVE_SAMPLE_MAX` | 32 | `outcome.rs:350` | Max samples in bounded ring |
-| `ARCHIVE_SAMPLE_PATH_PREFIX_MAX` | 192 bytes | `outcome.rs:352` | Max path prefix per sample |
-| `ENTRY_NOT_OPEN` | `u64::MAX` | `budget.rs:188` | Sentinel for entry-not-open state |
-| `VIRTUAL_FILE_ID_BASE` | `0x8000_0000` | `local_fs_archive_ctx.rs:85` | High-bit namespace for virtual IDs |
+| `ARCHIVE_STREAM_READ_MAX` | 256 KiB | `scan.rs` | Upper bound on single decompressed read |
+| `LOCATOR_LEN` | 18 bytes | `scan.rs` | `@` + kind + 16 hex digits |
+| `TAR_BLOCK_LEN` | 512 bytes | `formats/tar.rs` | Tar header/data block size |
+| `USTAR_MAGIC_OFFSET` | 257 | `formats/tar.rs` | Offset of `"ustar"` magic in tar header |
+| `EOCD_MIN_LEN` | 22 bytes | `formats/zip.rs` | Minimum end-of-central-directory size |
+| `EOCD_SEARCH_MAX` | 66 KiB | `formats/zip.rs` | Backward search window for EOCD |
+| `CDFH_LEN` | 46 bytes | `formats/zip.rs` | Central directory fixed header length |
+| `LFH_LEN` | 30 bytes | `formats/zip.rs` | Local file header fixed length |
+| `DEFAULT_MAX_COMPONENTS` | 256 | `path.rs` | Max path components during canonicalization |
+| `TRUNC_SUFFIX_LEN` | 18 bytes | `path.rs` | `~#` + 16 hex digits |
+| `ARCHIVE_SAMPLE_MAX` | 32 | `outcome.rs` | Max samples in bounded ring |
+| `ARCHIVE_SAMPLE_PATH_PREFIX_MAX` | 192 bytes | `outcome.rs` | Max path prefix per sample |
+| `ENTRY_NOT_OPEN` | `u64::MAX` | `budget.rs` | Sentinel for entry-not-open state |
+| `VIRTUAL_FILE_ID_BASE` | `0x8000_0000` | `local_fs_archive_ctx.rs` | High-bit namespace for virtual IDs |
 
 ### Frame Stack Sizing
 
@@ -490,78 +490,78 @@ The bounded `ArchiveSampleRing` (32 samples, 192-byte path prefix each) captures
 
 ## Source of Truth
 
-| File | Line(s) | Purpose |
-|------|---------|---------|
-| `archive/mod.rs` | 1–40 | Module root, re-exports |
-| `archive/config.rs` | 108–199 | `ArchiveConfig` struct + defaults (324–347) + validation (364–426) |
-| `archive/budget.rs` | 140–172 | `ArchiveBudgets` struct |
-| `archive/budget.rs` | 89–99 | `BudgetHit` enum |
-| `archive/budget.rs` | 107–116 | `ChargeResult` enum |
-| `archive/budget.rs` | 204–221 | `ArchiveFrame` struct |
-| `archive/budget.rs` | 409–417 | `enter_archive()` |
-| `archive/budget.rs` | 552–671 | `charge_decompressed_out()` — five-cap minimum logic |
-| `archive/budget.rs` | 686–775 | `charge_discarded_out()` — bypasses per-entry output cap |
-| `archive/detect.rs` | 53–66 | `ArchiveKind` enum |
-| `archive/detect.rs` | 90–105 | `detect_kind_from_path()` |
-| `archive/detect.rs` | 129–143 | `sniff_kind_from_header()` |
-| `archive/detect.rs` | 151–156 | `detect_kind()` — combined detection |
-| `archive/detect.rs` | 185–200 | `detect_kind_from_name_bytes()` — byte-level suffix matcher |
-| `archive/outcome.rs` | 58–87 | `ArchiveSkipReason` (14 variants) |
-| `archive/outcome.rs` | 132–153 | `EntrySkipReason` (10 variants) |
-| `archive/outcome.rs` | 218–243 | `PartialReason` (12 variants) |
-| `archive/outcome.rs` | 498–523 | `ArchiveStats` struct |
-| `archive/outcome.rs` | 409–416 | `ArchiveSampleRing` struct |
-| `archive/path.rs` | 104–117 | `EntryPathCanonicalizer` struct |
-| `archive/path.rs` | 181–301 | `canonicalize()` method |
-| `archive/path.rs` | 313–319 | `VirtualPathBuilder` struct |
-| `archive/path.rs` | 355–387 | `build()` method |
-| `archive/path.rs` | 546–578 | `apply_hash_suffix_truncation()` |
-| `archive/scan.rs` | 133–137 | `ArchiveEnd` enum |
-| `archive/scan.rs` | 143–153 | `EntryMeta` struct |
-| `archive/scan.rs` | 169–179 | `EntryChunk` struct |
-| `archive/scan.rs` | 206–212 | `ArchiveEntrySink` trait |
-| `archive/scan.rs` | 234–249 | `ArchiveScratch<Z>` struct |
-| `archive/scan.rs` | 356–378 | `ArchiveScanCtx` struct |
-| `archive/scan.rs` | 507–594 | `scan_gzip_stream()` |
-| `archive/scan.rs` | 620–777 | `scan_compressed_entry_stream()` — shared inner loop |
-| `archive/scan.rs` | 782–829 | `scan_bzip2_stream()` |
-| `archive/scan.rs` | 852–871 | `scan_tar_stream()` |
-| `archive/scan.rs` | 897–1599 | `scan_tar_stream_nested()` — recursive tar iteration |
-| `archive/scan.rs` | 1606–1616 | `scan_targz_stream()` |
-| `archive/scan.rs` | 1623–1633 | `scan_tarbz2_stream()` |
-| `archive/scan.rs` | 1666–2054 | `scan_zip_source()` |
-| `archive/util.rs` | 28–57 | `CountedRead` struct |
-| `archive/util.rs` | 71–100 | FNV-1a hash functions |
-| `archive/util.rs` | 119–124 | `write_u64_hex_lower()` |
-| `archive/util.rs` | 152–169 | `read_exact_n()` |
-| `archive/util.rs` | 186–213 | `budget_hit_to_partial()` |
-| `archive/formats/mod.rs` | 23–28 | `CompressedStream` trait |
-| `archive/formats/gzip.rs` | 101–104 | `GzipStream` struct |
-| `archive/formats/gzip.rs` | 128–154 | `new_with_header()` — header parsing |
-| `archive/formats/bzip2.rs` | 35–38 | `Bzip2Stream` struct |
-| `archive/formats/tar.rs` | 99–104 | `TarRead` trait |
-| `archive/formats/tar.rs` | 145–159 | `TarEntryMeta` struct |
-| `archive/formats/tar.rs` | 169–178 | `TarNext` enum |
-| `archive/formats/tar.rs` | 188–221 | `TarCursor` struct |
-| `archive/formats/tar.rs` | 304–413 | `next_entry()` — header parsing loop |
-| `archive/formats/zip.rs` | 39–51 | `ZipSource` trait |
-| `archive/formats/zip.rs` | 137–149 | `ZipEntryMeta` struct |
-| `archive/formats/zip.rs` | 173–193 | `ZipCursor` struct |
-| `archive/formats/zip.rs` | 265–426 | `open()` — EOCD parsing |
-| `archive/formats/zip.rs` | 429–579 | `next_entry()` — CDFH iteration |
-| `archive/formats/zip.rs` | 636–707 | `open_entry_reader()` — LFH validation + reader construction |
-| `archive/formats/zip.rs` | 713–734 | `ZipEntryReader` enum |
-| `archive/formats/zip.rs` | 739–767 | `LimitedRead` struct |
-| `scheduler/local_fs_archive_ctx.rs` | 84–92 | `alloc_virtual_file_id()` |
-| `scheduler/local_fs_archive_ctx.rs` | 125–138 | `dispatch_archive_scan()` |
-| `scheduler/local_fs_archive_ctx.rs` | 148–164 | `ArchiveEnd` (scheduler variant) |
-| `scheduler/local_fs_archive_ctx.rs` | 235–262 | `ArchiveScanCtx` (blocking-path variant) |
-| `scheduler/local_fs_archive_ctx.rs` | 324–371 | `scan_and_emit_chunk()` |
-| `scheduler/local_fs_archive_ctx.rs` | 429–471 | `apply_entry_budget_clamp()` |
-| `scheduler/local_fs_archive_ctx.rs` | 481–504 | `discard_remaining_payload()` |
-| `scheduler/local_fs_archive_ctx.rs` | 529–664 | `scan_compressed_stream_nested()` |
-| `scheduler/local_fs_gzip.rs` | 26–140 | `process_gzip_file()` |
-| `scheduler/local_fs_bzip2.rs` | 27–96 | `process_bzip2_file()` |
-| `scheduler/local_fs_tar.rs` | 1–774 | `process_tar_file()`, `process_targz_file()`, `process_tarbz2_file()`, recursive tar iteration |
-| `scheduler/local_fs_zip.rs` | 28–461 | `process_zip_file()` |
-| `scheduler/local_fs_extract.rs` | 35–131 | `extract_and_scan_file()` — binary extraction (non-archive) |
+| File | Purpose |
+|------|---------|
+| `archive/mod.rs` | Module root, re-exports |
+| `archive/config.rs` | `ArchiveConfig` struct + defaults + validation |
+| `archive/budget.rs` | `ArchiveBudgets` struct |
+| `archive/budget.rs` | `BudgetHit` enum |
+| `archive/budget.rs` | `ChargeResult` enum |
+| `archive/budget.rs` | `ArchiveFrame` struct |
+| `archive/budget.rs` | `enter_archive()` |
+| `archive/budget.rs` | `charge_decompressed_out()` — five-cap minimum logic |
+| `archive/budget.rs` | `charge_discarded_out()` — bypasses per-entry output cap |
+| `archive/detect.rs` | `ArchiveKind` enum |
+| `archive/detect.rs` | `detect_kind_from_path()` |
+| `archive/detect.rs` | `sniff_kind_from_header()` |
+| `archive/detect.rs` | `detect_kind()` — combined detection |
+| `archive/detect.rs` | `detect_kind_from_name_bytes()` — byte-level suffix matcher |
+| `archive/outcome.rs` | `ArchiveSkipReason` (14 variants) |
+| `archive/outcome.rs` | `EntrySkipReason` (10 variants) |
+| `archive/outcome.rs` | `PartialReason` (12 variants) |
+| `archive/outcome.rs` | `ArchiveStats` struct |
+| `archive/outcome.rs` | `ArchiveSampleRing` struct |
+| `archive/path.rs` | `EntryPathCanonicalizer` struct |
+| `archive/path.rs` | `canonicalize()` method |
+| `archive/path.rs` | `VirtualPathBuilder` struct |
+| `archive/path.rs` | `build()` method |
+| `archive/path.rs` | `apply_hash_suffix_truncation()` |
+| `archive/scan.rs` | `ArchiveEnd` enum |
+| `archive/scan.rs` | `EntryMeta` struct |
+| `archive/scan.rs` | `EntryChunk` struct |
+| `archive/scan.rs` | `ArchiveEntrySink` trait |
+| `archive/scan.rs` | `ArchiveScratch<Z>` struct |
+| `archive/scan.rs` | `ArchiveScanCtx` struct |
+| `archive/scan.rs` | `scan_gzip_stream()` |
+| `archive/scan.rs` | `scan_compressed_entry_stream()` — shared inner loop |
+| `archive/scan.rs` | `scan_bzip2_stream()` |
+| `archive/scan.rs` | `scan_tar_stream()` |
+| `archive/scan.rs` | `scan_tar_stream_nested()` — recursive tar iteration |
+| `archive/scan.rs` | `scan_targz_stream()` |
+| `archive/scan.rs` | `scan_tarbz2_stream()` |
+| `archive/scan.rs` | `scan_zip_source()` |
+| `archive/util.rs` | `CountedRead` struct |
+| `archive/util.rs` | FNV-1a hash functions |
+| `archive/util.rs` | `write_u64_hex_lower()` |
+| `archive/util.rs` | `read_exact_n()` |
+| `archive/util.rs` | `budget_hit_to_partial()` |
+| `archive/formats/mod.rs` | `CompressedStream` trait |
+| `archive/formats/gzip.rs` | `GzipStream` struct |
+| `archive/formats/gzip.rs` | `new_with_header()` — header parsing |
+| `archive/formats/bzip2.rs` | `Bzip2Stream` struct |
+| `archive/formats/tar.rs` | `TarRead` trait |
+| `archive/formats/tar.rs` | `TarEntryMeta` struct |
+| `archive/formats/tar.rs` | `TarNext` enum |
+| `archive/formats/tar.rs` | `TarCursor` struct |
+| `archive/formats/tar.rs` | `next_entry()` — header parsing loop |
+| `archive/formats/zip.rs` | `ZipSource` trait |
+| `archive/formats/zip.rs` | `ZipEntryMeta` struct |
+| `archive/formats/zip.rs` | `ZipCursor` struct |
+| `archive/formats/zip.rs` | `open()` — EOCD parsing |
+| `archive/formats/zip.rs` | `next_entry()` — CDFH iteration |
+| `archive/formats/zip.rs` | `open_entry_reader()` — LFH validation + reader construction |
+| `archive/formats/zip.rs` | `ZipEntryReader` enum |
+| `archive/formats/zip.rs` | `LimitedRead` struct |
+| `scheduler/local_fs_archive_ctx.rs` | `alloc_virtual_file_id()` |
+| `scheduler/local_fs_archive_ctx.rs` | `dispatch_archive_scan()` |
+| `scheduler/local_fs_archive_ctx.rs` | `ArchiveEnd` (scheduler variant) |
+| `scheduler/local_fs_archive_ctx.rs` | `ArchiveScanCtx` (blocking-path variant) |
+| `scheduler/local_fs_archive_ctx.rs` | `scan_and_emit_chunk()` |
+| `scheduler/local_fs_archive_ctx.rs` | `apply_entry_budget_clamp()` |
+| `scheduler/local_fs_archive_ctx.rs` | `discard_remaining_payload()` |
+| `scheduler/local_fs_archive_ctx.rs` | `scan_compressed_stream_nested()` |
+| `scheduler/local_fs_gzip.rs` | `process_gzip_file()` |
+| `scheduler/local_fs_bzip2.rs` | `process_bzip2_file()` |
+| `scheduler/local_fs_tar.rs` | `process_tar_file()`, `process_targz_file()`, `process_tarbz2_file()`, recursive tar iteration |
+| `scheduler/local_fs_zip.rs` | `process_zip_file()` |
+| `scheduler/local_fs_extract.rs` | `extract_and_scan_file()` — binary extraction (non-archive) |

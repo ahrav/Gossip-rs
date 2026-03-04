@@ -65,7 +65,7 @@ pub struct SimClock { now: u64 }
 // now_ticks() — current time
 ```
 
-Source: `crates/scanner-scheduler/src/sim/clock.rs:16-50`
+Source: `crates/scanner-scheduler/src/sim/clock.rs`
 
 ### SimRng — Deterministic RNG
 
@@ -79,7 +79,7 @@ pub struct SimRng { state: u64 }
 // gen_bool(numerator, denominator) — weighted coin flip
 ```
 
-Source: `crates/scanner-scheduler/src/sim/rng.rs:6-46`
+Source: `crates/scanner-scheduler/src/sim/rng.rs`
 
 ### SimFs — In-Memory Filesystem
 
@@ -94,7 +94,7 @@ pub struct SimFs {
 
 Built from a `SimFsSpec` containing `SimNodeSpec::File` and `SimNodeSpec::Dir` nodes. Files carry optional `discovery_len_hint` (for max-size filtering) and `type_hint` (`File`, `NotFile`, `Unknown`) modeling `DirEntry::file_type()` behavior.
 
-Source: `crates/scanner-scheduler/src/sim/fs.rs:82-188`
+Source: `crates/scanner-scheduler/src/sim/fs.rs`
 
 ### FaultPlan / FaultInjector — Fault Injection
 
@@ -133,7 +133,7 @@ pub struct ReadFault {
 
 Serialization encodes path bytes as lowercase hex strings for JSON compatibility. Deserialization accepts both hex (`"666f6f"`) and raw UTF-8 (`"foo"`).
 
-Source: `crates/scanner-scheduler/src/sim/fault.rs:1-188`
+Source: `crates/scanner-scheduler/src/sim/fault.rs`
 
 ### SimExecutor — Deterministic Work-Stealing Executor
 
@@ -153,7 +153,7 @@ Task states: `Runnable`, `Blocked`, `Completed`. The executor does not interpret
 
 **What this does NOT model**: real-time scheduling, cache effects, CAS failures, thread wake/sleep.
 
-Source: `crates/scanner-scheduler/src/sim/executor.rs:88-303`
+Source: `crates/scanner-scheduler/src/sim/executor.rs`
 
 ### TraceRing — Bounded Event Buffer
 
@@ -163,7 +163,7 @@ Fixed-capacity ring buffer of `TraceEvent`s. When full, oldest events are evicte
 
 The runner uses a `TraceCollector` that writes to both the ring buffer (always, capacity 2048) and an optional full trace (when `SIM_TRACE_FULL` is set).
 
-Source: `crates/scanner-scheduler/src/sim/trace.rs:1-117`
+Source: `crates/scanner-scheduler/src/sim/trace.rs`
 
 ### ReproArtifact — Failure Reproduction
 
@@ -186,13 +186,13 @@ pub struct ReproArtifact {
 
 `TraceDump` contains the ring-buffer snapshot (`ring`) and an optional full trace (`full`).
 
-Source: `crates/scanner-scheduler/src/sim/artifact.rs:1-44`
+Source: `crates/scanner-scheduler/src/sim/artifact.rs`
 
 ### VirtualPathTable — Archive Path Registry
 
 Byte-budgeted, append-only mapping between raw path bytes and `FileId`s. Root files get low IDs (0, 1, 2, ...), archive entries get high-bit IDs (`0x8000_0000+`). Duplicate paths reuse existing IDs. Insertions fail when the byte budget is exhausted.
 
-Source: `crates/scanner-scheduler/src/sim_scanner/vpath_table.rs:1-110`
+Source: `crates/scanner-scheduler/src/sim_scanner/vpath_table.rs`
 
 ## Scenario Generation
 
@@ -221,7 +221,7 @@ Configuration is via `ScenarioGenConfig`:
 | `archive_entries` | 2 | Entries per archive |
 | `representations` | Raw, Base64, UrlPercent, Utf16Le, Utf16Be | Allowed encodings |
 
-Source: `crates/scanner-scheduler/src/sim_scanner/generator.rs:128-281`
+Source: `crates/scanner-scheduler/src/sim_scanner/generator.rs`
 
 ### Mutation Generation (`build_mutation_scenario`)
 
@@ -235,7 +235,7 @@ The noise padding separates tokens from file boundaries and provides leading con
 
 Expected secrets use `MayMiss` point-span sentinels (1-byte spans every 8 bytes through the token region, for every rule ID). The real correctness check happens post-scan via `check_mutation_expectations`.
 
-Source: `crates/scanner-scheduler/src/sim/mutation/adapter.rs:139-231`
+Source: `crates/scanner-scheduler/src/sim/mutation/adapter.rs`
 
 ## Runner
 
@@ -255,7 +255,7 @@ Source: `crates/scanner-scheduler/src/sim/mutation/adapter.rs:139-231`
 
 **Stability mode**: When `run_config.stability_runs > 1`, the runner replays the same scenario under additional schedule seeds and compares normalized finding sets. A mismatch produces a `StabilityMismatch` failure.
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:138-2442`
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs`
 
 ### Failure Kinds
 
@@ -267,7 +267,7 @@ Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:138-2442`
 | `OracleMismatch` | Ground-truth, differential, or archive oracle failed |
 | `StabilityMismatch` | Different schedules produced different finding sets |
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:79-92`
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs`
 
 ### Oracles
 
@@ -283,7 +283,7 @@ The runner applies these correctness checks after a successful run:
 
 **Mutation oracle** (`check_mutation_expectations`) — post-scan check for mutation test cases. For each case, computes the expected token span and checks whether any finding from the same file with the correct rule_id intersects that span. `MustMatch` not found is a violation (false negative). `MustNotMatch` but found is silently tolerated (context wrappers can extend regex matches).
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs:567-2442` (dispatch + oracle impls), `crates/scanner-scheduler/src/sim/mutation/adapter.rs:283-341` (mutation oracle)
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs` (dispatch + oracle impls), `crates/scanner-scheduler/src/sim/mutation/adapter.rs` (mutation oracle)
 
 ### Invariant Codes
 
@@ -307,7 +307,7 @@ The runner checks numbered invariants. Key codes:
 | 50-54 | Archive entry lifecycle invariants |
 | 60 | Virtual path budget exceeded for root |
 
-Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs` (various)
+Source: `crates/scanner-scheduler/src/sim_scanner/runner.rs`
 
 ## Mutation Engine
 
@@ -333,7 +333,7 @@ Each family provides:
 - `param_bound()` — conservative upper bound for numeric parameters
 - `rule_id()` — positional index in `TokenFamily::ALL` (single source of truth)
 
-Source: `crates/scanner-scheduler/src/sim/mutation/family.rs:68-276`
+Source: `crates/scanner-scheduler/src/sim/mutation/family.rs`
 
 ### Mutation Operators (MutOp)
 
@@ -351,7 +351,7 @@ Composable perturbations applied left-to-right via `apply_ops`. Order-dependent.
 
 Safety: pipeline halts if output exceeds `MAX_OUTPUT_BYTES` (1 MiB). `ApplyResult` reports how many operators actually ran, which the oracle uses to avoid predicting based on unapplied operators.
 
-Source: `crates/scanner-scheduler/src/sim/mutation/op.rs:41-201`
+Source: `crates/scanner-scheduler/src/sim/mutation/op.rs`
 
 ### Expectation Oracle
 
@@ -365,7 +365,7 @@ Source: `crates/scanner-scheduler/src/sim/mutation/op.rs:41-201`
 
 The oracle evaluates operators left-to-right, tracking running token length. A `MustNotMatch` from any operator immediately dominates. Soft effects accumulate but can be overridden by later hard breakers.
 
-Source: `crates/scanner-scheduler/src/sim/mutation/family.rs:219-275`
+Source: `crates/scanner-scheduler/src/sim/mutation/family.rs`
 
 ### Encoding Layer
 
@@ -380,7 +380,7 @@ Self-contained encoders that produce bit-identical output for any given input. N
 | `Utf16Be` | `encode_utf16(_, true)` | Zero-extended to 16-bit BE |
 | `Nested { depth }` | `encode_nested` | Alternating base64/percent, clamped to depth 4 |
 
-Source: `crates/scanner-scheduler/src/sim/mutation/encode.rs:1-228`
+Source: `crates/scanner-scheduler/src/sim/mutation/encode.rs`
 
 ### Context Wrappers
 
@@ -397,7 +397,7 @@ Mutated tokens are embedded in surrounding context via `ContextWrap`:
 
 No escaping is applied — the test exercises raw byte scanning, not format-aware parsing.
 
-Source: `crates/scanner-scheduler/src/sim/mutation/plan.rs:32-158`
+Source: `crates/scanner-scheduler/src/sim/mutation/plan.rs`
 
 ### Plan Execution Pipeline
 
@@ -410,7 +410,7 @@ A `MutationPlan` is a serializable recipe for one test case. `execute_plan` mate
 
 The function is pure and deterministic: same plan always produces byte-identical output.
 
-Source: `crates/scanner-scheduler/src/sim/mutation/plan.rs:187-201`
+Source: `crates/scanner-scheduler/src/sim/mutation/plan.rs`
 
 ### Plan Generation
 
@@ -418,7 +418,7 @@ Source: `crates/scanner-scheduler/src/sim/mutation/plan.rs:187-201`
 
 `random_mutation_plans_all_families(rng, plans_per_family)` generates plans for every family, grouped by family in `TokenFamily::ALL` order.
 
-Source: `crates/scanner-scheduler/src/sim/mutation/plan_gen.rs:52-83`
+Source: `crates/scanner-scheduler/src/sim/mutation/plan_gen.rs`
 
 ## Minimization
 
@@ -443,7 +443,7 @@ The minimizer re-materializes archive bytes after each modification to keep the 
 
 **Configuration**: `MinimizerCfg { max_iterations: 8 }` (default).
 
-Source: `crates/scanner-scheduler/src/sim/minimize.rs:32-66`
+Source: `crates/scanner-scheduler/src/sim/minimize.rs`
 
 ## Replay
 
@@ -459,7 +459,7 @@ pub fn replay_artifact(artifact: &ReproArtifact) -> RunOutcome {
 
 Because all inputs are captured in the artifact (scenario, fault plan, seeds, run config), replay is fully deterministic.
 
-Source: `crates/scanner-scheduler/src/sim_scanner/replay.rs:12-27`
+Source: `crates/scanner-scheduler/src/sim_scanner/replay.rs`
 
 ## Oracle Verification
 
@@ -487,25 +487,25 @@ The scheduler simulation harness (separate from the scanner simulation) uses add
 
 ## Source of Truth
 
-| Component | File | Key Lines |
-|-----------|------|-----------|
-| Sim module root | `crates/scanner-scheduler/src/sim/mod.rs` | 1-33 |
-| SimClock | `crates/scanner-scheduler/src/sim/clock.rs` | 16-50 |
-| SimRng | `crates/scanner-scheduler/src/sim/rng.rs` | 6-46 |
-| SimFs, SimFsSpec, SimNodeSpec | `crates/scanner-scheduler/src/sim/fs.rs` | 52-188 |
-| FaultPlan, FaultInjector, IoFault | `crates/scanner-scheduler/src/sim/fault.rs` | 16-188 |
-| SimExecutor, SimTask, StepResult | `crates/scanner-scheduler/src/sim/executor.rs` | 88-303 |
-| TraceEvent, TraceRing | `crates/scanner-scheduler/src/sim/trace.rs` | 9-117 |
-| ReproArtifact, TraceDump | `crates/scanner-scheduler/src/sim/artifact.rs` | 14-44 |
-| minimize_scanner_case, MinimizerCfg | `crates/scanner-scheduler/src/sim/minimize.rs` | 16-66 |
-| MutOp, MutOpKind, apply_ops | `crates/scanner-scheduler/src/sim/mutation/op.rs` | 41-148 |
-| TokenFamily, Outcome | `crates/scanner-scheduler/src/sim/mutation/family.rs` | 68-276 |
-| SecretRepr, encode_secret | `crates/scanner-scheduler/src/sim/mutation/encode.rs` | 27-84 |
-| MutationPlan, execute_plan, ContextWrap | `crates/scanner-scheduler/src/sim/mutation/plan.rs` | 103-201 |
-| random_mutation_plan, random_mutation_plans_all_families | `crates/scanner-scheduler/src/sim/mutation/plan_gen.rs` | 52-83 |
-| build_mutation_scenario, check_mutation_expectations | `crates/scanner-scheduler/src/sim/mutation/adapter.rs` | 139-341 |
-| Scenario, RunConfig, ExpectedSecret | `crates/scanner-scheduler/src/sim_scanner/scenario.rs` | 13-231 |
-| generate_scenario, ScenarioGenConfig | `crates/scanner-scheduler/src/sim_scanner/generator.rs` | 38-524 |
-| ScannerSimRunner, RunOutcome, FailureKind | `crates/scanner-scheduler/src/sim_scanner/runner.rs` | 62-2442 |
-| replay_artifact | `crates/scanner-scheduler/src/sim_scanner/replay.rs` | 12-27 |
-| VirtualPathTable | `crates/scanner-scheduler/src/sim_scanner/vpath_table.rs` | 24-110 |
+| Component | File |
+|-----------|------|
+| Sim module root | `crates/scanner-scheduler/src/sim/mod.rs` |
+| SimClock | `crates/scanner-scheduler/src/sim/clock.rs` |
+| SimRng | `crates/scanner-scheduler/src/sim/rng.rs` |
+| SimFs, SimFsSpec, SimNodeSpec | `crates/scanner-scheduler/src/sim/fs.rs` |
+| FaultPlan, FaultInjector, IoFault | `crates/scanner-scheduler/src/sim/fault.rs` |
+| SimExecutor, SimTask, StepResult | `crates/scanner-scheduler/src/sim/executor.rs` |
+| TraceEvent, TraceRing | `crates/scanner-scheduler/src/sim/trace.rs` |
+| ReproArtifact, TraceDump | `crates/scanner-scheduler/src/sim/artifact.rs` |
+| minimize_scanner_case, MinimizerCfg | `crates/scanner-scheduler/src/sim/minimize.rs` |
+| MutOp, MutOpKind, apply_ops | `crates/scanner-scheduler/src/sim/mutation/op.rs` |
+| TokenFamily, Outcome | `crates/scanner-scheduler/src/sim/mutation/family.rs` |
+| SecretRepr, encode_secret | `crates/scanner-scheduler/src/sim/mutation/encode.rs` |
+| MutationPlan, execute_plan, ContextWrap | `crates/scanner-scheduler/src/sim/mutation/plan.rs` |
+| random_mutation_plan, random_mutation_plans_all_families | `crates/scanner-scheduler/src/sim/mutation/plan_gen.rs` |
+| build_mutation_scenario, check_mutation_expectations | `crates/scanner-scheduler/src/sim/mutation/adapter.rs` |
+| Scenario, RunConfig, ExpectedSecret | `crates/scanner-scheduler/src/sim_scanner/scenario.rs` |
+| generate_scenario, ScenarioGenConfig | `crates/scanner-scheduler/src/sim_scanner/generator.rs` |
+| ScannerSimRunner, RunOutcome, FailureKind | `crates/scanner-scheduler/src/sim_scanner/runner.rs` |
+| replay_artifact | `crates/scanner-scheduler/src/sim_scanner/replay.rs` |
+| VirtualPathTable | `crates/scanner-scheduler/src/sim_scanner/vpath_table.rs` |

@@ -37,80 +37,80 @@ flowchart TD
 
 ### Pack Index Types (`pack_idx.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `IdxView<'a>` | `pack_idx.rs:132` | Zero-copy view over a pack index v2 file |
-| `IdxOidIter<'a>` | `pack_idx.rs:394` | Iterator yielding `(oid_bytes, index)` pairs in sorted order |
-| `IdxError` | `pack_idx.rs:41` | Pack index parsing errors (corrupt, unsupported version, size limit) |
+| Type | Description |
+|------|-------------|
+| `IdxView<'a>` | Zero-copy view over a pack index v2 file |
+| `IdxOidIter<'a>` | Iterator yielding `(oid_bytes, index)` pairs in sorted order |
+| `IdxError` | Pack index parsing errors (corrupt, unsupported version, size limit) |
 
 ### Pack Inflate Types (`pack_inflate.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackFile<'a>` | `pack_inflate.rs:258` | Zero-copy view over pack bytes, excluding trailing hash |
-| `PackHeader` | `pack_inflate.rs:266` | Cached pack header metadata (oid_len, data_end) for repeated parsing |
-| `EntryHeader` | `pack_inflate.rs:244` | Parsed entry header: uncompressed size, data_start offset, entry kind |
-| `EntryKind` | `pack_inflate.rs:100` | Entry type: `NonDelta { kind }`, `OfsDelta { base_offset }`, `RefDelta { base_oid }` |
-| `ObjectKind` | `pack_inflate.rs:91` | Non-delta object kind: Commit, Tree, Blob, Tag |
-| `PackParseError` | `pack_inflate.rs:111` | Header/entry parsing errors |
-| `InflateError` | `pack_inflate.rs:145` | Zlib decompression errors (limit exceeded, truncated, stalled, backend) |
-| `DeltaError` | `pack_inflate.rs:167` | Delta application errors (truncated, size mismatch, copy out of range) |
-| `PackObjectError` | `pack_inflate.rs:195` | Composite error wrapping parse, inflate, and delta errors |
+| Type | Description |
+|------|-------------|
+| `PackFile<'a>` | Zero-copy view over pack bytes, excluding trailing hash |
+| `PackHeader` | Cached pack header metadata (oid_len, data_end) for repeated parsing |
+| `EntryHeader` | Parsed entry header: uncompressed size, data_start offset, entry kind |
+| `EntryKind` | Entry type: `NonDelta { kind }`, `OfsDelta { base_offset }`, `RefDelta { base_oid }` |
+| `ObjectKind` | Non-delta object kind: Commit, Tree, Blob, Tag |
+| `PackParseError` | Header/entry parsing errors |
+| `InflateError` | Zlib decompression errors (limit exceeded, truncated, stalled, backend) |
+| `DeltaError` | Delta application errors (truncated, size mismatch, copy out of range) |
+| `PackObjectError` | Composite error wrapping parse, inflate, and delta errors |
 
 ### Pack Decode Types (`pack_decode.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackDecodeLimits` | `pack_decode.rs:30` | Size caps: `max_header_bytes`, `max_object_bytes`, `max_delta_bytes` |
-| `PackDecodeError` | `pack_decode.rs:59` | Decode errors including `ObjectTooLarge` and `DeltaTooLarge` |
+| Type | Description |
+|------|-------------|
+| `PackDecodeLimits` | Size caps: `max_header_bytes`, `max_object_bytes`, `max_delta_bytes` |
+| `PackDecodeError` | Decode errors including `ObjectTooLarge` and `DeltaTooLarge` |
 
 ### Pack I/O Types (`pack_io.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackIo<'a>` | `pack_io.rs:173` | External base resolver with lazy mmap-backed pack cache and loose object fallback |
-| `PackIoLimits` | `pack_io.rs:50` | Decode limits plus cross-pack delta depth cap |
-| `PackIoError` | `pack_io.rs:72` | I/O errors (missing MIDX, pack not found, delta depth exceeded, loose object failures) |
+| Type | Description |
+|------|-------------|
+| `PackIo<'a>` | External base resolver with lazy mmap-backed pack cache and loose object fallback |
+| `PackIoLimits` | Decode limits plus cross-pack delta depth cap |
+| `PackIoError` | I/O errors (missing MIDX, pack not found, delta depth exceeded, loose object failures) |
 
 ### Pack Reader Types (`pack_reader.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackReader` (trait) | `pack_reader.rs:39` | Read-only `read_at` / `read_exact_at` interface for deterministic I/O |
-| `SlicePackReader<'a>` | `pack_reader.rs:76` | In-memory pack reader over a byte slice |
-| `PackReadError` | `pack_reader.rs:13` | Reader errors: out of range, short read, I/O |
+| Type | Description |
+|------|-------------|
+| `PackReader` (trait) | Read-only `read_at` / `read_exact_at` interface for deterministic I/O |
+| `SlicePackReader<'a>` | In-memory pack reader over a byte slice |
+| `PackReadError` | Reader errors: out of range, short read, I/O |
 
 ### Pack Cache Types (`pack_cache.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackCache` | `pack_cache.rs:477` | Two-tier (small + large) set-associative CLOCK cache |
-| `CachedObject<'a>` | `pack_cache.rs:166` | Cache hit result: object kind + borrowed bytes |
-| `PackCacheEvictionStats` | `pack_cache.rs:102` | Instrumentation: insert attempts, victim selections, dependency marks |
+| Type | Description |
+|------|-------------|
+| `PackCache` | Two-tier (small + large) set-associative CLOCK cache |
+| `CachedObject<'a>` | Cache hit result: object kind + borrowed bytes |
+| `PackCacheEvictionStats` | Instrumentation: insert attempts, victim selections, dependency marks |
 
 ### Pack Candidate Types (`pack_candidates.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackCandidate` | `pack_candidates.rs:25` | Blob candidate mapped to `(pack_id, offset)` with path context |
-| `LooseCandidate` | `pack_candidates.rs:41` | Blob candidate not in any pack (loose object) |
-| `PackCandidateSink` (trait) | `pack_candidates.rs:55` | Sink trait for packed/loose candidate output |
-| `PackCandidateCollector<'midx>` | `pack_candidates.rs:72` | Collector that resolves OIDs to pack offsets via MIDX |
+| Type | Description |
+|------|-------------|
+| `PackCandidate` | Blob candidate mapped to `(pack_id, offset)` with path context |
+| `LooseCandidate` | Blob candidate not in any pack (loose object) |
+| `PackCandidateSink` (trait) | Sink trait for packed/loose candidate output |
+| `PackCandidateCollector<'midx>` | Collector that resolves OIDs to pack offsets via MIDX |
 
 ### Pack Plan Types (`pack_plan.rs`, `pack_plan_model.rs`)
 
-| Type | Line | Description |
-|------|------|-------------|
-| `PackPlan` | `pack_plan_model.rs:193` | Complete decode plan for a single pack file |
-| `DeltaDep` | `pack_plan_model.rs:45` | Delta dependency record: offset, kind, base location, data_start, delta_size |
-| `DeltaKind` | `pack_plan_model.rs:25` | `Ofs` (OFS_DELTA) or `Ref` (REF_DELTA) |
-| `BaseLoc` | `pack_plan_model.rs:34` | `Offset(u64)` for in-pack bases or `External { oid }` for cross-pack/unresolved |
-| `CandidateAtOffset` | `pack_plan_model.rs:78` | `(offset, cand_idx)` pair for sorted candidate lookup |
-| `PackPlanStats` | `pack_plan_model.rs:89` | Summary: candidate count, need count, external bases, forward deps, span |
-| `PackPlanConfig` | `pack_plan.rs:50` | Planning limits: max delta depth, header bytes, worklist entries, base lookups |
-| `PackPlanError` | `pack_plan.rs:76` | Planning errors: parse failure, cycle detected, worklist/lookup limit exceeded |
-| `PackView<'a>` | `pack_plan.rs:181` | Header-only pack view for planning (no inflate) |
-| `OidResolver` (trait) | `pack_plan.rs:161` | Resolves OIDs to `(pack_id, offset)` — implemented by `MidxView` |
+| Type | Description |
+|------|-------------|
+| `PackPlan` | Complete decode plan for a single pack file |
+| `DeltaDep` | Delta dependency record: offset, kind, base location, data_start, delta_size |
+| `DeltaKind` | `Ofs` (OFS_DELTA) or `Ref` (REF_DELTA) |
+| `BaseLoc` | `Offset(u64)` for in-pack bases or `External { oid }` for cross-pack/unresolved |
+| `CandidateAtOffset` | `(offset, cand_idx)` pair for sorted candidate lookup |
+| `PackPlanStats` | Summary: candidate count, need count, external bases, forward deps, span |
+| `PackPlanConfig` | Planning limits: max delta depth, header bytes, worklist entries, base lookups |
+| `PackPlanError` | Planning errors: parse failure, cycle detected, worklist/lookup limit exceeded |
+| `PackView<'a>` | Header-only pack view for planning (no inflate) |
+| `OidResolver` (trait) | Resolves OIDs to `(pack_id, offset)` — implemented by `MidxView` |
 
 ## Index Lookup
 
@@ -145,7 +145,7 @@ borrow directly from the mapped file bytes.
 1. **Fanout bucket**: The first byte of the OID selects a fanout entry.
    `fanout[first_byte]` gives the upper bound (exclusive) of the range;
    `fanout[first_byte - 1]` (or 0) gives the lower bound.
-   Complexity: O(1). (`IdxView::fanout`, `pack_idx.rs:270`)
+   Complexity: O(1). (`IdxView::fanout`, `pack_idx.rs`)
 
 2. **Binary search**: Within the fanout bucket, binary search the OID
    table. OIDs are stored as raw bytes in lexicographic order.
@@ -155,14 +155,14 @@ borrow directly from the mapped file bytes.
    offset table. Small offsets (MSB clear) are direct 32-bit values.
    Large offsets (MSB set) index into the large-offset table for a
    full 64-bit pack offset.
-   (`IdxView::offset_at`, `pack_idx.rs:300`)
+   (`IdxView::offset_at`, `pack_idx.rs`)
 
 ### MIDX Integration
 
 Individual pack indices are merged into a multi-pack index (MIDX) that
 provides a single namespace over all packs. The MIDX `find_oid` method
-(`midx.rs:331`) uses the same fanout + binary search pattern. For sorted
-OID streams, `find_oid_sorted` (`midx.rs:371`) maintains a monotonic
+(`midx.rs`) uses the same fanout + binary search pattern. For sorted
+OID streams, `find_oid_sorted` (`midx.rs`) maintains a monotonic
 cursor that avoids restarting the binary search from the bucket boundary,
 enabling merge-join style mapping.
 
@@ -188,14 +188,14 @@ size and result size, followed by a sequence of opcodes:
 | Insert | `0xxxxxxx` (nonzero) | Insert the next N bytes from the delta stream literally |
 | Reserved | `00000000` | Invalid — returns `DeltaError::BadCommandZero` |
 
-Copy parameter decoding (`decode_copy_params`, `pack_inflate.rs:876`) is
+Copy parameter decoding (`decode_copy_params`, `pack_inflate.rs`) is
 on the hot loop. It pre-computes the total parameter byte count from
 `popcount(off_mask) + popcount(size_mask)`, performs one bounds check, then
 decodes with tight branches using `get_unchecked`.
 
 ### Delta Application
 
-`apply_delta` (`pack_inflate.rs:788`) writes directly into pre-reserved
+`apply_delta` (`pack_inflate.rs`) writes directly into pre-reserved
 `Vec` spare capacity via raw pointer arithmetic, eliminating per-chunk
 bounds checks and `Vec::extend` overhead:
 
@@ -207,7 +207,7 @@ bounds checks and `Vec::extend` overhead:
 5. After all opcodes, `set_len(written)` finalizes the output.
 
 The output is capped by `max_out` to prevent unbounded allocation on
-corrupt deltas. A streaming variant (`apply_delta_into`, `pack_inflate.rs:852`)
+corrupt deltas. A streaming variant (`apply_delta_into`, `pack_inflate.rs`)
 sends chunks to a caller-provided sink without buffering the full result.
 
 ### Delta Chain Walk
@@ -253,12 +253,12 @@ four entry points with different allocation and lifetime strategies:
 
 ### Entry Points
 
-| Function | File:Line | Decompressor | Output | Use Case |
-|----------|-----------|--------------|--------|----------|
-| `inflate_limited_with` | `pack_inflate.rs:456` | Caller-owned `Decompress` | `Vec` spare capacity, hard `max_out` cap | Pack executor hot path |
-| `inflate_limited` | `pack_inflate.rs:548` | Thread-local `InflateScratch` | Same as above | Convenience for single-threaded callers |
-| `inflate_exact_with` | `pack_inflate.rs:625` | Caller-owned | Exact `expected` bytes or error | Non-delta entries with known size |
-| `inflate_stream` | `pack_inflate.rs:563` | Thread-local | Chunked callback, exact `expected` total | Large objects that should not be buffered |
+| Function | File | Decompressor | Output | Use Case |
+|----------|------|--------------|--------|----------|
+| `inflate_limited_with` | `pack_inflate.rs` | Caller-owned `Decompress` | `Vec` spare capacity, hard `max_out` cap | Pack executor hot path |
+| `inflate_limited` | `pack_inflate.rs` | Thread-local `InflateScratch` | Same as above | Convenience for single-threaded callers |
+| `inflate_exact_with` | `pack_inflate.rs` | Caller-owned | Exact `expected` bytes or error | Non-delta entries with known size |
+| `inflate_stream` | `pack_inflate.rs` | Thread-local | Chunked callback, exact `expected` total | Large objects that should not be buffered |
 
 ### Buffer Management
 
@@ -273,7 +273,7 @@ capped so total output never exceeds `max_out`:
    `max_out` and `capacity`).
 6. Terminates on `StreamEnd` (returning consumed input bytes) or error.
 
-The thread-local `InflateScratch` (`pack_inflate.rs:38`) bundles a
+The thread-local `InflateScratch` (`pack_inflate.rs`) bundles a
 `Decompress` instance and a 64 KiB scratch buffer into a single
 `RefCell`, halving the TLS lookup cost. Reentrant callers must use the
 `_with` variants that accept a caller-owned `Decompress`.
@@ -282,17 +282,17 @@ The thread-local `InflateScratch` (`pack_inflate.rs:38`) bundles a
 
 `pack_decode.rs` wraps the raw inflate functions with size enforcement:
 
-- `entry_header_at` (`pack_decode.rs:113`) parses the entry header and
+- `entry_header_at` (`pack_decode.rs`) parses the entry header and
   rejects non-delta entries exceeding `max_object_bytes` and delta entries
   exceeding `max_delta_bytes` before any inflation occurs.
-- `inflate_entry_payload_with` (`pack_decode.rs:176`) inflates non-delta
+- `inflate_entry_payload_with` (`pack_decode.rs`) inflates non-delta
   entries with an exact-size contract and delta entries with a hard cap.
 
 ## Caching
 
 ### PackCache Architecture
 
-`PackCache` (`pack_cache.rs:477`) is a two-tier, set-associative,
+`PackCache` (`pack_cache.rs`) is a two-tier, set-associative,
 preallocated cache keyed by pack byte offset:
 
 | Tier | Slot Size | Budget | Purpose |
@@ -307,7 +307,7 @@ Objects exceeding 2 MiB are not cached. If total capacity is below
 
 Both tiers use 4-way set associativity (`WAYS = 4`). The set count is
 rounded down to a power of two. Set selection uses a MurmurHash3 fmix64
-finalizer (`hash_offset`, `pack_cache.rs:706`) folded to 32 bits, then
+finalizer (`hash_offset`, `pack_cache.rs`) folded to 32 bits, then
 masked to the set count.
 
 ```text
@@ -372,29 +372,29 @@ flowchart TD
     EXEC --> PLAN["PackPlan"]
 ```
 
-1. **Bucket** (`bucket_pack_candidates_sparse`, `pack_plan.rs:515`):
+1. **Bucket** (`bucket_pack_candidates_sparse`, `pack_plan.rs`):
    Group candidates by `pack_id`. Only touched packs allocate a bucket.
 
-2. **Parse** (`parse_entry`, `pack_plan.rs:553`): Parse each candidate's
+2. **Parse** (`parse_entry`, `pack_plan.rs`): Parse each candidate's
    entry header to determine its type. REF_DELTA entries resolve their
    base OID via the `OidResolver` (typically `MidxView`). Results are
    cached in a `HashMap<u64, ParsedEntry>`.
 
-3. **Expand** (BFS worklist, `pack_plan.rs:380`): For each delta entry,
+3. **Expand** (BFS worklist, `pack_plan.rs`): For each delta entry,
    enqueue its base offset. Continue up to `max_delta_depth` (default 64).
    Pack-local bases are added to `discovered_base_offsets`; cross-pack
    REF_DELTA bases are recorded as `BaseLoc::External`.
 
-4. **Merge** (`pack_plan.rs:434`): Combine candidate offsets and
+4. **Merge** (`pack_plan.rs`): Combine candidate offsets and
    discovered base offsets into a sorted, deduplicated `need_offsets` array.
 
-5. **Delta deps** (`build_delta_deps`, `pack_plan.rs:613`): Emit one
+5. **Delta deps** (`build_delta_deps`, `pack_plan.rs`): Emit one
    `DeltaDep` per delta entry, sorted by offset. The dense
-   `delta_dep_index` (`build_delta_dep_index`, `pack_plan.rs:666`) maps
+   `delta_dep_index` (`build_delta_dep_index`, `pack_plan.rs`) maps
    each `need_offsets[i]` to its `delta_deps` position in O(1) via a
    forward-only merge cursor.
 
-6. **Exec order** (`build_exec_order`, `pack_plan.rs:800`): Build a
+6. **Exec order** (`build_exec_order`, `pack_plan.rs`): Build a
    cache-aware DFS execution order. Thin subtrees are processed first
    (ascending descendant count) to minimize live cache entries. Returns
    `None` when natural ascending order is correct (fast path).
@@ -433,7 +433,7 @@ lazily mapped on first access and cached as `Arc<Mmap>` for the
 lifetime of the `PackIo` instance.
 
 ```rust
-// pack_io.rs:405–417 (simplified)
+// pack_io.rs (simplified)
 if self.pack_cache[idx].is_none() {
     let file = File::open(path)?;
     let mmap = unsafe { Mmap::map(&file)? };
@@ -442,25 +442,25 @@ if self.pack_cache[idx].is_none() {
 }
 ```
 
-Sequential access hints (`advise_sequential`, `pack_io.rs:421`):
+Sequential access hints (`advise_sequential`, `pack_io.rs`):
 - Linux: `posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)`
 - All Unix: `madvise(ptr, len, MADV_SEQUENTIAL)`
 
 ### PackReader Abstraction
 
-`PackReader` (`pack_reader.rs:39`) is a trait providing `read_at` /
+`PackReader` (`pack_reader.rs`) is a trait providing `read_at` /
 `read_exact_at` for deterministic I/O. This enables simulation testing
 with injected short reads and corruption:
 
 | Implementation | Source | Purpose |
 |----------------|--------|---------|
-| `SlicePackReader<'a>` | `pack_reader.rs:76` | In-memory bytes for tests |
-| `BytesView` | `pack_reader.rs:108` | Shared-ownership byte view |
+| `SlicePackReader<'a>` | `pack_reader.rs` | In-memory bytes for tests |
+| `BytesView` | `pack_reader.rs` | Shared-ownership byte view |
 
 ### Loose Object Access
 
 When an OID is not found in any pack (MIDX miss), `PackIo::load_loose_object`
-(`pack_io.rs:256`) falls back to the `objects/` directory:
+(`pack_io.rs`) falls back to the `objects/` directory:
 
 1. Hex-encode the OID.
 2. Split into `XX/YYYYYY...` directory/file path.
@@ -470,36 +470,36 @@ When an OID is not found in any pack (MIDX miss), `PackIo::load_loose_object`
 
 ## Source of Truth
 
-| Concept | File | Key Lines |
-|---------|------|-----------|
-| Pack index v2 parser | `pack_idx.rs` | `IdxView::parse` (151), `find_oid` via `fanout` + binary search |
-| Pack index OID iterator | `pack_idx.rs` | `IdxOidIter` (394), `iter_oids` (324) |
-| Pack header/entry parsing | `pack_inflate.rs` | `PackFile::parse` (276), `entry_header_at` (320), `parse_ofs_base` (413) |
-| Zlib inflate (bounded) | `pack_inflate.rs` | `inflate_limited_with` (456), `inflate_exact_with` (625), `inflate_stream` (563) |
-| Thread-local inflate scratch | `pack_inflate.rs` | `InflateScratch` (38), `with_inflate_scratch` (78) |
-| Delta application | `pack_inflate.rs` | `apply_delta` (788), `apply_delta_into` (852), `interpret_delta_body` (726) |
-| Delta copy decoding | `pack_inflate.rs` | `decode_copy_params` (876), `delta_sizes` (687) |
-| Delta re-export | `pack_delta.rs` | `apply_delta` (17), `DeltaError` (21) |
-| Bounded decode wrappers | `pack_decode.rs` | `entry_header_at` (113), `inflate_entry_payload_with` (176), `inflate_entry_payload` (226) |
-| Decode limits | `pack_decode.rs` | `PackDecodeLimits` (30), `PackDecodeError` (59) |
-| Pack I/O (external bases) | `pack_io.rs` | `PackIo::load_object` (244), `read_pack_object` (338), `pack_data` (386) |
-| Pack I/O (loose fallback) | `pack_io.rs` | `load_loose_object` (256), `parse_loose_object` (470) |
-| Pack I/O limits | `pack_io.rs` | `PackIoLimits` (50), delta depth enforcement (353–371) |
-| Pack I/O mmap hints | `pack_io.rs` | `advise_sequential` (421) |
-| ExternalBaseProvider impl | `pack_io.rs` | `PackIo` impl (441) |
-| Pack reader trait | `pack_reader.rs` | `PackReader` (39), `SlicePackReader` (76), `BytesView` impl (108) |
-| Pack cache (tiered CLOCK) | `pack_cache.rs` | `PackCache::new` (490), `get` (586), `insert` (607), `reset` (628) |
-| Cache tier internals | `pack_cache.rs` | `PackCacheTier` (180), `Slot` (135), `select_victim_clock` (351) |
-| Dependency-clock eviction | `pack_cache.rs` | `select_victim_dependency_clock` (372), `protect_dependency_base` (429) |
-| Cache hash function | `pack_cache.rs` | `hash_offset` (706) — MurmurHash3 fmix64, XOR-folded to 32 bits |
-| Pack candidates | `pack_candidates.rs` | `PackCandidate` (25), `LooseCandidate` (41), `PackCandidateSink` (55) |
-| Candidate collector | `pack_candidates.rs` | `PackCandidateCollector` (72), MIDX-backed OID→offset mapping |
-| Pack plan model | `pack_plan_model.rs` | `PackPlan` (193), `DeltaDep` (45), `BaseLoc` (34), `DeltaKind` (25) |
-| Pack plan builder | `pack_plan.rs` | `build_pack_plans` (267), `build_pack_plan_for_pack` (316) |
-| Delta closure expansion | `pack_plan.rs` | BFS worklist (380), `enqueue_pack_local_base` (1003) |
-| Delta dep index | `pack_plan.rs` | `build_delta_dep_index` (666) — O(n+m) forward merge cursor |
-| DFS exec order | `pack_plan.rs` | `build_exec_order` (800) — CSR adjacency, descendant counts, thin-first DFS |
-| Pack plan config | `pack_plan.rs` | `PackPlanConfig` (50), defaults (37–44) |
+| Concept | File |
+|---------|------|
+| Pack index v2 parser | `pack_idx.rs` |
+| Pack index OID iterator | `pack_idx.rs` |
+| Pack header/entry parsing | `pack_inflate.rs` |
+| Zlib inflate (bounded) | `pack_inflate.rs` |
+| Thread-local inflate scratch | `pack_inflate.rs` |
+| Delta application | `pack_inflate.rs` |
+| Delta copy decoding | `pack_inflate.rs` |
+| Delta re-export | `pack_delta.rs` |
+| Bounded decode wrappers | `pack_decode.rs` |
+| Decode limits | `pack_decode.rs` |
+| Pack I/O (external bases) | `pack_io.rs` |
+| Pack I/O (loose fallback) | `pack_io.rs` |
+| Pack I/O limits | `pack_io.rs` |
+| Pack I/O mmap hints | `pack_io.rs` |
+| ExternalBaseProvider impl | `pack_io.rs` |
+| Pack reader trait | `pack_reader.rs` |
+| Pack cache (tiered CLOCK) | `pack_cache.rs` |
+| Cache tier internals | `pack_cache.rs` |
+| Dependency-clock eviction | `pack_cache.rs` |
+| Cache hash function | `pack_cache.rs` |
+| Pack candidates | `pack_candidates.rs` |
+| Candidate collector | `pack_candidates.rs` |
+| Pack plan model | `pack_plan_model.rs` |
+| Pack plan builder | `pack_plan.rs` |
+| Delta closure expansion | `pack_plan.rs` |
+| Delta dep index | `pack_plan.rs` |
+| DFS exec order | `pack_plan.rs` |
+| Pack plan config | `pack_plan.rs` |
 
 ## Related Docs
 

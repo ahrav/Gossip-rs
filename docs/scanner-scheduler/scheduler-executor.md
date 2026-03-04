@@ -84,7 +84,7 @@ pub struct ExecutorConfig {
 }
 ```
 
-**Source**: `executor.rs:88–117`
+**Source**: `executor.rs`
 
 | Knob | Workload Sensitivity |
 |------|---------------------|
@@ -106,7 +106,7 @@ pub struct Executor<T> {
 }
 ```
 
-**Source**: `executor.rs:738–746`
+**Source**: `executor.rs`
 
 **Type parameter**: `T` is the task type. Should be small (≤32 bytes) and `Copy` if possible. Avoid `Box<dyn FnOnce()>` — use an enum instead.
 
@@ -138,7 +138,7 @@ pub struct ExecutorHandle<T> {
 }
 ```
 
-**Source**: `executor.rs:157–159`
+**Source**: `executor.rs`
 
 **Thread safety**: `Clone + Send + Sync`. Multiple producers can call `spawn` concurrently.
 
@@ -175,7 +175,7 @@ pub struct WorkerCtx<T, S> {
 }
 ```
 
-**Source**: `executor.rs:526–544`
+**Source**: `executor.rs`
 
 **Type parameters**:
 - `T`: Task type
@@ -209,7 +209,7 @@ struct Shared<T> {
 }
 ```
 
-**Source**: `executor.rs:385–426`
+**Source**: `executor.rs`
 
 **Invariants**:
 - `stealers.len() == unparkers.len() == config.workers`
@@ -225,7 +225,7 @@ struct Shared<T> {
 
 Abstraction over worker context that allows both the production `WorkerCtx` and the simulation harness to share the same `worker_step` logic.
 
-**Source**: `executor_core.rs:154–184`
+**Source**: `executor_core.rs`
 
 #### `WorkerStepResult<Tag>`
 
@@ -239,25 +239,25 @@ Outcome of a single worker step:
 | `ExitDone` | Executor is done; worker should exit |
 | `ExitPanicked` | Worker caught a panic and recorded it |
 
-**Source**: `executor_core.rs:63–75`
+**Source**: `executor_core.rs`
 
 #### `PopSource`
 
 Where a task was obtained from: `Local`, `Injector`, or `Steal`.
 
-**Source**: `executor_core.rs:52–56`
+**Source**: `executor_core.rs`
 
 #### `IdleHooks` / `IdleAction`
 
 Trait for pluggable idle policies. The production implementation (`TieredIdle`) uses spin → yield → park. Simulation can use a no-op or deterministic equivalent.
 
-**Source**: `executor_core.rs:132–145`
+**Source**: `executor_core.rs`
 
 #### `TraceHooks<T>` / `NoopTrace`
 
 Optional trace hooks for the step engine. Production uses `NoopTrace` (zero overhead). Simulation can plug in a recorder for deterministic replay.
 
-**Source**: `executor_core.rs:107–130`
+**Source**: `executor_core.rs`
 
 ---
 
@@ -299,7 +299,7 @@ sequenceDiagram
 
 ### Pop Priority Order
 
-The `pop_task` function (`executor_core.rs:266–306`) tries sources in this order:
+The `pop_task` function (`executor_core.rs`) tries sources in this order:
 
 1. **Local deque** (LIFO) — Zero contention, best cache locality. Tasks spawned locally likely operate on data still in L1/L2.
 2. **Global injector** (batch steal) — `steal_batch_and_pop` moves multiple tasks to the local deque, amortizing global queue access cost.
@@ -326,7 +326,7 @@ The executor uses a single `AtomicUsize` to encode both the accepting flag and t
                                  └── accepting bit (1=open, 0=closed)
 ```
 
-**Source**: `executor_core.rs:14–16`, `executor.rs:289–354`
+**Source**: `executor_core.rs`, `executor.rs`
 
 ### Why Combined State?
 
@@ -355,7 +355,7 @@ The combined state eliminates this by making the check-and-increment atomic via 
 
 ### Loom Verification
 
-The state machine is verified under all interleavings using loom tests in `executor_core.rs:412–594`:
+The state machine is verified under all interleavings using loom tests in `executor_core.rs`:
 - `spawn_vs_join_gate_atomicity` — CAS spawn racing against gate close
 - `completion_vs_join_termination` — Exactly one observer triggers termination
 - `concurrent_spawns_no_lost_count` — Two concurrent spawns produce count=2
@@ -422,7 +422,7 @@ graph LR
     F --> G
 ```
 
-**Source**: `executor.rs:1036–1075`
+**Source**: `executor.rs`
 
 | Phase | Condition | Action | Cost |
 |-------|-----------|--------|------|
@@ -434,7 +434,7 @@ graph LR
 
 Without this heuristic, a worker rapidly spawning local tasks accumulates thousands in its deque while siblings sleep. After `WAKE_ON_HOARD_THRESHOLD` (32) consecutive local spawns, the worker calls `unpark_one()` to wake a sibling for stealing.
 
-**Source**: `executor_core.rs:18–48`, `executor.rs:558–571`
+**Source**: `executor_core.rs`, `executor.rs`
 
 | Threshold | Wakeup Rate | Overhead | Tail Latency |
 |-----------|-------------|----------|--------------|
@@ -446,7 +446,7 @@ Without this heuristic, a worker rapidly spawning local tasks accumulates thousa
 
 `unpark_one()` uses a round-robin counter (`next_unpark`) to distribute wakeup load across workers. For power-of-two worker counts, bitmask is used instead of modulo to avoid division on ARM.
 
-**Source**: `executor.rs:430–443`
+**Source**: `executor.rs`
 
 ---
 
@@ -476,7 +476,7 @@ scan_local_with_progress()
     └─ ex.join() → MetricsSnapshot
 ```
 
-**Source**: `local_fs_owner.rs:1089–1202`
+**Source**: `local_fs_owner.rs`
 
 The `ExecutorConfig` is constructed from `LocalConfig`:
 ```rust
@@ -501,19 +501,19 @@ parallel_scan_dir(root, engine, config)
            └─ Executor<FileTask> (as above)
 ```
 
-**Source**: `parallel_scan.rs:555–587`
+**Source**: `parallel_scan.rs`
 
 ### `worker_id.rs` — Thread-Local Worker Identification
 
 Provides `set_current_worker_id` / `current_worker_id` TLS for per-worker fast-path routing in the buffer pool. Workers set their ID at startup; non-worker threads see `None`.
 
-**Source**: `worker_id.rs:1–80`
+**Source**: `worker_id.rs`
 
 ### `yield_policy.rs` — Cooperative Task Yielding
 
 Provides deterministic yield policies (`EveryN`, `NeverYield`, `AlwaysYield`, `AdaptiveYield`, `GitYieldPolicy`) for long-running tasks to voluntarily yield back to the executor. Tasks use `spawn_local` to re-enqueue themselves with updated cursor state.
 
-**Source**: `yield_policy.rs:1–647`
+**Source**: `yield_policy.rs`
 
 ---
 
@@ -521,36 +521,36 @@ Provides deterministic yield policies (`EveryN`, `NeverYield`, `AlwaysYield`, `A
 
 | Constant | Value | Location | Purpose |
 |----------|-------|----------|---------|
-| `ACCEPTING_BIT` | `1` | `executor_core.rs:14` | LSB in combined state word; 1 when accepting external spawns |
-| `COUNT_UNIT` | `2` | `executor_core.rs:16` | Increment unit for in-flight count (count stored in bits 1+) |
-| `WAKE_ON_HOARD_THRESHOLD` | `32` | `executor_core.rs:48` | Local spawns before proactively waking a sibling |
+| `ACCEPTING_BIT` | `1` | `executor_core.rs` | LSB in combined state word; 1 when accepting external spawns |
+| `COUNT_UNIT` | `2` | `executor_core.rs` | Increment unit for in-flight count (count stored in bits 1+) |
+| `WAKE_ON_HOARD_THRESHOLD` | `32` | `executor_core.rs` | Local spawns before proactively waking a sibling |
 
 ### `ExecutorConfig` Defaults
 
 | Parameter | Default | Source |
 |-----------|---------|--------|
-| `workers` | `1` | `executor.rs:134` |
-| `seed` | `0x853c49e6748fea9b` | `executor.rs:135` |
-| `steal_tries` | `4` | `executor.rs:136` |
-| `spin_iters` | `200` | `executor.rs:137` |
-| `park_timeout` | `200µs` | `executor.rs:138` |
-| `pin_threads` | `true` on Linux, `false` elsewhere | `executor.rs:139` |
+| `workers` | `1` | `executor.rs` |
+| `seed` | `0x853c49e6748fea9b` | `executor.rs` |
+| `steal_tries` | `4` | `executor.rs` |
+| `spin_iters` | `200` | `executor.rs` |
+| `park_timeout` | `200µs` | `executor.rs` |
+| `pin_threads` | `true` on Linux, `false` elsewhere | `executor.rs` |
 
 ### Tiered Idle Constants
 
 | Constant | Value | Source | Purpose |
 |----------|-------|--------|---------|
-| Yield frequency | Every 16th idle iteration past spin threshold | `executor.rs:1066` | Bitmask `& 0xF` — heuristic to avoid monopolizing core |
+| Yield frequency | Every 16th idle iteration past spin threshold | `executor.rs` | Bitmask `& 0xF` — heuristic to avoid monopolizing core |
 
 ### `ParallelScanConfig` Defaults (caller-facing)
 
 | Parameter | Default | Source |
 |-----------|---------|--------|
-| `workers` | `num_cpus::get()` | `parallel_scan.rs:316` |
-| `chunk_size` | 256 KiB | `parallel_scan.rs:319` |
-| `pool_buffers` | `4 × workers` | `parallel_scan.rs:320` |
-| `max_in_flight_objects` | `1024` | `parallel_scan.rs:321` |
-| `seed` | `0x853c49e6748fea9b` | `parallel_scan.rs:323` |
+| `workers` | `num_cpus::get()` | `parallel_scan.rs` |
+| `chunk_size` | 256 KiB | `parallel_scan.rs` |
+| `pool_buffers` | `4 × workers` | `parallel_scan.rs` |
+| `max_in_flight_objects` | `1024` | `parallel_scan.rs` |
+| `seed` | `0x853c49e6748fea9b` | `parallel_scan.rs` |
 
 ---
 
@@ -559,12 +559,12 @@ Provides deterministic yield policies (`EveryN`, `NeverYield`, `AlwaysYield`, `A
 | Invariant | Mechanism | Verified By |
 |-----------|-----------|-------------|
 | **Work-conserving** | Once spawned, a task will execute | Combined state prevents lost spawns after gate close |
-| **Termination detection** | `in_flight` counter in combined state | Loom tests in `executor_core.rs:462–594` |
+| **Termination detection** | `in_flight` counter in combined state | Loom tests in `executor_core.rs` |
 | **No lost wakeups** | Parker/Unparker pattern | Crossbeam guarantee: unpark before park becomes no-op |
-| **Panic isolation** | `catch_unwind` around runner | Test `panic_in_task_decrements_count` (`executor.rs:1380–1425`) |
+| **Panic isolation** | `catch_unwind` around runner | Test `panic_in_task_decrements_count` (`executor.rs`) |
 | **No TOCTOU on shutdown** | Combined atomic state word | Loom test `spawn_vs_join_gate_atomicity` |
 | **Exactly-once termination** | `prev_count == 1 && !accepting` check | Loom test `completion_vs_join_termination` |
-| **Counter bounded** | `in_flight` never underflows | `assert!(prev_count > 0)` in `worker_step` (`executor_core.rs:369–371`) |
+| **Counter bounded** | `in_flight` never underflows | `assert!(prev_count > 0)` in `worker_step` (`executor_core.rs`) |
 
 ## Performance Characteristics
 
@@ -582,34 +582,34 @@ Provides deterministic yield policies (`EveryN`, `NeverYield`, `AlwaysYield`, `A
 
 ## Source of Truth
 
-| Item | File | Line(s) |
-|------|------|---------|
-| `ExecutorConfig` | `executor.rs` | 88–143 |
-| `ExecutorHandle<T>` | `executor.rs` | 157–283 |
-| `Shared<T>` | `executor.rs` | 385–484 |
-| `WorkerCtx<T, S>` | `executor.rs` | 526–702 |
-| `Executor<T>` | `executor.rs` | 738–927 |
-| `worker_loop` | `executor.rs` | 1000–1030 |
-| `TieredIdle` | `executor.rs` | 1036–1075 |
-| `ACCEPTING_BIT` / `COUNT_UNIT` | `executor_core.rs` | 14–16 |
-| `WAKE_ON_HOARD_THRESHOLD` | `executor_core.rs` | 48 |
-| `PopSource` | `executor_core.rs` | 51–56 |
-| `WorkerStepResult<Tag>` | `executor_core.rs` | 63–75 |
-| `ExecTraceEvent<Tag>` | `executor_core.rs` | 83–102 |
-| `TraceHooks<T>` / `NoopTrace` | `executor_core.rs` | 107–130 |
-| `IdleAction` / `IdleHooks` | `executor_core.rs` | 133–145 |
-| `WorkerCtxLike<T, S>` | `executor_core.rs` | 154–184 |
-| `in_flight()` / `is_accepting()` / `close_gate()` / `increment_count()` | `executor_core.rs` | 187–208 |
-| `pop_task()` | `executor_core.rs` | 266–306 |
-| `worker_step()` | `executor_core.rs` | 320–399 |
-| Loom tests | `executor_core.rs` | 412–594 |
-| `XorShift64` (RNG) | `rng.rs` | 41–180 |
-| `CoreAssigner` / `default_pin_threads` | `affinity.rs` | 251–325 |
-| `set_current_worker_id` / `current_worker_id` | `worker_id.rs` | 62–80 |
-| `YieldPolicy` / `EveryN` / `NeverYield` / `AdaptiveYield` | `yield_policy.rs` | 70–483 |
-| `ParallelScanConfig` | `parallel_scan.rs` | 212–312 |
-| `scan_local_with_progress` (executor construction) | `local_fs_owner.rs` | 1089–1202 |
-| `WorkerMetricsLocal` | `metrics.rs` | 283 |
-| `MetricsSnapshot` | `metrics.rs` | 423 |
+| Item | File |
+|------|------|
+| `ExecutorConfig` | `executor.rs` |
+| `ExecutorHandle<T>` | `executor.rs` |
+| `Shared<T>` | `executor.rs` |
+| `WorkerCtx<T, S>` | `executor.rs` |
+| `Executor<T>` | `executor.rs` |
+| `worker_loop` | `executor.rs` |
+| `TieredIdle` | `executor.rs` |
+| `ACCEPTING_BIT` / `COUNT_UNIT` | `executor_core.rs` |
+| `WAKE_ON_HOARD_THRESHOLD` | `executor_core.rs` |
+| `PopSource` | `executor_core.rs` |
+| `WorkerStepResult<Tag>` | `executor_core.rs` |
+| `ExecTraceEvent<Tag>` | `executor_core.rs` |
+| `TraceHooks<T>` / `NoopTrace` | `executor_core.rs` |
+| `IdleAction` / `IdleHooks` | `executor_core.rs` |
+| `WorkerCtxLike<T, S>` | `executor_core.rs` |
+| `in_flight()` / `is_accepting()` / `close_gate()` / `increment_count()` | `executor_core.rs` |
+| `pop_task()` | `executor_core.rs` |
+| `worker_step()` | `executor_core.rs` |
+| Loom tests | `executor_core.rs` |
+| `XorShift64` (RNG) | `rng.rs` |
+| `CoreAssigner` / `default_pin_threads` | `affinity.rs` |
+| `set_current_worker_id` / `current_worker_id` | `worker_id.rs` |
+| `YieldPolicy` / `EveryN` / `NeverYield` / `AdaptiveYield` | `yield_policy.rs` |
+| `ParallelScanConfig` | `parallel_scan.rs` |
+| `scan_local_with_progress` (executor construction) | `local_fs_owner.rs` |
+| `WorkerMetricsLocal` | `metrics.rs` |
+| `MetricsSnapshot` | `metrics.rs` |
 
 All paths are relative to `crates/scanner-scheduler/src/scheduler/`.

@@ -64,7 +64,7 @@ Key characteristics:
 ### Ring Buffer Chunking
 
 ```rust
-// From stream_decode.rs, line 485
+// From stream_decode.rs
 scratch.decode_ring.push(chunk);
 ```
 
@@ -80,7 +80,6 @@ Two budget layers are enforced:
 
 1. **Per-transform budget** (`tc.max_decoded_bytes`):
    ```rust
-   // Line 249
    let max_out = tc.max_decoded_bytes.min(remaining);
    ```
    - Limits total decoded output for a single transform
@@ -88,7 +87,6 @@ Two budget layers are enforced:
 
 2. **Per-scan budget** (`max_total_decode_output_bytes`):
    ```rust
-   // Line 243-248
    let remaining = self.tuning.max_total_decode_output_bytes
        .saturating_sub(scratch.total_decode_output_bytes);
    if remaining == 0 {
@@ -98,7 +96,7 @@ Two budget layers are enforced:
    - Global limit across all transforms in a single scan pass
    - Prevents unbounded decode work across multiple transforms
 
-**Budget checking occurs on each chunk** (line 453-464):
+**Budget checking occurs on each chunk**:
 - Local chunk count tracked in `local_out`
 - Global total updated incrementally
 - Truncation triggered if limits exceeded
@@ -111,7 +109,6 @@ The module maintains strict invariants to ensure correctness:
 
 1. **Monotonic decoded offsets**:
    ```rust
-   // Line 689
    decoded_offset = decoded_offset.saturating_add(chunk.len() as u64);
    ```
    - Offsets only increase; never reset or go backward
@@ -119,7 +116,6 @@ The module maintains strict invariants to ensure correctness:
 
 2. **Timing wheel for window scheduling**:
    ```rust
-   // Line 658
    match scratch.pending_windows.push(pending.hi, pending) {
        Ok(PushOutcome::Scheduled) => {}
        Ok(PushOutcome::Ready(win)) => {
@@ -133,7 +129,6 @@ The module maintains strict invariants to ensure correctness:
 
 3. **Slab append-only semantics**:
    ```rust
-   // Line 303, 840
    let slab_start = scratch.slab.buf.len();
    // ... streaming work ...
    // On abort or fallback:
@@ -145,7 +140,6 @@ The module maintains strict invariants to ensure correctness:
 
 4. **Per-rule window cap**:
    ```rust
-   // Lines 615, 642
    let max_hits = self.tuning.max_windows_per_rule_variant as u32;
    if *hit > max_hits {
        force_full = true; // Fallback triggered
@@ -195,7 +189,7 @@ gate_db_failed         // Whether gate failed to open/scan
 
 ### Deduplication Without Full Buffering
 
-Streaming achieves dedupe without materializing the full buffer using **AEGIS-128L MAC** (lines 439-484):
+Streaming achieves dedupe without materializing the full buffer using **AEGIS-128L MAC**:
 
 ```rust
 let key = [0u8; 16];
@@ -221,7 +215,6 @@ if !scratch.seen.insert(h) {
 Stream decode uses `TransformConfig` from the transform module:
 
 ```rust
-// Lines 28, 69
 pub(super) fn decode_span_fallback(
     &self,
     tc: &TransformConfig,
@@ -243,7 +236,6 @@ pub(super) fn decode_span_fallback(
 ### Transform Streaming Decoder Invocation
 
 ```rust
-// Line 452
 let res = stream_decode(tc, encoded, |chunk| {
     // Process chunk callbacks here
     // ...
@@ -264,7 +256,6 @@ let res = stream_decode(tc, encoded, |chunk| {
 Streaming detectors for child transforms emit spans as decoded bytes arrive:
 
 ```rust
-// Lines 398-412
 for (tidx, tcfg) in self.transforms.iter().enumerate() {
     let state = match tcfg.id {
         TransformId::UrlPercent => SpanStreamState::Url(UrlSpanStream::new(tcfg)),
@@ -281,7 +272,6 @@ for (tidx, tcfg) in self.transforms.iter().enumerate() {
 
 **Per-chunk span feeding:**
 ```rust
-// Lines 778-782
 match &mut entry.state {
     SpanStreamState::Url(state) => state.feed(chunk, chunk_start, &mut on_span),
     SpanStreamState::Base64(state) => state.feed(chunk, chunk_start, &mut on_span),
@@ -297,7 +287,6 @@ match &mut entry.state {
 For `Gate::AnchorsInDecoded` Base64 transforms, a Vectorscan gate is applied:
 
 ```rust
-// Lines 282-301
 if gate_enabled {
     if let Some(db) = self.vs_gate.as_ref() {
         // Open a gate stream
@@ -310,7 +299,6 @@ if gate_enabled {
 
 **Per-chunk gate scanning:**
 ```rust
-// Lines 501-521
 if gate_db_active && gate_hit == 0 {
     if db.scan_stream(gstream, chunk, gscratch, gate_cb, ...).is_err() {
         gate_db_active = false;
@@ -321,7 +309,7 @@ if gate_db_active && gate_hit == 0 {
 
 - Gate patterns checked in decoded space
 - Early exit if gate patterns match (anchors found)
-- Fallback logic if gate fails (lines 1251-1261)
+- Fallback logic if gate fails
 
 ## 6. Key Types and Functions
 
@@ -424,7 +412,7 @@ pub(super) fn redecode_window_into(
 **Usage context:**
 - Called when a window has fallen out of the ring buffer
 - Enables lazy materialization of distant windows
-- Fallback if re-decode fails (line 1039)
+- Fallback if re-decode fails
 
 ### Key Data Structures
 
@@ -519,7 +507,7 @@ pub struct ScanScratch {
 
 ### `force_full` triggers (falls back to `decode_span_fallback`)
 
-1. **Window cap exceeded** (line 642-648):
+1. **Window cap exceeded**:
    ```rust
    if *hit > max_hits {
        force_full = true;
@@ -528,7 +516,7 @@ pub struct ScanScratch {
    - Per-rule-variant window count exceeds `max_windows_per_rule_variant`
    - Prevents unbounded window materialization and processing
 
-2. **Ring buffer unable to reconstruct window** (lines 329-342):
+2. **Ring buffer unable to reconstruct window** (stream decode path):
    ```rust
    if !scratch.decode_ring.extend_range_to(lo, hi, &mut scratch.window_bytes)
        && !self.redecode_window_into(tc, encoded, lo, hi, max_out, &mut scratch.window_bytes)
@@ -546,7 +534,7 @@ pub struct ScanScratch {
 
 ### Stream-abort triggers (no full-decode fallback for this span)
 
-1. **Decode budget exceeded** (lines 453-464):
+1. **Decode budget exceeded**:
    ```rust
    if local_out.saturating_add(chunk.len()) > max_out {
        truncated = true;
@@ -555,7 +543,7 @@ pub struct ScanScratch {
    - Per-transform budget exhausted
    - Further decoding halted
 
-2. **Total decode budget exceeded** (lines 457-464):
+2. **Total decode budget exceeded**:
    ```rust
    if scratch.total_decode_output_bytes.saturating_add(chunk.len())
        > self.tuning.max_total_decode_output_bytes
@@ -566,7 +554,7 @@ pub struct ScanScratch {
    - Per-scan global budget exhausted
    - No more decoding across any transform
 
-3. **Stream decode/scan error** (lines 487-498):
+3. **Stream decode/scan error**:
    ```rust
    if vs_stream.scan_stream(...).is_err() {
        truncated = true;
@@ -577,7 +565,7 @@ pub struct ScanScratch {
 
 ### Gate DB failure behavior (does not force fallback)
 
-1. **Gate database failure** (lines 501-521):
+1. **Gate database failure**:
    ```rust
    if db.scan_stream(...).is_err() {
        gate_db_active = false;
@@ -593,7 +581,6 @@ pub struct ScanScratch {
 For `Gate::AnchorsInDecoded` Base64 transforms:
 
 ```rust
-// Lines 256, 282-301
 let gate_enabled = tc.gate == Gate::AnchorsInDecoded;
 if gate_enabled {
     if let Some(db) = self.vs_gate.as_ref() {
@@ -618,7 +605,6 @@ if gate_enabled {
 If gate database unavailable or fails:
 
 ```rust
-// Lines 1245-1261
 let gate_satisfied = if gate_db_active || gate_hit != 0 {
     gate_hit != 0
 } else {
@@ -640,7 +626,7 @@ let enforce_gate = if gate_enabled {
 **Logic:**
 - If gate DB failed, don't enforce gate (avoid false negatives)
 - Relax enforcement if UTF-16 scanning enabled (UTF-16 anchors may miss in prefilter)
-- Otherwise, discard non-gated bytes (line 1274)
+- Otherwise, discard non-gated bytes
 
 ## 9. Flow Diagram
 

@@ -30,61 +30,61 @@ flowchart TD
 
 | Type | Kind | Description | Location |
 |------|------|-------------|----------|
-| `CommitGraph` | trait | Commit-graph access interface: lookup, generation, parents, OIDs, timestamps. Implementations must provide deterministic parent iteration. | `commit_walk.rs:78` |
-| `PlannedCommit` | struct | Output of the walk: a `Position` and `snapshot_root` flag indicating whether to diff against the empty tree. | `commit_walk.rs:63` |
-| `ParentScratch` | struct | Reusable scratch buffer for parent collection. Stores up to 16 parents inline (no allocation); spills to `Vec` for octopus merges. | `commit_walk.rs:122` |
-| `VisitedCommitBitset` | struct | 1-bit-per-commit bitset for cross-ref emission dedup. `test_and_set` returns whether the bit was newly marked. | `commit_walk.rs:220` |
-| `CommitPlanIter` | struct | Iterator over `(watermark, tip]` commits for all refs. Uses two generation-ordered heaps and per-ref scratch. Deduplicates across refs via `VisitedCommitBitset`. | `commit_walk.rs:480` |
-| `CommitWalkLimits` | struct | Hard caps for traversal: max graph size, heap entries, parents per commit, new-ref skip checks. 16 bytes, compile-time validated. | `commit_walk_limits.rs:18` |
+| `CommitGraph` | trait | Commit-graph access interface: lookup, generation, parents, OIDs, timestamps. Implementations must provide deterministic parent iteration. | `commit_walk.rs` |
+| `PlannedCommit` | struct | Output of the walk: a `Position` and `snapshot_root` flag indicating whether to diff against the empty tree. | `commit_walk.rs` |
+| `ParentScratch` | struct | Reusable scratch buffer for parent collection. Stores up to 16 parents inline (no allocation); spills to `Vec` for octopus merges. | `commit_walk.rs` |
+| `VisitedCommitBitset` | struct | 1-bit-per-commit bitset for cross-ref emission dedup. `test_and_set` returns whether the bit was newly marked. | `commit_walk.rs` |
+| `CommitPlanIter` | struct | Iterator over `(watermark, tip]` commits for all refs. Uses two generation-ordered heaps and per-ref scratch. Deduplicates across refs via `VisitedCommitBitset`. | `commit_walk.rs` |
+| `CommitWalkLimits` | struct | Hard caps for traversal: max graph size, heap entries, parents per commit, new-ref skip checks. 16 bytes, compile-time validated. | `commit_walk_limits.rs` |
 
 ### Commit Loading (`commit_loader.rs`)
 
 | Type | Kind | Description | Location |
 |------|------|-------------|----------|
-| `LoadedCommit` | struct | Commit with OID, tree OID, parent OIDs (in object order), and committer timestamp. Produced by BFS loading. | `commit_loader.rs:242` |
-| `CommitLoadLimits` | struct | Bounds for the loader: max commits, max object bytes, max parents, max delta depth, shallow file/root limits. | `commit_loader.rs:258` |
-| `CommitLoadError` | enum | Fail-closed error type covering I/O, MIDX, pack, parse, delta, loose-object, and limit-violation failures. | `commit_loader.rs:86` |
-| `ShallowBoundaryRoots` | enum | Compact shallow-root set (`Empty` / `One` / `ManySorted`) used to stop BFS at shallow boundaries. Binary-search lookup for `ManySorted`. | `commit_loader.rs:303` |
+| `LoadedCommit` | struct | Commit with OID, tree OID, parent OIDs (in object order), and committer timestamp. Produced by BFS loading. | `commit_loader.rs` |
+| `CommitLoadLimits` | struct | Bounds for the loader: max commits, max object bytes, max parents, max delta depth, shallow file/root limits. | `commit_loader.rs` |
+| `CommitLoadError` | enum | Fail-closed error type covering I/O, MIDX, pack, parse, delta, loose-object, and limit-violation failures. | `commit_loader.rs` |
+| `ShallowBoundaryRoots` | enum | Compact shallow-root set (`Empty` / `One` / `ManySorted`) used to stop BFS at shallow boundaries. Binary-search lookup for `ManySorted`. | `commit_loader.rs` |
 
 ### In-Memory Graph (`commit_graph_mem.rs`)
 
 | Type | Kind | Description | Location |
 |------|------|-------------|----------|
-| `CommitGraphMem` | struct | In-memory commit graph with SoA layout (OIDs, trees, timestamps, generations) and CSR parent encoding. Implements `CommitGraph` trait. | `commit_graph_mem.rs:61` |
+| `CommitGraphMem` | struct | In-memory commit graph with SoA layout (OIDs, trees, timestamps, generations) and CSR parent encoding. Implements `CommitGraph` trait. | `commit_graph_mem.rs` |
 
 ### Graph Index (`commit_graph.rs`)
 
 | Type | Kind | Description | Location |
 |------|------|-------------|----------|
-| `CommitGraphIndex` | struct | Cache-friendly index: flat arrays of commit OIDs, root tree OIDs, and timestamps copied from the commit graph. Optional per-commit identity IDs. O(1) positional lookups. | `commit_graph.rs:27` |
+| `CommitGraphIndex` | struct | Cache-friendly index: flat arrays of commit OIDs, root tree OIDs, and timestamps copied from the commit graph. Optional per-commit identity IDs. O(1) positional lookups. | `commit_graph.rs` |
 
 ### Commit Parsing (`commit_parse.rs`)
 
 | Type | Kind | Description | Location |
 |------|------|-------------|----------|
-| `ParsedCommit` | struct | Parsed commit fields: tree OID, parent OIDs, committer timestamp. | `commit_parse.rs:92` |
-| `CommitParseLimits` | struct | Max commit bytes (default 1 MiB) and max parents (default 256). | `commit_parse.rs:103` |
-| `CommitParseError` | enum | Parse errors: corrupt data, too large, too many parents, invalid hex, invalid OID length, invalid timestamp. | `commit_parse.rs:38` |
+| `ParsedCommit` | struct | Parsed commit fields: tree OID, parent OIDs, committer timestamp. | `commit_parse.rs` |
+| `CommitParseLimits` | struct | Max commit bytes (default 1 MiB) and max parents (default 256). | `commit_parse.rs` |
+| `CommitParseError` | enum | Parse errors: corrupt data, too large, too many parents, invalid hex, invalid OID length, invalid timestamp. | `commit_parse.rs` |
 
 ### Walk Limits (`commit_walk_limits.rs`)
 
 | Type | Kind | Description | Location |
 |------|------|-------------|----------|
-| `CommitWalkLimits` | struct | Four `u32` fields (16 bytes total) with `DEFAULT` and `RESTRICTIVE` const presets. Both `validate()` (panicking) and `try_validate()` (fallible) entry points. Compile-time validated via `const _: ()`. | `commit_walk_limits.rs:18` |
+| `CommitWalkLimits` | struct | Four `u32` fields (16 bytes total) with `DEFAULT` and `RESTRICTIVE` const presets. Both `validate()` (panicking) and `try_validate()` (fallible) entry points. Compile-time validated via `const _: ()`. | `commit_walk_limits.rs` |
 
 ### Error Types (`errors.rs`)
 
 | Variant | Description | Location |
 |---------|-------------|----------|
-| `CommitGraphOpen` | Commit-graph file could not be opened or parsed. | `errors.rs:128` |
-| `InvalidOidLength` | OID byte length does not match object format. | `errors.rs:130` |
-| `CommitGraphTooLarge` | Graph exceeds `max_commits_in_graph`. | `errors.rs:132` |
-| `TipNotFound` | Tip commit OID missing from commit-graph. | `errors.rs:134` |
-| `HeapLimitExceeded` | Combined heap frontier size exceeds `max_heap_entries`. | `errors.rs:136` |
-| `ParentDecodeFailed` | Corrupt parent list entry in commit-graph. | `errors.rs:138` |
-| `TooManyParents` | Commit exceeds `max_parents_per_commit`. | `errors.rs:140` |
-| `TopoSortCycle` | Kahn's algorithm could not drain all commits. | `errors.rs:142` |
-| `IdentityLengthMismatch` | Identity-ID vector length does not match commit count. | `errors.rs:144` |
+| `CommitGraphOpen` | Commit-graph file could not be opened or parsed. | `errors.rs` |
+| `InvalidOidLength` | OID byte length does not match object format. | `errors.rs` |
+| `CommitGraphTooLarge` | Graph exceeds `max_commits_in_graph`. | `errors.rs` |
+| `TipNotFound` | Tip commit OID missing from commit-graph. | `errors.rs` |
+| `HeapLimitExceeded` | Combined heap frontier size exceeds `max_heap_entries`. | `errors.rs` |
+| `ParentDecodeFailed` | Corrupt parent list entry in commit-graph. | `errors.rs` |
+| `TooManyParents` | Commit exceeds `max_parents_per_commit`. | `errors.rs` |
+| `TopoSortCycle` | Kahn's algorithm could not drain all commits. | `errors.rs` |
+| `IdentityLengthMismatch` | Identity-ID vector length does not match commit count. | `errors.rs` |
 
 ## Walking Algorithm
 
@@ -93,7 +93,7 @@ it yields exactly the commits in `reachable(tip) - reachable(watermark)`.
 
 ### Two-Frontier Generation-Ordered Walk
 
-`CommitPlanIter` (`commit_walk.rs:480`) maintains two max-heaps ordered by
+`CommitPlanIter` (`commit_walk.rs`) maintains two max-heaps ordered by
 `(generation, position)`:
 
 1. **Interesting frontier** -- seeded with the tip commit. Expanded by
@@ -104,7 +104,7 @@ it yields exactly the commits in `reachable(tip) - reachable(watermark)`.
 Each iteration:
 
 1. Peek the highest-generation interesting commit (`top_i`).
-2. Call `advance_uninteresting(top_i.gen)` (`commit_walk.rs:650`) to drain
+2. Call `advance_uninteresting(top_i.gen)` (`commit_walk.rs`) to drain
    the uninteresting heap down to that generation, marking all encountered
    commits as `MARK_U`.
 3. Pop `top_i`. If marked `MARK_U`, skip it. Otherwise, expand its parents
@@ -118,7 +118,7 @@ ordering.
 
 ### Per-Ref State Flags
 
-`RefScratch` (`commit_walk.rs:295`) stores one byte per commit with three
+`RefScratch` (`commit_walk.rs`) stores one byte per commit with three
 bit flags:
 
 | Flag | Value | Meaning |
@@ -133,21 +133,21 @@ Between refs, only the touched positions are cleared via the `touched` list
 ### New-Ref Skip Optimization
 
 When a ref has no watermark (new ref), the walker checks whether its tip is
-an ancestor of another ref's watermark (`commit_walk.rs:568`). If so, the
+an ancestor of another ref's watermark (`commit_walk.rs`). If so, the
 entire history was already scanned in a prior run and the ref is skipped.
 The number of ancestry checks is bounded by `max_new_ref_skip_checks`
 (default 1024) to avoid O(refs^2) cost.
 
 ### Ancestry Check
 
-`is_ancestor` (`commit_walk.rs:356`) performs a DFS from `descendant`
+`is_ancestor` (`commit_walk.rs`) performs a DFS from `descendant`
 looking for `ancestor`, using generation numbers for pruning. If
 `gen(ancestor) > gen(descendant)`, the answer is immediately `false`.
 Otherwise, the DFS skips any commit with `gen < gen(ancestor)`.
 
 ### Topological Ordering
 
-`topo_order_positions` (`commit_walk.rs:810`) applies Kahn's algorithm over
+`topo_order_positions` (`commit_walk.rs`) applies Kahn's algorithm over
 the scanned subgraph to produce ancestor-first ordering:
 
 1. Build in-degree and adjacency using dense arrays sized to the full
@@ -157,7 +157,7 @@ the scanned subgraph to produce ancestor-first ordering:
    zero.
 4. If `ordered.len() != total`, return `TopoSortCycle`.
 
-The public entry point `introduced_by_plan` (`commit_walk.rs:766`) combines
+The public entry point `introduced_by_plan` (`commit_walk.rs`) combines
 `CommitPlanIter` with `topo_order_positions` to produce the final
 `Vec<PlannedCommit>` in ancestor-first order.
 
@@ -178,7 +178,7 @@ source.
 
 ### CommitGraphMem Layout
 
-`CommitGraphMem` (`commit_graph_mem.rs:61`) uses Struct-of-Arrays (SoA) for
+`CommitGraphMem` (`commit_graph_mem.rs`) uses Struct-of-Arrays (SoA) for
 cache-friendly sequential access:
 
 | Array | Layout | Size per commit |
@@ -201,24 +201,24 @@ before position assignment. Input order does not affect positions.
 ### Generation Numbers
 
 Computed via Kahn's algorithm during `CommitGraphMem::build`
-(`commit_graph_mem.rs:105`):
+(`commit_graph_mem.rs`):
 
 - `gen(root) = 1`
 - `gen(commit) = 1 + max(gen(parent))` for in-set parents
 - Parents outside the loaded set are treated as generation 0 (external roots)
 - Cycles: unresolved commits are force-assigned `gen = 1`; the count is
-  exposed via `unresolved_commits()` (`commit_graph_mem.rs:325`)
+   exposed via `unresolved_commits()` (`commit_graph_mem.rs`)
 
 ### CommitGraphIndex
 
-`CommitGraphIndex` (`commit_graph.rs:27`) copies OIDs, tree OIDs, and
+`CommitGraphIndex` (`commit_graph.rs`) copies OIDs, tree OIDs, and
 timestamps into flat arrays so the backing graph can be dropped. All reads
 are O(1) positional lookups. Optionally carries per-commit identity IDs
 when identity enrichment is enabled.
 
 ## Commit Loading (BFS)
 
-`load_commits_from_tips` (`commit_loader.rs:401`) is the canonical loading
+`load_commits_from_tips` (`commit_loader.rs`) is the canonical loading
 entry point:
 
 1. Seed a `VecDeque` frontier with tip OIDs.
@@ -241,12 +241,12 @@ cached per pack id for the duration of the load. Delta chains are resolved
 recursively, bounded by `max_delta_depth` (default 64).
 
 **Identity enrichment**: `load_commits_with_identities`
-(`commit_loader.rs:442`) performs the same BFS but also extracts
+(`commit_loader.rs`) performs the same BFS but also extracts
 author/committer identity from raw commit bytes and interns them.
 
 ## Commit Parsing
 
-`parse_commit` (`commit_parse.rs:133`) extracts three fields from a raw
+`parse_commit` (`commit_parse.rs`) extracts three fields from a raw
 commit object:
 
 1. **Tree OID** -- from the `tree <hex>\n` line.
@@ -266,7 +266,7 @@ message are not parsed. Complexity is O(header size), not O(commit size).
 | Max parents | 256 | `CommitParseError::TooManyParents` |
 | Timestamp range | 0 to year 3000 | `CommitParseError::InvalidTimestamp` |
 
-The timestamp parser (`commit_parse.rs:319`) uses checked arithmetic to
+The timestamp parser (`commit_parse.rs`) uses checked arithmetic to
 detect u64 overflow, preventing wraparound attacks that could bypass range
 checks.
 
@@ -281,7 +281,7 @@ checks.
 | `max_parents_per_commit` | 128 | 32 | Guards against octopus/corrupt merges. Capped at 255 (pipeline stores `parent_idx` as `u8`). |
 | `max_new_ref_skip_checks` | 1,024 | 128 | Caps ancestry checks for new-ref skip optimization |
 
-Validation constraints (`commit_walk_limits.rs:71`):
+Validation constraints (`commit_walk_limits.rs`):
 
 - All fields must be > 0
 - `max_commits_in_graph <= 100,000,000`
@@ -289,7 +289,7 @@ Validation constraints (`commit_walk_limits.rs:71`):
 - `max_parents_per_commit <= 255`
 - `max_new_ref_skip_checks <= 1,000,000`
 - `DEFAULT` and `RESTRICTIVE` are validated at compile time via
-  `const _: ()` assertions (`commit_walk_limits.rs:146`)
+   `const _: ()` assertions (`commit_walk_limits.rs`)
 
 ### CommitLoadLimits
 
@@ -327,44 +327,44 @@ Cycles are detected at two levels:
 
 ## Source of Truth
 
-| Concept | Source File | Key Lines |
-|---------|-------------|-----------|
-| `CommitGraph` trait | `commit_walk.rs` | 78-106 |
-| Two-frontier range walk | `commit_walk.rs` | 440-748 |
-| `advance_uninteresting` | `commit_walk.rs` | 650-683 |
-| `is_ancestor` (DFS + generation pruning) | `commit_walk.rs` | 356-400 |
-| `introduced_by_plan` | `commit_walk.rs` | 766-785 |
-| `topo_order_positions` (Kahn's) | `commit_walk.rs` | 810-912 |
-| `PlannedCommit` | `commit_walk.rs` | 63-68 |
-| `ParentScratch` | `commit_walk.rs` | 122-209 |
-| `VisitedCommitBitset` | `commit_walk.rs` | 220-277 |
-| `CommitPlanIter` | `commit_walk.rs` | 480-544 |
-| `RefScratch` flags | `commit_walk.rs` | 284-336 |
-| BFS commit loading | `commit_loader.rs` | 401-420 |
-| `CommitLoader` (internal) | `commit_loader.rs` | 593-609 |
-| `LoadedCommit` | `commit_loader.rs` | 242-251 |
-| `CommitLoadLimits` | `commit_loader.rs` | 258-291 |
-| `ShallowBoundaryRoots` | `commit_loader.rs` | 303-348 |
-| Shallow file loading | `commit_loader.rs` | 508-584 |
-| Loose object loading | `commit_loader.rs` | 834-881 |
-| Delta resolution (recursive) | `commit_loader.rs` | 902-1021 |
-| Identity enrichment | `commit_loader.rs` | 442-462, 1162-1212 |
-| `CommitGraphMem` (SoA + CSR) | `commit_graph_mem.rs` | 61-85 |
-| `CommitGraphMem::build` (generation propagation) | `commit_graph_mem.rs` | 105-253 |
-| `CommitGraphMem::build_with_identities` | `commit_graph_mem.rs` | 267-299 |
-| `CommitGraph` impl for `CommitGraphMem` | `commit_graph_mem.rs` | 374-433 |
-| `CommitGraphIndex` | `commit_graph.rs` | 27-159 |
-| `parse_commit` | `commit_parse.rs` | 133-177 |
-| `CommitParseLimits` | `commit_parse.rs` | 103-117 |
-| `CommitParseError` | `commit_parse.rs` | 38-51 |
-| Timestamp parsing (checked arithmetic) | `commit_parse.rs` | 319-343 |
-| `CommitWalkLimits` | `commit_walk_limits.rs` | 18-46 |
-| `CommitWalkLimits::DEFAULT` | `commit_walk_limits.rs` | 50-55 |
-| `CommitWalkLimits::RESTRICTIVE` | `commit_walk_limits.rs` | 58-63 |
-| `CommitWalkLimits::validate` | `commit_walk_limits.rs` | 71-102 |
-| `CommitWalkLimits::try_validate` | `commit_walk_limits.rs` | 109-137 |
-| Compile-time validation | `commit_walk_limits.rs` | 146-148 |
-| `CommitPlanError` | `errors.rs` | 126-145 |
+| Concept | Source File |
+|---------|-------------|
+| `CommitGraph` trait | `commit_walk.rs` |
+| Two-frontier range walk | `commit_walk.rs` |
+| `advance_uninteresting` | `commit_walk.rs` |
+| `is_ancestor` (DFS + generation pruning) | `commit_walk.rs` |
+| `introduced_by_plan` | `commit_walk.rs` |
+| `topo_order_positions` (Kahn's) | `commit_walk.rs` |
+| `PlannedCommit` | `commit_walk.rs` |
+| `ParentScratch` | `commit_walk.rs` |
+| `VisitedCommitBitset` | `commit_walk.rs` |
+| `CommitPlanIter` | `commit_walk.rs` |
+| `RefScratch` flags | `commit_walk.rs` |
+| BFS commit loading | `commit_loader.rs` |
+| `CommitLoader` (internal) | `commit_loader.rs` |
+| `LoadedCommit` | `commit_loader.rs` |
+| `CommitLoadLimits` | `commit_loader.rs` |
+| `ShallowBoundaryRoots` | `commit_loader.rs` |
+| Shallow file loading | `commit_loader.rs` |
+| Loose object loading | `commit_loader.rs` |
+| Delta resolution (recursive) | `commit_loader.rs` |
+| Identity enrichment | `commit_loader.rs` |
+| `CommitGraphMem` (SoA + CSR) | `commit_graph_mem.rs` |
+| `CommitGraphMem::build` (generation propagation) | `commit_graph_mem.rs` |
+| `CommitGraphMem::build_with_identities` | `commit_graph_mem.rs` |
+| `CommitGraph` impl for `CommitGraphMem` | `commit_graph_mem.rs` |
+| `CommitGraphIndex` | `commit_graph.rs` |
+| `parse_commit` | `commit_parse.rs` |
+| `CommitParseLimits` | `commit_parse.rs` |
+| `CommitParseError` | `commit_parse.rs` |
+| Timestamp parsing (checked arithmetic) | `commit_parse.rs` |
+| `CommitWalkLimits` | `commit_walk_limits.rs` |
+| `CommitWalkLimits::DEFAULT` | `commit_walk_limits.rs` |
+| `CommitWalkLimits::RESTRICTIVE` | `commit_walk_limits.rs` |
+| `CommitWalkLimits::validate` | `commit_walk_limits.rs` |
+| `CommitWalkLimits::try_validate` | `commit_walk_limits.rs` |
+| Compile-time validation | `commit_walk_limits.rs` |
+| `CommitPlanError` | `errors.rs` |
 
 ## Related Docs
 

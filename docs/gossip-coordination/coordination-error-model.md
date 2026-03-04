@@ -35,14 +35,14 @@ semantically valid for that operation.
 
 ### Source files
 
-| File | Lines | Role |
-|------|:-----:|------|
-| `crates/gossip-coordination/src/error.rs` | ~1,796 | `CoordError`, all shard-level operation errors, `AcquireScratch`, `FixedBuf`, `IdempotentOutcome` |
-| `crates/gossip-coordination/src/validation.rs` | ~1,016 | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency` |
-| `crates/gossip-coordination/src/lease.rs` | ~865 | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult` |
-| `crates/gossip-coordination/src/run_errors.rs` | ~672 | `CreateRunError`, `RegisterShardsError`, `GetRunError`, `RunTransitionError`, `UnparkError` |
-| `crates/gossip-coordination/src/split_execution.rs` | ~659 | `DerivedShardKind`, derived shard IDs, payload hash functions |
-| `crates/gossip-coordination/src/facade.rs` | ~464 | `ClaimError`, `ShardClaiming` trait, default claim algorithm |
+| File | Role |
+|------|------|
+| `crates/gossip-coordination/src/error.rs` | `CoordError`, all shard-level operation errors, `AcquireScratch`, `FixedBuf`, `IdempotentOutcome` |
+| `crates/gossip-coordination/src/validation.rs` | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency` |
+| `crates/gossip-coordination/src/lease.rs` | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult` |
+| `crates/gossip-coordination/src/run_errors.rs` | `CreateRunError`, `RegisterShardsError`, `GetRunError`, `RunTransitionError`, `UnparkError` |
+| `crates/gossip-coordination/src/split_execution.rs` | `DerivedShardKind`, derived shard IDs, payload hash functions |
+| `crates/gossip-coordination/src/facade.rs` | `ClaimError`, `ShardClaiming` trait, default claim algorithm |
 
 ---
 
@@ -50,7 +50,7 @@ semantically valid for that operation.
 
 ### 2.1 CoordError -- the shared building block
 
-`CoordError` (error.rs:112-201) is the core coordination error enum. It
+`CoordError` (error.rs) is the core coordination error enum. It
 provides the shared vocabulary of error conditions used across all
 lease-gated shard operations. Individual operation error types wrap these
 variants via `From<CoordError>` impls.
@@ -71,7 +71,7 @@ CoordError (#[non_exhaustive])
 └── CheckpointMissingKey
 ```
 
-`CursorOutOfBoundsDetail` (error.rs:210-218) captures redacted byte lengths:
+`CursorOutOfBoundsDetail` (error.rs) captures redacted byte lengths:
 
 | Field | Type | Meaning |
 |-------|------|---------|
@@ -83,10 +83,10 @@ CoordError (#[non_exhaustive])
 
 Each shard operation has a dedicated error enum that wraps the subset of
 `CoordError` variants relevant to that operation. The `From<CoordError>` impls
-(error.rs:1053-1212) route accepted variants and `unreachable!()` on rejected
+(error.rs) route accepted variants and `unreachable!()` on rejected
 ones.
 
-#### AcquireError (error.rs:358-431)
+#### AcquireError (error.rs)
 
 Acquire is special: it does NOT require a pre-existing lease, so it cannot
 produce `StaleFence` or `LeaseExpired`. It has **no** `From<CoordError>` impl.
@@ -99,7 +99,7 @@ AcquireError (#[non_exhaustive])
 └── AlreadyLeased { current_owner: WorkerId, lease_deadline: LogicalTime }
 ```
 
-#### RenewError (error.rs:440-485)
+#### RenewError (error.rs)
 
 Renew extends a lease deadline without modifying shard progress. Excludes
 `OpIdConflict`, cursor, and split variants.
@@ -113,7 +113,7 @@ RenewError (#[non_exhaustive])
 └── ShardTerminal { shard: ShardKey, status: ShardStatus }
 ```
 
-#### CheckpointError (error.rs:498-645)
+#### CheckpointError (error.rs)
 
 Checkpoint is the richest mutation (advances cursor, idempotent via op-log).
 The widest error surface along with `CompleteError`. Excludes only
@@ -135,7 +135,7 @@ CheckpointError (#[non_exhaustive])
 └── ResourceExhausted(SlabFull)
 ```
 
-#### CompleteError (error.rs:656-803)
+#### CompleteError (error.rs)
 
 Shares most variants with `CheckpointError` (records a final cursor position).
 Excludes `SplitInvalid`. Has `From<SlabFull>`.
@@ -156,7 +156,7 @@ CompleteError (#[non_exhaustive])
 └── ResourceExhausted(SlabFull)
 ```
 
-#### ParkError (error.rs:812-902)
+#### ParkError (error.rs)
 
 Park transitions a shard to the `Parked` terminal state. Carries
 `OpIdConflict` but excludes all cursor variants, `CheckpointMissingKey`, and
@@ -172,7 +172,7 @@ ParkError (#[non_exhaustive])
 └── OpIdConflict { op_id: OpId, expected_hash: u64, actual_hash: u64 }
 ```
 
-#### SplitError (error.rs:912-1036)
+#### SplitError (error.rs)
 
 Used by both split operations. Carries `OpIdConflict` and `SplitInvalid` but
 excludes cursor variants and `CheckpointMissingKey`. Has `From<SlabFull>`.
@@ -189,7 +189,7 @@ SplitError (#[non_exhaustive])
 └── ResourceExhausted(SlabFull)
 ```
 
-Type aliases (error.rs:989-995):
+Type aliases (error.rs):
 - `SplitReplaceError = SplitError`
 - `SplitResidualError = SplitError`
 
@@ -227,7 +227,7 @@ variants differ meaningfully, rather than the `From<CoordError>` narrowing
 pattern. The only shared conversion across run-level types is
 `From<RunOpIdConflict>`.
 
-#### CreateRunError (run_errors.rs:61-105)
+#### CreateRunError (run_errors.rs)
 
 ```text
 CreateRunError (#[non_exhaustive])
@@ -238,7 +238,7 @@ CreateRunError (#[non_exhaustive])
 └── ConfigMismatch { run: RunId }
 ```
 
-#### RegisterShardsError (run_errors.rs:130-229)
+#### RegisterShardsError (run_errors.rs)
 
 ```text
 RegisterShardsError (#[non_exhaustive])
@@ -251,7 +251,7 @@ RegisterShardsError (#[non_exhaustive])
 └── ResourceExhausted { resource: &'static str }
 ```
 
-#### GetRunError (run_errors.rs:239-259)
+#### GetRunError (run_errors.rs)
 
 ```text
 GetRunError (#[non_exhaustive])
@@ -259,7 +259,7 @@ GetRunError (#[non_exhaustive])
 └── TenantMismatch { expected: TenantId }
 ```
 
-#### RunTransitionError (run_errors.rs:272-348)
+#### RunTransitionError (run_errors.rs)
 
 Shared by `complete_run`, `fail_run`, and `cancel_run`.
 
@@ -272,7 +272,7 @@ RunTransitionError (#[non_exhaustive])
 └── OpIdConflict(RunOpIdConflict)
 ```
 
-#### UnparkError (run_errors.rs:358-414)
+#### UnparkError (run_errors.rs)
 
 ```text
 UnparkError (#[non_exhaustive])
@@ -283,7 +283,7 @@ UnparkError (#[non_exhaustive])
 └── OpIdConflict(RunOpIdConflict)
 ```
 
-### 2.5 ClaimError (facade.rs:50-161)
+### 2.5 ClaimError (facade.rs)
 
 `ClaimError` is intentionally coarser than `AcquireError`: transient race
 conditions are absorbed by the claim retry loop and surface as
@@ -307,7 +307,7 @@ Every lease-gated mutation (checkpoint, complete, park, split) follows the
 same three-step validation pipeline. The ordering is deliberate and
 safety-critical.
 
-### Step 1: Idempotency check -- `check_op_idempotency` (validation.rs:312-337)
+### Step 1: Idempotency check -- `check_op_idempotency` (validation.rs)
 
 Called **first** so that replays succeed even after the lease expires or the
 shard reaches a terminal state.
@@ -334,28 +334,28 @@ new operation. This is safe because:
   intervening ops within the same lease epoch. The fence epoch is the primary
   deduplication guard.
 
-### Step 2: Lease validation -- `validate_lease` (validation.rs:114-180)
+### Step 2: Lease validation -- `validate_lease` (validation.rs)
 
 Five checks in security-priority order:
 
-1. **Tenant isolation** (validation.rs:128-130) -- `record.tenant == tenant`.
+1. **Tenant isolation** (validation.rs) -- `record.tenant == tenant`.
    Checked first so a mismatch never reveals whether the shard is terminal,
    has a stale fence, or has an expired lease.
 
-2. **Terminal status** (validation.rs:133-138) -- `!record.status.is_terminal()`.
+2. **Terminal status** (validation.rs) -- `!record.status.is_terminal()`.
    Fast rejection of dead shards before more expensive checks.
 
-3. **Fence epoch** (validation.rs:141-146) -- `lease.fence() == record.fence_epoch`.
+3. **Fence epoch** (validation.rs) -- `lease.fence() == record.fence_epoch`.
    Zombie worker fencing (Kleppmann protocol). A mismatch means another
    worker has since acquired the shard.
 
-4. **Lease expiry** (validation.rs:151-159) -- `now < record.lease_deadline()`.
+4. **Lease expiry** (validation.rs) -- `now < record.lease_deadline()`.
    If the fence check passes but the record has no lease holder (deadline is
    `None`), the record is in an inconsistent state and `StaleFence` is
    returned to force re-acquisition. The half-open interval means
    `now >= deadline` is expired.
 
-5. **Owner divergence** (validation.rs:166-171) --
+5. **Owner divergence** (validation.rs) --
    `record.lease_owner() == Some(lease.owner())`. Defense-in-depth: catches
    identity mismatches when fence epochs agree (e.g., state reconstruction
    bugs).
@@ -374,32 +374,32 @@ indicates a broken clock).
 Varies by operation:
 
 - **Checkpoint / Complete:** `validate_cursor_update_pooled`
-  (validation.rs:209-262)
+  (validation.rs)
 - **Split:** `validate_split_coverage` / `validate_residual_split`
   (from `gossip_contracts::coordination::shard_spec`)
 - **Park:** No additional validation beyond Steps 1-2
 - **Renew:** Step 1 is skipped (renew is not idempotent via OpId)
 
-### Cursor validation -- `validate_cursor_update_pooled` (validation.rs:209-262)
+### Cursor validation -- `validate_cursor_update_pooled` (validation.rs)
 
 Operates entirely on borrowed slices to avoid materializing owned cursor/spec
 values on the checkpoint hot path. Checks five properties in order:
 
-1. **Key presence** (validation.rs:216-218) -- `new_cursor.last_key()` must
+1. **Key presence** (validation.rs) -- `new_cursor.last_key()` must
    be `Some`. A checkpoint with no key represents no progress.
 
-2. **Key size** (validation.rs:221-226) --
+2. **Key size** (validation.rs) --
    `last_key.len() <= MAX_KEY_SIZE`. Defense-in-depth against oversized keys.
 
-3. **Token size** (validation.rs:229-236) --
+3. **Token size** (validation.rs) --
    `token.len() <= MAX_TOKEN_SIZE`. Defense-in-depth before storing in the
    slab.
 
-4. **Monotonicity** (validation.rs:239-246) --
+4. **Monotonicity** (validation.rs) --
    `new_last_key >= old_last_key` (lexicographic). Prevents cursor regression
    within a lease epoch.
 
-5. **Bounds** (validation.rs:249-259) -- `last_key` must fall within
+5. **Bounds** (validation.rs) -- `last_key` must fall within
    `[spec_start, spec_end)`. Empty `spec_start` / `spec_end` are treated as
    unbounded on that side.
 
@@ -411,7 +411,7 @@ actionable error first.
 
 ## 4. Lease Semantics
 
-### Lease structure (lease.rs:168-299)
+### Lease structure (lease.rs)
 
 `Lease` is the capability token returned by `acquire_and_restore_into` and
 required by every lease-gated mutation. It carries:
@@ -431,12 +431,12 @@ leases as opaque tokens.
 **Construction panics:** `fence < FenceEpoch::INITIAL` or
 `deadline == LogicalTime::ZERO`.
 
-**Renewal:** `set_deadline` (lease.rs:287-298) extends the deadline without
+**Renewal:** `set_deadline` (lease.rs) extends the deadline without
 changing the fence epoch. Panics if the new deadline is before the current
 deadline (monotonicity violation). Equal deadlines are allowed (harmless
 no-op).
 
-### LeaseHolder (lease.rs:89-142)
+### LeaseHolder (lease.rs)
 
 Stored *inside* the `ShardRecord`. Bundles `owner: WorkerId` and
 `deadline: LogicalTime` into a single value so the record stores
@@ -469,7 +469,7 @@ re-acquire the shard.
 
 ## 5. Idempotency Log
 
-### OpKind (lease.rs:350-478)
+### OpKind (lease.rs)
 
 Operation kinds that participate in per-shard idempotency. `#[repr(u8)]` with
 stable discriminants persisted in the op-log.
@@ -483,7 +483,7 @@ stable discriminants persisted in the op-log.
 | `SplitResidual` | 4 | none (parent stays Active) | yes |
 | `Unpark` | 5 | Parked -> Active (admin) | no |
 
-### OpResult (lease.rs:497-554)
+### OpResult (lease.rs)
 
 Stored result status for replay detection. `#[repr(u8)]`.
 
@@ -493,7 +493,7 @@ Stored result status for replay detection. `#[repr(u8)]`.
 | `Error` | 1 | Validation failed, shard NOT mutated |
 | `Superseded` | 2 | Valid but overtaken by a later mutation |
 
-### OpLogEntry (lease.rs:580-670)
+### OpLogEntry (lease.rs)
 
 A single entry in the bounded per-shard operation log.
 
@@ -522,7 +522,7 @@ A single entry in the bounded per-shard operation log.
 4. **Not found** -> execute the mutation, record the entry, return
    `IdempotentOutcome::Executed`.
 
-### IdempotentOutcome (error.rs:1738-1784)
+### IdempotentOutcome (error.rs)
 
 ```rust
 pub enum IdempotentOutcome<T> {
@@ -595,7 +595,7 @@ values via pattern matching.
 
 ## 8. AcquireScratch and FixedBuf
 
-### FixedBuf\<N\> (error.rs:1381-1483)
+### FixedBuf\<N\> (error.rs)
 
 Fixed-capacity byte buffer with logical length tracking. Used for inline
 storage of small variable-length fields without heap allocation.
@@ -611,7 +611,7 @@ storage of small variable-length fields without heap allocation.
 
 Implements `Clone`, `PartialEq`, `Eq`, `Debug` (shows first 8 hex bytes).
 
-### AcquireScratch (error.rs:1519-1682)
+### AcquireScratch (error.rs)
 
 Caller-owned scratch buffer for allocation-free acquire snapshots.
 Pre-allocates fixed-capacity arrays for every variable-size field in a shard
@@ -656,18 +656,18 @@ the caller from calling it again while the view is still live.
 
 ### Related result types
 
-**ShardSnapshotView\<'a\>** (error.rs:1289-1353): Borrowed shard state
+**ShardSnapshotView\<'a\>** (error.rs): Borrowed shard state
 view backed by `AcquireScratch`. Fields: `status`, `spec`, `cursor`,
 `cursor_semantics`, `parent`, `spawned`.
 
-**AcquireResultView\<'a\>** (error.rs:1365-1375): Contains `lease: Lease`,
+**AcquireResultView\<'a\>** (error.rs): Contains `lease: Lease`,
 `snapshot: ShardSnapshotView<'a>`, `capacity: CapacityHint`.
 
-**CapacityHint** (error.rs:1236-1269): Advisory capacity information
+**CapacityHint** (error.rs): Advisory capacity information
 piggybacked on acquire/renew results. Fields: `available_count: u32`,
 `earliest_deadline: Option<LogicalTime>`. Fail-open advisory metadata.
 
-**RenewResult** (error.rs:1688-1699): Contains `new_deadline: LogicalTime`,
+**RenewResult** (error.rs): Contains `new_deadline: LogicalTime`,
 `capacity: CapacityHint`.
 
 ---
@@ -710,7 +710,7 @@ piggybacked on acquire/renew results. Fields: `available_count: u32`,
              │
   ┌──────────▼───────────┐
   │  ? operator triggers  │ ──▶ From<CoordError> for CheckpointError
-  │  From conversion      │     (error.rs:1053-1088)
+  │  From conversion      │     (error.rs)
   └──────────┬────────────┘
              │
   ┌──────────▼───────────┐
@@ -765,83 +765,83 @@ type's `OpIdConflict` variant. Run-level errors do not go through
 
 | Type | Location | Variants |
 |------|----------|:--------:|
-| `CoordError` | error.rs:112-201 | 12 |
-| `CursorOutOfBoundsDetail` | error.rs:210-218 | struct (3 fields) |
-| `AcquireError` | error.rs:358-431 | 4 |
-| `RenewError` | error.rs:440-485 | 5 |
-| `CheckpointError` | error.rs:498-645 | 12 |
-| `CompleteError` | error.rs:656-803 | 12 |
-| `ParkError` | error.rs:812-902 | 6 |
-| `SplitError` | error.rs:912-1036 | 8 |
-| `SplitReplaceError` (alias) | error.rs:989 | = `SplitError` |
-| `SplitResidualError` (alias) | error.rs:995 | = `SplitError` |
+| `CoordError` | error.rs | 12 |
+| `CursorOutOfBoundsDetail` | error.rs | struct (3 fields) |
+| `AcquireError` | error.rs | 4 |
+| `RenewError` | error.rs | 5 |
+| `CheckpointError` | error.rs | 12 |
+| `CompleteError` | error.rs | 12 |
+| `ParkError` | error.rs | 6 |
+| `SplitError` | error.rs | 8 |
+| `SplitReplaceError` (alias) | error.rs | = `SplitError` |
+| `SplitResidualError` (alias) | error.rs | = `SplitError` |
 
 ### From impls (error.rs)
 
 | Conversion | Location |
 |------------|----------|
-| `From<CoordError> for CheckpointError` | error.rs:1053-1088 |
-| `From<CoordError> for CompleteError` | error.rs:1090-1124 |
-| `From<CoordError> for ParkError` | error.rs:1126-1156 |
-| `From<CoordError> for SplitError` | error.rs:1158-1188 |
-| `From<CoordError> for RenewError` | error.rs:1190-1212 |
-| `From<SlabFull> for CheckpointError` | error.rs:641-645 |
-| `From<SlabFull> for CompleteError` | error.rs:799-803 |
-| `From<SlabFull> for SplitError` | error.rs:1032-1036 |
+| `From<CoordError> for CheckpointError` | error.rs |
+| `From<CoordError> for CompleteError` | error.rs |
+| `From<CoordError> for ParkError` | error.rs |
+| `From<CoordError> for SplitError` | error.rs |
+| `From<CoordError> for RenewError` | error.rs |
+| `From<SlabFull> for CheckpointError` | error.rs |
+| `From<SlabFull> for CompleteError` | error.rs |
+| `From<SlabFull> for SplitError` | error.rs |
 
 ### Result and outcome types (error.rs)
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `CapacityHint` | error.rs:1236-1269 | Advisory shard availability |
-| `ShardSnapshotView<'a>` | error.rs:1289-1353 | Borrowed shard state view |
-| `AcquireResultView<'a>` | error.rs:1365-1375 | Lease + snapshot + capacity |
-| `FixedBuf<N>` | error.rs:1381-1483 | Fixed-capacity byte buffer |
-| `AcquireScratch` | error.rs:1519-1682 | Caller-owned scratch buffer |
-| `RenewResult` | error.rs:1688-1699 | Renewal result |
-| `IdempotentOutcome<T>` | error.rs:1738-1784 | Executed vs. Replayed wrapper |
+| `CapacityHint` | error.rs | Advisory shard availability |
+| `ShardSnapshotView<'a>` | error.rs | Borrowed shard state view |
+| `AcquireResultView<'a>` | error.rs | Lease + snapshot + capacity |
+| `FixedBuf<N>` | error.rs | Fixed-capacity byte buffer |
+| `AcquireScratch` | error.rs | Caller-owned scratch buffer |
+| `RenewResult` | error.rs | Renewal result |
+| `IdempotentOutcome<T>` | error.rs | Executed vs. Replayed wrapper |
 
 ### Validation functions (validation.rs)
 
 | Function | Location | Returns |
 |----------|----------|---------|
-| `validate_lease` | validation.rs:114-180 | `Result<(), CoordError>` |
-| `validate_cursor_update_pooled` | validation.rs:209-262 | `Result<(), CoordError>` |
-| `check_op_idempotency` | validation.rs:312-337 | `Result<Option<&OpLogEntry>, CoordError>` |
+| `validate_lease` | validation.rs | `Result<(), CoordError>` |
+| `validate_cursor_update_pooled` | validation.rs | `Result<(), CoordError>` |
+| `check_op_idempotency` | validation.rs | `Result<Option<&OpLogEntry>, CoordError>` |
 
 ### Lease types (lease.rs)
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `LeaseHolder` | lease.rs:89-142 | Owner + deadline stored in `ShardRecord` |
-| `Lease` | lease.rs:168-299 | Capability token returned to workers |
-| `OpKind` | lease.rs:350-478 | Operation type discriminant (`#[repr(u8)]`) |
-| `OpResult` | lease.rs:497-554 | Cached result status (`#[repr(u8)]`) |
-| `OpLogEntry` | lease.rs:580-670 | Single op-log entry |
+| `LeaseHolder` | lease.rs | Owner + deadline stored in `ShardRecord` |
+| `Lease` | lease.rs | Capability token returned to workers |
+| `OpKind` | lease.rs | Operation type discriminant (`#[repr(u8)]`) |
+| `OpResult` | lease.rs | Cached result status (`#[repr(u8)]`) |
+| `OpLogEntry` | lease.rs | Single op-log entry |
 
 ### Run-level error types (run_errors.rs)
 
 | Type | Location | Variants |
 |------|----------|:--------:|
-| `CreateRunError` | run_errors.rs:61-105 | 5 |
-| `RegisterShardsError` | run_errors.rs:130-229 | 7 |
-| `GetRunError` | run_errors.rs:239-259 | 2 |
-| `RunTransitionError` | run_errors.rs:272-348 | 5 |
-| `UnparkError` | run_errors.rs:358-414 | 5 |
+| `CreateRunError` | run_errors.rs | 5 |
+| `RegisterShardsError` | run_errors.rs | 7 |
+| `GetRunError` | run_errors.rs | 2 |
+| `RunTransitionError` | run_errors.rs | 5 |
+| `UnparkError` | run_errors.rs | 5 |
 
 ### Facade-level error (facade.rs)
 
 | Type | Location | Variants |
 |------|----------|:--------:|
-| `ClaimError` | facade.rs:50-161 | 4 |
+| `ClaimError` | facade.rs | 4 |
 
 ### Split execution types (split_execution.rs)
 
 | Type | Location | Purpose |
 |------|----------|---------|
-| `DerivedShardKind` | split_execution.rs:88-125 | Child vs. Residual discriminant |
-| `SplitReplaceResult` | split_execution.rs:149-154 | Child shard IDs from split-replace |
-| `SplitResidualResult` | split_execution.rs:163-168 | Residual shard ID from split-residual |
+| `DerivedShardKind` | split_execution.rs | Child vs. Residual discriminant |
+| `SplitReplaceResult` | split_execution.rs | Child shard IDs from split-replace |
+| `SplitResidualResult` | split_execution.rs | Residual shard ID from split-residual |
 
 ---
 

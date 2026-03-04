@@ -607,7 +607,7 @@ half-open `[start, end)` byte-key ranges.
 | D2.9  | `AcquireScratch` + `AcquireResultView` enable zero-alloc acquire path             |
 | D2.10 | Derived shard IDs have bit 63 set                                                 |
 | D2.11 | ShardRecord is self-contained (no back-references to RunConfig)                   |
-| D2.12 | ShardSnapshotView excludes lease, fence, op_log, tenant, park_reason, run, shard  |
+| D2.12 | ShardSnapshotView includes status, spec, cursor, cursor_semantics, parent, spawned; excludes lease, fence, op_log, tenant, park_reason |
 | D2.13 | Trait is synchronous (returns `Result`, not futures)                              |
 | D2.14 | Lease-gated operations take `(TenantId, Lease)`                                   |
 | D2.15 | `acquire_and_restore_into` is the only non-lease operation                        |
@@ -791,7 +791,158 @@ crate.
 
 ---
 
-## 14. References
+## 14. Event Model (`events.rs`)
+
+The coordination layer emits structured events for observability.
+Events are **pure inert data** — the coordination layer never acts on
+them.  Side effects (metrics, notifications, dashboards) are the
+caller's responsibility.  This keeps the coordination layer
+deterministic, testable, and compatible with simulation.
+
+### Design principles
+
+- Events are returned alongside operation results via `EventCollector`,
+  **not** via callbacks or subscriptions.
+- Events are **not** wired into the `CoordinationBackend` trait.
+  Backends that want emission implement companion `_with_events`
+  methods accepting `&mut EventCollector`.
+- `EventKind` is `#[non_exhaustive]` — new variants can be added
+  without breaking downstream.
+- `EventKind` must **not** derive `Serialize` because
+  `ShardCheckpointed` contains `RedactedKey` which only redacts via
+  `Debug`, not serialization.
+
+### EventKind
+
+| Variant | Terminal? | Category |
+|---|---|---|
+| `ShardAcquired { shard, worker, fence_epoch }` | No | Shard |
+| `ShardCheckpointed { shard, last_key: RedactedKey }` | No | Shard |
+| `ShardResidualCreated { parent, residual }` | No | Shard |
+| `ShardUnparked { shard, new_fence_epoch }` | No | Shard |
+| `ShardLeaseRenewed { shard, new_deadline }` | No | Shard |
+| `ShardCompleted { shard }` | Yes | Shard |
+| `ShardParked { shard, reason }` | Yes | Shard |
+| `ShardSplit { parent, children }` | Yes | Shard |
+| `RunCreated` | No | Run |
+| `RunActivated { shard_count }` | No | Run |
+| `RunCompleted` | Yes | Run |
+| `RunFailed` | Yes | Run |
+| `RunCancelled` | Yes | Run |
+
+Classification methods (`is_shard_event`, `is_run_event`,
+`is_terminal`) are exhaustive matches — the compiler enforces that new
+variants are handled.
+
+### RedactedKey
+
+Wraps `Option<Box<[u8]>>` to prevent accidental logging of sensitive
+key material.  `Debug` shows byte length (`Some(<15 bytes>)`) not
+contents.
+
+### StateTransitionEvent
+
+Envelope carrying `(tenant, run, at: LogicalTime, kind: EventKind)`.
+Every event can be routed by tenant, correlated to a run, and ordered
+by logical timestamp without pattern-matching the kind.
+
+### EventCollector
+
+Collects events during a coordination operation.  Supports optional
+hard capacity ceiling (`with_max_capacity`) — excess events are
+silently dropped.  Panics on cross-tenant mixing (invariant: one tenant
+per collector lifetime).
+
+| Method | Purpose |
+|---|---|
+| `new()` | Empty, no pre-allocation |
+| `with_capacity(cap)` | Pre-allocated |
+| `with_max_capacity(max)` | Hard ceiling, silently drops excess |
+| `emit(event) -> bool` | Push event; returns `false` at capacity |
+| `drain() -> Vec<..>` | O(1) pointer swap via `mem::take` |
+| `drain_with(f)` | Iterate and clear, preserving allocation for reuse |
+| `len()`, `is_empty()`, `iter()` | Inspection |
+
+### Operation-to-event mapping
+
+| Backend Operation | Event(s) Emitted |
+|---|---|
+| `acquire_and_restore_into` | `ShardAcquired` |
+| `checkpoint` | `ShardCheckpointed` |
+| `complete` | `ShardCompleted` |
+| `park_shard` | `ShardParked` |
+| `split_replace` | `ShardSplit` |
+| `split_residual` | `ShardResidualCreated` |
+| `renew` | `ShardLeaseRenewed` |
+| `create_run` | `RunCreated` |
+| `register_shards` | `RunActivated` |
+
+---
+
+## 15. WorkerSession (`session.rs`)
+
+`WorkerSession` is an ergonomic wrapper that captures `(backend,
+tenant, worker, lease)` at shard acquisition time and threads them
+through every subsequent call, eliminating repetitive boilerplate and
+preventing tenant/lease mismatches.
+
+### Design properties
+
+- **Generic over backend** — monomorphized per-backend, no trait-object
+  overhead.
+- **Exclusive borrow** (`&'b mut B`) — the Rust borrow checker enforces
+  single session per backend reference.
+- **No automatic lease renewal** — caller must call `renew()` explicitly.
+- **Move semantics for terminal ops** — `complete`, `park`,
+  `split_replace` consume `self`, making double-use a compile error.
+- **Borrow semantics for non-terminal ops** — `split_residual` takes
+  `&mut self` so the session stays active with a narrowed range.
+- **Snapshot staleness** — snapshot reflects acquisition time, is **not**
+  updated by checkpoint, but **is** refreshed after `split_residual`.
+
+### Lifecycle
+
+```text
+WorkerSession::new(backend, now, tenant, key, worker)
+          |
+          v
+       Active Session <--+
+          |               |
+    renew / checkpoint    |
+          |               |
+          v               |
+    split_residual -------+  (session stays active, snapshot narrowed)
+          |
+   +------+----------+
+   v      v          v
+complete  park   split_replace
+(Done)  (Parked)   (Split)
+   +------+----------+
+     session consumed -> cannot be used again
+```
+
+### Public API
+
+| Method | Semantics |
+|---|---|
+| `new(backend, now, tenant, key, worker)` | Acquire shard, create session |
+| `from_acquire_result(backend, acquired)` | Build from previously acquired snapshot |
+| `lease()` | Active lease (deadline updated by renew) |
+| `initial_snapshot()` | Borrowed snapshot from acquisition time |
+| `spec()` | Key range + metadata (updated after split_residual) |
+| `cursor()` | Cursor at acquisition time (not updated by checkpoint) |
+| `tenant()`, `worker()`, `shard_key()` | Identity accessors |
+| `capacity()` | Advisory backoff signal from last acquire/renew |
+| `renew(now)` | Extend lease deadline |
+| `checkpoint(now, cursor, op_id)` | Advance cursor (idempotent via op_id) |
+| `complete(self, now, cursor, op_id)` | **Terminal.** Shard -> Done |
+| `park(self, now, reason, op_id)` | **Terminal.** Shard -> Parked |
+| `split_replace(self, now, plan, op_id)` | **Terminal.** Shard -> Split, creates N children |
+| `split_residual(&mut self, now, plan, op_id)` | **Non-terminal.** Narrows range, creates residual child |
+
+---
+
+## 16. References
 
 - Gray, C. and Cheriton, D. "Leases: An Efficient Fault-Tolerant Mechanism
   for Distributed File Cache Consistency." SOSP 1989.

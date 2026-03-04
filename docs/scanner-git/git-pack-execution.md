@@ -126,7 +126,7 @@ The decode plan for a single pack file, produced by `pack_plan.rs`:
 | `delta_dep_index` | `Vec<u32>` | Dense index: `need_offsets[i]` → `delta_deps[j]` or `NONE_U32` |
 | `exec_order` | `Option<Vec<u32>>` | Permutation of `need_offsets` indices for out-of-order execution |
 
-### PackExecScratch (`pack_exec.rs:760`)
+### PackExecScratch (`pack_exec.rs`)
 
 Reusable scratch state for pack execution, amortizing allocation across plans:
 
@@ -137,7 +137,7 @@ Reusable scratch state for pack execution, amortizing allocation across plans:
 | `external_base_oids` | `Vec<OidBytes>` | Interned external REF delta OIDs |
 | `candidate_ranges` | `Vec<CandidateRange>` | Per-need-index candidate index ranges (out-of-order only) |
 
-### DecodeBufs (`pack_exec.rs:1174`)
+### DecodeBufs (`pack_exec.rs`)
 
 Three-buffer rotation scheme for zero-allocation decoding:
 
@@ -149,7 +149,7 @@ Three-buffer rotation scheme for zero-allocation decoding:
 | `delta_stack` | Collects `DeltaFrame`s during fallback chain walks |
 | `de` | Owned `flate2::Decompress` instance (reset between inflations) |
 
-### DecodeEnv (`pack_exec.rs:1151`)
+### DecodeEnv (`pack_exec.rs`)
 
 Immutable execution environment bundled into a single reference to reduce
 register pressure on the hot path:
@@ -165,7 +165,7 @@ register pressure on the hot path:
 | `external_base_oids` | Interned external OIDs |
 | `delta_dep_index` | Dense index into `delta_deps` |
 
-### ObjectStore (`object_store.rs:516`)
+### ObjectStore (`object_store.rs`)
 
 Worker-local object loader for tree traversal (`&mut self` API):
 
@@ -181,7 +181,7 @@ Worker-local object loader for tree traversal (`&mut self` API):
 | `spill` | `Option<SpillArena>` — mmap-backed large tree payload store |
 | `spill_index` | `SpillIndex` — open-addressed hash table for spilled payloads |
 
-### ObjectStoreLayout (`object_store.rs:453`)
+### ObjectStoreLayout (`object_store.rs`)
 
 Immutable shared repository layout, built once and cloned per worker:
 
@@ -192,7 +192,7 @@ Immutable shared repository layout, built once and cloned per worker:
 | `pack_paths` | Resolved pack file paths |
 | `loose_dirs` | Loose object directories |
 
-### BlobIntroducer (`blob_introducer.rs:515`)
+### BlobIntroducer (`blob_introducer.rs`)
 
 Serial blob discovery walker:
 
@@ -206,7 +206,7 @@ Serial blob discovery walker:
 | `tree_bytes_in_flight` | In-flight memory budget tracking |
 | `scan_binary` | When true, skips extension-based nonscannable filter |
 
-### SeenSets (`blob_introducer.rs:74`)
+### SeenSets (`blob_introducer.rs`)
 
 Three independent bitsets for MIDX-indexed deduplication:
 
@@ -233,7 +233,7 @@ Both tiers are 4-way set-associative. Objects > 2 MiB are not cached.
 Eviction is CLOCK by default, with an opt-in `dependency_clock` variant
 (env var `SCANNER_RS_PACK_CACHE_EVICTION`).
 
-### PackExecStrategy (`runner_exec.rs:522`)
+### PackExecStrategy (`runner_exec.rs`)
 
 Execution strategy selected by `select_pack_exec_strategy`:
 
@@ -257,7 +257,7 @@ from a base object. Two delta types exist:
 ### Resolution in ObjectStore (Tree Loading)
 
 The `ObjectStore::read_pack_object` method uses a two-phase iterative
-approach (`object_store.rs:739`):
+approach (`object_store.rs`):
 
 ```mermaid
 flowchart TD
@@ -322,7 +322,7 @@ walking commits in topological order.
 
 ### Serial Mode (`BlobIntroducer`)
 
-For each commit in plan order (`blob_introducer.rs:596`):
+For each commit in plan order (`blob_introducer.rs`):
 
 1. Resolve the commit's root tree OID.
 2. Check the MIDX `SeenSets.trees` bitmap — skip if already seen.
@@ -340,7 +340,7 @@ or spilled trees use `TreeStream` for incremental parsing.
 
 ### Parallel Mode (`introduce_parallel`)
 
-When `blob_intro_workers > 1` (`blob_introducer.rs:1126`):
+When `blob_intro_workers > 1` (`blob_introducer.rs`):
 
 1. Pre-partition the commit plan into `~4 × worker_count` chunks.
 2. Spawn workers with `std::thread::scope`. Each worker has:
@@ -387,7 +387,7 @@ byte budget.
 
 ### Pack Cache (Pack Execution)
 
-Sized by a layered heuristic (`runner_exec.rs:72`):
+Sized by a layered heuristic (`runner_exec.rs`):
 
 ```
 raw_estimate = total_pack_bytes / 16        (~6.25% of pack data)
@@ -411,7 +411,7 @@ Set-associative cache for decompressed tree payloads. Cache hits return
 Keyed by `(pack_id, offset)`. Stores decompressed tree base payloads
 to avoid repeated inflations when resolving delta chains through the
 same base. Auto-sized by `auto_tree_delta_cache_bytes`
-(`runner_exec.rs:210`):
+(`runner_exec.rs`):
 
 ```
 estimated_trees = object_count × 15%
@@ -425,17 +425,17 @@ result = clamp(estimated_bytes, 8 MiB, configured_max)
 
 | Resource | Limit | Location |
 |----------|-------|----------|
-| Pack cache per worker | 32 MiB – 2 GiB | `runner_exec.rs:98–118` |
-| Pack cache aggregate | 16 GiB | `runner_exec.rs:111` |
+| Pack cache per worker | 32 MiB – 2 GiB | `runner_exec.rs` |
+| Pack cache aggregate | 16 GiB | `runner_exec.rs` |
 | Max object bytes | `PackDecodeLimits::max_object_bytes` | `pack_decode.rs` |
 | Max delta bytes | `PackDecodeLimits::max_delta_bytes` | `pack_decode.rs` |
-| Tree bytes in flight | `TreeDiffLimits::max_tree_bytes_in_flight` | `blob_introducer.rs:559` |
-| Tree spill arena | `TreeDiffLimits::max_tree_spill_bytes` | `object_store.rs:595` |
-| Path length | 4096 bytes | `blob_introducer.rs:60` |
-| Delta chain depth | 64 | `object_store.rs:81`, `pack_plan.rs` |
-| Spill index slots | 64 – 1,048,576 (power of two) | `object_store.rs:85–87` |
-| Pack mmap total bytes | `PackMmapLimits::max_total_bytes` | `runner_exec.rs:342` |
-| Pack mmap count | `PackMmapLimits::max_open_packs` | `runner_exec.rs:348` |
+| Tree bytes in flight | `TreeDiffLimits::max_tree_bytes_in_flight` | `blob_introducer.rs` |
+| Tree spill arena | `TreeDiffLimits::max_tree_spill_bytes` | `object_store.rs` |
+| Path length | 4096 bytes | `blob_introducer.rs` |
+| Delta chain depth | 64 | `object_store.rs`, `pack_plan.rs` |
+| Spill index slots | 64 – 1,048,576 (power of two) | `object_store.rs` |
+| Pack mmap total bytes | `PackMmapLimits::max_total_bytes` | `runner_exec.rs` |
+| Pack mmap count | `PackMmapLimits::max_open_packs` | `runner_exec.rs` |
 
 ### Spill-to-Disk Strategies
 
@@ -531,12 +531,12 @@ The `SchedulerPackWorkerRuntime` uses `ManuallyDrop` and `unsafe` lifetime
 widening to keep the `EngineAdapter` (borrows `Engine`) and `PackIo`
 (borrows `MidxView`) alive across multiple tasks without per-task
 reconstruction. Drop ordering is enforced by a custom `Drop` impl and
-compile-time `offset_of!` assertions (`runner_exec.rs:1022`).
+compile-time `offset_of!` assertions (`runner_exec.rs`).
 
 ## Sharding Heuristics
 
 For `IntraPackSharded` strategy, shard count is the minimum of five
-independent caps (`runner_exec.rs:467`):
+independent caps (`runner_exec.rs`):
 
 | Cap | Constant | Description |
 |-----|----------|-------------|
@@ -553,30 +553,30 @@ cross-pack or loose-object fallback I/O.
 
 ## Source of Truth
 
-| Component | File | Key Lines |
-|-----------|------|-----------|
-| Pack plan data model | `crates/scanner-git/src/pack_plan_model.rs` | `PackPlan`, `DeltaDep`, `BaseLoc` |
-| Pack plan builder | `crates/scanner-git/src/pack_plan.rs` | `PackPlanConfig`, `PackPlanError`, `PackView::parse` |
-| Pack executor core | `crates/scanner-git/src/pack_exec.rs` | `decode_offset` (2459), `execute_offset_range_with_scratch` (1413), `resolve_and_apply_delta` (2342), `decode_base_from_pack` via `walk_delta_chain_to_root` (2962) |
-| Pack executor entry points | `crates/scanner-git/src/pack_exec.rs` | `execute_pack_plan_with_scratch` (1496), `execute_pack_plan_with_scratch_range_hot_deps` (1955), `execute_pack_plan_with_scratch_indices_hot_deps` (1748) |
-| Execution strategy | `crates/scanner-git/src/runner_exec.rs` | `select_pack_exec_strategy` (808), `select_plan_shard_count_with_hint` (749), `apply_locality_shard_cap` (697) |
-| Scheduler integration | `crates/scanner-git/src/runner_exec.rs` | `execute_pack_plans_with_scheduler` (1946), `run_scheduler_pack_task` (1355), `SchedulerPackWorkerRuntime` (994) |
-| Pack cache | `crates/scanner-git/src/pack_cache.rs` | Tiered CLOCK cache, `PackCache::new`, `PackCache::get`, `PackCache::insert` |
-| Cache sizing | `crates/scanner-git/src/runner_exec.rs` | `per_worker_cache_bytes` (265), `estimate_pack_cache_bytes` (230), constants (92–118) |
-| Object store | `crates/scanner-git/src/object_store.rs` | `ObjectStore` (516), `TreeSource` trait (217), `TreeBytes` (238), `SpillIndex` (141) |
-| Object store layout | `crates/scanner-git/src/object_store.rs` | `ObjectStoreLayout` (453) |
-| Tree delta resolution | `crates/scanner-git/src/object_store.rs` | `read_pack_object_impl` (764), `TreeDecodeBufs` (313), `TreeDeltaFrame` (409) |
-| Blob introducer (serial) | `crates/scanner-git/src/blob_introducer.rs` | `BlobIntroducer` (515), `introduce` (596), `walk_stack` (693) |
-| Blob introducer (parallel) | `crates/scanner-git/src/blob_introducer.rs` | `introduce_parallel` (1126), `BlobIntroWorker` (851), `merge_worker_results` (1330) |
-| Seen sets | `crates/scanner-git/src/blob_introducer.rs` | `SeenSets` (74), `LooseOidSet` (187) |
-| Pack inflate primitives | `crates/scanner-git/src/pack_inflate.rs` | `PackFile`, `EntryHeader`, `EntryKind`, `ObjectKind`, `inflate_limited_with`, `apply_delta`, `inflate_stream` |
-| Pack decode limits | `crates/scanner-git/src/pack_decode.rs` | `PackDecodeLimits`, `PackDecodeError` |
-| Delta application | `crates/scanner-git/src/pack_delta.rs` | Re-exports `apply_delta`, `DeltaError` from `pack_inflate` |
-| Mmap management | `crates/scanner-git/src/runner_exec.rs` | `mmap_pack_files` (342), `advise_sequential` (403) |
-| Spill candidate sink | `crates/scanner-git/src/runner_exec.rs` | `SpillCandidateSink` (130) |
-| Loose scanning | `crates/scanner-git/src/runner_exec.rs` | `scan_loose_candidates` (2001) |
-| Skip mapping | `crates/scanner-git/src/runner_exec.rs` | `collect_skipped_candidates` (2048) |
-| Result merging | `crates/scanner-git/src/runner_exec.rs` | `merge_scanned_blobs` (887), `append_scanned_blobs` (911) |
+| Component | File |
+|-----------|------|
+| Pack plan data model | `crates/scanner-git/src/pack_plan_model.rs` |
+| Pack plan builder | `crates/scanner-git/src/pack_plan.rs` |
+| Pack executor core | `crates/scanner-git/src/pack_exec.rs` |
+| Pack executor entry points | `crates/scanner-git/src/pack_exec.rs` |
+| Execution strategy | `crates/scanner-git/src/runner_exec.rs` |
+| Scheduler integration | `crates/scanner-git/src/runner_exec.rs` |
+| Pack cache | `crates/scanner-git/src/pack_cache.rs` |
+| Cache sizing | `crates/scanner-git/src/runner_exec.rs` |
+| Object store | `crates/scanner-git/src/object_store.rs` |
+| Object store layout | `crates/scanner-git/src/object_store.rs` |
+| Tree delta resolution | `crates/scanner-git/src/object_store.rs` |
+| Blob introducer (serial) | `crates/scanner-git/src/blob_introducer.rs` |
+| Blob introducer (parallel) | `crates/scanner-git/src/blob_introducer.rs` |
+| Seen sets | `crates/scanner-git/src/blob_introducer.rs` |
+| Pack inflate primitives | `crates/scanner-git/src/pack_inflate.rs` |
+| Pack decode limits | `crates/scanner-git/src/pack_decode.rs` |
+| Delta application | `crates/scanner-git/src/pack_delta.rs` |
+| Mmap management | `crates/scanner-git/src/runner_exec.rs` |
+| Spill candidate sink | `crates/scanner-git/src/runner_exec.rs` |
+| Loose scanning | `crates/scanner-git/src/runner_exec.rs` |
+| Skip mapping | `crates/scanner-git/src/runner_exec.rs` |
+| Result merging | `crates/scanner-git/src/runner_exec.rs` |
 
 ## Related Docs
 

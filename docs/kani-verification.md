@@ -89,5 +89,5 @@ so failures are isolated. See `.github/workflows/ci.yml`, job `kani`.
 | -------- | ------------------------------------------ | ------ | -------- |
 | **Kani** | Bounded model checking (80 proofs)         | `kani` | Nightly  |
 | **Miri** | Undefined behavior detection               | `miri` | Nightly  |
-| **Loom** | Exhaustive concurrency testing (8 models)  | `loom` | Nightly  |
+| **Loom** | Exhaustive concurrency testing (12 models) | `loom` | Nightly  |
 | **ASAN** | Address sanitizer for SIMD/unsafe paths    | `asan` | Nightly  |

@@ -7,7 +7,7 @@ the gossip-rs secret scanning system. It produces the `scanner-rs`
 executable that provides filesystem and git repository secret scanning
 from the terminal with configurable output formats.
 
-The crate is an intentionally **thin shell** (~22 lines of `main.rs`)
+The crate is an intentionally **thin shell** of `main.rs`
 that delegates all real work to `gossip-scanner-runtime`. Its sole
 responsibilities are:
 
@@ -15,6 +15,8 @@ responsibilities are:
 2. Invoking scan execution (`gossip_scanner_runtime::cli::run(config)`)
 3. Handling process-exit policy: printing help to stdout, errors to
    stderr, and setting exit codes
+4. Printing the full causal error chain via `print_error_chain` (walks
+   `Error::source()` to display nested causes)
 
 This separation is explicit: *"Process-exit policy is intentionally
 handled in this binary while `gossip-scanner-runtime` returns typed
@@ -26,7 +28,7 @@ errors."*
 
 | File | Purpose |
 |------|---------|
-| `src/main.rs` | Binary entrypoint (~22 lines): parse, dispatch, exit |
+| `src/main.rs` | Binary entrypoint: parse, dispatch, exit, error-chain printing |
 | `Cargo.toml` | Manifest: single dependency on `gossip-scanner-runtime` |
 
 There is no `lib.rs`, no additional modules, and no subdirectories.

@@ -6,7 +6,7 @@ Public data types for configuring the scanner engine and reporting results.
 
 | File | Purpose |
 |------|---------|
-| [crates/scanner-engine/src/api.rs](../../crates/scanner-engine/src/api.rs) | All public API types (1,830 lines) |
+| [crates/scanner-engine/src/api.rs](../../crates/scanner-engine/src/api.rs) | All public API types |
 | [crates/scanner-engine/src/lib.rs](../../crates/scanner-engine/src/lib.rs) | Re-exports for the `scanner-engine` crate |
 
 ## Overview
@@ -43,7 +43,7 @@ Key design invariants:
 
 ## Identifiers
 
-### `FileId` (line 50)
+### `FileId`
 
 ```rust
 pub struct FileId(pub u32);
@@ -58,7 +58,7 @@ can guarantee the index is valid.
 
 **Invariant:** Only valid for the `FileTable` that produced it.
 
-### `StepId` (line 61)
+### `StepId`
 
 ```rust
 pub struct StepId(pub(crate) u32);
@@ -80,7 +80,7 @@ arbitrary values outside of test harnesses.
 
 ## Rule Configuration
 
-### `RuleSpec` (line 687)
+### `RuleSpec`
 
 The central rule definition struct. Each `RuleSpec` configures one detection
 rule: anchor patterns, regex, validation gates, and metadata.
@@ -104,7 +104,7 @@ rule: anchor patterns, regex, validation gates, and metadata.
 | `min_confidence` | `Option<i8>` | Per-rule confidence threshold (0..=10). `None` = auto-derived from compiled gates. |
 | `re` | `Regex` | Bytes regex (no UTF-8 assumptions). |
 
-**Validation (`assert_valid`, line 838):** Panics on:
+**Validation (`assert_valid`):** Panics on:
 - Empty `name`.
 - Invalid `validator`, `two_phase`, `entropy`, `char_class`, `local_context`,
   or `offline_validation` sub-specs.
@@ -112,7 +112,7 @@ rule: anchor patterns, regex, validation gates, and metadata.
 - `secret_group` referencing a non-existent regex capture group.
 - `min_confidence` outside `0..=10`.
 
-### `AnchorPolicy` (line 1462)
+### `AnchorPolicy`
 
 ```rust
 pub enum AnchorPolicy {
@@ -130,7 +130,7 @@ Controls how anchors are selected at engine compilation:
 | `ManualOnly` | Use only manual anchors; skip derivation. |
 | `DerivedOnly` | Use only derived anchors; ignore manual anchors entirely. |
 
-### `ValidatorKind` (line 479)
+### `ValidatorKind`
 
 Fast-path validator that can confirm token-like rules at anchor hits, bypassing
 window accumulation and regex evaluation.
@@ -145,7 +145,7 @@ window accumulation and regex evaluation.
 **Precondition:** Only use fast validators when anchors are match-start aligned
 in raw bytes.
 
-### `TailCharset` (line 558)
+### `TailCharset`
 
 Character classes for fast-path validator tail bytes. All are strict ASCII;
 non-ASCII bytes terminate the tail.
@@ -160,7 +160,7 @@ non-ASCII bytes terminate the tail.
 | `DatabricksSet` | `[a-hA-H0-9]` |
 | `Base64Std` | `[A-Za-z0-9+/]` |
 
-### `DelimAfter` (line 541)
+### `DelimAfter`
 
 Post-match delimiter requirement for fast-path validators.
 
@@ -174,7 +174,7 @@ Post-match delimiter requirement for fast-path validators.
 Gates are pre- or post-match filters evaluated in the detection pipeline.
 They reduce false positives at varying cost.
 
-### `EntropySpec` (line 912)
+### `EntropySpec`
 
 Shannon entropy + optional min-entropy gate evaluated on extracted secret bytes
 (not the full match window).
@@ -194,7 +194,7 @@ Shannon entropy + optional min-entropy gate evaluated on extracted secret bytes
 4. Check Shannon entropy against `min_bits_per_byte`.
 5. If `min_entropy_bits_per_byte` is set, check min-entropy second.
 
-### `CharClassSpec` (line 987)
+### `CharClassSpec`
 
 Pre-regex character-class distribution gate. Rejects windows dominated by
 lowercase ASCII (i.e., English prose) via SIMD classification.
@@ -207,7 +207,7 @@ lowercase ASCII (i.e., English prose) via SIMD classification.
 **Auto-enabling:** When `None` in YAML and `entropy.min_bits_per_byte >= 3.0`,
 the YAML parser auto-enables with `max_lower_pct: 95`, `min_window_len: 32`.
 
-### `LocalContextSpec` (line 613)
+### `LocalContextSpec`
 
 Post-extraction local context gate. Examines bytes surrounding a confirmed
 regex match to check whether it looks like a real secret in use.
@@ -230,7 +230,7 @@ Checks 3 and 4 are independent; both must pass if both are enabled.
 All checks are bounded by `LOCAL_CONTEXT_MAX_LOOKAROUND` and allocation-free
 (`memchr` / `memmem` on small byte windows).
 
-### `TwoPhaseSpec` (line 437)
+### `TwoPhaseSpec`
 
 Two-phase rule: confirm in a smaller seed window, then expand to full radius.
 
@@ -244,7 +244,7 @@ Two-phase rule: confirm in a smaller seed window, then expand to full radius.
 1. Check `confirm_any` inside the seed window (`seed_radius`).
 2. If any confirm hit, expand to `full_radius` and run regex validation.
 
-### `OfflineValidationSpec` (line 1026)
+### `OfflineValidationSpec`
 
 Post-extraction structural validation applied before emitting a finding.
 No network access required.
@@ -262,7 +262,7 @@ No network access required.
 All variants suppress findings on `Invalid` verdict
 (`suppresses_on_invalid()` returns `true` for all).
 
-### `OfflineVerdict` (line 1104)
+### `OfflineVerdict`
 
 Result of an offline structural validation check.
 
@@ -274,7 +274,7 @@ Result of an offline structural validation check.
 
 ## Transform Types
 
-### `TransformId` (line 104)
+### `TransformId`
 
 Identifies a supported transform for derived-buffer scanning.
 
@@ -284,10 +284,10 @@ Identifies a supported transform for derived-buffer scanning.
 | `Base64` | Base64 decoding (optional whitespace allowances). | `base64` |
 
 **Associated items:**
-- `TransformId::ALL: &[TransformId]` — all variants in definition order (line 1684).
-- `TransformId::cli_name(self) -> &'static str` — canonical CLI name for `--transforms` (line 1692).
+- `TransformId::ALL: &[TransformId]` — all variants in definition order.
+- `TransformId::cli_name(self) -> &'static str` — canonical CLI name for `--transforms`.
 
-### `TransformMode` (line 116)
+### `TransformMode`
 
 Controls when a transform is applied during scanning.
 
@@ -297,7 +297,7 @@ Controls when a transform is applied during scanning.
 | `Always` | Always apply, subject to span and budget caps. |
 | `IfNoFindingsInThisBuffer` | Skip if the current buffer already produced findings. Explicit correctness trade-off: can miss findings in nested encodings. Each buffer tracks its own "has findings" flag independently. |
 
-### `Gate` (line 143)
+### `Gate`
 
 Gate policy for expensive transform decoding. Runs after decode but before
 the decoded buffer is enqueued for recursive scanning.
@@ -307,7 +307,7 @@ the decoded buffer is enqueued for recursive scanning.
 | `None` | No gate; decode all candidate spans (subject to caps). |
 | `AnchorsInDecoded` | Stream-decode and proceed only if decoded bytes contain any anchor variant (raw + UTF-16LE/BE). Sound only when anchors are required; false negatives possible with optional anchors. |
 
-### `TransformConfig` (line 170)
+### `TransformConfig`
 
 Configuration for a single transform stage. Lengths are in bytes of encoded
 input unless otherwise noted.
@@ -324,13 +324,13 @@ input unless otherwise noted.
 | `plus_to_space` | `bool` | Treat `+` as space. Only used for `UrlPercent`. |
 | `base64_allow_space_ws` | `bool` | Allow space as whitespace during Base64 span detection. Only used for `Base64`. |
 
-**Invariants (enforced by `assert_valid`, line 206):**
+**Invariants (enforced by `assert_valid`):**
 - `max_encoded_len >= min_len`.
 - When `mode != Disabled`: `max_spans_per_buffer > 0` and `max_decoded_bytes > 0`.
 
 ## Scan Output
 
-### `FindingRec` (line 375)
+### `FindingRec`
 
 Compact finding record stored during scanning. Fixed-width and `Copy` for
 ring-buffer-friendly hot-path accumulation. Materialized into `Finding` later.
@@ -359,7 +359,7 @@ ring-buffer-friendly hot-path accumulation. Materialized into `Finding` later.
 Findings below the rule's `min_confidence` threshold are suppressed before
 output.
 
-### `Finding` (line 338)
+### `Finding`
 
 Materialized, user-facing finding with full provenance.
 
@@ -370,7 +370,7 @@ Materialized, user-facing finding with full provenance.
 | `root_span_hint` | `Range<usize>` | Best-effort hint into the root buffer. For file-backed scans, absolute byte offset within the file. |
 | `decode_steps` | `DecodeSteps` | Inline fixed-capacity chain from root to the representation where `span` applies. |
 
-### `DecodeStep` (line 305)
+### `DecodeStep`
 
 A single step in the provenance chain.
 
@@ -379,7 +379,7 @@ A single step in the provenance chain.
 | `Transform` | `transform_idx: usize`, `parent_span: Range<usize>` | Deterministic via `transform_idx` (index into `Engine::transforms`). `parent_span` is a byte range in the parent. |
 | `Utf16Window` | `endianness: Utf16Endianness`, `parent_span: Range<usize>` | Local UTF-16 decode step. Consumer replays by decoding `parent_span` as UTF-16. |
 
-### `DecodeSteps` (line 327)
+### `DecodeSteps`
 
 ```rust
 pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
@@ -388,7 +388,7 @@ pub type DecodeSteps = FixedVec<DecodeStep, MAX_DECODE_STEPS>;
 Fixed-capacity decode-step chain stored inline in `Finding`. Bounded by
 `MAX_DECODE_STEPS` (8). Steps are ordered root to leaf.
 
-### `Utf16Endianness` (line 287)
+### `Utf16Endianness`
 
 ```rust
 pub enum Utf16Endianness {
@@ -403,7 +403,7 @@ of every ASCII anchor and scans for both when NUL bytes are present.
 
 ## Tuning
 
-### `Tuning` struct (line 1366)
+### `Tuning` struct
 
 Engine-wide performance and DoS-protection knobs. Every cap bounds worst-case
 CPU or memory cost. When exceeded, work is **dropped** (not queued) — the
@@ -430,14 +430,14 @@ engine favors bounded latency over completeness.
 - **Finding cap** enforced at insertion time; later findings in the same
   chunk are dropped.
 
-**Validation (`assert_valid`, line 1425):**
+**Validation (`assert_valid`):**
 - `max_anchor_hits_per_rule_variant > 0`.
 - `pressure_gap_start > 0` (avoids infinite coalesce loops).
 - Additional cross-field checks performed by `Engine::new`.
 
 ## Confidence Scoring
 
-### `confidence` module (line 1134)
+### `confidence` module
 
 Score constants for the additive per-finding confidence model. Evidence is
 collected per finding at each emission site in `window_validate.rs`.
@@ -462,26 +462,26 @@ root-semantic findings).
 
 ## Constants
 
-| Constant | Type | Value | Line | Description |
-|----------|------|-------|------|-------------|
-| `MAX_DECODE_STEPS` | `usize` | `8` | 67 | Hard cap on decode-step chains. Must be `>= Tuning::max_transform_depth + 1`. |
-| `STEP_ROOT` | `StepId` | `StepId(u32::MAX)` | 70 | Sentinel for root of a provenance chain. |
-| `LOCAL_CONTEXT_MAX_LOOKAROUND` | `usize` | `1024` | 578 | Max lookaround per side for local context gates. |
+| Constant | Type | Value | Description |
+|----------|------|-------|-------------|
+| `MAX_DECODE_STEPS` | `usize` | `8` | Hard cap on decode-step chains. Must be `>= Tuning::max_transform_depth + 1`. |
+| `STEP_ROOT` | `StepId` | `StepId(u32::MAX)` | Sentinel for root of a provenance chain. |
+| `LOCAL_CONTEXT_MAX_LOOKAROUND` | `usize` | `1024` | Max lookaround per side for local context gates. |
 
 ## Compile-Time Size Assertions
 
 The following compile-time assertions enforce layout invariants:
 
-| Assertion | Line | Purpose |
-|-----------|------|---------|
-| `size_of::<FindingRec>() <= 48` | 422 | `FindingRec` must fit in 48 bytes (3 cache-line halves on x86-64). Keeps per-finding arena slots cache-friendly. |
-| `confidence::OFFLINE_VALID <= 10` | 1146 | Offline-valid score fits Phase 1 ceiling. |
-| `(KEYWORD_PRESENT + ENTROPY_PASS) <= 10` | 1147 | Combined keyword+entropy score fits Phase 1 ceiling. |
-| `ASSIGNMENT_SHAPE <= 10` | 1148 | Assignment-shape score fits Phase 1 ceiling. |
+| Assertion | Purpose |
+|-----------|---------|
+| `size_of::<FindingRec>() <= 48` | `FindingRec` must fit in 48 bytes (3 cache-line halves on x86-64). Keeps per-finding arena slots cache-friendly. |
+| `confidence::OFFLINE_VALID <= 10` | Offline-valid score fits Phase 1 ceiling. |
+| `(KEYWORD_PRESENT + ENTROPY_PASS) <= 10` | Combined keyword+entropy score fits Phase 1 ceiling. |
+| `ASSIGNMENT_SHAPE <= 10` | Assignment-shape score fits Phase 1 ceiling. |
 
 ## Feature-Gated Types
 
-### `Base64DecodeStats` (line 236, `b64-stats` feature)
+### `Base64DecodeStats` (`b64-stats` feature)
 
 Instrumentation counters for base64 decode/gate operations. Counters saturate
 on overflow. Only available when the `b64-stats` feature is enabled.
@@ -520,7 +520,7 @@ Types with `encode_policy`:
 
 ## Re-exports
 
-`lib.rs` (line 56–62) re-exports the following from `api.rs` as public API:
+`lib.rs` re-exports the following from `api.rs` as public API:
 
 ```
 AnchorPolicy, CharClassSpec, DecodeStep, DecodeSteps, DelimAfter,
@@ -531,8 +531,7 @@ TailCharset, TransformConfig, TransformId, TransformMode, Tuning,
 TwoPhaseSpec, Utf16Endianness, ValidatorKind
 ```
 
-`Base64DecodeStats` is re-exported conditionally under the `b64-stats` feature
-(line 55).
+`Base64DecodeStats` is re-exported conditionally under the `b64-stats` feature.
 
 ## Gate Evaluation Pipeline
 

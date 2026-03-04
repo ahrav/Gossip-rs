@@ -3,9 +3,7 @@
 > **Status: Design specification only.**
 > The Rust types below (`DoneLedger`, `FindingsSink`, `PageCommit<S>`,
 > and supporting types) are described in doc comments at
-> `crates/gossip-contracts/src/persistence/mod.rs` (24 lines) and in
-> staged design artifacts under
-> `tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`.
+> `crates/gossip-contracts/src/persistence/mod.rs`.
 > **No compiled Rust trait definitions or implementations exist yet.**
 > The module doc placeholder describes the planned boundary, but the
 > types are not defined as code. The external storage backends (etcd,

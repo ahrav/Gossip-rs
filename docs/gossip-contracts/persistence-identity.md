@@ -12,7 +12,7 @@ Deterministic, versioned identity contracts for persistence across all
 scanner sources. These contracts let the scanner answer "have I seen this
 exact finding before?" across runs without storing raw secret bytes.
 
-**Planned source**: `crates/scanner-scheduler/src/store.rs` *(not yet implemented)*
+**Status**: Planned — no implementation exists yet in the gossip-rs workspace.
 
 ## Purpose
 
@@ -77,7 +77,10 @@ Zero changes to `identity.rs` or `keys.rs` are required.
 
 ### SourceKind and Occurrence ID
 
-The codebase has `SourceKind { Fs, Git }` in `crates/scanner-scheduler/src/source_kind.rs` for event
+> **Note:** The `SourceKind` enum and the crate path referenced below are
+> from the planned design and do not exist in the gossip-rs workspace.
+
+The planned design includes a `SourceKind { Fs, Git }` enum for event
 routing. This enum is **not** part of the `occurrence_id` payload. Source
 identity flows through the `object_key`, not a separate discriminator field.
 This is intentional: adding a `SourceKind` field to the canonical payload
@@ -86,18 +89,23 @@ are already unambiguous.
 
 ## Relationship to Git Persistence
 
-Git scanning (`crates/scanner-git/src/persist.rs`) has its own persistence pipeline
-that uses `(start, end, rule_id, norm_hash)` as finding keys and writes
-through a two-phase contract (data ops then watermarks).
+> **Note:** `crates/scanner-git/src/persist.rs` is the **implemented** Git
+> persistence module. The store path (`crates/scanner-scheduler/src/store/`)
+> referenced below is from the planned design and does not yet exist in the
+> gossip-rs workspace.  For the broader identity system, see
+> [boundary-1-identity-spine.md](boundary-1-identity-spine.md).
 
-The `crates/scanner-scheduler/src/store/` module is a **separate, parallel identity system** that
-currently targets FS scanning (Phases B-E) but can serve Git and other
-sources. The two systems share the same `norm_hash` concept (BLAKE3 of
-secret bytes) but differ in scope:
+The Git persistence pipeline (`crates/scanner-git/src/persist.rs`) uses
+`(start, end, rule_id, norm_hash)` as finding keys and writes through a
+two-phase contract (data ops then watermarks).
 
-| Aspect                | Git persistence                      | Store identity contracts              |
+The planned store module would be a **separate, parallel identity system**
+targeting FS scanning (Phases B-E) but extensible to Git and other
+sources. The two systems share the same `norm_hash` concept (BLAKE3
+of secret bytes) but differ in scope:
+
+| Aspect                | Git persistence (implemented)        | Store identity contracts (planned)    |
 | --------------------- | ------------------------------------ | ------------------------------------- |
-| Location              | `crates/scanner-git/src/persist.rs`  | `crates/scanner-scheduler/src/store/` |
 | Finding key           | `(start, end, rule_id, norm_hash)`   | `occurrence_id` (32-byte keyed hash)  |
 | Key material          | None (hashes are unkeyed)            | `SCANNER_SECRET_KEY` with KDF         |
 | Cross-run correlation | Via ref watermarks + seen-blob store | Via persistent key identity           |
