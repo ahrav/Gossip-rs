@@ -1019,12 +1019,11 @@ impl StartSetResolver for CliRefResolver {
             .map_err(RepoOpenError::io)?;
 
         if !rev_parse.status.success() {
-            return Err(RepoOpenError::io(io::Error::other(format!(
-                "git rev-parse '{}' failed for {}: {}",
-                ref_name,
-                self.repo_root.display(),
-                String::from_utf8_lossy(&rev_parse.stderr)
-            ))));
+            // Unborn branch: symbolic-ref succeeded (HEAD points at
+            // refs/heads/<branch>) but the branch has no commits yet.
+            // Return an empty start set so the scanner performs a valid
+            // zero-object scan — matching the old for-each-ref behavior.
+            return Ok(Vec::new());
         }
 
         let tip_hex = String::from_utf8_lossy(&rev_parse.stdout)
@@ -1226,5 +1225,43 @@ mod tests {
     fn decode_oid_hex_rejects_bad_length() {
         let err = decode_oid_hex("abc").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn resolve_returns_empty_start_set_for_unborn_repo() {
+        use scanner_git::repo_open::StartSetResolver;
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        // `git init` creates a repo with HEAD pointing to refs/heads/master,
+        // but that ref doesn't exist yet (no commits).
+        let status = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .arg(tmp.path())
+            .output()
+            .expect("git init");
+        assert!(status.status.success(), "git init failed");
+
+        let resolver = CliRefResolver::new(tmp.path().to_path_buf());
+        // Build a minimal GitRepoPaths — resolve() ignores it anyway.
+        let paths = scanner_git::GitRepoPaths {
+            kind: scanner_git::RepoKind::Worktree,
+            worktree_root: Some(tmp.path().to_path_buf()),
+            git_dir: tmp.path().join(".git"),
+            common_dir: tmp.path().join(".git"),
+            objects_dir: tmp.path().join(".git/objects"),
+            pack_dir: tmp.path().join(".git/objects/pack"),
+            alternate_object_dirs: Vec::new(),
+        };
+        let result = resolver.resolve(&paths);
+        // An unborn repo should return Ok with an empty start set,
+        // not a fatal error.
+        assert!(
+            result.is_ok(),
+            "expected Ok for unborn repo, got: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "expected empty start set for unborn repo"
+        );
     }
 }
