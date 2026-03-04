@@ -284,6 +284,7 @@ impl ScanDriver for GitScanDriver {
             let resolver = NativeRefResolver::new(StartSetConfig::DefaultBranchOnly);
             let watermarks = EmptyWatermarkStore;
             let seen = NeverSeenStore;
+            let scan_start = std::time::Instant::now();
             let result = run_git_scan(
                 &self.repo_root,
                 engine,
@@ -295,12 +296,13 @@ impl ScanDriver for GitScanDriver {
                 git_sink,
             )
             .with_context(|| format!("git scan failed for {}", self.repo_root.display()))?;
+            let scan_elapsed = scan_start.elapsed();
 
             self.debug_output = format_git_debug_output(&result.0, cfg.git.debug_level);
             drop(event_tx);
             join_scoped(event_forwarder, "event forwarder thread")?;
 
-            Ok(git_report_to_scan_report(result))
+            Ok(git_report_to_scan_report(result, scan_elapsed))
         })
     }
 
@@ -613,9 +615,17 @@ fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> 
 
 /// Convert a git scanner result into the generic [`ScanReport`] used by
 /// the coordination layer.
-fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
+fn git_report_to_scan_report(
+    result: GitScanResult,
+    scan_elapsed: std::time::Duration,
+) -> ScanReport {
     let report = result.0;
     let metrics = report.common_metrics;
+    let scan_ns = if report.stage_nanos.scan > 0 {
+        report.stage_nanos.scan
+    } else {
+        u64::try_from(scan_elapsed.as_nanos()).unwrap_or(u64::MAX)
+    };
     ScanReport {
         items_scanned: metrics.objects_scanned,
         bytes_scanned: metrics.bytes_scanned,
@@ -629,7 +639,7 @@ fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
         dropped_findings: 0,
         persist_emit_failures: 0,
         persist_incomplete: false,
-        scan_ns: report.stage_nanos.scan,
+        scan_ns,
         persist_ns: 0,
     }
 }
@@ -729,44 +739,56 @@ fn format_git_debug_output(
         "git.findings_emitted",
         report.common_metrics.findings_emitted,
     );
-    push_line(
-        &mut out,
-        "stage.tree_diff.nanos",
-        report.stage_nanos.tree_diff,
-    );
-    push_line(
-        &mut out,
-        "stage.commit_plan.nanos",
-        report.stage_nanos.commit_plan,
-    );
-    push_line(
-        &mut out,
-        "stage.blob_intro.nanos",
-        report.stage_nanos.blob_intro,
-    );
-    push_line(&mut out, "stage.spill.nanos", report.stage_nanos.spill);
-    push_line(
-        &mut out,
-        "stage.pack_collect.nanos",
-        report.stage_nanos.pack_collect,
-    );
-    push_line(&mut out, "stage.mapping.nanos", report.stage_nanos.mapping);
-    push_line(
-        &mut out,
-        "stage.pack_plan.nanos",
-        report.stage_nanos.pack_plan,
-    );
-    push_line(
-        &mut out,
-        "stage.pack_exec.nanos",
-        report.stage_nanos.pack_exec,
-    );
-    push_line(
-        &mut out,
-        "stage.loose_scan.nanos",
-        report.stage_nanos.loose_scan,
-    );
-    push_line(&mut out, "stage.scan.nanos", report.stage_nanos.scan);
+    let has_stage_nanos = report.stage_nanos.tree_diff > 0
+        || report.stage_nanos.commit_plan > 0
+        || report.stage_nanos.blob_intro > 0
+        || report.stage_nanos.spill > 0
+        || report.stage_nanos.pack_collect > 0
+        || report.stage_nanos.mapping > 0
+        || report.stage_nanos.pack_plan > 0
+        || report.stage_nanos.pack_exec > 0
+        || report.stage_nanos.loose_scan > 0
+        || report.stage_nanos.scan > 0;
+    if has_stage_nanos {
+        push_line(
+            &mut out,
+            "stage.tree_diff.nanos",
+            report.stage_nanos.tree_diff,
+        );
+        push_line(
+            &mut out,
+            "stage.commit_plan.nanos",
+            report.stage_nanos.commit_plan,
+        );
+        push_line(
+            &mut out,
+            "stage.blob_intro.nanos",
+            report.stage_nanos.blob_intro,
+        );
+        push_line(&mut out, "stage.spill.nanos", report.stage_nanos.spill);
+        push_line(
+            &mut out,
+            "stage.pack_collect.nanos",
+            report.stage_nanos.pack_collect,
+        );
+        push_line(&mut out, "stage.mapping.nanos", report.stage_nanos.mapping);
+        push_line(
+            &mut out,
+            "stage.pack_plan.nanos",
+            report.stage_nanos.pack_plan,
+        );
+        push_line(
+            &mut out,
+            "stage.pack_exec.nanos",
+            report.stage_nanos.pack_exec,
+        );
+        push_line(
+            &mut out,
+            "stage.loose_scan.nanos",
+            report.stage_nanos.loose_scan,
+        );
+        push_line(&mut out, "stage.scan.nanos", report.stage_nanos.scan);
+    }
 
     if matches!(level, GitDebugLevel::Perf) {
         out.push_str(&report.format_metrics());
