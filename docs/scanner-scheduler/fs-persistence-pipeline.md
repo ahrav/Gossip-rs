@@ -311,9 +311,10 @@ Run status is derived from `RunCounters` at `end_run` time:
 
 Precedence: Incomplete > CompleteWithCoverageLimits > Complete.
 
-#### Query Path
+#### Query Path (Planned -- Not Yet Implemented)
 
-Read-path queries in `crates/scanner-scheduler/src/store.rs`:
+> **Note:** The following query functions do not exist in `store.rs` yet.
+> They describe the planned read-path API for the SQLite backend.
 
 | Function           | CLI command           | Description                                                      |
 | ------------------ | --------------------- | ---------------------------------------------------------------- |
@@ -388,14 +389,14 @@ These feed into `LocalStats` and then into `FsRunLoss` at run end.
 The `emit_persistence_batch()` call is inserted at every scan site that
 produces findings:
 
-| Scan site              | Function                    | File                |
-| ---------------------- | --------------------------- | ------------------- |
-| Plain file chunk loop  | `process_file()`            | `local_fs_owner.rs` |
-| Binary text extraction | `extract_and_scan_file()`   | `local_fs_owner.rs` |
-| Top-level gzip         | `process_gzip_file()`       | `local_fs_owner.rs` |
-| Nested gzip stream     | `scan_gzip_stream_nested()` | `local_fs_owner.rs` |
-| Tar entry stream       | `scan_tar_stream_nested()`  | `local_fs_owner.rs` |
-| Zip entry              | `process_zip_file()`        | `local_fs_owner.rs` |
+| Scan site              | Function                    | File                  |
+| ---------------------- | --------------------------- | --------------------- |
+| Plain file chunk loop  | `process_file()`            | `local_fs_owner.rs`   |
+| Binary text extraction | `extract_and_scan_file()`   | `local_fs_extract.rs` |
+| Top-level gzip         | `process_gzip_file()`       | `local_fs_gzip.rs`    |
+| Nested compressed stream | `scan_compressed_stream_nested()` | `local_fs_archive_ctx.rs` |
+| Tar entry stream       | `scan_tar_stream_nested()`  | `local_fs_tar.rs`     |
+| Zip entry              | `process_zip_file()`        | `local_fs_zip.rs`     |
 
 ## Configuration and Wiring
 

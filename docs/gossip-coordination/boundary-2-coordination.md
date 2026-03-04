@@ -12,7 +12,7 @@ lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
-The module provides six core capabilities:
+The module provides seven core capabilities:
 
 - **Shard lifecycle state machine** -- a four-state automaton (`Active`,
   `Done`, `Split`, `Parked`) with terminal state enforcement and
@@ -39,27 +39,34 @@ The module provides six core capabilities:
 
 ### Source files
 
-| File                                      | Role                                                                                                                        |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `traits.rs`                               | `CoordinationBackend` trait -- the semantic contract for all backends                                                       |
-| `record.rs`                               | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`                                                             |
-| `run.rs`                                  | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait                                                                |
-| `gossip-contracts::coordination/split.rs` | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
-| `split_execution.rs`                      | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types                                |
-| `in_memory.rs`                            | In-memory reference implementation (executable spec)                                                                        |
-| `lease.rs`                                | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`                                                                  |
-| `cursor.rs`                               | `Cursor` type with monotonicity and bounds semantics                                                                        |
-| `shard_spec.rs`                           | `ShardSpec` key-range type, `CursorSemantics`, split validation                                                             |
-| `pooled.rs`                               | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers                                                        |
-| `limits.rs`                               | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)                                        |
-| `manifest.rs`                             | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`                                  |
-| `error.rs`                                | Shared `CoordError` and `IdempotentOutcome`                                                                                 |
-| `run_errors.rs`                           | Run-management error types                                                                                                  |
-| `validation.rs`                           | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                                                   |
-| `events.rs`                               | `EventCollector`, `EventKind`, `StateTransitionEvent`                                                                       |
-| `facade.rs`                               | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                                                                         |
-| `session.rs`                              | `WorkerSession` ergonomic wrapper with move/borrow lifecycle                                                                |
-| `lib.rs`                                  | Module root and public re-exports                                                                                           |
+#### `gossip-coordination` crate (`crates/gossip-coordination/src/`)
+
+| File                 | Role                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------ |
+| `traits.rs`          | `CoordinationBackend` trait -- the semantic contract for all backends                            |
+| `record.rs`          | `ShardRecord`, `ShardStatus`, `ParkReason`, `ShardSnapshotView`                                  |
+| `run.rs`             | `RunRecord`, `RunStatus`, `RunConfig`, `RunManagement` trait                                     |
+| `split_execution.rs` | Coordination-owned split execution helpers: derived shard IDs, payload hashing, result types     |
+| `in_memory.rs`       | In-memory reference implementation (executable spec)                                             |
+| `lease.rs`           | `Lease`, `LeaseHolder`, `OpLogEntry`, `OpKind`, `OpResult`                                       |
+| `error.rs`           | Shared `CoordError` and `IdempotentOutcome`                                                      |
+| `run_errors.rs`      | Run-management error types                                                                       |
+| `validation.rs`      | `validate_lease`, `validate_cursor_update_pooled`, `check_op_idempotency`                        |
+| `events.rs`          | `EventCollector`, `EventKind`, `StateTransitionEvent`                                            |
+| `facade.rs`          | `CoordinationFacade`, `ShardClaiming`, `ClaimError`                                              |
+| `session.rs`         | `WorkerSession` ergonomic wrapper with move/borrow lifecycle                                     |
+| `lib.rs`             | Module root and public re-exports                                                                |
+
+#### `gossip-contracts` crate (`crates/gossip-contracts/src/coordination/`)
+
+| File           | Role                                                                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `cursor.rs`    | `Cursor` type with monotonicity and bounds semantics                                                                       |
+| `shard_spec.rs`| `ShardSpec` key-range type, `CursorSemantics`, split validation                                                            |
+| `pooled.rs`    | `PooledShardSpec`, `PooledCursor` — arena-pooled byte-field wrappers                                                       |
+| `limits.rs`    | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)                                       |
+| `manifest.rs`  | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`                                 |
+| `split.rs`     | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
 
 ---
 
@@ -716,7 +723,75 @@ remove-mutate-restore pattern.
 
 ---
 
-## 13. References
+## 13. Additional Exported Types
+
+The following types are re-exported from `lib.rs` and are part of the crate's
+public API but are not covered in the operation-level sections above.
+
+### CoordinatorRuntimeConfig (`in_memory.rs`)
+
+Runtime configuration for the `InMemoryCoordinator`, controlling capacity limits
+and slab sizing.
+
+```rust
+pub struct CoordinatorRuntimeConfig {
+    pub default_lease_duration: u64,
+    pub max_shards_per_tenant: usize,
+    pub max_total_shards: usize,
+    pub claim_cooldown_interval: u64,
+    pub slab_capacity: usize,
+}
+```
+
+Default constants: `DEFAULT_MAX_AUTO_SLAB_CAPACITY`, `DEFAULT_MAX_SHARDS_PER_TENANT`,
+`DEFAULT_MAX_TOTAL_SHARDS`.
+
+### RunProgress (`run.rs`)
+
+Tracks shard-level progress for a run, returned by `RunManagement::get_run_progress`.
+Includes a watermark field for tracking convergence.
+
+### RunTerminalEvaluation and evaluate_run_terminal (`run.rs`)
+
+`RunTerminalEvaluation` represents the result of evaluating whether a run has
+reached a terminal state (all shards Done, Split, or Parked).
+`evaluate_run_terminal` is the pure function that performs this evaluation.
+
+### ShardFilter (`run.rs`)
+
+Predicate type for `list_shards` queries with named constructors:
+
+| Constructor  | Semantics                                 |
+| ------------ | ----------------------------------------- |
+| `all()`      | No filtering -- returns all shards        |
+| `active()`   | Shards in non-terminal states             |
+| `available()` | Shards available for claiming            |
+| `parked()`   | Parked shards only                        |
+
+The `root_only` field controls whether only root (non-child) shards are included.
+
+### ShardSummary (`run.rs`)
+
+Lightweight view of a shard returned by `list_shards`. Contains fields for
+status, spec bounds, cursor position, lease deadline, acquire count, key range
+boundaries, and parent/child relationships.
+
+### ShardArena and ShardSpecHandle (re-exported from gossip-contracts)
+
+`ShardArena` is the slab allocator for shard spec byte data. `ShardSpecHandle`
+is a reference into the arena that provides zero-copy access to shard spec
+fields. Both are re-exported for use by coordination consumers that need to
+construct or inspect shard specs.
+
+### validate_residual_split_bounds (re-exported from gossip-contracts)
+
+Validates that a residual split plan's key ranges are within the parent shard's
+bounds. Re-exported for use by split planning code outside the coordination
+crate.
+
+---
+
+## 14. References
 
 - Gray, C. and Cheriton, D. "Leases: An Efficient Fault-Tolerant Mechanism
   for Distributed File Cache Consistency." SOSP 1989.

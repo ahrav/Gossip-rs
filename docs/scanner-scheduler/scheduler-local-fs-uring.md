@@ -300,7 +300,7 @@ CPU:
 
 ### Cross-Rule Finding Deduplication
 
-Findings are deduplicated via `apply_cross_rule_dedupe` (imported from `local_fs_owner`), which runs unconditionally at all scan sites (CPU tasks, archive entries, and extract entries). This performs cross-rule winner selection: when multiple rules match the same location and content, only the best match survives.
+Findings are deduplicated via `apply_cross_rule_dedupe` (imported from `scan_helpers`), which runs unconditionally at all scan sites (CPU tasks, archive entries, and extract entries). This performs cross-rule winner selection: when multiple rules match the same location and content, only the best match survives.
 
 **Group key**: `(root_hint_start, root_hint_end, span_projection, norm_hash)` where `span_projection` is `(span_start, span_end)` when the rule participates in span-based dedup (`dedupe_with_span()`), or `(0, 0)` otherwise.
 
@@ -510,7 +510,7 @@ pub fn validate<E: ScanEngine>(&self, engine: &E) {
     // Buffer sizing
     let overlap = engine.required_overlap();
     let buf_len = overlap.saturating_add(self.chunk_size);
-    assert!(buf_len <= BUFFER_LEN_MAX);  // 4 MiB limit
+    assert!(buf_len <= BUFFER_LEN_MAX);  // 4 MiB limit (engine_stub::BUFFER_LEN_MAX)
 
     // io_depth must fit in ring
     let max_depth = (self.ring_entries as usize).saturating_sub(1);
@@ -643,7 +643,8 @@ enum FilePhase {
 }
 
 struct ReadState {
-    file: File,                  // Open file descriptor
+    file: Option<File>,          // Open file descriptor; None after ownership
+                                 // transferred to extraction workers
     size: u64,                   // Size captured at open (snapshot)
     next_offset: u64,            // Offset for next chunk (monotonic)
     overlap_buf: Box<[u8]>,      // Tail overlap bytes
@@ -1025,7 +1026,8 @@ enum FilePhase {
 }
 
 struct ReadState {
-    file: File,                     // Opened file descriptor
+    file: Option<File>,             // Opened file descriptor; None after
+                                    // ownership transferred to extraction workers
     size: u64,                      // Actual file size (from statx/fstat)
     next_offset: u64,               // Next chunk offset
     overlap_buf: Box<[u8]>,         // Tail overlap bytes
@@ -1147,7 +1149,7 @@ fn drain_in_flight(
 // CPU worker task runner
 fn cpu_runner<E: ScanEngine>(task: CpuTask, ctx: &mut WorkerCtx<CpuTask, CpuScratch<E>>);
 
-// Cross-rule dedup (imported from local_fs_owner, called at all scan sites)
+// Cross-rule dedup (imported from scan_helpers, called at all scan sites)
 // apply_cross_rule_dedupe<F, E>(findings: &mut Vec<F>, engine: &E) -> usize;
 
 // Emit findings as structured events

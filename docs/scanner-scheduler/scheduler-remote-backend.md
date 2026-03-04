@@ -274,6 +274,10 @@ pub fn scan_remote<B: RemoteBackend>(
 ) -> Result<(RemoteRunReport, MetricsSnapshot), RemoteRunError<B::Error>>
 ```
 
+> **Note:** The `engine` parameter is currently hardcoded to `Arc<MockEngine>`
+> rather than being generic over `ScanEngine`. This is a known limitation; the
+> function is test-ready but not yet production-generic.
+
 **Execution flow:**
 
 1. Validate config (thread counts, buffer sizes, chunk constraints)
@@ -298,7 +302,7 @@ pub fn scan_remote<B: RemoteBackend>(
 | `ObjectToken`   | Holds in-flight permit and file metadata. Released when last Arc drops (all chunks done). |
 | `ObjectWork<H>` | Sent from discovery to I/O threads. Contains object handle, size, and token.              |
 | `CpuTask`       | Task sent to CPU executor. Wraps buffer, offset, and findings info.                       |
-| `CpuScratch`    | Per-worker state: engine, event sink, scanning scratch space.                             |
+| `CpuScratch`    | Per-worker state: engine, event sink, scanning scratch, pending findings vec, hashed findings vec, and `dedupe_within_chunk` flag. |
 
 ### Public Functions
 

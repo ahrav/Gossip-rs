@@ -191,18 +191,24 @@ Current status: this module defines the contract and API, but scheduler backends
 
 ### I/O Model Enum
 
+> **Source of truth:** `device_slots.rs:506-545`
+
+The `IoModel` enum determines which resource limits apply to a given source:
+
 ```rust
 pub enum IoModel {
-    /// Explicit reads through scheduler's I/O stage
+    /// Explicit reads through scheduler's I/O stage.
+    /// Does NOT use device slots; uses read tokens instead.
     ExplicitReads,
 
-    /// Mmap-based I/O with implicit page faults
+    /// Mmap-based I/O with implicit page faults.
+    /// Uses device slots for concurrency control; does NOT use read tokens.
     MmapImplicit,
 }
 
 impl IoModel {
-    pub fn uses_device_slots(&self) -> bool { }
-    pub fn uses_read_tokens(&self) -> bool { }
+    pub fn uses_device_slots(&self) -> bool { matches!(self, IoModel::MmapImplicit) }
+    pub fn uses_read_tokens(&self) -> bool { matches!(self, IoModel::ExplicitReads) }
 }
 ```
 

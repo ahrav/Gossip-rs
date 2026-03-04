@@ -651,3 +651,84 @@ Readers must never observe partial writes. Write-to-tmp + rename is atomic on PO
 - `helpers.rs`: `hash128`, `pow2_at_least`, `contains_any_memmem`, `contains_all_memmem`.
 - `transform.rs`: `STREAM_DECODE_CHUNK_BYTES`, `is_url_trigger`, `map_decoded_offset`.
 - `window_validate.rs`: Consumes `RuleCompiled` gate indices to validate candidate windows.
+- `safelist.rs`: Emit-time false-positive suppression (see below).
+- `perf_counters.rs`: Feature-gated performance instrumentation (see below).
+
+---
+
+## Safelist Filtering (`engine/safelist.rs`)
+
+Emit-time false-positive suppression for detected secrets. When a candidate
+secret passes all detection gates, the safelist checks both the surrounding
+context window and the bare extracted value against curated pattern sets to
+identify synthetic, demo, and placeholder credentials.
+
+**Architecture**: Three tiers evaluated in order:
+
+1. **Context-window tier** (`SafelistFilter::matcher()`, 18 patterns):
+   `RegexSet::is_match()` against the byte window surrounding a root finding.
+   Any match suppresses. Patterns cover placeholder tokens (`hunter2`,
+   `INSERT_YOUR_*`), infrastructure references (`${VAR}`, `localhost` URIs),
+   metadata/schema noise (`changeme`, XML namespaces), redaction encodings
+   (`***` runs, base64 of "example"/"test"), source control artifacts
+   (`AKIA...EXAMPLE`, git conflict markers), and test paths
+   (`__tests__`, `fixtures`).
+
+2. **Secret-bytes tier** (`SafelistFilter::secret_bytes_matcher()`, 9 patterns):
+   Matched against the bare extracted secret value. Uses `^...$` anchoring
+   instead of `\b` word boundaries — `\b` treats hyphens/dots as boundaries,
+   which would falsely match placeholder words inside composite secrets
+   (e.g., `key-null-safety-9xK2mB` triggering on "null"). Excludes
+   context-anchored patterns that require surrounding text to be meaningful.
+
+3. **UUID quick-reject** (`is_uuid_format`): Procedural byte-level check for
+   canonical 8-4-4-4-12 hyphenated hex UUID format. Per-rule gating via
+   `RuleCompiled::uuid_format_secret()` so rules intentionally matching
+   UUID-format secrets bypass suppression.
+
+**Compile-time safety**: `const` assertions guard that pattern array lengths
+match declared constants — adding/removing a pattern without updating counts
+is a compile error.
+
+Source: `crates/scanner-engine/src/engine/safelist.rs`
+
+---
+
+## Performance Counters (`perf_counters.rs`)
+
+Feature-gated (`perf-counters`) global atomic counters for Git scanning
+pipeline instrumentation. When disabled, all recording functions compile to
+no-ops and `snapshot()` returns a zeroed struct — zero runtime cost.
+
+**Key types**:
+- `GitPerfStats`: 43-field `pub` snapshot struct (`Clone, Copy, Debug, Default`).
+  Stable shape regardless of feature flag.
+
+**Recording functions** (34 total, all `pub fn`):
+- **Pack decode**: `record_pack_inflate`, `record_delta_apply`
+- **Blob scanning**: `record_scan`, `record_scan_vs_prefilter`,
+  `record_scan_validate`, `record_scan_transform`, `record_scan_sort_dedup`,
+  `record_scan_reset`, `record_scan_blob`, `record_scan_chunk`,
+  `record_scan_zero_hit_chunk`, `record_scan_finding`,
+  `record_scan_chunker_bypass`, `record_scan_binary_skip`,
+  `record_scan_binary_extract`, `record_scan_prefilter_bypass`
+- **Mapping bridge**: `record_mapping`
+- **Cache**: `record_cache_hit`, `record_cache_miss`
+- **Tree loading**: `record_tree_load`, `record_tree_cache_hit`,
+  `record_tree_delta_cache_hit`, `record_tree_delta_cache_miss`,
+  `record_tree_spill_hit`, `record_tree_object`, `record_tree_inflate`,
+  `record_tree_delta_apply`
+- **Delta chain histogram**: `record_tree_delta_chain` buckets lengths into
+  5 bins (0, 1, 2-3, 4-7, 8+)
+
+**Control**:
+- `reset()`: zeroes all counters
+- `snapshot() -> GitPerfStats`: reads all atomics with `Relaxed` ordering
+- `time(f) -> (R, u64)`: measures closure wall-clock nanos
+
+**Design**: All loads/stores use `Relaxed` ordering — counters are for coarse
+diagnostics, not exact accounting. Snapshots are not transactionally consistent.
+Helper macros `perf_set!` and `perf_let!` let call sites conditionally assign
+fields or declare timer bindings without `#[cfg]` wrappers.
+
+Source: `crates/scanner-engine/src/perf_counters.rs`

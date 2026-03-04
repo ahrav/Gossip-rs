@@ -8,6 +8,10 @@ use crate::json_write::{write_f64, write_i8, write_json_bytes, write_json_str, w
 use crate::source_kind::SourceKind;
 use std::sync::Mutex;
 
+/// Scheduler event emitted during a scan run.
+///
+/// Covers finding reports, progress ticks, end-of-scan summaries, and
+/// diagnostic messages. Git-specific payloads live in [`GitEvent`].
 pub enum CoreEvent<'a> {
     /// Finding emitted from a scanned object.
     Finding(FindingEvent<'a>),
@@ -58,6 +62,7 @@ pub struct DiagnosticEvent<'a> {
     pub message: &'a str,
 }
 
+/// Git-specific event emitted alongside [`CoreEvent`] by git-aware scan paths.
 pub enum GitEvent<'a> {
     /// Per-commit metadata for git scans.
     CommitMeta(CommitMetaEvent<'a>),
@@ -97,6 +102,9 @@ pub trait GitEventOutput: EventOutput {
     fn emit_git(&self, event: GitEvent<'_>);
 }
 
+/// No-op event sink that silently discards all events.
+///
+/// Useful as a default or in tests where event output is irrelevant.
 #[derive(Default)]
 pub struct NullEventOutput;
 
@@ -113,12 +121,17 @@ impl GitEventOutput for NullEventOutput {
     fn emit_git(&self, _event: GitEvent<'_>) {}
 }
 
+/// Event sink that JSON-encodes events into an in-memory byte buffer.
+///
+/// Each event is serialized as a single newline-delimited JSON line.
+/// Accumulated output can be drained via [`VecEventOutput::take`].
 #[derive(Default)]
 pub struct VecEventOutput {
     encoded: Mutex<Vec<u8>>,
 }
 
 impl VecEventOutput {
+    /// Create an empty `VecEventOutput`.
     #[inline]
     pub fn new() -> Self {
         Self {

@@ -193,7 +193,7 @@ In test/sim-harness builds, a deterministic countdown (`set_deadline_check_count
 
 **`ArchiveScratch<Z>`** (`scan.rs:234`) — reusable scratch state. Contains `EntryPathCanonicalizer`, per-depth `VirtualPathBuilder`s, `ArchiveBudgets`, per-depth `TarCursor`s, `ZipCursor`, gzip header/name buffers, and the `stream_buf`. Preallocated to `max_archive_depth + 2` depth slots.
 
-**`ArchiveScanCtx`** (`scan.rs:356`) — borrow-split view that decomposes `ArchiveScratch` into independent mutable borrows for recursive nesting via `split_first_mut`.
+**`ArchiveScanCtx`** (`scan.rs:356`, crate-private) — borrow-split view that decomposes `ArchiveScratch` into independent mutable borrows for recursive nesting via `split_first_mut`. Not part of the public API.
 
 **`ArchiveEnd`** (`scan.rs:133`) — terminal outcome: `Scanned`, `Skipped(ArchiveSkipReason)`, `Partial(PartialReason)`.
 

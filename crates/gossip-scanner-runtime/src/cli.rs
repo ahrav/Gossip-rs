@@ -23,41 +23,67 @@ use crate::{
 /// CLI source command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliSource {
+    /// Scan a filesystem path (directory or file).
     Fs { path: PathBuf },
+    /// Scan a git repository.
     Git { repo: PathBuf },
 }
 
-/// Parsed CLI config.
+/// Parsed CLI config produced by [`parse_args`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliConfig {
+    /// Scan source (fs path or git repo).
     pub source: CliSource,
+    /// Execution mode flag (retained for compatibility/telemetry).
     pub execution_mode: ExecutionMode,
+    /// Scan execution budget controls.
     pub budgets: ScanBudgets,
+    /// When true, all emitted events are silently dropped.
     pub null_sink: bool,
+    /// Output format for emitted events.
     pub event_format: EventFormat,
+    /// When true, text output includes extra detail.
     pub verbose: bool,
+    /// Optional external rules file path override.
     pub rules_file: Option<PathBuf>,
+    /// Transform decoder filter.
     pub transform_filter: TransformFilter,
+    /// Optional worker thread count override.
     pub workers: Option<usize>,
+    /// Optional transform decode depth override.
     pub decode_depth: Option<usize>,
+    /// When true, archive expansion is disabled.
     pub skip_archives: bool,
+    /// When true, binary files are scanned.
     pub scan_binary: bool,
+    /// When true, findings are persisted via the commit sink bridge.
     pub persist_findings: bool,
+    /// Anchor extraction policy for rule matching.
     pub anchor_mode: AnchorMode,
+    /// Git debug output level.
     pub debug_level: GitDebugLevel,
+    /// When true, enrich commit metadata with identity dictionary IDs.
     pub enrich_identities: bool,
+    /// Stable repository identifier for persistence keys (git only).
     pub git_repo_id: u64,
+    /// Git scan strategy.
     pub git_scan_mode: GitScanMode,
+    /// Merge-diff strategy for merge commits.
     pub git_merge_mode: MergeDiffMode,
+    /// Optional tree delta cache size override in MiB.
     pub git_tree_delta_cache_mb: Option<u32>,
+    /// Optional engine chunk size override in MiB.
     pub git_engine_chunk_mb: Option<u32>,
 }
 
 /// Runtime CLI error.
 #[derive(Debug)]
 pub enum CliError {
+    /// `--help` or `-h` was passed; the contained string is the usage text.
     HelpRequested(String),
+    /// Invalid arguments or missing required flags.
     Usage(String),
+    /// The scan runtime returned an error during execution.
     Runtime(ScanRuntimeError),
 }
 

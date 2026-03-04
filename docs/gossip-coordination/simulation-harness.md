@@ -78,7 +78,7 @@ platforms and prevent invalid probability construction.
 | S1    | MutualExclusion            | At most one worker holds a non-expired lease per shard.                                                         |
 | S2    | FenceMonotonicity          | `fence_epoch` never decreases for a given `(RunId, ShardId)`.                                                   |
 | S3    | TerminalIrreversibility    | Terminal states (Done, Split, Parked) never revert, except Parked->Active (unpark) which requires a fence bump. |
-| S4    | RecordInvariant            | `SimIntrospection::validate_record_invariants()` returns `Ok` (delegates to `ShardRecord::validate_invariants()` with backend-owned storage context). |
+| S4    | RecordInvariant            | `SimIntrospection::validate_record_invariants()` returns `Ok` (delegates to `ShardRecord::assert_invariants()` with backend-owned storage context). |
 | S5    | CursorMonotonicity         | `cursor.last_key()` never decreases per shard.                                                                  |
 | S6    | CursorBounds               | Non-initial cursors remain within shard spec key range.                                                         |
 | S7    | SplitCoverage              | Split-parent's spawned children exist and reference the correct parent.                                         |
@@ -220,6 +220,51 @@ platform.
 5. **Run the full simulation** across multiple seeds to verify the new check
    does not produce false positives:
 
-   ```bash
-   cargo test --all-features -p gossip-coordination -- sim
-   ```
+    ```bash
+    cargo test --all-features -p gossip-coordination -- sim
+    ```
+
+---
+
+## Harness Type Reference
+
+The simulation harness exports several types from `sim/mod.rs` and its
+submodules that are part of the crate's public API.
+
+### Core Harness Types (`sim/harness.rs`)
+
+| Type           | Purpose                                                              |
+| -------------- | -------------------------------------------------------------------- |
+| `CoordinationSim` | Main simulation driver; configures workers, shards, fault level, and runs operations |
+| `SimReport`    | Simulation output: ops executed, violations, event counts, seed, timing |
+| `SimOp`        | Enum of 17 operation variants the harness can execute (Acquire, Renew, Checkpoint, Complete, Park, SplitReplace, SplitResidual, ReplayCheckpoint, ConflictCheckpoint, ZombieCheckpoint, ClaimNext, AdvanceTime, PauseWorker, ResumeWorker, SessionLifecycle, Unpark, TerminateRun) |
+| `SimEvent`     | Enum of 20 outcome variants recording what happened (AcquireOk, RenewOk, CheckpointOk, CompleteOk, ParkOk, SplitReplaceOk, SplitResidualOk, ReplayedOk, ClaimOk, ClaimNoneAvailable, ClaimThrottled, Rejected, TimeAdvanced, WorkerPaused, WorkerResumed, Skipped, SessionLifecycleOk, SessionLifecyclePartial, UnparkOk, RunTerminalOk) |
+| `SimEventKind` | Discriminant-only enum matching `SimEvent` variants, used for event counting |
+| `RejectionKind` | Enum of 24 rejection reasons (NotLeased, StaleFence, LeaseExpired, TerminalState, CursorRegression, CursorOutOfBounds, etc.) used by `SimEvent::Rejected` |
+
+### Backend Abstraction (`sim/backend.rs`)
+
+| Type/Trait           | Purpose                                                        |
+| -------------------- | -------------------------------------------------------------- |
+| `SimIntrospection`   | GAT-based trait for read-only coordinator inspection; provides `shards()`, `runs()`, `shard_count()`, `shard_lookup()`, `cursor_last_key()`, `spec_bounds()`, `validate_record_invariants()`, `spawned_children()`, `release_record_fields()` |
+| `SimulationBackend`  | Blanket trait combining `CoordinationFacade + SimIntrospection`; any type implementing both automatically satisfies this |
+
+### Fault Injection (`sim/fault_injector.rs`)
+
+| Type                         | Purpose                                                  |
+| ---------------------------- | -------------------------------------------------------- |
+| `FaultInjectingIntrospector<B>` | Wraps a `SimIntrospection` backend and injects synthetic shard records before invariant checking. Synthetic records appear in `shards()` iteration but are invisible to `shard_lookup()`. Used to test invariant checker robustness against corrupted state. |
+
+### Invariant Checking (`sim/invariants.rs`)
+
+| Type                    | Purpose                                                    |
+| ----------------------- | ---------------------------------------------------------- |
+| `InvariantChecker`      | Runs all safety/liveness invariants in a single pass over coordinator state |
+| `InvariantViolation`    | Enum of all detectable violations (S1-S9 safety, L1 liveness, D1 diagnostics) |
+| `SplitCoverageDetail`   | Detail record for S7 (split coverage) violations, containing parent/child spec information |
+
+### Overload Scenarios (`sim/overload.rs`)
+
+| Type                    | Purpose                                                    |
+| ----------------------- | ---------------------------------------------------------- |
+| `GoodputTracker`        | Tracks completion ratio during overload rounds for goodput reporting |
