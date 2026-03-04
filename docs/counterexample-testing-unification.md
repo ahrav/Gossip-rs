@@ -43,7 +43,7 @@ these verify mathematical properties of pure functions.
 
 ### 1.2 Simulation Tests
 
-Sixteen test files in `crates/scanner-engine-integration-tests/tests/simulation/` drive the scanner and git simulation
+Fifteen test files in `crates/scanner-engine-integration-tests/tests/simulation/` drive the scanner and git simulation
 harnesses. Scanner variants include random stress (`scanner_random.rs`), corpus
 replay (`scanner_corpus.rs`), archive-specific random and corpus tests, budget
 invariance, discovery, and max-file-size. Git variants include random stress

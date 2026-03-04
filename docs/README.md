@@ -31,6 +31,12 @@ coordination layer, scanner engine, scheduler, and supporting infrastructure.
 | [pipeline-state-machine.md](pipeline-state-machine.md) | State transitions & termination  | Reverse pump order, stall detection                    |
 | [git-scanning.md](scanner-git/git-scanning.md)         | End-to-end Git scanning pipeline | Pipeline stages, persistence contract, ODB-blob mode   |
 | [git-pack-execution.md](scanner-git/git-pack-execution.md) | Git packfile internals       | Pack parsing, delta resolution, blob introduction, caching |
+| [git-object-store.md](scanner-git/git-object-store.md) | Git object storage layer         | OID indexing, pack/loose unification, delta resolution     |
+| [commit-walking.md](scanner-git/commit-walking.md)     | Commit graph traversal           | Two-frontier walk, generation ordering, topo sort          |
+| [runner-orchestration.md](scanner-git/runner-orchestration.md) | Scan runner lifecycle      | Engine adapter, scheduling, finalization                   |
+| [tree-diffing.md](scanner-git/tree-diffing.md)         | Tree diff algorithm              | Merge-walk, canonical ordering, caching, streaming         |
+| [spill-and-memory.md](scanner-git/spill-and-memory.md) | Spill & memory management        | External sort, arenas, blob introduction, memory budgets   |
+| [pack-internals.md](scanner-git/pack-internals.md)     | Pack file low-level internals    | Index lookup, delta chains, inflation, caching, planning   |
 
 ---
 
@@ -211,7 +217,12 @@ Chart assets: [`assets/charts/`](assets/charts/) (scan-time, cold-warm-ratio, me
 | Understand content detection        | [content-policy-and-caching.md](scanner-engine/content-policy-and-caching.md)                                                                                 |
 | Understand the work-stealing executor | [scheduler-executor.md](scanner-scheduler/scheduler-executor.md)                                                                                            |
 | Understand archive scanning         | [archive-scanning.md](scanner-scheduler/archive-scanning.md)                                                                                                  |
-| Understand git pack internals       | [git-pack-execution.md](scanner-git/git-pack-execution.md)                                                                                                    |
+| Understand git pack internals       | [git-pack-execution.md](scanner-git/git-pack-execution.md) → [pack-internals.md](scanner-git/pack-internals.md)                                              |
+| Understand git object storage       | [git-object-store.md](scanner-git/git-object-store.md)                                                                                                        |
+| Understand commit graph walking     | [commit-walking.md](scanner-git/commit-walking.md)                                                                                                            |
+| Understand git scan orchestration   | [runner-orchestration.md](scanner-git/runner-orchestration.md)                                                                                                |
+| Understand tree diffing             | [tree-diffing.md](scanner-git/tree-diffing.md)                                                                                                                |
+| Understand spill/memory management  | [spill-and-memory.md](scanner-git/spill-and-memory.md)                                                                                                        |
 | Understand coordination errors      | [coordination-error-model.md](gossip-coordination/coordination-error-model.md)                                                                                |
 | Understand scanner simulation       | [simulation-framework.md](scanner-scheduler/simulation-framework.md)                                                                                          |
 | Understand FS persistence           | [fs-persistence-pipeline.md](scanner-scheduler/fs-persistence-pipeline.md)                                                                                    |

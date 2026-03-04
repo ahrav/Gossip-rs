@@ -399,7 +399,7 @@ CountBudget::release(1)
 ### TsBufferHandle
 - **Role**: Handle to buffer from thread-safe pool
 - **Lifetime**: Owned by Scan task; returned to pool on drop
-- **Size**: Capped at 8 MiB (`BUFFER_LEN_MAX`)
+- **Size**: Capped at 4 MiB (`BUFFER_LEN_MAX` from `engine_stub.rs`)
 
 ### TaskMetrics
 - **Role**: Per-worker aggregate statistics
