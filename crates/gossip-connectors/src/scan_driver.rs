@@ -991,7 +991,6 @@ impl RefWatermarkStore for EmptyWatermarkStore {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,5 +1112,4 @@ mod tests {
         let git_cfg = build_git_scan_config(&cfg).expect("build git config");
         assert_eq!(git_cfg.pack_exec_workers, 7);
     }
-
 }
