@@ -220,7 +220,9 @@ impl ScanDriver for FsScanDriver {
             Ok(ScanReport {
                 items_scanned: report.stats.files_enqueued,
                 bytes_scanned: report.metrics.bytes_scanned,
+                chunks_scanned: report.metrics.chunks_scanned,
                 findings_emitted: report.metrics.findings_emitted,
+                errors: report.metrics.io_errors,
             })
         })
     }
@@ -609,7 +611,12 @@ fn git_report_to_scan_report(result: GitScanResult) -> ScanReport {
     ScanReport {
         items_scanned: metrics.objects_scanned,
         bytes_scanned: metrics.bytes_scanned,
+        chunks_scanned: metrics.chunks_scanned,
         findings_emitted: metrics.findings_emitted,
+        // Git scan errors are tracked per-pack-exec and not aggregated into
+        // a single counter in `GitScanCommonMetrics`. Leave at zero for now;
+        // a follow-up can surface pack-exec error totals here.
+        errors: 0,
     }
 }
 
@@ -968,10 +975,13 @@ fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>, thread_name: &st
     handle.join().map_err(|_| anyhow!("{thread_name} panicked"))
 }
 
-/// Resolves git refs by shelling out to `git for-each-ref`.
+/// Resolves the default branch tip by shelling out to `git`.
 ///
-/// Requires `git` on `$PATH`. Returns all refs under `refs/heads`,
-/// `refs/remotes`, and `refs/tags` as `(refname, oid)` pairs.
+/// Matches the reference scanner's `GitCliResolver` with
+/// `StartSetConfig::DefaultBranchOnly`: resolve just the default branch
+/// (via `symbolic-ref HEAD`), falling back to detached `HEAD`.
+///
+/// Requires `git` on `$PATH`.
 #[derive(Clone, Debug)]
 struct CliRefResolver {
     repo_root: PathBuf,
@@ -985,46 +995,42 @@ impl CliRefResolver {
 
 impl StartSetResolver for CliRefResolver {
     fn resolve(&self, _paths: &GitRepoPaths) -> Result<Vec<(Vec<u8>, OidBytes)>, RepoOpenError> {
-        let output = Command::new("git")
+        // Try symbolic-ref first to find the default branch name.
+        let symbolic = Command::new("git")
             .arg("-C")
             .arg(&self.repo_root)
-            .args([
-                "for-each-ref",
-                "--format=%(refname)%00%(objectname)",
-                "refs/heads",
-                "refs/remotes",
-                "refs/tags",
-            ])
+            .args(["symbolic-ref", "--quiet", "HEAD"])
             .output()
             .map_err(RepoOpenError::io)?;
 
-        if !output.status.success() {
-            return Err(RepoOpenError::io(io::Error::other(format!(
-                "git for-each-ref failed for {}: {}",
-                self.repo_root.display(),
-                String::from_utf8_lossy(&output.stderr)
-            ))));
+        let ref_name = if symbolic.status.success() {
+            String::from_utf8_lossy(&symbolic.stdout).trim().to_string()
+        } else {
+            // Detached HEAD — use literal "HEAD".
+            "HEAD".to_string()
+        };
+
+        // Resolve the ref to a commit OID.
+        let rev_parse = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo_root)
+            .args(["rev-parse", &ref_name])
+            .output()
+            .map_err(RepoOpenError::io)?;
+
+        if !rev_parse.status.success() {
+            // Unborn branch: symbolic-ref succeeded (HEAD points at
+            // refs/heads/<branch>) but the branch has no commits yet.
+            // Return an empty start set so the scanner performs a valid
+            // zero-object scan — matching the old for-each-ref behavior.
+            return Ok(Vec::new());
         }
 
-        let text = String::from_utf8(output.stdout).map_err(|error| {
-            RepoOpenError::io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("git for-each-ref emitted invalid UTF-8: {error}"),
-            ))
-        })?;
-
-        let mut refs = Vec::new();
-        for line in text.lines() {
-            if line.is_empty() {
-                continue;
-            }
-            let Some((name, oid_hex)) = line.split_once('\0') else {
-                continue;
-            };
-            let oid = decode_oid_hex(oid_hex).map_err(RepoOpenError::io)?;
-            refs.push((name.as_bytes().to_vec(), oid));
-        }
-        Ok(refs)
+        let tip_hex = String::from_utf8_lossy(&rev_parse.stdout)
+            .trim()
+            .to_string();
+        let oid = decode_oid_hex(&tip_hex).map_err(RepoOpenError::io)?;
+        Ok(vec![(ref_name.into_bytes(), oid)])
     }
 }
 
@@ -1219,5 +1225,43 @@ mod tests {
     fn decode_oid_hex_rejects_bad_length() {
         let err = decode_oid_hex("abc").unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn resolve_returns_empty_start_set_for_unborn_repo() {
+        use scanner_git::repo_open::StartSetResolver;
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        // `git init` creates a repo with HEAD pointing to refs/heads/master,
+        // but that ref doesn't exist yet (no commits).
+        let status = std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .arg(tmp.path())
+            .output()
+            .expect("git init");
+        assert!(status.status.success(), "git init failed");
+
+        let resolver = CliRefResolver::new(tmp.path().to_path_buf());
+        // Build a minimal GitRepoPaths — resolve() ignores it anyway.
+        let paths = scanner_git::GitRepoPaths {
+            kind: scanner_git::RepoKind::Worktree,
+            worktree_root: Some(tmp.path().to_path_buf()),
+            git_dir: tmp.path().join(".git"),
+            common_dir: tmp.path().join(".git"),
+            objects_dir: tmp.path().join(".git/objects"),
+            pack_dir: tmp.path().join(".git/objects/pack"),
+            alternate_object_dirs: Vec::new(),
+        };
+        let result = resolver.resolve(&paths);
+        // An unborn repo should return Ok with an empty start set,
+        // not a fatal error.
+        assert!(
+            result.is_ok(),
+            "expected Ok for unborn repo, got: {result:?}"
+        );
+        assert!(
+            result.unwrap().is_empty(),
+            "expected empty start set for unborn repo"
+        );
     }
 }
