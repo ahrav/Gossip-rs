@@ -10,8 +10,10 @@ pub use crate::store::{
 
 /// Migration alias for [`StoreProducer`].
 ///
-/// Allows downstream crates to reference the finding-output contract
-/// without coupling to the internal `StoreProducer` name.
+/// Allows downstream call sites to use `FindingOutput` as a trait bound
+/// without importing `StoreProducer` directly. Implementors must still
+/// implement `StoreProducer`; the blanket `impl` provides `FindingOutput`
+/// automatically.
 pub trait FindingOutput: StoreProducer {}
 
 impl<T: StoreProducer + ?Sized> FindingOutput for T {}
