@@ -1187,6 +1187,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Enable when connector-backed filesystem enumeration lands
+    fn filesystem_driver_applies_shard_bounds_during_scan() {
+        // Verify that assignment shard bounds flow through FsScanDriver
+        // into the connector's key-range filter during actual scanning.
+        //
+        // Expected: create assignment with bounds [b"m", b"z"), run scan
+        // on a test directory, verify only files within range are scanned.
+    }
+
+    #[test]
     fn build_git_scan_config_maps_runtime_git_knobs() {
         let cfg = ScanExecutionConfig {
             workers: 3,

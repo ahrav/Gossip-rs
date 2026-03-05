@@ -3103,6 +3103,36 @@ fn with_shard_bounds_end_only_filters_upper_bound() {
 }
 
 #[test]
+fn with_shard_bounds_end_boundary_is_exclusive() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"a"),
+        ("middle", b"m"),
+        ("middle.txt", b"m2"),
+        ("y.txt", b"y"),
+        ("z", b"z1"),
+        ("z.txt", b"z2"),
+    ]);
+    // Shard range [middle, z) — file "z" sits exactly at the end bound and must be excluded.
+    let mut c = FilesystemConnector::new(dir.path()).with_shard_bounds(b"middle", b"z");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let keys: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"middle".to_vec(),
+            b"middle.txt".to_vec(),
+            b"y.txt".to_vec(),
+        ],
+        "end bound must be exclusive — file exactly at end should be excluded"
+    );
+}
+
+#[test]
 fn with_key_range_equal_bounds_returns_empty() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
     let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"m"));
