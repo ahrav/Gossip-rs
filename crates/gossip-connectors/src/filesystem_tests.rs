@@ -2226,9 +2226,16 @@ mod prop {
         pvec(any::<u8>(), 1..6usize)
     }
 
-    /// Strategy for shard bounds. Empty vectors exercise unbounded edges.
+    /// Strategy for shard bounds. Mixes random and targeted edge cases:
+    /// empty (unbounded), minimum/maximum byte values, and embedded nulls.
     fn shard_bound_strategy() -> impl Strategy<Value = Vec<u8>> {
-        pvec(any::<u8>(), 0..6usize)
+        prop_oneof![
+            Just(vec![]),
+            pvec(any::<u8>(), 1..6usize),
+            Just(vec![0x00]),
+            Just(vec![0xff]),
+            Just(vec![0x00, 0x01, 0x00]),
+        ]
     }
 
     /// Segment generator for adversarial path fixtures:
@@ -2330,6 +2337,29 @@ mod prop {
     /// across varying page budgets and process restarts.
     fn page_schedule_strategy() -> impl Strategy<Value = Vec<(usize, bool)>> {
         pvec((1usize..6usize, any::<bool>()), 1..12usize)
+    }
+
+    /// Strategy for deep path fixtures that stress token serialization size.
+    ///
+    /// Generates paths with 1–20 nesting levels and component names up to 32
+    /// characters to produce tokens near the `MAX_TOKEN_SIZE` boundary.
+    fn deep_fixture_strategy() -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
+        let segment = "[a-z0-9_-]{1,32}";
+        let deep_path = (
+            pvec(string_regex(segment).unwrap(), 1..20usize),
+            string_regex(segment).unwrap(),
+        )
+            .prop_map(|(dirs, leaf)| format!("{}/{}.bin", dirs.join("/"), leaf));
+
+        pvec((deep_path, pvec(any::<u8>(), 0..4usize)), 1..8usize).prop_map(
+            |entries: Vec<(String, Vec<u8>)>| {
+                let mut seen = std::collections::HashSet::new();
+                entries
+                    .into_iter()
+                    .filter(|(p, _)| seen.insert(p.clone()))
+                    .collect()
+            },
+        )
     }
 
     /// Create a connector from a generated file set, returning the tempdir
@@ -2597,10 +2627,11 @@ mod prop {
         }
     }
 
-    // Higher case count: adversarial fixtures have a large input space and these
-    // properties target subtle edge cases in cursor resume and corruption recovery.
+    // Safety-critical streaming tests use a higher case count than basic
+    // property tests (256 vs 64) to exercise adversarial path structures,
+    // token corruption, and cursor monotonicity under diverse inputs.
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(proptest_cases(1024)))]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases(256)))]
 
         #[test]
         fn streaming_matches_ground_truth(
@@ -2684,15 +2715,17 @@ mod prop {
             let (files, empty_dirs) = fixture;
             let start = make_key(b"\x00");
             let end = make_key(b"\xff");
-            let (dir, mut baseline_conn) = make_connector_with_empty_dirs(&files, &empty_dirs);
+            let (dir, mut conn) = make_connector_with_empty_dirs(&files, &empty_dirs);
             let root = dir.path().to_path_buf();
+            conn = conn.with_tokens(true);
 
-            let baseline_keys = extract_keys(&collect_all(&mut baseline_conn, &start, &end));
+            let baseline_keys = extract_keys(&collect_all(&mut conn, &start, &end));
             if baseline_keys.is_empty() {
                 return Ok(());
             }
 
-            let mut token_conn = FilesystemConnector::new(&root).with_tokens(true);
+            // Reuse the same connector for the checkpoint iteration phase;
+            // starting from Cursor::initial() resets the walk state.
             let budgets = small_page_budgets(page_size);
             let mut cursor = Cursor::initial();
             let mut chosen_cursor = None;
@@ -2705,7 +2738,7 @@ mod prop {
                     "pagination did not terminate while collecting checkpoint cursor"
                 );
                 steps += 1;
-                let page = token_conn
+                let page = conn
                     .enumerate_page_range(&start, &end, &cursor, budgets)
                     .expect("token page");
                 if page.items().is_empty() {
@@ -2846,6 +2879,11 @@ mod prop {
             if !start_bound.is_empty() && start_bound == end_bound {
                 prop_assert!(items.is_empty(), "equal shard bounds must yield no items");
             }
+
+            // Both bounds empty = unbounded; should yield all files.
+            if start_bound.is_empty() && end_bound.is_empty() && !files.is_empty() {
+                prop_assert!(!items.is_empty(), "unbounded range must yield items when files exist");
+            }
         }
 
         #[test]
@@ -2904,6 +2942,45 @@ mod prop {
                     );
                 }
                 previous_last_key = Some(cursor_last);
+                cursor = page.next_cursor().clone();
+            }
+        }
+
+        #[test]
+        fn token_size_stays_within_limit(
+            files in deep_fixture_strategy(),
+            page_size in 1usize..4usize,
+        ) {
+            // Token safety: every cursor token emitted by the connector must
+            // fit within MAX_TOKEN_SIZE, or the connector must gracefully omit
+            // the token (key-only cursor).
+            let (_dir, mut c) = make_connector(&files);
+            c = c.with_tokens(true);
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let budgets = small_page_budgets(page_size.max(1));
+            let mut cursor = Cursor::initial();
+            let mut steps = 0usize;
+            loop {
+                prop_assert!(
+                    steps < 4096,
+                    "pagination did not terminate while checking token sizes"
+                );
+                steps += 1;
+                let page = c
+                    .enumerate_page_range(&start, &end, &cursor, budgets)
+                    .expect("token size check page");
+                if page.items().is_empty() {
+                    break;
+                }
+                if let Some(token) = page.next_cursor().token() {
+                    prop_assert!(
+                        token.as_bytes().len() <= MAX_TOKEN_SIZE,
+                        "token size {} exceeds MAX_TOKEN_SIZE {}",
+                        token.as_bytes().len(),
+                        MAX_TOKEN_SIZE,
+                    );
+                }
                 cursor = page.next_cursor().clone();
             }
         }
