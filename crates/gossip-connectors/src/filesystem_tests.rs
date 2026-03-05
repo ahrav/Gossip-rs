@@ -3565,3 +3565,91 @@ fn stale_token_does_not_skip_keys_in_release_mode() {
         "stale token must not cause key skips; got {actual:?}, expected {expected:?}"
     );
 }
+
+/// A crafted token where a non-leaf frame has `next_child_index` equal to the
+/// directory entry count drains the parent's deque to empty. Siblings that
+/// appear after the child subtree in DFS order would be lost.
+/// `fast_forward_frame_entries` should reject this for non-leaf frames.
+#[test]
+fn exhausted_non_leaf_frame_in_token_does_not_skip_siblings() {
+    // Layout:
+    //   root/
+    //     a_file.txt        -> key "a_file.txt"
+    //     subdir/
+    //       inner.txt       -> key "subdir/inner.txt"
+    //     z_file.txt        -> key "z_file.txt"
+    //
+    // DFS order: a_file.txt, subdir/inner.txt, z_file.txt
+    //
+    // A crafted token that descends into subdir/ but drains root entries so
+    // next_child_index at root == total root entries would lose z_file.txt.
+    let dir = create_test_dir(&[
+        ("a_file.txt", b"a"),
+        ("subdir/inner.txt", b"i"),
+        ("z_file.txt", b"z"),
+    ]);
+
+    let mut c1 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Get page 1 (1 item) to emit a_file.txt.
+    let page1 = c1
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .expect("first page");
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"a_file.txt");
+    let last_key = page1
+        .next_cursor()
+        .last_key()
+        .expect("must have last key")
+        .clone();
+
+    // Count root directory entries for our forge.
+    let root_entry_count = std::fs::read_dir(dir.path()).expect("read root").count() as u32;
+
+    // Forge a token with 2 frames:
+    //   - Root frame: next_child_index = root_entry_count (drain all root entries)
+    //   - Child frame: component = "subdir", next_child_index = 0
+    let mut forged = Vec::new();
+    forged.push(WALK_TOKEN_VERSION);
+    forged.extend_from_slice(&2u16.to_le_bytes());
+    // Root frame.
+    forged.extend_from_slice(&0u16.to_le_bytes()); // empty component
+    forged.extend_from_slice(&root_entry_count.to_le_bytes());
+    // Child frame: "subdir".
+    let comp = b"subdir";
+    forged.extend_from_slice(&(comp.len() as u16).to_le_bytes());
+    forged.extend_from_slice(comp);
+    forged.extend_from_slice(&0u32.to_le_bytes());
+
+    let forged_token = TokenBytes::try_from_vec(forged).expect("forge token");
+    let forged_cursor = Cursor::with_token(last_key, forged_token);
+
+    // Collect remaining items.
+    let mut c2 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut remaining = Vec::new();
+    let mut cursor = forged_cursor;
+    loop {
+        let page = c2
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(10))
+            .expect("page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            remaining.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // Must see both "subdir/inner.txt" and "z_file.txt".
+    let actual: Vec<&[u8]> = remaining.iter().map(|v: &Vec<u8>| v.as_slice()).collect();
+    assert!(
+        actual.contains(&b"z_file.txt".as_slice()),
+        "exhausted non-leaf frame must not lose sibling z_file.txt; got {actual:?}"
+    );
+    assert!(
+        actual.contains(&b"subdir/inner.txt".as_slice()),
+        "subdir/inner.txt should still be reachable; got {actual:?}"
+    );
+}

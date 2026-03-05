@@ -242,6 +242,12 @@ struct WalkState {
     current_path: PathBuf,
     pending: Option<FileEntry>,
     last_emitted_key: Option<ItemKey>,
+    /// Approximate number of items emitted across the lifetime of this walk.
+    ///
+    /// After token-based resume, this only counts items from the token position
+    /// forward (not the global count from root). This field is currently
+    /// unused for decision logic — it exists for observability and may be
+    /// removed if no consumer materializes.
     emitted_count: usize,
     exhausted: bool,
     /// `(dev, ino)` pairs of directories already descended into.
@@ -600,7 +606,14 @@ impl FilesystemConnector {
             // A stale or corrupted token may position the walker past directories
             // that still contain unvisited keys > last_key. When divergence is
             // detected, discard the token result and adopt the key-only position.
-            let key_next = self.key_only_resume_probe(last_key, walk_query)?;
+            //
+            // The probe uses an unbounded deadline so a tight page budget cannot
+            // turn a successful token restore into a spurious retryable error.
+            let probe_query = WalkQuery {
+                deadline: None,
+                ..walk_query
+            };
+            let key_next = self.key_only_resume_probe(last_key, probe_query)?;
             let token_matches = token_next.as_ref().map(|k| k.as_bytes())
                 == key_next.as_ref().map(|k| k.as_bytes());
 
@@ -1273,8 +1286,13 @@ impl WalkToken {
         let truncated = keep < total_frames;
         frames.truncate(keep);
 
-        // Dropping deeper frames rewinds one child at the retained leaf frame
-        // so resume never jumps ahead of unvisited descendants.
+        // Invariant: in the DFS walk, the last entry consumed by the retained
+        // leaf frame is always the directory entry whose child frames are being
+        // dropped. Rewinding `next_child_index` by one forces that directory to
+        // be re-entered on resume so its descendants are not silently skipped.
+        //
+        // This relies on DFS never advancing a parent frame past the entry that
+        // caused descent while deeper frames are active on the stack.
         if truncated && let Some(last) = frames.last_mut() {
             last.next_child_index = last.next_child_index.saturating_sub(1);
         }
@@ -1514,6 +1532,12 @@ impl WalkState {
         if fast_forward_frame_entries(&mut root_entries, root_frame.next_child_index).is_none() {
             return Ok(None);
         }
+        // A non-leaf root (has child frames) must retain at least one entry
+        // after fast-forward; an empty deque would silently lose sibling files
+        // that appear after the child subtree in DFS order.
+        if !child_frames.is_empty() && root_entries.is_empty() {
+            return Ok(None);
+        }
 
         let mut visited_dirs = HashSet::new();
         if let Ok(root_meta) = fs::metadata(root) {
@@ -1568,6 +1592,13 @@ impl WalkState {
                 warnings,
             )?;
             if fast_forward_frame_entries(&mut entries, frame.next_child_index).is_none() {
+                return Ok(None);
+            }
+            // Non-leaf child frames (those that still have deeper children on
+            // the stack) must retain at least one entry after fast-forward;
+            // otherwise sibling files after the child subtree are lost.
+            let is_last_child = depth == child_frames.len() - 1;
+            if !is_last_child && entries.is_empty() {
                 return Ok(None);
             }
 
