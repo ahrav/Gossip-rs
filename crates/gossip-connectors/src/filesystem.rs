@@ -55,11 +55,24 @@
 //! Files are opened with `O_NONBLOCK`, validated as regular files via metadata,
 //! then `O_NONBLOCK` is cleared before reads.
 //!
-//! # Split hints
+//! # Split hints and caller relationship
 //!
-//! Split hints are estimated from a dedicated streaming walk pass using a
-//! bounded-memory quantile sketch. This keeps split selection independent from
-//! pagination state while preserving O(1)-ish memory relative to file count.
+//! Split hints are derived from the connector's integrated
+//! `StreamingSplitEstimator`, which is fed as `enumerate_page*` emits
+//! in-range files. There is no separate full-tree split-hint pass.
+//!
+//! This makes split hints connector-instance scoped:
+//!
+//! - a fresh connector starts with an empty estimator and typically returns
+//!   `None` until at least two files have been enumerated,
+//! - continued pagination on the same connector refines the hint over the
+//!   files observed so far for that walk,
+//! - rebuilding walk state (for example cursor realignment or creating a new
+//!   connector) also resets the estimator so hints never mix old and new walk
+//!   histories.
+//!
+//! Connector-level key-range bounds participate naturally because files outside
+//! the effective `[start, end)` range are neither emitted nor sampled.
 //!
 //! # Warnings and failures
 //!
@@ -277,7 +290,8 @@ pub struct FilesystemConnector {
     root_fd: Option<OwnedFd>,
     /// Single-entry FD cache for sequential `read_range` calls.
     cached_file: Option<CachedFile>,
-    /// Streaming split-point estimator fed during pagination walks.
+    /// Streaming split-point estimator fed during pagination walks and reset
+    /// whenever walk state is rebuilt from root.
     split_estimator: StreamingSplitEstimator,
 }
 
@@ -286,8 +300,8 @@ impl FilesystemConnector {
     const DEFAULT_MAX_WALK_DEPTH: usize = 512;
     /// Maximum warnings to collect before suppressing further diagnostics.
     const DEFAULT_MAX_WARNINGS: usize = 1024;
-    /// Default sketch compression used for streaming split estimation.
-    const SPLIT_ESTIMATOR_COMPRESSION: usize = StreamingSplitEstimator::DEFAULT_COMPRESSION;
+    /// Default retained sample cap used for streaming split estimation.
+    const SPLIT_ESTIMATOR_SAMPLE_CAP: usize = StreamingSplitEstimator::DEFAULT_SAMPLE_CAP;
 
     /// Create a connector rooted at `root`.
     ///
@@ -305,7 +319,7 @@ impl FilesystemConnector {
             overflow_warning_count: 0,
             root_fd: None,
             cached_file: None,
-            split_estimator: StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_COMPRESSION),
+            split_estimator: StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_SAMPLE_CAP),
         }
     }
 
@@ -442,6 +456,10 @@ impl FilesystemConnector {
     /// We clear `cached_file` because seek-style cursor jumps can move reads to
     /// unrelated paths, and keeping stale per-file cache entries provides no
     /// locality benefit after a full rewind.
+    ///
+    /// The split estimator is reset at the same time so split hints remain
+    /// aligned with the active walk history instead of mixing observations
+    /// collected before and after the rewind.
     fn reset_walk_state(&mut self, deadline: Option<Instant>) -> Result<(), EnumerateError> {
         let state = WalkState::new(
             &self.root,
@@ -452,7 +470,7 @@ impl FilesystemConnector {
         )?;
         self.cached_file = None;
         self.walk_state = Some(state);
-        self.split_estimator = StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_COMPRESSION);
+        self.split_estimator = StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_SAMPLE_CAP);
         Ok(())
     }
 
@@ -695,6 +713,11 @@ impl FilesystemConnector {
     /// not match `cursor.last_key`, the connector first attempts token-based
     /// stack restore, then falls back to root rebuild and key-only seek.
     ///
+    /// Every emitted file also feeds the integrated split estimator. As a
+    /// result, later [`Self::choose_split_point_bounds`] calls describe the
+    /// files this connector instance has actually served for the current walk,
+    /// not an independently recomputed full-range snapshot.
+    ///
     /// If no in-range items are available for this call, the returned page is
     /// empty and the cursor is left unchanged.
     fn enumerate_page_bounds(
@@ -776,6 +799,7 @@ impl FilesystemConnector {
                 "filesystem walk must produce strictly ascending keys"
             );
 
+            // Only caller-visible, in-range files contribute to the estimator.
             self.split_estimator.observe(file.key.as_bytes(), file.size);
             page_files.push(file);
         }
@@ -847,9 +871,14 @@ impl FilesystemConnector {
 
     /// Choose a split-point hint from the integrated streaming estimator.
     ///
-    /// The estimator is fed during pagination walks, so no separate walk is
-    /// required. Returns `Ok(None)` when insufficient data has been observed
-    /// or when the estimate does not pass cursor/bound guards.
+    /// The estimator is fed during pagination walks on this same connector
+    /// instance, so no separate walk is required or attempted here. A fresh
+    /// connector, or a connector that has rebuilt its walk state, starts from
+    /// an empty estimator and may therefore return `Ok(None)` until more pages
+    /// have been served.
+    ///
+    /// Returns `Ok(None)` when insufficient data has been observed or when the
+    /// estimate does not pass cursor/bound guards.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
