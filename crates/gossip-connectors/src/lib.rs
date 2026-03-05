@@ -1,12 +1,12 @@
-//! Source connectors: filesystem, git, and SaaS integrations.
+//! Source connectors: filesystem, git, and in-memory implementations.
 //!
 //! This crate provides concrete connector implementations that bridge
-//! specific data sources (local filesystem, git repository, cloud SaaS
-//! API, etc.) into the unified shard-based enumeration and read model
+//! specific data sources (local filesystem, git repository, or deterministic
+//! in-memory fixtures) into the unified shard-based enumeration and read model
 //! defined in `gossip-contracts`. Connector traits and shared value types
 //! (`ScanItem`, `ItemRef`, `EnumerationPage`, etc.) live in the
-//! `gossip_contracts::connector` module; this crate supplies the
-//! per-source-type implementations.
+//! `gossip_contracts::connector` module; this crate supplies the currently
+//! implemented per-source-type adapters.
 //!
 //! **Dependency direction:** This crate depends on `gossip-contracts` for
 //! trait definitions and value types. It must not depend on

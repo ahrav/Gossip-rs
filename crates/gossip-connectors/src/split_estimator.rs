@@ -404,8 +404,8 @@ impl fmt::Debug for StreamingSplitEstimator {
 
 impl StreamingSplitEstimator {
     /// Default retained sample count.
-    /// Sufficient for <1% byte-weighted error on Zipf-distributed streams
-    /// of tens of thousands of keys (validated by property tests).
+    /// Sufficient for <1% byte-weighted error on the crate's 20 000-key
+    /// descending-size regression workload.
     pub(crate) const DEFAULT_SAMPLE_CAP: usize = 1024;
 
     /// Create a new streaming estimator.
