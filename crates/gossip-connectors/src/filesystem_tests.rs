@@ -3031,6 +3031,32 @@ fn with_shard_bounds_empty_bounds_keep_full_keyspace() {
 }
 
 #[test]
+fn shard_bounds_intersect_with_connector_bounds_via_enumerate_page() {
+    // Connector-level bounds [g, t) and shard bounds [d, n) should intersect
+    // to the tighter [g, n), so only keys in that interval are returned.
+    let dir = create_test_dir(&[
+        ("alpha.txt", b"a"),
+        ("golf.txt", b"g"),
+        ("kilo.txt", b"k"),
+        ("november.txt", b"n"),
+        ("sierra.txt", b"s"),
+        ("zulu.txt", b"z"),
+    ]);
+
+    let mut c = FilesystemConnector::new(dir.path()).with_shard_bounds(b"g", b"t");
+    let shard = ShardSpec::try_with_range(b"d", b"n").unwrap();
+
+    let items = collect_all_via_shard(&mut c, &shard, default_budgets());
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
+
+    assert_eq!(
+        keys,
+        vec![b"golf.txt".as_slice(), b"kilo.txt".as_slice()],
+        "intersection of connector [g,t) and shard [d,n) should yield [g,n)"
+    );
+}
+
+#[test]
 fn with_key_range_equal_bounds_returns_empty() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
     let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"m"));

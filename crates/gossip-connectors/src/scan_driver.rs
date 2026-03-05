@@ -178,6 +178,12 @@ struct FsScanDriver {
 }
 
 impl FsScanDriver {
+    /// Return shard bounds as `Option` slices (empty vec → `None`).
+    ///
+    /// Not yet consumed by `parallel_scan_dir` — will be wired into
+    /// `FilesystemConnector::with_shard_bounds` once the scan path is
+    /// connector-backed.
+    #[allow(dead_code)]
     fn shard_bounds(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         (
             (!self.shard_start.is_empty()).then_some(self.shard_start.as_slice()),
@@ -197,10 +203,11 @@ impl ScanDriver for FsScanDriver {
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
-            // `parallel_scan_dir` currently has no key-range API. Keep the
-            // assignment bounds on the driver so connector-backed FS paths can
-            // consume them as they land.
-            let (_shard_start, _shard_end) = self.shard_bounds();
+            // TODO: pass shard_start/shard_end to FilesystemConnector via
+            // `with_shard_bounds` once parallel_scan_dir is replaced by a
+            // connector-backed enumeration path. Bounds are stored on the
+            // driver (populated from the assignment's ShardSpec) but cannot
+            // be applied yet because parallel_scan_dir has no key-range API.
 
             let (event_tx, event_rx) = unbounded();
             let event_forwarder = scope.spawn(move || forward_events(out, None, event_rx));
