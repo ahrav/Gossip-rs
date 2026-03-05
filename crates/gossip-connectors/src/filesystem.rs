@@ -84,7 +84,7 @@ use gossip_contracts::{
 
 use crate::common::{
     self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
-    derive_stable_item_id,
+    derive_stable_item_id, enumerate_error_to_read,
 };
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
@@ -285,6 +285,12 @@ impl FilesystemConnector {
     // ---------------------------------------------------------------
 
     /// Canonicalize and open the root directory once, then cache its fd.
+    ///
+    /// This method retries on every call when the root is unavailable rather
+    /// than latching permanent failures. The streaming walk model intentionally
+    /// omits failure memoization because root-directory conditions can change
+    /// between calls (e.g., a mount appearing, permissions being adjusted),
+    /// and the per-attempt cost is low (2-3 syscalls).
     ///
     /// Root identity is verified by comparing the opened fd's `(dev, ino)` to
     /// the canonical path's metadata, reducing TOCTOU exposure between
@@ -491,7 +497,7 @@ impl FilesystemConnector {
             .expect("walk state must exist after align_walk_to_cursor")
             .emitted_count;
 
-        let mut page_files = Vec::new();
+        let mut page_files = Vec::with_capacity(budgets.max_items());
         while page_files.len() < budgets.max_items() {
             if budgets.is_expired_at(Instant::now()) {
                 return Err(EnumerateError::retryable("budget deadline expired"));
@@ -527,25 +533,29 @@ impl FilesystemConnector {
                 break;
             }
 
-            {
-                let state = self
-                    .walk_state
-                    .as_mut()
-                    .expect("walk state must exist while enumerating");
-                if let Some(last_key) = state.last_emitted_key.as_ref() {
-                    debug_assert!(
-                        file.key > *last_key,
-                        "filesystem walk must produce strictly ascending keys"
-                    );
-                }
-                state.last_emitted_key = Some(file.key.clone());
-                state.emitted_count = state
-                    .emitted_count
-                    .checked_add(1)
-                    .ok_or_else(|| EnumerateError::permanent("emitted count overflow"))?;
-            }
+            debug_assert!(
+                page_files
+                    .last()
+                    .is_none_or(|prev: &FileEntry| file.key > prev.key),
+                "filesystem walk must produce strictly ascending keys"
+            );
 
             page_files.push(file);
+        }
+
+        {
+            let count = page_files.len();
+            let state = self
+                .walk_state
+                .as_mut()
+                .expect("walk state must exist after page production");
+            if let Some(last) = page_files.last() {
+                state.last_emitted_key = Some(last.key.clone());
+            }
+            state.emitted_count = state
+                .emitted_count
+                .checked_add(count)
+                .ok_or_else(|| EnumerateError::permanent("emitted count overflow"))?;
         }
 
         if page_files.is_empty() {
@@ -730,13 +740,7 @@ impl FilesystemConnector {
             .as_ref()
             .is_none_or(|cached| cached.item_ref.as_ref() != ref_bytes);
         if need_open {
-            self.ensure_root_fd().map_err(|e| {
-                if e.is_retryable() {
-                    ReadError::retryable(e.into_message())
-                } else {
-                    ReadError::permanent(e.into_message())
-                }
-            })?;
+            self.ensure_root_fd().map_err(enumerate_error_to_read)?;
             let (file, _metadata) = self.open_beneath_root(ref_bytes)?;
             clear_nonblock(&file)?;
             self.cached_file = Some(CachedFile {
@@ -801,13 +805,7 @@ impl ReadConnector for FilesystemConnector {
         item_ref: &ItemRef,
         _budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError> {
-        self.ensure_root_fd().map_err(|e| {
-            if e.is_retryable() {
-                ReadError::retryable(e.into_message())
-            } else {
-                ReadError::permanent(e.into_message())
-            }
-        })?;
+        self.ensure_root_fd().map_err(enumerate_error_to_read)?;
         let (file, _metadata) = self.open_beneath_root(item_ref.as_bytes())?;
         clear_nonblock(&file)?;
         Ok(Box::new(file))
@@ -900,33 +898,9 @@ fn cmp_with_trailing_sep(
     right: &[u8],
     right_is_dir: bool,
 ) -> std::cmp::Ordering {
-    let mut idx = 0usize;
-    loop {
-        let left_byte = if idx < left.len() {
-            Some(left[idx])
-        } else if idx == left.len() && left_is_dir {
-            Some(b'/')
-        } else {
-            None
-        };
-        let right_byte = if idx < right.len() {
-            Some(right[idx])
-        } else if idx == right.len() && right_is_dir {
-            Some(b'/')
-        } else {
-            None
-        };
-
-        match (left_byte, right_byte) {
-            (Some(l), Some(r)) => match l.cmp(&r) {
-                std::cmp::Ordering::Equal => idx += 1,
-                non_eq => return non_eq,
-            },
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
-        }
-    }
+    let l = left.iter().copied().chain(left_is_dir.then_some(b'/'));
+    let r = right.iter().copied().chain(right_is_dir.then_some(b'/'));
+    l.cmp(r)
 }
 
 #[inline]

@@ -399,45 +399,6 @@ fn token_enabled_vs_disabled_parity() {
 // ---------------------------------------------------------------
 
 #[test]
-fn split_point_fewer_than_two_returns_none() {
-    let dir = create_test_dir(&[("only.txt", b"1")]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    assert!(split.is_none());
-}
-
-#[test]
-fn split_point_empty_set_returns_none() {
-    let dir = create_test_dir(&[]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    assert!(split.is_none());
-}
-
-#[test]
-fn split_point_cursor_past_midpoint_returns_none() {
-    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    // Advance cursor past b.txt — only c.txt remains, fewer than 2.
-    let cursor = Cursor::with_last_key(make_key(b"b.txt"));
-    let split = c.choose_split_point_range(&start, &end, &cursor).unwrap();
-    assert!(split.is_none());
-}
-
-#[test]
 fn split_point_returns_none_when_disabled_even_with_many_items() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
@@ -976,49 +937,6 @@ fn unreadable_subdir_is_skipped_with_warning() {
 // Byte-weighted split tests
 // ---------------------------------------------------------------
 
-#[test]
-fn split_hint_disabled_for_byte_weighted_fixture() {
-    let dir = create_test_dir(&[
-        ("a.txt", &[0u8; 500] as &[u8]),
-        ("b.txt", &[0u8; 500]),
-        ("c.txt", b"x"),
-        ("d.txt", b"x"),
-        ("e.txt", b"x"),
-    ]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    assert!(
-        split.is_none(),
-        "split hints are disabled for streaming walk"
-    );
-}
-
-#[test]
-fn split_hint_disabled_for_zero_size_fixture() {
-    let dir = create_test_dir(&[
-        ("a.txt", b""),
-        ("b.txt", b""),
-        ("c.txt", b""),
-        ("d.txt", b""),
-    ]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    assert!(
-        split.is_none(),
-        "split hints are disabled for streaming walk"
-    );
-}
-
 // ---------------------------------------------------------------
 // Deep directory test
 // ---------------------------------------------------------------
@@ -1179,30 +1097,6 @@ fn enumerate_page_via_shard_spec_one_sided_unbounded_resumes() {
         page3.items().is_empty(),
         "resume should terminate without dupes"
     );
-}
-
-#[test]
-fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
-    let dir = create_test_dir(&[
-        ("a.txt", b"1"),
-        ("b.txt", b"2"),
-        ("c.txt", b"3"),
-        ("d.txt", b"4"),
-        ("e.txt", b"5"),
-    ]);
-    let mut c = FilesystemConnector::new(dir.path());
-
-    let unbounded = ShardSpec::try_with_range(b"", b"").unwrap();
-    let split_unbounded = c
-        .choose_split_point(&unbounded, &Cursor::initial(), default_budgets())
-        .unwrap();
-    assert!(split_unbounded.is_none());
-
-    let one_sided = ShardSpec::try_with_range(b"c.txt", b"").unwrap();
-    let split_one_sided = c
-        .choose_split_point(&one_sided, &Cursor::initial(), default_budgets())
-        .unwrap();
-    assert!(split_one_sided.is_none());
 }
 
 #[test]
@@ -2327,46 +2221,6 @@ fn permissions_removed_after_indexing_returns_permanent_error() {
         fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-}
-
-// ---------------------------------------------------------------
-// Split-hint disabled consistency test
-// ---------------------------------------------------------------
-
-#[test]
-fn split_hint_disabled_across_file_size_distributions() {
-    let configs: &[&[(&str, &[u8])]] = &[
-        &[
-            ("a.txt", &[0u8; 100] as &[u8]),
-            ("b.txt", &[0u8; 100]),
-            ("c.txt", &[0u8; 100]),
-            ("d.txt", &[0u8; 100]),
-        ],
-        &[
-            ("a.txt", &[0u8; 900] as &[u8]),
-            ("b.txt", &[0u8; 50]),
-            ("c.txt", &[0u8; 50]),
-        ],
-        &[
-            ("a.txt", &[0u8; 10] as &[u8]),
-            ("b.txt", &[0u8; 10]),
-            ("c.txt", &[0u8; 900]),
-        ],
-    ];
-
-    for (i, config) in configs.iter().enumerate() {
-        let dir = create_test_dir(config);
-        let mut c = FilesystemConnector::new(dir.path());
-        let start = make_key(b"\x00");
-        let end = make_key(b"\xff");
-        let split = c
-            .choose_split_point_range(&start, &end, &Cursor::initial())
-            .unwrap();
-        assert_eq!(
-            split, None,
-            "config {i}: split hints should remain disabled"
-        );
-    }
 }
 
 // ---------------------------------------------------------------

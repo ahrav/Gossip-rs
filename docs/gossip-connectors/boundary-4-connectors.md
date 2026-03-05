@@ -459,17 +459,17 @@ split selection via `common::choose_split_index`.
 
 ### FilesystemConnector (`filesystem.rs`, Unix-only)
 
-Real-IO connector for local filesystem directories. Lazy indexing
-(directory walk deferred until first `enumerate_page` call).
+Real-IO connector for local filesystem directories. Streaming sorted
+DFS walk (per-directory sorted frames, no full-tree materialization).
 `openat`-based reads with `O_NOFOLLOW` for read confinement.
 Symlinks are skipped during walk and rejected at open time.
 
 Capabilities: `seek_by_key: true`, `token_resume: false` (default,
-configurable via `with_tokens()`), `split_hints: true`,
+configurable via `with_tokens()`), `split_hints: false`,
 `range_read: true`.
 
-Split selection uses prefix-sum arrays for O(log n) byte-weighted median
-selection (`byte_weighted_split_idx`). Walk issues (permission denied,
+Split hints are disabled while streaming quantile support is pending;
+`choose_split_point` returns `Ok(None)`. Walk issues (permission denied,
 non-regular files) are captured as `WalkWarning`s rather than fatal
 errors.
 
@@ -537,8 +537,9 @@ consistent across `FilesystemConnector`, `GitConnector`, and
 | `upper_bound`           | Binary search: first index with key > target                     |
 | `choose_split_index`    | Byte-weighted median split with count-balanced fallback          |
 
-Both connectors use `choose_split_index` (or its prefix-sum equivalent)
-for byte-weighted median split selection. Count-balanced midpoint is the
+In-memory and git connectors use `choose_split_index`
+for byte-weighted median split selection; the filesystem connector no
+longer participates in split selection. Count-balanced midpoint is the
 fallback when all entries are zero-size or weight concentrates in the
 leading entry.
 
