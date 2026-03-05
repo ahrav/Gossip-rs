@@ -1137,7 +1137,7 @@ fn token_truncation_drops_oversized_component() {
 // ---------------------------------------------------------------
 
 #[test]
-fn split_point_returns_none_when_disabled_even_with_many_items() {
+fn split_point_returns_streaming_hint_for_nontrivial_range() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -1151,25 +1151,54 @@ fn split_point_returns_none_when_disabled_even_with_many_items() {
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
         .unwrap();
+    let split = split.expect("streaming split hint should be available");
     assert!(
-        split.is_none(),
-        "split hints are disabled for streaming walk"
+        split.as_bytes() > b"a.txt".as_slice() && split.as_bytes() <= b"d.txt".as_slice(),
+        "split should keep at least one item on the left and remain in-range"
     );
 }
 
 #[test]
-fn split_point_with_key_range_returns_none() {
-    let dir = create_test_dir(&[("a.txt", b"1"), ("m.txt", b"2"), ("z.txt", b"3")]);
-    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"a"), Some(b"z"));
+fn split_point_with_key_range_stays_within_configured_bounds() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("m.txt", b"2"),
+        ("r.txt", b"3"),
+        ("z.txt", b"4"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"z"));
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
         .unwrap();
+    let split = split.expect("split should exist within intersected bounds");
     assert!(
-        split.is_none(),
-        "split hints should be None even with key-range configured"
+        split.as_bytes() >= b"m".as_slice() && split.as_bytes() < b"z".as_slice(),
+        "split should honor connector-level key-range intersection"
+    );
+}
+
+#[test]
+fn split_point_advances_past_cursor_last_key() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+        ("e.txt", b"5"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let cursor = Cursor::with_last_key(make_key(b"c.txt"));
+
+    let split = c.choose_split_point_range(&start, &end, &cursor).unwrap();
+    let split = split.expect("split should still be available after cursor");
+    assert!(
+        split.as_bytes() > b"c.txt".as_slice(),
+        "split must advance past cursor last_key"
     );
 }
 
@@ -1196,13 +1225,13 @@ fn caps_reflect_token_setting() {
     assert!(!c_default.caps().token_resume);
     assert!(c_default.caps().seek_by_key);
     assert!(c_default.caps().range_read);
-    assert!(!c_default.caps().split_hints);
+    assert!(c_default.caps().split_hints);
 
     let c_with = FilesystemConnector::new(dir.path()).with_tokens(true);
     assert!(c_with.caps().token_resume);
     assert!(c_with.caps().seek_by_key);
     assert!(c_with.caps().range_read);
-    assert!(!c_with.caps().split_hints);
+    assert!(c_with.caps().split_hints);
 }
 
 // ---------------------------------------------------------------
@@ -1877,9 +1906,10 @@ fn choose_split_point_via_shard_spec() {
     let split = c
         .choose_split_point(&shard, &Cursor::initial(), default_budgets())
         .unwrap();
+    let split = split.expect("split should be available via shard API");
     assert!(
-        split.is_none(),
-        "split hints are disabled for streaming walk"
+        split.as_bytes() > b"a.txt".as_slice() && split.as_bytes() <= b"d.txt".as_slice(),
+        "split should be a valid in-range candidate"
     );
 }
 
@@ -2298,7 +2328,7 @@ mod prop {
         }
 
         #[test]
-        fn split_point_disabled_for_property_inputs(files in file_set_strategy(20)) {
+        fn split_point_is_valid_for_property_inputs(files in file_set_strategy(20)) {
             let start = make_key(b"\x00");
             let end = make_key(b"\xff");
             let (_dir, mut c) = make_connector(&files);
@@ -2306,7 +2336,19 @@ mod prop {
             let split = c
                 .choose_split_point_range(&start, &end, &Cursor::initial())
                 .expect("split lookup should not error");
-            prop_assert!(split.is_none());
+            let all = collect_all(&mut c, &start, &end);
+            if all.len() < 2 {
+                prop_assert!(split.is_none());
+            } else {
+                let split = split.expect("split should exist with at least two items");
+                let keys: Vec<&[u8]> = all.iter().map(|item| item.item_key().as_bytes()).collect();
+                let first = keys.first().expect("non-empty keys");
+                let last = keys.last().expect("non-empty keys");
+                prop_assert!(
+                    split.as_bytes() > *first && split.as_bytes() <= *last,
+                    "split must leave at least one key on the left and stay in bounds",
+                );
+            }
         }
 
         #[test]

@@ -57,9 +57,9 @@
 //!
 //! # Split hints
 //!
-//! Split-point hints are intentionally disabled in this streaming phase:
-//! `caps().split_hints == false`, and `choose_split_point*` returns `Ok(None)`
-//! after validating deadline/range inputs.
+//! Split hints are estimated from a dedicated streaming walk pass using a
+//! bounded-memory quantile sketch. This keeps split selection independent from
+//! pagination state while preserving O(1)-ish memory relative to file count.
 //!
 //! # Warnings and failures
 //!
@@ -97,6 +97,7 @@ use crate::common::{
     self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
     derive_stable_item_id, enumerate_error_to_read,
 };
+use crate::split_estimator::StreamingSplitEstimator;
 
 /// Connector tag used to domain-separate [`StableItemId`] derivation.
 ///
@@ -283,6 +284,8 @@ impl FilesystemConnector {
     const DEFAULT_MAX_WALK_DEPTH: usize = 512;
     /// Maximum warnings to collect before suppressing further diagnostics.
     const DEFAULT_MAX_WARNINGS: usize = 1024;
+    /// Default sketch compression used for streaming split estimation.
+    const SPLIT_ESTIMATOR_COMPRESSION: usize = StreamingSplitEstimator::DEFAULT_COMPRESSION;
 
     /// Create a connector rooted at `root`.
     ///
@@ -833,15 +836,16 @@ impl FilesystemConnector {
         self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor, None)
     }
 
-    /// Split hints are intentionally disabled until streaming quantiles land.
+    /// Choose a split-point hint over bounds without materializing a full index.
     ///
-    /// This still validates deadline and range bounds so callers get consistent
-    /// retryable/permanent classification even while hints are unavailable.
+    /// This runs an isolated streaming walk over effective bounds and feeds a
+    /// bounded-memory quantile sketch. The active pagination `walk_state` is
+    /// not modified.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-        _cursor: &Cursor,
+        cursor: &Cursor,
         deadline: Option<Instant>,
     ) -> Result<Option<ItemKey>, EnumerateError> {
         if let Some(dl) = deadline
@@ -854,7 +858,57 @@ impl FilesystemConnector {
         {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
-        Ok(None)
+
+        let config_start = self.walk_key_range_start.clone();
+        let config_end = self.walk_key_range_end.clone();
+        let Some((effective_start, effective_end)) =
+            intersect_key_bounds(start, end, config_start.as_deref(), config_end.as_deref())
+        else {
+            return Ok(None);
+        };
+
+        self.ensure_root_fd()?;
+
+        let mut split_warnings = Vec::new();
+        let mut split_overflow = 0usize;
+        let mut state = WalkState::new(
+            &self.root,
+            deadline,
+            self.max_warnings,
+            &mut split_warnings,
+            &mut split_overflow,
+        )?;
+        let walk_query = WalkQuery {
+            root: &self.root,
+            max_depth: self.max_walk_depth,
+            start: effective_start,
+            end: effective_end,
+            deadline,
+            max_warnings: self.max_warnings,
+        };
+        let mut estimator = StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_COMPRESSION);
+
+        loop {
+            let Some(file) =
+                state.next_file(walk_query, &mut split_warnings, &mut split_overflow)?
+            else {
+                break;
+            };
+            if !common::is_valid_split_candidate(file.key.as_bytes(), cursor, effective_end) {
+                continue;
+            }
+            estimator.observe(file.key.as_bytes(), file.size);
+        }
+
+        let Some(split_key) = estimator.estimate_split_key() else {
+            return Ok(None);
+        };
+        if !common::is_valid_split_candidate(&split_key, cursor, effective_end) {
+            return Ok(None);
+        }
+        let split = ItemKey::try_from_vec(split_key)
+            .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
+        Ok(Some(split))
     }
 
     // ---------------------------------------------------------------
@@ -981,7 +1035,7 @@ impl EnumerationConnector for FilesystemConnector {
             seek_by_key: true,
             token_resume: self.emit_tokens,
             range_read: true,
-            split_hints: false,
+            split_hints: true,
         }
     }
 
@@ -998,7 +1052,6 @@ impl EnumerationConnector for FilesystemConnector {
         self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
-    /// Split hints are disabled while streaming quantile support is pending.
     fn choose_split_point(
         &mut self,
         shard: &ShardSpec,

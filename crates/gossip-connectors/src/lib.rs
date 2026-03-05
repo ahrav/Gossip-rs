@@ -18,6 +18,8 @@ pub mod filesystem;
 pub mod git;
 pub mod in_memory;
 mod scan_driver;
+#[cfg(unix)]
+mod split_estimator;
 
 pub use common::path_buf_from_bytes;
 #[cfg(unix)]
