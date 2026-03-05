@@ -1,3 +1,10 @@
+//! Filesystem connector behavior and regression tests.
+//!
+//! The highest-risk logic is the per-directory sorted walker: it must produce
+//! global byte-sorted keys without whole-tree buffering, while still honoring
+//! depth limits and deadline checks. The ordering, stress, and deadline tests
+//! below document those invariants and guard walker regressions.
+
 use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
@@ -198,6 +205,36 @@ fn single_file_enumeration_and_resume() {
 }
 
 #[test]
+fn cold_resume_with_new_instance_skips_to_cursor_last_key() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let budgets = small_page_budgets(2);
+
+    let mut first = FilesystemConnector::new(dir.path());
+    let page1 = first
+        .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
+        .expect("first page should enumerate");
+    assert_eq!(page1.items().len(), 2);
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"a.txt");
+    assert_eq!(page1.items()[1].item_key().as_bytes(), b"b.txt");
+
+    // New connector instance resumes from only the persisted cursor key.
+    let mut resumed = FilesystemConnector::new(dir.path());
+    let page2 = resumed
+        .enumerate_page_range(&start, &end, page1.next_cursor(), budgets)
+        .expect("cold-resume page should enumerate");
+    assert_eq!(page2.items().len(), 2);
+    assert_eq!(page2.items()[0].item_key().as_bytes(), b"c.txt");
+    assert_eq!(page2.items()[1].item_key().as_bytes(), b"d.txt");
+}
+
+#[test]
 fn enumerate_page_uses_pooled_toxic_wrappers() {
     let dir = create_test_dir(&[("alpha.txt", b"a"), ("bravo.txt", b"b")]);
     let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
@@ -362,46 +399,7 @@ fn token_enabled_vs_disabled_parity() {
 // ---------------------------------------------------------------
 
 #[test]
-fn split_point_fewer_than_two_returns_none() {
-    let dir = create_test_dir(&[("only.txt", b"1")]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    assert!(split.is_none());
-}
-
-#[test]
-fn split_point_empty_set_returns_none() {
-    let dir = create_test_dir(&[]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap();
-    assert!(split.is_none());
-}
-
-#[test]
-fn split_point_cursor_past_midpoint_returns_none() {
-    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    // Advance cursor past b.txt — only c.txt remains, fewer than 2.
-    let cursor = Cursor::with_last_key(make_key(b"b.txt"));
-    let split = c.choose_split_point_range(&start, &end, &cursor).unwrap();
-    assert!(split.is_none());
-}
-
-#[test]
-fn split_point_valid_returns_key_between_bounds() {
+fn split_point_returns_none_when_disabled_even_with_many_items() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -415,9 +413,10 @@ fn split_point_valid_returns_key_between_bounds() {
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
         .unwrap();
-    let split = split.expect("should produce a split point");
-    assert!(split > make_key(b"\x00"));
-    assert!(split < make_key(b"\xff"));
+    assert!(
+        split.is_none(),
+        "split hints are disabled for streaming walk"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -432,13 +431,13 @@ fn caps_reflect_token_setting() {
     assert!(!c_default.caps().token_resume);
     assert!(c_default.caps().seek_by_key);
     assert!(c_default.caps().range_read);
-    assert!(c_default.caps().split_hints);
+    assert!(!c_default.caps().split_hints);
 
     let c_with = FilesystemConnector::new(dir.path()).with_tokens(true);
     assert!(c_with.caps().token_resume);
     assert!(c_with.caps().seek_by_key);
     assert!(c_with.caps().range_read);
-    assert!(c_with.caps().split_hints);
+    assert!(!c_with.caps().split_hints);
 }
 
 // ---------------------------------------------------------------
@@ -615,6 +614,8 @@ fn nested_dirs_sorted_by_full_path_key() {
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
+    // Interleaved fixture: traversal-by-discovery would be unstable here.
+    // The walker must match a global lexicographic sort of encoded path keys.
     let all = collect_all(&mut c, &start, &end);
     let keys: Vec<&[u8]> = all.iter().map(|i| i.item_key().as_bytes()).collect();
     assert_eq!(
@@ -624,6 +625,37 @@ fn nested_dirs_sorted_by_full_path_key() {
             b"a/z.txt".as_slice(),
             b"b/a.txt".as_slice(),
             b"c.txt".as_slice(),
+        ]
+    );
+}
+
+#[test]
+fn directory_file_prefix_order_matches_git_tree_sort_rules() {
+    let dir = create_test_dir(&[
+        ("src/inside.txt", b"1"),
+        ("src-utils.txt", b"2"),
+        ("a/inside.txt", b"3"),
+        ("aa.txt", b"4"),
+        ("z/inside.txt", b"5"),
+        ("z.txt", b"6"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Regression guard for trailing-separator ordering:
+    // `src-utils.txt` must sort before `src/...` because directories compare as `name/`.
+    let all = collect_all(&mut c, &start, &end);
+    let keys: Vec<&[u8]> = all.iter().map(|item| item.item_key().as_bytes()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            b"a/inside.txt".as_slice(),
+            b"aa.txt".as_slice(),
+            b"src-utils.txt".as_slice(),
+            b"src/inside.txt".as_slice(),
+            b"z.txt".as_slice(),
+            b"z/inside.txt".as_slice(),
         ]
     );
 }
@@ -644,22 +676,23 @@ fn empty_subdirectory_is_skipped() {
 }
 
 #[test]
-fn mutations_after_first_enumerate_invisible() {
+fn mutations_visible_after_restarting_from_initial_cursor() {
     let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
-    // First enumerate triggers indexing.
+    // First enumerate drains the current walk.
     let all1 = collect_all(&mut c, &start, &end);
     assert_eq!(all1.len(), 2);
 
     // Mutate directory after indexing.
     fs::write(dir.path().join("c.txt"), b"3").unwrap();
 
-    // Second enumerate on same connector still sees only original files.
+    // Restarting from the initial cursor rebuilds walk state and sees
+    // filesystem changes.
     let all2 = collect_all(&mut c, &start, &end);
-    assert_eq!(all2.len(), 2);
+    assert_eq!(all2.len(), 3);
 }
 
 #[test]
@@ -904,59 +937,6 @@ fn unreadable_subdir_is_skipped_with_warning() {
 // Byte-weighted split tests
 // ---------------------------------------------------------------
 
-#[test]
-fn byte_weighted_split_balances_by_size() {
-    let dir = create_test_dir(&[
-        ("a.txt", &[0u8; 500] as &[u8]),
-        ("b.txt", &[0u8; 500]),
-        ("c.txt", b"x"),
-        ("d.txt", b"x"),
-        ("e.txt", b"x"),
-    ]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap()
-        .expect("should have a split point");
-
-    // Count-balanced would split at c.txt (index 2, 5/2=2).
-    // Byte-weighted: cumulative at a.txt (500) < half (501),
-    // cumulative at b.txt (1000) >= half -> split_idx = 1.
-    assert_eq!(
-        split.as_bytes(),
-        b"b.txt",
-        "byte-weighted split should balance by file size, not count"
-    );
-}
-
-#[test]
-fn byte_weighted_split_falls_back_for_zero_size() {
-    let dir = create_test_dir(&[
-        ("a.txt", b""),
-        ("b.txt", b""),
-        ("c.txt", b""),
-        ("d.txt", b""),
-    ]);
-    let mut c = FilesystemConnector::new(dir.path());
-    let start = make_key(b"\x00");
-    let end = make_key(b"\xff");
-
-    let split = c
-        .choose_split_point_range(&start, &end, &Cursor::initial())
-        .unwrap()
-        .expect("should have a split point");
-
-    // Count-balanced: 4/2 = 2 -> files[2].key = "c.txt".
-    assert_eq!(
-        split.as_bytes(),
-        b"c.txt",
-        "zero-size fallback should use count-balanced median"
-    );
-}
-
 // ---------------------------------------------------------------
 // Deep directory test
 // ---------------------------------------------------------------
@@ -983,6 +963,84 @@ fn deep_directory_does_not_stack_overflow() {
     assert!(
         key.as_bytes().len() > 100,
         "key should be a long nested path"
+    );
+}
+
+// ---------------------------------------------------------------
+// Depth limit and cycle detection tests
+// ---------------------------------------------------------------
+
+#[test]
+fn depth_limit_catches_deep_trees() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let mut path = dir.path().to_path_buf();
+    // Create 10-deep tree: 00/01/02/.../09/leaf.txt
+    for i in 0..10 {
+        path = path.join(format!("{i:02}"));
+    }
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("leaf.txt"), b"deep").unwrap();
+
+    // Also create a shallow file that IS reachable.
+    fs::write(dir.path().join("shallow.txt"), b"top").unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_depth(5);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    // Only the shallow file should be returned; the deep leaf is past depth 5.
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"shallow.txt");
+
+    // A depth-exceeded warning should be present.
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("exceeded maximum walk depth")),
+        "expected a depth-exceeded warning, got: {:?}",
+        c.walk_warnings(),
+    );
+}
+
+#[test]
+fn file_deleted_between_readdir_and_stat_generates_warning() {
+    let dir = create_test_dir(&[("a.txt", b"aaa"), ("doomed.txt", b"bye"), ("z.txt", b"zzz")]);
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // First page: get a.txt with a page budget of 1.
+    let page1 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .unwrap();
+    assert_eq!(page1.items().len(), 1);
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"a.txt");
+
+    // Delete doomed.txt between pages — simulates the race.
+    fs::remove_file(dir.path().join("doomed.txt")).unwrap();
+
+    // Second page: doomed.txt is already buffered in the walker's directory
+    // entries but stat will fail. The walker should skip it with a warning
+    // and return z.txt.
+    let page2 = c
+        .enumerate_page_range(&start, &end, page1.next_cursor(), small_page_budgets(2))
+        .unwrap();
+    let keys: Vec<&[u8]> = page2
+        .items()
+        .iter()
+        .map(|i| i.item_key().as_bytes())
+        .collect();
+    assert_eq!(keys, vec![b"z.txt".as_slice()]);
+
+    // A metadata-related warning should have been recorded.
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("metadata failed")),
+        "expected a 'metadata failed' warning, got: {:?}",
+        c.walk_warnings(),
     );
 }
 
@@ -1054,7 +1112,10 @@ fn choose_split_point_via_shard_spec() {
     let split = c
         .choose_split_point(&shard, &Cursor::initial(), default_budgets())
         .unwrap();
-    assert!(split.is_some(), "should produce a split point");
+    assert!(
+        split.is_none(),
+        "split hints are disabled for streaming walk"
+    );
 }
 
 #[test]
@@ -1113,38 +1174,6 @@ fn enumerate_page_via_shard_spec_one_sided_unbounded_resumes() {
     assert!(
         page3.items().is_empty(),
         "resume should terminate without dupes"
-    );
-}
-
-#[test]
-fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
-    let dir = create_test_dir(&[
-        ("a.txt", b"1"),
-        ("b.txt", b"2"),
-        ("c.txt", b"3"),
-        ("d.txt", b"4"),
-        ("e.txt", b"5"),
-    ]);
-    let mut c = FilesystemConnector::new(dir.path());
-
-    let unbounded = ShardSpec::try_with_range(b"", b"").unwrap();
-    let split_unbounded = c
-        .choose_split_point(&unbounded, &Cursor::initial(), default_budgets())
-        .unwrap();
-    assert!(
-        split_unbounded.is_some(),
-        "unbounded split should produce a hint"
-    );
-
-    let one_sided = ShardSpec::try_with_range(b"c.txt", b"").unwrap();
-    let split_one_sided = c
-        .choose_split_point(&one_sided, &Cursor::initial(), default_budgets())
-        .unwrap();
-    assert_eq!(
-        split_one_sided
-            .expect("one-sided range should split")
-            .as_bytes(),
-        b"d.txt",
     );
 }
 
@@ -1327,7 +1356,7 @@ fn cached_fd_has_clear_nonblock_after_read_range() {
         .cached_file
         .as_ref()
         .expect("cached_file should be populated after read_range");
-    let fd = cached.1.as_raw_fd();
+    let fd = cached.file.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     assert!(flags >= 0, "fcntl(F_GETFL) failed");
     assert_eq!(
@@ -1353,7 +1382,7 @@ mod prop {
     ///
     /// Paths use `[a-z0-9_]{1,8}` segments with 0-2 levels of nesting.
     fn file_set_strategy(max_files: usize) -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
-        let segment = "[a-z0-9_]{1,8}";
+        let segment = "[a-z0-9_-]{1,8}";
         let path = string_regex(&format!(
             "{segment}(\\.txt|/{segment}\\.txt|/{segment}/{segment}\\.txt)"
         ))
@@ -1407,6 +1436,29 @@ mod prop {
         }
 
         #[test]
+        fn full_enum_matches_global_sort(files in file_set_strategy(20)) {
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let (_dir, mut c) = make_connector(&files);
+
+            let actual: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect();
+
+            // Global sort is the reference oracle for walker correctness.
+            // If per-directory sorting composes incorrectly, this diverges.
+            let mut expected: Vec<Vec<u8>> = files
+                .iter()
+                .map(|(path, _)| path.as_bytes().to_vec())
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
         fn token_vs_no_token_same_items(files in file_set_strategy(15)) {
             let start = make_key(b"\x00");
             let end = make_key(b"\xff");
@@ -1425,19 +1477,15 @@ mod prop {
         }
 
         #[test]
-        fn split_point_strictly_between_cursor_and_end(
-            files in file_set_strategy(20),
-        ) {
+        fn split_point_disabled_for_property_inputs(files in file_set_strategy(20)) {
             let start = make_key(b"\x00");
             let end = make_key(b"\xff");
             let (_dir, mut c) = make_connector(&files);
 
-            if let Ok(Some(split)) = c.choose_split_point_range(
-                &start, &end, &Cursor::initial(),
-            ) {
-                prop_assert!(split > start);
-                prop_assert!(split < end);
-            }
+            let split = c
+                .choose_split_point_range(&start, &end, &Cursor::initial())
+                .expect("split lookup should not error");
+            prop_assert!(split.is_none());
         }
 
         #[test]
@@ -1657,6 +1705,37 @@ fn walk_depth_zero_indexes_only_root_files() {
     assert_eq!(all[0].item_key().as_bytes(), b"top.txt");
 }
 
+#[test]
+fn walk_stress_wide_directory_tree() {
+    // Flat, high-breadth tree: regression guard for walkers that accumulate a
+    // whole frontier/sibling queue. The per-directory frame design should keep
+    // state bounded to active stack frames plus one buffered directory.
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let sibling_dirs = 8_192usize;
+    for i in 0..sibling_dirs {
+        let subdir = dir.path().join(format!("d{i:05}"));
+        fs::create_dir(&subdir).unwrap();
+        fs::write(subdir.join("f.txt"), b"x").unwrap();
+    }
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_depth(1);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    assert_eq!(all.len(), sibling_dirs, "all leaf files should be indexed");
+    assert!(
+        all.iter()
+            .any(|item| item.item_key().as_bytes() == b"d00000/f.txt"),
+        "expected first sibling leaf file"
+    );
+    assert!(
+        all.iter()
+            .any(|item| item.item_key().as_bytes() == b"d08191/f.txt"),
+        "expected last sibling leaf file"
+    );
+}
+
 // ---------------------------------------------------------------
 // Edge case tests
 // ---------------------------------------------------------------
@@ -1811,34 +1890,34 @@ fn very_long_filename_is_indexed() {
 }
 
 // ---------------------------------------------------------------
-// Membership enforcement tests
+// Read membership semantics tests
 // ---------------------------------------------------------------
 
 #[test]
-fn read_rejects_non_indexed_item_ref() {
+fn read_accepts_existing_item_ref_even_if_not_preenumerated() {
     let dir = create_test_dir(&[("a.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
-    // Trigger indexing.
+    // Drain initial walk state.
     let _ = collect_all(&mut c, &start, &end);
 
-    // Create a new file after indexing.
+    // Create a new file after the initial enumeration.
     fs::write(dir.path().join("b.txt"), b"post-index").unwrap();
 
-    // Attempt to read the non-indexed file.
+    // openat-based read membership should accept any confined path that exists.
     let bad_ref = ItemRef::try_from_slice(b"b.txt").unwrap();
-    let result = c.open(&bad_ref, default_budgets());
-    let err = result.err().expect("should reject item_ref not in index");
-    assert!(
-        !err.is_retryable(),
-        "membership rejection should be permanent"
-    );
+    let mut reader = c
+        .open(&bad_ref, default_budgets())
+        .expect("existing file should be readable even if not pre-enumerated");
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"post-index");
 }
 
 #[test]
-fn read_range_rejects_non_indexed_item_ref() {
+fn read_range_rejects_absent_item_ref() {
     let dir = create_test_dir(&[("a.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
@@ -1849,7 +1928,7 @@ fn read_range_rejects_non_indexed_item_ref() {
     let bad_ref = ItemRef::try_from_slice(b"nonexistent.txt").unwrap();
     let mut buf = [0u8; 32];
     let result = c.read_range(&bad_ref, 0, &mut buf, default_budgets());
-    assert!(result.is_err(), "should reject item_ref not in index");
+    assert!(result.is_err(), "non-existent item_ref should fail");
 }
 
 #[rstest]
@@ -1882,7 +1961,7 @@ fn open_without_prior_enumerate_triggers_lazy_indexing() {
     let mut c = FilesystemConnector::new(dir.path());
 
     // A valid ItemRef that exists on disk should succeed even without
-    // prior enumeration — lazy indexing satisfies the ReadConnector
+    // prior enumeration — lazy root setup satisfies the ReadConnector
     // affinity contract for compatible instances.
     let item_ref = ItemRef::try_from_slice(b"file.txt").unwrap();
     let mut reader = match c.open(&item_ref, default_budgets()) {
@@ -1899,16 +1978,16 @@ fn open_without_enumerate_rejects_absent_item_ref() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
     let mut c = FilesystemConnector::new(dir.path());
 
-    // An ItemRef for a file that does not exist should still fail
-    // after lazy indexing because membership enforcement rejects it.
+    // An ItemRef for a file that does not exist should fail with the
+    // underlying openat ENOENT classification.
     let item_ref = ItemRef::try_from_slice(b"no_such_file.txt").unwrap();
     let err = match c.open(&item_ref, default_budgets()) {
         Err(e) => e,
         Ok(_) => panic!("absent item_ref should be rejected"),
     };
     assert!(
-        err.message().contains("not found in index"),
-        "error should indicate item_ref not found, got: {}",
+        err.message().contains("No such file or directory"),
+        "error should indicate ENOENT from openat, got: {}",
         err.message()
     );
 }
@@ -2033,7 +2112,7 @@ fn deadline_expires_during_walk_returns_retryable() {
 fn deadline_expiry_allows_retry_with_fresh_deadline() {
     let dir = create_test_dir(&[("file.txt", b"data")]);
 
-    // First call with expired deadline fails.
+    // First call with an expired deadline fails retryably.
     let expired =
         Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
     let mut c = FilesystemConnector::new(dir.path());
@@ -2043,7 +2122,8 @@ fn deadline_expiry_allows_retry_with_fresh_deadline() {
     let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired);
     assert!(result.is_err());
 
-    // Second call with no deadline succeeds.
+    // Retryable deadline failures must not latch a permanent connector failure.
+    // A subsequent call with a fresh budget should initialize and succeed.
     let page = c
         .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
         .unwrap();
@@ -2219,58 +2299,6 @@ fn permissions_removed_after_indexing_returns_permanent_error() {
         fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-}
-
-// ---------------------------------------------------------------
-// Prefix-sum split consistency test
-// ---------------------------------------------------------------
-
-#[test]
-fn prefix_sum_split_matches_linear_scan() {
-    // Verify that the prefix-sum-based split produces the same result as the
-    // linear-scan in common::choose_split_index for various file configurations.
-    let configs: &[&[(&str, &[u8])]] = &[
-        &[
-            ("a.txt", &[0u8; 100] as &[u8]),
-            ("b.txt", &[0u8; 100]),
-            ("c.txt", &[0u8; 100]),
-            ("d.txt", &[0u8; 100]),
-        ],
-        &[
-            ("a.txt", &[0u8; 900] as &[u8]),
-            ("b.txt", &[0u8; 50]),
-            ("c.txt", &[0u8; 50]),
-        ],
-        &[
-            ("a.txt", &[0u8; 10] as &[u8]),
-            ("b.txt", &[0u8; 10]),
-            ("c.txt", &[0u8; 900]),
-        ],
-    ];
-
-    for (i, config) in configs.iter().enumerate() {
-        let dir = create_test_dir(config);
-        let mut c = FilesystemConnector::new(dir.path());
-        let start = make_key(b"\x00");
-        let end = make_key(b"\xff");
-
-        // Trigger indexing.
-        let _ = collect_all(&mut c, &start, &end);
-
-        // Prefix-sum split.
-        let ps_split = c
-            .choose_split_point_range(&start, &end, &Cursor::initial())
-            .unwrap();
-
-        // Linear-scan split via common::choose_split_index.
-        let linear_idx = common::choose_split_index(&c.files, 0, c.files.len());
-        let linear_split = linear_idx.map(|idx| c.files[idx].key.clone());
-
-        assert_eq!(
-            ps_split, linear_split,
-            "config {i}: prefix-sum split should match linear scan"
-        );
-    }
 }
 
 // ---------------------------------------------------------------
@@ -2506,22 +2534,17 @@ fn enumerate_error_for_nonexistent_root_does_not_leak_path() {
 
 #[test]
 fn intra_directory_deadline_check_triggers_within_large_directory() {
-    // Create a flat directory with enough files that the intra-directory
-    // deadline check (every DEADLINE_CHECK_INTERVAL=512 entries) is
-    // exercised.  We need well over 512 entries so the inner-loop check
-    // has a chance to fire.
+    // Single-directory fixture with enough entries to exercise the 512-entry
+    // deadline cadence while polling one frame (no fd-cap spill path needed).
     let dir = tempfile::tempdir().expect("create tempdir");
     let file_count = 2048usize;
     for i in 0..file_count {
         fs::write(dir.path().join(format!("f{i:05}.txt")), b"x").unwrap();
     }
 
-    // The deadline must be *alive* when the walk starts (so the
-    // per-directory check at the top of the outer loop passes) but expire
-    // while iterating entries inside the directory.  A very short future
-    // deadline achieves this: the per-directory Instant::now() < dl check
-    // passes, but by the time 512 dir entries are processed the deadline
-    // has elapsed.
+    // Keep the deadline live at walk start, but short enough to expire while
+    // draining one large frame. This confirms we do not defer budget checks
+    // until "directory complete" when per-directory buffering is large.
     let tight_deadline = Budgets::try_new(
         file_count + 1,
         u64::MAX,
@@ -2533,10 +2556,8 @@ fn intra_directory_deadline_check_triggers_within_large_directory() {
     let end = make_key(b"\xff");
 
     let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), tight_deadline);
-    // The walk should fail with a retryable deadline error.  Whether the
-    // per-directory or intra-directory check catches it first depends on
-    // scheduling, but with a deadline only nanoseconds away the inner
-    // check is virtually guaranteed to fire once entries are processed.
+    // The walk should fail with a retryable deadline error regardless of which
+    // checkpoint (per-directory vs 512-entry cadence) trips first.
     assert!(
         result.is_err(),
         "tight deadline should abort during a large directory walk"
@@ -2578,7 +2599,10 @@ fn root_fd_identity_check_rejects_dev_ino_mismatch() {
 
     let fd_a = open_dir_fd(dir_a.path()).expect("open dir_a fd");
 
-    let err = verify_root_identity(&fd_a, dir_b.path())
+    // Capture dir_b's identity and verify against dir_a's fd.
+    let b_meta = fs::metadata(dir_b.path()).expect("stat dir_b");
+    let b_id = (b_meta.dev(), b_meta.ino());
+    let err = verify_root_identity(&fd_a, b_id)
         .expect_err("verify_root_identity should reject a mismatched path");
 
     assert_eq!(err.kind(), std::io::ErrorKind::Other);
@@ -2586,4 +2610,128 @@ fn root_fd_identity_check_rejects_dev_ino_mismatch() {
         err.to_string().contains("dev/ino mismatch"),
         "error should mention dev/ino mismatch; got: {err}",
     );
+}
+
+// ---------------------------------------------------------------
+// Bug verification: exhausted walk with no files should not
+// prevent a second range from producing results
+// ---------------------------------------------------------------
+
+#[test]
+fn exhausted_empty_range_does_not_block_subsequent_populated_range() {
+    // Files exist only in the [a, d) range.
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2"), ("c.txt", b"3")]);
+    let mut c = FilesystemConnector::new(dir.path());
+
+    // First call: range [z, ~) — no files match, walk exhausts.
+    let empty_start = make_key(b"z");
+    let empty_end = make_key(b"\xff");
+    let page = c
+        .enumerate_page_range(
+            &empty_start,
+            &empty_end,
+            &Cursor::initial(),
+            default_budgets(),
+        )
+        .expect("empty range should not error");
+    assert!(page.items().is_empty(), "no files match [z, 0xff) range");
+
+    // Second call: range [\x00, \xff) — files exist, should be returned.
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let items = collect_all(&mut c, &start, &end);
+    assert_eq!(
+        items.len(),
+        3,
+        "second range should find all 3 files; got {}",
+        items.len()
+    );
+    assert_eq!(items[0].item_key().as_bytes(), b"a.txt");
+    assert_eq!(items[1].item_key().as_bytes(), b"b.txt");
+    assert_eq!(items[2].item_key().as_bytes(), b"c.txt");
+}
+
+// ---------------------------------------------------------------
+// Bug verification: current_path must be clean after deadline
+// error during directory descent
+// ---------------------------------------------------------------
+
+#[test]
+fn deadline_during_directory_descent_does_not_corrupt_subsequent_walk() {
+    // Create a deep directory structure: root/deep/nested/file.txt
+    // plus a root-level file that sorts after the directory.
+    let dir = create_test_dir(&[("deep/nested/file.txt", b"inner"), ("z_root.txt", b"root")]);
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Use a very tight deadline that may expire during directory descent.
+    // Even if the deadline doesn't trigger during next_file's directory
+    // processing, the retry must still produce correct results.
+    let tight_deadline = Budgets::try_new(
+        100,
+        u64::MAX,
+        Some(Instant::now() + Duration::from_nanos(1)),
+    )
+    .unwrap();
+
+    // First attempt: may succeed or fail with retryable error.
+    let _result = c.enumerate_page_range(&start, &end, &Cursor::initial(), tight_deadline);
+    // We don't care whether this succeeds or fails — only that a retry works.
+
+    // Retry with a generous deadline: must produce correct, uncorrupted keys.
+    let items = collect_all(&mut c, &start, &end);
+    let keys: Vec<&[u8]> = items.iter().map(|i| i.item_key().as_bytes()).collect();
+    assert_eq!(
+        keys,
+        vec![b"deep/nested/file.txt".as_slice(), b"z_root.txt"],
+        "retry after deadline error must produce correct paths, not corrupted ones"
+    );
+}
+
+// ---------------------------------------------------------------
+// Bug verification: cold-resume token index reflects total items
+// emitted, not just the current page
+// ---------------------------------------------------------------
+
+#[test]
+fn cold_resume_token_index_reflects_prior_emission_count() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let budgets = small_page_budgets(2);
+
+    // Page 1: emit items 0,1 (a.txt, b.txt) with tokens enabled.
+    let mut first = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let page1 = first
+        .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
+        .expect("first page");
+    assert_eq!(page1.items().len(), 2);
+
+    // Cold resume: new connector, resume from page1's cursor.
+    let mut resumed = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let page2 = resumed
+        .enumerate_page_range(&start, &end, page1.next_cursor(), budgets)
+        .expect("cold-resume page");
+    assert_eq!(page2.items().len(), 2);
+    assert_eq!(page2.items()[0].item_key().as_bytes(), b"c.txt");
+
+    // The token should encode next_idx = 4 (items 0..4 total).
+    // If emitted_count wasn't carried across cold resume, the token
+    // would incorrectly encode 2 (only current page items).
+    if let Some(token) = page2.next_cursor().token() {
+        let token_bytes = token.as_bytes();
+        if token_bytes.len() == 8 {
+            let encoded_idx = u64::from_be_bytes(token_bytes.try_into().unwrap());
+            assert_eq!(
+                encoded_idx, 4,
+                "cold-resume token should encode total emitted count (4), not just current page count"
+            );
+        }
+    }
 }
