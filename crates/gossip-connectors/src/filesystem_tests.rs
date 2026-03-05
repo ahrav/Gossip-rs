@@ -2355,13 +2355,13 @@ mod prop {
         mut cursor: Cursor,
         page_size: usize,
         with_tokens: bool,
-    ) -> Vec<Vec<u8>> {
+    ) -> Result<Vec<Vec<u8>>, TestCaseError> {
         let mut conn = FilesystemConnector::new(root).with_tokens(with_tokens);
         let budgets = small_page_budgets(page_size.max(1));
         let mut keys = Vec::new();
         let mut steps = 0usize;
         loop {
-            assert!(
+            prop_assert!(
                 steps < 4096,
                 "pagination did not terminate while collecting from cursor"
             );
@@ -2380,7 +2380,7 @@ mod prop {
             );
             cursor = page.next_cursor().clone();
         }
-        keys
+        Ok(keys)
     }
 
     proptest! {
@@ -2716,7 +2716,13 @@ mod prop {
             let mut chosen_cursor = None;
             let mut last_seen_cursor = None;
             let mut page_idx = 0usize;
+            let mut steps = 0usize;
             loop {
+                prop_assert!(
+                    steps < 4096,
+                    "pagination did not terminate while collecting checkpoint cursor"
+                );
+                steps += 1;
                 let page = token_conn
                     .enumerate_page_range(&start, &end, &cursor, budgets)
                     .expect("token page");
@@ -2767,7 +2773,7 @@ mod prop {
             };
 
             let resumed_keys =
-                collect_keys_from_cursor(&root, &start, &end, corrupted_cursor, page_size, true);
+                collect_keys_from_cursor(&root, &start, &end, corrupted_cursor, page_size, true)?;
             let expected_tail: Vec<Vec<u8>> = baseline_keys
                 .iter()
                 .filter(|key| key.as_slice() > last_key.as_bytes())
@@ -2797,8 +2803,10 @@ mod prop {
             } else {
                 (raw_end, raw_start)
             };
-            let shard = ShardSpec::try_with_range(start_bound.as_slice(), end_bound.as_slice())
-                .expect("valid shard bounds");
+            let Ok(shard) = ShardSpec::try_with_range(start_bound.as_slice(), end_bound.as_slice()) else {
+                // Equal non-empty bounds are rejected by ShardSpec; skip gracefully.
+                return Ok(());
+            };
 
             let (_dir, mut c) = make_connector_with_empty_dirs(&files, &empty_dirs);
             let items = collect_all_via_shard(&mut c, &shard, default_budgets());
@@ -2838,7 +2846,6 @@ mod prop {
                     steps < 4096,
                     "pagination did not terminate while checking cursor monotonicity"
                 );
-                steps += 1;
 
                 let page = c
                     .enumerate_page_range(&start, &end, &cursor, budgets)
@@ -2846,6 +2853,7 @@ mod prop {
                 if page.items().is_empty() {
                     break;
                 }
+                steps += 1;
 
                 let emitted_last = page
                     .items()
