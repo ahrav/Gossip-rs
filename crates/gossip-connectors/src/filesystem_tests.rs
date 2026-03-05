@@ -2958,3 +2958,125 @@ fn cold_resume_token_index_reflects_prior_emission_count() {
         }
     }
 }
+
+// ---------------------------------------------------------------
+// Unit tests — prefix_successor
+// ---------------------------------------------------------------
+
+#[rstest]
+#[case::empty_returns_none(b"", None)]
+#[case::single_byte(b"a", Some(b"b".as_slice()))]
+#[case::single_byte_max(b"\xff", None)]
+#[case::trailing_ff(b"abc\xff", None)]
+#[case::internal_ff_followed_by_normal(b"a\xff\x00", Some(b"a\xff\x01".as_slice()))]
+#[case::multi_byte_normal(b"src/lib", Some(b"src/lic".as_slice()))]
+#[case::slash_increments(b"src/", Some(b"src0".as_slice()))]
+fn prefix_successor_produces_expected_output(
+    #[case] input: &[u8],
+    #[case] expected: Option<&[u8]>,
+) {
+    let result = prefix_successor(input);
+    assert_eq!(
+        result.as_ref().map(|v| v.as_slice()),
+        expected,
+        "prefix_successor({input:?})"
+    );
+}
+
+// ---------------------------------------------------------------
+// Unit tests — empty / inverted key ranges
+// ---------------------------------------------------------------
+
+#[test]
+fn with_key_range_equal_bounds_returns_empty() {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"m"));
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert!(items.is_empty(), "equal start/end should yield zero items");
+}
+
+#[test]
+fn with_key_range_inverted_bounds_returns_empty() {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"z"), Some(b"a"));
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut c, &start, &end);
+    assert!(
+        items.is_empty(),
+        "inverted bounds (start > end) should yield zero items"
+    );
+}
+
+#[test]
+fn with_key_range_disjoint_intersection_returns_empty() {
+    let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
+    // Config range [a, b) and request range [y, z) are disjoint.
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"a"), Some(b"b"));
+    let request_start = make_key(b"y");
+    let request_end = make_key(b"z");
+
+    let items = collect_all(&mut c, &request_start, &request_end);
+    assert!(
+        items.is_empty(),
+        "disjoint config and request ranges should yield zero items"
+    );
+}
+
+// ---------------------------------------------------------------
+// Unit tests — cursor resume across pruned subtrees
+// ---------------------------------------------------------------
+
+#[test]
+fn with_key_range_cursor_resume_across_pruned_subtrees() {
+    let dir = create_test_dir(&[
+        ("aaa/file1.txt", b"1"),
+        ("aaa/file2.txt", b"2"),
+        ("mmm/file3.txt", b"3"),
+        ("mmm/file4.txt", b"4"),
+        ("zzz/file5.txt", b"5"),
+        ("zzz/file6.txt", b"6"),
+    ]);
+    // Only [mmm, zzz) is in range — aaa/ and zzz/ should be pruned.
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"mmm"), Some(b"zzz"));
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Page with max_items=1 to force cursor resume between items.
+    let budgets_1 = small_page_budgets(1);
+    let mut all_keys: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = Cursor::initial();
+
+    for _ in 0..10 {
+        let page = c
+            .enumerate_page_range(&start, &end, &cursor, budgets_1)
+            .expect("enumerate page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            all_keys.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    assert_eq!(
+        all_keys,
+        vec![b"mmm/file3.txt".to_vec(), b"mmm/file4.txt".to_vec(),],
+        "only files in [mmm, zzz) should be returned across cursor resumes"
+    );
+
+    // Keys must be in sorted order.
+    for window in all_keys.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "keys must be globally sorted: {:?} < {:?}",
+            window[0],
+            window[1]
+        );
+    }
+}

@@ -91,6 +91,8 @@ use gossip_contracts::{
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
 };
 
+use gossip_stdx::InlineVec;
+
 use crate::common::{
     self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
     derive_stable_item_id, enumerate_error_to_read,
@@ -1041,15 +1043,28 @@ fn intersect_key_bounds<'a>(
     }
 }
 
+/// Compute the lexicographic successor of `prefix` by incrementing the last byte.
+///
+/// Returns `None` when the input is empty or the last byte is `0xFF` (no finite
+/// successor without carry propagation). The result is stored in an `InlineVec`
+/// to avoid heap allocation for typical path-length prefixes (< 256 bytes).
+pub(crate) fn prefix_successor(prefix: &[u8]) -> Option<InlineVec<u8, 256>> {
+    let last = *prefix.last()?;
+    if last == u8::MAX {
+        return None;
+    }
+    let mut out = InlineVec::<u8, 256>::new();
+    out.extend_from_slice(&prefix[..prefix.len() - 1]);
+    out.push(last + 1);
+    Some(out)
+}
+
 /// Return `true` when a directory subtree cannot overlap `[shard_start, shard_end)`.
 ///
 /// `dir_prefix` is the encoded key prefix without a trailing `/` (for example
 /// `b"src/lib"`). Keys under the subtree are bounded by:
 /// - inclusive lower bound: `dir_prefix + b'/'`
 /// - exclusive upper bound: the byte-level successor of that lower bound
-///
-/// Both the "below-range" and "above-range" checks use iterator-based byte
-/// comparison, so this function performs zero heap allocations.
 ///
 /// The implementation is conservative: `true` means safe-to-skip; `false` may
 /// still be out of range but is kept to avoid false-positive pruning. Empty
@@ -1063,32 +1078,21 @@ pub(crate) fn should_skip_subtree(
     if dir_prefix.is_empty() {
         return false;
     }
-    let last = dir_prefix[dir_prefix.len() - 1];
 
     // Subtree entirely below range: prefix_successor(dir_prefix + b'/') <= shard_start.
-    // The successor of `dir_prefix + b'/'` is `dir_prefix[..n-1] + (last+1)` when
-    // the `/` byte (0x2F) increments to 0x30. Trailing 0xFF on `last` would require
-    // carry into the separator, so we conservatively disable this check.
-    if last != u8::MAX
-        && shard_start.is_some_and(|start| {
-            dir_prefix[..dir_prefix.len() - 1]
-                .iter()
-                .copied()
-                .chain(std::iter::once(last + 1))
-                .cmp(start.iter().copied())
-                != std::cmp::Ordering::Greater
-        })
+    // The subtree key `dir_prefix + b'/'` has successor `dir_prefix[..n-1] + (last+1)`
+    // because b'/' (0x2F) increments to 0x30.
+    let mut subtree_key = InlineVec::<u8, 256>::new();
+    subtree_key.extend_from_slice(dir_prefix);
+    subtree_key.push(b'/');
+    if let Some(successor) = prefix_successor(subtree_key.as_slice())
+        && shard_start.is_some_and(|start| successor.as_slice() <= start)
     {
         return true;
     }
 
     // Subtree entirely above range: shard_end <= dir_prefix + b'/'.
-    shard_end.is_some_and(|end| {
-        end.iter()
-            .copied()
-            .cmp(dir_prefix.iter().copied().chain(std::iter::once(b'/')))
-            != std::cmp::Ordering::Greater
-    })
+    shard_end.is_some_and(|end| end <= subtree_key.as_slice())
 }
 
 /// Eagerly read and sort one directory frame before DFS descent.
@@ -1467,9 +1471,10 @@ impl WalkState {
             }
 
             // Keys are globally sorted; once we exceed the upper bound every
-            // subsequent key will too.
+            // subsequent key will too for the current query. Do not set
+            // `self.exhausted` — the walk state may be reused with different
+            // bounds, and the caller already handles `None` correctly.
             if query.end.is_some_and(|upper| rel_bytes.as_slice() >= upper) {
-                self.exhausted = true;
                 let _ = self.current_path.pop();
                 return Ok(None);
             }
