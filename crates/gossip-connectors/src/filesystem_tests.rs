@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
 use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
-use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
+use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, MAX_TOKEN_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
@@ -277,8 +277,13 @@ fn enumerate_page_uses_pooled_toxic_wrappers() {
         "next cursor key should share pooled storage"
     );
     assert!(
-        next.token().is_some_and(|token| token.is_pooled()),
-        "token should be slab-backed when emitted"
+        next.token().is_some(),
+        "token should be emitted when token resume is enabled"
+    );
+    assert!(
+        next.token()
+            .is_some_and(|token| token.as_bytes().len() <= MAX_TOKEN_SIZE),
+        "token must respect MAX_TOKEN_SIZE"
     );
 }
 
@@ -540,6 +545,107 @@ fn token_enabled_vs_disabled_parity() {
         assert_eq!(a.stable_item_id(), b.stable_item_id());
         assert_eq!(a.version(), b.version());
     }
+}
+
+#[test]
+fn walk_token_round_trips_from_live_walk_state() {
+    let dir = create_test_dir(&[
+        ("a/one.txt", b"1"),
+        ("a/two.txt", b"2"),
+        ("b/three.txt", b"3"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .expect("first page");
+    let emitted = page
+        .next_cursor()
+        .token()
+        .expect("token must be present with token resume enabled");
+    let decoded = WalkToken::decode_bytes(emitted.as_bytes()).expect("decode emitted token");
+
+    let state = c
+        .walk_state
+        .as_ref()
+        .expect("walk state must persist after first page");
+    let rebuilt = WalkToken::encode_from_state(state).expect("encode token from walk state");
+    let rebuilt_decoded =
+        WalkToken::decode_bytes(rebuilt.as_bytes()).expect("decode rebuilt token");
+
+    assert_eq!(decoded, rebuilt_decoded);
+}
+
+#[test]
+fn walk_token_decode_rejects_invalid_payloads() {
+    // Wrong version byte.
+    assert!(WalkToken::decode_bytes(&[WALK_TOKEN_VERSION + 1, 0, 0]).is_none());
+
+    // Truncated frame payload.
+    assert!(WalkToken::decode_bytes(&[WALK_TOKEN_VERSION, 1, 0, 0]).is_none());
+
+    // Non-root frame with zero-length component is invalid.
+    let mut malformed = Vec::new();
+    malformed.push(WALK_TOKEN_VERSION);
+    malformed.extend_from_slice(&2u16.to_le_bytes());
+    malformed.extend_from_slice(&0u16.to_le_bytes());
+    malformed.extend_from_slice(&0u32.to_le_bytes());
+    malformed.extend_from_slice(&0u16.to_le_bytes());
+    malformed.extend_from_slice(&0u32.to_le_bytes());
+    assert!(WalkToken::decode_bytes(&malformed).is_none());
+}
+
+#[test]
+fn walk_token_encoding_truncates_to_token_budget() {
+    let mut stack = Vec::new();
+    stack.push(WalkFrame {
+        component: None,
+        depth: 0,
+        entries_since_check: 0,
+        next_child_index: 7,
+        entries: std::collections::VecDeque::new(),
+    });
+    for depth in 1..=512 {
+        stack.push(WalkFrame {
+            component: Some(std::ffi::OsString::from_vec(vec![b'a'; 255])),
+            depth,
+            entries_since_check: 0,
+            next_child_index: 7,
+            entries: std::collections::VecDeque::new(),
+        });
+    }
+    let state = WalkState {
+        stack,
+        current_path: std::path::PathBuf::from("/tmp"),
+        pending: None,
+        last_emitted_key: None,
+        emitted_count: 0,
+        exhausted: false,
+        visited_dirs: std::collections::HashSet::new(),
+    };
+
+    let token = WalkToken::encode_from_state(&state).expect("token should be emitted");
+    assert!(
+        token.as_bytes().len() <= MAX_TOKEN_SIZE,
+        "token exceeded MAX_TOKEN_SIZE"
+    );
+
+    let decoded = WalkToken::decode_bytes(token.as_bytes()).expect("decoded truncated token");
+    assert!(
+        decoded.frames.len() < state.stack.len(),
+        "deep stack should be truncated to fit budget"
+    );
+    assert_eq!(
+        decoded
+            .frames
+            .last()
+            .expect("truncated token keeps at least one frame")
+            .next_child_index,
+        6,
+        "truncated token rewinds one child at retained leaf frame"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -1653,6 +1759,58 @@ mod prop {
             for (x, y) in a.iter().zip(b.iter()) {
                 prop_assert_eq!(x.item_key(), y.item_key());
             }
+        }
+
+        #[test]
+        fn cold_resume_with_tokens_matches_key_only_resume(
+            files in file_set_strategy(20),
+            page_size in 1usize..5usize,
+        ) {
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let budgets = small_page_budgets(page_size);
+
+            let (token_dir, _token_seed_conn) = make_connector(&files);
+            let token_root = token_dir.path().to_path_buf();
+            let mut token_cursor = Cursor::initial();
+            let mut token_keys: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let mut conn = FilesystemConnector::new(&token_root).with_tokens(true);
+                let page = conn
+                    .enumerate_page_range(&start, &end, &token_cursor, budgets)
+                    .expect("token cold resume page");
+                if page.items().is_empty() {
+                    break;
+                }
+                token_keys.extend(
+                    page.items()
+                        .iter()
+                        .map(|item| item.item_key().as_bytes().to_vec()),
+                );
+                token_cursor = page.next_cursor().clone();
+            }
+
+            let (key_dir, _key_seed_conn) = make_connector(&files);
+            let key_root = key_dir.path().to_path_buf();
+            let mut key_cursor = Cursor::initial();
+            let mut key_only_keys: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let mut conn = FilesystemConnector::new(&key_root).with_tokens(false);
+                let page = conn
+                    .enumerate_page_range(&start, &end, &key_cursor, budgets)
+                    .expect("key-only cold resume page");
+                if page.items().is_empty() {
+                    break;
+                }
+                key_only_keys.extend(
+                    page.items()
+                        .iter()
+                        .map(|item| item.item_key().as_bytes().to_vec()),
+                );
+                key_cursor = page.next_cursor().clone();
+            }
+
+            prop_assert_eq!(token_keys, key_only_keys);
         }
 
         #[test]
@@ -2913,12 +3071,11 @@ fn deadline_during_directory_descent_does_not_corrupt_subsequent_walk() {
 }
 
 // ---------------------------------------------------------------
-// Bug verification: cold-resume token index reflects total items
-// emitted, not just the current page
+// Walk-token corruption and debug cross-check behavior
 // ---------------------------------------------------------------
 
 #[test]
-fn cold_resume_token_index_reflects_prior_emission_count() {
+fn corrupted_token_version_falls_back_to_key_only_resume() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -2929,34 +3086,88 @@ fn cold_resume_token_index_reflects_prior_emission_count() {
     let end = make_key(b"\xff");
     let budgets = small_page_budgets(2);
 
-    // Page 1: emit items 0,1 (a.txt, b.txt) with tokens enabled.
     let mut first = FilesystemConnector::new(dir.path()).with_tokens(true);
     let page1 = first
         .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
         .expect("first page");
-    assert_eq!(page1.items().len(), 2);
+    let last_key = page1
+        .next_cursor()
+        .last_key()
+        .expect("first page must carry last_key")
+        .clone();
+    let mut corrupted = page1
+        .next_cursor()
+        .token()
+        .expect("token must be emitted")
+        .as_bytes()
+        .to_vec();
+    corrupted[0] ^= 0x7f; // force version mismatch for decode failure.
+    let corrupted_cursor = Cursor::with_token(
+        last_key.clone(),
+        TokenBytes::try_from_vec(corrupted).expect("corrupted token bytes still valid wrapper"),
+    );
 
-    // Cold resume: new connector, resume from page1's cursor.
+    let mut resumed_with_corrupt = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let corrupt_page = resumed_with_corrupt
+        .enumerate_page_range(&start, &end, &corrupted_cursor, budgets)
+        .expect("corrupt token should fall back to key-only resume");
+
+    let key_only_cursor = Cursor::with_last_key(last_key);
+    let mut key_only = FilesystemConnector::new(dir.path()).with_tokens(false);
+    let key_page = key_only
+        .enumerate_page_range(&start, &end, &key_only_cursor, budgets)
+        .expect("key-only resume page");
+
+    let corrupt_keys: Vec<&[u8]> = corrupt_page
+        .items()
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    let key_keys: Vec<&[u8]> = key_page
+        .items()
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    assert_eq!(corrupt_keys, key_keys);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "token-based resume diverged from key-only resume")]
+fn debug_assert_panics_when_token_resume_disagrees_with_key_resume() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let budgets = small_page_budgets(2);
+
+    let mut first = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let page1 = first
+        .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
+        .expect("first page");
+    let last_key = page1
+        .next_cursor()
+        .last_key()
+        .expect("first page must carry last_key")
+        .clone();
+
+    // Valid v1 token with one root frame, but intentionally shifted root index.
+    let mut forged = Vec::new();
+    forged.push(WALK_TOKEN_VERSION);
+    forged.extend_from_slice(&1u16.to_le_bytes());
+    forged.extend_from_slice(&0u16.to_le_bytes());
+    forged.extend_from_slice(&3u32.to_le_bytes());
+    let forged_cursor = Cursor::with_token(
+        last_key,
+        TokenBytes::try_from_vec(forged).expect("forged token wrapper"),
+    );
+
     let mut resumed = FilesystemConnector::new(dir.path()).with_tokens(true);
-    let page2 = resumed
-        .enumerate_page_range(&start, &end, page1.next_cursor(), budgets)
-        .expect("cold-resume page");
-    assert_eq!(page2.items().len(), 2);
-    assert_eq!(page2.items()[0].item_key().as_bytes(), b"c.txt");
-
-    // The token should encode next_idx = 4 (items 0..4 total).
-    // If emitted_count wasn't carried across cold resume, the token
-    // would incorrectly encode 2 (only current page items).
-    if let Some(token) = page2.next_cursor().token() {
-        let token_bytes = token.as_bytes();
-        if token_bytes.len() == 8 {
-            let encoded_idx = u64::from_be_bytes(token_bytes.try_into().unwrap());
-            assert_eq!(
-                encoded_idx, 4,
-                "cold-resume token should encode total emitted count (4), not just current page count"
-            );
-        }
-    }
+    let _ = resumed.enumerate_page_range(&start, &end, &forged_cursor, budgets);
 }
 
 // ---------------------------------------------------------------
