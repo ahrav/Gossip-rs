@@ -236,7 +236,9 @@ fn compact_with_all_identical_byte_positions() {
     assert!(estimator.rank_sample_len() <= cap);
     assert!(estimator.byte_sample_len() <= cap);
     // Split should still be valid.
-    let split = estimator.estimate_split_key().expect("should produce split");
+    let split = estimator
+        .estimate_split_key()
+        .expect("should produce split");
     let split_idx = index_from_key(&split);
     assert!(split_idx >= 1, "split must not be index 0");
 }
@@ -253,7 +255,9 @@ fn compact_when_barely_exceeding_cap() {
     assert!(estimator.rank_sample_len() <= cap);
     assert!(estimator.byte_sample_len() <= cap);
     // Endpoints: first rank sample should be index 0, last should be cap.
-    let split = estimator.estimate_split_key().expect("should produce split");
+    let split = estimator
+        .estimate_split_key()
+        .expect("should produce split");
     let split_idx = index_from_key(&split);
     assert!(split_idx >= 1 && split_idx <= cap);
 }
@@ -269,7 +273,9 @@ fn compact_rank_preserves_endpoints() {
     }
     assert!(estimator.rank_sample_len() <= cap);
     // The estimator should be able to find a split within range.
-    let split = estimator.estimate_split_key().expect("should produce split");
+    let split = estimator
+        .estimate_split_key()
+        .expect("should produce split");
     let split_idx = index_from_key(&split);
     assert!(split_idx >= 1 && split_idx < n);
 }
@@ -285,16 +291,12 @@ fn merge_empty_into_populated() {
     for idx in 0..100 {
         estimator.observe(&key_for_index(idx), (idx as u64) + 1);
     }
-    let before = estimator
-        .estimate_split_key()
-        .expect("split before merge");
+    let before = estimator.estimate_split_key().expect("split before merge");
 
     let empty = StreamingSplitEstimator::new(128);
     estimator.merge(&empty);
 
-    let after = estimator
-        .estimate_split_key()
-        .expect("split after merge");
+    let after = estimator.estimate_split_key().expect("split after merge");
     assert_eq!(before, after, "merge of empty estimator should be a no-op");
 }
 
@@ -338,7 +340,7 @@ fn extreme_file_sizes_no_overflow() {
         .expect("should produce split with extreme sizes");
     let split_idx = index_from_key(&split);
     assert!(
-        split_idx >= 1 && split_idx <= 2,
+        (1..=2).contains(&split_idx),
         "split index should be 1 or 2, got {}",
         split_idx
     );
