@@ -233,8 +233,8 @@ pub struct FilesystemConnector {
     emit_tokens: bool,
     max_walk_depth: usize,
     max_warnings: usize,
-    walk_key_range_start: Option<Vec<u8>>,
-    walk_key_range_end: Option<Vec<u8>>,
+    walk_key_range_start: Option<Box<[u8]>>,
+    walk_key_range_end: Option<Box<[u8]>>,
     walk_state: Option<WalkState>,
     walk_warnings: Vec<WalkWarning>,
     overflow_warning_count: usize,
@@ -289,8 +289,8 @@ impl FilesystemConnector {
     /// enumeration becomes a no-op (empty pages, unchanged cursor) instead of
     /// returning an error.
     pub fn with_key_range(mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
-        self.walk_key_range_start = start.map(|bound| bound.to_vec());
-        self.walk_key_range_end = end.map(|bound| bound.to_vec());
+        self.walk_key_range_start = start.map(|bound| bound.to_vec().into_boxed_slice());
+        self.walk_key_range_end = end.map(|bound| bound.to_vec().into_boxed_slice());
         self
     }
 
@@ -532,44 +532,6 @@ impl FilesystemConnector {
         )
     }
 
-    /// Intersect per-request `[start, end)` bounds with connector-level walk
-    /// bounds, returning `None` when the intersection is empty.
-    ///
-    /// The returned slices borrow from either `start`/`end` (request bounds)
-    /// or `config_start`/`config_end` (connector bounds). Callers must ensure
-    /// the connector bounds outlive the returned references.
-    #[allow(clippy::type_complexity)]
-    fn effective_bounds<'a>(
-        config_start: Option<&'a [u8]>,
-        config_end: Option<&'a [u8]>,
-        start: Option<&'a [u8]>,
-        end: Option<&'a [u8]>,
-    ) -> Option<(Option<&'a [u8]>, Option<&'a [u8]>)> {
-        let mut effective_start = start;
-        if let Some(cfg_start) = config_start {
-            effective_start = Some(match effective_start {
-                Some(request_start) if request_start >= cfg_start => request_start,
-                _ => cfg_start,
-            });
-        }
-
-        let mut effective_end = end;
-        if let Some(cfg_end) = config_end {
-            effective_end = Some(match effective_end {
-                Some(request_end) if request_end <= cfg_end => request_end,
-                _ => cfg_end,
-            });
-        }
-
-        if let (Some(s), Some(e)) = (effective_start, effective_end)
-            && s >= e
-        {
-            return None;
-        }
-
-        Some((effective_start, effective_end))
-    }
-
     /// Core page enumeration used by both shard-based and explicit-range APIs.
     ///
     /// This method advances a resumable DFS walk state directly, skipping
@@ -605,7 +567,7 @@ impl FilesystemConnector {
         let config_end = self.walk_key_range_end.clone();
 
         let Some((effective_start, effective_end)) =
-            Self::effective_bounds(config_start.as_deref(), config_end.as_deref(), start, end)
+            intersect_key_bounds(start, end, config_start.as_deref(), config_end.as_deref())
         else {
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
         };
@@ -746,8 +708,6 @@ impl FilesystemConnector {
     ///
     /// This still validates deadline and range bounds so callers get consistent
     /// retryable/permanent classification even while hints are unavailable.
-    /// Bound intersection uses [`Self::effective_bounds`] so enabling hints
-    /// later does not change range semantics.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -764,17 +724,6 @@ impl FilesystemConnector {
             && s > e
         {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
-        }
-
-        if Self::effective_bounds(
-            self.walk_key_range_start.as_deref(),
-            self.walk_key_range_end.as_deref(),
-            start,
-            end,
-        )
-        .is_none()
-        {
-            return Ok(None);
         }
         Ok(None)
     }
@@ -1061,37 +1010,51 @@ fn cmp_dir_entry(left: &BufferedDirEntry, right: &BufferedDirEntry) -> std::cmp:
     )
 }
 
-#[inline]
-/// Return a conservative upper probe for `prefix` by incrementing only the
-/// last byte.
+/// Intersect request `[start, end)` with connector-level key-range bounds.
 ///
-/// This is intentionally not a full carry-propagating successor. Prefixes that
-/// end in `0xFF` (or otherwise need carry) return `None`, disabling pruning for
-/// that branch rather than risking false-positive skips.
-fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut out = prefix.to_vec();
-    let last = out.last_mut()?;
-    if *last == u8::MAX {
-        return None;
+/// Returns the tighter of each pair, or `None` when the intersection
+/// collapses to an empty interval (`effective_start >= effective_end`).
+#[allow(clippy::type_complexity)]
+fn intersect_key_bounds<'a>(
+    request_start: Option<&'a [u8]>,
+    request_end: Option<&'a [u8]>,
+    config_start: Option<&'a [u8]>,
+    config_end: Option<&'a [u8]>,
+) -> Option<(Option<&'a [u8]>, Option<&'a [u8]>)> {
+    let effective_start = match config_start {
+        Some(cs) => Some(match request_start {
+            Some(rs) if rs >= cs => rs,
+            _ => cs,
+        }),
+        None => request_start,
+    };
+    let effective_end = match config_end {
+        Some(ce) => Some(match request_end {
+            Some(re) if re <= ce => re,
+            _ => ce,
+        }),
+        None => request_end,
+    };
+    match (effective_start, effective_end) {
+        (Some(s), Some(e)) if s >= e => None,
+        bounds => Some(bounds),
     }
-    *last += 1;
-    Some(out)
 }
 
 /// Return `true` when a directory subtree cannot overlap `[shard_start, shard_end)`.
 ///
 /// `dir_prefix` is the encoded key prefix without a trailing `/` (for example
 /// `b"src/lib"`). Keys under the subtree are bounded by:
-/// - inclusive lower bound: `dir_prefix + b'/'`  (= `subtree_start`)
-/// - exclusive upper bound: `prefix_successor(subtree_start)` (= `subtree_upper`)
+/// - inclusive lower bound: `dir_prefix + b'/'`
+/// - exclusive upper bound: the byte-level successor of that lower bound
 ///
-/// Both the "below-range" and "above-range" checks use these tight subtree
-/// bounds, so pruning is symmetric and maximally aggressive without risking
-/// false-positive skips.
+/// Both the "below-range" and "above-range" checks use iterator-based byte
+/// comparison, so this function performs zero heap allocations.
 ///
 /// The implementation is conservative: `true` means safe-to-skip; `false` may
 /// still be out of range but is kept to avoid false-positive pruning. Empty
-/// prefixes (root) and prefixes without a finite upper probe are never pruned.
+/// prefixes (root) and prefixes whose last byte is `0xFF` (no finite successor)
+/// are never pruned on the below-range side.
 pub(crate) fn should_skip_subtree(
     dir_prefix: &[u8],
     shard_start: Option<&[u8]>,
@@ -1100,28 +1063,32 @@ pub(crate) fn should_skip_subtree(
     if dir_prefix.is_empty() {
         return false;
     }
+    let last = dir_prefix[dir_prefix.len() - 1];
 
-    let mut subtree_start = Vec::with_capacity(dir_prefix.len() + 1);
-    subtree_start.extend_from_slice(dir_prefix);
-    subtree_start.push(b'/');
-
-    // Subtree keys live in `[subtree_start, subtree_upper)`.
-    // If we cannot construct a finite upper bound (trailing 0xFF on the
-    // separator), keep the subtree conservatively.
-    let Some(subtree_upper) = prefix_successor(&subtree_start) else {
-        return false;
-    };
-
-    // Subtree entirely below the shard range: the exclusive upper bound of
-    // all subtree keys is at or below `shard_start`.
-    let subtree_is_below_range = shard_start.is_some_and(|start| subtree_upper.as_slice() <= start);
-    if subtree_is_below_range {
+    // Subtree entirely below range: prefix_successor(dir_prefix + b'/') <= shard_start.
+    // The successor of `dir_prefix + b'/'` is `dir_prefix[..n-1] + (last+1)` when
+    // the `/` byte (0x2F) increments to 0x30. Trailing 0xFF on `last` would require
+    // carry into the separator, so we conservatively disable this check.
+    if last != u8::MAX
+        && shard_start.is_some_and(|start| {
+            dir_prefix[..dir_prefix.len() - 1]
+                .iter()
+                .copied()
+                .chain(std::iter::once(last + 1))
+                .cmp(start.iter().copied())
+                != std::cmp::Ordering::Greater
+        })
+    {
         return true;
     }
 
-    // Subtree entirely above the shard range: the inclusive lower bound of
-    // all subtree keys is at or above `shard_end`.
-    shard_end.is_some_and(|end| end <= subtree_start.as_slice())
+    // Subtree entirely above range: shard_end <= dir_prefix + b'/'.
+    shard_end.is_some_and(|end| {
+        end.iter()
+            .copied()
+            .cmp(dir_prefix.iter().copied().chain(std::iter::once(b'/')))
+            != std::cmp::Ordering::Greater
+    })
 }
 
 /// Eagerly read and sort one directory frame before DFS descent.
@@ -1308,46 +1275,45 @@ impl WalkState {
             }
 
             if entry.file_type.is_dir() {
-                // Compute the key prefix for this directory first so we can
-                // decide whether the subtree is worth descending into before
-                // recording it in `visited_dirs`. Recording a pruned directory
-                // would poison cycle detection: a later in-range path to the
-                // same inode (e.g. via a bind mount) would be silently
-                // misclassified as a cycle.
-                let rel_dir = match self.current_path.strip_prefix(query.root) {
-                    Ok(rel) => rel,
-                    Err(_) => {
-                        push_walk_warning(
-                            warnings,
-                            query.max_warnings,
-                            overflow_count,
-                            WalkWarning::skipped(&self.current_path, "path escaped connector root"),
-                        );
+                // Key-range subtree pruning: only worth the prefix computation
+                // when at least one bound is present.
+                if query.start.is_some() || query.end.is_some() {
+                    let rel_dir = match self.current_path.strip_prefix(query.root) {
+                        Ok(rel) => rel,
+                        Err(_) => {
+                            push_walk_warning(
+                                warnings,
+                                query.max_warnings,
+                                overflow_count,
+                                WalkWarning::skipped(
+                                    &self.current_path,
+                                    "path escaped connector root",
+                                ),
+                            );
+                            let _ = self.current_path.pop();
+                            continue;
+                        }
+                    };
+                    let dir_prefix = match encode_rel_path(rel_dir) {
+                        Ok(prefix) => prefix,
+                        Err(err) => {
+                            push_walk_warning(
+                                warnings,
+                                query.max_warnings,
+                                overflow_count,
+                                WalkWarning::skipped(
+                                    &self.current_path,
+                                    &format!("path encoding failed: {}", err.message()),
+                                ),
+                            );
+                            let _ = self.current_path.pop();
+                            continue;
+                        }
+                    };
+                    if should_skip_subtree(&dir_prefix, query.start, query.end) {
                         let _ = self.current_path.pop();
                         continue;
                     }
-                };
-                let dir_prefix = match encode_rel_path(rel_dir) {
-                    Ok(prefix) => prefix,
-                    Err(err) => {
-                        push_walk_warning(
-                            warnings,
-                            query.max_warnings,
-                            overflow_count,
-                            WalkWarning::skipped(
-                                &self.current_path,
-                                &format!("path encoding failed: {}", err.message()),
-                            ),
-                        );
-                        let _ = self.current_path.pop();
-                        continue;
-                    }
-                };
-                if should_skip_subtree(&dir_prefix, query.start, query.end) {
-                    // Directory-level pruning only skips provably disjoint
-                    // subtrees; file-level bounds are still enforced below.
-                    let _ = self.current_path.pop();
-                    continue;
                 }
 
                 // Cycle detection: skip directories already visited (bind
@@ -1498,6 +1464,14 @@ impl WalkState {
             {
                 let _ = self.current_path.pop();
                 continue;
+            }
+
+            // Keys are globally sorted; once we exceed the upper bound every
+            // subsequent key will too.
+            if query.end.is_some_and(|upper| rel_bytes.as_slice() >= upper) {
+                self.exhausted = true;
+                let _ = self.current_path.pop();
+                return Ok(None);
             }
 
             let key = match ItemKey::try_from_vec(rel_bytes) {

@@ -567,6 +567,33 @@ fn split_point_returns_none_when_disabled_even_with_many_items() {
     );
 }
 
+#[test]
+fn split_point_with_key_range_returns_none() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("m.txt", b"2"), ("z.txt", b"3")]);
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"a"), Some(b"z"));
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let split = c
+        .choose_split_point_range(&start, &end, &Cursor::initial())
+        .unwrap();
+    assert!(
+        split.is_none(),
+        "split hints should be None even with key-range configured"
+    );
+}
+
+#[test]
+fn split_point_inverted_bounds_returns_permanent_error() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"a"), Some(b"z"));
+    let start = make_key(b"\xff");
+    let end = make_key(b"\x00");
+
+    let result = c.choose_split_point_range(&start, &end, &Cursor::initial());
+    assert!(result.is_err(), "inverted bounds should produce an error");
+}
+
 // ---------------------------------------------------------------
 // Unit tests — Capabilities
 // ---------------------------------------------------------------
