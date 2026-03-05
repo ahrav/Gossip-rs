@@ -532,6 +532,44 @@ impl FilesystemConnector {
         )
     }
 
+    /// Intersect per-request `[start, end)` bounds with connector-level walk
+    /// bounds, returning `None` when the intersection is empty.
+    ///
+    /// The returned slices borrow from either `start`/`end` (request bounds)
+    /// or `config_start`/`config_end` (connector bounds). Callers must ensure
+    /// the connector bounds outlive the returned references.
+    #[allow(clippy::type_complexity)]
+    fn effective_bounds<'a>(
+        config_start: Option<&'a [u8]>,
+        config_end: Option<&'a [u8]>,
+        start: Option<&'a [u8]>,
+        end: Option<&'a [u8]>,
+    ) -> Option<(Option<&'a [u8]>, Option<&'a [u8]>)> {
+        let mut effective_start = start;
+        if let Some(cfg_start) = config_start {
+            effective_start = Some(match effective_start {
+                Some(request_start) if request_start >= cfg_start => request_start,
+                _ => cfg_start,
+            });
+        }
+
+        let mut effective_end = end;
+        if let Some(cfg_end) = config_end {
+            effective_end = Some(match effective_end {
+                Some(request_end) if request_end <= cfg_end => request_end,
+                _ => cfg_end,
+            });
+        }
+
+        if let (Some(s), Some(e)) = (effective_start, effective_end)
+            && s >= e
+        {
+            return None;
+        }
+
+        Some((effective_start, effective_end))
+    }
+
     /// Core page enumeration used by both shard-based and explicit-range APIs.
     ///
     /// This method advances a resumable DFS walk state directly, skipping
@@ -561,31 +599,16 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let walk_start = self.walk_key_range_start.clone();
-        let walk_end = self.walk_key_range_end.clone();
+        // Clone connector bounds so the returned slices don't borrow `self`,
+        // letting us take `&mut self` for walk operations below.
+        let config_start = self.walk_key_range_start.clone();
+        let config_end = self.walk_key_range_end.clone();
 
-        // Intersect request bounds with long-lived connector bounds.
-        let mut effective_start = start;
-        if let Some(config_start) = walk_start.as_deref() {
-            effective_start = Some(match effective_start {
-                Some(request_start) if request_start >= config_start => request_start,
-                _ => config_start,
-            });
-        }
-
-        let mut effective_end = end;
-        if let Some(config_end) = walk_end.as_deref() {
-            effective_end = Some(match effective_end {
-                Some(request_end) if request_end <= config_end => request_end,
-                _ => config_end,
-            });
-        }
-
-        if let (Some(s), Some(e)) = (effective_start, effective_end)
-            && s >= e
-        {
+        let Some((effective_start, effective_end)) =
+            Self::effective_bounds(config_start.as_deref(), config_end.as_deref(), start, end)
+        else {
             return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
-        }
+        };
 
         self.align_walk_to_cursor(cursor, effective_start, effective_end, budgets.deadline())?;
 
@@ -723,8 +746,8 @@ impl FilesystemConnector {
     ///
     /// This still validates deadline and range bounds so callers get consistent
     /// retryable/permanent classification even while hints are unavailable.
-    /// Bound intersection mirrors [`Self::enumerate_page_bounds`] so enabling
-    /// hints later does not change range semantics.
+    /// Bound intersection uses [`Self::effective_bounds`] so enabling hints
+    /// later does not change range semantics.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -743,26 +766,13 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let walk_start = self.walk_key_range_start.clone();
-        let walk_end = self.walk_key_range_end.clone();
-
-        let mut effective_start = start;
-        if let Some(config_start) = walk_start.as_deref() {
-            effective_start = Some(match effective_start {
-                Some(request_start) if request_start >= config_start => request_start,
-                _ => config_start,
-            });
-        }
-
-        let mut effective_end = end;
-        if let Some(config_end) = walk_end.as_deref() {
-            effective_end = Some(match effective_end {
-                Some(request_end) if request_end <= config_end => request_end,
-                _ => config_end,
-            });
-        }
-        if let (Some(s), Some(e)) = (effective_start, effective_end)
-            && s >= e
+        if Self::effective_bounds(
+            self.walk_key_range_start.as_deref(),
+            self.walk_key_range_end.as_deref(),
+            start,
+            end,
+        )
+        .is_none()
         {
             return Ok(None);
         }
@@ -1072,13 +1082,16 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 ///
 /// `dir_prefix` is the encoded key prefix without a trailing `/` (for example
 /// `b"src/lib"`). Keys under the subtree are bounded by:
-/// - inclusive lower bound: `dir_prefix + b'/'`
-/// - exclusive upper bound: lexicographic successor of `dir_prefix`
+/// - inclusive lower bound: `dir_prefix + b'/'`  (= `subtree_start`)
+/// - exclusive upper bound: `prefix_successor(subtree_start)` (= `subtree_upper`)
+///
+/// Both the "below-range" and "above-range" checks use these tight subtree
+/// bounds, so pruning is symmetric and maximally aggressive without risking
+/// false-positive skips.
 ///
 /// The implementation is conservative: `true` means safe-to-skip; `false` may
 /// still be out of range but is kept to avoid false-positive pruning. Empty
-/// prefixes (root) and prefixes without a finite conservative upper probe are
-/// never pruned.
+/// prefixes (root) and prefixes without a finite upper probe are never pruned.
 pub(crate) fn should_skip_subtree(
     dir_prefix: &[u8],
     shard_start: Option<&[u8]>,
@@ -1088,21 +1101,26 @@ pub(crate) fn should_skip_subtree(
         return false;
     }
 
-    // If we cannot construct a finite upper bound (trailing 0xFF), keep the
-    // subtree conservatively.
-    let Some(prefix_upper) = prefix_successor(dir_prefix) else {
-        return false;
-    };
-
     let mut subtree_start = Vec::with_capacity(dir_prefix.len() + 1);
     subtree_start.extend_from_slice(dir_prefix);
     subtree_start.push(b'/');
 
-    let subtree_is_below_range = shard_start.is_some_and(|start| prefix_upper.as_slice() <= start);
+    // Subtree keys live in `[subtree_start, subtree_upper)`.
+    // If we cannot construct a finite upper bound (trailing 0xFF on the
+    // separator), keep the subtree conservatively.
+    let Some(subtree_upper) = prefix_successor(&subtree_start) else {
+        return false;
+    };
+
+    // Subtree entirely below the shard range: the exclusive upper bound of
+    // all subtree keys is at or below `shard_start`.
+    let subtree_is_below_range = shard_start.is_some_and(|start| subtree_upper.as_slice() <= start);
     if subtree_is_below_range {
         return true;
     }
 
+    // Subtree entirely above the shard range: the inclusive lower bound of
+    // all subtree keys is at or above `shard_end`.
     shard_end.is_some_and(|end| end <= subtree_start.as_slice())
 }
 
@@ -1290,26 +1308,12 @@ impl WalkState {
             }
 
             if entry.file_type.is_dir() {
-                // Cycle detection: skip directories already visited (bind mounts,
-                // directory hardlinks). The metadata call is cheap relative to the
-                // read_dir that would follow on descent.
-                if let Ok(dir_meta) = fs::metadata(&self.current_path) {
-                    let dir_id = (dir_meta.dev(), dir_meta.ino());
-                    if !self.visited_dirs.insert(dir_id) {
-                        push_walk_warning(
-                            warnings,
-                            query.max_warnings,
-                            overflow_count,
-                            WalkWarning::skipped(
-                                &self.current_path,
-                                "directory cycle detected (duplicate dev/ino)",
-                            ),
-                        );
-                        let _ = self.current_path.pop();
-                        continue;
-                    }
-                }
-
+                // Compute the key prefix for this directory first so we can
+                // decide whether the subtree is worth descending into before
+                // recording it in `visited_dirs`. Recording a pruned directory
+                // would poison cycle detection: a later in-range path to the
+                // same inode (e.g. via a bind mount) would be silently
+                // misclassified as a cycle.
                 let rel_dir = match self.current_path.strip_prefix(query.root) {
                     Ok(rel) => rel,
                     Err(_) => {
@@ -1344,6 +1348,27 @@ impl WalkState {
                     // subtrees; file-level bounds are still enforced below.
                     let _ = self.current_path.pop();
                     continue;
+                }
+
+                // Cycle detection: skip directories already visited (bind
+                // mounts, directory hardlinks). Placed after pruning so that
+                // a pruned directory does not poison the visited set — a
+                // later in-range path to the same inode can still descend.
+                if let Ok(dir_meta) = fs::metadata(&self.current_path) {
+                    let dir_id = (dir_meta.dev(), dir_meta.ino());
+                    if !self.visited_dirs.insert(dir_id) {
+                        push_walk_warning(
+                            warnings,
+                            query.max_warnings,
+                            overflow_count,
+                            WalkWarning::skipped(
+                                &self.current_path,
+                                "directory cycle detected (duplicate dev/ino)",
+                            ),
+                        );
+                        let _ = self.current_path.pop();
+                        continue;
+                    }
                 }
 
                 if depth < query.max_depth {

@@ -403,10 +403,16 @@ fn shard_bounds_no_items_in_range() {
 )]
 #[case::unbounded_start(b"zzz", None, Some(b"mmm".as_slice()), true)]
 #[case::unbounded_end(b"aaa", Some(b"mmm".as_slice()), None, true)]
-#[case::trailing_ff_is_conservative(
+#[case::trailing_ff_is_prunable(
     b"\xff",
     Some(b"abc".as_slice()),
     Some(b"xyz".as_slice()),
+    true
+)]
+#[case::trailing_ff_overlaps_unbounded_end(
+    b"\xff",
+    Some(b"abc".as_slice()),
+    None,
     false
 )]
 #[case::nested_prefix_outside(
