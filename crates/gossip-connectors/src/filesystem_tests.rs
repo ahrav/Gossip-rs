@@ -9,8 +9,8 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
-use gossip_contracts::connector::{TokenBytes, MAX_ITEM_KEY_SIZE, MAX_TOKEN_SIZE};
+use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
+use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, MAX_TOKEN_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
