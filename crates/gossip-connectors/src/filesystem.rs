@@ -867,6 +867,21 @@ impl FilesystemConnector {
             return Ok(None);
         };
 
+        // Advance the walk start past the cursor so we don't traverse
+        // already-processed files only to discard them in the filter below.
+        let cursor_key_bytes;
+        let walk_start = match cursor.last_key() {
+            Some(last_key) => {
+                cursor_key_bytes = Some(last_key.as_bytes().to_vec());
+                let ck = cursor_key_bytes.as_deref().unwrap();
+                match effective_start {
+                    Some(es) if es > ck => effective_start,
+                    _ => cursor_key_bytes.as_deref(),
+                }
+            }
+            None => effective_start,
+        };
+
         self.ensure_root_fd()?;
 
         let mut split_warnings = Vec::new();
@@ -881,7 +896,7 @@ impl FilesystemConnector {
         let walk_query = WalkQuery {
             root: &self.root,
             max_depth: self.max_walk_depth,
-            start: effective_start,
+            start: walk_start,
             end: effective_end,
             deadline,
             max_warnings: self.max_warnings,

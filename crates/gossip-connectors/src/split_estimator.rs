@@ -2,15 +2,12 @@
 //!
 //! This module provides a bounded-memory estimator that tracks the
 //! byte-weighted median over a streaming, globally sorted key sequence.
-//! It uses a T-Digest for weighted rank accumulation plus bounded key
-//! checkpoints for robust key recovery.
+//! It maintains bounded key checkpoints over both ordinal rank and
+//! cumulative byte weight for robust key recovery.
 
 use std::mem;
 
-use tdigest::{Centroid, TDigest};
-
-const MIN_COMPRESSION: usize = 32;
-const MIN_KEY_SAMPLE_CAP: usize = 64;
+const MIN_SAMPLE_CAP: usize = 64;
 const KEY_SAMPLE_FACTOR: usize = 4;
 
 #[derive(Clone, Debug)]
@@ -23,23 +20,15 @@ struct KeySample {
 ///
 /// Callers feed observed `(key, file_size)` pairs in globally sorted key order.
 /// `estimate_split_key` returns an observed key near the byte-weighted median.
-/// Memory remains bounded by the configured compression and sample caps.
+/// Memory remains bounded by the configured sample cap.
 #[derive(Clone, Debug)]
 pub(crate) struct StreamingSplitEstimator {
-    digest: TDigest,
-    compression: usize,
     sample_cap: usize,
-    pending_flush_limit: usize,
     /// Checkpoints over ordinal rank (`0..count`) for zero-byte fallback and
     /// degenerate front-loaded cases.
     rank_samples: Vec<KeySample>,
     /// Checkpoints over cumulative byte weight for median-by-bytes recovery.
     byte_samples: Vec<KeySample>,
-    pending_centroids: Vec<Centroid>,
-    pending_sum: f64,
-    pending_weight: f64,
-    pending_min: f64,
-    pending_max: f64,
     /// Total observed byte weight (saturating on overflow).
     total_bytes: u64,
     /// Total observed item count.
@@ -50,24 +39,18 @@ impl StreamingSplitEstimator {
     pub(crate) const DEFAULT_COMPRESSION: usize = 256;
 
     /// Create a new streaming estimator.
+    ///
+    /// `compression` controls the sample-cap sizing: higher values retain more
+    /// key checkpoints for better accuracy at the cost of more memory.
     pub(crate) fn new(compression: usize) -> Self {
-        let compression = compression.max(MIN_COMPRESSION);
+        let compression = compression.max(32);
         let sample_cap = compression
             .saturating_mul(KEY_SAMPLE_FACTOR)
-            .max(MIN_KEY_SAMPLE_CAP);
-        let pending_flush_limit = compression.max(MIN_COMPRESSION);
+            .max(MIN_SAMPLE_CAP);
         Self {
-            digest: TDigest::new_with_size(compression),
-            compression,
             sample_cap,
-            pending_flush_limit,
             rank_samples: Vec::new(),
             byte_samples: Vec::new(),
-            pending_centroids: Vec::new(),
-            pending_sum: 0.0,
-            pending_weight: 0.0,
-            pending_min: 0.0,
-            pending_max: 0.0,
             total_bytes: 0,
             count: 0,
         }
@@ -79,30 +62,19 @@ impl StreamingSplitEstimator {
         self.push_rank_sample(rank, key);
         self.count = self.count.saturating_add(1);
 
-        self.total_bytes = self.total_bytes.saturating_add(file_size);
-
         if file_size == 0 {
+            self.total_bytes = self.total_bytes.saturating_add(file_size);
             return;
         }
 
+        // Sample the cumulative position at the *start* of this file's byte
+        // range so that `nearest_sample(byte_samples, total/2)` selects the
+        // file whose range straddles the weighted median rather than the file
+        // whose cumulative end is nearest.
         let cumulative = self.total_bytes as f64;
         self.push_byte_sample(cumulative, key);
 
-        let weight = file_size as f64;
-        if self.pending_centroids.is_empty() {
-            self.pending_min = rank;
-            self.pending_max = rank;
-        } else {
-            self.pending_min = self.pending_min.min(rank);
-            self.pending_max = self.pending_max.max(rank);
-        }
-        self.pending_sum += rank * weight;
-        self.pending_weight += weight;
-        self.pending_centroids.push(Centroid::new(rank, weight));
-
-        if self.pending_centroids.len() >= self.pending_flush_limit {
-            self.flush_pending();
-        }
+        self.total_bytes = self.total_bytes.saturating_add(file_size);
     }
 
     /// Estimate the split key closest to the byte-weighted median.
@@ -114,6 +86,11 @@ impl StreamingSplitEstimator {
         }
 
         let max_rank = (self.count - 1) as f64;
+        // Clamp the lower bound to rank 1 so the estimator never returns the
+        // very first key (rank 0).  A "split at the first item" leaves zero
+        // keys on the left side and is degenerate for every downstream
+        // consumer.  When count == 2, max_rank == 1 and this collapses to
+        // exactly rank 1, which is the only valid split for two items.
         let min_rank = 1.0_f64.min(max_rank);
         let midpoint_rank = (self.count / 2) as f64;
 
@@ -152,13 +129,6 @@ impl StreamingSplitEstimator {
     /// in global key order (append-style merge).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn merge(&mut self, other: &Self) {
-        self.flush_pending();
-        let other_digest = other.merged_digest_with_pending();
-        if !other_digest.is_empty() {
-            let current = mem::replace(&mut self.digest, TDigest::new_with_size(self.compression));
-            self.digest = TDigest::merge_digests(vec![current, other_digest]);
-        }
-
         let rank_offset = self.count as f64;
         let byte_offset = self.total_bytes as f64;
         self.count = self.count.saturating_add(other.count);
@@ -190,7 +160,7 @@ impl StreamingSplitEstimator {
             position,
             key: key.to_vec(),
         });
-        while self.rank_samples.len() > self.sample_cap {
+        if self.rank_samples.len() > self.sample_cap {
             self.compact_rank_samples();
         }
     }
@@ -200,7 +170,7 @@ impl StreamingSplitEstimator {
             position,
             key: key.to_vec(),
         });
-        while self.byte_samples.len() > self.sample_cap {
+        if self.byte_samples.len() > self.sample_cap {
             self.compact_byte_samples();
         }
     }
@@ -247,6 +217,21 @@ impl StreamingSplitEstimator {
 
         let first = old.first().expect("non-empty samples").position;
         let last = old.last().expect("non-empty samples").position;
+
+        // When all positions are identical, position-based interpolation
+        // collapses and the loop below degenerates to sequential index
+        // picking via the `pick <= prev` guard.  Short-circuit with
+        // index-based even spacing for clarity.
+        if first == last {
+            self.byte_samples = (0..self.sample_cap)
+                .map(|i| {
+                    let idx = i * (len - 1) / (self.sample_cap - 1);
+                    old[idx].clone()
+                })
+                .collect();
+            return;
+        }
+
         let mut compacted = Vec::with_capacity(self.sample_cap);
         let mut cursor = 0usize;
         let mut last_pick: Option<usize> = None;
@@ -291,50 +276,6 @@ impl StreamingSplitEstimator {
         self.byte_samples = compacted;
     }
 
-    fn flush_pending(&mut self) {
-        let Some(pending_digest) = self.take_pending_digest() else {
-            return;
-        };
-        let current = mem::replace(&mut self.digest, TDigest::new_with_size(self.compression));
-        self.digest = TDigest::merge_digests(vec![current, pending_digest]);
-    }
-
-    fn take_pending_digest(&mut self) -> Option<TDigest> {
-        let pending_len = self.pending_centroids.len();
-        if pending_len == 0 {
-            return None;
-        }
-        let centroids = mem::take(&mut self.pending_centroids);
-        let digest = TDigest::new(
-            centroids,
-            self.pending_sum,
-            self.pending_weight,
-            self.pending_max,
-            self.pending_min,
-            pending_len.max(1),
-        );
-        self.pending_sum = 0.0;
-        self.pending_weight = 0.0;
-        self.pending_min = 0.0;
-        self.pending_max = 0.0;
-        Some(digest)
-    }
-
-    fn merged_digest_with_pending(&self) -> TDigest {
-        if self.pending_centroids.is_empty() {
-            return self.digest.clone();
-        }
-        let pending = TDigest::new(
-            self.pending_centroids.clone(),
-            self.pending_sum,
-            self.pending_weight,
-            self.pending_max,
-            self.pending_min,
-            self.pending_centroids.len().max(1),
-        );
-        TDigest::merge_digests(vec![self.digest.clone(), pending])
-    }
-
     fn nearest_sample(samples: &[KeySample], target: f64) -> Option<&[u8]> {
         if samples.is_empty() {
             return None;
@@ -368,16 +309,6 @@ impl StreamingSplitEstimator {
     #[cfg(test)]
     fn sample_cap(&self) -> usize {
         self.sample_cap
-    }
-
-    #[cfg(test)]
-    fn pending_len(&self) -> usize {
-        self.pending_centroids.len()
-    }
-
-    #[cfg(test)]
-    fn pending_cap(&self) -> usize {
-        self.pending_flush_limit
     }
 }
 
