@@ -153,8 +153,8 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
-          shared-key: stable-linux
-          save-cache: "false"
+          shared-key: stable-linux-bench
+          save-cache: "true"
 
       - run: cargo bench --features test-support,bench,perf-stats --no-run
 
@@ -187,8 +187,8 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           toolchain: stable
-          shared-key: stable-linux
-          save-cache: "false"
+          shared-key: stable-linux-doc
+          save-cache: "true"
 
       - run: cargo doc --no-deps --all-features
 
