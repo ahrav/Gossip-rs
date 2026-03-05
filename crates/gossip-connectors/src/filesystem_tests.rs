@@ -370,6 +370,148 @@ fn shard_bounds_no_items_in_range() {
     assert!(page.items().is_empty());
 }
 
+// Table-driven coverage for the subtree overlap predicate used by directory
+// pruning. Cases intentionally include conservative edges (root prefix and
+// trailing 0xFF) where we keep traversal to avoid false-positive skips.
+#[rstest]
+#[case::unbounded_shard(b"docs", None, None, false)]
+#[case::subtree_below_range(b"aaa", Some(b"mmm".as_slice()), Some(b"zzz".as_slice()), true)]
+#[case::subtree_above_range(b"zzz", Some(b"aaa".as_slice()), Some(b"mmm".as_slice()), true)]
+#[case::overlaps_shard_start(
+    b"mmm",
+    Some(b"mmm/abc".as_slice()),
+    Some(b"zzz".as_slice()),
+    false
+)]
+#[case::overlaps_shard_end(
+    b"src",
+    Some(b"aaa".as_slice()),
+    Some(b"src/z".as_slice()),
+    false
+)]
+#[case::fully_inside_shard(
+    b"src/lib",
+    Some(b"src/a".as_slice()),
+    Some(b"src/z".as_slice()),
+    false
+)]
+#[case::empty_prefix_root(
+    b"",
+    Some(b"abc".as_slice()),
+    Some(b"xyz".as_slice()),
+    false
+)]
+#[case::unbounded_start(b"zzz", None, Some(b"mmm".as_slice()), true)]
+#[case::unbounded_end(b"aaa", Some(b"mmm".as_slice()), None, true)]
+#[case::trailing_ff_is_conservative(
+    b"\xff",
+    Some(b"abc".as_slice()),
+    Some(b"xyz".as_slice()),
+    false
+)]
+#[case::nested_prefix_outside(
+    b"docs/internal",
+    Some(b"src/a".as_slice()),
+    Some(b"src/z".as_slice()),
+    true
+)]
+#[case::single_char_prefix(b"z", Some(b"a".as_slice()), Some(b"m".as_slice()), true)]
+fn should_skip_subtree_respects_range_overlap(
+    #[case] dir_prefix: &[u8],
+    #[case] shard_start: Option<&[u8]>,
+    #[case] shard_end: Option<&[u8]>,
+    #[case] expected: bool,
+) {
+    assert_eq!(
+        should_skip_subtree(dir_prefix, shard_start, shard_end),
+        expected
+    );
+}
+
+#[test]
+fn with_key_range_prunes_walk_to_expected_subset() {
+    let dir = create_test_dir(&[
+        ("docs/readme.md", b"docs"),
+        ("src/a.rs", b"a"),
+        ("src/mid.rs", b"mid"),
+        ("src/more/lib.rs", b"more"),
+        ("src/zeta.rs", b"z"),
+        ("tests/test.rs", b"test"),
+    ]);
+    let mut bounded =
+        FilesystemConnector::new(dir.path()).with_key_range(Some(b"src/m"), Some(b"src/z"));
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let items = collect_all(&mut bounded, &start, &end);
+    let keys: Vec<&[u8]> = items
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    assert_eq!(
+        keys,
+        // End bound is exclusive: src/zeta.rs is outside [src/m, src/z).
+        vec![b"src/mid.rs".as_slice(), b"src/more/lib.rs".as_slice()]
+    );
+}
+
+#[test]
+fn bounded_walk_matches_unbounded_filtered_range() {
+    let dir = create_test_dir(&[
+        ("aaa/one.txt", b"1"),
+        ("src/a.txt", b"2"),
+        ("src/m/a.txt", b"3"),
+        ("src/m/b.txt", b"4"),
+        ("src/t/z.txt", b"5"),
+        ("zzz/last.txt", b"6"),
+    ]);
+    let full_start = make_key(b"\x00");
+    let full_end = make_key(b"\xff");
+
+    let mut unbounded = FilesystemConnector::new(dir.path());
+    let baseline = collect_all(&mut unbounded, &full_start, &full_end);
+
+    let mut bounded =
+        FilesystemConnector::new(dir.path()).with_key_range(Some(b"src/m"), Some(b"src/t"));
+    let bounded_items = collect_all(&mut bounded, &full_start, &full_end);
+
+    // Baseline oracle: enumerate everything, then apply the same half-open
+    // filter the bounded walk should enforce.
+    let expected: Vec<Vec<u8>> = baseline
+        .iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .filter(|key| key.as_slice() >= b"src/m".as_slice() && key.as_slice() < b"src/t".as_slice())
+        .collect();
+    let actual: Vec<Vec<u8>> = bounded_items
+        .iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn with_key_range_intersects_per_request_bounds() {
+    let dir = create_test_dir(&[
+        ("src/a.txt", b"a"),
+        ("src/m.txt", b"m"),
+        ("src/t.txt", b"t"),
+        ("src/z.txt", b"z"),
+    ]);
+    let mut bounded =
+        FilesystemConnector::new(dir.path()).with_key_range(Some(b"src/m"), Some(b"src/z"));
+
+    // Request bounds are wider; effective range is the intersection.
+    let request_start = make_key(b"src/a");
+    let request_end = make_key(b"src/zz");
+    let items = collect_all(&mut bounded, &request_start, &request_end);
+    let keys: Vec<&[u8]> = items
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+
+    assert_eq!(keys, vec![b"src/m.txt".as_slice(), b"src/t.txt".as_slice()]);
+}
+
 // ---------------------------------------------------------------
 // Unit tests — Token parity
 // ---------------------------------------------------------------
@@ -846,7 +988,7 @@ fn dangling_symlink_is_skipped() {
 }
 
 // ---------------------------------------------------------------
-// Error classification & memoization tests
+// Error classification & retry semantics tests
 // ---------------------------------------------------------------
 
 #[test]
@@ -861,7 +1003,7 @@ fn root_not_found_is_permanent() {
 }
 
 #[test]
-fn index_failure_is_memoized() {
+fn index_failure_is_repeatable_without_memoization() {
     let mut c = FilesystemConnector::new("/nonexistent/path/that/does/not/exist");
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
@@ -870,7 +1012,7 @@ fn index_failure_is_memoized() {
     let err1 = c
         .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
         .unwrap_err();
-    // Second call returns the memoized error without re-walking.
+    // Second call re-attempts setup and should surface the same permanent class.
     let err2 = c
         .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
         .unwrap_err();
@@ -1380,7 +1522,7 @@ mod prop {
 
     /// Strategy: generate a set of (path, content) pairs with unique paths.
     ///
-    /// Paths use `[a-z0-9_]{1,8}` segments with 0-2 levels of nesting.
+    /// Paths use `[a-z0-9_-]{1,8}` segments with 0-2 levels of nesting.
     fn file_set_strategy(max_files: usize) -> impl Strategy<Value = Vec<(String, Vec<u8>)>> {
         let segment = "[a-z0-9_-]{1,8}";
         let path = string_regex(&format!(
@@ -1397,6 +1539,10 @@ mod prop {
                     .collect()
             },
         )
+    }
+
+    fn key_bound_strategy() -> impl Strategy<Value = Vec<u8>> {
+        pvec(any::<u8>(), 1..6usize)
     }
 
     /// Create a connector from a generated file set, returning the tempdir
@@ -1505,6 +1651,50 @@ mod prop {
                 prop_assert_eq!(x.item_ref(), y.item_ref());
                 prop_assert_eq!(x.stable_item_id(), y.stable_item_id());
             }
+        }
+
+        #[test]
+        fn bounded_walk_matches_unbounded_filtered_property(
+            files in file_set_strategy(20),
+            raw_start in key_bound_strategy(),
+            raw_end in key_bound_strategy(),
+        ) {
+            // with_key_range accepts arbitrary byte bounds; normalize to a
+            // non-inverted half-open interval for the expected-value oracle.
+            let (bound_start, bound_end) = if raw_start <= raw_end {
+                (raw_start, raw_end)
+            } else {
+                (raw_end, raw_start)
+            };
+
+            let full_start = make_key(b"\x00");
+            let full_end = make_key(b"\xff");
+
+            let (_dir_unbounded, mut unbounded) = make_connector(&files);
+            let baseline = collect_all(&mut unbounded, &full_start, &full_end);
+
+            let (_dir_bounded, mut bounded) = make_connector(&files);
+            bounded = bounded.with_key_range(
+                Some(bound_start.as_slice()),
+                Some(bound_end.as_slice()),
+            );
+            let actual = collect_all(&mut bounded, &full_start, &full_end);
+
+            // Oracle: unbounded enumeration filtered by the same half-open
+            // interval must match bounded traversal exactly.
+            let expected_keys: Vec<Vec<u8>> = baseline
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .filter(|key| {
+                    key.as_slice() >= bound_start.as_slice()
+                        && key.as_slice() < bound_end.as_slice()
+                })
+                .collect();
+            let actual_keys: Vec<Vec<u8>> = actual
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect();
+            prop_assert_eq!(actual_keys, expected_keys);
         }
 
         #[test]
@@ -2440,9 +2630,9 @@ fn expired_deadline_after_successful_indexing_returns_retryable() {
     let items = collect_all(&mut c, &start, &end);
     assert_eq!(items.len(), 1, "indexing should succeed");
 
-    // Now call enumerate with an already-expired deadline. This hits the
-    // deadline check in `enumerate_page_bounds` after `ensure_indexed`
-    // returns immediately from the memoized index.
+    // Now call enumerate with an already-expired deadline. The page-level
+    // deadline gate in `enumerate_page_bounds` should still classify this as
+    // retryable even after prior successful traversal.
     let expired_budgets =
         Budgets::try_new(100, u64::MAX, Some(Instant::now() - Duration::from_secs(1))).unwrap();
     let result = c.enumerate_page_range(&start, &end, &Cursor::initial(), expired_budgets);

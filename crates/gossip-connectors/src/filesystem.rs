@@ -14,11 +14,19 @@
 //! - a mutable path buffer for the active frame,
 //! - cursor-alignment metadata (`last_emitted_key`, `pending`, `exhausted`).
 //!
-//! This keeps memory proportional to `O(Σ entries_per_active_dir)` — the sum
-//! of entry counts in the directories currently on the DFS stack — instead of
-//! total file count. The improvement is significant for deep, balanced trees
-//! but degrades toward full-tree buffering for flat hierarchies with very
-//! large directories.
+//! This keeps memory proportional to:
+//! - `O(Σ entries_per_active_dir)` for buffered DFS frames, plus
+//! - `O(visited_dirs)` for cycle-detection identities collected during descent.
+//!
+//! This is still substantially smaller than full-tree materialization for deep,
+//! balanced trees, but can approach full-tree scale for very wide or highly
+//! connected hierarchies.
+//!
+//! Optional key-range pruning (`with_key_range`) further reduces walk I/O by
+//! skipping directory subtrees whose lexicographic prefix ranges cannot overlap
+//! the requested half-open key range. Pruning is conservative: when prefix
+//! bounds are ambiguous, the subtree is kept and leaf-level filtering enforces
+//! correctness.
 //!
 //! # Ordering and resume
 //!
@@ -50,7 +58,8 @@
 //! # Split hints
 //!
 //! Split-point hints are intentionally disabled in this streaming phase:
-//! `caps().split_hints == false` and `choose_split_point*` returns `Ok(None)`.
+//! `caps().split_hints == false`, and `choose_split_point*` returns `Ok(None)`
+//! after validating deadline/range inputs.
 //!
 //! # Warnings and failures
 //!
@@ -178,6 +187,16 @@ struct WalkFrame {
     entries: VecDeque<BufferedDirEntry>,
 }
 
+#[derive(Clone, Copy)]
+struct WalkQuery<'a> {
+    root: &'a Path,
+    max_depth: usize,
+    start: Option<&'a [u8]>,
+    end: Option<&'a [u8]>,
+    deadline: Option<Instant>,
+    max_warnings: usize,
+}
+
 /// Resumable sorted DFS state used as the serving layer for pagination.
 ///
 /// # Invariants
@@ -214,6 +233,8 @@ pub struct FilesystemConnector {
     emit_tokens: bool,
     max_walk_depth: usize,
     max_warnings: usize,
+    walk_key_range_start: Option<Vec<u8>>,
+    walk_key_range_end: Option<Vec<u8>>,
     walk_state: Option<WalkState>,
     walk_warnings: Vec<WalkWarning>,
     overflow_warning_count: usize,
@@ -238,6 +259,8 @@ impl FilesystemConnector {
             emit_tokens: false,
             max_walk_depth: Self::DEFAULT_MAX_WALK_DEPTH,
             max_warnings: Self::DEFAULT_MAX_WARNINGS,
+            walk_key_range_start: None,
+            walk_key_range_end: None,
             walk_state: None,
             walk_warnings: Vec::new(),
             overflow_warning_count: 0,
@@ -252,6 +275,22 @@ impl FilesystemConnector {
     /// Key-based resume remains available regardless of this setting.
     pub fn with_tokens(mut self, enabled: bool) -> Self {
         self.emit_tokens = enabled;
+        self
+    }
+
+    #[must_use]
+    /// Restrict traversal to keys inside the half-open range `[start, end)`.
+    ///
+    /// The range is applied during walk traversal (subtree pruning and
+    /// per-entry filtering) and intersected with per-request shard bounds.
+    /// `None` means unbounded on that side.
+    ///
+    /// If the configured bounds collapse to an empty interval (`start >= end`),
+    /// enumeration becomes a no-op (empty pages, unchanged cursor) instead of
+    /// returning an error.
+    pub fn with_key_range(mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
+        self.walk_key_range_start = start.map(|bound| bound.to_vec());
+        self.walk_key_range_end = end.map(|bound| bound.to_vec());
         self
     }
 
@@ -392,6 +431,8 @@ impl FilesystemConnector {
     fn align_walk_to_cursor(
         &mut self,
         cursor: &Cursor,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
         deadline: Option<Instant>,
     ) -> Result<(), EnumerateError> {
         self.start_walk_if_needed(deadline)?;
@@ -415,6 +456,14 @@ impl FilesystemConnector {
                 //     to any actual file on disk (cold resume with a stale
                 //     cursor).
                 let mut skipped: usize = 0;
+                let walk_query = WalkQuery {
+                    root: &self.root,
+                    max_depth: self.max_walk_depth,
+                    start,
+                    end,
+                    deadline,
+                    max_warnings: self.max_warnings,
+                };
                 loop {
                     let next = {
                         let state = self
@@ -422,10 +471,7 @@ impl FilesystemConnector {
                             .as_mut()
                             .expect("walk state must exist after reset_walk_state");
                         state.next_file(
-                            &self.root,
-                            self.max_walk_depth,
-                            deadline,
-                            self.max_warnings,
+                            walk_query,
                             &mut self.walk_warnings,
                             &mut self.overflow_warning_count,
                         )?
@@ -490,6 +536,8 @@ impl FilesystemConnector {
     ///
     /// This method advances a resumable DFS walk state directly, skipping
     /// out-of-range entries and emitting up to `budgets.max_items()` items.
+    /// Connector-level walk bounds from [`Self::with_key_range`] are intersected
+    /// with per-request bounds before traversal.
     ///
     /// Cursor handling is key-authoritative: when the in-memory walk cursor does
     /// not match `cursor.last_key`, the walk is reconstructed from root and
@@ -513,7 +561,33 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        self.align_walk_to_cursor(cursor, budgets.deadline())?;
+        let walk_start = self.walk_key_range_start.clone();
+        let walk_end = self.walk_key_range_end.clone();
+
+        // Intersect request bounds with long-lived connector bounds.
+        let mut effective_start = start;
+        if let Some(config_start) = walk_start.as_deref() {
+            effective_start = Some(match effective_start {
+                Some(request_start) if request_start >= config_start => request_start,
+                _ => config_start,
+            });
+        }
+
+        let mut effective_end = end;
+        if let Some(config_end) = walk_end.as_deref() {
+            effective_end = Some(match effective_end {
+                Some(request_end) if request_end <= config_end => request_end,
+                _ => config_end,
+            });
+        }
+
+        if let (Some(s), Some(e)) = (effective_start, effective_end)
+            && s >= e
+        {
+            return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
+        }
+
+        self.align_walk_to_cursor(cursor, effective_start, effective_end, budgets.deadline())?;
 
         let page_start = self
             .walk_state
@@ -522,6 +596,14 @@ impl FilesystemConnector {
             .emitted_count;
 
         let mut page_files = Vec::with_capacity(budgets.max_items());
+        let walk_query = WalkQuery {
+            root: &self.root,
+            max_depth: self.max_walk_depth,
+            start: effective_start,
+            end: effective_end,
+            deadline: budgets.deadline(),
+            max_warnings: self.max_warnings,
+        };
         while page_files.len() < budgets.max_items() {
             if budgets.is_expired_at(Instant::now()) {
                 return Err(EnumerateError::retryable("budget deadline expired"));
@@ -533,10 +615,7 @@ impl FilesystemConnector {
                     .as_mut()
                     .expect("walk state must exist while enumerating");
                 state.next_file(
-                    &self.root,
-                    self.max_walk_depth,
-                    budgets.deadline(),
-                    self.max_warnings,
+                    walk_query,
                     &mut self.walk_warnings,
                     &mut self.overflow_warning_count,
                 )?
@@ -545,10 +624,12 @@ impl FilesystemConnector {
                 break;
             };
 
-            if start.is_some_and(|lower| file.key.as_bytes() < lower) {
+            if effective_start.is_some_and(|lower| file.key.as_bytes() < lower) {
                 continue;
             }
-            if end.is_some_and(|upper| file.key.as_bytes() >= upper) {
+            if effective_end.is_some_and(|upper| file.key.as_bytes() >= upper) {
+                // Keys are globally sorted; once we cross the exclusive upper
+                // bound, stash this file for potential reuse by a later request.
                 let state = self
                     .walk_state
                     .as_mut()
@@ -642,6 +723,8 @@ impl FilesystemConnector {
     ///
     /// This still validates deadline and range bounds so callers get consistent
     /// retryable/permanent classification even while hints are unavailable.
+    /// Bound intersection mirrors [`Self::enumerate_page_bounds`] so enabling
+    /// hints later does not change range semantics.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -658,6 +741,30 @@ impl FilesystemConnector {
             && s > e
         {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
+        }
+
+        let walk_start = self.walk_key_range_start.clone();
+        let walk_end = self.walk_key_range_end.clone();
+
+        let mut effective_start = start;
+        if let Some(config_start) = walk_start.as_deref() {
+            effective_start = Some(match effective_start {
+                Some(request_start) if request_start >= config_start => request_start,
+                _ => config_start,
+            });
+        }
+
+        let mut effective_end = end;
+        if let Some(config_end) = walk_end.as_deref() {
+            effective_end = Some(match effective_end {
+                Some(request_end) if request_end <= config_end => request_end,
+                _ => config_end,
+            });
+        }
+        if let (Some(s), Some(e)) = (effective_start, effective_end)
+            && s >= e
+        {
+            return Ok(None);
         }
         Ok(None)
     }
@@ -944,6 +1051,61 @@ fn cmp_dir_entry(left: &BufferedDirEntry, right: &BufferedDirEntry) -> std::cmp:
     )
 }
 
+#[inline]
+/// Return a conservative upper probe for `prefix` by incrementing only the
+/// last byte.
+///
+/// This is intentionally not a full carry-propagating successor. Prefixes that
+/// end in `0xFF` (or otherwise need carry) return `None`, disabling pruning for
+/// that branch rather than risking false-positive skips.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    let last = out.last_mut()?;
+    if *last == u8::MAX {
+        return None;
+    }
+    *last += 1;
+    Some(out)
+}
+
+/// Return `true` when a directory subtree cannot overlap `[shard_start, shard_end)`.
+///
+/// `dir_prefix` is the encoded key prefix without a trailing `/` (for example
+/// `b"src/lib"`). Keys under the subtree are bounded by:
+/// - inclusive lower bound: `dir_prefix + b'/'`
+/// - exclusive upper bound: lexicographic successor of `dir_prefix`
+///
+/// The implementation is conservative: `true` means safe-to-skip; `false` may
+/// still be out of range but is kept to avoid false-positive pruning. Empty
+/// prefixes (root) and prefixes without a finite conservative upper probe are
+/// never pruned.
+pub(crate) fn should_skip_subtree(
+    dir_prefix: &[u8],
+    shard_start: Option<&[u8]>,
+    shard_end: Option<&[u8]>,
+) -> bool {
+    if dir_prefix.is_empty() {
+        return false;
+    }
+
+    // If we cannot construct a finite upper bound (trailing 0xFF), keep the
+    // subtree conservatively.
+    let Some(prefix_upper) = prefix_successor(dir_prefix) else {
+        return false;
+    };
+
+    let mut subtree_start = Vec::with_capacity(dir_prefix.len() + 1);
+    subtree_start.extend_from_slice(dir_prefix);
+    subtree_start.push(b'/');
+
+    let subtree_is_below_range = shard_start.is_some_and(|start| prefix_upper.as_slice() <= start);
+    if subtree_is_below_range {
+        return true;
+    }
+
+    shard_end.is_some_and(|end| end <= subtree_start.as_slice())
+}
+
 /// Eagerly read and sort one directory frame before DFS descent.
 ///
 /// This intentionally spends memory per active frame (`Vec` + `VecDeque`) so
@@ -1075,14 +1237,12 @@ impl WalkState {
     ///
     /// The walker is resilient to filesystem churn: unreadable entries,
     /// symlinks, special files, and encoding failures become warnings and are
-    /// skipped. Hard failures are reserved for budget expiry and root-level I/O
-    /// errors propagated via [`classify_io_enumerate_error`].
+    /// skipped. Hard failures are limited to deadline expiry and retryable
+    /// directory-buffer limits (for example `MAX_ENTRIES_PER_DIR` overflow)
+    /// plus root/bootstrap I/O classified by [`classify_io_enumerate_error`].
     fn next_file(
         &mut self,
-        root: &Path,
-        max_depth: usize,
-        deadline: Option<Instant>,
-        max_warnings: usize,
+        query: WalkQuery<'_>,
         warnings: &mut Vec<WalkWarning>,
         overflow_count: &mut usize,
     ) -> Result<Option<FileEntry>, EnumerateError> {
@@ -1096,7 +1256,7 @@ impl WalkState {
         while !self.stack.is_empty() {
             let maybe_entry = {
                 let frame = self.stack.last_mut().expect("non-empty walk stack");
-                Self::poll_frame(frame, deadline)?
+                Self::poll_frame(frame, query.deadline)?
             };
 
             let entry = match maybe_entry {
@@ -1121,7 +1281,7 @@ impl WalkState {
             if entry.file_type.is_symlink() {
                 push_walk_warning(
                     warnings,
-                    max_warnings,
+                    query.max_warnings,
                     overflow_count,
                     WalkWarning::skipped(&self.current_path, "symlink"),
                 );
@@ -1138,7 +1298,7 @@ impl WalkState {
                     if !self.visited_dirs.insert(dir_id) {
                         push_walk_warning(
                             warnings,
-                            max_warnings,
+                            query.max_warnings,
                             overflow_count,
                             WalkWarning::skipped(
                                 &self.current_path,
@@ -1150,8 +1310,44 @@ impl WalkState {
                     }
                 }
 
-                if depth < max_depth {
-                    if let Err(e) = check_walk_deadline(deadline) {
+                let rel_dir = match self.current_path.strip_prefix(query.root) {
+                    Ok(rel) => rel,
+                    Err(_) => {
+                        push_walk_warning(
+                            warnings,
+                            query.max_warnings,
+                            overflow_count,
+                            WalkWarning::skipped(&self.current_path, "path escaped connector root"),
+                        );
+                        let _ = self.current_path.pop();
+                        continue;
+                    }
+                };
+                let dir_prefix = match encode_rel_path(rel_dir) {
+                    Ok(prefix) => prefix,
+                    Err(err) => {
+                        push_walk_warning(
+                            warnings,
+                            query.max_warnings,
+                            overflow_count,
+                            WalkWarning::skipped(
+                                &self.current_path,
+                                &format!("path encoding failed: {}", err.message()),
+                            ),
+                        );
+                        let _ = self.current_path.pop();
+                        continue;
+                    }
+                };
+                if should_skip_subtree(&dir_prefix, query.start, query.end) {
+                    // Directory-level pruning only skips provably disjoint
+                    // subtrees; file-level bounds are still enforced below.
+                    let _ = self.current_path.pop();
+                    continue;
+                }
+
+                if depth < query.max_depth {
+                    if let Err(e) = check_walk_deadline(query.deadline) {
                         let _ = self.current_path.pop();
                         return Err(e);
                     }
@@ -1160,8 +1356,8 @@ impl WalkState {
                             let child_entries = match read_dir_sorted_entries(
                                 reader,
                                 &self.current_path,
-                                deadline,
-                                max_warnings,
+                                query.deadline,
+                                query.max_warnings,
                                 overflow_count,
                                 warnings,
                             ) {
@@ -1182,7 +1378,7 @@ impl WalkState {
                         Err(err) => {
                             push_walk_warning(
                                 warnings,
-                                max_warnings,
+                                query.max_warnings,
                                 overflow_count,
                                 WalkWarning::io(&self.current_path, "read_dir", &err),
                             );
@@ -1191,7 +1387,7 @@ impl WalkState {
                 } else {
                     push_walk_warning(
                         warnings,
-                        max_warnings,
+                        query.max_warnings,
                         overflow_count,
                         WalkWarning::skipped(&self.current_path, "exceeded maximum walk depth"),
                     );
@@ -1204,7 +1400,7 @@ impl WalkState {
             if !entry.file_type.is_file() {
                 push_walk_warning(
                     warnings,
-                    max_warnings,
+                    query.max_warnings,
                     overflow_count,
                     WalkWarning::skipped(&self.current_path, "special file (not regular)"),
                 );
@@ -1217,7 +1413,7 @@ impl WalkState {
                 Err(err) => {
                     push_walk_warning(
                         warnings,
-                        max_warnings,
+                        query.max_warnings,
                         overflow_count,
                         WalkWarning::io(&self.current_path, "metadata", &err),
                     );
@@ -1229,7 +1425,7 @@ impl WalkState {
             if !metadata.is_file() {
                 push_walk_warning(
                     warnings,
-                    max_warnings,
+                    query.max_warnings,
                     overflow_count,
                     WalkWarning::skipped(
                         &self.current_path,
@@ -1240,12 +1436,12 @@ impl WalkState {
                 continue;
             }
 
-            let rel = match self.current_path.strip_prefix(root) {
+            let rel = match self.current_path.strip_prefix(query.root) {
                 Ok(r) => r,
                 Err(_) => {
                     push_walk_warning(
                         warnings,
-                        max_warnings,
+                        query.max_warnings,
                         overflow_count,
                         WalkWarning::skipped(&self.current_path, "path escaped connector root"),
                     );
@@ -1259,7 +1455,7 @@ impl WalkState {
                 Err(err) => {
                     push_walk_warning(
                         warnings,
-                        max_warnings,
+                        query.max_warnings,
                         overflow_count,
                         WalkWarning::skipped(
                             &self.current_path,
@@ -1271,12 +1467,20 @@ impl WalkState {
                 }
             };
 
+            if query
+                .start
+                .is_some_and(|lower| rel_bytes.as_slice() < lower)
+            {
+                let _ = self.current_path.pop();
+                continue;
+            }
+
             let key = match ItemKey::try_from_vec(rel_bytes) {
                 Ok(key) => key,
                 Err(err) => {
                     push_walk_warning(
                         warnings,
-                        max_warnings,
+                        query.max_warnings,
                         overflow_count,
                         WalkWarning::skipped(
                             &self.current_path,
