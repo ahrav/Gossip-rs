@@ -33,6 +33,10 @@ pub(crate) struct StreamingSplitEstimator {
     total_bytes: u64,
     /// Total observed item count.
     count: u64,
+    /// The very first key observed in stream order. Tracked explicitly so the
+    /// "avoid degenerate first-item split" guard remains correct even if
+    /// compaction evicts the original rank_samples[0].
+    first_observed_key: Option<Vec<u8>>,
 }
 
 impl StreamingSplitEstimator {
@@ -53,11 +57,16 @@ impl StreamingSplitEstimator {
             byte_samples: Vec::new(),
             total_bytes: 0,
             count: 0,
+            first_observed_key: None,
         }
     }
 
-    /// Observe one key/value pair from the streaming walk.
+    /// Observe one key and its file size from the streaming walk.
     pub(crate) fn observe(&mut self, key: &[u8], file_size: u64) {
+        if self.first_observed_key.is_none() {
+            self.first_observed_key = Some(key.to_vec());
+        }
+
         let rank = self.count as f64;
         self.push_rank_sample(rank, key);
         self.count = self.count.saturating_add(1);
@@ -110,9 +119,9 @@ impl StreamingSplitEstimator {
         // Keep split semantics aligned with existing connectors: avoid
         // degenerate "first item" splits when weight is front-loaded.
         if self
-            .rank_samples
-            .first()
-            .is_some_and(|first| candidate.as_slice() == first.key.as_slice())
+            .first_observed_key
+            .as_ref()
+            .is_some_and(|first| candidate.as_slice() == first.as_slice())
         {
             let rank = midpoint_rank.clamp(min_rank, max_rank);
             if let Some(fallback) = Self::nearest_sample(&self.rank_samples, rank) {

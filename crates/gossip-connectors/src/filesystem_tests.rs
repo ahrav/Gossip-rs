@@ -1148,6 +1148,9 @@ fn split_point_returns_streaming_hint_for_nontrivial_range() {
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
+    // Enumerate to populate the integrated estimator.
+    let _ = collect_all(&mut c, &start, &end);
+
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
         .unwrap();
@@ -1169,6 +1172,9 @@ fn split_point_with_key_range_stays_within_configured_bounds() {
     let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"z"));
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
+
+    // Enumerate to populate the integrated estimator.
+    let _ = collect_all(&mut c, &start, &end);
 
     let split = c
         .choose_split_point_range(&start, &end, &Cursor::initial())
@@ -1192,8 +1198,11 @@ fn split_point_advances_past_cursor_last_key() {
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
-    let cursor = Cursor::with_last_key(make_key(b"c.txt"));
 
+    // Enumerate all pages to populate the integrated estimator.
+    let _ = collect_all(&mut c, &start, &end);
+
+    let cursor = Cursor::with_last_key(make_key(b"c.txt"));
     let split = c.choose_split_point_range(&start, &end, &cursor).unwrap();
     let split = split.expect("split should still be available after cursor");
     assert!(
@@ -1902,7 +1911,10 @@ fn choose_split_point_via_shard_spec() {
     ]);
     let mut c = FilesystemConnector::new(dir.path());
 
+    // Enumerate to populate the integrated estimator.
     let shard = ShardSpec::try_with_range(b"\x00", b"\xff").unwrap();
+    let _ = collect_all_via_shard(&mut c, &shard, default_budgets());
+
     let split = c
         .choose_split_point(&shard, &Cursor::initial(), default_budgets())
         .unwrap();
@@ -2333,10 +2345,11 @@ mod prop {
             let end = make_key(b"\xff");
             let (_dir, mut c) = make_connector(&files);
 
+            // Enumerate to populate the integrated estimator.
+            let all = collect_all(&mut c, &start, &end);
             let split = c
                 .choose_split_point_range(&start, &end, &Cursor::initial())
                 .expect("split lookup should not error");
-            let all = collect_all(&mut c, &start, &end);
             if all.len() < 2 {
                 prop_assert!(split.is_none());
             } else {

@@ -211,6 +211,38 @@ fn two_zero_size_items_split_at_second_key() {
 }
 
 // ---------------------------------------------------------------------------
+// Front-loaded split after compaction
+// ---------------------------------------------------------------------------
+
+/// After compaction evicts rank_samples[0], the estimator must still avoid
+/// returning the very first observed key when weight is front-loaded.
+/// This exercises the bug where `estimate_split_key` compared against
+/// `rank_samples.first()` instead of the true first observed key.
+#[test]
+fn front_loaded_split_avoids_first_key_after_compaction() {
+    // compression=32 → sample_cap = 128. Feed 2000 keys so compaction fires
+    // many times and evicts the original rank_samples[0].
+    let mut estimator = StreamingSplitEstimator::new(32);
+    let cap = estimator.sample_cap();
+    let n = 2000usize;
+    assert!(n > cap, "test must exceed sample_cap to trigger compaction");
+
+    // Massive first file: byte-weighted median lands squarely on index 0.
+    estimator.observe(&key_for_index(0), 100_000_000);
+    for idx in 1..n {
+        estimator.observe(&key_for_index(idx), 1);
+    }
+
+    let split = estimator.estimate_split_key().expect("split key expected");
+    let split_idx = index_from_key(&split);
+    assert!(
+        split_idx >= 1,
+        "split must not return index 0 (the first observed key) even after compaction, got {}",
+        split_idx
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Compaction edge-case tests
 // ---------------------------------------------------------------------------
 

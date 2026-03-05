@@ -277,6 +277,8 @@ pub struct FilesystemConnector {
     root_fd: Option<OwnedFd>,
     /// Single-entry FD cache for sequential `read_range` calls.
     cached_file: Option<CachedFile>,
+    /// Streaming split-point estimator fed during pagination walks.
+    split_estimator: StreamingSplitEstimator,
 }
 
 impl FilesystemConnector {
@@ -303,6 +305,7 @@ impl FilesystemConnector {
             overflow_warning_count: 0,
             root_fd: None,
             cached_file: None,
+            split_estimator: StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_COMPRESSION),
         }
     }
 
@@ -449,6 +452,7 @@ impl FilesystemConnector {
         )?;
         self.cached_file = None;
         self.walk_state = Some(state);
+        self.split_estimator = StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_COMPRESSION);
         Ok(())
     }
 
@@ -589,6 +593,9 @@ impl FilesystemConnector {
             return Ok(());
         };
 
+        // Try token-based restore first. On success, seek forward from the
+        // restored position. On any failure (decode, filesystem mismatch),
+        // fall through to key-only resume from root.
         if self.emit_tokens
             && let Some(walk_token) = WalkToken::decode_cursor_token(cursor)
             && let Some(restored) = WalkState::from_token(
@@ -622,10 +629,11 @@ impl FilesystemConnector {
                     let _ = self.seek_after_last_key(last_key, walk_query)?;
                 }
             }
-        } else {
-            self.reset_walk_state(deadline)?;
-            let _ = self.seek_after_last_key(last_key, walk_query)?;
+            return Ok(());
         }
+
+        self.reset_walk_state(deadline)?;
+        let _ = self.seek_after_last_key(last_key, walk_query)?;
 
         Ok(())
     }
@@ -768,6 +776,7 @@ impl FilesystemConnector {
                 "filesystem walk must produce strictly ascending keys"
             );
 
+            self.split_estimator.observe(file.key.as_bytes(), file.size);
             page_files.push(file);
         }
 
@@ -836,13 +845,13 @@ impl FilesystemConnector {
         self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor, None)
     }
 
-    /// Choose a split-point hint over bounds without materializing a full index.
+    /// Choose a split-point hint from the integrated streaming estimator.
     ///
-    /// This runs an isolated streaming walk over effective bounds and feeds a
-    /// bounded-memory quantile sketch. The active pagination `walk_state` is
-    /// not modified.
+    /// The estimator is fed during pagination walks, so no separate walk is
+    /// required. Returns `Ok(None)` when insufficient data has been observed
+    /// or when the estimate does not pass cursor/bound guards.
     fn choose_split_point_bounds(
-        &mut self,
+        &self,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
         cursor: &Cursor,
@@ -861,61 +870,13 @@ impl FilesystemConnector {
 
         let config_start = self.walk_key_range_start.clone();
         let config_end = self.walk_key_range_end.clone();
-        let Some((effective_start, effective_end)) =
+        let Some((_effective_start, effective_end)) =
             intersect_key_bounds(start, end, config_start.as_deref(), config_end.as_deref())
         else {
             return Ok(None);
         };
 
-        // Advance the walk start past the cursor so we don't traverse
-        // already-processed files only to discard them in the filter below.
-        let cursor_key_bytes;
-        let walk_start = match cursor.last_key() {
-            Some(last_key) => {
-                cursor_key_bytes = Some(last_key.as_bytes().to_vec());
-                let ck = cursor_key_bytes.as_deref().unwrap();
-                match effective_start {
-                    Some(es) if es > ck => effective_start,
-                    _ => cursor_key_bytes.as_deref(),
-                }
-            }
-            None => effective_start,
-        };
-
-        self.ensure_root_fd()?;
-
-        let mut split_warnings = Vec::new();
-        let mut split_overflow = 0usize;
-        let mut state = WalkState::new(
-            &self.root,
-            deadline,
-            self.max_warnings,
-            &mut split_warnings,
-            &mut split_overflow,
-        )?;
-        let walk_query = WalkQuery {
-            root: &self.root,
-            max_depth: self.max_walk_depth,
-            start: walk_start,
-            end: effective_end,
-            deadline,
-            max_warnings: self.max_warnings,
-        };
-        let mut estimator = StreamingSplitEstimator::new(Self::SPLIT_ESTIMATOR_COMPRESSION);
-
-        loop {
-            let Some(file) =
-                state.next_file(walk_query, &mut split_warnings, &mut split_overflow)?
-            else {
-                break;
-            };
-            if !common::is_valid_split_candidate(file.key.as_bytes(), cursor, effective_end) {
-                continue;
-            }
-            estimator.observe(file.key.as_bytes(), file.size);
-        }
-
-        let Some(split_key) = estimator.estimate_split_key() else {
+        let Some(split_key) = self.split_estimator.estimate_split_key() else {
             return Ok(None);
         };
         if !common::is_valid_split_candidate(&split_key, cursor, effective_end) {
@@ -1604,7 +1565,7 @@ impl WalkState {
         }
 
         let mut visited_dirs = HashSet::new();
-        if let Ok(root_meta) = fs::metadata(root) {
+        if let Ok(root_meta) = fs::symlink_metadata(root) {
             visited_dirs.insert((root_meta.dev(), root_meta.ino()));
         }
 
