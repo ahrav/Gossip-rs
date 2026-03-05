@@ -1201,9 +1201,13 @@ impl WalkToken {
 
         let mut offset = 1usize;
         let frame_count = decode_u16_le(bytes, &mut offset)? as usize;
-        // Cap pre-allocation to what the remaining bytes can actually hold
-        // (each frame needs at least 6 bytes: 2 component_len + 4 index).
-        let capacity_hint = frame_count.min(bytes.len().saturating_sub(offset) / 6);
+        // Cap pre-allocation: first by what the remaining bytes can actually
+        // hold (each frame needs at least 6 bytes: 2 component_len + 4 index),
+        // then by an absolute ceiling so a forged frame count cannot trigger an
+        // outsized allocation from a single untrusted token.
+        let capacity_hint = frame_count
+            .min(bytes.len().saturating_sub(offset) / 6)
+            .min(64);
         let mut frames = Vec::with_capacity(capacity_hint);
         for frame_idx in 0..frame_count {
             let component_len = decode_u16_le(bytes, &mut offset)? as usize;

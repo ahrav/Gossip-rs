@@ -683,6 +683,456 @@ fn walk_token_encoding_truncates_to_token_budget() {
 }
 
 // ---------------------------------------------------------------
+// Unit tests — from_token failure paths
+// ---------------------------------------------------------------
+
+#[test]
+fn from_token_rejects_empty_frames() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken { frames: Vec::new() };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "empty frames must yield None");
+}
+
+#[test]
+fn from_token_rejects_non_empty_root_component() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![WalkTokenFrame {
+            component: b"bad".to_vec(),
+            next_child_index: 0,
+        }],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "non-empty root component must yield None");
+}
+
+#[test]
+fn from_token_rejects_depth_exceeding_max() {
+    let dir = create_test_dir(&[("sub/a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: b"sub".to_vec(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    // max_depth=0 means zero children allowed.
+    let result =
+        WalkState::from_token(dir.path(), token, 0, None, 10, &mut warnings, &mut overflow)
+            .expect("should not error");
+    assert!(
+        result.is_none(),
+        "child count exceeding max_depth must yield None"
+    );
+}
+
+#[test]
+fn from_token_rejects_empty_child_component() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "empty child component must yield None");
+}
+
+#[test]
+fn from_token_rejects_child_with_slash() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: b"a/b".to_vec(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(
+        result.is_none(),
+        "child component with slash must yield None"
+    );
+}
+
+#[test]
+fn from_token_rejects_child_with_null_byte() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: vec![b'a', 0],
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(
+        result.is_none(),
+        "child component with null byte must yield None"
+    );
+}
+
+#[test]
+fn from_token_handles_missing_directory() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    // Point at a child directory that does not exist on disk.
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: b"nonexistent".to_vec(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "missing child directory must yield None");
+}
+
+#[test]
+fn from_token_rejects_out_of_range_child_index() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
+    // Root has 2 entries; an index of u32::MAX is way past the end.
+    let token = WalkToken {
+        frames: vec![WalkTokenFrame {
+            component: Vec::new(),
+            next_child_index: u32::MAX,
+        }],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "out-of-range child index must yield None");
+}
+
+// ---------------------------------------------------------------
+// Unit tests — Token resume after filesystem mutation
+// ---------------------------------------------------------------
+
+#[test]
+fn token_resume_after_filesystem_mutation() {
+    let dir = create_test_dir(&[
+        ("aaa.txt", b"1"),
+        ("bbb.txt", b"2"),
+        ("ccc.txt", b"3"),
+        ("ddd.txt", b"4"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Page 1: enumerate first 2 items.
+    let page1 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(2))
+        .expect("page 1");
+    assert_eq!(page1.items().len(), 2);
+    let last_key_p1 = page1.items().last().unwrap().item_key().as_bytes().to_vec();
+    let cursor_after_p1 = page1.next_cursor().clone();
+
+    // Mutate the filesystem between pages: remove one file, add another.
+    fs::remove_file(dir.path().join("ccc.txt")).expect("remove ccc.txt");
+    fs::write(dir.path().join("bcc.txt"), b"new").expect("write bcc.txt");
+
+    // Resume from the cursor saved after page 1.
+    let mut c2 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut remaining_keys = Vec::new();
+    let mut cursor = cursor_after_p1;
+    loop {
+        let page = c2
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(10))
+            .expect("resume page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            remaining_keys.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // Invariants: no duplicates, all keys sorted, all keys > last key from page 1.
+    for (i, key) in remaining_keys.iter().enumerate() {
+        assert!(
+            key.as_slice() > last_key_p1.as_slice(),
+            "resumed key {:?} should be > last page-1 key {:?}",
+            String::from_utf8_lossy(key),
+            String::from_utf8_lossy(&last_key_p1),
+        );
+        if i > 0 {
+            assert!(
+                key.as_slice() > remaining_keys[i - 1].as_slice(),
+                "keys must be strictly sorted"
+            );
+        }
+    }
+    // No duplicates (sorted + distinct check above implies this).
+}
+
+// ---------------------------------------------------------------
+// Unit tests — Token + shard bounds interaction
+// ---------------------------------------------------------------
+
+#[test]
+fn token_resume_with_shard_bounds() {
+    let dir = create_test_dir(&[
+        ("aaa/f1.txt", b"1"),
+        ("aaa/f2.txt", b"2"),
+        ("mmm/f1.txt", b"3"),
+        ("mmm/f2.txt", b"4"),
+        ("zzz/f1.txt", b"5"),
+        ("zzz/f2.txt", b"6"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path())
+        .with_tokens(true)
+        .with_shard_bounds(b"mmm", b"zzz");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Enumerate one item at a time to force multi-page token resume.
+    let mut all_keys = Vec::new();
+    let mut cursor = Cursor::initial();
+    loop {
+        let page = c
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(1))
+            .expect("page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            all_keys.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // All keys must be in [mmm, zzz) and sorted.
+    for (i, key) in all_keys.iter().enumerate() {
+        assert!(
+            key.as_slice() >= b"mmm".as_slice(),
+            "key {:?} should be >= mmm",
+            String::from_utf8_lossy(key),
+        );
+        assert!(
+            key.as_slice() < b"zzz".as_slice(),
+            "key {:?} should be < zzz",
+            String::from_utf8_lossy(key),
+        );
+        if i > 0 {
+            assert!(
+                key.as_slice() > all_keys[i - 1].as_slice(),
+                "keys must be strictly sorted"
+            );
+        }
+    }
+    // Expect exactly the mmm/ subtree items.
+    assert!(
+        !all_keys.is_empty(),
+        "should enumerate at least one key in [mmm, zzz)"
+    );
+    for key in &all_keys {
+        assert!(
+            key.starts_with(b"mmm/"),
+            "all keys should be under mmm/; got {:?}",
+            String::from_utf8_lossy(key),
+        );
+    }
+}
+
+// ---------------------------------------------------------------
+// Unit tests — Token size boundaries with long components
+// ---------------------------------------------------------------
+
+#[test]
+fn token_encodes_frames_with_varying_component_lengths() {
+    // Build a WalkState with components of length 1, 127, 254, and 255 bytes.
+    let component_lengths = [1usize, 127, 254, 255];
+    let mut stack = Vec::new();
+    stack.push(WalkFrame {
+        component: None,
+        depth: 0,
+        entries_since_check: 0,
+        next_child_index: 0,
+        entries: std::collections::VecDeque::new(),
+    });
+    for (i, &len) in component_lengths.iter().enumerate() {
+        stack.push(WalkFrame {
+            component: Some(std::ffi::OsString::from_vec(vec![b'x'; len])),
+            depth: i + 1,
+            entries_since_check: 0,
+            next_child_index: i as u32 + 1,
+            entries: std::collections::VecDeque::new(),
+        });
+    }
+    let state = WalkState {
+        stack,
+        current_path: std::path::PathBuf::from("/tmp"),
+        pending: None,
+        last_emitted_key: None,
+        emitted_count: 0,
+        exhausted: false,
+        visited_dirs: std::collections::HashSet::new(),
+    };
+
+    let token = WalkToken::encode_from_state(&state).expect("should encode");
+    let decoded = WalkToken::decode_bytes(token.as_bytes()).expect("should decode");
+
+    // All 5 frames (root + 4 components) should survive the round-trip.
+    assert_eq!(decoded.frames.len(), 5);
+    for (i, &len) in component_lengths.iter().enumerate() {
+        assert_eq!(
+            decoded.frames[i + 1].component.len(),
+            len,
+            "component {i} length mismatch"
+        );
+    }
+}
+
+#[test]
+fn token_truncation_drops_oversized_component() {
+    // A single frame with a component at u16::MAX + 1 bytes cannot be encoded
+    // because component_len exceeds u16. The encoder should break before it and
+    // produce a root-only token with the saturating_sub(1) rewind applied.
+    let huge_len = u16::MAX as usize + 1;
+    let stack = vec![
+        WalkFrame {
+            component: None,
+            depth: 0,
+            entries_since_check: 0,
+            next_child_index: 5,
+            entries: std::collections::VecDeque::new(),
+        },
+        WalkFrame {
+            component: Some(std::ffi::OsString::from_vec(vec![b'z'; huge_len])),
+            depth: 1,
+            entries_since_check: 0,
+            next_child_index: 0,
+            entries: std::collections::VecDeque::new(),
+        },
+    ];
+    let state = WalkState {
+        stack,
+        current_path: std::path::PathBuf::from("/tmp"),
+        pending: None,
+        last_emitted_key: None,
+        emitted_count: 0,
+        exhausted: false,
+        visited_dirs: std::collections::HashSet::new(),
+    };
+
+    let token = WalkToken::encode_from_state(&state).expect("root-only token should be emitted");
+    let decoded = WalkToken::decode_bytes(token.as_bytes()).expect("should decode");
+
+    // Only the root frame survives; it becomes the truncated leaf.
+    assert_eq!(decoded.frames.len(), 1, "only root frame should survive");
+    assert_eq!(
+        decoded.frames[0].next_child_index, 4,
+        "truncated leaf root should have saturating_sub(1) applied: 5 -> 4"
+    );
+}
+
+// ---------------------------------------------------------------
 // Unit tests — Split points
 // ---------------------------------------------------------------
 
