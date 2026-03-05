@@ -60,7 +60,7 @@
 //! Deadline expiry remains retryable; malformed bounds remain permanent.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::{CString, OsString},
     fs, io,
     os::unix::{
@@ -188,6 +188,8 @@ struct WalkFrame {
 /// - `last_emitted_key` tracks connector-visible resume position, not merely
 ///   "last discovered" path.
 /// - `exhausted` is sticky once a full walk pass returns `None`.
+/// - `visited_dirs` tracks `(dev, ino)` pairs of already-descended directories
+///   to break cycles from bind mounts or directory hardlinks.
 struct WalkState {
     stack: Vec<WalkFrame>,
     current_path: PathBuf,
@@ -195,6 +197,9 @@ struct WalkState {
     last_emitted_key: Option<ItemKey>,
     emitted_count: usize,
     exhausted: bool,
+    /// `(dev, ino)` pairs of directories already descended into.
+    /// Prevents infinite traversal on bind-mount or hardlink cycles.
+    visited_dirs: HashSet<(u64, u64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,11 +295,13 @@ impl FilesystemConnector {
     /// than latching permanent failures. The streaming walk model intentionally
     /// omits failure memoization because root-directory conditions can change
     /// between calls (e.g., a mount appearing, permissions being adjusted),
-    /// and the per-attempt cost is low (2-3 syscalls).
+    /// and the per-attempt cost is low (3-4 syscalls).
     ///
-    /// Root identity is verified by comparing the opened fd's `(dev, ino)` to
-    /// the canonical path's metadata, reducing TOCTOU exposure between
-    /// canonicalization and open.
+    /// Root identity is verified by capturing the canonical path's `(dev, ino)`
+    /// *before* opening, then comparing it to the opened fd's `fstat` result.
+    /// This narrows the TOCTOU window: the race is stat→open (same direction)
+    /// rather than open→stat where the fd could refer to a different directory
+    /// than the one we stat'd.
     fn ensure_root_fd(&mut self) -> Result<(), EnumerateError> {
         if self.root_fd.is_some() {
             return Ok(());
@@ -304,14 +311,18 @@ impl FilesystemConnector {
         self.root = fs::canonicalize(&self.root)
             .map_err(|err| classify_io_enumerate_error("canonicalize", &self.root, &err))?;
 
+        // Capture path identity BEFORE open so the authoritative check is
+        // fstat on the fd (which cannot be swapped out from under us).
+        let path_meta = fs::metadata(&self.root)
+            .map_err(|err| classify_io_enumerate_error("stat_root", &self.root, &err))?;
+        let expected_id = (path_meta.dev(), path_meta.ino());
+
         // Open root as a directory fd for openat-based reads.
         let root_fd = open_dir_fd(&self.root)
             .map_err(|err| classify_io_enumerate_error("open_root_dir", &self.root, &err))?;
 
-        // Verify the opened fd still refers to the same directory we
-        // canonicalized. A mismatch indicates the root was replaced
-        // (rename + symlink, bind-mount swap, etc.) between steps.
-        verify_root_identity(&root_fd, &self.root)
+        // Verify the opened fd matches the pre-captured identity.
+        verify_root_identity(&root_fd, expected_id)
             .map_err(|err| classify_io_enumerate_error("verify_root_identity", &self.root, &err))?;
 
         self.root_fd = Some(root_fd);
@@ -392,6 +403,17 @@ impl FilesystemConnector {
         ) {
             self.reset_walk_state(deadline)?;
             if let Some(last_key) = cursor.last_key() {
+                // Skip forward past all keys ≤ last_key. The first key
+                // strictly greater than last_key is staged in `pending`.
+                //
+                // Correctness argument for the debug assertion in
+                // `emit_page_range` (`file.key > last_emitted_key`):
+                //   - The loop below only breaks when `file.key > last_key`.
+                //   - We then set `last_emitted_key = last_key.clone()`.
+                //   - Therefore `pending.key > last_emitted_key` holds by
+                //     construction, even if `last_key` does not correspond
+                //     to any actual file on disk (cold resume with a stale
+                //     cursor).
                 let mut skipped: usize = 0;
                 loop {
                     let next = {
@@ -422,6 +444,8 @@ impl FilesystemConnector {
                     skipped += 1;
                 }
 
+                // Record how many items were skipped so `emitted_count`
+                // reflects the global index across connector lifetimes.
                 let state = self
                     .walk_state
                     .as_mut()
@@ -845,6 +869,13 @@ impl ReadConnector for FilesystemConnector {
 /// Balances deadline responsiveness against `Instant::now()` syscall overhead.
 const DEADLINE_CHECK_INTERVAL: usize = 512;
 
+/// Hard cap on entries buffered from a single directory.
+///
+/// Pathological directories (e.g. `/proc`-like mounts or intentional DoS via
+/// millions of files in one folder) could otherwise exhaust memory during the
+/// sort step. 500K entries × ~40 bytes ≈ 20 MB, which is large but bounded.
+const MAX_ENTRIES_PER_DIR: usize = 500_000;
+
 #[inline]
 /// Append a warning until capacity is reached, then increment overflow count.
 fn push_walk_warning(
@@ -926,7 +957,7 @@ fn read_dir_sorted_entries(
     overflow_count: &mut usize,
     warnings: &mut Vec<WalkWarning>,
 ) -> Result<VecDeque<BufferedDirEntry>, EnumerateError> {
-    let mut buffered = Vec::new();
+    let mut buffered = Vec::with_capacity(256);
     let mut entries_since_check = 0usize;
     for entry_result in reader {
         entries_since_check += 1;
@@ -964,6 +995,11 @@ fn read_dir_sorted_entries(
             }
         };
         buffered.push(BufferedDirEntry { name, file_type });
+        if buffered.len() >= MAX_ENTRIES_PER_DIR {
+            return Err(EnumerateError::retryable(
+                "directory exceeds maximum entry count",
+            ));
+        }
     }
     buffered.sort_unstable_by(cmp_dir_entry);
     Ok(VecDeque::from(buffered))
@@ -993,6 +1029,13 @@ impl WalkState {
             warnings,
         )?;
 
+        // Seed visited set with the root directory identity so cycles back
+        // to root are detected immediately.
+        let mut visited_dirs = HashSet::new();
+        if let Ok(root_meta) = fs::metadata(root) {
+            visited_dirs.insert((root_meta.dev(), root_meta.ino()));
+        }
+
         Ok(Self {
             stack: vec![WalkFrame {
                 component: None,
@@ -1000,11 +1043,18 @@ impl WalkState {
                 entries_since_check: 0,
                 entries: root_entries,
             }],
-            current_path: root.to_path_buf(),
+            current_path: {
+                // Pre-allocate for root + one page of typical path components
+                // to avoid repeated small reallocations during DFS descent.
+                let mut buf = OsString::with_capacity(root.as_os_str().len() + 4096);
+                buf.push(root);
+                PathBuf::from(buf)
+            },
             pending: None,
             last_emitted_key: None,
             emitted_count: 0,
             exhausted: false,
+            visited_dirs,
         })
     }
 
@@ -1080,6 +1130,26 @@ impl WalkState {
             }
 
             if entry.file_type.is_dir() {
+                // Cycle detection: skip directories already visited (bind mounts,
+                // directory hardlinks). The metadata call is cheap relative to the
+                // read_dir that would follow on descent.
+                if let Ok(dir_meta) = fs::metadata(&self.current_path) {
+                    let dir_id = (dir_meta.dev(), dir_meta.ino());
+                    if !self.visited_dirs.insert(dir_id) {
+                        push_walk_warning(
+                            warnings,
+                            max_warnings,
+                            overflow_count,
+                            WalkWarning::skipped(
+                                &self.current_path,
+                                "directory cycle detected (duplicate dev/ino)",
+                            ),
+                        );
+                        let _ = self.current_path.pop();
+                        continue;
+                    }
+                }
+
                 if depth < max_depth {
                     if let Err(e) = check_walk_deadline(deadline) {
                         let _ = self.current_path.pop();
@@ -1391,12 +1461,12 @@ fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
     Ok((stat.st_dev as u64, stat.st_ino as u64))
 }
 
-/// Verify that the opened root fd still refers to the same directory as
-/// the canonicalized path.
+/// Verify that the opened root fd matches a pre-captured `(dev, ino)` identity.
 ///
-/// Compares `(dev, ino)` from `fstat(root_fd)` against `stat(root_path)`.
-/// Returns an error if they mismatch, indicating the root directory was
-/// replaced between `open_dir_fd` and the walk (rename, bind mount, etc.).
+/// The caller captures the expected identity via `fs::metadata` *before*
+/// opening the fd, then passes it here. This keeps the authoritative check
+/// on the fd side (fstat cannot be raced) and narrows the TOCTOU window to
+/// stat→open rather than open→stat.
 ///
 /// # Error classification
 ///
@@ -1407,11 +1477,9 @@ fn fd_dev_ino(fd: &OwnedFd) -> io::Result<(u64, u64)> {
 /// path itself. Retryable classification allows callers to re-canonicalize and
 /// re-open on the next attempt — at which point the fd and path will agree (or
 /// the path will have vanished, producing a different permanent error).
-fn verify_root_identity(root_fd: &OwnedFd, root_path: &Path) -> Result<(), io::Error> {
+fn verify_root_identity(root_fd: &OwnedFd, expected_id: (u64, u64)) -> Result<(), io::Error> {
     let (fd_dev, fd_ino) = fd_dev_ino(root_fd)?;
-    let path_meta = fs::metadata(root_path)?;
-    let (path_dev, path_ino) = (path_meta.dev(), path_meta.ino());
-    if fd_dev != path_dev || fd_ino != path_ino {
+    if fd_dev != expected_id.0 || fd_ino != expected_id.1 {
         return Err(io::Error::other(
             "root directory changed between open and walk (dev/ino mismatch); retry with a fresh connector",
         ));

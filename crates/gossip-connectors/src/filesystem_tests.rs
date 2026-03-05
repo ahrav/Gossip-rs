@@ -967,6 +967,84 @@ fn deep_directory_does_not_stack_overflow() {
 }
 
 // ---------------------------------------------------------------
+// Depth limit and cycle detection tests
+// ---------------------------------------------------------------
+
+#[test]
+fn depth_limit_catches_deep_trees() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let mut path = dir.path().to_path_buf();
+    // Create 10-deep tree: 00/01/02/.../09/leaf.txt
+    for i in 0..10 {
+        path = path.join(format!("{i:02}"));
+    }
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("leaf.txt"), b"deep").unwrap();
+
+    // Also create a shallow file that IS reachable.
+    fs::write(dir.path().join("shallow.txt"), b"top").unwrap();
+
+    let mut c = FilesystemConnector::new(dir.path()).with_max_depth(5);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let all = collect_all(&mut c, &start, &end);
+    // Only the shallow file should be returned; the deep leaf is past depth 5.
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].item_key().as_bytes(), b"shallow.txt");
+
+    // A depth-exceeded warning should be present.
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("exceeded maximum walk depth")),
+        "expected a depth-exceeded warning, got: {:?}",
+        c.walk_warnings(),
+    );
+}
+
+#[test]
+fn file_deleted_between_readdir_and_stat_generates_warning() {
+    let dir = create_test_dir(&[("a.txt", b"aaa"), ("doomed.txt", b"bye"), ("z.txt", b"zzz")]);
+
+    let mut c = FilesystemConnector::new(dir.path());
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // First page: get a.txt with a page budget of 1.
+    let page1 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .unwrap();
+    assert_eq!(page1.items().len(), 1);
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"a.txt");
+
+    // Delete doomed.txt between pages — simulates the race.
+    fs::remove_file(dir.path().join("doomed.txt")).unwrap();
+
+    // Second page: doomed.txt is already buffered in the walker's directory
+    // entries but stat will fail. The walker should skip it with a warning
+    // and return z.txt.
+    let page2 = c
+        .enumerate_page_range(&start, &end, page1.next_cursor(), small_page_budgets(2))
+        .unwrap();
+    let keys: Vec<&[u8]> = page2
+        .items()
+        .iter()
+        .map(|i| i.item_key().as_bytes())
+        .collect();
+    assert_eq!(keys, vec![b"z.txt".as_slice()]);
+
+    // A metadata-related warning should have been recorded.
+    assert!(
+        c.walk_warnings()
+            .iter()
+            .any(|w| w.message.contains("metadata failed")),
+        "expected a 'metadata failed' warning, got: {:?}",
+        c.walk_warnings(),
+    );
+}
+
+// ---------------------------------------------------------------
 // FD cache test
 // ---------------------------------------------------------------
 
@@ -2521,7 +2599,10 @@ fn root_fd_identity_check_rejects_dev_ino_mismatch() {
 
     let fd_a = open_dir_fd(dir_a.path()).expect("open dir_a fd");
 
-    let err = verify_root_identity(&fd_a, dir_b.path())
+    // Capture dir_b's identity and verify against dir_a's fd.
+    let b_meta = fs::metadata(dir_b.path()).expect("stat dir_b");
+    let b_id = (b_meta.dev(), b_meta.ino());
+    let err = verify_root_identity(&fd_a, b_id)
         .expect_err("verify_root_identity should reject a mismatched path");
 
     assert_eq!(err.kind(), std::io::ErrorKind::Other);
