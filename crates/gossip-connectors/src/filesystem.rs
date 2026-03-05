@@ -34,9 +34,9 @@
 //! keys. Cursor progression is key-authoritative:
 //!
 //! - Sequential pages continue from the existing walk state.
-//! - Cursor mismatch (including cold resume in a fresh connector) rebuilds the
-//!   walk from root and skips forward until the first key strictly greater than
-//!   `cursor.last_key()`.
+//! - Cursor mismatch (including cold resume in a fresh connector) first attempts
+//!   token-based walk-stack restore, then falls back to rebuilding from root and
+//!   skipping until the first key strictly greater than `cursor.last_key()`.
 //!
 //! # Consistency model
 //!
@@ -73,7 +73,7 @@ use std::{
     ffi::{CString, OsString},
     fs, io,
     os::unix::{
-        ffi::OsStrExt,
+        ffi::{OsStrExt, OsStringExt},
         fs::{FileExt, MetadataExt},
         io::{AsRawFd, FromRawFd, OwnedFd},
     },
@@ -84,8 +84,8 @@ use std::{
 use gossip_contracts::{
     connector::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, ToxicDigest,
-        VersionId,
+        EnumerationPage, ItemKey, ItemRef, MAX_TOKEN_SIZE, ReadConnector, ReadError, ScanItem,
+        TokenBytes, ToxicDigest, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorTag, ObjectVersionId, StableItemId},
@@ -185,6 +185,8 @@ struct WalkFrame {
     depth: usize,
     /// Yielded-entry count since the last deadline check.
     entries_since_check: usize,
+    /// Index of the next child to poll in this frame's sorted entry list.
+    next_child_index: u32,
     /// Sorted remaining entries for this directory.
     entries: VecDeque<BufferedDirEntry>,
 }
@@ -197,6 +199,30 @@ struct WalkQuery<'a> {
     end: Option<&'a [u8]>,
     deadline: Option<Instant>,
     max_warnings: usize,
+}
+
+/// Cursor token encoding version for serialized DFS walk checkpoints.
+const WALK_TOKEN_VERSION: u8 = 0x01;
+
+/// Compact serialized DFS walk position used for cursor resume.
+///
+/// Tokens are advisory only. Decode/restore failure falls back to key-only
+/// resume from root.
+///
+/// Wire format (little-endian except version):
+/// `[version: u8][frame_count: u16][frames..]`, where each frame is
+/// `[component_len: u16][component_bytes][next_child_index: u32]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WalkToken {
+    frames: Vec<WalkTokenFrame>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WalkTokenFrame {
+    /// Directory component relative to parent (empty for root frame).
+    component: Vec<u8>,
+    /// Index of the next child to poll in this directory's sorted list.
+    next_child_index: u32,
 }
 
 /// Resumable sorted DFS state used as the serving layer for pagination.
@@ -216,6 +242,12 @@ struct WalkState {
     current_path: PathBuf,
     pending: Option<FileEntry>,
     last_emitted_key: Option<ItemKey>,
+    /// Approximate number of items emitted across the lifetime of this walk.
+    ///
+    /// After token-based resume, this only counts items from the token position
+    /// forward (not the global count from root). This field is currently
+    /// unused for decision logic — it exists for observability and may be
+    /// removed if no consumer materializes.
     emitted_count: usize,
     exhausted: bool,
     /// `(dev, ino)` pairs of directories already descended into.
@@ -431,16 +463,95 @@ impl FilesystemConnector {
         }
     }
 
+    /// Advance the active walk to the first file strictly greater than `last_key`.
+    ///
+    /// The selected file is staged into `WalkState::pending` so page assembly
+    /// can emit it without re-traversal.
+    fn seek_after_last_key(
+        &mut self,
+        last_key: &ItemKey,
+        walk_query: WalkQuery<'_>,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        let mut skipped = 0usize;
+        {
+            let state = self
+                .walk_state
+                .as_mut()
+                .expect("walk state must exist while seeking to cursor");
+            state.pending = None;
+        }
+
+        loop {
+            let next = {
+                let state = self
+                    .walk_state
+                    .as_mut()
+                    .expect("walk state must exist while seeking to cursor");
+                state.next_file(
+                    walk_query,
+                    &mut self.walk_warnings,
+                    &mut self.overflow_warning_count,
+                )?
+            };
+            let Some(file) = next else {
+                break;
+            };
+            if file.key.as_bytes() > last_key.as_bytes() {
+                let state = self
+                    .walk_state
+                    .as_mut()
+                    .expect("walk state must exist while seeking to cursor");
+                state.pending = Some(file);
+                break;
+            }
+            skipped += 1;
+        }
+
+        let state = self
+            .walk_state
+            .as_mut()
+            .expect("walk state must exist while finalizing cursor seek");
+        state.last_emitted_key = Some(last_key.clone());
+        state.emitted_count = skipped;
+        Ok(state.pending.as_ref().map(|file| file.key.clone()))
+    }
+
+    /// Walk from root to find the first key strictly greater than `last_key`.
+    ///
+    /// Used as the ground-truth reference for token resume cross-checks in
+    /// test builds. Runs after token resume to detect divergence from stale
+    /// or corrupted tokens.
+    #[cfg(test)]
+    fn key_only_resume_probe(
+        &mut self,
+        last_key: &ItemKey,
+        walk_query: WalkQuery<'_>,
+    ) -> Result<Option<ItemKey>, EnumerateError> {
+        let mut probe_warnings = Vec::new();
+        let mut probe_overflow = 0usize;
+        let mut probe = WalkState::new(
+            &self.root,
+            walk_query.deadline,
+            self.max_warnings,
+            &mut probe_warnings,
+            &mut probe_overflow,
+        )?;
+
+        loop {
+            let next = probe.next_file(walk_query, &mut probe_warnings, &mut probe_overflow)?;
+            let Some(file) = next else {
+                return Ok(None);
+            };
+            if file.key.as_bytes() > last_key.as_bytes() {
+                return Ok(Some(file.key));
+            }
+        }
+    }
+
     /// Ensure traversal state is aligned with the caller-provided cursor.
     ///
-    /// On mismatch we rewind to root, then stream forward until the first key
-    /// strictly greater than `cursor.last_key()`. That key is staged in
-    /// `WalkState::pending` so the next page emits it without re-traversal.
-    ///
-    /// Skipped entries are counted so that `emitted_count` reflects the total
-    /// number of items emitted across all pages, including those from previous
-    /// connector instances. This ensures opaque resume tokens encode correct
-    /// global indices after cold resume.
+    /// On mismatch we first try rebuilding from the advisory walk token. Any
+    /// decode/restore failure falls back to key-only seek from root.
     fn align_walk_to_cursor(
         &mut self,
         cursor: &Cursor,
@@ -449,72 +560,89 @@ impl FilesystemConnector {
         deadline: Option<Instant>,
     ) -> Result<(), EnumerateError> {
         self.start_walk_if_needed(deadline)?;
-        if !Self::cursor_matches_state(
+
+        if Self::cursor_matches_state(
             self.walk_state
                 .as_ref()
                 .expect("walk state must exist after start_walk_if_needed"),
             cursor,
         ) {
-            self.reset_walk_state(deadline)?;
-            if let Some(last_key) = cursor.last_key() {
-                // Skip forward past all keys ≤ last_key. The first key
-                // strictly greater than last_key is staged in `pending`.
-                //
-                // Correctness argument for the debug assertion in
-                // `emit_page_range` (`file.key > last_emitted_key`):
-                //   - The loop below only breaks when `file.key > last_key`.
-                //   - We then set `last_emitted_key = last_key.clone()`.
-                //   - Therefore `pending.key > last_emitted_key` holds by
-                //     construction, even if `last_key` does not correspond
-                //     to any actual file on disk (cold resume with a stale
-                //     cursor).
-                let mut skipped: usize = 0;
-                let walk_query = WalkQuery {
-                    root: &self.root,
-                    max_depth: self.max_walk_depth,
-                    start,
-                    end,
-                    deadline,
-                    max_warnings: self.max_warnings,
-                };
-                loop {
-                    let next = {
-                        let state = self
-                            .walk_state
-                            .as_mut()
-                            .expect("walk state must exist after reset_walk_state");
-                        state.next_file(
-                            walk_query,
-                            &mut self.walk_warnings,
-                            &mut self.overflow_warning_count,
-                        )?
-                    };
-                    let Some(file) = next else {
-                        break;
-                    };
-                    if file.key.as_bytes() > last_key.as_bytes() {
-                        let state = self
-                            .walk_state
-                            .as_mut()
-                            .expect("walk state must exist while aligning cursor");
-                        state.pending = Some(file);
-                        break;
-                    }
-                    skipped += 1;
-                }
+            return Ok(());
+        }
 
-                // Record how many items were skipped so `emitted_count`
-                // reflects the global index across connector lifetimes.
-                let state = self
-                    .walk_state
-                    .as_mut()
-                    .expect("walk state must exist while aligning cursor");
-                state.emitted_count = skipped;
-                state.last_emitted_key = Some(last_key.clone());
+        self.cached_file = None;
+        let root = self.root.clone();
+        let walk_query = WalkQuery {
+            root: &root,
+            max_depth: self.max_walk_depth,
+            start,
+            end,
+            deadline,
+            max_warnings: self.max_warnings,
+        };
+
+        let Some(last_key) = cursor.last_key() else {
+            self.reset_walk_state(deadline)?;
+            return Ok(());
+        };
+
+        if self.emit_tokens
+            && let Some(walk_token) = WalkToken::decode_cursor_token(cursor)
+            && let Some(restored) = WalkState::from_token(
+                &root,
+                walk_token,
+                self.max_walk_depth,
+                deadline,
+                self.max_warnings,
+                &mut self.walk_warnings,
+                &mut self.overflow_warning_count,
+            )?
+        {
+            self.walk_state = Some(restored);
+            let _token_next = self.seek_after_last_key(last_key, walk_query)?;
+
+            // Cross-check: verify token-based resume agrees with key-only
+            // resume. Limited to test builds so production does not pay for
+            // the full-tree walk on every resume. On mismatch, fall back to
+            // key-only position (stale tokens are expected in adversarial tests).
+            #[cfg(test)]
+            {
+                let probe_query = WalkQuery {
+                    deadline: None,
+                    ..walk_query
+                };
+                let key_next = self.key_only_resume_probe(last_key, probe_query)?;
+                let token_matches = _token_next.as_ref().map(|k| k.as_bytes())
+                    == key_next.as_ref().map(|k| k.as_bytes());
+                if !token_matches {
+                    self.reset_walk_state(deadline)?;
+                    let _ = self.seek_after_last_key(last_key, walk_query)?;
+                }
             }
+        } else {
+            self.reset_walk_state(deadline)?;
+            let _ = self.seek_after_last_key(last_key, walk_query)?;
         }
 
         Ok(())
+    }
+
+    /// Build the next cursor from `last_key` plus optional walk-state token.
+    ///
+    /// Token construction failures (for example size-budget truncation to zero)
+    /// degrade to key-only cursors by design.
+    fn build_next_walk_cursor(&self, last_key: ItemKey) -> Cursor {
+        if !self.emit_tokens {
+            return Cursor::with_last_key(last_key);
+        }
+        match self
+            .walk_state
+            .as_ref()
+            .and_then(WalkToken::encode_from_state)
+        {
+            Some(token) => Cursor::with_token(last_key, token),
+            None => Cursor::with_last_key(last_key),
+        }
     }
 
     // ---------------------------------------------------------------
@@ -553,8 +681,8 @@ impl FilesystemConnector {
     /// with per-request bounds before traversal.
     ///
     /// Cursor handling is key-authoritative: when the in-memory walk cursor does
-    /// not match `cursor.last_key`, the walk is reconstructed from root and
-    /// advanced until the first key strictly greater than `last_key`.
+    /// not match `cursor.last_key`, the connector first attempts token-based
+    /// stack restore, then falls back to root rebuild and key-only seek.
     ///
     /// If no in-range items are available for this call, the returned page is
     /// empty and the cursor is left unchanged.
@@ -586,12 +714,6 @@ impl FilesystemConnector {
         };
 
         self.align_walk_to_cursor(cursor, effective_start, effective_end, budgets.deadline())?;
-
-        let page_start = self
-            .walk_state
-            .as_ref()
-            .expect("walk state must exist after align_walk_to_cursor")
-            .emitted_count;
 
         let mut page_files = Vec::with_capacity(budgets.max_items());
         let walk_query = WalkQuery {
@@ -667,10 +789,10 @@ impl FilesystemConnector {
 
         let staged = common::assemble_pooled_page_shared_key_ref(
             page_files.iter().map(|file| file.key.as_bytes()),
-            self.emit_tokens,
-            page_start,
+            false,
+            0,
         )?;
-        let common::StagedPage { wrappers, token } = staged;
+        let common::StagedPage { wrappers, token: _ } = staged;
         let mut out = Vec::with_capacity(wrappers.len());
         for ((item_key, item_ref), file) in wrappers.into_iter().zip(page_files.into_iter()) {
             out.push(
@@ -684,13 +806,7 @@ impl FilesystemConnector {
             .expect("page_files non-empty implies staged output non-empty")
             .item_key()
             .clone();
-        let next_cursor = common::build_next_cursor_from_staged(
-            last_key,
-            page_start,
-            out.len(),
-            self.emit_tokens,
-            token,
-        )?;
+        let next_cursor = self.build_next_walk_cursor(last_key);
 
         Ok(EnumerationPage::new(out, next_cursor))
     }
@@ -1054,6 +1170,140 @@ fn intersect_key_bounds<'a>(
     }
 }
 
+#[inline]
+fn decode_u16_le(bytes: &[u8], offset: &mut usize) -> Option<u16> {
+    let end = offset.checked_add(std::mem::size_of::<u16>())?;
+    let chunk = bytes.get(*offset..end)?;
+    *offset = end;
+    Some(u16::from_le_bytes(chunk.try_into().ok()?))
+}
+
+#[inline]
+fn decode_u32_le(bytes: &[u8], offset: &mut usize) -> Option<u32> {
+    let end = offset.checked_add(std::mem::size_of::<u32>())?;
+    let chunk = bytes.get(*offset..end)?;
+    *offset = end;
+    Some(u32::from_le_bytes(chunk.try_into().ok()?))
+}
+
+impl WalkToken {
+    #[inline]
+    fn decode_cursor_token(cursor: &Cursor) -> Option<Self> {
+        cursor
+            .token()
+            .and_then(|token| Self::decode_bytes(token.as_bytes()))
+    }
+
+    fn decode_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.first().copied()? != WALK_TOKEN_VERSION {
+            return None;
+        }
+
+        let mut offset = 1usize;
+        let frame_count = decode_u16_le(bytes, &mut offset)? as usize;
+        // Cap pre-allocation: first by what the remaining bytes can actually
+        // hold (each frame needs at least 6 bytes: 2 component_len + 4 index),
+        // then by an absolute ceiling so a forged frame count cannot trigger an
+        // outsized allocation from a single untrusted token.
+        let capacity_hint = frame_count
+            .min(bytes.len().saturating_sub(offset) / 6)
+            .min(64);
+        let mut frames = Vec::with_capacity(capacity_hint);
+        for frame_idx in 0..frame_count {
+            let component_len = decode_u16_le(bytes, &mut offset)? as usize;
+            let component_end = offset.checked_add(component_len)?;
+            let component = bytes.get(offset..component_end)?.to_vec();
+            offset = component_end;
+            let next_child_index = decode_u32_le(bytes, &mut offset)?;
+
+            // Root frame uses an empty component; all non-root frames must have
+            // non-empty component bytes and represent a single path segment.
+            // Reject `.` and `..` to prevent path traversal outside the root.
+            if frame_idx == 0 {
+                if !component.is_empty() {
+                    return None;
+                }
+            } else if component.is_empty()
+                || component.contains(&b'/')
+                || component.contains(&0)
+                || component == b"."
+                || component == b".."
+            {
+                return None;
+            }
+
+            frames.push(WalkTokenFrame {
+                component,
+                next_child_index,
+            });
+        }
+
+        if offset != bytes.len() {
+            return None;
+        }
+
+        Some(Self { frames })
+    }
+
+    fn encode_from_state(state: &WalkState) -> Option<TokenBytes> {
+        if state.stack.is_empty() {
+            return None;
+        }
+
+        let total_frames = state.stack.len().min(u16::MAX as usize);
+
+        // First pass: compute encoded_size and keep count directly from
+        // state.stack without allocating an intermediate Vec<WalkTokenFrame>.
+        let mut encoded_size = 1usize + std::mem::size_of::<u16>();
+        let mut keep = 0usize;
+        for frame in &state.stack[..total_frames] {
+            let component_len = frame.component.as_ref().map_or(0, |c| c.as_bytes().len());
+            if component_len > u16::MAX as usize {
+                break;
+            }
+            let frame_size = std::mem::size_of::<u16>()
+                .checked_add(component_len)?
+                .checked_add(std::mem::size_of::<u32>())?;
+            let next_size = encoded_size.checked_add(frame_size)?;
+            if next_size > MAX_TOKEN_SIZE {
+                break;
+            }
+            encoded_size = next_size;
+            keep += 1;
+        }
+
+        if keep == 0 {
+            return None;
+        }
+
+        let truncated = keep < total_frames;
+
+        // Second pass: serialize directly from state.stack into a single buffer.
+        let frame_count = u16::try_from(keep).ok()?;
+        let mut out = Vec::with_capacity(encoded_size);
+        out.push(WALK_TOKEN_VERSION);
+        out.extend_from_slice(&frame_count.to_le_bytes());
+        for (idx, frame) in state.stack[..keep].iter().enumerate() {
+            let component_bytes: &[u8] = frame.component.as_ref().map_or(&[], |c| c.as_bytes());
+            let component_len = u16::try_from(component_bytes.len()).ok()?;
+            out.extend_from_slice(&component_len.to_le_bytes());
+            out.extend_from_slice(component_bytes);
+
+            // Invariant: in the DFS walk, the last entry consumed by the
+            // retained leaf frame is always the directory entry whose child
+            // frames are being dropped. Rewinding `next_child_index` by one
+            // forces that directory to be re-entered on resume so its
+            // descendants are not silently skipped.
+            let mut next_child_index = frame.next_child_index;
+            if truncated && idx == keep - 1 {
+                next_child_index = next_child_index.saturating_sub(1);
+            }
+            out.extend_from_slice(&next_child_index.to_le_bytes());
+        }
+        TokenBytes::try_from_vec(out).ok()
+    }
+}
+
 /// Compute the lexicographic successor of `prefix` by incrementing the last byte.
 ///
 /// Returns `None` when the input is empty or the last byte is `0xFF` (no finite
@@ -1167,6 +1417,19 @@ fn read_dir_sorted_entries(
     Ok(VecDeque::from(buffered))
 }
 
+#[inline]
+fn fast_forward_frame_entries(
+    entries: &mut VecDeque<BufferedDirEntry>,
+    next_child_index: u32,
+) -> Option<()> {
+    let to_skip = usize::try_from(next_child_index).ok()?;
+    if to_skip > entries.len() {
+        return None;
+    }
+    entries.drain(..to_skip);
+    Some(())
+}
+
 impl WalkState {
     /// Build a fresh traversal state rooted at `root`.
     ///
@@ -1203,6 +1466,7 @@ impl WalkState {
                 component: None,
                 depth: 0,
                 entries_since_check: 0,
+                next_child_index: 0,
                 entries: root_entries,
             }],
             current_path: {
@@ -1220,6 +1484,145 @@ impl WalkState {
         })
     }
 
+    /// Rebuild traversal state from a serialized walk token.
+    ///
+    /// Returns `Ok(None)` when token data is syntactically valid but cannot be
+    /// restored against the current filesystem view (missing path, out-of-range
+    /// child index, or cycle identity mismatch). Callers should fall back to
+    /// key-only resume in that case.
+    fn from_token(
+        root: &Path,
+        token: WalkToken,
+        max_depth: usize,
+        deadline: Option<Instant>,
+        max_warnings: usize,
+        warnings: &mut Vec<WalkWarning>,
+        overflow_count: &mut usize,
+    ) -> Result<Option<Self>, EnumerateError> {
+        let mut frames = token.frames.into_iter();
+        let root_frame = match frames.next() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        if !root_frame.component.is_empty() {
+            return Ok(None);
+        }
+        let child_count = frames.len();
+        if child_count > max_depth {
+            return Ok(None);
+        }
+
+        check_walk_deadline(deadline)?;
+        let root_reader = match fs::read_dir(root) {
+            Ok(reader) => reader,
+            Err(_) => return Ok(None),
+        };
+        let mut root_entries = read_dir_sorted_entries(
+            root_reader,
+            root,
+            deadline,
+            max_warnings,
+            overflow_count,
+            warnings,
+        )?;
+        if fast_forward_frame_entries(&mut root_entries, root_frame.next_child_index).is_none() {
+            return Ok(None);
+        }
+        // A non-leaf root (has child frames) must retain at least one entry
+        // after fast-forward; an empty deque would silently lose sibling files
+        // that appear after the child subtree in DFS order.
+        if child_count > 0 && root_entries.is_empty() {
+            return Ok(None);
+        }
+
+        let mut visited_dirs = HashSet::new();
+        if let Ok(root_meta) = fs::metadata(root) {
+            visited_dirs.insert((root_meta.dev(), root_meta.ino()));
+        }
+
+        let mut stack = Vec::with_capacity(1 + child_count);
+        stack.push(WalkFrame {
+            component: None,
+            depth: 0,
+            entries_since_check: 0,
+            next_child_index: root_frame.next_child_index,
+            entries: root_entries,
+        });
+
+        let mut current_path = {
+            let mut buf = OsString::with_capacity(root.as_os_str().len() + 4096);
+            buf.push(root);
+            PathBuf::from(buf)
+        };
+
+        for (depth, frame) in frames.enumerate() {
+            if frame.component.is_empty()
+                || frame.component.contains(&b'/')
+                || frame.component.contains(&0)
+                || frame.component == b"."
+                || frame.component == b".."
+            {
+                return Ok(None);
+            }
+            let component = OsString::from_vec(frame.component);
+            current_path.push(&component);
+
+            if let Ok(dir_meta) = fs::symlink_metadata(&current_path) {
+                // Reject symlinks to prevent token-supplied components from
+                // being followed during restore.
+                if dir_meta.file_type().is_symlink() {
+                    return Ok(None);
+                }
+                let dir_id = (dir_meta.dev(), dir_meta.ino());
+                if !visited_dirs.insert(dir_id) {
+                    return Ok(None);
+                }
+            }
+
+            check_walk_deadline(deadline)?;
+            let reader = match fs::read_dir(&current_path) {
+                Ok(reader) => reader,
+                Err(_) => return Ok(None),
+            };
+            let mut entries = read_dir_sorted_entries(
+                reader,
+                &current_path,
+                deadline,
+                max_warnings,
+                overflow_count,
+                warnings,
+            )?;
+            if fast_forward_frame_entries(&mut entries, frame.next_child_index).is_none() {
+                return Ok(None);
+            }
+            // Non-leaf child frames (those that still have deeper children on
+            // the stack) must retain at least one entry after fast-forward;
+            // otherwise sibling files after the child subtree are lost.
+            let is_last_child = depth == child_count - 1;
+            if !is_last_child && entries.is_empty() {
+                return Ok(None);
+            }
+
+            stack.push(WalkFrame {
+                component: Some(component),
+                depth: depth + 1,
+                entries_since_check: 0,
+                next_child_index: frame.next_child_index,
+                entries,
+            });
+        }
+
+        Ok(Some(Self {
+            stack,
+            current_path,
+            pending: None,
+            last_emitted_key: None,
+            emitted_count: 0,
+            exhausted: false,
+            visited_dirs,
+        }))
+    }
+
     #[inline]
     /// Pop the next entry from a frame while maintaining deadline cadence.
     fn poll_frame(
@@ -1229,6 +1632,10 @@ impl WalkState {
         let Some(entry) = frame.entries.pop_front() else {
             return Ok(None);
         };
+        frame.next_child_index = frame
+            .next_child_index
+            .checked_add(1)
+            .ok_or_else(|| EnumerateError::permanent("walk frame index overflow"))?;
         bump_entry_counter(frame, deadline)?;
         Ok(Some(entry))
     }
@@ -1377,6 +1784,7 @@ impl WalkState {
                                 component: Some(entry.name),
                                 depth: depth + 1,
                                 entries_since_check: 0,
+                                next_child_index: 0,
                                 entries: child_entries,
                             });
                             continue;

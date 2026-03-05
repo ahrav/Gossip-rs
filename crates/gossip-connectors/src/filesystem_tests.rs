@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
 use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
-use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
+use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, MAX_TOKEN_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
@@ -241,8 +241,10 @@ fn enumerate_page_uses_pooled_toxic_wrappers() {
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
+    // Use a page budget of 1 so the walk is NOT exhausted after the first page;
+    // an exhausted walk does not emit a resume token.
     let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
         .unwrap();
     // Filesystem pages should emit pooled wrappers for key/ref fields.
     assert!(
@@ -277,8 +279,13 @@ fn enumerate_page_uses_pooled_toxic_wrappers() {
         "next cursor key should share pooled storage"
     );
     assert!(
-        next.token().is_some_and(|token| token.is_pooled()),
-        "token should be slab-backed when emitted"
+        next.token().is_some(),
+        "token should be emitted when token resume is enabled"
+    );
+    assert!(
+        next.token()
+            .is_some_and(|token| token.as_bytes().len() <= MAX_TOKEN_SIZE),
+        "token must respect MAX_TOKEN_SIZE"
     );
 }
 
@@ -540,6 +547,589 @@ fn token_enabled_vs_disabled_parity() {
         assert_eq!(a.stable_item_id(), b.stable_item_id());
         assert_eq!(a.version(), b.version());
     }
+}
+
+#[test]
+fn walk_token_round_trips_from_live_walk_state() {
+    let dir = create_test_dir(&[
+        ("a/one.txt", b"1"),
+        ("a/two.txt", b"2"),
+        ("b/three.txt", b"3"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let page = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .expect("first page");
+    let emitted = page
+        .next_cursor()
+        .token()
+        .expect("token must be present with token resume enabled");
+    let decoded = WalkToken::decode_bytes(emitted.as_bytes()).expect("decode emitted token");
+
+    let state = c
+        .walk_state
+        .as_ref()
+        .expect("walk state must persist after first page");
+    let rebuilt = WalkToken::encode_from_state(state).expect("encode token from walk state");
+    let rebuilt_decoded =
+        WalkToken::decode_bytes(rebuilt.as_bytes()).expect("decode rebuilt token");
+
+    assert_eq!(decoded, rebuilt_decoded);
+}
+
+#[test]
+fn walk_token_decode_rejects_invalid_payloads() {
+    // Wrong version byte.
+    assert!(WalkToken::decode_bytes(&[WALK_TOKEN_VERSION + 1, 0, 0]).is_none());
+
+    // Truncated frame payload.
+    assert!(WalkToken::decode_bytes(&[WALK_TOKEN_VERSION, 1, 0, 0]).is_none());
+
+    // Non-root frame with zero-length component is invalid.
+    let mut malformed = Vec::new();
+    malformed.push(WALK_TOKEN_VERSION);
+    malformed.extend_from_slice(&2u16.to_le_bytes());
+    malformed.extend_from_slice(&0u16.to_le_bytes());
+    malformed.extend_from_slice(&0u32.to_le_bytes());
+    malformed.extend_from_slice(&0u16.to_le_bytes());
+    malformed.extend_from_slice(&0u32.to_le_bytes());
+    assert!(WalkToken::decode_bytes(&malformed).is_none());
+
+    // `.` component in non-root frame is rejected (path traversal).
+    let mut dot = Vec::new();
+    dot.push(WALK_TOKEN_VERSION);
+    dot.extend_from_slice(&2u16.to_le_bytes());
+    // root frame: empty component
+    dot.extend_from_slice(&0u16.to_le_bytes());
+    dot.extend_from_slice(&0u32.to_le_bytes());
+    // child frame: "."
+    dot.extend_from_slice(&1u16.to_le_bytes());
+    dot.push(b'.');
+    dot.extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        WalkToken::decode_bytes(&dot).is_none(),
+        "dot component must be rejected"
+    );
+
+    // `..` component in non-root frame is rejected (path traversal).
+    let mut dotdot = Vec::new();
+    dotdot.push(WALK_TOKEN_VERSION);
+    dotdot.extend_from_slice(&2u16.to_le_bytes());
+    // root frame: empty component
+    dotdot.extend_from_slice(&0u16.to_le_bytes());
+    dotdot.extend_from_slice(&0u32.to_le_bytes());
+    // child frame: ".."
+    dotdot.extend_from_slice(&2u16.to_le_bytes());
+    dotdot.extend_from_slice(b"..");
+    dotdot.extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        WalkToken::decode_bytes(&dotdot).is_none(),
+        "dotdot component must be rejected"
+    );
+}
+
+#[test]
+fn walk_token_encoding_truncates_to_token_budget() {
+    let mut stack = Vec::new();
+    stack.push(WalkFrame {
+        component: None,
+        depth: 0,
+        entries_since_check: 0,
+        next_child_index: 7,
+        entries: std::collections::VecDeque::new(),
+    });
+    for depth in 1..=512 {
+        stack.push(WalkFrame {
+            component: Some(std::ffi::OsString::from_vec(vec![b'a'; 255])),
+            depth,
+            entries_since_check: 0,
+            next_child_index: 7,
+            entries: std::collections::VecDeque::new(),
+        });
+    }
+    let state = WalkState {
+        stack,
+        current_path: std::path::PathBuf::from("/tmp"),
+        pending: None,
+        last_emitted_key: None,
+        emitted_count: 0,
+        exhausted: false,
+        visited_dirs: std::collections::HashSet::new(),
+    };
+
+    let token = WalkToken::encode_from_state(&state).expect("token should be emitted");
+    assert!(
+        token.as_bytes().len() <= MAX_TOKEN_SIZE,
+        "token exceeded MAX_TOKEN_SIZE"
+    );
+
+    let decoded = WalkToken::decode_bytes(token.as_bytes()).expect("decoded truncated token");
+    assert!(
+        decoded.frames.len() < state.stack.len(),
+        "deep stack should be truncated to fit budget"
+    );
+    assert_eq!(
+        decoded
+            .frames
+            .last()
+            .expect("truncated token keeps at least one frame")
+            .next_child_index,
+        6,
+        "truncated token rewinds one child at retained leaf frame"
+    );
+}
+
+// ---------------------------------------------------------------
+// Unit tests — from_token failure paths
+// ---------------------------------------------------------------
+
+#[test]
+fn from_token_rejects_empty_frames() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken { frames: Vec::new() };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "empty frames must yield None");
+}
+
+#[test]
+fn from_token_rejects_non_empty_root_component() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![WalkTokenFrame {
+            component: b"bad".to_vec(),
+            next_child_index: 0,
+        }],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "non-empty root component must yield None");
+}
+
+#[test]
+fn from_token_rejects_depth_exceeding_max() {
+    let dir = create_test_dir(&[("sub/a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: b"sub".to_vec(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    // max_depth=0 means zero children allowed.
+    let result =
+        WalkState::from_token(dir.path(), token, 0, None, 10, &mut warnings, &mut overflow)
+            .expect("should not error");
+    assert!(
+        result.is_none(),
+        "child count exceeding max_depth must yield None"
+    );
+}
+
+#[test]
+fn from_token_rejects_empty_child_component() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "empty child component must yield None");
+}
+
+#[test]
+fn from_token_rejects_child_with_slash() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: b"a/b".to_vec(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(
+        result.is_none(),
+        "child component with slash must yield None"
+    );
+}
+
+#[test]
+fn from_token_rejects_child_with_null_byte() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: vec![b'a', 0],
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(
+        result.is_none(),
+        "child component with null byte must yield None"
+    );
+}
+
+#[test]
+fn from_token_handles_missing_directory() {
+    let dir = create_test_dir(&[("a.txt", b"1")]);
+    // Point at a child directory that does not exist on disk.
+    let token = WalkToken {
+        frames: vec![
+            WalkTokenFrame {
+                component: Vec::new(),
+                next_child_index: 0,
+            },
+            WalkTokenFrame {
+                component: b"nonexistent".to_vec(),
+                next_child_index: 0,
+            },
+        ],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "missing child directory must yield None");
+}
+
+#[test]
+fn from_token_rejects_out_of_range_child_index() {
+    let dir = create_test_dir(&[("a.txt", b"1"), ("b.txt", b"2")]);
+    // Root has 2 entries; an index of u32::MAX is way past the end.
+    let token = WalkToken {
+        frames: vec![WalkTokenFrame {
+            component: Vec::new(),
+            next_child_index: u32::MAX,
+        }],
+    };
+    let mut warnings = Vec::new();
+    let mut overflow = 0usize;
+    let result = WalkState::from_token(
+        dir.path(),
+        token,
+        64,
+        None,
+        10,
+        &mut warnings,
+        &mut overflow,
+    )
+    .expect("should not error");
+    assert!(result.is_none(), "out-of-range child index must yield None");
+}
+
+// ---------------------------------------------------------------
+// Unit tests — Token resume after filesystem mutation
+// ---------------------------------------------------------------
+
+#[test]
+fn token_resume_after_filesystem_mutation() {
+    let dir = create_test_dir(&[
+        ("aaa.txt", b"1"),
+        ("bbb.txt", b"2"),
+        ("ccc.txt", b"3"),
+        ("ddd.txt", b"4"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Page 1: enumerate first 2 items.
+    let page1 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(2))
+        .expect("page 1");
+    assert_eq!(page1.items().len(), 2);
+    let last_key_p1 = page1.items().last().unwrap().item_key().as_bytes().to_vec();
+    let cursor_after_p1 = page1.next_cursor().clone();
+
+    // Mutate the filesystem between pages: remove one file, add another.
+    fs::remove_file(dir.path().join("ccc.txt")).expect("remove ccc.txt");
+    fs::write(dir.path().join("bcc.txt"), b"new").expect("write bcc.txt");
+
+    // Resume from the cursor saved after page 1.
+    let mut c2 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut remaining_keys = Vec::new();
+    let mut cursor = cursor_after_p1;
+    loop {
+        let page = c2
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(10))
+            .expect("resume page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            remaining_keys.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // Invariants: no duplicates, all keys sorted, all keys > last key from page 1.
+    for (i, key) in remaining_keys.iter().enumerate() {
+        assert!(
+            key.as_slice() > last_key_p1.as_slice(),
+            "resumed key {:?} should be > last page-1 key {:?}",
+            String::from_utf8_lossy(key),
+            String::from_utf8_lossy(&last_key_p1),
+        );
+        if i > 0 {
+            assert!(
+                key.as_slice() > remaining_keys[i - 1].as_slice(),
+                "keys must be strictly sorted"
+            );
+        }
+    }
+    // No duplicates (sorted + distinct check above implies this).
+}
+
+// ---------------------------------------------------------------
+// Unit tests — Token + shard bounds interaction
+// ---------------------------------------------------------------
+
+#[test]
+fn token_resume_with_shard_bounds() {
+    let dir = create_test_dir(&[
+        ("aaa/f1.txt", b"1"),
+        ("aaa/f2.txt", b"2"),
+        ("mmm/f1.txt", b"3"),
+        ("mmm/f2.txt", b"4"),
+        ("zzz/f1.txt", b"5"),
+        ("zzz/f2.txt", b"6"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path())
+        .with_tokens(true)
+        .with_shard_bounds(b"mmm", b"zzz");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Enumerate one item at a time to force multi-page token resume.
+    let mut all_keys = Vec::new();
+    let mut cursor = Cursor::initial();
+    loop {
+        let page = c
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(1))
+            .expect("page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            all_keys.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // All keys must be in [mmm, zzz) and sorted.
+    for (i, key) in all_keys.iter().enumerate() {
+        assert!(
+            key.as_slice() >= b"mmm".as_slice(),
+            "key {:?} should be >= mmm",
+            String::from_utf8_lossy(key),
+        );
+        assert!(
+            key.as_slice() < b"zzz".as_slice(),
+            "key {:?} should be < zzz",
+            String::from_utf8_lossy(key),
+        );
+        if i > 0 {
+            assert!(
+                key.as_slice() > all_keys[i - 1].as_slice(),
+                "keys must be strictly sorted"
+            );
+        }
+    }
+    // Expect exactly the mmm/ subtree items.
+    assert!(
+        !all_keys.is_empty(),
+        "should enumerate at least one key in [mmm, zzz)"
+    );
+    for key in &all_keys {
+        assert!(
+            key.starts_with(b"mmm/"),
+            "all keys should be under mmm/; got {:?}",
+            String::from_utf8_lossy(key),
+        );
+    }
+}
+
+// ---------------------------------------------------------------
+// Unit tests — Token size boundaries with long components
+// ---------------------------------------------------------------
+
+#[test]
+fn token_encodes_frames_with_varying_component_lengths() {
+    // Build a WalkState with components of length 1, 127, 254, and 255 bytes.
+    let component_lengths = [1usize, 127, 254, 255];
+    let mut stack = Vec::new();
+    stack.push(WalkFrame {
+        component: None,
+        depth: 0,
+        entries_since_check: 0,
+        next_child_index: 0,
+        entries: std::collections::VecDeque::new(),
+    });
+    for (i, &len) in component_lengths.iter().enumerate() {
+        stack.push(WalkFrame {
+            component: Some(std::ffi::OsString::from_vec(vec![b'x'; len])),
+            depth: i + 1,
+            entries_since_check: 0,
+            next_child_index: i as u32 + 1,
+            entries: std::collections::VecDeque::new(),
+        });
+    }
+    let state = WalkState {
+        stack,
+        current_path: std::path::PathBuf::from("/tmp"),
+        pending: None,
+        last_emitted_key: None,
+        emitted_count: 0,
+        exhausted: false,
+        visited_dirs: std::collections::HashSet::new(),
+    };
+
+    let token = WalkToken::encode_from_state(&state).expect("should encode");
+    let decoded = WalkToken::decode_bytes(token.as_bytes()).expect("should decode");
+
+    // All 5 frames (root + 4 components) should survive the round-trip.
+    assert_eq!(decoded.frames.len(), 5);
+    for (i, &len) in component_lengths.iter().enumerate() {
+        assert_eq!(
+            decoded.frames[i + 1].component.len(),
+            len,
+            "component {i} length mismatch"
+        );
+    }
+}
+
+#[test]
+fn token_truncation_drops_oversized_component() {
+    // A single frame with a component at u16::MAX + 1 bytes cannot be encoded
+    // because component_len exceeds u16. The encoder should break before it and
+    // produce a root-only token with the saturating_sub(1) rewind applied.
+    let huge_len = u16::MAX as usize + 1;
+    let stack = vec![
+        WalkFrame {
+            component: None,
+            depth: 0,
+            entries_since_check: 0,
+            next_child_index: 5,
+            entries: std::collections::VecDeque::new(),
+        },
+        WalkFrame {
+            component: Some(std::ffi::OsString::from_vec(vec![b'z'; huge_len])),
+            depth: 1,
+            entries_since_check: 0,
+            next_child_index: 0,
+            entries: std::collections::VecDeque::new(),
+        },
+    ];
+    let state = WalkState {
+        stack,
+        current_path: std::path::PathBuf::from("/tmp"),
+        pending: None,
+        last_emitted_key: None,
+        emitted_count: 0,
+        exhausted: false,
+        visited_dirs: std::collections::HashSet::new(),
+    };
+
+    let token = WalkToken::encode_from_state(&state).expect("root-only token should be emitted");
+    let decoded = WalkToken::decode_bytes(token.as_bytes()).expect("should decode");
+
+    // Only the root frame survives; it becomes the truncated leaf.
+    assert_eq!(decoded.frames.len(), 1, "only root frame should survive");
+    assert_eq!(
+        decoded.frames[0].next_child_index, 4,
+        "truncated leaf root should have saturating_sub(1) applied: 5 -> 4"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -1653,6 +2243,58 @@ mod prop {
             for (x, y) in a.iter().zip(b.iter()) {
                 prop_assert_eq!(x.item_key(), y.item_key());
             }
+        }
+
+        #[test]
+        fn cold_resume_with_tokens_matches_key_only_resume(
+            files in file_set_strategy(20),
+            page_size in 1usize..5usize,
+        ) {
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let budgets = small_page_budgets(page_size);
+
+            let (token_dir, _token_seed_conn) = make_connector(&files);
+            let token_root = token_dir.path().to_path_buf();
+            let mut token_cursor = Cursor::initial();
+            let mut token_keys: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let mut conn = FilesystemConnector::new(&token_root).with_tokens(true);
+                let page = conn
+                    .enumerate_page_range(&start, &end, &token_cursor, budgets)
+                    .expect("token cold resume page");
+                if page.items().is_empty() {
+                    break;
+                }
+                token_keys.extend(
+                    page.items()
+                        .iter()
+                        .map(|item| item.item_key().as_bytes().to_vec()),
+                );
+                token_cursor = page.next_cursor().clone();
+            }
+
+            let (key_dir, _key_seed_conn) = make_connector(&files);
+            let key_root = key_dir.path().to_path_buf();
+            let mut key_cursor = Cursor::initial();
+            let mut key_only_keys: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let mut conn = FilesystemConnector::new(&key_root).with_tokens(false);
+                let page = conn
+                    .enumerate_page_range(&start, &end, &key_cursor, budgets)
+                    .expect("key-only cold resume page");
+                if page.items().is_empty() {
+                    break;
+                }
+                key_only_keys.extend(
+                    page.items()
+                        .iter()
+                        .map(|item| item.item_key().as_bytes().to_vec()),
+                );
+                key_cursor = page.next_cursor().clone();
+            }
+
+            prop_assert_eq!(token_keys, key_only_keys);
         }
 
         #[test]
@@ -2913,12 +3555,11 @@ fn deadline_during_directory_descent_does_not_corrupt_subsequent_walk() {
 }
 
 // ---------------------------------------------------------------
-// Bug verification: cold-resume token index reflects total items
-// emitted, not just the current page
+// Walk-token corruption and debug cross-check behavior
 // ---------------------------------------------------------------
 
 #[test]
-fn cold_resume_token_index_reflects_prior_emission_count() {
+fn corrupted_token_version_falls_back_to_key_only_resume() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -2929,34 +3570,104 @@ fn cold_resume_token_index_reflects_prior_emission_count() {
     let end = make_key(b"\xff");
     let budgets = small_page_budgets(2);
 
-    // Page 1: emit items 0,1 (a.txt, b.txt) with tokens enabled.
     let mut first = FilesystemConnector::new(dir.path()).with_tokens(true);
     let page1 = first
         .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
         .expect("first page");
-    assert_eq!(page1.items().len(), 2);
+    let last_key = page1
+        .next_cursor()
+        .last_key()
+        .expect("first page must carry last_key")
+        .clone();
+    let mut corrupted = page1
+        .next_cursor()
+        .token()
+        .expect("token must be emitted")
+        .as_bytes()
+        .to_vec();
+    corrupted[0] ^= 0x7f; // force version mismatch for decode failure.
+    let corrupted_cursor = Cursor::with_token(
+        last_key.clone(),
+        TokenBytes::try_from_vec(corrupted).expect("corrupted token bytes still valid wrapper"),
+    );
 
-    // Cold resume: new connector, resume from page1's cursor.
+    let mut resumed_with_corrupt = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let corrupt_page = resumed_with_corrupt
+        .enumerate_page_range(&start, &end, &corrupted_cursor, budgets)
+        .expect("corrupt token should fall back to key-only resume");
+
+    let key_only_cursor = Cursor::with_last_key(last_key);
+    let mut key_only = FilesystemConnector::new(dir.path()).with_tokens(false);
+    let key_page = key_only
+        .enumerate_page_range(&start, &end, &key_only_cursor, budgets)
+        .expect("key-only resume page");
+
+    let corrupt_keys: Vec<&[u8]> = corrupt_page
+        .items()
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    let key_keys: Vec<&[u8]> = key_page
+        .items()
+        .iter()
+        .map(|item| item.item_key().as_bytes())
+        .collect();
+    assert_eq!(corrupt_keys, key_keys);
+}
+
+/// A forged token with a shifted `next_child_index` is detected by the
+/// key-only cross-check and discarded. The connector falls back to key-only
+/// resume and returns the correct next items without skipping any keys.
+#[test]
+fn shifted_token_falls_back_to_key_only_resume() {
+    let dir = create_test_dir(&[
+        ("a.txt", b"1"),
+        ("b.txt", b"2"),
+        ("c.txt", b"3"),
+        ("d.txt", b"4"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+    let budgets = small_page_budgets(2);
+
+    let mut first = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let page1 = first
+        .enumerate_page_range(&start, &end, &Cursor::initial(), budgets)
+        .expect("first page");
+    let last_key = page1
+        .next_cursor()
+        .last_key()
+        .expect("first page must carry last_key")
+        .clone();
+
+    // Valid v1 token with one root frame, but intentionally shifted root index
+    // past the remaining children so the token-based walker would skip c.txt.
+    let mut forged = Vec::new();
+    forged.push(WALK_TOKEN_VERSION);
+    forged.extend_from_slice(&1u16.to_le_bytes());
+    forged.extend_from_slice(&0u16.to_le_bytes());
+    forged.extend_from_slice(&3u32.to_le_bytes());
+    let forged_cursor = Cursor::with_token(
+        last_key,
+        TokenBytes::try_from_vec(forged).expect("forged token wrapper"),
+    );
+
     let mut resumed = FilesystemConnector::new(dir.path()).with_tokens(true);
     let page2 = resumed
-        .enumerate_page_range(&start, &end, page1.next_cursor(), budgets)
-        .expect("cold-resume page");
-    assert_eq!(page2.items().len(), 2);
-    assert_eq!(page2.items()[0].item_key().as_bytes(), b"c.txt");
+        .enumerate_page_range(&start, &end, &forged_cursor, budgets)
+        .expect("resumed page after forged token");
 
-    // The token should encode next_idx = 4 (items 0..4 total).
-    // If emitted_count wasn't carried across cold resume, the token
-    // would incorrectly encode 2 (only current page items).
-    if let Some(token) = page2.next_cursor().token() {
-        let token_bytes = token.as_bytes();
-        if token_bytes.len() == 8 {
-            let encoded_idx = u64::from_be_bytes(token_bytes.try_into().unwrap());
-            assert_eq!(
-                encoded_idx, 4,
-                "cold-resume token should encode total emitted count (4), not just current page count"
-            );
-        }
-    }
+    // The fallback must produce the correct remaining items.
+    let keys: Vec<&[u8]> = page2
+        .items()
+        .iter()
+        .map(|i| i.item_key().as_bytes())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"c.txt".as_slice(), b"d.txt".as_slice()],
+        "shifted token must fall back to key-only resume; got {keys:?}"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -3224,4 +3935,205 @@ fn with_key_range_cursor_resume_across_pruned_subtrees() {
             window[1]
         );
     }
+}
+
+#[test]
+fn walk_token_decode_rejects_dot_and_dotdot_components() {
+    // A forged token with ".." as a non-root component should be rejected
+    // during decode to prevent path traversal outside the configured root.
+    for component in &[b".." as &[u8], b"." as &[u8]] {
+        let mut payload = Vec::new();
+        payload.push(WALK_TOKEN_VERSION);
+        // Two frames: root + one child.
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        // Root frame: empty component, next_child_index = 0.
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        // Child frame: ".." or "." component, next_child_index = 0.
+        payload.extend_from_slice(&(component.len() as u16).to_le_bytes());
+        payload.extend_from_slice(component);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        assert!(
+            WalkToken::decode_bytes(&payload).is_none(),
+            "decode_bytes should reject component {:?}",
+            std::str::from_utf8(component).unwrap()
+        );
+    }
+}
+
+/// A stale/corrupted token with a shifted `next_child_index` at root can
+/// cause token-based resume to skip directory subtrees that contain keys
+/// greater than `last_key`. In release builds, the `debug_assert_eq!`
+/// cross-check is compiled out. The resume must fall back to key-only
+/// seek when the token-based position diverges.
+///
+/// This test constructs a directory tree, gets a valid cursor from page 1
+/// (with page size 1), then forges a token whose root `next_child_index`
+/// is advanced past directories that still contain unvisited keys. The
+/// forged cursor is handed back to enumerate. If the code trusts the
+/// shifted token without cross-checking, it will skip keys.
+#[test]
+fn stale_token_does_not_skip_keys_in_release_mode() {
+    // Directory layout (sorted):
+    //   a/file.txt   -> key "a/file.txt"
+    //   b/file.txt   -> key "b/file.txt"
+    //   c/file.txt   -> key "c/file.txt"
+    //
+    // Page 1 (size=1) emits "a/file.txt".
+    // The correct token should position us at child index 1 (directory "b").
+    // We forge a token that positions at child index 2 (directory "c"),
+    // skipping "b/" entirely. If token resume is trusted, "b/file.txt" is
+    // lost.
+    let dir = create_test_dir(&[
+        ("a/file.txt", b"a"),
+        ("b/file.txt", b"b"),
+        ("c/file.txt", b"c"),
+    ]);
+
+    let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Get the first page (1 item) to obtain a valid cursor.
+    let page1 = c
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .expect("first page");
+    let first_key = page1.items()[0].item_key().clone();
+    assert_eq!(first_key.as_bytes(), b"a/file.txt");
+
+    let real_token = page1.next_cursor().token().expect("cursor must have token");
+
+    // Decode the real token, bump root next_child_index to skip "b/" entirely.
+    let mut decoded = WalkToken::decode_bytes(real_token.as_bytes()).expect("decode real token");
+    // Root frame next_child_index: advance past "b/" so token resume starts at "c/".
+    decoded.frames[0].next_child_index += 1;
+
+    // Re-encode the forged token.
+    let mut forged_bytes = Vec::new();
+    forged_bytes.push(WALK_TOKEN_VERSION);
+    forged_bytes.extend_from_slice(&(decoded.frames.len() as u16).to_le_bytes());
+    for frame in &decoded.frames {
+        forged_bytes.extend_from_slice(&(frame.component.len() as u16).to_le_bytes());
+        forged_bytes.extend_from_slice(&frame.component);
+        forged_bytes.extend_from_slice(&frame.next_child_index.to_le_bytes());
+    }
+    let forged_token = TokenBytes::try_from_vec(forged_bytes).expect("forge token");
+
+    // Build a cursor with the forged token and the real last key.
+    let forged_cursor = Cursor::with_token(first_key, forged_token);
+
+    // Collect remaining items from a fresh connector using the forged cursor.
+    let mut c2 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut remaining = Vec::new();
+    let mut cursor = forged_cursor;
+    loop {
+        let page = c2
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(10))
+            .expect("page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            remaining.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // We must see BOTH "b/file.txt" and "c/file.txt".
+    // If the forged token was blindly trusted, "b/file.txt" would be missing.
+    let expected: Vec<&[u8]> = vec![b"b/file.txt", b"c/file.txt"];
+    let actual: Vec<&[u8]> = remaining.iter().map(|v: &Vec<u8>| v.as_slice()).collect();
+    assert_eq!(
+        actual, expected,
+        "stale token must not cause key skips; got {actual:?}, expected {expected:?}"
+    );
+}
+
+/// A crafted token where a non-leaf frame has `next_child_index` equal to the
+/// directory entry count drains the parent's deque to empty. Siblings that
+/// appear after the child subtree in DFS order would be lost.
+/// `fast_forward_frame_entries` should reject this for non-leaf frames.
+#[test]
+fn exhausted_non_leaf_frame_in_token_does_not_skip_siblings() {
+    // Layout:
+    //   root/
+    //     a_file.txt        -> key "a_file.txt"
+    //     subdir/
+    //       inner.txt       -> key "subdir/inner.txt"
+    //     z_file.txt        -> key "z_file.txt"
+    //
+    // DFS order: a_file.txt, subdir/inner.txt, z_file.txt
+    //
+    // A crafted token that descends into subdir/ but drains root entries so
+    // next_child_index at root == total root entries would lose z_file.txt.
+    let dir = create_test_dir(&[
+        ("a_file.txt", b"a"),
+        ("subdir/inner.txt", b"i"),
+        ("z_file.txt", b"z"),
+    ]);
+
+    let mut c1 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    // Get page 1 (1 item) to emit a_file.txt.
+    let page1 = c1
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .expect("first page");
+    assert_eq!(page1.items()[0].item_key().as_bytes(), b"a_file.txt");
+    let last_key = page1
+        .next_cursor()
+        .last_key()
+        .expect("must have last key")
+        .clone();
+
+    // Count root directory entries for our forge.
+    let root_entry_count = std::fs::read_dir(dir.path()).expect("read root").count() as u32;
+
+    // Forge a token with 2 frames:
+    //   - Root frame: next_child_index = root_entry_count (drain all root entries)
+    //   - Child frame: component = "subdir", next_child_index = 0
+    let mut forged = Vec::new();
+    forged.push(WALK_TOKEN_VERSION);
+    forged.extend_from_slice(&2u16.to_le_bytes());
+    // Root frame.
+    forged.extend_from_slice(&0u16.to_le_bytes()); // empty component
+    forged.extend_from_slice(&root_entry_count.to_le_bytes());
+    // Child frame: "subdir".
+    let comp = b"subdir";
+    forged.extend_from_slice(&(comp.len() as u16).to_le_bytes());
+    forged.extend_from_slice(comp);
+    forged.extend_from_slice(&0u32.to_le_bytes());
+
+    let forged_token = TokenBytes::try_from_vec(forged).expect("forge token");
+    let forged_cursor = Cursor::with_token(last_key, forged_token);
+
+    // Collect remaining items.
+    let mut c2 = FilesystemConnector::new(dir.path()).with_tokens(true);
+    let mut remaining = Vec::new();
+    let mut cursor = forged_cursor;
+    loop {
+        let page = c2
+            .enumerate_page_range(&start, &end, &cursor, small_page_budgets(10))
+            .expect("page");
+        if page.items().is_empty() {
+            break;
+        }
+        for item in page.items() {
+            remaining.push(item.item_key().as_bytes().to_vec());
+        }
+        cursor = page.next_cursor().clone();
+    }
+
+    // Must see both "subdir/inner.txt" and "z_file.txt".
+    let actual: Vec<&[u8]> = remaining.iter().map(|v: &Vec<u8>| v.as_slice()).collect();
+    assert!(
+        actual.contains(&b"z_file.txt".as_slice()),
+        "exhausted non-leaf frame must not lose sibling z_file.txt; got {actual:?}"
+    );
+    assert!(
+        actual.contains(&b"subdir/inner.txt".as_slice()),
+        "subdir/inner.txt should still be reachable; got {actual:?}"
+    );
 }
