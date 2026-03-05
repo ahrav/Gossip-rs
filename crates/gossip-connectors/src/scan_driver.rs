@@ -54,8 +54,8 @@ fn filesystem_driver_from_assignment(assignment: &Assignment) -> Result<FsScanDr
     Ok(FsScanDriver {
         root: root.clone(),
         checkpoint_hint: None,
-        shard_start: assignment.shard_spec.key_range_start().to_vec(),
-        shard_end: assignment.shard_spec.key_range_end().to_vec(),
+        shard_start: assignment.shard_spec.key_range_start().into(),
+        shard_end: assignment.shard_spec.key_range_end().into(),
     })
 }
 
@@ -172,9 +172,9 @@ struct FsScanDriver {
     root: PathBuf,
     checkpoint_hint: Option<CursorUpdate>,
     /// Inclusive assignment lower bound (`[]` means unbounded).
-    shard_start: Vec<u8>,
+    shard_start: Box<[u8]>,
     /// Exclusive assignment upper bound (`[]` means unbounded).
-    shard_end: Vec<u8>,
+    shard_end: Box<[u8]>,
 }
 
 impl FsScanDriver {
@@ -186,8 +186,8 @@ impl FsScanDriver {
     #[allow(dead_code)]
     fn shard_bounds(&self) -> (Option<&[u8]>, Option<&[u8]>) {
         (
-            (!self.shard_start.is_empty()).then_some(self.shard_start.as_slice()),
-            (!self.shard_end.is_empty()).then_some(self.shard_end.as_slice()),
+            (!self.shard_start.is_empty()).then_some(&self.shard_start),
+            (!self.shard_end.is_empty()).then_some(&self.shard_end),
         )
     }
 }
@@ -1167,8 +1167,8 @@ mod tests {
         let assignment = filesystem_assignment(b"m", b"z");
 
         let driver = filesystem_driver_from_assignment(&assignment).expect("filesystem driver");
-        assert_eq!(driver.shard_start, b"m");
-        assert_eq!(driver.shard_end, b"z");
+        assert_eq!(&*driver.shard_start, b"m");
+        assert_eq!(&*driver.shard_end, b"z");
     }
 
     #[test]

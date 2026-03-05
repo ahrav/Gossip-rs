@@ -3057,6 +3057,52 @@ fn shard_bounds_intersect_with_connector_bounds_via_enumerate_page() {
 }
 
 #[test]
+fn with_shard_bounds_start_only_filters_lower_bound() {
+    let dir = create_test_dir(&[
+        ("alpha.txt", b"a"),
+        ("middle.txt", b"m"),
+        ("zulu.txt", b"z"),
+    ]);
+    // start="middle", end="" (unbounded) → keys >= "middle".
+    let mut c = FilesystemConnector::new(dir.path()).with_shard_bounds(b"middle", b"");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let keys: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"middle.txt".to_vec(), b"zulu.txt".to_vec()],
+        "start-only bound should filter out keys below 'middle'"
+    );
+}
+
+#[test]
+fn with_shard_bounds_end_only_filters_upper_bound() {
+    let dir = create_test_dir(&[
+        ("alpha.txt", b"a"),
+        ("middle.txt", b"m"),
+        ("zulu.txt", b"z"),
+    ]);
+    // start="" (unbounded), end="middle" → keys < "middle".
+    let mut c = FilesystemConnector::new(dir.path()).with_shard_bounds(b"", b"middle");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let keys: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![b"alpha.txt".to_vec()],
+        "end-only bound should filter out keys at or above 'middle'"
+    );
+}
+
+#[test]
 fn with_key_range_equal_bounds_returns_empty() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
     let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"m"));
