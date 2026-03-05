@@ -67,8 +67,18 @@
 //!   For Zipf-like workloads dominated by a few very large files the byte
 //!   axis may have gaps in that region, causing the estimator to rely more
 //!   on the rank-axis fallback.  In practice the rank sample for the same
-//!   file still captures it, and the accuracy property tests confirm <1%
-//!   byte-weighted error on 20 000-key Zipf streams.
+//!   file still captures it, and the dedicated Zipf-like accuracy regression
+//!   test confirms <1% byte-weighted error on a 20 000-key stream.
+//!
+//! # Validation support
+//!
+//! Companion tests in `split_estimator_tests.rs` pin the estimator's weighted
+//! accuracy, >2^53 byte-position precision, and deterministic retained-sample
+//! layout. Cross-crate performance harnesses use
+//! [`crate::benchmark_streaming_split_estimator_observe_fixed_size`] to drive
+//! the same `observe` loop on a fixed-size stream, which keeps benchmark and
+//! allocation-regression numbers focused on the estimator rather than on
+//! filesystem traversal or random workload generation.
 
 use std::fmt;
 use std::mem;
@@ -601,6 +611,24 @@ impl Default for StreamingSplitEstimator {
     fn default() -> Self {
         Self::new(Self::DEFAULT_SAMPLE_CAP)
     }
+}
+
+pub(crate) fn benchmark_observe_fixed_size(
+    sample_cap: usize,
+    count: usize,
+    file_size: u64,
+) -> Option<u64> {
+    // Fixed-width big-endian keys preserve the same total ordering used by the
+    // estimator's unit tests, giving benches and allocation guards a fully
+    // deterministic stream shape.
+    let mut estimator = StreamingSplitEstimator::new(sample_cap);
+    for idx in 0..count {
+        let key = u64::try_from(idx).expect("bench key index must fit in u64");
+        estimator.observe(&key.to_be_bytes(), file_size);
+    }
+    estimator
+        .estimate_split_key()
+        .map(|key| u64::from_be_bytes(key.try_into().expect("split keys use u64 bytes")))
 }
 
 #[cfg(test)]

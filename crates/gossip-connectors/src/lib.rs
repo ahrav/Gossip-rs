@@ -29,3 +29,21 @@ pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 pub use scan_driver::{
     FilesystemScanSourceFactory, GitScanSourceFactory, InMemoryScanSourceFactory,
 };
+
+#[cfg(unix)]
+#[doc(hidden)]
+/// Benchmark-only wrapper around the private streaming split estimator.
+///
+/// The estimator itself stays crate-private because production callers consume
+/// split hints through connector APIs, not by instantiating the sketch
+/// directly. Criterion benches and cross-crate regression tests still need a
+/// stable way to drive the real `observe` path, so this doc-hidden shim
+/// exposes a deterministic fixed-size workload entry point while leaving the
+/// estimator type and its internal sampling helpers unexported.
+pub fn benchmark_streaming_split_estimator_observe_fixed_size(
+    sample_cap: usize,
+    count: usize,
+    file_size: u64,
+) -> Option<u64> {
+    split_estimator::benchmark_observe_fixed_size(sample_cap, count, file_size)
+}
