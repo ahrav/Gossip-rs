@@ -34,23 +34,34 @@ use crate::in_memory::MemItem;
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FilesystemScanSourceFactory;
 
+/// Build a filesystem driver from an assignment and preserve its shard bounds.
+///
+/// The bounds are stored on the driver even though `parallel_scan_dir` cannot
+/// consume them yet, so assignment metadata is not lost as execution paths
+/// evolve toward connector-backed filesystem enumeration.
+fn filesystem_driver_from_assignment(assignment: &Assignment) -> Result<FsScanDriver> {
+    if assignment.connector_kind != ConnectorKind::Filesystem {
+        bail!(
+            "assignment kind mismatch: expected filesystem, got {:?}",
+            assignment.connector_kind
+        );
+    }
+
+    let AssignmentSource::Filesystem { root } = &assignment.source else {
+        bail!("filesystem assignment missing filesystem source payload");
+    };
+
+    Ok(FsScanDriver {
+        root: root.clone(),
+        checkpoint_hint: None,
+        shard_start: assignment.shard_spec.key_range_start().to_vec(),
+        shard_end: assignment.shard_spec.key_range_end().to_vec(),
+    })
+}
+
 impl ScanSourceFactory for FilesystemScanSourceFactory {
     fn driver_for_assignment(&self, assignment: &Assignment) -> Result<Box<dyn ScanDriver>> {
-        if assignment.connector_kind != ConnectorKind::Filesystem {
-            bail!(
-                "assignment kind mismatch: expected filesystem, got {:?}",
-                assignment.connector_kind
-            );
-        }
-
-        let AssignmentSource::Filesystem { root } = &assignment.source else {
-            bail!("filesystem assignment missing filesystem source payload");
-        };
-
-        Ok(Box::new(FsScanDriver {
-            root: root.clone(),
-            checkpoint_hint: None,
-        }))
+        Ok(Box::new(filesystem_driver_from_assignment(assignment)?))
     }
 
     fn capabilities(&self) -> SourceCapabilities {
@@ -160,6 +171,19 @@ impl ScanSourceFactory for InMemoryScanSourceFactory {
 struct FsScanDriver {
     root: PathBuf,
     checkpoint_hint: Option<CursorUpdate>,
+    /// Inclusive assignment lower bound (`[]` means unbounded).
+    shard_start: Vec<u8>,
+    /// Exclusive assignment upper bound (`[]` means unbounded).
+    shard_end: Vec<u8>,
+}
+
+impl FsScanDriver {
+    fn shard_bounds(&self) -> (Option<&[u8]>, Option<&[u8]>) {
+        (
+            (!self.shard_start.is_empty()).then_some(self.shard_start.as_slice()),
+            (!self.shard_end.is_empty()).then_some(self.shard_end.as_slice()),
+        )
+    }
 }
 
 impl ScanDriver for FsScanDriver {
@@ -173,6 +197,11 @@ impl ScanDriver for FsScanDriver {
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
+            // `parallel_scan_dir` currently has no key-range API. Keep the
+            // assignment bounds on the driver so connector-backed FS paths can
+            // consume them as they land.
+            let (_shard_start, _shard_end) = self.shard_bounds();
+
             let (event_tx, event_rx) = unbounded();
             let event_forwarder = scope.spawn(move || forward_events(out, None, event_rx));
 
@@ -1040,7 +1069,7 @@ impl RefWatermarkStore for EmptyWatermarkStore {
 mod tests {
     use super::*;
     use gossip_scan_driver::{CommitSink, FindingsBatch, ItemMeta};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     /// Spy commit sink that records the keys passed to each lifecycle call.
@@ -1064,6 +1093,23 @@ mod tests {
 
         fn finish_item(&self, _item_key: &ItemKey) -> Result<()> {
             Ok(())
+        }
+    }
+
+    fn filesystem_assignment(shard_start: &[u8], shard_end: &[u8]) -> Assignment {
+        Assignment {
+            job_id: "job-1".to_owned(),
+            connector_kind: ConnectorKind::Filesystem,
+            connector_instance_id: "fs-1".to_owned(),
+            policy_hash: gossip_contracts::identity::PolicyHash::from_bytes([0x11; 32]),
+            shard_spec: gossip_contracts::coordination::ShardSpec::with_range(
+                shard_start,
+                shard_end,
+            ),
+            cursor: gossip_contracts::connector::Cursor::initial(),
+            source: AssignmentSource::Filesystem {
+                root: PathBuf::from("/tmp/scan-root"),
+            },
         }
     }
 
@@ -1106,6 +1152,30 @@ mod tests {
         assert_eq!(
             keys[0], b"src/main.rs",
             "batch key must be a relative path in connector keyspace"
+        );
+    }
+
+    #[test]
+    fn filesystem_driver_extracts_shard_bounds_from_assignment() {
+        let assignment = filesystem_assignment(b"m", b"z");
+
+        let driver = filesystem_driver_from_assignment(&assignment).expect("filesystem driver");
+        assert_eq!(driver.shard_start, b"m");
+        assert_eq!(driver.shard_end, b"z");
+    }
+
+    #[test]
+    fn filesystem_driver_preserves_unbounded_shard_bounds() {
+        let assignment = filesystem_assignment(b"", b"");
+
+        let driver = filesystem_driver_from_assignment(&assignment).expect("filesystem driver");
+        assert!(
+            driver.shard_start.is_empty(),
+            "empty shard start should stay unbounded"
+        );
+        assert!(
+            driver.shard_end.is_empty(),
+            "empty shard end should stay unbounded"
         );
     }
 

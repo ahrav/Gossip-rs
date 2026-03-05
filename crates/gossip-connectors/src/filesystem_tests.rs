@@ -2988,6 +2988,49 @@ fn prefix_successor_produces_expected_output(
 // ---------------------------------------------------------------
 
 #[test]
+fn with_shard_bounds_filters_to_half_open_range() {
+    let dir = create_test_dir(&[
+        ("alpha.txt", b"a"),
+        ("middle.txt", b"m"),
+        ("zulu.txt", b"z"),
+    ]);
+    let mut c = FilesystemConnector::new(dir.path()).with_shard_bounds(b"middle", b"z");
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let keys: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+    assert_eq!(keys, vec![b"middle.txt".to_vec()]);
+}
+
+#[test]
+fn with_shard_bounds_empty_bounds_keep_full_keyspace() {
+    let dir = create_test_dir(&[
+        ("alpha.txt", b"a"),
+        ("middle.txt", b"m"),
+        ("zulu.txt", b"z"),
+    ]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let mut baseline = FilesystemConnector::new(dir.path());
+    let all_keys: Vec<Vec<u8>> = collect_all(&mut baseline, &start, &end)
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+
+    let mut shard_unbounded = FilesystemConnector::new(dir.path()).with_shard_bounds(b"", b"");
+    let unbounded_keys: Vec<Vec<u8>> = collect_all(&mut shard_unbounded, &start, &end)
+        .into_iter()
+        .map(|item| item.item_key().as_bytes().to_vec())
+        .collect();
+
+    assert_eq!(unbounded_keys, all_keys);
+}
+
+#[test]
 fn with_key_range_equal_bounds_returns_empty() {
     let dir = create_test_dir(&[("a.txt", b"a"), ("m.txt", b"m"), ("z.txt", b"z")]);
     let mut c = FilesystemConnector::new(dir.path()).with_key_range(Some(b"m"), Some(b"m"));
