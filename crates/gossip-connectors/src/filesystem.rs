@@ -297,6 +297,17 @@ impl FilesystemConnector {
     }
 
     #[must_use]
+    /// Restrict traversal using shard-style byte bounds `[start, end)`.
+    ///
+    /// Empty slices are treated as unbounded on that side, matching
+    /// [`ShardSpec`] semantics.
+    pub fn with_shard_bounds(self, start: &[u8], end: &[u8]) -> Self {
+        let start = (!start.is_empty()).then_some(start);
+        let end = (!end.is_empty()).then_some(end);
+        self.with_key_range(start, end)
+    }
+
+    #[must_use]
     /// Set a hard ceiling on DFS depth.
     ///
     /// Exceeding this limit does not fail enumeration; affected subtrees are
