@@ -510,7 +510,12 @@ impl FilesystemConnector {
         Ok(state.pending.as_ref().map(|file| file.key.clone()))
     }
 
-    #[cfg(debug_assertions)]
+    /// Walk from root to find the first key strictly greater than `last_key`.
+    ///
+    /// Used as the ground-truth reference for token resume cross-checks.
+    /// Runs unconditionally after token resume to detect divergence from stale
+    /// or corrupted tokens; on mismatch the key-only result is adopted and the
+    /// token result is discarded.
     fn key_only_resume_probe(
         &mut self,
         last_key: &ItemKey,
@@ -591,17 +596,18 @@ impl FilesystemConnector {
             self.walk_state = Some(restored);
             let token_next = self.seek_after_last_key(last_key, walk_query)?;
 
-            #[cfg(debug_assertions)]
-            {
-                let key_next = self.key_only_resume_probe(last_key, walk_query)?;
-                debug_assert_eq!(
-                    token_next.as_ref().map(|key| key.as_bytes()),
-                    key_next.as_ref().map(|key| key.as_bytes()),
-                    "token-based resume diverged from key-only resume"
-                );
-            }
+            // Cross-check: verify token-based resume agrees with key-only resume.
+            // A stale or corrupted token may position the walker past directories
+            // that still contain unvisited keys > last_key. When divergence is
+            // detected, discard the token result and adopt the key-only position.
+            let key_next = self.key_only_resume_probe(last_key, walk_query)?;
+            let token_matches = token_next.as_ref().map(|k| k.as_bytes())
+                == key_next.as_ref().map(|k| k.as_bytes());
 
-            resumed_from_token = true;
+            if token_matches {
+                resumed_from_token = true;
+            }
+            // On mismatch, fall through to key-only resume below.
         }
 
         if !resumed_from_token {
@@ -1196,11 +1202,17 @@ impl WalkToken {
 
             // Root frame uses an empty component; all non-root frames must have
             // non-empty component bytes and represent a single path segment.
+            // Reject `.` and `..` to prevent path traversal outside the root.
             if frame_idx == 0 {
                 if !component.is_empty() {
                     return None;
                 }
-            } else if component.is_empty() || component.contains(&b'/') || component.contains(&0) {
+            } else if component.is_empty()
+                || component.contains(&b'/')
+                || component.contains(&0)
+                || component == b"."
+                || component == b".."
+            {
                 return None;
             }
 
@@ -1527,6 +1539,8 @@ impl WalkState {
             if frame.component.is_empty()
                 || frame.component.contains(&b'/')
                 || frame.component.contains(&0)
+                || frame.component == b"."
+                || frame.component == b".."
             {
                 return Ok(None);
             }
