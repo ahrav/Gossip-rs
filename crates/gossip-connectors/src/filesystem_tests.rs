@@ -3678,10 +3678,11 @@ fn corrupted_token_version_falls_back_to_key_only_resume() {
 }
 
 /// A forged token with a shifted `next_child_index` is detected by the
-/// A shifted token positions the walker past some entries. Without a
-/// cross-check probe, the token is trusted and resume proceeds from the
-/// shifted position. Key-based seek ensures we never emit keys <= last_key,
-/// but entries between last_key and the shifted position may be skipped.
+/// `#[cfg(test)]` cross-check probe in `align_walk_to_cursor`. The probe
+/// compares the token-based next key against a key-only resume and finds a
+/// mismatch (token yields `d.txt`, key-only yields `c.txt`), so the
+/// connector falls back to key-only seek. All entries after `last_key` are
+/// emitted without skipping.
 #[test]
 fn shifted_token_resumes_from_token_position() {
     let dir = create_test_dir(&[
@@ -3721,7 +3722,8 @@ fn shifted_token_resumes_from_token_position() {
         .enumerate_page_range(&start, &end, &forged_cursor, budgets)
         .expect("resumed page after forged token");
 
-    // Token is trusted: resume from the shifted position yields only d.txt.
+    // Cross-check detects the mismatch and falls back to key-only resume,
+    // so all entries after last_key (b.txt) are returned without skipping.
     let keys: Vec<&[u8]> = page2
         .items()
         .iter()
@@ -3729,8 +3731,8 @@ fn shifted_token_resumes_from_token_position() {
         .collect();
     assert_eq!(
         keys,
-        vec![b"d.txt".as_slice()],
-        "shifted token resumes from token position; got {keys:?}"
+        vec![b"c.txt".as_slice(), b"d.txt".as_slice()],
+        "cross-check should fall back to key-only resume; got {keys:?}"
     );
 }
 
@@ -4026,13 +4028,11 @@ fn walk_token_decode_rejects_dot_and_dotdot_components() {
     }
 }
 
-/// A stale/corrupted token with a shifted `next_child_index` at root can
-/// cause token-based resume to skip directory subtrees that contain keys
-/// A forged token with an advanced `next_child_index` causes the walker to
-/// skip directories. Without a cross-check probe, the token is trusted and
-/// some keys may be skipped. Key-based seek ensures we never regress behind
-/// `last_key`, but entries between `last_key` and the shifted position are
-/// lost.
+/// A stale/corrupted token with a shifted `next_child_index` at root would
+/// cause token-based resume to skip directory subtrees. The `#[cfg(test)]`
+/// cross-check probe in `align_walk_to_cursor` detects the mismatch between
+/// the token-based next key and the key-only next key, and falls back to
+/// key-only seek. All entries after `last_key` are emitted without skipping.
 #[test]
 fn stale_token_resumes_from_token_position() {
     // Directory layout (sorted):
@@ -4042,7 +4042,7 @@ fn stale_token_resumes_from_token_position() {
     //
     // Page 1 (size=1) emits "a/file.txt".
     // We forge a token that positions at child index 2 (directory "c"),
-    // skipping "b/" entirely.
+    // skipping "b/" entirely. Cross-check catches this and falls back.
     let dir = create_test_dir(&[
         ("a/file.txt", b"a"),
         ("b/file.txt", b"b"),
@@ -4090,12 +4090,13 @@ fn stale_token_resumes_from_token_position() {
         cursor = page.next_cursor().clone();
     }
 
-    // Token is trusted: "b/file.txt" is skipped, only "c/file.txt" remains.
-    let expected: Vec<&[u8]> = vec![b"c/file.txt"];
+    // Cross-check detects the mismatch and falls back to key-only resume,
+    // so "b/file.txt" is NOT skipped.
+    let expected: Vec<&[u8]> = vec![b"b/file.txt", b"c/file.txt"];
     let actual: Vec<&[u8]> = remaining.iter().map(|v: &Vec<u8>| v.as_slice()).collect();
     assert_eq!(
         actual, expected,
-        "stale token resumes from token position; got {actual:?}, expected {expected:?}"
+        "cross-check should fall back to key-only resume; got {actual:?}, expected {expected:?}"
     );
 }
 
