@@ -1,8 +1,9 @@
 //! Tests for [`StreamingSplitEstimator`].
 //!
 //! Unit tests cover specific edge cases (minimum entries, front-loaded weight,
-//! zipf accuracy, merge consistency). Property tests verify general invariants
-//! (memory boundedness, zero-size midpoint fallback) over randomised inputs.
+//! zipf accuracy). Property tests verify general invariants (memory
+//! boundedness, zero-size midpoint fallback, sample ordering) over randomised
+//! inputs.
 
 use proptest::prelude::*;
 
@@ -38,6 +39,18 @@ fn relative_weight_error(sizes: &[u64], idx: usize) -> f64 {
     (observed - half).abs() / total as f64
 }
 
+fn assert_samples_sorted(estimator: &StreamingSplitEstimator) {
+    let samples = estimator.sample_debug_view();
+    assert!(
+        samples.windows(2).all(|window| window[0].0 < window[1].0),
+        "sample ranks must remain strictly increasing: {samples:?}"
+    );
+    assert!(
+        samples.windows(2).all(|window| window[0].1 <= window[1].1),
+        "sample byte positions must remain non-decreasing: {samples:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests — specific edge cases and regression guards
 // ---------------------------------------------------------------------------
@@ -54,9 +67,7 @@ fn equal_weight_files_split_near_midpoint() {
     let split = estimator
         .estimate_split_key()
         .expect("should produce split");
-    let split_idx = index_from_key(&split);
-    // With 5 equal-weight files, acceptable midpoints are indices 2 or 3
-    // (a 2/3 or 3/2 byte split). Both are within one file of the true median.
+    let split_idx = index_from_key(split);
     assert!(
         split_idx == 2 || split_idx == 3,
         "expected split near midpoint (index 2 or 3), got index {}",
@@ -67,9 +78,6 @@ fn equal_weight_files_split_near_midpoint() {
 #[test]
 fn skewed_sizes_split_selects_straddling_file() {
     let mut estimator = StreamingSplitEstimator::new(256);
-    // Three files: sizes 5, 5, 100. Total = 110. Target = 55.
-    // Pre-increment cumulative starts: [0, 5, 10].
-    // File 2's range is [10, 110), which contains target 55.
     estimator.observe(&key_for_index(0), 5);
     estimator.observe(&key_for_index(1), 5);
     estimator.observe(&key_for_index(2), 100);
@@ -77,9 +85,7 @@ fn skewed_sizes_split_selects_straddling_file() {
     let split = estimator
         .estimate_split_key()
         .expect("should produce split");
-    let split_idx = index_from_key(&split);
-    // The correct split is at index 2: it's the file whose byte range
-    // straddles the 50% mark. Index 1 would be a left-shifted split.
+    let split_idx = index_from_key(split);
     assert_eq!(
         split_idx, 2,
         "expected split at index 2 (file straddling the median), got index {}",
@@ -98,6 +104,17 @@ fn estimate_requires_at_least_two_entries() {
 }
 
 #[test]
+fn observe_does_not_duplicate_samples_when_rank_and_byte_triggers_overlap() {
+    let mut estimator = StreamingSplitEstimator::new(32);
+    estimator.observe(&key_for_index(0), 1);
+    assert_eq!(
+        estimator.sample_len(),
+        1,
+        "a single observation that satisfies both sampling rules should retain only one sample"
+    );
+}
+
+#[test]
 fn estimator_avoids_first_item_on_heavy_lead_weight() {
     let mut estimator = StreamingSplitEstimator::new(128);
     estimator.observe(&key_for_index(0), 10_000_000);
@@ -105,7 +122,7 @@ fn estimator_avoids_first_item_on_heavy_lead_weight() {
         estimator.observe(&key_for_index(idx), 1);
     }
     let split = estimator.estimate_split_key().expect("split key expected");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     assert!(
         split_idx >= 1,
         "split must leave at least one key on the left"
@@ -122,7 +139,6 @@ fn zipf_like_stream_is_within_one_percent_weight_error() {
     let mut estimator = StreamingSplitEstimator::new(256);
     let mut sizes = Vec::with_capacity(count);
     for idx in 0..count {
-        // Monotone-decreasing sizes approximate real skewed repositories.
         let size = (count - idx) as u64;
         sizes.push(size);
         let key = key_for_index(idx);
@@ -130,48 +146,13 @@ fn zipf_like_stream_is_within_one_percent_weight_error() {
     }
 
     let split = estimator.estimate_split_key().expect("split key expected");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     let error = relative_weight_error(&sizes, split_idx);
     assert!(
         error <= 0.01,
         "expected <=1% weighted error, got {:.4} at index {}",
         error,
         split_idx
-    );
-}
-
-#[test]
-fn merge_matches_single_pass_for_append_order_streams() {
-    let count = 8_000usize;
-    let mut full = StreamingSplitEstimator::new(128);
-    let mut left = StreamingSplitEstimator::new(128);
-    let mut right = StreamingSplitEstimator::new(128);
-
-    for idx in 0..count {
-        let size = ((idx as u64)
-            .wrapping_mul(1_103_515_245)
-            .wrapping_add(12_345)
-            % 4_096)
-            + 1;
-        let key = key_for_index(idx);
-        full.observe(&key, size);
-        if idx < count / 2 {
-            left.observe(&key, size);
-        } else {
-            right.observe(&key, size);
-        }
-    }
-
-    let full_idx = index_from_key(&full.estimate_split_key().expect("full split"));
-    left.merge(&right);
-    let merged_idx = index_from_key(&left.estimate_split_key().expect("merged split"));
-    let delta = full_idx.abs_diff(merged_idx);
-    assert!(
-        delta <= (count / 100) + 2,
-        "merge drift too large: full={}, merged={}, delta={}",
-        full_idx,
-        merged_idx,
-        delta
     );
 }
 
@@ -185,7 +166,7 @@ fn two_items_split_at_second_key() {
     let split = estimator
         .estimate_split_key()
         .expect("should produce split");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     assert_eq!(
         split_idx, 1,
         "with two items, split must be at index 1, got {}",
@@ -202,7 +183,7 @@ fn two_zero_size_items_split_at_second_key() {
     let split = estimator
         .estimate_split_key()
         .expect("should produce split");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     assert_eq!(
         split_idx, 1,
         "with two zero-size items, split must be at index 1, got {}",
@@ -211,147 +192,80 @@ fn two_zero_size_items_split_at_second_key() {
 }
 
 // ---------------------------------------------------------------------------
-// Front-loaded split after compaction
+// Downsampling regressions
 // ---------------------------------------------------------------------------
 
-/// After compaction evicts rank_samples[0], the estimator must still avoid
-/// returning the very first observed key when weight is front-loaded.
-/// This exercises the bug where `estimate_split_key` compared against
-/// `rank_samples.first()` instead of the true first observed key.
+/// After repeated downsampling, the estimator must still avoid returning the
+/// very first observed key when weight is front-loaded.
 #[test]
-fn front_loaded_split_avoids_first_key_after_compaction() {
-    // compression=32 → sample_cap = 128. Feed 2000 keys so compaction fires
-    // many times and evicts the original rank_samples[0].
+fn front_loaded_split_avoids_first_key_after_downsampling() {
     let mut estimator = StreamingSplitEstimator::new(32);
     let cap = estimator.sample_cap();
-    let n = 2000usize;
-    assert!(n > cap, "test must exceed sample_cap to trigger compaction");
+    let n = 2_000usize;
+    assert!(
+        n > cap,
+        "test must exceed sample_cap to trigger downsampling"
+    );
 
-    // Massive first file: byte-weighted median lands squarely on index 0.
     estimator.observe(&key_for_index(0), 100_000_000);
     for idx in 1..n {
         estimator.observe(&key_for_index(idx), 1);
     }
 
     let split = estimator.estimate_split_key().expect("split key expected");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     assert!(
         split_idx >= 1,
-        "split must not return index 0 (the first observed key) even after compaction, got {}",
+        "split must not return index 0 (the first observed key) after downsampling, got {}",
         split_idx
     );
 }
 
-// ---------------------------------------------------------------------------
-// Compaction edge-case tests
-// ---------------------------------------------------------------------------
-
-/// When all observed files have the same cumulative byte position (all zero
-/// sizes pushed through the byte path would not happen, but identical non-zero
-/// sizes produce identical *starting* positions only when there's one item),
-/// compact_byte_samples must not panic or produce duplicates.
 #[test]
-fn compact_with_all_identical_byte_positions() {
-    // Use compression=32 → sample_cap = 32*4 = 128.
+fn sample_count_stays_bounded_after_repeated_downsampling() {
     let mut estimator = StreamingSplitEstimator::new(32);
     let cap = estimator.sample_cap();
-    // Feed cap + 10 items each with size 1. The cumulative *start* positions
-    // are 0, 1, 2, ... so they aren't truly identical. To force identical
-    // positions we need files with size 0 — but those skip the byte path.
-    // Instead, test the rank path with identical keys: all have rank 0..n
-    // which are unique. The interesting degenerate case is when file sizes
-    // are all identical, producing evenly spaced positions.
-    for idx in 0..(cap + 10) {
-        estimator.observe(&key_for_index(idx), 42);
+    let n = cap * 8;
+    for idx in 0..n {
+        estimator.observe(&key_for_index(idx), (idx as u64) + 1);
     }
-    // After compaction both sample arrays must be within cap.
-    assert!(estimator.rank_sample_len() <= cap);
-    assert!(estimator.byte_sample_len() <= cap);
-    // Split should still be valid.
-    let split = estimator
-        .estimate_split_key()
-        .expect("should produce split");
-    let split_idx = index_from_key(&split);
-    assert!(split_idx >= 1, "split must not be index 0");
+
+    assert!(
+        estimator.sample_len() <= cap,
+        "sample count ({}) exceeded cap ({cap})",
+        estimator.sample_len()
+    );
+    assert_samples_sorted(&estimator);
+
+    let samples = estimator.sample_debug_view();
+    assert_eq!(
+        index_from_key(samples.first().expect("samples").2.as_slice()),
+        0,
+        "downsampling must preserve the first observed key"
+    );
+    assert_eq!(
+        index_from_key(samples.last().expect("samples").2.as_slice()),
+        n - 1,
+        "downsampling must preserve the last observed key"
+    );
 }
 
-/// Observe exactly `sample_cap + 1` items with the smallest compression (32)
-/// to verify compaction fires once and preserves endpoints.
 #[test]
-fn compact_when_barely_exceeding_cap() {
+fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
     let mut estimator = StreamingSplitEstimator::new(32);
     let cap = estimator.sample_cap();
     for idx in 0..(cap + 1) {
         estimator.observe(&key_for_index(idx), (idx as u64) + 1);
     }
-    assert!(estimator.rank_sample_len() <= cap);
-    assert!(estimator.byte_sample_len() <= cap);
-    // Endpoints: first rank sample should be index 0, last should be cap.
+
+    assert!(estimator.sample_len() <= cap);
+    assert_samples_sorted(&estimator);
+
     let split = estimator
         .estimate_split_key()
         .expect("should produce split");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     assert!(split_idx >= 1 && split_idx <= cap);
-}
-
-/// Verify first and last rank samples survive compaction.
-#[test]
-fn compact_rank_preserves_endpoints() {
-    let mut estimator = StreamingSplitEstimator::new(32);
-    let cap = estimator.sample_cap();
-    let n = cap * 3;
-    for idx in 0..n {
-        estimator.observe(&key_for_index(idx), 1);
-    }
-    assert!(estimator.rank_sample_len() <= cap);
-    // The estimator should be able to find a split within range.
-    let split = estimator
-        .estimate_split_key()
-        .expect("should produce split");
-    let split_idx = index_from_key(&split);
-    assert!(split_idx >= 1 && split_idx < n);
-}
-
-// ---------------------------------------------------------------------------
-// Merge edge-case tests
-// ---------------------------------------------------------------------------
-
-/// Merging an empty estimator into a populated one is a no-op.
-#[test]
-fn merge_empty_into_populated() {
-    let mut estimator = StreamingSplitEstimator::new(128);
-    for idx in 0..100 {
-        estimator.observe(&key_for_index(idx), (idx as u64) + 1);
-    }
-    let before = estimator.estimate_split_key().expect("split before merge");
-
-    let empty = StreamingSplitEstimator::new(128);
-    estimator.merge(&empty);
-
-    let after = estimator.estimate_split_key().expect("split after merge");
-    assert_eq!(before, after, "merge of empty estimator should be a no-op");
-}
-
-/// Merging two estimators where all files have zero size produces a valid
-/// rank-based split.
-#[test]
-fn merge_with_all_zero_sizes() {
-    let mut left = StreamingSplitEstimator::new(128);
-    let mut right = StreamingSplitEstimator::new(128);
-    for idx in 0..50 {
-        left.observe(&key_for_index(idx), 0);
-    }
-    for idx in 50..100 {
-        right.observe(&key_for_index(idx), 0);
-    }
-    left.merge(&right);
-    let split = left.estimate_split_key().expect("merged split");
-    let split_idx = index_from_key(&split);
-    assert_eq!(
-        split_idx, 50,
-        "100 zero-size items should split at midpoint 50, got {}",
-        split_idx
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -366,15 +280,145 @@ fn extreme_file_sizes_no_overflow() {
     estimator.observe(&key_for_index(0), huge);
     estimator.observe(&key_for_index(1), huge);
     estimator.observe(&key_for_index(2), 1);
-    // total_bytes saturates at u64::MAX rather than wrapping.
     let split = estimator
         .estimate_split_key()
         .expect("should produce split with extreme sizes");
-    let split_idx = index_from_key(&split);
+    let split_idx = index_from_key(split);
     assert!(
         (1..=2).contains(&split_idx),
         "split index should be 1 or 2, got {}",
         split_idx
+    );
+}
+
+#[test]
+fn byte_positions_above_f64_precision_boundary_remain_distinguishable() {
+    let mut estimator = StreamingSplitEstimator::new(256);
+    let boundary = 1u64 << 53;
+
+    estimator.observe(&key_for_index(0), boundary);
+    estimator.observe(&key_for_index(1), 1);
+    estimator.observe(&key_for_index(2), 1);
+    estimator.observe(&key_for_index(3), boundary);
+
+    let split = estimator
+        .estimate_split_key()
+        .expect("should produce split");
+    assert_eq!(
+        index_from_key(split),
+        2,
+        "adjacent byte offsets above 2^53 must remain distinguishable"
+    );
+
+    let samples = estimator.sample_debug_view();
+    assert!(
+        samples
+            .iter()
+            .any(|(_, bytes, key)| { *bytes == boundary && index_from_key(key.as_slice()) == 1 }),
+        "expected sample at byte offset 2^53 for key 1"
+    );
+    assert!(
+        samples.iter().any(|(_, bytes, key)| {
+            *bytes == boundary + 1 && index_from_key(key.as_slice()) == 2
+        }),
+        "expected sample at byte offset 2^53 + 1 for key 2"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Internal helper tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn align_to_stride_edge_cases() {
+    use super::align_to_stride;
+
+    assert_eq!(align_to_stride(0, 5), 0, "zero already aligned");
+    assert_eq!(align_to_stride(1, 5), 5, "round up");
+    assert_eq!(align_to_stride(5, 5), 5, "exact multiple");
+    assert_eq!(align_to_stride(6, 5), 10, "round up past multiple");
+    assert_eq!(align_to_stride(u64::MAX, 5), u64::MAX, "MAX passthrough");
+    assert_eq!(
+        align_to_stride(u64::MAX - 2, 4),
+        u64::MAX,
+        "saturating_add triggers"
+    );
+    assert_eq!(align_to_stride(0, 1), 0, "stride=1 is identity for 0");
+    assert_eq!(align_to_stride(7, 1), 7, "stride=1 is identity");
+}
+
+#[test]
+fn interpolated_position_edge_cases() {
+    use super::interpolated_position;
+
+    assert_eq!(interpolated_position(0, 100, 0, 5), 0, "first endpoint");
+    assert_eq!(interpolated_position(0, 100, 4, 5), 100, "last endpoint");
+    assert_eq!(interpolated_position(0, 100, 2, 5), 50, "midpoint");
+    assert_eq!(interpolated_position(10, 110, 1, 3), 60, "non-zero first");
+    // Verify no panic/overflow on large span via u128 path.
+    let result = interpolated_position(0, u64::MAX, 1, 3);
+    assert_eq!(
+        result,
+        u64::MAX / 2,
+        "large span uses u128 arithmetic without overflow"
+    );
+}
+
+#[test]
+fn compact_samples_preserves_endpoints_and_monotonicity() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+
+    let original_first_key = samples.first().unwrap().key.clone();
+    let original_last_key = samples.last().unwrap().key.clone();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+    assert_eq!(samples.first().unwrap().key, original_first_key);
+    assert_eq!(samples.last().unwrap().key, original_last_key);
+
+    // Ranks strictly increasing.
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+    // Bytes non-decreasing.
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Saturation edge-case tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn observe_with_max_file_size() {
+    let mut estimator = StreamingSplitEstimator::new(256);
+    estimator.observe(&key_for_index(0), u64::MAX);
+    estimator.observe(&key_for_index(1), 1);
+    estimator.observe(&key_for_index(2), 1);
+
+    let split = estimator.estimate_split_key().expect("split expected");
+    let split_idx = index_from_key(split);
+    assert!(split_idx >= 1, "first-key guard must hold, got {split_idx}");
+}
+
+#[test]
+fn cumulative_bytes_saturation() {
+    let mut estimator = StreamingSplitEstimator::new(256);
+    estimator.observe(&key_for_index(0), u64::MAX - 10);
+    estimator.observe(&key_for_index(1), 20); // saturates to MAX
+    estimator.observe(&key_for_index(2), 100); // already at MAX
+
+    let split = estimator.estimate_split_key().expect("split expected");
+    let split_idx = index_from_key(split);
+    assert!(
+        split_idx >= 1,
+        "valid split required, got index {split_idx}"
     );
 }
 
@@ -395,7 +439,7 @@ proptest! {
             .estimate_split_key()
             .expect("should produce a split with count >= 2");
         prop_assert_eq!(
-            index_from_key(&key),
+            index_from_key(key),
             count / 2,
             "zero-size stream of {} items should split at index {}",
             count,
@@ -419,7 +463,7 @@ proptest! {
             .estimate_split_key()
             .expect("should produce split with count >= 2");
         prop_assert!(
-            observed_keys.iter().any(|k| k.as_slice() == split.as_slice()),
+            observed_keys.iter().any(|k| k.as_slice() == split),
             "split key {:?} was not among the {} observed keys",
             split,
             count
@@ -427,11 +471,10 @@ proptest! {
     }
 
     /// For any compression setting and stream length (with mixed zero and
-    /// non-zero sizes), rank and byte sample arrays never exceed their
-    /// respective caps.
+    /// non-zero sizes), the unified sample set remains bounded and sorted.
     ///
-    /// Ranges are tuned to exercise compaction paths while keeping wall-clock
-    /// time under ~10 s on CI.
+    /// Ranges are tuned to exercise downsampling paths while keeping wall-clock
+    /// time under CI-friendly bounds.
     #[test]
     fn prop_sample_memory_bounded(
         compression in 32..512usize,
@@ -440,21 +483,28 @@ proptest! {
         let mut estimator = StreamingSplitEstimator::new(compression);
         for idx in 0..count {
             let key = key_for_index(idx);
-            // Mix of zero and non-zero sizes to exercise both sample arrays.
             let size = if idx % 3 == 0 { 0 } else { (idx as u64) + 1 };
             estimator.observe(&key, size);
         }
+
         prop_assert!(
-            estimator.rank_sample_len() <= estimator.sample_cap(),
-            "rank samples ({}) exceeded cap ({})",
-            estimator.rank_sample_len(),
+            estimator.sample_len() <= estimator.sample_cap(),
+            "samples ({}) exceeded cap ({})",
+            estimator.sample_len(),
             estimator.sample_cap()
         );
+
+        let samples = estimator.sample_debug_view();
         prop_assert!(
-            estimator.byte_sample_len() <= estimator.sample_cap(),
-            "byte samples ({}) exceeded cap ({})",
-            estimator.byte_sample_len(),
-            estimator.sample_cap()
+            samples.windows(2).all(|window| window[0].0 < window[1].0),
+            "sample ranks must remain strictly increasing: {:?}",
+            samples
+        );
+        prop_assert!(
+            samples.windows(2).all(|window| window[0].1 <= window[1].1),
+            "sample byte positions must remain non-decreasing: {:?}",
+            samples
         );
     }
+
 }
