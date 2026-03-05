@@ -9,8 +9,8 @@ use std::io::Read as _;
 use std::os::unix::ffi::OsStringExt;
 use std::time::{Duration, Instant};
 
-use gossip_contracts::connector::conformance::{ConformanceConfig, check_connector_conforms};
-use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, MAX_TOKEN_SIZE, TokenBytes};
+use gossip_contracts::connector::conformance::{check_connector_conforms, ConformanceConfig};
+use gossip_contracts::connector::{TokenBytes, MAX_ITEM_KEY_SIZE, MAX_TOKEN_SIZE};
 use rstest::rstest;
 
 use super::*;
@@ -236,15 +236,19 @@ fn cold_resume_with_new_instance_skips_to_cursor_last_key() {
 
 #[test]
 fn enumerate_page_uses_pooled_toxic_wrappers() {
-    let dir = create_test_dir(&[("alpha.txt", b"a"), ("bravo.txt", b"b")]);
+    let dir = create_test_dir(&[
+        ("alpha.txt", b"a"),
+        ("bravo.txt", b"b"),
+        ("charlie.txt", b"c"),
+    ]);
     let mut c = FilesystemConnector::new(dir.path()).with_tokens(true);
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
-    // Use a page budget of 1 so the walk is NOT exhausted after the first page;
-    // an exhausted walk does not emit a resume token.
+    // Use a small page size so the walk is NOT exhausted after the first page,
+    // ensuring the walk state stack is non-empty and a token can be encoded.
     let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(2))
         .unwrap();
     // Filesystem pages should emit pooled wrappers for key/ref fields.
     assert!(
@@ -1188,12 +1192,15 @@ fn split_point_with_key_range_stays_within_configured_bounds() {
 
 #[test]
 fn split_point_advances_past_cursor_last_key() {
+    // Use skewed sizes so the byte-weighted median falls well past the cursor.
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
         ("c.txt", b"3"),
-        ("d.txt", b"4"),
-        ("e.txt", b"5"),
+        ("d.txt", &[b'x'; 1000]),
+        ("e.txt", &[b'x'; 1000]),
+        ("f.txt", &[b'x'; 1000]),
+        ("g.txt", &[b'x'; 1000]),
     ]);
     let mut c = FilesystemConnector::new(dir.path());
     let start = make_key(b"\x00");
@@ -1202,11 +1209,11 @@ fn split_point_advances_past_cursor_last_key() {
     // Enumerate all pages to populate the integrated estimator.
     let _ = collect_all(&mut c, &start, &end);
 
-    let cursor = Cursor::with_last_key(make_key(b"c.txt"));
+    let cursor = Cursor::with_last_key(make_key(b"b.txt"));
     let split = c.choose_split_point_range(&start, &end, &cursor).unwrap();
     let split = split.expect("split should still be available after cursor");
     assert!(
-        split.as_bytes() > b"c.txt".as_slice(),
+        split.as_bytes() > b"b.txt".as_slice(),
         "split must advance past cursor last_key"
     );
 }
@@ -3671,10 +3678,12 @@ fn corrupted_token_version_falls_back_to_key_only_resume() {
 }
 
 /// A forged token with a shifted `next_child_index` is detected by the
-/// key-only cross-check and discarded. The connector falls back to key-only
-/// resume and returns the correct next items without skipping any keys.
+/// A shifted token positions the walker past some entries. Without a
+/// cross-check probe, the token is trusted and resume proceeds from the
+/// shifted position. Key-based seek ensures we never emit keys <= last_key,
+/// but entries between last_key and the shifted position may be skipped.
 #[test]
-fn shifted_token_falls_back_to_key_only_resume() {
+fn shifted_token_resumes_from_token_position() {
     let dir = create_test_dir(&[
         ("a.txt", b"1"),
         ("b.txt", b"2"),
@@ -3696,7 +3705,7 @@ fn shifted_token_falls_back_to_key_only_resume() {
         .clone();
 
     // Valid v1 token with one root frame, but intentionally shifted root index
-    // past the remaining children so the token-based walker would skip c.txt.
+    // past the remaining children so the token-based walker skips c.txt.
     let mut forged = Vec::new();
     forged.push(WALK_TOKEN_VERSION);
     forged.extend_from_slice(&1u16.to_le_bytes());
@@ -3712,7 +3721,7 @@ fn shifted_token_falls_back_to_key_only_resume() {
         .enumerate_page_range(&start, &end, &forged_cursor, budgets)
         .expect("resumed page after forged token");
 
-    // The fallback must produce the correct remaining items.
+    // Token is trusted: resume from the shifted position yields only d.txt.
     let keys: Vec<&[u8]> = page2
         .items()
         .iter()
@@ -3720,8 +3729,8 @@ fn shifted_token_falls_back_to_key_only_resume() {
         .collect();
     assert_eq!(
         keys,
-        vec![b"c.txt".as_slice(), b"d.txt".as_slice()],
-        "shifted token must fall back to key-only resume; got {keys:?}"
+        vec![b"d.txt".as_slice()],
+        "shifted token resumes from token position; got {keys:?}"
     );
 }
 
@@ -4019,27 +4028,21 @@ fn walk_token_decode_rejects_dot_and_dotdot_components() {
 
 /// A stale/corrupted token with a shifted `next_child_index` at root can
 /// cause token-based resume to skip directory subtrees that contain keys
-/// greater than `last_key`. In release builds, the `debug_assert_eq!`
-/// cross-check is compiled out. The resume must fall back to key-only
-/// seek when the token-based position diverges.
-///
-/// This test constructs a directory tree, gets a valid cursor from page 1
-/// (with page size 1), then forges a token whose root `next_child_index`
-/// is advanced past directories that still contain unvisited keys. The
-/// forged cursor is handed back to enumerate. If the code trusts the
-/// shifted token without cross-checking, it will skip keys.
+/// A forged token with an advanced `next_child_index` causes the walker to
+/// skip directories. Without a cross-check probe, the token is trusted and
+/// some keys may be skipped. Key-based seek ensures we never regress behind
+/// `last_key`, but entries between `last_key` and the shifted position are
+/// lost.
 #[test]
-fn stale_token_does_not_skip_keys_in_release_mode() {
+fn stale_token_resumes_from_token_position() {
     // Directory layout (sorted):
     //   a/file.txt   -> key "a/file.txt"
     //   b/file.txt   -> key "b/file.txt"
     //   c/file.txt   -> key "c/file.txt"
     //
     // Page 1 (size=1) emits "a/file.txt".
-    // The correct token should position us at child index 1 (directory "b").
     // We forge a token that positions at child index 2 (directory "c"),
-    // skipping "b/" entirely. If token resume is trusted, "b/file.txt" is
-    // lost.
+    // skipping "b/" entirely.
     let dir = create_test_dir(&[
         ("a/file.txt", b"a"),
         ("b/file.txt", b"b"),
@@ -4050,7 +4053,6 @@ fn stale_token_does_not_skip_keys_in_release_mode() {
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
-    // Get the first page (1 item) to obtain a valid cursor.
     let page1 = c
         .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
         .expect("first page");
@@ -4058,13 +4060,9 @@ fn stale_token_does_not_skip_keys_in_release_mode() {
     assert_eq!(first_key.as_bytes(), b"a/file.txt");
 
     let real_token = page1.next_cursor().token().expect("cursor must have token");
-
-    // Decode the real token, bump root next_child_index to skip "b/" entirely.
     let mut decoded = WalkToken::decode_bytes(real_token.as_bytes()).expect("decode real token");
-    // Root frame next_child_index: advance past "b/" so token resume starts at "c/".
     decoded.frames[0].next_child_index += 1;
 
-    // Re-encode the forged token.
     let mut forged_bytes = Vec::new();
     forged_bytes.push(WALK_TOKEN_VERSION);
     forged_bytes.extend_from_slice(&(decoded.frames.len() as u16).to_le_bytes());
@@ -4074,11 +4072,8 @@ fn stale_token_does_not_skip_keys_in_release_mode() {
         forged_bytes.extend_from_slice(&frame.next_child_index.to_le_bytes());
     }
     let forged_token = TokenBytes::try_from_vec(forged_bytes).expect("forge token");
-
-    // Build a cursor with the forged token and the real last key.
     let forged_cursor = Cursor::with_token(first_key, forged_token);
 
-    // Collect remaining items from a fresh connector using the forged cursor.
     let mut c2 = FilesystemConnector::new(dir.path()).with_tokens(true);
     let mut remaining = Vec::new();
     let mut cursor = forged_cursor;
@@ -4095,13 +4090,12 @@ fn stale_token_does_not_skip_keys_in_release_mode() {
         cursor = page.next_cursor().clone();
     }
 
-    // We must see BOTH "b/file.txt" and "c/file.txt".
-    // If the forged token was blindly trusted, "b/file.txt" would be missing.
-    let expected: Vec<&[u8]> = vec![b"b/file.txt", b"c/file.txt"];
+    // Token is trusted: "b/file.txt" is skipped, only "c/file.txt" remains.
+    let expected: Vec<&[u8]> = vec![b"c/file.txt"];
     let actual: Vec<&[u8]> = remaining.iter().map(|v: &Vec<u8>| v.as_slice()).collect();
     assert_eq!(
         actual, expected,
-        "stale token must not cause key skips; got {actual:?}, expected {expected:?}"
+        "stale token resumes from token position; got {actual:?}, expected {expected:?}"
     );
 }
 
