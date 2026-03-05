@@ -52,6 +52,7 @@ The crate provides four core capabilities:
 | `common.rs`      | Shared utilities: binary search, identity derivation, split-point selection, pooled page assembly, I/O error classification, path conversion |
 | `in_memory.rs`   | `InMemoryDeterministicConnector` -- deterministic in-memory fixture                                           |
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |
+| `split_estimator.rs` | `StreamingSplitEstimator` -- bounded-memory byte-weighted split-point estimation                          |
 | `git.rs`         | `GitConnector` -- Git repository connector with ref enumeration and blob reading                              |
 | `scan_driver.rs` | `ScanSourceFactory` impls: `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
 
@@ -103,6 +104,7 @@ The crate provides four core capabilities:
 | Conformance testing            | `gossip-contracts::connector`    | `check_connector_conforms`, `ConformanceConfig`                                    |
 | Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
 | Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `choose_split_index`                                 |
+| Streaming split estimation     | `gossip-connectors::split_estimator` | `StreamingSplitEstimator` (bounded-memory byte-weighted median)             |
 | Scan driver traits             | `gossip-scan-driver`             | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`                             |
 | Scan source factory impls      | `gossip-connectors::scan_driver` | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
 | Scan runtime entry points      | `gossip-scanner-runtime`         | `scan_fs()`, `scan_git()`, execution-mode dispatch                                 |
@@ -465,13 +467,16 @@ DFS walk (per-directory sorted frames, no full-tree materialization).
 Symlinks are skipped during walk and rejected at open time.
 
 Capabilities: `seek_by_key: true`, `token_resume: false` (default,
-configurable via `with_tokens()`), `split_hints: false`,
+configurable via `with_tokens()`), `split_hints: true`,
 `range_read: true`.
 
-Split hints are disabled while streaming quantile support is pending;
-`choose_split_point` returns `Ok(None)`. Walk issues (permission denied,
-non-regular files) are captured as `WalkWarning`s rather than fatal
-errors.
+Split hints are provided by a `StreamingSplitEstimator` integrated into
+the pagination walk. The estimator is fed `(key, file_size)` pairs as
+each file is emitted during `enumerate_page`, and `choose_split_point`
+reads the byte-weighted median estimate without a separate walk pass.
+Memory is bounded by the configured sample cap. Walk issues (permission
+denied, non-regular files) are captured as `WalkWarning`s rather than
+fatal errors.
 
 ### GitConnector (`git.rs`)
 
@@ -538,10 +543,12 @@ consistent across `FilesystemConnector`, `GitConnector`, and
 | `choose_split_index`    | Byte-weighted median split with count-balanced fallback          |
 
 In-memory and git connectors use `choose_split_index`
-for byte-weighted median split selection; the filesystem connector no
-longer participates in split selection. Count-balanced midpoint is the
-fallback when all entries are zero-size or weight concentrates in the
-leading entry.
+for byte-weighted median split selection over materialized indices.
+The filesystem connector uses a `StreamingSplitEstimator`
+(`split_estimator.rs`) integrated into the pagination walk for bounded-
+memory split estimation without full-index materialization. Count-balanced
+midpoint is the fallback when all entries are zero-size or weight
+concentrates in the leading entry.
 
 #### Bound resolution and cursor resume
 

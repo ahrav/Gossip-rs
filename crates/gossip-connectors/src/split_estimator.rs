@@ -10,6 +10,86 @@ use std::mem;
 const MIN_SAMPLE_CAP: usize = 64;
 const KEY_SAMPLE_FACTOR: usize = 4;
 
+/// Compact a sample vector to at most `cap` entries using position-based
+/// nearest-neighbor selection.
+///
+/// Shared by both rank and byte sample compaction. Positions are assumed
+/// monotonically non-decreasing. When all positions are identical,
+/// falls back to index-based even spacing.
+fn compact_samples(samples: &mut Vec<KeySample>, cap: usize) {
+    if samples.len() <= cap {
+        return;
+    }
+    let old = mem::take(samples);
+    let len = old.len();
+    if cap == 1 {
+        samples.push(
+            old.last()
+                .expect("len > cap implies at least one sample")
+                .clone(),
+        );
+        return;
+    }
+
+    let first = old.first().expect("non-empty samples").position;
+    let last = old.last().expect("non-empty samples").position;
+
+    // When all positions are identical, position-based interpolation
+    // collapses. Short-circuit with index-based even spacing.
+    if first == last {
+        *samples = (0..cap)
+            .map(|i| {
+                let idx = i * (len - 1) / (cap - 1);
+                old[idx].clone()
+            })
+            .collect();
+        return;
+    }
+
+    let mut compacted = Vec::with_capacity(cap);
+    let mut cursor = 0usize;
+    let mut last_pick: Option<usize> = None;
+    for i in 0..cap {
+        let target = if i == 0 {
+            first
+        } else if i + 1 == cap {
+            last
+        } else {
+            first + (last - first) * (i as f64) / ((cap - 1) as f64)
+        };
+
+        while cursor + 1 < len && old[cursor + 1].position < target {
+            cursor += 1;
+        }
+
+        let mut pick = if cursor + 1 < len {
+            let next = cursor + 1;
+            let d_curr = (old[cursor].position - target).abs();
+            let d_next = (old[next].position - target).abs();
+            if d_next < d_curr { next } else { cursor }
+        } else {
+            cursor
+        };
+
+        if let Some(prev) = last_pick
+            && pick <= prev
+        {
+            pick = prev + 1;
+        }
+        let remaining = cap - i - 1;
+        let max_pick = len - remaining - 1;
+        if pick > max_pick {
+            pick = max_pick;
+        }
+
+        compacted.push(old[pick].clone());
+        last_pick = Some(pick);
+        cursor = pick;
+    }
+
+    *samples = compacted;
+}
+
 #[derive(Clone, Debug)]
 struct KeySample {
     position: f64,
@@ -185,104 +265,11 @@ impl StreamingSplitEstimator {
     }
 
     fn compact_rank_samples(&mut self) {
-        if self.rank_samples.len() <= self.sample_cap {
-            return;
-        }
-        // Rebalance to evenly spaced samples in stream-order index space.
-        let old = mem::take(&mut self.rank_samples);
-        let len = old.len();
-        if self.sample_cap == 1 {
-            self.rank_samples.push(
-                old.last()
-                    .expect("len > sample_cap implies at least one sample")
-                    .clone(),
-            );
-            return;
-        }
-        self.rank_samples = (0..self.sample_cap)
-            .map(|i| {
-                let idx = i * (len - 1) / (self.sample_cap - 1);
-                old[idx].clone()
-            })
-            .collect();
+        compact_samples(&mut self.rank_samples, self.sample_cap);
     }
 
     fn compact_byte_samples(&mut self) {
-        if self.byte_samples.len() <= self.sample_cap {
-            return;
-        }
-        // Rebalance by cumulative-byte position so 50th-percentile byte
-        // lookups remain stable under strongly skewed size distributions.
-        let old = mem::take(&mut self.byte_samples);
-        let len = old.len();
-        if self.sample_cap == 1 {
-            self.byte_samples.push(
-                old.last()
-                    .expect("len > sample_cap implies at least one sample")
-                    .clone(),
-            );
-            return;
-        }
-
-        let first = old.first().expect("non-empty samples").position;
-        let last = old.last().expect("non-empty samples").position;
-
-        // When all positions are identical, position-based interpolation
-        // collapses and the loop below degenerates to sequential index
-        // picking via the `pick <= prev` guard.  Short-circuit with
-        // index-based even spacing for clarity.
-        if first == last {
-            self.byte_samples = (0..self.sample_cap)
-                .map(|i| {
-                    let idx = i * (len - 1) / (self.sample_cap - 1);
-                    old[idx].clone()
-                })
-                .collect();
-            return;
-        }
-
-        let mut compacted = Vec::with_capacity(self.sample_cap);
-        let mut cursor = 0usize;
-        let mut last_pick: Option<usize> = None;
-        for i in 0..self.sample_cap {
-            let target = if i == 0 {
-                first
-            } else if i + 1 == self.sample_cap {
-                last
-            } else {
-                first + (last - first) * (i as f64) / ((self.sample_cap - 1) as f64)
-            };
-
-            while cursor + 1 < len && old[cursor + 1].position < target {
-                cursor += 1;
-            }
-
-            let mut pick = if cursor + 1 < len {
-                let next = cursor + 1;
-                let d_curr = (old[cursor].position - target).abs();
-                let d_next = (old[next].position - target).abs();
-                if d_next < d_curr { next } else { cursor }
-            } else {
-                cursor
-            };
-
-            if let Some(prev) = last_pick
-                && pick <= prev
-            {
-                pick = prev + 1;
-            }
-            let remaining = self.sample_cap - i - 1;
-            let max_pick = len - remaining - 1;
-            if pick > max_pick {
-                pick = max_pick;
-            }
-
-            compacted.push(old[pick].clone());
-            last_pick = Some(pick);
-            cursor = pick;
-        }
-
-        self.byte_samples = compacted;
+        compact_samples(&mut self.byte_samples, self.sample_cap);
     }
 
     fn nearest_sample(samples: &[KeySample], target: f64) -> Option<&[u8]> {
