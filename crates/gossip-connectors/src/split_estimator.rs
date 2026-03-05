@@ -14,7 +14,7 @@
 //! # Invariants
 //!
 //! - **Sample cap**: the number of retained samples never exceeds
-//!   `compression * KEY_SAMPLE_FACTOR` (at least [`MIN_SAMPLE_CAP`]).
+//!   `sample_cap` (at least [`MIN_SAMPLE_CAP`]).
 //! - **Monotonicity**: retained samples are strictly increasing in rank and
 //!   non-decreasing in cumulative byte position at all times, including after
 //!   compaction and merge.
@@ -22,6 +22,15 @@
 //!   never synthesizes or interpolates key bytes.
 //! - **First-key guard**: the very first key observed is tracked separately so
 //!   the "avoid degenerate first-item split" logic survives downsampling.
+//!
+//! # Sample-cap contract
+//!
+//! - [`StreamingSplitEstimator::new`] takes a retained-sample ceiling directly;
+//!   it is not a compression ratio or an "accuracy level" enum.
+//! - Values below [`MIN_SAMPLE_CAP`] are clamped upward so callers get a stable
+//!   minimum-quality configuration instead of an unusably sparse sketch.
+//! - [`StreamingSplitEstimator::DEFAULT_SAMPLE_CAP`] is the connector-facing
+//!   default used by the filesystem connector.
 //!
 //! # Algorithm
 //!
@@ -35,8 +44,9 @@
 //!    identical). Both strides are then doubled, so future observations are
 //!    sampled at the coarser cadence.
 //! 3. **Estimation** — `estimate_split_key` binary-searches the retained
-//!    samples for the key closest to `total_bytes / 2`. If all items are
-//!    zero-size it falls back to the rank midpoint.
+//!    samples for the key whose recorded position is closest to
+//!    `total_bytes / 2`. If all items are zero-size it falls back to the
+//!    rank midpoint.
 //!
 //! Because the buffer halves and the strides double together, the total number
 //! of compaction events is logarithmic in stream length, and non-sampled
@@ -48,21 +58,18 @@
 //!   sizes benefit from byte-balanced shards rather than item-balanced ones.
 //! - **Sparse sample set over full sketch**: retaining concrete keys avoids
 //!   the need to re-derive a split key from a quantile summary, at the cost
-//!   of a tunable `compression` parameter.
+//!   of a tunable sample-cap parameter.
 //! - **u128 arithmetic in interpolation**: avoids floating-point rounding
 //!   issues at byte offsets above 2^53.
 
+use std::fmt;
 use std::mem;
 
-/// Absolute floor on sample capacity to prevent degenerate compaction
-/// behaviour at very low compression values.
-const MIN_SAMPLE_CAP: usize = 64;
-
-/// Multiplier applied to the user-supplied `compression` to derive the
-/// retained-sample cap. A factor of 4 gives enough headroom for the
-/// nearest-neighbor compaction to preserve byte-space fidelity across
-/// repeated halving cycles.
-const KEY_SAMPLE_FACTOR: usize = 4;
+/// Absolute floor on retained sample count.
+///
+/// Smaller caps remain mechanically correct, but they downsample so
+/// aggressively that split accuracy becomes too noisy for pagination use.
+const MIN_SAMPLE_CAP: usize = 128;
 
 /// The coordinate axis used when spacing retained samples during compaction
 /// and when searching for the nearest sample to a target position.
@@ -85,7 +92,7 @@ enum SampleAxis {
 /// at the point the key was sampled). Carrying both axes lets the estimator
 /// use byte-space interpolation for accuracy while falling back to rank
 /// when byte positions collapse.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Sample {
     /// 0-based ordinal index of this key in stream order.
     rank: u64,
@@ -100,6 +107,38 @@ struct Sample {
     /// right-hand estimator's byte samples onto the global byte cadence.
     sampled_by_bytes: bool,
     key: Box<[u8]>,
+}
+
+#[derive(Clone, Copy)]
+struct RedactedKeyLen(usize);
+
+impl fmt::Debug for RedactedKeyLen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{} bytes]", self.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RedactedOptionalKeyLen(Option<usize>);
+
+impl fmt::Debug for RedactedOptionalKeyLen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(len) => write!(f, "Some([{} bytes])", len),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl fmt::Debug for Sample {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sample")
+            .field("rank", &self.rank)
+            .field("cumulative_bytes", &self.cumulative_bytes)
+            .field("sampled_by_bytes", &self.sampled_by_bytes)
+            .field("key", &RedactedKeyLen(self.key.len()))
+            .finish()
+    }
 }
 
 impl Sample {
@@ -293,7 +332,8 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 ///
 /// Feed observed `(key, file_size)` pairs via [`observe`](Self::observe) in
 /// globally sorted key order. Call [`estimate_split_key`](Self::estimate_split_key)
-/// at any time to retrieve the key closest to the byte-weighted median.
+/// at any time to retrieve the retained key whose recorded position is
+/// closest to the byte-weighted midpoint.
 ///
 /// Two or more independent estimators covering non-overlapping, contiguous
 /// key ranges can be combined with [`merge`](Self::merge) (append-style only).
@@ -306,7 +346,7 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 /// - **`merge`**: O(sample_cap) for sample translation plus at most one
 ///   compaction pass.
 /// - **Memory**: O(sample_cap) samples, each carrying a heap-allocated key.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct StreamingSplitEstimator {
     sample_cap: usize,
     /// Sparse checkpoints retained from the stream. Each sample carries both
@@ -331,23 +371,44 @@ pub(crate) struct StreamingSplitEstimator {
     first_observed_key: Option<Box<[u8]>>,
 }
 
+impl fmt::Debug for StreamingSplitEstimator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamingSplitEstimator")
+            .field("sample_cap", &self.sample_cap)
+            .field("samples_len", &self.samples.len())
+            .field("rank_stride", &self.rank_stride)
+            .field("byte_stride", &self.byte_stride)
+            .field("next_rank_sample", &self.next_rank_sample)
+            .field("next_byte_mark", &self.next_byte_mark)
+            .field("total_bytes", &self.total_bytes)
+            .field("count", &self.count)
+            .field(
+                "first_observed_key",
+                &RedactedOptionalKeyLen(self.first_observed_key.as_ref().map(|key| key.len())),
+            )
+            .finish()
+    }
+}
+
 impl StreamingSplitEstimator {
-    /// Default compression parameter yielding a sample cap of 1024.
+    /// Default retained sample count.
     /// Sufficient for <1% byte-weighted error on Zipf-distributed streams
     /// of tens of thousands of keys (validated by property tests).
-    pub(crate) const DEFAULT_COMPRESSION: usize = 256;
+    pub(crate) const DEFAULT_SAMPLE_CAP: usize = 1024;
 
     /// Create a new streaming estimator.
     ///
-    /// `compression` controls the sample-cap sizing: higher values retain more
-    /// key checkpoints for better accuracy at the cost of more memory.
-    /// Internally the requested compression is clamped to at least `32`, then
-    /// multiplied by [`KEY_SAMPLE_FACTOR`] to derive the retained-sample cap.
-    pub(crate) fn new(compression: usize) -> Self {
-        let compression = compression.max(32);
-        let sample_cap = compression
-            .saturating_mul(KEY_SAMPLE_FACTOR)
-            .max(MIN_SAMPLE_CAP);
+    /// `sample_cap` controls how many key checkpoints are retained. Higher
+    /// values use more memory and generally reduce split drift.
+    ///
+    /// This value is a hard ceiling on retained checkpoints after each public
+    /// operation returns; it does not change how many observations callers feed
+    /// into the estimator.
+    ///
+    /// Values below [`MIN_SAMPLE_CAP`] are rounded up to keep downsampling
+    /// accurate enough for pagination workloads.
+    pub(crate) fn new(sample_cap: usize) -> Self {
+        let sample_cap = sample_cap.max(MIN_SAMPLE_CAP);
         Self {
             sample_cap,
             samples: Vec::new(),
@@ -367,6 +428,9 @@ impl StreamingSplitEstimator {
     /// `file_size` may be zero; zero-size items are still counted for rank
     /// purposes but contribute no byte weight and cannot trigger a byte-stride
     /// sample.
+    ///
+    /// Callers should feed every key they want the eventual split hint to
+    /// represent; omitted observations simply do not participate in the sketch.
     ///
     /// If the sample buffer exceeds its cap after insertion, a compaction
     /// cycle runs (halve samples, double strides) before returning.
@@ -408,7 +472,8 @@ impl StreamingSplitEstimator {
         self.realign_sample_marks();
     }
 
-    /// Estimate the split key closest to the byte-weighted median.
+    /// Estimate the split key whose recorded byte position is closest to the
+    /// byte-weighted midpoint.
     ///
     /// Returns `None` until at least two keys have been observed (a split
     /// requires at least one item on each side).
@@ -459,6 +524,10 @@ impl StreamingSplitEstimator {
     ///
     /// `other` must represent keys that are strictly greater than every key
     /// in `self` (append-style merge over a contiguous global key order).
+    ///
+    /// This is intended for callers that already partitioned one logical
+    /// sorted stream into adjacent segments and now want a single estimator
+    /// view without replaying every observation.
     ///
     /// All ranks and byte positions from `other` are shifted by the
     /// corresponding totals in `self`. Byte-triggered samples in `other`
@@ -594,7 +663,7 @@ impl StreamingSplitEstimator {
 
 impl Default for StreamingSplitEstimator {
     fn default() -> Self {
-        Self::new(Self::DEFAULT_COMPRESSION)
+        Self::new(Self::DEFAULT_SAMPLE_CAP)
     }
 }
 

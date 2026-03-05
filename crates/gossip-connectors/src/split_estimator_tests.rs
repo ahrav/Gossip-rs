@@ -7,7 +7,11 @@
 
 use proptest::prelude::*;
 
-use super::StreamingSplitEstimator;
+use super::{MIN_SAMPLE_CAP, Sample, StreamingSplitEstimator};
+
+const SMALL_SAMPLE_CAP: usize = MIN_SAMPLE_CAP;
+const MEDIUM_SAMPLE_CAP: usize = 512;
+const LARGE_SAMPLE_CAP: usize = StreamingSplitEstimator::DEFAULT_SAMPLE_CAP;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -68,7 +72,7 @@ fn assert_samples_sorted(estimator: &StreamingSplitEstimator) {
 /// a perfect 50/50 is impossible, so either a 2/3 or 3/2 split is acceptable.
 #[test]
 fn equal_weight_files_split_near_midpoint() {
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     for idx in 0..5u64 {
         estimator.observe(&key_for_index(idx as usize), 1);
     }
@@ -85,7 +89,7 @@ fn equal_weight_files_split_near_midpoint() {
 
 #[test]
 fn skewed_sizes_split_selects_straddling_file() {
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 5);
     estimator.observe(&key_for_index(1), 5);
     estimator.observe(&key_for_index(2), 100);
@@ -113,7 +117,7 @@ fn estimate_requires_at_least_two_entries() {
 
 #[test]
 fn observe_does_not_duplicate_samples_when_rank_and_byte_triggers_overlap() {
-    let mut estimator = StreamingSplitEstimator::new(32);
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 1);
     assert_eq!(
         estimator.sample_len(),
@@ -124,7 +128,7 @@ fn observe_does_not_duplicate_samples_when_rank_and_byte_triggers_overlap() {
 
 #[test]
 fn estimator_avoids_first_item_on_heavy_lead_weight() {
-    let mut estimator = StreamingSplitEstimator::new(128);
+    let mut estimator = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 10_000_000);
     for idx in 1..64 {
         estimator.observe(&key_for_index(idx), 1);
@@ -144,7 +148,7 @@ fn estimator_avoids_first_item_on_heavy_lead_weight() {
 #[test]
 fn zipf_like_stream_is_within_one_percent_weight_error() {
     let count = 20_000usize;
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     let mut sizes = Vec::with_capacity(count);
     for idx in 0..count {
         let size = (count - idx) as u64;
@@ -167,9 +171,9 @@ fn zipf_like_stream_is_within_one_percent_weight_error() {
 #[test]
 fn merge_matches_single_pass_for_append_order_streams() {
     let count = 8_000usize;
-    let mut full = StreamingSplitEstimator::new(128);
-    let mut left = StreamingSplitEstimator::new(128);
-    let mut right = StreamingSplitEstimator::new(128);
+    let mut full = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
+    let mut left = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
+    let mut right = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
 
     for idx in 0..count {
         let size = deterministic_size(idx);
@@ -200,9 +204,9 @@ fn merge_then_continue_observing_matches_single_pass() {
     let count = 12_000usize;
     let split_one = 4_000usize;
     let split_two = 8_000usize;
-    let mut full = StreamingSplitEstimator::new(128);
-    let mut prefix = StreamingSplitEstimator::new(128);
-    let mut middle = StreamingSplitEstimator::new(128);
+    let mut full = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
+    let mut prefix = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
+    let mut middle = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
 
     for idx in 0..count {
         let size = deterministic_size(idx);
@@ -238,7 +242,7 @@ fn merge_then_continue_observing_matches_single_pass() {
 /// Splitting at index 0 would leave zero items on the left side.
 #[test]
 fn two_items_split_at_second_key() {
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 100);
     estimator.observe(&key_for_index(1), 1);
     let split = estimator
@@ -255,7 +259,7 @@ fn two_items_split_at_second_key() {
 /// Two zero-sized items also split at index 1 (rank midpoint for count=2).
 #[test]
 fn two_zero_size_items_split_at_second_key() {
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 0);
     estimator.observe(&key_for_index(1), 0);
     let split = estimator
@@ -269,6 +273,61 @@ fn two_zero_size_items_split_at_second_key() {
     );
 }
 
+#[test]
+fn sample_debug_redacts_key_bytes() {
+    let key = b"/secret/customer/path";
+    let sample = Sample::new(7, 42, true, key);
+
+    let rendered = format!("{sample:?}");
+
+    assert!(
+        rendered.contains(&format!("[{} bytes]", key.len())),
+        "sample Debug should include only the key length: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/secret/customer/path"),
+        "sample Debug must redact raw key bytes: {rendered}"
+    );
+}
+
+#[test]
+fn estimator_debug_redacts_observed_keys() {
+    let first = b"/secret/customer/path";
+    let second = b"/secret/customer/path-2";
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.observe(first, 5);
+    estimator.observe(second, 7);
+
+    let rendered = format!("{estimator:?}");
+
+    assert!(
+        rendered.contains("samples_len: 2"),
+        "estimator Debug should report structural sample counts: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("Some([{} bytes])", first.len())),
+        "estimator Debug should redact the first key to a length summary: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/secret/customer/path"),
+        "estimator Debug must redact raw first key bytes: {rendered}"
+    );
+    assert!(
+        !rendered.contains("/secret/customer/path-2"),
+        "estimator Debug must not leak retained sample keys: {rendered}"
+    );
+}
+
+#[test]
+fn requested_sample_cap_is_clamped_to_minimum() {
+    let estimator = StreamingSplitEstimator::new(1);
+    assert_eq!(
+        estimator.sample_cap(),
+        SMALL_SAMPLE_CAP,
+        "requested caps below the minimum should round up"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Downsampling regressions
 // ---------------------------------------------------------------------------
@@ -277,7 +336,7 @@ fn two_zero_size_items_split_at_second_key() {
 /// very first observed key when weight is front-loaded.
 #[test]
 fn front_loaded_split_avoids_first_key_after_downsampling() {
-    let mut estimator = StreamingSplitEstimator::new(32);
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     let cap = estimator.sample_cap();
     let n = 2_000usize;
     assert!(
@@ -301,7 +360,7 @@ fn front_loaded_split_avoids_first_key_after_downsampling() {
 
 #[test]
 fn sample_count_stays_bounded_after_repeated_downsampling() {
-    let mut estimator = StreamingSplitEstimator::new(32);
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     let cap = estimator.sample_cap();
     let n = cap * 8;
     for idx in 0..n {
@@ -330,7 +389,7 @@ fn sample_count_stays_bounded_after_repeated_downsampling() {
 
 #[test]
 fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
-    let mut estimator = StreamingSplitEstimator::new(32);
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
     let cap = estimator.sample_cap();
     for idx in 0..(cap + 1) {
         estimator.observe(&key_for_index(idx), (idx as u64) + 1);
@@ -353,13 +412,13 @@ fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
 /// Merging an empty estimator into a populated one is a no-op.
 #[test]
 fn merge_empty_into_populated() {
-    let mut estimator = StreamingSplitEstimator::new(128);
+    let mut estimator = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
     for idx in 0..100 {
         estimator.observe(&key_for_index(idx), (idx as u64) + 1);
     }
     let before = estimator.estimate_split_key().expect("split before merge");
 
-    let empty = StreamingSplitEstimator::new(128);
+    let empty = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
     estimator.merge(&empty);
 
     let after = estimator.estimate_split_key().expect("split after merge");
@@ -370,8 +429,8 @@ fn merge_empty_into_populated() {
 /// rank-based split.
 #[test]
 fn merge_with_all_zero_sizes() {
-    let mut left = StreamingSplitEstimator::new(128);
-    let mut right = StreamingSplitEstimator::new(128);
+    let mut left = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
+    let mut right = StreamingSplitEstimator::new(MEDIUM_SAMPLE_CAP);
     for idx in 0..50 {
         left.observe(&key_for_index(idx), 0);
     }
@@ -395,7 +454,7 @@ fn merge_with_all_zero_sizes() {
 /// Very large file sizes (near u64::MAX / 2) should not overflow or panic.
 #[test]
 fn extreme_file_sizes_no_overflow() {
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     let huge = u64::MAX / 2;
     estimator.observe(&key_for_index(0), huge);
     estimator.observe(&key_for_index(1), huge);
@@ -413,7 +472,7 @@ fn extreme_file_sizes_no_overflow() {
 
 #[test]
 fn byte_positions_above_f64_precision_boundary_remain_distinguishable() {
-    let mut estimator = StreamingSplitEstimator::new(256);
+    let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     let boundary = 1u64 << 53;
 
     estimator.observe(&key_for_index(0), boundary);
@@ -493,17 +552,17 @@ proptest! {
         );
     }
 
-    /// For any compression setting and stream length (with mixed zero and
+    /// For any sample-cap setting and stream length (with mixed zero and
     /// non-zero sizes), the unified sample set remains bounded and sorted.
     ///
     /// Ranges are tuned to exercise downsampling paths while keeping wall-clock
     /// time under CI-friendly bounds.
     #[test]
     fn prop_sample_memory_bounded(
-        compression in 32..512usize,
+        sample_cap in MIN_SAMPLE_CAP..2048usize,
         count in 0..2_000usize,
     ) {
-        let mut estimator = StreamingSplitEstimator::new(compression);
+        let mut estimator = StreamingSplitEstimator::new(sample_cap);
         for idx in 0..count {
             let key = key_for_index(idx);
             let size = if idx % 3 == 0 { 0 } else { (idx as u64) + 1 };
