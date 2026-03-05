@@ -2217,10 +2217,124 @@ mod prop {
         pvec(any::<u8>(), 1..6usize)
     }
 
+    /// Strategy for shard bounds. Empty vectors exercise unbounded edges.
+    fn shard_bound_strategy() -> impl Strategy<Value = Vec<u8>> {
+        pvec(any::<u8>(), 0..6usize)
+    }
+
+    /// Segment generator for adversarial path fixtures:
+    /// mixes regular ASCII names with known edge-case prefixes and Unicode.
+    fn adversarial_component_strategy() -> impl Strategy<Value = String> {
+        prop_oneof![
+            string_regex("[a-z0-9_-]{1,8}").unwrap(),
+            Just("src".to_string()),
+            Just("src-utils".to_string()),
+            Just("solo".to_string()),
+            Just("deep".to_string()),
+            Just("nested".to_string()),
+            Just("über".to_string()),
+            Just("mañana".to_string()),
+            Just("δοκιμή".to_string()),
+        ]
+    }
+
+    fn adversarial_file_path_strategy() -> impl Strategy<Value = String> {
+        let ext = prop_oneof![
+            Just("txt".to_string()),
+            Just("log".to_string()),
+            Just("bin".to_string()),
+        ];
+        (
+            pvec(adversarial_component_strategy(), 0..4usize),
+            adversarial_component_strategy(),
+            ext,
+        )
+            .prop_map(|(dirs, leaf, ext)| {
+                if dirs.is_empty() {
+                    format!("{leaf}.{ext}")
+                } else {
+                    format!("{}/{}.{}", dirs.join("/"), leaf, ext)
+                }
+            })
+    }
+
+    fn adversarial_dir_path_strategy() -> impl Strategy<Value = String> {
+        pvec(adversarial_component_strategy(), 1..4usize).prop_map(|parts| parts.join("/"))
+    }
+
+    /// Build fixtures that always include key adversarial structures:
+    /// - dir/file prefix collisions (`src/` + `src-utils.txt`)
+    /// - deep nesting (4 levels)
+    /// - single-file directories
+    /// - optional Unicode paths
+    /// - explicit empty directories
+    fn adversarial_fixture_strategy(
+        max_files: usize,
+    ) -> impl Strategy<Value = (Vec<(String, Vec<u8>)>, Vec<String>)> {
+        (
+            pvec(
+                (
+                    adversarial_file_path_strategy(),
+                    pvec(any::<u8>(), 0..48usize),
+                ),
+                0..max_files,
+            ),
+            pvec(adversarial_dir_path_strategy(), 0..8usize),
+            any::<bool>(),
+        )
+            .prop_map(|(random_files, random_dirs, include_unicode)| {
+                let mut files = vec![
+                    ("src/inside.txt".to_string(), b"1".to_vec()),
+                    ("src-utils.txt".to_string(), b"2".to_vec()),
+                    ("solo/only.txt".to_string(), b"3".to_vec()),
+                    ("deep/l1/l2/l3/file.txt".to_string(), b"4".to_vec()),
+                ];
+                if include_unicode {
+                    files.push(("über/mañana.txt".to_string(), b"u".to_vec()));
+                    files.push(("δelta/δοκιμή.bin".to_string(), b"v".to_vec()));
+                }
+                files.extend(random_files);
+
+                let mut seen_files = std::collections::HashSet::new();
+                files.retain(|(path, _)| seen_files.insert(path.clone()));
+
+                let mut empty_dirs = vec![
+                    "empty".to_string(),
+                    "src/empty".to_string(),
+                    "solo/empty".to_string(),
+                ];
+                if include_unicode {
+                    empty_dirs.push("空/空".to_string());
+                }
+                empty_dirs.extend(random_dirs);
+
+                let mut seen_dirs = std::collections::HashSet::new();
+                empty_dirs.retain(|dir| !dir.is_empty() && seen_dirs.insert(dir.clone()));
+
+                (files, empty_dirs)
+            })
+    }
+
+    /// Random `(page_size, cold_restart)` schedule to exercise resumability
+    /// across varying page budgets and process restarts.
+    fn page_schedule_strategy() -> impl Strategy<Value = Vec<(usize, bool)>> {
+        pvec((1usize..6usize, any::<bool>()), 1..12usize)
+    }
+
     /// Create a connector from a generated file set, returning the tempdir
     /// (to keep it alive) and the connector.
     fn make_connector(files: &[(String, Vec<u8>)]) -> (tempfile::TempDir, FilesystemConnector) {
+        make_connector_with_empty_dirs(files, &[])
+    }
+
+    fn make_connector_with_empty_dirs(
+        files: &[(String, Vec<u8>)],
+        empty_dirs: &[String],
+    ) -> (tempfile::TempDir, FilesystemConnector) {
         let dir = tempfile::tempdir().expect("create tempdir");
+        for rel in empty_dirs {
+            fs::create_dir_all(dir.path().join(rel)).expect("create empty dir fixture");
+        }
         for (rel, content) in files {
             let path = dir.path().join(rel);
             if let Some(parent) = path.parent() {
@@ -2230,6 +2344,43 @@ mod prop {
         }
         let conn = FilesystemConnector::new(dir.path());
         (dir, conn)
+    }
+
+    /// Drain pages starting from an arbitrary cursor, with a hard step guard so
+    /// liveness regressions fail fast instead of hanging the test process.
+    fn collect_keys_from_cursor(
+        root: &std::path::Path,
+        start: &ItemKey,
+        end: &ItemKey,
+        mut cursor: Cursor,
+        page_size: usize,
+        with_tokens: bool,
+    ) -> Vec<Vec<u8>> {
+        let mut conn = FilesystemConnector::new(root).with_tokens(with_tokens);
+        let budgets = small_page_budgets(page_size.max(1));
+        let mut keys = Vec::new();
+        let mut steps = 0usize;
+        loop {
+            assert!(
+                steps < 4096,
+                "pagination did not terminate while collecting from cursor"
+            );
+            steps += 1;
+
+            let page = conn
+                .enumerate_page_range(start, end, &cursor, budgets)
+                .expect("page from cursor");
+            if page.items().is_empty() {
+                break;
+            }
+            keys.extend(
+                page.items()
+                    .iter()
+                    .map(|item| item.item_key().as_bytes().to_vec()),
+            );
+            cursor = page.next_cursor().clone();
+        }
+        keys
     }
 
     proptest! {
@@ -2451,6 +2602,278 @@ mod prop {
                 reader.read_to_end(&mut buf).unwrap();
                 // Content must not be empty only if original was non-empty,
                 // but we verify the read itself succeeds without error.
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases(1024)))]
+
+        #[test]
+        fn streaming_matches_ground_truth(
+            fixture in adversarial_fixture_strategy(12),
+        ) {
+            // Comparator safety: streaming DFS order must exactly match
+            // globally sorted path bytes for the same filesystem snapshot.
+            let (files, empty_dirs) = fixture;
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let (_dir, mut c) = make_connector_with_empty_dirs(&files, &empty_dirs);
+
+            let actual: Vec<Vec<u8>> = collect_all(&mut c, &start, &end)
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect();
+            let mut expected: Vec<Vec<u8>> = files
+                .iter()
+                .map(|(path, _)| path.as_bytes().to_vec())
+                .collect();
+            expected.sort_unstable();
+            expected.dedup();
+
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn resume_at_random_pages_matches_single_pass(
+            fixture in adversarial_fixture_strategy(12),
+            schedule in page_schedule_strategy(),
+        ) {
+            // Liveness + work conservation: paging with random sizes and restart
+            // points must enumerate exactly the same stream as single-pass scan.
+            let (files, empty_dirs) = fixture;
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let (dir, mut baseline_conn) = make_connector_with_empty_dirs(&files, &empty_dirs);
+            let root = dir.path().to_path_buf();
+
+            let expected: Vec<Vec<u8>> = collect_all(&mut baseline_conn, &start, &end)
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect();
+
+            let mut hot_conn = FilesystemConnector::new(&root).with_tokens(true);
+            let mut cursor = Cursor::initial();
+            let mut actual = Vec::new();
+            let mut steps = 0usize;
+            loop {
+                prop_assert!(
+                    steps < 4096,
+                    "pagination did not terminate under random page schedule"
+                );
+                let (page_size, cold_restart) = schedule[steps % schedule.len()];
+                let budgets = small_page_budgets(page_size.max(1));
+                let page = if cold_restart {
+                    let mut cold = FilesystemConnector::new(&root).with_tokens(true);
+                    cold.enumerate_page_range(&start, &end, &cursor, budgets)
+                        .expect("cold restart page")
+                } else {
+                    hot_conn
+                        .enumerate_page_range(&start, &end, &cursor, budgets)
+                        .expect("hot resume page")
+                };
+                if page.items().is_empty() {
+                    break;
+                }
+                actual.extend(
+                    page.items()
+                        .iter()
+                        .map(|item| item.item_key().as_bytes().to_vec()),
+                );
+                cursor = page.next_cursor().clone();
+                steps += 1;
+            }
+
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn corrupt_token_falls_back_to_last_key(
+            fixture in adversarial_fixture_strategy(12),
+            page_size in 1usize..5usize,
+            checkpoint_page in 1usize..6usize,
+            corruption_seed in any::<u8>(),
+        ) {
+            // Corruption recovery: malformed or missing token must still resume
+            // correctly from `last_key` with no gaps or duplicates.
+            let (files, empty_dirs) = fixture;
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let (dir, mut baseline_conn) = make_connector_with_empty_dirs(&files, &empty_dirs);
+            let root = dir.path().to_path_buf();
+
+            let baseline_keys: Vec<Vec<u8>> = collect_all(&mut baseline_conn, &start, &end)
+                .iter()
+                .map(|item| item.item_key().as_bytes().to_vec())
+                .collect();
+            if baseline_keys.is_empty() {
+                return Ok(());
+            }
+
+            let mut token_conn = FilesystemConnector::new(&root).with_tokens(true);
+            let budgets = small_page_budgets(page_size);
+            let mut cursor = Cursor::initial();
+            let mut chosen_cursor = None;
+            let mut last_seen_cursor = None;
+            let mut page_idx = 0usize;
+            loop {
+                let page = token_conn
+                    .enumerate_page_range(&start, &end, &cursor, budgets)
+                    .expect("token page");
+                if page.items().is_empty() {
+                    break;
+                }
+                page_idx += 1;
+                cursor = page.next_cursor().clone();
+                last_seen_cursor = Some(cursor.clone());
+                if page_idx == checkpoint_page {
+                    chosen_cursor = Some(cursor.clone());
+                    break;
+                }
+            }
+            let Some(resume_cursor) = chosen_cursor.or(last_seen_cursor) else {
+                return Ok(());
+            };
+
+            let last_key = resume_cursor
+                .last_key()
+                .expect("resume cursor from non-empty page should have last_key")
+                .clone();
+            let corrupted_cursor = match corruption_seed % 3 {
+                0 => Cursor::with_last_key(last_key.clone()),
+                1 => {
+                    if let Some(token) = resume_cursor.token() {
+                        let mut token_bytes = token.as_bytes().to_vec();
+                        if !token_bytes.is_empty() {
+                            let idx = usize::from(corruption_seed) % token_bytes.len();
+                            token_bytes[idx] ^= 0x5a;
+                        }
+                        match TokenBytes::try_from_vec(token_bytes) {
+                            Ok(corrupted) => Cursor::with_token(last_key.clone(), corrupted),
+                            Err(_) => Cursor::with_last_key(last_key.clone()),
+                        }
+                    } else {
+                        Cursor::with_last_key(last_key.clone())
+                    }
+                }
+                _ => {
+                    let noise_len = usize::from(corruption_seed % 16) + 1;
+                    let noise = vec![0xa5; noise_len];
+                    match TokenBytes::try_from_vec(noise) {
+                        Ok(corrupted) => Cursor::with_token(last_key.clone(), corrupted),
+                        Err(_) => Cursor::with_last_key(last_key.clone()),
+                    }
+                }
+            };
+
+            let resumed_keys =
+                collect_keys_from_cursor(&root, &start, &end, corrupted_cursor, page_size, true);
+            let expected_tail: Vec<Vec<u8>> = baseline_keys
+                .iter()
+                .filter(|key| key.as_slice() > last_key.as_bytes())
+                .cloned()
+                .collect();
+            prop_assert_eq!(resumed_keys.as_slice(), expected_tail.as_slice());
+
+            let mut reconstructed: Vec<Vec<u8>> = baseline_keys
+                .iter()
+                .filter(|key| key.as_slice() <= last_key.as_bytes())
+                .cloned()
+                .collect();
+            reconstructed.extend(resumed_keys);
+            prop_assert_eq!(reconstructed, baseline_keys);
+        }
+
+        #[test]
+        fn all_emitted_keys_within_shard_bounds(
+            fixture in adversarial_fixture_strategy(12),
+            raw_start in shard_bound_strategy(),
+            raw_end in shard_bound_strategy(),
+        ) {
+            // Range safety: emitted keys must stay inside [start, end).
+            let (files, empty_dirs) = fixture;
+            let (start_bound, end_bound) = if raw_start <= raw_end {
+                (raw_start, raw_end)
+            } else {
+                (raw_end, raw_start)
+            };
+            let shard = ShardSpec::try_with_range(start_bound.as_slice(), end_bound.as_slice())
+                .expect("valid shard bounds");
+
+            let (_dir, mut c) = make_connector_with_empty_dirs(&files, &empty_dirs);
+            let items = collect_all_via_shard(&mut c, &shard, default_budgets());
+            for item in &items {
+                let key = item.item_key().as_bytes();
+                if !start_bound.is_empty() {
+                    prop_assert!(key >= start_bound.as_slice(), "key below shard start");
+                }
+                if !end_bound.is_empty() {
+                    prop_assert!(key < end_bound.as_slice(), "key at-or-above shard end");
+                }
+            }
+
+            if !start_bound.is_empty() && start_bound == end_bound {
+                prop_assert!(items.is_empty(), "equal shard bounds must yield no items");
+            }
+        }
+
+        #[test]
+        fn cursor_last_key_strictly_advances(
+            fixture in adversarial_fixture_strategy(12),
+            page_size in 1usize..6usize,
+        ) {
+            // Cursor safety: non-empty pages must set `next_cursor.last_key`
+            // to the last emitted item and strictly advance across pages.
+            let (files, empty_dirs) = fixture;
+            let start = make_key(b"\x00");
+            let end = make_key(b"\xff");
+            let (_dir, mut c) = make_connector_with_empty_dirs(&files, &empty_dirs);
+
+            let budgets = small_page_budgets(page_size);
+            let mut cursor = Cursor::initial();
+            let mut previous_last_key: Option<Vec<u8>> = None;
+            let mut steps = 0usize;
+            loop {
+                prop_assert!(
+                    steps < 4096,
+                    "pagination did not terminate while checking cursor monotonicity"
+                );
+                steps += 1;
+
+                let page = c
+                    .enumerate_page_range(&start, &end, &cursor, budgets)
+                    .expect("cursor monotonicity page");
+                if page.items().is_empty() {
+                    break;
+                }
+
+                let emitted_last = page
+                    .items()
+                    .last()
+                    .expect("non-empty page must have a last item")
+                    .item_key()
+                    .as_bytes()
+                    .to_vec();
+                let cursor_last = page
+                    .next_cursor()
+                    .last_key()
+                    .expect("non-empty page cursor must have last_key")
+                    .as_bytes()
+                    .to_vec();
+                prop_assert_eq!(
+                    cursor_last.as_slice(),
+                    emitted_last.as_slice(),
+                    "next_cursor.last_key must match the final emitted key on each page"
+                );
+
+                if let Some(prev) = previous_last_key.as_ref() {
+                    prop_assert!(
+                        prev.as_slice() < cursor_last.as_slice(),
+                        "cursor.last_key must strictly increase across non-empty pages"
+                    );
+                }
+                previous_last_key = Some(cursor_last);
+                cursor = page.next_cursor().clone();
             }
         }
     }
