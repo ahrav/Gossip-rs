@@ -17,7 +17,7 @@
 //!   `sample_cap` (at least [`MIN_SAMPLE_CAP`]).
 //! - **Monotonicity**: retained samples are strictly increasing in rank and
 //!   non-decreasing in cumulative byte position at all times, including after
-//!   compaction and merge.
+//!   compaction.
 //! - **Key fidelity**: the estimator only returns *actually observed* keys; it
 //!   never synthesizes or interpolates key bytes.
 //! - **First-key guard**: the very first key observed is tracked separately so
@@ -61,6 +61,14 @@
 //!   of a tunable sample-cap parameter.
 //! - **u128 arithmetic in interpolation**: avoids floating-point rounding
 //!   issues at byte offsets above 2^53.
+//! - **Single byte-mark per `observe` call**: each call to [`observe`] records
+//!   at most one sample, even if the file's byte range spans multiple stride
+//!   marks.  This is a deliberate trade-off for O(1) per-observation cost.
+//!   For Zipf-like workloads dominated by a few very large files the byte
+//!   axis may have gaps in that region, causing the estimator to rely more
+//!   on the rank-axis fallback.  In practice the rank sample for the same
+//!   file still captures it, and the accuracy property tests confirm <1%
+//!   byte-weighted error on 20 000-key Zipf streams.
 
 use std::fmt;
 use std::mem;
@@ -98,14 +106,10 @@ struct Sample {
     rank: u64,
     /// Cumulative byte position at which this sample was recorded.
     ///
-    /// When `sampled_by_bytes` is true this is the exact byte-stride mark
-    /// that the file straddles; otherwise it is the cumulative byte total
+    /// When sampled by the byte-stride trigger this is the exact byte-stride
+    /// mark that the file straddles; otherwise it is the cumulative byte total
     /// at the start of the file (a rank-triggered fallback position).
     cumulative_bytes: u64,
-    /// Marks whether `cumulative_bytes` came from a byte-stride checkpoint
-    /// rather than a pure rank fallback. Merge uses this to phase-align the
-    /// right-hand estimator's byte samples onto the global byte cadence.
-    sampled_by_bytes: bool,
     key: Box<[u8]>,
 }
 
@@ -135,18 +139,16 @@ impl fmt::Debug for Sample {
         f.debug_struct("Sample")
             .field("rank", &self.rank)
             .field("cumulative_bytes", &self.cumulative_bytes)
-            .field("sampled_by_bytes", &self.sampled_by_bytes)
             .field("key", &RedactedKeyLen(self.key.len()))
             .finish()
     }
 }
 
 impl Sample {
-    fn new(rank: u64, cumulative_bytes: u64, sampled_by_bytes: bool, key: &[u8]) -> Self {
+    fn new(rank: u64, cumulative_bytes: u64, key: &[u8]) -> Self {
         Self {
             rank,
             cumulative_bytes,
-            sampled_by_bytes,
             key: Box::<[u8]>::from(key),
         }
     }
@@ -210,6 +212,7 @@ fn compact_samples(samples: &mut Vec<Sample>, cap: usize) {
 ///   for the picks still to come.
 fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
     debug_assert!(samples.len() > cap);
+    debug_assert!(cap >= 2, "compact target must be >= 2");
 
     let len = samples.len();
     if cap == 1 {
@@ -265,6 +268,11 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
         cursor = pick;
     }
 
+    debug_assert!(
+        picks.windows(2).all(|w| w[0] < w[1]),
+        "selected indices must be strictly increasing"
+    );
+
     picks
 }
 
@@ -292,6 +300,7 @@ fn preferred_axis(samples: &[Sample]) -> SampleAxis {
 /// Debug-asserts `cap >= 2`.
 fn interpolated_position(first: u64, last: u64, idx: usize, cap: usize) -> u64 {
     debug_assert!(cap >= 2);
+    debug_assert!(last >= first, "interpolation requires last >= first");
 
     if idx == 0 {
         return first;
@@ -300,7 +309,7 @@ fn interpolated_position(first: u64, last: u64, idx: usize, cap: usize) -> u64 {
         return last;
     }
 
-    let span = (last - first) as u128;
+    let span = last.saturating_sub(first) as u128;
     let numerator = span.saturating_mul(idx as u128);
     let denominator = (cap - 1) as u128;
     (first as u128 + numerator / denominator) as u64
@@ -310,11 +319,9 @@ fn interpolated_position(first: u64, last: u64, idx: usize, cap: usize) -> u64 {
 /// `u64::MAX`). Used after compaction to realign the next sampling marks
 /// onto the (now-doubled) stride grid.
 ///
-/// # Panics
-///
-/// Debug-asserts `stride > 0`.
+/// A zero `stride` is clamped to 1, making this a no-op identity.
 fn align_to_stride(value: u64, stride: u64) -> u64 {
-    debug_assert!(stride > 0, "stride must remain non-zero");
+    let stride = stride.max(1);
     if value == u64::MAX {
         return value;
     }
@@ -335,16 +342,11 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 /// at any time to retrieve the retained key whose recorded position is
 /// closest to the byte-weighted midpoint.
 ///
-/// Two or more independent estimators covering non-overlapping, contiguous
-/// key ranges can be combined with [`merge`](Self::merge) (append-style only).
-///
 /// # Complexity
 ///
 /// - **`observe`**: O(1) amortised. Compaction fires at most
 ///   O(log(stream_length / sample_cap)) times, each costing O(sample_cap).
 /// - **`estimate_split_key`**: O(log sample_cap) binary search.
-/// - **`merge`**: O(sample_cap) for sample translation plus at most one
-///   compaction pass.
 /// - **Memory**: O(sample_cap) samples, each carrying a heap-allocated key.
 #[derive(Clone)]
 pub(crate) struct StreamingSplitEstimator {
@@ -432,6 +434,10 @@ impl StreamingSplitEstimator {
     /// Callers should feed every key they want the eventual split hint to
     /// represent; omitted observations simply do not participate in the sketch.
     ///
+    /// **Note:** at most one sample is recorded per call, even if `file_size`
+    /// spans multiple byte-stride marks. This is an intentional O(1)
+    /// amortised-cost trade-off; see the module-level "Design choices" section.
+    ///
     /// If the sample buffer exceeds its cap after insertion, a compaction
     /// cycle runs (halve samples, double strides) before returning.
     pub(crate) fn observe(&mut self, key: &[u8], file_size: u64) {
@@ -459,8 +465,7 @@ impl StreamingSplitEstimator {
             } else {
                 cumulative_bytes
             };
-            self.samples
-                .push(Sample::new(rank, byte_position, sample_bytes, key));
+            self.samples.push(Sample::new(rank, byte_position, key));
         }
 
         self.count = self.count.saturating_add(1);
@@ -486,7 +491,7 @@ impl StreamingSplitEstimator {
     /// ones), the byte-weighted median can land on item 0, which would
     /// produce a zero-item left shard. In that case the estimator falls back
     /// to the rank-based midpoint instead.
-    pub(crate) fn estimate_split_key(&self) -> Option<Vec<u8>> {
+    pub(crate) fn estimate_split_key(&self) -> Option<&[u8]> {
         if self.count < 2 {
             return None;
         }
@@ -496,93 +501,24 @@ impl StreamingSplitEstimator {
         let rank_target = midpoint_rank.clamp(1, max_rank);
 
         if self.total_bytes == 0 {
-            return Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target)
-                .map(ToOwned::to_owned);
+            return Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target);
         }
 
         let target_weight = self.total_bytes / 2;
-        let mut candidate = Self::nearest_sample(&self.samples, SampleAxis::Bytes, target_weight)
-            .or_else(|| Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target))?
-            .to_vec();
+        let candidate = Self::nearest_sample(&self.samples, SampleAxis::Bytes, target_weight)
+            .or_else(|| Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target))?;
 
         // Keep split semantics aligned with existing connectors: avoid
         // degenerate "first item" splits when weight is front-loaded.
         if self
             .first_observed_key
             .as_ref()
-            .is_some_and(|first| candidate.as_slice() == first.as_ref())
-            && let Some(fallback) =
-                Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target)
+            .is_some_and(|first| candidate == first.as_ref())
         {
-            candidate = fallback.to_vec();
+            return Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target);
         }
 
         Some(candidate)
-    }
-
-    /// Append-merge `other` into `self`.
-    ///
-    /// `other` must represent keys that are strictly greater than every key
-    /// in `self` (append-style merge over a contiguous global key order).
-    ///
-    /// This is intended for callers that already partitioned one logical
-    /// sorted stream into adjacent segments and now want a single estimator
-    /// view without replaying every observation.
-    ///
-    /// All ranks and byte positions from `other` are shifted by the
-    /// corresponding totals in `self`. Byte-triggered samples in `other`
-    /// receive additional phase-alignment: their byte position is
-    /// snapped to the next multiple of `other.byte_stride` above
-    /// `self.total_bytes`, so that the merged byte axis remains monotonic
-    /// and evenly cadenced despite the two estimators having been built
-    /// independently.
-    ///
-    /// After translation, if the merged sample count exceeds the cap, one
-    /// or more compaction cycles run to restore the bound.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn merge(&mut self, other: &Self) {
-        if other.count == 0 {
-            return;
-        }
-
-        if self.first_observed_key.is_none() {
-            self.first_observed_key = other.first_observed_key.clone();
-        }
-
-        let rank_offset = self.count;
-        let byte_offset = self.total_bytes;
-        // Phase-align: the first byte-stride mark in the right-hand estimator
-        // should land on a grid-aligned position relative to self's byte total.
-        let other_byte_phase = align_to_stride(byte_offset, other.byte_stride);
-
-        self.count = self.count.saturating_add(other.count);
-        self.total_bytes = self.total_bytes.saturating_add(other.total_bytes);
-        self.rank_stride = self.rank_stride.max(other.rank_stride);
-        self.byte_stride = self.byte_stride.max(other.byte_stride);
-
-        self.samples.reserve(other.samples.len());
-        for sample in &other.samples {
-            // Byte-triggered samples use the phase-aligned base so the merged
-            // byte axis stays monotonic at stride boundaries. Rank-triggered
-            // samples use a plain offset because their byte position was
-            // already a "best-effort" cumulative snapshot.
-            let cumulative_bytes = if sample.sampled_by_bytes {
-                other_byte_phase.saturating_add(sample.cumulative_bytes)
-            } else {
-                byte_offset.saturating_add(sample.cumulative_bytes)
-            };
-            self.samples.push(Sample {
-                rank: sample.rank.saturating_add(rank_offset),
-                cumulative_bytes,
-                sampled_by_bytes: sample.sampled_by_bytes,
-                key: sample.key.clone(),
-            });
-        }
-
-        while self.samples.len() > self.sample_cap {
-            self.grow_strides_and_compact();
-        }
-        self.realign_sample_marks();
     }
 
     /// Compact the sample buffer and double both strides.
@@ -598,7 +534,7 @@ impl StreamingSplitEstimator {
     }
 
     /// Snap the next rank and byte sampling marks to the current stride grid.
-    /// Called after every `observe` and after merge to keep the cadence aligned.
+    /// Called after every `observe` to keep the cadence aligned.
     fn realign_sample_marks(&mut self) {
         self.next_rank_sample = align_to_stride(self.count, self.rank_stride);
         self.next_byte_mark = align_to_stride(self.total_bytes, self.byte_stride);

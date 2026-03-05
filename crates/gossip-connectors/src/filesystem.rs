@@ -908,10 +908,10 @@ impl FilesystemConnector {
         let Some(split_key) = self.split_estimator.estimate_split_key() else {
             return Ok(None);
         };
-        if !common::is_valid_split_candidate(&split_key, cursor, effective_end) {
+        if !common::is_valid_split_candidate(split_key, cursor, effective_end) {
             return Ok(None);
         }
-        let split = ItemKey::try_from_vec(split_key)
+        let split = ItemKey::try_from_vec(split_key.to_vec())
             .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
         Ok(Some(split))
     }
