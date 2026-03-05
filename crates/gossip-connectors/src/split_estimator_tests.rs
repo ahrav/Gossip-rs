@@ -7,7 +7,7 @@
 
 use proptest::prelude::*;
 
-use super::{Sample, StreamingSplitEstimator, MIN_SAMPLE_CAP};
+use super::{MIN_SAMPLE_CAP, Sample, StreamingSplitEstimator};
 
 const SMALL_SAMPLE_CAP: usize = MIN_SAMPLE_CAP;
 const MEDIUM_SAMPLE_CAP: usize = 512;
@@ -425,7 +425,7 @@ fn interpolated_position_edge_cases() {
 
 #[test]
 fn compact_samples_preserves_endpoints_and_monotonicity() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -443,9 +443,11 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
     // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
     // Bytes non-decreasing.
-    assert!(samples
-        .windows(2)
-        .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes)
+    );
 }
 
 // ---------------------------------------------------------------------------

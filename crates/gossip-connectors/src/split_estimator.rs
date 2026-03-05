@@ -140,7 +140,7 @@ impl fmt::Debug for Sample {
             .field("rank", &self.rank)
             .field("cumulative_bytes", &self.cumulative_bytes)
             .field("key", &RedactedKeyLen(self.key.len()))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -388,7 +388,7 @@ impl fmt::Debug for StreamingSplitEstimator {
                 "first_observed_key",
                 &RedactedOptionalKeyLen(self.first_observed_key.as_ref().map(|key| key.len())),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
