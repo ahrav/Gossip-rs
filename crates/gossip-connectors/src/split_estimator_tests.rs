@@ -184,6 +184,7 @@ fn merge_matches_single_pass_for_append_order_streams() {
 
     let full_idx = index_from_key(&full.estimate_split_key().expect("full split"));
     left.merge(&right);
+    assert_samples_sorted(&left);
     let merged_idx = index_from_key(&left.estimate_split_key().expect("merged split"));
     let delta = full_idx.abs_diff(merged_idx);
     assert!(
@@ -216,6 +217,7 @@ fn merge_then_continue_observing_matches_single_pass() {
     }
 
     prefix.merge(&middle);
+    assert_samples_sorted(&prefix);
     for idx in split_two..count {
         let size = deterministic_size(idx);
         let key = key_for_index(idx);
@@ -389,6 +391,190 @@ fn merge_with_all_zero_sizes() {
 }
 
 // ---------------------------------------------------------------------------
+// Merge byte-axis monotonicity tests
+// ---------------------------------------------------------------------------
+
+/// After merge, sample byte positions must remain non-decreasing. This test
+/// constructs a scenario where `self.total_bytes % other.byte_stride != 0`
+/// so that the phase-aligned offset differs from the plain byte offset,
+/// which would cause inversions if byte-triggered and rank-triggered
+/// samples received different translation bases.
+#[test]
+fn merge_preserves_byte_monotonicity_with_unaligned_offset() {
+    // Use small compression so compaction fires early and strides grow.
+    let mut left = StreamingSplitEstimator::new(32);
+    let mut right = StreamingSplitEstimator::new(32);
+
+    // Feed left enough items to accumulate a total_bytes that is unlikely
+    // to be a multiple of right's byte_stride after compaction.
+    // Use varied sizes so total_bytes is odd/unaligned.
+    for idx in 0..200 {
+        left.observe(&key_for_index(idx), deterministic_size(idx));
+    }
+
+    // Feed right enough items to trigger at least one compaction cycle,
+    // which doubles byte_stride to >= 2. Use sizes that create interleaved
+    // byte-triggered and rank-triggered samples.
+    let right_cap = right.sample_cap();
+    let right_count = right_cap * 3; // well past compaction threshold
+    for idx in 0..right_count {
+        let size = deterministic_size(200 + idx);
+        right.observe(&key_for_index(200 + idx), size);
+    }
+
+    // The merge should produce a sample array with non-decreasing byte positions.
+    left.merge(&right);
+    assert_samples_sorted(&left);
+}
+
+/// Construct a scenario where `other` has a byte-triggered sample followed
+/// by a rank-triggered sample whose byte delta is less than the stride, and
+/// `self.total_bytes` creates a phase gap large enough to invert their
+/// translated byte positions (if the merge used different offset bases).
+///
+/// This validates that the uniform-offset translation in `merge` preserves
+/// the monotonicity invariant.
+#[test]
+fn merge_byte_monotonicity_with_close_mixed_triggers() {
+    let mut right = StreamingSplitEstimator::new(32);
+    let right_cap = right.sample_cap(); // 128
+
+    // Push right through multiple compaction cycles to grow strides.
+    // Use uniform small sizes so byte_stride grows predictably.
+    let items_per_cycle = right_cap / 2;
+    let target_cycles = 6;
+    let total_items = items_per_cycle * target_cycles + right_cap;
+
+    for idx in 0..total_items {
+        right.observe(&key_for_index(10_000 + idx), 50);
+    }
+
+    let stride = right.byte_stride();
+
+    // Add items with varying sizes to create interleaved byte-triggered
+    // and rank-triggered samples naturally.
+    for idx in 0..200 {
+        let base = 10_000 + total_items + idx;
+        let size = if idx % (stride as usize / 10).max(3) == 0 {
+            stride * 2
+        } else {
+            1
+        };
+        right.observe(&key_for_index(base), size);
+    }
+
+    let right_stride = right.byte_stride();
+
+    // Merge with left having total_bytes = 1 (maximally misaligned:
+    // phase_gap = stride - 1, which is the largest possible gap).
+    let mut left = StreamingSplitEstimator::new(32);
+    left.observe(&key_for_index(0), 1);
+
+    left.merge(&right);
+    assert_samples_sorted(&left);
+
+    // Verify the merged estimator still produces a valid split.
+    if left.estimate_split_key().is_some() {
+        let right_samples = right.sample_full_debug_view();
+        let has_both_types =
+            right_samples.iter().any(|s| s.2) && right_samples.iter().any(|s| !s.2);
+        // This test is only meaningful if right had mixed trigger types.
+        // If not, the test passes vacuously but is still correct.
+        assert!(
+            has_both_types || right_stride <= 1,
+            "expected mixed trigger types with stride > 1"
+        );
+    }
+}
+
+/// Same scenario as above but with the existing merge test data — this adds
+/// the missing `assert_samples_sorted` call to the append-order test.
+#[test]
+fn merge_append_order_preserves_byte_monotonicity() {
+    let count = 8_000usize;
+    let mut left = StreamingSplitEstimator::new(128);
+    let mut right = StreamingSplitEstimator::new(128);
+
+    for idx in 0..count {
+        let size = deterministic_size(idx);
+        let key = key_for_index(idx);
+        if idx < count / 2 {
+            left.observe(&key, size);
+        } else {
+            right.observe(&key, size);
+        }
+    }
+
+    left.merge(&right);
+    assert_samples_sorted(&left);
+}
+
+/// When both sides are at capacity, merge triggers compaction and the result
+/// stays within bounds with sorted samples.
+#[test]
+fn merge_both_at_capacity_triggers_compaction() {
+    let mut left = StreamingSplitEstimator::new(32);
+    let mut right = StreamingSplitEstimator::new(32);
+    let cap = left.sample_cap(); // 128
+
+    // Feed cap entries to each side to fill them to capacity.
+    for idx in 0..cap {
+        left.observe(&key_for_index(idx), deterministic_size(idx));
+    }
+    for idx in cap..(cap * 2) {
+        right.observe(&key_for_index(idx), deterministic_size(idx));
+    }
+
+    left.merge(&right);
+
+    assert!(
+        left.sample_len() <= left.sample_cap(),
+        "merged samples ({}) exceeded cap ({})",
+        left.sample_len(),
+        left.sample_cap()
+    );
+    assert_samples_sorted(&left);
+
+    let split = left.estimate_split_key().expect("split expected");
+    let split_idx = index_from_key(&split);
+    assert!(
+        split_idx >= 1 && split_idx < cap * 2,
+        "split index {split_idx} out of range"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// First-key guard fallback tests
+// ---------------------------------------------------------------------------
+
+/// After merge + heavy compaction, the first-key guard still works.
+#[test]
+fn first_key_guard_survives_merge_and_compaction() {
+    let mut left = StreamingSplitEstimator::new(32);
+    let mut right = StreamingSplitEstimator::new(32);
+
+    // Left has one huge file.
+    left.observe(&key_for_index(0), 1_000_000_000);
+    for idx in 1..100 {
+        left.observe(&key_for_index(idx), 1);
+    }
+
+    // Right has many small files.
+    for idx in 100..2000 {
+        right.observe(&key_for_index(idx), 1);
+    }
+
+    left.merge(&right);
+    let split = left.estimate_split_key().expect("split key expected");
+    let split_idx = index_from_key(&split);
+    assert!(
+        split_idx >= 1,
+        "first-key guard must survive merge, got index {}",
+        split_idx
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Extreme value tests
 // ---------------------------------------------------------------------------
 
@@ -442,6 +628,103 @@ fn byte_positions_above_f64_precision_boundary_remain_distinguishable() {
             *bytes == boundary + 1 && index_from_key(key.as_slice()) == 2
         }),
         "expected sample at byte offset 2^53 + 1 for key 2"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Internal helper tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn align_to_stride_edge_cases() {
+    use super::align_to_stride;
+
+    assert_eq!(align_to_stride(0, 5), 0, "zero already aligned");
+    assert_eq!(align_to_stride(1, 5), 5, "round up");
+    assert_eq!(align_to_stride(5, 5), 5, "exact multiple");
+    assert_eq!(align_to_stride(6, 5), 10, "round up past multiple");
+    assert_eq!(align_to_stride(u64::MAX, 5), u64::MAX, "MAX passthrough");
+    assert_eq!(
+        align_to_stride(u64::MAX - 2, 4),
+        u64::MAX,
+        "saturating_add triggers"
+    );
+    assert_eq!(align_to_stride(0, 1), 0, "stride=1 is identity for 0");
+    assert_eq!(align_to_stride(7, 1), 7, "stride=1 is identity");
+}
+
+#[test]
+fn interpolated_position_edge_cases() {
+    use super::interpolated_position;
+
+    assert_eq!(interpolated_position(0, 100, 0, 5), 0, "first endpoint");
+    assert_eq!(interpolated_position(0, 100, 4, 5), 100, "last endpoint");
+    assert_eq!(interpolated_position(0, 100, 2, 5), 50, "midpoint");
+    assert_eq!(interpolated_position(10, 110, 1, 3), 60, "non-zero first");
+    // Verify no panic/overflow on large span via u128 path.
+    let result = interpolated_position(0, u64::MAX, 1, 3);
+    assert_eq!(
+        result,
+        u64::MAX / 2,
+        "large span uses u128 arithmetic without overflow"
+    );
+}
+
+#[test]
+fn compact_samples_preserves_endpoints_and_monotonicity() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, false, &key_for_index(i)))
+        .collect();
+
+    let original_first_key = samples.first().unwrap().key.clone();
+    let original_last_key = samples.last().unwrap().key.clone();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+    assert_eq!(samples.first().unwrap().key, original_first_key);
+    assert_eq!(samples.last().unwrap().key, original_last_key);
+
+    // Ranks strictly increasing.
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+    // Bytes non-decreasing.
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Saturation edge-case tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn observe_with_max_file_size() {
+    let mut estimator = StreamingSplitEstimator::new(256);
+    estimator.observe(&key_for_index(0), u64::MAX);
+    estimator.observe(&key_for_index(1), 1);
+    estimator.observe(&key_for_index(2), 1);
+
+    let split = estimator.estimate_split_key().expect("split expected");
+    let split_idx = index_from_key(&split);
+    assert!(split_idx >= 1, "first-key guard must hold, got {split_idx}");
+}
+
+#[test]
+fn cumulative_bytes_saturation() {
+    let mut estimator = StreamingSplitEstimator::new(256);
+    estimator.observe(&key_for_index(0), u64::MAX - 10);
+    estimator.observe(&key_for_index(1), 20); // saturates to MAX
+    estimator.observe(&key_for_index(2), 100); // already at MAX
+
+    let split = estimator.estimate_split_key().expect("split expected");
+    let split_idx = index_from_key(&split);
+    assert!(
+        split_idx >= 1,
+        "valid split required, got index {split_idx}"
     );
 }
 
