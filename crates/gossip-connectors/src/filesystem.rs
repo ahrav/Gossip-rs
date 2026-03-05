@@ -518,10 +518,10 @@ impl FilesystemConnector {
 
     /// Walk from root to find the first key strictly greater than `last_key`.
     ///
-    /// Used as the ground-truth reference for token resume cross-checks.
-    /// Runs unconditionally after token resume to detect divergence from stale
-    /// or corrupted tokens; on mismatch the key-only result is adopted and the
-    /// token result is discarded.
+    /// Used as the ground-truth reference for token resume cross-checks in
+    /// test builds. Runs after token resume to detect divergence from stale
+    /// or corrupted tokens.
+    #[cfg(test)]
     fn key_only_resume_probe(
         &mut self,
         last_key: &ItemKey,
@@ -586,12 +586,11 @@ impl FilesystemConnector {
             return Ok(());
         };
 
-        let mut resumed_from_token = false;
         if self.emit_tokens
             && let Some(walk_token) = WalkToken::decode_cursor_token(cursor)
             && let Some(restored) = WalkState::from_token(
                 &root,
-                &walk_token,
+                walk_token,
                 self.max_walk_depth,
                 deadline,
                 self.max_warnings,
@@ -600,30 +599,27 @@ impl FilesystemConnector {
             )?
         {
             self.walk_state = Some(restored);
-            let token_next = self.seek_after_last_key(last_key, walk_query)?;
+            let _token_next = self.seek_after_last_key(last_key, walk_query)?;
 
-            // Cross-check: verify token-based resume agrees with key-only resume.
-            // A stale or corrupted token may position the walker past directories
-            // that still contain unvisited keys > last_key. When divergence is
-            // detected, discard the token result and adopt the key-only position.
-            //
-            // The probe uses an unbounded deadline so a tight page budget cannot
-            // turn a successful token restore into a spurious retryable error.
-            let probe_query = WalkQuery {
-                deadline: None,
-                ..walk_query
-            };
-            let key_next = self.key_only_resume_probe(last_key, probe_query)?;
-            let token_matches = token_next.as_ref().map(|k| k.as_bytes())
-                == key_next.as_ref().map(|k| k.as_bytes());
-
-            if token_matches {
-                resumed_from_token = true;
+            // Cross-check: verify token-based resume agrees with key-only
+            // resume. Limited to test builds so production does not pay for
+            // the full-tree walk on every resume. On mismatch, fall back to
+            // key-only position (stale tokens are expected in adversarial tests).
+            #[cfg(test)]
+            {
+                let probe_query = WalkQuery {
+                    deadline: None,
+                    ..walk_query
+                };
+                let key_next = self.key_only_resume_probe(last_key, probe_query)?;
+                let token_matches = _token_next.as_ref().map(|k| k.as_bytes())
+                    == key_next.as_ref().map(|k| k.as_bytes());
+                if !token_matches {
+                    self.reset_walk_state(deadline)?;
+                    let _ = self.seek_after_last_key(last_key, walk_query)?;
+                }
             }
-            // On mismatch, fall through to key-only resume below.
-        }
-
-        if !resumed_from_token {
+        } else {
             self.reset_walk_state(deadline)?;
             let _ = self.seek_after_last_key(last_key, walk_query)?;
         }
@@ -1205,7 +1201,10 @@ impl WalkToken {
 
         let mut offset = 1usize;
         let frame_count = decode_u16_le(bytes, &mut offset)? as usize;
-        let mut frames = Vec::with_capacity(frame_count);
+        // Cap pre-allocation to what the remaining bytes can actually hold
+        // (each frame needs at least 6 bytes: 2 component_len + 4 index).
+        let capacity_hint = frame_count.min(bytes.len().saturating_sub(offset) / 6);
+        let mut frames = Vec::with_capacity(capacity_hint);
         for frame_idx in 0..frame_count {
             let component_len = decode_u16_le(bytes, &mut offset)? as usize;
             let component_end = offset.checked_add(component_len)?;
@@ -1247,29 +1246,19 @@ impl WalkToken {
             return None;
         }
 
-        let mut frames: Vec<WalkTokenFrame> = state
-            .stack
-            .iter()
-            .map(|frame| WalkTokenFrame {
-                component: frame
-                    .component
-                    .as_ref()
-                    .map_or_else(Vec::new, |component| component.as_bytes().to_vec()),
-                next_child_index: frame.next_child_index,
-            })
-            .collect();
+        let total_frames = state.stack.len().min(u16::MAX as usize);
 
-        let total_frames = frames.len().min(u16::MAX as usize);
-        frames.truncate(total_frames);
-
+        // First pass: compute encoded_size and keep count directly from
+        // state.stack without allocating an intermediate Vec<WalkTokenFrame>.
         let mut encoded_size = 1usize + std::mem::size_of::<u16>();
         let mut keep = 0usize;
-        for frame in &frames {
-            if frame.component.len() > u16::MAX as usize {
+        for frame in &state.stack[..total_frames] {
+            let component_len = frame.component.as_ref().map_or(0, |c| c.as_bytes().len());
+            if component_len > u16::MAX as usize {
                 break;
             }
             let frame_size = std::mem::size_of::<u16>()
-                .checked_add(frame.component.len())?
+                .checked_add(component_len)?
                 .checked_add(std::mem::size_of::<u32>())?;
             let next_size = encoded_size.checked_add(frame_size)?;
             if next_size > MAX_TOKEN_SIZE {
@@ -1284,28 +1273,28 @@ impl WalkToken {
         }
 
         let truncated = keep < total_frames;
-        frames.truncate(keep);
 
-        // Invariant: in the DFS walk, the last entry consumed by the retained
-        // leaf frame is always the directory entry whose child frames are being
-        // dropped. Rewinding `next_child_index` by one forces that directory to
-        // be re-entered on resume so its descendants are not silently skipped.
-        //
-        // This relies on DFS never advancing a parent frame past the entry that
-        // caused descent while deeper frames are active on the stack.
-        if truncated && let Some(last) = frames.last_mut() {
-            last.next_child_index = last.next_child_index.saturating_sub(1);
-        }
-
-        let frame_count = u16::try_from(frames.len()).ok()?;
+        // Second pass: serialize directly from state.stack into a single buffer.
+        let frame_count = u16::try_from(keep).ok()?;
         let mut out = Vec::with_capacity(encoded_size);
         out.push(WALK_TOKEN_VERSION);
         out.extend_from_slice(&frame_count.to_le_bytes());
-        for frame in frames {
-            let component_len = u16::try_from(frame.component.len()).ok()?;
+        for (idx, frame) in state.stack[..keep].iter().enumerate() {
+            let component_bytes: &[u8] = frame.component.as_ref().map_or(&[], |c| c.as_bytes());
+            let component_len = u16::try_from(component_bytes.len()).ok()?;
             out.extend_from_slice(&component_len.to_le_bytes());
-            out.extend_from_slice(&frame.component);
-            out.extend_from_slice(&frame.next_child_index.to_le_bytes());
+            out.extend_from_slice(component_bytes);
+
+            // Invariant: in the DFS walk, the last entry consumed by the
+            // retained leaf frame is always the directory entry whose child
+            // frames are being dropped. Rewinding `next_child_index` by one
+            // forces that directory to be re-entered on resume so its
+            // descendants are not silently skipped.
+            let mut next_child_index = frame.next_child_index;
+            if truncated && idx == keep - 1 {
+                next_child_index = next_child_index.saturating_sub(1);
+            }
+            out.extend_from_slice(&next_child_index.to_le_bytes());
         }
         TokenBytes::try_from_vec(out).ok()
     }
@@ -1499,20 +1488,23 @@ impl WalkState {
     /// key-only resume in that case.
     fn from_token(
         root: &Path,
-        token: &WalkToken,
+        token: WalkToken,
         max_depth: usize,
         deadline: Option<Instant>,
         max_warnings: usize,
         warnings: &mut Vec<WalkWarning>,
         overflow_count: &mut usize,
     ) -> Result<Option<Self>, EnumerateError> {
-        let Some((root_frame, child_frames)) = token.frames.split_first() else {
-            return Ok(None);
+        let mut frames = token.frames.into_iter();
+        let root_frame = match frames.next() {
+            Some(f) => f,
+            None => return Ok(None),
         };
         if !root_frame.component.is_empty() {
             return Ok(None);
         }
-        if child_frames.len() > max_depth {
+        let child_count = frames.len();
+        if child_count > max_depth {
             return Ok(None);
         }
 
@@ -1535,7 +1527,7 @@ impl WalkState {
         // A non-leaf root (has child frames) must retain at least one entry
         // after fast-forward; an empty deque would silently lose sibling files
         // that appear after the child subtree in DFS order.
-        if !child_frames.is_empty() && root_entries.is_empty() {
+        if child_count > 0 && root_entries.is_empty() {
             return Ok(None);
         }
 
@@ -1544,7 +1536,7 @@ impl WalkState {
             visited_dirs.insert((root_meta.dev(), root_meta.ino()));
         }
 
-        let mut stack = Vec::with_capacity(token.frames.len());
+        let mut stack = Vec::with_capacity(1 + child_count);
         stack.push(WalkFrame {
             component: None,
             depth: 0,
@@ -1559,7 +1551,7 @@ impl WalkState {
             PathBuf::from(buf)
         };
 
-        for (depth, frame) in child_frames.iter().enumerate() {
+        for (depth, frame) in frames.enumerate() {
             if frame.component.is_empty()
                 || frame.component.contains(&b'/')
                 || frame.component.contains(&0)
@@ -1568,10 +1560,15 @@ impl WalkState {
             {
                 return Ok(None);
             }
-            let component = OsString::from_vec(frame.component.clone());
+            let component = OsString::from_vec(frame.component);
             current_path.push(&component);
 
-            if let Ok(dir_meta) = fs::metadata(&current_path) {
+            if let Ok(dir_meta) = fs::symlink_metadata(&current_path) {
+                // Reject symlinks to prevent token-supplied components from
+                // being followed during restore.
+                if dir_meta.file_type().is_symlink() {
+                    return Ok(None);
+                }
                 let dir_id = (dir_meta.dev(), dir_meta.ino());
                 if !visited_dirs.insert(dir_id) {
                     return Ok(None);
@@ -1597,7 +1594,7 @@ impl WalkState {
             // Non-leaf child frames (those that still have deeper children on
             // the stack) must retain at least one entry after fast-forward;
             // otherwise sibling files after the child subtree are lost.
-            let is_last_child = depth == child_frames.len() - 1;
+            let is_last_child = depth == child_count - 1;
             if !is_last_child && entries.is_empty() {
                 return Ok(None);
             }

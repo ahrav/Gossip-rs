@@ -241,8 +241,10 @@ fn enumerate_page_uses_pooled_toxic_wrappers() {
     let start = make_key(b"\x00");
     let end = make_key(b"\xff");
 
+    // Use a page budget of 1 so the walk is NOT exhausted after the first page;
+    // an exhausted walk does not emit a resume token.
     let page = c
-        .enumerate_page_range(&start, &end, &Cursor::initial(), default_budgets())
+        .enumerate_page_range(&start, &end, &Cursor::initial(), small_page_budgets(1))
         .unwrap();
     // Filesystem pages should emit pooled wrappers for key/ref fields.
     assert!(
@@ -595,6 +597,38 @@ fn walk_token_decode_rejects_invalid_payloads() {
     malformed.extend_from_slice(&0u16.to_le_bytes());
     malformed.extend_from_slice(&0u32.to_le_bytes());
     assert!(WalkToken::decode_bytes(&malformed).is_none());
+
+    // `.` component in non-root frame is rejected (path traversal).
+    let mut dot = Vec::new();
+    dot.push(WALK_TOKEN_VERSION);
+    dot.extend_from_slice(&2u16.to_le_bytes());
+    // root frame: empty component
+    dot.extend_from_slice(&0u16.to_le_bytes());
+    dot.extend_from_slice(&0u32.to_le_bytes());
+    // child frame: "."
+    dot.extend_from_slice(&1u16.to_le_bytes());
+    dot.push(b'.');
+    dot.extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        WalkToken::decode_bytes(&dot).is_none(),
+        "dot component must be rejected"
+    );
+
+    // `..` component in non-root frame is rejected (path traversal).
+    let mut dotdot = Vec::new();
+    dotdot.push(WALK_TOKEN_VERSION);
+    dotdot.extend_from_slice(&2u16.to_le_bytes());
+    // root frame: empty component
+    dotdot.extend_from_slice(&0u16.to_le_bytes());
+    dotdot.extend_from_slice(&0u32.to_le_bytes());
+    // child frame: ".."
+    dotdot.extend_from_slice(&2u16.to_le_bytes());
+    dotdot.extend_from_slice(b"..");
+    dotdot.extend_from_slice(&0u32.to_le_bytes());
+    assert!(
+        WalkToken::decode_bytes(&dotdot).is_none(),
+        "dotdot component must be rejected"
+    );
 }
 
 #[test]
