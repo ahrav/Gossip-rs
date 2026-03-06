@@ -882,6 +882,7 @@ name = "gossip-connectors"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "criterion",
  "crossbeam-channel",
  "gossip-contracts",
  "gossip-scan-driver",

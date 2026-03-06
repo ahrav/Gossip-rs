@@ -1,9 +1,17 @@
 //! Tests for [`StreamingSplitEstimator`].
 //!
-//! Unit tests cover specific edge cases (minimum entries, front-loaded weight,
-//! zipf accuracy). Property tests verify general invariants (memory
-//! boundedness, zero-size midpoint fallback, sample ordering) over randomised
-//! inputs.
+//! Coverage is layered so readers can map tests back to the estimator's
+//! promises:
+//! - unit/regression tests pin split semantics, redaction, and downsampling
+//!   behavior on concrete workloads,
+//! - precision tests exercise byte positions above `2^53`, where a
+//!   float-based implementation would start collapsing adjacent integer marks,
+//! - property tests fuzz the bounded-memory and monotonicity invariants over
+//!   randomized streams.
+//!
+//! The separate 1M-item allocation guard lives in
+//! `tests/streaming_split_estimator_perf.rs` because it needs a process-wide
+//! counting allocator and the doc-hidden benchmark hook exported from `lib.rs`.
 
 use proptest::prelude::*;
 
@@ -328,7 +336,7 @@ fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
 }
 
 // ---------------------------------------------------------------------------
-// Extreme value tests
+// Extreme value, precision, and determinism tests
 // ---------------------------------------------------------------------------
 
 /// Very large file sizes (near u64::MAX / 2) should not overflow or panic.
@@ -350,6 +358,9 @@ fn extreme_file_sizes_no_overflow() {
     );
 }
 
+/// Regression guard for the `u128` byte-position path: adjacent byte marks
+/// above `2^53` must stay distinguishable, or midpoint search would drift once
+/// integer offsets stop round-tripping through `f64`.
 #[test]
 fn byte_positions_above_f64_precision_boundary_remain_distinguishable() {
     let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
@@ -564,6 +575,42 @@ proptest! {
             "sample byte positions must remain non-decreasing: {:?}",
             samples
         );
+    }
+
+    /// Appending equal-size items should only move the estimated midpoint
+    /// backward by at most one retained-sample gap when compaction reshapes
+    /// the sketch.
+    #[test]
+    fn prop_split_estimate_stable_under_append(count in (MIN_SAMPLE_CAP + 1)..4_096usize) {
+        let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+        let mut previous_split = None;
+
+        estimator.observe(&key_for_index(0), 1);
+
+        for idx in 1..count {
+            estimator.observe(&key_for_index(idx), 1);
+
+            let split = estimator
+                .estimate_split_key()
+                .expect("count >= 2 should always produce a split");
+            let split_idx = index_from_key(split);
+
+            if let Some(previous) = previous_split {
+                let observed = idx + 1;
+                let max_backward_jump = observed.div_ceil(estimator.sample_cap()) + 1;
+                prop_assert!(
+                    split_idx + max_backward_jump >= previous,
+                    "split moved backward too far after append: prev={}, current={}, observed={}, cap={}, allowed_backstep={}",
+                    previous,
+                    split_idx,
+                    observed,
+                    estimator.sample_cap(),
+                    max_backward_jump
+                );
+            }
+
+            previous_split = Some(split_idx);
+        }
     }
 
 }

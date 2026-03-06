@@ -67,8 +67,17 @@
 //!   For Zipf-like workloads dominated by a few very large files the byte
 //!   axis may have gaps in that region, causing the estimator to rely more
 //!   on the rank-axis fallback.  In practice the rank sample for the same
-//!   file still captures it, and the accuracy property tests confirm <1%
-//!   byte-weighted error on 20 000-key Zipf streams.
+//!   file still captures it, and the dedicated Zipf-like accuracy regression
+//!   test confirms <1% byte-weighted error on a 20 000-key stream.
+//!
+//! # Validation support
+//!
+//! Companion tests in `split_estimator_tests.rs` pin the estimator's weighted
+//! accuracy and >2^53 byte-position precision. Cross-crate performance harnesses use
+//! [`crate::benchmark_streaming_split_estimator_observe_fixed_size`] to drive
+//! the same `observe` loop on a fixed-size stream, which keeps benchmark and
+//! allocation-regression numbers focused on the estimator rather than on
+//! filesystem traversal or random workload generation.
 
 use std::fmt;
 use std::mem;
@@ -394,8 +403,8 @@ impl fmt::Debug for StreamingSplitEstimator {
 
 impl StreamingSplitEstimator {
     /// Default retained sample count.
-    /// Sufficient for <1% byte-weighted error on Zipf-distributed streams
-    /// of tens of thousands of keys (validated by property tests).
+    /// Sufficient for <1% byte-weighted error on the crate's 20 000-key
+    /// descending-size regression workload.
     pub(crate) const DEFAULT_SAMPLE_CAP: usize = 1024;
 
     /// Create a new streaming estimator.
