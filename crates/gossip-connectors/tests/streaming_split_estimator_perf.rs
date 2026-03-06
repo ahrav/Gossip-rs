@@ -43,6 +43,8 @@ fn observe_one_million_items_allocates_sublinearly() {
     // Count only allocation-producing events. Deallocation churn can vary with
     // compaction timing, but regressions in the hot `observe` path show up as
     // extra alloc/realloc pressure.
+    // As of 2026-03: actual heap_ops ≈ 1026 at sample_cap=128, count=1M.
+    // Bound is ~3x slack (2944) to absorb implementation changes.
     let heap_ops = delta.allocs + delta.reallocs;
     let upper_bound = observe_allocation_upper_bound(sample_cap, count);
     assert!(

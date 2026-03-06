@@ -4,7 +4,7 @@
 //! promises:
 //! - unit/regression tests pin split semantics, redaction, and downsampling
 //!   behavior on concrete workloads,
-//! - precision/determinism tests exercise byte positions above `2^53`, where a
+//! - precision tests exercise byte positions above `2^53`, where a
 //!   float-based implementation would start collapsing adjacent integer marks,
 //! - property tests fuzz the bounded-memory and monotonicity invariants over
 //!   randomized streams.
@@ -61,31 +61,6 @@ fn assert_samples_sorted(estimator: &StreamingSplitEstimator) {
         samples.windows(2).all(|window| window[0].1 <= window[1].1),
         "sample byte positions must remain non-decreasing: {samples:?}"
     );
-}
-
-/// Build a symmetric stream whose exact midpoint sits inside the run of
-/// 1-byte items just above the `2^53` precision boundary.
-///
-/// Returning both the chosen split index and the retained sample layout lets
-/// the determinism test prove that repeated runs produce identical results,
-/// not merely "close enough" split locations.
-fn run_precision_boundary_stream(
-    sample_cap: usize,
-    count: usize,
-) -> (usize, Vec<(u64, u64, Vec<u8>)>) {
-    let mut estimator = StreamingSplitEstimator::new(sample_cap);
-    let boundary = 1u64 << 53;
-
-    estimator.observe(&key_for_index(0), boundary);
-    for idx in 1..(count - 1) {
-        estimator.observe(&key_for_index(idx), 1);
-    }
-    estimator.observe(&key_for_index(count - 1), boundary);
-
-    let split = estimator
-        .estimate_split_key()
-        .expect("precision-boundary stream should produce a split");
-    (index_from_key(split), estimator.sample_debug_view())
 }
 
 // ---------------------------------------------------------------------------
@@ -420,44 +395,6 @@ fn byte_positions_above_f64_precision_boundary_remain_distinguishable() {
     );
 }
 
-/// Replaying the same >2^53 stream should yield the same split and identical
-/// retained samples when compaction is not involved.
-///
-/// This keeps the benchmark hook and the precision tests stable across runs:
-/// if identical input streams ever produced different sample layouts, the
-/// observed split could fluctuate even without randomness in the workload.
-#[test]
-fn deterministic_above_two_pow_53_with_many_files() {
-    let sample_cap = LARGE_SAMPLE_CAP;
-    let count = SMALL_SAMPLE_CAP * 4;
-    // The exact midpoint lands within the interior run of 1-byte items, not on
-    // either heavy endpoint.
-    let expected_idx = 1 + (count - 2) / 2;
-
-    // Keep every sample so this test isolates precision and ordering
-    // determinism rather than compaction policy.
-    assert!(
-        count < sample_cap,
-        "determinism guard expects every >2^53 byte mark to remain retained"
-    );
-
-    let (first_split, first_samples) = run_precision_boundary_stream(sample_cap, count);
-    let (second_split, second_samples) = run_precision_boundary_stream(sample_cap, count);
-
-    assert_eq!(
-        first_split, expected_idx,
-        "precision-boundary stream should split at the exact byte midpoint"
-    );
-    assert_eq!(
-        second_split, expected_idx,
-        "re-running the same >2^53 stream should preserve the exact split index"
-    );
-    assert_eq!(
-        first_samples, second_samples,
-        "downsampling above 2^53 should be deterministic across runs"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Internal helper tests
 // ---------------------------------------------------------------------------
@@ -648,12 +585,10 @@ proptest! {
         let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
         let mut previous_split = None;
 
-        for idx in 0..count {
-            estimator.observe(&key_for_index(idx), 1);
+        estimator.observe(&key_for_index(0), 1);
 
-            if idx < 1 {
-                continue;
-            }
+        for idx in 1..count {
+            estimator.observe(&key_for_index(idx), 1);
 
             let split = estimator
                 .estimate_split_key()

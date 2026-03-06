@@ -32,18 +32,21 @@ pub use scan_driver::{
 
 #[cfg(unix)]
 #[doc(hidden)]
-/// Benchmark-only wrapper around the private streaming split estimator.
-///
-/// The estimator itself stays crate-private because production callers consume
-/// split hints through connector APIs, not by instantiating the sketch
-/// directly. Criterion benches and cross-crate regression tests still need a
-/// stable way to drive the real `observe` path, so this doc-hidden shim
-/// exposes a deterministic fixed-size workload entry point while leaving the
-/// estimator type and its internal sampling helpers unexported.
+/// Benchmark hook: drives the streaming split estimator's `observe` loop on a
+/// deterministic fixed-size workload for Criterion benches and allocation guards.
 pub fn benchmark_streaming_split_estimator_observe_fixed_size(
     sample_cap: usize,
     count: usize,
     file_size: u64,
 ) -> Option<u64> {
-    split_estimator::benchmark_observe_fixed_size(sample_cap, count, file_size)
+    use split_estimator::StreamingSplitEstimator;
+
+    let mut estimator = StreamingSplitEstimator::new(sample_cap);
+    for idx in 0..count {
+        let key = u64::try_from(idx).expect("bench key index must fit in u64");
+        estimator.observe(&key.to_be_bytes(), file_size);
+    }
+    estimator
+        .estimate_split_key()
+        .map(|key| u64::from_be_bytes(key.try_into().expect("split keys use u64 bytes")))
 }
