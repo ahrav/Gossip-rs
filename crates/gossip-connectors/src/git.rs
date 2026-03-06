@@ -66,7 +66,7 @@ use gossip_contracts::{
         EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorTag, ObjectVersionId, StableItemId},
+    identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
 };
 
 use crate::common::{
@@ -87,7 +87,8 @@ pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal"
 struct GitEntry {
     /// Repository-relative path used as both the item key and the item ref.
     key: ItemKey,
-    /// Domain-separated BLAKE3 identity derived from `(ConnectorTag, key)`.
+    /// Domain-separated BLAKE3 identity derived from
+    /// `(ConnectorTag, ConnectorInstanceIdHash, key)`.
     stable_item_id: StableItemId,
     /// Weak version fingerprint over `(path, size, mtime)`.
     version: VersionId,
@@ -144,6 +145,8 @@ enum IndexState {
 pub struct GitConnector {
     /// Absolute path to the repository root (working directory).
     repo: PathBuf,
+    /// Stable connector-instance scope used for `StableItemId` derivation.
+    connector_instance: ConnectorInstanceIdHash,
     /// Whether pagination cursors include positional tokens for O(1)
     /// resume. Defaults to `true`; set to `false` for key-only cursors.
     emit_tokens: bool,
@@ -159,8 +162,16 @@ pub struct GitConnector {
 impl GitConnector {
     /// Create a connector rooted at `repo`.
     pub fn new(repo: impl Into<PathBuf>) -> Self {
+        let repo = repo.into();
+        assert!(
+            !repo.as_os_str().is_empty(),
+            "GitConnector repo path must not be empty"
+        );
+        let connector_instance =
+            ConnectorInstanceIdHash::from_instance_id_bytes(repo.as_os_str().as_encoded_bytes());
         Self {
-            repo: repo.into(),
+            repo,
+            connector_instance,
             emit_tokens: true,
             max_tracked_files: None,
             index_state: IndexState::NotIndexed,
@@ -341,7 +352,12 @@ impl GitConnector {
             if !metadata.is_file() {
                 continue;
             }
-            let entry = build_git_entry(&key_bytes, metadata.len(), metadata.modified().ok())?;
+            let entry = build_git_entry(
+                self.connector_instance,
+                &key_bytes,
+                metadata.len(),
+                metadata.modified().ok(),
+            )?;
             entries.push(entry);
         }
 
@@ -581,6 +597,7 @@ impl ReadConnector for GitConnector {
 /// validation catches oversized or malformed paths at index time rather
 /// than during later enumeration or read calls.
 fn build_git_entry(
+    connector_instance: ConnectorInstanceIdHash,
     key_bytes: &[u8],
     size_hint: u64,
     modified: Option<std::time::SystemTime>,
@@ -592,7 +609,7 @@ fn build_git_entry(
     // size limits, so both must pass.
     let _ = ItemRef::try_from_slice(key_bytes)
         .map_err(|error| EnumerateError::permanent(format!("invalid git item_ref: {error}")))?;
-    let stable_item_id = derive_stable_item_id(GIT_CONNECTOR_TAG, &key);
+    let stable_item_id = derive_stable_item_id(GIT_CONNECTOR_TAG, connector_instance, &key);
     let version = build_weak_version(key_bytes, size_hint, modified);
 
     Ok(GitEntry {

@@ -16,7 +16,7 @@ use gossip_contracts::{
         Budgets, ConnectorInputError, Cursor, EnumerateError, ItemKey, ItemRef, MAX_ITEM_KEY_SIZE,
         PooledByteSlab, ReadError, TokenBytes, ToxicDigest,
     },
-    identity::{ConnectorTag, ItemIdentityKey, StableItemId},
+    identity::{ConnectorInstanceIdHash, ConnectorTag, ItemIdentityKey, StableItemId},
 };
 use gossip_stdx::{ByteSlab, ByteSlot};
 
@@ -35,11 +35,15 @@ pub(crate) fn parse_u64_be(bytes: &[u8]) -> Option<u64> {
 
 /// Derive a stable per-key identity via the canonical [`ItemIdentityKey`] path.
 ///
-/// The hash input includes both the [`ConnectorTag`] and the key bytes under
-/// domain-separated BLAKE3, so identical key bytes from different connectors
-/// produce distinct IDs.
-pub(crate) fn derive_stable_item_id(tag: ConnectorTag, key: &ItemKey) -> StableItemId {
-    ItemIdentityKey::new(tag, key.as_bytes()).stable_id()
+/// The hash input includes the [`ConnectorTag`], connector-instance scope, and
+/// key bytes under domain-separated BLAKE3, so identical key bytes from
+/// different connectors or connector instances produce distinct IDs.
+pub(crate) fn derive_stable_item_id(
+    tag: ConnectorTag,
+    connector_instance: ConnectorInstanceIdHash,
+    key: &ItemKey,
+) -> StableItemId {
+    ItemIdentityKey::new(tag, connector_instance, key.as_bytes()).stable_id()
 }
 
 /// Validate a shard key-range bound where `[]` (empty) means unbounded.

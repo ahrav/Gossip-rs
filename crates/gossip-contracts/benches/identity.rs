@@ -1,9 +1,11 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use gossip_contracts::identity::{
-    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey, NormHash,
-    ObjectVersionId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint, StableItemId, TenantId,
-    TenantSecretKey, compute_policy_hash, derive_finding_id, derive_occurrence_id, key_secret_hash,
+    ConnectorInstanceIdHash, ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey,
+    NormHash, ObjectVersionId, ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash,
+    PolicyHashInputs, RuleFingerprint, StableItemId, TenantId, TenantSecretKey,
+    compute_policy_hash, derive_finding_id, derive_observation_id, derive_occurrence_id,
+    key_secret_hash,
 };
 
 fn bench_key_secret_hash(c: &mut Criterion) {
@@ -45,6 +47,17 @@ fn bench_derive_occurrence_id(c: &mut Criterion) {
     });
 }
 
+fn bench_derive_observation_id(c: &mut Criterion) {
+    let inputs = ObservationIdInputs {
+        tenant: TenantId::from_bytes([0x77; 32]),
+        policy: PolicyHash::from_bytes([0x88; 32]),
+        occurrence: OccurrenceId::from_bytes([0x99; 32]),
+    };
+    c.bench_function("derive_observation_id", |b| {
+        b.iter(|| derive_observation_id(black_box(&inputs)))
+    });
+}
+
 fn bench_compute_policy_hash(c: &mut Criterion) {
     let inputs = PolicyHashInputs {
         policy_hash_version: 1,
@@ -61,6 +74,7 @@ fn bench_compute_policy_hash(c: &mut Criterion) {
 fn bench_item_key_stable_id(c: &mut Criterion) {
     let key = ItemIdentityKey::new(
         ConnectorTag::from_ascii(b"github"),
+        ConnectorInstanceIdHash::from_instance_id_bytes(b"github-installation-1"),
         b"org/repo\0src/main.rs",
     );
 
@@ -71,6 +85,8 @@ fn bench_item_key_stable_id(c: &mut Criterion) {
 
 fn bench_full_derivation_chain(c: &mut Criterion) {
     let connector = ConnectorTag::from_ascii(b"github");
+    let connector_instance =
+        ConnectorInstanceIdHash::from_instance_id_bytes(b"github-installation-1");
     let path = b"org/repo\0src/main.rs".to_vec();
     let tenant_key = TenantSecretKey::from_bytes([0xBB; 32]);
     let norm = NormHash::from_digest([0xCC; 32]);
@@ -80,7 +96,7 @@ fn bench_full_derivation_chain(c: &mut Criterion) {
 
     c.bench_function("full_derivation_chain", |b| {
         b.iter(|| {
-            let key = ItemIdentityKey::new(connector, path.clone());
+            let key = ItemIdentityKey::new(connector, connector_instance, path.clone());
             let stable_id = key.stable_id();
             let secret = key_secret_hash(&tenant_key, &norm);
             let finding = derive_finding_id(&FindingIdInputs {
@@ -104,6 +120,7 @@ criterion_group!(
     bench_key_secret_hash,
     bench_derive_finding_id,
     bench_derive_occurrence_id,
+    bench_derive_observation_id,
     bench_compute_policy_hash,
     bench_item_key_stable_id,
     bench_full_derivation_chain,

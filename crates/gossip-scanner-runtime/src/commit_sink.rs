@@ -10,9 +10,8 @@ use anyhow::{Result, anyhow};
 use gossip_contracts::{
     connector::ItemKey,
     identity::{
-        ConnectorTag, FindingIdInputs, IdentityInputError, ItemIdentityKey, NormHash,
-        ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId, TenantSecretKey,
-        derive_finding_id, derive_occurrence_id, key_secret_hash,
+        FindingIdInputs, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId,
+        TenantSecretKey, derive_finding_id, derive_occurrence_id, key_secret_hash,
     },
 };
 use gossip_scan_driver::{CommitSink, FindingRecord, FindingsBatch, ItemMeta};
@@ -39,29 +38,28 @@ pub struct DurableCommitSink {
     recorder: std::sync::Arc<dyn CoordinationEventRecorder>,
     tenant_id: TenantId,
     tenant_secret_key: TenantSecretKey,
-    connector_tag: ConnectorTag,
     in_flight_meta: Mutex<BTreeMap<Vec<u8>, ItemMeta>>,
 }
 
 impl DurableCommitSink {
     /// Creates a durable commit sink bound to `shard_id`.
     ///
-    /// All identity derivation uses the provided `tenant_id`, `tenant_secret_key`,
-    /// and `connector_tag`. Derived records are persisted through `recorder`.
+    /// All identity derivation uses the provided `tenant_id` and
+    /// `tenant_secret_key`, while stable item identity is trusted from
+    /// connector-provided [`ItemMeta`]. Derived records are persisted through
+    /// `recorder`.
     #[must_use]
     pub fn new(
         recorder: std::sync::Arc<dyn CoordinationEventRecorder>,
         shard_id: impl Into<String>,
         tenant_id: TenantId,
         tenant_secret_key: TenantSecretKey,
-        connector_tag: ConnectorTag,
     ) -> Self {
         Self {
             shard_id: shard_id.into(),
             recorder,
             tenant_id,
             tenant_secret_key,
-            connector_tag,
             in_flight_meta: Mutex::new(BTreeMap::new()),
         }
     }
@@ -71,15 +69,10 @@ impl DurableCommitSink {
             .in_flight_meta
             .lock()
             .map_err(|_| anyhow!("durable commit sink metadata lock poisoned"))?;
-        Ok(guard.get(item_key.as_bytes()).cloned().unwrap_or_default())
-    }
-
-    fn item_identity_key(&self, item_key: &ItemKey) -> Result<ItemIdentityKey> {
-        ItemIdentityKey::try_new(self.connector_tag, item_key.as_bytes()).map_err(
-            |error: IdentityInputError| {
-                anyhow!("invalid item key for identity derivation: {error}")
-            },
-        )
+        guard
+            .get(item_key.as_bytes())
+            .cloned()
+            .ok_or_else(|| anyhow!("upsert_findings called before begin_item for item"))
     }
 
     fn derive_identity_record(
@@ -88,14 +81,12 @@ impl DurableCommitSink {
         meta: &ItemMeta,
         finding: &FindingRecord,
     ) -> Result<IdentityChainRecord> {
-        let stable_item = self.item_identity_key(item_key)?.stable_id();
-
         let norm_hash = NormHash::from_digest(finding.norm_hash);
         let secret_hash = key_secret_hash(&self.tenant_secret_key, &norm_hash);
 
         let finding_id = derive_finding_id(&FindingIdInputs {
             tenant: self.tenant_id,
-            item: stable_item,
+            item: meta.stable_item_id,
             rule: rule_fingerprint_from_rule_id(finding.rule_id),
             secret: secret_hash,
         });
@@ -103,7 +94,14 @@ impl DurableCommitSink {
         let object_version = meta
             .version
             .map(|version| version.object_version_id())
-            .unwrap_or_else(|| ObjectVersionId::from_version_bytes(item_key.as_bytes()));
+            .unwrap_or_else(|| {
+                tracing::debug!(
+                    item_key = ?item_key.as_bytes(),
+                    "missing connector version metadata; temporarily deriving ObjectVersionId \
+                     from item_key bytes until filesystem version propagation is plumbed"
+                );
+                ObjectVersionId::from_version_bytes(item_key.as_bytes())
+            });
         let occurrence_id = derive_occurrence_id(&OccurrenceIdInputs {
             finding: finding_id,
             version: object_version,
@@ -223,12 +221,18 @@ mod tests {
             "shard-a",
             TenantId::from_bytes([0x11; 32]),
             TenantSecretKey::from_bytes([0x22; 32]),
-            ConnectorTag::from_ascii(b"fs"),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/file.txt").expect("item key");
-        sink.begin_item(&item_key, &ItemMeta::default())
-            .expect("begin item");
+        sink.begin_item(
+            &item_key,
+            &ItemMeta {
+                stable_item_id: gossip_contracts::identity::StableItemId::from_bytes([0x33; 32]),
+                version: None,
+                size_hint: None,
+            },
+        )
+        .expect("begin item");
 
         sink.upsert_findings(
             &item_key,
@@ -256,19 +260,16 @@ mod tests {
     }
 
     /// Calling `upsert_findings` without a prior `begin_item` is a protocol
-    /// violation. The current code silently falls back to `ItemMeta::default()`
-    /// via `unwrap_or_default()`, which means identity derivation uses an
-    /// item-key-based version ID instead of the connector-provided one. This
-    /// test documents that the violation is silently tolerated.
+    /// violation and must be rejected so the runtime never fabricates stable
+    /// identity or version metadata.
     #[test]
-    fn upsert_without_begin_item_uses_default_metadata() {
+    fn upsert_without_begin_item_is_rejected() {
         let recorder = Arc::new(Recorder::default());
         let sink = DurableCommitSink::new(
             recorder.clone(),
             "shard-b",
             TenantId::from_bytes([0x11; 32]),
             TenantSecretKey::from_bytes([0x22; 32]),
-            ConnectorTag::from_ascii(b"fs"),
         );
 
         let item_key = ItemKey::try_from_slice(b"path/to/other.txt").expect("item key");
@@ -287,18 +288,12 @@ mod tests {
             },
         );
 
-        // Current behaviour: succeeds silently with default metadata.
-        // If we tighten the contract, this should return Err.
         assert!(
-            result.is_ok(),
-            "upsert_findings without begin_item currently succeeds (uses default metadata)"
+            result.is_err(),
+            "upsert_findings without begin_item must fail"
         );
 
         let identity = recorder.identity.lock().expect("identity lock");
-        assert_eq!(
-            identity.len(),
-            1,
-            "identity record should still be produced"
-        );
+        assert!(identity.is_empty(), "identity record must not be produced");
     }
 }

@@ -16,7 +16,7 @@ The module provides three core capabilities:
 - **Canonical encoding** -- the `CanonicalBytes` trait and its primitive
   implementations, providing deterministic, collision-free binary serialization
   for hash-input construction.
-- **Domain-separated hashing** -- a registry of 13 domain constants and two
+- **Domain-separated hashing** -- a registry of 15 domain constants and two
   hashing modes (keyed and derive-key) that prevent cross-derivation and
   cross-tenant collisions.
 
@@ -35,8 +35,8 @@ macros.
 | `canonical.rs`    | `CanonicalBytes` trait + primitive impls                                                                                      |
 | `hashing.rs`      | `domain_hasher`, `finalize_32`, `finalize_64`, `derive_from_cached`                           |
 | `domain.rs`       | 13 domain-separation constants + `ALL` registry                                                                               |
-| `item.rs`         | `ConnectorTag`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`, `IdentityInputError`    |
-| `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId` + derivation fns                                     |
+| `item.rs`         | `ConnectorTag`, `ConnectorInstanceIdHash`, `ItemIdentityKey`, `StableItemId`, `ObjectVersionId`, `IdentityInputError` |
+| `finding.rs`      | `NormHash`, `SecretHash`, `RuleFingerprint`, `FindingId`, `OccurrenceId`, `ObservationId` + derivation fns                    |
 | `policy.rs`       | `IdHashMode`, `PolicyHashInputs`, `compute_policy_hash`                                                                       |
 | `macros.rs`       | `define_id_32!`, `define_id_32_restricted!`, smoke-test macros                                                                |
 | `coordination.rs` | `RunId`, `ShardId`, `WorkerId`, `OpId`, `JobId`, `FenceEpoch`, `LogicalTime`, `ShardKey` — 64-bit coordination identity types |
@@ -53,28 +53,38 @@ TenantSecretKey ───┘                                     │
                                                          │
                         TenantId ────────────────────────┤
                                                          ├─ derive_finding_id() ──> FindingId ──┐
-ItemIdentityKey ──> StableItemId ────────────────────────┤                                      │
+ConnectorInstanceIdHash ─┐                               │                                      │
+ConnectorTag ────────────┼─ ItemIdentityKey               │                                      │
+locator ─────────────────┘       │                       │                                      │
+                          StableItemId ──────────────────┤                                      │
                                                          │                                      │
             RuleFingerprint ─────────────────────────────┘                                      │
                                                                                                 │
-                                                         ├─ derive_occurrence_id() ──> OccurrenceId
-            ObjectVersionId ─────────────────────────────┤
-            byte_offset (u64) ───────────────────────────┤
-            byte_length (u64) ───────────────────────────┘
+                                                         ├─ derive_occurrence_id() ──> OccurrenceId ──┐
+            ObjectVersionId ─────────────────────────────┤                                            │
+            byte_offset (u64) ───────────────────────────┤                                            │
+            byte_length (u64) ───────────────────────────┘                                            │
+                                                                                                      │
+                        TenantId ────────────────────────┐                                            │
+                                                         ├─ derive_observation_id() ──> ObservationId
+                        PolicyHash ──────────────────────┤
+                        OccurrenceId ────────────────────┘
 ```
 
 ### Role of each type
 
-| Type              | Role                                                                                                  |
-| ----------------- | ----------------------------------------------------------------------------------------------------- |
-| `ItemIdentityKey` | Human-meaningful item identity: `ConnectorTag` (8 B) + opaque locator bytes                           |
-| `StableItemId`    | Fixed-width (32 B) content-addressed identity derived from `ItemIdentityKey` via `domain::ITEM_ID_V1` |
-| `NormHash`        | Normalized secret digest from the detection engine (tenant-agnostic)                                  |
-| `SecretHash`      | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`                    |
-| `RuleFingerprint` | Identity of the detection rule that matched                                                           |
-| `FindingId`       | Version-stable finding identity: `(TenantId, StableItemId, RuleFingerprint, SecretHash)`              |
-| `ObjectVersionId` | Version-specific content identity (commit SHA, S3 ETag, etc.)                                         |
-| `OccurrenceId`    | Version-specific occurrence: `(FindingId, ObjectVersionId, byte_offset, byte_length)`                 |
+| Type                       | Role                                                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `ConnectorInstanceIdHash`  | Fixed-width (32 B) hash of connector-instance identifier (e.g., repo path), scopes items per instance |
+| `ItemIdentityKey`          | Human-meaningful item identity: `ConnectorTag` (8 B) + `ConnectorInstanceIdHash` (32 B) + locator     |
+| `StableItemId`             | Fixed-width (32 B) content-addressed identity derived from `ItemIdentityKey` via `domain::ITEM_ID_V1` |
+| `NormHash`                 | Normalized secret digest from the detection engine (tenant-agnostic)                                  |
+| `SecretHash`               | Tenant-scoped secret identity, derived by keying `NormHash` with `TenantSecretKey`                    |
+| `RuleFingerprint`          | Identity of the detection rule that matched                                                           |
+| `FindingId`                | Version-stable finding identity: `(TenantId, StableItemId, RuleFingerprint, SecretHash)`              |
+| `ObjectVersionId`          | Version-specific content identity (commit SHA, S3 ETag, etc.)                                         |
+| `OccurrenceId`             | Version-specific occurrence: `(FindingId, ObjectVersionId, byte_offset, byte_length)`                 |
+| `ObservationId`            | Policy-scoped detection event: `(TenantId, PolicyHash, OccurrenceId)`                                 |
 
 ### Why ObjectVersionId is excluded from FindingId
 
@@ -168,7 +178,8 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `PolicyHash`         | 32 B             | `from_bytes` (pub)                                 | `POLICY_HASH_V2` (via `compute_...`) | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `TenantSecretKey`    | 32 B             | `from_bytes` (pub)                                 | --                                   | Clone Copy Eq (constant-time)           | Yes: no Ord, Hash, CanonicalBytes; redacted Debug |
 | `ConnectorTag`       | 8 B              | `from_ascii` / `from_bytes`                        | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
-| `ItemIdentityKey`    | variable         | `new(connector, locator)`                          | --                                   | Clone Eq Hash CanonicalBytes            | No                                                |
+| `ConnectorInstanceIdHash` | 32 B        | `from_instance_id_bytes`                           | `CONNECTOR_INSTANCE_ID_V1`           | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `ItemIdentityKey`    | variable         | `new(connector, instance, locator)`                | --                                   | Clone Eq Hash CanonicalBytes            | No                                                |
 | `StableItemId`       | 32 B             | derived via `ItemIdentityKey::stable_id()`         | `ITEM_ID_V1`                         | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `ObjectVersionId`    | 32 B             | `from_version_bytes` / `from_bytes`                | `OBJECT_VERSION_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `NormHash`           | 32 B             | `from_digest` (pub) / `from_bytes_internal` (pub(crate)) | --                                   | Clone Copy Eq Ord Hash CanonicalBytes   | Yes: redacted Debug                               |
@@ -176,6 +187,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 | `RuleFingerprint`    | 32 B             | `from_bytes` (pub)                                 | `RULE_FINGERPRINT_V1`                | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `FindingId`          | 32 B             | `from_bytes` (pub)                                 | `FINDING_ID_V1`                      | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `OccurrenceId`       | 32 B             | `from_bytes` (pub)                                 | `OCCURRENCE_ID_V1`                   | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
+| `ObservationId`      | 32 B             | `from_bytes` (pub)                                 | `OBSERVATION_ID_V1`                  | Clone Copy Eq Ord Hash CanonicalBytes   | No                                                |
 | `IdHashMode`         | 1 B (`repr(u8)`) | `from_u8` / variant literal                        | --                                   | Clone Copy Debug Eq Hash CanonicalBytes | No                                                |
 | `FindingIdInputs`    | 128 B            | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
 | `OccurrenceIdInputs` | 80 B             | struct literal                                     | --                                   | Clone Copy Debug Eq CanonicalBytes      | No                                                |
@@ -185,7 +197,7 @@ Because `SecretHash = BLAKE3_keyed(tenant_key, domain_tag || norm_hash)`:
 
 ## 5. Domain Separation Registry
 
-All 13 domain constants live in `domain.rs` and follow the naming convention
+All 15 domain constants live in `domain.rs` and follow the naming convention
 `"gossip/<subsystem>/v<N>[/<operation>]"`.
 
 ### Constants
@@ -196,8 +208,10 @@ All 13 domain constants live in `domain.rs` and follow the naming convention
 | `OP_PAYLOAD_V1`       | `gossip/coord/v1/op-payload`         | Coordination | derive-key | Op-log payload hashing for idempotency              |
 | `FINDING_ID_V1`       | `gossip/finding/v1`                  | Identity     | derive-key | `FindingId` derivation                              |
 | `OCCURRENCE_ID_V1`    | `gossip/occurrence/v1`               | Identity     | derive-key | `OccurrenceId` derivation                           |
+| `OBSERVATION_ID_V1`   | `gossip/observation/v1`              | Identity     | derive-key | `ObservationId` derivation                          |
 | `SECRET_HASH_V1`      | `gossip/secret-hash/v1`              | Identity     | **keyed**  | `SecretHash` keying (sole keyed-mode constant)      |
 | `ITEM_ID_V1`          | `gossip/item-id/v1`                  | Identity     | derive-key | `StableItemId` derivation                           |
+| `CONNECTOR_INSTANCE_ID_V1` | `gossip/connector-instance-id/v1` | Identity     | derive-key | `ConnectorInstanceIdHash` derivation                |
 | `OBJECT_VERSION_V1`   | `gossip/object-version/v1`           | Identity     | derive-key | `ObjectVersionId` derivation                        |
 | `RULE_FINGERPRINT_V1` | `gossip/rule/v1`                     | Identity     | derive-key | `RuleFingerprint` derivation (registry placeholder) |
 | `POLICY_HASH_V2`      | `gossip/policy-hash/v2`              | Policy       | derive-key | `PolicyHash` derivation (v2: redesigned after spec) |
@@ -209,7 +223,7 @@ All 13 domain constants live in `domain.rs` and follow the naming convention
 ### Uniqueness enforcement
 
 1. **Compile-time array length** -- The `ALL` array is declared as
-   `[&str; 13]`. Adding a constant without updating `ALL` is a compile error.
+   `[&str; 15]`. Adding a constant without updating `ALL` is a compile error.
 2. **`no_duplicate_values` test** -- Iterates `ALL` through a `HashSet` and
    panics on collision.
 3. **`no_duplicate_names` test** -- Checks the `(name, value)` fixture for

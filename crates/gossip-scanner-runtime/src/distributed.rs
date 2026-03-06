@@ -9,8 +9,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Error as AnyError, Result};
-use gossip_contracts::identity::{ConnectorTag, TenantId, TenantSecretKey};
-use gossip_scan_driver::{Assignment, CancellationToken, ConnectorKind, CursorUpdate, ScanReport};
+use gossip_contracts::identity::{TenantId, TenantSecretKey};
+use gossip_scan_driver::{Assignment, CancellationToken, CursorUpdate, ScanReport};
 
 use crate::commit_sink::DurableCommitSink;
 use crate::coordination_sink::{
@@ -138,7 +138,6 @@ pub fn run_worker(
             lease.shard_id.clone(),
             lease.tenant_id,
             lease.tenant_secret_key,
-            connector_tag_for_kind(lease.assignment.connector_kind),
         );
         let cancel = CancellationToken::new();
 
@@ -169,14 +168,6 @@ pub fn run_worker(
     }
 
     Ok(report)
-}
-
-fn connector_tag_for_kind(kind: ConnectorKind) -> ConnectorTag {
-    match kind {
-        ConnectorKind::Filesystem => ConnectorTag::from_ascii(b"fs"),
-        ConnectorKind::Git => ConnectorTag::from_ascii(b"git"),
-        ConnectorKind::InMemory => ConnectorTag::from_ascii(b"inmem"),
-    }
 }
 
 /// In-memory distributed coordinator for tests and local harnesses.
