@@ -105,6 +105,16 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 }
 
 /// Run the distributed worker loop until no more shards are available.
+///
+/// For each lease the runtime:
+/// 1. checks the done ledger and releases already-complete shards without scanning,
+/// 2. executes the assignment with coordinator-backed event and commit sinks,
+/// 3. records completion before marking the shard done.
+///
+/// The `complete_shard` -> `mark_shard_done` ordering is intentional: if the
+/// process crashes between those calls, the shard may be retried, but the system
+/// never observes a done-ledger entry without the corresponding report and
+/// checkpoint metadata.
 pub fn run_worker(
     coordinator: &dyn DistributedCoordinator,
     config: DistributedRuntimeConfig,

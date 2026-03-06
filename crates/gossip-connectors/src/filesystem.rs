@@ -205,6 +205,11 @@ struct WalkFrame {
     entries: VecDeque<BufferedDirEntry>,
 }
 
+/// Borrowed per-call walk parameters passed down into [`WalkState::next_file`].
+///
+/// This bundles immutable query knobs (bounds, deadline, connector-instance
+/// scope, warning cap) so helper calls do not have to thread a long parameter
+/// list. The walk state itself still owns all resumable traversal state.
 #[derive(Clone, Copy)]
 struct WalkQuery<'a> {
     root: &'a Path,
@@ -236,7 +241,11 @@ struct WalkToken {
 struct WalkTokenFrame {
     /// Directory component relative to parent (empty for root frame).
     component: Vec<u8>,
-    /// Index of the next child to poll in this directory's sorted list.
+    /// Count of already-consumed children in this directory's sorted list.
+    ///
+    /// Restore logic replays this by dropping the first `next_child_index`
+    /// entries from the freshly sorted directory buffer, so the meaning is
+    /// "children seen so far", not "remaining children".
     next_child_index: u32,
 }
 
@@ -1487,6 +1496,11 @@ fn read_dir_sorted_entries(
     Ok(VecDeque::from(buffered))
 }
 
+/// Drop the first `next_child_index` entries from a restored directory frame.
+///
+/// Returns `None` when the token points past the directory's current entry
+/// count, signalling that token restore has drifted from the live filesystem
+/// and the caller should fall back to key-only resume.
 #[inline]
 fn fast_forward_frame_entries(
     entries: &mut VecDeque<BufferedDirEntry>,

@@ -494,10 +494,11 @@ impl GitConnector {
     /// Resolve an `ItemRef` to an absolute filesystem path.
     ///
     /// Ensures the index is built, then performs an O(log N) binary search
-    /// to verify the ref exists in the snapshot. After resolution, the
-    /// path is canonicalized and checked against the repo boundary to
-    /// prevent read-time escapes (e.g., if a symlink was created between
-    /// indexing and reading).
+    /// to verify the ref exists in the snapshot. The resolved path is then
+    /// canonicalized and checked against the repo boundary before the caller
+    /// opens it. This catches snapshot drift such as a tracked path being
+    /// replaced with an out-of-repo symlink after indexing, but it is still a
+    /// best-effort containment check rather than a TOCTOU-proof openat walk.
     fn open_path_for_ref(&mut self, item_ref: &ItemRef) -> Result<PathBuf, ReadError> {
         self.ensure_indexed(None).map_err(enumerate_error_to_read)?;
 
@@ -627,6 +628,12 @@ fn build_git_entry(
 /// contents will collide. This is acceptable because the coordination
 /// layer treats weak versions as change-detection hints, not as content
 /// identity proofs.
+///
+/// The encoded material includes `key_bytes`, so renaming a tracked file
+/// changes its weak version even if the file's bytes and metadata are
+/// otherwise unchanged. That matches the connector's path-keyed item model:
+/// path changes are visible as item-version changes to downstream resume and
+/// occurrence tracking.
 ///
 /// When `modified` is `None` (e.g., on filesystems that lack mtime
 /// support), the mtime component defaults to zero. This still produces a

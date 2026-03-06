@@ -1,11 +1,16 @@
 //! Domain-separated hashing helpers for content-addressed ID derivation.
 //!
-//! Every ID derivation in the system flows through [`domain_hasher`] and
-//! one of the finalization functions:
+//! Most derive-key ID derivations in the system flow through [`domain_hasher`]
+//! or a cached hasher built from the same BLAKE3 derive-key mode, plus one of
+//! the finalization functions:
 //!
 //! - [`finalize_32`] — full 256-bit digest for content-addressed IDs.
 //! - [`finalize_64`] — truncated 64-bit digest for coordination IDs
 //!   (op-log payload hashes, split shard ID derivation).
+//!
+//! [`key_secret_hash`](super::key_secret_hash) is the one notable exception:
+//! it uses BLAKE3 keyed mode and feeds its domain tag as input data rather than
+//! going through [`domain_hasher`].
 //!
 //! ```
 //! use gossip_contracts::identity::{domain_hasher, finalize_32, CanonicalBytes};
@@ -100,6 +105,9 @@ pub static OP_PAYLOAD_HASHER: LazyLock<Hasher> =
 ///
 /// `base` is expected to be one of this module's `LazyLock<Hasher>` statics
 /// (e.g., `FINDING_HASHER`); deref coercion provides `&Hasher` transparently.
+/// The pairing between `base` and the caller's output type is a semantic
+/// invariant rather than a type-level one: passing the wrong cached domain
+/// still compiles, but would silently derive bytes in the wrong hash domain.
 ///
 /// The `T: [CanonicalBytes](super::CanonicalBytes)` bound guarantees that
 /// `inputs` produces a collision-free, deterministic byte encoding, so the
