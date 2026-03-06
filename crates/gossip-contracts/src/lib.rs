@@ -15,7 +15,8 @@
 //! - **Connector boundary** — enumeration/read traits and connector
 //!   registration.
 //! - **Persistence boundary** — done-ledger identities, findings record
-//!   shapes, validation types, and backend-neutral traits.
+//!   shapes, durable acknowledgement handles and receipts, commit-ordering
+//!   typestate, and backend-neutral traits.
 //!
 //! Ownership boundary: this crate provides contracts, canonical encodings,
 //! and pure validation logic. It does not implement coordinator state
@@ -56,7 +57,8 @@ pub mod connector;
 pub mod coordination;
 /// Provides content-addressed identity types, canonical encoding, and domain-separated hashing.
 pub mod identity;
-/// Defines persistence-boundary record types, OVID hashing, and backend-neutral traits.
+/// Defines persistence-boundary record types, durable acknowledgement semantics, OVID hashing,
+/// and backend-neutral traits.
 pub mod persistence;
 
 /// Shared test helpers (proptest config, canonical digest, shard strategies).
