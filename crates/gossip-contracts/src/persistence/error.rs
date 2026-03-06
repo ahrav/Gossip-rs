@@ -19,6 +19,14 @@ pub enum PersistenceInputError {
     },
     /// Occurrence span length must be non-zero.
     ZeroSpanLength,
+    /// `findings_count` contradicts `DoneLedgerStatus`.
+    ///
+    /// `ScannedWithFindings` requires `findings_count > 0` and
+    /// `ScannedClean` requires `findings_count == 0`.
+    InconsistentFindingsCount {
+        status: &'static str,
+        findings_count: u32,
+    },
 }
 
 impl fmt::Display for PersistenceInputError {
@@ -33,6 +41,13 @@ impl fmt::Display for PersistenceInputError {
                 "{field} contains invalid byte 0x{byte:02X} at index {index}"
             ),
             Self::ZeroSpanLength => write!(f, "OccurrenceRecord.byte_length must be non-zero"),
+            Self::InconsistentFindingsCount {
+                status,
+                findings_count,
+            } => write!(
+                f,
+                "findings_count {findings_count} is inconsistent with status {status}"
+            ),
         }
     }
 }

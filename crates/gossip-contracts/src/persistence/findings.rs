@@ -68,6 +68,14 @@ pub struct FindingRecord {
 
 impl FindingRecord {
     /// Construct a stable finding record from its identity components.
+    ///
+    /// # Caller responsibility
+    ///
+    /// `finding_id` must be the output of
+    /// [`derive_finding_id`](crate::identity::derive_finding_id) applied to
+    /// the matching `(tenant_id, stable_item_id, rule_fingerprint, secret_hash)`.
+    /// Passing a mismatched `FindingId` breaks content-addressed deduplication
+    /// but is not memory-unsafe.
     #[inline]
     #[must_use]
     pub const fn new(

@@ -146,10 +146,30 @@ impl DoneLedgerStatus {
     /// Numeric discriminant used as the total-order key for lattice merge.
     ///
     /// This value is what backends should persist and compare during upsert.
+    /// Use [`from_rank`](Self::from_rank) to reconstitute the enum from a
+    /// stored discriminant.
     #[inline]
     #[must_use]
     pub const fn rank(self) -> u8 {
         self as u8
+    }
+
+    /// Reconstitute a [`DoneLedgerStatus`] from a persisted rank discriminant.
+    ///
+    /// Returns `None` for values that do not correspond to a known variant.
+    /// Backends should treat an unknown rank as a data-corruption signal
+    /// rather than silently mapping it to a default.
+    #[inline]
+    #[must_use]
+    pub const fn from_rank(rank: u8) -> Option<Self> {
+        match rank {
+            1 => Some(Self::FailedRetryable),
+            2 => Some(Self::FailedPermanent),
+            3 => Some(Self::Skipped),
+            10 => Some(Self::ScannedClean),
+            11 => Some(Self::ScannedWithFindings),
+            _ => None,
+        }
     }
 
     /// Returns `true` for terminal success states (`ScannedClean` or
@@ -168,6 +188,13 @@ impl DoneLedgerStatus {
     #[must_use]
     pub const fn is_failure(self) -> bool {
         matches!(self, Self::FailedRetryable | Self::FailedPermanent)
+    }
+
+    /// Returns `true` for the `Skipped` state.
+    #[inline]
+    #[must_use]
+    pub const fn is_skipped(self) -> bool {
+        matches!(self, Self::Skipped)
     }
 
     /// Lattice join: returns whichever status has the higher rank.
@@ -357,24 +384,50 @@ pub struct DoneLedgerRecord {
 }
 
 impl DoneLedgerRecord {
-    /// Construct a done-ledger record from all constituent parts.
-    #[must_use]
-    pub fn new(
+    /// Construct a done-ledger record, validating that `findings_count` is
+    /// consistent with `status`.
+    ///
+    /// # Invariant
+    ///
+    /// - `ScannedWithFindings` requires `findings_count > 0`.
+    /// - `ScannedClean` requires `findings_count == 0`.
+    /// - Failure and skip statuses accept any `findings_count`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceInputError::InconsistentFindingsCount`] if the
+    /// invariant is violated.
+    pub fn try_new(
         key: DoneLedgerKey,
         status: DoneLedgerStatus,
         bytes_scanned: u64,
         findings_count: u32,
         provenance: DoneLedgerProvenance,
         error_code: Option<DoneLedgerErrorCode>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, PersistenceInputError> {
+        match status {
+            DoneLedgerStatus::ScannedWithFindings if findings_count == 0 => {
+                return Err(PersistenceInputError::InconsistentFindingsCount {
+                    status: "ScannedWithFindings",
+                    findings_count,
+                });
+            }
+            DoneLedgerStatus::ScannedClean if findings_count > 0 => {
+                return Err(PersistenceInputError::InconsistentFindingsCount {
+                    status: "ScannedClean",
+                    findings_count,
+                });
+            }
+            _ => {}
+        }
+        Ok(Self {
             key,
             status,
             bytes_scanned,
             findings_count,
             provenance,
             error_code,
-        }
+        })
     }
 
     /// Deduplication key: `(tenant, policy, object-version)`.
@@ -413,7 +466,12 @@ impl DoneLedgerRecord {
     }
 
     /// Structured error code, conventionally present only for failure or skip
-    /// statuses (not enforced at construction).
+    /// statuses.
+    ///
+    /// This invariant is **not** enforced at construction. Callers should
+    /// set this to `None` when `status.is_scanned()` is `true`.
+    /// Observability pipelines may ignore or warn on error codes attached to
+    /// terminal success statuses.
     #[inline]
     #[must_use]
     pub fn error_code(&self) -> Option<&DoneLedgerErrorCode> {
@@ -565,9 +623,125 @@ mod tests {
     }
 
     #[test]
+    fn done_ledger_status_from_rank_round_trips_all_variants() {
+        for status in ALL_STATUSES {
+            let rank = status.rank();
+            let reconstituted = DoneLedgerStatus::from_rank(rank)
+                .unwrap_or_else(|| panic!("from_rank({rank}) should reconstitute {status:?}"));
+            assert_eq!(reconstituted, status);
+        }
+    }
+
+    #[test]
+    fn done_ledger_status_from_rank_rejects_unknown_discriminants() {
+        // Gaps in the rank space and out-of-range values.
+        for invalid in [0, 4, 5, 6, 7, 8, 9, 12, 255] {
+            assert!(
+                DoneLedgerStatus::from_rank(invalid).is_none(),
+                "from_rank({invalid}) should return None"
+            );
+        }
+    }
+
+    #[test]
     fn done_ledger_key_canonical_digest_is_stable() {
         let key = DoneLedgerKey::new(tenant(5), policy(7), ovid(11));
 
         assert_eq!(canonical_digest(&key), canonical_digest(&key));
+    }
+
+    fn make_provenance() -> DoneLedgerProvenance {
+        use crate::identity::{FenceEpoch, LogicalTime, RunId, ShardId};
+        DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(2),
+            FenceEpoch::from_raw(3),
+            LogicalTime::from_raw(100),
+            LogicalTime::from_raw(200),
+        )
+    }
+
+    #[test]
+    fn rejects_scanned_with_findings_when_findings_count_is_zero() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let result = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedWithFindings,
+            1024,
+            0, // contradiction: "with findings" but count is 0
+            make_provenance(),
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            PersistenceInputError::InconsistentFindingsCount {
+                status: "ScannedWithFindings",
+                findings_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_scanned_clean_when_findings_count_is_nonzero() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let result = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            1024,
+            5, // contradiction: "clean" but count is 5
+            make_provenance(),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "ScannedClean with findings_count > 0 should be rejected"
+        );
+    }
+
+    #[test]
+    fn accepts_consistent_scanned_with_findings_record() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedWithFindings,
+            1024,
+            3,
+            make_provenance(),
+            None,
+        )
+        .expect("consistent ScannedWithFindings should be accepted");
+        assert_eq!(record.findings_count(), 3);
+    }
+
+    #[test]
+    fn accepts_consistent_scanned_clean_record() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            1024,
+            0,
+            make_provenance(),
+            None,
+        )
+        .expect("consistent ScannedClean should be accepted");
+        assert_eq!(record.findings_count(), 0);
+    }
+
+    #[test]
+    fn failure_and_skip_statuses_accept_any_findings_count() {
+        for status in [
+            DoneLedgerStatus::FailedRetryable,
+            DoneLedgerStatus::FailedPermanent,
+            DoneLedgerStatus::Skipped,
+        ] {
+            // findings_count is meaningless for non-scanned statuses.
+            let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+            DoneLedgerRecord::try_new(key, status, 0, 0, make_provenance(), None)
+                .unwrap_or_else(|e| panic!("{status:?} with count 0 should succeed: {e}"));
+            let key2 = DoneLedgerKey::new(tenant(1), policy(2), ovid(4));
+            DoneLedgerRecord::try_new(key2, status, 0, 5, make_provenance(), None)
+                .unwrap_or_else(|e| panic!("{status:?} with count 5 should succeed: {e}"));
+        }
     }
 }
