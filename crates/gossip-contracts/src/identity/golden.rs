@@ -26,11 +26,13 @@
 //!
 //! | Vector | Domain constant | Trigger conditions |
 //! |--------|----------------|--------------------|
+//! | `CONNECTOR_INSTANCE_ID_HASH_EXPECTED` | `domain::CONNECTOR_INSTANCE_ID_V1` | Instance-ID encoding or domain tag changes |
 //! | `STABLE_ITEM_ID_EXPECTED` | `domain::ITEM_ID_V1` | `ItemIdentityKey` encoding or domain tag changes |
 //! | `OBJECT_VERSION_ID_EXPECTED` | `domain::OBJECT_VERSION_V1` | `ObjectVersionId` encoding changes |
 //! | `KEY_SECRET_HASH_EXPECTED` | `domain::SECRET_HASH_V1` | Secret keying scheme changes |
 //! | `FINDING_ID_EXPECTED` | `domain::FINDING_ID_V1` | `FindingIdInputs` encoding changes |
 //! | `OCCURRENCE_ID_EXPECTED` | `domain::OCCURRENCE_ID_V1` | `OccurrenceIdInputs` encoding changes |
+//! | `OBSERVATION_ID_EXPECTED` | `domain::OBSERVATION_ID_V1` | `ObservationIdInputs` encoding changes |
 //! | `POLICY_HASH_EXPECTED` | `domain::POLICY_HASH_V2` | `PolicyHashInputs` encoding changes |
 //! | `FINALIZE_64_EXPECTED` | (test-only domain) | `finalize_64` truncation or endianness changes |
 //!
@@ -58,10 +60,10 @@ use super::{
 // Registry
 // ============================================================================
 
-/// Names of all golden-vector derivation functions.
+/// Names of all golden-vector derivation tests tracked by this module.
 ///
-/// The compile-time array length enforces exhaustiveness: adding a new
-/// derivation without updating this array is a compile error.
+/// The explicit array length keeps the registry count self-checking once this
+/// list is updated, but the list itself is still maintained manually.
 const ALL: [&str; 9] = [
     "ConnectorInstanceIdHash",
     "StableItemId",

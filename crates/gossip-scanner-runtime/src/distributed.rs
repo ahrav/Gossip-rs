@@ -105,6 +105,18 @@ impl From<ScanRuntimeError> for DistributedRuntimeError {
 }
 
 /// Run the distributed worker loop until no more shards are available.
+///
+/// For each lease the runtime:
+/// 1. checks the done ledger and releases already-complete shards without scanning,
+/// 2. executes the assignment with coordinator-backed event and commit sinks,
+/// 3. records completion before marking the shard done.
+///
+/// The `complete_shard` -> `mark_shard_done` ordering is intentional: if the
+/// process crashes between those calls, the shard may be retried, but the system
+/// never observes a done-ledger entry without the corresponding report and
+/// checkpoint metadata. `DistributedCoordinator::complete_shard` implementations
+/// must therefore be idempotent (or at-least-once tolerant) for any coordinator
+/// that supports shard re-lease after a failure.
 pub fn run_worker(
     coordinator: &dyn DistributedCoordinator,
     config: DistributedRuntimeConfig,
@@ -479,6 +491,47 @@ mod tests {
     /// persisted through the identity chain. The shard is still marked done,
     /// silently dropping findings.
     ///
+    /// Verifies that calling `complete_shard` twice for the same lease produces
+    /// duplicate entries in the `InMemoryCoordinator`. This confirms the trait
+    /// implementation is NOT idempotent — a property that matters for crash+retry
+    /// coordinators where a shard may be re-leased after a failure between
+    /// `complete_shard` and `mark_shard_done`.
+    #[test]
+    fn complete_shard_duplicate_call_produces_duplicate_entry() {
+        let dir = tempdir().expect("tempdir");
+        fs::write(dir.path().join("dummy.txt"), "nothing-secret").expect("write fixture");
+
+        let lease = fs_lease("idempotency-check", dir.path());
+        let coordinator = InMemoryCoordinator::new(vec![]);
+        let report = ScanReport::default();
+
+        // First call.
+        coordinator
+            .complete_shard(&lease, None, report)
+            .expect("first complete_shard");
+        assert_eq!(
+            coordinator.completed_shards().len(),
+            1,
+            "single call should produce one entry"
+        );
+
+        // Second (duplicate) call for the same shard.
+        coordinator
+            .complete_shard(&lease, None, report)
+            .expect("second complete_shard");
+
+        // If complete_shard were idempotent, len would still be 1.
+        let completed = coordinator.completed_shards();
+        assert_eq!(
+            completed.len(),
+            2,
+            "InMemoryCoordinator::complete_shard is not idempotent — \
+             duplicate call produces a second entry"
+        );
+        assert_eq!(completed[0].0, "idempotency-check");
+        assert_eq!(completed[1].0, "idempotency-check");
+    }
+
     /// Known failure: `GitScanDriver::run` takes `_commit` (unused) in
     /// `gossip-connectors/src/scan_driver.rs`. The fix belongs there —
     /// wire a commit channel through the git scan path, matching what

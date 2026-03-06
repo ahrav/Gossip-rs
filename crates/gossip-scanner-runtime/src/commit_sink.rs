@@ -91,6 +91,12 @@ impl DurableCommitSink {
             secret: secret_hash,
         });
 
+        // Connector-provided versions are authoritative because they align
+        // occurrence identity with the source's own version model. The
+        // item-key fallback is a temporary compatibility path for scan flows
+        // that have not plumbed version metadata through `ItemMeta` yet: it
+        // keeps occurrence IDs deterministic, but collapses all revisions of
+        // the same item key onto the same pseudo-version.
         let object_version = meta
             .version
             .map(|version| version.object_version_id())
@@ -164,6 +170,13 @@ impl CommitSink for DurableCommitSink {
     }
 }
 
+/// Expand a numeric runtime rule ID into the 32-byte fingerprint shape used by
+/// the identity layer.
+///
+/// This is a compatibility shim for sources that currently expose only
+/// scheduler rule IDs. The little-endian `u32` lives in the first four bytes
+/// and the remaining bytes are zero. Once the runtime carries real rule
+/// fingerprints end-to-end, this helper should disappear.
 fn rule_fingerprint_from_rule_id(rule_id: u32) -> RuleFingerprint {
     let mut bytes = [0u8; 32];
     bytes[..4].copy_from_slice(&rule_id.to_le_bytes());

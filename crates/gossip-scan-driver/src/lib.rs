@@ -4,7 +4,9 @@
 //! distributed runtime, coordination layer) and source-specific backends
 //! (filesystem, git, in-memory). It defines the shared vocabulary — types,
 //! traits, and config — without containing any implementation logic. Concrete
-//! drivers live in downstream crates (`gossip-connectors`, `gossip-scanner-runtime`).
+//! driver implementations live in downstream crates, primarily
+//! `gossip-connectors`; runtime crates consume these interfaces and bridge them
+//! to coordination.
 //!
 //! # Execution flow
 //!
@@ -128,8 +130,14 @@ pub struct Assignment {
     pub job_id: String,
     /// Backend that should execute this assignment.
     pub connector_kind: ConnectorKind,
-    /// Opaque identifier for the specific connector instance (e.g., a
-    /// repository URL hash or filesystem mount point identifier).
+    /// Stable identifier for the specific connector instance.
+    ///
+    /// Filesystem and in-memory factories feed these UTF-8 bytes back into
+    /// `ConnectorInstanceIdHash::try_from_instance_id_bytes` when reconstructing
+    /// stable item identity from assignments. Even for backends that do not yet
+    /// consume the value directly (for example the current git scan-driver
+    /// path), this string should stay stable across retries and continue to
+    /// represent the same logical source instance.
     pub connector_instance_id: String,
     /// Hash of the detection policy active when this assignment was created.
     /// Drivers do not interpret it — it flows through to the engine.
