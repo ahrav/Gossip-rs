@@ -5,11 +5,17 @@
 //! throughput and heap-traffic checks stay aligned: both cover monotonically
 //! ordered fixed-width keys with a uniform file size, without filesystem walk
 //! noise or randomized workload generation.
+//!
+//! The benchmark hook is only exported on Unix (the split estimator depends on
+//! Unix filesystem APIs), so this file compiles as a no-op on other platforms.
 
+#[cfg(unix)]
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+#[cfg(unix)]
 use gossip_connectors::benchmark_streaming_split_estimator_observe_fixed_size;
 
 /// Measure steady-state `observe` cost across sample-cap settings.
+#[cfg(unix)]
 fn bench_observe(c: &mut Criterion) {
     let mut group = c.benchmark_group("streaming_split_estimator_observe");
     // Match the perf regression test's 1M-item workload so throughput numbers
@@ -38,5 +44,12 @@ fn bench_observe(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(unix)]
 criterion_group!(benches, bench_observe);
+#[cfg(unix)]
 criterion_main!(benches);
+
+// On non-Unix platforms the estimator (and its benchmark hook) is unavailable,
+// so the bench binary compiles but does nothing.
+#[cfg(not(unix))]
+fn main() {}
