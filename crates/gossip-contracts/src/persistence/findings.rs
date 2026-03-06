@@ -302,60 +302,70 @@ impl ObservationRecord {
         }
     }
 
+    /// Tenant isolation boundary.
     #[inline]
     #[must_use]
     pub const fn tenant_id(&self) -> TenantId {
         self.tenant_id
     }
 
+    /// Content-addressed observation identity.
     #[inline]
     #[must_use]
     pub const fn observation_id(&self) -> ObservationId {
         self.observation_id
     }
 
+    /// Parent occurrence this observation references.
     #[inline]
     #[must_use]
     pub const fn occurrence_id(&self) -> OccurrenceId {
         self.occurrence_id
     }
 
+    /// Scan policy under which this observation was produced.
     #[inline]
     #[must_use]
     pub const fn policy_hash(&self) -> PolicyHash {
         self.policy_hash
     }
 
+    /// Object-version identity linking back to the done-ledger.
     #[inline]
     #[must_use]
     pub const fn ovid_hash(&self) -> OvidHash {
         self.ovid_hash
     }
 
+    /// Run that produced this observation.
     #[inline]
     #[must_use]
     pub const fn run_id(&self) -> RunId {
         self.run_id
     }
 
+    /// Shard being processed when this observation was recorded.
     #[inline]
     #[must_use]
     pub const fn shard_id(&self) -> ShardId {
         self.shard_id
     }
 
+    /// Lease epoch under which the writing worker held its shard lease.
     #[inline]
     #[must_use]
     pub const fn fence_epoch(&self) -> FenceEpoch {
         self.fence_epoch
     }
 
+    /// Logical timestamp when the occurrence was observed.
     #[inline]
     #[must_use]
     pub const fn seen_at(&self) -> LogicalTime {
         self.seen_at
     }
 
+    /// Display-safe location metadata (path and optional URL), if attached.
     #[inline]
     #[must_use]
     pub fn location(&self) -> Option<&Location> {
@@ -363,7 +373,12 @@ impl ObservationRecord {
     }
 }
 
-/// Borrowed batch view for findings-sink upserts.
+/// Borrowed, zero-copy batch view grouping all three record layers for a
+/// single [`FindingsSink::upsert_batch`] call.
+///
+/// This type borrows slices rather than owning them so the caller retains
+/// control over allocation and can reuse buffers across flushes. An empty
+/// batch (all three slices empty) is a valid no-op input.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FindingsUpsertBatch<'a> {
     findings: &'a [FindingRecord],
@@ -372,7 +387,7 @@ pub struct FindingsUpsertBatch<'a> {
 }
 
 impl<'a> FindingsUpsertBatch<'a> {
-    /// Construct a batch view.
+    /// Construct a batch view over the three record layers.
     #[inline]
     #[must_use]
     pub const fn new(
@@ -387,28 +402,28 @@ impl<'a> FindingsUpsertBatch<'a> {
         }
     }
 
-    /// Stable findings in the batch.
+    /// Stable finding records (layer 1) in this batch.
     #[inline]
     #[must_use]
     pub const fn findings(self) -> &'a [FindingRecord] {
         self.findings
     }
 
-    /// Version-specific occurrences in the batch.
+    /// Version-specific occurrence records (layer 2) in this batch.
     #[inline]
     #[must_use]
     pub const fn occurrences(self) -> &'a [OccurrenceRecord] {
         self.occurrences
     }
 
-    /// Policy-scoped observations in the batch.
+    /// Policy-scoped observation records (layer 3) in this batch.
     #[inline]
     #[must_use]
     pub const fn observations(self) -> &'a [ObservationRecord] {
         self.observations
     }
 
-    /// Returns `true` if the batch contains no rows.
+    /// Returns `true` if all three layers are empty.
     #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
@@ -416,21 +431,29 @@ impl<'a> FindingsUpsertBatch<'a> {
     }
 }
 
-/// Durable sink for findings, occurrences, and observations.
+/// Backend-neutral trait for persisting findings, occurrences, and observations.
 ///
-/// Backends must treat this as an idempotent upsert surface. Replaying the same
-/// batch, or overlapping batches, must not create duplicates.
+/// # Implementor contract
+///
+/// 1. **Idempotent upsert.** Replaying the same batch, or overlapping batches,
+///    must not create duplicate rows. Content-addressed IDs (`FindingId`,
+///    `OccurrenceId`, `ObservationId`) serve as natural deduplication keys.
+/// 2. **Referential integrity.** The backend must ensure that every
+///    `OccurrenceRecord.finding_id` references a persisted or in-batch
+///    `FindingRecord`, and every `ObservationRecord.occurrence_id` references
+///    a persisted or in-batch `OccurrenceRecord`.
+/// 3. **Atomicity scope.** Whether the batch is applied atomically (single
+///    transaction) or row-by-row is a backend decision; the trait does not
+///    mandate transactional guarantees beyond idempotency.
 pub trait FindingsSink: Send + Sync {
     /// Backend-specific error type.
     type Error: Error + Send + Sync + 'static;
 
-    /// Upsert a batch of findings-layer rows.
+    /// Persist all rows in `batch`, inserting new records and ignoring
+    /// duplicates (upsert semantics).
     ///
-    /// Referential integrity is the backend's responsibility:
-    /// - `OccurrenceRecord.finding_id` must reference a persisted or in-batch
-    ///   `FindingRecord`
-    /// - `ObservationRecord.occurrence_id` must reference a persisted or
-    ///   in-batch `OccurrenceRecord`
+    /// An empty batch is a valid no-op. The backend must enforce referential
+    /// integrity as described in the trait-level documentation.
     fn upsert_batch(&self, batch: FindingsUpsertBatch<'_>) -> Result<(), Self::Error>;
 }
 

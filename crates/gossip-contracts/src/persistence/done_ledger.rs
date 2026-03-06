@@ -412,7 +412,8 @@ impl DoneLedgerRecord {
         self.provenance
     }
 
-    /// Structured error code, present only for failure or skip statuses.
+    /// Structured error code, conventionally present only for failure or skip
+    /// statuses (not enforced at construction).
     #[inline]
     #[must_use]
     pub fn error_code(&self) -> Option<&DoneLedgerErrorCode> {
