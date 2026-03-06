@@ -1,5 +1,5 @@
 //! Persistence-boundary core contracts: done-ledger identity, findings record
-//! shapes, validation errors, and backend-neutral traits.
+//! shapes, durable acknowledgement semantics, and backend-neutral traits.
 //!
 //! This module is intentionally storage-agnostic. It defines the durable data
 //! model that persistence backends compile against without committing to any
@@ -7,22 +7,31 @@
 //!
 //! ## Surface split
 //!
+//! - `commit.rs` defines backend-neutral durable acknowledgement handles and
+//!   receipt types.
 //! - `ovid.rs` defines object-version identity hashing used by the done-ledger.
 //! - `done_ledger.rs` defines done-ledger keys, records, safe error codes, and
 //!   the backend-neutral `DoneLedger` trait.
 //! - `findings.rs` defines stable finding, occurrence, and observation record
 //!   shapes plus the backend-neutral `FindingsSink` trait.
+//! - `page_commit.rs` defines the `PageCommit<S>` typestate machine that
+//!   enforces findings → done-ledger → checkpoint ordering.
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
 //!
+//! ## Submission vs durability
+//!
+//! Persistence sinks separate request acceptance from durable acknowledgement:
+//! `Ok(handle)` means the backend accepted responsibility for the write, while
+//! `handle.wait()` establishes durability and returns a receipt proving what
+//! committed.
+//!
 //! ## Cross-trait ordering contract
 //!
-//! When a scan produces findings, callers must persist them via
-//! `FindingsSink::upsert_batch` **before** recording completion in
-//! `DoneLedger::batch_upsert`. This ordering ensures that a done-ledger
-//! entry with `ScannedWithFindings` always has its findings already durable.
-//! Mechanical enforcement of this ordering is deferred to the commit protocol
-//! layer (`PageCommit`), which is not yet defined in this crate.
+//! When a scan produces findings, callers must durably persist them via
+//! `FindingsSink::upsert_batch` **before** durably recording completion in
+//! `DoneLedger::batch_upsert`, and only checkpoint the cursor after both layers
+//! are durable. The `PageCommit<S>` typestate machine enforces that ordering.
 //!
 //! ## Batch size guidance
 //!
@@ -39,10 +48,12 @@
 //! - Free-form strings are limited to explicitly safe, size-bounded wrappers or
 //!   reused safe boundary types such as [`Location`](crate::connector::Location).
 
+mod commit;
 mod done_ledger;
 mod error;
 mod findings;
 mod ovid;
+mod page_commit;
 
 /// Recommended maximum batch size for persistence operations.
 ///
@@ -51,6 +62,10 @@ mod ovid;
 /// associated error type.
 pub const RECOMMENDED_MAX_BATCH_SIZE: usize = 10_000;
 
+pub use commit::{
+    CheckpointCommitReceipt, CommitHandle, CommitReceipt, DoneLedgerCommitReceipt,
+    FindingsCommitReceipt, ItemCommitReceipt, PageCommitReceipt, ReadyCommitHandle,
+};
 pub use done_ledger::{
     DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
     DoneLedgerStatus, MAX_DONE_LEDGER_ERROR_CODE_SIZE,
@@ -60,3 +75,7 @@ pub use findings::{
     FindingRecord, FindingsSink, FindingsUpsertBatch, ObservationRecord, OccurrenceRecord,
 };
 pub use ovid::{OvidHash, OvidHashInputs, derive_ovid_hash};
+pub use page_commit::{
+    AwaitingFindings, CheckpointDurable, CommitAdvanceError, FindingsDurable, ItemDurable,
+    PageCommit, PageCommitScope, PageCommitValidationError,
+};
