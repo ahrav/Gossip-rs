@@ -525,11 +525,37 @@ fn saturated_tail_preserves_last_sample() {
 
     assert_eq!(samples.len(), 10);
     assert_eq!(
+        &*samples.first().unwrap().key,
+        key_for_index(0).as_slice(),
+        "first sample must be preserved under u64::MAX saturation plateau"
+    );
+    assert_eq!(
         samples.last().unwrap().key,
         original_last_key,
         "last sample must be preserved under u64::MAX saturation plateau"
     );
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+}
+
+/// Compacting to a single slot must preserve the last sample (most-recent
+/// observation), not the first.
+#[test]
+fn compact_to_single_slot_keeps_last_sample() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..5)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+
+    let original_last_key = samples.last().unwrap().key.clone();
+
+    compact_samples(&mut samples, 1);
+
+    assert_eq!(samples.len(), 1, "should compact down to exactly 1 sample");
+    assert_eq!(
+        samples[0].key, original_last_key,
+        "the single retained sample must be the last (most-recent) observation"
+    );
 }
 
 // ---------------------------------------------------------------------------
