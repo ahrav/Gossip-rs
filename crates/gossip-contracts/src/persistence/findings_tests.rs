@@ -3,9 +3,10 @@ use std::num::NonZeroU64;
 use crate::{
     connector::Location,
     identity::{
-        FenceEpoch, FindingId, LogicalTime, ObjectVersionId, ObservationId, OccurrenceId,
-        PolicyHash, RunId, ShardId, TenantId,
+        FenceEpoch, FindingId, LogicalTime, ObjectVersionId, ObservationId, OccurrenceId, RunId,
+        ShardId, TenantId,
     },
+    test_util::{ovid, policy, tenant},
 };
 
 use super::*;
@@ -13,10 +14,6 @@ use super::*;
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-fn tenant(seed: u8) -> TenantId {
-    TenantId::from_bytes([seed; 32])
-}
 
 fn finding(seed: u8) -> FindingId {
     FindingId::from_bytes([seed; 32])
@@ -28,14 +25,6 @@ fn occurrence(seed: u8) -> OccurrenceId {
 
 fn object_version(seed: u8) -> ObjectVersionId {
     ObjectVersionId::from_bytes([seed; 32])
-}
-
-fn policy(seed: u8) -> PolicyHash {
-    PolicyHash::from_bytes([seed; 32])
-}
-
-fn ovid(seed: u8) -> OvidHash {
-    OvidHash::from_bytes([seed; 32])
 }
 
 // ---------------------------------------------------------------------------

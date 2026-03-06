@@ -1,8 +1,8 @@
 use rstest::rstest;
 
 use crate::{
-    identity::{FenceEpoch, LogicalTime, PolicyHash, RunId, ShardId, TenantId},
-    test_util::canonical_digest,
+    identity::{FenceEpoch, LogicalTime, RunId, ShardId},
+    test_util::{canonical_digest, ovid, policy, tenant},
 };
 
 use super::*;
@@ -21,18 +21,6 @@ const ALL_STATUSES: [DoneLedgerStatus; 5] = [
     ScannedClean,
     ScannedWithFindings,
 ];
-
-fn tenant(seed: u8) -> TenantId {
-    TenantId::from_bytes([seed; 32])
-}
-
-fn policy(seed: u8) -> PolicyHash {
-    PolicyHash::from_bytes([seed; 32])
-}
-
-fn ovid(seed: u8) -> OvidHash {
-    OvidHash::from_bytes([seed; 32])
-}
 
 fn make_provenance() -> DoneLedgerProvenance {
     DoneLedgerProvenance::new(

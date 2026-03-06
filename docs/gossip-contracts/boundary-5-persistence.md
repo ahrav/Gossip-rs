@@ -1,14 +1,12 @@
 # Boundary 5 - Persistence Architecture
 
-> **Status: Design specification only.**
-> The Rust types below (`DoneLedger`, `FindingsSink`, `PageCommit<S>`,
-> and supporting types) are described in doc comments at
-> `crates/gossip-contracts/src/persistence/mod.rs`.
-> **No compiled Rust trait definitions or implementations exist yet.**
-> The module doc placeholder describes the planned boundary, but the
-> types are not defined as code. The external storage backends (etcd,
-> ScyllaDB, PostgreSQL) described in sections 2-4 are **aspirational
-> design targets** -- no production backend implementations exist yet.
+> **Status: Core data types and traits implemented in `crates/gossip-contracts/src/persistence/`.**
+> The Rust types below (`DoneLedger`, `FindingsSink`, `CommitHandle`,
+> `CommitReceipt`, `PageCommit<S>`, and supporting record/receipt types)
+> are compiled code with full test coverage. The external storage
+> backends (etcd, ScyllaDB, PostgreSQL) described in sections 2-4 are
+> **aspirational design targets** -- no production backend implementations
+> exist yet; only the backend-neutral traits and data shapes are defined.
 > The coordination backend trait lives in `gossip-coordination` as
 > `CoordinationBackend` (`crates/gossip-coordination/src/traits.rs`).
 
@@ -33,54 +31,86 @@ Non-negotiables (project-wide):
 
 ---
 
-## Planned Rust types
+## Rust types (implemented)
 
-> **Note:** The types below are design-time artifacts defined in staged
-> files (`tmp/gossip-project-artifacts/boundary_5_chunk_{1..5}.rs`). They
-> do not exist as compiled code in any workspace crate. The module doc
-> placeholder lives at `crates/gossip-contracts/src/persistence/mod.rs`.
-> No production backend implementations exist yet; only in-memory test
-> doubles (behind `test-support` feature flag).
+> Source: `crates/gossip-contracts/src/persistence/` (9 files including
+> tests). All types listed below are compiled code with unit and property
+> tests. No production backend implementations exist yet.
 
 ### Traits
 
 | Trait | Purpose | Key methods |
 |-------|---------|-------------|
-| `DoneLedger` | Dedupe index: "was this object-version scanned under this policy?" | `batch_get(&self, &DoneLedgerGetBatch, LogicalTime) -> Result<DoneLedgerGetResult, DoneLedgerGetError>`, `batch_upsert(&self, &DoneLedgerUpsertBatch, ShardId, FenceEpoch, LogicalTime) -> Result<(), DoneLedgerUpsertError>` |
-| `FindingsSink` | Triage/query plane: findings + occurrences persistence | `upsert_findings(&self, &FindingsUpsertBatch, ShardId, FenceEpoch, LogicalTime) -> Result<FindingsUpsertResult, FindingsUpsertError>` |
+| `DoneLedger` | Dedupe index: "was this object-version scanned under this policy?" | `batch_get(&self, TenantId, PolicyHash, &[OvidHash]) -> Result<Vec<Option<DoneLedgerRecord>>, Self::Error>`, `batch_upsert(&self, &[DoneLedgerRecord]) -> Result<Self::CommitHandle, Self::Error>` |
+| `FindingsSink` | Triage/query plane: findings + occurrences + observations persistence | `upsert_batch(&self, FindingsUpsertBatch<'_>) -> Result<Self::CommitHandle, Self::Error>` |
+| `CommitHandle` | Durable acknowledgement handle; `wait()` consumes self and returns a receipt | `wait(self) -> Result<Self::Receipt, Self::Error>` |
+| `CommitReceipt` | Marker trait for durable persistence proof objects | Supertrait bounds: `Clone + Debug + Send + Sync + 'static` |
 | `CoordinationBackend` | Shard lifecycle: acquire, checkpoint, complete, park, split (lives in `gossip-coordination/src/traits.rs`, not in this module) | `acquire_and_restore_into`, `checkpoint`, `complete`, `park_shard`, `split_residual`, `split_replace` |
 
 ### Typestate machine
 
 | Type | Purpose |
 |------|---------|
-| `PageCommit<S>` | Compile-time enforcement of the commit protocol ordering: findings flush → done-ledger upsert → cursor checkpoint. State parameter `S` transitions through `Pending` → `FindingsFlushed` → `LedgerCommitted` → `CommitProof`. |
+| `PageCommit<S>` | Compile-time enforcement of the commit protocol ordering: findings flush → done-ledger upsert → cursor checkpoint. State parameter `S` transitions through `AwaitingFindings` → `FindingsDurable` → `ItemDurable` → `CheckpointDurable`. Each state exposes only the transition methods valid for that stage; out-of-order calls are compile errors. |
+| `PageCommitScope` | Immutable scope for a single page commit: tenant, run, shard, fence epoch, item count, and cursor boundary. Frozen at construction; every receipt-validation check compares against these values. |
 
 ### Data types
 
+**Done-ledger records** (`done_ledger.rs`):
+
 | Type | Purpose |
 |------|---------|
-| `DoneLedgerKey` | Composite lookup key: `(TenantId, PolicyHash, OvidHash)` — 96-byte fixed-width. |
-| `OvidHash` | Content-addressed Object-Version Identity digest (BLAKE3, 32 bytes). Derived from `OvidInputs` via `derive_ovid_hash`. |
-| `DoneLedgerStatus` | Scan outcome enum with monotonic join-semilattice semantics: `NotSeen < Failed < Scanned`. |
-| `DoneLedgerEntry` | Stored entry: status + metadata (scanned_at, run_id, shard_id). |
-| `DoneLedgerLookup` | Query result per key: `NotSeen` or `Found(DoneLedgerEntry)`. |
-| `DoneLedgerGetBatch` / `DoneLedgerGetResult` | Batch query request/response containers. |
-| `DoneLedgerUpsertItem` / `DoneLedgerUpsertBatch` | Batch upsert request containers. |
-| `FindingRecord` | Detection finding with content-addressed `FindingId`, tenant, rule, secret hash, location (never raw secrets). |
-| `OccurrenceRecord` | Version-specific sighting of a finding: byte offset/length, version_id, shard provenance. |
-| `FindingsUpsertBatch` | Capacity-bounded batch of findings + occurrences for atomic upsert. |
-| `FindingsUpsertResult` | Upsert outcome counts: inserted vs. deduplicated for findings and occurrences. |
+| `DoneLedgerKey` | Composite lookup key: `(TenantId, PolicyHash, OvidHash)` — fixed-width, implements `CanonicalBytes`. |
+| `DoneLedgerStatus` | Scan outcome enum with monotonic join-semilattice semantics: `FailedRetryable(1) < FailedPermanent(2) < Skipped(3) < ScannedClean(10) < ScannedWithFindings(11)`. Rank gap between 3 and 10 reserves space for future non-terminal states. |
+| `DoneLedgerRecord` | Complete done-ledger row: key, lattice status, `bytes_scanned`, `findings_count`, provenance, optional error code. Validated at construction (`try_new`) and optionally via `validate()` before persisting. Supports `merge_with` for lattice upsert. |
+| `DoneLedgerProvenance` | Write-side metadata: `run_id`, `shard_id`, `fence_epoch`, `started_at`, `finished_at`. Not part of the dedup key. |
+| `DoneLedgerErrorCode` | ASCII-safe bounded string (max 128 bytes) for structured error codes like `HTTP_403`, `TIMEOUT`. Validated alphabet at construction. |
+| `OvidHash` | Content-addressed Object-Version Identity digest (BLAKE3, 32 bytes). Derived from `OvidHashInputs` via `derive_ovid_hash`. |
+| `OvidHashInputs` | Structured inputs: `stable_item_id` + `version` (strong or weak `VersionId`). |
 
-### Test doubles (`test-support` feature) — Planned
+**Findings records** (`findings.rs`):
 
-> **Note:** These test double types are described in design artifacts but
-> do not exist as compiled Rust code yet.
+| Type | Purpose |
+|------|---------|
+| `FindingRecord` | Layer 1 — stable identity: `(tenant, stable_item_id, rule_fingerprint, secret_hash)`. Content-addressed `FindingId`. Version-independent and policy-independent. Never stores raw secrets. |
+| `OccurrenceRecord` | Layer 2 — version-specific: pins a finding to an `ObjectVersionId` with `(byte_offset, byte_length)` span. `byte_length` guaranteed non-zero via `NonZeroU64`. Content-addressed `OccurrenceId`. |
+| `ObservationRecord` | Layer 3 — policy- and run-scoped: records that an occurrence was seen under a specific `(policy_hash, run_id, shard_id, fence_epoch)`. Optional display-safe `Location` metadata. Content-addressed `ObservationId`. |
+| `FindingsUpsertBatch<'a>` | Borrowed zero-copy batch view over all three layers. Provides `validate_referential_integrity()` for intra-batch consistency checks. |
+
+**Commit receipts** (`commit.rs`):
+
+| Type | Purpose |
+|------|---------|
+| `FindingsCommitReceipt` | Proves three-layer findings data is durable. Carries `finding_count`, `occurrence_count`, `observation_count`. |
+| `DoneLedgerCommitReceipt` | Proves done-ledger rows are durable. Carries `record_count`, `scanned_count`, `findings_count`. |
+| `CheckpointCommitReceipt` | Proves cursor checkpoint is durable. Carries full scope fields (tenant, run, shard, epoch, cursor, item count, timestamp) for validation by the typestate machine. |
+| `ItemCommitReceipt` | Composite: findings + done-ledger. Assembled by `PageCommit` after validating ordering. |
+| `PageCommitReceipt` | Terminal composite: item-commit + checkpoint. Sufficient proof that the cursor can be safely advanced. |
+
+**Typestate and error types** (`page_commit.rs`):
+
+| Type | Purpose |
+|------|---------|
+| `AwaitingFindings` | Typestate: entry point, no durable acknowledgement yet. |
+| `FindingsDurable` | Typestate: findings are durable; done-ledger is next. Carries `FindingsCommitReceipt`. |
+| `ItemDurable` | Typestate: findings + done-ledger durable; checkpoint is next. Carries `ItemCommitReceipt`. |
+| `CheckpointDurable` | Typestate: terminal state, all three stages durable. Carries `PageCommitReceipt`. |
+| `PageCommitValidationError` | Receipt-vs-scope mismatch errors (item count, tenant, run, shard, epoch, cursor). |
+| `CommitAdvanceError<E>` | Combined wait-or-validation error for `wait_*` transitions. |
+
+**Shared error type** (`error.rs`):
+
+| Type | Purpose |
+|------|---------|
+| `PersistenceInputError` | Validation errors for value types: empty fields, size limits, invalid bytes, zero spans, inconsistent findings counts, missing/unexpected error codes, orphaned references, inconsistent tenants. |
+
+### Test doubles and adapters
 
 | Type | Implements | Notes |
 |------|-----------|-------|
-| `InMemoryDoneLedger` | `DoneLedger` | `HashMap`-backed. Tracks fence watermarks per shard. Not thread-safe. |
-| `InMemoryFindingsSink` | `FindingsSink` | `HashMap`-backed. First-write-wins dedup. Not thread-safe. |
+| `ReadyCommitHandle<R, E>` | `CommitHandle` | Pre-resolved handle wrapping an already-computed `Result<R, E>`. `wait()` returns immediately. Used by synchronous backends and test doubles. Provides `ok()`, `err()`, and `from_result()` constructors. |
+| `InMemoryDoneLedger` | `DoneLedger` | Planned: `HashMap`-backed. Tracks fence watermarks per shard. Not thread-safe. Not yet implemented. |
+| `InMemoryFindingsSink` | `FindingsSink` | Planned: `HashMap`-backed. First-write-wins dedup. Not thread-safe. Not yet implemented. |
 
 ---
 
@@ -492,17 +522,18 @@ Updates:
 
 ## 5. Cross-subsystem commit ordering (correctness-critical)
 
-The worker-side commit protocol is mandatory and enforces correctness without cross-store transactions:
+The worker-side commit protocol is mandatory and enforces correctness without cross-store transactions. The `PageCommit<S>` typestate machine makes this ordering a compile-time guarantee:
 
-1. Findings durable (Postgres)
-2. Done-ledger durable (Scylla)
-3. Only then emit `ItemCommitted` enabling cursor checkpoint (etcd)
+1. **`AwaitingFindings` → `FindingsDurable`**: Findings durable (Postgres) — `record_findings` / `wait_findings`
+2. **`FindingsDurable` → `ItemDurable`**: Done-ledger durable (Scylla) — `record_done_ledger` / `wait_done_ledger` (validates item count)
+3. **`ItemDurable` → `CheckpointDurable`**: Cursor checkpoint durable (etcd) — `record_checkpoint` / `wait_checkpoint` (validates full scope: tenant, run, shard, epoch, item count, cursor)
 
 Consequences:
 
 - If done-ledger says “Scanned,” findings are already durable.
 - Cursor never advances beyond what has been durably committed.
 - Retries and reassignment are safe: idempotent sinks dedupe by deterministic IDs.
+- Out-of-order calls are rejected at compile time, not runtime.
 
 ---
 

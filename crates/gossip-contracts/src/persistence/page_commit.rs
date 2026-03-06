@@ -37,12 +37,30 @@
 //!   a runtime state enum with panics — trades compile-time safety for
 //!   simpler generics. Given that incorrect ordering is a data-loss bug,
 //!   compile-time enforcement is worth the generics cost.
-//! - **Full-scope validation on checkpoint:** only the checkpoint stage
-//!   validates all scope fields (tenant, run, shard, epoch, cursor, item
-//!   count). Findings and done-ledger receipts carry lighter payloads because
-//!   they are produced by the same in-process pipeline that constructed the
-//!   scope, while checkpoints go through a backend round-trip where mix-ups
-//!   are more likely.
+//! - **Scope validation on checkpoint:** the checkpoint receipt embeds a
+//!   full [`PageCommitScope`], so the typestate machine validates receipt-
+//!   to-scope correspondence with a single equality check. Findings and
+//!   done-ledger receipts carry lighter payloads because they are produced
+//!   by the same in-process pipeline that constructed the scope, while
+//!   checkpoints go through a backend round-trip where mix-ups are more
+//!   likely.
+//!
+//! # Error handling
+//!
+//! `wait_*` methods consume the state machine. If the backend wait fails,
+//! the `PageCommit` is gone and the caller must reconstruct a new one from
+//! scratch. This is intentional: after a wait failure, the page's I/O state
+//! is unknown (the backend may or may not have committed), so the only safe
+//! action is to treat the page as abandoned and retry the full page-commit
+//! protocol from `AwaitingFindings`.
+//!
+//! Callers that need finer retry control should use `record_*` methods with
+//! a separately managed `handle.wait()` call, keeping the `PageCommit` alive
+//! until a receipt is in hand.
+//!
+//! `record_*` validation failures (e.g. [`PageCommitValidationError`]) are
+//! deterministic scope mismatches — retrying will produce the same result.
+//! These indicate a programming error, not a transient failure.
 
 use std::{error::Error, fmt};
 
@@ -152,24 +170,8 @@ impl PageCommitScope {
 pub enum PageCommitValidationError {
     /// The done-ledger receipt covers a different number of items than the page.
     LedgerItemCountMismatch { expected: u64, actual: u64 },
-    /// The checkpoint receipt belongs to a different tenant.
-    CheckpointTenantMismatch {
-        expected: TenantId,
-        actual: TenantId,
-    },
-    /// The checkpoint receipt belongs to a different run.
-    CheckpointRunMismatch { expected: RunId, actual: RunId },
-    /// The checkpoint receipt belongs to a different shard.
-    CheckpointShardMismatch { expected: ShardId, actual: ShardId },
-    /// The checkpoint receipt belongs to a different fence epoch.
-    CheckpointFenceMismatch {
-        expected: FenceEpoch,
-        actual: FenceEpoch,
-    },
-    /// The checkpoint receipt covers a different number of items than the page.
-    CheckpointItemCountMismatch { expected: u64, actual: u64 },
-    /// The checkpoint receipt advanced to a different cursor than expected.
-    CheckpointCursorMismatch,
+    /// The checkpoint receipt's scope does not match the page scope.
+    CheckpointScopeMismatch,
 }
 
 impl fmt::Display for PageCommitValidationError {
@@ -179,36 +181,8 @@ impl fmt::Display for PageCommitValidationError {
                 f,
                 "done-ledger receipt item count mismatch: expected {expected}, got {actual}"
             ),
-            Self::CheckpointTenantMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "checkpoint receipt tenant mismatch: expected {expected:?}, got {actual:?}"
-                )
-            }
-            Self::CheckpointRunMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "checkpoint receipt run mismatch: expected {expected:?}, got {actual:?}"
-                )
-            }
-            Self::CheckpointShardMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "checkpoint receipt shard mismatch: expected {expected:?}, got {actual:?}"
-                )
-            }
-            Self::CheckpointFenceMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "checkpoint receipt fence epoch mismatch: expected {expected:?}, got {actual:?}"
-                )
-            }
-            Self::CheckpointItemCountMismatch { expected, actual } => write!(
-                f,
-                "checkpoint receipt item count mismatch: expected {expected}, got {actual}"
-            ),
-            Self::CheckpointCursorMismatch => {
-                write!(f, "checkpoint receipt cursor does not match page scope")
+            Self::CheckpointScopeMismatch => {
+                write!(f, "checkpoint receipt scope does not match page scope")
             }
         }
     }
@@ -351,15 +325,7 @@ pub struct CheckpointDurable {
 ///     Cursor::initial(),
 /// );
 /// let page = PageCommit::new(scope.clone()).record_findings(FindingsCommitReceipt::new(1, 1, 1));
-/// let checkpoint = CheckpointCommitReceipt::new(
-///     scope.tenant_id(),
-///     scope.run_id(),
-///     scope.shard_id(),
-///     scope.fence_epoch(),
-///     scope.checkpoint_cursor().clone(),
-///     scope.committed_items(),
-///     LogicalTime::from_raw(5),
-/// );
+/// let checkpoint = CheckpointCommitReceipt::new(scope.clone(), LogicalTime::from_raw(5));
 ///
 /// let _ = page.record_checkpoint(checkpoint);
 /// ```
@@ -485,54 +451,20 @@ impl PageCommit<ItemDurable> {
 
     /// Advance the page after obtaining a durable checkpoint receipt.
     ///
-    /// Performs full scope validation: tenant, run, shard, fence epoch, item
-    /// count, and cursor must all match the page's [`PageCommitScope`].
-    /// This is the most thorough validation in the protocol because the
-    /// checkpoint receipt travels through a backend round-trip where routing
-    /// errors between concurrent pages are possible.
+    /// Validates that the receipt's embedded [`PageCommitScope`] matches this
+    /// page's scope exactly. This guards against receipt mix-ups between
+    /// concurrent pages at the earliest possible point.
     ///
     /// # Errors
     ///
-    /// Returns the first mismatched field as a
-    /// [`PageCommitValidationError`]. Fields are checked in a fixed order
-    /// (tenant → run → shard → epoch → item count → cursor), so only the
-    /// first mismatch is reported.
+    /// Returns [`PageCommitValidationError::CheckpointScopeMismatch`] if the
+    /// receipt's scope differs from the page's scope in any field.
     pub fn record_checkpoint(
         self,
         receipt: CheckpointCommitReceipt,
     ) -> Result<PageCommit<CheckpointDurable>, PageCommitValidationError> {
-        if receipt.tenant_id() != self.scope.tenant_id() {
-            return Err(PageCommitValidationError::CheckpointTenantMismatch {
-                expected: self.scope.tenant_id(),
-                actual: receipt.tenant_id(),
-            });
-        }
-        if receipt.run_id() != self.scope.run_id() {
-            return Err(PageCommitValidationError::CheckpointRunMismatch {
-                expected: self.scope.run_id(),
-                actual: receipt.run_id(),
-            });
-        }
-        if receipt.shard_id() != self.scope.shard_id() {
-            return Err(PageCommitValidationError::CheckpointShardMismatch {
-                expected: self.scope.shard_id(),
-                actual: receipt.shard_id(),
-            });
-        }
-        if receipt.fence_epoch() != self.scope.fence_epoch() {
-            return Err(PageCommitValidationError::CheckpointFenceMismatch {
-                expected: self.scope.fence_epoch(),
-                actual: receipt.fence_epoch(),
-            });
-        }
-        if receipt.committed_items() != self.scope.committed_items() {
-            return Err(PageCommitValidationError::CheckpointItemCountMismatch {
-                expected: self.scope.committed_items(),
-                actual: receipt.committed_items(),
-            });
-        }
-        if receipt.cursor() != self.scope.checkpoint_cursor() {
-            return Err(PageCommitValidationError::CheckpointCursorMismatch);
+        if receipt.scope() != &self.scope {
+            return Err(PageCommitValidationError::CheckpointScopeMismatch);
         }
 
         let page_commit = PageCommitReceipt::new(self.state.item_commit, receipt);
@@ -579,31 +511,14 @@ impl PageCommit<CheckpointDurable> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fmt;
-
-    use rstest::rstest;
 
     use crate::{
         connector::ItemKey,
-        identity::{LogicalTime, TenantId},
+        identity::LogicalTime,
+        test_util::{TestWaitError, tenant},
     };
 
     use super::super::commit::ReadyCommitHandle;
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct TestWaitError(&'static str);
-
-    impl fmt::Display for TestWaitError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.0)
-        }
-    }
-
-    impl Error for TestWaitError {}
-
-    fn tenant(seed: u8) -> TenantId {
-        TenantId::from_bytes([seed; 32])
-    }
 
     fn sample_cursor(seed: u8) -> Cursor {
         Cursor::with_last_key(ItemKey::try_from_slice(&[seed]).unwrap())
@@ -629,15 +544,7 @@ mod tests {
     }
 
     fn sample_checkpoint_receipt(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            scope.tenant_id(),
-            scope.run_id(),
-            scope.shard_id(),
-            scope.fence_epoch(),
-            scope.checkpoint_cursor().clone(),
-            scope.committed_items(),
-            LogicalTime::from_raw(99),
-        )
+        CheckpointCommitReceipt::new(scope.clone(), LogicalTime::from_raw(99))
     }
 
     fn sample_item_commit() -> PageCommit<ItemDurable> {
@@ -648,76 +555,18 @@ mod tests {
             .unwrap()
     }
 
-    fn checkpoint_tenant_mismatch(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            tenant(9),
+    /// Construct a checkpoint receipt with a scope that differs from the given
+    /// scope (different tenant), so scope equality will fail.
+    fn checkpoint_with_wrong_scope(scope: &PageCommitScope) -> CheckpointCommitReceipt {
+        let wrong_scope = PageCommitScope::new(
+            tenant(99),
             scope.run_id(),
             scope.shard_id(),
             scope.fence_epoch(),
-            scope.checkpoint_cursor().clone(),
             scope.committed_items(),
-            LogicalTime::from_raw(99),
-        )
-    }
-
-    fn checkpoint_run_mismatch(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            scope.tenant_id(),
-            RunId::from_raw(scope.run_id().as_raw() + 1),
-            scope.shard_id(),
-            scope.fence_epoch(),
             scope.checkpoint_cursor().clone(),
-            scope.committed_items(),
-            LogicalTime::from_raw(99),
-        )
-    }
-
-    fn checkpoint_shard_mismatch(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            scope.tenant_id(),
-            scope.run_id(),
-            ShardId::from_raw(scope.shard_id().as_raw() + 1),
-            scope.fence_epoch(),
-            scope.checkpoint_cursor().clone(),
-            scope.committed_items(),
-            LogicalTime::from_raw(99),
-        )
-    }
-
-    fn checkpoint_fence_mismatch(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            scope.tenant_id(),
-            scope.run_id(),
-            scope.shard_id(),
-            FenceEpoch::from_raw(scope.fence_epoch().as_raw() + 1),
-            scope.checkpoint_cursor().clone(),
-            scope.committed_items(),
-            LogicalTime::from_raw(99),
-        )
-    }
-
-    fn checkpoint_item_count_mismatch(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            scope.tenant_id(),
-            scope.run_id(),
-            scope.shard_id(),
-            scope.fence_epoch(),
-            scope.checkpoint_cursor().clone(),
-            scope.committed_items() + 1,
-            LogicalTime::from_raw(99),
-        )
-    }
-
-    fn checkpoint_cursor_mismatch(scope: &PageCommitScope) -> CheckpointCommitReceipt {
-        CheckpointCommitReceipt::new(
-            scope.tenant_id(),
-            scope.run_id(),
-            scope.shard_id(),
-            scope.fence_epoch(),
-            sample_cursor(8),
-            scope.committed_items(),
-            LogicalTime::from_raw(99),
-        )
+        );
+        CheckpointCommitReceipt::new(wrong_scope, LogicalTime::from_raw(99))
     }
 
     #[test]
@@ -802,56 +651,15 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case::tenant(
-        checkpoint_tenant_mismatch,
-        PageCommitValidationError::CheckpointTenantMismatch {
-            expected: tenant(1),
-            actual: tenant(9),
-        },
-    )]
-    #[case::run(
-        checkpoint_run_mismatch,
-        PageCommitValidationError::CheckpointRunMismatch {
-            expected: RunId::from_raw(2),
-            actual: RunId::from_raw(3),
-        },
-    )]
-    #[case::shard(
-        checkpoint_shard_mismatch,
-        PageCommitValidationError::CheckpointShardMismatch {
-            expected: ShardId::from_raw(3),
-            actual: ShardId::from_raw(4),
-        },
-    )]
-    #[case::fence(
-        checkpoint_fence_mismatch,
-        PageCommitValidationError::CheckpointFenceMismatch {
-            expected: FenceEpoch::from_raw(4),
-            actual: FenceEpoch::from_raw(5),
-        },
-    )]
-    #[case::item_count(
-        checkpoint_item_count_mismatch,
-        PageCommitValidationError::CheckpointItemCountMismatch {
-            expected: 2,
-            actual: 3,
-        },
-    )]
-    #[case::cursor(
-        checkpoint_cursor_mismatch,
-        PageCommitValidationError::CheckpointCursorMismatch
-    )]
-    fn record_checkpoint_rejects_scope_mismatches(
-        #[case] make_receipt: fn(&PageCommitScope) -> CheckpointCommitReceipt,
-        #[case] expected: PageCommitValidationError,
-    ) {
+    #[test]
+    fn record_checkpoint_rejects_scope_mismatch() {
         let page = sample_item_commit();
         let scope = page.scope().clone();
 
         assert_eq!(
-            page.record_checkpoint(make_receipt(&scope)).unwrap_err(),
-            expected
+            page.record_checkpoint(checkpoint_with_wrong_scope(&scope))
+                .unwrap_err(),
+            PageCommitValidationError::CheckpointScopeMismatch
         );
     }
 
@@ -876,12 +684,12 @@ mod tests {
         assert_eq!(
             page.wait_checkpoint(
                 ReadyCommitHandle::<CheckpointCommitReceipt, TestWaitError>::ok(
-                    checkpoint_cursor_mismatch(&scope),
+                    checkpoint_with_wrong_scope(&scope),
                 )
             )
             .unwrap_err(),
             CommitAdvanceError::<TestWaitError>::Validation(
-                PageCommitValidationError::CheckpointCursorMismatch,
+                PageCommitValidationError::CheckpointScopeMismatch,
             )
         );
     }
@@ -905,7 +713,7 @@ mod tests {
         // This is the documented behavior (module docs lines 40-45):
         // done-ledger receipts carry only aggregate counts because they
         // are produced by the same in-process pipeline.
-        let page_a = PageCommit::new(scope_a.clone())
+        let page_a = PageCommit::new(scope_a)
             .record_findings(sample_findings_receipt())
             .record_done_ledger(sample_done_ledger_receipt(scope_b.committed_items()))
             .expect("done-ledger stage validates count, not scope — by design");
@@ -915,10 +723,7 @@ mod tests {
         let wrong_checkpoint = sample_checkpoint_receipt(&scope_b);
         assert_eq!(
             page_a.record_checkpoint(wrong_checkpoint).unwrap_err(),
-            PageCommitValidationError::CheckpointTenantMismatch {
-                expected: scope_a.tenant_id(),
-                actual: scope_b.tenant_id(),
-            }
+            PageCommitValidationError::CheckpointScopeMismatch
         );
     }
 }

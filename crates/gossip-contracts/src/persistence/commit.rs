@@ -38,10 +38,7 @@
 
 use std::{error::Error, fmt};
 
-use crate::{
-    connector::Cursor,
-    identity::{FenceEpoch, LogicalTime, RunId, ShardId, TenantId},
-};
+use crate::identity::LogicalTime;
 
 use super::page_commit::PageCommitScope;
 
@@ -223,85 +220,30 @@ impl CommitReceipt for DoneLedgerCommitReceipt {}
 
 /// Durable acknowledgement for a cursor checkpoint.
 ///
-/// Unlike the other receipt types, this carries the full page-scope identity
-/// fields (tenant, run, shard, fence epoch, cursor, item count). The
-/// [`PageCommit`](super::PageCommit) typestate machine validates every field
-/// against the original [`PageCommitScope`] before accepting the checkpoint,
-/// guarding against receipt mix-ups across concurrent pages.
+/// Embeds the full [`PageCommitScope`] so the [`PageCommit`](super::PageCommit)
+/// typestate machine can validate receipt-to-scope correspondence with a single
+/// equality check, guarding against receipt mix-ups across concurrent pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointCommitReceipt {
-    tenant_id: TenantId,
-    run_id: RunId,
-    shard_id: ShardId,
-    fence_epoch: FenceEpoch,
-    cursor: Cursor,
-    committed_items: u64,
+    scope: PageCommitScope,
     checkpointed_at: LogicalTime,
 }
 
 impl CheckpointCommitReceipt {
     /// Construct a checkpoint receipt.
     #[must_use]
-    pub fn new(
-        tenant_id: TenantId,
-        run_id: RunId,
-        shard_id: ShardId,
-        fence_epoch: FenceEpoch,
-        cursor: Cursor,
-        committed_items: u64,
-        checkpointed_at: LogicalTime,
-    ) -> Self {
+    pub fn new(scope: PageCommitScope, checkpointed_at: LogicalTime) -> Self {
         Self {
-            tenant_id,
-            run_id,
-            shard_id,
-            fence_epoch,
-            cursor,
-            committed_items,
+            scope,
             checkpointed_at,
         }
     }
 
-    /// Tenant isolation boundary for the committed page.
+    /// Page scope covered by this checkpoint receipt.
     #[inline]
     #[must_use]
-    pub const fn tenant_id(&self) -> TenantId {
-        self.tenant_id
-    }
-
-    /// Run that advanced the checkpoint.
-    #[inline]
-    #[must_use]
-    pub const fn run_id(&self) -> RunId {
-        self.run_id
-    }
-
-    /// Shard whose cursor advanced.
-    #[inline]
-    #[must_use]
-    pub const fn shard_id(&self) -> ShardId {
-        self.shard_id
-    }
-
-    /// Fence epoch under which the checkpoint was committed.
-    #[inline]
-    #[must_use]
-    pub const fn fence_epoch(&self) -> FenceEpoch {
-        self.fence_epoch
-    }
-
-    /// Durable cursor boundary acknowledged by the backend.
-    #[inline]
-    #[must_use]
-    pub fn cursor(&self) -> &Cursor {
-        &self.cursor
-    }
-
-    /// Number of page items included in the checkpoint.
-    #[inline]
-    #[must_use]
-    pub const fn committed_items(&self) -> u64 {
-        self.committed_items
+    pub fn scope(&self) -> &PageCommitScope {
+        &self.scope
     }
 
     /// Logical timestamp when the checkpoint became durable.
@@ -416,16 +358,7 @@ impl CommitReceipt for PageCommitReceipt {}
 mod tests {
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct TestWaitError(&'static str);
-
-    impl fmt::Display for TestWaitError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str(self.0)
-        }
-    }
-
-    impl Error for TestWaitError {}
+    use crate::test_util::TestWaitError;
 
     #[test]
     fn ready_commit_handle_wait_returns_receipt() {

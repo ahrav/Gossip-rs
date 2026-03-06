@@ -166,3 +166,35 @@ impl Drop for TestSlab {
         self.0.clear();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Persistence test helpers — shared across persistence test modules
+// ---------------------------------------------------------------------------
+
+/// Deterministic [`TenantId`](crate::identity::TenantId) from a seed byte.
+pub fn tenant(seed: u8) -> crate::identity::TenantId {
+    crate::identity::TenantId::from_bytes([seed; 32])
+}
+
+/// Deterministic [`PolicyHash`](crate::identity::PolicyHash) from a seed byte.
+pub fn policy(seed: u8) -> crate::identity::PolicyHash {
+    crate::identity::PolicyHash::from_bytes([seed; 32])
+}
+
+/// Deterministic [`OvidHash`](crate::persistence::OvidHash) from a seed byte.
+pub fn ovid(seed: u8) -> crate::persistence::OvidHash {
+    crate::persistence::OvidHash::from_bytes([seed; 32])
+}
+
+/// Minimal error type for [`CommitHandle`](crate::persistence::CommitHandle)
+/// test doubles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestWaitError(pub &'static str);
+
+impl std::fmt::Display for TestWaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TestWaitError {}
