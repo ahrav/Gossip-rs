@@ -47,10 +47,11 @@
 //! 5. Update the [`registry_is_complete`] test assertion.
 
 use super::{
-    ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey, NormHash,
-    ObjectVersionId, OccurrenceId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint,
-    SecretHash, StableItemId, TenantId, TenantSecretKey, compute_policy_hash, derive_finding_id,
-    derive_occurrence_id, domain_hasher, finalize_64, key_secret_hash,
+    ConnectorInstanceIdHash, ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey,
+    NormHash, ObjectVersionId, ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash,
+    PolicyHashInputs, RuleFingerprint, SecretHash, StableItemId, TenantId, TenantSecretKey,
+    compute_policy_hash, derive_finding_id, derive_observation_id, derive_occurrence_id,
+    domain_hasher, finalize_64, key_secret_hash,
 };
 
 // ============================================================================
@@ -61,12 +62,14 @@ use super::{
 ///
 /// The compile-time array length enforces exhaustiveness: adding a new
 /// derivation without updating this array is a compile error.
-const ALL: [&str; 7] = [
+const ALL: [&str; 9] = [
+    "ConnectorInstanceIdHash",
     "StableItemId",
     "ObjectVersionId",
     "key_secret_hash",
     "FindingId",
     "OccurrenceId",
+    "ObservationId",
     "PolicyHash",
     "finalize_64",
 ];
@@ -75,13 +78,22 @@ const ALL: [&str; 7] = [
 // Expected byte arrays
 // ============================================================================
 
+/// `ConnectorInstanceIdHash::from_instance_id_bytes(b"github-installation-1")`.
+#[rustfmt::skip]
+const CONNECTOR_INSTANCE_ID_HASH_EXPECTED: [u8; 32] = [
+    0xAC, 0x8D, 0x5E, 0xF3, 0xD4, 0x00, 0xED, 0x9C,
+    0x79, 0x43, 0xA1, 0x06, 0xE7, 0x49, 0x14, 0xFF,
+    0xE1, 0x4C, 0x23, 0xDC, 0xE3, 0x7E, 0x62, 0xEE,
+    0x83, 0xBB, 0x6E, 0xAA, 0x0A, 0x1D, 0x11, 0xAB,
+];
+
 /// `ItemIdentityKey::stable_id()` with connector `b"github"`, locator `b"org/repo\0src/main.rs"`.
 #[rustfmt::skip]
 const STABLE_ITEM_ID_EXPECTED: [u8; 32] = [
-    0x6D, 0x29, 0x2B, 0x2F, 0x4D, 0x9C, 0x56, 0x8A,
-    0x41, 0x04, 0x57, 0xCD, 0x3A, 0xBE, 0xE8, 0x7F,
-    0x77, 0x25, 0x46, 0x4A, 0xAA, 0x36, 0xFB, 0x18,
-    0x13, 0xA8, 0x93, 0x03, 0x10, 0xDF, 0x89, 0xA4,
+    0x1C, 0x69, 0xB5, 0x50, 0x54, 0x7C, 0x36, 0xC4,
+    0x98, 0x84, 0x47, 0x40, 0xEA, 0x1F, 0x1C, 0x03,
+    0xD9, 0x75, 0x0B, 0x34, 0x07, 0x4C, 0xD6, 0x82,
+    0x6A, 0x3E, 0x19, 0xCF, 0xC0, 0xA5, 0x7D, 0x61,
 ];
 
 /// `ObjectVersionId::from_version_bytes(b"abc123def456")`.
@@ -122,6 +134,15 @@ const OCCURRENCE_ID_EXPECTED: [u8; 32] = [
     0x24, 0x46, 0xCD, 0xE9, 0x96, 0x23, 0xDC, 0x85,
 ];
 
+/// `derive_observation_id` with tenant `[0x77; 32]`, policy `[0x88; 32]`, occurrence `[0x99; 32]`.
+#[rustfmt::skip]
+const OBSERVATION_ID_EXPECTED: [u8; 32] = [
+    0x85, 0x45, 0x4A, 0x29, 0x8E, 0xCD, 0x3A, 0x94,
+    0x9C, 0xB1, 0xB9, 0xFF, 0x04, 0x08, 0x07, 0xDA,
+    0xCE, 0xF8, 0xFB, 0xCE, 0x52, 0xEC, 0x5A, 0xEB,
+    0xFC, 0xF6, 0x14, 0x0A, 0x3C, 0x52, 0x28, 0x20,
+];
+
 /// `compute_policy_hash` with version 1, `KeyedV1`, evidence version 1, digest `[0xAA; 32]`.
 #[rustfmt::skip]
 const POLICY_HASH_EXPECTED: [u8; 32] = [
@@ -143,9 +164,23 @@ const FINALIZE_64_EXPECTED: u64 = 0x_8665_9F94_9814_3183;
 // ============================================================================
 
 #[test]
+fn connector_instance_id_hash_golden_value() {
+    let id = ConnectorInstanceIdHash::from_instance_id_bytes(b"github-installation-1");
+    assert_eq!(
+        id.as_bytes(),
+        &CONNECTOR_INSTANCE_ID_HASH_EXPECTED,
+        "ConnectorInstanceIdHash golden vector changed (domain::CONNECTOR_INSTANCE_ID_V1). \
+         See identity::golden module docs for regeneration protocol.\n\
+         Actual: {:02X?}",
+        id.as_bytes(),
+    );
+}
+
+#[test]
 fn stable_item_id_golden_value() {
     let key = ItemIdentityKey::new(
         ConnectorTag::from_ascii(b"github"),
+        ConnectorInstanceIdHash::from_instance_id_bytes(b"github-installation-1"),
         b"org/repo\0src/main.rs",
     );
     let id = key.stable_id();
@@ -226,6 +261,24 @@ fn derive_occurrence_id_golden_value() {
 }
 
 #[test]
+fn derive_observation_id_golden_value() {
+    let inputs = ObservationIdInputs {
+        tenant: TenantId::from_bytes([0x77; 32]),
+        policy: PolicyHash::from_bytes([0x88; 32]),
+        occurrence: OccurrenceId::from_bytes([0x99; 32]),
+    };
+    let id = derive_observation_id(&inputs);
+    assert_eq!(
+        id.as_bytes(),
+        &OBSERVATION_ID_EXPECTED,
+        "ObservationId golden vector changed (domain::OBSERVATION_ID_V1). \
+         See identity::golden module docs for regeneration protocol.\n\
+         Actual: {:02X?}",
+        id.as_bytes(),
+    );
+}
+
+#[test]
 fn compute_policy_hash_golden_value() {
     let inputs = PolicyHashInputs {
         policy_hash_version: 1,
@@ -269,8 +322,8 @@ fn finalize_64_golden_value() {
 fn registry_is_complete() {
     assert_eq!(
         ALL.len(),
-        7,
-        "ALL registry has {} entries, expected 7. Did you add a derivation \
+        9,
+        "ALL registry has {} entries, expected 9. Did you add a derivation \
          without updating the registry? (Coordination golden vectors moved \
          to gossip-coordination.)",
         ALL.len(),
@@ -297,6 +350,7 @@ proptest::proptest! {
     #[test]
     fn full_chain_item_to_occurrence_is_pure(
         connector_bytes in proptest::array::uniform8(proptest::num::u8::ANY),
+        connector_instance in proptest::array::uniform32(proptest::num::u8::ANY),
         path in proptest::collection::vec(proptest::num::u8::ANY, 1..64),
         tenant_key_bytes in proptest::array::uniform32(proptest::num::u8::ANY),
         norm_bytes in proptest::array::uniform32(proptest::num::u8::ANY),
@@ -306,7 +360,11 @@ proptest::proptest! {
         byte_offset in proptest::num::u64::ANY,
         byte_length in proptest::num::u64::ANY,
     ) {
-        let key = ItemIdentityKey::new(ConnectorTag::from_bytes(connector_bytes), path);
+        let key = ItemIdentityKey::new(
+            ConnectorTag::from_bytes(connector_bytes),
+            ConnectorInstanceIdHash::from_bytes(connector_instance),
+            path,
+        );
         let tenant_key = TenantSecretKey::from_bytes(tenant_key_bytes);
         let norm = NormHash::from_digest(norm_bytes);
 
@@ -350,11 +408,17 @@ proptest::proptest! {
     #[test]
     fn full_chain_collision_free(
         connector_a in proptest::array::uniform8(proptest::num::u8::ANY),
+        connector_instance_a in proptest::array::uniform32(proptest::num::u8::ANY),
         path_a in proptest::collection::vec(proptest::num::u8::ANY, 1..64),
         connector_b in proptest::array::uniform8(proptest::num::u8::ANY),
+        connector_instance_b in proptest::array::uniform32(proptest::num::u8::ANY),
         path_b in proptest::collection::vec(proptest::num::u8::ANY, 1..64),
     ) {
-        proptest::prop_assume!(connector_a != connector_b || path_a != path_b);
+        proptest::prop_assume!(
+            connector_a != connector_b
+                || connector_instance_a != connector_instance_b
+                || path_a != path_b
+        );
 
         let tenant_key = TenantSecretKey::from_bytes([0xBB; 32]);
         let norm = NormHash::from_digest([0xCC; 32]);
@@ -363,7 +427,11 @@ proptest::proptest! {
         let rule = RuleFingerprint::from_bytes([0x33; 32]);
         let version = ObjectVersionId::from_bytes([0x66; 32]);
 
-        let key_a = ItemIdentityKey::new(ConnectorTag::from_bytes(connector_a), path_a);
+        let key_a = ItemIdentityKey::new(
+            ConnectorTag::from_bytes(connector_a),
+            ConnectorInstanceIdHash::from_bytes(connector_instance_a),
+            path_a,
+        );
         let finding_a = derive_finding_id(&FindingIdInputs {
             tenant,
             item: key_a.stable_id(),
@@ -377,7 +445,11 @@ proptest::proptest! {
             byte_length: 42,
         });
 
-        let key_b = ItemIdentityKey::new(ConnectorTag::from_bytes(connector_b), path_b);
+        let key_b = ItemIdentityKey::new(
+            ConnectorTag::from_bytes(connector_b),
+            ConnectorInstanceIdHash::from_bytes(connector_instance_b),
+            path_b,
+        );
         let finding_b = derive_finding_id(&FindingIdInputs {
             tenant,
             item: key_b.stable_id(),

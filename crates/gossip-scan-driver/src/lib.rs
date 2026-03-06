@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use gossip_contracts::connector::{Cursor, ItemKey, VersionId};
 use gossip_contracts::coordination::ShardSpec;
-use gossip_contracts::identity::PolicyHash;
+use gossip_contracts::identity::{PolicyHash, StableItemId};
 use scanner_git::{GitEventOutput, GitScanMode, MergeDiffMode};
 use scanner_scheduler::events::EventOutput;
 
@@ -340,11 +340,15 @@ pub struct SourceCapabilities {
 
 /// Per-item metadata passed to [`CommitSink::begin_item`].
 ///
-/// Carries optional connector-provided context that the sink may use
-/// when persisting identity chains (e.g., a version ID from a versioned
-/// object store).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Carries connector-provided identity and optional context that the sink may
+/// use when persisting identity chains (for example a version ID from a
+/// versioned object store).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemMeta {
+    /// Connector-assigned stable identity for the scanned item. This must be
+    /// computed by the source and trusted by downstream persistence code; the
+    /// runtime must not re-derive it from ad hoc tags or raw item keys.
+    pub stable_item_id: StableItemId,
     /// Connector-assigned version for the item snapshot being scanned,
     /// if the source supports versioned objects. `None` for unversioned
     /// sources (plain filesystem).

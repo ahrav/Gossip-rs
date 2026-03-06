@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use gossip_contracts::connector::ItemKey;
+use gossip_contracts::identity::{ConnectorInstanceIdHash, StableItemId};
 use gossip_scan_driver::{
     Assignment, AssignmentSource, CommitSink, ConnectorKind, CursorUpdate, FindingRecord,
     FindingsBatch, GitDebugLevel, ItemMeta, ScanDriver, ScanExecutionConfig, ScanReport,
@@ -25,10 +26,12 @@ use scanner_scheduler::events::{
 use scanner_scheduler::parallel_scan::{ParallelScanConfig, parallel_scan_dir};
 use scanner_scheduler::source_kind::SourceKind;
 use scanner_scheduler::store::{
-    FsFindingBatch, FsRunLoss, FsStoreError, OwnedFsFindingBatch, StoreProducer,
+    FsFindingBatch, FsFindingRecord, FsRunLoss, FsStoreError, StoreProducer,
 };
 
-use crate::in_memory::MemItem;
+use crate::common::derive_stable_item_id;
+use crate::filesystem::FILESYSTEM_CONNECTOR_TAG;
+use crate::in_memory::{IN_MEMORY_CONNECTOR_TAG, MemItem};
 
 /// Factory for filesystem assignments.
 #[derive(Clone, Copy, Debug, Default)]
@@ -50,9 +53,14 @@ fn filesystem_driver_from_assignment(assignment: &Assignment) -> Result<FsScanDr
     let AssignmentSource::Filesystem { root } = &assignment.source else {
         bail!("filesystem assignment missing filesystem source payload");
     };
+    let connector_instance = ConnectorInstanceIdHash::try_from_instance_id_bytes(
+        assignment.connector_instance_id.as_bytes(),
+    )
+    .map_err(|error| anyhow!("invalid filesystem connector_instance_id: {error}"))?;
 
     Ok(FsScanDriver {
         root: root.clone(),
+        connector_instance,
         checkpoint_hint: None,
         shard_start: assignment.shard_spec.key_range_start().into(),
         shard_end: assignment.shard_spec.key_range_end().into(),
@@ -147,9 +155,14 @@ impl ScanSourceFactory for InMemoryScanSourceFactory {
                 dataset_id
             );
         }
+        let connector_instance = ConnectorInstanceIdHash::try_from_instance_id_bytes(
+            assignment.connector_instance_id.as_bytes(),
+        )
+        .map_err(|error| anyhow!("invalid in-memory connector_instance_id: {error}"))?;
 
         Ok(Box::new(InMemoryScanDriver {
             items: Arc::clone(&self.items),
+            connector_instance,
             checkpoint_hint: None,
         }))
     }
@@ -170,6 +183,7 @@ impl ScanSourceFactory for InMemoryScanSourceFactory {
 #[derive(Debug)]
 struct FsScanDriver {
     root: PathBuf,
+    connector_instance: ConnectorInstanceIdHash,
     checkpoint_hint: Option<CursorUpdate>,
     /// Inclusive assignment lower bound (`[]` means unbounded).
     shard_start: Box<[u8]>,
@@ -228,6 +242,7 @@ impl ScanDriver for FsScanDriver {
                 scan_cfg.store_producer = Some(Arc::new(ChannelStoreProducer::new(
                     commit_tx.clone(),
                     self.root.clone(),
+                    self.connector_instance,
                 )));
             }
 
@@ -357,6 +372,7 @@ impl ScanDriver for GitScanDriver {
 #[derive(Debug)]
 struct InMemoryScanDriver {
     items: Arc<[MemItem]>,
+    connector_instance: ConnectorInstanceIdHash,
     checkpoint_hint: Option<CursorUpdate>,
 }
 
@@ -386,6 +402,11 @@ impl ScanDriver for InMemoryScanDriver {
             }
 
             let meta = ItemMeta {
+                stable_item_id: derive_stable_item_id(
+                    IN_MEMORY_CONNECTOR_TAG,
+                    self.connector_instance,
+                    &item.key,
+                ),
                 version: None,
                 size_hint: Some(item.bytes.len() as u64),
             };
@@ -486,11 +507,20 @@ struct ChannelStoreProducer {
     /// Scan root used to strip the absolute prefix from scheduler paths,
     /// yielding `/`-separated relative keys matching the connector keyspace.
     root: PathBuf,
+    connector_instance: ConnectorInstanceIdHash,
 }
 
 impl ChannelStoreProducer {
-    fn new(tx: Sender<CommitMessage>, root: PathBuf) -> Self {
-        Self { tx, root }
+    fn new(
+        tx: Sender<CommitMessage>,
+        root: PathBuf,
+        connector_instance: ConnectorInstanceIdHash,
+    ) -> Self {
+        Self {
+            tx,
+            root,
+            connector_instance,
+        }
     }
 }
 
@@ -500,9 +530,14 @@ impl StoreProducer for ChannelStoreProducer {
         // relative key encoding before forwarding through the channel.
         let normalized_path = normalize_scheduler_path(&self.root, batch.object_path)
             .map_err(|e| FsStoreError::backend(format!("path normalization failed: {e}")))?;
+        let item_key = ItemKey::try_from_slice(&normalized_path)
+            .map_err(|e| FsStoreError::backend(format!("normalized item key invalid: {e}")))?;
+        let stable_item_id =
+            derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, self.connector_instance, &item_key);
         self.tx
-            .send(CommitMessage::Batch(OwnedFsFindingBatch {
+            .send(CommitMessage::Batch(OwnedCommitBatch {
                 object_path: normalized_path,
+                stable_item_id,
                 findings: batch.findings.to_vec(),
             }))
             .map_err(|_| FsStoreError::backend("commit forwarding channel closed"))
@@ -525,9 +560,16 @@ impl StoreProducer for ChannelStoreProducer {
 /// coordination layer's [`CommitSink`] via a crossbeam channel.
 #[derive(Debug)]
 enum CommitMessage {
-    Batch(OwnedFsFindingBatch),
+    Batch(OwnedCommitBatch),
     RunLoss(FsRunLoss),
     EndRun(bool),
+}
+
+#[derive(Debug)]
+struct OwnedCommitBatch {
+    object_path: Vec<u8>,
+    stable_item_id: StableItemId,
+    findings: Vec<FsFindingRecord>,
 }
 
 /// Drain owned events from `rx` and re-emit them into `out` as borrowed
@@ -625,12 +667,16 @@ fn normalize_scheduler_path(root: &Path, raw_bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Map a scheduler [`OwnedFsFindingBatch`] to the [`CommitSink`] lifecycle:
+/// Map a scheduler batch to the [`CommitSink`] lifecycle:
 /// `begin_item` → `upsert_findings` (if any) → `finish_item`.
-fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedFsFindingBatch) -> Result<()> {
+fn forward_commit_batch(commit: &dyn CommitSink, batch: OwnedCommitBatch) -> Result<()> {
     let item_key = ItemKey::try_from_slice(&batch.object_path)
         .map_err(|error| anyhow!("invalid item key from scheduler batch: {error}"))?;
-    let meta = ItemMeta::default();
+    let meta = ItemMeta {
+        stable_item_id: batch.stable_item_id,
+        version: None,
+        size_hint: None,
+    };
     commit.begin_item(&item_key, &meta)?;
 
     if !batch.findings.is_empty() {
@@ -1083,14 +1129,19 @@ mod tests {
     #[derive(Default)]
     struct SpyCommitSink {
         begin_keys: Mutex<Vec<Vec<u8>>>,
+        begin_stable_item_ids: Mutex<Vec<StableItemId>>,
     }
 
     impl CommitSink for SpyCommitSink {
-        fn begin_item(&self, item_key: &ItemKey, _meta: &ItemMeta) -> Result<()> {
+        fn begin_item(&self, item_key: &ItemKey, meta: &ItemMeta) -> Result<()> {
             self.begin_keys
                 .lock()
                 .unwrap()
                 .push(item_key.as_bytes().to_vec());
+            self.begin_stable_item_ids
+                .lock()
+                .unwrap()
+                .push(meta.stable_item_id);
             Ok(())
         }
 
@@ -1146,8 +1197,9 @@ mod tests {
     fn commit_batch_keys_use_relative_paths() {
         // After normalization by ChannelStoreProducer, forward_commit_batch
         // receives relative paths. Verify the full ItemKey creation works.
-        let batch = OwnedFsFindingBatch {
+        let batch = OwnedCommitBatch {
             object_path: b"src/main.rs".to_vec(),
+            stable_item_id: StableItemId::from_bytes([0xAB; 32]),
             findings: vec![],
         };
 
@@ -1159,6 +1211,11 @@ mod tests {
         assert_eq!(
             keys[0], b"src/main.rs",
             "batch key must be a relative path in connector keyspace"
+        );
+        let stable_ids = spy.begin_stable_item_ids.lock().unwrap();
+        assert_eq!(
+            stable_ids.as_slice(),
+            &[StableItemId::from_bytes([0xAB; 32])]
         );
     }
 

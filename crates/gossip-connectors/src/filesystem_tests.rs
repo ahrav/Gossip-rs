@@ -554,6 +554,24 @@ fn token_enabled_vs_disabled_parity() {
 }
 
 #[test]
+fn different_roots_produce_different_stable_ids_for_same_relative_path() {
+    let dir_a = create_test_dir(&[("same/path.txt", b"one")]);
+    let dir_b = create_test_dir(&[("same/path.txt", b"one")]);
+    let start = make_key(b"\x00");
+    let end = make_key(b"\xff");
+
+    let mut a = FilesystemConnector::new(dir_a.path());
+    let mut b = FilesystemConnector::new(dir_b.path());
+
+    let item_a = collect_all(&mut a, &start, &end).remove(0);
+    let item_b = collect_all(&mut b, &start, &end).remove(0);
+
+    assert_eq!(item_a.item_key().as_bytes(), b"same/path.txt");
+    assert_eq!(item_b.item_key().as_bytes(), b"same/path.txt");
+    assert_ne!(item_a.stable_item_id(), item_b.stable_item_id());
+}
+
+#[test]
 fn walk_token_round_trips_from_live_walk_state() {
     let dir = create_test_dir(&[
         ("a/one.txt", b"1"),
@@ -2552,8 +2570,8 @@ mod prop {
             let start = make_key(b"\x00");
             let end = make_key(b"\xff");
 
-            let (_dir1, mut c1) = make_connector(&files);
-            let (_dir2, mut c2) = make_connector(&files);
+            let (dir, mut c1) = make_connector(&files);
+            let mut c2 = FilesystemConnector::new(dir.path());
 
             let a = collect_all(&mut c1, &start, &end);
             let b = collect_all(&mut c2, &start, &end);

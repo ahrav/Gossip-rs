@@ -18,7 +18,8 @@
 //!    [`Budgets::max_items`] are yielded by index iteration over precomputed
 //!    metadata.
 //! 3. **Deterministic IDs** -- [`StableItemId`] derived via
-//!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id) (connector-tag + key, domain-separated),
+//!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id)
+//!    (connector-tag + connector-instance + key, domain-separated),
 //!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
 //!    (domain-separated BLAKE3 of content bytes), [`ItemRef`] = big-endian
 //!    index. All items carry [`VersionId::Strong`] since content is immutable.
@@ -41,7 +42,7 @@
 //! Duplicate keys are unsupported because:
 //!
 //! - Cursor resume via `upper_bound(last_key)` skips remaining duplicates.
-//! - [`StableItemId`] is derived from `(connector_tag, key)`, so duplicates
+//! - [`StableItemId`] is derived from `(connector_tag, connector_instance, key)`, so duplicates
 //!   collide on identity.
 //! - Split-point selection can return a duplicate key, producing empty shards.
 //!
@@ -82,10 +83,13 @@ use gossip_contracts::{
         EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorTag, ObjectVersionId, StableItemId},
+    identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
 };
 
 use crate::common::{self, borrowed_shard_bound, derive_stable_item_id, parse_u64_be};
+
+/// Canonical connector tag for the deterministic in-memory connector.
+pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmemdet");
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
 #[derive(Clone, Debug)]
@@ -127,7 +131,7 @@ struct PreparedItem {
     bytes: Arc<[u8]>,
     /// Big-endian `u64` index into the sorted item array.
     item_ref: ItemRef,
-    /// Domain-separated BLAKE3 hash of `(connector_tag, key)`.
+    /// Domain-separated BLAKE3 hash of `(connector_tag, connector_instance, key)`.
     stable_item_id: StableItemId,
     /// Domain-separated BLAKE3 hash of the content bytes.
     version_id: ObjectVersionId,
@@ -163,7 +167,8 @@ impl common::SizedEntry for PreparedItem {
 /// - [`ItemRef`] values are big-endian `u64` indices into that sorted vector,
 ///   so the Nth item always gets `ItemRef(N)`.
 /// - [`StableItemId`] is derived via [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id)
-///   (domain-separated BLAKE3 of connector-tag + key) and [`ObjectVersionId`]
+///   (domain-separated BLAKE3 of connector-tag + connector-instance + key)
+///   and [`ObjectVersionId`]
 ///   via [`ObjectVersionId::from_version_bytes`] (domain-separated BLAKE3 of
 ///   the item's content bytes), both deterministic and precomputed once at
 ///   construction. All items are emitted with [`VersionId::Strong`] because
@@ -212,8 +217,14 @@ impl InMemoryDeterministicConnector {
     /// test-setup bug and cannot be paginated correctly (see module docs).
     ///
     /// [`with_tokens(false)`]: Self::with_tokens
-    pub fn new(connector_tag: ConnectorTag, mut items: Vec<MemItem>) -> Self {
+    pub fn new(
+        connector_tag: ConnectorTag,
+        connector_instance_id: impl AsRef<[u8]>,
+        mut items: Vec<MemItem>,
+    ) -> Self {
         items.sort_by(|left, right| left.key.cmp(&right.key));
+        let connector_instance =
+            ConnectorInstanceIdHash::from_instance_id_bytes(connector_instance_id.as_ref());
 
         // Enforce unique keys. Duplicate keys break cursor resume
         // (upper_bound skips remaining duplicates), StableItemId derivation
@@ -233,7 +244,8 @@ impl InMemoryDeterministicConnector {
                 let idx_u64 = u64::try_from(idx).expect("item count must fit in u64");
                 let item_ref = ItemRef::try_from_slice(&idx_u64.to_be_bytes())
                     .expect("8-byte big-endian index is always valid for ItemRef");
-                let stable_item_id = derive_stable_item_id(connector_tag, &item.key);
+                let stable_item_id =
+                    derive_stable_item_id(connector_tag, connector_instance, &item.key);
                 let version_id = ObjectVersionId::from_version_bytes(&item.bytes);
                 let size_hint = item.bytes.len() as u64;
                 PreparedItem {

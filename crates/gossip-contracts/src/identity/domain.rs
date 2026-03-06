@@ -57,6 +57,11 @@ pub const FINDING_ID_V1: &str = "gossip/finding/v1";
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const OCCURRENCE_ID_V1: &str = "gossip/occurrence/v1";
 
+/// `ObservationId` derivation from `(tenant, policy, occurrence)`.
+///
+/// Hash mode: BLAKE3 derive-key via `domain_hasher`.
+pub const OBSERVATION_ID_V1: &str = "gossip/observation/v1";
+
 /// `SecretHash` keying — tenant-scoped secret identity.
 ///
 /// Hash mode: **BLAKE3 keyed mode** (`Hasher::new_keyed`). The domain tag is
@@ -67,6 +72,11 @@ pub const SECRET_HASH_V1: &str = "gossip/secret-hash/v1";
 ///
 /// Hash mode: BLAKE3 derive-key via `domain_hasher`.
 pub const ITEM_ID_V1: &str = "gossip/item-id/v1";
+
+/// `ConnectorInstanceIdHash` derivation from connector-instance bytes.
+///
+/// Hash mode: BLAKE3 derive-key via `domain_hasher`.
+pub const CONNECTOR_INSTANCE_ID_V1: &str = "gossip/connector-instance-id/v1";
 
 /// `ObjectVersionId` derivation from version bytes.
 ///
@@ -127,13 +137,15 @@ pub const TRIAGE_GROUP_KEY_V1: &str = "gossip/persistence/v1/triage-group";
 /// The array length is checked at compile time — adding a constant without
 /// updating `ALL` is a compile error. Tests use this for uniqueness and
 /// coverage checks.
-pub const ALL: [&str; 13] = [
+pub const ALL: [&str; 15] = [
     SPLIT_ID_V1,
     OP_PAYLOAD_V1,
     FINDING_ID_V1,
     OCCURRENCE_ID_V1,
+    OBSERVATION_ID_V1,
     SECRET_HASH_V1,
     ITEM_ID_V1,
+    CONNECTOR_INSTANCE_ID_V1,
     OBJECT_VERSION_V1,
     RULE_FINGERPRINT_V1,
     POLICY_HASH_V2,
@@ -163,8 +175,10 @@ pub(crate) fn all_domain_constants() -> Vec<(&'static str, &'static str)> {
         ("OP_PAYLOAD_V1", OP_PAYLOAD_V1),
         ("FINDING_ID_V1", FINDING_ID_V1),
         ("OCCURRENCE_ID_V1", OCCURRENCE_ID_V1),
+        ("OBSERVATION_ID_V1", OBSERVATION_ID_V1),
         ("SECRET_HASH_V1", SECRET_HASH_V1),
         ("ITEM_ID_V1", ITEM_ID_V1),
+        ("CONNECTOR_INSTANCE_ID_V1", CONNECTOR_INSTANCE_ID_V1),
         ("OBJECT_VERSION_V1", OBJECT_VERSION_V1),
         ("RULE_FINGERPRINT_V1", RULE_FINGERPRINT_V1),
         ("POLICY_HASH_V2", POLICY_HASH_V2),

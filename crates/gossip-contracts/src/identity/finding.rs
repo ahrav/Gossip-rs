@@ -10,6 +10,7 @@
 //! | [`RuleFingerprint`] | 32 B | `from_bytes` (pub) | Detection rule identity |
 //! | [`FindingId`] | 32 B | `derive_finding_id` | Version-stable finding identity |
 //! | [`OccurrenceId`] | 32 B | `derive_occurrence_id` | Version-specific occurrence location |
+//! | [`ObservationId`] | 32 B | `derive_observation_id` | Policy-scoped detection event identity |
 //!
 //! # Derivation chain
 //!
@@ -25,6 +26,8 @@
 //!                                                       ├─ derive_occurrence_id ──► OccurrenceId
 //! ObjectVersionId ──────────────────────────────────────┤
 //! byte_offset + byte_length ────────────────────────────┘
+//!                                                                                            │
+//! TenantId + PolicyHash ───────────────────────────────────────────────── derive_observation_id ──► ObservationId
 //! ```
 //!
 //! # Construction boundary
@@ -39,9 +42,11 @@ use blake3::Hasher;
 
 use super::canonical::CanonicalBytes;
 use super::domain;
-use super::hashing::{FINDING_HASHER, OCCURRENCE_HASHER, derive_from_cached, finalize_32};
+use super::hashing::{
+    FINDING_HASHER, OBSERVATION_HASHER, OCCURRENCE_HASHER, derive_from_cached, finalize_32,
+};
 use super::item::{ObjectVersionId, StableItemId};
-use super::types::{TenantId, TenantSecretKey};
+use super::types::{PolicyHash, TenantId, TenantSecretKey};
 
 // ---------------------------------------------------------------------------
 // NormHash — normalized secret digest
@@ -169,6 +174,28 @@ crate::define_id_32! {
 }
 
 // ---------------------------------------------------------------------------
+// ObservationId — policy-scoped detection event identity
+// ---------------------------------------------------------------------------
+
+crate::define_id_32! {
+    /// Policy-scoped detection event identity.
+    ///
+    /// Derived from `(tenant, policy, occurrence)`. This lets the system
+    /// distinguish "policy A detected occurrence O" from "policy B detected
+    /// the same occurrence O" without changing the underlying
+    /// [`FindingId`] or [`OccurrenceId`] derivations.
+    ///
+    /// # Invariants
+    ///
+    /// **Safety**: `ObservationId` MUST be a pure function of
+    /// [`ObservationIdInputs`]. Same inputs → same output.
+    ///
+    /// **Safety**: Distinct inputs MUST produce distinct `ObservationId`
+    /// values (with cryptographic collision resistance).
+    ObservationId
+}
+
+// ---------------------------------------------------------------------------
 // FindingIdInputs
 // ---------------------------------------------------------------------------
 
@@ -252,6 +279,46 @@ impl CanonicalBytes for OccurrenceIdInputs {
         self.version.write_canonical(h);
         self.byte_offset.write_canonical(h);
         self.byte_length.write_canonical(h);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ObservationIdInputs
+// ---------------------------------------------------------------------------
+
+/// Inputs to [`derive_observation_id`].
+///
+/// All fields are fixed-width (3 × 32 = 96 bytes), so the canonical
+/// encoding writes them sequentially with no length prefixes.
+///
+/// # Field-ordering invariant
+///
+/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
+/// declaration order**. Reordering fields without updating
+/// `write_canonical` silently changes every derived `ObservationId` and
+/// breaks the golden vectors in `golden.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservationIdInputs {
+    /// Tenant that owns the scan.
+    pub tenant: TenantId,
+    /// Hash of the active policy.
+    pub policy: PolicyHash,
+    /// Policy-independent occurrence identity for this detection.
+    pub occurrence: OccurrenceId,
+}
+
+impl CanonicalBytes for ObservationIdInputs {
+    /// Feeds three 32-byte fields sequentially (96 bytes total, no length
+    /// prefixes).
+    ///
+    /// Field order must match struct declaration order — reordering fields
+    /// without updating this impl silently changes all derived IDs and breaks
+    /// the golden vectors in `golden.rs`.
+    #[inline]
+    fn write_canonical(&self, h: &mut Hasher) {
+        self.tenant.write_canonical(h);
+        self.policy.write_canonical(h);
+        self.occurrence.write_canonical(h);
     }
 }
 
@@ -344,6 +411,28 @@ pub fn derive_occurrence_id(inputs: &OccurrenceIdInputs) -> OccurrenceId {
     OccurrenceId::from_bytes(derive_from_cached(&OCCURRENCE_HASHER, inputs))
 }
 
+/// Derive a policy-scoped [`ObservationId`] from its inputs.
+///
+/// Uses BLAKE3 derive-key mode with [`domain::OBSERVATION_ID_V1`].
+///
+/// # Examples
+///
+/// ```
+/// use gossip_contracts::identity::{
+///     ObservationIdInputs, OccurrenceId, PolicyHash, TenantId, derive_observation_id,
+/// };
+///
+/// let inputs = ObservationIdInputs {
+///     tenant: TenantId::from_bytes([0x01; 32]),
+///     policy: PolicyHash::from_bytes([0x02; 32]),
+///     occurrence: OccurrenceId::from_bytes([0x03; 32]),
+/// };
+/// let observation_id = derive_observation_id(&inputs);
+/// ```
+pub fn derive_observation_id(inputs: &ObservationIdInputs) -> ObservationId {
+    ObservationId::from_bytes(derive_from_cached(&OBSERVATION_HASHER, inputs))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -371,6 +460,7 @@ mod tests {
     #[case::rule_fingerprint(format!("{:?}", RuleFingerprint::from_bytes([0xAB; 32])), "RuleFingerprint")]
     #[case::finding_id(format!("{:?}", FindingId::from_bytes([0xCD; 32])), "FindingId")]
     #[case::occurrence_id(format!("{:?}", OccurrenceId::from_bytes([0xEF; 32])), "OccurrenceId")]
+    #[case::observation_id(format!("{:?}", ObservationId::from_bytes([0x99; 32])), "ObservationId")]
     fn public_types_debug_is_safe(#[case] dbg: String, #[case] name: &str) {
         assert!(
             dbg.starts_with(name),
@@ -439,6 +529,22 @@ mod tests {
             };
             let a = derive_occurrence_id(&inputs);
             let b = derive_occurrence_id(&inputs);
+            proptest::prop_assert_eq!(a, b);
+        }
+
+        #[test]
+        fn observation_id_is_pure(
+            tenant in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            let inputs = ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant),
+                policy: PolicyHash::from_bytes(policy),
+                occurrence: OccurrenceId::from_bytes(occurrence),
+            };
+            let a = derive_observation_id(&inputs);
+            let b = derive_observation_id(&inputs);
             proptest::prop_assert_eq!(a, b);
         }
 
@@ -513,6 +619,31 @@ mod tests {
                 version: ObjectVersionId::from_bytes(v2),
                 byte_offset: off2,
                 byte_length: len2,
+            });
+            proptest::prop_assert_ne!(a, b);
+        }
+
+        #[test]
+        fn observation_id_collision_free(
+            tenant_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            tenant_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence_b in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(
+                tenant_a != tenant_b || policy_a != policy_b || occurrence_a != occurrence_b
+            );
+            let a = derive_observation_id(&ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant_a),
+                policy: PolicyHash::from_bytes(policy_a),
+                occurrence: OccurrenceId::from_bytes(occurrence_a),
+            });
+            let b = derive_observation_id(&ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant_b),
+                policy: PolicyHash::from_bytes(policy_b),
+                occurrence: OccurrenceId::from_bytes(occurrence_b),
             });
             proptest::prop_assert_ne!(a, b);
         }
@@ -764,6 +895,52 @@ mod tests {
                 derive_occurrence_id(&varied),
             );
         }
+
+        #[test]
+        fn observation_id_policy_field_sensitivity(
+            tenant in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(policy_a != policy_b);
+            let base = ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant),
+                policy: PolicyHash::from_bytes(policy_a),
+                occurrence: OccurrenceId::from_bytes(occurrence),
+            };
+            let varied = ObservationIdInputs {
+                policy: PolicyHash::from_bytes(policy_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_observation_id(&base),
+                derive_observation_id(&varied),
+            );
+        }
+
+        #[test]
+        fn observation_id_occurrence_field_sensitivity(
+            tenant in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence_b in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(occurrence_a != occurrence_b);
+            let base = ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant),
+                policy: PolicyHash::from_bytes(policy),
+                occurrence: OccurrenceId::from_bytes(occurrence_a),
+            };
+            let varied = ObservationIdInputs {
+                occurrence: OccurrenceId::from_bytes(occurrence_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_observation_id(&base),
+                derive_observation_id(&varied),
+            );
+        }
     }
 
     // -- Field-order swap tests --
@@ -807,6 +984,24 @@ mod tests {
         assert_ne!(
             derive_occurrence_id(&inputs_a),
             derive_occurrence_id(&inputs_b)
+        );
+    }
+
+    #[test]
+    fn observation_id_inputs_field_order_matters() {
+        let inputs_a = ObservationIdInputs {
+            tenant: TenantId::from_bytes([0x11; 32]),
+            policy: PolicyHash::from_bytes([0x22; 32]),
+            occurrence: OccurrenceId::from_bytes([0x33; 32]),
+        };
+        let inputs_b = ObservationIdInputs {
+            tenant: TenantId::from_bytes([0x22; 32]),
+            policy: PolicyHash::from_bytes([0x11; 32]),
+            occurrence: OccurrenceId::from_bytes([0x33; 32]),
+        };
+        assert_ne!(
+            derive_observation_id(&inputs_a),
+            derive_observation_id(&inputs_b)
         );
     }
 }

@@ -1,7 +1,9 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 
-use gossip_contracts::identity::{ConnectorTag, ItemIdentityKey, ObjectVersionId};
+use gossip_contracts::identity::{
+    ConnectorInstanceIdHash, ConnectorTag, ItemIdentityKey, ObjectVersionId,
+};
 
 fuzz_target!(|data: &[u8]| {
     // Fuzz ConnectorTag::from_ascii — must not panic on arbitrary bytes
@@ -16,7 +18,11 @@ fuzz_target!(|data: &[u8]| {
         let locator = data[8..].to_vec();
         if !locator.is_empty() {
             let connector = ConnectorTag::from_bytes(tag_bytes);
-            let key = ItemIdentityKey::new(connector, locator);
+            let key = ItemIdentityKey::new(
+                connector,
+                ConnectorInstanceIdHash::from_instance_id_bytes(b"fuzz-instance"),
+                locator,
+            );
             // Derive stable_id — must not panic.
             let _ = key.stable_id();
         }

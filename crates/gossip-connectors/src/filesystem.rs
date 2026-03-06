@@ -101,7 +101,7 @@ use gossip_contracts::{
         TokenBytes, ToxicDigest, VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorTag, ObjectVersionId, StableItemId},
+    identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
 };
 
 use gossip_stdx::InlineVec;
@@ -208,6 +208,7 @@ struct WalkFrame {
 #[derive(Clone, Copy)]
 struct WalkQuery<'a> {
     root: &'a Path,
+    connector_instance: ConnectorInstanceIdHash,
     max_depth: usize,
     start: Option<&'a [u8]>,
     end: Option<&'a [u8]>,
@@ -278,6 +279,7 @@ struct WalkState {
 /// See [module-level documentation](self) for full design details.
 pub struct FilesystemConnector {
     root: PathBuf,
+    connector_instance: ConnectorInstanceIdHash,
     emit_tokens: bool,
     max_walk_depth: usize,
     max_warnings: usize,
@@ -307,8 +309,12 @@ impl FilesystemConnector {
     ///
     /// Walk initialization is lazy; the root is canonicalized at first use.
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        let connector_instance =
+            ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_bytes());
         Self {
-            root: root.into(),
+            root,
+            connector_instance,
             emit_tokens: false,
             max_walk_depth: Self::DEFAULT_MAX_WALK_DEPTH,
             max_warnings: Self::DEFAULT_MAX_WARNINGS,
@@ -599,6 +605,7 @@ impl FilesystemConnector {
         let root = self.root.clone();
         let walk_query = WalkQuery {
             root: &root,
+            connector_instance: self.connector_instance,
             max_depth: self.max_walk_depth,
             start,
             end,
@@ -752,6 +759,7 @@ impl FilesystemConnector {
         let mut page_files = Vec::with_capacity(budgets.max_items());
         let walk_query = WalkQuery {
             root: &self.root,
+            connector_instance: self.connector_instance,
             max_depth: self.max_walk_depth,
             start: effective_start,
             end: effective_end,
@@ -1973,7 +1981,8 @@ impl WalkState {
                 }
             };
 
-            let stable_item_id = derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, &key);
+            let stable_item_id =
+                derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, query.connector_instance, &key);
             let version = VersionId::Weak(derive_fs_version_id(&metadata));
             let size = metadata.len();
 

@@ -2,9 +2,9 @@
 use libfuzzer_sys::fuzz_target;
 
 use gossip_contracts::identity::{
-    derive_finding_id, derive_occurrence_id, key_secret_hash, ConnectorTag, FindingIdInputs,
-    ItemIdentityKey, NormHash, ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId,
-    TenantSecretKey,
+    ConnectorInstanceIdHash, ConnectorTag, FindingIdInputs, ItemIdentityKey, NormHash,
+    ObjectVersionId, OccurrenceIdInputs, RuleFingerprint, TenantId, TenantSecretKey,
+    derive_finding_id, derive_occurrence_id, key_secret_hash,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -27,7 +27,11 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let connector = ConnectorTag::from_bytes(*b"fuzztest");
-    let item_key = ItemIdentityKey::new(connector, path);
+    let item_key = ItemIdentityKey::new(
+        connector,
+        ConnectorInstanceIdHash::from_instance_id_bytes(b"fuzz-instance"),
+        path,
+    );
     let stable_id = item_key.stable_id();
 
     let tenant_key = TenantSecretKey::from_bytes(tenant_key_bytes);

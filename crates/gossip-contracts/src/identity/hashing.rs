@@ -25,7 +25,7 @@
 //!
 //! # Crate-internal fast path
 //!
-//! For the seven domain tags used across identity and coordination derivation,
+//! For the cached domain tags used across identity and coordination derivation,
 //! pre-initialized hashers are cached in `LazyLock<Hasher>` statics
 //! (`FINDING_HASHER`, `SPLIT_ID_HASHER`, etc.).
 //! [`derive_from_cached`] clones one of these statics instead of re-running
@@ -61,9 +61,17 @@ pub(crate) static FINDING_HASHER: LazyLock<Hasher> =
 pub(crate) static OCCURRENCE_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::OCCURRENCE_ID_V1));
 
+/// Cached derive-key hasher for [`ObservationId`](super::ObservationId) derivation.
+pub(crate) static OBSERVATION_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::OBSERVATION_ID_V1));
+
 /// Cached derive-key hasher for [`StableItemId`](super::StableItemId) derivation.
 pub(crate) static ITEM_ID_HASHER: LazyLock<Hasher> =
     LazyLock::new(|| Hasher::new_derive_key(domain::ITEM_ID_V1));
+
+/// Cached derive-key hasher for [`ConnectorInstanceIdHash`](super::ConnectorInstanceIdHash) derivation.
+pub(crate) static CONNECTOR_INSTANCE_HASHER: LazyLock<Hasher> =
+    LazyLock::new(|| Hasher::new_derive_key(domain::CONNECTOR_INSTANCE_ID_V1));
 
 /// Cached derive-key hasher for [`ObjectVersionId`](super::ObjectVersionId) derivation.
 pub(crate) static OBJECT_VERSION_HASHER: LazyLock<Hasher> =
