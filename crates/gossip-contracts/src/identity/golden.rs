@@ -26,6 +26,7 @@
 //!
 //! | Vector | Domain constant | Trigger conditions |
 //! |--------|----------------|--------------------|
+//! | `CONNECTOR_INSTANCE_ID_HASH_EXPECTED` | `domain::CONNECTOR_INSTANCE_ID_V1` | Instance-ID encoding or domain tag changes |
 //! | `STABLE_ITEM_ID_EXPECTED` | `domain::ITEM_ID_V1` | `ItemIdentityKey` encoding or domain tag changes |
 //! | `OBJECT_VERSION_ID_EXPECTED` | `domain::OBJECT_VERSION_V1` | `ObjectVersionId` encoding changes |
 //! | `KEY_SECRET_HASH_EXPECTED` | `domain::SECRET_HASH_V1` | Secret keying scheme changes |
