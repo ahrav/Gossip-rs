@@ -95,7 +95,7 @@ impl DurableCommitSink {
             .version
             .map(|version| version.object_version_id())
             .unwrap_or_else(|| {
-                tracing::warn!(
+                tracing::debug!(
                     item_key = ?item_key.as_bytes(),
                     "missing connector version metadata; temporarily deriving ObjectVersionId \
                      from item_key bytes until filesystem version propagation is plumbed"

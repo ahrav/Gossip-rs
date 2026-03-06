@@ -472,10 +472,10 @@ impl ItemIdentityKey {
 }
 
 impl CanonicalBytes for ItemIdentityKey {
-    /// Writes `ConnectorTag` (8 bytes, fixed-width) followed by `locator`
-    /// (4-byte LE length prefix + variable-length body). The length prefix
-    /// on the locator prevents concatenation ambiguity between connector tag
-    /// padding and locator content.
+    /// Writes `ConnectorTag` (8 bytes, fixed-width) followed by
+    /// `ConnectorInstanceIdHash` (32 bytes, fixed-width) followed by
+    /// `locator` (4-byte LE length prefix + variable-length body). The
+    /// length prefix on the locator prevents concatenation ambiguity.
     #[inline]
     fn write_canonical(&self, h: &mut Hasher) {
         self.connector.write_canonical(h);

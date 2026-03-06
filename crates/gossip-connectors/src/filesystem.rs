@@ -310,6 +310,10 @@ impl FilesystemConnector {
     /// Walk initialization is lazy; the root is canonicalized at first use.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        assert!(
+            !root.as_os_str().is_empty(),
+            "FilesystemConnector root path must not be empty"
+        );
         let connector_instance =
             ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_bytes());
         Self {

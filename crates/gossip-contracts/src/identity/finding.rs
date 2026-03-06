@@ -920,6 +920,29 @@ mod tests {
         }
 
         #[test]
+        fn observation_id_tenant_field_sensitivity(
+            tenant_a in proptest::array::uniform32(proptest::num::u8::ANY),
+            tenant_b in proptest::array::uniform32(proptest::num::u8::ANY),
+            policy in proptest::array::uniform32(proptest::num::u8::ANY),
+            occurrence in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            proptest::prop_assume!(tenant_a != tenant_b);
+            let base = ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant_a),
+                policy: PolicyHash::from_bytes(policy),
+                occurrence: OccurrenceId::from_bytes(occurrence),
+            };
+            let varied = ObservationIdInputs {
+                tenant: TenantId::from_bytes(tenant_b),
+                ..base
+            };
+            proptest::prop_assert_ne!(
+                derive_observation_id(&base),
+                derive_observation_id(&varied),
+            );
+        }
+
+        #[test]
         fn observation_id_occurrence_field_sensitivity(
             tenant in proptest::array::uniform32(proptest::num::u8::ANY),
             policy in proptest::array::uniform32(proptest::num::u8::ANY),

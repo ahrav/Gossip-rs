@@ -163,6 +163,10 @@ impl GitConnector {
     /// Create a connector rooted at `repo`.
     pub fn new(repo: impl Into<PathBuf>) -> Self {
         let repo = repo.into();
+        assert!(
+            !repo.as_os_str().is_empty(),
+            "GitConnector repo path must not be empty"
+        );
         let connector_instance =
             ConnectorInstanceIdHash::from_instance_id_bytes(repo.as_os_str().as_encoded_bytes());
         Self {
