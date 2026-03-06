@@ -301,8 +301,8 @@ pub struct ObservationRecord {
 }
 
 impl ObservationRecord {
-    /// Construct an observation record, deriving [`ObservationId`] from the
-    /// natural key fields.
+    /// Construct an observation record, deriving [`ObservationId`] canonically
+    /// from `(tenant_id, policy_hash, occurrence_id)`.
     ///
     /// Location metadata is set to `None` by default; use
     /// [`with_location`](Self::with_location) to attach it via builder
@@ -341,6 +341,60 @@ impl ObservationRecord {
         }
     }
 
+    /// Reconstruct an observation record from persisted storage and verify
+    /// that the stored `observation_id` still matches the canonical
+    /// derivation.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "ObservationRecord intentionally mirrors a flat durable row schema"
+    )]
+    pub fn from_persisted(
+        tenant_id: TenantId,
+        observation_id: ObservationId,
+        occurrence_id: OccurrenceId,
+        policy_hash: PolicyHash,
+        ovid_hash: OvidHash,
+        run_id: RunId,
+        shard_id: ShardId,
+        fence_epoch: FenceEpoch,
+        seen_at: LogicalTime,
+    ) -> Result<Self, PersistenceInputError> {
+        let record = Self::new(
+            tenant_id,
+            occurrence_id,
+            policy_hash,
+            ovid_hash,
+            run_id,
+            shard_id,
+            fence_epoch,
+            seen_at,
+        );
+
+        if record.observation_id != observation_id {
+            return Err(PersistenceInputError::ObservationIdMismatch {
+                expected: record.observation_id,
+                actual: observation_id,
+            });
+        }
+
+        Ok(record)
+    }
+
+    /// Verify that the stored `observation_id` still matches the canonical
+    /// derivation from `(tenant, policy_hash, occurrence_id)`.
+    pub fn validate_identity(&self) -> Result<(), PersistenceInputError> {
+        let expected = self.derived_observation_id();
+
+        if self.observation_id != expected {
+            return Err(PersistenceInputError::ObservationIdMismatch {
+                expected,
+                actual: self.observation_id,
+            });
+        }
+
+        Ok(())
+    }
+
     /// Attach display-safe location metadata (path and optional URL).
     #[must_use]
     pub fn with_location(self, location: Location) -> Self {
@@ -362,6 +416,17 @@ impl ObservationRecord {
     #[must_use]
     pub const fn observation_id(&self) -> ObservationId {
         self.observation_id
+    }
+
+    /// Recompute the canonical observation id from this record's identity
+    /// fields.
+    #[must_use]
+    pub fn derived_observation_id(&self) -> ObservationId {
+        derive_observation_id(&ObservationIdInputs {
+            tenant: self.tenant_id,
+            policy: self.policy_hash,
+            occurrence: self.occurrence_id,
+        })
     }
 
     /// Parent occurrence this observation references.
@@ -424,12 +489,7 @@ impl ObservationRecord {
     /// derivation from the record's identity fields.
     #[must_use]
     pub fn verify_id(&self) -> bool {
-        let expected = derive_observation_id(&ObservationIdInputs {
-            tenant: self.tenant_id,
-            policy: self.policy_hash,
-            occurrence: self.occurrence_id,
-        });
-        self.observation_id == expected
+        self.validate_identity().is_ok()
     }
 }
 
@@ -488,6 +548,19 @@ impl<'a> FindingsUpsertBatch<'a> {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.findings.is_empty() && self.occurrences.is_empty() && self.observations.is_empty()
+    }
+
+    /// Validate A3 observation-identity invariants that are local to this
+    /// batch.
+    ///
+    /// This checks that every observation's stored `observation_id` matches
+    /// the canonical derivation from `(tenant, policy_hash, occurrence_id)`.
+    pub fn validate(self) -> Result<(), PersistenceInputError> {
+        for observation in self.observations {
+            observation.validate_identity()?;
+        }
+
+        Ok(())
     }
 
     /// Total number of records across all three layers.
@@ -571,10 +644,13 @@ impl<'a> FindingsUpsertBatch<'a> {
 ///    `OccurrenceRecord.finding_id` references a persisted or in-batch
 ///    `FindingRecord`, and every `ObservationRecord.occurrence_id` references
 ///    a persisted or in-batch `OccurrenceRecord`.
-/// 3. **Atomicity scope.** Whether the batch is applied atomically (single
+/// 3. **Canonical observation identity.** `ObservationRecord.observation_id`
+///    must equal the canonical derivation from `(tenant_id, policy_hash,
+///    occurrence_id)`.
+/// 4. **Atomicity scope.** Whether the batch is applied atomically (single
 ///    transaction) or row-by-row is a backend decision; the trait does not
 ///    mandate transactional guarantees beyond idempotency.
-/// 4. **Submission is not durability.** Returning `Ok(handle)` means the
+/// 5. **Submission is not durability.** Returning `Ok(handle)` means the
 ///    backend accepted the batch; durability is established only when
 ///    [`CommitHandle::wait`] yields a [`FindingsCommitReceipt`].
 pub trait FindingsSink: Send + Sync {
@@ -590,7 +666,8 @@ pub trait FindingsSink: Send + Sync {
     /// [`RECOMMENDED_MAX_BATCH_SIZE`](super::RECOMMENDED_MAX_BATCH_SIZE).
     ///
     /// An empty batch is a valid no-op. The backend must enforce referential
-    /// integrity as described in the trait-level documentation.
+    /// integrity and canonical observation-identity invariants as described in
+    /// the trait-level documentation.
     ///
     /// `Ok(handle)` means the backend accepted responsibility for the batch.
     /// The caller must wait on the returned handle before treating the write as

@@ -33,6 +33,14 @@
 //! `DoneLedger::batch_upsert`, and only checkpoint the cursor after both layers
 //! are durable. The `PageCommit<S>` typestate machine enforces that ordering.
 //!
+//! ## A3 Identity Scope
+//!
+//! Durable policy-scoped observations are rooted in a canonical
+//! [`ObservationId`](crate::identity::ObservationId) derived from
+//! `(tenant_id, policy_hash, occurrence_id)`. Persistence constructors and
+//! storage round-trip rebuild paths must reject mismatched observation ids
+//! rather than trusting caller-provided values.
+//!
 //! ## Batch size guidance
 //!
 //! Both `DoneLedger` and `FindingsSink` accept slice-based batches.
