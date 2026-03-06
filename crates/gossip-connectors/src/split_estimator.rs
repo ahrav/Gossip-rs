@@ -224,10 +224,6 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
     debug_assert!(cap >= 2, "compact target must be >= 2");
 
     let len = samples.len();
-    if cap == 1 {
-        return vec![len - 1];
-    }
-
     let axis = preferred_axis(samples);
     let first = samples.first().expect("non-empty samples").position(axis);
     let last = samples.last().expect("non-empty samples").position(axis);
@@ -243,6 +239,19 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
     let mut last_pick: Option<usize> = None;
 
     for i in 0..cap {
+        // Endpoints: always preserve first and last sample regardless of
+        // axis-value ties or plateau layout.
+        if i == 0 {
+            picks.push(0);
+            last_pick = Some(0);
+            cursor = 0;
+            continue;
+        }
+        if i + 1 == cap {
+            picks.push(len - 1);
+            break;
+        }
+
         let target = interpolated_position(first, last, i, cap);
 
         while cursor + 1 < len && samples[cursor + 1].position(axis) < target {
