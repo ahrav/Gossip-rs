@@ -83,7 +83,7 @@ Non-negotiables (project-wide):
 |------|---------|
 | `FindingsCommitReceipt` | Proves three-layer findings data is durable. Carries `finding_count`, `occurrence_count`, `observation_count`. |
 | `DoneLedgerCommitReceipt` | Proves done-ledger rows are durable. Carries `record_count`, `scanned_count`, `findings_count`. |
-| `CheckpointCommitReceipt` | Proves cursor checkpoint is durable. Carries full scope fields (tenant, run, shard, epoch, cursor, item count, timestamp) for validation by the typestate machine. |
+| `CheckpointCommitReceipt` | Proves cursor checkpoint is durable. Embeds a `PageCommitScope` and `checkpointed_at` timestamp; the typestate machine validates receipt-to-scope correspondence with a single equality check. |
 | `ItemCommitReceipt` | Composite: findings + done-ledger. Assembled by `PageCommit` after validating ordering. |
 | `PageCommitReceipt` | Terminal composite: item-commit + checkpoint. Sufficient proof that the cursor can be safely advanced. |
 
@@ -95,7 +95,7 @@ Non-negotiables (project-wide):
 | `FindingsDurable` | Typestate: findings are durable; done-ledger is next. Carries `FindingsCommitReceipt`. |
 | `ItemDurable` | Typestate: findings + done-ledger durable; checkpoint is next. Carries `ItemCommitReceipt`. |
 | `CheckpointDurable` | Typestate: terminal state, all three stages durable. Carries `PageCommitReceipt`. |
-| `PageCommitValidationError` | Receipt-vs-scope mismatch errors (item count, tenant, run, shard, epoch, cursor). |
+| `PageCommitValidationError` | Receipt-vs-scope mismatch errors: `LedgerItemCountMismatch` (done-ledger) and `CheckpointScopeMismatch` (checkpoint). |
 | `CommitAdvanceError<E>` | Combined wait-or-validation error for `wait_*` transitions. |
 
 **Shared error type** (`error.rs`):
@@ -526,7 +526,7 @@ The worker-side commit protocol is mandatory and enforces correctness without cr
 
 1. **`AwaitingFindings` → `FindingsDurable`**: Findings durable (Postgres) — `record_findings` / `wait_findings`
 2. **`FindingsDurable` → `ItemDurable`**: Done-ledger durable (Scylla) — `record_done_ledger` / `wait_done_ledger` (validates item count)
-3. **`ItemDurable` → `CheckpointDurable`**: Cursor checkpoint durable (etcd) — `record_checkpoint` / `wait_checkpoint` (validates full scope: tenant, run, shard, epoch, item count, cursor)
+3. **`ItemDurable` → `CheckpointDurable`**: Cursor checkpoint durable (etcd) — `record_checkpoint` / `wait_checkpoint` (validates receipt scope equals page scope)
 
 Consequences:
 
