@@ -2,8 +2,9 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use gossip_contracts::identity::{
     ConnectorInstanceIdHash, ConnectorTag, FindingId, FindingIdInputs, IdHashMode, ItemIdentityKey,
-    NormHash, ObjectVersionId, OccurrenceIdInputs, PolicyHashInputs, RuleFingerprint, StableItemId,
-    TenantId, TenantSecretKey, compute_policy_hash, derive_finding_id, derive_occurrence_id,
+    NormHash, ObjectVersionId, ObservationIdInputs, OccurrenceId, OccurrenceIdInputs, PolicyHash,
+    PolicyHashInputs, RuleFingerprint, StableItemId, TenantId, TenantSecretKey,
+    compute_policy_hash, derive_finding_id, derive_observation_id, derive_occurrence_id,
     key_secret_hash,
 };
 
@@ -43,6 +44,17 @@ fn bench_derive_occurrence_id(c: &mut Criterion) {
 
     c.bench_function("derive_occurrence_id", |b| {
         b.iter(|| derive_occurrence_id(black_box(&inputs)))
+    });
+}
+
+fn bench_derive_observation_id(c: &mut Criterion) {
+    let inputs = ObservationIdInputs {
+        tenant: TenantId::from_bytes([0x77; 32]),
+        policy: PolicyHash::from_bytes([0x88; 32]),
+        occurrence: OccurrenceId::from_bytes([0x99; 32]),
+    };
+    c.bench_function("derive_observation_id", |b| {
+        b.iter(|| derive_observation_id(black_box(&inputs)))
     });
 }
 
@@ -108,6 +120,7 @@ criterion_group!(
     bench_key_secret_hash,
     bench_derive_finding_id,
     bench_derive_occurrence_id,
+    bench_derive_observation_id,
     bench_compute_policy_hash,
     bench_item_key_stable_id,
     bench_full_derivation_chain,

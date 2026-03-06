@@ -13,14 +13,15 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Fuzz ItemIdentityKey::new — must not panic except on empty locator.
-    if data.len() >= 9 {
+    if data.len() >= 41 {
         let tag_bytes: [u8; 8] = data[..8].try_into().unwrap();
-        let locator = data[8..].to_vec();
+        let instance_id_bytes = &data[8..40];
+        let locator = data[40..].to_vec();
         if !locator.is_empty() {
             let connector = ConnectorTag::from_bytes(tag_bytes);
             let key = ItemIdentityKey::new(
                 connector,
-                ConnectorInstanceIdHash::from_instance_id_bytes(b"fuzz-instance"),
+                ConnectorInstanceIdHash::from_instance_id_bytes(instance_id_bytes),
                 locator,
             );
             // Derive stable_id — must not panic.

@@ -8,8 +8,8 @@ use gossip_contracts::identity::{
 };
 
 fuzz_target!(|data: &[u8]| {
-    // Need at least 128 bytes to fill the full derivation chain inputs.
-    if data.len() < 128 {
+    // Need at least 160 bytes to fill the full derivation chain inputs.
+    if data.len() < 160 {
         return;
     }
 
@@ -18,10 +18,11 @@ fuzz_target!(|data: &[u8]| {
     let norm_bytes: [u8; 32] = data[32..64].try_into().unwrap();
     let tenant_bytes: [u8; 32] = data[64..96].try_into().unwrap();
     let rule_bytes: [u8; 32] = data[96..128].try_into().unwrap();
+    let instance_id_bytes = &data[128..160];
 
     // Use remaining bytes as item path (or a fallback).
-    let path = if data.len() > 128 {
-        data[128..].to_vec()
+    let path = if data.len() > 160 {
+        data[160..].to_vec()
     } else {
         vec![0x42]
     };
@@ -29,7 +30,7 @@ fuzz_target!(|data: &[u8]| {
     let connector = ConnectorTag::from_bytes(*b"fuzztest");
     let item_key = ItemIdentityKey::new(
         connector,
-        ConnectorInstanceIdHash::from_instance_id_bytes(b"fuzz-instance"),
+        ConnectorInstanceIdHash::from_instance_id_bytes(instance_id_bytes),
         path,
     );
     let stable_id = item_key.stable_id();
