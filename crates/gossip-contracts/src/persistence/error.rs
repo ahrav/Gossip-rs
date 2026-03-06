@@ -27,6 +27,17 @@ pub enum PersistenceInputError {
         status: &'static str,
         findings_count: u32,
     },
+    /// A failure or skip status requires an error code, but none was provided.
+    MissingErrorCode { status: &'static str },
+    /// A scanned (success) status must not carry an error code.
+    UnexpectedErrorCode { status: &'static str },
+    /// A child record references a parent that does not exist in the batch.
+    OrphanedReference {
+        child_type: &'static str,
+        parent_type: &'static str,
+    },
+    /// Records in the batch belong to different tenants.
+    InconsistentTenant,
 }
 
 impl fmt::Display for PersistenceInputError {
@@ -48,6 +59,25 @@ impl fmt::Display for PersistenceInputError {
                 f,
                 "findings_count {findings_count} is inconsistent with status {status}"
             ),
+            Self::MissingErrorCode { status } => {
+                write!(
+                    f,
+                    "status {status} requires an error code, but none was provided"
+                )
+            }
+            Self::UnexpectedErrorCode { status } => {
+                write!(f, "status {status} must not carry an error code")
+            }
+            Self::OrphanedReference {
+                child_type,
+                parent_type,
+            } => write!(
+                f,
+                "{child_type} references a {parent_type} not present in the batch"
+            ),
+            Self::InconsistentTenant => {
+                write!(f, "records in the batch belong to different tenants")
+            }
         }
     }
 }

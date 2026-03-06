@@ -26,37 +26,19 @@ crate::define_id_32! {
 }
 
 /// Structured inputs to [`derive_ovid_hash`].
+///
+/// Fields are public to match peer input types ([`FindingIdInputs`],
+/// [`OccurrenceIdInputs`], [`ObservationIdInputs`]).
+///
+/// [`FindingIdInputs`]: crate::identity::FindingIdInputs
+/// [`OccurrenceIdInputs`]: crate::identity::OccurrenceIdInputs
+/// [`ObservationIdInputs`]: crate::identity::ObservationIdInputs
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OvidHashInputs {
-    stable_item_id: StableItemId,
-    version: VersionId,
-}
-
-impl OvidHashInputs {
-    /// Construct OVID-hash inputs from the stable item identity and version
-    /// claim returned by a connector.
-    #[inline]
-    #[must_use]
-    pub const fn new(stable_item_id: StableItemId, version: VersionId) -> Self {
-        Self {
-            stable_item_id,
-            version,
-        }
-    }
-
-    /// Stable item identity component.
-    #[inline]
-    #[must_use]
-    pub const fn stable_item_id(self) -> StableItemId {
-        self.stable_item_id
-    }
-
-    /// Version claim component.
-    #[inline]
-    #[must_use]
-    pub const fn version(self) -> VersionId {
-        self.version
-    }
+    /// Stable item identity (connector-scoped).
+    pub stable_item_id: StableItemId,
+    /// Version claim (strong or weak) from the connector.
+    pub version: VersionId,
 }
 
 impl CanonicalBytes for OvidHashInputs {
@@ -109,31 +91,37 @@ mod tests {
 
     #[test]
     fn ovid_hash_is_deterministic_for_same_inputs() {
-        let inputs = OvidHashInputs::new(stable_item(7), VersionId::Strong(version(11)));
+        let inputs = OvidHashInputs {
+            stable_item_id: stable_item(7),
+            version: VersionId::Strong(version(11)),
+        };
 
         assert_eq!(derive_ovid_hash(&inputs), derive_ovid_hash(&inputs));
     }
 
     #[test]
     fn strong_and_weak_versions_hash_differ() {
-        let stable_item_id = stable_item(3);
+        let sid = stable_item(3);
         let object_version_id = version(9);
 
-        let strong = derive_ovid_hash(&OvidHashInputs::new(
-            stable_item_id,
-            VersionId::Strong(object_version_id),
-        ));
-        let weak = derive_ovid_hash(&OvidHashInputs::new(
-            stable_item_id,
-            VersionId::Weak(object_version_id),
-        ));
+        let strong = derive_ovid_hash(&OvidHashInputs {
+            stable_item_id: sid,
+            version: VersionId::Strong(object_version_id),
+        });
+        let weak = derive_ovid_hash(&OvidHashInputs {
+            stable_item_id: sid,
+            version: VersionId::Weak(object_version_id),
+        });
 
         assert_ne!(strong, weak);
     }
 
     #[test]
     fn ovid_hash_inputs_canonical_digest_is_stable() {
-        let inputs = OvidHashInputs::new(stable_item(21), VersionId::Weak(version(33)));
+        let inputs = OvidHashInputs {
+            stable_item_id: stable_item(21),
+            version: VersionId::Weak(version(33)),
+        };
 
         assert_eq!(canonical_digest(&inputs), canonical_digest(&inputs));
     }
@@ -149,12 +137,12 @@ mod tests {
         ) {
             let stable_item_id = StableItemId::from_bytes(stable_item_bytes);
             let object_version_id = ObjectVersionId::from_bytes(version_bytes);
-            let version = if is_strong {
+            let ver = if is_strong {
                 VersionId::Strong(object_version_id)
             } else {
                 VersionId::Weak(object_version_id)
             };
-            let inputs = OvidHashInputs::new(stable_item_id, version);
+            let inputs = OvidHashInputs { stable_item_id, version: ver };
 
             prop_assert_eq!(derive_ovid_hash(&inputs), derive_ovid_hash(&inputs));
         }

@@ -224,6 +224,9 @@ impl CanonicalBytes for DoneLedgerStatus {
 /// This is intentionally not a free-form message field. It exists for bounded
 /// internal values like `HTTP_403`, `TIMEOUT`, `UNSUPPORTED FORMAT`, etc. Raw
 /// connector or source content must never be stored here.
+///
+/// Allocation tier: WARM — error codes are only attached to failure/skip
+/// statuses, which are non-steady-state paths.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DoneLedgerErrorCode(Box<str>);
 
@@ -257,6 +260,7 @@ impl DoneLedgerErrorCode {
                 max: MAX_DONE_LEDGER_ERROR_CODE_SIZE,
             });
         }
+        let mut all_spaces = true;
         for (index, byte) in code.bytes().enumerate() {
             let ok = byte.is_ascii_alphanumeric()
                 || matches!(byte, b' ' | b'_' | b'-' | b'.' | b':' | b'/');
@@ -267,6 +271,14 @@ impl DoneLedgerErrorCode {
                     byte,
                 });
             }
+            if byte != b' ' {
+                all_spaces = false;
+            }
+        }
+        if all_spaces {
+            return Err(PersistenceInputError::Empty {
+                field: "DoneLedgerErrorCode",
+            });
         }
         Ok(Self(code.into_boxed_str()))
     }
@@ -312,15 +324,25 @@ pub struct DoneLedgerProvenance {
 
 impl DoneLedgerProvenance {
     /// Construct provenance for a done-ledger write.
+    ///
+    /// # Debug-mode invariant
+    ///
+    /// `started_at` must not exceed `finished_at`. A violation triggers a
+    /// `debug_assert` panic in debug builds but is silently accepted in
+    /// release builds.
     #[inline]
     #[must_use]
-    pub const fn new(
+    pub fn new(
         run_id: RunId,
         shard_id: ShardId,
         fence_epoch: FenceEpoch,
         started_at: LogicalTime,
         finished_at: LogicalTime,
     ) -> Self {
+        debug_assert!(
+            started_at.as_raw() <= finished_at.as_raw(),
+            "provenance: started_at ({started_at:?}) must not exceed finished_at ({finished_at:?})"
+        );
         Self {
             run_id,
             shard_id,
@@ -477,6 +499,81 @@ impl DoneLedgerRecord {
     pub fn error_code(&self) -> Option<&DoneLedgerErrorCode> {
         self.error_code.as_ref()
     }
+
+    /// Validate cross-field invariants that are intentionally not enforced at
+    /// construction (to keep [`try_new`](Self::try_new) flexible for
+    /// deserialization).
+    ///
+    /// Write-path callers should invoke this before persisting a record.
+    ///
+    /// # Checks
+    ///
+    /// - `ScannedClean`: `findings_count == 0` **and** `error_code` is `None`.
+    /// - `ScannedWithFindings`: `findings_count > 0`.
+    /// - `FailedRetryable` / `FailedPermanent` / `Skipped`: `error_code` is `Some`.
+    pub fn validate(&self) -> Result<(), PersistenceInputError> {
+        let status_name = match self.status {
+            DoneLedgerStatus::ScannedClean => "ScannedClean",
+            DoneLedgerStatus::ScannedWithFindings => "ScannedWithFindings",
+            DoneLedgerStatus::FailedRetryable => "FailedRetryable",
+            DoneLedgerStatus::FailedPermanent => "FailedPermanent",
+            DoneLedgerStatus::Skipped => "Skipped",
+        };
+
+        match self.status {
+            DoneLedgerStatus::ScannedClean => {
+                if self.findings_count != 0 {
+                    return Err(PersistenceInputError::InconsistentFindingsCount {
+                        status: status_name,
+                        findings_count: self.findings_count,
+                    });
+                }
+                if self.error_code.is_some() {
+                    return Err(PersistenceInputError::UnexpectedErrorCode {
+                        status: status_name,
+                    });
+                }
+            }
+            DoneLedgerStatus::ScannedWithFindings => {
+                if self.findings_count == 0 {
+                    return Err(PersistenceInputError::InconsistentFindingsCount {
+                        status: status_name,
+                        findings_count: self.findings_count,
+                    });
+                }
+                if self.error_code.is_some() {
+                    return Err(PersistenceInputError::UnexpectedErrorCode {
+                        status: status_name,
+                    });
+                }
+            }
+            DoneLedgerStatus::FailedRetryable
+            | DoneLedgerStatus::FailedPermanent
+            | DoneLedgerStatus::Skipped => {
+                if self.error_code.is_none() {
+                    return Err(PersistenceInputError::MissingErrorCode {
+                        status: status_name,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Merge this record with an existing one, returning the record whose
+    /// status dominates according to the [`DoneLedgerStatus`] lattice.
+    ///
+    /// Backends call `incoming.merge_with(&existing_row)` instead of
+    /// reimplementing the lattice merge logic.
+    #[must_use]
+    pub fn merge_with(self, existing: &DoneLedgerRecord) -> Self {
+        let merged_status = self.status.merge(existing.status);
+        if merged_status == self.status {
+            self
+        } else {
+            existing.clone()
+        }
+    }
 }
 
 /// Backend-neutral trait for a durable done-ledger store.
@@ -500,6 +597,11 @@ pub trait DoneLedger: Send + Sync {
     /// Look up done-ledger rows for a batch of object-versions within one
     /// tenant and policy.
     ///
+    /// This is a WARM-tier operation (per-batch, not per-item). Callers
+    /// SHOULD keep `ovid_hashes` at or below
+    /// [`RECOMMENDED_MAX_BATCH_SIZE`](super::RECOMMENDED_MAX_BATCH_SIZE);
+    /// backends may impose implementation-specific limits.
+    ///
     /// Returns a positional `Vec` aligned with `ovid_hashes`: the *i*-th
     /// element is `Some(record)` if the key `(tenant_id, policy_hash,
     /// ovid_hashes[i])` exists, or `None` otherwise.
@@ -512,6 +614,9 @@ pub trait DoneLedger: Send + Sync {
 
     /// Upsert a batch of done-ledger records, applying monotonic merge
     /// semantics for any keys that already exist.
+    ///
+    /// Callers SHOULD keep `records` at or below
+    /// [`RECOMMENDED_MAX_BATCH_SIZE`](super::RECOMMENDED_MAX_BATCH_SIZE).
     ///
     /// If the batch contains duplicate keys, the implementation must
     /// merge them (not produce duplicate rows). The final persisted status
@@ -743,5 +848,292 @@ mod tests {
             DoneLedgerRecord::try_new(key2, status, 0, 5, make_provenance(), None)
                 .unwrap_or_else(|e| panic!("{status:?} with count 5 should succeed: {e}"));
         }
+    }
+
+    // -- Associativity --
+
+    #[test]
+    fn done_ledger_status_merge_is_associative() {
+        for a in ALL_STATUSES {
+            for b in ALL_STATUSES {
+                for c in ALL_STATUSES {
+                    assert_eq!(
+                        a.merge(b.merge(c)),
+                        a.merge(b).merge(c),
+                        "associativity failed for ({a:?}, {b:?}, {c:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    // -- All-whitespace error code rejection --
+
+    #[test]
+    fn done_ledger_error_code_rejects_all_whitespace() {
+        assert_eq!(
+            DoneLedgerErrorCode::try_new("   ").unwrap_err(),
+            PersistenceInputError::Empty {
+                field: "DoneLedgerErrorCode",
+            }
+        );
+    }
+
+    // -- validate cross-field invariants --
+
+    #[test]
+    fn validate_accepts_consistent_scanned_clean() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            1024,
+            0,
+            make_provenance(),
+            None,
+        )
+        .unwrap();
+        record
+            .validate()
+            .expect("consistent ScannedClean should pass validation");
+    }
+
+    #[test]
+    fn validate_accepts_consistent_scanned_with_findings() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedWithFindings,
+            1024,
+            3,
+            make_provenance(),
+            None,
+        )
+        .unwrap();
+        record
+            .validate()
+            .expect("consistent ScannedWithFindings should pass validation");
+    }
+
+    #[test]
+    fn validate_accepts_failure_with_error_code() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let code = DoneLedgerErrorCode::try_new("TIMEOUT").unwrap();
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::FailedRetryable,
+            0,
+            0,
+            make_provenance(),
+            Some(code),
+        )
+        .unwrap();
+        record
+            .validate()
+            .expect("FailedRetryable with error code should pass validation");
+    }
+
+    #[test]
+    fn validate_accepts_skipped_with_error_code() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let code = DoneLedgerErrorCode::try_new("UNSUPPORTED_FORMAT").unwrap();
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::Skipped,
+            0,
+            0,
+            make_provenance(),
+            Some(code),
+        )
+        .unwrap();
+        record
+            .validate()
+            .expect("Skipped with error code should pass validation");
+    }
+
+    #[test]
+    fn validate_rejects_scanned_clean_with_error_code() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let code = DoneLedgerErrorCode::try_new("STALE").unwrap();
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            1024,
+            0,
+            make_provenance(),
+            Some(code),
+        )
+        .unwrap();
+        assert_eq!(
+            record.validate().unwrap_err(),
+            PersistenceInputError::UnexpectedErrorCode {
+                status: "ScannedClean",
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_scanned_with_findings_with_error_code() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let code = DoneLedgerErrorCode::try_new("STALE").unwrap();
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedWithFindings,
+            1024,
+            5,
+            make_provenance(),
+            Some(code),
+        )
+        .unwrap();
+        assert_eq!(
+            record.validate().unwrap_err(),
+            PersistenceInputError::UnexpectedErrorCode {
+                status: "ScannedWithFindings",
+            }
+        );
+    }
+
+    #[test]
+    fn validate_rejects_failure_without_error_code() {
+        for status in [
+            DoneLedgerStatus::FailedRetryable,
+            DoneLedgerStatus::FailedPermanent,
+        ] {
+            let status_name = match status {
+                DoneLedgerStatus::FailedRetryable => "FailedRetryable",
+                DoneLedgerStatus::FailedPermanent => "FailedPermanent",
+                _ => unreachable!(),
+            };
+            let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+            let record =
+                DoneLedgerRecord::try_new(key, status, 0, 0, make_provenance(), None).unwrap();
+            assert_eq!(
+                record.validate().unwrap_err(),
+                PersistenceInputError::MissingErrorCode {
+                    status: status_name,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_skipped_without_error_code() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let record = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::Skipped,
+            0,
+            0,
+            make_provenance(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            record.validate().unwrap_err(),
+            PersistenceInputError::MissingErrorCode { status: "Skipped" }
+        );
+    }
+
+    // -- merge_with --
+
+    #[test]
+    fn merge_with_returns_dominant_record() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let code = DoneLedgerErrorCode::try_new("TIMEOUT").unwrap();
+        let failure = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::FailedRetryable,
+            0,
+            0,
+            make_provenance(),
+            Some(code),
+        )
+        .unwrap();
+        let success = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            1024,
+            0,
+            make_provenance(),
+            None,
+        )
+        .unwrap();
+
+        // ScannedClean dominates FailedRetryable.
+        let merged = success.clone().merge_with(&failure);
+        assert_eq!(merged.status(), DoneLedgerStatus::ScannedClean);
+
+        // When incoming is dominated, existing wins.
+        let merged = failure.merge_with(&success);
+        assert_eq!(merged.status(), DoneLedgerStatus::ScannedClean);
+    }
+
+    #[test]
+    fn merge_with_same_status_returns_incoming() {
+        let key = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+        let a = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            100,
+            0,
+            make_provenance(),
+            None,
+        )
+        .unwrap();
+        let b = DoneLedgerRecord::try_new(
+            key,
+            DoneLedgerStatus::ScannedClean,
+            200,
+            0,
+            make_provenance(),
+            None,
+        )
+        .unwrap();
+
+        // Equal ranks: self wins (incoming record).
+        let merged = a.clone().merge_with(&b);
+        assert_eq!(merged.bytes_scanned(), 100);
+    }
+
+    // -- Provenance temporal ordering --
+
+    #[test]
+    fn provenance_accepts_equal_timestamps() {
+        let t = LogicalTime::from_raw(100);
+        let prov = DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(2),
+            FenceEpoch::from_raw(3),
+            t,
+            t,
+        );
+        assert_eq!(prov.started_at(), t);
+        assert_eq!(prov.finished_at(), t);
+    }
+
+    #[test]
+    fn provenance_accepts_start_before_finish() {
+        let prov = DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(2),
+            FenceEpoch::from_raw(3),
+            LogicalTime::from_raw(10),
+            LogicalTime::from_raw(20),
+        );
+        assert_eq!(prov.started_at().as_raw(), 10);
+        assert_eq!(prov.finished_at().as_raw(), 20);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "must not exceed")]
+    fn provenance_rejects_start_after_finish_in_debug() {
+        let _ = DoneLedgerProvenance::new(
+            RunId::from_raw(1),
+            ShardId::from_raw(2),
+            FenceEpoch::from_raw(3),
+            LogicalTime::from_raw(200),
+            LogicalTime::from_raw(100),
+        );
     }
 }

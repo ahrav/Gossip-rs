@@ -15,6 +15,22 @@
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
 //!
+//! ## Cross-trait ordering contract
+//!
+//! When a scan produces findings, callers must persist them via
+//! `FindingsSink::upsert_batch` **before** recording completion in
+//! `DoneLedger::batch_upsert`. This ordering ensures that a done-ledger
+//! entry with `ScannedWithFindings` always has its findings already durable.
+//! Mechanical enforcement of this ordering is deferred to the commit protocol
+//! layer (`PageCommit`), which is not yet defined in this crate.
+//!
+//! ## Batch size guidance
+//!
+//! Both `DoneLedger` and `FindingsSink` accept slice-based batches.
+//! Callers SHOULD keep batches at or below `RECOMMENDED_MAX_BATCH_SIZE`
+//! records. Implementations SHOULD reject batches exceeding this limit via
+//! their associated error type.
+//!
 //! ## Invariants
 //!
 //! - No raw secret bytes appear in any public record shape.
@@ -27,6 +43,13 @@ mod done_ledger;
 mod error;
 mod findings;
 mod ovid;
+
+/// Recommended maximum batch size for persistence operations.
+///
+/// Both [`DoneLedger`] and [`FindingsSink`] accept slice-based batches.
+/// Implementations SHOULD reject batches exceeding this limit via their
+/// associated error type.
+pub const RECOMMENDED_MAX_BATCH_SIZE: usize = 10_000;
 
 pub use done_ledger::{
     DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
