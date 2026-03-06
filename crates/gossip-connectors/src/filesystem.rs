@@ -315,7 +315,7 @@ impl FilesystemConnector {
             "FilesystemConnector root path must not be empty"
         );
         let connector_instance =
-            ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_bytes());
+            ConnectorInstanceIdHash::from_instance_id_bytes(root.as_os_str().as_encoded_bytes());
         Self {
             root,
             connector_instance,
