@@ -179,19 +179,28 @@ impl fmt::Display for PageCommitValidationError {
                 f,
                 "done-ledger receipt item count mismatch: expected {expected}, got {actual}"
             ),
-            Self::CheckpointTenantMismatch { .. } => {
-                write!(f, "checkpoint receipt tenant does not match page scope")
-            }
-            Self::CheckpointRunMismatch { .. } => {
-                write!(f, "checkpoint receipt run does not match page scope")
-            }
-            Self::CheckpointShardMismatch { .. } => {
-                write!(f, "checkpoint receipt shard does not match page scope")
-            }
-            Self::CheckpointFenceMismatch { .. } => {
+            Self::CheckpointTenantMismatch { expected, actual } => {
                 write!(
                     f,
-                    "checkpoint receipt fence epoch does not match page scope"
+                    "checkpoint receipt tenant mismatch: expected {expected:?}, got {actual:?}"
+                )
+            }
+            Self::CheckpointRunMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "checkpoint receipt run mismatch: expected {expected:?}, got {actual:?}"
+                )
+            }
+            Self::CheckpointShardMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "checkpoint receipt shard mismatch: expected {expected:?}, got {actual:?}"
+                )
+            }
+            Self::CheckpointFenceMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "checkpoint receipt fence epoch mismatch: expected {expected:?}, got {actual:?}"
                 )
             }
             Self::CheckpointItemCountMismatch { expected, actual } => write!(
@@ -874,6 +883,42 @@ mod tests {
             CommitAdvanceError::<TestWaitError>::Validation(
                 PageCommitValidationError::CheckpointCursorMismatch,
             )
+        );
+    }
+
+    #[test]
+    fn done_ledger_validates_count_not_scope_by_design() {
+        // Two pages with different scopes but the same committed_items.
+        let scope_a = sample_scope(); // committed_items = 2
+        let scope_b = PageCommitScope::new(
+            tenant(9),                // different tenant
+            RunId::from_raw(99),      // different run
+            ShardId::from_raw(88),    // different shard
+            FenceEpoch::from_raw(77), // different epoch
+            2,                        // same committed_items
+            sample_cursor(6),         // different cursor
+        );
+        assert_eq!(scope_a.committed_items(), scope_b.committed_items());
+        assert_ne!(scope_a.tenant_id(), scope_b.tenant_id());
+
+        // Page A accepts a done-ledger receipt matching page B's count.
+        // This is the documented behavior (module docs lines 40-45):
+        // done-ledger receipts carry only aggregate counts because they
+        // are produced by the same in-process pipeline.
+        let page_a = PageCommit::new(scope_a.clone())
+            .record_findings(sample_findings_receipt())
+            .record_done_ledger(sample_done_ledger_receipt(scope_b.committed_items()))
+            .expect("done-ledger stage validates count, not scope — by design");
+
+        // The checkpoint stage is where full scope validation occurs.
+        // A checkpoint receipt scoped to page B is rejected.
+        let wrong_checkpoint = sample_checkpoint_receipt(&scope_b);
+        assert_eq!(
+            page_a.record_checkpoint(wrong_checkpoint).unwrap_err(),
+            PageCommitValidationError::CheckpointTenantMismatch {
+                expected: scope_a.tenant_id(),
+                actual: scope_b.tenant_id(),
+            }
         );
     }
 }

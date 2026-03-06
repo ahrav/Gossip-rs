@@ -115,10 +115,23 @@ fn done_ledger_status_from_rank_rejects_unknown_discriminants() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn done_ledger_key_canonical_digest_is_stable() {
-    let key = DoneLedgerKey::new(tenant(5), policy(7), ovid(11));
+fn done_ledger_key_canonical_digest_is_deterministic() {
+    let a = DoneLedgerKey::new(tenant(5), policy(7), ovid(11));
+    let b = DoneLedgerKey::new(tenant(5), policy(7), ovid(11));
+    assert_eq!(canonical_digest(&a), canonical_digest(&b));
+}
 
-    assert_eq!(canonical_digest(&key), canonical_digest(&key));
+#[test]
+fn done_ledger_key_canonical_digest_golden_value() {
+    let key = DoneLedgerKey::new(tenant(5), policy(7), ovid(11));
+    let digest = canonical_digest(&key);
+    // Golden hash — if this changes, the canonical encoding changed.
+    // Regenerate with: cargo test done_ledger_key_canonical_digest_golden -- --nocapture
+    assert_eq!(
+        digest.to_hex().as_str(),
+        "5e27eaa0abcf3d6a721958222ea7ee068b00bc182123d6beb5a467aaa1d8016b",
+        "golden hash mismatch — did DoneLedgerKey::write_canonical change?"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +308,21 @@ fn merge_with_same_status_returns_incoming() {
     // Equal ranks: self wins (incoming record).
     let merged = a.clone().merge_with(&b);
     assert_eq!(merged.bytes_scanned(), 100);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "merge_with requires matching keys")]
+fn merge_with_different_keys_panics_in_debug() {
+    let key_a = DoneLedgerKey::new(tenant(1), policy(2), ovid(3));
+    let key_b = DoneLedgerKey::new(tenant(9), policy(8), ovid(7));
+    let a =
+        DoneLedgerRecord::try_new(key_a, ScannedClean, 100, 0, make_provenance(), None).unwrap();
+    let b =
+        DoneLedgerRecord::try_new(key_b, ScannedClean, 200, 0, make_provenance(), None).unwrap();
+
+    // Must panic — merging records with different keys is a backend bug.
+    let _ = a.merge_with(&b);
 }
 
 // ---------------------------------------------------------------------------

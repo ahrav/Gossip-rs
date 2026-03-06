@@ -32,7 +32,7 @@
 //! implement as an idempotent upsert. Replaying the same batch — or
 //! overlapping batches — must not create duplicate rows.
 
-use std::{error::Error, num::NonZeroU64};
+use std::{collections::HashSet, error::Error, num::NonZeroU64};
 
 use crate::{
     connector::Location,
@@ -537,24 +537,19 @@ impl<'a> FindingsUpsertBatch<'a> {
         }
 
         // Referential integrity: occurrences → findings, observations → occurrences.
+        let finding_ids: HashSet<_> = self.findings.iter().map(|f| f.finding_id()).collect();
         for occ in self.occurrences {
-            if !self
-                .findings
-                .iter()
-                .any(|f| f.finding_id() == occ.finding_id())
-            {
+            if !finding_ids.contains(&occ.finding_id()) {
                 return Err(PersistenceInputError::OrphanedReference {
                     child_type: "OccurrenceRecord",
                     parent_type: "FindingRecord",
                 });
             }
         }
+        let occurrence_ids: HashSet<_> =
+            self.occurrences.iter().map(|o| o.occurrence_id()).collect();
         for obs in self.observations {
-            if !self
-                .occurrences
-                .iter()
-                .any(|o| o.occurrence_id() == obs.occurrence_id())
-            {
+            if !occurrence_ids.contains(&obs.occurrence_id()) {
                 return Err(PersistenceInputError::OrphanedReference {
                     child_type: "ObservationRecord",
                     parent_type: "OccurrenceRecord",

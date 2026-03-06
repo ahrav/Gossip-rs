@@ -569,8 +569,19 @@ impl DoneLedgerRecord {
     ///
     /// Backends call `incoming.merge_with(&existing_row)` instead of
     /// reimplementing the lattice merge logic.
+    ///
+    /// # Debug-mode invariant
+    ///
+    /// Both records must share the same [`DoneLedgerKey`]. A mismatch triggers
+    /// a `debug_assert` panic in debug builds. In release builds the check is
+    /// elided — callers are expected to have queried by key before merging.
     #[must_use]
     pub fn merge_with(self, existing: &DoneLedgerRecord) -> Self {
+        debug_assert_eq!(
+            self.key, existing.key,
+            "merge_with requires matching keys: self={:?}, existing={:?}",
+            self.key, existing.key
+        );
         let merged_status = self.status.merge(existing.status);
         if merged_status == self.status {
             self
