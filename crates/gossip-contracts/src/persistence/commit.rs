@@ -36,7 +36,7 @@
 //! is gone. [`ReadyCommitHandle`] provides a zero-cost adapter for synchronous
 //! backends and test doubles that already have the result in hand.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use crate::identity::LogicalTime;
 
@@ -260,7 +260,7 @@ impl CommitReceipt for CheckpointCommitReceipt {}
 /// durably committed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemCommitReceipt {
-    scope: PageCommitScope,
+    scope: Arc<PageCommitScope>,
     findings: FindingsCommitReceipt,
     done_ledger: DoneLedgerCommitReceipt,
 }
@@ -272,8 +272,8 @@ impl ItemCommitReceipt {
     /// typestate machine should assemble this after validating ordering.
     #[inline]
     #[must_use]
-    pub(super) const fn new(
-        scope: PageCommitScope,
+    pub(super) fn new(
+        scope: Arc<PageCommitScope>,
         findings: FindingsCommitReceipt,
         done_ledger: DoneLedgerCommitReceipt,
     ) -> Self {
@@ -327,10 +327,7 @@ impl PageCommitReceipt {
     /// receipt against the page scope.
     #[inline]
     #[must_use]
-    pub(super) const fn new(
-        item_commit: ItemCommitReceipt,
-        checkpoint: CheckpointCommitReceipt,
-    ) -> Self {
+    pub(super) fn new(item_commit: ItemCommitReceipt, checkpoint: CheckpointCommitReceipt) -> Self {
         Self {
             item_commit,
             checkpoint,

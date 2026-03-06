@@ -62,7 +62,7 @@
 //! deterministic scope mismatches — retrying will produce the same result.
 //! These indicate a programming error, not a transient failure.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use crate::{
     connector::Cursor,
@@ -332,7 +332,7 @@ pub struct CheckpointDurable {
 #[must_use = "page commits must be driven to a durable receipt or explicitly dropped"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageCommit<S> {
-    scope: PageCommitScope,
+    scope: Arc<PageCommitScope>,
     state: S,
 }
 
@@ -350,7 +350,7 @@ impl PageCommit<AwaitingFindings> {
     #[inline]
     pub fn new(scope: PageCommitScope) -> Self {
         Self {
-            scope,
+            scope: Arc::new(scope),
             state: AwaitingFindings,
         }
     }
@@ -463,7 +463,7 @@ impl PageCommit<ItemDurable> {
         self,
         receipt: CheckpointCommitReceipt,
     ) -> Result<PageCommit<CheckpointDurable>, PageCommitValidationError> {
-        if receipt.scope() != &self.scope {
+        if receipt.scope() != self.scope() {
             return Err(PageCommitValidationError::CheckpointScopeMismatch);
         }
 
@@ -600,6 +600,18 @@ mod tests {
             sample_done_ledger_receipt(scope.committed_items())
         );
         assert_eq!(receipt.checkpoint(), &sample_checkpoint_receipt(&scope));
+    }
+
+    #[test]
+    fn wait_findings_returns_wait_error() {
+        let page = PageCommit::new(sample_scope());
+        assert_eq!(
+            page.wait_findings(ReadyCommitHandle::<FindingsCommitReceipt, _>::err(
+                TestWaitError("findings wait failed"),
+            ))
+            .unwrap_err(),
+            TestWaitError("findings wait failed")
+        );
     }
 
     #[test]
