@@ -461,6 +461,103 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
     );
 }
 
+/// Regression: when the last N samples share identical `cumulative_bytes`
+/// (a byte-position plateau), compaction must still preserve the actual last
+/// sample. Before the fix, nearest-neighbor tie-breaking picked the first
+/// plateau entry instead of `len - 1`.
+#[test]
+fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
+    use super::{Sample, compact_samples};
+
+    // 20 samples: first 12 have distinct increasing byte positions,
+    // last 8 all share the same cumulative_bytes value (plateau).
+    let plateau_bytes = 1200_u64;
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| {
+            let bytes = if i < 12 {
+                (i as u64) * 100
+            } else {
+                plateau_bytes
+            };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    let original_last_key = samples.last().unwrap().key.clone();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+    assert_eq!(
+        &*samples.first().unwrap().key,
+        key_for_index(0).as_slice(),
+        "first sample must be preserved"
+    );
+    assert_eq!(
+        samples.last().unwrap().key,
+        original_last_key,
+        "last sample must be preserved even in a trailing plateau"
+    );
+    // Ranks strictly increasing.
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+}
+
+/// Regression: trailing samples saturated at `u64::MAX` must still preserve
+/// the actual last sample after compaction.
+#[test]
+fn saturated_tail_preserves_last_sample() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| {
+            let bytes = if i < 10 {
+                (i as u64) * 1_000_000
+            } else {
+                u64::MAX
+            };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    let original_last_key = samples.last().unwrap().key.clone();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+    assert_eq!(
+        &*samples.first().unwrap().key,
+        key_for_index(0).as_slice(),
+        "first sample must be preserved under u64::MAX saturation plateau"
+    );
+    assert_eq!(
+        samples.last().unwrap().key,
+        original_last_key,
+        "last sample must be preserved under u64::MAX saturation plateau"
+    );
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+}
+
+/// Compacting to a single slot must preserve the last sample (most-recent
+/// observation), not the first.
+#[test]
+fn compact_to_single_slot_keeps_last_sample() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..5)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+
+    let original_last_key = samples.last().unwrap().key.clone();
+
+    compact_samples(&mut samples, 1);
+
+    assert_eq!(samples.len(), 1, "should compact down to exactly 1 sample");
+    assert_eq!(
+        samples[0].key, original_last_key,
+        "the single retained sample must be the last (most-recent) observation"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Saturation edge-case tests
 // ---------------------------------------------------------------------------
