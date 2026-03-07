@@ -1,5 +1,73 @@
 **NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
 
+<!-- comment-policy-v2 -->
+
+## Comment Policy — MANDATORY, HOOK-ENFORCED
+
+**Source code is not a conversation, a changelog, or a response to PR feedback.**
+Comments must describe the code they annotate — its behavior, invariants, edge
+cases, or non-obvious design reasoning. Nothing else.
+
+A PostToolUse hook (`comment-lint.sh`) scans every `.rs` file write and will
+flag violations. Fix them before moving on.
+
+### What Is Banned
+
+| Category | Examples of BANNED comments |
+|----------|-----------------------------|
+| Tracking IDs | `// F-011: BatchValidation error variant`, `// C3: edge case` |
+| PR / review references | `// PR #124`, `// per review feedback`, `// addressed reviewer concern` |
+| Test justification | `// Verification tests for PR review comments`, `// Added to cover finding F7` |
+| Temporal narration | `// Previously used linear scan`, `// Was changed from X to Y`, `// Newly added` |
+| Conversational | `// Good catch`, `// As discussed`, `// Note to reviewer` |
+| History narration | `// Refactored from module A`, `// Moved from old_engine.rs` |
+
+### What Is Required
+
+Comments must stand alone. A reader with no access to your PR, issue tracker,
+or chat history must fully understand the comment from the code context alone.
+
+**BAD → GOOD rewrites:**
+
+```rust
+// BAD: F-011: BatchValidation error variant
+// GOOD: Rejects submissions that span multiple tenants in a single batch.
+
+// BAD: Verification tests for PR review comments
+// GOOD: Edge-case coverage for batch boundary conditions.
+
+// BAD: F1: Merge panic bug fix
+// GOOD: Merge transition clears stale metadata to prevent use-after-move.
+
+// BAD: Previously used linear scan, refactored to binary search
+// GOOD: Binary search — the rank array is sorted by construction (see insert_sorted above).
+
+// BAD: Added per reviewer suggestion to handle empty input
+// GOOD: Empty input returns Ok(()) — callers depend on this for idempotent retry loops.
+```
+
+### Self-Check Before Writing Any Comment
+
+If you are about to write a comment, ask:
+
+1. Does it reference a finding ID, PR number, or reviewer? **Delete it.**
+2. Does it explain *when* or *why it was changed* rather than *what the code does*? **Rewrite it.**
+3. Would it make sense to someone who has never seen the PR? If not, **rewrite it.**
+
+### Code-Internal Cross-References Are Fine
+
+Stable identifiers that exist purely within the codebase for internal
+cross-referencing (e.g., invariant labels S1–S7 in the simulation checker)
+are documentation, not tracking noise.
+
+### Enforcement
+
+- **Hook**: `comment-lint.sh` runs on every `.rs` file write and flags violations.
+- **Review**: Any PR introducing banned comment patterns will be rejected.
+- **Existing violations**: Must be cleaned up when touching a file.
+
+<!-- end-comment-policy -->
+
 ## Task Management
 
 This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
@@ -341,36 +409,6 @@ Use an operationally tiered policy instead of blanket no-allocation rules.
   allocation behavior will be rejected.
 
 <!-- end-zero-alloc-hot-path -->
-
-<!-- comment-policy-v1 -->
-
-## Comment Policy — Code Comments Are About Code
-
-Comments in source files must describe the code they annotate — its behavior,
-invariants, edge cases, or non-obvious reasoning. They must not reference
-external tracking systems.
-
-### Rules
-
-1. **No issue/tracking IDs in comments.** Do not embed beads IDs, finding
-   numbers (F4, C3, H9), priority tags (P0–P4), or any other external tracker
-   references in code comments. These belong in the tracker, not the source.
-2. **Descriptive text stays.** Section headers like `// -- Exact boundary tests --`
-   are fine. The tracking ID portion is what gets removed.
-3. **Code-internal naming schemes are fine.** Stable identifiers that exist
-   purely to cross-reference within the codebase (e.g., invariant labels S1–S7
-   in the simulation checker) are documentation, not tracking noise.
-4. **Comments explain *why*, not *what*.** Prefer comments that explain
-   non-obvious reasoning, invariants, or edge cases over comments that restate
-   what the code already says.
-
-### Enforcement
-
-Any PR that introduces external tracking IDs in code comments will be
-rejected. If a comment only makes sense when paired with an external tracker,
-rewrite it to stand on its own.
-
-<!-- end-comment-policy -->
 
 ## Rust Code Modification Workflow
 

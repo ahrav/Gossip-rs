@@ -19,6 +19,8 @@ use crate::{
     InMemoryStoreKind,
 };
 
+use gossip_contracts::persistence::PersistenceInputError;
+
 use DoneLedgerStatus::{FailedPermanent, FailedRetryable, ScannedClean, ScannedWithFindings};
 
 fn provenance(
