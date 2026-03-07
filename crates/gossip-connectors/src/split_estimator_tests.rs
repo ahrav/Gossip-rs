@@ -434,6 +434,86 @@ fn interpolated_position_edge_cases() {
     );
 }
 
+// -- nearest_by_rank_in_range --
+
+#[test]
+fn nearest_by_rank_in_range_single_element() {
+    use super::{Sample, nearest_by_rank_in_range};
+
+    let samples = vec![Sample::new(42, 0, &key_for_index(0))];
+    assert_eq!(
+        nearest_by_rank_in_range(&samples, 0, 0, 42),
+        0,
+        "single element must return lo"
+    );
+    assert_eq!(
+        nearest_by_rank_in_range(&samples, 0, 0, 100),
+        0,
+        "single element must return lo regardless of target"
+    );
+}
+
+#[test]
+fn nearest_by_rank_in_range_selects_closest() {
+    use super::{Sample, nearest_by_rank_in_range};
+
+    let samples: Vec<Sample> = (0..10)
+        .map(|i| Sample::new(i * 10, 0, &key_for_index(i as usize)))
+        .collect();
+
+    // Target 25 is between rank 20 (idx 2) and rank 30 (idx 3).
+    // 30 − 25 = 5, 25 − 20 = 5 → tie → earlier index wins.
+    assert_eq!(
+        nearest_by_rank_in_range(&samples, 0, 9, 25),
+        2,
+        "equidistant target should pick earlier index"
+    );
+
+    // Target 26 is closer to rank 30 (idx 3) than rank 20 (idx 2).
+    assert_eq!(
+        nearest_by_rank_in_range(&samples, 0, 9, 26),
+        3,
+        "target closer to higher rank should pick that index"
+    );
+
+    // Restrict range to [4, 7] (ranks 40..70), target 55.
+    assert_eq!(
+        nearest_by_rank_in_range(&samples, 4, 7, 55),
+        5,
+        "should snap to nearest within restricted range"
+    );
+}
+
+#[test]
+fn nearest_by_rank_in_range_tie_breaks_to_earlier() {
+    use super::{Sample, nearest_by_rank_in_range};
+
+    // Two samples equidistant from target.
+    let samples = vec![
+        Sample::new(10, 0, &key_for_index(0)),
+        Sample::new(30, 0, &key_for_index(1)),
+    ];
+    // Target 20 is equidistant from 10 and 30.
+    assert_eq!(
+        nearest_by_rank_in_range(&samples, 0, 1, 20),
+        0,
+        "tie must break to earlier index"
+    );
+}
+
+#[test]
+#[should_panic]
+fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
+    use super::{Sample, nearest_by_rank_in_range};
+
+    let samples = vec![
+        Sample::new(0, 0, &key_for_index(0)),
+        Sample::new(10, 0, &key_for_index(1)),
+    ];
+    // lo > hi should panic (slice indexing).
+    nearest_by_rank_in_range(&samples, 1, 0, 5);
+}
+
 #[test]
 fn compact_samples_preserves_endpoints_and_monotonicity() {
     use super::{Sample, compact_samples};
@@ -893,15 +973,18 @@ fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
         .map(|s| s.rank)
         .collect();
 
-    if plateau2_ranks.len() >= 2 {
-        let span = plateau2_ranks.last().unwrap() - plateau2_ranks.first().unwrap();
-        assert!(
-            span >= 10,
-            "second plateau retained samples should be spread, got span {} from {:?}",
-            span,
-            plateau2_ranks
-        );
-    }
+    assert!(
+        plateau2_ranks.len() >= 2,
+        "second plateau must retain >= 2 samples for spread check, got {:?}",
+        plateau2_ranks
+    );
+    let span = plateau2_ranks.last().unwrap() - plateau2_ranks.first().unwrap();
+    assert!(
+        span >= 10,
+        "second plateau retained samples should be spread, got span {} from {:?}",
+        span,
+        plateau2_ranks
+    );
 
     // Similarly for the third plateau (rank 50..90).
     let plateau3_ranks: Vec<u64> = samples
@@ -910,15 +993,18 @@ fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
         .map(|s| s.rank)
         .collect();
 
-    if plateau3_ranks.len() >= 2 {
-        let span = plateau3_ranks.last().unwrap() - plateau3_ranks.first().unwrap();
-        assert!(
-            span >= 10,
-            "third plateau retained samples should be spread, got span {} from {:?}",
-            span,
-            plateau3_ranks
-        );
-    }
+    assert!(
+        plateau3_ranks.len() >= 2,
+        "third plateau must retain >= 2 samples for spread check, got {:?}",
+        plateau3_ranks
+    );
+    let span = plateau3_ranks.last().unwrap() - plateau3_ranks.first().unwrap();
+    assert!(
+        span >= 10,
+        "third plateau retained samples should be spread, got span {} from {:?}",
+        span,
+        plateau3_ranks
+    );
 
     // Endpoints preserved.
     assert_eq!(samples.first().unwrap().rank, 0);
@@ -962,4 +1048,105 @@ fn plateau_of_two_samples_is_handled() {
             .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes),
         "byte positions must remain non-decreasing"
     );
+}
+
+/// Plateau with a large rank gap at the end. When `nearest_by_rank_in_range`
+/// snaps two consecutive picks to the highest-rank sample, the `floor`
+/// enforcement pushes the second pick past `eff_end` without a ceiling
+/// constraint.
+///
+/// Layout (7 samples, compact to 6):
+///   index 0: rank=0,     bytes=0    (leading boundary)
+///   index 1: rank=1,     bytes=1000 ┐
+///   index 2: rank=2,     bytes=1000 │ plateau
+///   index 3: rank=3,     bytes=1000 │
+///   index 4: rank=4,     bytes=1000 │
+///   index 5: rank=10000, bytes=1000 ┘ large rank gap
+///   index 6: rank=10001, bytes=2000   (trailing boundary)
+///
+/// The main loop assigns 4 of its 6 picks to the plateau. During
+/// redistribution, interpolated rank targets pull the last two picks
+/// towards index 5 (rank 10000). After the first is placed at index 5,
+/// `floor` for the next pick becomes 6, exceeding `eff_end`=5.
+#[test]
+fn plateau_with_rank_gap_preserves_strict_ordering() {
+    use super::{Sample, compact_samples};
+
+    let mut samples = vec![
+        Sample::new(0, 0, &key_for_index(0)),
+        Sample::new(1, 1000, &key_for_index(1)),
+        Sample::new(2, 1000, &key_for_index(2)),
+        Sample::new(3, 1000, &key_for_index(3)),
+        Sample::new(4, 1000, &key_for_index(4)),
+        Sample::new(10000, 1000, &key_for_index(5)),
+        Sample::new(10001, 2000, &key_for_index(6)),
+    ];
+
+    compact_samples(&mut samples, 6);
+
+    assert_eq!(samples.len(), 6);
+    assert!(
+        samples.windows(2).all(|w| w[0].rank < w[1].rank),
+        "ranks must remain strictly increasing after plateau redistribution: {:?}",
+        samples.iter().map(|s| s.rank).collect::<Vec<_>>()
+    );
+}
+
+/// When the plateau starts at index 0 (all leading samples share the same
+/// byte position), the `lower` constraint calculation takes the `else { 0 }`
+/// branch. Verify that compaction still spreads picks across the leading
+/// plateau by rank and preserves monotonicity.
+#[test]
+fn plateau_redistribution_spreads_picks_across_leading_plateau() {
+    use super::{Sample, compact_samples};
+
+    // 30 samples: first 15 at cumulative_bytes = 0 (the plateau),
+    // then 15 with increasing byte positions.
+    let mut samples: Vec<Sample> = (0..30)
+        .map(|i| {
+            let bytes = if i < 15 { 0u64 } else { (i - 14) as u64 * 100 };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+
+    // Endpoint preservation.
+    assert_eq!(
+        samples.first().unwrap().rank,
+        0,
+        "first sample must be preserved"
+    );
+    assert_eq!(
+        samples.last().unwrap().rank,
+        29,
+        "last sample must be preserved"
+    );
+
+    // Strictly increasing ranks.
+    assert!(
+        samples.windows(2).all(|w| w[0].rank < w[1].rank),
+        "ranks must remain strictly increasing: {:?}",
+        samples.iter().map(|s| s.rank).collect::<Vec<_>>()
+    );
+
+    // Plateau samples (rank 0..15) should be spread, not bunched at the
+    // leading edge.
+    let plateau_ranks: Vec<u64> = samples
+        .iter()
+        .filter(|s| s.rank < 15)
+        .map(|s| s.rank)
+        .collect();
+
+    if plateau_ranks.len() >= 2 {
+        let span = plateau_ranks.last().unwrap() - plateau_ranks.first().unwrap();
+        assert!(
+            span >= 5,
+            "leading plateau retained samples should be spread, got span {} from {:?}",
+            span,
+            plateau_ranks
+        );
+    }
 }

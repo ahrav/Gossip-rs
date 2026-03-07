@@ -354,10 +354,13 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 ///    [`interpolated_position`].
 /// 4. Snaps each target to the nearest sample by rank
 ///    ([`nearest_by_rank_in_range`]), enforcing the strictly-increasing
-///    invariant at each step.
+///    invariant at each step with both a floor (forward progress) and a
+///    ceiling (room for remaining picks).
 ///
 /// When all samples in the usable range also share the same rank (fully
-/// degenerate), falls back to uniform index spacing within that range.
+/// degenerate), the strictly-increasing rank invariant guarantees this
+/// only occurs when `eff_start == eff_end`, which the size guard rejects
+/// before redistribution runs.
 ///
 /// # Complexity
 ///
@@ -423,18 +426,13 @@ fn redistribute_plateau_picks(samples: &[Sample], picks: &mut [usize], axis: Sam
                 let rank_first = samples[eff_start].rank;
                 let rank_last = samples[eff_end].rank;
 
-                // When all samples in the effective range share the same rank
-                // (degenerate), fall back to uniform index spacing.
-                let use_rank = rank_first != rank_last;
-
+                // Ranks are strictly increasing, so rank_first < rank_last
+                // whenever eff_start < eff_end (which the size guard above
+                // guarantees for run_len >= 2).
                 for j in 0..run_len {
-                    let new_pick = if use_rank {
-                        let target_rank = interpolated_position(rank_first, rank_last, j, run_len);
-                        nearest_by_rank_in_range(samples, eff_start, eff_end, target_rank)
-                    } else {
-                        // Uniform index spacing within the effective range.
-                        eff_start + j * (eff_end - eff_start) / (run_len - 1)
-                    };
+                    let target_rank = interpolated_position(rank_first, rank_last, j, run_len);
+                    let new_pick =
+                        nearest_by_rank_in_range(samples, eff_start, eff_end, target_rank);
 
                     // Enforce strictly increasing relative to previous pick.
                     let floor = if j > 0 {
@@ -444,8 +442,10 @@ fn redistribute_plateau_picks(samples: &[Sample], picks: &mut [usize], axis: Sam
                     } else {
                         0
                     };
+                    // Leave room for the remaining picks within the plateau.
+                    let ceil = eff_end - (run_len - 1 - j);
 
-                    picks[run_start + j] = new_pick.max(floor);
+                    picks[run_start + j] = new_pick.max(floor).min(ceil);
                 }
             }
         }
