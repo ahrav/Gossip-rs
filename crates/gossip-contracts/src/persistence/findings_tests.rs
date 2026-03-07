@@ -3,8 +3,8 @@ use std::num::NonZeroU64;
 use crate::{
     connector::Location,
     identity::{
-        FenceEpoch, FindingId, LogicalTime, ObjectVersionId, ObservationId, OccurrenceId, RunId,
-        ShardId, TenantId,
+        FenceEpoch, FindingId, LogicalTime, ObjectVersionId, ObservationId, OccurrenceId,
+        PolicyHash, RunId, ShardId, TenantId,
     },
     test_util::{ovid, policy, tenant},
 };
@@ -87,6 +87,55 @@ fn total_records_sums_all_layers() {
     assert_eq!(FindingsUpsertBatch::default().total_records(), 0);
 }
 
+#[test]
+fn findings_upsert_batch_validate_observation_identity_accepts_canonical() {
+    let observations = [make_observation_record(0x03)];
+
+    FindingsUpsertBatch::new(&[], &[], &observations)
+        .validate_observation_identity()
+        .expect("canonical observations should pass observation-identity validation");
+}
+
+#[test]
+fn findings_upsert_batch_validate_observation_identity_accepts_empty() {
+    FindingsUpsertBatch::default()
+        .validate_observation_identity()
+        .expect("empty batch should pass observation identity validation");
+}
+
+#[test]
+fn findings_upsert_batch_validate_observation_identity_rejects_mismatch() {
+    let mut observation = make_observation_record(0x03);
+    let actual = ObservationId::from_bytes([0xAA; 32]);
+    observation.observation_id = actual;
+    let expected = observation.derived_observation_id();
+    let observations = [observation];
+
+    assert_eq!(
+        FindingsUpsertBatch::new(&[], &[], &observations)
+            .validate_observation_identity()
+            .unwrap_err(),
+        PersistenceInputError::ObservationIdMismatch { expected, actual }
+    );
+}
+
+#[test]
+fn findings_upsert_batch_validate_observation_identity_rejects_one_bad_among_valid() {
+    let good = make_observation_record(0x01);
+    let mut bad = make_observation_record(0x02);
+    let actual = ObservationId::from_bytes([0xBB; 32]);
+    bad.observation_id = actual;
+    let expected = bad.derived_observation_id();
+    let observations = [good, bad];
+
+    assert_eq!(
+        FindingsUpsertBatch::new(&[], &[], &observations)
+            .validate_observation_identity()
+            .unwrap_err(),
+        PersistenceInputError::ObservationIdMismatch { expected, actual }
+    );
+}
+
 // ---------------------------------------------------------------------------
 // ObservationRecord location metadata
 // ---------------------------------------------------------------------------
@@ -108,6 +157,115 @@ fn observation_record_preserves_optional_location() {
     );
 
     assert_eq!(observation.location().unwrap().display(), "repo/path");
+}
+
+#[test]
+fn observation_record_validation_helpers_match_stored_identity() {
+    let record = make_observation_record(0x03);
+
+    assert_eq!(record.derived_observation_id(), record.observation_id());
+    record
+        .validate_identity()
+        .expect("freshly derived observation id should validate");
+}
+
+#[test]
+fn observation_record_validate_identity_rejects_tampered_id() {
+    let mut record = make_observation_record(0x03);
+    let actual = ObservationId::from_bytes([0xFF; 32]);
+    record.observation_id = actual;
+    let expected = record.derived_observation_id();
+
+    assert_eq!(
+        record.validate_identity().unwrap_err(),
+        PersistenceInputError::ObservationIdMismatch { expected, actual }
+    );
+}
+
+#[test]
+fn observation_record_from_persisted_accepts_matching_id() {
+    let record = make_observation_record(0x03);
+
+    let rebuilt = ObservationRecord::from_persisted(
+        record.tenant_id(),
+        record.observation_id(),
+        record.occurrence_id(),
+        record.policy_hash(),
+        record.ovid_hash(),
+        record.run_id(),
+        record.shard_id(),
+        record.fence_epoch(),
+        record.seen_at(),
+        None,
+    )
+    .expect("matching persisted observation id should be accepted");
+
+    assert_eq!(rebuilt, record);
+}
+
+#[test]
+fn observation_record_from_persisted_rejects_mismatched_id() {
+    let record = make_observation_record(0x03);
+    let actual = ObservationId::from_bytes([0xEE; 32]);
+
+    assert_eq!(
+        ObservationRecord::from_persisted(
+            record.tenant_id(),
+            actual,
+            record.occurrence_id(),
+            record.policy_hash(),
+            record.ovid_hash(),
+            record.run_id(),
+            record.shard_id(),
+            record.fence_epoch(),
+            record.seen_at(),
+            None,
+        )
+        .unwrap_err(),
+        PersistenceInputError::ObservationIdMismatch {
+            expected: record.derived_observation_id(),
+            actual,
+        }
+    );
+}
+
+#[test]
+fn from_persisted_preserves_location_metadata() {
+    let location =
+        Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap();
+    let record = make_observation_record(0x03).with_location(location.clone());
+
+    let rebuilt = ObservationRecord::from_persisted(
+        record.tenant_id(),
+        record.observation_id(),
+        record.occurrence_id(),
+        record.policy_hash(),
+        record.ovid_hash(),
+        record.run_id(),
+        record.shard_id(),
+        record.fence_epoch(),
+        record.seen_at(),
+        Some(location),
+    )
+    .expect("matching id should be accepted");
+
+    assert_eq!(rebuilt, record);
+}
+
+#[test]
+fn derive_observation_id_is_field_order_sensitive() {
+    let canonical = derive_observation_id(&ObservationIdInputs {
+        tenant: TenantId::from_bytes([0x11; 32]),
+        policy: PolicyHash::from_bytes([0x22; 32]),
+        occurrence: OccurrenceId::from_bytes([0x33; 32]),
+    });
+    let swapped = derive_observation_id(&ObservationIdInputs {
+        tenant: TenantId::from_bytes([0x22; 32]),
+        policy: PolicyHash::from_bytes([0x11; 32]),
+        occurrence: OccurrenceId::from_bytes([0x33; 32]),
+    });
+
+    assert_ne!(canonical, swapped);
 }
 
 // ---------------------------------------------------------------------------
@@ -430,5 +588,6 @@ proptest::proptest! {
             tenant: tid, policy: ph, occurrence: oid,
         });
         proptest::prop_assert_eq!(record.observation_id(), expected);
+        proptest::prop_assert!(record.validate_identity().is_ok());
     }
 }
