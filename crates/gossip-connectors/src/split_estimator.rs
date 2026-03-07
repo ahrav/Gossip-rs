@@ -203,6 +203,8 @@ fn compact_samples(samples: &mut Vec<Sample>, cap: usize) {
     }
 
     let keep = selected_sample_indices(samples, cap);
+    // `selected_sample_indices` guarantees strictly-increasing indices, so
+    // `write` (which increments by 1 each iteration) never overtakes `src`.
     let mut write = 0usize;
     for &src in &keep {
         debug_assert!(
