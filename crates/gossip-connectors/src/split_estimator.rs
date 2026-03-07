@@ -692,11 +692,18 @@ impl StreamingSplitEstimator {
     /// When all observed files are zero-size the byte axis is degenerate, so
     /// the estimator falls back to the rank midpoint (`count / 2`).
     ///
-    /// A special guard prevents returning the very first observed key: when
-    /// weight is front-loaded (e.g. one huge file followed by many small
-    /// ones), the byte-weighted median can land on item 0, which would
-    /// produce a zero-item left shard. In that case the estimator falls back
-    /// to the rank-based midpoint instead.
+    /// Two boundary guards prevent degenerate splits:
+    ///
+    /// - **First-key guard**: when weight is front-loaded (e.g. one huge file
+    ///   followed by many small ones), the byte-weighted median can land on
+    ///   item 0, producing a zero-item left shard. The first observed key is
+    ///   tracked explicitly so this guard survives downsampling.
+    /// - **Last-key guard**: the symmetric case — when weight is back-loaded,
+    ///   the candidate can land on the last key, producing an empty right
+    ///   shard. The check uses `samples.last()` since the estimator only
+    ///   returns sampled keys and compaction preserves endpoints.
+    ///
+    /// Both guards fall back to the rank-based midpoint instead.
     pub(crate) fn estimate_split_key(&self) -> Option<&[u8]> {
         if self.count < 2 {
             return None;
