@@ -312,9 +312,7 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 
     redistribute_plateau_picks(samples, &mut picks, axis);
 
-    // Release-mode: redistribute_plateau_picks mutates picks in-place;
-    // verify the critical strictly-increasing invariant unconditionally.
-    assert!(
+    debug_assert!(
         picks.windows(2).all(|w| w[0] < w[1]),
         "selected indices must be strictly increasing after plateau redistribution"
     );

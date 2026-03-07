@@ -1143,3 +1143,92 @@ fn plateau_redistribution_spreads_picks_across_leading_plateau() {
         );
     }
 }
+
+/// Exercise the `picks.len() < 3` early-return guard in
+/// `redistribute_plateau_picks`. With 0, 1, or 2 picks there cannot be a
+/// non-endpoint plateau cluster, so the function must be a no-op.
+#[test]
+fn redistribute_plateau_picks_early_return_for_small_pick_arrays() {
+    use super::{Sample, SampleAxis, redistribute_plateau_picks};
+
+    let samples: Vec<Sample> = (0..10)
+        .map(|i| Sample::new(i as u64, 500, &key_for_index(i)))
+        .collect();
+
+    // 0 picks — empty slice must not panic.
+    let mut empty: Vec<usize> = vec![];
+    redistribute_plateau_picks(&samples, &mut empty, SampleAxis::Bytes);
+    assert!(empty.is_empty());
+
+    // 1 pick — single element must be unchanged.
+    let mut one = vec![5];
+    redistribute_plateau_picks(&samples, &mut one, SampleAxis::Bytes);
+    assert_eq!(one, vec![5]);
+
+    // 2 picks — pair must be unchanged (cannot form a non-endpoint plateau).
+    let mut two = vec![0, 9];
+    redistribute_plateau_picks(&samples, &mut two, SampleAxis::Bytes);
+    assert_eq!(two, vec![0, 9]);
+}
+
+/// Trailing plateau: 30 samples where the first 15 have increasing byte
+/// positions and the last 15 share the same byte position. Compaction must
+/// spread picks within the trailing plateau by rank, not bunch them at the
+/// plateau's leading edge.
+#[test]
+fn plateau_redistribution_spreads_picks_across_trailing_plateau() {
+    use super::{Sample, compact_samples};
+
+    let shared_bytes = 1500u64;
+    let mut samples: Vec<Sample> = (0..30)
+        .map(|i| {
+            let bytes = if i < 15 {
+                (i as u64) * 100
+            } else {
+                shared_bytes
+            };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+
+    // Endpoint preservation.
+    assert_eq!(
+        samples.first().unwrap().rank,
+        0,
+        "first sample must be preserved"
+    );
+    assert_eq!(
+        samples.last().unwrap().rank,
+        29,
+        "last sample must be preserved"
+    );
+
+    // Strictly increasing ranks.
+    assert!(
+        samples.windows(2).all(|w| w[0].rank < w[1].rank),
+        "ranks must remain strictly increasing: {:?}",
+        samples.iter().map(|s| s.rank).collect::<Vec<_>>()
+    );
+
+    // Trailing plateau samples (rank 15..30) should be spread, not bunched at
+    // the plateau's leading edge.
+    let trailing_ranks: Vec<u64> = samples
+        .iter()
+        .filter(|s| s.rank >= 15)
+        .map(|s| s.rank)
+        .collect();
+
+    if trailing_ranks.len() >= 2 {
+        let span = trailing_ranks.last().unwrap() - trailing_ranks.first().unwrap();
+        assert!(
+            span >= 5,
+            "trailing plateau retained samples should be spread, got span {} from {:?}",
+            span,
+            trailing_ranks
+        );
+    }
+}
