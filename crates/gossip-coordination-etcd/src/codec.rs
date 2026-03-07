@@ -112,7 +112,7 @@ impl BlobKind {
 
 /// Decoded owner-key payload stored under a shard's `/owner` key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnerLeaseValueV1 {
+pub struct OwnerLeaseValue {
     pub worker: WorkerId,
     pub fence: FenceEpoch,
 }
@@ -318,7 +318,7 @@ pub fn decode_shard_record(
 
 /// Encode the `(worker, fence)` binding stored in a shard owner key.
 #[must_use]
-pub fn encode_owner_value_v1(worker: WorkerId, fence: FenceEpoch) -> Vec<u8> {
+pub fn encode_owner_value(worker: WorkerId, fence: FenceEpoch) -> Vec<u8> {
     let mut out = Vec::with_capacity(3 + 16);
     out.extend_from_slice(VERSION_PREFIX_V1);
     out.push(BlobKind::ShardOwner.as_u8());
@@ -328,13 +328,19 @@ pub fn encode_owner_value_v1(worker: WorkerId, fence: FenceEpoch) -> Vec<u8> {
 }
 
 /// Decode a shard owner-key payload.
-pub fn decode_owner_value_v1(bytes: &[u8]) -> Result<OwnerLeaseValueV1, EtcdCodecError> {
+pub fn decode_owner_value(bytes: &[u8]) -> Result<OwnerLeaseValue, EtcdCodecError> {
     let mut decoder = Decoder::new(bytes);
     decoder.expect_header(BlobKind::ShardOwner)?;
     let worker = WorkerId::from_raw(decoder.read_u64()?);
     let fence = FenceEpoch::from_raw(decoder.read_u64()?);
+    if fence < FenceEpoch::INITIAL {
+        return Err(EtcdCodecError::InvariantViolation {
+            kind: "OwnerLeaseValue",
+            detail: "fence must be >= INITIAL",
+        });
+    }
     decoder.finish()?;
-    Ok(OwnerLeaseValueV1 { worker, fence })
+    Ok(OwnerLeaseValue { worker, fence })
 }
 
 /// Heap-owned mirror of [`RunRecord`] used as the decode intermediate.

@@ -42,8 +42,8 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::codec::{
-    EtcdCodecError, OwnerLeaseValueV1, decode_owner_value_v1, decode_run_record,
-    decode_shard_record, encode_owner_value_v1, encode_run_record, encode_shard_record,
+    EtcdCodecError, OwnerLeaseValue, decode_owner_value, decode_run_record, decode_shard_record,
+    encode_owner_value, encode_run_record, encode_shard_record,
 };
 use crate::config::{DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
@@ -92,7 +92,7 @@ struct PersistedRun {
 /// ID that controls the key's TTL-based automatic deletion.
 #[derive(Clone, Debug)]
 struct PersistedOwner {
-    binding: OwnerLeaseValueV1,
+    binding: OwnerLeaseValue,
     /// etcd lease ID attached to the owner key. Revocation of this lease
     /// causes etcd to delete the owner key, signaling ownership loss.
     lease_id: i64,
@@ -131,7 +131,7 @@ impl PersistedShard {
     fn expected_owner_value(&self) -> Option<Vec<u8>> {
         self.owner
             .as_ref()
-            .map(|owner| encode_owner_value_v1(owner.binding.worker, owner.binding.fence))
+            .map(|owner| encode_owner_value(owner.binding.worker, owner.binding.fence))
     }
 
     /// Returns `true` if the persisted owner binding matches the
@@ -333,14 +333,23 @@ impl EtcdCoordinator {
             })
     }
 
-    /// Send a single keep-alive ping for an existing etcd lease.
+    /// Send a single keep-alive ping for an existing etcd lease and
+    /// consume the server ACK to confirm the renewal succeeded.
     fn etcd_lease_keep_alive_once(&self, lease_id: i64) -> Result<(), EtcdCoordinatorError> {
         let mut client = self.client.clone();
         self.runtime
             .block_on(async move {
-                let (mut keeper, _stream) = client.lease_keep_alive(lease_id).await?;
+                let (mut keeper, mut stream) = client.lease_keep_alive(lease_id).await?;
                 keeper.keep_alive().await?;
-                Ok::<(), etcd_client::Error>(())
+                // The keep_alive() call only sends the request; the server
+                // ACK (or error) arrives on the response stream. Read it to
+                // confirm the lease was actually renewed.
+                match stream.message().await? {
+                    Some(resp) if resp.ttl() > 0 => Ok(()),
+                    _ => Err(etcd_client::Error::LeaseKeepAliveError(
+                        "lease expired or keep-alive rejected by server".into(),
+                    )),
+                }
             })
             .map_err(|source| EtcdCoordinatorError::Etcd {
                 operation: EtcdOperation::LeaseKeepAlive,
@@ -409,17 +418,17 @@ impl EtcdCoordinator {
         &self,
         operation: EtcdOperation,
         bytes: &[u8],
-    ) -> Result<OwnerLeaseValueV1, EtcdCoordinatorError> {
-        decode_owner_value_v1(bytes)
+    ) -> Result<OwnerLeaseValue, EtcdCoordinatorError> {
+        decode_owner_value(bytes)
             .map_err(|source| EtcdCoordinatorError::Codec { operation, source })
     }
 
     /// Load a single shard record and its owner binding by exact key.
     ///
-    /// Performs two etcd `get` calls (one for the shard record, one for
-    /// the `/owner` key) and cross-validates the owner binding against
-    /// the shard record's lease fields. Returns `None` if the shard
-    /// record key does not exist.
+    /// Issues both reads in a single etcd transaction so the shard record
+    /// and `/owner` key come from the same etcd revision. Cross-validates
+    /// the owner binding against the shard record's lease fields. Returns
+    /// `None` if the shard record key does not exist.
     ///
     /// # Errors
     ///
@@ -433,10 +442,29 @@ impl EtcdCoordinator {
     ) -> Result<Option<PersistedShard>, EtcdCoordinatorError> {
         let shard_record_key = self
             .keyspace
-            .shard_record_key(tenant, key.run(), key.shard())
-            .into_bytes();
-        let response = self.etcd_get(shard_record_key, None)?;
-        let Some(kv) = response.kvs().first() else {
+            .shard_record_key(tenant, key.run(), key.shard());
+        let owner_key_str = self
+            .keyspace
+            .shard_owner_key(tenant, key.run(), key.shard());
+
+        // Read both keys in a single txn so they share one etcd revision.
+        let txn = Txn::new().and_then(vec![
+            TxnOp::get(shard_record_key.clone().into_bytes(), None),
+            TxnOp::get(owner_key_str.into_bytes(), None),
+        ]);
+        let txn_response = self.etcd_txn(txn)?;
+        let mut op_responses = txn_response.op_responses();
+
+        let shard_get = match op_responses.remove(0) {
+            etcd_client::TxnOpResponse::Get(resp) => resp,
+            _ => unreachable!("first txn op must be a Get"),
+        };
+        let owner_get = match op_responses.remove(0) {
+            etcd_client::TxnOpResponse::Get(resp) => resp,
+            _ => unreachable!("second txn op must be a Get"),
+        };
+
+        let Some(kv) = shard_get.kvs().first() else {
             return Ok(None);
         };
 
@@ -449,12 +477,7 @@ impl EtcdCoordinator {
         })?;
         let mod_revision = kv.mod_revision();
 
-        let owner_key = self
-            .keyspace
-            .shard_owner_key(tenant, key.run(), key.shard())
-            .into_bytes();
-        let owner_response = self.etcd_get(owner_key, None)?;
-        let owner = match owner_response.kvs().first() {
+        let owner = match owner_get.kvs().first() {
             None => None,
             Some(owner_kv) => {
                 let binding = self.decode_owner_binding(EtcdOperation::Get, owner_kv.value())?;
@@ -852,7 +875,7 @@ impl CoordinationBackend for EtcdCoordinator {
             persisted.record.assert_invariants(&persisted.slab);
             let shard_blob = encode_shard_record(&persisted.record, &persisted.slab)
                 .unwrap_or_else(|err| self.fatal_storage_error("acquire.encode_shard", err));
-            let owner_blob = encode_owner_value_v1(worker, new_fence);
+            let owner_blob = encode_owner_value(worker, new_fence);
 
             let shard_record_key = self
                 .keyspace
@@ -992,8 +1015,16 @@ impl CoordinationBackend for EtcdCoordinator {
                 .as_ref()
                 .map(|owner| owner.lease_id)
                 .expect("validated owner must exist");
-            self.etcd_lease_keep_alive_once(old_lease_id)
-                .unwrap_or_else(|err| self.fatal_storage_error("renew.lease_keep_alive", err));
+            if self.etcd_lease_keep_alive_once(old_lease_id).is_err() {
+                // The etcd lease already expired (e.g., TTL fired between
+                // the owner-key read and this keep-alive call). This is a
+                // normal operational condition — treat it as a stale fence
+                // so the caller can re-acquire.
+                return Err(RenewError::StaleFence {
+                    presented: lease.fence(),
+                    current: persisted.record.fence_epoch,
+                });
+            }
 
             let mut persisted = persisted;
             persisted.record.lease = Some(LeaseHolder::new(lease.owner(), new_deadline));

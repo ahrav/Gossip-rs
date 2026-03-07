@@ -632,7 +632,7 @@ fn test_run() -> RunId {
 }
 
 fn test_shard() -> ShardId {
-    ShardId::from_raw(0x8000_0000_0000_0011)
+    ShardId::from_raw(0x0000_0000_0000_0011)
 }
 
 fn test_worker(id: u64) -> WorkerId {

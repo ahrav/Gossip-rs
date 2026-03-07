@@ -43,8 +43,8 @@ mod keyspace;
 
 pub use backend::EtcdCoordinator;
 pub use codec::{
-    BlobKind, EtcdCodecError, OwnerLeaseValueV1, decode_owner_value_v1, decode_run_record,
-    decode_shard_record, encode_owner_value_v1, encode_run_record, encode_shard_record,
+    BlobKind, EtcdCodecError, OwnerLeaseValue, decode_owner_value, decode_run_record,
+    decode_shard_record, encode_owner_value, encode_run_record, encode_shard_record,
 };
 pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};
