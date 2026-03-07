@@ -22,7 +22,7 @@ use crate::{
 // Backend definition
 // ---------------------------------------------------------------------------
 
-struct DoneLedgerPayload {
+pub(crate) struct DoneLedgerPayload {
     records: Vec<DoneLedgerRecord>,
 }
 

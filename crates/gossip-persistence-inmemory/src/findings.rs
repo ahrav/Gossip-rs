@@ -30,7 +30,7 @@ type FindingKey = (TenantId, FindingId);
 type OccurrenceKey = (TenantId, OccurrenceId);
 type ObservationKey = (TenantId, ObservationId);
 
-struct FindingsPayload {
+pub(crate) struct FindingsPayload {
     findings: Vec<FindingRecord>,
     occurrences: Vec<OccurrenceRecord>,
     observations: Vec<ObservationRecord>,
