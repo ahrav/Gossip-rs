@@ -227,6 +227,39 @@ pub(crate) fn is_valid_split_candidate(
     past_cursor && below_end
 }
 
+/// Estimate a byte-weighted split key from a sorted entry range.
+///
+/// Shared post-selection flow for batch connectors (git, in-memory) that
+/// already hold all entries in memory. Builds a [`StreamingSplitEstimator`]
+/// with sample cap equal to `entry_count` (no compaction), estimates the
+/// split key, validates it against the cursor and end bound, and converts
+/// to an [`ItemKey`].
+///
+/// Returns `Ok(None)` when the estimator produces no candidate or the
+/// candidate fails validation (does not advance past the cursor, or lands
+/// at or beyond the upper shard bound).
+pub(crate) fn estimate_split_from_sorted<'a>(
+    entries: impl Iterator<Item = (&'a [u8], u64)>,
+    entry_count: usize,
+    cursor: &Cursor,
+    end: Option<&[u8]>,
+) -> Result<Option<ItemKey>, EnumerateError> {
+    use crate::split_estimator::StreamingSplitEstimator;
+
+    let split_estimator = StreamingSplitEstimator::from_sorted_entries(entry_count, entries);
+    let Some(split_key) = split_estimator.estimate_split_key() else {
+        return Ok(None);
+    };
+    if !is_valid_split_candidate(split_key, cursor, end) {
+        return Ok(None);
+    }
+    // Split key bytes originate from validated ItemKey values, so they are
+    // guaranteed non-empty and within MAX_ITEM_KEY_SIZE.
+    let split = ItemKey::try_from_slice(split_key)
+        .expect("split key bytes from validated ItemKey must round-trip");
+    Ok(Some(split))
+}
+
 /// Decode the optional cursor token as an absolute next-index.
 ///
 /// Returns `None` when the cursor has no token, the token is malformed, or the

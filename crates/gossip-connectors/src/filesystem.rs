@@ -926,7 +926,7 @@ impl FilesystemConnector {
         if !common::is_valid_split_candidate(split_key, cursor, effective_end) {
             return Ok(None);
         }
-        let split = ItemKey::try_from_vec(split_key.to_vec())
+        let split = ItemKey::try_from_slice(split_key)
             .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
         Ok(Some(split))
     }

@@ -15,6 +15,10 @@
           {
             "type": "command",
             "command": ".claude/hooks/design-doc-scope-check.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/comment-lint.sh"
           }
         ]
       }

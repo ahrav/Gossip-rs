@@ -210,7 +210,7 @@ fn expired_budget_returns_retryable_error() {
 }
 
 #[test]
-fn choose_split_point_uses_streaming_estimator_nearest_neighbor() {
+fn choose_split_point_selects_byte_weighted_midpoint() {
     let dir = create_test_repo(&[
         ("a.txt", b"1"),
         ("b.txt", b"22"),
@@ -228,7 +228,10 @@ fn choose_split_point_uses_streaming_estimator_nearest_neighbor() {
         )
         .unwrap();
     let split = split.expect("expected split candidate for multi-item range");
-    assert_eq!(split.as_bytes(), b"d.txt");
+    // The byte-weighted candidate is d.txt (position 6, closest to midpoint 5),
+    // but the last-key guard prevents an empty right shard. Rank-fallback
+    // selects the rank midpoint: c.txt (rank 2 of 4).
+    assert_eq!(split.as_bytes(), b"c.txt");
 }
 
 #[test]

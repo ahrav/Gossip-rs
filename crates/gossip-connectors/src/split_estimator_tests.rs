@@ -88,7 +88,7 @@ fn equal_weight_files_split_near_midpoint() {
 }
 
 #[test]
-fn skewed_sizes_split_selects_straddling_file() {
+fn skewed_sizes_split_avoids_last_key_with_back_loaded_weight() {
     let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 5);
     estimator.observe(&key_for_index(1), 5);
@@ -98,9 +98,12 @@ fn skewed_sizes_split_selects_straddling_file() {
         .estimate_split_key()
         .expect("should produce split");
     let split_idx = index_from_key(split);
+    // The byte-weighted candidate is key 2 (back-loaded weight), but the
+    // last-key guard prevents an empty right shard. Rank-fallback yields
+    // the midpoint key (index 1).
     assert_eq!(
-        split_idx, 2,
-        "expected split at index 2 (file straddling the median), got index {}",
+        split_idx, 1,
+        "last-key guard should fall back to rank midpoint, got index {}",
         split_idx
     );
 }
@@ -299,6 +302,117 @@ fn from_sorted_entries_estimates_split_for_materialized_range() {
         .estimate_split_key()
         .expect("materialized range should produce a split");
     assert_eq!(index_from_key(split), 2);
+}
+
+/// Exercise the compaction path of `from_sorted_entries` with more entries
+/// than MIN_SAMPLE_CAP.  Verifies that the constructor delegates compaction
+/// correctly end-to-end, matching the manual `observe` path.
+#[test]
+fn from_sorted_entries_compacts_when_exceeding_sample_cap() {
+    let n = SMALL_SAMPLE_CAP * 4;
+    let keys: Vec<[u8; 8]> = (0..n).map(key_for_index).collect();
+    let sizes: Vec<u64> = (0..n).map(|i| (i as u64) + 1).collect();
+
+    let built = StreamingSplitEstimator::from_sorted_entries(
+        SMALL_SAMPLE_CAP,
+        keys.iter()
+            .zip(sizes.iter())
+            .map(|(k, &s)| (k.as_slice(), s)),
+    );
+
+    // Sample count must stay within the cap.
+    assert!(
+        built.sample_len() <= built.sample_cap(),
+        "sample count ({}) exceeded cap ({}) after from_sorted_entries with n={n}",
+        built.sample_len(),
+        built.sample_cap()
+    );
+
+    // Must match the manual observe path exactly.
+    let mut observed = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    for (key, &size) in keys.iter().zip(sizes.iter()) {
+        observed.observe(key, size);
+    }
+    assert_eq!(built.sample_cap(), observed.sample_cap());
+    assert_eq!(built.sample_debug_view(), observed.sample_debug_view());
+    assert_eq!(built.estimate_split_key(), observed.estimate_split_key());
+
+    // Split key must be valid.
+    let split = built
+        .estimate_split_key()
+        .expect("should produce a split for n > 2");
+    let split_idx = index_from_key(split);
+    assert!(split_idx >= 1 && split_idx < n);
+}
+
+/// An empty iterator produces an estimator with no observations, so
+/// `estimate_split_key` must return `None`.
+#[test]
+fn from_sorted_entries_empty_produces_none() {
+    let estimator =
+        StreamingSplitEstimator::from_sorted_entries(SMALL_SAMPLE_CAP, std::iter::empty());
+    assert!(
+        estimator.estimate_split_key().is_none(),
+        "empty input must yield no split key"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch-connector accuracy: ranges exceeding DEFAULT_SAMPLE_CAP
+// ---------------------------------------------------------------------------
+
+/// Batch connectors (git, in-memory) should pass the range length as
+/// sample_cap so that no compaction fires and the split is exact.  This
+/// test verifies that using `n` as the cap eliminates the drift that
+/// DEFAULT_SAMPLE_CAP introduces on large ranges.
+#[test]
+fn batch_range_cap_eliminates_split_drift() {
+    let n = 2_000usize;
+    assert!(
+        n > LARGE_SAMPLE_CAP,
+        "test must exceed DEFAULT_SAMPLE_CAP to be meaningful"
+    );
+
+    // Descending sizes: entry 0 is largest, entry n-1 is smallest.
+    let sizes: Vec<u64> = (0..n).map(|i| (n - i) as u64).collect();
+    let keys: Vec<[u8; 8]> = (0..n).map(key_for_index).collect();
+
+    let make_iter = || {
+        keys.iter()
+            .zip(sizes.iter())
+            .map(|(k, &s)| (k.as_slice(), s))
+    };
+
+    // Exact estimator: sample_cap = n, no compaction.
+    let exact = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
+    let exact_key = exact
+        .estimate_split_key()
+        .expect("exact estimator should produce a split");
+
+    // Capped estimator: DEFAULT_SAMPLE_CAP triggers compaction and drift.
+    let capped = StreamingSplitEstimator::from_sorted_entries(LARGE_SAMPLE_CAP, make_iter());
+    let capped_key = capped
+        .estimate_split_key()
+        .expect("capped estimator should produce a split");
+
+    // Confirm that DEFAULT_SAMPLE_CAP actually introduces drift (the
+    // motivating observation from the review).
+    assert_ne!(
+        index_from_key(exact_key),
+        index_from_key(capped_key),
+        "expected capped estimator to drift from exact on n={n}, \
+         cap={LARGE_SAMPLE_CAP} — if this starts passing, the batch-cap \
+         fix may no longer be necessary"
+    );
+
+    // The fix: batch connectors pass range.len() as sample_cap.  With
+    // cap = n no compaction fires, so the result matches the exact path.
+    let batch = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
+    assert_eq!(
+        batch.estimate_split_key(),
+        exact.estimate_split_key(),
+        "batch-cap estimator must match exact estimator"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -714,8 +828,8 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
 
 /// Regression: when the last N samples share identical `cumulative_bytes`
 /// (a byte-position plateau), compaction must still preserve the actual last
-/// sample. Before the fix, nearest-neighbor tie-breaking picked the first
-/// plateau entry instead of `len - 1`.
+/// sample. Nearest-neighbor tie-breaking must select `len - 1` (the true
+/// last sample), not the first plateau entry.
 #[test]
 fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
     use super::{Sample, compact_samples};
@@ -1102,6 +1216,46 @@ proptest! {
             "rank fallback too far from midpoint: split_idx={}, midpoint={}, distance={}, tolerance={}, n={}, cap={}",
             split_idx, midpoint, distance, tolerance, n, sample_cap
         );
+    }
+
+    /// The split key must never equal the first or last observed key when
+    /// count >= 3, because that would produce a degenerate empty left or
+    /// right shard.
+    #[test]
+    fn prop_split_key_never_first_or_last_when_three_or_more(
+        count in 3..500usize,
+        size_range in 1..10_000u64,
+    ) {
+        let mut estimator = StreamingSplitEstimator::new(MIN_SAMPLE_CAP);
+        let first_key = key_for_index(0);
+        let last_key = key_for_index(count - 1);
+        for idx in 0..count {
+            estimator.observe(&key_for_index(idx), size_range);
+        }
+        if let Some(split) = estimator.estimate_split_key() {
+            prop_assert!(split != first_key.as_slice(),
+                "split must not be the first key (count={})", count);
+            prop_assert!(split != last_key.as_slice(),
+                "split must not be the last key (count={})", count);
+        }
+    }
+
+    /// Same bounds invariant with zero-size files, exercising the rank-fallback
+    /// path where byte-axis is degenerate.
+    #[test]
+    fn prop_split_key_never_first_or_last_zero_sizes(count in 3..500usize) {
+        let mut estimator = StreamingSplitEstimator::new(MIN_SAMPLE_CAP);
+        let first_key = key_for_index(0);
+        let last_key = key_for_index(count - 1);
+        for idx in 0..count {
+            estimator.observe(&key_for_index(idx), 0);
+        }
+        if let Some(split) = estimator.estimate_split_key() {
+            prop_assert!(split != first_key.as_slice(),
+                "split must not be the first key (count={})", count);
+            prop_assert!(split != last_key.as_slice(),
+                "split must not be the last key (count={})", count);
+        }
     }
 
 }

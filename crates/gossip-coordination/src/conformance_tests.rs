@@ -493,12 +493,11 @@ fn terminal_clears_lease() {
 }
 
 // ============================================================================
-// Group B: Gap-Filling Tests
+// Group B: Boundary Conditions and Variant Coverage
 //
-// Edge cases and code paths that have zero or minimal coverage in the unit
-// tests and scenario tests. Each test targets a specific gap: an untested
-// enum variant, a boundary condition, or an interaction that only manifests
-// under particular timing or sequencing.
+// Edge cases and code paths with minimal coverage in the unit tests and
+// scenario tests: untested enum variants, boundary conditions, and
+// interactions that only manifest under particular timing or sequencing.
 // ============================================================================
 
 /// `CursorSemantics::Dispatched` propagates through the full operation chain.

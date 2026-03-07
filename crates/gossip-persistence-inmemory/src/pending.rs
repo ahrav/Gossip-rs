@@ -1,8 +1,15 @@
-//! Shared internal types for the pending-write queue used by both the
-//! done-ledger and findings backends.
+//! Shared internal types for the pending-write queue used by all in-memory
+//! persistence backends.
 //!
 //! These types are crate-private — they encode the lifecycle state of a
 //! single in-memory write operation and its buffered payload.
+//!
+//! [`PendingOp`] and [`PendingState`] are the building blocks used by
+//! [`InMemoryStoreCore`](crate::store::InMemoryStoreCore), which owns the
+//! operation map, insertion-order queue, id counter, and all fault-injection
+//! counters. Domain-specific apply logic (lattice merge for done-ledger,
+//! referential integrity for findings) is injected through the
+//! [`StoreBackend`](crate::store::StoreBackend) trait.
 
 use crate::error::InMemoryPersistenceError;
 

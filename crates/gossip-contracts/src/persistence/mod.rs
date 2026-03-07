@@ -93,8 +93,7 @@ pub use commit::{
 };
 pub use conformance::{
     DurableFindingsCounts, FindingsConformanceProbe, PersistenceConformanceError,
-    PersistenceConformanceReport, run_conformance, run_done_ledger_conformance,
-    run_findings_conformance, run_redaction_conformance,
+    PersistenceConformanceReport, run_conformance,
 };
 pub use done_ledger::{
     DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,

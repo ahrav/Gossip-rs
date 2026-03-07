@@ -77,7 +77,6 @@ use crate::common::{
     self, GIT_CONNECTOR_TAG, borrowed_shard_bound, classify_io_enumerate_error,
     classify_io_read_error, derive_stable_item_id, enumerate_error_to_read, path_buf_from_bytes,
 };
-use crate::split_estimator::StreamingSplitEstimator;
 
 /// A single indexed file from `git ls-files`.
 ///
@@ -458,11 +457,10 @@ impl GitConnector {
 
     /// Choose a byte-weighted split point in the optional range `[start, end)`.
     ///
-    /// The git connector already holds an indexed, sorted snapshot, so it
-    /// bulk-loads the remaining range into [`StreamingSplitEstimator`] via
-    /// [`StreamingSplitEstimator::from_sorted_entries`]. The candidate is
-    /// rejected if it does not advance past the current cursor or would land
-    /// at or beyond the upper shard bound.
+    /// Delegates to [`common::estimate_split_from_sorted`] after resolving
+    /// bounds and the cursor resume position. Returns `None` when fewer than
+    /// two keys remain, the estimator produces no candidate, or the candidate
+    /// fails validation.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -478,22 +476,15 @@ impl GitConnector {
             return Ok(None);
         }
 
-        let split_estimator = StreamingSplitEstimator::from_sorted_entries(
-            StreamingSplitEstimator::DEFAULT_SAMPLE_CAP,
-            self.entries[start_idx..bounds.range_end]
+        let range = &self.entries[start_idx..bounds.range_end];
+        common::estimate_split_from_sorted(
+            range
                 .iter()
                 .map(|entry| (entry.key.as_bytes(), entry.size_hint)),
-        );
-        let Some(split_key) = split_estimator.estimate_split_key() else {
-            return Ok(None);
-        };
-        if !common::is_valid_split_candidate(split_key, cursor, end) {
-            return Ok(None);
-        }
-
-        let split = ItemKey::try_from_vec(split_key.to_vec())
-            .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
-        Ok(Some(split))
+            range.len(),
+            cursor,
+            end,
+        )
     }
 
     /// Resolve an `ItemRef` to an absolute filesystem path.

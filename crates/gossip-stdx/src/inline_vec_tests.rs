@@ -568,8 +568,8 @@ fn extend_from_slice_panic_drops_partial_clones() {
     let after_source = drops.load(Ordering::Relaxed);
     assert_eq!(after_source, 3);
 
-    // Drop v. With the fix, v has 2 elements (1 original + 1 clone) → 2 drops.
-    // Without the fix, v has 1 element (clone leaked) → 1 drop.
+    // Drop v. Correct behavior: v has 2 elements (1 original + 1 clone) → 2 drops.
+    // If extend_from_slice leaks a cloned element, v would have only 1 → 1 drop.
     drop(v);
     let total = drops.load(Ordering::Relaxed);
     assert_eq!(

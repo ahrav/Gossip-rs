@@ -91,7 +91,6 @@ use gossip_contracts::{
 };
 
 use crate::common::{self, borrowed_shard_bound, derive_stable_item_id, parse_u64_be};
-use crate::split_estimator::StreamingSplitEstimator;
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
 #[derive(Clone, Debug)]
@@ -414,18 +413,10 @@ impl InMemoryDeterministicConnector {
 
     /// Choose a midpoint key that can be used as a shard split hint.
     ///
-    /// The in-memory connector already owns a sorted immutable snapshot, so it
-    /// bulk-loads the remaining range into [`StreamingSplitEstimator`] via
-    /// [`StreamingSplitEstimator::from_sorted_entries`] instead of keeping a
-    /// mutable estimator field.
-    ///
-    /// Returns `None` when fewer than two keys remain, when the candidate
-    /// would not advance past the cursor, or when it falls at or beyond the
-    /// upper shard bound (which would produce an empty right shard).
-    ///
-    /// Bound resolution is shared with filesystem via [`common::resolve_bounds`]
-    /// and [`common::key_resume_start`], so both connectors enforce the same
-    /// split-eligibility window before applying connector-local heuristics.
+    /// Delegates to [`common::estimate_split_from_sorted`] after resolving
+    /// bounds and the cursor resume position. Returns `None` when fewer than
+    /// two keys remain, the estimator produces no candidate, or the candidate
+    /// fails validation.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
@@ -438,22 +429,15 @@ impl InMemoryDeterministicConnector {
             return Ok(None);
         }
 
-        let split_estimator = StreamingSplitEstimator::from_sorted_entries(
-            StreamingSplitEstimator::DEFAULT_SAMPLE_CAP,
-            self.items[start_idx..bounds.range_end]
+        let range = &self.items[start_idx..bounds.range_end];
+        common::estimate_split_from_sorted(
+            range
                 .iter()
                 .map(|item| (item.key.as_bytes(), item.size_hint)),
-        );
-        let Some(split_key) = split_estimator.estimate_split_key() else {
-            return Ok(None);
-        };
-        if !common::is_valid_split_candidate(split_key, cursor, end) {
-            return Ok(None);
-        }
-
-        let split = ItemKey::try_from_vec(split_key.to_vec())
-            .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
-        Ok(Some(split))
+            range.len(),
+            cursor,
+            end,
+        )
     }
 
     /// Resolve an [`ItemRef`] into the backing bytes.
