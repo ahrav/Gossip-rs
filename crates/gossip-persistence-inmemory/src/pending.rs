@@ -26,10 +26,6 @@ impl<R> PendingState<R> {
 }
 
 /// A buffered write operation: the payload to apply and its lifecycle state.
-///
-/// The payload is retained even after completion because `finish_*_op` clones
-/// the payload out of a shared `&HashMap` reference before mutably applying it
-/// (we cannot hold a `&payload` and `&mut state` simultaneously).
 pub(crate) struct PendingOp<P, R> {
     pub(crate) payload: P,
     pub(crate) state: PendingState<R>,

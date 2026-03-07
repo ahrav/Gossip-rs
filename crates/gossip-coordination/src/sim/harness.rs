@@ -9,7 +9,7 @@
 //! A simulation run consists of three sequential stages:
 //!
 //! 1. **Zombie scenario** (deterministic preamble): A scripted sequence that
-//!    exercises the bookkeeping-cleanup path (B1) by expiring a lease and
+//!    exercises the bookkeeping-cleanup path by expiring a lease and
 //!    re-acquiring on a different worker. Attempted before random ops; it
 //!    returns early when fewer than two workers or zero shards are available.
 //! 2. **Safety phase** (`safety_ops` iterations): Weighted random operations

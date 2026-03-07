@@ -13,7 +13,7 @@ use gossip_contracts::{
     identity::TenantId,
     persistence::{
         CommitHandle, DoneLedger, DoneLedgerCommitReceipt, DoneLedgerKey, DoneLedgerRecord,
-        OvidHash,
+        DoneLedgerStatus, OvidHash,
     },
 };
 
@@ -112,9 +112,15 @@ impl InMemoryDoneLedger {
     /// Create an empty done-ledger with an explicit auto-complete mode.
     #[must_use]
     pub fn with_auto_complete(auto_complete: bool) -> Self {
-        let this = Self::default();
-        let _ = this.set_auto_complete(auto_complete);
-        this
+        Self {
+            inner: Arc::new(DoneLedgerInner {
+                state: Mutex::new(DoneLedgerState {
+                    auto_complete,
+                    ..DoneLedgerState::default()
+                }),
+                cv: Condvar::new(),
+            }),
+        }
     }
 
     /// Toggle whether future submissions complete immediately.
@@ -186,6 +192,10 @@ impl InMemoryDoneLedger {
     }
 
     /// Release a specific delayed operation by id.
+    ///
+    /// The released operation's entry is removed from the `order` queue to
+    /// prevent stale IDs from accumulating when `release_specific` is the
+    /// primary release mechanism (instead of `release_next`).
     pub fn release_specific(
         &self,
         op_id: PendingWriteId,
@@ -199,15 +209,38 @@ impl InMemoryDoneLedger {
             return Ok(false);
         }
         finish_done_ledger_op(&mut guard, op_id)?;
+        guard.order.retain(|id| *id != op_id);
         self.inner.cv.notify_all();
         Ok(true)
     }
 
-    /// Release every currently delayed operation.
+    /// Release every currently delayed operation under a single lock
+    /// acquisition.
+    ///
+    /// Only operations that are pending at the time of the call are released.
+    /// Operations submitted concurrently *after* the call are not drained,
+    /// preventing unbounded loops when writer threads are active.
     pub fn release_all(&self, order: CompletionOrder) -> Result<usize, InMemoryPersistenceError> {
+        let mut guard = self.lock_state()?;
+
+        let mut pending: Vec<PendingWriteId> = guard
+            .order
+            .iter()
+            .copied()
+            .filter(|op_id| guard.ops.get(op_id).is_some_and(|op| op.state.is_pending()))
+            .collect();
+        if order == CompletionOrder::NewestFirst {
+            pending.reverse();
+        }
+
         let mut released = 0usize;
-        while self.release_next(order)?.is_some() {
+        for op_id in pending {
+            finish_done_ledger_op(&mut guard, op_id)?;
+            guard.order.retain(|id| *id != op_id);
             released += 1;
+        }
+        if released > 0 {
+            self.inner.cv.notify_all();
         }
         Ok(released)
     }
@@ -519,18 +552,19 @@ fn apply_done_ledger_payload(
 
 /// Transition a pending done-ledger operation to `Finished`.
 ///
-/// Clones the payload out of the op before calling `apply_done_ledger_payload`
-/// because we need `&mut state` for mutation but the payload lives inside
-/// `state.ops` (split-borrow limitation). Already-finished ops are a no-op.
+/// Removes the op from the map to avoid the split-borrow limitation (we need
+/// `&op.payload` and `&mut state` simultaneously), applies the payload, then
+/// re-inserts the finished op. Already-finished ops are a no-op.
 fn finish_done_ledger_op(
     state: &mut DoneLedgerState,
     op_id: PendingWriteId,
 ) -> Result<(), InMemoryPersistenceError> {
-    let records = match state.ops.get(&op_id) {
-        Some(op) => match op.state {
-            PendingState::Pending => op.payload.records.clone(),
-            PendingState::Finished(_) => return Ok(()),
-        },
+    let mut op = match state.ops.remove(&op_id) {
+        Some(op) if op.state.is_pending() => op,
+        Some(op) => {
+            state.ops.insert(op_id, op);
+            return Ok(());
+        }
         None => {
             return Err(InMemoryPersistenceError::UnknownOperation {
                 store: InMemoryStoreKind::DoneLedger,
@@ -539,10 +573,9 @@ fn finish_done_ledger_op(
         }
     };
 
-    let result = apply_done_ledger_payload(state, &records);
-    if let Some(op) = state.ops.get_mut(&op_id) {
-        op.state = PendingState::Finished(Some(result));
-    }
+    let result = apply_done_ledger_payload(state, &op.payload.records);
+    op.state = PendingState::Finished(Some(result));
+    state.ops.insert(op_id, op);
     Ok(())
 }
 
@@ -552,8 +585,10 @@ fn finish_done_ledger_op(
 ///
 /// 1. **Status**: lattice join via [`DoneLedgerStatus::merge`] — the higher
 ///    rank wins, ensuring scanned states can never be downgraded.
-/// 2. **Metrics** (`bytes_scanned`, `findings_count`): take the max of each,
-///    since these are monotonically increasing scan-lifetime counters.
+/// 2. **Metrics**: `bytes_scanned` takes the max (monotonically increasing).
+///    `findings_count` is status-aware: forced to 0 for `ScannedClean`,
+///    forced to at least 1 for `ScannedWithFindings`, and max for other
+///    statuses.
 /// 3. **Provenance winner**: the record whose provenance is "freshest" is
 ///    chosen as the source of `provenance`, `error_code`, and display
 ///    metadata. Tie-breaking order:
@@ -579,7 +614,14 @@ fn merge_done_ledger_records(
 ) -> DoneLedgerRecord {
     let merged_status = existing.status().merge(incoming.status());
     let bytes_scanned = existing.bytes_scanned().max(incoming.bytes_scanned());
-    let findings_count = existing.findings_count().max(incoming.findings_count());
+    let findings_count = match merged_status {
+        DoneLedgerStatus::ScannedClean => 0,
+        DoneLedgerStatus::ScannedWithFindings => existing
+            .findings_count()
+            .max(incoming.findings_count())
+            .max(1),
+        _ => existing.findings_count().max(incoming.findings_count()),
+    };
 
     // Determine which record's provenance to trust for non-metric fields.
     let choose_incoming = incoming.status().rank() > existing.status().rank()

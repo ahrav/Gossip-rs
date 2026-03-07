@@ -55,21 +55,11 @@ impl fmt::Display for InMemoryStoreKind {
 pub struct PendingWriteId(u64);
 
 impl PendingWriteId {
-    /// Zero sentinel value.
-    pub const ZERO: Self = Self(0);
-
     /// Construct from a raw integer.
     #[inline]
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
-    }
-
-    /// Return the raw integer value.
-    #[inline]
-    #[must_use]
-    pub const fn as_raw(self) -> u64 {
-        self.0
     }
 }
 

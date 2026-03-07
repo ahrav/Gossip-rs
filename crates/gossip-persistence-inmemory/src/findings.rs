@@ -126,9 +126,15 @@ impl InMemoryFindingsSink {
     /// Create an empty findings sink with an explicit auto-complete mode.
     #[must_use]
     pub fn with_auto_complete(auto_complete: bool) -> Self {
-        let this = Self::default();
-        let _ = this.set_auto_complete(auto_complete);
-        this
+        Self {
+            inner: Arc::new(FindingsInner {
+                state: Mutex::new(FindingsState {
+                    auto_complete,
+                    ..FindingsState::default()
+                }),
+                cv: Condvar::new(),
+            }),
+        }
     }
 
     /// Toggle whether future submissions complete immediately.
@@ -190,6 +196,10 @@ impl InMemoryFindingsSink {
     }
 
     /// Release a specific delayed operation by id.
+    ///
+    /// The released operation's entry is removed from the `order` queue to
+    /// prevent stale IDs from accumulating when `release_specific` is the
+    /// primary release mechanism (instead of `release_next`).
     pub fn release_specific(
         &self,
         op_id: PendingWriteId,
@@ -203,15 +213,38 @@ impl InMemoryFindingsSink {
             return Ok(false);
         }
         finish_findings_op(&mut guard, op_id)?;
+        guard.order.retain(|id| *id != op_id);
         self.inner.cv.notify_all();
         Ok(true)
     }
 
-    /// Release every currently delayed operation.
+    /// Release every currently delayed operation under a single lock
+    /// acquisition.
+    ///
+    /// Only operations that are pending at the time of the call are released.
+    /// Operations submitted concurrently *after* the call are not drained,
+    /// preventing unbounded loops when writer threads are active.
     pub fn release_all(&self, order: CompletionOrder) -> Result<usize, InMemoryPersistenceError> {
+        let mut guard = self.lock_state()?;
+
+        let mut pending: Vec<PendingWriteId> = guard
+            .order
+            .iter()
+            .copied()
+            .filter(|op_id| guard.ops.get(op_id).is_some_and(|op| op.state.is_pending()))
+            .collect();
+        if order == CompletionOrder::NewestFirst {
+            pending.reverse();
+        }
+
         let mut released = 0usize;
-        while self.release_next(order)?.is_some() {
+        for op_id in pending {
+            finish_findings_op(&mut guard, op_id)?;
+            guard.order.retain(|id| *id != op_id);
             released += 1;
+        }
+        if released > 0 {
+            self.inner.cv.notify_all();
         }
         Ok(released)
     }
@@ -493,12 +526,9 @@ impl FindingsSink for InMemoryFindingsSink {
             guard.order.push_back(op_id);
             guard.ops.insert(op_id, op);
         } else {
-            let payload = FindingsPayload {
-                findings: op.payload.findings.clone(),
-                occurrences: op.payload.occurrences.clone(),
-                observations: op.payload.observations.clone(),
-            };
-            let result = apply_findings_payload(&mut guard, &payload);
+            // `op` is a local variable not yet inserted into any map, so
+            // `&op.payload` can be passed directly — no clone needed.
+            let result = apply_findings_payload(&mut guard, &op.payload);
             op.state = PendingState::Finished(Some(result));
             guard.ops.insert(op_id, op);
             self.inner.cv.notify_all();
@@ -560,21 +590,19 @@ fn validate_batch_tenant_consistency(
 
 /// Transition a pending findings operation to `Finished`.
 ///
-/// Same clone-then-apply pattern as the done-ledger's `finish_done_ledger_op`
-/// to work around the split-borrow limitation on `state.ops`.
+/// Removes the op from the map to avoid the split-borrow limitation (we need
+/// `&op.payload` and `&mut state` simultaneously), applies the payload, then
+/// re-inserts the finished op. Already-finished ops are a no-op.
 fn finish_findings_op(
     state: &mut FindingsState,
     op_id: PendingWriteId,
 ) -> Result<(), InMemoryPersistenceError> {
-    let payload = match state.ops.get(&op_id) {
-        Some(op) => match op.state {
-            PendingState::Pending => FindingsPayload {
-                findings: op.payload.findings.clone(),
-                occurrences: op.payload.occurrences.clone(),
-                observations: op.payload.observations.clone(),
-            },
-            PendingState::Finished(_) => return Ok(()),
-        },
+    let mut op = match state.ops.remove(&op_id) {
+        Some(op) if op.state.is_pending() => op,
+        Some(op) => {
+            state.ops.insert(op_id, op);
+            return Ok(());
+        }
         None => {
             return Err(InMemoryPersistenceError::UnknownOperation {
                 store: InMemoryStoreKind::Findings,
@@ -583,22 +611,22 @@ fn finish_findings_op(
         }
     };
 
-    let result = apply_findings_payload(state, &payload);
-    if let Some(op) = state.ops.get_mut(&op_id) {
-        op.state = PendingState::Finished(Some(result));
-    }
+    let result = apply_findings_payload(state, &op.payload);
+    op.state = PendingState::Finished(Some(result));
+    state.ops.insert(op_id, op);
     Ok(())
 }
 
 /// Apply a findings payload to the durable state with full integrity checks.
 ///
-/// # Staged-snapshot approach
+/// # Validate-then-mutate approach
 ///
-/// To ensure atomicity on failure, the function clones the three durable maps
-/// into `staged_*` working copies and validates against those. Only if the
-/// entire payload passes validation are the staged maps swapped into
-/// `state.durable_*`. A validation error at any point aborts without mutating
-/// durable state — this mimics a real backend's transactional rollback.
+/// To ensure atomicity on failure the function builds temporary `batch_*` maps
+/// from the payload and validates every invariant as read-only lookups against
+/// the union of `batch_*` (same-batch rows) and `state.durable_*` (already-
+/// durable rows). Only after the entire payload passes validation are the new
+/// rows inserted into `state.durable_*`. A validation error at any point
+/// aborts without mutating durable state.
 ///
 /// # Processing order (findings -> occurrences -> observations)
 ///
@@ -610,7 +638,7 @@ fn finish_findings_op(
 ///    content are silently deduplicated; differing content is a conflict error.
 /// 2. **Occurrences**: same immutability rule as findings, plus each
 ///    occurrence must reference a finding in `batch_findings` or
-///    `staged_findings`.
+///    `state.durable_findings`.
 /// 3. **Observations**: upsert semantics — identity fields must match, but
 ///    provenance (`seen_at`, `location`, `run_id`, etc.) may be updated via
 ///    [`merge_observations`].
@@ -625,11 +653,6 @@ fn apply_findings_payload(
         });
     }
 
-    // Clone durable state into working copies for atomic-on-failure semantics.
-    let mut staged_findings = state.durable_findings.clone();
-    let mut staged_occurrences = state.durable_occurrences.clone();
-    let mut staged_observations = state.durable_observations.clone();
-
     // --- Layer 1: Findings (immutable insert-or-check) ---
     let mut batch_findings: HashMap<FindingKey, FindingRecord> = HashMap::new();
     for finding in &payload.findings {
@@ -643,15 +666,13 @@ fn apply_findings_payload(
             }
             continue;
         }
-        if let Some(existing) = staged_findings.get(&key) {
-            if existing != finding {
-                return Err(InMemoryPersistenceError::FindingConflict {
-                    tenant_id: finding.tenant_id(),
-                    finding_id: finding.finding_id(),
-                });
-            }
-        } else {
-            staged_findings.insert(key, finding.clone());
+        if let Some(existing) = state.durable_findings.get(&key)
+            && existing != finding
+        {
+            return Err(InMemoryPersistenceError::FindingConflict {
+                tenant_id: finding.tenant_id(),
+                finding_id: finding.finding_id(),
+            });
         }
         batch_findings.insert(key, finding.clone());
     }
@@ -661,7 +682,8 @@ fn apply_findings_payload(
     for occurrence in &payload.occurrences {
         let key = (occurrence.tenant_id(), occurrence.occurrence_id());
         let finding_key = (occurrence.tenant_id(), occurrence.finding_id());
-        if !batch_findings.contains_key(&finding_key) && !staged_findings.contains_key(&finding_key)
+        if !batch_findings.contains_key(&finding_key)
+            && !state.durable_findings.contains_key(&finding_key)
         {
             return Err(InMemoryPersistenceError::MissingFinding {
                 tenant_id: occurrence.tenant_id(),
@@ -678,15 +700,13 @@ fn apply_findings_payload(
             }
             continue;
         }
-        if let Some(existing) = staged_occurrences.get(&key) {
-            if existing != occurrence {
-                return Err(InMemoryPersistenceError::OccurrenceConflict {
-                    tenant_id: occurrence.tenant_id(),
-                    occurrence_id: occurrence.occurrence_id(),
-                });
-            }
-        } else {
-            staged_occurrences.insert(key, occurrence.clone());
+        if let Some(existing) = state.durable_occurrences.get(&key)
+            && existing != occurrence
+        {
+            return Err(InMemoryPersistenceError::OccurrenceConflict {
+                tenant_id: occurrence.tenant_id(),
+                occurrence_id: occurrence.occurrence_id(),
+            });
         }
         batch_occurrences.insert(key, occurrence.clone());
     }
@@ -700,7 +720,7 @@ fn apply_findings_payload(
         let key = (observation.tenant_id(), observation.observation_id());
         let occurrence_key = (observation.tenant_id(), observation.occurrence_id());
         if !batch_occurrences.contains_key(&occurrence_key)
-            && !staged_occurrences.contains_key(&occurrence_key)
+            && !state.durable_occurrences.contains_key(&occurrence_key)
         {
             return Err(InMemoryPersistenceError::MissingOccurrence {
                 tenant_id: observation.tenant_id(),
@@ -711,29 +731,44 @@ fn apply_findings_payload(
 
         if let Some(existing) = batch_observations.get(&key) {
             let merged = merge_observations(existing, observation)?;
-            batch_observations.insert(key, merged.clone());
-            staged_observations.insert(key, merged);
+            batch_observations.insert(key, merged);
             continue;
         }
 
-        if let Some(existing) = staged_observations.get(&key) {
+        if let Some(existing) = state.durable_observations.get(&key) {
             let merged = merge_observations(existing, observation)?;
-            staged_observations.insert(key, merged.clone());
             batch_observations.insert(key, merged);
         } else {
-            staged_observations.insert(key, observation.clone());
             batch_observations.insert(key, observation.clone());
         }
     }
 
-    state.durable_findings = staged_findings;
-    state.durable_occurrences = staged_occurrences;
-    state.durable_observations = staged_observations;
+    // Validation passed — commit new rows into durable state.
+    for (key, record) in &batch_findings {
+        state
+            .durable_findings
+            .entry(*key)
+            .or_insert_with(|| record.clone());
+    }
+    for (key, record) in &batch_occurrences {
+        state
+            .durable_occurrences
+            .entry(*key)
+            .or_insert_with(|| record.clone());
+    }
+    // Observations use upsert semantics: always overwrite with the merged result.
+    for (key, record) in batch_observations.iter() {
+        state.durable_observations.insert(*key, record.clone());
+    }
 
+    // Use deduplicated batch map sizes rather than raw payload lengths.
+    // Within-batch duplicates (same key, same content) are silently skipped
+    // by the `continue` branches above, so `batch_*.len()` reflects the
+    // number of distinct rows actually acknowledged by this commit.
     Ok(FindingsCommitReceipt::new(
-        payload.findings.len() as u64,
-        payload.occurrences.len() as u64,
-        payload.observations.len() as u64,
+        batch_findings.len() as u64,
+        batch_occurrences.len() as u64,
+        batch_observations.len() as u64,
     ))
 }
 
