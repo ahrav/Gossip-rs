@@ -26,7 +26,7 @@ use gossip_coordination::{
 /// |---|---|
 /// | `version` | etcd server version string (e.g. `"3.5.12"`). |
 /// | `db_size` | Total on-disk size of the member's backend store (bytes). |
-/// | `raft_used_db_size` | Portion of `db_size` actually used by Raft entries (defrag reclaims the gap). |
+/// | `raft_used_db_size` | Portion of `db_size` actually in use by the backend store (defrag reclaims the gap). |
 /// | `leader` | Member ID of the current Raft leader (`0` if no leader is elected). |
 /// | `raft_index` | Latest Raft log index the member is aware of. |
 /// | `raft_term` | Current Raft election term. |
@@ -311,9 +311,10 @@ impl CoordinationBackend for EtcdCoordinator {
 // Same delegation pattern as `CoordinationBackend` above: every method
 // forwards to `InMemoryCoordinator`. Run creation, shard registration,
 // progress queries, and terminal transitions (complete/fail/cancel) all
-// carry their full semantics from the reference implementation. Mutating
-// methods accept `OpId` for idempotency; the in-memory delegate enforces
-// this via a bounded op-log on each `RunRecord`.
+// carry their full semantics from the reference implementation. Most
+// mutating methods accept `OpId` for idempotency (`create_run` is the
+// exception — it is inherently non-idempotent); the in-memory delegate
+// enforces dedup via a bounded op-log on each `RunRecord`.
 
 impl RunManagement for EtcdCoordinator {
     fn create_run(
@@ -419,9 +420,10 @@ impl RunManagement for EtcdCoordinator {
 // Trait delegation — shard claiming
 // ---------------------------------------------------------------------------
 //
-// `ShardClaiming` is a supertrait of `CoordinationBackend + RunManagement`.
-// `claim_next_available` queries run state for claimable shards, then
-// acquires one — both steps delegated to the in-memory coordinator.
+// `ShardClaiming` extends `CoordinationBackend + RunManagement` (they are
+// its supertraits). `claim_next_available` queries run state for claimable
+// shards, then acquires one — both steps delegated to the in-memory
+// coordinator.
 
 impl ShardClaiming for EtcdCoordinator {
     fn claim_next_available<'a>(

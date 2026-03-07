@@ -25,10 +25,11 @@ pub(crate) const DEFAULT_BOOTSTRAP_LEASE_DURATION: u64 = 30;
 ///
 /// # Construction and normalization
 ///
-/// All constructors ([`new`], [`from_endpoints_csv`], [`localhost`]) trim
-/// leading/trailing whitespace from each endpoint and the namespace prefix
-/// before validation. This means `"  http://host:2379  "` is accepted and
-/// stored as `"http://host:2379"`.
+/// [`new`] and [`from_endpoints_csv`] trim leading/trailing whitespace from
+/// each endpoint and the namespace prefix before validation. This means
+/// `"  http://host:2379  "` is accepted and stored as `"http://host:2379"`.
+/// [`localhost`] uses hard-coded values and skips both trimming and
+/// validation.
 ///
 /// # Invariants
 ///
