@@ -12,6 +12,11 @@ lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
+The emerging durable backend lives in `crates/gossip-coordination-etcd/`.
+It currently owns a real etcd client connection and exposes the final
+`EtcdCoordinator` type, but still delegates protocol semantics to
+`InMemoryCoordinator` until the etcd keyspace and transactional writes land.
+
 The module provides seven core capabilities:
 
 - **Shard lifecycle state machine** -- a four-state automaton (`Active`,
@@ -67,6 +72,15 @@ The module provides seven core capabilities:
 | `limits.rs`    | Capacity constants for split fan-out (`MAX_SPLIT_CHILDREN`, `MAX_SPAWNED_PER_SHARD`)                                       |
 | `manifest.rs`  | `InitialShardInput`, `validate_manifest` — shard manifest validation for `register_shards`                                 |
 | `split.rs`     | Contracts-owned split planner core (`SplitReplacePlan`, `SplitResidualPlan`, `plan_split_replace*`, `plan_split_residual*`) |
+
+#### `gossip-coordination-etcd` crate (`crates/gossip-coordination-etcd/src/`)
+
+| File         | Role                                                                                         |
+| ------------ | -------------------------------------------------------------------------------------------- |
+| `backend.rs` | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
+| `config.rs`  | Endpoint + namespace validation for etcd connectivity                                         |
+| `runtime.rs` | Private sync/async bridge for driving the async etcd client from sync coordination traits     |
+| `error.rs`   | etcd connection/runtime error surfaces                                                        |
 
 ---
 

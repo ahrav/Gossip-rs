@@ -4,23 +4,27 @@
 
 ## Comment Policy — MANDATORY, HOOK-ENFORCED
 
-**Source code is not a conversation, a changelog, or a response to PR feedback.**
-Comments must describe the code they annotate — its behavior, invariants, edge
-cases, or non-obvious design reasoning. Nothing else.
+**Source code and documentation are not conversations, changelogs, or responses
+to PR feedback.** Comments and doc prose must describe the code they annotate —
+its behavior, invariants, edge cases, or non-obvious design reasoning.
+Nothing else.
 
-A PostToolUse hook (`comment-lint.sh`) scans every `.rs` file write and will
-flag violations. Fix them before moving on.
+A PostToolUse hook (`comment-lint.sh`) scans every `.rs` file write and every
+`.md` file write under `docs/` and `diagrams/`. It will flag violations. Fix
+them before moving on.
 
 ### What Is Banned
 
 | Category | Examples of BANNED comments |
 |----------|-----------------------------|
 | Tracking IDs | `// F-011: BatchValidation error variant`, `// C3: edge case` |
+| Milestone / phase labels | `// B0 scaffold`, `// until B1 lands`, `// B1/B2 will add`, `phase 1` |
 | PR / review references | `// PR #124`, `// per review feedback`, `// addressed reviewer concern` |
 | Test justification | `// Verification tests for PR review comments`, `// Added to cover finding F7` |
 | Temporal narration | `// Previously used linear scan`, `// Was changed from X to Y`, `// Newly added` |
 | Conversational | `// Good catch`, `// As discussed`, `// Note to reviewer` |
 | History narration | `// Refactored from module A`, `// Moved from old_engine.rs` |
+| Task IDs in docs | `gossip-8968`, `gossip-rs-8r9.25`, `Step gossip-rs-...` (in `.md` files) |
 
 ### What Is Required
 
@@ -39,12 +43,21 @@ or chat history must fully understand the comment from the code context alone.
 // BAD: F1: Merge panic bug fix
 // GOOD: Merge transition clears stale metadata to prevent use-after-move.
 
+// BAD: B0 etcd coordination backend scaffold.
+// GOOD: etcd coordination backend.
+
+// BAD: until B1/B2 land the etcd keyspace and transactional writes.
+// GOOD: until the etcd keyspace and transactional writes land.
+
 // BAD: Previously used linear scan, refactored to binary search
 // GOOD: Binary search — the rank array is sorted by construction (see insert_sorted above).
 
 // BAD: Added per reviewer suggestion to handle empty input
 // GOOD: Empty input returns Ok(()) — callers depend on this for idempotent retry loops.
 ```
+
+**Docs (`docs/`, `diagrams/`) follow the same policy.** No milestone labels,
+task IDs, or step tracking references in documentation prose.
 
 ### Self-Check Before Writing Any Comment
 
@@ -62,7 +75,8 @@ are documentation, not tracking noise.
 
 ### Enforcement
 
-- **Hook**: `comment-lint.sh` runs on every `.rs` file write and flags violations.
+- **Hook**: `comment-lint.sh` runs on every `.rs` file write and every `.md`
+  file write under `docs/` or `diagrams/`, flagging violations.
 - **Review**: Any PR introducing banned comment patterns will be rejected.
 - **Existing violations**: Must be cleaned up when touching a file.
 

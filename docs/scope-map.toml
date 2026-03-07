@@ -43,6 +43,15 @@ dir = "crates/gossip-frontier/src/"
 doc = "specs/coordination/README.md"
 dir = "specs/coordination/"
 
+# etcd coordination backend.
+[[scopes]]
+doc = "docs/gossip-coordination/boundary-2-coordination.md"
+dir = "crates/gossip-coordination-etcd/src/"
+
+[[scopes]]
+doc = "docs/gossip-coordination/coordination-testing.md"
+dir = "crates/gossip-coordination-etcd/src/"
+
 # Boundary 4: Connectors (value types, traits, page validation, conformance).
 [[scopes]]
 doc = "docs/gossip-connectors/boundary-4-connectors.md"

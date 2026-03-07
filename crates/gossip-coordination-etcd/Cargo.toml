@@ -1,0 +1,21 @@
+[package]
+name = "gossip-coordination-etcd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "etcd-backed coordination backend for gossip-coordination"
+
+[features]
+default = []
+tls = ["etcd-client/tls"]
+test-support = ["gossip-coordination/test-support"]
+
+[dependencies]
+gossip-coordination.workspace = true
+etcd-client = { version = "0.18", default-features = false }
+tokio = { version = "1", features = ["rt", "time", "net"] }
+
+[dev-dependencies]
+gossip-coordination = { workspace = true, features = ["test-support"] }

@@ -1,0 +1,49 @@
+//! etcd-backed coordination backend for shard and run lifecycle management.
+//!
+//! This crate provides [`EtcdCoordinator`], which implements the full
+//! coordination trait surface ([`CoordinationBackend`], [`RunManagement`],
+//! [`ShardClaiming`]) backed by a real etcd cluster connection. It is the
+//! production-path alternative to the in-memory coordinator used in tests.
+//!
+//! # Architecture
+//!
+//! The crate is structured in three internal modules:
+//!
+//! - **`config`** — Validated connection parameters (endpoints, namespace
+//!   prefix). Construction normalizes whitespace and enforces keyspace
+//!   prefix invariants.
+//! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client,
+//!   exposes health-check (`status()`), and forwards trait methods.
+//! - **`error`** — Unified error types covering configuration validation,
+//!   Tokio runtime creation, and etcd client failures.
+//!
+//! # Current delegation model
+//!
+//! All shard and run protocol semantics (acquire, renew, checkpoint,
+//! complete, split, park, claim) are delegated to [`InMemoryCoordinator`]
+//! from `gossip-coordination`. The etcd connection is established and
+//! health-checked at construction, but shard/run state lives in memory.
+//!
+//! # Build requirements
+//!
+//! The upstream `etcd-client` crate generates gRPC stubs at build time.
+//! Build hosts must have `protoc` installed (or the `PROTOC` environment
+//! variable pointing to its binary).
+//!
+//! [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
+//! [`RunManagement`]: gossip_coordination::RunManagement
+//! [`ShardClaiming`]: gossip_coordination::ShardClaiming
+//! [`InMemoryCoordinator`]: gossip_coordination::InMemoryCoordinator
+
+#![forbid(unsafe_code)]
+
+mod backend;
+mod config;
+mod error;
+
+pub use backend::EtcdCoordinator;
+pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
+pub use error::{EtcdCoordinatorError, EtcdOperation};
+
+#[cfg(test)]
+mod tests;

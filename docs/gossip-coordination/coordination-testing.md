@@ -12,11 +12,18 @@ tests validate backend execution semantics using those shared planner surfaces.
 For protocol details see [boundary-2-coordination.md](boundary-2-coordination.md).
 For simulation architecture see [simulation-harness.md](simulation-harness.md).
 
-Step `gossip-rs-8r9.25` introduces a new unified execution seam in
-`crates/gossip-scan-driver/` (`Assignment -> ScanSourceFactory -> ScanDriver`).
-Coordination tests continue to validate protocol invariants independently of
-scan execution internals, while runtime integration tests should now exercise
-that assignment-to-driver boundary.
+A unified execution seam in `crates/gossip-scan-driver/`
+(`Assignment -> ScanSourceFactory -> ScanDriver`) bridges coordination and
+scan execution. Coordination tests continue to validate protocol invariants
+independently of scan execution internals, while runtime integration tests
+exercise that assignment-to-driver boundary.
+
+The etcd scaffold in `crates/gossip-coordination-etcd/` adds backend-specific
+bootstrap tests: configuration validation stays local and deterministic, while
+an ignored smoke test verifies `EtcdCoordinator::connect()` + `status()` against
+a real local etcd. Protocol conformance, scenario, and simulation coverage
+remain rooted in `InMemoryCoordinator` until real etcd transactions replace the
+current delegation path.
 
 ## Allocation Policy Scope (Tiered)
 
@@ -130,7 +137,7 @@ catch regressions where a fix for one invariant violates another.
 | `owner_divergence_with_matching_fence`             | Lease validation (fence + owner identity) + tenant isolation                                              |
 | `terminal_clears_lease`                            | Terminal transitions clear leases + correct terminal status per operation (complete, park, split_replace) |
 
-### Group B: Gap-Filling Tests
+### Group B: Supplementary Coverage Tests
 
 Edge cases with zero or minimal coverage elsewhere.
 

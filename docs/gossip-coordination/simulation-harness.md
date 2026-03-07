@@ -10,6 +10,12 @@ source-specific execution backends. The simulation harness remains focused on
 coordination correctness and intentionally does not depend on scanner-engine
 or scheduler internals.
 
+Persistence note: `crates/gossip-coordination-etcd/` currently owns a real etcd
+client for connectivity checks but still delegates protocol semantics to
+`InMemoryCoordinator`. Deterministic simulation therefore continues to model the
+reference backend directly until the etcd implementation replaces delegation
+with real transactional writes.
+
 ## Architecture
 
 The simulation is built in five layers, each composing the one below it:
@@ -168,14 +174,14 @@ Pause durations and time-jump magnitudes scale with the level. See
 
 The harness exercises two distinct zombie-rejection paths:
 
-1. **B1 bookkeeping cleanup** -- When Worker B acquires a shard previously
+1. **Local bookkeeping cleanup** -- When Worker B acquires a shard previously
    held by Worker A (whose lease expired), Worker A's local bookkeeping is
    cleared. A subsequent checkpoint attempt by Worker A is rejected with
    `NotLeased` before reaching the coordinator.
 
 2. **Coordinator fence-based StaleFence** -- Stale leases are saved when
    bookkeeping cleanup supersedes them. `ZombieCheckpoint` ops use these
-   saved stale leases to bypass B1 cleanup entirely, exercising the
+   saved stale leases to bypass local cleanup entirely, exercising the
    coordinator's `StaleFence` error path directly.
 
 ## Reproducing a Failing Seed
