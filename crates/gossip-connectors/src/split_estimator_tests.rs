@@ -799,6 +799,51 @@ fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
     nearest_by_rank_in_range(&samples, 1, 0, 5);
 }
 
+/// Compacting with `cap == len` is a no-op: no samples are evicted and every
+/// field remains identical.
+#[test]
+fn compact_samples_noop_when_cap_equals_len() {
+    use super::{Sample, compact_samples};
+
+    let original: Vec<Sample> = (0..10)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+    let mut samples = original.clone();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+    for (a, b) in samples.iter().zip(original.iter()) {
+        assert_eq!(a.rank, b.rank);
+        assert_eq!(a.recorded_byte_position, b.recorded_byte_position);
+        assert_eq!(a.key, b.key);
+    }
+}
+
+/// Compacting with `cap == len - 1` evicts exactly one sample. Endpoints and
+/// monotonicity invariants must still hold in this most-constrained case.
+#[test]
+fn compact_samples_evicts_exactly_one_when_cap_is_len_minus_one() {
+    use super::{Sample, compact_samples};
+
+    let n = 20usize;
+    let mut samples: Vec<Sample> = (0..n)
+        .map(|i| Sample::new(i as u64, (i as u64) * 50, &key_for_index(i)))
+        .collect();
+
+    compact_samples(&mut samples, n - 1);
+
+    assert_eq!(samples.len(), n - 1);
+    assert_eq!(samples.first().unwrap().rank, 0);
+    assert_eq!(samples.last().unwrap().rank, (n - 1) as u64);
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
+}
+
 #[test]
 fn compact_samples_preserves_endpoints_and_monotonicity() {
     use super::{Sample, compact_samples};
@@ -905,6 +950,12 @@ fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
     );
     // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+    // Byte positions non-decreasing (plateau means equal is expected).
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
 }
 
 /// Compacting to 2 retains only the first and last sample, with strictly
@@ -925,6 +976,10 @@ fn compact_samples_cap_two_preserves_first_and_last() {
     assert!(
         samples[0].rank < samples[1].rank,
         "ranks must be strictly increasing"
+    );
+    assert!(
+        samples[0].recorded_byte_position <= samples[1].recorded_byte_position,
+        "byte positions must be non-decreasing"
     );
 }
 
@@ -964,6 +1019,12 @@ fn compact_samples_typical_half_reduction() {
 
     // Monotonicity: ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+    // Byte positions non-decreasing.
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
+    );
 
     // Approximate uniform spacing: average rank gap should be close to 2.
     let gaps: Vec<u64> = samples.windows(2).map(|w| w[1].rank - w[0].rank).collect();
@@ -1028,6 +1089,55 @@ fn compact_to_single_slot_keeps_last_sample() {
         samples[0].key, original_last_key,
         "the single retained sample must be the last (most-recent) observation"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Compaction edge-case tests — early-return paths
+// ---------------------------------------------------------------------------
+
+/// Empty sample vec is a no-op: `compact_samples` returns immediately.
+#[test]
+fn compact_samples_empty_vec_is_noop() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = vec![];
+    compact_samples(&mut samples, 10);
+    assert!(samples.is_empty());
+}
+
+/// Single-element vec is preserved unchanged when cap >= 1.
+#[test]
+fn compact_samples_single_element_preserved() {
+    use super::{Sample, compact_samples};
+
+    let mut samples = vec![Sample::new(0, 42, &key_for_index(0))];
+    compact_samples(&mut samples, 10);
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].rank, 0);
+    assert_eq!(samples[0].recorded_byte_position, 42);
+}
+
+/// When len == cap, no compaction is needed — identity operation.
+#[test]
+fn compact_samples_at_cap_is_identity() {
+    use super::{Sample, compact_samples};
+
+    let original: Vec<Sample> = (0..10)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+    let expected: Vec<_> = original
+        .iter()
+        .map(|s| (s.rank, s.recorded_byte_position, s.key.clone()))
+        .collect();
+
+    let mut samples = original;
+    compact_samples(&mut samples, 10);
+
+    let actual: Vec<_> = samples
+        .iter()
+        .map(|s| (s.rank, s.recorded_byte_position, s.key.clone()))
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1473,68 @@ proptest! {
             prop_assert!(split != last_key.as_slice(),
                 "split must not be the last key (count={})", count);
         }
+    }
+
+    /// The in-place swap compaction must produce the same retained samples as
+    /// a naive "collect selected indices into a new vec" approach.
+    #[test]
+    fn prop_compact_samples_matches_naive_collect(
+        len in 3usize..200,
+        cap_frac in 0.1f64..0.99,
+    ) {
+        use super::{Sample, compact_samples, selected_sample_indices};
+
+        let cap = ((len as f64 * cap_frac) as usize).max(1).min(len - 1);
+        let samples: Vec<Sample> = (0..len)
+            .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+            .collect();
+
+        // Naive: collect into new vec via the index selector.
+        let keep = selected_sample_indices(&samples, cap);
+        let expected: Vec<_> = keep
+            .iter()
+            .map(|&idx| {
+                (
+                    samples[idx].rank,
+                    samples[idx].recorded_byte_position,
+                    samples[idx].key.clone(),
+                )
+            })
+            .collect();
+
+        // In-place swap compaction.
+        let mut actual_samples = samples;
+        compact_samples(&mut actual_samples, cap);
+        let actual: Vec<_> = actual_samples
+            .iter()
+            .map(|s| (s.rank, s.recorded_byte_position, s.key.clone()))
+            .collect();
+
+        prop_assert_eq!(actual, expected);
+    }
+
+    /// `selected_sample_indices` must return strictly increasing indices for
+    /// any valid (count > cap) input, including streams with uniform, ascending,
+    /// and plateau byte positions.
+    #[test]
+    fn prop_selected_indices_strictly_increasing(
+        count in 2..500usize,
+        cap_mult in 1..4usize,
+    ) {
+        use super::selected_sample_indices;
+
+        let cap = (MIN_SAMPLE_CAP * cap_mult).min(count);
+        // Skip degenerate cases where cap >= count (no compaction needed).
+        prop_assume!(count > cap);
+
+        let samples: Vec<Sample> = (0..count)
+            .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+            .collect();
+        let indices = selected_sample_indices(&samples, cap);
+        prop_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "indices must be strictly increasing: {:?}", indices
+        );
     }
 
 }

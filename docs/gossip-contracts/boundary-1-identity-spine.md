@@ -110,6 +110,21 @@ pub struct FindingIdInputs {
 The `secret` field takes `SecretHash` (post-keying), not raw `NormHash`. This
 ensures tenant isolation is baked into the finding identity.
 
+### Why there is no umbrella `DerivationContext`
+
+Boundary 1 intentionally keeps per-derivation input structs (`FindingIdInputs`,
+`OccurrenceIdInputs`, `ObservationIdInputs`) instead of introducing one
+cross-cutting context bag. The scoping axes do not actually line up into a
+single reusable bundle:
+
+- `TenantId` scopes finding and observation identities
+- `ConnectorInstanceIdHash` is consumed earlier when deriving `StableItemId`
+- `PolicyHash` scopes observations only
+
+A shared `DerivationContext` would therefore carry unused fields through most
+call sites and obscure which derivation owns which scope. The code keeps those
+boundaries explicit and local.
+
 ---
 
 ## 3. Keyed / Unkeyed Boundary
@@ -138,6 +153,11 @@ let id = finalize_32(&h);
 The domain string is consumed as a key-derivation context, producing a
 context-dependent key schedule. Two hashers with different domain tags behave as
 independent hash functions.
+
+For simple fixed-field input structs, the crate now generates
+`CanonicalBytes` from the struct declaration itself via a declarative helper in
+`identity/macros.rs`, so declaration order remains the single source of truth
+for hash order.
 
 ### Keyed mode (SecretHash only)
 
@@ -259,23 +279,26 @@ All 15 domain constants live in `domain.rs` and follow the naming convention
 | 18  | `OccurrenceId` purity                             | proptest                              | `occurrence_id_is_pure`                                                                                                                                                                                                                | `finding.rs`   |
 | 19  | `OccurrenceId` collision-freedom                  | proptest                              | `occurrence_id_collision_free`                                                                                                                                                                                                         | `finding.rs`   |
 | 20  | `OccurrenceId` per-field sensitivity              | proptest                              | `occurrence_id_finding_field_sensitivity`, `occurrence_id_version_field_sensitivity`, `occurrence_id_offset_field_sensitivity`, `occurrence_id_length_field_sensitivity`                                                               | `finding.rs`   |
-| 21  | `StableItemId` purity                             | proptest                              | `item_key_stable_id_is_pure`                                                                                                                                                                                                           | `item.rs`      |
-| 22  | `StableItemId` collision-freedom                  | proptest                              | `item_key_stable_id_collision_free`                                                                                                                                                                                                    | `item.rs`      |
-| 23  | `ObjectVersionId` purity                          | proptest                              | `object_version_id_is_pure`                                                                                                                                                                                                            | `item.rs`      |
-| 24  | `ObjectVersionId` collision-freedom               | proptest                              | `object_version_id_collision_free`                                                                                                                                                                                                     | `item.rs`      |
-| 25  | `ConnectorTag` input validation                   | unit test + proptest                  | `connector_tag_empty_panics`, `connector_tag_too_long_panics`, `from_ascii_rejects_non_graphic`, `connector_tag_from_ascii_pads_correctly`                                                                                             | `item.rs`      |
-| 26  | `PolicyHash` purity                               | proptest                              | `compute_policy_hash_is_pure`                                                                                                                                                                                                          | `policy.rs`    |
-| 27  | `PolicyHash` collision-freedom                    | proptest                              | `policy_hash_collision_free`                                                                                                                                                                                                           | `policy.rs`    |
-| 28  | `PolicyHash` per-field sensitivity                | proptest                              | `policy_hash_version_field_sensitivity`, `id_hash_mode_field_sensitivity`, `evidence_hash_version_field_sensitivity`, `rules_digest_field_sensitivity`                                                                                 | `policy.rs`    |
-| 29  | `IdHashMode` discriminant stability               | unit test                             | `id_hash_mode_discriminants_are_stable`, `id_hash_mode_roundtrip`, `id_hash_mode_unknown_returns_none`                                                                                                                                 | `policy.rs`    |
-| 30  | Macro-generated types: traits, Debug, Canonical   | compile-time + unit + proptest        | `macro_types_implement_required_traits`, `pub_debug_shows_hex_prefix`, `restricted_debug_is_redacted`, `pub_canonical_bytes_stable` (and more)                                                                                         | `macros.rs`    |
-| 31  | Golden vectors (7 derivations)                    | unit test                             | `stable_item_id_golden_value`, `object_version_id_golden_value`, `key_secret_hash_golden_value`, `derive_finding_id_golden_value`, `derive_occurrence_id_golden_value`, `compute_policy_hash_golden_value`, `finalize_64_golden_value` | `golden.rs`    |
-| 32  | Golden vector registry completeness               | unit test                             | `registry_is_complete`                                                                                                                                                                                                                 | `golden.rs`    |
-| 33  | Full-chain determinism (composed)                 | proptest                              | `full_chain_item_to_occurrence_is_pure`                                                                                                                                                                                                | `golden.rs`    |
-| 34  | Full-chain collision-freedom (composed)           | proptest                              | `full_chain_collision_free`                                                                                                                                                                                                            | `golden.rs`    |
-| 35  | Boundary u64 values in OccurrenceId               | unit test                             | `boundary_u64_occurrence_id`                                                                                                                                                                                                           | `golden.rs`    |
-| 36  | `domain_hasher` matches `blake3::derive_key`      | unit test                             | `domain_hasher_matches_blake3_derive_key`                                                                                                                                                                                              | `hashing.rs`   |
-| 37  | Domain separation for random payloads             | proptest                              | `domain_separation_for_random_payload`                                                                                                                                                                                                 | `hashing.rs`   |
+| 21  | `ObservationId` purity                            | proptest                              | `observation_id_is_pure`                                                                                                                                                                                                               | `finding.rs`   |
+| 22  | `ObservationId` collision-freedom                 | proptest                              | `observation_id_collision_free`                                                                                                                                                                                                         | `finding.rs`   |
+| 23  | `ObservationId` per-field sensitivity             | proptest                              | `observation_id_policy_field_sensitivity`, `observation_id_tenant_field_sensitivity`, `observation_id_occurrence_field_sensitivity`                                                                                                     | `finding.rs`   |
+| 24  | `StableItemId` purity                             | proptest                              | `item_key_stable_id_is_pure`                                                                                                                                                                                                           | `item.rs`      |
+| 25  | `StableItemId` collision-freedom                  | proptest                              | `item_key_stable_id_collision_free`                                                                                                                                                                                                    | `item.rs`      |
+| 26  | `ObjectVersionId` purity                          | proptest                              | `object_version_id_is_pure`                                                                                                                                                                                                            | `item.rs`      |
+| 27  | `ObjectVersionId` collision-freedom               | proptest                              | `object_version_id_collision_free`                                                                                                                                                                                                     | `item.rs`      |
+| 28  | `ConnectorTag` input validation                   | unit test + proptest                  | `connector_tag_empty_panics`, `connector_tag_too_long_panics`, `from_ascii_rejects_non_graphic`, `connector_tag_from_ascii_pads_correctly`                                                                                             | `item.rs`      |
+| 29  | `PolicyHash` purity                               | proptest                              | `compute_policy_hash_is_pure`                                                                                                                                                                                                          | `policy.rs`    |
+| 30  | `PolicyHash` collision-freedom                    | proptest                              | `policy_hash_collision_free`                                                                                                                                                                                                           | `policy.rs`    |
+| 31  | `PolicyHash` per-field sensitivity                | proptest                              | `policy_hash_version_field_sensitivity`, `id_hash_mode_field_sensitivity`, `evidence_hash_version_field_sensitivity`, `rules_digest_field_sensitivity`                                                                                 | `policy.rs`    |
+| 32  | `IdHashMode` discriminant stability               | unit test                             | `id_hash_mode_discriminants_are_stable`, `id_hash_mode_roundtrip`, `id_hash_mode_unknown_returns_none`                                                                                                                                 | `policy.rs`    |
+| 33  | Macro-generated types: traits, Debug, Canonical   | compile-time + unit + proptest        | `macro_types_implement_required_traits`, `pub_debug_shows_hex_prefix`, `restricted_debug_is_redacted`, `pub_canonical_bytes_stable` (and more)                                                                                         | `macros.rs`    |
+| 34  | Golden vectors (9 derivations)                    | unit test                             | `connector_instance_id_hash_golden_value`, `stable_item_id_golden_value`, `object_version_id_golden_value`, `key_secret_hash_golden_value`, `derive_finding_id_golden_value`, `derive_occurrence_id_golden_value`, `derive_observation_id_golden_value`, `compute_policy_hash_golden_value`, `finalize_64_golden_value` | `golden.rs`    |
+| 35  | Golden vector registry completeness               | unit test                             | `registry_is_complete`                                                                                                                                                                                                                 | `golden.rs`    |
+| 36  | Full-chain determinism (composed)                 | proptest                              | `full_chain_item_to_occurrence_is_pure`                                                                                                                                                                                                | `golden.rs`    |
+| 37  | Full-chain collision-freedom (composed)           | proptest                              | `full_chain_collision_free`                                                                                                                                                                                                            | `golden.rs`    |
+| 38  | Boundary u64 values in OccurrenceId               | unit test                             | `boundary_u64_occurrence_id`                                                                                                                                                                                                           | `golden.rs`    |
+| 39  | `domain_hasher` matches `blake3::derive_key`      | unit test                             | `domain_hasher_matches_blake3_derive_key`                                                                                                                                                                                              | `hashing.rs`   |
+| 40  | Domain separation for random payloads             | proptest                              | `domain_separation_for_random_payload`                                                                                                                                                                                                 | `hashing.rs`   |
 
 ---
 
@@ -301,14 +324,17 @@ If a golden vector test fails, follow this 5-step protocol:
 
 ### Version-bump trigger conditions
 
-| Vector                       | Domain Constant     | Triggers                                         |
-| ---------------------------- | ------------------- | ------------------------------------------------ |
-| `STABLE_ITEM_ID_EXPECTED`    | `ITEM_ID_V1`        | `ItemIdentityKey` encoding or domain tag changes |
-| `OBJECT_VERSION_ID_EXPECTED` | `OBJECT_VERSION_V1` | `ObjectVersionId` encoding changes               |
-| `KEY_SECRET_HASH_EXPECTED`   | `SECRET_HASH_V1`    | Secret keying scheme changes                     |
-| `FINDING_ID_EXPECTED`        | `FINDING_ID_V1`     | `FindingIdInputs` encoding changes               |
-| `OCCURRENCE_ID_EXPECTED`     | `OCCURRENCE_ID_V1`  | `OccurrenceIdInputs` encoding changes            |
-| `POLICY_HASH_EXPECTED`       | `POLICY_HASH_V2`    | `PolicyHashInputs` encoding changes              |
+| Vector                                | Domain Constant          | Triggers                                         |
+| ------------------------------------- | ------------------------ | ------------------------------------------------ |
+| `CONNECTOR_INSTANCE_ID_HASH_EXPECTED` | `CONNECTOR_INSTANCE_ID_V1` | Instance-ID encoding or domain tag changes    |
+| `STABLE_ITEM_ID_EXPECTED`             | `ITEM_ID_V1`             | `ItemIdentityKey` encoding or domain tag changes |
+| `OBJECT_VERSION_ID_EXPECTED`          | `OBJECT_VERSION_V1`      | `ObjectVersionId` encoding changes               |
+| `KEY_SECRET_HASH_EXPECTED`            | `SECRET_HASH_V1`         | Secret keying scheme changes                     |
+| `FINDING_ID_EXPECTED`                 | `FINDING_ID_V1`          | `FindingIdInputs` encoding changes               |
+| `OCCURRENCE_ID_EXPECTED`              | `OCCURRENCE_ID_V1`       | `OccurrenceIdInputs` encoding changes            |
+| `OBSERVATION_ID_EXPECTED`             | `OBSERVATION_ID_V1`      | `ObservationIdInputs` encoding changes           |
+| `POLICY_HASH_EXPECTED`                | `POLICY_HASH_V2`         | `PolicyHashInputs` encoding changes              |
+| `FINALIZE_64_EXPECTED`                | (test-only domain)       | `finalize_64` truncation or endianness changes   |
 
 ---
 

@@ -126,7 +126,7 @@ struct Sample {
     /// Recorded byte position at which this sample was stored.
     ///
     /// When sampled by the byte-stride trigger this is the exact byte-stride
-    /// mark that the file straddles; otherwise it is the cumulative byte total
+    /// mark that the file straddles; otherwise it is the recorded byte position
     /// at the start of the file (a rank-triggered fallback position).
     recorded_byte_position: u64,
     key: Box<[u8]>,
@@ -207,7 +207,7 @@ fn compact_samples(samples: &mut Vec<Sample>, cap: usize) {
     // `write` (which increments by 1 each iteration) never overtakes `src`.
     let mut write = 0usize;
     for &src in &keep {
-        debug_assert!(
+        assert!(
             write <= src,
             "selected indices must stay ahead of the write cursor"
         );

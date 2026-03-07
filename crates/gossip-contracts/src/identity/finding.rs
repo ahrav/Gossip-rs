@@ -37,10 +37,25 @@
 //! `pub(crate)`, so only derivation functions inside this crate can produce them.
 //! All other types use [`define_id_32!`](crate::define_id_32) with a public `from_bytes`
 //! constructor.
+//!
+//! # Why there is no umbrella derivation context
+//!
+//! The identity spine keeps per-derivation input structs rather than threading
+//! a single `DerivationContext` through every layer. The scoping axes only
+//! partially overlap:
+//!
+//! - [`TenantId`] scopes finding and observation identities.
+//! - [`ConnectorInstanceIdHash`](crate::identity::ConnectorInstanceIdHash) is
+//!   consumed upstream when deriving [`StableItemId`], then disappears behind
+//!   that stable item boundary.
+//! - [`PolicyHash`] scopes observations only.
+//!
+//! A single bag-of-fields context would therefore carry unused data through
+//! most call sites and blur which derivation actually owns which scope. The
+//! explicit input structs below keep each hash boundary local and visible.
 
 use blake3::Hasher;
 
-use super::canonical::CanonicalBytes;
 use super::domain;
 use super::hashing::{
     FINDING_HASHER, OBSERVATION_HASHER, OCCURRENCE_HASHER, derive_from_cached, finalize_32,
@@ -199,42 +214,28 @@ crate::define_id_32! {
 // FindingIdInputs
 // ---------------------------------------------------------------------------
 
-/// Inputs to [`derive_finding_id`].
-///
-/// All fields are fixed-width (4 × 32 = 128 bytes), so the canonical
-/// encoding writes them sequentially with no length prefixes.
-///
-/// # Field-ordering invariant
-///
-/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
-/// declaration order**.  Reordering fields without updating
-/// `write_canonical` silently changes every derived `FindingId` and
-/// breaks the golden vectors in `golden.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FindingIdInputs {
-    /// Tenant that owns the scanned item.
-    pub tenant: TenantId,
-    /// Version-stable identity of the scanned item (repo, bucket, etc.).
-    pub item: StableItemId,
-    /// Detection rule that matched.
-    pub rule: RuleFingerprint,
-    /// Tenant-keyed secret identity (post-[`key_secret_hash`], not raw `NormHash`).
-    pub secret: SecretHash,
-}
-
-impl CanonicalBytes for FindingIdInputs {
-    /// Feeds all four 32-byte fields sequentially (128 bytes total, no length
-    /// prefixes).
+super::macros::define_canonical_input! {
+    /// Inputs to [`derive_finding_id`].
     ///
-    /// Field order must match struct declaration order — reordering fields
-    /// without updating this impl silently changes all derived IDs and breaks
-    /// the golden vectors in `golden.rs`.
-    #[inline]
-    fn write_canonical(&self, h: &mut Hasher) {
-        self.tenant.write_canonical(h);
-        self.item.write_canonical(h);
-        self.rule.write_canonical(h);
-        self.secret.write_canonical(h);
+    /// All fields are fixed-width (4 × 32 = 128 bytes), so the canonical
+    /// encoding writes them sequentially with no length prefixes.
+    ///
+    /// # Field-ordering invariant
+    ///
+    /// The [`CanonicalBytes`](crate::identity::CanonicalBytes) impl is
+    /// generated from this declaration, so hash order follows **struct
+    /// declaration order** automatically. Reordering fields is therefore a
+    /// breaking change: it changes every derived `FindingId` and breaks the
+    /// golden vectors in `golden.rs`.
+    pub struct FindingIdInputs {
+        /// Tenant that owns the scanned item.
+        pub tenant: TenantId,
+        /// Version-stable identity of the scanned item (repo, bucket, etc.).
+        pub item: StableItemId,
+        /// Detection rule that matched.
+        pub rule: RuleFingerprint,
+        /// Tenant-keyed secret identity (post-[`key_secret_hash`], not raw `NormHash`).
+        pub secret: SecretHash,
     }
 }
 
@@ -242,43 +243,29 @@ impl CanonicalBytes for FindingIdInputs {
 // OccurrenceIdInputs
 // ---------------------------------------------------------------------------
 
-/// Inputs to [`derive_occurrence_id`].
-///
-/// Mixed-width fields (2 × 32 + 2 × 8 = 80 bytes). All fixed-width,
-/// so the canonical encoding writes them sequentially with no length
-/// prefixes.
-///
-/// # Field-ordering invariant
-///
-/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
-/// declaration order**.  Reordering fields without updating
-/// `write_canonical` silently changes every derived `OccurrenceId` and
-/// breaks the golden vectors in `golden.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OccurrenceIdInputs {
-    /// The version-stable finding this occurrence belongs to.
-    pub finding: FindingId,
-    /// Specific version of the scanned object (commit SHA, object etag, etc.).
-    pub version: ObjectVersionId,
-    /// Byte offset of the secret within the scanned content.
-    pub byte_offset: u64,
-    /// Byte length of the secret within the scanned content.
-    pub byte_length: u64,
-}
-
-impl CanonicalBytes for OccurrenceIdInputs {
-    /// Feeds two 32-byte fields and two 8-byte LE integers (80 bytes total,
-    /// no length prefixes).
+super::macros::define_canonical_input! {
+    /// Inputs to [`derive_occurrence_id`].
     ///
-    /// Field order must match struct declaration order — reordering fields
-    /// without updating this impl silently changes all derived IDs and breaks
-    /// the golden vectors in `golden.rs`.
-    #[inline]
-    fn write_canonical(&self, h: &mut Hasher) {
-        self.finding.write_canonical(h);
-        self.version.write_canonical(h);
-        self.byte_offset.write_canonical(h);
-        self.byte_length.write_canonical(h);
+    /// Mixed-width fields (2 × 32 + 2 × 8 = 80 bytes). All fixed-width,
+    /// so the canonical encoding writes them sequentially with no length
+    /// prefixes.
+    ///
+    /// # Field-ordering invariant
+    ///
+    /// The [`CanonicalBytes`](crate::identity::CanonicalBytes) impl is
+    /// generated from this declaration, so hash order follows **struct
+    /// declaration order** automatically. Reordering fields is therefore a
+    /// breaking change: it changes every derived `OccurrenceId` and breaks the
+    /// golden vectors in `golden.rs`.
+    pub struct OccurrenceIdInputs {
+        /// The version-stable finding this occurrence belongs to.
+        pub finding: FindingId,
+        /// Specific version of the scanned object (commit SHA, object etag, etc.).
+        pub version: ObjectVersionId,
+        /// Byte offset of the secret within the scanned content.
+        pub byte_offset: u64,
+        /// Byte length of the secret within the scanned content.
+        pub byte_length: u64,
     }
 }
 
@@ -286,39 +273,26 @@ impl CanonicalBytes for OccurrenceIdInputs {
 // ObservationIdInputs
 // ---------------------------------------------------------------------------
 
-/// Inputs to [`derive_observation_id`].
-///
-/// All fields are fixed-width (3 × 32 = 96 bytes), so the canonical
-/// encoding writes them sequentially with no length prefixes.
-///
-/// # Field-ordering invariant
-///
-/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
-/// declaration order**. Reordering fields without updating
-/// `write_canonical` silently changes every derived `ObservationId` and
-/// breaks the golden vectors in `golden.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservationIdInputs {
-    /// Tenant that owns the scan.
-    pub tenant: TenantId,
-    /// Hash of the active policy.
-    pub policy: PolicyHash,
-    /// Policy-independent occurrence identity for this detection.
-    pub occurrence: OccurrenceId,
-}
-
-impl CanonicalBytes for ObservationIdInputs {
-    /// Feeds three 32-byte fields sequentially (96 bytes total, no length
-    /// prefixes).
+super::macros::define_canonical_input! {
+    /// Inputs to [`derive_observation_id`].
     ///
-    /// Field order must match struct declaration order — reordering fields
-    /// without updating this impl silently changes all derived IDs and breaks
-    /// the golden vectors in `golden.rs`.
-    #[inline]
-    fn write_canonical(&self, h: &mut Hasher) {
-        self.tenant.write_canonical(h);
-        self.policy.write_canonical(h);
-        self.occurrence.write_canonical(h);
+    /// All fields are fixed-width (3 × 32 = 96 bytes), so the canonical
+    /// encoding writes them sequentially with no length prefixes.
+    ///
+    /// # Field-ordering invariant
+    ///
+    /// The [`CanonicalBytes`](crate::identity::CanonicalBytes) impl is
+    /// generated from this declaration, so hash order follows **struct
+    /// declaration order** automatically. Reordering fields is therefore a
+    /// breaking change: it changes every derived `ObservationId` and breaks the
+    /// golden vectors in `golden.rs`.
+    pub struct ObservationIdInputs {
+        /// Tenant that owns the scan.
+        pub tenant: TenantId,
+        /// Hash of the active policy.
+        pub policy: PolicyHash,
+        /// Policy-independent occurrence identity for this detection.
+        pub occurrence: OccurrenceId,
     }
 }
 
@@ -968,10 +942,11 @@ mod tests {
 
     // -- Field-order swap tests --
     //
-    // These catch bugs where two same-width fields are swapped in
-    // `write_canonical` without changing the struct declaration order.
-    // With uniform fill bytes, a swap silently produces the same hash;
-    // with distinct fill bytes per field, a swap changes the hash.
+    // These guard the declaration-order = hash-order invariant.
+    // The generated CanonicalBytes impl should walk fields in the order the
+    // struct declares them. With uniform fill bytes, a swap can silently
+    // produce the same hash; with distinct fill bytes per field, a swap
+    // changes the hash.
 
     #[test]
     fn finding_id_inputs_field_order_matters() {
