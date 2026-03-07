@@ -301,6 +301,117 @@ fn from_sorted_entries_estimates_split_for_materialized_range() {
     assert_eq!(index_from_key(split), 2);
 }
 
+/// Exercise the compaction path of `from_sorted_entries` with more entries
+/// than MIN_SAMPLE_CAP.  Verifies that the constructor delegates compaction
+/// correctly end-to-end, matching the manual `observe` path.
+#[test]
+fn from_sorted_entries_compacts_when_exceeding_sample_cap() {
+    let n = SMALL_SAMPLE_CAP * 4;
+    let keys: Vec<[u8; 8]> = (0..n).map(key_for_index).collect();
+    let sizes: Vec<u64> = (0..n).map(|i| (i as u64) + 1).collect();
+
+    let built = StreamingSplitEstimator::from_sorted_entries(
+        SMALL_SAMPLE_CAP,
+        keys.iter()
+            .zip(sizes.iter())
+            .map(|(k, &s)| (k.as_slice(), s)),
+    );
+
+    // Sample count must stay within the cap.
+    assert!(
+        built.sample_len() <= built.sample_cap(),
+        "sample count ({}) exceeded cap ({}) after from_sorted_entries with n={n}",
+        built.sample_len(),
+        built.sample_cap()
+    );
+
+    // Must match the manual observe path exactly.
+    let mut observed = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    for (key, &size) in keys.iter().zip(sizes.iter()) {
+        observed.observe(key, size);
+    }
+    assert_eq!(built.sample_cap(), observed.sample_cap());
+    assert_eq!(built.sample_debug_view(), observed.sample_debug_view());
+    assert_eq!(built.estimate_split_key(), observed.estimate_split_key());
+
+    // Split key must be valid.
+    let split = built
+        .estimate_split_key()
+        .expect("should produce a split for n > 2");
+    let split_idx = index_from_key(split);
+    assert!(split_idx >= 1 && split_idx < n);
+}
+
+/// An empty iterator produces an estimator with no observations, so
+/// `estimate_split_key` must return `None`.
+#[test]
+fn from_sorted_entries_empty_produces_none() {
+    let estimator =
+        StreamingSplitEstimator::from_sorted_entries(SMALL_SAMPLE_CAP, std::iter::empty());
+    assert!(
+        estimator.estimate_split_key().is_none(),
+        "empty input must yield no split key"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Batch-connector accuracy: ranges exceeding DEFAULT_SAMPLE_CAP
+// ---------------------------------------------------------------------------
+
+/// Batch connectors (git, in-memory) should pass the range length as
+/// sample_cap so that no compaction fires and the split is exact.  This
+/// test verifies that using `n` as the cap eliminates the drift that
+/// DEFAULT_SAMPLE_CAP introduces on large ranges.
+#[test]
+fn batch_range_cap_eliminates_split_drift() {
+    let n = 2_000usize;
+    assert!(
+        n > LARGE_SAMPLE_CAP,
+        "test must exceed DEFAULT_SAMPLE_CAP to be meaningful"
+    );
+
+    // Descending sizes: entry 0 is largest, entry n-1 is smallest.
+    let sizes: Vec<u64> = (0..n).map(|i| (n - i) as u64).collect();
+    let keys: Vec<[u8; 8]> = (0..n).map(key_for_index).collect();
+
+    let make_iter = || {
+        keys.iter()
+            .zip(sizes.iter())
+            .map(|(k, &s)| (k.as_slice(), s))
+    };
+
+    // Exact estimator: sample_cap = n, no compaction.
+    let exact = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
+    let exact_key = exact
+        .estimate_split_key()
+        .expect("exact estimator should produce a split");
+
+    // Capped estimator: DEFAULT_SAMPLE_CAP triggers compaction and drift.
+    let capped = StreamingSplitEstimator::from_sorted_entries(LARGE_SAMPLE_CAP, make_iter());
+    let capped_key = capped
+        .estimate_split_key()
+        .expect("capped estimator should produce a split");
+
+    // Confirm that DEFAULT_SAMPLE_CAP actually introduces drift (the
+    // motivating observation from the review).
+    assert_ne!(
+        index_from_key(exact_key),
+        index_from_key(capped_key),
+        "expected capped estimator to drift from exact on n={n}, \
+         cap={LARGE_SAMPLE_CAP} — if this starts passing, the batch-cap \
+         fix may no longer be necessary"
+    );
+
+    // The fix: batch connectors pass range.len() as sample_cap.  With
+    // cap = n no compaction fires, so the result matches the exact path.
+    let batch = StreamingSplitEstimator::from_sorted_entries(n, make_iter());
+    assert_eq!(
+        batch.estimate_split_key(),
+        exact.estimate_split_key(),
+        "batch-cap estimator must match exact estimator"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Downsampling regressions
 // ---------------------------------------------------------------------------

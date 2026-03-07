@@ -515,6 +515,11 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 /// in-memory range can build the estimator in one pass with
 /// [`from_sorted_entries`](Self::from_sorted_entries).
 ///
+/// **Batch-connector note**: connectors that already hold all entries in
+/// memory (git, in-memory) should pass the range length as `sample_cap`
+/// so that no compaction fires and the split is exact.  The bounded-memory
+/// property only benefits the filesystem connector's incremental walk.
+///
 /// # Complexity
 ///
 /// - **`observe`**: O(1) amortised. Compaction fires at most
@@ -631,6 +636,13 @@ impl StreamingSplitEstimator {
     /// If the sample buffer exceeds its cap after insertion, a compaction
     /// cycle runs (halve samples, double strides) before returning.
     pub(crate) fn observe(&mut self, key: &[u8], file_size: u64) {
+        debug_assert!(
+            self.samples
+                .last()
+                .is_none_or(|last| key >= last.key.as_ref()),
+            "observe() requires keys in non-decreasing order; received key that precedes the last sampled key"
+        );
+
         if self.first_observed_key.is_none() {
             self.first_observed_key = Some(Box::<[u8]>::from(key));
         }
