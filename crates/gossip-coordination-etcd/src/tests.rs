@@ -204,6 +204,40 @@ fn config_accepts_root_namespace_slash() {
 }
 
 // ---------------------------------------------------------------------------
+// Debug output tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_debug_does_not_expose_raw_endpoint_credentials() {
+    // Endpoints with embedded credentials pass validation (only scheme is checked).
+    // Debug output must not leak the full URI including user:pass.
+    let config = EtcdCoordinatorConfig::new(["http://admin:secret@etcd-0:2379"], "/gossip/v1")
+        .expect("endpoint with userinfo should pass scheme-only validation");
+
+    let debug_output = format!("{config:?}");
+    assert!(
+        !debug_output.contains("secret"),
+        "Debug output must not contain credentials, got: {debug_output}"
+    );
+    assert!(
+        debug_output.contains("***@etcd-0:2379"),
+        "Debug output should show redacted host, got: {debug_output}"
+    );
+}
+
+#[test]
+fn config_debug_shows_endpoints_without_credentials_normally() {
+    let config = EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1")
+        .expect("plain endpoint should pass validation");
+
+    let debug_output = format!("{config:?}");
+    assert!(
+        debug_output.contains("http://etcd-0:2379"),
+        "Debug output should show plain endpoints unchanged, got: {debug_output}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // URL scheme validation tests
 // ---------------------------------------------------------------------------
 

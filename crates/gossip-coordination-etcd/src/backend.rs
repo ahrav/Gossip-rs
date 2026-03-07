@@ -165,11 +165,12 @@ impl EtcdCoordinator {
 
 /// Custom [`Debug`] output. Omits the etcd `Client` (which does not
 /// implement `Debug`) and the Tokio runtime (internal plumbing). Shows
-/// the config fields and a note about the current delegation storage mode.
+/// endpoint count (not raw URIs — they may contain credentials), the
+/// namespace prefix, and a note about the current delegation storage mode.
 impl fmt::Debug for EtcdCoordinator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EtcdCoordinator")
-            .field("endpoints", &self.config.endpoints())
+            .field("endpoint_count", &self.config.endpoints().len())
             .field("namespace_prefix", &self.config.namespace_prefix())
             .field(
                 "coordination_storage_mode",
