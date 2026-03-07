@@ -299,7 +299,7 @@ impl EtcdKeyspace {
     /// Exact key for an active-shard index entry:
     /// `{run_record_key}/shards_active/{shard_hex}`.
     #[must_use]
-    pub fn active_shard_index_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> String {
+    pub fn shard_active_index_key(&self, tenant: TenantId, run: RunId, shard: ShardId) -> String {
         format!(
             "{}/{}",
             self.shards_active_prefix(tenant, run),

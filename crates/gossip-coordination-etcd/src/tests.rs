@@ -268,7 +268,7 @@ fn keyspace_builds_expected_paths() {
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs_active/0123456789abcdef"
     );
     assert_eq!(
-        keyspace.active_shard_index_key(tenant, run, shard),
+        keyspace.shard_active_index_key(tenant, run, shard),
         "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards_active/8000000000000042"
     );
     assert_eq!(
@@ -355,7 +355,7 @@ proptest! {
         let runs_active = ks.runs_active_prefix(tenant);
         let run_active = ks.run_active_index_key(tenant, run);
         let shards_active = ks.shards_active_prefix(tenant, run);
-        let shard_active = ks.active_shard_index_key(tenant, run, shard);
+        let shard_active = ks.shard_active_index_key(tenant, run, shard);
 
         let all_keys = [
             &tenants, &tenant_pfx, &runs, &run_key, &shards_pfx, &scan_pfx,

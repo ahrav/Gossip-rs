@@ -75,12 +75,14 @@ The module provides seven core capabilities:
 
 #### `gossip-coordination-etcd` crate (`crates/gossip-coordination-etcd/src/`)
 
-| File         | Role                                                                                         |
-| ------------ | -------------------------------------------------------------------------------------------- |
-| `backend.rs` | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
-| `config.rs`  | Endpoint + namespace validation for etcd connectivity                                         |
-| `runtime.rs` | Private sync/async bridge for driving the async etcd client from sync coordination traits     |
-| `error.rs`   | etcd connection/runtime error surfaces                                                        |
+| File              | Role                                                                                         |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| `backend.rs`      | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
+| `config.rs`       | Endpoint + namespace validation for etcd connectivity                                         |
+| `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
+| `codec.rs`        | Explicit binary encoding/decoding for coordination records persisted to etcd                  |
+| `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
+| `error.rs`        | etcd connection/runtime error surfaces                                                        |
 
 ---
 

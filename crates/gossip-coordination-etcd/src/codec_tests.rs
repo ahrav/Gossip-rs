@@ -4,6 +4,7 @@ use gossip_contracts::coordination::{CursorSemantics, CursorUpdate, PooledSpawne
 use gossip_contracts::identity::{
     FenceEpoch, LogicalTime, OpId, RunId, ShardId, TenantId, WorkerId,
 };
+use gossip_contracts::test_util::miri_proptest_config;
 use gossip_coordination::{
     LeaseHolder, OpKind, OpLogEntry, OpResult, ParkReason, RunConfig, RunOpKind, RunOpLogEntry,
     RunOpResult, RunRecord, RunStatus, ShardRecord, ShardStatus,
@@ -226,18 +227,6 @@ fn decode_shard_record_rolls_back_on_slab_exhaustion() {
 // Proptest: RunRecord round-trip with random fields
 // ---------------------------------------------------------------------------
 
-fn miri_proptest_config() -> proptest::test_runner::Config {
-    if cfg!(miri) {
-        proptest::test_runner::Config {
-            failure_persistence: None,
-            cases: 32,
-            ..Default::default()
-        }
-    } else {
-        proptest::test_runner::Config::default()
-    }
-}
-
 fn arb_cursor_semantics() -> impl Strategy<Value = CursorSemantics> {
     prop_oneof![
         Just(CursorSemantics::Completed),
@@ -395,6 +384,319 @@ proptest! {
 
         prop_assert_eq!(&decoded, &record, "decode(encode(r)) != r");
         prop_assert_eq!(&reencoded, &encoded, "encode(decode(encode(r))) != encode(r)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proptest: ShardRecord round-trip with random fields
+// ---------------------------------------------------------------------------
+
+fn arb_shard_status() -> impl Strategy<Value = ShardStatus> {
+    prop_oneof![
+        Just(ShardStatus::Active),
+        Just(ShardStatus::Done),
+        Just(ShardStatus::Split),
+        Just(ShardStatus::Parked),
+    ]
+}
+
+fn arb_park_reason() -> impl Strategy<Value = ParkReason> {
+    prop_oneof![
+        Just(ParkReason::PermissionDenied),
+        Just(ParkReason::NotFound),
+        Just(ParkReason::Poisoned),
+        Just(ParkReason::TooManyErrors),
+        Just(ParkReason::Other),
+    ]
+}
+
+fn arb_op_kind() -> impl Strategy<Value = OpKind> {
+    prop_oneof![
+        Just(OpKind::Checkpoint),
+        Just(OpKind::Complete),
+        Just(OpKind::Park),
+        Just(OpKind::SplitReplace),
+        Just(OpKind::SplitResidual),
+        Just(OpKind::Unpark),
+    ]
+}
+
+fn arb_op_result() -> impl Strategy<Value = OpResult> {
+    prop_oneof![
+        Just(OpResult::Completed),
+        Just(OpResult::Error),
+        Just(OpResult::Superseded),
+    ]
+}
+
+/// Proptest input for a structurally valid `ShardRecord`.
+///
+/// Holds all primitive building blocks needed to construct a record.
+/// `ByteSlab` does not implement `Debug`, so the strategy generates this
+/// intermediate and the test body materializes the record + slab.
+#[derive(Clone, Debug)]
+struct ArbShardInput {
+    tenant_bytes: [u8; 32],
+    run_raw: u64,
+    shard_raw: u64,
+    status: ShardStatus,
+    park_reason: ParkReason,
+    cursor_semantics: CursorSemantics,
+    key_start: Vec<u8>,
+    key_end: Vec<u8>,
+    metadata: Vec<u8>,
+    has_last_key: bool,
+    last_key_content: Vec<u8>,
+    has_token: bool,
+    token_content: Vec<u8>,
+    has_lease: bool,
+    worker_raw: u64,
+    lease_deadline: u64,
+    fence_raw: u64,
+    has_parent: bool,
+    parent_raw: u64,
+    spawned_raws: Vec<u64>,
+    op_entries: Vec<(u64, OpKind, OpResult, u64, u64)>,
+}
+
+impl ArbShardInput {
+    /// Materialize a `ShardRecord` + `ByteSlab` with status-consistent fields.
+    fn build(self) -> (ShardRecord, ByteSlab) {
+        let tenant = TenantId::from_bytes(self.tenant_bytes);
+        let run = RunId::from_raw(self.run_raw);
+        // Derived shards (bit 63 set) require a parent. Root shards
+        // (bit 63 clear) must not have one. Enforce consistency.
+        let shard = if self.has_parent {
+            ShardId::from_raw(self.shard_raw | (1u64 << 63))
+        } else {
+            ShardId::from_raw(self.shard_raw & !(1u64 << 63))
+        };
+        let status = self.status;
+
+        let mut slab = ByteSlab::with_capacity(4096);
+
+        let mut key_end = self.key_end;
+        if key_end <= self.key_start {
+            key_end = self
+                .key_start
+                .iter()
+                .copied()
+                .chain(std::iter::once(0xFF))
+                .collect();
+        }
+
+        let spec = ShardSpecRef::with_range_and_metadata(&self.key_start, &key_end, &self.metadata);
+
+        let mut record = if self.has_last_key {
+            let cursor = if self.has_token {
+                CursorUpdate::with_token(&self.last_key_content, &self.token_content)
+            } else {
+                CursorUpdate::with_last_key(&self.last_key_content)
+            };
+            if self.has_parent {
+                ShardRecord::new_split_child(
+                    tenant,
+                    run,
+                    shard,
+                    spec,
+                    cursor,
+                    self.cursor_semantics,
+                    ShardId::from_raw(self.parent_raw),
+                    &mut slab,
+                )
+                .expect("shard record should fit in slab")
+            } else {
+                ShardRecord::new_active_with_cursor(
+                    tenant,
+                    run,
+                    shard,
+                    spec,
+                    cursor,
+                    self.cursor_semantics,
+                    &mut slab,
+                )
+                .expect("shard record should fit in slab")
+            }
+        } else if self.has_parent {
+            ShardRecord::new_split_child(
+                tenant,
+                run,
+                shard,
+                spec,
+                CursorUpdate::initial(),
+                self.cursor_semantics,
+                ShardId::from_raw(self.parent_raw),
+                &mut slab,
+            )
+            .expect("shard record should fit in slab")
+        } else {
+            ShardRecord::new_active(tenant, run, shard, spec, self.cursor_semantics, &mut slab)
+                .expect("shard record should fit in slab")
+        };
+
+        record.status = status;
+        record.park_reason = if status == ShardStatus::Parked {
+            Some(self.park_reason)
+        } else {
+            None
+        };
+
+        record.lease = if status == ShardStatus::Active && self.has_lease {
+            Some(LeaseHolder::new(
+                WorkerId::from_raw(self.worker_raw),
+                LogicalTime::from_raw(self.lease_deadline),
+            ))
+        } else {
+            None
+        };
+
+        record.fence_epoch = FenceEpoch::from_raw(self.fence_raw);
+
+        let mut spawned_ids: Vec<ShardId> = self
+            .spawned_raws
+            .into_iter()
+            .map(|r| derived_shard(r.wrapping_add(1)))
+            .collect();
+        if status == ShardStatus::Split && spawned_ids.is_empty() {
+            spawned_ids.push(derived_shard(0x0000_0000_0000_FFFF));
+        }
+        record.spawned = pooled_spawned(&spawned_ids, &mut slab);
+
+        let mut clock = 1u64;
+        for (op_raw, kind, result, hash, time_delta) in self.op_entries {
+            clock += time_delta;
+            record.op_log.push_back_overwrite(OpLogEntry::new(
+                OpId::from_raw(op_raw.wrapping_add(1)),
+                kind,
+                result,
+                hash,
+                LogicalTime::from_raw(clock),
+            ));
+        }
+
+        (record, slab)
+    }
+}
+
+/// Strategy generating structurally valid shard record inputs.
+///
+/// Status-dependent fields are kept consistent in `ArbShardInput::build`:
+/// - `park_reason` is `Some` iff status == Parked (INV-1)
+/// - Terminal statuses (Done, Split, Parked) have no lease (INV-3)
+/// - Split status always has at least one spawned child
+/// - Cursor token is only present when last_key is present
+/// - Op-log timestamps are monotonically increasing
+fn arb_shard_input() -> impl Strategy<Value = ArbShardInput> {
+    let identity_and_spec = (
+        proptest::array::uniform32(any::<u8>()),
+        any::<u64>(),
+        any::<u64>(),
+        arb_shard_status(),
+        arb_park_reason(),
+        arb_cursor_semantics(),
+        proptest::collection::vec(any::<u8>(), 1..=8usize),
+        proptest::collection::vec(any::<u8>(), 1..=8usize),
+        proptest::collection::vec(any::<u8>(), 0..=16usize),
+        any::<bool>(),
+        proptest::collection::vec(any::<u8>(), 1..=8usize),
+    );
+    let ownership_and_ops = (
+        any::<bool>(),
+        proptest::collection::vec(any::<u8>(), 1..=8usize),
+        any::<bool>(),
+        any::<u64>(),
+        1u64..=1_000_000u64,
+        any::<u64>(),
+        any::<bool>(),
+        any::<u64>(),
+        proptest::collection::vec(any::<u64>(), 0..=3usize),
+        proptest::collection::vec(
+            (
+                any::<u64>(),
+                arb_op_kind(),
+                arb_op_result(),
+                1u64..=0xFFFF_FFFF_FFFF_FFFEu64,
+                1u64..=1_000u64,
+            ),
+            0..=4usize,
+        ),
+    );
+
+    (identity_and_spec, ownership_and_ops).prop_map(
+        |(
+            (
+                tenant_bytes,
+                run_raw,
+                shard_raw,
+                status,
+                park_reason,
+                cursor_semantics,
+                key_start,
+                key_end,
+                metadata,
+                has_last_key,
+                last_key_content,
+            ),
+            (
+                has_token,
+                token_content,
+                has_lease,
+                worker_raw,
+                lease_deadline,
+                fence_raw,
+                has_parent,
+                parent_raw,
+                spawned_raws,
+                op_entries,
+            ),
+        )| {
+            ArbShardInput {
+                tenant_bytes,
+                run_raw,
+                shard_raw,
+                status,
+                park_reason,
+                cursor_semantics,
+                key_start,
+                key_end,
+                metadata,
+                has_last_key,
+                last_key_content,
+                has_token,
+                token_content,
+                has_lease,
+                worker_raw,
+                lease_deadline,
+                fence_raw,
+                has_parent,
+                parent_raw,
+                spawned_raws,
+                op_entries,
+            }
+        },
+    )
+}
+
+proptest! {
+    #![proptest_config(miri_proptest_config())]
+
+    /// Shard record round-trip: `decode(encode(r)) == r` and
+    /// `encode(decode(encode(r))) == encode(r)`.
+    #[test]
+    fn shard_record_proptest_round_trip(input in arb_shard_input()) {
+        let (mut record, mut slab) = input.build();
+        let encoded = encode_shard_record(&record, &slab);
+
+        let mut decode_slab = ByteSlab::with_capacity(4096);
+        let mut decoded = decode_shard_record(&encoded, &mut decode_slab)
+            .expect("proptest-generated shard record must decode");
+        let reencoded = encode_shard_record(&decoded, &decode_slab);
+
+        assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+        prop_assert_eq!(&reencoded, &encoded, "encode(decode(encode(r))) != encode(r)");
+
+        release_shard_record(&mut record, &mut slab);
+        release_shard_record(&mut decoded, &mut decode_slab);
     }
 }
 
@@ -786,9 +1088,8 @@ fn decode_shard_record_rolls_back_spec_on_cursor_parse_failure() {
     );
 }
 
-/// A blob encoding `root_len = 1_000_000` (requesting ~8 MB for ShardIds)
-/// should be rejected before the allocation occurs. If this test completes
-/// without error, the allocator guard is missing.
+/// Crafted blob with root_shards length exceeding MAX_ROOT_SHARDS is
+/// rejected with an InvariantViolation before any allocation occurs.
 #[test]
 fn decode_run_record_rejects_oversized_root_shards() {
     let mut blob = Vec::new();
@@ -802,19 +1103,18 @@ fn decode_run_record_rejects_oversized_root_shards() {
     blob.push(RunStatus::Active.as_u8());
     push_u64(&mut blob, LogicalTime::from_raw(5).as_raw()); // created_at
     blob.push(0); // completed_at absent
-    // Encode an absurdly large root_shards length — this should be rejected
-    // before `Vec::with_capacity` is called.
-    push_u32(&mut blob, 1_000_000);
-    // Don't provide the actual data — decoder should reject before reading.
+    push_u32(&mut blob, 1_000_000); // exceeds MAX_ROOT_SHARDS
 
-    let result = decode_run_record(&blob);
-    // The blob is truncated, so the decoder will hit a Truncated error during
-    // the loop. But the real concern is whether Vec::with_capacity(1_000_000)
-    // is called before the loop. With a small enough value the alloc succeeds
-    // but wastes memory. The test documents the missing bounds check.
+    let error = decode_run_record(&blob).expect_err("oversized root_shards must fail decode");
     assert!(
-        result.is_err(),
-        "oversized root_shards blob must fail decode"
+        matches!(
+            error,
+            EtcdCodecError::InvariantViolation {
+                kind: "RunRecord",
+                ..
+            }
+        ),
+        "expected InvariantViolation for oversized root_shards, got: {error:?}"
     );
 }
 
