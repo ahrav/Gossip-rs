@@ -145,7 +145,8 @@ if [[ ${#VIOLATIONS[@]} -gt 0 ]]; then
     else
         echo "COMMENT POLICY VIOLATION in $(basename "$FILE_PATH"):"
         echo "  Documentation must not reference internal tracking systems, milestone"
-        echo "  phases (B0/B1/B2), task IDs, PR discussions, or change history."
+        echo "  phases (B0), task IDs, PR discussions, or change history."
+        echo "  (B1-B5 are legitimate boundary names in docs and are not flagged.)"
     fi
     echo ""
     for v in "${VIOLATIONS[@]}"; do

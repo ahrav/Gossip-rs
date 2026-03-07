@@ -1,0 +1,1828 @@
+//! Run lifecycle: configuration, status, shard manifests, progress, and the
+//! [`RunManagement`] admin trait.
+//!
+//! A **run** is a single scan invocation that groups a set of shards
+//! collectively covering a target data source. The run lifecycle proceeds
+//! through two phases:
+//!
+//! 1. **Setup** — `create_run` (Initializing) followed by `register_shards`
+//!    which validates the shard manifest and transitions the run to Active.
+//! 2. **Execution** — workers claim, checkpoint, and complete shards.
+//!    Once all shards are Done, `complete_run` marks the run terminal.
+//!    `fail_run` and `cancel_run` provide early termination paths.
+//!
+//! ## Key types
+//!
+//! | Type | Role |
+//! |------|------|
+//! | [`RunConfig`] | Immutable per-run settings (cursor semantics, lease duration, retry budget) |
+//! | [`RunRecord`] | Coordinator-authoritative run state, similar to [`ShardRecord`] for shards |
+//! | [`RunStatus`] | Lifecycle state machine: Initializing -> Active -> Done/Failed/Cancelled |
+//! | [`RunProgress`] | Aggregated shard status counts for observability |
+//! | [`ShardFilter`] / [`ShardSummary`] | Querying and summarizing shard state within a run |
+//! | [`RunManagement`] | Admin trait for run lifecycle + shard unparking |
+//!
+//! ## Idempotency
+//!
+//! Run lifecycle mutations (`register_shards`, `complete_run`, `fail_run`,
+//! `cancel_run`) use a per-run op-log with the same `(OpId, payload_hash)`
+//! deduplication scheme as shard-level operations. The run op-log is bounded
+//! to [`RunRecord::OP_LOG_CAP`] entries.
+//!
+//! `unpark_shard` is the exception: idempotency is recorded in the target
+//! shard's op-log (cap = 16), because unpark operations are keyed by shard.
+//!
+//! ## Manifest validation
+//!
+//! [`validate_manifest`](gossip_contracts::coordination::manifest::validate_manifest) enforces that the initial shard set is non-empty,
+//! contains no duplicate IDs, uses bounded key ranges, and has cursor values
+//! within declared shard bounds. This prevents invalid initial states from
+//! entering the coordination layer.
+//!
+//! [`ShardRecord`]: super::record::ShardRecord
+
+use std::fmt;
+use std::num::NonZeroU64;
+
+use crate::error::{FixedBuf, IdempotentOutcome};
+use crate::record::{ParkReason, ShardRecord, ShardStatus};
+use crate::run_errors::{
+    CreateRunError, GetRunError, RegisterShardsError, RunTransitionError, UnparkError,
+};
+use crate::split_execution::op_payload_hash;
+use gossip_contracts::coordination::cursor::MAX_KEY_SIZE;
+use gossip_contracts::coordination::manifest::InitialShardInput;
+use gossip_contracts::coordination::shard_spec::CursorSemantics;
+use gossip_contracts::identity::{
+    CanonicalBytes, FenceEpoch, LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId,
+};
+use gossip_stdx::{ByteSlab, RingBuffer};
+
+// ============================================================================
+// RunStatus
+// ============================================================================
+
+/// Run lifecycle state.
+///
+/// ```text
+///  Initializing ──register_shards──→ Active
+///       │                              │
+///       │ cancel_run          ┌────────┼────────┐
+///       ▼                  complete  fail_run  cancel
+///    Cancelled               │        │        │
+///                            ▼        ▼        ▼
+///                          Done     Failed   Cancelled
+/// ```
+///
+/// ## Invariants
+///
+/// **Safety (discriminant stability)**: `#[repr(u8)]` values are persisted.
+/// Never reorder or reuse discriminant slots.
+/// **Safety (terminal irreversibility)**: Done/Failed/Cancelled never changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RunStatus {
+    /// Run is being set up. `register_shards` has not yet been called.
+    /// No shards exist in this state (INV-4).
+    Initializing = 0,
+
+    /// Run is active and its shards are being processed by workers.
+    /// Reached after `register_shards` succeeds. At least one root shard
+    /// must exist (INV-1).
+    Active = 1,
+
+    /// All shards completed successfully. Terminal.
+    Done = 2,
+
+    /// Run failed (some shards parked). Terminal.
+    Failed = 3,
+
+    /// Run was administratively cancelled. Terminal.
+    /// Reachable from both `Initializing` and `Active`.
+    Cancelled = 4,
+}
+
+impl RunStatus {
+    /// Whether the run is in a terminal state (no further transitions).
+    #[inline]
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+
+    /// Reconstruct from a persisted `u8` discriminant.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Initializing),
+            1 => Some(Self::Active),
+            2 => Some(Self::Done),
+            3 => Some(Self::Failed),
+            4 => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+
+    /// The persisted discriminant value.
+    #[inline]
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Initializing => f.write_str("Initializing"),
+            Self::Active => f.write_str("Active"),
+            Self::Done => f.write_str("Done"),
+            Self::Failed => f.write_str("Failed"),
+            Self::Cancelled => f.write_str("Cancelled"),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<RunStatus>() == 1);
+
+// ============================================================================
+// RunConfigError
+// ============================================================================
+
+/// Error returned by [`RunConfig::try_new`] when validation fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RunConfigError {
+    /// Lease duration must be strictly positive.
+    ZeroLeaseDuration,
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroLeaseDuration => f.write_str("lease_duration must be > 0"),
+        }
+    }
+}
+
+impl std::error::Error for RunConfigError {}
+
+// ============================================================================
+// RunConfig
+// ============================================================================
+
+/// Per-run configuration, immutable after creation.
+///
+/// Captures the three knobs that vary between runs:
+///
+/// - **Cursor semantics** — governs when cursor advancement counts as
+///   committed progress. `Completed` means progress is durable only on
+///   `complete`; `Checkpointed` means every checkpoint advances the
+///   durable position. The choice affects the strength of the progress
+///   guarantee and interacts with retry logic.
+///
+/// - **Lease duration** — how long (in logical time ticks) a worker holds
+///   exclusive ownership of a shard before the lease expires and the
+///   shard becomes re-acquirable. Stored as [`NonZeroU64`] so the
+///   zero-duration invariant is structurally unrepresentable.
+///
+/// - **Max shard retries** — optional cap on the number of times a
+///   shard may be re-acquired before the orchestrator should park it.
+///   `None` means unlimited retries. Enforcement is external to the
+///   coordination layer (the orchestrator inspects `ShardSummary::acquire_count`
+///   and calls `park_shard` when the budget is exhausted).
+///
+/// Fields are `pub` to allow coordinator-internal mutation during
+/// record construction, with public accessor methods for external callers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunConfig {
+    /// Controls when cursor advancement counts as durable progress.
+    pub cursor_semantics: CursorSemantics,
+    /// Lease duration in [`LogicalTime`] ticks. `NonZeroU64` makes the
+    /// zero-duration invariant unrepresentable — no runtime check needed.
+    pub lease_duration: NonZeroU64,
+    /// Optional retry budget per shard. `None` = unlimited.
+    pub max_shard_retries: Option<u32>,
+}
+
+impl RunConfig {
+    /// Create a validated `RunConfig`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunConfigError::ZeroLeaseDuration`] if `lease_duration` is 0.
+    pub fn try_new(
+        cursor_semantics: CursorSemantics,
+        lease_duration: u64,
+        max_shard_retries: Option<u32>,
+    ) -> Result<Self, RunConfigError> {
+        let lease_duration =
+            NonZeroU64::new(lease_duration).ok_or(RunConfigError::ZeroLeaseDuration)?;
+        Ok(Self {
+            cursor_semantics,
+            lease_duration,
+            max_shard_retries,
+        })
+    }
+
+    /// Panicking validator for coordinator-internal paths.
+    ///
+    /// Use [`try_new`](Self::try_new) for external input.
+    ///
+    /// # Panics
+    ///
+    /// This is a no-op because `NonZeroU64` structurally enforces
+    /// `lease_duration > 0`.
+    pub fn assert_valid(&self) {
+        // lease_duration > 0 is guaranteed by NonZeroU64.
+        let _ = self.lease_duration;
+    }
+
+    /// When cursor advancement counts as committed progress.
+    #[must_use]
+    pub fn cursor_semantics(&self) -> CursorSemantics {
+        self.cursor_semantics
+    }
+
+    /// Lease duration in [`LogicalTime`] ticks. Always positive.
+    #[must_use]
+    pub fn lease_duration(&self) -> u64 {
+        self.lease_duration.get()
+    }
+
+    /// Optional per-shard retry budget. `None` means unlimited retries.
+    ///
+    /// The coordination layer does not enforce this limit directly; the
+    /// orchestrator inspects `ShardSummary::acquire_count` and calls
+    /// `park_shard` when the budget is exhausted.
+    #[must_use]
+    pub fn max_shard_retries(&self) -> Option<u32> {
+        self.max_shard_retries
+    }
+}
+
+// ============================================================================
+// RunOpKind
+// ============================================================================
+
+/// Discriminant for run-level op-log entries.
+///
+/// Note: `UnparkShard` is intentionally absent. Unpark idempotency lives in
+/// the shard op-log (cap=16), not the run op-log, because unpark targets a
+/// specific shard and the run op-log would need a keying scheme to distinguish
+/// `unpark(shard_A)` from `unpark(shard_B)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum RunOpKind {
+    /// Initial shard manifest registration.
+    RegisterShards = 0,
+    /// Terminal transition: run completed successfully.
+    CompleteRun = 1,
+    /// Terminal transition: run failed (some shards parked).
+    FailRun = 2,
+    /// Terminal transition: run administratively cancelled.
+    CancelRun = 3,
+}
+
+impl RunOpKind {
+    /// Parse a `u8` discriminant to the corresponding variant.
+    ///
+    /// Returns `None` for unrecognized values.
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::RegisterShards),
+            1 => Some(Self::CompleteRun),
+            2 => Some(Self::FailRun),
+            3 => Some(Self::CancelRun),
+            _ => None,
+        }
+    }
+
+    /// The persisted `u8` discriminant value.
+    #[inline]
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for RunOpKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RegisterShards => f.write_str("RegisterShards"),
+            Self::CompleteRun => f.write_str("CompleteRun"),
+            Self::FailRun => f.write_str("FailRun"),
+            Self::CancelRun => f.write_str("CancelRun"),
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<RunOpKind>() == 1);
+
+// ============================================================================
+// RunOpResult
+// ============================================================================
+
+/// Result payload stored in a run op-log entry.
+///
+/// `RegisteredShards` carries the created shard IDs so that idempotent replays
+/// of `register_shards` can return the same IDs without re-querying state.
+/// Terminal operations (complete, fail, cancel) have no meaningful return data,
+/// so they use `Ack`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunOpResult {
+    /// Shard IDs created by `register_shards`, cached for replay.
+    RegisteredShards { shard_ids: Box<[ShardId]> },
+    /// No-data acknowledgment for terminal transitions (complete, fail, cancel).
+    Ack,
+}
+
+// ============================================================================
+// RunOpLogEntry
+// ============================================================================
+
+/// A single entry in the run-level bounded op-log.
+///
+/// Private fields with a validating constructor, matching the shard-level
+/// `OpLogEntry` pattern in `lease.rs`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunOpLogEntry {
+    op_id: OpId,
+    kind: RunOpKind,
+    payload_hash: u64,
+    executed_at: LogicalTime,
+    result: RunOpResult,
+}
+
+impl RunOpLogEntry {
+    /// Create a new entry with validation.
+    ///
+    /// # Panics
+    ///
+    /// - `payload_hash == 0`: zero indicates a hashing failure or omission.
+    /// - `executed_at <= LogicalTime::ZERO`: timestamps must be positive.
+    pub fn new(
+        op_id: OpId,
+        kind: RunOpKind,
+        payload_hash: u64,
+        executed_at: LogicalTime,
+        result: RunOpResult,
+    ) -> Self {
+        assert!(
+            payload_hash != 0,
+            "RunOpLogEntry: payload_hash must not be zero"
+        );
+        assert!(
+            executed_at > LogicalTime::ZERO,
+            "RunOpLogEntry: executed_at must be > ZERO"
+        );
+        // INV-11 at construction: kind-result consistency.
+        match (&kind, &result) {
+            (RunOpKind::RegisterShards, RunOpResult::RegisteredShards { .. }) => {}
+            (RunOpKind::RegisterShards, RunOpResult::Ack) => {
+                panic!("RunOpLogEntry: RegisterShards must have RegisteredShards result, not Ack");
+            }
+            (_, RunOpResult::Ack) => {}
+            (k, RunOpResult::RegisteredShards { .. }) => {
+                panic!("RunOpLogEntry: {k:?} must have Ack result, not RegisteredShards",);
+            }
+        }
+        Self {
+            op_id,
+            kind,
+            payload_hash,
+            executed_at,
+            result,
+        }
+    }
+
+    /// The caller-provided idempotency key for this operation.
+    #[must_use]
+    pub fn op_id(&self) -> OpId {
+        self.op_id
+    }
+
+    /// Which run-level operation this entry records.
+    #[must_use]
+    pub fn kind(&self) -> RunOpKind {
+        self.kind
+    }
+
+    /// BLAKE3-derived hash of the operation's payload, used for
+    /// idempotency conflict detection. Always non-zero.
+    #[must_use]
+    pub fn payload_hash(&self) -> u64 {
+        self.payload_hash
+    }
+
+    /// Logical time at which this operation was first executed.
+    #[must_use]
+    pub fn executed_at(&self) -> LogicalTime {
+        self.executed_at
+    }
+
+    /// The cached result payload, returned on idempotent replay.
+    #[must_use]
+    pub fn result(&self) -> &RunOpResult {
+        &self.result
+    }
+}
+
+// ============================================================================
+// RunOpIdConflict
+// ============================================================================
+
+/// OpId reuse detected with a different payload hash.
+///
+/// Used as an intermediate type for `From` impls on operation-specific errors.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RunOpIdConflict {
+    pub op_id: OpId,
+    pub expected_hash: u64,
+    pub actual_hash: u64,
+}
+
+// Custom Debug: redact hashes per SEC-6.
+impl fmt::Debug for RunOpIdConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunOpIdConflict")
+            .field("op_id", &self.op_id)
+            .field("expected_hash", &"<redacted>")
+            .field("actual_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for RunOpIdConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "run op-id conflict: {:?} reused with different payload",
+            self.op_id
+        )
+    }
+}
+
+impl std::error::Error for RunOpIdConflict {}
+
+// ============================================================================
+// RunRecord
+// ============================================================================
+
+/// The coordinator's authoritative record for a scan run.
+///
+/// ## Invariants (checked by `assert_invariants`)
+///
+/// 1. Active implies non-empty `root_shards`.
+/// 2. `completed_at.is_some()` iff status is terminal.
+/// 3. `created_at > LogicalTime::ZERO`.
+/// 4. Initializing implies empty `root_shards`.
+/// 5. `completed_at >= created_at` when `Some`.
+/// 6. `op_log.len() <= OP_LOG_CAP`.
+/// 7. No duplicate `OpId` values in `op_log`.
+/// 8. Config valid: `lease_duration > 0`.
+/// 9. No duplicate `ShardId` values in `root_shards`.
+/// 10. Op-log timestamps non-decreasing.
+/// 11. Kind-result consistency: `RegisterShards` entries have `RegisteredShards`
+///     result; all other ops have `Ack` result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRecord {
+    /// Owning tenant. All operations must present this tenant for isolation.
+    pub tenant: TenantId,
+    /// Unique run identifier within the tenant.
+    pub run: RunId,
+    /// Immutable per-run configuration set at creation time.
+    pub config: RunConfig,
+    /// Current lifecycle status. Transitions validated by
+    /// [`assert_transition_legal`](Self::assert_transition_legal).
+    pub status: RunStatus,
+    /// Logical time at which the run was created. Always > `LogicalTime::ZERO` (INV-3).
+    pub created_at: LogicalTime,
+    /// Logical time at which the run reached a terminal state.
+    /// `Some` iff `status.is_terminal()` (INV-2).
+    pub completed_at: Option<LogicalTime>,
+    /// Root shard IDs registered at creation. Does not include split children.
+    /// Empty while `status == Initializing` (INV-4); non-empty when `Active` (INV-1).
+    pub root_shards: Vec<ShardId>,
+    /// Bounded op-log for idempotent replay of run-level ops.
+    pub op_log: RingBuffer<RunOpLogEntry, { RunRecord::OP_LOG_CAP }>,
+}
+
+impl RunRecord {
+    /// Maximum number of retained run op-log entries.
+    ///
+    /// 8 provides headroom for the worst case: `register_shards` + up to 7
+    /// terminal/admin operations before the first is evicted. `create_run`
+    /// does NOT write to the op-log (no `OpId`), so cap=8 is adequate.
+    ///
+    /// ## Eviction safety
+    ///
+    /// When the op-log is full, `op_log_push` evicts the oldest entry.
+    /// Eviction is safe because every run-level operation has a secondary
+    /// status-check barrier: even if the op-log entry is evicted and a
+    /// stale retry is treated as "new," the status check (e.g., "run must
+    /// be Active") prevents re-execution on an already-transitioned run.
+    ///
+    /// This assumes a single-writer model per run. Production backends
+    /// with concurrent writers need external serialization (e.g., database
+    /// transactions) to prevent TOCTOU races between the op-log check and
+    /// the status check.
+    pub const OP_LOG_CAP: usize = 8;
+
+    /// Assert all structural invariants (INV-1 through INV-11).
+    ///
+    /// Call after every state transition, before persisting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the 11 invariants documented on [`RunRecord`] are
+    /// violated. This is the crash-to-prevent-corruption philosophy: an
+    /// invariant violation means in-memory state is inconsistent, and
+    /// panicking before persistence ensures crash-recovery returns to the
+    /// last valid state.
+    pub fn assert_invariants(&self) {
+        self.assert_lifecycle_invariants();
+        self.assert_oplog_invariants();
+    }
+
+    fn assert_lifecycle_invariants(&self) {
+        // INV-1: Active implies non-empty root_shards.
+        if self.status == RunStatus::Active {
+            assert!(
+                !self.root_shards.is_empty(),
+                "Active run {:?} must have at least one root shard",
+                self.run,
+            );
+        }
+
+        // INV-2: completed_at.is_some() iff terminal.
+        assert_eq!(
+            self.completed_at.is_some(),
+            self.status.is_terminal(),
+            "Run {:?}: completed_at must be Some iff status is terminal (status: {:?})",
+            self.run,
+            self.status,
+        );
+
+        // INV-3: created_at > ZERO.
+        assert!(
+            self.created_at > LogicalTime::ZERO,
+            "Run {:?}: created_at must be > ZERO",
+            self.run,
+        );
+
+        // INV-4: Initializing implies empty root_shards.
+        if self.status == RunStatus::Initializing {
+            assert!(
+                self.root_shards.is_empty(),
+                "Initializing run {:?} must have empty root_shards",
+                self.run,
+            );
+        }
+
+        // INV-5: completed_at >= created_at when Some.
+        if let Some(completed) = self.completed_at {
+            assert!(
+                completed >= self.created_at,
+                "Run {:?}: completed_at ({:?}) must be >= created_at ({:?})",
+                self.run,
+                completed,
+                self.created_at,
+            );
+        }
+
+        // INV-9: No duplicate ShardIds in root_shards.
+        // O(n²) scan like INV-7: n is bounded by MAX_INITIAL_SHARDS.
+        for i in 0..self.root_shards.len() {
+            for j in (i + 1)..self.root_shards.len() {
+                assert!(
+                    self.root_shards[i] != self.root_shards[j],
+                    "Run {:?}: duplicate ShardId {:?} in root_shards at indices {i} and {j}",
+                    self.run,
+                    self.root_shards[i],
+                );
+            }
+        }
+    }
+
+    fn assert_oplog_invariants(&self) {
+        // INV-6: Op-log bounded — defense-in-depth: RingBuffer enforces capacity
+        // structurally, but this assertion catches corruption before persistence.
+        assert!(
+            self.op_log.len() <= Self::OP_LOG_CAP,
+            "Run {:?}: op_log length {} exceeds cap {}",
+            self.run,
+            self.op_log.len(),
+            Self::OP_LOG_CAP,
+        );
+
+        // INV-7: No duplicate OpIds in op-log.
+        // O(n²) scan is intentional: n ≤ OP_LOG_CAP (8), so max 28 comparisons.
+        // A HashSet would add allocation overhead that dominates at this scale.
+        for i in 0..self.op_log.len() {
+            let a = self.op_log.get(i).unwrap();
+            for j in (i + 1)..self.op_log.len() {
+                assert!(
+                    a.op_id() != self.op_log.get(j).unwrap().op_id(),
+                    "Run {:?}: duplicate OpId {:?} in op_log at indices {i} and {j}",
+                    self.run,
+                    a.op_id(),
+                );
+            }
+        }
+
+        // INV-10: Op-log timestamps non-decreasing.
+        let mut iter = self.op_log.iter();
+        if let Some(mut prev) = iter.next() {
+            for entry in iter {
+                assert!(
+                    entry.executed_at() >= prev.executed_at(),
+                    "Run {:?}: op_log timestamps not non-decreasing: {:?} followed by {:?}",
+                    self.run,
+                    prev.executed_at(),
+                    entry.executed_at(),
+                );
+                prev = entry;
+            }
+        }
+
+        // INV-11: Kind-result consistency.
+        // RegisterShards entries must have RegisteredShards result (not Ack).
+        // All other ops must have Ack result (not RegisteredShards).
+        for entry in &self.op_log {
+            match (entry.kind(), entry.result()) {
+                (RunOpKind::RegisterShards, RunOpResult::RegisteredShards { .. }) => {}
+                (RunOpKind::RegisterShards, RunOpResult::Ack) => {
+                    panic!(
+                        "Run {:?}: RegisterShards op-log entry must have RegisteredShards result, not Ack",
+                        self.run,
+                    );
+                }
+                (_, RunOpResult::Ack) => {}
+                (kind, RunOpResult::RegisteredShards { .. }) => {
+                    panic!(
+                        "Run {:?}: {kind:?} op-log entry must not have RegisteredShards result",
+                        self.run,
+                    );
+                }
+            }
+        }
+
+        // INV-8: Config valid.
+        self.config.assert_valid();
+    }
+
+    /// Look up an op-log entry by `OpId`.
+    ///
+    /// Reverse scan for retry optimization — retries involve the most
+    /// recent operations.
+    #[must_use]
+    pub fn op_log_lookup(&self, op: OpId) -> Option<&RunOpLogEntry> {
+        debug_assert!(self.op_log.len() <= Self::OP_LOG_CAP);
+        self.op_log.iter().rev().find(|e| e.op_id() == op)
+    }
+
+    /// Push an op-log entry, evicting the oldest if at capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entry.op_id()` already exists in the log. Callers must
+    /// check via `check_op_idempotency` first.
+    pub fn op_log_push(&mut self, entry: RunOpLogEntry) {
+        assert!(
+            !self.op_log.iter().any(|e| e.op_id() == entry.op_id()),
+            "Run {:?}: attempt to push duplicate OpId {:?}",
+            self.run,
+            entry.op_id(),
+        );
+        self.op_log.push_back_overwrite(entry);
+        // Defense-in-depth: RingBuffer enforces capacity structurally, but
+        // this assertion catches corruption before persistence.
+        assert!(self.op_log.len() <= Self::OP_LOG_CAP);
+    }
+
+    /// Check idempotency for a run-level operation.
+    ///
+    /// - Returns `Ok(None)` if the OpId is not in the log (new operation).
+    /// - Returns `Ok(Some(entry))` if the OpId matches with same payload hash (replay).
+    /// - Returns `Err(RunOpIdConflict)` if the OpId matches with different hash.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `payload_hash == 0`.
+    pub fn check_op_idempotency(
+        &self,
+        op_id: OpId,
+        payload_hash: u64,
+    ) -> Result<Option<&RunOpLogEntry>, RunOpIdConflict> {
+        assert!(payload_hash != 0, "payload_hash must not be zero");
+        match self.op_log_lookup(op_id) {
+            None => Ok(None),
+            Some(entry) => {
+                if entry.payload_hash() == payload_hash {
+                    Ok(Some(entry))
+                } else {
+                    Err(RunOpIdConflict {
+                        op_id,
+                        expected_hash: entry.payload_hash(),
+                        actual_hash: payload_hash,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Assert that transitioning to `new_status` is legal from the current state.
+    ///
+    /// Legal transitions (see [`RunStatus`] state machine):
+    /// - Initializing → Active (via `register_shards`)
+    /// - Initializing → Cancelled (via `cancel_run`)
+    /// - Active → Done (via `complete_run`)
+    /// - Active → Failed (via `fail_run`)
+    /// - Active → Cancelled (via `cancel_run`)
+    ///
+    /// Terminal states (Done, Failed, Cancelled) cannot transition to any
+    /// other state. Mirrors [`ShardRecord::assert_transition_legal`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the transition is illegal.
+    pub fn assert_transition_legal(&self, new_status: RunStatus) {
+        let legal = match (self.status, new_status) {
+            (RunStatus::Initializing, RunStatus::Active) => true,
+            (RunStatus::Initializing, RunStatus::Cancelled) => true,
+            (RunStatus::Active, RunStatus::Done) => true,
+            (RunStatus::Active, RunStatus::Failed) => true,
+            (RunStatus::Active, RunStatus::Cancelled) => true,
+            // Same-state is legal (idempotent path, not used inline but
+            // keeps the guard compatible with replay-then-assert patterns).
+            (s, t) if s == t => true,
+            _ => false,
+        };
+        assert!(
+            legal,
+            "Run {:?}: illegal transition from {:?} to {:?}",
+            self.run, self.status, new_status,
+        );
+    }
+
+    // -- Public accessors --
+
+    /// The tenant that owns this run.
+    #[must_use]
+    pub fn tenant(&self) -> TenantId {
+        self.tenant
+    }
+
+    /// Unique identifier for this run within the tenant.
+    #[must_use]
+    pub fn run(&self) -> RunId {
+        self.run
+    }
+
+    /// Immutable per-run configuration (cursor semantics, lease duration, retry budget).
+    #[must_use]
+    pub fn config(&self) -> &RunConfig {
+        &self.config
+    }
+
+    /// Current lifecycle status. See [`RunStatus`] for the state machine.
+    #[must_use]
+    pub fn status(&self) -> RunStatus {
+        self.status
+    }
+
+    /// Logical time at which this run was created. Always > `LogicalTime::ZERO`.
+    #[must_use]
+    pub fn created_at(&self) -> LogicalTime {
+        self.created_at
+    }
+
+    /// Logical time at which this run reached a terminal state.
+    /// `Some` iff `status().is_terminal()` (INV-2).
+    #[must_use]
+    pub fn completed_at(&self) -> Option<LogicalTime> {
+        self.completed_at
+    }
+
+    /// Root shard IDs registered at creation time. Does not include
+    /// split-spawned children.
+    #[must_use]
+    pub fn root_shards(&self) -> &[ShardId] {
+        &self.root_shards
+    }
+}
+
+// Compile-time guards for OP_LOG_CAP.
+const _: () = assert!(RunRecord::OP_LOG_CAP == 8);
+const _: () = assert!(ShardRecord::OP_LOG_CAP >= RunRecord::OP_LOG_CAP);
+
+// ============================================================================
+// RunProgress + RunTerminalEvaluation
+// ============================================================================
+
+/// Aggregated shard status counts and in-flight watermark for a run.
+///
+/// Constructed by iterating a run's shards once and tallying each shard's
+/// status and lease state via [`observe_shard`](Self::observe_shard). The
+/// result is a point-in-time snapshot -- not a monotonic stream.
+///
+/// ## Status counters
+///
+/// `total == active + done + split + parked` (asserted after every update).
+/// `leased <= active` (only Active shards can hold a lease).
+///
+/// ## Watermark
+///
+/// The `watermark` tracks the lexicographic minimum `cursor.last_key` among
+/// Active shards with non-initial cursors. Terminal shards are intentionally
+/// excluded even if they carry cursor keys -- this tracks in-flight progress
+/// only. The watermark is **not monotonic**: splits, unparks, and new shard
+/// activations can introduce Active shards with earlier cursor positions.
+///
+/// ## Field sizes
+///
+/// Uses `u32` (not `u64`) because the maximum shard count is bounded by
+/// `MAX_INITIAL_SHARDS` (10K) plus spawned children, well within `u32::MAX`.
+///
+/// `RunProgress` is intentionally `Clone` (not `Copy`) because `watermark`
+/// stores owned key bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunProgress {
+    /// Total shard count: always `active + done + split + parked`.
+    pub total: u32,
+    /// Shards in `Active` status (both leased and unleased).
+    pub active: u32,
+    /// Shards that completed successfully (`Done` status).
+    pub done: u32,
+    /// Shards retired by split (replaced by children, `Split` status).
+    pub split: u32,
+    /// Shards halted due to errors (`Parked` status).
+    pub parked: u32,
+    /// Subset of `active`: shards currently held by a worker lease.
+    pub leased: u32,
+    /// Lexicographic minimum `cursor.last_key` among `Active` shards whose
+    /// cursor is non-initial.
+    ///
+    /// Terminal shards (`Done`/`Split`/`Parked`) are deliberately ignored even
+    /// if they carry cursor keys; this tracks in-flight progress only.
+    /// `None` means no active shard currently has a non-initial cursor
+    /// (including runs with zero active shards).
+    pub watermark: Option<FixedBuf<MAX_KEY_SIZE>>,
+}
+
+impl RunProgress {
+    /// Total shard count: `active + done + split + parked`.
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        self.total
+    }
+
+    /// Shards in `Active` status (leased or unleased).
+    #[must_use]
+    pub fn active(&self) -> u32 {
+        self.active
+    }
+
+    /// Shards that completed successfully.
+    #[must_use]
+    pub fn done(&self) -> u32 {
+        self.done
+    }
+
+    /// Shards retired by split (replaced by children).
+    #[must_use]
+    pub fn split(&self) -> u32 {
+        self.split
+    }
+
+    /// Shards halted due to errors (candidates for unpark).
+    #[must_use]
+    pub fn parked(&self) -> u32 {
+        self.parked
+    }
+
+    /// Active shards currently held by a worker lease. Always `<= active()`.
+    #[must_use]
+    pub fn leased(&self) -> u32 {
+        self.leased
+    }
+
+    /// Lexicographic minimum last-key among active, non-initial shards.
+    ///
+    /// Returns `None` if there are no active shards with a non-initial cursor.
+    /// This can happen when all active shards are still at `CursorUpdate::initial()`
+    /// or when the run has no active shards.
+    ///
+    /// **Non-monotonicity**: This is a point-in-time snapshot, not a monotonic
+    /// watermark stream. Splits, unparks, and new shard activations can
+    /// introduce active shards with earlier cursor positions, causing the
+    /// watermark to decrease. Consumers that need a monotonic progress bound
+    /// should maintain a running maximum externally.
+    #[must_use]
+    pub fn watermark(&self) -> Option<&[u8]> {
+        self.watermark.as_ref().map(|wm| wm.read())
+    }
+
+    /// Whether all active work is complete (no Active shards remain).
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        self.active == 0
+    }
+
+    /// Settled with zero parked shards — clean completion.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.is_settled() && self.parked == 0
+    }
+
+    /// Any shards parked (error/poison).
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.parked > 0
+    }
+
+    /// Evaluate whether this run should transition to a terminal state.
+    ///
+    /// Equivalent to [`evaluate_run_terminal`], but called as a method.
+    #[must_use]
+    pub fn terminal_evaluation(&self) -> RunTerminalEvaluation {
+        evaluate_run_terminal(self)
+    }
+
+    /// Count a shard into the progress tallies.
+    ///
+    /// This updates only status/lease counters. Call [`Self::observe_shard`] when
+    /// you need both counter updates and watermark tracking in one API.
+    ///
+    /// # Panics
+    ///
+    /// - `is_leased` is `true` but `status` is not `Active`.
+    /// - Any counter overflows `u32::MAX`.
+    pub fn count_shard(&mut self, status: ShardStatus, is_leased: bool) {
+        assert!(
+            !is_leased || status == ShardStatus::Active,
+            "is_leased=true is only valid for Active shards, got status: {status:?}"
+        );
+        self.total = self
+            .total
+            .checked_add(1)
+            .expect("RunProgress::total overflow");
+        match status {
+            ShardStatus::Active => {
+                self.active = self
+                    .active
+                    .checked_add(1)
+                    .expect("RunProgress::active overflow");
+                if is_leased {
+                    self.leased = self
+                        .leased
+                        .checked_add(1)
+                        .expect("RunProgress::leased overflow");
+                }
+            }
+            ShardStatus::Done => {
+                self.done = self
+                    .done
+                    .checked_add(1)
+                    .expect("RunProgress::done overflow");
+            }
+            ShardStatus::Split => {
+                self.split = self
+                    .split
+                    .checked_add(1)
+                    .expect("RunProgress::split overflow");
+            }
+            ShardStatus::Parked => {
+                self.parked = self
+                    .parked
+                    .checked_add(1)
+                    .expect("RunProgress::parked overflow");
+            }
+        }
+        self.assert_invariants();
+    }
+
+    /// Observe one shard snapshot and update counters + watermark together.
+    ///
+    /// `cursor_last_key` is only considered when `status` is `Active`. If the
+    /// shard is terminal, the key is ignored.
+    ///
+    /// # Panics
+    ///
+    /// - Same panic conditions as [`Self::count_shard`].
+    /// - `cursor_last_key` exceeds [`MAX_KEY_SIZE`] when `status` is `Active`.
+    pub fn observe_shard(
+        &mut self,
+        status: ShardStatus,
+        is_leased: bool,
+        cursor_last_key: Option<&[u8]>,
+    ) {
+        self.count_shard(status, is_leased);
+
+        if status == ShardStatus::Active
+            && let Some(last_key) = cursor_last_key
+        {
+            assert!(
+                last_key.len() <= MAX_KEY_SIZE,
+                "RunProgress::observe_shard: last_key too large ({} bytes, max {MAX_KEY_SIZE})",
+                last_key.len(),
+            );
+            debug_assert!(
+                !last_key.is_empty(),
+                "RunProgress::observe_shard: last_key must be non-empty when present"
+            );
+
+            match &mut self.watermark {
+                Some(current) if last_key < current.read() => {
+                    current.write(last_key, "watermark key exceeds MAX_KEY_SIZE");
+                }
+                None => {
+                    self.watermark = Some(FixedBuf::from_slice(
+                        last_key,
+                        "watermark key exceeds MAX_KEY_SIZE",
+                    ));
+                }
+                // Equality or greater: watermark only advances toward
+                // smaller keys, so same-value or larger keys are no-ops.
+                _ => {}
+            }
+        }
+    }
+
+    /// Assert structural invariants of the progress tallies.
+    ///
+    /// - `total == active + done + split + parked`
+    /// - `leased <= active`
+    /// - `watermark` must be `None` when `active == 0`
+    pub fn assert_invariants(&self) {
+        assert_eq!(
+            self.total,
+            self.active + self.done + self.split + self.parked,
+            "RunProgress: total must equal sum of per-status counts"
+        );
+        assert!(
+            self.leased <= self.active,
+            "RunProgress: leased ({}) must not exceed active ({})",
+            self.leased,
+            self.active,
+        );
+        // Watermark can only be Some when there are active shards.
+        if self.active == 0 {
+            assert!(
+                self.watermark.is_none(),
+                "RunProgress: watermark must be None when active == 0"
+            );
+        }
+    }
+}
+
+/// Evaluation of whether a run should transition to a terminal state.
+///
+/// Produced by [`evaluate_run_terminal`], which checks `active > 0` first
+/// (still processing), then `parked > 0` (failures), then concludes all done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunTerminalEvaluation {
+    /// At least one shard is still Active — the run cannot terminate yet.
+    StillActive,
+    /// All shards settled with zero parked — clean completion.
+    AllDone,
+    /// All shards settled but some are parked — partial failure.
+    HasFailures,
+}
+
+/// Pure function: evaluate whether a run should transition to a terminal
+/// state based on its shard progress counts.
+///
+/// Decision tree (checked in priority order):
+///
+/// 1. `active > 0` --> [`StillActive`](RunTerminalEvaluation::StillActive):
+///    at least one shard is still being processed. The run cannot terminate.
+/// 2. `parked > 0` --> [`HasFailures`](RunTerminalEvaluation::HasFailures):
+///    all shards settled but some parked. The orchestrator should call
+///    `fail_run` (or decide to unpark and retry).
+/// 3. Otherwise --> [`AllDone`](RunTerminalEvaluation::AllDone): every shard
+///    is Done or Split. The orchestrator should call `complete_run`.
+///
+/// This function is intentionally external to `RunRecord` -- the coordinator
+/// decides *when* and *whether* to act on the evaluation. The function only
+/// provides the recommendation; it does not mutate any state.
+///
+/// # Panics
+///
+/// Panics if `progress.total == 0`. A run with no shards cannot be evaluated
+/// for terminal status (it should not exist in `Active` state).
+#[must_use]
+pub fn evaluate_run_terminal(progress: &RunProgress) -> RunTerminalEvaluation {
+    assert!(
+        progress.total > 0,
+        "evaluate_run_terminal called with zero-total progress"
+    );
+    if progress.active > 0 {
+        RunTerminalEvaluation::StillActive
+    } else if progress.parked > 0 {
+        RunTerminalEvaluation::HasFailures
+    } else {
+        RunTerminalEvaluation::AllDone
+    }
+}
+
+// ============================================================================
+// ShardSummary
+// ============================================================================
+
+/// Fixed-capacity byte storage for allocation-free [`ShardSummary`] fields.
+///
+/// Stores up to `N` bytes inline (on the stack or within the parent struct)
+/// with a `len` field tracking the occupied prefix. This avoids heap
+/// allocation when constructing summaries from slab-backed shard records.
+///
+/// `ShardSummary::from_record` writes directly into this inline buffer.
+/// The `From<Vec<u8>>` impl exists as an adapter for non-hot-path callers; any
+/// allocation implied by `Vec` construction happens at the call site, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryBytes<const N: usize> {
+    /// Fixed-size backing array. Only `bytes[..len]` contains valid data.
+    bytes: [u8; N],
+    /// Number of valid bytes in the `bytes` array.
+    len: usize,
+}
+
+impl<const N: usize> SummaryBytes<N> {
+    /// Create an empty buffer (zero-length, zeroed backing array).
+    #[inline]
+    fn new() -> Self {
+        Self {
+            bytes: [0u8; N],
+            len: 0,
+        }
+    }
+
+    /// Copy `src` into the buffer, replacing any previous content.
+    ///
+    /// # Panics
+    ///
+    /// Panics with `oversize_msg` if `src.len() > N`.
+    #[inline]
+    fn write(&mut self, src: &[u8], oversize_msg: &'static str) {
+        assert!(src.len() <= N, "{oversize_msg}");
+        self.bytes[..src.len()].copy_from_slice(src);
+        self.len = src.len();
+    }
+
+    /// Borrow the occupied portion of the buffer.
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// Adapter for non-hot-path callers. Any heap allocation is the caller's
+/// responsibility; the conversion itself only copies bytes into the
+/// fixed-capacity inline buffer.
+///
+/// # Panics
+///
+/// Panics if `value.len() > N`.
+impl<const N: usize> From<Vec<u8>> for SummaryBytes<N> {
+    fn from(value: Vec<u8>) -> Self {
+        let mut out = Self::new();
+        out.write(&value, "summary bytes exceed fixed capacity");
+        out
+    }
+}
+
+/// Lightweight shard summary for listing and observability.
+///
+/// Constructed from a [`ShardRecord`] via `from_record`, which copies
+/// slab-backed byte fields into fixed-capacity in-struct buffers (no heap
+/// allocation). This decouples the summary from the coordinator's slab
+/// lifetime while keeping repeated listing allocation-silent after caller
+/// buffer warmup.
+///
+/// [`ShardFilter::matches_record`] provides a pre-filter that checks
+/// status/lease/root criteria on the record directly, avoiding unnecessary
+/// byte copies for filtered-out shards.
+///
+/// [`ShardRecord`]: super::record::ShardRecord
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShardSummary {
+    /// Shard identifier (unique within the run).
+    pub shard: ShardId,
+    /// Lifecycle status at snapshot time.
+    pub status: ShardStatus,
+    /// Park reason, set only when `status == Parked`.
+    pub park_reason: Option<ParkReason>,
+    /// Whether the shard has an active (non-expired) lease at snapshot time.
+    pub is_leased: bool,
+    /// Deadline of the current lease, if any.  `Some` only when
+    /// `is_leased` is `true`.  Callers use this to schedule retry
+    /// attempts near the soonest expiry without a separate query.
+    pub lease_deadline: Option<LogicalTime>,
+    /// Number of times this shard has been acquired.
+    ///
+    /// Derived as `fence_epoch - INITIAL`, since each `acquire_and_restore_into`
+    /// bumps the fence. Saturates at `u32::MAX` if the epoch difference
+    /// exceeds 32-bit range (astronomically unlikely in practice).
+    pub acquire_count: u32,
+    /// Cursor's `last_key` at snapshot time, or `None` if the cursor
+    /// is at its initial (no-progress) position.
+    pub last_key: Option<SummaryBytes<MAX_KEY_SIZE>>,
+    /// Inclusive lower bound of this shard's key range (copied from spec).
+    pub key_range_start: SummaryBytes<MAX_KEY_SIZE>,
+    /// Exclusive upper bound of this shard's key range (copied from spec).
+    pub key_range_end: SummaryBytes<MAX_KEY_SIZE>,
+    /// Parent shard ID if this shard was created by a split, `None` for root shards.
+    pub parent: Option<ShardId>,
+    /// Number of child shards spawned by this shard via split operations.
+    /// Saturates at `u32::MAX` (astronomically unlikely in practice).
+    pub spawned_count: u32,
+}
+
+impl ShardSummary {
+    /// Build a summary snapshot from a [`ShardRecord`] at logical time `now`.
+    ///
+    /// Copies slab-backed cursor/spec bytes into fixed-capacity inline buffers
+    /// so the returned summary no longer borrows the coordinator slab. Lease
+    /// status is evaluated against `now` (a lease past its deadline is treated
+    /// as expired).
+    pub fn from_record(record: &ShardRecord, now: LogicalTime, slab: &ByteSlab) -> Self {
+        let last_key = record.cursor.last_key(slab).map(|key| {
+            let mut bytes = SummaryBytes::new();
+            bytes.write(key, "shard summary cursor key exceeds MAX_KEY_SIZE");
+            bytes
+        });
+
+        let mut key_range_start = SummaryBytes::new();
+        key_range_start.write(
+            record.spec.key_range_start(slab),
+            "shard summary start key exceeds MAX_KEY_SIZE",
+        );
+
+        let mut key_range_end = SummaryBytes::new();
+        key_range_end.write(
+            record.spec.key_range_end(slab),
+            "shard summary end key exceeds MAX_KEY_SIZE",
+        );
+
+        Self {
+            shard: record.shard,
+            status: record.status,
+            park_reason: record.park_reason,
+            is_leased: record.is_leased_at(now),
+            lease_deadline: if record.is_leased_at(now) {
+                record.lease_deadline()
+            } else {
+                None
+            },
+            // Derive acquire count from fence epoch: each successful acquire
+            // bumps the epoch by 1, so (current - initial) = total acquisitions.
+            acquire_count: u32::try_from(
+                record
+                    .fence_epoch
+                    .as_raw()
+                    .saturating_sub(FenceEpoch::INITIAL.as_raw()),
+            )
+            .unwrap_or(u32::MAX),
+            last_key,
+            key_range_start,
+            key_range_end,
+            parent: record.parent,
+            spawned_count: u32::try_from(record.spawned.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// The shard's unique identifier.
+    #[must_use]
+    pub fn shard(&self) -> ShardId {
+        self.shard
+    }
+
+    /// Current lifecycle status of this shard.
+    #[must_use]
+    pub fn status(&self) -> ShardStatus {
+        self.status
+    }
+
+    /// Why this shard was parked, if `status() == Parked`.
+    #[must_use]
+    pub fn park_reason(&self) -> Option<ParkReason> {
+        self.park_reason
+    }
+
+    /// Whether a worker holds an active (non-expired) lease at snapshot time.
+    #[must_use]
+    pub fn is_leased(&self) -> bool {
+        self.is_leased
+    }
+
+    /// Deadline of the current lease, if leased. Callers can use this to
+    /// schedule retry attempts near the soonest expiry.
+    #[must_use]
+    pub fn lease_deadline(&self) -> Option<LogicalTime> {
+        self.lease_deadline
+    }
+
+    /// Number of times this shard has been acquired (derived from fence epoch).
+    /// Useful for enforcing per-shard retry budgets.
+    #[must_use]
+    pub fn acquire_count(&self) -> u32 {
+        self.acquire_count
+    }
+
+    /// The cursor's `last_key` at snapshot time, or `None` if the cursor
+    /// is at its initial (no-progress) position.
+    #[must_use]
+    pub fn last_key(&self) -> Option<&[u8]> {
+        self.last_key.as_ref().map(SummaryBytes::as_slice)
+    }
+
+    /// Inclusive lower bound of this shard's key range.
+    #[must_use]
+    pub fn key_range_start(&self) -> &[u8] {
+        self.key_range_start.as_slice()
+    }
+
+    /// Exclusive upper bound of this shard's key range.
+    #[must_use]
+    pub fn key_range_end(&self) -> &[u8] {
+        self.key_range_end.as_slice()
+    }
+
+    /// Parent shard ID if this shard was created by a split, `None` for root shards.
+    #[must_use]
+    pub fn parent(&self) -> Option<ShardId> {
+        self.parent
+    }
+
+    /// Number of child shards spawned by this shard via split operations.
+    #[must_use]
+    pub fn spawned_count(&self) -> u32 {
+        self.spawned_count
+    }
+}
+
+// ============================================================================
+// ShardFilter
+// ============================================================================
+
+/// Filter criteria for [`RunManagement::list_shards_into`].
+///
+/// All fields default to "match anything" (no constraint). Named
+/// constructors compose common filter patterns:
+///
+/// - [`ShardFilter::all()`] -- every shard (no filter)
+/// - [`ShardFilter::active()`] -- Active shards (leased or unleased)
+/// - [`ShardFilter::available()`] -- Active AND unleased (candidates for claiming)
+/// - [`ShardFilter::parked()`] -- Parked shards (candidates for unpark)
+///
+/// Fields are `pub` to prevent ad-hoc construction outside the
+/// crate. The `is_leased` filter is evaluated at the `now` parameter
+/// passed to `list_shards_into`: a lease whose deadline has passed is treated
+/// as unleased.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardFilter {
+    pub status: Option<ShardStatus>,
+    /// Evaluated at the `now` parameter passed to [`RunManagement::list_shards_into`]:
+    /// a lease whose deadline has passed is treated as unleased.
+    pub is_leased: Option<bool>,
+    /// When `true`, excludes split children (shards with a `parent`).
+    pub root_only: bool,
+}
+
+impl ShardFilter {
+    /// No constraints — matches every shard in the run.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// Active shards only (includes both leased and unleased).
+    #[must_use]
+    pub fn active() -> Self {
+        Self {
+            status: Some(ShardStatus::Active),
+            ..Self::default()
+        }
+    }
+
+    /// Active and unleased — shards ready for a worker to acquire.
+    #[must_use]
+    pub fn available() -> Self {
+        Self {
+            status: Some(ShardStatus::Active),
+            is_leased: Some(false),
+            ..Self::default()
+        }
+    }
+
+    /// Parked shards only — candidates for `unpark_shard`.
+    #[must_use]
+    pub fn parked() -> Self {
+        Self {
+            status: Some(ShardStatus::Parked),
+            ..Self::default()
+        }
+    }
+
+    /// Test whether a [`ShardSummary`] passes all filter criteria.
+    #[must_use]
+    pub fn matches(&self, summary: &ShardSummary) -> bool {
+        if let Some(status) = self.status
+            && summary.status != status
+        {
+            return false;
+        }
+        if let Some(leased) = self.is_leased
+            && summary.is_leased != leased
+        {
+            return false;
+        }
+        if self.root_only && summary.parent.is_some() {
+            return false;
+        }
+        true
+    }
+
+    /// Pre-filter on [`ShardRecord`] fields before constructing a
+    /// [`ShardSummary`].
+    ///
+    /// Equivalent to `self.matches(&ShardSummary::from_record(record, now))`
+    /// but avoids unnecessary byte copies for filtered-out records.
+    #[must_use]
+    pub fn matches_record(&self, record: &ShardRecord, now: LogicalTime) -> bool {
+        if let Some(status) = self.status
+            && record.status != status
+        {
+            return false;
+        }
+        if let Some(leased) = self.is_leased
+            && record.is_leased_at(now) != leased
+        {
+            return false;
+        }
+        if self.root_only && record.parent.is_some() {
+            return false;
+        }
+        true
+    }
+}
+
+// ============================================================================
+// Payload hash functions
+// ============================================================================
+
+/// Payload hash for `register_shards`.
+///
+/// Sort by `shard.as_raw()` for order-independence — callers may provide
+/// shards in any order.
+#[must_use]
+pub fn hash_register_shards_payload(shards: &[InitialShardInput<'_>]) -> u64 {
+    op_payload_hash(b"register_shards", |h| {
+        (shards.len() as u32).write_canonical(h);
+
+        let mut sorted: Vec<usize> = (0..shards.len()).collect();
+        sorted.sort_by_key(|&idx| shards[idx].shard().as_raw());
+        for &index in &sorted {
+            let shard = &shards[index];
+            shard.shard().write_canonical(h);
+            shard.spec().write_canonical(h);
+            shard.cursor().write_canonical(h);
+        }
+    })
+}
+
+/// Shared implementation for terminal run operation payload hashes.
+///
+/// Terminal ops (complete, fail, cancel) carry no per-invocation parameters
+/// beyond the `RunId` (implicit in the call site), so the payload is just
+/// the domain-separated tag. Each tag produces a distinct hash (non-zero
+/// with overwhelming probability ~1-2^{-64}; verified by
+/// `hash_terminal_ops_distinct` test).
+///
+/// Not `pub` because callers use the typed wrappers ([`hash_complete_run_payload`],
+/// [`hash_fail_run_payload`], [`hash_cancel_run_payload`]) which encode the
+/// correct domain tag for each operation.
+fn hash_run_terminal_payload(tag: &[u8]) -> u64 {
+    op_payload_hash(tag, |_h| {})
+}
+
+/// Payload hash for `complete_run`. Parameterless (tag-only).
+#[must_use]
+pub fn hash_complete_run_payload() -> u64 {
+    hash_run_terminal_payload(b"complete_run")
+}
+
+/// Payload hash for `fail_run`. Parameterless (tag-only).
+#[must_use]
+pub fn hash_fail_run_payload() -> u64 {
+    hash_run_terminal_payload(b"fail_run")
+}
+
+/// Payload hash for `cancel_run`. Parameterless (tag-only).
+#[must_use]
+pub fn hash_cancel_run_payload() -> u64 {
+    hash_run_terminal_payload(b"cancel_run")
+}
+
+/// Payload hash for `unpark_shard`.
+///
+/// Includes both `run` and `shard` from the key so that unpark operations
+/// on different shards within the same run produce distinct hashes.
+#[must_use]
+pub fn hash_unpark_payload(key: &ShardKey) -> u64 {
+    op_payload_hash(b"unpark_shard", |h| {
+        key.run().write_canonical(h);
+        key.shard().write_canonical(h);
+    })
+}
+
+// ============================================================================
+// RunManagement trait
+// ============================================================================
+
+/// Run-level management operations: setup, terminal transitions, listing,
+/// progress, and shard unparking.
+///
+/// Separated from [`CoordinationBackend`](super::traits::CoordinationBackend)
+/// because the two trait surfaces serve different callers with different
+/// authorization models:
+///
+/// - **`CoordinationBackend`** — called by *workers* during shard processing.
+///   Every mutation requires a valid lease (worker proof-of-ownership).
+/// - **`RunManagement`** — called by the *orchestrator/scheduler* or an
+///   *admin operator*. No lease required; authorization is out-of-band.
+///
+/// Keeping them separate also enables independent testability: a run
+/// management test does not need to set up shard leases, and a shard
+/// lifecycle test does not need run creation boilerplate.
+///
+/// ## Lifecycle
+///
+/// ```text
+/// create_run(Initializing) --> register_shards(Active) --> complete_run(Done)
+///                          \-> cancel_run(Cancelled)       fail_run(Failed)
+///                                                          cancel_run(Cancelled)
+/// ```
+///
+/// ## Idempotency
+///
+/// All mutating methods (except `create_run`) accept an `OpId`.
+///
+/// `register_shards`, `complete_run`, `fail_run`, and `cancel_run` are
+/// idempotent via the run's bounded op-log (capacity
+/// [`RunRecord::OP_LOG_CAP`] = 8). Evicted entries are treated as new
+/// operations, but status-check guards prevent re-execution on an
+/// already-transitioned run.
+///
+/// ## Cross-cutting: `unpark_shard` idempotency
+///
+/// Unlike other run-level operations, `unpark_shard` stores its idempotency
+/// entries in the **shard** op-log (cap=16), not the run op-log. This is
+/// because unpark targets a specific shard, and the run op-log would need
+/// a keying scheme to distinguish `unpark(shard_A)` from `unpark(shard_B)`.
+pub trait RunManagement {
+    /// Create a new run in `Initializing` status. **NOT** idempotent.
+    ///
+    /// The caller should generate a unique `RunId` before calling. On failure
+    /// (e.g., duplicate), the caller may retry with a new `RunId` or attempt
+    /// `create_run_with_shards` for the retry-friendly path.
+    fn create_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        config: RunConfig,
+    ) -> Result<RunRecord, CreateRunError>;
+
+    /// Register initial shards and activate the run.
+    ///
+    /// Idempotent via `op_id`. Uses collect-then-insert internally:
+    /// all shards are validated first, then inserted atomically.
+    fn register_shards(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        shards: &[InitialShardInput<'_>],
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError>;
+
+    /// Convenience: create + register in one call.
+    ///
+    /// On retry, if the run already exists with the same config, attempts
+    /// to re-apply `register_shards` (idempotent via `op_id`).
+    ///
+    /// # Production note
+    ///
+    /// The default implementation is **not atomic**: `create_run` and
+    /// `register_shards` are separate calls with a TOCTOU window between
+    /// the existence check and the registration. The in-memory backend
+    /// serializes via `&mut self`, but production backends should override
+    /// this with a transactional implementation to avoid partial-creation
+    /// races under concurrent callers.
+    fn create_run_with_shards(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        config: RunConfig,
+        shards: &[InitialShardInput<'_>],
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<RunRecord>, CreateRunError> {
+        match self.create_run(now, tenant, run, config) {
+            Ok(_) => {} // Fresh creation succeeded; proceed to registration.
+            Err(CreateRunError::RunAlreadyExists { .. }) => {
+                // Retry path: the run already exists (prior attempt may have
+                // crashed between create and register). Verify configs match
+                // to ensure the caller isn't accidentally reusing a RunId.
+                let existing = self.get_run(tenant, run)?;
+                if existing.config != config {
+                    return Err(CreateRunError::ConfigMismatch { run });
+                }
+                // Config matches: fall through to register_shards, which is
+                // idempotent via op_id and will detect replays.
+            }
+            Err(e) => return Err(e),
+        }
+
+        // register_shards is idempotent: on retry it returns Replayed
+        // with the same shard IDs from the original execution.
+        let outcome = self.register_shards(now, tenant, run, shards, op_id)?;
+
+        let record = self.get_run(tenant, run)?;
+
+        Ok(outcome.map(|_| record))
+    }
+
+    /// Retrieve the run record for a given tenant and run ID.
+    ///
+    /// # Errors
+    ///
+    /// - [`GetRunError::RunNotFound`] -- no run with this ID for the tenant.
+    /// - [`GetRunError::TenantMismatch`] -- tenant isolation violation.
+    fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError>;
+
+    /// Return a point-in-time progress snapshot for `run`.
+    ///
+    /// The snapshot is read-only and evaluated at `now`:
+    /// - status counters reflect current shard statuses,
+    /// - `leased` counts shards where lease is active at `now` (`now < deadline`),
+    /// - `watermark` is the lexicographic minimum `last_key` among `Active`
+    ///   shards with non-initial cursors only (resume cursors and
+    ///   checkpoint cursors are both eligible while shard status is `Active`).
+    ///
+    /// `watermark` intentionally ignores `Done`/`Split`/`Parked` shards and
+    /// active shards still at `CursorUpdate::initial()`. It is a snapshot, not a
+    /// monotonic stream, and may move backward between calls as shard
+    /// membership changes.
+    ///
+    /// Implementations must return a consistent snapshot. The in-memory
+    /// backend achieves this via `&self` borrow exclusivity; database
+    /// backends should use snapshot isolation or equivalent.
+    fn get_run_progress(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+    ) -> Result<RunProgress, GetRunError>;
+
+    /// List shards for a run, filtered, into a caller-provided output buffer.
+    /// Ordered by `key_range_start` ascending.
+    ///
+    /// This API allows callers to reuse `out` across repeated queries.
+    /// Implementations may grow `out` when needed; callers may still pre-size
+    /// it to avoid repeated reallocations.
+    /// Ordering ties (same `key_range_start`) are backend-defined.
+    ///
+    /// `ShardFilter::is_leased` must be evaluated against `now`: a lease whose
+    /// deadline has passed counts as unleased, not leased.
+    ///
+    fn list_shards_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        filter: ShardFilter,
+        out: &mut Vec<ShardSummary>,
+    ) -> Result<(), GetRunError>;
+
+    /// Collect claimable shard IDs and the earliest lease deadline in a single
+    /// pass over the run's shard set.
+    ///
+    /// This is a specialized query for the shard-claiming hot path.  Unlike
+    /// [`list_shards_into`](Self::list_shards_into), it never constructs
+    /// [`ShardSummary`] objects and never copies slab-backed byte fields,
+    /// avoiding ~12 KiB of wasted memcpy per shard when only the `ShardId`
+    /// and lease deadline are needed.
+    ///
+    /// On return, `candidates` contains the IDs of all Active, unleased
+    /// shards in implementation-defined order. Backends using
+    /// [`default_claim_next_available`](super::default_claim_next_available)
+    /// should sort for deterministic worker-offset behavior.  The returned
+    /// `Option<LogicalTime>` is the earliest lease deadline among Active
+    /// shards that **are** leased, or `None` if no Active shard is currently
+    /// leased.  Callers use this deadline to schedule retry attempts near
+    /// the soonest expiry instead of busy-spinning.
+    ///
+    /// `candidates` is cleared before use.  The caller owns the buffer and
+    /// reuses it across calls; implementations may grow it if needed.
+    ///
+    /// # Errors
+    ///
+    /// - [`GetRunError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`GetRunError::TenantMismatch`] — tenant isolation violation.
+    fn collect_claim_candidates_into(
+        &self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        candidates: &mut Vec<ShardId>,
+    ) -> Result<Option<LogicalTime>, GetRunError>;
+
+    /// Mark run as Done. Precondition: Active. Idempotent via `op_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunTransitionError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`RunTransitionError::TenantMismatch`] — tenant isolation violation.
+    /// - [`RunTransitionError::RunTerminal`] — run is already in a terminal state.
+    /// - [`RunTransitionError::WrongStatus`] (target = `Done`) — run is not `Active`.
+    /// - [`RunTransitionError::OpIdConflict`] — `op_id` reused with different payload.
+    fn complete_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    /// Mark run as Failed. Precondition: **Active only** (not Initializing).
+    /// Use `cancel_run` for Initializing runs. Idempotent via `op_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunTransitionError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`RunTransitionError::TenantMismatch`] — tenant isolation violation.
+    /// - [`RunTransitionError::RunTerminal`] — run is already in a terminal state.
+    /// - [`RunTransitionError::WrongStatus`] (target = `Failed`) — run is not `Active`.
+    /// - [`RunTransitionError::OpIdConflict`] — `op_id` reused with different payload.
+    fn fail_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    /// Cancel run (sets Cancelled). Accepts Initializing OR Active.
+    /// Idempotent via `op_id`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunTransitionError::RunNotFound`] — no run with this ID for the tenant.
+    /// - [`RunTransitionError::TenantMismatch`] — tenant isolation violation.
+    /// - [`RunTransitionError::RunTerminal`] — run is already in a terminal state.
+    /// - [`RunTransitionError::OpIdConflict`] — `op_id` reused with different payload.
+    ///
+    /// Never returns [`RunTransitionError::WrongStatus`] — both Initializing and
+    /// Active are accepted.
+    fn cancel_run(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        run: RunId,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, RunTransitionError>;
+
+    /// Unpark a parked shard. Admin-only, NOT lease-gated.
+    ///
+    /// Bumps `fence_epoch` (fencing any zombie workers), clears park state,
+    /// restores Active status. Preserves cursor position.
+    ///
+    /// Idempotency is stored in the **shard** op-log, not the run op-log.
+    ///
+    /// # Errors
+    ///
+    /// - [`UnparkError::ShardNotFound`] — shard does not exist.
+    /// - [`UnparkError::TenantMismatch`] — tenant isolation violation.
+    /// - [`UnparkError::RunTerminal`] — run is already in a terminal state.
+    /// - [`UnparkError::NotParked`] — shard is not in Parked status.
+    /// - [`UnparkError::OpIdConflict`] — `op_id` reused with different payload.
+    fn unpark_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, UnparkError>;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod tests;

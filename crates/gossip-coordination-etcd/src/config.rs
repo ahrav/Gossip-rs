@@ -53,10 +53,39 @@ pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`new`]: Self::new
 /// [`from_endpoints_csv`]: Self::from_endpoints_csv
 /// [`localhost`]: Self::localhost
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EtcdCoordinatorConfig {
     endpoints: Vec<String>,
     namespace_prefix: String,
+}
+
+/// Redacts endpoint URIs to prevent credential leakage in logs and
+/// diagnostics. Endpoint strings may contain embedded credentials
+/// (e.g. `http://user:pass@host:2379`); the `Debug` output shows only
+/// the host:port portion of each endpoint.
+impl fmt::Debug for EtcdCoordinatorConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        /// Strip the userinfo portion from a URI, keeping only `scheme://host:port/path`.
+        fn redact_endpoint(endpoint: &str) -> String {
+            // Find `://`, then check if there's a `@` before the next `/`.
+            if let Some(scheme_end) = endpoint.find("://") {
+                let authority_start = scheme_end + 3;
+                let rest = &endpoint[authority_start..];
+                // If there's an `@`, the part before it is userinfo — strip it.
+                let path_start = rest.find('/').unwrap_or(rest.len());
+                if let Some(at_pos) = rest[..path_start].find('@') {
+                    return format!("{}://***@{}", &endpoint[..scheme_end], &rest[at_pos + 1..]);
+                }
+            }
+            endpoint.to_owned()
+        }
+
+        let redacted: Vec<String> = self.endpoints.iter().map(|e| redact_endpoint(e)).collect();
+        f.debug_struct("EtcdCoordinatorConfig")
+            .field("endpoints", &redacted)
+            .field("namespace_prefix", &self.namespace_prefix)
+            .finish()
+    }
 }
 
 impl EtcdCoordinatorConfig {
@@ -126,7 +155,7 @@ impl EtcdCoordinatorConfig {
     /// endpoints are forwarded to [`new`](Self::new) for full validation.
     ///
     /// This is primarily intended for environment-variable-driven
-    /// configuration (e.g. `ETCD_ENDPOINTS=host1:2379,host2:2379`).
+    /// configuration (e.g. `ETCD_ENDPOINTS=http://host1:2379,http://host2:2379`).
     ///
     /// # Errors
     ///

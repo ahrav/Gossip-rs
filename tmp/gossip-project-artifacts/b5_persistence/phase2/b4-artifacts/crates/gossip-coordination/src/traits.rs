@@ -1,0 +1,597 @@
+//! The coordination trait: the operation contract that all backends
+//! (in-memory, FoundationDB, PostgreSQL, deterministic simulator)
+//! must implement.
+//!
+//! This module contains a single item — [`CoordinationBackend`] — which
+//! defines the semantic contract for seven shard lifecycle operations.
+//! See [`super::session::WorkerSession`] for the ergonomic caller wrapper,
+//! and [`super::in_memory::InMemoryCoordinator`] for the reference backend.
+//!
+//! ## Operation Lifecycle
+//!
+//! A worker processes a shard through three phases:
+//!
+//! ```text
+//! acquire_and_restore_into   ──►  renew / checkpoint (loop)  ──►  complete
+//!         (entry)                    (steady state)              / park_shard
+//!                                                               / split_replace
+//!                                                               / split_residual*
+//! ```
+//!
+//! `split_residual` is non-terminal: the parent stays Active and retains its
+//! lease. All other terminal operations (complete, park, split_replace) consume
+//! the lease and move the shard to a terminal status.
+//!
+//! ## Synchronous API
+//!
+//! The trait is synchronous (returns `Result<T, E>`, not futures). Async
+//! adaptation is the backend's responsibility — the contract defines
+//! semantics, not execution model. This keeps the deterministic simulator
+//! simple (no async runtime needed).
+//!
+//! ## Parameter Conventions
+//!
+//! Lease-gated operations take `(TenantId, Lease)` — the backend extracts
+//! the `ShardKey` from the lease via `lease.shard_key()`.
+//! `acquire_and_restore_into` is the exception: it takes
+//! `(TenantId, ShardKey, WorkerId)` since no lease exists yet.
+//!
+//! `now: LogicalTime` is passed explicitly to every operation. The
+//! coordinator never reads a clock — time is an input. This is
+//! essential for deterministic simulation.
+//! Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021).
+//!
+//! ## Validation Pipeline
+//!
+//! Every lease-gated mutation follows the same three-step validation
+//! pipeline (see [`super::validation`] for the shared implementation):
+//!
+//! 1. **Idempotency** — [`super::validation::check_op_idempotency`] detects
+//!    replays via the per-shard op-log. Checked first so that a successful
+//!    replay is never blocked by an expired lease or terminal status.
+//! 2. **Lease validation** — [`super::validation::validate_lease`] checks
+//!    tenant isolation, terminal status, fence epoch, lease expiry, and owner
+//!    identity, in security-priority order.
+//! 3. **Operation-specific** — cursor monotonicity/bounds (checkpoint, complete),
+//!    split coverage (split_replace), or residual geometry (split_residual).
+//!
+//! This ordering is critical for crash recovery: a worker that completed an
+//! operation but crashed before receiving the response must be able to retry
+//! and get the cached result, even if the lease has since expired.
+//!
+//! ## Fencing Protocol
+//!
+//! All lease-gated writes carry the fence epoch, and the backend rejects
+//! stale epochs. This is the "fencing token protocol."
+//! Reference: Kleppmann, "How to do distributed locking" (2016);
+//! Gray & Cheriton, "Leases" (SOSP 1989).
+
+use crate::error::{
+    AcquireError, AcquireResultView, AcquireScratch, CheckpointError, CompleteError,
+    IdempotentOutcome, ParkError, RenewError, RenewResult, SplitReplaceError, SplitResidualError,
+};
+use crate::lease::Lease;
+use crate::record::ParkReason;
+use crate::split_execution::{SplitReplaceResult, SplitResidualResult};
+use gossip_contracts::coordination::cursor::CursorUpdate;
+use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
+use gossip_contracts::identity::{LogicalTime, OpId, ShardKey, TenantId, WorkerId};
+
+/// The coordination contract for the distributed secret scanner.
+///
+/// Every backend (in-memory, FoundationDB, PostgreSQL, deterministic
+/// simulator) implements this trait. The trait defines the **semantic
+/// contract** — what each operation must do and what invariants it
+/// must maintain. Backends choose their own concurrency control and
+/// persistence strategies.
+///
+/// ## Design Principles
+///
+/// **Synchronous API**: The trait methods are synchronous. Async
+/// backends wrap the implementation; the deterministic simulator
+/// calls methods directly without an async runtime.
+///
+/// **Time as input**: Every method takes `now: LogicalTime`. The
+/// backend never reads a clock. This makes all operations
+/// deterministic given the same inputs, enabling simulation testing.
+///
+/// Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021).
+///
+/// **Tenant-first**: Every method takes `TenantId` as its first
+/// parameter (after `&mut self` and `now`). The backend asserts
+/// tenant isolation on every call.
+///
+/// **Lease-gated mutations**: All mutating operations (except
+/// `acquire_and_restore_into`) require a valid `Lease`. The backend
+/// validates the lease's fence epoch and deadline before executing.
+///
+/// ## Operation Summary
+///
+/// | Method | Terminal? | Idempotent? | Key action |
+/// |--------|:---------:|:-----------:|------------|
+/// | [`acquire_and_restore_into`](Self::acquire_and_restore_into) | no | no (bumps fence) | Grant lease, return snapshot |
+/// | [`renew`](Self::renew) | no | no (no op-log) | Extend lease deadline |
+/// | [`checkpoint`](Self::checkpoint) | no | yes (OpId) | Advance cursor |
+/// | [`complete`](Self::complete) | **yes** (Done) | yes (OpId) | Mark shard finished |
+/// | [`park_shard`](Self::park_shard) | **yes** (Parked) | yes (OpId) | Halt shard on error |
+/// | [`split_replace`](Self::split_replace) | **yes** (Split) | yes (OpId) | Replace with N children |
+/// | [`split_residual`](Self::split_residual) | no | yes (OpId) | Shrink parent, create residual |
+///
+/// ## Invariants (must hold across ALL backends)
+///
+/// **Safety (tenant isolation)**: A request scoped to tenant A must
+/// never read or write shard records belonging to tenant B.
+///
+/// **Safety (fence monotonicity)**: `fence_epoch` for a shard MUST
+/// be monotonically non-decreasing. It increments on every ownership
+/// transfer (acquire). It never decreases.
+///
+/// **Safety (idempotency)**: For any operation with an `OpId`:
+/// - Same `(op_id, payload_hash)` → return cached result, no mutation
+/// - Same `op_id`, different `payload_hash` → `OpIdConflict` error
+/// - New `op_id` → execute and record in op-log
+///
+/// Reference: Stripe idempotency key pattern (Brandur Leach, 2017);
+///            IETF Draft: Idempotency-Key HTTP Header Field.
+///
+/// **Safety (cursor monotonicity)**: Across checkpoints within the
+/// same lease epoch, `cursor.last_key` must be lexicographically
+/// non-decreasing.
+///
+/// **Safety (cursor bounds)**: `cursor.last_key` must fall within
+/// the shard's `[spec.start, spec.end)`.
+///
+/// **Safety (split coverage)**: Split children must exactly partition
+/// the parent's key range — no gaps, no overlaps.
+///
+/// **Safety (terminal irreversibility)**: Once a shard reaches Done,
+/// Split, or Parked, no protocol operation changes its status.
+///
+/// **Liveness (lease expiry)**: If a worker fails to renew, its lease
+/// expires and the shard becomes available for another worker.
+///
+/// ## Verification Strategy
+///
+/// The deterministic simulator exercises all operations with fault
+/// injection (simulated crashes, lease expirations, concurrent
+/// acquisitions). Property-based tests verify invariants hold across
+/// random operation sequences.
+///
+/// Reference: FoundationDB simulation (Zhou et al., SIGMOD 2021);
+///            TigerBeetle VOPR; Jepsen methodology.
+///
+/// ## Production Backend Requirements
+///
+/// ### Conditional writes (storage-layer fencing)
+///
+/// Production backends MUST enforce fencing at the storage mutation point
+/// using conditional writes (`WHERE fence_epoch = $expected` or equivalent).
+/// The in-memory backend validates the fence epoch in application code, which
+/// is correct only because mutations are single-threaded. Networked backends
+/// (FoundationDB, PostgreSQL, DynamoDB) must push this check into the storage
+/// transaction to close the TOCTTOU window between validation and write.
+///
+/// Without conditional writes, the following race is possible:
+/// 1. Worker A validates `fence_epoch == 5` in application code.
+/// 2. Worker B acquires the shard, bumping `fence_epoch` to 6.
+/// 3. Worker A's write lands with stale epoch — data corruption.
+///
+/// Conditional writes make step 3 fail atomically.
+///
+/// Reference: Kleppmann, "How to do distributed locking" (2016) — fencing
+/// tokens; Jepsen etcd 3.4.3 — lease revocation race; AWS KCL — DynamoDB
+/// conditional writes for shard leasing.
+///
+/// ### Data-plane fencing
+///
+/// Workers must carry `Lease.fence()` on all scan-result writes to downstream
+/// storage. A stale worker whose lease expired but continues writing scan
+/// results can corrupt data even though the coordination layer correctly
+/// rejected its shard mutations. The coordination layer fences shard record
+/// mutations; the data plane must independently fence scan-result persistence.
+///
+/// Pattern: include the `fence_epoch` in the downstream write's conditional
+/// expression, so the target store rejects writes from superseded workers.
+pub trait CoordinationBackend {
+    // —— Shard lifecycle operations ——————————————————————————————
+    //
+    // Methods are ordered by typical call sequence: acquire → renew/checkpoint
+    // (steady-state loop) → terminal operation (complete/park/split).
+    //
+    // Allocation-sensitive methods (`acquire_and_restore_into`) use caller-owned
+    // scratch buffers to avoid per-call heap allocation on hot paths.
+
+    /// Acquire a shard for processing and restore its last checkpoint.
+    ///
+    /// This is the entry point for a worker to start or resume scanning
+    /// a shard. If the shard is currently unleased (or its lease has
+    /// expired), the backend grants a new lease to the requesting worker.
+    ///
+    /// Unlike all other methods, this takes `(ShardKey, WorkerId)` instead
+    /// of `Lease` — no lease exists yet. The returned [`Lease`] must be
+    /// presented on all subsequent operations.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Look up the shard record by `(tenant, key)`.
+    /// 2. Verify tenant isolation: `record.tenant == tenant`.
+    /// 3. Verify shard is Active (not terminal).
+    /// 4. If currently leased and lease is live at `now`: reject with
+    ///    `AlreadyLeased`.
+    /// 5. Increment `fence_epoch` (ownership transfer).
+    /// 6. Set `lease_owner = worker`, `lease_deadline = now + lease_duration`.
+    ///    `lease_duration` is a backend configuration parameter, not a
+    ///    per-call argument.
+    /// 7. Return `AcquireResult`: the lease, shard snapshot, and a
+    ///    `CapacityHint` reflecting post-acquisition shard availability.
+    ///
+    /// ## Idempotency
+    ///
+    /// `acquire_and_restore_into` is NOT idempotent via OpId. It is
+    /// inherently non-idempotent: each call that succeeds increments
+    /// the fence epoch. A worker that calls acquire twice gets two
+    /// different leases (the first is immediately invalidated by the
+    /// second's epoch bump).
+    ///
+    /// Workers that need to resume after a transient failure should
+    /// simply call acquire again — the new lease supersedes the old.
+    ///
+    /// ## Invariants
+    ///
+    /// **Safety**: `fence_epoch` strictly increases on successful acquire.
+    /// **Safety**: The returned `Lease.fence` matches the record's new epoch.
+    /// **Safety**: The returned snapshot reflects the record's state at
+    /// acquisition time (after epoch bump, before any worker mutations).
+    /// **Capacity**: The `capacity` field in the result reflects the run's
+    /// available-shard count computed *after* this operation completes.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`AcquireError`] on failure:
+    /// - `ShardNotFound` -- no record exists for `(tenant, key)`.
+    /// - `TenantMismatch` -- the record belongs to a different tenant.
+    /// - `ShardTerminal` -- the shard is in a terminal state (Done/Split/Parked).
+    /// - `AlreadyLeased` -- the shard has a live lease held by another worker.
+    ///
+    /// `out` is caller-owned scratch reused across calls. Implementations may
+    /// overwrite it fully and must not retain references into it after return.
+    fn acquire_and_restore_into<'a>(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        key: ShardKey,
+        worker: WorkerId,
+        out: &'a mut AcquireScratch,
+    ) -> Result<AcquireResultView<'a>, AcquireError>;
+
+    /// Renew an existing lease, extending the deadline.
+    ///
+    /// The worker calls this periodically to signal liveness and prevent
+    /// its lease from expiring. The fence epoch does NOT change — this
+    /// is a deadline extension, not an ownership transfer.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Validate lease (tenant, fence epoch, not expired at `now`).
+    /// 2. Set `lease_deadline = now + lease_duration`.
+    /// 3. Return `RenewResult`: the new deadline and a `CapacityHint`
+    ///    reflecting current shard availability. Production backends may
+    ///    cache or approximate the capacity hint rather than recomputing
+    ///    on every renewal.
+    ///
+    /// ## Idempotency
+    ///
+    /// `renew` is NOT idempotent via OpId and has no op-log entry.
+    /// Duplicate calls simply extend the deadline further, which is
+    /// harmless — the lease remains valid for longer.
+    ///
+    /// ## Invariants
+    ///
+    /// **Safety**: The fence epoch does not change on renewal.
+    /// **Safety**: The lease owner does not change on renewal.
+    /// **Liveness**: The new deadline is strictly after `now`.
+    /// **Capacity**: The `capacity` field in the result reflects the run's
+    /// available-shard count computed *after* this operation completes.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`RenewError`] on failure:
+    /// - `ShardNotFound` -- no record exists for the lease's shard key.
+    /// - `TenantMismatch` -- the record belongs to a different tenant.
+    /// - `ShardTerminal` -- the shard has reached a terminal state.
+    /// - `StaleFence` -- the lease's fence epoch does not match the record's.
+    /// - `LeaseExpired` -- the lease has already expired at `now`.
+    fn renew(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+    ) -> Result<RenewResult, RenewError>;
+
+    /// Checkpoint: advance the cursor within the shard's key range.
+    ///
+    /// Records progress without changing shard status. The worker
+    /// calls this periodically to persist scan progress so that
+    /// a crash-recovery resumes from the last checkpoint, not from
+    /// the beginning.
+    ///
+    /// `new_cursor` is a borrowed [`CursorUpdate`]. Implementations must
+    /// treat it as call-scoped input and copy bytes into backend-owned
+    /// storage before returning.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Check idempotency via `op_id` (see Idempotency below).
+    ///    Idempotency is checked first so that replays succeed even
+    ///    after the lease has expired or the shard has reached a
+    ///    terminal status. Without this ordering, a worker that
+    ///    checkpointed successfully but crashed before receiving the
+    ///    response could not retry after its lease expired.
+    /// 2. Validate lease (tenant, fence epoch, not expired at `now`).
+    /// 3. Validate `new_cursor.last_key.is_some()`.
+    /// 4. Validate cursor monotonicity: `new >= old` (lexicographic).
+    /// 5. Validate cursor bounds: `last_key ∈ [spec.start, spec.end)`.
+    /// 6. Persist `new_cursor` as the shard's latest cursor.
+    /// 7. Record in op-log.
+    ///
+    /// ## Idempotency
+    ///
+    /// Idempotent via `op_id`:
+    /// - Same `(op_id, hash_checkpoint_payload(new_cursor))` → `Replayed(())`
+    /// - Same `op_id`, different hash → `OpIdConflict`
+    /// - New `op_id` → execute, record in op-log, `Executed(())`
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`CheckpointError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was previously used with a different payload.
+    /// - `ShardNotFound` -- no record exists for the lease's shard key.
+    /// - `TenantMismatch` / `ShardTerminal` / `StaleFence` / `LeaseExpired` -- lease
+    ///   validation failures (see [`validate_lease`](super::validation::validate_lease)).
+    /// - `CheckpointMissingKey` -- `new_cursor` has no `last_key`.
+    /// - `CursorRegression` -- the new key is lexicographically before the old.
+    /// - `CursorOutOfBounds` -- the key falls outside the shard's `[start, end)`.
+    /// - `CursorKeyTooLarge` / `CursorTokenTooLarge` -- field exceeds size limit.
+    /// - `ResourceExhausted` -- the byte slab could not allocate space for the
+    ///   new cursor.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the cursor update (step 6) as a single conditional write or
+    /// transaction. See trait-level *Production Backend Requirements*.
+    fn checkpoint(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        new_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CheckpointError>;
+
+    /// Complete: mark the shard as successfully done.
+    ///
+    /// Terminal operation. After completion, the shard's status is `Done`
+    /// and no further mutations are accepted.
+    ///
+    /// The `final_cursor` records the worker's final position. It must
+    /// satisfy the same monotonicity and bounds constraints as a
+    /// checkpoint cursor.
+    ///
+    /// `final_cursor` is a borrowed [`CursorUpdate`]. Implementations must
+    /// not retain references past the call boundary.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Check idempotency via `op_id` (replay succeeds even after
+    ///    lease expiry or terminal status).
+    /// 2. Validate lease and preconditions.
+    /// 3. Apply cursor constraints (monotonicity, bounds, non-empty key).
+    /// 4. Set `status = Done`, `cursor = final_cursor`.
+    /// 5. Release lease (`lease = None`).
+    /// 6. Record in op-log.
+    ///
+    /// ## Idempotency
+    ///
+    /// Idempotent via `op_id` + `hash_complete_payload(final_cursor)`.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`CompleteError`] on failure. Error conditions are the same as
+    /// [`checkpoint`](Self::checkpoint) (OpId conflict, lease validation, cursor
+    /// constraints, `ResourceExhausted`) since completion carries a final cursor
+    /// update.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the status transition (step 4) as a single conditional write or
+    /// transaction. See trait-level *Production Backend Requirements*.
+    fn complete(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        final_cursor: &CursorUpdate<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, CompleteError>;
+
+    /// Park: halt the shard due to an error condition.
+    ///
+    /// Terminal operation. After parking, the shard's status is `Parked`
+    /// with the given reason. No further mutations are accepted.
+    ///
+    /// Unparking is an out-of-band admin operation (not part of this trait).
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Check idempotency via `op_id` (replay succeeds even after
+    ///    lease expiry or terminal status).
+    /// 2. Validate lease and preconditions.
+    /// 3. Set `status = Parked`, `park_reason = Some(reason)`.
+    /// 4. Release lease.
+    /// 5. Record in op-log.
+    ///
+    /// ## Idempotency
+    ///
+    /// Idempotent via `op_id` + `hash_park_payload(reason)`.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`ParkError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
+    /// - Lease validation failures (same as [`checkpoint`](Self::checkpoint),
+    ///   minus cursor errors since park carries no cursor update).
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the status transition (step 3) as a single conditional write or
+    /// transaction. See trait-level *Production Backend Requirements*.
+    fn park_shard(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        reason: ParkReason,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<()>, ParkError>;
+
+    /// SplitReplace: replace this shard with N child shards.
+    ///
+    /// Terminal operation for the parent (status → Split). Creates N
+    /// new Active child shards whose key ranges collectively cover the
+    /// parent's range exactly.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Check idempotency via `op_id` (replay succeeds even after
+    ///    lease expiry or terminal status).
+    /// 2. Validate lease and preconditions.
+    /// 3. Validate split coverage (contiguous child boundaries, no gaps,
+    ///    no overlaps, start/end alignment with parent).
+    /// 4. Derive deterministic child IDs via `derive_split_shard_id`
+    ///    with `DerivedShardKind::Child` and index `spawned.len() + i`.
+    /// 5. Create child ShardRecords (Active, initial cursors from plan).
+    /// 6. Set parent status to Split, record children in `spawned`.
+    /// 7. Release parent lease.
+    /// 8. Record in op-log.
+    ///
+    /// ## Idempotency
+    ///
+    /// Idempotent via `op_id` + `hash_split_replace_payload(plan)`.
+    /// On replay, returns the same child IDs without creating duplicates.
+    ///
+    /// NOTE(safety): Op-log eviction cannot affect split_replace replays.
+    /// After split_replace, parent status becomes Split (terminal). No further
+    /// ops can push entries, so the split_replace op_log entry is never evicted.
+    /// `check_op_idempotency()` will always detect the replay.
+    ///
+    /// ## Atomicity
+    ///
+    /// Production backends must execute steps 4-8 (child ID derivation,
+    /// child creation, parent status transition to Split, lease release,
+    /// and op-log recording) in a single atomic transaction. A partial
+    /// commit — e.g., child1 written but child2 not — violates the split
+    /// coverage invariant and creates a gap in the shard map.
+    ///
+    /// Pattern: read the parent's `revision`, write children + parent update
+    /// in one transaction, fail if the parent was modified concurrently
+    /// (optimistic concurrency via revision check).
+    ///
+    /// The in-memory backend achieves this trivially (single-threaded
+    /// mutation). Networked backends must use multi-key transactions or
+    /// batch conditional writes.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`SplitReplaceError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
+    /// - Lease validation failures (same as other lease-gated operations).
+    /// - `SplitInvalid(SplitValidationError)` -- split geometry or spawn-cap
+    ///   preconditions failed (for example: coverage mismatch, invalid child
+    ///   spec, or spawn limit exceeded).
+    /// - `ResourceExhausted` -- allocation failed while materializing split
+    ///   records in slab-backed storage.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the multi-record mutation (steps 4-8) as a single conditional
+    /// transaction. See trait-level *Production Backend Requirements*.
+    fn split_replace(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitReplacePlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError>;
+
+    /// SplitResidual: shrink this shard and create a residual for the
+    /// unprocessed remainder.
+    ///
+    /// Non-terminal for the parent (stays Active with a smaller range).
+    /// Creates one new Active residual shard covering the upper portion
+    /// of the original range. This contrasts with [`split_replace`](Self::split_replace),
+    /// where the parent transitions to `Split` (terminal) and releases
+    /// its lease. Here, the parent retains its lease and continues
+    /// processing within the narrowed range.
+    ///
+    /// ## Behavior
+    ///
+    /// 1. Check idempotency via `op_id` (replay succeeds even after
+    ///    lease expiry or terminal status).
+    /// 2. Validate lease and preconditions.
+    /// 3. Validate residual split geometry against the parent bounds and
+    ///    ensure the existing parent cursor remains inside the narrowed
+    ///    `plan.parent_new_spec()`.
+    /// 4. Derive deterministic residual ID via `derive_split_shard_id`
+    ///    with `DerivedShardKind::Residual` and index `spawned.len()`.
+    /// 5. Update parent's spec to `plan.parent_new_spec`.
+    /// 6. Create residual ShardRecord (Active).
+    /// 7. Record residual in parent's `spawned`.
+    /// 8. Parent keeps its lease (continues processing).
+    /// 9. Record in op-log.
+    ///
+    /// ## Idempotency
+    ///
+    /// Idempotent via `op_id` + `hash_split_residual_payload(plan)`.
+    ///
+    /// ## Atomicity
+    ///
+    /// Production backends must execute steps 4-9 (residual ID derivation,
+    /// parent spec update, residual creation, `spawned` recording, lease
+    /// retention, and op-log recording) in a single atomic transaction. A
+    /// partial commit leaves the parent with a smaller range but no
+    /// corresponding residual shard, creating a coverage gap.
+    ///
+    /// Same transactional pattern as `split_replace`: read the parent
+    /// revision, write all changes in one transaction, fail on concurrent
+    /// modification.
+    ///
+    /// ## Errors
+    ///
+    /// Returns [`SplitResidualError`] on failure:
+    /// - `OpIdConflict` -- the `op_id` was reused with a different payload.
+    /// - Lease validation failures (same as other lease-gated operations).
+    /// - `SplitInvalid(SplitValidationError)` -- residual partition or
+    ///   preconditions failed (for example: invalid geometry, cursor
+    ///   stranded by shrink, or spawn limit exceeded).
+    /// - `ResourceExhausted` -- allocation failed while materializing split
+    ///   records in slab-backed storage.
+    ///
+    /// ## Production note
+    ///
+    /// Backends with external storage must execute lease validation (step 2)
+    /// and the multi-record mutation (steps 4-9) as a single conditional
+    /// transaction. See trait-level *Production Backend Requirements*.
+    fn split_residual(
+        &mut self,
+        now: LogicalTime,
+        tenant: TenantId,
+        lease: &Lease,
+        plan: SplitResidualPlan<'_>,
+        op_id: OpId,
+    ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError>;
+}
