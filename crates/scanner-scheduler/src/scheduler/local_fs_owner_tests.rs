@@ -1,5 +1,4 @@
 use super::*;
-use crate::Engine;
 use crate::api::{FileId, RuleSpec, TransformConfig, Tuning, ValidatorKind};
 use crate::archive::PartialReason;
 use crate::events::VecEventOutput;
@@ -7,8 +6,9 @@ use crate::scheduler::engine_stub::{FindingRec, MockEngine, MockRule, RuleId};
 use crate::scheduler::engine_trait::{
     EngineScratch, FindingRecord, FindingWithHash, FindingWithHashRecord, ScanEngine,
 };
-use crate::scheduler::local_fs_archive_ctx::{ArchiveEnd, apply_entry_budget_clamp};
+use crate::scheduler::local_fs_archive_ctx::{apply_entry_budget_clamp, ArchiveEnd};
 use crate::store::{EmitOnlyStoreProducer, FailingStoreProducer, InMemoryStoreProducer};
+use crate::Engine;
 use regex::bytes::Regex;
 use std::fs;
 use std::io::Write;
@@ -1458,7 +1458,7 @@ fn account_effective_dropped_subtracts_pruned() {
 fn account_effective_dropped_saturates_when_pruned_exceeds_dropped() {
     let mut m = WorkerMetricsLocal::new();
 
-    // Pruned > dropped: saturating_sub gives 0 (this was the bug).
+    // Pruned > dropped: saturating_sub correctly yields 0.
     account_effective_dropped_findings(&mut m, 2, 5);
     assert_eq!(m.findings_dropped, 0);
 
