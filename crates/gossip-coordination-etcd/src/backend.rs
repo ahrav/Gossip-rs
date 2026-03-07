@@ -15,61 +15,6 @@ use gossip_coordination::{
     SplitResidualResult, TenantId, UnparkError, WorkerId,
 };
 
-/// Health snapshot of a single etcd cluster member, returned by the
-/// maintenance `Status` RPC.
-///
-/// Useful for liveness probes, operator dashboards, and diagnosing cluster
-/// issues (e.g., a member falling behind on Raft apply, or a leader change
-/// during a network partition).
-///
-/// # Visibility
-///
-/// Fields expose internal cluster topology (leader identity, Raft indices,
-/// member roles). Do not surface this data to untrusted callers — it can
-/// leak operational details useful for targeted disruption.
-///
-/// # Fields
-///
-/// | Field | Meaning |
-/// |---|---|
-/// | `version` | etcd server version string (e.g. `"3.5.12"`). |
-/// | `db_size` | Total on-disk size of the member's backend store (bytes). Clamped to zero if the upstream `i64` is negative. |
-/// | `raft_used_db_size` | Portion of `db_size` actually in use by the backend store (defrag reclaims the gap). Clamped to zero if the upstream `i64` is negative. |
-/// | `leader` | Member ID of the current Raft leader (`0` if no leader is elected). |
-/// | `raft_index` | Latest Raft log index the member is aware of. |
-/// | `raft_term` | Current Raft election term. |
-/// | `raft_applied_index` | Highest Raft log index the member has applied to its state machine. A gap between `raft_index` and `raft_applied_index` indicates the member is catching up. |
-/// | `errors` | Alarm strings reported by this member (e.g. `NOSPACE`). Empty when healthy. |
-/// | `is_learner` | Whether this member is a non-voting learner (cannot become leader). |
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EtcdEndpointStatus {
-    pub version: String,
-    pub db_size: u64,
-    pub raft_used_db_size: u64,
-    pub leader: u64,
-    pub raft_index: u64,
-    pub raft_term: u64,
-    pub raft_applied_index: u64,
-    pub errors: Vec<String>,
-    pub is_learner: bool,
-}
-
-impl From<etcd_client::StatusResponse> for EtcdEndpointStatus {
-    fn from(value: etcd_client::StatusResponse) -> Self {
-        Self {
-            version: value.version().to_owned(),
-            db_size: value.db_size().max(0) as u64,
-            raft_used_db_size: value.raft_used_db_size().max(0) as u64,
-            leader: value.leader(),
-            raft_index: value.raft_index(),
-            raft_term: value.raft_term(),
-            raft_applied_index: value.raft_applied_index(),
-            errors: value.errors().to_vec(),
-            is_learner: value.is_learner(),
-        }
-    }
-}
-
 /// etcd-backed coordination backend.
 ///
 /// Implements [`CoordinationBackend`], [`RunManagement`], and
@@ -86,34 +31,33 @@ impl From<etcd_client::StatusResponse> for EtcdEndpointStatus {
 /// # Delegation architecture
 ///
 /// All protocol semantics (shard lifecycle, run lifecycle, idempotency,
-/// lease fencing) are currently **delegated** to an embedded
+/// lease fencing) are **delegated** to an embedded
 /// [`InMemoryCoordinator`]. The etcd connection is established and
 /// health-checked at construction time, but shard and run state lives
 /// entirely in process memory.
 ///
-/// **Implication:** state is lost on process restart. This is intentional —
-/// the delegation model lets the etcd integration crate ship a correct,
-/// test-covered trait surface immediately while the etcd keyspace layout,
-/// record codecs, and transactional write protocol are developed
-/// separately. Once those land, each trait method will be replaced with
-/// real etcd transactions; the `protocol_delegate` field will be removed.
+/// **Implication:** state is lost on process restart. The delegation model
+/// provides a correct, test-covered trait surface while the etcd keyspace
+/// layout, record codecs, and transactional write protocol are developed
+/// in parallel.
 ///
 /// # Threading and async
 ///
 /// The coordination traits are synchronous. The upstream `etcd-client`
-/// crate is async (tonic/gRPC). A private `SyncRuntime` bridges the
-/// gap via a current-thread Tokio runtime that drives async RPCs from
-/// sync trait methods. Callers must not invoke trait methods from within
-/// an existing Tokio async context (nested `block_on` panics).
+/// crate is async (tonic/gRPC). A private current-thread Tokio runtime
+/// bridges the gap by driving async RPCs from sync trait methods. Callers
+/// must not invoke trait methods from within an existing Tokio async
+/// context (nested `block_on` panics).
 pub struct EtcdCoordinator {
     config: EtcdCoordinatorConfig,
-    runtime: SyncRuntime,
-    /// Live gRPC connection to the etcd cluster. Currently used only for
-    /// health-check (`status()`); will carry all coordination traffic once
-    /// the transactional protocol is implemented.
+    /// Current-thread Tokio runtime that bridges the sync coordination
+    /// traits to the async etcd client. See [struct-level docs](Self)
+    /// for threading constraints.
+    runtime: tokio::runtime::Runtime,
+    /// Live gRPC connection to the etcd cluster. Used for health-check
+    /// (`status()`). Coordination traffic uses the in-memory delegate.
     client: etcd_client::Client,
-    /// Holds all shard/run state in memory. Every trait method forwards
-    /// here today; will be replaced by etcd read/write transactions.
+    /// Holds all shard/run state in memory. Every trait method delegates here.
     protocol_delegate: InMemoryCoordinator,
 }
 
@@ -141,10 +85,21 @@ impl EtcdCoordinator {
     /// cannot be created, or [`EtcdCoordinatorError::Etcd`] if the connect
     /// or status probe fails (including connect timeout).
     pub fn connect(config: EtcdCoordinatorConfig) -> Result<Self, EtcdCoordinatorError> {
-        let runtime = SyncRuntime::new()?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .map_err(EtcdCoordinatorError::RuntimeBuild)?;
+
         let endpoints = config.endpoints().to_vec();
         let connect_opts =
             etcd_client::ConnectOptions::new().with_connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "connect() must not be called from within an active Tokio runtime"
+        );
+
         let mut client = runtime
             .block_on(etcd_client::Client::connect(endpoints, Some(connect_opts)))
             .map_err(|source| EtcdCoordinatorError::Etcd {
@@ -173,21 +128,10 @@ impl EtcdCoordinator {
         &self.config
     }
 
-    /// Return the configured etcd endpoints.
-    #[must_use]
-    pub fn endpoints(&self) -> &[String] {
-        self.config.endpoints()
-    }
-
-    /// Return the namespace prefix used as the etcd keyspace root.
-    #[must_use]
-    pub fn namespace_prefix(&self) -> &str {
-        self.config.namespace_prefix()
-    }
-
     /// Round-trip a maintenance `Status` RPC against the etcd cluster.
     ///
-    /// Returns a point-in-time health snapshot of the connected member.
+    /// Returns the upstream [`etcd_client::StatusResponse`] as a
+    /// point-in-time health snapshot of the connected member.
     /// Useful as a liveness probe or for operator-facing diagnostics.
     ///
     /// # Client clone
@@ -200,24 +144,28 @@ impl EtcdCoordinator {
     ///
     /// # Panics
     ///
-    /// Panics if called from within an active Tokio async context (nested
-    /// `block_on` is not supported by Tokio). This method — and all
-    /// coordination trait methods — must be called from synchronous code
-    /// only. See the [struct-level docs](Self) for details.
-    pub fn status(&self) -> Result<EtcdEndpointStatus, EtcdCoordinatorError> {
+    /// Panics (in debug builds) if called from within an active Tokio
+    /// async context (nested `block_on` is not supported by Tokio). This
+    /// method — and all coordination trait methods — must be called from
+    /// synchronous code only. See the [struct-level docs](Self) for
+    /// details.
+    pub fn status(&self) -> Result<etcd_client::StatusResponse, EtcdCoordinatorError> {
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "status() must not be called from within an active Tokio runtime"
+        );
         let mut client = self.client.clone();
-        let response = self.runtime.block_on(client.status()).map_err(|source| {
-            EtcdCoordinatorError::Etcd {
+        self.runtime
+            .block_on(client.status())
+            .map_err(|source| EtcdCoordinatorError::Etcd {
                 operation: EtcdOperation::Status,
                 source,
-            }
-        })?;
-        Ok(response.into())
+            })
     }
 }
 
 /// Custom [`Debug`] output. Omits the etcd `Client` (which does not
-/// implement `Debug`) and the `SyncRuntime` (internal plumbing). Shows
+/// implement `Debug`) and the Tokio runtime (internal plumbing). Shows
 /// the config fields and a note about the current delegation storage mode.
 impl fmt::Debug for EtcdCoordinator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -226,7 +174,7 @@ impl fmt::Debug for EtcdCoordinator {
             .field("namespace_prefix", &self.config.namespace_prefix())
             .field(
                 "coordination_storage_mode",
-                &"delegated to InMemoryCoordinator until etcd keyspace/codec lands",
+                &"delegated to InMemoryCoordinator",
             )
             .finish()
     }
@@ -241,14 +189,9 @@ impl fmt::Debug for EtcdCoordinator {
 // fencing, idempotency dedup, cursor persistence, split logic — are defined
 // and tested in `gossip-coordination`. This impl adds no additional behavior.
 //
-// When the etcd transactional write protocol lands, each method will be
-// replaced with: (1) read current shard state from etcd, (2) apply the
-// protocol logic, (3) write back via an etcd `Txn` with a compare guard.
-// The method signatures and error types will remain unchanged.
-//
-// Note: once delegation is replaced by real etcd RPCs, every method here
-// will go through `SyncRuntime::block_on()`, adding network round-trip
-// latency. Callers on hot paths should account for that cost.
+// Once delegation is replaced by real etcd RPCs, every method here will go
+// through `self.runtime.block_on()`, adding network round-trip latency.
+// Callers on hot paths should account for that cost.
 
 impl CoordinationBackend for EtcdCoordinator {
     fn acquire_and_restore_into<'a>(

@@ -5,10 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
-description = "etcd-backed coordination backend scaffold for gossip-coordination"
+description = "etcd-backed coordination backend for gossip-coordination"
 
 [features]
 default = []
+tls = ["etcd-client/tls"]
 test-support = ["gossip-coordination/test-support"]
 
 [dependencies]

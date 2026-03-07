@@ -7,7 +7,7 @@
 //!
 //! # Architecture
 //!
-//! The crate is structured in four internal modules:
+//! The crate is structured in three internal modules:
 //!
 //! - **`config`** — Validated connection parameters (endpoints, namespace
 //!   prefix). Construction normalizes whitespace and enforces keyspace
@@ -16,10 +16,6 @@
 //!   exposes health-check (`status()`), and forwards trait methods.
 //! - **`error`** — Unified error types covering configuration validation,
 //!   Tokio runtime creation, and etcd client failures.
-//! - **`runtime`** — A thin sync/async bridge: the coordination traits are
-//!   synchronous, but the upstream `etcd-client` crate is async. A private
-//!   current-thread Tokio runtime drives async calls from sync trait
-//!   methods.
 //!
 //! # Current delegation model
 //!
@@ -27,8 +23,6 @@
 //! complete, split, park, claim) are delegated to [`InMemoryCoordinator`]
 //! from `gossip-coordination`. The etcd connection is established and
 //! health-checked at construction, but shard/run state lives in memory.
-//! Once the etcd keyspace layout and record codecs are implemented,
-//! operations will be persisted as etcd transactions.
 //!
 //! # Build requirements
 //!
@@ -46,9 +40,8 @@
 mod backend;
 mod config;
 mod error;
-mod runtime;
 
-pub use backend::{EtcdCoordinator, EtcdEndpointStatus};
+pub use backend::EtcdCoordinator;
 pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};
 

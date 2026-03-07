@@ -1,12 +1,11 @@
 use std::fmt;
 use std::time::Duration;
 
-/// Logical lease duration (in seconds) passed to the temporary
+/// Logical lease duration (in seconds) passed to the
 /// [`InMemoryCoordinator`] delegate.
 ///
 /// This constant is `pub(crate)` because it is only consumed by
-/// [`EtcdCoordinator::connect`] when constructing the delegate. It will be
-/// removed once persistence moves to real etcd leases.
+/// [`EtcdCoordinator::connect`] when constructing the delegate.
 ///
 /// [`InMemoryCoordinator`]: gossip_coordination::InMemoryCoordinator
 /// [`EtcdCoordinator::connect`]: crate::backend::EtcdCoordinator::connect
@@ -205,14 +204,6 @@ impl EtcdCoordinatorConfig {
     #[must_use]
     pub fn namespace_prefix(&self) -> &str {
         &self.namespace_prefix
-    }
-}
-
-/// Defaults to [`localhost()`](Self::localhost): a single-node local etcd
-/// at `http://127.0.0.1:2379` with prefix `/gossip/v1`.
-impl Default for EtcdCoordinatorConfig {
-    fn default() -> Self {
-        Self::localhost()
     }
 }
 

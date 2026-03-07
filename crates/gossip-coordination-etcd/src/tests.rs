@@ -96,8 +96,8 @@ fn from_endpoints_csv_with_all_empty_segments_returns_no_endpoints() {
 
 #[test]
 fn from_endpoints_csv_drops_trailing_empty_segments() {
-    // Verify that trailing commas (common in env vars) are silently accepted
-    // rather than failing with EmptyEndpoint — this is the documented behavior.
+    // Trailing commas (common in env vars) are silently accepted
+    // rather than failing with EmptyEndpoint.
     let config = EtcdCoordinatorConfig::from_endpoints_csv("http://a:2379,,", "/gossip/v1")
         .expect("trailing empty segments should be silently dropped");
     assert_eq!(config.endpoints(), ["http://a:2379"]);
@@ -193,24 +193,6 @@ fn config_error_converts_to_coordinator_error_via_from() {
 }
 
 // ---------------------------------------------------------------------------
-// SyncRuntime tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn sync_runtime_creation_succeeds() {
-    use crate::runtime::SyncRuntime;
-    let _rt = SyncRuntime::new().expect("SyncRuntime creation should succeed");
-}
-
-#[test]
-fn sync_runtime_block_on_returns_future_output() {
-    use crate::runtime::SyncRuntime;
-    let rt = SyncRuntime::new().expect("SyncRuntime creation should succeed");
-    let result = rt.block_on(async { 42 });
-    assert_eq!(result, 42);
-}
-
-// ---------------------------------------------------------------------------
 // Config edge cases
 // ---------------------------------------------------------------------------
 
@@ -219,13 +201,6 @@ fn config_accepts_root_namespace_slash() {
     let config = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/")
         .expect("root namespace '/' should be accepted");
     assert_eq!(config.namespace_prefix(), "/");
-}
-
-#[test]
-fn config_default_equals_localhost() {
-    let default_config = EtcdCoordinatorConfig::default();
-    let localhost_config = EtcdCoordinatorConfig::localhost();
-    assert_eq!(default_config, localhost_config);
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +273,7 @@ fn connects_to_local_etcd_and_fetches_status() {
     let status = backend.status().expect("status call should succeed");
 
     assert!(
-        !status.version.is_empty(),
+        !status.version().is_empty(),
         "connected member should report a version"
     );
 }
