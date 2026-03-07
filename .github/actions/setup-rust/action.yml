@@ -38,12 +38,13 @@ runs:
   using: "composite"
   steps:
     # vectorscan-rs-sys (scanner-engine dep) requires Boost headers + cmake.
+    # etcd-client compiles .proto files via prost-build, which needs protoc.
     - name: Install system deps (Linux)
       if: runner.os == 'Linux'
       shell: bash
       run: |
         set -euo pipefail
-        base_packages=(libboost-dev)
+        base_packages=(libboost-dev protobuf-compiler)
 
         raw_input='${{ inputs.extra-apt }}'
         normalized_input="${raw_input//$'\n'/ }"
