@@ -655,11 +655,10 @@ mod kani_proofs {
 
     /// Verifies reset clears all items at the u64::MAX boundary with G=2.
     ///
-    /// This directly targets the bug: with G=2, `ceil(u64::MAX / 2) = 2^63`
-    /// but `floor(u64::MAX / 2) = 2^63 - 1`. The old `reset()` called
-    /// `advance_and_drain(u64::MAX)` which computed `now_bucket = 2^63 - 1`,
-    /// unable to drain items at bucket key `2^63`. The fix clears state
-    /// unconditionally instead.
+    /// With G=2, `ceil(u64::MAX / 2) = 2^63` but `floor(u64::MAX / 2) = 2^63 - 1`.
+    /// An advance-based reset computing `now_bucket = floor(u64::MAX / G)`
+    /// would reach only bucket `2^63 - 1`, missing items at bucket key `2^63`.
+    /// `reset()` must clear state unconditionally to avoid this boundary gap.
     ///
     /// Bounded: wheel_size=4, cap=4, single push at u64::MAX boundary.
     #[kani::proof]

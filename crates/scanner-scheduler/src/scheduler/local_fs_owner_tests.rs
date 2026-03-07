@@ -1458,7 +1458,7 @@ fn account_effective_dropped_subtracts_pruned() {
 fn account_effective_dropped_saturates_when_pruned_exceeds_dropped() {
     let mut m = WorkerMetricsLocal::new();
 
-    // Pruned > dropped: saturating_sub gives 0 (this was the bug).
+    // Pruned > dropped: saturating_sub correctly yields 0.
     account_effective_dropped_findings(&mut m, 2, 5);
     assert_eq!(m.findings_dropped, 0);
 

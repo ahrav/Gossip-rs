@@ -109,8 +109,10 @@ Non-negotiables (project-wide):
 | Type | Implements | Notes |
 |------|-----------|-------|
 | `ReadyCommitHandle<R, E>` | `CommitHandle` | Pre-resolved handle wrapping an already-computed `Result<R, E>`. `wait()` returns immediately. Used by synchronous backends and test doubles. Provides `ok()`, `err()`, and `from_result()` constructors. |
-| `InMemoryDoneLedger` | `DoneLedger` | Planned: `HashMap`-backed. Tracks fence watermarks per shard. Not thread-safe. Not yet implemented. |
-| `InMemoryFindingsSink` | `FindingsSink` | Planned: `HashMap`-backed. First-write-wins dedup. Not thread-safe. Not yet implemented. |
+| `InMemoryDoneLedger` | `DoneLedger` | `HashMap`-backed reference implementation with configurable commit timing, injected failures, and lattice-merge semantics. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_conformance`. |
+| `InMemoryFindingsSink` | `FindingsSink` | `HashMap`-backed reference implementation with three-layer upsert, referential integrity checks, and configurable commit timing. Thread-safe via internal `Mutex`. Lives in `gossip-persistence-inmemory` crate. Passes `run_conformance`. |
+| `FindingsConformanceProbe` | (test-only trait) | Test-only read-side probe for observing durable findings state. The production `FindingsSink` API is write-only; this trait adds a narrow read surface so the conformance harness can snapshot row counts and prove replay does not duplicate rows. Backend crates implement this on their test double or integration-test wrapper. |
+| `run_conformance` | (harness entry point) | Backend-agnostic conformance harness (`persistence::conformance` module) that verifies done-ledger idempotency and lattice merge (§8.2), findings idempotency and referential integrity (§8.3), and sensitive-type `Debug` redaction. Returns a `PersistenceConformanceReport` on success. |
 
 ---
 
