@@ -822,11 +822,51 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
     assert!(
         samples
             .windows(2)
-            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes)
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position)
     );
 }
 
-/// Regression: when the last N samples share identical `cumulative_bytes`
+#[test]
+fn compact_samples_keeps_exact_indices_selected_for_compaction() {
+    use super::{Sample, compact_samples, selected_sample_indices};
+
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| {
+            let bytes = if i < 12 { (i as u64) * 100 } else { 1_200 };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    let expected: Vec<_> = selected_sample_indices(&samples, 10)
+        .into_iter()
+        .map(|idx| {
+            let sample = &samples[idx];
+            (
+                sample.rank,
+                sample.recorded_byte_position,
+                sample.key.clone(),
+            )
+        })
+        .collect();
+
+    compact_samples(&mut samples, 10);
+
+    let actual: Vec<_> = samples
+        .iter()
+        .map(|sample| {
+            (
+                sample.rank,
+                sample.recorded_byte_position,
+                sample.key.clone(),
+            )
+        })
+        .collect();
+
+    assert_eq!(actual, expected);
+}
+
+/// Regression: when the last N samples share identical
+/// `recorded_byte_position`
 /// (a byte-position plateau), compaction must still preserve the actual last
 /// sample. Nearest-neighbor tie-breaking must select `len - 1` (the true
 /// last sample), not the first plateau entry.
@@ -835,7 +875,7 @@ fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
     use super::{Sample, compact_samples};
 
     // 20 samples: first 12 have distinct increasing byte positions,
-    // last 8 all share the same cumulative_bytes value (plateau).
+    // last 8 all share the same recorded byte position (plateau).
     let plateau_bytes = 1200_u64;
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| {
@@ -940,7 +980,7 @@ fn observe_with_max_file_size() {
 }
 
 #[test]
-fn cumulative_bytes_saturation() {
+fn recorded_byte_position_saturation() {
     let mut estimator = StreamingSplitEstimator::new(256);
     estimator.observe(&key_for_index(0), u64::MAX - 10);
     estimator.observe(&key_for_index(1), 20); // saturates to MAX
@@ -1425,7 +1465,7 @@ fn plateau_of_two_samples_is_handled() {
     assert!(
         samples
             .windows(2)
-            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes),
+            .all(|w| w[0].recorded_byte_position <= w[1].recorded_byte_position),
         "byte positions must remain non-decreasing"
     );
 }
@@ -1519,7 +1559,7 @@ fn plateau_redistribution_clamps_to_effective_range() {
 fn plateau_redistribution_spreads_picks_across_leading_plateau() {
     use super::{Sample, compact_samples};
 
-    // 30 samples: first 15 at cumulative_bytes = 0 (the plateau),
+    // 30 samples: first 15 at recorded byte position = 0 (the plateau),
     // then 15 with increasing byte positions.
     let mut samples: Vec<Sample> = (0..30)
         .map(|i| {

@@ -91,7 +91,6 @@
 //! filesystem traversal or random workload generation.
 
 use std::fmt;
-use std::mem;
 
 /// Absolute floor on retained sample count.
 ///
@@ -104,10 +103,10 @@ const MIN_SAMPLE_CAP: usize = 128;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum SampleAxis {
     /// Space samples by ordinal rank (0-based item index in stream order).
-    /// Used as a fallback when all cumulative byte positions are identical
+    /// Used as a fallback when all recorded byte positions are identical
     /// (e.g. all-zero-size streams).
     Rank,
-    /// Space samples by cumulative byte position. Preferred whenever the
+    /// Space samples by recorded byte position. Preferred whenever the
     /// byte range is non-degenerate, because it directly optimises for
     /// byte-balanced splits.
     Bytes,
@@ -116,20 +115,20 @@ enum SampleAxis {
 /// A retained checkpoint from the key stream.
 ///
 /// Each sample captures an observed key together with its position on both
-/// the rank axis (ordinal index) and the byte axis (cumulative byte weight
+/// the rank axis (ordinal index) and the byte axis (recorded byte position
 /// at the point the key was sampled). Carrying both axes lets the estimator
-/// use byte-space interpolation for accuracy while falling back to rank
-/// when byte positions collapse.
+/// use byte-space interpolation for accuracy while falling back to rank when
+/// byte positions collapse.
 #[derive(Clone)]
 struct Sample {
     /// 0-based ordinal index of this key in stream order.
     rank: u64,
-    /// Cumulative byte position at which this sample was recorded.
+    /// Recorded byte position at which this sample was stored.
     ///
     /// When sampled by the byte-stride trigger this is the exact byte-stride
     /// mark that the file straddles; otherwise it is the cumulative byte total
     /// at the start of the file (a rank-triggered fallback position).
-    cumulative_bytes: u64,
+    recorded_byte_position: u64,
     key: Box<[u8]>,
 }
 
@@ -158,17 +157,17 @@ impl fmt::Debug for Sample {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sample")
             .field("rank", &self.rank)
-            .field("cumulative_bytes", &self.cumulative_bytes)
+            .field("recorded_byte_position", &self.recorded_byte_position)
             .field("key", &RedactedKeyLen(self.key.len()))
             .finish_non_exhaustive()
     }
 }
 
 impl Sample {
-    fn new(rank: u64, cumulative_bytes: u64, key: &[u8]) -> Self {
+    fn new(rank: u64, recorded_byte_position: u64, key: &[u8]) -> Self {
         Self {
             rank,
-            cumulative_bytes,
+            recorded_byte_position,
             key: Box::<[u8]>::from(key),
         }
     }
@@ -178,47 +177,42 @@ impl Sample {
     fn position(&self, axis: SampleAxis) -> u64 {
         match axis {
             SampleAxis::Rank => self.rank,
-            SampleAxis::Bytes => self.cumulative_bytes,
+            SampleAxis::Bytes => self.recorded_byte_position,
         }
     }
 }
 
 /// Reduce `samples` to at most `cap` entries in-place.
 ///
-/// Selection uses nearest-neighbor interpolation on the preferred axis
-/// (cumulative bytes when the byte range is non-degenerate, rank otherwise).
+/// Selection uses nearest-neighbor interpolation on the compaction axis
+/// (recorded byte position when the byte range is non-degenerate, rank
+/// otherwise).
 /// This preserves the first and last samples and maximises spacing uniformity
-/// on the axis that matters for split accuracy.
-///
-/// The old vector is consumed via [`mem::take`] so dropped samples are freed
-/// before the compacted vector is written back, keeping peak memory at
-/// roughly `old.len() + cap`.
+/// on the axis that matters for split accuracy. A forward write cursor swaps
+/// each retained sample into place so compaction reuses the existing backing
+/// allocation instead of building a transient replacement `Vec`.
 fn compact_samples(samples: &mut Vec<Sample>, cap: usize) {
     if samples.len() <= cap {
         return;
     }
 
-    let old = mem::take(samples);
-    let keep = selected_sample_indices(&old, cap);
-    let mut keep_iter = keep.into_iter();
-    let mut next_keep = keep_iter.next();
-    let mut compacted = Vec::with_capacity(cap);
-
-    for (idx, sample) in old.into_iter().enumerate() {
-        if Some(idx) == next_keep {
-            compacted.push(sample);
-            next_keep = keep_iter.next();
-            if next_keep.is_none() && compacted.len() == cap {
-                break;
-            }
+    let keep = selected_sample_indices(samples, cap);
+    let mut write = 0usize;
+    for &src in &keep {
+        debug_assert!(
+            write <= src,
+            "selected indices must stay ahead of the write cursor"
+        );
+        if write != src {
+            samples.swap(write, src);
         }
+        write += 1;
     }
-
-    *samples = compacted;
+    samples.truncate(write);
 }
 
 /// Choose `cap` indices from `samples` that are approximately evenly spaced
-/// on the preferred axis (bytes or rank).
+/// on the compaction axis (recorded byte position or rank).
 ///
 /// Returns a strictly-increasing `Vec<usize>` of length `cap`. When all
 /// samples share the same axis value (degenerate case), falls back to
@@ -252,7 +246,7 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
     if cap == 1 {
         return vec![len - 1];
     }
-    let axis = preferred_axis(samples);
+    let axis = compaction_axis(samples);
     let first = samples.first().expect("non-empty samples").position(axis);
     let last = samples.last().expect("non-empty samples").position(axis);
 
@@ -451,13 +445,13 @@ fn nearest_by_rank_in_range(samples: &[Sample], lo: usize, hi: usize, target: u6
     }
 }
 
-/// Choose the compaction/search axis: bytes when the range is non-degenerate,
-/// rank otherwise. Checked on the first and last samples only (the array is
-/// sorted, so if the endpoints differ the range is non-degenerate).
-fn preferred_axis(samples: &[Sample]) -> SampleAxis {
+/// Choose the compaction axis: recorded byte position when the range is
+/// non-degenerate, rank otherwise. Checked on the first and last samples
+/// only; estimation still performs its own byte-first search.
+fn compaction_axis(samples: &[Sample]) -> SampleAxis {
     let first = samples.first().expect("non-empty samples");
     let last = samples.last().expect("non-empty samples");
-    if first.cumulative_bytes != last.cumulative_bytes {
+    if first.recorded_byte_position != last.recorded_byte_position {
         SampleAxis::Bytes
     } else {
         SampleAxis::Rank
@@ -653,15 +647,15 @@ impl StreamingSplitEstimator {
         }
 
         let rank = self.count;
-        let cumulative_bytes = self.total_bytes;
+        let recorded_byte_position = self.total_bytes;
         let end_bytes = self.total_bytes.saturating_add(file_size);
 
         // Dual-axis trigger: record if the rank cadence fires OR if this
-        // file's byte interval [cumulative_bytes, end_bytes) straddles the
+        // file's byte interval [recorded_byte_position, end_bytes) straddles the
         // next byte mark.
         let sample_rank = rank >= self.next_rank_sample;
         let sample_bytes = file_size > 0
-            && cumulative_bytes <= self.next_byte_mark
+            && recorded_byte_position <= self.next_byte_mark
             && self.next_byte_mark < end_bytes;
 
         if sample_rank || sample_bytes {
@@ -670,7 +664,7 @@ impl StreamingSplitEstimator {
             let byte_position = if sample_bytes {
                 self.next_byte_mark
             } else {
-                cumulative_bytes
+                recorded_byte_position
             };
             self.samples.push(Sample::new(rank, byte_position, key));
         }
@@ -847,7 +841,7 @@ impl StreamingSplitEstimator {
             .map(|sample| {
                 (
                     sample.rank,
-                    sample.cumulative_bytes,
+                    sample.recorded_byte_position,
                     sample.key.as_ref().to_vec(),
                 )
             })
