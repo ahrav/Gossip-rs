@@ -66,16 +66,13 @@ use gossip_contracts::{
         EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
+    identity::{ConnectorInstanceIdHash, ObjectVersionId, StableItemId},
 };
 
 use crate::common::{
-    self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
-    derive_stable_item_id, enumerate_error_to_read, path_buf_from_bytes,
+    self, GIT_CONNECTOR_TAG, borrowed_shard_bound, classify_io_enumerate_error,
+    classify_io_read_error, derive_stable_item_id, enumerate_error_to_read, path_buf_from_bytes,
 };
-
-/// Connector tag used to domain-separate stable item identity derivation.
-pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
 
 /// A single indexed file from `git ls-files`.
 ///

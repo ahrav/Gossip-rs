@@ -101,22 +101,16 @@ use gossip_contracts::{
         TokenBytes, ToxicDigest, VersionId,
     },
     coordination::ShardSpec,
-    identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
+    identity::{ConnectorInstanceIdHash, ObjectVersionId, StableItemId},
 };
 
 use gossip_stdx::InlineVec;
 
 use crate::common::{
-    self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
-    derive_stable_item_id, enumerate_error_to_read,
+    self, FILESYSTEM_CONNECTOR_TAG, borrowed_shard_bound, classify_io_enumerate_error,
+    classify_io_read_error, derive_stable_item_id, enumerate_error_to_read,
 };
 use crate::split_estimator::StreamingSplitEstimator;
-
-/// Connector tag used to domain-separate [`StableItemId`] derivation.
-///
-/// All filesystem-sourced items share this tag so that identity hashes are
-/// disjoint from items produced by other connector types (in-memory, git, SaaS).
-pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
 
 // ---------------------------------------------------------------------------
 // WalkWarning

@@ -24,23 +24,25 @@ mod scan_driver;
 #[cfg(unix)]
 mod split_estimator;
 
-pub use common::path_buf_from_bytes;
+pub use common::{
+    FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG, path_buf_from_bytes,
+};
 #[cfg(unix)]
-pub use filesystem::{FILESYSTEM_CONNECTOR_TAG, FilesystemConnector};
-#[cfg(not(unix))]
-pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
-pub use git::{GIT_CONNECTOR_TAG, GitConnector};
-pub use in_memory::{IN_MEMORY_CONNECTOR_TAG, InMemoryDeterministicConnector, MemItem};
+pub use filesystem::FilesystemConnector;
+pub use git::GitConnector;
+pub use in_memory::{InMemoryDeterministicConnector, MemItem};
 pub use scan_driver::{
     FilesystemScanSourceFactory, GitScanSourceFactory, InMemoryScanSourceFactory,
 };
 
 /// Return the canonical tag assigned to a connector kind.
 ///
-/// This is the single source of truth for translating a runtime-visible
-/// [`ConnectorKind`] into the tag namespace used for stable item identity
-/// derivation. Centralizing the match keeps drivers, runtimes, and tests from
-/// drifting into parallel tag registries for the same logical connector kind.
+/// This is a convenience dispatcher that maps a runtime [`ConnectorKind`]
+/// to the canonical tag constant. The tag constants themselves
+/// (`FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`,
+/// `IN_MEMORY_CONNECTOR_TAG`) are the authoritative source of truth —
+/// this function simply provides a `match`-based lookup for callers that
+/// need to resolve a dynamic kind at runtime.
 #[must_use]
 pub const fn connector_tag_for_kind(kind: ConnectorKind) -> ConnectorTag {
     match kind {

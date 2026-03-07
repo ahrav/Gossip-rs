@@ -6,6 +6,7 @@ use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
+use crate::common::IN_MEMORY_CONNECTOR_TAG;
 use crate::common::test_util::{default_budgets, make_key, small_page_budgets};
 
 // ---------------------------------------------------------------
