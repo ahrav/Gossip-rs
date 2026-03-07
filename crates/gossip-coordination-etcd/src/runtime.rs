@@ -38,13 +38,14 @@ pub(crate) struct SyncRuntime {
 impl SyncRuntime {
     /// Build a current-thread Tokio runtime with IO and timer drivers enabled.
     ///
-    /// `enable_all()` activates both the IO driver (needed for TCP/TLS
-    /// sockets used by gRPC) and the time driver (needed for connect
-    /// timeouts and keep-alive intervals). Omitting either would cause the
-    /// etcd client to panic or hang on the first RPC.
+    /// Enables the IO driver (needed for TCP/TLS sockets used by gRPC)
+    /// and the time driver (needed for connect timeouts and keep-alive
+    /// intervals). Omitting either would cause the etcd client to panic
+    /// or hang on the first RPC.
     pub(crate) fn new() -> Result<Self, EtcdCoordinatorError> {
         let inner = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
+            .enable_io()
+            .enable_time()
             .build()
             .map_err(EtcdCoordinatorError::RuntimeBuild)?;
         Ok(Self { inner })

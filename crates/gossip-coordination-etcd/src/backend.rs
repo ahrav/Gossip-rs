@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::config::{DEFAULT_BOOTSTRAP_LEASE_DURATION, EtcdCoordinatorConfig};
+use crate::config::{
+    DEFAULT_BOOTSTRAP_LEASE_DURATION, DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig,
+};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::runtime::SyncRuntime;
 use gossip_coordination::{
@@ -20,13 +22,19 @@ use gossip_coordination::{
 /// issues (e.g., a member falling behind on Raft apply, or a leader change
 /// during a network partition).
 ///
+/// # Visibility
+///
+/// Fields expose internal cluster topology (leader identity, Raft indices,
+/// member roles). Do not surface this data to untrusted callers — it can
+/// leak operational details useful for targeted disruption.
+///
 /// # Fields
 ///
 /// | Field | Meaning |
 /// |---|---|
 /// | `version` | etcd server version string (e.g. `"3.5.12"`). |
-/// | `db_size` | Total on-disk size of the member's backend store (bytes). |
-/// | `raft_used_db_size` | Portion of `db_size` actually in use by the backend store (defrag reclaims the gap). |
+/// | `db_size` | Total on-disk size of the member's backend store (bytes). Clamped to zero if the upstream `i64` is negative. |
+/// | `raft_used_db_size` | Portion of `db_size` actually in use by the backend store (defrag reclaims the gap). Clamped to zero if the upstream `i64` is negative. |
 /// | `leader` | Member ID of the current Raft leader (`0` if no leader is elected). |
 /// | `raft_index` | Latest Raft log index the member is aware of. |
 /// | `raft_term` | Current Raft election term. |
@@ -36,8 +44,8 @@ use gossip_coordination::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EtcdEndpointStatus {
     pub version: String,
-    pub db_size: i64,
-    pub raft_used_db_size: i64,
+    pub db_size: u64,
+    pub raft_used_db_size: u64,
     pub leader: u64,
     pub raft_index: u64,
     pub raft_term: u64,
@@ -50,8 +58,8 @@ impl From<etcd_client::StatusResponse> for EtcdEndpointStatus {
     fn from(value: etcd_client::StatusResponse) -> Self {
         Self {
             version: value.version().to_owned(),
-            db_size: value.db_size(),
-            raft_used_db_size: value.raft_used_db_size(),
+            db_size: value.db_size().max(0) as u64,
+            raft_used_db_size: value.raft_used_db_size().max(0) as u64,
             leader: value.leader(),
             raft_index: value.raft_index(),
             raft_term: value.raft_term(),
@@ -66,6 +74,14 @@ impl From<etcd_client::StatusResponse> for EtcdEndpointStatus {
 ///
 /// Implements [`CoordinationBackend`], [`RunManagement`], and
 /// [`ShardClaiming`] against a live etcd cluster connection.
+///
+/// # Security
+///
+/// TLS and authentication are not yet wired into the connection path.
+/// All traffic is plaintext gRPC over TCP. **Do not deploy this backend
+/// against non-localhost etcd endpoints** until TLS certificate paths
+/// and auth credentials are plumbed through [`EtcdCoordinatorConfig`]
+/// into [`etcd_client::ConnectOptions`].
 ///
 /// # Delegation architecture
 ///
@@ -104,13 +120,16 @@ pub struct EtcdCoordinator {
 impl EtcdCoordinator {
     /// Connect to etcd and return a ready-to-use backend.
     ///
-    /// Performs a three-phase fail-fast initialization:
+    /// Performs a two-phase fail-fast initialization:
     ///
-    /// 1. **Config validation** — rejects empty endpoints, malformed namespace
-    ///    prefixes, etc. before any I/O.
-    /// 2. **gRPC connect** — establishes a channel to the etcd cluster.
-    /// 3. **Status probe** — round-trips a maintenance `Status` RPC to
+    /// 1. **gRPC connect** — establishes a channel to the etcd cluster with a
+    ///    5-second connect timeout.
+    /// 2. **Status probe** — round-trips a maintenance `Status` RPC to
     ///    confirm the cluster is reachable and responsive.
+    ///
+    /// Config validation is performed by the [`EtcdCoordinatorConfig`]
+    /// constructors (`new`, `from_endpoints_csv`, `localhost`), so the
+    /// `config` argument is guaranteed valid on entry.
     ///
     /// On success the caller is guaranteed a validated config, a live etcd
     /// connection, and a fully initialized in-memory protocol delegate
@@ -118,17 +137,16 @@ impl EtcdCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns [`EtcdCoordinatorError::Config`] for invalid configuration,
-    /// [`EtcdCoordinatorError::RuntimeBuild`] if the Tokio runtime cannot
-    /// be created, or [`EtcdCoordinatorError::Etcd`] if the connect or
-    /// status probe fails.
+    /// Returns [`EtcdCoordinatorError::RuntimeBuild`] if the Tokio runtime
+    /// cannot be created, or [`EtcdCoordinatorError::Etcd`] if the connect
+    /// or status probe fails (including connect timeout).
     pub fn connect(config: EtcdCoordinatorConfig) -> Result<Self, EtcdCoordinatorError> {
-        config.validate()?;
-
         let runtime = SyncRuntime::new()?;
         let endpoints = config.endpoints().to_vec();
+        let connect_opts =
+            etcd_client::ConnectOptions::new().with_connect_timeout(DEFAULT_CONNECT_TIMEOUT);
         let mut client = runtime
-            .block_on(etcd_client::Client::connect(endpoints, None))
+            .block_on(etcd_client::Client::connect(endpoints, Some(connect_opts)))
             .map_err(|source| EtcdCoordinatorError::Etcd {
                 operation: EtcdOperation::Connect,
                 source,
@@ -179,6 +197,13 @@ impl EtcdCoordinator {
     /// we clone the `Client` handle — which is cheap because `Client`
     /// wraps tonic `Channel` handles that share the underlying HTTP/2
     /// connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from within an active Tokio async context (nested
+    /// `block_on` is not supported by Tokio). This method — and all
+    /// coordination trait methods — must be called from synchronous code
+    /// only. See the [struct-level docs](Self) for details.
     pub fn status(&self) -> Result<EtcdEndpointStatus, EtcdCoordinatorError> {
         let mut client = self.client.clone();
         let response = self.runtime.block_on(client.status()).map_err(|source| {
@@ -203,7 +228,7 @@ impl fmt::Debug for EtcdCoordinator {
                 "coordination_storage_mode",
                 &"delegated to InMemoryCoordinator until etcd keyspace/codec lands",
             )
-            .finish_non_exhaustive()
+            .finish()
     }
 }
 
@@ -220,6 +245,10 @@ impl fmt::Debug for EtcdCoordinator {
 // replaced with: (1) read current shard state from etcd, (2) apply the
 // protocol logic, (3) write back via an etcd `Txn` with a compare guard.
 // The method signatures and error types will remain unchanged.
+//
+// Note: once delegation is replaced by real etcd RPCs, every method here
+// will go through `SyncRuntime::block_on()`, adding network round-trip
+// latency. Callers on hot paths should account for that cost.
 
 impl CoordinationBackend for EtcdCoordinator {
     fn acquire_and_restore_into<'a>(

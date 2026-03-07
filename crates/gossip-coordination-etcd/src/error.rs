@@ -4,12 +4,7 @@ use crate::config::EtcdCoordinatorConfigError;
 
 /// Labels the specific etcd RPC that failed, providing diagnostic context
 /// inside [`EtcdCoordinatorError::Etcd`].
-///
-/// Marked `#[non_exhaustive]` because new variants will be added as the
-/// backend evolves from delegation to real etcd persistence (e.g. `Put`,
-/// `Txn`, `LeaseGrant`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum EtcdOperation {
     /// Initial gRPC connection to the etcd cluster.
     Connect,
@@ -37,12 +32,7 @@ impl fmt::Display for EtcdOperation {
 ///    sync/async bridge from starting.
 /// 3. **etcd client errors** ([`Etcd`](Self::Etcd)) — network, TLS, or
 ///    cluster-level failures encountered during gRPC calls.
-///
-/// Marked `#[non_exhaustive]` because new variants will appear as the
-/// backend adds real persistence operations (e.g. lease management, key
-/// encoding errors).
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum EtcdCoordinatorError {
     /// The [`EtcdCoordinatorConfig`](crate::EtcdCoordinatorConfig) failed validation before any I/O.
     ///

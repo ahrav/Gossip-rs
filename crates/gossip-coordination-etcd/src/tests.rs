@@ -8,7 +8,10 @@
 
 use std::env;
 
-use crate::{EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
+use crate::{
+    EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
+    EtcdOperation,
+};
 
 #[test]
 fn config_rejects_empty_endpoint_list() {
@@ -76,6 +79,194 @@ fn from_endpoints_csv_trims_and_filters_empty_items() {
         config.endpoints(),
         ["http://127.0.0.1:2379", "http://127.0.0.1:32379"]
     );
+}
+
+#[test]
+fn from_endpoints_csv_with_all_empty_segments_returns_no_endpoints() {
+    for input in [",", ",,,", "  ,  ,  "] {
+        let error = EtcdCoordinatorConfig::from_endpoints_csv(input, "/gossip/v1").expect_err(
+            &format!("all-empty segments '{input}' must fail validation"),
+        );
+        assert!(
+            matches!(error, EtcdCoordinatorConfigError::NoEndpoints),
+            "expected NoEndpoints for input '{input}', got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn from_endpoints_csv_drops_trailing_empty_segments() {
+    // Verify that trailing commas (common in env vars) are silently accepted
+    // rather than failing with EmptyEndpoint — this is the documented behavior.
+    let config = EtcdCoordinatorConfig::from_endpoints_csv("http://a:2379,,", "/gossip/v1")
+        .expect("trailing empty segments should be silently dropped");
+    assert_eq!(config.endpoints(), ["http://a:2379"]);
+}
+
+// ---------------------------------------------------------------------------
+// Error Display tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn etcd_operation_display_connect() {
+    assert_eq!(EtcdOperation::Connect.to_string(), "connect");
+}
+
+#[test]
+fn etcd_operation_display_status() {
+    assert_eq!(EtcdOperation::Status.to_string(), "status");
+}
+
+#[test]
+fn config_error_display_no_endpoints() {
+    let error = EtcdCoordinatorConfigError::NoEndpoints;
+    assert_eq!(error.to_string(), "at least one etcd endpoint is required");
+}
+
+#[test]
+fn config_error_display_invalid_scheme() {
+    let error = EtcdCoordinatorConfigError::InvalidEndpointScheme { index: 2 };
+    assert_eq!(
+        error.to_string(),
+        "etcd endpoint at index 2 has invalid scheme (expected http:// or https://)"
+    );
+}
+
+#[test]
+fn coordinator_error_display_wraps_config_error() {
+    let inner = EtcdCoordinatorConfigError::NoEndpoints;
+    let outer = EtcdCoordinatorError::Config(inner);
+    assert!(
+        outer
+            .to_string()
+            .contains("invalid etcd coordinator config"),
+        "Display should wrap the config error message"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Error source chain tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn coordinator_error_config_source_returns_inner() {
+    use std::error::Error;
+
+    let inner = EtcdCoordinatorConfigError::NoEndpoints;
+    let outer = EtcdCoordinatorError::Config(inner);
+    let source = outer.source().expect("Config variant must have a source");
+    assert!(
+        source
+            .downcast_ref::<EtcdCoordinatorConfigError>()
+            .is_some(),
+        "source should downcast to EtcdCoordinatorConfigError"
+    );
+}
+
+#[test]
+fn coordinator_error_runtime_source_returns_inner() {
+    use std::error::Error;
+
+    let io_err = std::io::Error::other("test");
+    let outer = EtcdCoordinatorError::RuntimeBuild(io_err);
+    let source = outer
+        .source()
+        .expect("RuntimeBuild variant must have a source");
+    assert!(
+        source.downcast_ref::<std::io::Error>().is_some(),
+        "source should downcast to io::Error"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// From conversion test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_error_converts_to_coordinator_error_via_from() {
+    let config_err = EtcdCoordinatorConfigError::NoEndpoints;
+    let coord_err: EtcdCoordinatorError = config_err.into();
+    assert!(
+        matches!(coord_err, EtcdCoordinatorError::Config(_)),
+        "From should produce Config variant"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SyncRuntime tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sync_runtime_creation_succeeds() {
+    use crate::runtime::SyncRuntime;
+    let _rt = SyncRuntime::new().expect("SyncRuntime creation should succeed");
+}
+
+#[test]
+fn sync_runtime_block_on_returns_future_output() {
+    use crate::runtime::SyncRuntime;
+    let rt = SyncRuntime::new().expect("SyncRuntime creation should succeed");
+    let result = rt.block_on(async { 42 });
+    assert_eq!(result, 42);
+}
+
+// ---------------------------------------------------------------------------
+// Config edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_accepts_root_namespace_slash() {
+    let config = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/")
+        .expect("root namespace '/' should be accepted");
+    assert_eq!(config.namespace_prefix(), "/");
+}
+
+#[test]
+fn config_default_equals_localhost() {
+    let default_config = EtcdCoordinatorConfig::default();
+    let localhost_config = EtcdCoordinatorConfig::localhost();
+    assert_eq!(default_config, localhost_config);
+}
+
+// ---------------------------------------------------------------------------
+// URL scheme validation tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn config_rejects_endpoint_without_http_scheme() {
+    let error = EtcdCoordinatorConfig::new(["etcd-0:2379"], "/gossip/v1")
+        .expect_err("endpoint without http:// or https:// must fail");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::InvalidEndpointScheme { index: 0 }
+    ));
+}
+
+#[test]
+fn config_rejects_endpoint_with_ftp_scheme() {
+    let error = EtcdCoordinatorConfig::new(["ftp://etcd-0:2379"], "/gossip/v1")
+        .expect_err("endpoint with ftp:// scheme must fail");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::InvalidEndpointScheme { index: 0 }
+    ));
+}
+
+#[test]
+fn config_accepts_https_endpoint() {
+    let config = EtcdCoordinatorConfig::new(["https://etcd-0:2379"], "/gossip/v1")
+        .expect("https:// endpoint should be accepted");
+    assert_eq!(config.endpoints(), ["https://etcd-0:2379"]);
+}
+
+#[test]
+fn config_rejects_second_endpoint_with_bad_scheme() {
+    let error = EtcdCoordinatorConfig::new(["http://etcd-0:2379", "etcd-1:2379"], "/gossip/v1")
+        .expect_err("second endpoint without scheme must fail");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::InvalidEndpointScheme { index: 1 }
+    ));
 }
 
 /// Integration smoke-test: connect to a real etcd and verify the status RPC.

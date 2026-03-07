@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::Duration;
 
 /// Logical lease duration (in seconds) passed to the temporary
 /// [`InMemoryCoordinator`] delegate.
@@ -10,6 +11,17 @@ use std::fmt;
 /// [`InMemoryCoordinator`]: gossip_coordination::InMemoryCoordinator
 /// [`EtcdCoordinator::connect`]: crate::backend::EtcdCoordinator::connect
 pub(crate) const DEFAULT_BOOTSTRAP_LEASE_DURATION: u64 = 30;
+
+/// Default timeout for establishing a gRPC connection to etcd.
+///
+/// Applied via [`ConnectOptions::with_connect_timeout`] to prevent
+/// `connect()` from blocking indefinitely when an endpoint is unreachable
+/// (firewall drop, wrong host, network partition). Five seconds is
+/// generous for LAN/localhost and fast enough to surface misconfigurations
+/// during startup.
+///
+/// [`ConnectOptions::with_connect_timeout`]: etcd_client::ConnectOptions::with_connect_timeout
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Validated connection configuration for [`EtcdCoordinator`].
 ///
@@ -28,8 +40,8 @@ pub(crate) const DEFAULT_BOOTSTRAP_LEASE_DURATION: u64 = 30;
 /// [`new`] and [`from_endpoints_csv`] trim leading/trailing whitespace from
 /// each endpoint and the namespace prefix before validation. This means
 /// `"  http://host:2379  "` is accepted and stored as `"http://host:2379"`.
-/// [`localhost`] uses hard-coded values and skips both trimming and
-/// validation.
+/// [`localhost`] delegates to [`new`] and is therefore subject to the same
+/// validation rules.
 ///
 /// # Invariants
 ///
@@ -100,14 +112,12 @@ impl EtcdCoordinatorConfig {
     /// `http://127.0.0.1:2379` with namespace prefix `/gossip/v1`.
     ///
     /// Useful for development and integration tests that run against a
-    /// local etcd instance. Bypasses validation because the hard-coded
-    /// values are known-valid.
+    /// local etcd instance. Routed through [`new`](Self::new) so the
+    /// hard-coded values stay in lockstep with the validation rules.
     #[must_use]
     pub fn localhost() -> Self {
-        Self {
-            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
-            namespace_prefix: "/gossip/v1".to_owned(),
-        }
+        Self::new(["http://127.0.0.1:2379"], "/gossip/v1")
+            .expect("hard-coded localhost config must remain valid")
     }
 
     /// Parse a comma-separated endpoint string into a validated config.
@@ -148,6 +158,7 @@ impl EtcdCoordinatorConfig {
     ///
     /// 1. At least one endpoint must be present.
     /// 2. No endpoint may be empty.
+    ///    2b. Every endpoint must start with `http://` or `https://`.
     /// 3. Namespace prefix must be non-empty.
     /// 4. Namespace prefix must start with `'/'`.
     /// 5. Namespace prefix must not end with `'/'` (unless it is exactly
@@ -160,6 +171,9 @@ impl EtcdCoordinatorConfig {
         for (index, endpoint) in self.endpoints.iter().enumerate() {
             if endpoint.is_empty() {
                 return Err(EtcdCoordinatorConfigError::EmptyEndpoint { index });
+            }
+            if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+                return Err(EtcdCoordinatorConfigError::InvalidEndpointScheme { index });
             }
         }
 
@@ -206,15 +220,16 @@ impl Default for EtcdCoordinatorConfig {
 /// [`EtcdCoordinatorConfig`].
 ///
 /// Each variant maps to exactly one of the validation rules enforced by
-/// [`EtcdCoordinatorConfig::validate`]. The enum is `#[non_exhaustive]`
-/// so new rules can be added without a semver break.
+/// [`EtcdCoordinatorConfig::validate`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum EtcdCoordinatorConfigError {
     /// The endpoint list is empty — at least one etcd member is required.
     NoEndpoints,
     /// The endpoint at the given `index` is empty (after trimming).
     EmptyEndpoint { index: usize },
+    /// The endpoint at the given `index` has an invalid scheme (expected
+    /// `http://` or `https://`).
+    InvalidEndpointScheme { index: usize },
     /// The namespace prefix is empty (after trimming).
     EmptyNamespacePrefix,
     /// The namespace prefix does not start with `'/'`.
@@ -229,6 +244,12 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             Self::NoEndpoints => f.write_str("at least one etcd endpoint is required"),
             Self::EmptyEndpoint { index } => {
                 write!(f, "etcd endpoint at index {index} must not be empty")
+            }
+            Self::InvalidEndpointScheme { index } => {
+                write!(
+                    f,
+                    "etcd endpoint at index {index} has invalid scheme (expected http:// or https://)"
+                )
             }
             Self::EmptyNamespacePrefix => f.write_str("namespace_prefix must not be empty"),
             Self::NamespacePrefixMustStartWithSlash => {

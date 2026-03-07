@@ -76,7 +76,7 @@ if $IS_RUST; then
 elif $IS_MD; then
     # Match B0 in prose context (preceded by whitespace or start-of-line).
     # This avoids false positives in array/list labels like [B0, B1, ...].
-    check_pattern '(^|[[:space:]])B0\b' "milestone tracking"
+    check_pattern '(^[0-9]+:|[[:space:]])B0\b' "milestone tracking"
 fi
 
 # --- Markdown: beads task IDs and step tracking refs ---
