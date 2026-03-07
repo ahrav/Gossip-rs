@@ -21,6 +21,8 @@
 //!   never synthesizes or interpolates key bytes.
 //! - **First-key guard**: the very first key observed is tracked separately so
 //!   the "avoid degenerate first-item split" logic survives downsampling.
+//! - **Last-key guard**: the most recent key observed is tracked separately so
+//!   the "avoid degenerate last-item split" logic prevents an empty right shard.
 //!
 //! # Sample-cap contract
 //!

@@ -986,6 +986,46 @@ proptest! {
         );
     }
 
+    /// The split key must never equal the first or last observed key when
+    /// count >= 3, because that would produce a degenerate empty left or
+    /// right shard.
+    #[test]
+    fn prop_split_key_never_first_or_last_when_three_or_more(
+        count in 3..500usize,
+        size_range in 1..10_000u64,
+    ) {
+        let mut estimator = StreamingSplitEstimator::new(MIN_SAMPLE_CAP);
+        let first_key = key_for_index(0);
+        let last_key = key_for_index(count - 1);
+        for idx in 0..count {
+            estimator.observe(&key_for_index(idx), size_range);
+        }
+        if let Some(split) = estimator.estimate_split_key() {
+            prop_assert!(split != first_key.as_slice(),
+                "split must not be the first key (count={})", count);
+            prop_assert!(split != last_key.as_slice(),
+                "split must not be the last key (count={})", count);
+        }
+    }
+
+    /// Same bounds invariant with zero-size files, exercising the rank-fallback
+    /// path where byte-axis is degenerate.
+    #[test]
+    fn prop_split_key_never_first_or_last_zero_sizes(count in 3..500usize) {
+        let mut estimator = StreamingSplitEstimator::new(MIN_SAMPLE_CAP);
+        let first_key = key_for_index(0);
+        let last_key = key_for_index(count - 1);
+        for idx in 0..count {
+            estimator.observe(&key_for_index(idx), 0);
+        }
+        if let Some(split) = estimator.estimate_split_key() {
+            prop_assert!(split != first_key.as_slice(),
+                "split must not be the first key (count={})", count);
+            prop_assert!(split != last_key.as_slice(),
+                "split must not be the last key (count={})", count);
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------------------
