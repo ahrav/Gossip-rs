@@ -710,4 +710,256 @@ proptest! {
         }
     }
 
+    /// After byte-axis compaction on a front-loaded stream with a zero-byte
+    /// tail, the rank fallback must still land near the true rank midpoint.
+    ///
+    /// Regression guard for the plateau-aware redistribution fix: without
+    /// redistribution, retained samples cluster at the start of the
+    /// byte-position plateau, making the rank-axis search return a sample
+    /// far from the actual midpoint rank.
+    #[test]
+    fn prop_compaction_preserves_rank_diversity_in_zero_tail(
+        n in 500..4_000usize,
+        cap_mult in 1..4usize,
+    ) {
+        let sample_cap = SMALL_SAMPLE_CAP * cap_mult;
+        let mut estimator = StreamingSplitEstimator::new(sample_cap);
+
+        // One huge file followed by N zero-byte files.
+        estimator.observe(&key_for_index(0), 100_000_000);
+        for idx in 1..=n {
+            estimator.observe(&key_for_index(idx), 0);
+        }
+
+        let total_count = n + 1; // including the huge file
+        let split = estimator
+            .estimate_split_key()
+            .expect("should produce split with count >= 2");
+        let split_idx = index_from_key(split);
+
+        // The split must not be the first key (first-key guard).
+        prop_assert!(split_idx >= 1, "split must not be index 0, got {}", split_idx);
+
+        // The rank fallback should land within a bounded distance of the
+        // true rank midpoint (total_count / 2).
+        let midpoint = total_count / 2;
+        let tolerance = 2 * total_count / estimator.sample_cap();
+        let distance = split_idx.abs_diff(midpoint);
+        prop_assert!(
+            distance <= tolerance,
+            "rank fallback too far from midpoint: split_idx={}, midpoint={}, distance={}, tolerance={}, n={}, cap={}",
+            split_idx, midpoint, distance, tolerance, n, sample_cap
+        );
+    }
+
+}
+
+// ---------------------------------------------------------------------------
+// Plateau redistribution tests
+// ---------------------------------------------------------------------------
+
+/// Regression: 1 huge file + many zero-byte files. After compaction the rank
+/// fallback must land near the rank midpoint, not near rank 0.
+#[test]
+fn front_loaded_zero_tail_fallback_stays_near_rank_midpoint_after_compaction() {
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    let cap = estimator.sample_cap();
+    let n = 2_000usize;
+    assert!(
+        n > cap,
+        "test must exceed sample_cap to trigger downsampling"
+    );
+
+    // One 100 MB file, then 2 000 zero-byte files.
+    estimator.observe(&key_for_index(0), 100_000_000);
+    for idx in 1..=n {
+        estimator.observe(&key_for_index(idx), 0);
+    }
+
+    let total_count = n + 1;
+    let split = estimator.estimate_split_key().expect("split key expected");
+    let split_idx = index_from_key(split);
+
+    // Must not return the first key.
+    assert!(
+        split_idx >= 1,
+        "split must not be the first observed key, got index {}",
+        split_idx
+    );
+
+    // Must be within 2 * count / sample_cap of the true rank midpoint.
+    let midpoint = total_count / 2;
+    let tolerance = 2 * total_count / cap;
+    let distance = split_idx.abs_diff(midpoint);
+    assert!(
+        distance <= tolerance,
+        "rank fallback landed at index {} (distance {} from midpoint {}), \
+         tolerance is {} (2 * {} / {})",
+        split_idx,
+        distance,
+        midpoint,
+        tolerance,
+        total_count,
+        cap
+    );
+}
+
+/// Plateau in the middle of the stream: a narrow leading region, a large
+/// plateau occupying most of the byte range, and a narrow trailing region.
+/// Compaction must spread picks within the mid-stream plateau by rank.
+#[test]
+fn plateau_redistribution_spreads_picks_across_mid_stream_plateau() {
+    use super::{Sample, compact_samples};
+
+    // 200 samples: 10 with a narrow byte range (0..9), 180 sharing the same
+    // cumulative byte position (the plateau), 10 resuming above the plateau.
+    // The plateau at byte 5000 dominates the byte axis, so most interpolated
+    // targets resolve to it, clustering picks there before redistribution.
+    let plateau_bytes = 5_000u64;
+    let mut samples: Vec<Sample> = (0..200)
+        .map(|i| {
+            let bytes = if i < 10 {
+                i as u64
+            } else if i < 190 {
+                plateau_bytes
+            } else {
+                plateau_bytes + (i - 190) as u64 + 1
+            };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    compact_samples(&mut samples, 20);
+
+    assert_eq!(samples.len(), 20);
+
+    // Collect ranks of retained samples that were in the plateau region
+    // (original ranks 10..190).
+    let plateau_ranks: Vec<u64> = samples
+        .iter()
+        .filter(|s| s.rank >= 10 && s.rank < 190)
+        .map(|s| s.rank)
+        .collect();
+
+    assert!(
+        plateau_ranks.len() >= 2,
+        "at least 2 samples should be retained from the plateau, got {:?}",
+        plateau_ranks
+    );
+
+    // The retained plateau samples should span a good range of the original
+    // plateau (not be bunched at the start).
+    let rank_span = plateau_ranks.last().unwrap() - plateau_ranks.first().unwrap();
+    assert!(
+        rank_span >= 50,
+        "retained plateau samples should span a wide rank range, got span {} from {:?}",
+        rank_span,
+        plateau_ranks
+    );
+}
+
+/// Multiple disjoint byte-position plateaus: each should be redistributed
+/// independently.
+#[test]
+fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
+    use super::{Sample, compact_samples};
+
+    // 100 samples: 10 at bytes=0, 40 at bytes=500, 40 at bytes=1000,
+    // 10 with increasing bytes above 1000.
+    let mut samples: Vec<Sample> = (0..100)
+        .map(|i| {
+            let bytes = if i < 10 {
+                0u64
+            } else if i < 50 {
+                500
+            } else if i < 90 {
+                1000
+            } else {
+                1000 + ((i - 90) as u64 + 1) * 100
+            };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    compact_samples(&mut samples, 20);
+
+    assert_eq!(samples.len(), 20);
+
+    // Samples from the second plateau (rank 10..50) should not all bunch at
+    // rank 10–12.
+    let plateau2_ranks: Vec<u64> = samples
+        .iter()
+        .filter(|s| s.rank >= 10 && s.rank < 50)
+        .map(|s| s.rank)
+        .collect();
+
+    if plateau2_ranks.len() >= 2 {
+        let span = plateau2_ranks.last().unwrap() - plateau2_ranks.first().unwrap();
+        assert!(
+            span >= 10,
+            "second plateau retained samples should be spread, got span {} from {:?}",
+            span,
+            plateau2_ranks
+        );
+    }
+
+    // Similarly for the third plateau (rank 50..90).
+    let plateau3_ranks: Vec<u64> = samples
+        .iter()
+        .filter(|s| s.rank >= 50 && s.rank < 90)
+        .map(|s| s.rank)
+        .collect();
+
+    if plateau3_ranks.len() >= 2 {
+        let span = plateau3_ranks.last().unwrap() - plateau3_ranks.first().unwrap();
+        assert!(
+            span >= 10,
+            "third plateau retained samples should be spread, got span {} from {:?}",
+            span,
+            plateau3_ranks
+        );
+    }
+
+    // Endpoints preserved.
+    assert_eq!(samples.first().unwrap().rank, 0);
+    assert_eq!(samples.last().unwrap().rank, 99);
+    // Strictly increasing.
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+}
+
+/// Minimal plateau case: exactly 2 consecutive samples with the same byte
+/// position. Redistribution must handle this without panicking and preserve
+/// strict ordering.
+#[test]
+fn plateau_of_two_samples_is_handled() {
+    use super::{Sample, compact_samples};
+
+    // 20 samples, with indices 9 and 10 sharing a byte-position plateau.
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| {
+            let bytes = if i == 9 || i == 10 {
+                900u64
+            } else {
+                (i as u64) * 100
+            };
+            Sample::new(i as u64, bytes, &key_for_index(i))
+        })
+        .collect();
+
+    compact_samples(&mut samples, 10);
+
+    assert_eq!(samples.len(), 10);
+    assert_eq!(samples.first().unwrap().rank, 0);
+    assert_eq!(samples.last().unwrap().rank, 19);
+    assert!(
+        samples.windows(2).all(|w| w[0].rank < w[1].rank),
+        "ranks must remain strictly increasing: {:?}",
+        samples.iter().map(|s| s.rank).collect::<Vec<_>>()
+    );
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes),
+        "byte positions must remain non-decreasing"
+    );
 }

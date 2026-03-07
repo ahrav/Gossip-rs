@@ -43,6 +43,14 @@
 //!    cumulative-byte axis (falling back to rank when all byte positions are
 //!    identical). Both strides are then doubled, so future observations are
 //!    sampled at the coarser cadence.
+//!    - **Plateau redistribution** — after nearest-neighbor selection,
+//!      consecutive picks that landed on the same byte-axis value (a
+//!      "plateau") are spread evenly across the plateau's rank extent.
+//!      Without this step, byte-axis plateaus (e.g. a large run of
+//!      zero-size files after a single heavy file) would cluster retained
+//!      samples at the plateau's leading edge, degrading rank-axis
+//!      diversity and causing the rank-fallback split to drift far from
+//!      the true ordinal midpoint.
 //! 3. **Estimation** — `estimate_split_key` binary-searches the retained
 //!    samples for the key whose recorded position is closest to
 //!    `total_bytes / 2`. If all items are zero-size it falls back to the
@@ -213,12 +221,22 @@ fn compact_samples(samples: &mut Vec<Sample>, cap: usize) {
 /// samples share the same axis value (degenerate case), falls back to
 /// uniform index spacing.
 ///
-/// The algorithm walks the sample array once with a forward cursor,
-/// snapping each ideal interpolated position to the nearest actual sample.
-/// Two constraints keep the output well-formed:
-/// - **Forward progress**: each pick must exceed the previous pick.
-/// - **Room for remaining**: each pick is capped so enough indices remain
-///   for the picks still to come.
+/// The algorithm has two phases:
+///
+/// 1. **Nearest-neighbor selection** — walks the sample array once with a
+///    forward cursor, snapping each ideal interpolated position to the
+///    nearest actual sample. Two constraints keep the output well-formed:
+///    - **Forward progress**: each pick must exceed the previous pick.
+///    - **Room for remaining**: each pick is capped so enough indices remain
+///      for the picks still to come.
+///
+/// 2. **Plateau redistribution** — a post-pass
+///    ([`redistribute_plateau_picks`]) detects runs of picks that share the
+///    same axis value and spreads them across the full plateau extent by
+///    rank. This prevents the forward-progress constraint from bunching
+///    plateau picks at the leading edge, which would destroy rank diversity
+///    and make the rank-fallback split inaccurate on streams with large
+///    zero-byte tails.
 fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
     debug_assert!(samples.len() > cap);
 
@@ -292,12 +310,177 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
         cursor = pick;
     }
 
+    redistribute_plateau_picks(samples, &mut picks, axis);
+
     debug_assert!(
         picks.windows(2).all(|w| w[0] < w[1]),
-        "selected indices must be strictly increasing"
+        "selected indices must be strictly increasing after plateau redistribution"
     );
 
     picks
+}
+
+/// Spread plateau-clustered picks across the full plateau rank extent.
+///
+/// # Problem
+///
+/// The byte-axis nearest-neighbor pass in [`selected_sample_indices`] can
+/// assign many consecutive picks to the same byte-axis value when the sample
+/// array contains a "plateau" — a contiguous region of samples that all share
+/// one `cumulative_bytes` value. This happens in practice when a single large
+/// file is followed by many zero-byte entries: the zero-byte samples all
+/// record the same cumulative position, so every interpolated byte target
+/// that lands inside the plateau snaps to the earliest available index
+/// (due to forward-progress). The result is a tight cluster of retained
+/// samples at the plateau's leading edge with no coverage of the later
+/// ordinal ranks.
+///
+/// When `estimate_split_key` later falls back to the rank axis (because the
+/// byte-weighted midpoint lands on the first key), the lack of rank diversity
+/// makes the rank-based search return a sample far from the true midpoint,
+/// producing a badly unbalanced split.
+///
+/// # Solution
+///
+/// After the main selection loop, this function scans `picks` for maximal
+/// runs where every picked sample shares one axis value. For each such run
+/// of length >= 2 it:
+///
+/// 1. Finds the full plateau extent in `samples` (all contiguous indices
+///    with the same axis value).
+/// 2. Constrains the usable range so it does not collide with adjacent
+///    non-plateau picks (or the array boundaries).
+/// 3. Computes evenly-spaced rank targets across the usable range via
+///    [`interpolated_position`].
+/// 4. Snaps each target to the nearest sample by rank
+///    ([`nearest_by_rank_in_range`]), enforcing the strictly-increasing
+///    invariant at each step.
+///
+/// When all samples in the usable range also share the same rank (fully
+/// degenerate), falls back to uniform index spacing within that range.
+///
+/// # Complexity
+///
+/// O(picks.len() * plateau_extent) in the worst case for a single plateau
+/// that spans the entire sample array, but in practice plateau extents are
+/// bounded by the sample cap divided by the number of distinct byte values.
+///
+/// # Invariants preserved
+///
+/// - `picks` remains strictly increasing after redistribution.
+/// - Endpoint picks (first = 0, last = len − 1) are never moved: the main
+///   loop forces them explicitly, so they never appear inside a multi-pick
+///   plateau cluster.
+/// - The function is a no-op when `picks.len() < 3` (0–2 picks cannot
+///   contain a non-endpoint plateau cluster).
+fn redistribute_plateau_picks(samples: &[Sample], picks: &mut [usize], axis: SampleAxis) {
+    if picks.len() < 3 {
+        // With 0–2 picks there cannot be a non-endpoint plateau cluster.
+        return;
+    }
+
+    let sample_len = samples.len();
+    let mut run_start = 0;
+
+    while run_start < picks.len() {
+        let plateau_val = samples[picks[run_start]].position(axis);
+
+        // Find the end of this run (exclusive).
+        let mut run_end = run_start + 1;
+        while run_end < picks.len() && samples[picks[run_end]].position(axis) == plateau_val {
+            run_end += 1;
+        }
+
+        let run_len = run_end - run_start;
+        if run_len >= 2 {
+            // Full plateau extent in the sample array.
+            let mut p_start = picks[run_start];
+            while p_start > 0 && samples[p_start - 1].position(axis) == plateau_val {
+                p_start -= 1;
+            }
+            let mut p_end = picks[run_end - 1];
+            while p_end + 1 < sample_len && samples[p_end + 1].position(axis) == plateau_val {
+                p_end += 1;
+            }
+
+            // Constrain to avoid overlapping with adjacent non-plateau picks.
+            let lower = if run_start > 0 {
+                picks[run_start - 1] + 1
+            } else {
+                0
+            };
+            let upper = if run_end < picks.len() {
+                picks[run_end] - 1
+            } else {
+                sample_len - 1
+            };
+
+            let eff_start = p_start.max(lower);
+            let eff_end = p_end.min(upper);
+
+            // Only redistribute when the effective range has enough room.
+            if eff_end >= eff_start && eff_end - eff_start + 1 >= run_len {
+                let rank_first = samples[eff_start].rank;
+                let rank_last = samples[eff_end].rank;
+
+                // When all samples in the effective range share the same rank
+                // (degenerate), fall back to uniform index spacing.
+                let use_rank = rank_first != rank_last;
+
+                for j in 0..run_len {
+                    let new_pick = if use_rank {
+                        let target_rank = interpolated_position(rank_first, rank_last, j, run_len);
+                        nearest_by_rank_in_range(samples, eff_start, eff_end, target_rank)
+                    } else {
+                        // Uniform index spacing within the effective range.
+                        eff_start + j * (eff_end - eff_start) / (run_len - 1)
+                    };
+
+                    // Enforce strictly increasing relative to previous pick.
+                    let floor = if j > 0 {
+                        picks[run_start + j - 1] + 1
+                    } else if run_start > 0 {
+                        picks[run_start - 1] + 1
+                    } else {
+                        0
+                    };
+
+                    picks[run_start + j] = new_pick.max(floor);
+                }
+            }
+        }
+
+        run_start = run_end;
+    }
+}
+
+/// Find the sample in `samples[lo..=hi]` whose rank is closest to `target`.
+///
+/// Used by [`redistribute_plateau_picks`] to snap an evenly-spaced rank
+/// target to an actual sample within a plateau's effective index range.
+/// A linear scan is acceptable here because the range is bounded by the
+/// plateau extent, which is typically a small fraction of the sample buffer.
+///
+/// Ties are broken in favour of the earlier index (lower rank), which biases
+/// toward preserving forward-progress when the caller enforces
+/// strictly-increasing picks.
+///
+/// Returns an absolute index into `samples`, not relative to `lo`.
+///
+/// # Panics
+///
+/// Panics if `lo > hi` or if either bound is out of range for `samples`.
+fn nearest_by_rank_in_range(samples: &[Sample], lo: usize, hi: usize, target: u64) -> usize {
+    let mut best = lo;
+    let mut best_dist = samples[lo].rank.abs_diff(target);
+    for (offset, sample) in samples[lo + 1..=hi].iter().enumerate() {
+        let dist = sample.rank.abs_diff(target);
+        if dist < best_dist {
+            best = lo + 1 + offset;
+            best_dist = dist;
+        }
+    }
+    best
 }
 
 /// Choose the compaction/search axis: bytes when the range is non-degenerate,
