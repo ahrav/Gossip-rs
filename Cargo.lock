@@ -1044,7 +1044,11 @@ name = "gossip-coordination-etcd"
 version = "0.1.0"
 dependencies = [
  "etcd-client",
+ "gossip-contracts",
  "gossip-coordination",
+ "gossip-stdx",
+ "proptest",
+ "rstest",
  "tokio",
 ]
 

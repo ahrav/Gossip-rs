@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::config::EtcdCoordinatorConfigError;
+use crate::keyspace::EtcdKeyspaceError;
 
 /// Labels the specific etcd RPC that failed, providing diagnostic context
 /// inside [`EtcdCoordinatorError::Etcd`].
@@ -52,6 +53,10 @@ pub enum EtcdCoordinatorError {
         operation: EtcdOperation,
         source: etcd_client::Error,
     },
+
+    /// The etcd namespace prefix could not be converted into a valid
+    /// deterministic keyspace builder.
+    Keyspace(EtcdKeyspaceError),
 }
 
 impl fmt::Display for EtcdCoordinatorError {
@@ -62,6 +67,7 @@ impl fmt::Display for EtcdCoordinatorError {
             Self::Etcd { operation, source } => {
                 write!(f, "etcd {operation} operation failed: {source}")
             }
+            Self::Keyspace(error) => write!(f, "invalid etcd keyspace: {error}"),
         }
     }
 }
@@ -72,6 +78,7 @@ impl std::error::Error for EtcdCoordinatorError {
             Self::Config(error) => Some(error),
             Self::RuntimeBuild(error) => Some(error),
             Self::Etcd { source, .. } => Some(source),
+            Self::Keyspace(error) => Some(error),
         }
     }
 }
@@ -84,5 +91,11 @@ impl std::error::Error for EtcdCoordinatorError {
 impl From<EtcdCoordinatorConfigError> for EtcdCoordinatorError {
     fn from(value: EtcdCoordinatorConfigError) -> Self {
         Self::Config(value)
+    }
+}
+
+impl From<EtcdKeyspaceError> for EtcdCoordinatorError {
+    fn from(value: EtcdKeyspaceError) -> Self {
+        Self::Keyspace(value)
     }
 }
