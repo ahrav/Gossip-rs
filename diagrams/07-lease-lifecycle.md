@@ -506,16 +506,17 @@ candidates, it returns `ClaimError::NoneAvailable { earliest_deadline }`. The
 `earliest_deadline` value comes from one of two paths:
 
 1. **Primary path — candidates exist but all are leased.** The facade iterates
-   candidate shards and calls `acquire_and_restore` on each. Every
+   candidate shards and calls `acquire_and_restore_into` on each. Every
    `AcquireError::AlreadyLeased` rejection carries the shard's current lease
    deadline. The facade tracks the minimum across all rejections and surfaces it
    as `earliest_deadline`.
-2. **Secondary fast path — no unleased candidates at all.** When the initial
-   candidate query returns zero shards, the facade falls back to
-   `list_shards(ShardFilter::active())` and computes the minimum
-   `lease_deadline()` across all active shards in the run. This avoids returning
-   `None` (which signals "no active leases, stop retrying") when shards do exist
-   but are all leased.
+2. **Empty-candidate path — no unleased candidates.** When
+   `collect_claim_candidates_into` returns zero candidates, its return value
+   already includes the earliest lease deadline among Active-but-leased shards
+   (computed during the same single pass over the run's shard set). The facade
+   surfaces this deadline as `earliest_deadline` in `NoneAvailable`, avoiding
+   a separate query and ensuring callers can schedule a retry near the soonest
+   lease expiry even when no unleased shards were found.
 
 Workers use `earliest_deadline` to schedule their next claim attempt: sleeping
 until roughly that time avoids busy-spinning on a fully-leased run while still

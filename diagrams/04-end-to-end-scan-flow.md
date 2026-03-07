@@ -47,7 +47,7 @@ sequenceDiagram
 
     note over W,C: Step 2 — Acquire Shard
 
-    W->>C: acquire_and_restore(tenant, run_id, worker_id)
+    W->>C: acquire_and_restore_into(tenant, run_id, worker_id)
     activate C
     C->>C: grant lease on Active shard<br/>increment FenceEpoch
     C-->>W: AcquireResult { lease, snapshot, capacity }
@@ -69,7 +69,7 @@ sequenceDiagram
 
                 note over W,ID: Step 4 — Derive StableItemId
 
-                W->>ID: ItemIdentityKey::new(tag, locator).stable_id()
+                W->>ID: ItemIdentityKey::new(tag, instance, locator).stable_id()
                 activate ID
                 ID-->>W: StableItemId
                 deactivate ID
@@ -101,6 +101,8 @@ sequenceDiagram
                     ID-->>W: FindingId
                     W->>ID: derive_occurrence_id(OccurrenceIdInputs)
                     ID-->>W: OccurrenceId
+                    W->>ID: derive_observation_id(ObservationIdInputs)
+                    ID-->>W: ObservationId
 
                     note over W: Step 8 — Accumulate
 
@@ -109,20 +111,16 @@ sequenceDiagram
                 end
             end
 
-            note over W,P: Step 9 — Seal & Commit (ATOMIC)
+            note over W,P: Step 9 — Receipt-Chained Commit
 
-            W->>W: page_commit.seal()
             activate W
 
             rect rgb(255, 240, 240)
-                note over W,P: Atomic Transaction Boundary
-                W->>P: commit(done_ledger, findings_sink, cursor)
-                activate P
-                P->>P: write findings
-                P->>P: write done-ledger entries
-                P->>P: advance cursor
-                P-->>W: PageCommit<Committed>
-                deactivate P
+                note over W,P: Atomic Transaction Boundary (typestate-enforced)
+                W->>P: upsert_batch(findings) → wait FindingsCommitReceipt
+                W->>P: batch_upsert(done_ledger) → wait DoneLedgerCommitReceipt
+                W->>C: checkpoint(cursor) → wait CheckpointCommitReceipt
+                P-->>W: PageCommitReceipt
             end
 
             deactivate W
@@ -392,4 +390,6 @@ it was committed in a previous page's transaction.
 | Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/`   |
 | Coordination protocol (run creation, shard assignment, completion)     | `crates/gossip-coordination/src/`             |
 | Persistence (done-ledger, findings sink, op-log)                       | `crates/gossip-contracts/src/persistence/`    |
+| Persistence (in-memory backends)                                       | `crates/gossip-persistence-inmemory/`         |
+| Coordination (etcd backend)                                            | `crates/gossip-coordination-etcd/`            |
 | Design specification                                                   | `08-cross-cutting/02-data-flow-end-to-end.md` |

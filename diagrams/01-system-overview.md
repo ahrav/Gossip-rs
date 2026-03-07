@@ -85,6 +85,10 @@ orchestration. `gossip-scanner-runtime` wires everything together into runnable
 scan pipelines for both the `scanner-rs` CLI binary and the distributed
 `gossip-worker` binary.
 
+`gossip-coordination-etcd` provides an etcd-backed coordination backend.
+`gossip-persistence-inmemory` provides in-memory persistence backends for testing
+and conformance.
+
 ```mermaid
 %% Diagram: crate-mapping
 graph LR
@@ -101,20 +105,24 @@ graph LR
         stdx["gossip-stdx"]
         frontier["gossip-frontier"]
         coordination["gossip-coordination"]
+        coordination_etcd["gossip-coordination-etcd"]
         connectors["gossip-connectors"]
         scan_driver["gossip-scan-driver"]
         scanner_engine["scanner-engine"]
         scanner_scheduler["scanner-scheduler"]
         scanner_git["scanner-git"]
+        persistence_inmem["gossip-persistence-inmemory"]
         runtime["gossip-scanner-runtime"]
         worker["gossip-worker"]
         cli["scanner-rs-cli"]
+        integration_tests["scanner-engine-integration-tests"]
     end
 
     B1 -->|"contains"| contracts
     B3 -->|"contains"| contracts
     B3 -->|"contains"| frontier
     B5 -->|"persistence contracts"| contracts
+    B5 -->|"persistence impl"| persistence_inmem
     B2 -->|"contains"| coordination
     B4 -->|"contains"| connectors
 
@@ -134,6 +142,10 @@ graph LR
     worker -->|"depends on"| coordination
     cli -->|"depends on"| runtime
 
+    coordination --> coordination_etcd
+    contracts --> persistence_inmem
+    scanner_engine --> integration_tests
+
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style B3 fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
     style B2 fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
@@ -152,6 +164,9 @@ graph LR
     style runtime fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style worker fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style cli fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style coordination_etcd fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style persistence_inmem fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style integration_tests fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
 ---
@@ -234,10 +249,12 @@ The crate graph compiles in four tiers. Tier 0 (`gossip-stdx`, `gossip-contracts
 and `gossip-frontier`) has no dependencies on higher-level crates and compiles
 first. `gossip-stdx` is a foundational utility crate depended on by contracts,
 frontier, and coordination. Tier 1 includes `gossip-coordination`,
-`gossip-connectors`, `scanner-engine`, `scanner-scheduler`, and `scanner-git` --
+`gossip-coordination-etcd`, `gossip-connectors`, `gossip-persistence-inmemory`,
+`scanner-engine`, `scanner-scheduler`, and `scanner-git` --
 these compile in parallel once Tier 0 finishes. Tier 2 includes `gossip-scan-driver`
 and `gossip-scanner-runtime`, which depend on Tier 1 crates. Tier 3
-(`gossip-worker`, `scanner-rs-cli`) are the final binaries.
+(`gossip-worker`, `scanner-rs-cli`, `scanner-engine-integration-tests`) are the
+final binaries and test crates.
 
 ```mermaid
 %% Diagram: build-dag
@@ -250,7 +267,9 @@ graph TD
 
     subgraph "Tier 1"
         coordination["gossip-coordination"]
+        coordination_etcd["gossip-coordination-etcd"]
         connectors["gossip-connectors"]
+        persistence_inmem["gossip-persistence-inmemory"]
         scanner_engine["scanner-engine"]
         scanner_scheduler["scanner-scheduler"]
         scanner_git["scanner-git"]
@@ -264,6 +283,7 @@ graph TD
     subgraph "Tier 3"
         worker["gossip-worker"]
         cli["scanner-rs-cli"]
+        integration_tests["scanner-engine-integration-tests"]
     end
 
     stdx --> contracts
@@ -273,6 +293,8 @@ graph TD
     contracts --> frontier
     contracts --> coordination
     contracts --> connectors
+    contracts --> persistence_inmem
+    coordination --> coordination_etcd
     scanner_engine --> scan_driver
     scanner_scheduler --> scan_driver
     scan_driver --> connectors
@@ -283,6 +305,7 @@ graph TD
     runtime --> worker
     coordination --> worker
     runtime --> cli
+    scanner_engine --> integration_tests
 
     style stdx fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style contracts fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
@@ -296,6 +319,9 @@ graph TD
     style runtime fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style worker fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style cli fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style coordination_etcd fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style persistence_inmem fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style integration_tests fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
 For the full type-annotated dependency DAG and tiered compilation analysis, see [Boundary Dependency Graph](02-boundary-dependency-graph.md).
@@ -328,4 +354,7 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | Scanner runtime    | `crates/gossip-scanner-runtime/`                                                                                                     |
 | Worker binary      | `crates/gossip-worker/`                                                                                                              |
 | CLI binary         | `crates/scanner-rs-cli/`                                                                                                             |
+| B2: Coordination (etcd) | `crates/gossip-coordination-etcd/`                                                                                              |
+| B5: Persistence (in-mem) | `crates/gossip-persistence-inmemory/`                                                                                           |
+| Integration tests        | `crates/scanner-engine-integration-tests/`                                                                                      |
 | Architecture prose | `00-prologue/03-architecture-at-a-glance.md`                                                                                         |

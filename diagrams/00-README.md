@@ -36,7 +36,7 @@ graph TD
 
     SO[01-system-overview.md<br/>5-boundary architecture<br/>4 diagrams]
     BD[02-boundary-dependency-graph.md<br/>Type-annotated DAG<br/>3 diagrams]
-    ID[03-id-derivation-dag.md<br/>15-type identity hierarchy<br/>6 diagrams]
+    ID[03-id-derivation-dag.md<br/>19-type identity hierarchy<br/>7 diagrams]
     E2E[04-end-to-end-scan-flow.md<br/>13-step scan sequence<br/>3 diagrams]
 
     SM[05-shard-and-run-state-machines.md<br/>Shard + Run state machines<br/>4 diagrams]
@@ -49,6 +49,13 @@ graph TD
     TI[11-tenant-isolation.md<br/>3 isolation layers<br/>5 diagrams]
     SP[12-split-operations.md<br/>split_replace + split_residual<br/>5 diagrams]
     SA[13-shard-algebra-types.md<br/>B3 deep dive: types, keys,<br/>hints, builder<br/>7 diagrams]
+    CA[14-connector-architecture.md<br/>B4 deep dive: traits, types,<br/>driver bridge, errors<br/>4 diagrams]
+    PL[15-enumeration-page-lifecycle.md<br/>Page flow, validation,<br/>assembly, budgets<br/>4 diagrams]
+    CR[16-cursor-resume-strategy.md<br/>Two-layer cursor,<br/>token fallback<br/>5 diagrams]
+    FW[17-filesystem-walk-state-machine.md<br/>DFS walk, WalkToken,<br/>pruning, safety<br/>5 diagrams]
+    SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
+    PCC[19-persistence-contracts.md<br/>Traits, data model, lattice,<br/>OVID, receipts<br/>5 diagrams]
+    ECP[20-etcd-coordinator-persistence.md<br/>Keyspace, codec, backend,<br/>delegation, wire format<br/>5 diagrams]
 
     R --> SO
     SO --> BD
@@ -66,6 +73,15 @@ graph TD
     ID --> TI
     BD --> SA
     SP --> SA
+    E2E --> CA
+    CA --> PL
+    CA --> CR
+    CR --> FW
+    PL --> SE
+    SE --> SP
+    BD --> PCC
+    PCC --> ECP
+    PC --> PCC
 
     style R fill:#F3F4F6,stroke:#374151
     style SO fill:#F3F4F6,stroke:#374151
@@ -81,6 +97,13 @@ graph TD
     style TI fill:#F3F4F6,stroke:#374151
     style SP fill:#FFF7ED,stroke:#9A3412
     style SA fill:#FFF7ED,stroke:#9A3412
+    style CA fill:#FEE2E2,stroke:#991B1B
+    style PL fill:#FEE2E2,stroke:#991B1B
+    style CR fill:#FEE2E2,stroke:#991B1B
+    style FW fill:#FEE2E2,stroke:#991B1B
+    style SE fill:#FEE2E2,stroke:#991B1B
+    style PCC fill:#EDE9FE,stroke:#5B21B6
+    style ECP fill:#DCFCE7,stroke:#166534
 ```
 
 ### Suggested Reading Paths
@@ -96,11 +119,20 @@ graph TD
 
 **Deep dive into identity**:
 3. `02-boundary-dependency-graph.md` — How boundaries depend on each other
-4. `03-id-derivation-dag.md` — The 15-type identity hierarchy
+4. `03-id-derivation-dag.md` — The 19-type identity hierarchy
 
 **Deep dive into persistence and connectors**:
 5. `08-pagecommit-typestate.md` — Compile-time safety for atomic commits
-6. `09-circuit-breaker.md` — Failure isolation for external APIs
+6. `19-persistence-contracts.md` — Traits, data model, lattice, OVID, receipts
+7. `09-circuit-breaker.md` — Failure isolation for external APIs
+8. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
+9. `15-enumeration-page-lifecycle.md` — Page enumeration flow, validation, assembly
+10. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
+11. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
+12. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
+
+**Deep dive into etcd coordination persistence**:
+5. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
 
 **Cross-cutting concerns**:
 7. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
@@ -118,7 +150,7 @@ graph TD
 | 00  | `00-README.md`                       | 1        | All              | Index, color legend, reading order                                        |
 | 01  | `01-system-overview.md`              | 4        | All              | 5-boundary model, crate mapping, scan flow, build DAG                     |
 | 02  | `02-boundary-dependency-graph.md`    | 3        | B1, All          | Type-annotated DAG, tiered compilation, anti-patterns                     |
-| 03  | `03-id-derivation-dag.md`            | 6        | B1               | 15-type hierarchy, item/secret/finding/occurrence chains                  |
+| 03  | `03-id-derivation-dag.md`            | 7        | B1               | 19-type hierarchy, item/secret/finding/occurrence/observation chains     |
 | 04  | `04-end-to-end-scan-flow.md`         | 3        | All              | 13-step sequence, atomic commit boundary                                  |
 | 05  | `05-shard-and-run-state-machines.md` | 4        | B2               | Shard SM, run SM, splits lifecycle, illegal transitions                   |
 | 06  | `06-fencing-protocol.md`             | 4        | B2               | 5-check validation, zombie resolution, decision tree                      |
@@ -129,7 +161,14 @@ graph TD
 | 11  | `11-tenant-isolation.md`             | 5        | B1, B2           | 3 isolation layers, correlation attack, TenantSecretKey                   |
 | 12  | `12-split-operations.md`             | 5        | B2, B3           | split_replace, split_residual, coverage validation                        |
 | 13  | `13-shard-algebra-types.md`          | 7        | B3               | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration    |
-|     | **Total**                            | **63**   |                  |                                                                           |
+| 14  | `14-connector-architecture.md`       | 4        | B4               | Trait hierarchy, core types, scan-driver bridge, error classification     |
+| 15  | `15-enumeration-page-lifecycle.md`   | 4        | B4               | Page enumeration flow, 9-check validation, assembly paths, budgets        |
+| 16  | `16-cursor-resume-strategy.md`       | 5        | B4               | Two-layer cursor, token encoding, resilience model, resume decision       |
+| 17  | `17-filesystem-walk-state-machine.md`| 5        | B4               | DFS walk, WalkFrame stack, subtree pruning, WalkToken, safety mechanisms  |
+| 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
+| 19  | `19-persistence-contracts.md`        | 5        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
+| 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
+|     | **Total**                            | **97**   |                  |                                                                           |
 
 ## Implementation Status Legend
 
@@ -175,6 +214,13 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `11-tenant-isolation.md`             | `08-cross-cutting/04-tenant-isolation.md`                                                                                                                                                   |
 | `12-split-operations.md`             | `04-boundary-2-coordination/06-split-operations.md`                                                                                                                                         |
 | `13-shard-algebra-types.md`          | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
+| `14-connector-architecture.md`       | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`, `page_validator.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`, `in_memory.rs`, `scan_driver.rs`; `crates/gossip-scan-driver/src/lib.rs` |
+| `15-enumeration-page-lifecycle.md`   | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`, `page_validator.rs`; `crates/gossip-connectors/src/common.rs`                                                                                                      |
+| `16-cursor-resume-strategy.md`       | `crates/gossip-contracts/src/connector/types.rs`, `conformance.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`                                                                                        |
+| `17-filesystem-walk-state-machine.md`| `crates/gossip-connectors/src/filesystem.rs` (WalkState, WalkFrame, WalkToken, should_skip_subtree)                                                                                                                             |
+| `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |
+| `19-persistence-contracts.md`        | `crates/gossip-contracts/src/persistence/commit.rs`, `findings.rs`, `done_ledger.rs`, `ovid.rs`, `page_commit.rs`, `error.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/`                                      |
+| `20-etcd-coordinator-persistence.md` | `crates/gossip-coordination-etcd/src/backend.rs`, `keyspace.rs`, `codec.rs`, `config.rs`, `error.rs`; `crates/gossip-coordination/src/traits.rs`, `in_memory.rs`                                                                |
 
 ## Source Code References
 
@@ -189,6 +235,8 @@ The diagrams reference source code in the main [gossip-rs](https://github.com/ah
 | `gossip-contracts`    | `crates/gossip-contracts/src/connector/`    | B4: Connector                                                                                                         |
 | `gossip-connectors`   | `crates/gossip-connectors/`                 | B4: Connector (crate)                                                                                                 |
 | `gossip-contracts`    | `crates/gossip-contracts/src/persistence/`  | B5: Persistence                                                                                                       |
+| `gossip-coordination-etcd` | `crates/gossip-coordination-etcd/`     | B2: Coordination (etcd backend)                                                                                       |
+| `gossip-persistence-inmemory` | `crates/gossip-persistence-inmemory/` | B5: Persistence (in-memory backend)                                                                                  |
 
 ## Rendering
 
