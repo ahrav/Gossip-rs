@@ -321,14 +321,17 @@ If a golden vector test fails, follow this 5-step protocol:
 
 ### Version-bump trigger conditions
 
-| Vector                       | Domain Constant     | Triggers                                         |
-| ---------------------------- | ------------------- | ------------------------------------------------ |
-| `STABLE_ITEM_ID_EXPECTED`    | `ITEM_ID_V1`        | `ItemIdentityKey` encoding or domain tag changes |
-| `OBJECT_VERSION_ID_EXPECTED` | `OBJECT_VERSION_V1` | `ObjectVersionId` encoding changes               |
-| `KEY_SECRET_HASH_EXPECTED`   | `SECRET_HASH_V1`    | Secret keying scheme changes                     |
-| `FINDING_ID_EXPECTED`        | `FINDING_ID_V1`     | `FindingIdInputs` encoding changes               |
-| `OCCURRENCE_ID_EXPECTED`     | `OCCURRENCE_ID_V1`  | `OccurrenceIdInputs` encoding changes            |
-| `POLICY_HASH_EXPECTED`       | `POLICY_HASH_V2`    | `PolicyHashInputs` encoding changes              |
+| Vector                                | Domain Constant          | Triggers                                         |
+| ------------------------------------- | ------------------------ | ------------------------------------------------ |
+| `CONNECTOR_INSTANCE_ID_HASH_EXPECTED` | `CONNECTOR_INSTANCE_ID_V1` | Instance-ID encoding or domain tag changes    |
+| `STABLE_ITEM_ID_EXPECTED`             | `ITEM_ID_V1`             | `ItemIdentityKey` encoding or domain tag changes |
+| `OBJECT_VERSION_ID_EXPECTED`          | `OBJECT_VERSION_V1`      | `ObjectVersionId` encoding changes               |
+| `KEY_SECRET_HASH_EXPECTED`            | `SECRET_HASH_V1`         | Secret keying scheme changes                     |
+| `FINDING_ID_EXPECTED`                 | `FINDING_ID_V1`          | `FindingIdInputs` encoding changes               |
+| `OCCURRENCE_ID_EXPECTED`              | `OCCURRENCE_ID_V1`       | `OccurrenceIdInputs` encoding changes            |
+| `OBSERVATION_ID_EXPECTED`             | `OBSERVATION_ID_V1`      | `ObservationIdInputs` encoding changes           |
+| `POLICY_HASH_EXPECTED`                | `POLICY_HASH_V2`         | `PolicyHashInputs` encoding changes              |
+| `FINALIZE_64_EXPECTED`                | (test-only domain)       | `finalize_64` truncation or endianness changes   |
 
 ---
 
