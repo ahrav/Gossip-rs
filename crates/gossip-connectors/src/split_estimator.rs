@@ -312,7 +312,7 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 
     redistribute_plateau_picks(samples, &mut picks, axis);
 
-    assert!(
+    debug_assert!(
         picks.windows(2).all(|w| w[0] < w[1]),
         "selected indices must be strictly increasing after plateau redistribution"
     );
@@ -336,7 +336,7 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 ///    invariant at each step with both a floor (forward progress) and a
 ///    ceiling (room for remaining picks).
 ///
-/// O(picks.len() * plateau_extent) worst case.
+/// O(picks.len() * log(plateau_extent)) worst case.
 ///
 /// # Invariants preserved
 ///
@@ -423,21 +423,29 @@ fn redistribute_plateau_picks(samples: &[Sample], picks: &mut [usize], axis: Sam
 
 /// Find the sample in `samples[lo..=hi]` whose rank is closest to `target`.
 ///
-/// Linear scan over the plateau extent. Ties break to the earlier index
-/// (lower rank) to preserve forward-progress in the caller.
+/// Binary search via `partition_point` over the slice (ranks are strictly
+/// increasing — module invariant). Ties break to the earlier index (lower
+/// rank) to preserve forward-progress in the caller.
 ///
 /// Returns an absolute index into `samples`, not relative to `lo`.
 fn nearest_by_rank_in_range(samples: &[Sample], lo: usize, hi: usize, target: u64) -> usize {
-    let mut best = lo;
-    let mut best_dist = samples[lo].rank.abs_diff(target);
-    for (offset, sample) in samples[lo + 1..=hi].iter().enumerate() {
-        let dist = sample.rank.abs_diff(target);
-        if dist < best_dist {
-            best = lo + 1 + offset;
-            best_dist = dist;
-        }
+    debug_assert!(lo <= hi, "lo ({lo}) must not exceed hi ({hi})");
+    let slice = &samples[lo..=hi];
+    // pp is the first index where rank >= target.
+    let pp = slice.partition_point(|s| s.rank < target);
+    if pp == 0 {
+        return lo;
     }
-    best
+    if pp >= slice.len() {
+        return lo + slice.len() - 1;
+    }
+    let d_prev = slice[pp - 1].rank.abs_diff(target);
+    let d_curr = slice[pp].rank.abs_diff(target);
+    if d_prev <= d_curr {
+        lo + pp - 1
+    } else {
+        lo + pp
+    }
 }
 
 /// Choose the compaction/search axis: bytes when the range is non-degenerate,

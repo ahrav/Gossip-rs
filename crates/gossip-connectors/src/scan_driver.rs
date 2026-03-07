@@ -30,8 +30,7 @@ use scanner_scheduler::store::{
 };
 
 use crate::common::derive_stable_item_id;
-use crate::filesystem::FILESYSTEM_CONNECTOR_TAG;
-use crate::in_memory::{IN_MEMORY_CONNECTOR_TAG, MemItem};
+use crate::{MemItem, connector_tag_for_kind};
 
 /// Factory for filesystem assignments.
 #[derive(Clone, Copy, Debug, Default)]
@@ -403,7 +402,7 @@ impl ScanDriver for InMemoryScanDriver {
 
             let meta = ItemMeta {
                 stable_item_id: derive_stable_item_id(
-                    IN_MEMORY_CONNECTOR_TAG,
+                    connector_tag_for_kind(ConnectorKind::InMemory),
                     self.connector_instance,
                     &item.key,
                 ),
@@ -532,8 +531,11 @@ impl StoreProducer for ChannelStoreProducer {
             .map_err(|e| FsStoreError::backend(format!("path normalization failed: {e}")))?;
         let item_key = ItemKey::try_from_slice(&normalized_path)
             .map_err(|e| FsStoreError::backend(format!("normalized item key invalid: {e}")))?;
-        let stable_item_id =
-            derive_stable_item_id(FILESYSTEM_CONNECTOR_TAG, self.connector_instance, &item_key);
+        let stable_item_id = derive_stable_item_id(
+            connector_tag_for_kind(ConnectorKind::Filesystem),
+            self.connector_instance,
+            &item_key,
+        );
         self.tx
             .send(CommitMessage::Batch(OwnedCommitBatch {
                 object_path: normalized_path,

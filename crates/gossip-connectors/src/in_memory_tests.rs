@@ -6,13 +6,14 @@ use gossip_contracts::connector::{MAX_ITEM_KEY_SIZE, TokenBytes};
 use rstest::rstest;
 
 use super::*;
+use crate::common::IN_MEMORY_CONNECTOR_TAG;
 use crate::common::test_util::{default_budgets, make_key, small_page_budgets};
 
 // ---------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------
 
-const TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmemdet");
+const TAG: ConnectorTag = IN_MEMORY_CONNECTOR_TAG;
 const TEST_INSTANCE_ID: &[u8] = b"dataset-a";
 
 fn make_item(key: &[u8], data: &[u8]) -> MemItem {

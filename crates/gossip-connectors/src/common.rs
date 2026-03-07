@@ -1,5 +1,6 @@
 //! Shared connector utilities: shard-bound validation, binary search,
-//! pooled page assembly, split-point selection, and identity derivation.
+//! pooled page assembly, split-point selection, identity derivation, and
+//! canonical connector-tag constants.
 
 use std::{
     io,
@@ -19,6 +20,32 @@ use gossip_contracts::{
     identity::{ConnectorInstanceIdHash, ConnectorTag, ItemIdentityKey, StableItemId},
 };
 use gossip_stdx::{ByteSlab, ByteSlot};
+
+// ---------------------------------------------------------------------------
+// Canonical connector-tag constants
+// ---------------------------------------------------------------------------
+//
+// These live in `common` (always compiled, no `cfg` gates) so every
+// platform sees a single definition.  Individual connector modules
+// import them from here; `lib.rs` re-exports them as public API.
+
+/// Connector tag for filesystem-sourced items.
+///
+/// Domain-separates [`StableItemId`] derivation so that identity hashes are
+/// disjoint from items produced by other connector types.
+pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
+
+/// Connector tag for git-sourced items.
+///
+/// Domain-separates [`StableItemId`] derivation so that identity hashes are
+/// disjoint from items produced by other connector types.
+pub const GIT_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"gitlocal");
+
+/// Connector tag for the deterministic in-memory connector kind.
+///
+/// Domain-separates [`StableItemId`] derivation so that identity hashes are
+/// disjoint from items produced by other connector types.
+pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmem");
 
 /// Parse an 8-byte big-endian `u64` from a byte slice.
 ///
