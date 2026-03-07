@@ -84,8 +84,8 @@ The module provides seven core capabilities:
 
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
-| `backend.rs`      | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
-| `config.rs`       | Endpoint + namespace validation for etcd connectivity                                         |
+| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint |
+| `config.rs`       | Endpoint + namespace validation plus owner-lease TTL and optimistic retry tuning             |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
