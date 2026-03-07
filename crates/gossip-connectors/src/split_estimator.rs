@@ -15,7 +15,7 @@
 //! - **Sample cap**: after each public operation returns, the number of
 //!   retained samples never exceeds `sample_cap` (at least [`MIN_SAMPLE_CAP`]).
 //! - **Monotonicity**: retained samples are strictly increasing in rank and
-//!   non-decreasing in cumulative byte position at all times, including after
+//!   non-decreasing in recorded byte position at all times, including after
 //!   compaction.
 //! - **Key fidelity**: the estimator only returns *actually observed* keys; it
 //!   never synthesizes or interpolates key bytes.
@@ -43,7 +43,7 @@
 //!    it straddles, giving better byte-space fidelity than rank alone.
 //! 2. **Stride-doubling compaction** — when the sample buffer exceeds its cap,
 //!    it is compacted to half capacity via nearest-neighbor selection on the
-//!    cumulative-byte axis (falling back to rank when all byte positions are
+//!    byte axis (falling back to rank when all byte positions are
 //!    identical). Both strides are then doubled, so future observations are
 //!    sampled at the coarser cadence.
 //!    - **Plateau redistribution** — after nearest-neighbor selection,
@@ -191,6 +191,12 @@ impl Sample {
 /// on the axis that matters for split accuracy. A forward write cursor swaps
 /// each retained sample into place so compaction reuses the existing backing
 /// allocation instead of building a transient replacement `Vec`.
+///
+/// # Correctness
+///
+/// The in-place swap relies on `selected_sample_indices` returning strictly
+/// increasing indices, ensuring the write cursor never overtakes unread
+/// source positions (invariant: `write <= src` at each iteration).
 fn compact_samples(samples: &mut Vec<Sample>, cap: usize) {
     if samples.len() <= cap {
         return;
@@ -309,7 +315,10 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 
     redistribute_plateau_picks(samples, &mut picks, axis);
 
-    debug_assert!(
+    // Promote to `assert!` rather than `debug_assert!`: `compact_samples`
+    // relies on strict monotonicity for swap-cursor correctness.  A violation
+    // in release builds would silently corrupt the retained sketch.
+    assert!(
         picks.windows(2).all(|w| w[0] < w[1]),
         "selected indices must be strictly increasing after plateau redistribution"
     );
@@ -533,11 +542,11 @@ pub(crate) struct StreamingSplitEstimator {
     samples: Vec<Sample>,
     /// Rank sampling stride in observed items.
     rank_stride: u64,
-    /// Byte sampling stride in cumulative byte space.
+    /// Byte sampling stride in byte-position space.
     byte_stride: u64,
     /// Next rank at which a sample should be recorded.
     next_rank_sample: u64,
-    /// Next cumulative-byte mark whose straddling file should be sampled.
+    /// Next byte-position mark whose straddling file should be sampled.
     next_byte_mark: u64,
     /// Total observed byte weight (saturating on overflow).
     total_bytes: u64,

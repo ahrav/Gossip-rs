@@ -907,6 +907,73 @@ fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
 }
 
+/// Compacting to 2 retains only the first and last sample, with strictly
+/// increasing ranks.
+#[test]
+fn compact_samples_cap_two_preserves_first_and_last() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..10)
+        .map(|i| Sample::new(i as u64, (i as u64) * 50, &key_for_index(i)))
+        .collect();
+
+    compact_samples(&mut samples, 2);
+
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].rank, 0, "first sample preserved");
+    assert_eq!(samples[1].rank, 9, "last sample preserved");
+    assert!(
+        samples[0].rank < samples[1].rank,
+        "ranks must be strictly increasing"
+    );
+}
+
+/// When all samples share byte position 0, `selected_sample_indices` falls
+/// back to uniform index spacing. With 20 samples compacted to 5, the
+/// expected picks are indices 0, 4, 9, 14, 19 (i.e. `i * 19 / 4`).
+#[test]
+fn compact_samples_all_identical_byte_positions_uses_index_spacing() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..20)
+        .map(|i| Sample::new(i as u64, 0, &key_for_index(i)))
+        .collect();
+
+    compact_samples(&mut samples, 5);
+
+    assert_eq!(samples.len(), 5);
+    let ranks: Vec<u64> = samples.iter().map(|s| s.rank).collect();
+    assert_eq!(ranks, vec![0, 4, 9, 14, 19]);
+}
+
+/// Half-reduction of a 512-sample stream preserves endpoints, monotonicity,
+/// and approximately uniform rank spacing.
+#[test]
+fn compact_samples_typical_half_reduction() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = (0..512)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+
+    compact_samples(&mut samples, 256);
+
+    assert_eq!(samples.len(), 256);
+    assert_eq!(samples.first().unwrap().rank, 0, "first sample preserved");
+    assert_eq!(samples.last().unwrap().rank, 511, "last sample preserved");
+
+    // Monotonicity: ranks strictly increasing.
+    assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
+
+    // Approximate uniform spacing: average rank gap should be close to 2.
+    let gaps: Vec<u64> = samples.windows(2).map(|w| w[1].rank - w[0].rank).collect();
+    let avg_gap = gaps.iter().sum::<u64>() as f64 / gaps.len() as f64;
+    assert!(
+        (1.5..=2.5).contains(&avg_gap),
+        "average rank gap {avg_gap:.2} should be approximately 2.0"
+    );
+}
+
 /// Regression: trailing samples saturated at `u64::MAX` must still preserve
 /// the actual last sample after compaction.
 #[test]
@@ -1312,7 +1379,7 @@ fn plateau_redistribution_spreads_picks_across_mid_stream_plateau() {
     use super::{Sample, compact_samples};
 
     // 200 samples: 10 with a narrow byte range (0..9), 180 sharing the same
-    // cumulative byte position (the plateau), 10 resuming above the plateau.
+    // recorded byte position (the plateau), 10 resuming above the plateau.
     // The plateau at byte 5000 dominates the byte axis, so most interpolated
     // targets resolve to it, clustering picks there before redistribution.
     let plateau_bytes = 5_000u64;
