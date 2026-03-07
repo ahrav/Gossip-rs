@@ -337,6 +337,49 @@ fn duplicate_keys_panic() {
     InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
 }
 
+#[test]
+fn duplicate_keys_panic_redacts_item_key() {
+    // Use a non-printable byte (\xff) so the negative assertions guard against
+    // both `{:?}` byte-array leaks *and* any `from_utf8_lossy` string-form leaks.
+    let key_bytes: &[u8] = b"dup\xffsecret";
+    let items = vec![
+        make_item(key_bytes, b"first"),
+        make_item(key_bytes, b"second"),
+    ];
+
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    }))
+    .expect_err("duplicate keys should panic");
+
+    let panic_msg = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    let redacted = format!("{}", make_key(key_bytes));
+    let raw_bytes = format!("{:?}", key_bytes);
+
+    assert!(
+        panic_msg.contains("unique item keys"),
+        "panic should explain the duplicate-key contract: {panic_msg}"
+    );
+    assert!(
+        panic_msg.contains(&redacted),
+        "panic should use redacted ItemKey formatting: {panic_msg}"
+    );
+    assert!(
+        !panic_msg.contains(&raw_bytes),
+        "panic leaked raw key bytes: {panic_msg}"
+    );
+    // Guard against from_utf8_lossy paths that would reveal partial key content.
+    let lossy = String::from_utf8_lossy(key_bytes);
+    assert!(
+        !panic_msg.contains(lossy.as_ref()),
+        "panic leaked lossy UTF-8 key representation: {panic_msg}"
+    );
+}
+
 // ---------------------------------------------------------------
 // Inverted range rejection
 // ---------------------------------------------------------------

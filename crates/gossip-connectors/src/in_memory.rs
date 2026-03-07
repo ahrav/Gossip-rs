@@ -210,6 +210,8 @@ impl InMemoryDeterministicConnector {
     ///
     /// Panics if any two items share the same key. Duplicate keys are a
     /// test-setup bug and cannot be paginated correctly (see module docs).
+    /// The panic message reports the offending key through [`ItemKey`] display
+    /// formatting so diagnostics stay redacted under the toxic-byte policy.
     ///
     /// [`with_tokens(false)`]: Self::with_tokens
     pub fn new(
@@ -223,12 +225,13 @@ impl InMemoryDeterministicConnector {
 
         // Enforce unique keys. Duplicate keys break cursor resume
         // (upper_bound skips remaining duplicates), StableItemId derivation
-        // (collisions), and split-point selection (empty shards).
+        // (collisions), and split-point selection (empty shards). Format the
+        // duplicate through ItemKey itself so panic diagnostics stay redacted.
         if let Some(pos) = items.windows(2).position(|w| w[0].key == w[1].key) {
             panic!(
                 "InMemoryDeterministicConnector requires unique item keys; \
-                 duplicate key {:?} at sorted position {pos}",
-                items[pos].key.as_bytes()
+                 duplicate key {} at sorted position {pos}",
+                items[pos].key
             );
         }
 
