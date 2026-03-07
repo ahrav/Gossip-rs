@@ -1,5 +1,7 @@
 use std::{error::Error, fmt};
 
+use crate::identity::ObservationId;
+
 /// Validation errors for persistence-boundary value types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PersistenceInputError {
@@ -19,6 +21,11 @@ pub enum PersistenceInputError {
     },
     /// Occurrence span length must be non-zero.
     ZeroSpanLength,
+    /// A provided observation id does not match the canonical derived value.
+    ObservationIdMismatch {
+        expected: ObservationId,
+        actual: ObservationId,
+    },
     /// `findings_count` contradicts `DoneLedgerStatus`.
     ///
     /// `ScannedWithFindings` requires `findings_count > 0` and
@@ -52,6 +59,10 @@ impl fmt::Display for PersistenceInputError {
                 "{field} contains invalid byte 0x{byte:02X} at index {index}"
             ),
             Self::ZeroSpanLength => write!(f, "OccurrenceRecord.byte_length must be non-zero"),
+            Self::ObservationIdMismatch { expected, actual } => write!(
+                f,
+                "observation_id does not match canonical derivation (expected {expected:?}, got {actual:?})"
+            ),
             Self::InconsistentFindingsCount {
                 status,
                 findings_count,
