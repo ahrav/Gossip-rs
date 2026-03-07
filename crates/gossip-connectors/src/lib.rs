@@ -12,6 +12,9 @@
 //! trait definitions and value types. It must not depend on
 //! `gossip-persistence` or the coordination backend implementation.
 
+use gossip_contracts::identity::ConnectorTag;
+use gossip_scan_driver::ConnectorKind;
+
 mod common;
 #[cfg(unix)]
 pub mod filesystem;
@@ -24,11 +27,28 @@ mod split_estimator;
 pub use common::path_buf_from_bytes;
 #[cfg(unix)]
 pub use filesystem::{FILESYSTEM_CONNECTOR_TAG, FilesystemConnector};
+#[cfg(not(unix))]
+pub const FILESYSTEM_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"fslocal");
 pub use git::{GIT_CONNECTOR_TAG, GitConnector};
-pub use in_memory::{InMemoryDeterministicConnector, MemItem};
+pub use in_memory::{IN_MEMORY_CONNECTOR_TAG, InMemoryDeterministicConnector, MemItem};
 pub use scan_driver::{
     FilesystemScanSourceFactory, GitScanSourceFactory, InMemoryScanSourceFactory,
 };
+
+/// Return the canonical tag assigned to a connector kind.
+///
+/// This is the single source of truth for translating a runtime-visible
+/// [`ConnectorKind`] into the tag namespace used for stable item identity
+/// derivation. Centralizing the match keeps drivers, runtimes, and tests from
+/// drifting into parallel tag registries for the same logical connector kind.
+#[must_use]
+pub const fn connector_tag_for_kind(kind: ConnectorKind) -> ConnectorTag {
+    match kind {
+        ConnectorKind::Filesystem => FILESYSTEM_CONNECTOR_TAG,
+        ConnectorKind::Git => GIT_CONNECTOR_TAG,
+        ConnectorKind::InMemory => IN_MEMORY_CONNECTOR_TAG,
+    }
+}
 
 #[cfg(unix)]
 #[doc(hidden)]
@@ -49,4 +69,38 @@ pub fn benchmark_streaming_split_estimator_observe_fixed_size(
     estimator
         .estimate_split_key()
         .map(|key| u64::from_be_bytes(key.try_into().expect("split keys use u64 bytes")))
+}
+
+#[cfg(test)]
+mod tests {
+    use gossip_scan_driver::ConnectorKind;
+
+    use super::{
+        FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG,
+        connector_tag_for_kind,
+    };
+
+    #[test]
+    fn canonical_tag_mapping_matches_constants() {
+        assert_eq!(
+            connector_tag_for_kind(ConnectorKind::Filesystem),
+            FILESYSTEM_CONNECTOR_TAG
+        );
+        assert_eq!(
+            connector_tag_for_kind(ConnectorKind::Git),
+            GIT_CONNECTOR_TAG
+        );
+        assert_eq!(
+            connector_tag_for_kind(ConnectorKind::InMemory),
+            IN_MEMORY_CONNECTOR_TAG
+        );
+        assert_eq!(IN_MEMORY_CONNECTOR_TAG.as_bytes(), b"inmem\0\0\0");
+    }
+
+    #[test]
+    fn canonical_connector_tags_are_distinct() {
+        assert_ne!(FILESYSTEM_CONNECTOR_TAG, GIT_CONNECTOR_TAG);
+        assert_ne!(FILESYSTEM_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG);
+        assert_ne!(GIT_CONNECTOR_TAG, IN_MEMORY_CONNECTOR_TAG);
+    }
 }

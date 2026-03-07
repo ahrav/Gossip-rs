@@ -88,8 +88,8 @@ use gossip_contracts::{
 
 use crate::common::{self, borrowed_shard_bound, derive_stable_item_id, parse_u64_be};
 
-/// Canonical connector tag for the deterministic in-memory connector.
-pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmemdet");
+/// Canonical connector tag for the deterministic in-memory connector kind.
+pub const IN_MEMORY_CONNECTOR_TAG: ConnectorTag = ConnectorTag::from_ascii(b"inmem");
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
 #[derive(Clone, Debug)]
