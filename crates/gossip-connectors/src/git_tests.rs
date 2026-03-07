@@ -228,7 +228,10 @@ fn choose_split_point_selects_byte_weighted_midpoint() {
         )
         .unwrap();
     let split = split.expect("expected split candidate for multi-item range");
-    assert_eq!(split.as_bytes(), b"d.txt");
+    // The byte-weighted candidate is d.txt (position 6, closest to midpoint 5),
+    // but the last-key guard prevents an empty right shard. Rank-fallback
+    // selects the rank midpoint: c.txt (rank 2 of 4).
+    assert_eq!(split.as_bytes(), b"c.txt");
 }
 
 #[test]

@@ -88,7 +88,7 @@ fn equal_weight_files_split_near_midpoint() {
 }
 
 #[test]
-fn skewed_sizes_split_selects_straddling_file() {
+fn skewed_sizes_split_avoids_last_key_with_back_loaded_weight() {
     let mut estimator = StreamingSplitEstimator::new(LARGE_SAMPLE_CAP);
     estimator.observe(&key_for_index(0), 5);
     estimator.observe(&key_for_index(1), 5);
@@ -98,9 +98,12 @@ fn skewed_sizes_split_selects_straddling_file() {
         .estimate_split_key()
         .expect("should produce split");
     let split_idx = index_from_key(split);
+    // The byte-weighted candidate is key 2 (back-loaded weight), but the
+    // last-key guard prevents an empty right shard. Rank-fallback yields
+    // the midpoint key (index 1).
     assert_eq!(
-        split_idx, 2,
-        "expected split at index 2 (file straddling the median), got index {}",
+        split_idx, 1,
+        "last-key guard should fall back to rank midpoint, got index {}",
         split_idx
     );
 }

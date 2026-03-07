@@ -21,8 +21,10 @@
 //!   never synthesizes or interpolates key bytes.
 //! - **First-key guard**: the very first key observed is tracked separately so
 //!   the "avoid degenerate first-item split" logic survives downsampling.
-//! - **Last-key guard**: the most recent key observed is tracked separately so
-//!   the "avoid degenerate last-item split" logic prevents an empty right shard.
+//! - **Last-key guard**: the last retained sample is checked at estimation time
+//!   so the "avoid degenerate last-item split" logic prevents an empty right
+//!   shard. Because compaction always preserves the last sample and the
+//!   estimator only returns sampled keys, `samples.last()` is sufficient.
 //!
 //! # Sample-cap contract
 //!
@@ -551,10 +553,6 @@ pub(crate) struct StreamingSplitEstimator {
     /// "avoid degenerate first-item split" guard remains correct even if
     /// downsampling evicts the original first sample.
     first_observed_key: Option<Box<[u8]>>,
-    /// The most recent key observed in stream order. Tracked explicitly so the
-    /// "avoid degenerate last-item split" guard prevents an empty right shard
-    /// even if downsampling evicts the original last sample.
-    last_observed_key: Option<Box<[u8]>>,
 }
 
 impl fmt::Debug for StreamingSplitEstimator {
@@ -571,10 +569,6 @@ impl fmt::Debug for StreamingSplitEstimator {
             .field(
                 "first_observed_key",
                 &RedactedOptionalKeyLen(self.first_observed_key.as_ref().map(|key| key.len())),
-            )
-            .field(
-                "last_observed_key",
-                &RedactedOptionalKeyLen(self.last_observed_key.as_ref().map(|key| key.len())),
             )
             .finish_non_exhaustive()
     }
@@ -609,7 +603,6 @@ impl StreamingSplitEstimator {
             total_bytes: 0,
             count: 0,
             first_observed_key: None,
-            last_observed_key: None,
         }
     }
 
@@ -657,7 +650,6 @@ impl StreamingSplitEstimator {
         if self.first_observed_key.is_none() {
             self.first_observed_key = Some(Box::<[u8]>::from(key));
         }
-        self.last_observed_key = Some(Box::<[u8]>::from(key));
 
         let rank = self.count;
         let cumulative_bytes = self.total_bytes;
@@ -733,11 +725,14 @@ impl StreamingSplitEstimator {
         }
 
         // Symmetric guard: avoid degenerate "last item" splits when weight is
-        // back-loaded, which would produce an empty right shard.
+        // back-loaded, which would produce an empty right shard. The estimator
+        // only returns sampled keys (key-fidelity invariant), and compaction
+        // always preserves the last sample, so checking samples.last() is
+        // sufficient without a separate per-observe tracked field.
         if self
-            .last_observed_key
-            .as_ref()
-            .is_some_and(|last| candidate == last.as_ref())
+            .samples
+            .last()
+            .is_some_and(|last| candidate == last.key.as_ref())
         {
             return Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target);
         }
