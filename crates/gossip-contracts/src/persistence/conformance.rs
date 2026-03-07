@@ -608,10 +608,12 @@ where
 ///
 /// Returns the number of checks that passed (currently 3).
 pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
+    let mut checks = 0u32;
     let fixture = sample_fixture(0x77)?;
     let norm = NormHash::from_digest([0xE7; 32]);
     let norm_debug = format!("{norm:?}");
     assert_no_raw_hex("redaction/norm-hash-debug", &norm_debug, norm.as_bytes())?;
+    checks += 1;
 
     let secret_hash = fixture.finding.secret_hash();
     let secret_debug = format!("{secret_hash:?}");
@@ -620,6 +622,7 @@ pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
         &secret_debug,
         secret_hash.as_bytes(),
     )?;
+    checks += 1;
 
     let finding_debug = format!("{:?}", fixture.finding);
     assert_no_raw_hex(
@@ -627,8 +630,9 @@ pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
         &finding_debug,
         secret_hash.as_bytes(),
     )?;
+    checks += 1;
 
-    Ok(3)
+    Ok(checks)
 }
 
 /// Submit a done-ledger batch and wait for durable acknowledgement.
@@ -915,9 +919,13 @@ impl SampleFixture {
 /// also flows into provenance fields (run, shard, epoch, logical time) to
 /// keep fixtures fully distinguishable under inspection.
 ///
-/// The `failed_record` uses smaller provenance offsets and a smaller
-/// `bytes_scanned` (2048) than the `scanned_record` (4096), so the dominance
-/// checks can verify that monotonic fields never regress.
+/// The `failed_record` intentionally uses a **larger** `bytes_scanned` (4096)
+/// than the `scanned_record` (2048). This is realistic — a failure during a
+/// large-file scan followed by a successful scan of a smaller file — and
+/// ensures the conformance harness's per-field max check in
+/// [`assert_scanned_dominates`] is non-vacuous: a backend that simply returns
+/// the dominant record wholesale (instead of computing per-field max) will
+/// fail the check.
 fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError> {
     let tenant_id = TenantId::from_bytes(fill32(seed));
     let policy_hash = PolicyHash::from_bytes(fill32(seed.wrapping_add(1)));
@@ -973,7 +981,7 @@ fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError
     let failed_record = DoneLedgerRecord::try_new(
         key,
         DoneLedgerStatus::FailedRetryable,
-        2_048,
+        4_096,
         1,
         DoneLedgerProvenance::new(
             RunId::from_raw(50_000 + u64::from(seed)),
@@ -996,7 +1004,7 @@ fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError
     let scanned_record = DoneLedgerRecord::try_new(
         key,
         DoneLedgerStatus::ScannedWithFindings,
-        4_096,
+        2_048,
         1,
         DoneLedgerProvenance::new(
             RunId::from_raw(50_100 + u64::from(seed)),

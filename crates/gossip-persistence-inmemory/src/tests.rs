@@ -3,8 +3,9 @@ use std::{num::NonZeroU64, sync::mpsc, thread, time::Duration};
 use gossip_contracts::{
     connector::Location,
     identity::{
-        FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId, ObservationId, OccurrenceId,
-        RuleFingerprint, RunId, ShardId, StableItemId, TenantSecretKey, key_secret_hash,
+        key_secret_hash, FenceEpoch, FindingId, LogicalTime, NormHash, ObjectVersionId,
+        ObservationId, OccurrenceId, RuleFingerprint, RunId, ShardId, StableItemId,
+        TenantSecretKey,
     },
     persistence::{
         CommitHandle, DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance,

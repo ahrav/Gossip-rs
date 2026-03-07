@@ -125,6 +125,14 @@ where
 /// [`FindingRecord`](super::FindingRecord),
 /// [`OccurrenceRecord`](super::OccurrenceRecord), and
 /// [`ObservationRecord`](super::ObservationRecord) rows respectively.
+///
+/// **Semantics note:** counts reflect the number of distinct records in the
+/// submitted batch that the backend has durably acknowledged, *not* the number
+/// of newly inserted rows. An idempotent replay of an already-durable batch
+/// returns the same counts as the original write. Callers that need to detect
+/// "did anything new get written?" should compare probe snapshots (e.g.,
+/// [`FindingsConformanceProbe`](super::conformance::FindingsConformanceProbe))
+/// or track insertion state externally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FindingsCommitReceipt {
     finding_count: u64,
@@ -144,21 +152,27 @@ impl FindingsCommitReceipt {
         }
     }
 
-    /// Number of stable finding rows durably acknowledged.
+    /// Number of distinct finding rows in the batch durably acknowledged.
+    ///
+    /// Includes rows that already existed in durable state (idempotent replay).
     #[inline]
     #[must_use]
     pub const fn finding_count(self) -> u64 {
         self.finding_count
     }
 
-    /// Number of occurrence rows durably acknowledged.
+    /// Number of distinct occurrence rows in the batch durably acknowledged.
+    ///
+    /// Includes rows that already existed in durable state (idempotent replay).
     #[inline]
     #[must_use]
     pub const fn occurrence_count(self) -> u64 {
         self.occurrence_count
     }
 
-    /// Number of observation rows durably acknowledged.
+    /// Number of distinct observation rows in the batch durably acknowledged.
+    ///
+    /// Includes rows that already existed in durable state (idempotent replay).
     #[inline]
     #[must_use]
     pub const fn observation_count(self) -> u64 {
