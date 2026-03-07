@@ -83,6 +83,17 @@ pub struct DurableFindingsCounts {
 }
 
 impl DurableFindingsCounts {
+    /// Construct count totals for all three findings layers.
+    #[inline]
+    #[must_use]
+    pub const fn new(findings: u64, occurrences: u64, observations: u64) -> Self {
+        Self {
+            findings,
+            occurrences,
+            observations,
+        }
+    }
+
     /// Return the per-layer saturating delta from `base`.
     ///
     /// Used by the conformance harness to compare before/after snapshots.
@@ -140,6 +151,39 @@ pub struct PersistenceConformanceReport {
     pub findings_checks: u32,
     /// Number of redaction checks that completed successfully.
     pub redaction_checks: u32,
+}
+
+impl PersistenceConformanceReport {
+    /// Construct a report from the completed check counts.
+    #[inline]
+    #[must_use]
+    pub const fn new(done_ledger_checks: u32, findings_checks: u32, redaction_checks: u32) -> Self {
+        Self {
+            done_ledger_checks,
+            findings_checks,
+            redaction_checks,
+        }
+    }
+
+    /// Sum of all check counts across sub-suites.
+    #[inline]
+    #[must_use]
+    pub const fn total_checks(self) -> u32 {
+        self.done_ledger_checks + self.findings_checks + self.redaction_checks
+    }
+}
+
+impl fmt::Display for PersistenceConformanceReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "persistence conformance: {} done-ledger, {} findings, {} redaction ({} total)",
+            self.done_ledger_checks,
+            self.findings_checks,
+            self.redaction_checks,
+            self.total_checks(),
+        )
+    }
 }
 
 /// Failure reported by the persistence conformance harness.
@@ -234,15 +278,20 @@ impl fmt::Display for PersistenceConformanceError {
             Self::Probe { case, source } => write!(f, "findings probe failed in {case}: {source}"),
             Self::RedactionLeak {
                 case,
-                debug_output,
                 leaked_fragment,
-            } => write!(
-                f,
-                "sensitive Debug output leaked raw bytes in {case}: \
-                 fragment_len={}, output_len={}",
-                leaked_fragment.len(),
-                debug_output.len()
-            ),
+                ..
+            } => {
+                let truncated = if leaked_fragment.len() > 8 {
+                    format!("{}...", &leaked_fragment[..8])
+                } else {
+                    leaked_fragment.clone()
+                };
+                write!(
+                    f,
+                    "sensitive Debug output leaked raw bytes in {case}: \
+                     leaked fragment `{truncated}` (full output redacted)"
+                )
+            }
         }
     }
 }
@@ -527,23 +576,12 @@ where
     F: FindingsSink + FindingsConformanceProbe,
 {
     let fixture = sample_fixture(0x55)?;
-    let before = probe_counts(findings, "findings/missing-finding:before")?;
     let occurrences = [fixture.occurrence.clone()];
-    expect_findings_failure(
+    assert_orphan_rejected(
         findings,
         "findings/missing-finding",
         FindingsUpsertBatch::new(&[], &occurrences, &[]),
     )?;
-    let after = probe_counts(findings, "findings/missing-finding:after")?;
-    if after != before {
-        return Err(PersistenceConformanceError::FindingsInvariant {
-            case: "findings/missing-finding:after",
-            message: format!(
-                "failed write changed durable counts: before {:?}, after {:?}",
-                before, after
-            ),
-        });
-    }
     Ok(())
 }
 
@@ -555,23 +593,12 @@ where
     F: FindingsSink + FindingsConformanceProbe,
 {
     let fixture = sample_fixture(0x66)?;
-    let before = probe_counts(findings, "findings/missing-occurrence:before")?;
     let observations = [fixture.observation.clone()];
-    expect_findings_failure(
+    assert_orphan_rejected(
         findings,
         "findings/missing-occurrence",
         FindingsUpsertBatch::new(&[], &[], &observations),
     )?;
-    let after = probe_counts(findings, "findings/missing-occurrence:after")?;
-    if after != before {
-        return Err(PersistenceConformanceError::FindingsInvariant {
-            case: "findings/missing-occurrence:after",
-            message: format!(
-                "failed write changed durable counts: before {:?}, after {:?}",
-                before, after
-            ),
-        });
-    }
     Ok(())
 }
 
@@ -592,10 +619,12 @@ where
 ///
 /// Returns the number of checks that passed (currently 3).
 pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
+    let mut checks = 0u32;
     let fixture = sample_fixture(0x77)?;
     let norm = NormHash::from_digest([0xE7; 32]);
     let norm_debug = format!("{norm:?}");
     assert_no_raw_encoding("redaction/norm-hash-debug", &norm_debug, norm.as_bytes())?;
+    checks += 1;
 
     let secret_hash = fixture.finding.secret_hash();
     let secret_debug = format!("{secret_hash:?}");
@@ -604,6 +633,7 @@ pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
         &secret_debug,
         secret_hash.as_bytes(),
     )?;
+    checks += 1;
 
     let finding_debug = format!("{:?}", fixture.finding);
     assert_no_raw_encoding(
@@ -611,8 +641,9 @@ pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
         &finding_debug,
         secret_hash.as_bytes(),
     )?;
+    checks += 1;
 
-    Ok(3)
+    Ok(checks)
 }
 
 /// Submit a done-ledger batch and wait for durable acknowledgement.
@@ -803,6 +834,33 @@ where
     }
 }
 
+/// Submit an orphan batch and assert it is rejected without side effects.
+///
+/// Snapshots durable counts before and after the expected failure and asserts
+/// they are identical — proving the rejected write left no partial rows.
+fn assert_orphan_rejected<F>(
+    findings: &F,
+    case: &'static str,
+    batch: FindingsUpsertBatch<'_>,
+) -> Result<(), PersistenceConformanceError>
+where
+    F: FindingsSink + FindingsConformanceProbe,
+{
+    let before = probe_counts(findings, case)?;
+    expect_findings_failure(findings, case, batch)?;
+    let after = probe_counts(findings, case)?;
+    if after != before {
+        return Err(PersistenceConformanceError::FindingsInvariant {
+            case,
+            message: format!(
+                "failed write changed durable counts: before {:?}, after {:?}",
+                before, after
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Snapshot the current durable findings counts via the test probe.
 fn probe_counts<F>(
     findings: &F,
@@ -822,22 +880,45 @@ where
 /// Assert that `debug_output` does not contain common encodings of
 /// `raw_bytes` (hex or base64).
 ///
-/// Checks both lowercase/uppercase hex representations (via case-insensitive
-/// comparison) and standard base64 encoding of the full byte sequence. This
-/// catches the two most common ways secret material leaks through `Debug`
-/// output. Partial-leak detection is left to manual review.
+/// Three checks are performed:
+///
+/// 1. **Full-length hex** — the complete lowercase hex encoding of the byte
+///    sequence (case-insensitive comparison).
+/// 2. **Prefix hex** — the first 8 bytes (16 hex chars). This catches the
+///    `define_id_32!` 4-byte Debug format (`TypeName(e7e7e7e7..)`) with
+///    margin, guarding against accidental use of an unrestricted macro on a
+///    sensitive type.
+/// 3. **Base64** — standard base64 encoding of the full byte sequence.
+///
+/// Partial-leak detection is left to manual review.
 fn assert_no_raw_encoding(
     case: &'static str,
     debug_output: &str,
     raw_bytes: &[u8],
 ) -> Result<(), PersistenceConformanceError> {
-    let leaked_fragment = hex_lower(raw_bytes);
-    if debug_output.to_ascii_lowercase().contains(&leaked_fragment) {
+    let lowered = debug_output.to_ascii_lowercase();
+
+    // Full-length check.
+    let full_hex = hex_lower(raw_bytes);
+    if lowered.contains(&full_hex) {
         return Err(PersistenceConformanceError::RedactionLeak {
             case,
             debug_output: debug_output.to_owned(),
-            leaked_fragment,
+            leaked_fragment: full_hex,
         });
+    }
+
+    // Prefix check: catches define_id_32! 4-byte Debug format.
+    const PREFIX_BYTES: usize = 8;
+    if raw_bytes.len() >= PREFIX_BYTES {
+        let prefix_hex = hex_lower(&raw_bytes[..PREFIX_BYTES]);
+        if lowered.contains(&prefix_hex) {
+            return Err(PersistenceConformanceError::RedactionLeak {
+                case,
+                debug_output: debug_output.to_owned(),
+                leaked_fragment: prefix_hex,
+            });
+        }
     }
 
     // Also check standard base64 encoding.
@@ -932,9 +1013,13 @@ impl SampleFixture {
 /// also flows into provenance fields (run, shard, epoch, logical time) to
 /// keep fixtures fully distinguishable under inspection.
 ///
-/// The `failed_record` uses smaller provenance offsets and a smaller
-/// `bytes_scanned` (2048) than the `scanned_record` (4096), so the dominance
-/// checks can verify that monotonic fields never regress.
+/// The `failed_record` intentionally uses a **larger** `bytes_scanned` (4096)
+/// than the `scanned_record` (2048). This is realistic — a failure during a
+/// large-file scan followed by a successful scan of a smaller file — and
+/// ensures the conformance harness's per-field max check in
+/// [`assert_scanned_dominates`] is non-vacuous: a backend that simply returns
+/// the dominant record wholesale (instead of computing per-field max) will
+/// fail the check.
 fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError> {
     debug_assert!(
         seed <= 0xF9,
@@ -995,7 +1080,7 @@ fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError
     let failed_record = DoneLedgerRecord::try_new(
         key,
         DoneLedgerStatus::FailedRetryable,
-        2_048,
+        4_096,
         1,
         DoneLedgerProvenance::new(
             RunId::from_raw(50_000 + u64::from(seed)),
@@ -1018,7 +1103,7 @@ fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError
     let scanned_record = DoneLedgerRecord::try_new(
         key,
         DoneLedgerStatus::ScannedWithFindings,
-        4_096,
+        2_048,
         1,
         DoneLedgerProvenance::new(
             RunId::from_raw(50_100 + u64::from(seed)),

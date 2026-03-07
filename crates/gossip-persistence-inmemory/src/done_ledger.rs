@@ -4,7 +4,7 @@
 //! fault injection semantics.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
     sync::{Arc, Condvar, Mutex, MutexGuard},
 };
@@ -19,7 +19,7 @@ use gossip_contracts::{
 
 use crate::{
     error::{CompletionOrder, InMemoryPersistenceError, InMemoryStoreKind, PendingWriteId},
-    pending::{PendingOp, PendingState},
+    pending::{PendingOp, PendingOps, PendingState},
 };
 
 // ---------------------------------------------------------------------------
@@ -35,37 +35,13 @@ struct DoneLedgerPayload {
 /// `durable` is the committed keyspace — the source of truth for
 /// [`batch_get`](DoneLedger::batch_get) and [`snapshot`](InMemoryDoneLedger::snapshot).
 ///
-/// `ops` + `order` form the pending-write queue. `ops` owns each operation's
-/// payload and lifecycle state; `order` preserves insertion order so
-/// [`release_next`](InMemoryDoneLedger::release_next) can drain FIFO or LIFO.
-///
-/// The three fault-injection counters (`fail_submit_remaining`,
-/// `fail_commit_remaining`, `delay_next`) are decremented on use and operate
-/// independently. See the [crate-level docs](crate) for evaluation order.
+/// `pending` is the shared pending-write queue that owns each operation's
+/// payload, lifecycle state, insertion order, and fault-injection counters.
+/// See [`PendingOps`] and the [crate-level docs](crate) for details.
+#[derive(Default)]
 struct DoneLedgerState {
     durable: HashMap<DoneLedgerKey, DoneLedgerRecord>,
-    ops: HashMap<PendingWriteId, PendingOp<DoneLedgerPayload, DoneLedgerCommitReceipt>>,
-    order: VecDeque<PendingWriteId>,
-    next_op_id: u64,
-    auto_complete: bool,
-    delay_next: usize,
-    fail_submit_remaining: usize,
-    fail_commit_remaining: usize,
-}
-
-impl Default for DoneLedgerState {
-    fn default() -> Self {
-        Self {
-            durable: HashMap::new(),
-            ops: HashMap::new(),
-            order: VecDeque::new(),
-            next_op_id: 1,
-            auto_complete: true,
-            delay_next: 0,
-            fail_submit_remaining: 0,
-            fail_commit_remaining: 0,
-        }
-    }
+    pending: PendingOps<DoneLedgerPayload, DoneLedgerCommitReceipt>,
 }
 
 struct DoneLedgerInner {
@@ -115,7 +91,7 @@ impl InMemoryDoneLedger {
         Self {
             inner: Arc::new(DoneLedgerInner {
                 state: Mutex::new(DoneLedgerState {
-                    auto_complete,
+                    pending: PendingOps::with_auto_complete(auto_complete),
                     ..DoneLedgerState::default()
                 }),
                 cv: Condvar::new(),
@@ -126,7 +102,7 @@ impl InMemoryDoneLedger {
     /// Toggle whether future submissions complete immediately.
     pub fn set_auto_complete(&self, auto_complete: bool) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.auto_complete = auto_complete;
+        guard.pending.auto_complete = auto_complete;
         Ok(())
     }
 
@@ -134,21 +110,23 @@ impl InMemoryDoneLedger {
     /// until released explicitly.
     pub fn delay_next_writes(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.delay_next = guard.delay_next.saturating_add(count);
+        guard.pending.delay_next = guard.pending.delay_next.saturating_add(count);
         Ok(())
     }
 
     /// Fail the next `count` submissions immediately.
     pub fn fail_next_submissions(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.fail_submit_remaining = guard.fail_submit_remaining.saturating_add(count);
+        guard.pending.fail_submit_remaining =
+            guard.pending.fail_submit_remaining.saturating_add(count);
         Ok(())
     }
 
     /// Fail the next `count` durable commits.
     pub fn fail_next_commits(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.fail_commit_remaining = guard.fail_commit_remaining.saturating_add(count);
+        guard.pending.fail_commit_remaining =
+            guard.pending.fail_commit_remaining.saturating_add(count);
         Ok(())
     }
 
@@ -166,24 +144,7 @@ impl InMemoryDoneLedger {
         order: CompletionOrder,
     ) -> Result<Option<PendingWriteId>, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        // Walk the queue until we find a still-pending op or exhaust it.
-        let op_id = loop {
-            let maybe = match order {
-                CompletionOrder::OldestFirst => guard.order.pop_front(),
-                CompletionOrder::NewestFirst => guard.order.pop_back(),
-            };
-            let Some(op_id) = maybe else {
-                break None;
-            };
-            if guard
-                .ops
-                .get(&op_id)
-                .is_some_and(|op| op.state.is_pending())
-            {
-                break Some(op_id);
-            }
-        };
-        let Some(op_id) = op_id else {
+        let Some(op_id) = guard.pending.find_next_pending(order) else {
             return Ok(None);
         };
         finish_done_ledger_op(&mut guard, op_id)?;
@@ -201,15 +162,11 @@ impl InMemoryDoneLedger {
         op_id: PendingWriteId,
     ) -> Result<bool, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        let is_pending = guard
-            .ops
-            .get(&op_id)
-            .is_some_and(|op| op.state.is_pending());
-        if !is_pending {
+        if !guard.pending.is_pending(op_id) {
             return Ok(false);
         }
         finish_done_ledger_op(&mut guard, op_id)?;
-        guard.order.retain(|id| *id != op_id);
+        guard.pending.remove_from_order(op_id);
         self.inner.cv.notify_all();
         Ok(true)
     }
@@ -222,21 +179,12 @@ impl InMemoryDoneLedger {
     /// preventing unbounded loops when writer threads are active.
     pub fn release_all(&self, order: CompletionOrder) -> Result<usize, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-
-        let mut pending: Vec<PendingWriteId> = guard
-            .order
-            .iter()
-            .copied()
-            .filter(|op_id| guard.ops.get(op_id).is_some_and(|op| op.state.is_pending()))
-            .collect();
-        if order == CompletionOrder::NewestFirst {
-            pending.reverse();
-        }
+        let pending = guard.pending.collect_pending_ordered(order);
 
         let mut released = 0usize;
         for op_id in pending {
             finish_done_ledger_op(&mut guard, op_id)?;
-            guard.order.retain(|id| *id != op_id);
+            guard.pending.remove_from_order(op_id);
             released += 1;
         }
         if released > 0 {
@@ -248,22 +196,13 @@ impl InMemoryDoneLedger {
     /// Number of operations that are still pending durability.
     pub fn pending_count(&self) -> Result<usize, InMemoryPersistenceError> {
         let guard = self.lock_state()?;
-        Ok(guard
-            .ops
-            .values()
-            .filter(|op| op.state.is_pending())
-            .count())
+        Ok(guard.pending.pending_count())
     }
 
     /// Pending operation ids in their current queue order.
     pub fn pending_ids(&self) -> Result<Vec<PendingWriteId>, InMemoryPersistenceError> {
         let guard = self.lock_state()?;
-        Ok(guard
-            .order
-            .iter()
-            .copied()
-            .filter(|op_id| guard.ops.get(op_id).is_some_and(|op| op.state.is_pending()))
-            .collect())
+        Ok(guard.pending.pending_ids())
     }
 
     /// Return the durable row for `key`, if present.
@@ -320,15 +259,8 @@ impl fmt::Debug for InMemoryDoneLedger {
             Ok(guard) => f
                 .debug_struct("InMemoryDoneLedger")
                 .field("durable_rows", &guard.durable.len())
-                .field(
-                    "pending_ops",
-                    &guard
-                        .ops
-                        .values()
-                        .filter(|op| op.state.is_pending())
-                        .count(),
-                )
-                .field("auto_complete", &guard.auto_complete)
+                .field("pending_ops", &guard.pending.pending_count())
+                .field("auto_complete", &guard.pending.auto_complete)
                 .finish(),
             Err(_) => f.write_str("InMemoryDoneLedger(<poisoned>)"),
         }
@@ -394,7 +326,7 @@ impl CommitHandle for InMemoryDoneLedgerHandle {
                 })?;
 
         loop {
-            let finished = match guard.ops.get_mut(&self.op_id) {
+            let finished = match guard.pending.get_mut(self.op_id) {
                 Some(op) => match &mut op.state {
                     PendingState::Pending => None,
                     PendingState::Finished(result) => Some(result.take().ok_or(
@@ -415,7 +347,7 @@ impl CommitHandle for InMemoryDoneLedgerHandle {
             if let Some(result) = finished {
                 // Clean up: remove the entry so pending_count/pending_ids
                 // no longer see this completed op.
-                guard.ops.remove(&self.op_id);
+                guard.pending.remove(self.op_id);
                 return result?;
             }
 
@@ -460,15 +392,11 @@ impl DoneLedger for InMemoryDoneLedger {
     ) -> Result<Self::CommitHandle, Self::Error> {
         let mut guard = self.lock_state()?;
 
-        if guard.fail_submit_remaining > 0 {
-            guard.fail_submit_remaining -= 1;
-            return Err(InMemoryPersistenceError::InjectedSubmissionFailure {
-                store: InMemoryStoreKind::DoneLedger,
-            });
-        }
+        guard
+            .pending
+            .check_submit_fault(InMemoryStoreKind::DoneLedger)?;
 
-        let op_id = PendingWriteId::from_raw(guard.next_op_id);
-        guard.next_op_id = guard.next_op_id.saturating_add(1);
+        let op_id = guard.pending.allocate_op_id();
 
         let mut op = PendingOp {
             payload: DoneLedgerPayload {
@@ -477,20 +405,12 @@ impl DoneLedger for InMemoryDoneLedger {
             state: PendingState::Pending,
         };
 
-        let should_delay = if guard.delay_next > 0 {
-            guard.delay_next -= 1;
-            true
-        } else {
-            !guard.auto_complete
-        };
-
-        if should_delay {
-            guard.order.push_back(op_id);
-            guard.ops.insert(op_id, op);
+        if guard.pending.should_delay() {
+            guard.pending.enqueue_pending(op_id, op);
         } else {
             let result = apply_done_ledger_payload(&mut guard, &op.payload.records);
             op.state = PendingState::Finished(Some(result));
-            guard.ops.insert(op_id, op);
+            guard.pending.insert_finished(op_id, op);
             self.inner.cv.notify_all();
         }
 
@@ -517,12 +437,9 @@ fn apply_done_ledger_payload(
     state: &mut DoneLedgerState,
     records: &[DoneLedgerRecord],
 ) -> Result<DoneLedgerCommitReceipt, InMemoryPersistenceError> {
-    if state.fail_commit_remaining > 0 {
-        state.fail_commit_remaining -= 1;
-        return Err(InMemoryPersistenceError::InjectedCommitFailure {
-            store: InMemoryStoreKind::DoneLedger,
-        });
-    }
+    state
+        .pending
+        .check_commit_fault(InMemoryStoreKind::DoneLedger)?;
 
     for record in records {
         let key = record.key();
@@ -559,10 +476,10 @@ fn finish_done_ledger_op(
     state: &mut DoneLedgerState,
     op_id: PendingWriteId,
 ) -> Result<(), InMemoryPersistenceError> {
-    let mut op = match state.ops.remove(&op_id) {
+    let mut op = match state.pending.remove(op_id) {
         Some(op) if op.state.is_pending() => op,
         Some(op) => {
-            state.ops.insert(op_id, op);
+            state.pending.insert(op_id, op);
             return Ok(());
         }
         None => {
@@ -575,7 +492,7 @@ fn finish_done_ledger_op(
 
     let result = apply_done_ledger_payload(state, &op.payload.records);
     op.state = PendingState::Finished(Some(result));
-    state.ops.insert(op_id, op);
+    state.pending.insert(op_id, op);
     Ok(())
 }
 

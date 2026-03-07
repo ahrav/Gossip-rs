@@ -700,8 +700,8 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
 
 /// Regression: when the last N samples share identical `cumulative_bytes`
 /// (a byte-position plateau), compaction must still preserve the actual last
-/// sample. Before the fix, nearest-neighbor tie-breaking picked the first
-/// plateau entry instead of `len - 1`.
+/// sample. Nearest-neighbor tie-breaking must select `len - 1` (the true
+/// last sample), not the first plateau entry.
 #[test]
 fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
     use super::{Sample, compact_samples};

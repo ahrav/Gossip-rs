@@ -19,6 +19,8 @@ use crate::{
     InMemoryStoreKind,
 };
 
+use gossip_contracts::persistence::PersistenceInputError;
+
 use DoneLedgerStatus::{FailedPermanent, FailedRetryable, ScannedClean, ScannedWithFindings};
 
 fn provenance(
@@ -477,7 +479,7 @@ fn findings_submission_failures_and_release_all_are_deterministic() {
 }
 
 // ---------------------------------------------------------------------------
-// Verification tests for PR review comments
+// Consistency and correctness edge-case tests
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -559,7 +561,7 @@ fn findings_receipt_counts_deduplicated_rows_not_raw_input() {
 }
 
 // ---------------------------------------------------------------------------
-// Coverage gap tests
+// Empty-batch handling and identity-conflict edge cases
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -750,7 +752,7 @@ fn done_ledger_intra_batch_duplicate_keys_merge_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// F1: Merge panic bug fix
+// Merge transition clears stale metadata
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -777,7 +779,8 @@ fn done_ledger_merge_failure_to_scanned_clean_clears_findings_count() {
 
     // Incoming: ScannedClean with findings_count=0 (valid — ScannedClean
     // requires 0). The lattice join promotes to ScannedClean (rank 10 > rank 1).
-    // Without the fix, max(3, 0) = 3 paired with ScannedClean panics in try_new.
+    // A naive max(3, 0) would pair findings_count=3 with ScannedClean, violating
+    // the status/count invariant. The merge must reset findings_count to 0.
     let clean = done_record(
         1,
         2,
@@ -802,7 +805,7 @@ fn done_ledger_merge_failure_to_scanned_clean_clears_findings_count() {
 }
 
 // ---------------------------------------------------------------------------
-// F7: High-priority test gap coverage
+// Delay injection and concurrent write ordering
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -913,7 +916,7 @@ fn multiple_threads_wait_on_different_handles() {
 }
 
 // ---------------------------------------------------------------------------
-// F8: Medium-priority test gap coverage
+// Release queue edge cases
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1081,4 +1084,173 @@ fn get_record_and_get_finding_return_none_for_missing_keys() {
             .unwrap(),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Batch validation rejects cross-tenant submissions
+// ---------------------------------------------------------------------------
+
+/// Submit a findings batch containing records from two different tenants.
+/// The pre-lock tenant consistency check should reject it immediately with
+/// `BatchValidation(InconsistentTenant)`, and no durable state should be
+/// mutated.
+///
+/// `UnknownOperation` and `Poisoned` are defensive-only variants that are
+/// unreachable through the public API under correct usage — they guard against
+/// internal misuse (double-wait, mutex poisoning) and are not tested here.
+#[test]
+fn inconsistent_tenant_batch_is_rejected_before_lock() {
+    let store = InMemoryFindingsSink::new();
+    let finding_a = finding_record(1, 10);
+    let finding_b = finding_record(2, 11);
+
+    let findings = [finding_a, finding_b];
+    let error = store
+        .upsert_batch(FindingsUpsertBatch::new(&findings, &[], &[]))
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        InMemoryPersistenceError::BatchValidation(PersistenceInputError::InconsistentTenant),
+    );
+
+    // Durable state must be empty — validation fires before the lock is acquired.
+    assert!(store.findings_snapshot().unwrap().is_empty());
+    assert!(store.occurrences_snapshot().unwrap().is_empty());
+    assert!(store.observations_snapshot().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Observation merge tie-breaking and replay stability
+// ---------------------------------------------------------------------------
+
+/// Equal `seen_at`, both have location → existing wins (stable under replay).
+#[test]
+fn observation_merge_equal_seen_at_both_with_location_keeps_existing() {
+    let store = InMemoryFindingsSink::new();
+    let finding = finding_record(1, 10);
+    let occurrence = occurrence_record(1, &finding, 20, 100);
+
+    let existing_obs = observation_record(1, &occurrence, 30, 40, 50, 60, 70, 100).with_location(
+        Location::try_new("existing/path".into(), Some("https://existing.test".into())).unwrap(),
+    );
+
+    let findings = [finding.clone()];
+    let occurrences = [occurrence.clone()];
+    let existing_arr = [existing_obs.clone()];
+    store
+        .upsert_batch(FindingsUpsertBatch::new(
+            &findings,
+            &occurrences,
+            &existing_arr,
+        ))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    // Same seen_at (100), both with location → existing provenance wins.
+    let incoming_obs = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100).with_location(
+        Location::try_new("incoming/path".into(), Some("https://incoming.test".into())).unwrap(),
+    );
+    let incoming_arr = [incoming_obs];
+    store
+        .upsert_batch(FindingsUpsertBatch::new(&[], &[], &incoming_arr))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.observations_snapshot().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].seen_at(), LogicalTime::from_raw(100));
+    // Existing provenance wins → run_id from existing record.
+    assert_eq!(stored[0].run_id(), RunId::from_raw(50));
+    assert_eq!(stored[0].location().unwrap().display(), "existing/path");
+}
+
+/// Earlier incoming `seen_at` → existing provenance preserved.
+#[test]
+fn observation_merge_earlier_incoming_keeps_existing_provenance() {
+    let store = InMemoryFindingsSink::new();
+    let finding = finding_record(1, 10);
+    let occurrence = occurrence_record(1, &finding, 20, 100);
+
+    // Existing has seen_at=200.
+    let existing_obs = observation_record(1, &occurrence, 30, 40, 50, 60, 70, 200);
+
+    let findings = [finding.clone()];
+    let occurrences = [occurrence.clone()];
+    let existing_arr = [existing_obs.clone()];
+    store
+        .upsert_batch(FindingsUpsertBatch::new(
+            &findings,
+            &occurrences,
+            &existing_arr,
+        ))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    // Incoming has earlier seen_at=100 → existing wins entirely.
+    let incoming_obs = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100).with_location(
+        Location::try_new("incoming/path".into(), Some("https://incoming.test".into())).unwrap(),
+    );
+    let incoming_arr = [incoming_obs];
+    store
+        .upsert_batch(FindingsUpsertBatch::new(&[], &[], &incoming_arr))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.observations_snapshot().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].seen_at(), LogicalTime::from_raw(200));
+    assert_eq!(stored[0].run_id(), RunId::from_raw(50));
+    // Location from incoming is adopted through the fallback chain even though
+    // existing won provenance (existing has no location).
+    assert!(
+        stored[0].location().is_some(),
+        "location should be recovered from the fallback chain"
+    );
+    assert_eq!(stored[0].location().unwrap().display(), "incoming/path");
+}
+
+/// Equal `seen_at`, existing has location, incoming does not → existing wins.
+#[test]
+fn observation_merge_equal_seen_at_existing_has_location_keeps_existing() {
+    let store = InMemoryFindingsSink::new();
+    let finding = finding_record(1, 10);
+    let occurrence = occurrence_record(1, &finding, 20, 100);
+
+    let existing_obs = observation_record(1, &occurrence, 30, 40, 50, 60, 70, 100).with_location(
+        Location::try_new("existing/path".into(), Some("https://existing.test".into())).unwrap(),
+    );
+
+    let findings = [finding.clone()];
+    let occurrences = [occurrence.clone()];
+    let existing_arr = [existing_obs.clone()];
+    store
+        .upsert_batch(FindingsUpsertBatch::new(
+            &findings,
+            &occurrences,
+            &existing_arr,
+        ))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    // Same seen_at (100), existing has location, incoming does not.
+    // The `else` branch fires (existing wins), keeping existing provenance.
+    let incoming_obs = observation_record(1, &occurrence, 30, 40, 90, 91, 92, 100);
+    let incoming_arr = [incoming_obs];
+    store
+        .upsert_batch(FindingsUpsertBatch::new(&[], &[], &incoming_arr))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.observations_snapshot().unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].seen_at(), LogicalTime::from_raw(100));
+    assert_eq!(stored[0].run_id(), RunId::from_raw(50));
+    assert_eq!(stored[0].location().unwrap().display(), "existing/path");
 }

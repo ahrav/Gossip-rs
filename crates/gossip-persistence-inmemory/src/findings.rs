@@ -4,7 +4,7 @@
 //! fault injection semantics.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
     sync::{Arc, Condvar, Mutex, MutexGuard},
 };
@@ -20,7 +20,7 @@ use gossip_contracts::{
 
 use crate::{
     error::{CompletionOrder, InMemoryPersistenceError, InMemoryStoreKind, PendingWriteId},
-    pending::{PendingOp, PendingState},
+    pending::{PendingOp, PendingOps, PendingState},
 };
 
 // ---------------------------------------------------------------------------
@@ -40,34 +40,12 @@ struct FindingsPayload {
     observations: Vec<ObservationRecord>,
 }
 
+#[derive(Default)]
 struct FindingsState {
     durable_findings: HashMap<FindingKey, FindingRecord>,
     durable_occurrences: HashMap<OccurrenceKey, OccurrenceRecord>,
     durable_observations: HashMap<ObservationKey, ObservationRecord>,
-    ops: HashMap<PendingWriteId, PendingOp<FindingsPayload, FindingsCommitReceipt>>,
-    order: VecDeque<PendingWriteId>,
-    next_op_id: u64,
-    auto_complete: bool,
-    delay_next: usize,
-    fail_submit_remaining: usize,
-    fail_commit_remaining: usize,
-}
-
-impl Default for FindingsState {
-    fn default() -> Self {
-        Self {
-            durable_findings: HashMap::new(),
-            durable_occurrences: HashMap::new(),
-            durable_observations: HashMap::new(),
-            ops: HashMap::new(),
-            order: VecDeque::new(),
-            next_op_id: 1,
-            auto_complete: true,
-            delay_next: 0,
-            fail_submit_remaining: 0,
-            fail_commit_remaining: 0,
-        }
-    }
+    pending: PendingOps<FindingsPayload, FindingsCommitReceipt>,
 }
 
 struct FindingsInner {
@@ -130,7 +108,7 @@ impl InMemoryFindingsSink {
         Self {
             inner: Arc::new(FindingsInner {
                 state: Mutex::new(FindingsState {
-                    auto_complete,
+                    pending: PendingOps::with_auto_complete(auto_complete),
                     ..FindingsState::default()
                 }),
                 cv: Condvar::new(),
@@ -141,28 +119,30 @@ impl InMemoryFindingsSink {
     /// Toggle whether future submissions complete immediately.
     pub fn set_auto_complete(&self, auto_complete: bool) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.auto_complete = auto_complete;
+        guard.pending.auto_complete = auto_complete;
         Ok(())
     }
 
     /// Delay the next `count` submissions until released explicitly.
     pub fn delay_next_writes(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.delay_next = guard.delay_next.saturating_add(count);
+        guard.pending.delay_next = guard.pending.delay_next.saturating_add(count);
         Ok(())
     }
 
     /// Fail the next `count` submissions immediately.
     pub fn fail_next_submissions(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.fail_submit_remaining = guard.fail_submit_remaining.saturating_add(count);
+        guard.pending.fail_submit_remaining =
+            guard.pending.fail_submit_remaining.saturating_add(count);
         Ok(())
     }
 
     /// Fail the next `count` durable commits.
     pub fn fail_next_commits(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        guard.fail_commit_remaining = guard.fail_commit_remaining.saturating_add(count);
+        guard.pending.fail_commit_remaining =
+            guard.pending.fail_commit_remaining.saturating_add(count);
         Ok(())
     }
 
@@ -172,23 +152,7 @@ impl InMemoryFindingsSink {
         order: CompletionOrder,
     ) -> Result<Option<PendingWriteId>, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        let op_id = loop {
-            let maybe = match order {
-                CompletionOrder::OldestFirst => guard.order.pop_front(),
-                CompletionOrder::NewestFirst => guard.order.pop_back(),
-            };
-            let Some(op_id) = maybe else {
-                break None;
-            };
-            if guard
-                .ops
-                .get(&op_id)
-                .is_some_and(|op| op.state.is_pending())
-            {
-                break Some(op_id);
-            }
-        };
-        let Some(op_id) = op_id else {
+        let Some(op_id) = guard.pending.find_next_pending(order) else {
             return Ok(None);
         };
         finish_findings_op(&mut guard, op_id)?;
@@ -206,15 +170,11 @@ impl InMemoryFindingsSink {
         op_id: PendingWriteId,
     ) -> Result<bool, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-        let is_pending = guard
-            .ops
-            .get(&op_id)
-            .is_some_and(|op| op.state.is_pending());
-        if !is_pending {
+        if !guard.pending.is_pending(op_id) {
             return Ok(false);
         }
         finish_findings_op(&mut guard, op_id)?;
-        guard.order.retain(|id| *id != op_id);
+        guard.pending.remove_from_order(op_id);
         self.inner.cv.notify_all();
         Ok(true)
     }
@@ -227,21 +187,12 @@ impl InMemoryFindingsSink {
     /// preventing unbounded loops when writer threads are active.
     pub fn release_all(&self, order: CompletionOrder) -> Result<usize, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
-
-        let mut pending: Vec<PendingWriteId> = guard
-            .order
-            .iter()
-            .copied()
-            .filter(|op_id| guard.ops.get(op_id).is_some_and(|op| op.state.is_pending()))
-            .collect();
-        if order == CompletionOrder::NewestFirst {
-            pending.reverse();
-        }
+        let pending = guard.pending.collect_pending_ordered(order);
 
         let mut released = 0usize;
         for op_id in pending {
             finish_findings_op(&mut guard, op_id)?;
-            guard.order.retain(|id| *id != op_id);
+            guard.pending.remove_from_order(op_id);
             released += 1;
         }
         if released > 0 {
@@ -253,22 +204,13 @@ impl InMemoryFindingsSink {
     /// Number of operations still pending durability.
     pub fn pending_count(&self) -> Result<usize, InMemoryPersistenceError> {
         let guard = self.lock_state()?;
-        Ok(guard
-            .ops
-            .values()
-            .filter(|op| op.state.is_pending())
-            .count())
+        Ok(guard.pending.pending_count())
     }
 
     /// Pending operation ids in their current queue order.
     pub fn pending_ids(&self) -> Result<Vec<PendingWriteId>, InMemoryPersistenceError> {
         let guard = self.lock_state()?;
-        Ok(guard
-            .order
-            .iter()
-            .copied()
-            .filter(|op_id| guard.ops.get(op_id).is_some_and(|op| op.state.is_pending()))
-            .collect())
+        Ok(guard.pending.pending_ids())
     }
 
     /// Durable findings snapshot, sorted by `(tenant_id, finding_id)`.
@@ -377,15 +319,8 @@ impl fmt::Debug for InMemoryFindingsSink {
                 .field("durable_findings", &guard.durable_findings.len())
                 .field("durable_occurrences", &guard.durable_occurrences.len())
                 .field("durable_observations", &guard.durable_observations.len())
-                .field(
-                    "pending_ops",
-                    &guard
-                        .ops
-                        .values()
-                        .filter(|op| op.state.is_pending())
-                        .count(),
-                )
-                .field("auto_complete", &guard.auto_complete)
+                .field("pending_ops", &guard.pending.pending_count())
+                .field("auto_complete", &guard.pending.auto_complete)
                 .finish(),
             Err(_) => f.write_str("InMemoryFindingsSink(<poisoned>)"),
         }
@@ -450,7 +385,7 @@ impl CommitHandle for InMemoryFindingsHandle {
                 })?;
 
         loop {
-            let finished = match guard.ops.get_mut(&self.op_id) {
+            let finished = match guard.pending.get_mut(self.op_id) {
                 Some(op) => match &mut op.state {
                     PendingState::Pending => None,
                     PendingState::Finished(result) => Some(result.take().ok_or(
@@ -469,7 +404,7 @@ impl CommitHandle for InMemoryFindingsHandle {
             };
 
             if let Some(result) = finished {
-                guard.ops.remove(&self.op_id);
+                guard.pending.remove(self.op_id);
                 return result?;
             }
 
@@ -510,15 +445,11 @@ impl FindingsSink for InMemoryFindingsSink {
 
         let mut guard = self.lock_state()?;
 
-        if guard.fail_submit_remaining > 0 {
-            guard.fail_submit_remaining -= 1;
-            return Err(InMemoryPersistenceError::InjectedSubmissionFailure {
-                store: InMemoryStoreKind::Findings,
-            });
-        }
+        guard
+            .pending
+            .check_submit_fault(InMemoryStoreKind::Findings)?;
 
-        let op_id = PendingWriteId::from_raw(guard.next_op_id);
-        guard.next_op_id = guard.next_op_id.saturating_add(1);
+        let op_id = guard.pending.allocate_op_id();
 
         let mut op = PendingOp {
             payload: FindingsPayload {
@@ -529,22 +460,14 @@ impl FindingsSink for InMemoryFindingsSink {
             state: PendingState::Pending,
         };
 
-        let should_delay = if guard.delay_next > 0 {
-            guard.delay_next -= 1;
-            true
-        } else {
-            !guard.auto_complete
-        };
-
-        if should_delay {
-            guard.order.push_back(op_id);
-            guard.ops.insert(op_id, op);
+        if guard.pending.should_delay() {
+            guard.pending.enqueue_pending(op_id, op);
         } else {
             // `op` is a local variable not yet inserted into any map, so
             // `&op.payload` can be passed directly — no clone needed.
             let result = apply_findings_payload(&mut guard, &op.payload);
             op.state = PendingState::Finished(Some(result));
-            guard.ops.insert(op_id, op);
+            guard.pending.insert_finished(op_id, op);
             self.inner.cv.notify_all();
         }
 
@@ -611,10 +534,10 @@ fn finish_findings_op(
     state: &mut FindingsState,
     op_id: PendingWriteId,
 ) -> Result<(), InMemoryPersistenceError> {
-    let mut op = match state.ops.remove(&op_id) {
+    let mut op = match state.pending.remove(op_id) {
         Some(op) if op.state.is_pending() => op,
         Some(op) => {
-            state.ops.insert(op_id, op);
+            state.pending.insert(op_id, op);
             return Ok(());
         }
         None => {
@@ -627,7 +550,7 @@ fn finish_findings_op(
 
     let result = apply_findings_payload(state, &op.payload);
     op.state = PendingState::Finished(Some(result));
-    state.ops.insert(op_id, op);
+    state.pending.insert(op_id, op);
     Ok(())
 }
 
@@ -660,12 +583,9 @@ fn apply_findings_payload(
     state: &mut FindingsState,
     payload: &FindingsPayload,
 ) -> Result<FindingsCommitReceipt, InMemoryPersistenceError> {
-    if state.fail_commit_remaining > 0 {
-        state.fail_commit_remaining -= 1;
-        return Err(InMemoryPersistenceError::InjectedCommitFailure {
-            store: InMemoryStoreKind::Findings,
-        });
-    }
+    state
+        .pending
+        .check_commit_fault(InMemoryStoreKind::Findings)?;
 
     // --- Layer 1: Findings (immutable insert-or-check) ---
     let mut batch_findings: HashMap<FindingKey, FindingRecord> = HashMap::new();
@@ -757,32 +677,28 @@ fn apply_findings_payload(
         }
     }
 
-    // Validation passed — commit new rows into durable state.
-    for (key, record) in &batch_findings {
-        state
-            .durable_findings
-            .entry(*key)
-            .or_insert_with(|| record.clone());
+    // Capture counts before consuming the batch maps.
+    let findings_count = batch_findings.len() as u64;
+    let occurrences_count = batch_occurrences.len() as u64;
+    let observations_count = batch_observations.len() as u64;
+
+    // Validation passed — commit new rows into durable state by consuming the
+    // batch maps (avoids one clone per record compared to borrowed iteration).
+    for (key, record) in batch_findings {
+        state.durable_findings.entry(key).or_insert(record);
     }
-    for (key, record) in &batch_occurrences {
-        state
-            .durable_occurrences
-            .entry(*key)
-            .or_insert_with(|| record.clone());
+    for (key, record) in batch_occurrences {
+        state.durable_occurrences.entry(key).or_insert(record);
     }
     // Observations use upsert semantics: always overwrite with the merged result.
-    for (key, record) in batch_observations.iter() {
-        state.durable_observations.insert(*key, record.clone());
+    for (key, record) in batch_observations {
+        state.durable_observations.insert(key, record);
     }
 
-    // Use deduplicated batch map sizes rather than raw payload lengths.
-    // Within-batch duplicates (same key, same content) are silently skipped
-    // by the `continue` branches above, so `batch_*.len()` reflects the
-    // number of distinct rows actually acknowledged by this commit.
     Ok(FindingsCommitReceipt::new(
-        batch_findings.len() as u64,
-        batch_occurrences.len() as u64,
-        batch_observations.len() as u64,
+        findings_count,
+        occurrences_count,
+        observations_count,
     ))
 }
 
