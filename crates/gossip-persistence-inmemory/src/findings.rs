@@ -12,8 +12,9 @@ use std::{
 use gossip_contracts::{
     identity::{FindingId, ObservationId, OccurrenceId, TenantId},
     persistence::{
-        CommitHandle, FindingRecord, FindingsCommitReceipt, FindingsSink, FindingsUpsertBatch,
-        ObservationRecord, OccurrenceRecord, PersistenceInputError,
+        CommitHandle, DurableFindingsCounts, FindingRecord, FindingsCommitReceipt,
+        FindingsConformanceProbe, FindingsSink, FindingsUpsertBatch, ObservationRecord,
+        OccurrenceRecord, PersistenceInputError,
     },
 };
 
@@ -355,6 +356,19 @@ impl fmt::Debug for InMemoryFindingsSink {
                 .finish(),
             Err(_) => f.write_str("InMemoryFindingsSink(<poisoned>)"),
         }
+    }
+}
+
+impl FindingsConformanceProbe for InMemoryFindingsSink {
+    type Error = InMemoryPersistenceError;
+
+    fn durable_counts(&self) -> Result<DurableFindingsCounts, Self::Error> {
+        let guard = self.lock_state()?;
+        Ok(DurableFindingsCounts::new(
+            guard.durable_findings.len() as u64,
+            guard.durable_occurrences.len() as u64,
+            guard.durable_observations.len() as u64,
+        ))
     }
 }
 

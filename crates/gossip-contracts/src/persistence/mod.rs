@@ -18,6 +18,19 @@
 //!   enforces findings → done-ledger → checkpoint ordering.
 //! - `error.rs` defines shared input-validation errors used by persistence-only
 //!   value wrappers.
+//! - `conformance.rs` defines the backend-agnostic persistence conformance
+//!   harness used by reference backends and future production implementations.
+//!
+//! ## Conformance harness
+//!
+//! The reusable persistence conformance harness enables backend
+//! implementors to verify correctness against the contract surface:
+//!
+//! - `run_conformance` executes done-ledger, findings, and redaction checks.
+//! - `FindingsConformanceProbe` keeps findings replay/idempotency verification
+//!   out of the production `FindingsSink` trait surface.
+//! - External backend crates can depend on this public module in integration
+//!   tests without enabling a contracts-only cfg gate.
 //!
 //! ## Submission vs durability
 //!
@@ -60,6 +73,7 @@
 //!   reused safe boundary types such as [`Location`](crate::connector::Location).
 
 mod commit;
+pub mod conformance;
 mod done_ledger;
 mod error;
 mod findings;
@@ -76,6 +90,11 @@ pub const RECOMMENDED_MAX_BATCH_SIZE: usize = 10_000;
 pub use commit::{
     CheckpointCommitReceipt, CommitHandle, CommitReceipt, DoneLedgerCommitReceipt,
     FindingsCommitReceipt, ItemCommitReceipt, PageCommitReceipt, ReadyCommitHandle,
+};
+pub use conformance::{
+    DurableFindingsCounts, FindingsConformanceProbe, PersistenceConformanceError,
+    PersistenceConformanceReport, run_conformance, run_done_ledger_conformance,
+    run_findings_conformance, run_redaction_conformance,
 };
 pub use done_ledger::{
     DoneLedger, DoneLedgerErrorCode, DoneLedgerKey, DoneLedgerProvenance, DoneLedgerRecord,
