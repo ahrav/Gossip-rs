@@ -1,9 +1,56 @@
 //! Generic in-memory store infrastructure shared by all persistence backends.
 //!
-//! [`InMemoryStoreCore`] captures the queue management, fault injection,
-//! condvar coordination, and commit handle lifecycle that would otherwise be
-//! duplicated in every backend module. Domain-specific behavior is injected
-//! through the [`StoreBackend`] trait.
+//! # Problem
+//!
+//! Both the done-ledger and findings backends need identical machinery for
+//! pending-write queuing, condvar-based durability signaling, fault injection,
+//! and commit-handle lifecycle management. Without a shared core, every backend
+//! would duplicate this coordination logic — a maintenance and correctness
+//! hazard.
+//!
+//! # Design
+//!
+//! [`InMemoryStoreCore`] is the generic interior that owns all of that shared
+//! machinery. Domain-specific behavior — how a payload is applied to durable
+//! state — is injected through the [`StoreBackend`] trait. Each public wrapper
+//! (`InMemoryDoneLedger`, `InMemoryFindingsSink`) holds an
+//! `Arc<InMemoryStoreCore<B>>` and delegates control/release/query methods.
+//!
+//! # Operation lifecycle
+//!
+//! ```text
+//!   submit()
+//!     │
+//!     ├─ fail_submit_remaining > 0 ──► InjectedSubmissionFailure (no state change)
+//!     │
+//!     ├─ delay_next > 0 or !auto_complete
+//!     │     └─► op inserted as Pending into `ops` + `order` queue
+//!     │         └─► caller gets StoreHandle, wait() blocks on condvar
+//!     │             └─► release_next / release_specific / release_all
+//!     │                   └─► finish_op() applies payload ──► condvar.notify_all()
+//!     │
+//!     └─ auto_complete (default)
+//!           └─► B::apply() runs immediately under the lock
+//!               └─► op inserted as Finished ──► condvar.notify_all()
+//!                   └─► wait() returns at once
+//! ```
+//!
+//! # Invariants
+//!
+//! - **Op IDs are monotonically increasing**: `next_op_id` starts at 1 and is
+//!   incremented with `checked_add`, preventing wrap-around.
+//! - **`order` queue only tracks delayed ops**: auto-completed ops are never
+//!   pushed to `order`, so the queue faithfully represents the pending backlog.
+//! - **Single-consumer results**: each `Finished` result is wrapped in
+//!   `Option` and consumed via `take()` by the first `wait()` call. A second
+//!   `wait()` on the same op (impossible at compile time since `wait` consumes
+//!   `self`) would see `None`.
+//! - **Condvar wake is conservative**: `notify_all` is called after every
+//!   state transition to `Finished`, even for auto-completed ops. This is
+//!   correct but over-notifies — acceptable for a test/simulation backend.
+//! - **Lock ordering**: there is exactly one mutex per `InMemoryStoreCore`
+//!   instance. No code path acquires a second lock while holding this one,
+//!   eliminating deadlock risk.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -21,8 +68,27 @@ use crate::{
 
 /// Domain-specific behavior that differs between persistence backends.
 ///
-/// Implementors provide the payload type, receipt type, store kind tag, and
-/// the function that applies a payload to the durable state.
+/// Each implementor defines four things:
+///
+/// 1. The **payload** type buffered by a pending write (e.g. a vec of records).
+/// 2. The **receipt** returned to callers after a successful commit.
+/// 3. The **durable state** that payloads are applied to.
+/// 4. The **apply** function that performs the domain-specific mutation.
+///
+/// # Contract
+///
+/// `apply` is called under the `StoreState` mutex — it must not block on
+/// external I/O or acquire other locks. The `fail_commit_remaining` counter
+/// is passed by mutable reference so that each backend can check it at the
+/// top of `apply` and decrement it to inject a commit failure *before*
+/// mutating durable state. This keeps fault injection deterministic and
+/// ensures partial mutations never occur on injected failures.
+///
+/// # Implementors
+///
+/// - `DoneLedgerBackend` — monotonic lattice merge for done-ledger records.
+/// - `FindingsBackend` — referential integrity enforcement for findings,
+///   occurrences, and observations.
 pub(crate) trait StoreBackend: Send + 'static {
     /// The buffered write payload (e.g. a vec of records).
     type Payload: Send;
@@ -33,14 +99,19 @@ pub(crate) trait StoreBackend: Send + 'static {
     /// The mutable durable state that payloads are applied to.
     type Durable: Send + Default;
 
-    /// Discriminator used in error variants.
+    /// Discriminator used in error variants to identify which backend
+    /// produced the error without requiring downcasting.
     const STORE_KIND: InMemoryStoreKind;
 
-    /// Apply `payload` to `durable`, consulting and mutating the fault
-    /// injection counter `fail_commit_remaining`.
+    /// Apply `payload` to `durable`, producing a receipt on success.
     ///
-    /// Implementations must check `fail_commit_remaining` first and
-    /// decrement it when injecting a commit failure.
+    /// # Fault injection protocol
+    ///
+    /// Implementations **must** check `fail_commit_remaining` before any
+    /// mutation. If the counter is non-zero, decrement it and return
+    /// [`InjectedCommitFailure`](InMemoryPersistenceError::InjectedCommitFailure)
+    /// without touching `durable`. This guarantees that injected failures
+    /// leave durable state unchanged.
     fn apply(
         durable: &mut Self::Durable,
         fail_commit_remaining: &mut usize,
@@ -53,14 +124,51 @@ pub(crate) trait StoreBackend: Send + 'static {
 // ---------------------------------------------------------------------------
 
 /// Queue and fault-injection state shared by all in-memory backends.
+///
+/// Operations live in two parallel structures:
+///
+/// - **`ops`** (`HashMap`): keyed by `PendingWriteId`, stores the payload and
+///   lifecycle state (`Pending` or `Finished`). Both delayed and auto-completed
+///   ops are inserted here so that `StoreHandle::wait` can look up results by
+///   id regardless of completion mode.
+/// - **`order`** (`VecDeque`): tracks submission order for delayed ops only.
+///   Used by `release_next` to drain in FIFO/LIFO order. Auto-completed ops
+///   are never pushed here.
+///
+/// # Fault injection counters
+///
+/// Three independent, monotonically decremented counters control failure
+/// injection. They are checked in the order listed during each submission:
+///
+/// 1. `fail_submit_remaining` — rejects before handle creation (submission
+///    failure).
+/// 2. `delay_next` / `auto_complete` — determines whether the accepted write
+///    is delayed or applied immediately.
+/// 3. `fail_commit_remaining` — checked inside `B::apply()` at commit time.
+///
+/// All counters use `saturating_add` when incremented, preventing overflow
+/// when tests configure multiple rounds of failures.
 pub(crate) struct StoreState<B: StoreBackend> {
+    /// Backend-specific durable state (e.g. the `HashMap` of records).
     pub(crate) durable: B::Durable,
+    /// All operations indexed by id, both pending and recently finished.
+    /// Finished entries are removed when `StoreHandle::wait` consumes them.
     ops: HashMap<PendingWriteId, PendingOp<B::Payload, B::Receipt>>,
+    /// Submission-order queue of delayed operations awaiting manual release.
+    /// Auto-completed operations are never added to this queue.
     order: VecDeque<PendingWriteId>,
+    /// Monotonically increasing counter for the next operation id. Starts at 1
+    /// so that id 0 is never issued (useful as a sentinel in tests).
     next_op_id: u64,
+    /// When `true`, submissions are applied immediately rather than enqueued.
     pub(crate) auto_complete: bool,
+    /// Number of upcoming submissions to force-delay regardless of
+    /// `auto_complete`. Decremented on each delayed submission.
     delay_next: usize,
+    /// Remaining submissions to reject with `InjectedSubmissionFailure`.
     fail_submit_remaining: usize,
+    /// Remaining commits to fail with `InjectedCommitFailure`. Passed to
+    /// `B::apply()` which is responsible for checking and decrementing it.
     fail_commit_remaining: usize,
 }
 
@@ -83,11 +191,22 @@ impl<B: StoreBackend> Default for StoreState<B> {
 // Core (Mutex + Condvar wrapper)
 // ---------------------------------------------------------------------------
 
-/// Shared interior that wraps `StoreState<B>` with a mutex and condvar.
+/// Shared interior that wraps [`StoreState`] with a mutex and condvar.
 ///
-/// All public control methods (release, fault injection, pending queries) are
-/// implemented here once. Domain wrappers hold `Arc<InMemoryStoreCore<B>>`
-/// and delegate to these methods.
+/// This is the single synchronization point for each backend. All public
+/// control methods — fault injection, release, pending queries — are
+/// implemented here once. Domain-specific wrappers (`InMemoryDoneLedger`,
+/// `InMemoryFindingsSink`) hold `Arc<InMemoryStoreCore<B>>` and delegate to
+/// these methods, adding only payload construction and trait-impl boilerplate.
+///
+/// # Condvar protocol
+///
+/// The condvar is signaled (`notify_all`) whenever any operation transitions
+/// to `Finished`. Waiters (`StoreHandle::wait`) re-check their specific op id
+/// after each wake, tolerating spurious wakes and wakes for other operations.
+/// `notify_all` (rather than `notify_one`) is used because multiple handles
+/// may be waiting on different operations simultaneously, and the condvar is
+/// shared across all of them.
 pub(crate) struct InMemoryStoreCore<B: StoreBackend> {
     pub(crate) state: Mutex<StoreState<B>>,
     pub(crate) cv: Condvar,
@@ -104,6 +223,9 @@ impl<B: StoreBackend> Default for InMemoryStoreCore<B> {
 
 impl<B: StoreBackend> InMemoryStoreCore<B> {
     /// Create a core with an explicit auto-complete mode.
+    ///
+    /// Pass `false` to start in delayed mode, where all submissions are
+    /// enqueued as pending and must be released explicitly.
     pub(crate) fn with_auto_complete(auto_complete: bool) -> Self {
         Self {
             state: Mutex::new(StoreState {
@@ -114,6 +236,8 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
         }
     }
 
+    /// Acquire the state mutex, converting a poisoned lock into the
+    /// backend-specific `Poisoned` error variant.
     pub(crate) fn lock_state(
         &self,
     ) -> Result<MutexGuard<'_, StoreState<B>>, InMemoryPersistenceError> {
@@ -126,6 +250,12 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
 
     // -- Fault injection controls ------------------------------------------
 
+    /// Toggle the auto-complete mode for all future submissions.
+    ///
+    /// When `auto_complete` is `true` (the default), submissions apply their
+    /// payload immediately and the returned handle's `wait()` returns at once.
+    /// When `false`, submissions are enqueued and block until explicitly
+    /// released.
     pub(crate) fn set_auto_complete(
         &self,
         auto_complete: bool,
@@ -135,12 +265,27 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
         Ok(())
     }
 
+    /// Force the next `count` submissions to be delayed, regardless of
+    /// `auto_complete`.
+    ///
+    /// The `delay_next` counter takes priority over `auto_complete`: even if
+    /// auto-complete is on, the next `count` writes will be enqueued as
+    /// pending. This allows mixed-mode operation within a single test
+    /// without toggling `auto_complete` back and forth.
+    ///
+    /// Calls are additive — `delay_next_writes(2)` followed by
+    /// `delay_next_writes(3)` delays 5 writes total (saturating addition).
     pub(crate) fn delay_next_writes(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
         guard.delay_next = guard.delay_next.saturating_add(count);
         Ok(())
     }
 
+    /// Fail the next `count` submissions with `InjectedSubmissionFailure`.
+    ///
+    /// Submission failures are checked before any state mutation — no handle
+    /// is created, no op id is allocated, and the durable state is untouched.
+    /// This simulates backend unavailability at the request-acceptance layer.
     pub(crate) fn fail_next_submissions(
         &self,
         count: usize,
@@ -150,6 +295,11 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
         Ok(())
     }
 
+    /// Fail the next `count` commits with `InjectedCommitFailure`.
+    ///
+    /// Unlike submission failures, commit failures occur at apply time — the
+    /// caller receives a valid handle, but `wait()` returns the injected error.
+    /// This simulates fsync/replication failures in real backends.
     pub(crate) fn fail_next_commits(&self, count: usize) -> Result<(), InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
         guard.fail_commit_remaining = guard.fail_commit_remaining.saturating_add(count);
@@ -160,9 +310,14 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
 
     /// Release one delayed operation in the requested order.
     ///
+    /// Pops entries from the `order` queue (front for `OldestFirst`, back for
+    /// `NewestFirst`) until it finds one that is still `Pending`, then applies
+    /// its payload via [`finish_op`]. Already-finished entries are silently
+    /// discarded — this can happen when `release_specific` was used to
+    /// complete an op out of queue order.
+    ///
     /// Returns `Ok(Some(id))` with the released operation's id, or `Ok(None)`
-    /// if the pending queue is empty. Already-finished operations in the queue
-    /// are silently skipped.
+    /// if no pending operations remain in the queue.
     pub(crate) fn release_next(
         &self,
         order: CompletionOrder,
@@ -183,6 +338,7 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
             {
                 break Some(op_id);
             }
+            // Stale entry (already finished via release_specific) — skip it.
         };
         let Some(op_id) = op_id else {
             return Ok(None);
@@ -194,8 +350,12 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
 
     /// Release a specific delayed operation by id.
     ///
-    /// The released operation's entry is removed from the `order` queue to
-    /// prevent stale IDs from accumulating.
+    /// Returns `Ok(true)` if the operation was pending and has now been
+    /// applied, or `Ok(false)` if the id is unknown or already finished.
+    ///
+    /// The released operation's entry is explicitly removed from the `order`
+    /// queue via `retain` to prevent stale IDs from accumulating. This is
+    /// O(n) in queue length, acceptable for a test backend.
     pub(crate) fn release_specific(
         &self,
         op_id: PendingWriteId,
@@ -217,14 +377,27 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
     /// Release every currently delayed operation under a single lock
     /// acquisition.
     ///
-    /// Uses a `HashSet` for the drain filter to achieve O(n+m) complexity
-    /// instead of the O(n*m) cost of linear search per retained element.
+    /// Only operations that are `Pending` at snapshot time are released.
+    /// Operations submitted concurrently after the snapshot are not drained,
+    /// preventing unbounded loops when writer threads are active.
+    ///
+    /// The `order` parameter controls the apply sequence: `OldestFirst`
+    /// (FIFO) is the natural drain; `NewestFirst` (LIFO) lets tests exercise
+    /// out-of-order durability.
+    ///
+    /// # Complexity
+    ///
+    /// Uses a `HashSet` for the queue cleanup pass to achieve O(n+m)
+    /// (n = queue length, m = released count) instead of the O(n*m)
+    /// cost of per-element linear search via `retain`.
     pub(crate) fn release_all(
         &self,
         order: CompletionOrder,
     ) -> Result<usize, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
 
+        // Snapshot pending ops before mutation so concurrent submitters
+        // cannot extend the set we drain.
         let mut pending: Vec<PendingWriteId> = guard
             .order
             .iter()
@@ -273,16 +446,39 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
 
     // -- Submission --------------------------------------------------------
 
-    /// Core submission logic: check fault injection, allocate an op id,
-    /// decide delay vs auto-complete, and return the new handle.
+    /// Submit a payload for durability, returning a handle that can be
+    /// waited on for the commit result.
     ///
-    /// The caller must build the `payload` before calling this method.
+    /// This is the primary entry point for all write operations. The caller
+    /// (a domain wrapper) constructs the `payload` and passes it here; all
+    /// queuing, fault injection, and completion logic is handled generically.
+    ///
+    /// # Execution order
+    ///
+    /// 1. Check `fail_submit_remaining` — if non-zero, reject immediately.
+    /// 2. Allocate a monotonic op id.
+    /// 3. Determine delay: `delay_next > 0` takes priority over
+    ///    `auto_complete`. This lets callers force a specific number of
+    ///    delayed writes without toggling the global mode.
+    /// 4. If delayed: enqueue in `ops` + `order`, return a blocking handle.
+    ///    If auto-complete: apply the payload now, store the `Finished`
+    ///    result, notify waiters, return a handle that resolves immediately.
+    ///
+    /// # Errors
+    ///
+    /// - `InjectedSubmissionFailure` — the `fail_submit_remaining` counter
+    ///   was non-zero (no state change occurs).
+    /// - `InjectedSubmissionFailure` — op id counter overflow (should be
+    ///   unreachable in practice with `u64`).
+    /// - Any error from `B::apply()` for auto-completed writes — stored in
+    ///   the op and surfaced when the handle is waited on.
     pub(crate) fn submit(
         self: &Arc<Self>,
         payload: B::Payload,
     ) -> Result<StoreHandle<B>, InMemoryPersistenceError> {
         let mut guard = self.lock_state()?;
 
+        // Phase 1: Submission fault injection — reject before any state change.
         if guard.fail_submit_remaining > 0 {
             guard.fail_submit_remaining -= 1;
             return Err(InMemoryPersistenceError::InjectedSubmissionFailure {
@@ -290,6 +486,7 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
             });
         }
 
+        // Phase 2: Allocate a unique, monotonically increasing op id.
         let op_id = PendingWriteId::from_raw(guard.next_op_id);
         guard.next_op_id = guard.next_op_id.checked_add(1).ok_or(
             InMemoryPersistenceError::InjectedSubmissionFailure {
@@ -302,6 +499,8 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
             state: PendingState::Pending,
         };
 
+        // Phase 3: delay_next takes priority over auto_complete, allowing
+        // per-submission delay overrides without toggling global mode.
         let should_delay = if guard.delay_next > 0 {
             guard.delay_next -= 1;
             true
@@ -309,10 +508,14 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
             !guard.auto_complete
         };
 
+        // Phase 4: Enqueue or apply.
         if should_delay {
             guard.order.push_back(op_id);
             guard.ops.insert(op_id, op);
         } else {
+            // Reborrow through a local to satisfy the borrow checker: we
+            // need `&mut state.durable` and `&mut state.fail_commit_remaining`
+            // simultaneously, which requires destructuring through `&mut *guard`.
             let state = &mut *guard;
             let result = B::apply(
                 &mut state.durable,
@@ -337,8 +540,17 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
 
 /// Commit handle backed by the generic store core.
 ///
-/// Calling [`wait`](CommitHandle::wait) blocks the current thread on the
-/// shared condvar until the operation transitions to `Finished`.
+/// Each handle is a lightweight `(Arc, PendingWriteId)` pair. Calling
+/// [`wait`](StoreHandle::wait) blocks the current thread on the shared
+/// condvar until the operation transitions to `Finished`, then extracts
+/// the result and removes the operation entry from the map.
+///
+/// # Single-use consumption
+///
+/// `wait` takes `self` by value, so a handle can only be consumed once.
+/// After `wait` returns, the operation's entry is removed from the `ops`
+/// map. If the entry was somehow already consumed (should be impossible
+/// at the type level), `UnknownOperation` is returned.
 pub(crate) struct StoreHandle<B: StoreBackend> {
     inner: Arc<InMemoryStoreCore<B>>,
     op_id: PendingWriteId,
@@ -351,7 +563,24 @@ impl<B: StoreBackend> StoreHandle<B> {
         self.op_id
     }
 
-    /// Block until this operation is durable (or fails).
+    /// Block until this operation is durable (or fails), consuming the handle.
+    ///
+    /// The wait loop re-acquires the mutex after each condvar wake and checks
+    /// whether this specific operation has transitioned to `Finished`. Spurious
+    /// wakes and wakes for other operations are handled by looping.
+    ///
+    /// On success, the `Finished` result is `take()`n out of the `Option`
+    /// (consuming it) and the operation entry is removed from the `ops` map.
+    /// This ensures no stale entries accumulate across the lifetime of the
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// - `UnknownOperation` — the op id was not found in the map (indicates
+    ///   a bug or double-wait, which the type system prevents).
+    /// - `Poisoned` — the mutex was poisoned by a panic in another thread.
+    /// - Any `InMemoryPersistenceError` produced by `B::apply()` during
+    ///   commit (e.g. `InjectedCommitFailure`, referential integrity errors).
     pub(crate) fn wait(self) -> Result<B::Receipt, InMemoryPersistenceError> {
         let mut guard =
             self.inner
@@ -381,6 +610,7 @@ impl<B: StoreBackend> StoreHandle<B> {
             };
 
             if let Some(result) = finished {
+                // Clean up the finished entry to prevent unbounded map growth.
                 guard.ops.remove(&self.op_id);
                 return result?;
             }
@@ -402,9 +632,27 @@ impl<B: StoreBackend> StoreHandle<B> {
 
 /// Transition a pending operation to `Finished` by applying its payload.
 ///
-/// Removes the op from the map to avoid the split-borrow limitation (we need
-/// `&op.payload` and `&mut state` simultaneously), applies the payload, then
-/// re-inserts the finished op. Already-finished ops are a no-op.
+/// # Borrow-checker dance
+///
+/// We need `&op.payload` (immutable) and `&mut state.durable` (mutable)
+/// simultaneously, but both live inside `state.ops` / `state`. Rust's
+/// borrow checker cannot prove these do not alias through the `HashMap`.
+/// The workaround is a **remove → apply → reinsert** sequence:
+///
+/// 1. Remove the op from `ops` (now we own it independently).
+/// 2. Destructure `state` to get `&mut durable` and `&mut fail_commit_remaining`.
+/// 3. Call `B::apply()` with the owned `op.payload` and the destructured refs.
+/// 4. Store the result in `op.state` and reinsert.
+///
+/// Already-finished ops (e.g. from a concurrent `release_specific` call)
+/// are silently reinserted without re-applying.
+///
+/// # Errors
+///
+/// Returns `UnknownOperation` if the op id is not in the map. Errors from
+/// `B::apply()` (including injected commit failures) are stored in the
+/// operation's `Finished` state and surfaced when the handle is waited on —
+/// this function itself returns `Ok(())` in that case.
 fn finish_op<B: StoreBackend>(
     state: &mut StoreState<B>,
     op_id: PendingWriteId,
@@ -412,6 +660,7 @@ fn finish_op<B: StoreBackend>(
     let mut op = match state.ops.remove(&op_id) {
         Some(op) if op.state.is_pending() => op,
         Some(op) => {
+            // Already finished — reinsert without re-applying.
             state.ops.insert(op_id, op);
             return Ok(());
         }
