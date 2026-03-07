@@ -11,6 +11,7 @@ members = [
     "crates/gossip-scanner-runtime",
     "crates/gossip-connectors",
     "crates/gossip-coordination",
+    "crates/gossip-coordination-etcd",
     "crates/gossip-persistence-inmemory",
     "crates/gossip-frontier",
     "crates/gossip-worker",
@@ -35,6 +36,7 @@ scanner-git = { path = "crates/scanner-git" }
 gossip-scanner-runtime = { path = "crates/gossip-scanner-runtime" }
 gossip-connectors = { path = "crates/gossip-connectors" }
 gossip-coordination = { path = "crates/gossip-coordination" }
+gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
 gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
 gossip-frontier = { path = "crates/gossip-frontier" }
 
