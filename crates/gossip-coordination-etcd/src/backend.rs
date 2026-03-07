@@ -4,7 +4,6 @@ use crate::config::{
     DEFAULT_BOOTSTRAP_LEASE_DURATION, DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig,
 };
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
-use crate::runtime::SyncRuntime;
 use gossip_coordination::{
     AcquireError, AcquireResultView, AcquireScratch, CheckpointError, ClaimError, CompleteError,
     CoordinationBackend, CreateRunError, CursorUpdate, GetRunError, IdempotentOutcome,
