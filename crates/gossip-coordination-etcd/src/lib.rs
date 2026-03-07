@@ -49,8 +49,8 @@ mod keyspace;
 
 pub use backend::EtcdCoordinator;
 pub use codec::{
-    BlobKind, EtcdCodecError, decode_run_record_v1, decode_shard_record_v1, encode_run_record_v1,
-    encode_shard_record_v1,
+    BlobKind, EtcdCodecError, decode_run_record, decode_shard_record, encode_run_record,
+    encode_shard_record,
 };
 pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};

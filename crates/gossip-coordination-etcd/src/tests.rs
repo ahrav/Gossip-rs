@@ -305,6 +305,8 @@ fn keyspace_root_prefix_does_not_emit_double_slashes() {
 #[case::no_leading_slash("gossip/v1", Err(EtcdKeyspaceError::PrefixMustStartWithSlash))]
 #[case::trailing_slash("/gossip/", Err(EtcdKeyspaceError::PrefixMustNotEndWithSlash))]
 #[case::trailing_slash_deep("/a/b/c/", Err(EtcdKeyspaceError::PrefixMustNotEndWithSlash))]
+#[case::double_slash("/gossip//v1", Err(EtcdKeyspaceError::PrefixContainsDoubleSlash))]
+#[case::double_slash_deep("/a//b/c", Err(EtcdKeyspaceError::PrefixContainsDoubleSlash))]
 fn keyspace_prefix_validation(
     #[case] input: &str,
     #[case] expected: Result<(), EtcdKeyspaceError>,
@@ -394,6 +396,12 @@ proptest! {
         prop_assert!(run_active.starts_with(&runs_active));
         prop_assert!(runs_active.contains("/runs_active"));
 
+        // Scan isolation: run_records_scan_prefix must NOT match
+        // runs_active keys (the trailing slash prevents this).
+        let run_scan_pfx = ks.run_records_scan_prefix(tenant);
+        prop_assert!(run_scan_pfx.ends_with('/'));
+        prop_assert!(!run_active.starts_with(&run_scan_pfx));
+
         // Active-shard index keys are siblings of shards/, not children.
         prop_assert!(shards_active.starts_with(&run_key));
         prop_assert!(shard_active.starts_with(&shards_active));
@@ -422,6 +430,41 @@ proptest! {
         prop_assert_eq!(shard_segment.len(), 16);
         prop_assert!(shard_segment.chars().all(|c| c.is_ascii_hexdigit()));
     }
+}
+
+/// Verify: `EtcdKeyspace::new` accepts prefixes with interior double-slashes.
+///
+/// If this test passes (construction succeeds), the double-slash rejection
+/// is missing.
+#[test]
+fn keyspace_rejects_interior_double_slashes() {
+    let result = EtcdKeyspace::new("/gossip//v1");
+    assert!(
+        result.is_err(),
+        "prefix with interior double-slash must be rejected, but was accepted"
+    );
+}
+
+/// Verify: `run_records_scan_prefix` isolates run records from `runs_active`.
+///
+/// The scan prefix must end with `/` so an etcd byte-prefix scan does not
+/// accidentally match `runs_active/` sibling keys.
+#[test]
+fn run_records_scan_prefix_is_scan_safe() {
+    let ks = EtcdKeyspace::new("/gossip/v1").unwrap();
+    let tenant = TenantId::from_bytes([0xCC; 32]);
+
+    let scan_prefix = ks.run_records_scan_prefix(tenant);
+    let runs_active = ks.runs_active_prefix(tenant);
+
+    assert!(
+        scan_prefix.ends_with('/'),
+        "run_records_scan_prefix must end with trailing slash"
+    );
+    assert!(
+        !runs_active.starts_with(&scan_prefix),
+        "runs_active ({runs_active}) must not be matched by run_records_scan_prefix ({scan_prefix})"
+    );
 }
 
 #[test]

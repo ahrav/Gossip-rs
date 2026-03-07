@@ -61,6 +61,9 @@ pub enum EtcdKeyspaceError {
     /// Prefix must not end with `/` (unless it is exactly `"/"`), because
     /// path joins would produce double slashes.
     PrefixMustNotEndWithSlash,
+    /// Prefix contains consecutive slashes (`//`), which would create
+    /// invisible empty path segments in the etcd keyspace.
+    PrefixContainsDoubleSlash,
 }
 
 impl fmt::Display for EtcdKeyspaceError {
@@ -72,6 +75,9 @@ impl fmt::Display for EtcdKeyspaceError {
             }
             Self::PrefixMustNotEndWithSlash => {
                 f.write_str("etcd keyspace prefix must not end with '/' unless it is exactly '/'")
+            }
+            Self::PrefixContainsDoubleSlash => {
+                f.write_str("etcd keyspace prefix must not contain consecutive slashes '//'")
             }
         }
     }
@@ -135,6 +141,9 @@ impl EtcdKeyspace {
         if prefix.ends_with('/') && prefix.len() > 1 {
             return Err(EtcdKeyspaceError::PrefixMustNotEndWithSlash);
         }
+        if prefix.contains("//") {
+            return Err(EtcdKeyspaceError::PrefixContainsDoubleSlash);
+        }
         Ok(Self { prefix })
     }
 
@@ -167,11 +176,27 @@ impl EtcdKeyspace {
     // Run record keys
     // -----------------------------------------------------------------------
 
-    /// Scan prefix for all run records under a tenant:
+    /// Common segment for run records under a tenant:
     /// `{prefix}/tenants/{tenant_hex}/runs`.
+    ///
+    /// This is the *non-trailing-slash* form used for building child keys.
+    /// Use [`run_records_scan_prefix`](Self::run_records_scan_prefix) for
+    /// etcd prefix scans to avoid matching sibling `runs_active/` keys.
     #[must_use]
     pub fn runs_prefix(&self, tenant: TenantId) -> String {
         format!("{}/runs", self.tenant_prefix(tenant))
+    }
+
+    /// Scan prefix for enumerating run records under a tenant:
+    /// `{prefix}/tenants/{tenant_hex}/runs/`.
+    ///
+    /// The trailing slash is critical. Without it, an etcd prefix scan on
+    /// `.../runs` would also match `.../runs_active/...` keys because
+    /// `"runs"` is a prefix of `"runs_active"`. The trailing slash
+    /// restricts the scan to children of the `runs/` directory only.
+    #[must_use]
+    pub fn run_records_scan_prefix(&self, tenant: TenantId) -> String {
+        format!("{}/", self.runs_prefix(tenant))
     }
 
     /// Exact key for a run record:

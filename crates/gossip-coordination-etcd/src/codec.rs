@@ -73,6 +73,14 @@ use gossip_stdx::{ByteSlab, RingBuffer, SlabFull};
 
 const VERSION_PREFIX_V1: &[u8; 2] = b"v1";
 
+/// Decode-time upper bound on root shard count per run.
+///
+/// Prevents a crafted blob from triggering a multi-gigabyte allocation via
+/// an inflated length prefix. The value (1024) is deliberately generous —
+/// typical runs have far fewer root shards — but bounded enough to prevent
+/// DoS from untrusted input.
+const MAX_ROOT_SHARDS: usize = 1024;
+
 /// Blob discriminator embedded after the 2-byte version header.
 ///
 /// The decoder reads this byte to dispatch to the correct record parser.
@@ -212,7 +220,7 @@ impl From<SlabFull> for EtcdCodecError {
 /// Encoding is infallible — all record fields serialize to fixed or
 /// length-prefixed representations with no size limits beyond available memory.
 #[must_use]
-pub fn encode_run_record_v1(record: &RunRecord) -> Vec<u8> {
+pub fn encode_run_record(record: &RunRecord) -> Vec<u8> {
     let owned = OwnedRunRecord::from_record(record);
     let mut out = Vec::with_capacity(256);
     out.extend_from_slice(VERSION_PREFIX_V1);
@@ -236,7 +244,7 @@ pub fn encode_run_record_v1(record: &RunRecord) -> Vec<u8> {
 /// - Invalid enum discriminants
 /// - Structural invariant violations (e.g. `Active` status with no root shards)
 /// - Unexpected trailing bytes
-pub fn decode_run_record_v1(blob: &[u8]) -> Result<RunRecord, EtcdCodecError> {
+pub fn decode_run_record(blob: &[u8]) -> Result<RunRecord, EtcdCodecError> {
     let mut decoder = Decoder::new(blob);
     decoder.expect_header(BlobKind::RunRecord)?;
     let owned = OwnedRunRecord::decode(&mut decoder)?;
@@ -253,7 +261,7 @@ pub fn decode_run_record_v1(blob: &[u8]) -> Result<RunRecord, EtcdCodecError> {
 /// Encoding is infallible given a valid record. The output begins with the
 /// standard 3-byte header followed by all record fields in deterministic order.
 #[must_use]
-pub fn encode_shard_record_v1(record: &ShardRecord, slab: &ByteSlab) -> Vec<u8> {
+pub fn encode_shard_record(record: &ShardRecord, slab: &ByteSlab) -> Vec<u8> {
     let owned = OwnedShardRecord::from_record(record, slab);
     let mut out = Vec::with_capacity(256);
     out.extend_from_slice(VERSION_PREFIX_V1);
@@ -273,11 +281,11 @@ pub fn encode_shard_record_v1(record: &ShardRecord, slab: &ByteSlab) -> Vec<u8> 
 /// # Errors
 ///
 /// Returns [`EtcdCodecError`] on:
-/// - Any wire-level or invariant error (same as [`decode_run_record_v1`])
+/// - Any wire-level or invariant error (same as [`decode_run_record`])
 /// - Invalid shard spec or cursor byte content
 /// - Insufficient slab capacity ([`EtcdCodecError::SlabFull`]) — slab is
 ///   left unchanged on this error
-pub fn decode_shard_record_v1(
+pub fn decode_shard_record(
     blob: &[u8],
     slab: &mut ByteSlab,
 ) -> Result<ShardRecord, EtcdCodecError> {
@@ -377,6 +385,12 @@ impl OwnedRunRecord {
         let completed_at = decoder.read_opt_u64()?.map(LogicalTime::from_raw);
 
         let root_len = decoder.read_len()?;
+        if root_len > MAX_ROOT_SHARDS {
+            return Err(EtcdCodecError::InvariantViolation {
+                kind: "RunRecord",
+                detail: "root_shards exceeds decode cap",
+            });
+        }
         let mut root_shards = Vec::with_capacity(root_len);
         for _ in 0..root_len {
             root_shards.push(ShardId::from_raw(decoder.read_u64()?));
@@ -677,6 +691,12 @@ impl OwnedRunOpResult {
         match decoder.read_u8()? {
             1 => {
                 let len = decoder.read_len()?;
+                if len > MAX_ROOT_SHARDS {
+                    return Err(EtcdCodecError::InvariantViolation {
+                        kind: "RunOpResult",
+                        detail: "RegisteredShards count exceeds decode cap",
+                    });
+                }
                 let mut shard_ids = Vec::with_capacity(len);
                 for _ in 0..len {
                     shard_ids.push(ShardId::from_raw(decoder.read_u64()?));
@@ -920,16 +940,26 @@ impl OwnedShardRecord {
 
         let cursor_update = match (&self.cursor_last_key, &self.cursor_token) {
             (None, None) => CursorUpdate::initial(),
-            (Some(last_key), None) => CursorUpdate::try_with_last_key(last_key).map_err(|err| {
-                EtcdCodecError::InvalidCursor {
-                    message: err.to_string(),
+            (Some(last_key), None) => match CursorUpdate::try_with_last_key(last_key) {
+                Ok(cu) => cu,
+                Err(err) => {
+                    pooled_spec.deallocate(slab);
+                    return Err(EtcdCodecError::InvalidCursor {
+                        message: err.to_string(),
+                    });
                 }
-            })?,
-            (Some(last_key), Some(token)) => CursorUpdate::try_with_token(last_key, token)
-                .map_err(|err| EtcdCodecError::InvalidCursor {
-                    message: err.to_string(),
-                })?,
+            },
+            (Some(last_key), Some(token)) => match CursorUpdate::try_with_token(last_key, token) {
+                Ok(cu) => cu,
+                Err(err) => {
+                    pooled_spec.deallocate(slab);
+                    return Err(EtcdCodecError::InvalidCursor {
+                        message: err.to_string(),
+                    });
+                }
+            },
             (None, Some(_)) => {
+                pooled_spec.deallocate(slab);
                 return Err(EtcdCodecError::InvariantViolation {
                     kind: "ShardRecord",
                     detail: "cursor token without cursor last_key is invalid",
@@ -1096,6 +1126,14 @@ impl OwnedShardRecord {
                     });
                 }
             }
+
+            if i > 0 && self.op_log[i].executed_at < self.op_log[i - 1].executed_at {
+                return Err(EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "op_log timestamps must be non-decreasing",
+                });
+            }
+
             self.op_log[i].validate()?;
         }
 

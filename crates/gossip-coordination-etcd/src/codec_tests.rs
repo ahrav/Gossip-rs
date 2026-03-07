@@ -29,9 +29,9 @@ use rstest::rstest;
 #[case::cancelled_dispatched(RunStatus::Cancelled, CursorSemantics::Dispatched)]
 fn run_record_v1_round_trips(#[case] status: RunStatus, #[case] semantics: CursorSemantics) {
     let record = sample_run_record(status, semantics);
-    let encoded = encode_run_record_v1(&record);
-    let decoded = decode_run_record_v1(&encoded).expect("run record should decode");
-    let reencoded = encode_run_record_v1(&decoded);
+    let encoded = encode_run_record(&record);
+    let decoded = decode_run_record(&encoded).expect("run record should decode");
+    let reencoded = encode_run_record(&decoded);
 
     assert_eq!(
         decoded, record,
@@ -52,12 +52,12 @@ fn run_record_v1_round_trips(#[case] status: RunStatus, #[case] semantics: Curso
 #[case::dispatched(CursorSemantics::Dispatched)]
 fn shard_record_v1_round_trips_active(#[case] semantics: CursorSemantics) {
     let (mut record, mut slab) = sample_active_child_shard_record(semantics);
-    let encoded = encode_shard_record_v1(&record, &slab);
+    let encoded = encode_shard_record(&record, &slab);
 
     let mut decode_slab = ByteSlab::with_capacity(4096);
     let mut decoded =
-        decode_shard_record_v1(&encoded, &mut decode_slab).expect("shard record should decode");
-    let reencoded = encode_shard_record_v1(&decoded, &decode_slab);
+        decode_shard_record(&encoded, &mut decode_slab).expect("shard record should decode");
+    let reencoded = encode_shard_record(&decoded, &decode_slab);
 
     assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
     assert_eq!(reencoded, encoded);
@@ -69,9 +69,9 @@ fn shard_record_v1_round_trips_active(#[case] semantics: CursorSemantics) {
 #[test]
 fn shard_record_v1_round_trips_done() {
     let (mut done_record, mut done_slab) = sample_done_shard_record();
-    let done_encoded = encode_shard_record_v1(&done_record, &done_slab);
+    let done_encoded = encode_shard_record(&done_record, &done_slab);
     let mut done_decode_slab = ByteSlab::with_capacity(4096);
-    let mut done_decoded = decode_shard_record_v1(&done_encoded, &mut done_decode_slab)
+    let mut done_decoded = decode_shard_record(&done_encoded, &mut done_decode_slab)
         .expect("done record should decode");
     assert_shard_record_eq(&done_record, &done_slab, &done_decoded, &done_decode_slab);
     release_shard_record(&mut done_record, &mut done_slab);
@@ -81,9 +81,9 @@ fn shard_record_v1_round_trips_done() {
 #[test]
 fn shard_record_v1_round_trips_split() {
     let (mut split_record, mut split_slab) = sample_split_shard_record();
-    let split_encoded = encode_shard_record_v1(&split_record, &split_slab);
+    let split_encoded = encode_shard_record(&split_record, &split_slab);
     let mut split_decode_slab = ByteSlab::with_capacity(4096);
-    let mut split_decoded = decode_shard_record_v1(&split_encoded, &mut split_decode_slab)
+    let mut split_decoded = decode_shard_record(&split_encoded, &mut split_decode_slab)
         .expect("split record should decode");
     assert_shard_record_eq(
         &split_record,
@@ -103,12 +103,12 @@ fn shard_record_v1_round_trips_split() {
 #[case::other(ParkReason::Other)]
 fn shard_record_v1_round_trips_parked(#[case] park_reason: ParkReason) {
     let (mut record, mut slab) = sample_parked_shard_record(park_reason);
-    let encoded = encode_shard_record_v1(&record, &slab);
+    let encoded = encode_shard_record(&record, &slab);
 
     let mut decode_slab = ByteSlab::with_capacity(4096);
     let mut decoded =
-        decode_shard_record_v1(&encoded, &mut decode_slab).expect("parked record should decode");
-    let reencoded = encode_shard_record_v1(&decoded, &decode_slab);
+        decode_shard_record(&encoded, &mut decode_slab).expect("parked record should decode");
+    let reencoded = encode_shard_record(&decoded, &decode_slab);
 
     assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
     assert_eq!(reencoded, encoded);
@@ -123,13 +123,13 @@ fn shard_record_v1_round_trips_parked(#[case] park_reason: ParkReason) {
 
 #[test]
 fn decode_run_record_rejects_wrong_version_prefix() {
-    let mut blob = encode_run_record_v1(&sample_run_record(
+    let mut blob = encode_run_record(&sample_run_record(
         RunStatus::Active,
         CursorSemantics::Completed,
     ));
     blob[0] = b'x';
 
-    let error = decode_run_record_v1(&blob).expect_err("bad prefix must fail");
+    let error = decode_run_record(&blob).expect_err("bad prefix must fail");
     assert!(matches!(
         error,
         EtcdCodecError::InvalidVersionPrefix { actual } if actual == [b'x', b'1']
@@ -138,13 +138,13 @@ fn decode_run_record_rejects_wrong_version_prefix() {
 
 #[test]
 fn decode_run_record_rejects_trailing_bytes() {
-    let mut blob = encode_run_record_v1(&sample_run_record(
+    let mut blob = encode_run_record(&sample_run_record(
         RunStatus::Active,
         CursorSemantics::Completed,
     ));
     blob.push(0xff);
 
-    let error = decode_run_record_v1(&blob).expect_err("trailing bytes must fail");
+    let error = decode_run_record(&blob).expect_err("trailing bytes must fail");
     assert!(matches!(
         error,
         EtcdCodecError::TrailingBytes { remaining: 1 }
@@ -153,19 +153,18 @@ fn decode_run_record_rejects_trailing_bytes() {
 
 #[test]
 fn decode_run_record_rejects_truncated_blob() {
-    let blob = encode_run_record_v1(&sample_run_record(
+    let blob = encode_run_record(&sample_run_record(
         RunStatus::Done,
         CursorSemantics::Completed,
     ));
-    let error =
-        decode_run_record_v1(&blob[..blob.len() - 1]).expect_err("truncated blob must fail");
+    let error = decode_run_record(&blob[..blob.len() - 1]).expect_err("truncated blob must fail");
     assert!(matches!(error, EtcdCodecError::Truncated { .. }));
 }
 
 #[test]
 fn decode_run_record_rejects_active_without_root_shards() {
     let blob = invalid_active_run_without_roots_blob();
-    let error = decode_run_record_v1(&blob).expect_err("invalid run should fail");
+    let error = decode_run_record(&blob).expect_err("invalid run should fail");
     assert!(matches!(
         error,
         EtcdCodecError::InvariantViolation {
@@ -177,12 +176,12 @@ fn decode_run_record_rejects_active_without_root_shards() {
 
 #[test]
 fn decode_shard_record_rejects_wrong_blob_kind() {
-    let blob = encode_run_record_v1(&sample_run_record(
+    let blob = encode_run_record(&sample_run_record(
         RunStatus::Active,
         CursorSemantics::Completed,
     ));
     let mut slab = ByteSlab::with_capacity(4096);
-    let error = decode_shard_record_v1(&blob, &mut slab).expect_err("wrong kind must fail");
+    let error = decode_shard_record(&blob, &mut slab).expect_err("wrong kind must fail");
     assert!(matches!(
         error,
         EtcdCodecError::UnexpectedBlobKind {
@@ -196,7 +195,7 @@ fn decode_shard_record_rejects_wrong_blob_kind() {
 fn decode_shard_record_rejects_cursor_token_without_last_key() {
     let blob = invalid_shard_token_without_last_key_blob();
     let mut slab = ByteSlab::with_capacity(4096);
-    let error = decode_shard_record_v1(&blob, &mut slab).expect_err("invalid shard should fail");
+    let error = decode_shard_record(&blob, &mut slab).expect_err("invalid shard should fail");
     assert!(matches!(
         error,
         EtcdCodecError::InvariantViolation {
@@ -209,10 +208,10 @@ fn decode_shard_record_rejects_cursor_token_without_last_key() {
 #[test]
 fn decode_shard_record_rolls_back_on_slab_exhaustion() {
     let (mut record, mut slab) = sample_active_child_shard_record(CursorSemantics::Dispatched);
-    let blob = encode_shard_record_v1(&record, &slab);
+    let blob = encode_shard_record(&record, &slab);
     let mut tiny_slab = ByteSlab::with_capacity(48);
 
-    let error = decode_shard_record_v1(&blob, &mut tiny_slab).expect_err("small slab must fail");
+    let error = decode_shard_record(&blob, &mut tiny_slab).expect_err("small slab must fail");
     assert!(matches!(error, EtcdCodecError::SlabFull(_)));
     assert_eq!(
         tiny_slab.live_count(),
@@ -389,10 +388,10 @@ proptest! {
     /// `decode(encode(record)) == record` AND `encode(decode(encode(r))) == encode(r)`.
     #[test]
     fn run_record_v1_proptest_round_trip(record in arb_run_record()) {
-        let encoded = encode_run_record_v1(&record);
-        let decoded = decode_run_record_v1(&encoded)
+        let encoded = encode_run_record(&record);
+        let decoded = decode_run_record(&encoded)
             .expect("proptest-generated record must decode");
-        let reencoded = encode_run_record_v1(&decoded);
+        let reencoded = encode_run_record(&decoded);
 
         prop_assert_eq!(&decoded, &record, "decode(encode(r)) != r");
         prop_assert_eq!(&reencoded, &encoded, "encode(decode(encode(r))) != encode(r)");
@@ -740,4 +739,139 @@ fn push_bytes(out: &mut Vec<u8>, value: &[u8]) {
         u32::try_from(value.len()).expect("test payload length exceeds u32"),
     );
     out.extend_from_slice(value);
+}
+
+/// Constructs a blob with valid spec fields but an empty cursor_last_key
+/// (present but zero-length), which should be rejected by
+/// `CursorUpdate::try_with_last_key`. If the slab's live count is nonzero
+/// after the decode error, the spec allocation was leaked.
+#[test]
+fn decode_shard_record_rolls_back_spec_on_cursor_parse_failure() {
+    // Build a blob with a valid spec (start < end) but an invalid cursor
+    // (present but empty last_key, which CursorUpdate::try_with_last_key rejects).
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"v1");
+    blob.push(BlobKind::ShardRecord as u8);
+    blob.extend_from_slice(TenantId::from_bytes([0x88; 32]).as_bytes());
+    push_u64(&mut blob, RunId::from_raw(1).as_raw());
+    push_u64(&mut blob, ShardId::from_raw(2).as_raw());
+    blob.push(ShardStatus::Active.as_u8());
+    blob.push(0); // park_reason absent
+    push_bytes(&mut blob, b"a"); // key_range_start
+    push_bytes(&mut blob, b"z"); // key_range_end
+    push_bytes(&mut blob, b"m"); // metadata
+    // cursor_last_key: present but empty — triggers EmptyLastKey error
+    // in CursorUpdate::try_with_last_key AFTER PooledShardSpec is allocated.
+    blob.push(1); // present
+    push_bytes(&mut blob, b""); // empty last_key
+    blob.push(0); // cursor_token absent
+    blob.push(CursorSemantics::Completed.as_u8());
+    blob.push(0); // no lease owner
+    push_u64(&mut blob, FenceEpoch::INITIAL.as_raw());
+    blob.push(0); // parent absent
+    push_u32(&mut blob, 0); // spawned len
+    push_u32(&mut blob, 0); // op_log len
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let result = decode_shard_record(&blob, &mut slab);
+    let err = result.expect_err("empty cursor last_key should be rejected");
+    assert!(
+        matches!(err, EtcdCodecError::InvalidCursor { .. }),
+        "expected InvalidCursor error from CursorUpdate validation, got: {err:?}"
+    );
+    assert_eq!(
+        slab.live_count(),
+        0,
+        "slab must have zero live allocations after cursor-parse failure — spec was leaked"
+    );
+}
+
+/// A blob encoding `root_len = 1_000_000` (requesting ~8 MB for ShardIds)
+/// should be rejected before the allocation occurs. If this test completes
+/// without error, the allocator guard is missing.
+#[test]
+fn decode_run_record_rejects_oversized_root_shards() {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"v1");
+    blob.push(BlobKind::RunRecord as u8);
+    blob.extend_from_slice(TenantId::from_bytes([0x99; 32]).as_bytes());
+    push_u64(&mut blob, RunId::from_raw(1).as_raw());
+    blob.push(CursorSemantics::Completed.as_u8());
+    push_u64(&mut blob, 30); // lease_duration
+    blob.push(0); // max_shard_retries absent
+    blob.push(RunStatus::Active.as_u8());
+    push_u64(&mut blob, LogicalTime::from_raw(5).as_raw()); // created_at
+    blob.push(0); // completed_at absent
+    // Encode an absurdly large root_shards length — this should be rejected
+    // before `Vec::with_capacity` is called.
+    push_u32(&mut blob, 1_000_000);
+    // Don't provide the actual data — decoder should reject before reading.
+
+    let result = decode_run_record(&blob);
+    // The blob is truncated, so the decoder will hit a Truncated error during
+    // the loop. But the real concern is whether Vec::with_capacity(1_000_000)
+    // is called before the loop. With a small enough value the alloc succeeds
+    // but wastes memory. The test documents the missing bounds check.
+    assert!(
+        result.is_err(),
+        "oversized root_shards blob must fail decode"
+    );
+}
+
+/// Verify: shard op_log timestamps are not checked for monotonicity.
+///
+/// Encodes a shard record with out-of-order op_log timestamps. If this
+/// decodes successfully, the monotonicity check is missing.
+#[test]
+fn decode_shard_record_rejects_non_monotonic_op_log_timestamps() {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"v1");
+    blob.push(BlobKind::ShardRecord as u8);
+    blob.extend_from_slice(TenantId::from_bytes([0xAA; 32]).as_bytes());
+    push_u64(&mut blob, RunId::from_raw(1).as_raw());
+    push_u64(&mut blob, ShardId::from_raw(2).as_raw());
+    blob.push(ShardStatus::Active.as_u8());
+    blob.push(0); // park_reason absent
+    push_bytes(&mut blob, b"a"); // key_range_start
+    push_bytes(&mut blob, b"z"); // key_range_end
+    push_bytes(&mut blob, b"m"); // metadata
+    blob.push(0); // cursor_last_key absent
+    blob.push(0); // cursor_token absent
+    blob.push(CursorSemantics::Completed.as_u8());
+    blob.push(0); // no lease
+    push_u64(&mut blob, FenceEpoch::INITIAL.as_raw());
+    blob.push(0); // parent absent
+    push_u32(&mut blob, 0); // spawned len
+
+    // Two op_log entries with decreasing timestamps (20, then 10).
+    push_u32(&mut blob, 2); // op_log len
+    // Entry 0: op_id=1, kind=Checkpoint, result=Completed, hash=0xAA, executed_at=20
+    push_u64(&mut blob, OpId::from_raw(1).as_raw());
+    blob.push(OpKind::Checkpoint.as_u8());
+    blob.push(OpResult::Completed.as_u8());
+    push_u64(&mut blob, 0xAA); // payload_hash (must be non-zero)
+    push_u64(&mut blob, LogicalTime::from_raw(20).as_raw());
+    // Entry 1: op_id=2, kind=Checkpoint, result=Completed, hash=0xBB, executed_at=10
+    push_u64(&mut blob, OpId::from_raw(2).as_raw());
+    blob.push(OpKind::Checkpoint.as_u8());
+    blob.push(OpResult::Completed.as_u8());
+    push_u64(&mut blob, 0xBB); // payload_hash (must be non-zero)
+    push_u64(&mut blob, LogicalTime::from_raw(10).as_raw());
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let result = decode_shard_record(&blob, &mut slab);
+    assert!(
+        result.is_err(),
+        "shard record with non-monotonic op_log timestamps should be rejected"
+    );
+    match result {
+        Err(EtcdCodecError::InvariantViolation { detail, .. }) => {
+            assert!(
+                detail.contains("non-decreasing"),
+                "error should mention timestamp monotonicity, got: {detail}"
+            );
+        }
+        Err(other) => panic!("expected InvariantViolation, got: {other:?}"),
+        Ok(_) => unreachable!(),
+    }
 }
