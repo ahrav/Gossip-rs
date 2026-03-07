@@ -677,32 +677,28 @@ fn apply_findings_payload(
         }
     }
 
-    // Validation passed — commit new rows into durable state.
-    for (key, record) in &batch_findings {
-        state
-            .durable_findings
-            .entry(*key)
-            .or_insert_with(|| record.clone());
+    // Capture counts before consuming the batch maps.
+    let findings_count = batch_findings.len() as u64;
+    let occurrences_count = batch_occurrences.len() as u64;
+    let observations_count = batch_observations.len() as u64;
+
+    // Validation passed — commit new rows into durable state by consuming the
+    // batch maps (avoids one clone per record compared to borrowed iteration).
+    for (key, record) in batch_findings {
+        state.durable_findings.entry(key).or_insert(record);
     }
-    for (key, record) in &batch_occurrences {
-        state
-            .durable_occurrences
-            .entry(*key)
-            .or_insert_with(|| record.clone());
+    for (key, record) in batch_occurrences {
+        state.durable_occurrences.entry(key).or_insert(record);
     }
     // Observations use upsert semantics: always overwrite with the merged result.
-    for (key, record) in batch_observations.iter() {
-        state.durable_observations.insert(*key, record.clone());
+    for (key, record) in batch_observations {
+        state.durable_observations.insert(key, record);
     }
 
-    // Use deduplicated batch map sizes rather than raw payload lengths.
-    // Within-batch duplicates (same key, same content) are silently skipped
-    // by the `continue` branches above, so `batch_*.len()` reflects the
-    // number of distinct rows actually acknowledged by this commit.
     Ok(FindingsCommitReceipt::new(
-        batch_findings.len() as u64,
-        batch_occurrences.len() as u64,
-        batch_observations.len() as u64,
+        findings_count,
+        occurrences_count,
+        observations_count,
     ))
 }
 
