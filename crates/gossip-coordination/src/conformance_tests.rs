@@ -40,10 +40,9 @@ use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::sim::backend::SimIntrospection as _;
 use crate::test_fixtures::{
-    acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
+    LEASE_DURATION, acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
     seeded_coordinator_with_semantics, test_cursor, test_key, test_run, test_run_config,
     test_shard, test_split_replace_plan, test_split_residual_plan, test_tenant, test_worker,
-    LEASE_DURATION,
 };
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
