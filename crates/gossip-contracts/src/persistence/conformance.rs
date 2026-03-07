@@ -595,18 +595,18 @@ pub fn run_redaction_conformance() -> Result<u32, PersistenceConformanceError> {
     let fixture = sample_fixture(0x77)?;
     let norm = NormHash::from_digest([0xE7; 32]);
     let norm_debug = format!("{norm:?}");
-    assert_no_raw_hex("redaction/norm-hash-debug", &norm_debug, norm.as_bytes())?;
+    assert_no_raw_encoding("redaction/norm-hash-debug", &norm_debug, norm.as_bytes())?;
 
     let secret_hash = fixture.finding.secret_hash();
     let secret_debug = format!("{secret_hash:?}");
-    assert_no_raw_hex(
+    assert_no_raw_encoding(
         "redaction/secret-hash-debug",
         &secret_debug,
         secret_hash.as_bytes(),
     )?;
 
     let finding_debug = format!("{:?}", fixture.finding);
-    assert_no_raw_hex(
+    assert_no_raw_encoding(
         "redaction/finding-record-debug",
         &finding_debug,
         secret_hash.as_bytes(),
@@ -788,10 +788,10 @@ where
 {
     match findings.upsert_batch(batch) {
         // Failure at submission — acceptable.
-        Err(_) => Ok(()),
+        Err(_submit_err) => Ok(()),
         Ok(handle) => match handle.wait() {
             // Failure at durability — also acceptable.
-            Err(_) => Ok(()),
+            Err(_wait_err) => Ok(()),
             Ok(receipt) => Err(PersistenceConformanceError::FindingsInvariant {
                 case,
                 message: format!(
@@ -819,14 +819,14 @@ where
         })
 }
 
-/// Assert that `debug_output` does not contain the full lowercase-hex encoding
-/// of `raw_bytes`.
+/// Assert that `debug_output` does not contain common encodings of
+/// `raw_bytes` (hex or base64).
 ///
-/// This is a conservative check: it catches both lowercase and uppercase hex
-/// representations of the full byte sequence (via case-insensitive comparison)
-/// but does not attempt to catch partial leaks or base64 encodings. Those
-/// would require a more expensive analysis and are left to manual review.
-fn assert_no_raw_hex(
+/// Checks both lowercase/uppercase hex representations (via case-insensitive
+/// comparison) and standard base64 encoding of the full byte sequence. This
+/// catches the two most common ways secret material leaks through `Debug`
+/// output. Partial-leak detection is left to manual review.
+fn assert_no_raw_encoding(
     case: &'static str,
     debug_output: &str,
     raw_bytes: &[u8],
@@ -839,6 +839,17 @@ fn assert_no_raw_hex(
             leaked_fragment,
         });
     }
+
+    // Also check standard base64 encoding.
+    let base64_fragment = base64_encode(raw_bytes);
+    if base64_fragment.len() >= 4 && debug_output.contains(&base64_fragment) {
+        return Err(PersistenceConformanceError::RedactionLeak {
+            case,
+            debug_output: debug_output.to_owned(),
+            leaked_fragment: base64_fragment,
+        });
+    }
+
     Ok(())
 }
 
@@ -850,6 +861,28 @@ fn hex_lower(bytes: &[u8]) -> String {
     for &byte in bytes {
         out.push(LUT[(byte >> 4) as usize] as char);
         out.push(LUT[(byte & 0x0F) as usize] as char);
+    }
+    out
+}
+
+/// Encode bytes as standard base64 (RFC 4648) without padding.
+/// Hand-rolled to avoid adding a crate dependency for a test-only helper.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[((triple >> 6) & 0x3F) as usize] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(triple & 0x3F) as usize] as char);
+        }
     }
     out
 }
@@ -903,6 +936,11 @@ impl SampleFixture {
 /// `bytes_scanned` (2048) than the `scanned_record` (4096), so the dominance
 /// checks can verify that monotonic fields never regress.
 fn sample_fixture(seed: u8) -> Result<SampleFixture, PersistenceConformanceError> {
+    debug_assert!(
+        seed <= 0xF9,
+        "seed too high; wrapping_add offsets would collide"
+    );
+
     let tenant_id = TenantId::from_bytes(fill32(seed));
     let policy_hash = PolicyHash::from_bytes(fill32(seed.wrapping_add(1)));
     let stable_item_id = StableItemId::from_bytes(fill32(seed.wrapping_add(2)));
