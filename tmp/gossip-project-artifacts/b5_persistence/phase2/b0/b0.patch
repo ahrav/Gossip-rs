@@ -1,0 +1,698 @@
+diff -ruN gossip-original/Cargo.toml gossip/Cargo.toml
+--- gossip-original/Cargo.toml	2026-03-07 05:11:12.864807350 +0000
++++ gossip/Cargo.toml	2026-03-07 05:24:10.961952402 +0000
+@@ -13,6 +13,7 @@
+     "crates/gossip-coordination",
+     "crates/gossip-persistence-inmemory",
+     "crates/gossip-frontier",
++    "crates/gossip-coordination-etcd",
+     "crates/gossip-worker",
+     "crates/scanner-rs-cli",
+ ]
+@@ -37,6 +38,7 @@
+ gossip-coordination = { path = "crates/gossip-coordination" }
+ gossip-persistence-inmemory = { path = "crates/gossip-persistence-inmemory" }
+ gossip-frontier = { path = "crates/gossip-frontier" }
++gossip-coordination-etcd = { path = "crates/gossip-coordination-etcd" }
+ 
+ # External dev/test dependencies
+ rstest = "0.25"
+diff -ruN gossip-original/crates/gossip-coordination-etcd/Cargo.toml gossip/crates/gossip-coordination-etcd/Cargo.toml
+--- gossip-original/crates/gossip-coordination-etcd/Cargo.toml	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/Cargo.toml	2026-03-07 05:23:59.459287778 +0000
+@@ -0,0 +1,20 @@
++[package]
++name = "gossip-coordination-etcd"
++version.workspace = true
++edition.workspace = true
++rust-version.workspace = true
++license.workspace = true
++publish = false
++description = "etcd-backed coordination backend scaffold for gossip-coordination"
++
++[features]
++default = []
++test-support = ["gossip-coordination/test-support"]
++
++[dependencies]
++gossip-coordination.workspace = true
++etcd-client = { version = "0.18", default-features = false }
++tokio = { version = "1", features = ["full"] }
++
++[dev-dependencies]
++gossip-coordination = { workspace = true, features = ["test-support"] }
+diff -ruN gossip-original/crates/gossip-coordination-etcd/src/backend.rs gossip/crates/gossip-coordination-etcd/src/backend.rs
+--- gossip-original/crates/gossip-coordination-etcd/src/backend.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/src/backend.rs	2026-03-07 05:27:33.807925735 +0000
+@@ -0,0 +1,320 @@
++use std::fmt;
++
++use crate::config::{DEFAULT_BOOTSTRAP_LEASE_DURATION, EtcdCoordinatorConfig};
++use crate::error::{EtcdCoordinatorError, EtcdOperation};
++use crate::runtime::SyncRuntime;
++use gossip_coordination::{
++    AcquireError, AcquireResultView, AcquireScratch, CheckpointError, CompleteError,
++    CoordinationBackend, CreateRunError, CursorUpdate, GetRunError, IdempotentOutcome,
++    InMemoryCoordinator, InitialShardInput, Lease, LogicalTime, OpId, ParkError, ParkReason, RegisterShardsError,
++    RenewError, RenewResult, RunConfig, RunId, RunManagement, RunProgress, RunRecord,
++    RunTransitionError, ShardFilter, ShardId, ShardKey, ShardSummary, SplitReplaceError,
++    SplitReplacePlan, SplitReplaceResult, SplitResidualError, SplitResidualPlan,
++    SplitResidualResult, TenantId, UnparkError, WorkerId,
++};
++
++/// A single-member status snapshot returned by `etcd status`.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct EtcdEndpointStatus {
++    pub version: String,
++    pub db_size: i64,
++    pub raft_used_db_size: i64,
++    pub leader: u64,
++    pub raft_index: u64,
++    pub raft_term: u64,
++    pub raft_applied_index: u64,
++    pub errors: Vec<String>,
++    pub is_learner: bool,
++}
++
++impl From<etcd_client::StatusResponse> for EtcdEndpointStatus {
++    fn from(value: etcd_client::StatusResponse) -> Self {
++        Self {
++            version: value.version().to_owned(),
++            db_size: value.db_size(),
++            raft_used_db_size: value.raft_used_db_size(),
++            leader: value.leader(),
++            raft_index: value.raft_index(),
++            raft_term: value.raft_term(),
++            raft_applied_index: value.raft_applied_index(),
++            errors: value.errors().to_vec(),
++            is_learner: value.is_learner(),
++        }
++    }
++}
++
++/// B0 etcd coordination backend scaffold.
++///
++/// This type does two real things already:
++/// - owns a live etcd client connection,
++/// - exposes the final backend type that downstream crates will depend on.
++///
++/// What it does **not** do yet is persist shard/run state into etcd. That is
++/// B1's job, once the keyspace layout and versioned shard/run record codecs are
++/// implemented. Until then, protocol semantics are delegated to the executable
++/// reference backend (`InMemoryCoordinator`) so the crate can build and be wired
++/// into tests without lying about durability guarantees.
++pub struct EtcdCoordinator {
++    config: EtcdCoordinatorConfig,
++    runtime: SyncRuntime,
++    client: etcd_client::Client,
++    protocol_delegate: InMemoryCoordinator,
++}
++
++impl EtcdCoordinator {
++    /// Connect to etcd, verify the connection with a `status` call, and create
++    /// the B0 backend scaffold.
++    pub fn connect(config: EtcdCoordinatorConfig) -> Result<Self, EtcdCoordinatorError> {
++        config.validate()?;
++
++        let runtime = SyncRuntime::new()?;
++        let endpoints = config.endpoints().to_vec();
++        let mut client = runtime
++            .block_on(etcd_client::Client::connect(endpoints, None))
++            .map_err(|source| EtcdCoordinatorError::Etcd {
++                operation: EtcdOperation::Connect,
++                source,
++            })?;
++
++        runtime
++            .block_on(client.status())
++            .map_err(|source| EtcdCoordinatorError::Etcd {
++                operation: EtcdOperation::Status,
++                source,
++            })?;
++
++        Ok(Self {
++            config,
++            runtime,
++            client,
++            protocol_delegate: InMemoryCoordinator::new(DEFAULT_BOOTSTRAP_LEASE_DURATION),
++        })
++    }
++
++    /// Return the validated configuration used to construct this backend.
++    #[must_use]
++    pub fn config(&self) -> &EtcdCoordinatorConfig {
++        &self.config
++    }
++
++    /// Return the configured etcd endpoints.
++    #[must_use]
++    pub fn endpoints(&self) -> &[String] {
++        self.config.endpoints()
++    }
++
++    /// Return the namespace prefix that B1 will use as the etcd keyspace root.
++    #[must_use]
++    pub fn namespace_prefix(&self) -> &str {
++        self.config.namespace_prefix()
++    }
++
++    /// Round-trip a maintenance `status` request against etcd.
++    pub fn status(&self) -> Result<EtcdEndpointStatus, EtcdCoordinatorError> {
++        let mut client = self.client.clone();
++        let response = self
++            .runtime
++            .block_on(async move { client.status().await })
++            .map_err(|source| EtcdCoordinatorError::Etcd {
++                operation: EtcdOperation::Status,
++                source,
++            })?;
++        Ok(response.into())
++    }
++}
++
++impl fmt::Debug for EtcdCoordinator {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("EtcdCoordinator")
++            .field("endpoints", &self.config.endpoints())
++            .field("namespace_prefix", &self.config.namespace_prefix())
++            .field(
++                "coordination_storage_mode",
++                &"B0 bootstrap: delegated to InMemoryCoordinator until B1 keyspace/codec lands",
++            )
++            .finish_non_exhaustive()
++    }
++}
++
++impl CoordinationBackend for EtcdCoordinator {
++    fn acquire_and_restore_into<'a>(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        key: ShardKey,
++        worker: WorkerId,
++        out: &'a mut AcquireScratch,
++    ) -> Result<AcquireResultView<'a>, AcquireError> {
++        self.protocol_delegate
++            .acquire_and_restore_into(now, tenant, key, worker, out)
++    }
++
++    fn renew(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        lease: &Lease,
++    ) -> Result<RenewResult, RenewError> {
++        self.protocol_delegate.renew(now, tenant, lease)
++    }
++
++    fn checkpoint(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        lease: &Lease,
++        new_cursor: &CursorUpdate<'_>,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, CheckpointError> {
++        self.protocol_delegate
++            .checkpoint(now, tenant, lease, new_cursor, op_id)
++    }
++
++    fn complete(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        lease: &Lease,
++        final_cursor: &CursorUpdate<'_>,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, CompleteError> {
++        self.protocol_delegate
++            .complete(now, tenant, lease, final_cursor, op_id)
++    }
++
++    fn park_shard(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        lease: &Lease,
++        reason: ParkReason,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, ParkError> {
++        self.protocol_delegate
++            .park_shard(now, tenant, lease, reason, op_id)
++    }
++
++    fn split_replace(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        lease: &Lease,
++        plan: SplitReplacePlan<'_>,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<SplitReplaceResult>, SplitReplaceError> {
++        self.protocol_delegate
++            .split_replace(now, tenant, lease, plan, op_id)
++    }
++
++    fn split_residual(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        lease: &Lease,
++        plan: SplitResidualPlan<'_>,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<SplitResidualResult>, SplitResidualError> {
++        self.protocol_delegate
++            .split_residual(now, tenant, lease, plan, op_id)
++    }
++}
++
++impl RunManagement for EtcdCoordinator {
++    fn create_run(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        config: RunConfig,
++    ) -> Result<RunRecord, CreateRunError> {
++        self.protocol_delegate.create_run(now, tenant, run, config)
++    }
++
++    fn register_shards(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        shards: &[InitialShardInput<'_>],
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<Vec<ShardId>>, RegisterShardsError> {
++        self.protocol_delegate
++            .register_shards(now, tenant, run, shards, op_id)
++    }
++
++    fn get_run(&self, tenant: TenantId, run: RunId) -> Result<RunRecord, GetRunError> {
++        self.protocol_delegate.get_run(tenant, run)
++    }
++
++    fn get_run_progress(
++        &self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++    ) -> Result<RunProgress, GetRunError> {
++        self.protocol_delegate.get_run_progress(now, tenant, run)
++    }
++
++    fn list_shards_into(
++        &self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        filter: ShardFilter,
++        out: &mut Vec<ShardSummary>,
++    ) -> Result<(), GetRunError> {
++        self.protocol_delegate
++            .list_shards_into(now, tenant, run, filter, out)
++    }
++
++    fn collect_claim_candidates_into(
++        &self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        candidates: &mut Vec<ShardId>,
++    ) -> Result<Option<LogicalTime>, GetRunError> {
++        self.protocol_delegate
++            .collect_claim_candidates_into(now, tenant, run, candidates)
++    }
++
++    fn complete_run(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
++        self.protocol_delegate.complete_run(now, tenant, run, op_id)
++    }
++
++    fn fail_run(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
++        self.protocol_delegate.fail_run(now, tenant, run, op_id)
++    }
++
++    fn cancel_run(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        run: RunId,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, RunTransitionError> {
++        self.protocol_delegate.cancel_run(now, tenant, run, op_id)
++    }
++
++    fn unpark_shard(
++        &mut self,
++        now: LogicalTime,
++        tenant: TenantId,
++        key: ShardKey,
++        op_id: OpId,
++    ) -> Result<IdempotentOutcome<()>, UnparkError> {
++        self.protocol_delegate.unpark_shard(now, tenant, key, op_id)
++    }
++}
+diff -ruN gossip-original/crates/gossip-coordination-etcd/src/config.rs gossip/crates/gossip-coordination-etcd/src/config.rs
+--- gossip-original/crates/gossip-coordination-etcd/src/config.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/src/config.rs	2026-03-07 05:28:36.659909349 +0000
+@@ -0,0 +1,146 @@
++use std::fmt;
++
++/// Default logical lease duration for the temporary in-memory protocol
++/// delegate used during B0 scaffolding.
++///
++/// This value is intentionally internal: once B1 lands, the etcd backend will
++/// stop delegating coordination semantics to `InMemoryCoordinator` and this
++/// bootstrap constant will disappear.
++pub(crate) const DEFAULT_BOOTSTRAP_LEASE_DURATION: u64 = 30;
++
++/// Configuration for connecting the etcd coordination backend.
++///
++/// B0 scope is intentionally narrow:
++/// - establish a real etcd client connection,
++/// - validate endpoint/prefix configuration,
++/// - expose a backend type that already implements the coordination traits.
++///
++/// The actual etcd key layout and shard/run record serialization arrive in B1.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct EtcdCoordinatorConfig {
++    endpoints: Vec<String>,
++    namespace_prefix: String,
++}
++
++impl EtcdCoordinatorConfig {
++    /// Create a validated configuration.
++    pub fn new<I, S>(
++        endpoints: I,
++        namespace_prefix: impl Into<String>,
++    ) -> Result<Self, EtcdCoordinatorConfigError>
++    where
++        I: IntoIterator<Item = S>,
++        S: Into<String>,
++    {
++        let endpoints = endpoints
++            .into_iter()
++            .map(Into::into)
++            .map(|s| s.trim().to_owned())
++            .collect::<Vec<_>>();
++        let namespace_prefix = namespace_prefix.into().trim().to_owned();
++
++        let cfg = Self {
++            endpoints,
++            namespace_prefix,
++        };
++        cfg.validate()?;
++        Ok(cfg)
++    }
++
++    /// Convenience configuration for a local single-node etcd.
++    #[must_use]
++    pub fn localhost() -> Self {
++        Self {
++            endpoints: vec!["http://127.0.0.1:2379".to_owned()],
++            namespace_prefix: "/gossip/v1".to_owned(),
++        }
++    }
++
++    /// Comma-separated endpoint parser for local/dev tests.
++    pub fn from_endpoints_csv(
++        endpoints_csv: &str,
++        namespace_prefix: impl Into<String>,
++    ) -> Result<Self, EtcdCoordinatorConfigError> {
++        let endpoints = endpoints_csv
++            .split(',')
++            .map(str::trim)
++            .filter(|s| !s.is_empty())
++            .map(str::to_owned)
++            .collect::<Vec<_>>();
++        Self::new(endpoints, namespace_prefix)
++    }
++
++    /// Validate the configuration.
++    pub fn validate(&self) -> Result<(), EtcdCoordinatorConfigError> {
++        if self.endpoints.is_empty() {
++            return Err(EtcdCoordinatorConfigError::NoEndpoints);
++        }
++
++        for (index, endpoint) in self.endpoints.iter().enumerate() {
++            if endpoint.trim().is_empty() {
++                return Err(EtcdCoordinatorConfigError::EmptyEndpoint { index });
++            }
++        }
++
++        if self.namespace_prefix.is_empty() {
++            return Err(EtcdCoordinatorConfigError::EmptyNamespacePrefix);
++        }
++        if !self.namespace_prefix.starts_with('/') {
++            return Err(EtcdCoordinatorConfigError::NamespacePrefixMustStartWithSlash);
++        }
++        if self.namespace_prefix.ends_with('/') && self.namespace_prefix.len() > 1 {
++            return Err(EtcdCoordinatorConfigError::NamespacePrefixMustNotEndWithSlash);
++        }
++
++        Ok(())
++    }
++
++    /// Endpoints passed to the etcd client.
++    #[must_use]
++    pub fn endpoints(&self) -> &[String] {
++        &self.endpoints
++    }
++
++    /// Keyspace namespace prefix for all keys written by this backend.
++    #[must_use]
++    pub fn namespace_prefix(&self) -> &str {
++        &self.namespace_prefix
++    }
++}
++
++impl Default for EtcdCoordinatorConfig {
++    fn default() -> Self {
++        Self::localhost()
++    }
++}
++
++/// Validation errors for [`EtcdCoordinatorConfig`].
++#[derive(Clone, Debug, PartialEq, Eq)]
++#[non_exhaustive]
++pub enum EtcdCoordinatorConfigError {
++    NoEndpoints,
++    EmptyEndpoint { index: usize },
++    EmptyNamespacePrefix,
++    NamespacePrefixMustStartWithSlash,
++    NamespacePrefixMustNotEndWithSlash,
++}
++
++impl fmt::Display for EtcdCoordinatorConfigError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::NoEndpoints => f.write_str("at least one etcd endpoint is required"),
++            Self::EmptyEndpoint { index } => {
++                write!(f, "etcd endpoint at index {index} must not be empty")
++            }
++            Self::EmptyNamespacePrefix => f.write_str("namespace_prefix must not be empty"),
++            Self::NamespacePrefixMustStartWithSlash => {
++                f.write_str("namespace_prefix must start with '/'")
++            }
++            Self::NamespacePrefixMustNotEndWithSlash => {
++                f.write_str("namespace_prefix must not end with '/' unless it is exactly '/'")
++            }
++        }
++    }
++}
++
++impl std::error::Error for EtcdCoordinatorConfigError {}
+diff -ruN gossip-original/crates/gossip-coordination-etcd/src/error.rs gossip/crates/gossip-coordination-etcd/src/error.rs
+--- gossip-original/crates/gossip-coordination-etcd/src/error.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/src/error.rs	2026-03-07 05:25:08.403669057 +0000
+@@ -0,0 +1,60 @@
++use std::fmt;
++
++use crate::config::EtcdCoordinatorConfigError;
++
++/// etcd operations performed by the B0 backend scaffold.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[non_exhaustive]
++pub enum EtcdOperation {
++    Connect,
++    Status,
++}
++
++impl fmt::Display for EtcdOperation {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Connect => f.write_str("connect"),
++            Self::Status => f.write_str("status"),
++        }
++    }
++}
++
++/// Errors surfaced by the B0 etcd coordinator scaffold.
++#[derive(Debug)]
++#[non_exhaustive]
++pub enum EtcdCoordinatorError {
++    Config(EtcdCoordinatorConfigError),
++    RuntimeBuild(std::io::Error),
++    Etcd {
++        operation: EtcdOperation,
++        source: etcd_client::Error,
++    },
++}
++
++impl fmt::Display for EtcdCoordinatorError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Config(err) => write!(f, "invalid etcd coordinator config: {err}"),
++            Self::RuntimeBuild(err) => write!(f, "failed to build tokio runtime: {err}"),
++            Self::Etcd { operation, source } => {
++                write!(f, "etcd {operation} operation failed: {source}")
++            }
++        }
++    }
++}
++
++impl std::error::Error for EtcdCoordinatorError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Config(err) => Some(err),
++            Self::RuntimeBuild(err) => Some(err),
++            Self::Etcd { source, .. } => Some(source),
++        }
++    }
++}
++
++impl From<EtcdCoordinatorConfigError> for EtcdCoordinatorError {
++    fn from(value: EtcdCoordinatorConfigError) -> Self {
++        Self::Config(value)
++    }
++}
+diff -ruN gossip-original/crates/gossip-coordination-etcd/src/lib.rs gossip/crates/gossip-coordination-etcd/src/lib.rs
+--- gossip-original/crates/gossip-coordination-etcd/src/lib.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/src/lib.rs	2026-03-07 05:26:57.280066976 +0000
+@@ -0,0 +1,24 @@
++//! etcd-backed coordination backend scaffold.
++//!
++//! B0 scope is intentionally narrow:
++//! - create the workspace crate and dependency wiring,
++//! - own a real etcd client connection,
++//! - expose the final backend type and trait impl surface,
++//! - prove local etcd connectivity with a smoke test.
++//!
++//! Real etcd persistence of shard/run state starts in B1 once the keyspace
++//! layout and versioned record codecs are implemented.
++
++#![forbid(unsafe_code)]
++
++mod backend;
++mod config;
++mod error;
++mod runtime;
++
++pub use backend::{EtcdCoordinator, EtcdEndpointStatus};
++pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
++pub use error::{EtcdCoordinatorError, EtcdOperation};
++
++#[cfg(test)]
++mod tests;
+diff -ruN gossip-original/crates/gossip-coordination-etcd/src/runtime.rs gossip/crates/gossip-coordination-etcd/src/runtime.rs
+--- gossip-original/crates/gossip-coordination-etcd/src/runtime.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/src/runtime.rs	2026-03-07 05:25:19.535261352 +0000
+@@ -0,0 +1,31 @@
++use std::future::Future;
++
++use crate::error::EtcdCoordinatorError;
++
++/// Small sync/async bridge for the synchronous coordination traits.
++///
++/// `gossip-coordination` is intentionally synchronous, while the upstream
++/// etcd Rust client is asynchronous. B0 bridges that mismatch with a private
++/// current-thread Tokio runtime. B1 will reuse the same bridge for real etcd
++/// transactions.
++#[derive(Debug)]
++pub(crate) struct SyncRuntime {
++    inner: tokio::runtime::Runtime,
++}
++
++impl SyncRuntime {
++    pub(crate) fn new() -> Result<Self, EtcdCoordinatorError> {
++        let inner = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .map_err(EtcdCoordinatorError::RuntimeBuild)?;
++        Ok(Self { inner })
++    }
++
++    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
++    where
++        F: Future,
++    {
++        self.inner.block_on(future)
++    }
++}
+diff -ruN gossip-original/crates/gossip-coordination-etcd/src/tests.rs gossip/crates/gossip-coordination-etcd/src/tests.rs
+--- gossip-original/crates/gossip-coordination-etcd/src/tests.rs	1970-01-01 00:00:00.000000000 +0000
++++ gossip/crates/gossip-coordination-etcd/src/tests.rs	2026-03-07 05:27:14.562070859 +0000
+@@ -0,0 +1,50 @@
++use std::env;
++
++use crate::{EtcdCoordinator, EtcdCoordinatorConfig};
++
++#[test]
++fn config_rejects_empty_endpoint_list() {
++    let err = EtcdCoordinatorConfig::new(Vec::<String>::new(), "/gossip/v1")
++        .expect_err("empty endpoints must fail validation");
++    assert!(matches!(
++        err,
++        crate::EtcdCoordinatorConfigError::NoEndpoints
++    ));
++}
++
++#[test]
++fn config_rejects_invalid_namespace_prefix() {
++    let err = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "gossip/v1")
++        .expect_err("namespace prefix without leading slash must fail");
++    assert!(matches!(
++        err,
++        crate::EtcdCoordinatorConfigError::NamespacePrefixMustStartWithSlash
++    ));
++}
++
++#[test]
++#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
++fn connects_to_local_etcd_and_fetches_status() {
++    let endpoints = env::var("ETCD_ENDPOINTS")
++        .ok()
++        .and_then(|raw| {
++            let trimmed = raw.trim().to_owned();
++            if trimmed.is_empty() {
++                None
++            } else {
++                Some(trimmed)
++            }
++        })
++        .unwrap_or_else(|| "http://127.0.0.1:2379".to_owned());
++
++    let config = EtcdCoordinatorConfig::from_endpoints_csv(&endpoints, "/gossip/v1")
++        .expect("test endpoint configuration should be valid");
++
++    let backend = EtcdCoordinator::connect(config).expect("local etcd should be reachable");
++    let status = backend.status().expect("status call should succeed");
++
++    assert!(
++        !status.version.is_empty(),
++        "connected member should report a version"
++    );
++}
