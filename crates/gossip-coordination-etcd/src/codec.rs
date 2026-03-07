@@ -1421,3 +1421,7 @@ fn put_opt_u8(out: &mut Vec<u8>, value: Option<u8>) {
         None => put_bool(out, false),
     }
 }
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod tests;
