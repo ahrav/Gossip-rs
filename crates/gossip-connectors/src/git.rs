@@ -15,6 +15,10 @@
 //!   enumeration call are invisible.
 //! - Enumeration order is deterministic for a fixed repository state because
 //!   entries are globally sorted by raw key bytes after indexing.
+//! - Split hints bulk-load the indexed suffix into
+//!   `StreamingSplitEstimator`,
+//!   so git and filesystem connectors share the same byte-weighted split
+//!   algorithm even though one indexes eagerly and the other streams walks.
 //!
 //! # Version model
 //!
@@ -73,6 +77,7 @@ use crate::common::{
     self, GIT_CONNECTOR_TAG, borrowed_shard_bound, classify_io_enumerate_error,
     classify_io_read_error, derive_stable_item_id, enumerate_error_to_read, path_buf_from_bytes,
 };
+use crate::split_estimator::StreamingSplitEstimator;
 
 /// A single indexed file from `git ls-files`.
 ///
@@ -96,12 +101,6 @@ struct GitEntry {
 impl common::KeyedEntry for GitEntry {
     fn key_bytes(&self) -> &[u8] {
         self.key.as_bytes()
-    }
-}
-
-impl common::SizedEntry for GitEntry {
-    fn entry_size(&self) -> u64 {
-        self.size_hint
     }
 }
 
@@ -459,10 +458,11 @@ impl GitConnector {
 
     /// Choose a byte-weighted split point in the optional range `[start, end)`.
     ///
-    /// Delegates to [`common::choose_split_index`] which picks the entry
-    /// closest to the cumulative-size midpoint. The candidate is rejected
-    /// if it does not advance past the current cursor or would land at or
-    /// beyond the upper shard bound.
+    /// The git connector already holds an indexed, sorted snapshot, so it
+    /// bulk-loads the remaining range into [`StreamingSplitEstimator`] via
+    /// [`StreamingSplitEstimator::from_sorted_entries`]. The candidate is
+    /// rejected if it does not advance past the current cursor or would land
+    /// at or beyond the upper shard bound.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -474,18 +474,26 @@ impl GitConnector {
 
         let bounds = common::resolve_bounds(&self.entries, start, end)?;
         let start_idx = common::key_resume_start(&self.entries, cursor, bounds.range_start);
-        let split_idx = match common::choose_split_index(&self.entries, start_idx, bounds.range_end)
-        {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        let candidate = &self.entries[split_idx].key;
-        if !common::is_valid_split_candidate(candidate.as_bytes(), cursor, end) {
+        if start_idx >= bounds.range_end {
             return Ok(None);
         }
 
-        Ok(Some(candidate.clone()))
+        let split_estimator = StreamingSplitEstimator::from_sorted_entries(
+            StreamingSplitEstimator::DEFAULT_SAMPLE_CAP,
+            self.entries[start_idx..bounds.range_end]
+                .iter()
+                .map(|entry| (entry.key.as_bytes(), entry.size_hint)),
+        );
+        let Some(split_key) = split_estimator.estimate_split_key() else {
+            return Ok(None);
+        };
+        if !common::is_valid_split_candidate(split_key, cursor, end) {
+            return Ok(None);
+        }
+
+        let split = ItemKey::try_from_vec(split_key.to_vec())
+            .map_err(|err| EnumerateError::permanent(format!("invalid split key: {err}")))?;
+        Ok(Some(split))
     }
 
     /// Resolve an `ItemRef` to an absolute filesystem path.

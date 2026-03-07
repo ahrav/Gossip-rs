@@ -258,6 +258,49 @@ fn requested_sample_cap_is_clamped_to_minimum() {
     );
 }
 
+#[test]
+fn from_sorted_entries_matches_manual_observe_path() {
+    let entries: Vec<(Vec<u8>, u64)> = vec![
+        (key_for_index(0).to_vec(), 7),
+        (key_for_index(1).to_vec(), 0),
+        (key_for_index(2).to_vec(), 13),
+        (key_for_index(3).to_vec(), 5),
+        (key_for_index(4).to_vec(), 1),
+    ];
+
+    let built = StreamingSplitEstimator::from_sorted_entries(
+        1,
+        entries.iter().map(|(key, size)| (key.as_slice(), *size)),
+    );
+
+    let mut observed = StreamingSplitEstimator::new(1);
+    for (key, size) in &entries {
+        observed.observe(key, *size);
+    }
+
+    assert_eq!(built.sample_cap(), observed.sample_cap());
+    assert_eq!(built.sample_debug_view(), observed.sample_debug_view());
+    assert_eq!(built.estimate_split_key(), observed.estimate_split_key());
+}
+
+#[test]
+fn from_sorted_entries_estimates_split_for_materialized_range() {
+    let keys: Vec<[u8; 8]> = (0..4).map(key_for_index).collect();
+    let sizes = [1u64, 1, 1_000, 1];
+
+    let estimator = StreamingSplitEstimator::from_sorted_entries(
+        LARGE_SAMPLE_CAP,
+        keys.iter()
+            .zip(sizes)
+            .map(|(key, size)| (key.as_slice(), size)),
+    );
+
+    let split = estimator
+        .estimate_split_key()
+        .expect("materialized range should produce a split");
+    assert_eq!(index_from_key(split), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Downsampling regressions
 // ---------------------------------------------------------------------------

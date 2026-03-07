@@ -4,12 +4,11 @@
 //!
 //! During filesystem pagination walks the connector needs a split key that
 //! divides the key space into two roughly equal halves *by total byte weight*,
-//! not by item count. The batch predecessor [`choose_split_index`] requires
-//! all items in memory; this module provides [`StreamingSplitEstimator`], which
-//! achieves the same goal in bounded memory over an arbitrarily long,
-//! globally-sorted key stream.
-//!
-//! [`choose_split_index`]: crate::common::choose_split_index
+//! not by item count. [`StreamingSplitEstimator`] is the canonical bounded-
+//! memory algorithm for that selection problem, whether connectors feed
+//! observations incrementally during a walk or bulk-load an already
+//! materialized sorted range via
+//! [`StreamingSplitEstimator::from_sorted_entries`].
 //!
 //! # Invariants
 //!
@@ -512,7 +511,9 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 /// Feed observed `(key, file_size)` pairs via [`observe`](Self::observe) in
 /// globally sorted key order. Call [`estimate_split_key`](Self::estimate_split_key)
 /// at any time to retrieve the retained key whose recorded position is
-/// closest to the byte-weighted midpoint.
+/// closest to the byte-weighted midpoint. Callers that already have a sorted
+/// in-memory range can build the estimator in one pass with
+/// [`from_sorted_entries`](Self::from_sorted_entries).
 ///
 /// # Complexity
 ///
@@ -594,6 +595,23 @@ impl StreamingSplitEstimator {
             count: 0,
             first_observed_key: None,
         }
+    }
+
+    /// Build an estimator from a fully materialized sorted key range.
+    ///
+    /// This convenience constructor reuses the same bounded-memory algorithm as
+    /// streaming callers without requiring the caller to store a persistent
+    /// estimator. Entries must be yielded in globally sorted ascending key
+    /// order as `(key_bytes, entry_size)` pairs.
+    pub(crate) fn from_sorted_entries<'a>(
+        sample_cap: usize,
+        entries: impl Iterator<Item = (&'a [u8], u64)>,
+    ) -> Self {
+        let mut estimator = Self::new(sample_cap);
+        for (key, entry_size) in entries {
+            estimator.observe(key, entry_size);
+        }
+        estimator
     }
 
     /// Record one `(key, file_size)` observation from the streaming walk.

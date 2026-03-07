@@ -103,7 +103,7 @@ The crate provides four core capabilities:
 | Page validation                | `gossip-contracts::connector`    | `validate_page`, `validate_page_range`, `PageValidationError`                      |
 | Conformance testing            | `gossip-contracts::connector`    | `check_connector_conforms`, `ConformanceConfig`                                    |
 | Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
-| Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `choose_split_index`                                 |
+| Shared connector utilities     | `gossip-connectors::common`      | `lower_bound`, `upper_bound`, `resolve_bounds`                                     |
 | Streaming split estimation     | `gossip-connectors::split_estimator` | `StreamingSplitEstimator` (bounded-memory byte-weighted median)             |
 | Scan driver traits             | `gossip-scan-driver`             | `ScanDriver::run()`, `ScanSourceFactory`, `Assignment`                             |
 | Scan source factory impls      | `gossip-connectors::scan_driver` | `FilesystemScanSourceFactory`, `GitScanSourceFactory`, `InMemoryScanSourceFactory` |
@@ -456,8 +456,9 @@ configurable via `with_tokens()`), `split_hints: true`,
 `range_read: true`.
 
 Enumeration uses binary search (`common::lower_bound` /
-`common::upper_bound`) for seek and resume, and byte-weighted median
-split selection via `common::choose_split_index`.
+`common::upper_bound`) for seek and resume. Split hints reuse
+`StreamingSplitEstimator` via `from_sorted_entries`, bulk-loading the
+already-sorted in-memory range without a persistent estimator field.
 
 ### FilesystemConnector (`filesystem.rs`, Unix-only)
 
@@ -496,9 +497,10 @@ identity. Security hardening includes path-component filtering (rejects
 `symlink_metadata`. Read-time opens re-canonicalize and check the repo
 boundary to prevent read-time escapes.
 
-Split selection uses `common::choose_split_index` (linear scan). Token
-fast-path provides O(1) resume when the positional token agrees with
-the key-derived position; falls back to O(log N) key-based resume on
+Split hints reuse `StreamingSplitEstimator` via `from_sorted_entries`,
+bulk-loading the already-indexed sorted range on demand. Token fast-path
+provides O(1) resume when the positional token agrees with the
+key-derived position; falls back to O(log N) key-based resume on
 mismatch.
 
 ### Connector tags and public constants
@@ -540,15 +542,15 @@ consistent across `FilesystemConnector`, `GitConnector`, and
 | `borrowed_shard_bound`  | Validate + borrow shard key-range bound (empty = unbounded)      |
 | `lower_bound`           | Binary search: first index with key >= target                    |
 | `upper_bound`           | Binary search: first index with key > target                     |
-| `choose_split_index`    | Byte-weighted median split with count-balanced fallback          |
+| `is_valid_split_candidate` | Post-selection guard: split advances past cursor, stays below end |
 
-In-memory and git connectors use `choose_split_index`
-for byte-weighted median split selection over materialized indices.
-The filesystem connector uses a `StreamingSplitEstimator`
-(`split_estimator.rs`) integrated into the pagination walk for bounded-
-memory split estimation without full-index materialization. Count-balanced
-midpoint is the fallback when all entries are zero-size or weight
-concentrates in the leading entry.
+Filesystem, git, and in-memory connectors all use
+`StreamingSplitEstimator` (`split_estimator.rs`) for byte-weighted split
+selection. The filesystem connector feeds it incrementally during the
+pagination walk; git and in-memory connectors bulk-load their
+already-materialized sorted ranges via `from_sorted_entries`.
+Count-balanced midpoint is the fallback when all entries are zero-size
+or weight concentrates in the leading entry.
 
 #### Bound resolution and cursor resume
 
@@ -585,7 +587,6 @@ concentrates in the leading entry.
 | Trait          | Purpose                                            |
 | -------------- | -------------------------------------------------- |
 | `KeyedEntry`   | Key byte slice access for generic binary search    |
-| `SizedEntry`   | Byte size access for generic split-point selection |
 
 ---
 

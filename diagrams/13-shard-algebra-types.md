@@ -420,20 +420,24 @@ sequenceDiagram
     C-->>W: Ok(split_point)
 ```
 
-**Split point strategies.** Both `FilesystemConnector` and
-`InMemoryDeterministicConnector` use byte-weighted median split selection.
-`FilesystemConnector` uses a prefix-sum array for O(log n) selection;
-`InMemoryDeterministicConnector` uses the generic `common::choose_split_index`
-with linear scan. Both fall back to a count-balanced midpoint when all entries
-are zero-size or weight concentrates in the leading entry.
+**Split point strategies.** `FilesystemConnector`,
+`InMemoryDeterministicConnector`, and `GitConnector` all use
+`StreamingSplitEstimator` for byte-weighted split selection.
+`FilesystemConnector` feeds the estimator incrementally during
+pagination walks; in-memory and git connectors bulk-load their
+already-sorted ranges via `from_sorted_entries`. The estimator falls
+back to a count-balanced midpoint when all entries are zero-size or
+weight concentrates in the leading entry.
 
 **ConnectorCapabilities.** Each connector advertises its abilities through a
 capabilities struct: `seek_by_key`, `token_resume`, `range_read`, and `split_hints`.
 The worker uses these flags to choose the optimal enumeration and split strategy.
 
 Source: `crates/gossip-contracts/src/connector/api.rs:396-407`,
-`crates/gossip-connectors/src/filesystem.rs:411-746`,
-`crates/gossip-connectors/src/in_memory.rs:264-515`
+`crates/gossip-connectors/src/filesystem.rs:411-932`,
+`crates/gossip-connectors/src/git.rs:214-548`,
+`crates/gossip-connectors/src/in_memory.rs:308-505`,
+`crates/gossip-connectors/src/split_estimator.rs:508-713`
 
 ---
 

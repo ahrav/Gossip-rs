@@ -1,6 +1,6 @@
 //! Shared connector utilities: shard-bound validation, binary search,
-//! pooled page assembly, split-point selection, identity derivation, and
-//! canonical connector-tag constants.
+//! pooled page assembly, split-candidate validation, identity derivation,
+//! and canonical connector-tag constants.
 
 use std::{
     io,
@@ -299,14 +299,6 @@ pub(crate) fn build_next_cursor_from_staged(
     build_next_cursor(last_key, next_idx, emit_tokens)
 }
 
-/// Trait abstraction for entries that expose a byte size.
-///
-/// Enables the generic [`choose_split_index`] to work over both
-/// `FileEntry` (`.size`) and `PreparedItem` (`.size_hint`).
-pub(crate) trait SizedEntry {
-    fn entry_size(&self) -> u64;
-}
-
 /// Round a logical byte length to the slab allocation size.
 ///
 /// Mirrors `ByteSlab`'s size-class rule: `0 -> 0`, otherwise
@@ -582,62 +574,6 @@ pub(crate) fn assemble_pooled_page_shared_key_ref<'a>(
     Ok(StagedPage { wrappers, token })
 }
 
-/// Byte-weighted median split-point selection.
-///
-/// Given a slice of items at indices `[start_idx, range_end)`, returns the
-/// index where cumulative byte size crosses the halfway mark, producing
-/// shards balanced by total byte volume rather than item count.
-///
-/// Falls back to a count-balanced midpoint when:
-/// - All entries are zero-size (`total_bytes == 0`).
-/// - All weight concentrates in the leading entry (`split_idx == start_idx`),
-///   which would produce a zero-item left shard.
-///
-/// The result is clamped to `[start_idx + 1, range_end - 1]` to guarantee
-/// at least one item on each side.
-///
-/// Returns `None` when fewer than two items remain in the range.
-pub(crate) fn choose_split_index<T: SizedEntry>(
-    items: &[T],
-    start_idx: usize,
-    range_end: usize,
-) -> Option<usize> {
-    if range_end.saturating_sub(start_idx) < 2 {
-        return None;
-    }
-
-    let range = &items[start_idx..range_end];
-    let total_bytes: u64 = range
-        .iter()
-        .map(|e| e.entry_size())
-        .fold(0u64, u64::saturating_add);
-
-    let split_idx = if total_bytes == 0 {
-        start_idx + range.len() / 2
-    } else {
-        let half = total_bytes / 2;
-        let mut cumulative = 0u64;
-        let mut idx = start_idx;
-        for (i, entry) in range.iter().enumerate() {
-            cumulative = cumulative.saturating_add(entry.entry_size());
-            if cumulative >= half {
-                idx = start_idx + i;
-                break;
-            }
-        }
-        // Guard: if all weight concentrates in the first item, fall back
-        // to count-balanced midpoint.
-        if idx == start_idx {
-            start_idx + (range_end - start_idx) / 2
-        } else {
-            idx
-        }
-    };
-
-    // Clamp to ensure at least one item on each side.
-    Some(split_idx.max(start_idx + 1).min(range_end - 1))
-}
-
 // ---------------------------------------------------------------------------
 // I/O error classification
 // ---------------------------------------------------------------------------
@@ -842,97 +778,6 @@ mod page_slab_tests {
         let half = 1usize << 31;
         assert!(page_slab_capacity([half]).is_ok());
         assert!(page_slab_capacity([half, half]).is_err());
-    }
-}
-
-/// Tests for byte-weighted split-point selection.
-///
-/// Exact-value cases are consolidated into an rstest parameterized test.
-/// Inequality/range assertions remain as individual tests because their
-/// assertion style differs. A proptest verifies the clamping invariant
-/// over random size distributions.
-#[cfg(test)]
-mod choose_split_tests {
-    use super::*;
-    use proptest::prelude::*;
-    use rstest::rstest;
-
-    struct TestEntry {
-        size: u64,
-    }
-
-    impl SizedEntry for TestEntry {
-        fn entry_size(&self) -> u64 {
-            self.size
-        }
-    }
-
-    fn entries(sizes: &[u64]) -> Vec<TestEntry> {
-        sizes.iter().map(|&size| TestEntry { size }).collect()
-    }
-
-    // -- Exact-value cases: identical assertion structure --
-
-    #[rstest]
-    #[case::empty_range(&[10, 20], 1, 1, None)]
-    #[case::single_item(&[10, 20, 30], 1, 2, None)]
-    #[case::two_items(&[10, 20], 0, 2, Some(1))]
-    #[case::all_zero_count_midpoint(&[0, 0, 0, 0], 0, 4, Some(2))]
-    #[case::first_heavy_count_fallback(&[100, 1, 1, 1], 0, 4, Some(2))]
-    #[case::middle_heavy_byte_weight(&[1, 1, 100, 1], 0, 4, Some(2))]
-    fn split_index_exact(
-        #[case] sizes: &[u64],
-        #[case] start: usize,
-        #[case] end: usize,
-        #[case] expected: Option<usize>,
-    ) {
-        let items = entries(sizes);
-        assert_eq!(choose_split_index(&items, start, end), expected);
-    }
-
-    // -- Inequality/range assertions: kept individual --
-
-    #[test]
-    fn clamp_prevents_empty_left_shard() {
-        let items = entries(&[0, 100]);
-        let split = choose_split_index(&items, 0, 2).unwrap();
-        assert!(split >= 1, "split must leave at least one item on the left");
-    }
-
-    #[test]
-    fn clamp_prevents_empty_right_shard() {
-        let items = entries(&[0, 0, 0, 100]);
-        let split = choose_split_index(&items, 0, 4).unwrap();
-        assert!(
-            split <= 3,
-            "split must leave at least one item on the right"
-        );
-    }
-
-    #[test]
-    fn nonzero_start_idx_offset() {
-        let items = entries(&[99, 99, 10, 20, 30]);
-        let split = choose_split_index(&items, 2, 5).unwrap();
-        assert!((3..=4).contains(&split), "split {split} out of [3, 4]");
-    }
-
-    // -- Property: clamping invariant over random size distributions --
-
-    proptest! {
-        #[test]
-        fn split_index_bounds_invariant(
-            sizes in proptest::collection::vec(0..10_000u64, 0..20),
-        ) {
-            let items = entries(&sizes);
-            let len = items.len();
-            // Test the full range [0, len).
-            if let Some(split) = choose_split_index(&items, 0, len) {
-                prop_assert!(split >= 1, "split {split} must be >= start_idx + 1");
-                prop_assert!(split < len, "split {split} must be < range_end");
-            } else {
-                prop_assert!(len < 2, "None only when fewer than 2 items, got {len}");
-            }
-        }
     }
 }
 
