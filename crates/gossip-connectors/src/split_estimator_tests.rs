@@ -378,6 +378,106 @@ fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
     assert!(split_idx >= 1 && split_idx <= cap);
 }
 
+#[test]
+fn observe_leaves_marks_unchanged_when_no_cadence_fires() {
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 10;
+    estimator.count = 3;
+    estimator.total_bytes = 13;
+    estimator.next_rank_sample = 4;
+    estimator.next_byte_mark = 20;
+
+    estimator.observe(&key_for_index(3), 5);
+
+    assert_eq!(
+        estimator.sample_len(),
+        0,
+        "no cadence should mean no sample"
+    );
+    assert_eq!(estimator.count, 4);
+    assert_eq!(estimator.total_bytes, 18);
+    assert_eq!(
+        estimator.next_rank_sample, 4,
+        "rank mark should stay put until the pending cadence actually fires"
+    );
+    assert_eq!(
+        estimator.next_byte_mark, 20,
+        "byte mark should stay put when the file does not straddle it"
+    );
+}
+
+#[test]
+fn observe_realigns_byte_mark_after_wide_file_skips_multiple_cadences() {
+    use super::align_to_stride;
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 10;
+    estimator.count = 3;
+    estimator.total_bytes = 12;
+    estimator.next_rank_sample = 4;
+    estimator.next_byte_mark = 20;
+
+    estimator.observe(&key_for_index(3), 100);
+
+    assert_eq!(
+        estimator.sample_len(),
+        1,
+        "wide file should still emit one sample"
+    );
+    assert_eq!(
+        estimator.next_rank_sample, 4,
+        "rank mark should remain pending because only the byte cadence fired"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark must jump beyond every mark consumed by the wide file"
+    );
+    assert_eq!(estimator.next_byte_mark, 120);
+
+    let samples = estimator.sample_debug_view();
+    assert_eq!(samples[0].0, 3, "sample should retain the triggering rank");
+    assert_eq!(
+        samples[0].1, 20,
+        "sample should retain the original byte mark that was straddled"
+    );
+}
+
+#[test]
+fn compaction_realigns_marks_to_the_doubled_stride_grid() {
+    use super::{Sample, align_to_stride};
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 2;
+    estimator.byte_stride = 5;
+    estimator.count = 5;
+    estimator.total_bytes = 13;
+    estimator.next_rank_sample = 6;
+    estimator.next_byte_mark = 15;
+    estimator.samples = (0..(estimator.sample_cap() + 1))
+        .map(|idx| Sample::new((idx as u64) * 2, (idx as u64) * 5, &key_for_index(idx)))
+        .collect();
+
+    estimator.grow_strides_and_compact();
+
+    assert_eq!(estimator.rank_stride, 4);
+    assert_eq!(estimator.byte_stride, 10);
+    assert_eq!(
+        estimator.next_rank_sample,
+        align_to_stride(estimator.count, estimator.rank_stride),
+        "rank mark should snap to the new stride grid after compaction"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark should snap to the new stride grid after compaction"
+    );
+    assert!(estimator.sample_len() <= estimator.sample_cap());
+    assert_samples_sorted(&estimator);
+}
+
 // ---------------------------------------------------------------------------
 // Extreme value, precision, and determinism tests
 // ---------------------------------------------------------------------------
