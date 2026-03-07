@@ -7,21 +7,21 @@
 //! bytes. For this pipeline to be useful as a test oracle, three structural
 //! properties must hold universally:
 //!
-//! - **Determinism (P3)** — identical plans always produce byte-identical
+//! - **Determinism** — identical plans always produce byte-identical
 //!   output. This is the foundation that makes shrink-sequence
 //!   reproducibility possible and enables future corpus serialization and
 //!   CI replay (the plan derives `Serialize`/`Deserialize` for this
 //!   purpose). If `execute_plan` were non-deterministic, a failing seed
 //!   recorded today could not be reproduced tomorrow.
 //!
-//! - **Non-commutativity (P4)** — operator ordering is semantically
+//! - **Non-commutativity** — operator ordering is semantically
 //!   significant. `Truncate`-then-`Extend` must differ from
 //!   `Extend`-then-`Truncate`. This confirms that `apply_ops` composes
 //!   operators as a strict left-to-right pipeline rather than treating them
 //!   as a commutative set, which would collapse distinct mutation scenarios
 //!   into identical outputs.
 //!
-//! - **Offset correctness (P6)** — the [`WrappedToken`] offset metadata
+//! - **Offset correctness** — the [`WrappedToken`] offset metadata
 //!   correctly locates the mutated token within its surrounding context
 //!   bytes. The test harness relies on these offsets to verify that the
 //!   mutated token can be recovered from context (JSON field, env

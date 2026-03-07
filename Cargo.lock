@@ -934,6 +934,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gossip-persistence-inmemory"
+version = "0.1.0"
+dependencies = [
+ "gossip-contracts",
+]
+
+[[package]]
 name = "gossip-scan-driver"
 version = "0.1.0"
 dependencies = [
