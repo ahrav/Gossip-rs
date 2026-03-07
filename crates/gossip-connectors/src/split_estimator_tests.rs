@@ -492,6 +492,134 @@ fn downsampling_when_barely_exceeding_cap_keeps_split_in_range() {
     assert!(split_idx >= 1 && split_idx <= cap);
 }
 
+#[test]
+fn observe_leaves_marks_unchanged_when_no_cadence_fires() {
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 10;
+    estimator.count = 3;
+    estimator.total_bytes = 13;
+    estimator.next_rank_sample = 4;
+    estimator.next_byte_mark = 20;
+
+    estimator.observe(&key_for_index(3), 5);
+
+    assert_eq!(
+        estimator.sample_len(),
+        0,
+        "no cadence should mean no sample"
+    );
+    assert_eq!(estimator.count, 4);
+    assert_eq!(estimator.total_bytes, 18);
+    assert_eq!(
+        estimator.next_rank_sample, 4,
+        "rank mark should stay put until the pending cadence actually fires"
+    );
+    assert_eq!(
+        estimator.next_byte_mark, 20,
+        "byte mark should stay put when the file does not straddle it"
+    );
+}
+
+#[test]
+fn observe_realigns_byte_mark_after_wide_file_skips_multiple_cadences() {
+    use super::align_to_stride;
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 10;
+    estimator.count = 3;
+    estimator.total_bytes = 12;
+    estimator.next_rank_sample = 4;
+    estimator.next_byte_mark = 20;
+
+    estimator.observe(&key_for_index(3), 100);
+
+    assert_eq!(
+        estimator.sample_len(),
+        1,
+        "wide file should still emit one sample"
+    );
+    assert_eq!(
+        estimator.next_rank_sample, 4,
+        "rank mark should remain pending because only the byte cadence fired"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark must jump beyond every mark consumed by the wide file"
+    );
+    assert_eq!(estimator.next_byte_mark, 120);
+
+    let samples = estimator.sample_debug_view();
+    assert_eq!(samples[0].0, 3, "sample should retain the triggering rank");
+    assert_eq!(
+        samples[0].1, 20,
+        "sample should retain the original byte mark that was straddled"
+    );
+}
+
+#[test]
+fn observe_advances_rank_mark_only_when_rank_cadence_fires_alone() {
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 10;
+    estimator.count = 4;
+    estimator.total_bytes = 13;
+    estimator.next_rank_sample = 4;
+    estimator.next_byte_mark = 20;
+
+    // end_bytes = 13 + 3 = 16, which does NOT straddle 20.
+    estimator.observe(&key_for_index(4), 3);
+
+    assert_eq!(
+        estimator.sample_len(),
+        1,
+        "rank cadence should emit a sample"
+    );
+    assert_eq!(
+        estimator.next_rank_sample, 8,
+        "rank mark must advance by exactly one rank_stride from the firing rank"
+    );
+    assert_eq!(
+        estimator.next_byte_mark, 20,
+        "byte mark must remain unchanged when only the rank cadence fires"
+    );
+}
+
+#[test]
+fn compaction_realigns_marks_to_the_doubled_stride_grid() {
+    use super::{Sample, align_to_stride};
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 2;
+    estimator.byte_stride = 5;
+    estimator.count = 5;
+    estimator.total_bytes = 13;
+    estimator.next_rank_sample = 6;
+    estimator.next_byte_mark = 15;
+    estimator.samples = (0..(estimator.sample_cap() + 1))
+        .map(|idx| Sample::new((idx as u64) * 2, (idx as u64) * 5, &key_for_index(idx)))
+        .collect();
+
+    estimator.grow_strides_and_compact();
+
+    assert_eq!(estimator.rank_stride, 4);
+    assert_eq!(estimator.byte_stride, 10);
+    assert_eq!(
+        estimator.next_rank_sample,
+        align_to_stride(estimator.count, estimator.rank_stride),
+        "rank mark should snap to the new stride grid after compaction"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark should snap to the new stride grid after compaction"
+    );
+    assert!(estimator.sample_len() <= estimator.sample_cap());
+    assert_samples_sorted(&estimator);
+}
+
 // ---------------------------------------------------------------------------
 // Extreme value, precision, and determinism tests
 // ---------------------------------------------------------------------------
@@ -823,6 +951,107 @@ fn cumulative_bytes_saturation() {
     assert!(
         split_idx >= 1,
         "valid split required, got index {split_idx}"
+    );
+}
+
+#[test]
+fn observe_realigns_marks_after_u64_max_saturation() {
+    use super::align_to_stride;
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 100;
+    // count must sit on the rank stride grid so the rank cadence fires cleanly.
+    // u64::MAX % 4 == 3, so u64::MAX - 3 is divisible by 4.
+    estimator.count = u64::MAX - 3;
+    estimator.total_bytes = u64::MAX - 500;
+    // Set marks so both cadences fire on the next observe.
+    estimator.next_rank_sample = u64::MAX - 3;
+    estimator.next_byte_mark = u64::MAX - 500;
+    // Seed a prior sample so the buffer is non-empty (mirrors realistic state).
+    estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
+    estimator.first_observed_key = Some(Box::from(key_for_index(0).as_slice()));
+
+    // This observe fires both cadences (rank == next_rank_sample, byte interval
+    // straddles next_byte_mark). After updating count/total_bytes, at least one
+    // of them saturates to u64::MAX, which triggers realign_sample_marks().
+    estimator.observe(&key_for_index(1), 600);
+
+    assert_eq!(
+        estimator.total_bytes,
+        u64::MAX,
+        "total_bytes should saturate"
+    );
+    assert!(
+        estimator.sample_len() >= 2,
+        "cadence should have emitted a sample"
+    );
+    assert_eq!(
+        estimator.next_rank_sample,
+        align_to_stride(estimator.count, estimator.rank_stride),
+        "rank mark must be realigned to stride grid after saturation"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark must be realigned to stride grid after saturation"
+    );
+    // When total_bytes == u64::MAX, align_to_stride returns u64::MAX.
+    assert_eq!(
+        estimator.next_byte_mark,
+        u64::MAX,
+        "byte mark should be pinned at u64::MAX when total_bytes is saturated"
+    );
+}
+
+#[test]
+fn observe_realigns_marks_after_count_saturates_to_max() {
+    use super::align_to_stride;
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 100;
+    // Next observe will push count from MAX-1 to MAX via saturating_add.
+    estimator.count = u64::MAX - 1;
+    estimator.total_bytes = 5000;
+    // Set marks so neither cadence fires — we only care about the saturation
+    // guard realigning marks, not about emitting a new sample.
+    estimator.next_rank_sample = u64::MAX;
+    estimator.next_byte_mark = 6000;
+    estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
+    estimator.first_observed_key = Some(Box::from(key_for_index(0).as_slice()));
+
+    estimator.observe(&key_for_index(1), 10);
+
+    assert_eq!(
+        estimator.count,
+        u64::MAX,
+        "count should saturate to u64::MAX"
+    );
+    assert_eq!(
+        estimator.total_bytes, 5010,
+        "total_bytes should advance normally (not saturated)"
+    );
+    assert_eq!(
+        estimator.next_rank_sample,
+        align_to_stride(estimator.count, estimator.rank_stride),
+        "rank mark must be realigned after count saturates"
+    );
+    // count == u64::MAX → align_to_stride(u64::MAX, 4) == u64::MAX.
+    assert_eq!(
+        estimator.next_rank_sample,
+        u64::MAX,
+        "rank mark should be pinned at u64::MAX when count is saturated"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark must be realigned onto the stride grid after saturation"
+    );
+    // total_bytes == 5010, byte_stride == 100 → align_to_stride(5010, 100) == 5100.
+    assert_eq!(
+        estimator.next_byte_mark, 5100,
+        "byte mark should snap forward to the next stride-aligned value"
     );
 }
 

@@ -491,8 +491,8 @@ fn interpolated_position(first: u64, last: u64, idx: usize, cap: usize) -> u64 {
 }
 
 /// Round `value` up to the next multiple of `stride` (saturating at
-/// `u64::MAX`). Used after compaction to realign the next sampling marks
-/// onto the (now-doubled) stride grid.
+/// `u64::MAX`). Used when compaction changes the cadence grid or when a
+/// wide file observation skips past more than one byte mark.
 ///
 /// A zero `stride` is clamped to 1, making this a no-op identity.
 fn align_to_stride(value: u64, stride: u64) -> u64 {
@@ -638,7 +638,8 @@ impl StreamingSplitEstimator {
     /// amortised-cost trade-off; see the module-level "Design choices" section.
     ///
     /// If the sample buffer exceeds its cap after insertion, a compaction
-    /// cycle runs (halve samples, double strides) before returning.
+    /// cycle runs (halve samples, double strides, then snap the next marks
+    /// onto the new stride grid) before returning.
     pub(crate) fn observe(&mut self, key: &[u8], file_size: u64) {
         debug_assert!(
             self.samples
@@ -679,8 +680,36 @@ impl StreamingSplitEstimator {
 
         if self.samples.len() > self.sample_cap {
             self.grow_strides_and_compact();
+            return;
         }
-        self.realign_sample_marks();
+
+        if sample_rank {
+            // `rank` is always a multiple of `rank_stride` when the cadence fires
+            // (maintained by initialization at 0, incremental +rank_stride advances,
+            // and post-compaction realignment), so adding `rank_stride` keeps the
+            // mark on the stride grid without a modulo op.
+            debug_assert_eq!(
+                rank % self.rank_stride,
+                0,
+                "rank cadence fired at a non-grid-aligned rank; mark will drift"
+            );
+            self.next_rank_sample = rank.saturating_add(self.rank_stride);
+        }
+        if sample_bytes {
+            let next_byte_mark = self.next_byte_mark.saturating_add(self.byte_stride);
+            self.next_byte_mark = if next_byte_mark < end_bytes {
+                // A single file may span more than one byte mark even though we
+                // only record one sample per observation; snap forward so the
+                // next mark stays ahead of the bytes we just consumed.
+                align_to_stride(self.total_bytes, self.byte_stride)
+            } else {
+                next_byte_mark
+            };
+        }
+
+        if self.count == u64::MAX || self.total_bytes == u64::MAX {
+            self.realign_sample_marks();
+        }
     }
 
     /// Estimate the split key whose recorded byte position is closest to the
@@ -747,7 +776,8 @@ impl StreamingSplitEstimator {
         Some(candidate)
     }
 
-    /// Compact the sample buffer and double both strides.
+    /// Compact the sample buffer, double both strides, and realign the next
+    /// sampling marks onto the new stride grid.
     ///
     /// Called when a new sample pushes the buffer past `sample_cap`. The
     /// target is half the cap so the next batch of observations has room
@@ -757,10 +787,12 @@ impl StreamingSplitEstimator {
         compact_samples(&mut self.samples, target);
         self.rank_stride = self.rank_stride.saturating_mul(2).max(1);
         self.byte_stride = self.byte_stride.saturating_mul(2).max(1);
+        self.realign_sample_marks();
     }
 
     /// Snap the next rank and byte sampling marks to the current stride grid.
-    /// Called after every `observe` to keep the cadence aligned.
+    /// Called after compaction and when `observe` needs to recover from
+    /// saturation onto the current stride grid.
     fn realign_sample_marks(&mut self) {
         self.next_rank_sample = align_to_stride(self.count, self.rank_stride);
         self.next_byte_mark = align_to_stride(self.total_bytes, self.byte_stride);

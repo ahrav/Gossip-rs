@@ -23,10 +23,10 @@ fn in_memory_backends_pass_persistence_conformance() {
     let report = run_conformance(&done_ledger, &findings)
         .unwrap_or_else(|err| panic!("in-memory persistence conformance failed: {err}"));
 
-    assert_eq!(report.done_ledger_checks, 3);
-    assert_eq!(report.findings_checks, 3);
+    assert_eq!(report.done_ledger_checks, 4);
+    assert_eq!(report.findings_checks, 4);
     assert_eq!(report.redaction_checks, 3);
-    assert_eq!(report.total_checks(), 9);
+    assert_eq!(report.total_checks(), 11);
 }
 
 /// The reference in-memory backend intentionally accepts batches of any size.

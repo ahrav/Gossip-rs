@@ -21,7 +21,9 @@ use crate::{
 
 use gossip_contracts::persistence::PersistenceInputError;
 
-use DoneLedgerStatus::{FailedPermanent, FailedRetryable, ScannedClean, ScannedWithFindings};
+use DoneLedgerStatus::{
+    FailedPermanent, FailedRetryable, ScannedClean, ScannedWithFindings, Skipped,
+};
 
 fn provenance(
     run_id: u64,
@@ -1084,6 +1086,183 @@ fn get_record_and_get_finding_return_none_for_missing_keys() {
             .unwrap(),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Skipped status merge tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn skipped_dominates_failed_retryable() {
+    let store = InMemoryDoneLedger::new();
+
+    let failure = done_record(
+        1,
+        2,
+        3,
+        FailedRetryable,
+        100,
+        0,
+        provenance(10, 11, 12, 20, 30),
+        Some("TIMEOUT"),
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&failure))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let skipped = done_record(
+        1,
+        2,
+        3,
+        Skipped,
+        50,
+        0,
+        provenance(20, 21, 22, 40, 50),
+        Some("UNSUPPORTED_FORMAT"),
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&skipped))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.get_record(failure.key()).unwrap().unwrap();
+    assert_eq!(stored.status(), Skipped);
+    assert_eq!(stored.bytes_scanned(), 100);
+    assert_eq!(
+        stored.error_code().map(|c| c.as_str()),
+        Some("UNSUPPORTED_FORMAT")
+    );
+}
+
+#[test]
+fn scanned_clean_dominates_skipped() {
+    let store = InMemoryDoneLedger::new();
+
+    let skipped = done_record(
+        1,
+        2,
+        3,
+        Skipped,
+        80,
+        0,
+        provenance(10, 11, 12, 20, 30),
+        Some("SIZE_CAP"),
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&skipped))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let clean = done_record(
+        1,
+        2,
+        3,
+        ScannedClean,
+        200,
+        0,
+        provenance(20, 21, 22, 40, 50),
+        None,
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&clean))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.get_record(skipped.key()).unwrap().unwrap();
+    assert_eq!(stored.status(), ScannedClean);
+    assert_eq!(stored.bytes_scanned(), 200);
+    assert_eq!(stored.error_code(), None);
+}
+
+#[test]
+fn scanned_with_findings_not_downgraded_by_skipped() {
+    let store = InMemoryDoneLedger::new();
+
+    let with_findings = done_record(
+        1,
+        2,
+        3,
+        ScannedWithFindings,
+        300,
+        5,
+        provenance(10, 11, 12, 20, 30),
+        None,
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&with_findings))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let skipped = done_record(
+        1,
+        2,
+        3,
+        Skipped,
+        50,
+        0,
+        provenance(20, 21, 22, 40, 50),
+        Some("FILTERED"),
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&skipped))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.get_record(with_findings.key()).unwrap().unwrap();
+    assert_eq!(stored.status(), ScannedWithFindings);
+    assert_eq!(stored.findings_count(), 5);
+    assert_eq!(stored.bytes_scanned(), 300);
+    assert_eq!(stored.error_code(), None);
+}
+
+#[test]
+fn scanned_with_findings_not_downgraded_by_scanned_clean() {
+    let store = InMemoryDoneLedger::new();
+
+    let with_findings = done_record(
+        1,
+        2,
+        3,
+        ScannedWithFindings,
+        250,
+        3,
+        provenance(10, 11, 12, 20, 30),
+        None,
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&with_findings))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let clean = done_record(
+        1,
+        2,
+        3,
+        ScannedClean,
+        400,
+        0,
+        provenance(20, 21, 22, 40, 50),
+        None,
+    );
+    store
+        .batch_upsert(std::slice::from_ref(&clean))
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    let stored = store.get_record(with_findings.key()).unwrap().unwrap();
+    assert_eq!(stored.status(), ScannedWithFindings);
+    assert_eq!(stored.findings_count(), 3);
+    assert_eq!(stored.bytes_scanned(), 400);
+    assert_eq!(stored.error_code(), None);
 }
 
 // ---------------------------------------------------------------------------

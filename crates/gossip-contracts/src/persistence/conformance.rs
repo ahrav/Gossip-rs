@@ -16,11 +16,12 @@
 //!
 //! The suite is split into three independently runnable sub-suites:
 //!
-//! 1. **Done-ledger** ([`run_done_ledger_conformance`]) — three checks:
-//!    idempotent upsert, fail-then-scan dominance, scan-then-fail dominance.
-//! 2. **Findings** ([`run_findings_conformance`]) — three checks: idempotent
+//! 1. **Done-ledger** ([`run_done_ledger_conformance`]) — four checks:
+//!    idempotent upsert, fail-then-scan dominance, scan-then-fail dominance,
+//!    batch-get positional semantics.
+//! 2. **Findings** ([`run_findings_conformance`]) — four checks: idempotent
 //!    upsert with durable count verification, orphan occurrence rejection,
-//!    orphan observation rejection.
+//!    orphan observation rejection, observation upsert merge idempotency.
 //! 3. **Redaction** ([`run_redaction_conformance`]) — three checks: `NormHash`,
 //!    `SecretHash`, and `FindingRecord` `Debug` output must not contain raw hex
 //!    bytes of the underlying secret material.
@@ -140,8 +141,10 @@ pub trait FindingsConformanceProbe: Send + Sync {
 /// *all* checks passed.
 ///
 /// Current check counts (for reference):
-/// - Done-ledger: 3 (idempotent upsert, fail→scan dominance, scan→fail dominance)
-/// - Findings: 3 (idempotent upsert, orphan occurrence, orphan observation)
+/// - Done-ledger: 4 (idempotent upsert, fail→scan dominance, scan→fail dominance,
+///   batch-get positional semantics)
+/// - Findings: 4 (idempotent upsert, orphan occurrence, orphan observation,
+///   observation upsert merge)
 /// - Redaction: 3 (`NormHash` debug, `SecretHash` debug, `FindingRecord` debug)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PersistenceConformanceReport {
@@ -347,7 +350,7 @@ where
 
 /// Run only the done-ledger portion of the conformance suite.
 ///
-/// Verifies three properties of the [`DoneLedger`] implementation:
+/// Verifies four properties of the [`DoneLedger`] implementation:
 ///
 /// 1. **Idempotent upsert** — writing the same `ScannedWithFindings` record
 ///    twice must not alter durable state. The harness writes, replays, reads
@@ -362,7 +365,13 @@ where
 ///    same result: a subsequent failure write must not downgrade a scanned
 ///    entry. This tests the lattice property regardless of arrival order.
 ///
-/// Returns the number of checks that passed (currently 3).
+/// 4. **Batch-get positional semantics** — `batch_get` with a multi-element
+///    `ovid_hashes` slice must return a result vector of the same length,
+///    where `result[i]` corresponds to `ovid_hashes[i]`. Existing keys
+///    yield `Some`, absent keys yield `None`, and the positional alignment
+///    must hold regardless of which keys are present.
+///
+/// Returns the number of checks that passed (currently 4).
 ///
 /// # Errors
 ///
@@ -374,7 +383,8 @@ where
     check_done_ledger_idempotent(done_ledger)?;
     check_done_ledger_fail_then_scan(done_ledger)?;
     check_done_ledger_scan_then_fail(done_ledger)?;
-    Ok(3)
+    check_done_ledger_batch_get_positional(done_ledger)?;
+    Ok(4)
 }
 
 /// Check 1: writing the same `ScannedWithFindings` record twice must not
@@ -476,9 +486,65 @@ where
     )
 }
 
+/// Check 4: `batch_get` with a two-element `ovid_hashes` slice must return
+/// a result vector of the same length, where `result[0]` is `Some` for a
+/// written key and `result[1]` is `None` for an absent key.
+fn check_done_ledger_batch_get_positional<L>(
+    done_ledger: &L,
+) -> Result<(), PersistenceConformanceError>
+where
+    L: DoneLedger,
+{
+    let fixture = sample_fixture(0xAA)?;
+    let _ = submit_done_ledger(
+        done_ledger,
+        "done-ledger/batch-get-positional:write",
+        std::slice::from_ref(&fixture.scanned_record),
+    )?;
+    // Derive a second ovid_hash that shares tenant/policy but was never written.
+    let absent_ovid_hash = derive_ovid_hash(&OvidHashInputs {
+        stable_item_id: StableItemId::from_bytes(fill32(0xAA_u8.wrapping_add(20))),
+        version: VersionId::Strong(ObjectVersionId::from_version_bytes(
+            b"conformance-absent-version",
+        )),
+    });
+    let rows = done_ledger
+        .batch_get(
+            fixture.tenant_id,
+            fixture.policy_hash,
+            &[fixture.ovid_hash, absent_ovid_hash],
+        )
+        .map_err(|err| PersistenceConformanceError::DoneLedgerGet {
+            case: "done-ledger/batch-get-positional:fetch",
+            source: Box::new(err),
+        })?;
+    if rows.len() != 2 {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/batch-get-positional:fetch",
+            message: format!(
+                "expected result length 2 for two-element query, got {}",
+                rows.len()
+            ),
+        });
+    }
+    if rows[0].is_none() {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/batch-get-positional:fetch",
+            message: "result[0] should be Some for a written key, got None".to_owned(),
+        });
+    }
+    if rows[1].is_some() {
+        return Err(PersistenceConformanceError::DoneLedgerInvariant {
+            case: "done-ledger/batch-get-positional:fetch",
+            message: "result[1] should be None for an absent key, got Some".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Run only the findings-layer portion of the conformance suite.
 ///
-/// Verifies three properties of a [`FindingsSink`] + [`FindingsConformanceProbe`]
+/// Verifies four properties of a [`FindingsSink`] + [`FindingsConformanceProbe`]
 /// implementation:
 ///
 /// 1. **Idempotent upsert** — writing a complete (finding, occurrence,
@@ -494,7 +560,13 @@ where
 /// 3. **Orphan observation rejection** — submitting an observation without
 ///    its parent occurrence must fail and leave no partial rows.
 ///
-/// Returns the number of checks that passed (currently 3).
+/// 4. **Observation upsert merge** — replaying the same observation (same
+///    `observation_id`) with a different `seen_at` timestamp must not create
+///    a duplicate observation row. The harness writes a full batch, then
+///    replays the observation with a later timestamp and verifies durable
+///    counts are unchanged.
+///
+/// Returns the number of checks that passed (currently 4).
 ///
 /// # Errors
 ///
@@ -506,7 +578,8 @@ where
     check_findings_idempotent(findings)?;
     check_findings_orphan_occurrence(findings)?;
     check_findings_orphan_observation(findings)?;
-    Ok(3)
+    check_findings_observation_merge(findings)?;
+    Ok(4)
 }
 
 /// Check 1: writing a complete (finding, occurrence, observation) batch twice
@@ -599,6 +672,51 @@ where
         "findings/missing-occurrence",
         FindingsUpsertBatch::new(&[], &[], &observations),
     )?;
+    Ok(())
+}
+
+/// Check 4: replaying the same observation (same `observation_id`) with a
+/// different `seen_at` timestamp must not create a duplicate observation row.
+/// The backend must merge (upsert) instead of inserting a duplicate.
+fn check_findings_observation_merge<F>(findings: &F) -> Result<(), PersistenceConformanceError>
+where
+    F: FindingsSink + FindingsConformanceProbe,
+{
+    let fixture = sample_fixture(0x88)?;
+    let batch = fixture.findings_batch();
+    let _ = submit_findings(findings, "findings/observation-merge:first", batch)?;
+    let after_first = probe_counts(findings, "findings/observation-merge:after-first")?;
+
+    // Construct a second observation with the same identity inputs but a
+    // later seen_at timestamp.
+    let replayed_observation = ObservationRecord::new(
+        fixture.observation.tenant_id(),
+        fixture.observation.occurrence_id(),
+        fixture.observation.policy_hash(),
+        fixture.observation.ovid_hash(),
+        fixture.observation.run_id(),
+        fixture.observation.shard_id(),
+        fixture.observation.fence_epoch(),
+        LogicalTime::from_raw(fixture.observation.seen_at().as_raw() + 1000),
+    );
+    let findings_slice = [fixture.finding.clone()];
+    let occurrences_slice = [fixture.occurrence.clone()];
+    let observations_slice = [replayed_observation];
+    let replay_batch =
+        FindingsUpsertBatch::new(&findings_slice, &occurrences_slice, &observations_slice);
+    let _ = submit_findings(findings, "findings/observation-merge:replay", replay_batch)?;
+    let after_replay = probe_counts(findings, "findings/observation-merge:after-replay")?;
+
+    if after_replay.observations != after_first.observations {
+        return Err(PersistenceConformanceError::FindingsInvariant {
+            case: "findings/observation-merge:after-replay",
+            message: format!(
+                "replaying an observation with the same observation_id but different seen_at \
+                 created a duplicate row: observations before replay {}, after replay {}",
+                after_first.observations, after_replay.observations
+            ),
+        });
+    }
     Ok(())
 }
 
