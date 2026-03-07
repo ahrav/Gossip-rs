@@ -21,7 +21,6 @@ pub mod filesystem;
 pub mod git;
 pub mod in_memory;
 mod scan_driver;
-#[cfg(unix)]
 mod split_estimator;
 
 pub use common::{
@@ -52,7 +51,6 @@ pub const fn connector_tag_for_kind(kind: ConnectorKind) -> ConnectorTag {
     }
 }
 
-#[cfg(unix)]
 #[doc(hidden)]
 /// Benchmark hook: drives the streaming split estimator's `observe` loop on a
 /// deterministic fixed-size workload for Criterion benches and allocation guards.

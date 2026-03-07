@@ -17,7 +17,11 @@
 //!    and resolved with binary search (O(log n)), then up to
 //!    [`Budgets::max_items`] are yielded by index iteration over precomputed
 //!    metadata.
-//! 3. **Deterministic IDs** -- [`StableItemId`] derived via
+//! 3. **Split hints** -- `choose_split_point*` bulk-loads the remaining
+//!    sorted range into `StreamingSplitEstimator`,
+//!    keeping byte-weighted split selection aligned with the filesystem and
+//!    git connectors without storing mutable estimator state.
+//! 4. **Deterministic IDs** -- [`StableItemId`] derived via
 //!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id)
 //!    (connector-tag + connector-instance + key, domain-separated),
 //!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
@@ -139,12 +143,6 @@ struct PreparedItem {
 impl common::KeyedEntry for PreparedItem {
     fn key_bytes(&self) -> &[u8] {
         self.key.as_bytes()
-    }
-}
-
-impl common::SizedEntry for PreparedItem {
-    fn entry_size(&self) -> u64 {
-        self.size_hint
     }
 }
 
@@ -415,20 +413,10 @@ impl InMemoryDeterministicConnector {
 
     /// Choose a midpoint key that can be used as a shard split hint.
     ///
-    /// The candidate is chosen by byte-weight median: the split point falls
-    /// at the item whose cumulative byte size first reaches half the total
-    /// byte volume of the remaining range. This ensures balanced shards even
-    /// when object sizes are highly skewed. When all weight concentrates in a
-    /// single leading item (making the byte-weight median degenerate), the
-    /// algorithm falls back to a count-based midpoint.
-    ///
-    /// Returns `None` when fewer than two keys remain, when the candidate
-    /// would not advance past the cursor, or when it falls at or beyond the
-    /// upper shard bound (which would produce an empty right shard).
-    ///
-    /// Bound resolution is shared with filesystem via [`common::resolve_bounds`]
-    /// and [`common::key_resume_start`], so both connectors enforce the same
-    /// split-eligibility window before applying connector-local heuristics.
+    /// Delegates to [`common::estimate_split_from_sorted`] after resolving
+    /// bounds and the cursor resume position. Returns `None` when fewer than
+    /// two keys remain, the estimator produces no candidate, or the candidate
+    /// fails validation.
     fn choose_split_point_bounds(
         &self,
         start: Option<&[u8]>,
@@ -437,17 +425,19 @@ impl InMemoryDeterministicConnector {
     ) -> Result<Option<ItemKey>, EnumerateError> {
         let bounds = common::resolve_bounds(&self.items, start, end)?;
         let start_idx = common::key_resume_start(&self.items, cursor, bounds.range_start);
-        let split_idx = match common::choose_split_index(&self.items, start_idx, bounds.range_end) {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        let candidate = &self.items[split_idx].key;
-        if !common::is_valid_split_candidate(candidate.as_bytes(), cursor, end) {
+        if start_idx >= bounds.range_end {
             return Ok(None);
         }
 
-        Ok(Some(candidate.clone()))
+        let range = &self.items[start_idx..bounds.range_end];
+        common::estimate_split_from_sorted(
+            range
+                .iter()
+                .map(|item| (item.key.as_bytes(), item.size_hint)),
+            range.len(),
+            cursor,
+            end,
+        )
     }
 
     /// Resolve an [`ItemRef`] into the backing bytes.

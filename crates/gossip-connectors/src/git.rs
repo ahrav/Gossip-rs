@@ -15,6 +15,10 @@
 //!   enumeration call are invisible.
 //! - Enumeration order is deterministic for a fixed repository state because
 //!   entries are globally sorted by raw key bytes after indexing.
+//! - Split hints bulk-load the indexed suffix into
+//!   `StreamingSplitEstimator`,
+//!   so git and filesystem connectors share the same byte-weighted split
+//!   algorithm even though one indexes eagerly and the other streams walks.
 //!
 //! # Version model
 //!
@@ -96,12 +100,6 @@ struct GitEntry {
 impl common::KeyedEntry for GitEntry {
     fn key_bytes(&self) -> &[u8] {
         self.key.as_bytes()
-    }
-}
-
-impl common::SizedEntry for GitEntry {
-    fn entry_size(&self) -> u64 {
-        self.size_hint
     }
 }
 
@@ -459,10 +457,10 @@ impl GitConnector {
 
     /// Choose a byte-weighted split point in the optional range `[start, end)`.
     ///
-    /// Delegates to [`common::choose_split_index`] which picks the entry
-    /// closest to the cumulative-size midpoint. The candidate is rejected
-    /// if it does not advance past the current cursor or would land at or
-    /// beyond the upper shard bound.
+    /// Delegates to [`common::estimate_split_from_sorted`] after resolving
+    /// bounds and the cursor resume position. Returns `None` when fewer than
+    /// two keys remain, the estimator produces no candidate, or the candidate
+    /// fails validation.
     fn choose_split_point_bounds(
         &mut self,
         start: Option<&[u8]>,
@@ -474,18 +472,19 @@ impl GitConnector {
 
         let bounds = common::resolve_bounds(&self.entries, start, end)?;
         let start_idx = common::key_resume_start(&self.entries, cursor, bounds.range_start);
-        let split_idx = match common::choose_split_index(&self.entries, start_idx, bounds.range_end)
-        {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
-
-        let candidate = &self.entries[split_idx].key;
-        if !common::is_valid_split_candidate(candidate.as_bytes(), cursor, end) {
+        if start_idx >= bounds.range_end {
             return Ok(None);
         }
 
-        Ok(Some(candidate.clone()))
+        let range = &self.entries[start_idx..bounds.range_end];
+        common::estimate_split_from_sorted(
+            range
+                .iter()
+                .map(|entry| (entry.key.as_bytes(), entry.size_hint)),
+            range.len(),
+            cursor,
+            end,
+        )
     }
 
     /// Resolve an `ItemRef` to an absolute filesystem path.

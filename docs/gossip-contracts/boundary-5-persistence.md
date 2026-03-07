@@ -33,9 +33,11 @@ Non-negotiables (project-wide):
 
 ## Rust types (implemented)
 
-> Source: `crates/gossip-contracts/src/persistence/` (9 files including
+> Source: `crates/gossip-contracts/src/persistence/` (10 files including
 > tests). All types listed below are compiled code with unit and property
 > tests. No production backend implementations exist yet.
+> `conformance.rs` provides the backend-agnostic conformance harness
+> (done-ledger, findings, and redaction checks).
 
 ### Traits
 

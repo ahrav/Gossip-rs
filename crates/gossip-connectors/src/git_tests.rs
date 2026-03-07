@@ -210,7 +210,7 @@ fn expired_budget_returns_retryable_error() {
 }
 
 #[test]
-fn choose_split_point_returns_candidate_for_multiple_items() {
+fn choose_split_point_selects_byte_weighted_midpoint() {
     let dir = create_test_repo(&[
         ("a.txt", b"1"),
         ("b.txt", b"22"),
@@ -227,10 +227,28 @@ fn choose_split_point_returns_candidate_for_multiple_items() {
             None,
         )
         .unwrap();
-    assert!(
-        split.is_some(),
-        "expected split candidate for multi-item range"
-    );
+    let split = split.expect("expected split candidate for multi-item range");
+    // The byte-weighted candidate is d.txt (position 6, closest to midpoint 5),
+    // but the last-key guard prevents an empty right shard. Rank-fallback
+    // selects the rank midpoint: c.txt (rank 2 of 4).
+    assert_eq!(split.as_bytes(), b"c.txt");
+}
+
+#[test]
+fn choose_split_point_avoids_first_file_when_weight_is_front_loaded() {
+    let dir = create_test_repo(&[("a.txt", &[0u8; 64]), ("b.txt", b"1"), ("c.txt", b"2")]);
+    let mut connector = GitConnector::new(dir.path());
+
+    let split = connector
+        .choose_split_point_range(
+            &make_key(b"\x00"),
+            &make_key(b"\xff"),
+            &Cursor::initial(),
+            None,
+        )
+        .unwrap();
+    let split = split.expect("expected split candidate for multi-item range");
+    assert_eq!(split.as_bytes(), b"b.txt");
 }
 
 // ---------------------------------------------------------------

@@ -4,17 +4,16 @@
 //!
 //! During filesystem pagination walks the connector needs a split key that
 //! divides the key space into two roughly equal halves *by total byte weight*,
-//! not by item count. The batch predecessor [`choose_split_index`] requires
-//! all items in memory; this module provides [`StreamingSplitEstimator`], which
-//! achieves the same goal in bounded memory over an arbitrarily long,
-//! globally-sorted key stream.
-//!
-//! [`choose_split_index`]: crate::common::choose_split_index
+//! not by item count. [`StreamingSplitEstimator`] is the canonical bounded-
+//! memory algorithm for that selection problem, whether connectors feed
+//! observations incrementally during a walk or bulk-load an already
+//! materialized sorted range via
+//! [`StreamingSplitEstimator::from_sorted_entries`].
 //!
 //! # Invariants
 //!
-//! - **Sample cap**: the number of retained samples never exceeds
-//!   `sample_cap` (at least [`MIN_SAMPLE_CAP`]).
+//! - **Sample cap**: after each public operation returns, the number of
+//!   retained samples never exceeds `sample_cap` (at least [`MIN_SAMPLE_CAP`]).
 //! - **Monotonicity**: retained samples are strictly increasing in rank and
 //!   non-decreasing in cumulative byte position at all times, including after
 //!   compaction.
@@ -22,6 +21,10 @@
 //!   never synthesizes or interpolates key bytes.
 //! - **First-key guard**: the very first key observed is tracked separately so
 //!   the "avoid degenerate first-item split" logic survives downsampling.
+//! - **Last-key guard**: the last retained sample is checked at estimation time
+//!   so the "avoid degenerate last-item split" logic prevents an empty right
+//!   shard. Because compaction always preserves the last sample and the
+//!   estimator only returns sampled keys, `samples.last()` is sufficient.
 //!
 //! # Sample-cap contract
 //!
@@ -72,11 +75,11 @@
 //! - **Single byte-mark per `observe` call**: each call to [`observe`] records
 //!   at most one sample, even if the file's byte range spans multiple stride
 //!   marks.  This is a deliberate trade-off for O(1) per-observation cost.
-//!   For Zipf-like workloads dominated by a few very large files the byte
+//!   For skewed workloads dominated by a few very large files the byte
 //!   axis may have gaps in that region, causing the estimator to rely more
 //!   on the rank-axis fallback.  In practice the rank sample for the same
-//!   file still captures it, and the dedicated Zipf-like accuracy regression
-//!   test confirms <1% byte-weighted error on a 20 000-key stream.
+//!   file still captures it, and the dedicated descending-size accuracy
+//!   regression test confirms <1% byte-weighted error on a 20 000-key stream.
 //!
 //! # Validation support
 //!
@@ -336,7 +339,7 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 ///    invariant at each step with both a floor (forward progress) and a
 ///    ceiling (room for remaining picks).
 ///
-/// O(picks.len() * log(plateau_extent)) worst case.
+/// O(samples.len() + picks.len() * log(plateau_extent)) worst case.
 ///
 /// # Invariants preserved
 ///
@@ -512,7 +515,14 @@ fn align_to_stride(value: u64, stride: u64) -> u64 {
 /// Feed observed `(key, file_size)` pairs via [`observe`](Self::observe) in
 /// globally sorted key order. Call [`estimate_split_key`](Self::estimate_split_key)
 /// at any time to retrieve the retained key whose recorded position is
-/// closest to the byte-weighted midpoint.
+/// closest to the byte-weighted midpoint. Callers that already have a sorted
+/// in-memory range can build the estimator in one pass with
+/// [`from_sorted_entries`](Self::from_sorted_entries).
+///
+/// **Batch-connector note**: connectors that already hold all entries in
+/// memory (git, in-memory) should pass the range length as `sample_cap`
+/// so that no compaction fires and the split is exact.  The bounded-memory
+/// property only benefits the filesystem connector's incremental walk.
 ///
 /// # Complexity
 ///
@@ -596,9 +606,26 @@ impl StreamingSplitEstimator {
         }
     }
 
+    /// Build an estimator from a fully materialized sorted key range.
+    ///
+    /// This convenience constructor reuses the same bounded-memory algorithm as
+    /// streaming callers without requiring the caller to store a persistent
+    /// estimator. Entries must be yielded in globally sorted ascending key
+    /// order as `(key_bytes, entry_size)` pairs. Duplicate keys are permitted.
+    pub(crate) fn from_sorted_entries<'a>(
+        sample_cap: usize,
+        entries: impl Iterator<Item = (&'a [u8], u64)>,
+    ) -> Self {
+        let mut estimator = Self::new(sample_cap);
+        for (key, entry_size) in entries {
+            estimator.observe(key, entry_size);
+        }
+        estimator
+    }
+
     /// Record one `(key, file_size)` observation from the streaming walk.
     ///
-    /// Keys **must** be supplied in globally sorted (ascending) order.
+    /// Keys **must** be supplied in globally sorted (non-decreasing) order.
     /// `file_size` may be zero; zero-size items are still counted for rank
     /// purposes but contribute no byte weight and cannot trigger a byte-stride
     /// sample.
@@ -613,6 +640,13 @@ impl StreamingSplitEstimator {
     /// If the sample buffer exceeds its cap after insertion, a compaction
     /// cycle runs (halve samples, double strides) before returning.
     pub(crate) fn observe(&mut self, key: &[u8], file_size: u64) {
+        debug_assert!(
+            self.samples
+                .last()
+                .is_none_or(|last| key >= last.key.as_ref()),
+            "observe() requires keys in non-decreasing order; received key that precedes the last sampled key"
+        );
+
         if self.first_observed_key.is_none() {
             self.first_observed_key = Some(Box::<[u8]>::from(key));
         }
@@ -658,11 +692,18 @@ impl StreamingSplitEstimator {
     /// When all observed files are zero-size the byte axis is degenerate, so
     /// the estimator falls back to the rank midpoint (`count / 2`).
     ///
-    /// A special guard prevents returning the very first observed key: when
-    /// weight is front-loaded (e.g. one huge file followed by many small
-    /// ones), the byte-weighted median can land on item 0, which would
-    /// produce a zero-item left shard. In that case the estimator falls back
-    /// to the rank-based midpoint instead.
+    /// Two boundary guards prevent degenerate splits:
+    ///
+    /// - **First-key guard**: when weight is front-loaded (e.g. one huge file
+    ///   followed by many small ones), the byte-weighted median can land on
+    ///   item 0, producing a zero-item left shard. The first observed key is
+    ///   tracked explicitly so this guard survives downsampling.
+    /// - **Last-key guard**: the symmetric case — when weight is back-loaded,
+    ///   the candidate can land on the last key, producing an empty right
+    ///   shard. The check uses `samples.last()` since the estimator only
+    ///   returns sampled keys and compaction preserves endpoints.
+    ///
+    /// Both guards fall back to the rank-based midpoint instead.
     pub(crate) fn estimate_split_key(&self) -> Option<&[u8]> {
         if self.count < 2 {
             return None;
@@ -686,6 +727,19 @@ impl StreamingSplitEstimator {
             .first_observed_key
             .as_ref()
             .is_some_and(|first| candidate == first.as_ref())
+        {
+            return Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target);
+        }
+
+        // Symmetric guard: avoid degenerate "last item" splits when weight is
+        // back-loaded, which would produce an empty right shard. The estimator
+        // only returns sampled keys (key-fidelity invariant), and compaction
+        // always preserves the last sample, so checking samples.last() is
+        // sufficient without a separate per-observe tracked field.
+        if self
+            .samples
+            .last()
+            .is_some_and(|last| candidate == last.key.as_ref())
         {
             return Self::nearest_sample(&self.samples, SampleAxis::Rank, rank_target);
         }
