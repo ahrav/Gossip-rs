@@ -210,7 +210,7 @@ fn expired_budget_returns_retryable_error() {
 }
 
 #[test]
-fn choose_split_point_uses_streaming_estimator_nearest_neighbor() {
+fn choose_split_point_selects_byte_weighted_midpoint() {
     let dir = create_test_repo(&[
         ("a.txt", b"1"),
         ("b.txt", b"22"),

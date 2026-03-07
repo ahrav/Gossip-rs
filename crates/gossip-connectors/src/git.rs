@@ -478,7 +478,9 @@ impl GitConnector {
 
         let range = &self.entries[start_idx..bounds.range_end];
         common::estimate_split_from_sorted(
-            range.iter().map(|entry| (entry.key.as_bytes(), entry.size_hint)),
+            range
+                .iter()
+                .map(|entry| (entry.key.as_bytes(), entry.size_hint)),
             range.len(),
             cursor,
             end,

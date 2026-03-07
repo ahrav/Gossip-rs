@@ -397,11 +397,11 @@ impl FindingsConformanceProbe for InMemoryFindingsSink {
 
     fn durable_counts(&self) -> Result<DurableFindingsCounts, Self::Error> {
         let guard = self.lock_state()?;
-        Ok(DurableFindingsCounts::new(
-            guard.durable_findings.len() as u64,
-            guard.durable_occurrences.len() as u64,
-            guard.durable_observations.len() as u64,
-        ))
+        Ok(DurableFindingsCounts {
+            findings: guard.durable_findings.len() as u64,
+            occurrences: guard.durable_occurrences.len() as u64,
+            observations: guard.durable_observations.len() as u64,
+        })
     }
 }
 

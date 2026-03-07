@@ -74,44 +74,15 @@ type BoxError = Box<dyn Error + Send + Sync + 'static>;
 /// deltas and verify that replays produce zero additional rows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DurableFindingsCounts {
-    findings: u64,
-    occurrences: u64,
-    observations: u64,
+    /// Number of durable finding rows.
+    pub findings: u64,
+    /// Number of durable occurrence rows.
+    pub occurrences: u64,
+    /// Number of durable observation rows.
+    pub observations: u64,
 }
 
 impl DurableFindingsCounts {
-    /// Construct count totals for all three findings layers.
-    #[inline]
-    #[must_use]
-    pub const fn new(findings: u64, occurrences: u64, observations: u64) -> Self {
-        Self {
-            findings,
-            occurrences,
-            observations,
-        }
-    }
-
-    /// Number of durable finding rows.
-    #[inline]
-    #[must_use]
-    pub const fn findings(self) -> u64 {
-        self.findings
-    }
-
-    /// Number of durable occurrence rows.
-    #[inline]
-    #[must_use]
-    pub const fn occurrences(self) -> u64 {
-        self.occurrences
-    }
-
-    /// Number of durable observation rows.
-    #[inline]
-    #[must_use]
-    pub const fn observations(self) -> u64 {
-        self.observations
-    }
-
     /// Return the per-layer saturating delta from `base`.
     ///
     /// Used by the conformance harness to compare before/after snapshots.
@@ -163,43 +134,12 @@ pub trait FindingsConformanceProbe: Send + Sync {
 /// - Redaction: 3 (`NormHash` debug, `SecretHash` debug, `FindingRecord` debug)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PersistenceConformanceReport {
-    done_ledger_checks: u32,
-    findings_checks: u32,
-    redaction_checks: u32,
-}
-
-impl PersistenceConformanceReport {
-    /// Construct a report from the completed check counts.
-    #[inline]
-    #[must_use]
-    pub const fn new(done_ledger_checks: u32, findings_checks: u32, redaction_checks: u32) -> Self {
-        Self {
-            done_ledger_checks,
-            findings_checks,
-            redaction_checks,
-        }
-    }
-
     /// Number of done-ledger checks that completed successfully.
-    #[inline]
-    #[must_use]
-    pub const fn done_ledger_checks(self) -> u32 {
-        self.done_ledger_checks
-    }
-
+    pub done_ledger_checks: u32,
     /// Number of findings checks that completed successfully.
-    #[inline]
-    #[must_use]
-    pub const fn findings_checks(self) -> u32 {
-        self.findings_checks
-    }
-
+    pub findings_checks: u32,
     /// Number of redaction checks that completed successfully.
-    #[inline]
-    #[must_use]
-    pub const fn redaction_checks(self) -> u32 {
-        self.redaction_checks
-    }
+    pub redaction_checks: u32,
 }
 
 /// Failure reported by the persistence conformance harness.
@@ -298,7 +238,10 @@ impl fmt::Display for PersistenceConformanceError {
                 leaked_fragment,
             } => write!(
                 f,
-                "sensitive Debug output leaked raw bytes in {case}: leaked fragment `{leaked_fragment}` in `{debug_output}`"
+                "sensitive Debug output leaked raw bytes in {case}: \
+                 fragment_len={}, output_len={}",
+                leaked_fragment.len(),
+                debug_output.len()
             ),
         }
     }
@@ -346,11 +289,11 @@ where
     let done_ledger_checks = run_done_ledger_conformance(done_ledger)?;
     let findings_checks = run_findings_conformance(findings)?;
     let redaction_checks = run_redaction_conformance()?;
-    Ok(PersistenceConformanceReport::new(
+    Ok(PersistenceConformanceReport {
         done_ledger_checks,
         findings_checks,
         redaction_checks,
-    ))
+    })
 }
 
 /// Run only the done-ledger portion of the conformance suite.
@@ -379,9 +322,19 @@ pub fn run_done_ledger_conformance<L>(done_ledger: &L) -> Result<u32, Persistenc
 where
     L: DoneLedger,
 {
-    let mut checks = 0u32;
+    check_done_ledger_idempotent(done_ledger)?;
+    check_done_ledger_fail_then_scan(done_ledger)?;
+    check_done_ledger_scan_then_fail(done_ledger)?;
+    Ok(3)
+}
 
-    // --- Check 1: idempotent upsert ---
+/// Check 1: writing the same `ScannedWithFindings` record twice must not
+/// alter durable state. The harness writes, replays, reads back, and asserts
+/// byte-for-byte equality.
+fn check_done_ledger_idempotent<L>(done_ledger: &L) -> Result<(), PersistenceConformanceError>
+where
+    L: DoneLedger,
+{
     let fixture = sample_fixture(0x11)?;
     let receipt = submit_done_ledger(
         done_ledger,
@@ -415,11 +368,16 @@ where
             ),
         });
     }
-    checks += 1;
+    Ok(())
+}
 
-    // --- Check 2: fail-then-scan dominance ---
-    // Write a failure first, then a scanned record for the same key.
-    // The lattice merge must yield the scanned state.
+/// Check 2: writing a `FailedRetryable` record followed by a
+/// `ScannedWithFindings` record for the same key must leave the durable state
+/// in the scanned status (the lattice join of failed v scanned).
+fn check_done_ledger_fail_then_scan<L>(done_ledger: &L) -> Result<(), PersistenceConformanceError>
+where
+    L: DoneLedger,
+{
     let fixture = sample_fixture(0x22)?;
     let _ = submit_done_ledger(
         done_ledger,
@@ -438,12 +396,16 @@ where
         &fixture.failed_record,
         &fixture.scanned_record,
         &fetched,
-    )?;
-    checks += 1;
+    )
+}
 
-    // --- Check 3: scan-then-fail dominance ---
-    // Reverse arrival order: scanned first, failure second. The lattice
-    // property guarantees the scanned state still wins.
+/// Check 3: the reverse arrival order (scanned first, failure second) must
+/// produce the same result. A subsequent failure write must not downgrade a
+/// scanned entry. This tests the lattice property regardless of arrival order.
+fn check_done_ledger_scan_then_fail<L>(done_ledger: &L) -> Result<(), PersistenceConformanceError>
+where
+    L: DoneLedger,
+{
     let fixture = sample_fixture(0x33)?;
     let _ = submit_done_ledger(
         done_ledger,
@@ -462,10 +424,7 @@ where
         &fixture.failed_record,
         &fixture.scanned_record,
         &fetched,
-    )?;
-    checks += 1;
-
-    Ok(checks)
+    )
 }
 
 /// Run only the findings-layer portion of the conformance suite.
@@ -495,9 +454,20 @@ pub fn run_findings_conformance<F>(findings: &F) -> Result<u32, PersistenceConfo
 where
     F: FindingsSink + FindingsConformanceProbe,
 {
-    let mut checks = 0u32;
+    check_findings_idempotent(findings)?;
+    check_findings_orphan_occurrence(findings)?;
+    check_findings_orphan_observation(findings)?;
+    Ok(3)
+}
 
-    // --- Check 1: idempotent upsert with durable count verification ---
+/// Check 1: writing a complete (finding, occurrence, observation) batch twice
+/// must add exactly one row per layer on the first write and zero additional
+/// rows on the replay. Uses the probe to snapshot durable counts before,
+/// between, and after the two writes.
+fn check_findings_idempotent<F>(findings: &F) -> Result<(), PersistenceConformanceError>
+where
+    F: FindingsSink + FindingsConformanceProbe,
+{
     let fixture = sample_fixture(0x44)?;
     let before = probe_counts(findings, "findings/idempotent:before")?;
     let batch = fixture.findings_batch();
@@ -518,7 +488,13 @@ where
     }
     let after_first = probe_counts(findings, "findings/idempotent:after-first")?;
     let delta = after_first.saturating_sub(before);
-    if delta != DurableFindingsCounts::new(1, 1, 1) {
+    if delta
+        != (DurableFindingsCounts {
+            findings: 1,
+            occurrences: 1,
+            observations: 1,
+        })
+    {
         return Err(PersistenceConformanceError::FindingsInvariant {
             case: "findings/idempotent:after-first",
             message: format!("expected durable count delta of (1,1,1), got {:?}", delta),
@@ -540,12 +516,16 @@ where
             ),
         });
     }
-    checks += 1;
+    Ok(())
+}
 
-    // --- Check 2: orphan occurrence (missing parent finding) ---
-    // The occurrence references a finding_id, but the batch omits the
-    // FindingRecord. The backend must reject this to preserve referential
-    // integrity, and the failure must not leave partial rows behind.
+/// Check 2: submitting an occurrence without its parent finding must fail (at
+/// submission or at durable commit). The failure must not leave partial rows
+/// behind.
+fn check_findings_orphan_occurrence<F>(findings: &F) -> Result<(), PersistenceConformanceError>
+where
+    F: FindingsSink + FindingsConformanceProbe,
+{
     let fixture = sample_fixture(0x55)?;
     let before = probe_counts(findings, "findings/missing-finding:before")?;
     let occurrences = [fixture.occurrence.clone()];
@@ -564,10 +544,16 @@ where
             ),
         });
     }
-    checks += 1;
+    Ok(())
+}
 
-    // --- Check 3: orphan observation (missing parent occurrence) ---
-    // Same principle as check 2, one level deeper in the hierarchy.
+/// Check 3: submitting an observation without its parent occurrence must fail
+/// and leave no partial rows. Same principle as orphan occurrence rejection,
+/// one level deeper in the hierarchy.
+fn check_findings_orphan_observation<F>(findings: &F) -> Result<(), PersistenceConformanceError>
+where
+    F: FindingsSink + FindingsConformanceProbe,
+{
     let fixture = sample_fixture(0x66)?;
     let before = probe_counts(findings, "findings/missing-occurrence:before")?;
     let observations = [fixture.observation.clone()];
@@ -586,9 +572,7 @@ where
             ),
         });
     }
-    checks += 1;
-
-    Ok(checks)
+    Ok(())
 }
 
 /// Run only the redaction-related portion of the conformance suite.

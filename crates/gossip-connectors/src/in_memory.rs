@@ -431,7 +431,9 @@ impl InMemoryDeterministicConnector {
 
         let range = &self.items[start_idx..bounds.range_end];
         common::estimate_split_from_sorted(
-            range.iter().map(|item| (item.key.as_bytes(), item.size_hint)),
+            range
+                .iter()
+                .map(|item| (item.key.as_bytes(), item.size_hint)),
             range.len(),
             cursor,
             end,
