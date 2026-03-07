@@ -92,7 +92,7 @@ fn findings_upsert_batch_validate_accepts_canonical_observations() {
     let observations = [make_observation_record(0x03)];
 
     FindingsUpsertBatch::new(&[], &[], &observations)
-        .validate()
+        .validate_observation_identity()
         .expect("canonical observations should pass A3 validation");
 }
 
@@ -106,7 +106,7 @@ fn findings_upsert_batch_validate_rejects_mismatched_observation_identity() {
 
     assert_eq!(
         FindingsUpsertBatch::new(&[], &[], &observations)
-            .validate()
+            .validate_observation_identity()
             .unwrap_err(),
         PersistenceInputError::ObservationIdMismatch { expected, actual }
     );
@@ -172,6 +172,7 @@ fn observation_record_from_persisted_accepts_matching_id() {
         record.shard_id(),
         record.fence_epoch(),
         record.seen_at(),
+        None,
     )
     .expect("matching persisted observation id should be accepted");
 
@@ -194,6 +195,7 @@ fn observation_record_from_persisted_rejects_mismatched_id() {
             record.shard_id(),
             record.fence_epoch(),
             record.seen_at(),
+            None,
         )
         .unwrap_err(),
         PersistenceInputError::ObservationIdMismatch {
@@ -201,6 +203,29 @@ fn observation_record_from_persisted_rejects_mismatched_id() {
             actual,
         }
     );
+}
+
+#[test]
+fn from_persisted_preserves_location_metadata() {
+    let location =
+        Location::try_new("repo/path".into(), Some("https://example.test".into())).unwrap();
+    let record = make_observation_record(0x03).with_location(location.clone());
+
+    let rebuilt = ObservationRecord::from_persisted(
+        record.tenant_id(),
+        record.observation_id(),
+        record.occurrence_id(),
+        record.policy_hash(),
+        record.ovid_hash(),
+        record.run_id(),
+        record.shard_id(),
+        record.fence_epoch(),
+        record.seen_at(),
+        Some(location),
+    )
+    .expect("matching id should be accepted");
+
+    assert_eq!(rebuilt, record);
 }
 
 #[test]

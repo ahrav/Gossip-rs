@@ -358,8 +358,9 @@ impl ObservationRecord {
         shard_id: ShardId,
         fence_epoch: FenceEpoch,
         seen_at: LogicalTime,
+        location: Option<Location>,
     ) -> Result<Self, PersistenceInputError> {
-        let record = Self::new(
+        let mut record = Self::new(
             tenant_id,
             occurrence_id,
             policy_hash,
@@ -377,6 +378,7 @@ impl ObservationRecord {
             });
         }
 
+        record.location = location;
         Ok(record)
     }
 
@@ -555,7 +557,12 @@ impl<'a> FindingsUpsertBatch<'a> {
     ///
     /// This checks that every observation's stored `observation_id` matches
     /// the canonical derivation from `(tenant, policy_hash, occurrence_id)`.
-    pub fn validate(self) -> Result<(), PersistenceInputError> {
+    ///
+    /// Note: this does **not** check referential integrity or tenant
+    /// consistency — call
+    /// [`validate_referential_integrity`](Self::validate_referential_integrity)
+    /// separately for those.
+    pub fn validate_observation_identity(self) -> Result<(), PersistenceInputError> {
         for observation in self.observations {
             observation.validate_identity()?;
         }
