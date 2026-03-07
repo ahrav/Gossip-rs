@@ -312,7 +312,7 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 
     redistribute_plateau_picks(samples, &mut picks, axis);
 
-    debug_assert!(
+    assert!(
         picks.windows(2).all(|w| w[0] < w[1]),
         "selected indices must be strictly increasing after plateau redistribution"
     );
@@ -322,29 +322,8 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 
 /// Spread plateau-clustered picks across the full plateau rank extent.
 ///
-/// # Problem
-///
-/// The byte-axis nearest-neighbor pass in [`selected_sample_indices`] can
-/// assign many consecutive picks to the same byte-axis value when the sample
-/// array contains a "plateau" — a contiguous region of samples that all share
-/// one `cumulative_bytes` value. This happens in practice when a single large
-/// file is followed by many zero-byte entries: the zero-byte samples all
-/// record the same cumulative position, so every interpolated byte target
-/// that lands inside the plateau snaps to the earliest available index
-/// (due to forward-progress). The result is a tight cluster of retained
-/// samples at the plateau's leading edge with no coverage of the later
-/// ordinal ranks.
-///
-/// When `estimate_split_key` later falls back to the rank axis (because the
-/// byte-weighted midpoint lands on the first key), the lack of rank diversity
-/// makes the rank-based search return a sample far from the true midpoint,
-/// producing a badly unbalanced split.
-///
-/// # Solution
-///
-/// After the main selection loop, this function scans `picks` for maximal
-/// runs where every picked sample shares one axis value. For each such run
-/// of length >= 2 it:
+/// Scans `picks` for maximal runs where every picked sample shares one axis
+/// value. For each such run of length >= 2 it:
 ///
 /// 1. Finds the full plateau extent in `samples` (all contiguous indices
 ///    with the same axis value).
@@ -357,25 +336,13 @@ fn selected_sample_indices(samples: &[Sample], cap: usize) -> Vec<usize> {
 ///    invariant at each step with both a floor (forward progress) and a
 ///    ceiling (room for remaining picks).
 ///
-/// When all samples in the usable range also share the same rank (fully
-/// degenerate), the strictly-increasing rank invariant guarantees this
-/// only occurs when `eff_start == eff_end`, which the size guard rejects
-/// before redistribution runs.
-///
-/// # Complexity
-///
-/// O(picks.len() * plateau_extent) in the worst case for a single plateau
-/// that spans the entire sample array, but in practice plateau extents are
-/// bounded by the sample cap divided by the number of distinct byte values.
+/// O(picks.len() * plateau_extent) worst case.
 ///
 /// # Invariants preserved
 ///
 /// - `picks` remains strictly increasing after redistribution.
-/// - Endpoint picks (first = 0, last = len − 1) are never moved: the main
-///   loop forces them explicitly, so they never appear inside a multi-pick
-///   plateau cluster.
-/// - The function is a no-op when `picks.len() < 3` (0–2 picks cannot
-///   contain a non-endpoint plateau cluster).
+/// - Endpoint picks (first = 0, last = len − 1) are never moved.
+/// - No-op when `picks.len() < 3`.
 fn redistribute_plateau_picks(samples: &[Sample], picks: &mut [usize], axis: SampleAxis) {
     if picks.len() < 3 {
         // With 0–2 picks there cannot be a non-endpoint plateau cluster.
@@ -456,20 +423,10 @@ fn redistribute_plateau_picks(samples: &[Sample], picks: &mut [usize], axis: Sam
 
 /// Find the sample in `samples[lo..=hi]` whose rank is closest to `target`.
 ///
-/// Used by [`redistribute_plateau_picks`] to snap an evenly-spaced rank
-/// target to an actual sample within a plateau's effective index range.
-/// A linear scan is acceptable here because the range is bounded by the
-/// plateau extent, which is typically a small fraction of the sample buffer.
-///
-/// Ties are broken in favour of the earlier index (lower rank), which biases
-/// toward preserving forward-progress when the caller enforces
-/// strictly-increasing picks.
+/// Linear scan over the plateau extent. Ties break to the earlier index
+/// (lower rank) to preserve forward-progress in the caller.
 ///
 /// Returns an absolute index into `samples`, not relative to `lo`.
-///
-/// # Panics
-///
-/// Panics if `lo > hi` or if either bound is out of range for `samples`.
 fn nearest_by_rank_in_range(samples: &[Sample], lo: usize, hi: usize, target: u64) -> usize {
     let mut best = lo;
     let mut best_dist = samples[lo].rank.abs_diff(target);

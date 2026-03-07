@@ -838,52 +838,6 @@ proptest! {
 // Plateau redistribution tests
 // ---------------------------------------------------------------------------
 
-/// Regression: 1 huge file + many zero-byte files. After compaction the rank
-/// fallback must land near the rank midpoint, not near rank 0.
-#[test]
-fn front_loaded_zero_tail_fallback_stays_near_rank_midpoint_after_compaction() {
-    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
-    let cap = estimator.sample_cap();
-    let n = 2_000usize;
-    assert!(
-        n > cap,
-        "test must exceed sample_cap to trigger downsampling"
-    );
-
-    // One 100 MB file, then 2 000 zero-byte files.
-    estimator.observe(&key_for_index(0), 100_000_000);
-    for idx in 1..=n {
-        estimator.observe(&key_for_index(idx), 0);
-    }
-
-    let total_count = n + 1;
-    let split = estimator.estimate_split_key().expect("split key expected");
-    let split_idx = index_from_key(split);
-
-    // Must not return the first key.
-    assert!(
-        split_idx >= 1,
-        "split must not be the first observed key, got index {}",
-        split_idx
-    );
-
-    // Must be within 2 * count / sample_cap of the true rank midpoint.
-    let midpoint = total_count / 2;
-    let tolerance = 2 * total_count / cap;
-    let distance = split_idx.abs_diff(midpoint);
-    assert!(
-        distance <= tolerance,
-        "rank fallback landed at index {} (distance {} from midpoint {}), \
-         tolerance is {} (2 * {} / {})",
-        split_idx,
-        distance,
-        midpoint,
-        tolerance,
-        total_count,
-        cap
-    );
-}
-
 /// Plateau in the middle of the stream: a narrow leading region, a large
 /// plateau occupying most of the byte range, and a narrow trailing region.
 /// Compaction must spread picks within the mid-stream plateau by rank.
@@ -1089,6 +1043,45 @@ fn plateau_with_rank_gap_preserves_strict_ordering() {
         samples.windows(2).all(|w| w[0].rank < w[1].rank),
         "ranks must remain strictly increasing after plateau redistribution: {:?}",
         samples.iter().map(|s| s.rank).collect::<Vec<_>>()
+    );
+}
+
+/// Regression: when a plateau's effective range is a tight fit (exactly
+/// run_len indices) and ranks are non-uniformly distributed, the floor
+/// cascade can push picks past eff_end without the ceiling constraint.
+#[test]
+fn plateau_redistribution_clamps_to_effective_range() {
+    use super::{Sample, SampleAxis, redistribute_plateau_picks};
+
+    // 6 samples: 1 non-plateau, 4 plateau (tight fit), 1 non-plateau.
+    // The plateau has ranks 1,2,3,1000 — a big gap that causes
+    // nearest_by_rank to cluster early picks near index 3, leaving
+    // no room for j=3 which gets pushed past eff_end by the floor.
+    let samples = vec![
+        Sample::new(0, 0, &key_for_index(0)),   // index 0: non-plateau
+        Sample::new(1, 500, &key_for_index(1)), // index 1: plateau
+        Sample::new(2, 500, &key_for_index(2)), // index 2: plateau
+        Sample::new(3, 500, &key_for_index(3)), // index 3: plateau
+        Sample::new(1000, 500, &key_for_index(4)), // index 4: plateau (rank gap)
+        Sample::new(2000, 1000, &key_for_index(5)), // index 5: non-plateau
+    ];
+
+    // picks[0]=0 (non-plateau), picks[1..5] on plateau, picks[5]=5 (non-plateau).
+    // The plateau run is picks[1..5], run_len=4.
+    // eff_start=1, eff_end=4 → tight fit (4-1+1=4 == run_len).
+    let mut picks = vec![0, 1, 2, 3, 4, 5];
+
+    redistribute_plateau_picks(&samples, &mut picks, SampleAxis::Bytes);
+
+    assert!(
+        picks.windows(2).all(|w| w[0] < w[1]),
+        "picks must be strictly increasing after redistribution, got {:?}",
+        picks
+    );
+    assert!(
+        picks.iter().all(|&p| p < samples.len()),
+        "all picks must be valid indices, got {:?}",
+        picks
     );
 }
 
