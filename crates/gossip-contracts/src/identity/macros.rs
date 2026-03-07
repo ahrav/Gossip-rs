@@ -218,6 +218,11 @@ macro_rules! define_id_32_restricted {
 /// proc-macro crate: the identity layer already uses declarative macros for
 /// boilerplate, and keeping the struct definition plus `CanonicalBytes` impl in
 /// one macro invocation makes the declaration order the single source of truth.
+///
+/// # Syntax
+///
+/// All fields must end with a trailing comma, including the last field.
+/// Omitting it produces an unhelpful "no rules matched" error.
 macro_rules! define_canonical_input {
     (
         $(#[$meta:meta])*
