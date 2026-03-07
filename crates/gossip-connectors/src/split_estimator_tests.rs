@@ -840,6 +840,107 @@ fn cumulative_bytes_saturation() {
     );
 }
 
+#[test]
+fn observe_realigns_marks_after_u64_max_saturation() {
+    use super::align_to_stride;
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 100;
+    // count must sit on the rank stride grid so the rank cadence fires cleanly.
+    // u64::MAX % 4 == 3, so u64::MAX - 3 is divisible by 4.
+    estimator.count = u64::MAX - 3;
+    estimator.total_bytes = u64::MAX - 500;
+    // Set marks so both cadences fire on the next observe.
+    estimator.next_rank_sample = u64::MAX - 3;
+    estimator.next_byte_mark = u64::MAX - 500;
+    // Seed a prior sample so the buffer is non-empty (mirrors realistic state).
+    estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
+    estimator.first_observed_key = Some(Box::from(key_for_index(0).as_slice()));
+
+    // This observe fires both cadences (rank == next_rank_sample, byte interval
+    // straddles next_byte_mark). After updating count/total_bytes, at least one
+    // of them saturates to u64::MAX, which triggers realign_sample_marks().
+    estimator.observe(&key_for_index(1), 600);
+
+    assert_eq!(
+        estimator.total_bytes,
+        u64::MAX,
+        "total_bytes should saturate"
+    );
+    assert!(
+        estimator.sample_len() >= 2,
+        "cadence should have emitted a sample"
+    );
+    assert_eq!(
+        estimator.next_rank_sample,
+        align_to_stride(estimator.count, estimator.rank_stride),
+        "rank mark must be realigned to stride grid after saturation"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark must be realigned to stride grid after saturation"
+    );
+    // When total_bytes == u64::MAX, align_to_stride returns u64::MAX.
+    assert_eq!(
+        estimator.next_byte_mark,
+        u64::MAX,
+        "byte mark should be pinned at u64::MAX when total_bytes is saturated"
+    );
+}
+
+#[test]
+fn observe_realigns_marks_after_count_saturates_to_max() {
+    use super::align_to_stride;
+
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 100;
+    // Next observe will push count from MAX-1 to MAX via saturating_add.
+    estimator.count = u64::MAX - 1;
+    estimator.total_bytes = 5000;
+    // Set marks so neither cadence fires — we only care about the saturation
+    // guard realigning marks, not about emitting a new sample.
+    estimator.next_rank_sample = u64::MAX;
+    estimator.next_byte_mark = 6000;
+    estimator.samples.push(Sample::new(0, 0, &key_for_index(0)));
+    estimator.first_observed_key = Some(Box::from(key_for_index(0).as_slice()));
+
+    estimator.observe(&key_for_index(1), 10);
+
+    assert_eq!(
+        estimator.count,
+        u64::MAX,
+        "count should saturate to u64::MAX"
+    );
+    assert_eq!(
+        estimator.total_bytes, 5010,
+        "total_bytes should advance normally (not saturated)"
+    );
+    assert_eq!(
+        estimator.next_rank_sample,
+        align_to_stride(estimator.count, estimator.rank_stride),
+        "rank mark must be realigned after count saturates"
+    );
+    // count == u64::MAX → align_to_stride(u64::MAX, 4) == u64::MAX.
+    assert_eq!(
+        estimator.next_rank_sample,
+        u64::MAX,
+        "rank mark should be pinned at u64::MAX when count is saturated"
+    );
+    assert_eq!(
+        estimator.next_byte_mark,
+        align_to_stride(estimator.total_bytes, estimator.byte_stride),
+        "byte mark must be realigned onto the stride grid after saturation"
+    );
+    // total_bytes == 5010, byte_stride == 100 → align_to_stride(5010, 100) == 5100.
+    assert_eq!(
+        estimator.next_byte_mark, 5100,
+        "byte mark should snap forward to the next stride-aligned value"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Property tests — general invariants over randomised inputs
 // ---------------------------------------------------------------------------

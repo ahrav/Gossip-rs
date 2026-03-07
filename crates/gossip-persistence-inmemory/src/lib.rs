@@ -62,6 +62,7 @@ mod done_ledger;
 pub mod error;
 mod findings;
 pub(crate) mod pending;
+pub(crate) mod store;
 
 pub use done_ledger::{InMemoryDoneLedger, InMemoryDoneLedgerHandle};
 pub use error::{CompletionOrder, InMemoryPersistenceError, InMemoryStoreKind, PendingWriteId};
