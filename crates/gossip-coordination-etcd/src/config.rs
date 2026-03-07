@@ -214,6 +214,9 @@ impl EtcdCoordinatorConfig {
         if self.namespace_prefix.ends_with('/') && self.namespace_prefix.len() > 1 {
             return Err(EtcdCoordinatorConfigError::NamespacePrefixMustNotEndWithSlash);
         }
+        if self.namespace_prefix.contains("//") {
+            return Err(EtcdCoordinatorConfigError::NamespacePrefixContainsDoubleSlash);
+        }
 
         Ok(())
     }
@@ -256,6 +259,8 @@ pub enum EtcdCoordinatorConfigError {
     NamespacePrefixMustStartWithSlash,
     /// The namespace prefix ends with `'/'` and is longer than `"/"`.
     NamespacePrefixMustNotEndWithSlash,
+    /// The namespace prefix contains consecutive slashes (`//`).
+    NamespacePrefixContainsDoubleSlash,
 }
 
 impl fmt::Display for EtcdCoordinatorConfigError {
@@ -277,6 +282,9 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             }
             Self::NamespacePrefixMustNotEndWithSlash => {
                 f.write_str("namespace_prefix must not end with '/' unless it is exactly '/'")
+            }
+            Self::NamespacePrefixContainsDoubleSlash => {
+                f.write_str("namespace_prefix must not contain consecutive slashes '//'")
             }
         }
     }

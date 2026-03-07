@@ -1,3 +1,87 @@
+**NEVER auto-commit, auto-add, or auto-push code to git. Only perform git operations when explicitly asked by the user.**
+
+<!-- comment-policy-v2 -->
+
+## Comment Policy — MANDATORY, HOOK-ENFORCED
+
+**Source code and documentation are not conversations, changelogs, or responses
+to PR feedback.** Comments and doc prose must describe the code they annotate —
+its behavior, invariants, edge cases, or non-obvious design reasoning.
+Nothing else.
+
+A PostToolUse hook (`comment-lint.sh`) scans every `.rs` file write and every
+`.md` file write under `docs/` and `diagrams/`. It will flag violations. Fix
+them before moving on.
+
+### What Is Banned
+
+| Category | Examples of BANNED comments |
+|----------|-----------------------------|
+| Tracking IDs | `// F-011: BatchValidation error variant`, `// C3: edge case` |
+| Milestone / phase labels | `// B0 scaffold`, `// until B1 lands`, `// B1/B2 will add`, `phase 1` |
+| PR / review references | `// PR #124`, `// per review feedback`, `// addressed reviewer concern` |
+| Test justification | `// Verification tests for PR review comments`, `// Added to cover finding F7` |
+| Temporal narration | `// Previously used linear scan`, `// Was changed from X to Y`, `// Newly added` |
+| Conversational | `// Good catch`, `// As discussed`, `// Note to reviewer` |
+| History narration | `// Refactored from module A`, `// Moved from old_engine.rs` |
+| Task IDs in docs | `gossip-8968`, `gossip-rs-8r9.25`, `Step gossip-rs-...` (in `.md` files) |
+
+### What Is Required
+
+Comments must stand alone. A reader with no access to your PR, issue tracker,
+or chat history must fully understand the comment from the code context alone.
+
+**BAD → GOOD rewrites:**
+
+```rust
+// BAD: F-011: BatchValidation error variant
+// GOOD: Rejects submissions that span multiple tenants in a single batch.
+
+// BAD: Verification tests for PR review comments
+// GOOD: Edge-case coverage for batch boundary conditions.
+
+// BAD: F1: Merge panic bug fix
+// GOOD: Merge transition clears stale metadata to prevent use-after-move.
+
+// BAD: B0 etcd coordination backend scaffold.
+// GOOD: etcd coordination backend.
+
+// BAD: until B1/B2 land the etcd keyspace and transactional writes.
+// GOOD: until the etcd keyspace and transactional writes land.
+
+// BAD: Previously used linear scan, refactored to binary search
+// GOOD: Binary search — the rank array is sorted by construction (see insert_sorted above).
+
+// BAD: Added per reviewer suggestion to handle empty input
+// GOOD: Empty input returns Ok(()) — callers depend on this for idempotent retry loops.
+```
+
+**Docs (`docs/`, `diagrams/`) follow the same policy.** No milestone labels,
+task IDs, or step tracking references in documentation prose.
+
+### Self-Check Before Writing Any Comment
+
+If you are about to write a comment, ask:
+
+1. Does it reference a finding ID, PR number, or reviewer? **Delete it.**
+2. Does it explain *when* or *why it was changed* rather than *what the code does*? **Rewrite it.**
+3. Would it make sense to someone who has never seen the PR? If not, **rewrite it.**
+
+### Code-Internal Cross-References Are Fine
+
+Stable identifiers that exist purely within the codebase for internal
+cross-referencing (e.g., invariant labels S1–S7 in the simulation checker)
+are documentation, not tracking noise.
+
+### Enforcement
+
+- **Hook**: `comment-lint.sh` runs on every `.rs` file write and every `.md`
+  file write under `docs/` or `diagrams/`, flagging violations.
+- **Review**: Any PR introducing banned comment patterns will be rejected.
+- **Existing violations**: Must be cleaned up when touching a file.
+
+<!-- end-comment-policy -->
+
 ## Task Management
 
 This project uses `bd` (Beads) for issue tracking. Issues live in `.beads/`.
@@ -17,7 +101,45 @@ After modifying Rust code, ALWAYS run these steps:
 
 1. `cargo fmt --all && cargo check && cargo clippy --all-targets --all-features -- -D warnings && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`
 2. Run `/doc-rigor` skill on the new code to keep documentation updated
-3. If adding new components, update relevant docs: `docs/gossip-coordination/coordination-testing.md`, `docs/gossip-coordination/simulation-harness.md`, `docs/gossip-coordination/boundary-2-coordination.md`
+3. If a hook fires naming a design doc (`DESIGN DOC CHECK`), open that doc and verify
+   it still matches the code. If the hook says `[NEW FILE]`, update the doc's file list.
+
+<!-- no-versioning-v1 -->
+
+## No Versioning, No Legacy Code — MANDATORY
+
+This is pre-release developmental code with zero backwards-compatibility
+obligations. There is exactly one version: the current one.
+
+### Rules
+
+1. **Never version APIs, structs, enums, or serialization formats.** No `V1`/`V2`
+   suffixes, no `_v2` functions, no version discriminants in wire formats.
+2. **Never introduce `#[deprecated]` attributes.** If something is wrong, fix it
+   or remove it. Do not leave the old path around with a deprecation warning.
+3. **Never create legacy or compatibility shims.** No `old_*` / `new_*` parallel
+   implementations, no feature flags gating old behavior, no migration layers.
+4. **All changes are breaking.** Rename, restructure, and delete freely. Callers
+   must be updated in the same commit. There are no downstream consumers to
+   protect.
+5. **One code path per behavior.** If a refactor replaces an approach, delete the
+   old approach entirely. Dead code is a liability, not a safety net.
+6. **No `cfg` gates for old-vs-new.** Feature flags are for optional capabilities,
+   not for preserving defunct logic.
+
+### What This Means in Practice
+
+- Changing a struct field? Rename it everywhere in one pass.
+- Replacing an algorithm? Delete the old one, wire in the new one.
+- Updating serialization? Change the format, update all readers/writers.
+- Removing a public function? Remove it and fix every call site.
+
+### Enforcement
+
+Any PR that introduces versioned types, deprecated annotations, compatibility
+shims, or parallel old/new code paths will be rejected. No exceptions.
+
+<!-- end-no-versioning -->
 
 <!-- zero-alloc-hot-path-v1 -->
 
@@ -310,6 +432,37 @@ If during review a duplicate is found that could have been caught by searching
 the codebase first, the change will be rejected. No exceptions.
 
 <!-- end-duplication-prevention -->
+
+## Design Doc Maintenance
+
+Design docs in `docs/` describe architecture and invariants for specific source
+directories. The `design-doc-scope-check.sh` hook fires automatically when editing
+`.rs` files and produces three kinds of alerts:
+
+| Alert | Meaning |
+|-------|---------|
+| `DESIGN DOC CHECK: <path> is in scope of: -> <doc>` | Existing file — verify doc still matches code |
+| `DESIGN DOC CHECK [NEW FILE]: <path> is NEW and in scope of: -> <doc>` | New file — update doc's file list and counts |
+| `NOTE: <path> has no design doc coverage.` | No doc covers this directory — consider adding one |
+
+### Rules
+
+- **Act on hook reminders.** When the hook names a doc, open it and verify the code
+  change is consistent with what the doc describes.
+- **Update docs for new files.** `[NEW FILE]` alerts mean the doc's file inventory
+  is out of date. Add the new file and adjust any counts.
+- **Add scopes for new docs.** When creating a new design doc, add a `[[scopes]]`
+  entry in `docs/scope-map.toml` so the hook knows about it.
+- **Check docs before closing tasks.** Before marking work complete, verify any
+  in-scope design docs are still accurate.
+
+## Architecture References
+
+- `diagrams/` — 12 Mermaid diagram files covering all 5 boundaries (start with `diagrams/00-README.md`)
+- `docs/gossip-coordination/coordination-testing.md` — Test tier breakdown and cargo test commands
+- `docs/gossip-coordination/simulation-harness.md` — Simulation architecture, invariants S1–S7, fault levels
+- `docs/gossip-coordination/boundary-2-coordination.md` — Coordination protocol specification
+- `docs/gossip-contracts/boundary-1-identity-spine.md` — Identity type hierarchy
 
 ## Landing the Plane (Session Completion)
 

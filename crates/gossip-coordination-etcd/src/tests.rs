@@ -1,17 +1,19 @@
 //! Tests for the etcd coordination backend.
 //!
-//! The bulk of this module covers [`EtcdCoordinatorConfig`] validation —
-//! these are pure, deterministic tests that require no external services.
-//!
-//! A single `#[ignore]`-gated integration test (`connects_to_local_etcd_and_fetches_status`)
-//! exercises the full connect → status round-trip against a live etcd instance.
+//! These cover three layers:
+//! - config validation (pure, deterministic)
+//! - keyspace path construction
+//! - etcd integration (requires local etcd, `#[ignore]`)
 
 use std::env;
 
 use crate::{
     EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
-    EtcdOperation,
+    EtcdKeyspace, EtcdKeyspaceError, EtcdOperation,
 };
+use gossip_contracts::identity::{RunId, ShardId, TenantId};
+use proptest::prelude::*;
+use rstest::rstest;
 
 #[test]
 fn config_rejects_empty_endpoint_list() {
@@ -96,105 +98,10 @@ fn from_endpoints_csv_with_all_empty_segments_returns_no_endpoints() {
 
 #[test]
 fn from_endpoints_csv_drops_trailing_empty_segments() {
-    // Trailing commas (common in env vars) are silently accepted
-    // rather than failing with EmptyEndpoint.
     let config = EtcdCoordinatorConfig::from_endpoints_csv("http://a:2379,,", "/gossip/v1")
         .expect("trailing empty segments should be silently dropped");
     assert_eq!(config.endpoints(), ["http://a:2379"]);
 }
-
-// ---------------------------------------------------------------------------
-// Error Display tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn etcd_operation_display_connect() {
-    assert_eq!(EtcdOperation::Connect.to_string(), "connect");
-}
-
-#[test]
-fn etcd_operation_display_status() {
-    assert_eq!(EtcdOperation::Status.to_string(), "status");
-}
-
-#[test]
-fn config_error_display_no_endpoints() {
-    let error = EtcdCoordinatorConfigError::NoEndpoints;
-    assert_eq!(error.to_string(), "at least one etcd endpoint is required");
-}
-
-#[test]
-fn config_error_display_invalid_scheme() {
-    let error = EtcdCoordinatorConfigError::InvalidEndpointScheme { index: 2 };
-    assert_eq!(
-        error.to_string(),
-        "etcd endpoint at index 2 has invalid scheme (expected http:// or https://)"
-    );
-}
-
-#[test]
-fn coordinator_error_display_wraps_config_error() {
-    let inner = EtcdCoordinatorConfigError::NoEndpoints;
-    let outer = EtcdCoordinatorError::Config(inner);
-    assert!(
-        outer
-            .to_string()
-            .contains("invalid etcd coordinator config"),
-        "Display should wrap the config error message"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Error source chain tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn coordinator_error_config_source_returns_inner() {
-    use std::error::Error;
-
-    let inner = EtcdCoordinatorConfigError::NoEndpoints;
-    let outer = EtcdCoordinatorError::Config(inner);
-    let source = outer.source().expect("Config variant must have a source");
-    assert!(
-        source
-            .downcast_ref::<EtcdCoordinatorConfigError>()
-            .is_some(),
-        "source should downcast to EtcdCoordinatorConfigError"
-    );
-}
-
-#[test]
-fn coordinator_error_runtime_source_returns_inner() {
-    use std::error::Error;
-
-    let io_err = std::io::Error::other("test");
-    let outer = EtcdCoordinatorError::RuntimeBuild(io_err);
-    let source = outer
-        .source()
-        .expect("RuntimeBuild variant must have a source");
-    assert!(
-        source.downcast_ref::<std::io::Error>().is_some(),
-        "source should downcast to io::Error"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// From conversion test
-// ---------------------------------------------------------------------------
-
-#[test]
-fn config_error_converts_to_coordinator_error_via_from() {
-    let config_err = EtcdCoordinatorConfigError::NoEndpoints;
-    let coord_err: EtcdCoordinatorError = config_err.into();
-    assert!(
-        matches!(coord_err, EtcdCoordinatorError::Config(_)),
-        "From should produce Config variant"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Config edge cases
-// ---------------------------------------------------------------------------
 
 #[test]
 fn config_accepts_root_namespace_slash() {
@@ -278,13 +185,288 @@ fn config_rejects_second_endpoint_with_bad_scheme() {
     ));
 }
 
-/// Integration smoke-test: connect to a real etcd and verify the status RPC.
+#[test]
+fn etcd_operation_display_connect() {
+    assert_eq!(EtcdOperation::Connect.to_string(), "connect");
+}
+
+#[test]
+fn etcd_operation_display_status() {
+    assert_eq!(EtcdOperation::Status.to_string(), "status");
+}
+
+#[test]
+fn coordinator_error_display_wraps_config_error() {
+    let inner = EtcdCoordinatorConfigError::NoEndpoints;
+    let outer = EtcdCoordinatorError::Config(inner);
+    assert!(
+        outer
+            .to_string()
+            .contains("invalid etcd coordinator config"),
+        "display should wrap the config error message"
+    );
+}
+
+#[test]
+fn coordinator_error_config_source_returns_inner() {
+    use std::error::Error;
+
+    let inner = EtcdCoordinatorConfigError::NoEndpoints;
+    let outer = EtcdCoordinatorError::Config(inner);
+    let source = outer.source().expect("Config variant must have a source");
+    assert!(
+        source
+            .downcast_ref::<EtcdCoordinatorConfigError>()
+            .is_some(),
+        "source should downcast to EtcdCoordinatorConfigError"
+    );
+}
+
+#[test]
+fn coordinator_error_runtime_source_returns_inner() {
+    use std::error::Error;
+
+    let io_err = std::io::Error::other("test");
+    let outer = EtcdCoordinatorError::RuntimeBuild(io_err);
+    let source = outer
+        .source()
+        .expect("RuntimeBuild variant must have a source");
+    assert!(
+        source.downcast_ref::<std::io::Error>().is_some(),
+        "source should downcast to io::Error"
+    );
+}
+
+#[test]
+fn config_error_converts_to_coordinator_error_via_from() {
+    let config_err = EtcdCoordinatorConfigError::NoEndpoints;
+    let coord_err: EtcdCoordinatorError = config_err.into();
+    assert!(matches!(coord_err, EtcdCoordinatorError::Config(_)));
+}
+
+#[test]
+fn keyspace_builds_expected_paths() {
+    let tenant = TenantId::from_bytes([0xAB; 32]);
+    let run = RunId::from_raw(0x0123_4567_89ab_cdef);
+    let shard = ShardId::from_raw(0x8000_0000_0000_0042);
+
+    let keyspace = EtcdKeyspace::new("/gossip/v1").expect("valid keyspace prefix");
+    assert_eq!(
+        keyspace.run_record_key(tenant, run),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef"
+    );
+    assert_eq!(
+        keyspace.shard_record_key(tenant, run, shard),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/8000000000000042"
+    );
+    assert_eq!(
+        keyspace.shard_owner_key(tenant, run, shard),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/8000000000000042/owner"
+    );
+    assert_eq!(
+        keyspace.run_active_index_key(tenant, run),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs_active/0123456789abcdef"
+    );
+    assert_eq!(
+        keyspace.shard_active_index_key(tenant, run, shard),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards_active/8000000000000042"
+    );
+    assert_eq!(
+        keyspace.shard_records_scan_prefix(tenant, run),
+        "/gossip/v1/tenants/abababababababababababababababababababababababababababababababab/runs/0123456789abcdef/shards/"
+    );
+}
+
+#[test]
+fn keyspace_root_prefix_does_not_emit_double_slashes() {
+    let tenant = TenantId::from_bytes([0x11; 32]);
+    let run = RunId::from_raw(0x42);
+    let keyspace = EtcdKeyspace::new("/").expect("root prefix should be valid");
+
+    assert_eq!(
+        keyspace.run_record_key(tenant, run),
+        "/tenants/1111111111111111111111111111111111111111111111111111111111111111/runs/0000000000000042"
+    );
+    assert_eq!(keyspace.tenants_prefix(), "/tenants");
+}
+
+// ---------------------------------------------------------------------------
+// Keyspace prefix validation (rstest)
+// ---------------------------------------------------------------------------
+
+#[rstest]
+#[case::normal("/gossip/v1", Ok(()))]
+#[case::root("/", Ok(()))]
+#[case::single_segment("/a", Ok(()))]
+#[case::deep_nesting("/a/b/c/d", Ok(()))]
+#[case::trimmed_whitespace("  /gossip  ", Ok(()))]
+#[case::empty("", Err(EtcdKeyspaceError::EmptyPrefix))]
+#[case::whitespace_only("   ", Err(EtcdKeyspaceError::EmptyPrefix))]
+#[case::no_leading_slash("gossip/v1", Err(EtcdKeyspaceError::PrefixMustStartWithSlash))]
+#[case::trailing_slash("/gossip/", Err(EtcdKeyspaceError::PrefixMustNotEndWithSlash))]
+#[case::trailing_slash_deep("/a/b/c/", Err(EtcdKeyspaceError::PrefixMustNotEndWithSlash))]
+#[case::double_slash("/gossip//v1", Err(EtcdKeyspaceError::PrefixContainsDoubleSlash))]
+#[case::double_slash_deep("/a//b/c", Err(EtcdKeyspaceError::PrefixContainsDoubleSlash))]
+fn keyspace_prefix_validation(
+    #[case] input: &str,
+    #[case] expected: Result<(), EtcdKeyspaceError>,
+) {
+    let result = EtcdKeyspace::new(input).map(|_| ());
+    assert_eq!(result, expected);
+}
+
+/// Whitespace-trimmed prefix stores the trimmed value, not the raw input.
+#[test]
+fn keyspace_trims_whitespace_and_stores_clean_prefix() {
+    let ks = EtcdKeyspace::new("  /gossip/v1  ").unwrap();
+    assert_eq!(ks.prefix(), "/gossip/v1");
+}
+
+// ---------------------------------------------------------------------------
+// Keyspace structural invariants (proptest)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    /// Every generated key starts with the configured prefix, contains no
+    /// double slashes, is pure ASCII, and respects the hierarchical
+    /// containment relationships between parent prefixes and child keys.
+    #[test]
+    fn keyspace_structural_invariants(
+        // Generate valid prefixes: `/` followed by 1-3 path segments.
+        prefix in "/[a-z]{1,8}(/[a-z]{1,8}){0,3}",
+        tenant_bytes in proptest::array::uniform32(any::<u8>()),
+        run_raw in any::<u64>(),
+        shard_raw in any::<u64>(),
+    ) {
+        let ks = EtcdKeyspace::new(&prefix).unwrap();
+        let tenant = TenantId::from_bytes(tenant_bytes);
+        let run = RunId::from_raw(run_raw);
+        let shard = ShardId::from_raw(shard_raw);
+
+        // -- Prefix containment --
+        let tenants = ks.tenants_prefix();
+        let tenant_pfx = ks.tenant_prefix(tenant);
+        let runs = ks.runs_prefix(tenant);
+        let run_key = ks.run_record_key(tenant, run);
+        let shards_pfx = ks.run_shards_prefix(tenant, run);
+        let scan_pfx = ks.shard_records_scan_prefix(tenant, run);
+        let shard_key = ks.shard_record_key(tenant, run, shard);
+        let owner_key = ks.shard_owner_key(tenant, run, shard);
+        let runs_active = ks.runs_active_prefix(tenant);
+        let run_active = ks.run_active_index_key(tenant, run);
+        let shards_active = ks.shards_active_prefix(tenant, run);
+        let shard_active = ks.shard_active_index_key(tenant, run, shard);
+
+        let all_keys = [
+            &tenants, &tenant_pfx, &runs, &run_key, &shards_pfx, &scan_pfx,
+            &shard_key, &owner_key, &runs_active, &run_active,
+            &shards_active, &shard_active,
+        ];
+
+        for key in &all_keys {
+            // Every key starts with the configured prefix.
+            prop_assert!(
+                key.starts_with(&prefix),
+                "key {key:?} must start with prefix {prefix:?}"
+            );
+            // No double slashes.
+            prop_assert!(
+                !key.contains("//"),
+                "key {key:?} contains double slash"
+            );
+            // All output is ASCII.
+            prop_assert!(key.is_ascii(), "key {key:?} is not ASCII");
+        }
+
+        // Hierarchical containment: each child starts with its parent.
+        prop_assert!(tenant_pfx.starts_with(&tenants));
+        prop_assert!(runs.starts_with(&tenant_pfx));
+        prop_assert!(run_key.starts_with(&runs));
+        prop_assert!(shards_pfx.starts_with(&run_key));
+        prop_assert!(shard_key.starts_with(&shards_pfx));
+        prop_assert!(owner_key.starts_with(&shard_key));
+        prop_assert!(owner_key.ends_with("/owner"));
+
+        // Scan prefix ends with trailing slash.
+        prop_assert!(scan_pfx.ends_with('/'));
+        prop_assert!(scan_pfx.starts_with(&shards_pfx));
+
+        // Active-index keys live under tenant, not under runs/.
+        prop_assert!(runs_active.starts_with(&tenant_pfx));
+        prop_assert!(run_active.starts_with(&runs_active));
+        prop_assert!(runs_active.contains("/runs_active"));
+
+        // Scan isolation: run_records_scan_prefix must NOT match
+        // runs_active keys (the trailing slash prevents this).
+        let run_scan_pfx = ks.run_records_scan_prefix(tenant);
+        prop_assert!(run_scan_pfx.ends_with('/'));
+        prop_assert!(!run_active.starts_with(&run_scan_pfx));
+
+        // Active-shard index keys are siblings of shards/, not children.
+        prop_assert!(shards_active.starts_with(&run_key));
+        prop_assert!(shard_active.starts_with(&shards_active));
+        prop_assert!(shards_active.contains("/shards_active"));
+
+        // Scan isolation: shard_records_scan_prefix must NOT match
+        // shards_active keys (the trailing slash prevents this).
+        prop_assert!(!shard_active.starts_with(&scan_pfx));
+
+        // Hex encoding: tenant segment is 64 hex chars, run/shard are 16.
+        let tenant_segment = tenant_pfx
+            .strip_prefix(&format!("{}/", tenants))
+            .unwrap_or("");
+        prop_assert_eq!(tenant_segment.len(), 64);
+        prop_assert!(tenant_segment.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let run_segment = run_key
+            .strip_prefix(&format!("{}/", runs))
+            .unwrap_or("");
+        prop_assert_eq!(run_segment.len(), 16);
+        prop_assert!(run_segment.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let shard_segment = shard_key
+            .strip_prefix(&format!("{}/", shards_pfx))
+            .unwrap_or("");
+        prop_assert_eq!(shard_segment.len(), 16);
+        prop_assert!(shard_segment.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+/// Verify: `EtcdKeyspace::new` accepts prefixes with interior double-slashes.
 ///
-/// Ignored by default — run with `cargo test -p gossip-coordination-etcd -- --ignored`.
+/// If this test passes (construction succeeds), the double-slash rejection
+/// is missing.
+#[test]
+fn keyspace_rejects_interior_double_slashes() {
+    let result = EtcdKeyspace::new("/gossip//v1");
+    assert!(
+        result.is_err(),
+        "prefix with interior double-slash must be rejected, but was accepted"
+    );
+}
+
+/// Verify: `run_records_scan_prefix` isolates run records from `runs_active`.
 ///
-/// Override the target cluster by setting `ETCD_ENDPOINTS` to a comma-separated
-/// list of gRPC endpoints (e.g. `http://10.0.0.1:2379,http://10.0.0.2:2379`).
-/// Falls back to `http://127.0.0.1:2379` when the variable is unset or blank.
+/// The scan prefix must end with `/` so an etcd byte-prefix scan does not
+/// accidentally match `runs_active/` sibling keys.
+#[test]
+fn run_records_scan_prefix_is_scan_safe() {
+    let ks = EtcdKeyspace::new("/gossip/v1").unwrap();
+    let tenant = TenantId::from_bytes([0xCC; 32]);
+
+    let scan_prefix = ks.run_records_scan_prefix(tenant);
+    let runs_active = ks.runs_active_prefix(tenant);
+
+    assert!(
+        scan_prefix.ends_with('/'),
+        "run_records_scan_prefix must end with trailing slash"
+    );
+    assert!(
+        !runs_active.starts_with(&scan_prefix),
+        "runs_active ({runs_active}) must not be matched by run_records_scan_prefix ({scan_prefix})"
+    );
+}
+
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn connects_to_local_etcd_and_fetches_status() {

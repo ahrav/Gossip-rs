@@ -4,6 +4,7 @@ use crate::config::{
     DEFAULT_BOOTSTRAP_LEASE_DURATION, DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig,
 };
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
+use crate::keyspace::EtcdKeyspace;
 use gossip_coordination::{
     AcquireError, AcquireResultView, AcquireScratch, CheckpointError, ClaimError, CompleteError,
     CoordinationBackend, CreateRunError, CursorUpdate, GetRunError, IdempotentOutcome,
@@ -49,6 +50,9 @@ use gossip_coordination::{
 /// context (nested `block_on` panics).
 pub struct EtcdCoordinator {
     config: EtcdCoordinatorConfig,
+    /// Deterministic etcd key builder rooted at the configured namespace
+    /// prefix. Persistence operations use this layout for all etcd keys.
+    keyspace: EtcdKeyspace,
     /// Current-thread Tokio runtime that bridges the sync coordination
     /// traits to the async etcd client. See [struct-level docs](Self)
     /// for threading constraints.
@@ -113,8 +117,11 @@ impl EtcdCoordinator {
                 source,
             })?;
 
+        let keyspace = EtcdKeyspace::new(config.namespace_prefix())?;
+
         Ok(Self {
             config,
+            keyspace,
             runtime,
             client,
             protocol_delegate: InMemoryCoordinator::new(DEFAULT_BOOTSTRAP_LEASE_DURATION),
@@ -125,6 +132,12 @@ impl EtcdCoordinator {
     #[must_use]
     pub fn config(&self) -> &EtcdCoordinatorConfig {
         &self.config
+    }
+
+    /// Deterministic builder for this coordinator's etcd namespace.
+    #[must_use]
+    pub fn keyspace(&self) -> &EtcdKeyspace {
+        &self.keyspace
     }
 
     /// Round-trip a maintenance `Status` RPC against the etcd cluster.
@@ -171,7 +184,7 @@ impl fmt::Debug for EtcdCoordinator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EtcdCoordinator")
             .field("endpoint_count", &self.config.endpoints().len())
-            .field("namespace_prefix", &self.config.namespace_prefix())
+            .field("namespace_prefix", &self.keyspace.prefix())
             .field(
                 "coordination_storage_mode",
                 &"delegated to InMemoryCoordinator",

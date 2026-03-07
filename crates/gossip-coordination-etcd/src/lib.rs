@@ -7,13 +7,17 @@
 //!
 //! # Architecture
 //!
-//! The crate is structured in three internal modules:
+//! The crate is structured in five internal modules:
 //!
 //! - **`config`** — Validated connection parameters (endpoints, namespace
 //!   prefix). Construction normalizes whitespace and enforces keyspace
 //!   prefix invariants.
 //! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client,
 //!   exposes health-check (`status()`), and forwards trait methods.
+//! - **`keyspace`** — Deterministic ASCII etcd path construction for
+//!   runs, shards, ownership leases, and active indexes.
+//! - **`codec`** — Explicit versioned binary encoding for coordination
+//!   records persisted to etcd.
 //! - **`error`** — Unified error types covering configuration validation,
 //!   Tokio runtime creation, and etcd client failures.
 //!
@@ -38,12 +42,19 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod codec;
 mod config;
 mod error;
+mod keyspace;
 
 pub use backend::EtcdCoordinator;
+pub use codec::{
+    BlobKind, EtcdCodecError, decode_run_record, decode_shard_record, encode_run_record,
+    encode_shard_record,
+};
 pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};
+pub use keyspace::{EtcdKeyspace, EtcdKeyspaceError};
 
 #[cfg(test)]
 mod tests;

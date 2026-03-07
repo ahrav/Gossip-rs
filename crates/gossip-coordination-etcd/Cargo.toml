@@ -10,12 +10,17 @@ description = "etcd-backed coordination backend for gossip-coordination"
 [features]
 default = []
 tls = ["etcd-client/tls"]
-test-support = ["gossip-coordination/test-support"]
+test-support = ["gossip-coordination/test-support", "gossip-contracts/test-support"]
 
 [dependencies]
 gossip-coordination.workspace = true
+gossip-contracts.workspace = true
+gossip-stdx.workspace = true
 etcd-client = { version = "0.18", default-features = false }
-tokio = { version = "1", features = ["rt", "time", "net"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "net"] }
 
 [dev-dependencies]
 gossip-coordination = { workspace = true, features = ["test-support"] }
+gossip-contracts = { workspace = true, features = ["test-support"] }
+rstest.workspace = true
+proptest.workspace = true

@@ -12,10 +12,11 @@ lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
-The emerging durable backend lives in `crates/gossip-coordination-etcd/`.
-It currently owns a real etcd client connection and exposes the final
-`EtcdCoordinator` type, but still delegates protocol semantics to
-`InMemoryCoordinator` until the etcd keyspace and transactional writes land.
+The durable backend lives in `crates/gossip-coordination-etcd/`.
+It owns a real etcd client connection, a deterministic keyspace layout
+(`keyspace.rs`), and an explicit binary codec (`codec.rs`) for persisting
+coordination records. It still delegates protocol semantics to
+`InMemoryCoordinator` until transactional persistence lands.
 
 The module provides seven core capabilities:
 
@@ -75,12 +76,14 @@ The module provides seven core capabilities:
 
 #### `gossip-coordination-etcd` crate (`crates/gossip-coordination-etcd/src/`)
 
-| File         | Role                                                                                         |
-| ------------ | -------------------------------------------------------------------------------------------- |
-| `backend.rs` | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
-| `config.rs`  | Endpoint + namespace validation for etcd connectivity                                         |
-| `runtime.rs` | Private sync/async bridge for driving the async etcd client from sync coordination traits     |
-| `error.rs`   | etcd connection/runtime error surfaces                                                        |
+| File              | Role                                                                                         |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| `backend.rs`      | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
+| `config.rs`       | Endpoint + namespace validation for etcd connectivity                                         |
+| `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
+| `codec.rs`        | Explicit binary encoding/decoding for coordination records persisted to etcd                  |
+| `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
+| `error.rs`        | etcd connection/runtime error surfaces                                                        |
 
 ---
 
