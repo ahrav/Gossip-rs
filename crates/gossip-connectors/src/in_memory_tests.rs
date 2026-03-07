@@ -674,7 +674,7 @@ fn different_instances_produce_different_stable_ids() {
 }
 
 // ---------------------------------------------------------------
-// Budget clamping (F10)
+// Budget clamping
 // ---------------------------------------------------------------
 
 #[test]
@@ -696,7 +696,7 @@ fn read_range_budget_clamps_read() {
 }
 
 // ---------------------------------------------------------------
-// ShardSpec trait-method coverage (F11)
+// ShardSpec trait-method coverage
 // ---------------------------------------------------------------
 
 #[test]
@@ -942,7 +942,7 @@ fn trait_methods_accept_exact_max_size_bound() {
 }
 
 // ---------------------------------------------------------------
-// Degenerate split point (F12)
+// Degenerate split point
 // ---------------------------------------------------------------
 
 #[test]
