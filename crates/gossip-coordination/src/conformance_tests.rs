@@ -40,9 +40,10 @@ use crate::run::{RunManagement, RunStatus};
 use crate::run_errors::{RunTransitionError, UnparkError};
 use crate::sim::backend::SimIntrospection as _;
 use crate::test_fixtures::{
-    LEASE_DURATION, acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
+    acquire_shard, checkpoint_ok, complete_ok, now, park_ok, seeded_coordinator,
     seeded_coordinator_with_semantics, test_cursor, test_key, test_run, test_run_config,
     test_shard, test_split_replace_plan, test_split_residual_plan, test_tenant, test_worker,
+    LEASE_DURATION,
 };
 use crate::traits::CoordinationBackend;
 use gossip_contracts::coordination::cursor::CursorUpdate;
@@ -493,12 +494,11 @@ fn terminal_clears_lease() {
 }
 
 // ============================================================================
-// Group B: Gap-Filling Tests
+// Group B: Boundary Conditions and Variant Coverage
 //
-// Edge cases and code paths that have zero or minimal coverage in the unit
-// tests and scenario tests. Each test targets a specific gap: an untested
-// enum variant, a boundary condition, or an interaction that only manifests
-// under particular timing or sequencing.
+// Edge cases and code paths with minimal coverage in the unit tests and
+// scenario tests: untested enum variants, boundary conditions, and
+// interactions that only manifest under particular timing or sequencing.
 // ============================================================================
 
 /// `CursorSemantics::Dispatched` propagates through the full operation chain.

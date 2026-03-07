@@ -15,7 +15,7 @@
 
 use proptest::prelude::*;
 
-use super::{Sample, StreamingSplitEstimator, MIN_SAMPLE_CAP};
+use super::{MIN_SAMPLE_CAP, Sample, StreamingSplitEstimator};
 
 const SMALL_SAMPLE_CAP: usize = MIN_SAMPLE_CAP;
 const MEDIUM_SAMPLE_CAP: usize = 512;
@@ -438,7 +438,7 @@ fn interpolated_position_edge_cases() {
 
 #[test]
 fn nearest_by_rank_in_range_single_element() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     let samples = vec![Sample::new(42, 0, &key_for_index(0))];
     assert_eq!(
@@ -455,7 +455,7 @@ fn nearest_by_rank_in_range_single_element() {
 
 #[test]
 fn nearest_by_rank_in_range_selects_closest() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     let samples: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i * 10, 0, &key_for_index(i as usize)))
@@ -486,7 +486,7 @@ fn nearest_by_rank_in_range_selects_closest() {
 
 #[test]
 fn nearest_by_rank_in_range_tie_breaks_to_earlier() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     // Two samples equidistant from target.
     let samples = vec![
@@ -504,7 +504,7 @@ fn nearest_by_rank_in_range_tie_breaks_to_earlier() {
 #[test]
 #[should_panic]
 fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
-    use super::{nearest_by_rank_in_range, Sample};
+    use super::{Sample, nearest_by_rank_in_range};
 
     let samples = vec![
         Sample::new(0, 0, &key_for_index(0)),
@@ -516,7 +516,7 @@ fn nearest_by_rank_in_range_panics_on_invalid_bounds() {
 
 #[test]
 fn compact_samples_preserves_endpoints_and_monotonicity() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -534,9 +534,11 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
     // Ranks strictly increasing.
     assert!(samples.windows(2).all(|w| w[0].rank < w[1].rank));
     // Bytes non-decreasing.
-    assert!(samples
-        .windows(2)
-        .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes));
+    assert!(
+        samples
+            .windows(2)
+            .all(|w| w[0].cumulative_bytes <= w[1].cumulative_bytes)
+    );
 }
 
 /// Regression: when the last N samples share identical `cumulative_bytes`
@@ -545,7 +547,7 @@ fn compact_samples_preserves_endpoints_and_monotonicity() {
 /// last sample), not the first plateau entry.
 #[test]
 fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 20 samples: first 12 have distinct increasing byte positions,
     // last 8 all share the same cumulative_bytes value (plateau).
@@ -584,7 +586,7 @@ fn compact_samples_preserves_last_sample_when_byte_positions_repeat_at_end() {
 /// the actual last sample after compaction.
 #[test]
 fn saturated_tail_preserves_last_sample() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..20)
         .map(|i| {
@@ -619,7 +621,7 @@ fn saturated_tail_preserves_last_sample() {
 /// observation), not the first.
 #[test]
 fn compact_to_single_slot_keeps_last_sample() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples: Vec<Sample> = (0..5)
         .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
@@ -841,7 +843,7 @@ proptest! {
 /// Compaction must spread picks within the mid-stream plateau by rank.
 #[test]
 fn plateau_redistribution_spreads_picks_across_mid_stream_plateau() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 200 samples: 10 with a narrow byte range (0..9), 180 sharing the same
     // cumulative byte position (the plateau), 10 resuming above the plateau.
@@ -894,7 +896,7 @@ fn plateau_redistribution_spreads_picks_across_mid_stream_plateau() {
 /// independently.
 #[test]
 fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 100 samples: 10 at bytes=0, 40 at bytes=500, 40 at bytes=1000,
     // 10 with increasing bytes above 1000.
@@ -970,7 +972,7 @@ fn plateau_redistribution_handles_multiple_disjoint_plateaus() {
 /// strict ordering.
 #[test]
 fn plateau_of_two_samples_is_handled() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 20 samples, with indices 9 and 10 sharing a byte-position plateau.
     let mut samples: Vec<Sample> = (0..20)
@@ -1022,7 +1024,7 @@ fn plateau_of_two_samples_is_handled() {
 /// `floor` for the next pick becomes 6, exceeding `eff_end`=5.
 #[test]
 fn plateau_with_rank_gap_preserves_strict_ordering() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let mut samples = vec![
         Sample::new(0, 0, &key_for_index(0)),
@@ -1049,7 +1051,7 @@ fn plateau_with_rank_gap_preserves_strict_ordering() {
 /// cascade can push picks past eff_end without the ceiling constraint.
 #[test]
 fn plateau_redistribution_clamps_to_effective_range() {
-    use super::{redistribute_plateau_picks, Sample, SampleAxis};
+    use super::{Sample, SampleAxis, redistribute_plateau_picks};
 
     // 6 samples: 1 non-plateau, 4 plateau (tight fit), 1 non-plateau.
     // The plateau has ranks 1,2,3,1000 — a big gap that causes
@@ -1089,7 +1091,7 @@ fn plateau_redistribution_clamps_to_effective_range() {
 /// plateau by rank and preserves monotonicity.
 #[test]
 fn plateau_redistribution_spreads_picks_across_leading_plateau() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     // 30 samples: first 15 at cumulative_bytes = 0 (the plateau),
     // then 15 with increasing byte positions.
@@ -1147,7 +1149,7 @@ fn plateau_redistribution_spreads_picks_across_leading_plateau() {
 /// non-endpoint plateau cluster, so the function must be a no-op.
 #[test]
 fn redistribute_plateau_picks_early_return_for_small_pick_arrays() {
-    use super::{redistribute_plateau_picks, Sample, SampleAxis};
+    use super::{Sample, SampleAxis, redistribute_plateau_picks};
 
     let samples: Vec<Sample> = (0..10)
         .map(|i| Sample::new(i as u64, 500, &key_for_index(i)))
@@ -1175,7 +1177,7 @@ fn redistribute_plateau_picks_early_return_for_small_pick_arrays() {
 /// plateau's leading edge.
 #[test]
 fn plateau_redistribution_spreads_picks_across_trailing_plateau() {
-    use super::{compact_samples, Sample};
+    use super::{Sample, compact_samples};
 
     let shared_bytes = 1500u64;
     let mut samples: Vec<Sample> = (0..30)

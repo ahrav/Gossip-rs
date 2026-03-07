@@ -4865,10 +4865,8 @@ fn tiger_boundary_url_percent_adjacent_secret() {
     // region and yield identical regex matches, staging two FindingRecs that
     // cause `replace_same_scan_duplicate` to overwrite the raw finding.
     //
-    // The tiger harness didn't catch this because `check_oracle_covered`
-    // compares oracle vs chunked — but the oracle itself was wrong (the raw
-    // finding was also lost in single-chunk mode). This test validates the
-    // oracle contains the raw finding AND that chunking doesn't regress it.
+    // The single-chunk oracle must include the raw finding (not just the
+    // decoded one), and no chunking plan may regress it.
     let engine = cached_correctness_engine();
 
     // Byte layout (same buffer as regression_slack_webhook_raw_match_not_suppressed):
@@ -4898,7 +4896,7 @@ fn tiger_boundary_url_percent_adjacent_secret() {
         oracle
     );
 
-    // Exercise multiple chunk plans to ensure no plan reintroduces the bug.
+    // Exercise multiple chunk plans to ensure every plan preserves the raw finding.
     let plans = [
         ("fixed-32", ChunkPlan::fixed(32)),
         ("fixed-48", ChunkPlan::fixed(48)),
