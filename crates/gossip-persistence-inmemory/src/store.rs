@@ -68,12 +68,13 @@ use crate::{
 
 /// Domain-specific behavior that differs between persistence backends.
 ///
-/// Each implementor defines four things:
+/// Each implementor defines five items:
 ///
 /// 1. The **payload** type buffered by a pending write (e.g. a vec of records).
 /// 2. The **receipt** returned to callers after a successful commit.
 /// 3. The **durable state** that payloads are applied to.
-/// 4. The **apply** function that performs the domain-specific mutation.
+/// 4. The **store kind** discriminator used in error variants.
+/// 5. The **apply** function that performs the domain-specific mutation.
 ///
 /// # Contract
 ///
@@ -470,8 +471,11 @@ impl<B: StoreBackend> InMemoryStoreCore<B> {
     ///   was non-zero (no state change occurs).
     /// - `InjectedSubmissionFailure` — op id counter overflow (should be
     ///   unreachable in practice with `u64`).
-    /// - Any error from `B::apply()` for auto-completed writes — stored in
-    ///   the op and surfaced when the handle is waited on.
+    ///
+    /// Note: for auto-completed writes, errors from `B::apply()` do **not**
+    /// cause `submit` to fail. Instead, the error is stored inside the
+    /// operation's `Finished` state and surfaced when `StoreHandle::wait`
+    /// is called.
     pub(crate) fn submit(
         self: &Arc<Self>,
         payload: B::Payload,
