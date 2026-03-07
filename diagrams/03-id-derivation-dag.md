@@ -230,11 +230,11 @@ graph TD
     style excluded fill:#FEE2E2,stroke:#991B1B,color:#991B1B
 ```
 
-`FindingIdInputs` is a fixed-width struct (4 x 32 = 128 bytes) whose `CanonicalBytes` impl feeds fields to BLAKE3 in struct declaration order: `tenant`, `item`, `rule`, `secret`. The `derive_finding_id()` function uses a cached BLAKE3 derive-key hasher with domain constant `"gossip/finding/v1"` (INV-S01, INV-S02).
+`FindingIdInputs` is a fixed-width struct (4 x 32 = 128 bytes) whose macro-generated `CanonicalBytes` implementation feeds fields to BLAKE3 in struct declaration order: `tenant`, `item`, `rule`, `secret`. The `derive_finding_id()` function uses a cached BLAKE3 derive-key hasher with domain constant `"gossip/finding/v1"` (INV-S01, INV-S02).
 
 The exclusion of `ObjectVersionId` is the key design decision: it makes `FindingId` version-stable. "Rule R found secret S in item I for tenant T" is the same finding regardless of which commit or object version it was first detected in. This enables stable triage state -- an operator can mark a finding as "accepted" or "false positive" and that decision persists across all future scans of the same item, even as the file changes.
 
-Each of the four input fields independently affects the output (verified by per-field sensitivity tests in the codebase), and the field-order swap test confirms that reordering fields in `write_canonical` would change the hash.
+Each of the four input fields independently affects the output (verified by per-field sensitivity tests in the codebase), and the field-order swap test confirms that reordering the struct declaration would change the hash.
 
 ---
 

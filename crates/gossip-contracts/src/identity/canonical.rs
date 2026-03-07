@@ -46,6 +46,10 @@ use blake3::Hasher;
 ///     }
 /// }
 /// ```
+///
+/// Within `gossip-contracts`, simple fixed-field identity input structs should
+/// prefer the helper macro in `identity/macros.rs` so the declaration order
+/// and hash order stay coupled in one place.
 pub trait CanonicalBytes {
     /// Write this value's canonical byte representation into `hasher`.
     fn write_canonical(&self, hasher: &mut Hasher);

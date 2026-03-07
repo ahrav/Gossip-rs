@@ -91,39 +91,29 @@ pub const CURRENT_VERSION: u32 = 1;
 /// this invalidates all derived `PolicyHash` values and forces rescans.
 pub const CURRENT_EVIDENCE_VERSION: u32 = 1;
 
-/// Structured inputs to [`compute_policy_hash`].
-///
-/// The canonical encoding is 41 bytes: `u32` (4) + `u8` (1) + `u32` (4) +
-/// `[u8; 32]` (32). All fields are fixed-width, so no length prefixes are
-/// needed.
-///
-/// # Field-ordering invariant
-///
-/// The [`CanonicalBytes`] impl feeds fields to BLAKE3 in **struct
-/// declaration order**.  Reordering fields without updating
-/// `write_canonical` silently changes every derived `PolicyHash` and
-/// breaks the golden vectors in `golden.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PolicyHashInputs {
-    /// Schema version of the policy-hash derivation itself.
-    pub policy_hash_version: u32,
-    /// Keyed vs. unkeyed hashing mode.
-    pub id_hash_mode: IdHashMode,
-    /// Version of the evidence normalization / input pipeline.
-    pub evidence_hash_version: u32,
-    /// Content-addressed digest of the full rule set.
-    pub rules_digest: [u8; 32],
-}
-
-impl CanonicalBytes for PolicyHashInputs {
-    /// Field order must match struct declaration order — reordering fields
-    /// without updating this impl silently changes all derived hashes.
-    #[inline]
-    fn write_canonical(&self, h: &mut Hasher) {
-        self.policy_hash_version.write_canonical(h);
-        self.id_hash_mode.write_canonical(h);
-        self.evidence_hash_version.write_canonical(h);
-        self.rules_digest.write_canonical(h);
+super::macros::define_canonical_input! {
+    /// Structured inputs to [`compute_policy_hash`].
+    ///
+    /// The canonical encoding is 41 bytes: `u32` (4) + `u8` (1) + `u32` (4) +
+    /// `[u8; 32]` (32). All fields are fixed-width, so no length prefixes are
+    /// needed.
+    ///
+    /// # Field-ordering invariant
+    ///
+    /// The [`CanonicalBytes`](crate::identity::CanonicalBytes) impl is
+    /// generated from this declaration, so hash order follows **struct
+    /// declaration order** automatically. Reordering fields is therefore a
+    /// breaking change: it changes every derived `PolicyHash` and breaks the
+    /// golden vectors in `golden.rs`.
+    pub struct PolicyHashInputs {
+        /// Schema version of the policy-hash derivation itself.
+        pub policy_hash_version: u32,
+        /// Keyed vs. unkeyed hashing mode.
+        pub id_hash_mode: IdHashMode,
+        /// Version of the evidence normalization / input pipeline.
+        pub evidence_hash_version: u32,
+        /// Content-addressed digest of the full rule set.
+        pub rules_digest: [u8; 32],
     }
 }
 

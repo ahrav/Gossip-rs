@@ -209,6 +209,47 @@ macro_rules! define_id_32_restricted {
     };
 }
 
+/// Generate a fixed-field input struct whose
+/// [`CanonicalBytes`](crate::identity::CanonicalBytes) encoding follows the
+/// declared field order.
+///
+/// This is an internal helper for identity/policy input structs such as
+/// `FindingIdInputs` and `PolicyHashInputs`. It intentionally avoids a
+/// proc-macro crate: the identity layer already uses declarative macros for
+/// boilerplate, and keeping the struct definition plus `CanonicalBytes` impl in
+/// one macro invocation makes the declaration order the single source of truth.
+macro_rules! define_canonical_input {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident {
+            $(
+                $(#[$field_meta:meta])*
+                $field_vis:vis $field:ident : $ty:ty,
+            )*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        $vis struct $name {
+            $(
+                $(#[$field_meta])*
+                $field_vis $field: $ty,
+            )*
+        }
+
+        impl $crate::identity::CanonicalBytes for $name {
+            #[inline]
+            fn write_canonical(&self, h: &mut $crate::blake3::Hasher) {
+                $(
+                    self.$field.write_canonical(h);
+                )*
+            }
+        }
+    };
+}
+
+pub(crate) use define_canonical_input;
+
 /// Import-canary macro for consumer crates: asserts that every listed
 /// [`define_id_32!`] type is still 32 bytes and that its `ZERO` sentinel is
 /// all-zero.
@@ -458,6 +499,18 @@ mod tests {
         debug_display = "RestrictedTestId([redacted])"
     }
 
+    define_canonical_input! {
+        /// Test canonical input for macro verification.
+        pub struct CanonicalInputTest {
+            /// A fixed-width version field.
+            pub version: u32,
+            /// A single-byte mode tag.
+            pub mode: u8,
+            /// A fixed-width digest.
+            pub digest: [u8; 32],
+        }
+    }
+
     // ---------------------------------------------------------------
     // define_id_32! — construction and accessors
     // ---------------------------------------------------------------
@@ -521,6 +574,13 @@ mod tests {
     fn macro_types_implement_required_traits() {
         assert_id_traits::<PubTestId>();
         assert_id_traits::<RestrictedTestId>();
+    }
+
+    fn assert_canonical_input_traits<T: Clone + Copy + core::fmt::Debug + PartialEq + Eq>() {}
+
+    #[test]
+    fn canonical_input_macro_types_implement_required_traits() {
+        assert_canonical_input_traits::<CanonicalInputTest>();
     }
 
     // ---------------------------------------------------------------
@@ -642,6 +702,25 @@ mod tests {
         h_raw.update(&bytes);
 
         assert_eq!(h_id.finalize(), h_raw.finalize());
+    }
+
+    #[test]
+    fn canonical_input_macro_matches_declaration_order() {
+        let inputs = CanonicalInputTest {
+            version: 7,
+            mode: 1,
+            digest: [0xAB; 32],
+        };
+
+        let mut generated = Hasher::new();
+        inputs.write_canonical(&mut generated);
+
+        let mut manual = Hasher::new();
+        7u32.write_canonical(&mut manual);
+        1u8.write_canonical(&mut manual);
+        [0xAB; 32].write_canonical(&mut manual);
+
+        assert_eq!(generated.finalize(), manual.finalize());
     }
 
     // ---------------------------------------------------------------

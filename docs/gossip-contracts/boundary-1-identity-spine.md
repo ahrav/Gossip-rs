@@ -110,6 +110,21 @@ pub struct FindingIdInputs {
 The `secret` field takes `SecretHash` (post-keying), not raw `NormHash`. This
 ensures tenant isolation is baked into the finding identity.
 
+### Why there is no umbrella `DerivationContext`
+
+Boundary 1 intentionally keeps per-derivation input structs (`FindingIdInputs`,
+`OccurrenceIdInputs`, `ObservationIdInputs`) instead of introducing one
+cross-cutting context bag. The scoping axes do not actually line up into a
+single reusable bundle:
+
+- `TenantId` scopes finding and observation identities
+- `ConnectorInstanceIdHash` is consumed earlier when deriving `StableItemId`
+- `PolicyHash` scopes observations only
+
+A shared `DerivationContext` would therefore carry unused fields through most
+call sites and obscure which derivation owns which scope. The code keeps those
+boundaries explicit and local.
+
 ---
 
 ## 3. Keyed / Unkeyed Boundary
@@ -138,6 +153,11 @@ let id = finalize_32(&h);
 The domain string is consumed as a key-derivation context, producing a
 context-dependent key schedule. Two hashers with different domain tags behave as
 independent hash functions.
+
+For simple fixed-field input structs, the crate now generates
+`CanonicalBytes` from the struct declaration itself via a declarative helper in
+`identity/macros.rs`, so declaration order remains the single source of truth
+for hash order.
 
 ### Keyed mode (SecretHash only)
 
