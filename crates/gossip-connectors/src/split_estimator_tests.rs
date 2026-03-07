@@ -1092,6 +1092,55 @@ fn compact_to_single_slot_keeps_last_sample() {
 }
 
 // ---------------------------------------------------------------------------
+// Compaction edge-case tests — early-return paths
+// ---------------------------------------------------------------------------
+
+/// Empty sample vec is a no-op: `compact_samples` returns immediately.
+#[test]
+fn compact_samples_empty_vec_is_noop() {
+    use super::{Sample, compact_samples};
+
+    let mut samples: Vec<Sample> = vec![];
+    compact_samples(&mut samples, 10);
+    assert!(samples.is_empty());
+}
+
+/// Single-element vec is preserved unchanged when cap >= 1.
+#[test]
+fn compact_samples_single_element_preserved() {
+    use super::{Sample, compact_samples};
+
+    let mut samples = vec![Sample::new(0, 42, &key_for_index(0))];
+    compact_samples(&mut samples, 10);
+    assert_eq!(samples.len(), 1);
+    assert_eq!(samples[0].rank, 0);
+    assert_eq!(samples[0].recorded_byte_position, 42);
+}
+
+/// When len == cap, no compaction is needed — identity operation.
+#[test]
+fn compact_samples_at_cap_is_identity() {
+    use super::{Sample, compact_samples};
+
+    let original: Vec<Sample> = (0..10)
+        .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+        .collect();
+    let expected: Vec<_> = original
+        .iter()
+        .map(|s| (s.rank, s.recorded_byte_position, s.key.clone()))
+        .collect();
+
+    let mut samples = original;
+    compact_samples(&mut samples, 10);
+
+    let actual: Vec<_> = samples
+        .iter()
+        .map(|s| (s.rank, s.recorded_byte_position, s.key.clone()))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+// ---------------------------------------------------------------------------
 // Saturation edge-case tests
 // ---------------------------------------------------------------------------
 
@@ -1462,6 +1511,30 @@ proptest! {
             .collect();
 
         prop_assert_eq!(actual, expected);
+    }
+
+    /// `selected_sample_indices` must return strictly increasing indices for
+    /// any valid (count > cap) input, including streams with uniform, ascending,
+    /// and plateau byte positions.
+    #[test]
+    fn prop_selected_indices_strictly_increasing(
+        count in 2..500usize,
+        cap_mult in 1..4usize,
+    ) {
+        use super::selected_sample_indices;
+
+        let cap = (MIN_SAMPLE_CAP * cap_mult).min(count);
+        // Skip degenerate cases where cap >= count (no compaction needed).
+        prop_assume!(count > cap);
+
+        let samples: Vec<Sample> = (0..count)
+            .map(|i| Sample::new(i as u64, (i as u64) * 100, &key_for_index(i)))
+            .collect();
+        let indices = selected_sample_indices(&samples, cap);
+        prop_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "indices must be strictly increasing: {:?}", indices
+        );
     }
 
 }
