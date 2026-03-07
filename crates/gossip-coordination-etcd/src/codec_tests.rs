@@ -80,6 +80,31 @@ fn shard_record_v1_round_trips_done() {
 }
 
 #[test]
+fn owner_value_v1_round_trips() {
+    let encoded = encode_owner_value_v1(WorkerId::from_raw(7), FenceEpoch::from_raw(42));
+    let decoded = decode_owner_value_v1(&encoded).expect("owner value should decode");
+
+    assert_eq!(decoded.worker, WorkerId::from_raw(7));
+    assert_eq!(decoded.fence, FenceEpoch::from_raw(42));
+}
+
+#[test]
+fn owner_value_v1_rejects_wrong_blob_kind() {
+    let blob = encode_run_record(&sample_run_record(
+        RunStatus::Active,
+        CursorSemantics::Completed,
+    ));
+    let error = decode_owner_value_v1(&blob).expect_err("wrong kind must fail");
+    assert!(matches!(
+        error,
+        EtcdCodecError::UnexpectedBlobKind {
+            expected: BlobKind::ShardOwner,
+            actual: BlobKind::RunRecord,
+        }
+    ));
+}
+
+#[test]
 fn shard_record_v1_round_trips_split() {
     let (mut split_record, mut split_slab) = sample_split_shard_record();
     let split_encoded =

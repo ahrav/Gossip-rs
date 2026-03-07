@@ -91,6 +91,8 @@ pub enum BlobKind {
     RunRecord = 1,
     /// Serialized [`ShardRecord`] payload.
     ShardRecord = 2,
+    /// Serialized owner-key binding payload.
+    ShardOwner = 3,
 }
 
 impl BlobKind {
@@ -98,6 +100,7 @@ impl BlobKind {
         match raw {
             1 => Some(Self::RunRecord),
             2 => Some(Self::ShardRecord),
+            3 => Some(Self::ShardOwner),
             _ => None,
         }
     }
@@ -105,6 +108,13 @@ impl BlobKind {
     fn as_u8(self) -> u8 {
         self as u8
     }
+}
+
+/// Decoded owner-key payload stored under a shard's `/owner` key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerLeaseValueV1 {
+    pub worker: WorkerId,
+    pub fence: FenceEpoch,
 }
 
 /// Deterministic encode/decode failures for versioned etcd blobs.
@@ -304,6 +314,27 @@ pub fn decode_shard_record(
     let owned = OwnedShardRecord::decode(&mut decoder)?;
     decoder.finish()?;
     owned.into_record(slab)
+}
+
+/// Encode the `(worker, fence)` binding stored in a shard owner key.
+#[must_use]
+pub fn encode_owner_value_v1(worker: WorkerId, fence: FenceEpoch) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + 16);
+    out.extend_from_slice(VERSION_PREFIX_V1);
+    out.push(BlobKind::ShardOwner.as_u8());
+    put_u64(&mut out, worker.as_raw());
+    put_u64(&mut out, fence.as_raw());
+    out
+}
+
+/// Decode a shard owner-key payload.
+pub fn decode_owner_value_v1(bytes: &[u8]) -> Result<OwnerLeaseValueV1, EtcdCodecError> {
+    let mut decoder = Decoder::new(bytes);
+    decoder.expect_header(BlobKind::ShardOwner)?;
+    let worker = WorkerId::from_raw(decoder.read_u64()?);
+    let fence = FenceEpoch::from_raw(decoder.read_u64()?);
+    decoder.finish()?;
+    Ok(OwnerLeaseValueV1 { worker, fence })
 }
 
 /// Heap-owned mirror of [`RunRecord`] used as the decode intermediate.
@@ -1084,7 +1115,9 @@ impl OwnedShardRecord {
 
     /// Enforce all `ShardRecord` structural invariants on the decoded data.
     ///
-    /// Mirrors the invariants documented on [`ShardRecord`] (INV-1 through INV-10).
+    /// Mirrors the invariants documented on [`ShardRecord`] plus additional
+    /// wire-format constraints (joint lease presence, cursor field consistency,
+    /// op-log ordering and uniqueness).
     /// Called after initial decode and again at the start of `into_record`.
     fn validate(&self) -> Result<(), EtcdCodecError> {
         if self.status == ShardStatus::Parked && self.park_reason.is_none() {
@@ -1288,6 +1321,14 @@ impl OwnedShardOpLogEntry {
     }
 }
 
+/// Upper bound on any single variable-length field decoded from a blob.
+///
+/// Guards against untrusted input causing unbounded `Vec::with_capacity`
+/// allocations. 1 MiB is far larger than any legitimate coordination
+/// record field while remaining small enough to prevent OOM from a single
+/// crafted length prefix.
+const MAX_FIELD_SIZE: usize = 1 << 20;
+
 /// Forward-only cursor over an immutable byte slice.
 ///
 /// All `read_*` methods advance `offset` by exactly the number of bytes
@@ -1298,14 +1339,6 @@ impl OwnedShardOpLogEntry {
 ///
 /// [`finish`](Self::finish) asserts that the cursor has consumed the
 /// entire input, catching blobs that are longer than expected.
-/// Upper bound on any single variable-length field decoded from a blob.
-///
-/// Guards against untrusted input causing unbounded `Vec::with_capacity`
-/// allocations. 1 MiB is far larger than any legitimate coordination
-/// record field while remaining small enough to prevent OOM from a single
-/// crafted length prefix.
-const MAX_FIELD_SIZE: usize = 1 << 20;
-
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,

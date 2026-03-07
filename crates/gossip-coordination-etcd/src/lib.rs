@@ -1,9 +1,9 @@
 //! etcd-backed coordination backend for shard and run lifecycle management.
 //!
-//! This crate provides [`EtcdCoordinator`], which implements the full
-//! coordination trait surface ([`CoordinationBackend`], [`RunManagement`],
-//! [`ShardClaiming`]) backed by a real etcd cluster connection. It is the
-//! production-path alternative to the in-memory coordinator used in tests.
+//! This crate provides [`EtcdCoordinator`], which implements the coordination
+//! trait surface against persisted etcd state. It uses etcd transactions for
+//! fenced hot-path mutations and real etcd leases for ephemeral shard-owner
+//! bindings.
 //!
 //! # Architecture
 //!
@@ -12,21 +12,15 @@
 //! - **`config`** — Validated connection parameters (endpoints, namespace
 //!   prefix). Construction normalizes whitespace and enforces keyspace
 //!   prefix invariants.
-//! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client,
-//!   exposes health-check (`status()`), and forwards trait methods.
+//! - **`backend`** — [`EtcdCoordinator`] itself: owns the etcd client, exposes
+//!   health-check (`status()`), and executes persisted coordination
+//!   transactions.
 //! - **`keyspace`** — Deterministic ASCII etcd path construction for
 //!   runs, shards, ownership leases, and active indexes.
-//! - **`codec`** — Explicit versioned binary encoding for coordination
-//!   records persisted to etcd.
+//! - **`codec`** — Explicit binary encoding (v1 wire format) for coordination
+//!   records and shard-owner bindings persisted to etcd.
 //! - **`error`** — Unified error types covering configuration validation,
 //!   Tokio runtime creation, and etcd client failures.
-//!
-//! # Current delegation model
-//!
-//! All shard and run protocol semantics (acquire, renew, checkpoint,
-//! complete, split, park, claim) are delegated to [`InMemoryCoordinator`]
-//! from `gossip-coordination`. The etcd connection is established and
-//! health-checked at construction, but shard/run state lives in memory.
 //!
 //! # Build requirements
 //!
@@ -49,8 +43,8 @@ mod keyspace;
 
 pub use backend::EtcdCoordinator;
 pub use codec::{
-    BlobKind, EtcdCodecError, decode_run_record, decode_shard_record, encode_run_record,
-    encode_shard_record,
+    BlobKind, EtcdCodecError, OwnerLeaseValueV1, decode_owner_value_v1, decode_run_record,
+    decode_shard_record, encode_owner_value_v1, encode_run_record, encode_shard_record,
 };
 pub use config::{EtcdCoordinatorConfig, EtcdCoordinatorConfigError};
 pub use error::{EtcdCoordinatorError, EtcdOperation};
