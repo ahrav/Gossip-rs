@@ -137,6 +137,12 @@ impl FindingRecord {
     ///
     /// Returns `true` if the stored ID is consistent with the derivation.
     /// Write-path callers can use this as a verification checkpoint.
+    ///
+    /// Note: `FindingRecord` uses a simple bool check because its ID is
+    /// derived entirely from record-local fields. See
+    /// [`ObservationRecord::validate_identity`] for the richer
+    /// `Result`-returning validation used when the ID spans cross-boundary
+    /// fields.
     #[must_use]
     pub fn verify_id(&self) -> bool {
         let expected = derive_finding_id(&FindingIdInputs {
@@ -264,6 +270,12 @@ impl OccurrenceRecord {
 
     /// Verify that the stored `occurrence_id` matches the content-addressed
     /// derivation from the record's identity fields.
+    ///
+    /// Note: like [`FindingRecord::verify_id`], this returns a simple bool
+    /// because the occurrence ID is derived entirely from record-local
+    /// fields. See [`ObservationRecord::validate_identity`] for the richer
+    /// `Result`-returning validation used when the ID spans cross-boundary
+    /// fields.
     #[must_use]
     pub fn verify_id(&self) -> bool {
         let expected = derive_occurrence_id(&OccurrenceIdInputs {
@@ -350,7 +362,7 @@ impl ObservationRecord {
     )]
     pub fn from_persisted(
         tenant_id: TenantId,
-        observation_id: ObservationId,
+        stored_observation_id: ObservationId,
         occurrence_id: OccurrenceId,
         policy_hash: PolicyHash,
         ovid_hash: OvidHash,
@@ -371,10 +383,10 @@ impl ObservationRecord {
             seen_at,
         );
 
-        if record.observation_id != observation_id {
+        if record.observation_id != stored_observation_id {
             return Err(PersistenceInputError::ObservationIdMismatch {
                 expected: record.observation_id,
-                actual: observation_id,
+                actual: stored_observation_id,
             });
         }
 
@@ -552,11 +564,19 @@ impl<'a> FindingsUpsertBatch<'a> {
         self.findings.is_empty() && self.occurrences.is_empty() && self.observations.is_empty()
     }
 
-    /// Validate A3 observation-identity invariants that are local to this
-    /// batch.
+    /// Validate observation-identity invariants local to this batch.
     ///
-    /// This checks that every observation's stored `observation_id` matches
-    /// the canonical derivation from `(tenant, policy_hash, occurrence_id)`.
+    /// Checks that every observation's stored `observation_id` matches the
+    /// canonical derivation from `(tenant, policy_hash, occurrence_id)`.
+    /// This is a WARM-tier operation (per-batch, not per-item). Cost is
+    /// O(n) in the number of observations, bounded by
+    /// [`RECOMMENDED_MAX_BATCH_SIZE`](super::RECOMMENDED_MAX_BATCH_SIZE).
+    ///
+    /// Only observations are checked because `FindingRecord` and
+    /// `OccurrenceRecord` always derive their IDs at construction — no
+    /// caller-supplied ID is accepted. `ObservationRecord::from_persisted()`
+    /// is the only path that accepts a stored ID, making observations the
+    /// only layer where mismatch is possible.
     ///
     /// Note: this does **not** check referential integrity or tenant
     /// consistency — call
@@ -653,7 +673,10 @@ impl<'a> FindingsUpsertBatch<'a> {
 ///    a persisted or in-batch `OccurrenceRecord`.
 /// 3. **Canonical observation identity.** `ObservationRecord.observation_id`
 ///    must equal the canonical derivation from `(tenant_id, policy_hash,
-///    occurrence_id)`.
+///    occurrence_id)`. The primary enforcement point is
+///    [`ObservationRecord::from_persisted`], which rejects mismatches at
+///    construction. [`FindingsUpsertBatch::validate_observation_identity`]
+///    provides batch-level defense-in-depth.
 /// 4. **Atomicity scope.** Whether the batch is applied atomically (single
 ///    transaction) or row-by-row is a backend decision; the trait does not
 ///    mandate transactional guarantees beyond idempotency.

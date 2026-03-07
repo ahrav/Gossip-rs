@@ -88,21 +88,45 @@ fn total_records_sums_all_layers() {
 }
 
 #[test]
-fn findings_upsert_batch_validate_accepts_canonical_observations() {
+fn findings_upsert_batch_validate_observation_identity_accepts_canonical() {
     let observations = [make_observation_record(0x03)];
 
     FindingsUpsertBatch::new(&[], &[], &observations)
         .validate_observation_identity()
-        .expect("canonical observations should pass A3 validation");
+        .expect("canonical observations should pass observation-identity validation");
 }
 
 #[test]
-fn findings_upsert_batch_validate_rejects_mismatched_observation_identity() {
+fn findings_upsert_batch_validate_observation_identity_accepts_empty() {
+    FindingsUpsertBatch::default()
+        .validate_observation_identity()
+        .expect("empty batch should pass observation identity validation");
+}
+
+#[test]
+fn findings_upsert_batch_validate_observation_identity_rejects_mismatch() {
     let mut observation = make_observation_record(0x03);
     let actual = ObservationId::from_bytes([0xAA; 32]);
     observation.observation_id = actual;
     let expected = observation.derived_observation_id();
     let observations = [observation];
+
+    assert_eq!(
+        FindingsUpsertBatch::new(&[], &[], &observations)
+            .validate_observation_identity()
+            .unwrap_err(),
+        PersistenceInputError::ObservationIdMismatch { expected, actual }
+    );
+}
+
+#[test]
+fn findings_upsert_batch_validate_observation_identity_rejects_one_bad_among_valid() {
+    let good = make_observation_record(0x01);
+    let mut bad = make_observation_record(0x02);
+    let actual = ObservationId::from_bytes([0xBB; 32]);
+    bad.observation_id = actual;
+    let expected = bad.derived_observation_id();
+    let observations = [good, bad];
 
     assert_eq!(
         FindingsUpsertBatch::new(&[], &[], &observations)
@@ -564,5 +588,6 @@ proptest::proptest! {
             tenant: tid, policy: ph, occurrence: oid,
         });
         proptest::prop_assert_eq!(record.observation_id(), expected);
+        proptest::prop_assert!(record.validate_identity().is_ok());
     }
 }

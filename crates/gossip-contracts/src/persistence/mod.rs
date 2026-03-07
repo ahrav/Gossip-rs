@@ -33,13 +33,16 @@
 //! `DoneLedger::batch_upsert`, and only checkpoint the cursor after both layers
 //! are durable. The `PageCommit<S>` typestate machine enforces that ordering.
 //!
-//! ## A3 Identity Scope
+//! ## Observation-identity scope
 //!
 //! Durable policy-scoped observations are rooted in a canonical
 //! [`ObservationId`](crate::identity::ObservationId) derived from
-//! `(tenant_id, policy_hash, occurrence_id)`. Persistence constructors and
-//! storage round-trip rebuild paths must reject mismatched observation ids
-//! rather than trusting caller-provided values.
+//! `(tenant_id, policy_hash, occurrence_id)`. Persistence constructors
+//! ([`ObservationRecord::from_persisted`](crate::persistence::ObservationRecord::from_persisted))
+//! and batch validation
+//! ([`FindingsUpsertBatch::validate_observation_identity`](crate::persistence::FindingsUpsertBatch::validate_observation_identity))
+//! reject mismatched observation IDs rather than trusting caller-provided
+//! values.
 //!
 //! ## Batch size guidance
 //!
