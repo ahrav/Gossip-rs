@@ -12,10 +12,11 @@ lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 (Identity & Hashing Spine) for `TenantId`, `ShardId`, `RunId`, `OpId`,
 `FenceEpoch`, `LogicalTime`, and `CanonicalBytes`.
 
-The emerging durable backend lives in `crates/gossip-coordination-etcd/`.
-It currently owns a real etcd client connection and exposes the final
-`EtcdCoordinator` type, but still delegates protocol semantics to
-`InMemoryCoordinator` until the etcd keyspace and transactional writes land.
+The durable backend lives in `crates/gossip-coordination-etcd/`.
+It owns a real etcd client connection, a deterministic keyspace layout
+(`keyspace.rs`), and an explicit binary codec (`codec.rs`) for persisting
+coordination records. It still delegates protocol semantics to
+`InMemoryCoordinator` until transactional persistence lands.
 
 The module provides seven core capabilities:
 

@@ -53,12 +53,12 @@ fn run_record_v1_round_trips(#[case] status: RunStatus, #[case] semantics: Curso
 #[case::dispatched(CursorSemantics::Dispatched)]
 fn shard_record_v1_round_trips_active(#[case] semantics: CursorSemantics) {
     let (mut record, mut slab) = sample_active_child_shard_record(semantics);
-    let encoded = encode_shard_record(&record, &slab);
+    let encoded = encode_shard_record(&record, &slab).expect("valid record encodes");
 
     let mut decode_slab = ByteSlab::with_capacity(4096);
     let mut decoded =
         decode_shard_record(&encoded, &mut decode_slab).expect("shard record should decode");
-    let reencoded = encode_shard_record(&decoded, &decode_slab);
+    let reencoded = encode_shard_record(&decoded, &decode_slab).expect("re-encode succeeds");
 
     assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
     assert_eq!(reencoded, encoded);
@@ -70,7 +70,7 @@ fn shard_record_v1_round_trips_active(#[case] semantics: CursorSemantics) {
 #[test]
 fn shard_record_v1_round_trips_done() {
     let (mut done_record, mut done_slab) = sample_done_shard_record();
-    let done_encoded = encode_shard_record(&done_record, &done_slab);
+    let done_encoded = encode_shard_record(&done_record, &done_slab).expect("valid record encodes");
     let mut done_decode_slab = ByteSlab::with_capacity(4096);
     let mut done_decoded = decode_shard_record(&done_encoded, &mut done_decode_slab)
         .expect("done record should decode");
@@ -82,7 +82,8 @@ fn shard_record_v1_round_trips_done() {
 #[test]
 fn shard_record_v1_round_trips_split() {
     let (mut split_record, mut split_slab) = sample_split_shard_record();
-    let split_encoded = encode_shard_record(&split_record, &split_slab);
+    let split_encoded =
+        encode_shard_record(&split_record, &split_slab).expect("valid record encodes");
     let mut split_decode_slab = ByteSlab::with_capacity(4096);
     let mut split_decoded = decode_shard_record(&split_encoded, &mut split_decode_slab)
         .expect("split record should decode");
@@ -104,12 +105,12 @@ fn shard_record_v1_round_trips_split() {
 #[case::other(ParkReason::Other)]
 fn shard_record_v1_round_trips_parked(#[case] park_reason: ParkReason) {
     let (mut record, mut slab) = sample_parked_shard_record(park_reason);
-    let encoded = encode_shard_record(&record, &slab);
+    let encoded = encode_shard_record(&record, &slab).expect("valid record encodes");
 
     let mut decode_slab = ByteSlab::with_capacity(4096);
     let mut decoded =
         decode_shard_record(&encoded, &mut decode_slab).expect("parked record should decode");
-    let reencoded = encode_shard_record(&decoded, &decode_slab);
+    let reencoded = encode_shard_record(&decoded, &decode_slab).expect("re-encode succeeds");
 
     assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
     assert_eq!(reencoded, encoded);
@@ -209,7 +210,7 @@ fn decode_shard_record_rejects_cursor_token_without_last_key() {
 #[test]
 fn decode_shard_record_rolls_back_on_slab_exhaustion() {
     let (mut record, mut slab) = sample_active_child_shard_record(CursorSemantics::Dispatched);
-    let blob = encode_shard_record(&record, &slab);
+    let blob = encode_shard_record(&record, &slab).expect("valid record encodes");
     let mut tiny_slab = ByteSlab::with_capacity(48);
 
     let error = decode_shard_record(&blob, &mut tiny_slab).expect_err("small slab must fail");
@@ -279,7 +280,8 @@ fn arb_run_record() -> impl Strategy<Value = RunRecord> {
                     Just(retries),
                     Just(status),
                     Just(created_raw),
-                    proptest::collection::vec(1u64..=100_000u64, root_count),
+                    proptest::collection::hash_set(1u64..=100_000u64, root_count)
+                        .prop_map(|s| s.into_iter().collect::<Vec<_>>()),
                     proptest::collection::vec(
                         (
                             1u64..=100_000u64,
@@ -324,7 +326,10 @@ fn arb_run_record() -> impl Strategy<Value = RunRecord> {
                 let mut clock = created_raw;
                 for (i, (op_raw, hash, time_delta)) in op_entries.into_iter().enumerate() {
                     clock += time_delta;
-                    let op_id = OpId::from_raw(op_raw + i as u64);
+                    // Stride by 5 (> max entries 4) so no two (op_raw, i)
+                    // pairs can collide: (a*5+i) == (b*5+j) requires
+                    // 5*(a-b) == j-i, impossible when |j-i| ∈ {1..4}.
+                    let op_id = OpId::from_raw(op_raw * 5 + i as u64);
                     let executed_at = LogicalTime::from_raw(clock);
 
                     if i == 0 && status != RunStatus::Initializing {
@@ -606,7 +611,7 @@ fn arb_shard_input() -> impl Strategy<Value = ArbShardInput> {
         any::<bool>(),
         any::<u64>(),
         1u64..=1_000_000u64,
-        any::<u64>(),
+        1u64..=u64::MAX, // fence_raw: must be >= FenceEpoch::INITIAL (1)
         any::<bool>(),
         any::<u64>(),
         proptest::collection::vec(any::<u64>(), 0..=3usize),
@@ -685,12 +690,14 @@ proptest! {
     #[test]
     fn shard_record_proptest_round_trip(input in arb_shard_input()) {
         let (mut record, mut slab) = input.build();
-        let encoded = encode_shard_record(&record, &slab);
+        let encoded = encode_shard_record(&record, &slab)
+            .expect("proptest-generated shard record must encode");
 
         let mut decode_slab = ByteSlab::with_capacity(4096);
         let mut decoded = decode_shard_record(&encoded, &mut decode_slab)
             .expect("proptest-generated shard record must decode");
-        let reencoded = encode_shard_record(&decoded, &decode_slab);
+        let reencoded = encode_shard_record(&decoded, &decode_slab)
+            .expect("re-encode must succeed");
 
         assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
         prop_assert_eq!(&reencoded, &encoded, "encode(decode(encode(r))) != encode(r)");
@@ -698,6 +705,376 @@ proptest! {
         release_shard_record(&mut record, &mut slab);
         release_shard_record(&mut decoded, &mut decode_slab);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Decoder primitive unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decoder_read_bool_zero_is_false() {
+    let mut d = Decoder::new(&[0]);
+    assert!(!d.read_bool().unwrap());
+}
+
+#[test]
+fn decoder_read_bool_one_is_true() {
+    let mut d = Decoder::new(&[1]);
+    assert!(d.read_bool().unwrap());
+}
+
+#[test]
+fn decoder_read_bool_rejects_invalid() {
+    for byte in 2..=255u8 {
+        let buf = [byte];
+        let mut d = Decoder::new(&buf);
+        assert!(
+            matches!(d.read_bool(), Err(EtcdCodecError::InvalidBool { actual }) if actual == byte),
+            "byte {byte} should be rejected as invalid bool"
+        );
+    }
+}
+
+#[test]
+fn decoder_read_u32_valid() {
+    let expected = 0x0403_0201u32;
+    let buf = expected.to_le_bytes();
+    let mut d = Decoder::new(&buf);
+    assert_eq!(d.read_u32().unwrap(), expected);
+}
+
+#[test]
+fn decoder_read_u32_truncated() {
+    let mut d = Decoder::new(&[0x01, 0x02, 0x03]);
+    assert!(matches!(
+        d.read_u32(),
+        Err(EtcdCodecError::Truncated {
+            needed: 4,
+            remaining: 3
+        })
+    ));
+}
+
+#[test]
+fn decoder_read_u64_valid() {
+    let expected = 0x0807_0605_0403_0201u64;
+    let buf = expected.to_le_bytes();
+    let mut d = Decoder::new(&buf);
+    assert_eq!(d.read_u64().unwrap(), expected);
+}
+
+#[test]
+fn decoder_read_u64_truncated() {
+    let mut d = Decoder::new(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    assert!(matches!(
+        d.read_u64(),
+        Err(EtcdCodecError::Truncated {
+            needed: 8,
+            remaining: 7
+        })
+    ));
+}
+
+#[test]
+fn decoder_read_vec_valid() {
+    let payload = b"hello";
+    let mut buf = Vec::new();
+    push_u32(&mut buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+    let mut d = Decoder::new(&buf);
+    assert_eq!(d.read_vec().unwrap(), payload);
+}
+
+#[test]
+fn decoder_read_vec_truncated_body() {
+    let mut buf = Vec::new();
+    push_u32(&mut buf, 10);
+    buf.extend_from_slice(&[0u8; 5]); // only 5 of 10 bytes present
+    let mut d = Decoder::new(&buf);
+    assert!(matches!(
+        d.read_vec(),
+        Err(EtcdCodecError::Truncated {
+            needed: 10,
+            remaining: 5
+        })
+    ));
+}
+
+#[test]
+fn decoder_read_vec_rejects_too_large() {
+    let oversized_len = (MAX_FIELD_SIZE + 1) as u32;
+    let buf = oversized_len.to_le_bytes();
+    let mut d = Decoder::new(&buf);
+    assert!(matches!(
+        d.read_vec(),
+        Err(EtcdCodecError::FieldTooLarge {
+            actual,
+            max,
+        }) if actual == MAX_FIELD_SIZE + 1 && max == MAX_FIELD_SIZE
+    ));
+}
+
+#[test]
+fn decoder_read_opt_vec_none() {
+    let mut d = Decoder::new(&[0x00]);
+    assert_eq!(d.read_opt_vec().unwrap(), None);
+}
+
+#[test]
+fn decoder_read_opt_vec_some() {
+    let payload = b"data";
+    let mut buf = vec![0x01]; // presence tag
+    push_u32(&mut buf, payload.len() as u32);
+    buf.extend_from_slice(payload);
+    let mut d = Decoder::new(&buf);
+    assert_eq!(d.read_opt_vec().unwrap(), Some(payload.to_vec()));
+}
+
+#[test]
+fn decoder_read_tenant_valid() {
+    let bytes = [0xAB; 32];
+    let mut d = Decoder::new(&bytes);
+    let tenant = d.read_tenant().unwrap();
+    assert_eq!(tenant, TenantId::from_bytes(bytes));
+}
+
+#[test]
+fn decoder_read_tenant_truncated() {
+    let buf = [0xAB; 31];
+    let mut d = Decoder::new(&buf);
+    assert!(matches!(
+        d.read_tenant(),
+        Err(EtcdCodecError::Truncated {
+            needed: 32,
+            remaining: 31
+        })
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Collection-cap boundary condition tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn shard_record_at_op_log_cap_round_trips() {
+    let tenant = TenantId::from_bytes([0xC1; 32]);
+    let run = RunId::from_raw(0xC100);
+    let shard = ShardId::from_raw(0xC1);
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let spec = ShardSpecRef::with_range_and_metadata(b"a", b"z", b"cap-test");
+    let mut record = ShardRecord::new_active(
+        tenant,
+        run,
+        shard,
+        spec,
+        CursorSemantics::Completed,
+        &mut slab,
+    )
+    .expect("shard record should fit in slab");
+
+    // Fill op_log to exactly ShardRecord::OP_LOG_CAP (16) entries.
+    for i in 0..ShardRecord::OP_LOG_CAP {
+        let ts = (i as u64) + 1;
+        record.op_log.push_back_overwrite(OpLogEntry::new(
+            OpId::from_raw(ts),
+            OpKind::Checkpoint,
+            OpResult::Completed,
+            0xAAAA + ts,
+            LogicalTime::from_raw(ts),
+        ));
+    }
+    assert_eq!(record.op_log.len(), ShardRecord::OP_LOG_CAP);
+    record.assert_invariants(&slab);
+
+    let encoded = encode_shard_record(&record, &slab).expect("at-cap shard record must encode");
+    let mut decode_slab = ByteSlab::with_capacity(4096);
+    let mut decoded =
+        decode_shard_record(&encoded, &mut decode_slab).expect("at-cap shard record must decode");
+
+    assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+
+    release_shard_record(&mut record, &mut slab);
+    release_shard_record(&mut decoded, &mut decode_slab);
+}
+
+#[test]
+fn shard_record_over_op_log_cap_rejected() {
+    let over_cap = (ShardRecord::OP_LOG_CAP + 1) as u32;
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"v1");
+    blob.push(BlobKind::ShardRecord as u8);
+    blob.extend_from_slice(TenantId::from_bytes([0xC2; 32]).as_bytes());
+    push_u64(&mut blob, RunId::from_raw(0xC200).as_raw());
+    push_u64(&mut blob, ShardId::from_raw(0xC2).as_raw());
+    blob.push(ShardStatus::Active.as_u8());
+    blob.push(0); // park_reason absent
+    push_bytes(&mut blob, b"a"); // key_range_start
+    push_bytes(&mut blob, b"z"); // key_range_end
+    push_bytes(&mut blob, b"meta"); // metadata
+    blob.push(0); // cursor_last_key absent
+    blob.push(0); // cursor_token absent
+    blob.push(CursorSemantics::Completed.as_u8());
+    blob.push(0); // no lease
+    push_u64(&mut blob, FenceEpoch::INITIAL.as_raw());
+    blob.push(0); // parent absent
+    push_u32(&mut blob, 0); // spawned len
+    push_u32(&mut blob, over_cap); // op_log len exceeds cap
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let error = decode_shard_record(&blob, &mut slab).expect_err("over-cap op_log must fail");
+    assert!(
+        matches!(
+            error,
+            EtcdCodecError::InvariantViolation {
+                kind: "ShardRecord",
+                detail: "op_log exceeds cap",
+            }
+        ),
+        "expected InvariantViolation for over-cap op_log, got: {error:?}"
+    );
+}
+
+#[test]
+fn shard_record_at_max_spawned_round_trips() {
+    let tenant = TenantId::from_bytes([0xC3; 32]);
+    let run = RunId::from_raw(0xC300);
+    // Split status requires at least one spawned child, so a root shard is fine.
+    let shard = ShardId::from_raw(0xC3);
+
+    let mut slab = ByteSlab::with_capacity(64 * 1024);
+    let spec = ShardSpecRef::with_range_and_metadata(b"a", b"z", b"spawned-cap");
+    let mut record = ShardRecord::new_active(
+        tenant,
+        run,
+        shard,
+        spec,
+        CursorSemantics::Completed,
+        &mut slab,
+    )
+    .expect("shard record should fit in slab");
+
+    record.status = ShardStatus::Split;
+
+    let spawned_ids: Vec<ShardId> = (0..MAX_SPAWNED_PER_SHARD)
+        .map(|i| derived_shard(i as u64))
+        .collect();
+    record.spawned = pooled_spawned(&spawned_ids, &mut slab);
+
+    // Add one op_log entry so invariants pass (split needs at least one entry).
+    record.op_log.push_back_overwrite(OpLogEntry::new(
+        OpId::from_raw(1),
+        OpKind::SplitReplace,
+        OpResult::Completed,
+        0xBBBB,
+        LogicalTime::from_raw(1),
+    ));
+    record.assert_invariants(&slab);
+
+    let encoded =
+        encode_shard_record(&record, &slab).expect("at-max-spawned shard record must encode");
+    let mut decode_slab = ByteSlab::with_capacity(64 * 1024);
+    let mut decoded = decode_shard_record(&encoded, &mut decode_slab)
+        .expect("at-max-spawned shard record must decode");
+
+    assert_shard_record_eq(&record, &slab, &decoded, &decode_slab);
+
+    release_shard_record(&mut record, &mut slab);
+    release_shard_record(&mut decoded, &mut decode_slab);
+}
+
+#[test]
+fn shard_record_over_max_spawned_rejected() {
+    let over_max = (MAX_SPAWNED_PER_SHARD + 1) as u32;
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"v1");
+    blob.push(BlobKind::ShardRecord as u8);
+    blob.extend_from_slice(TenantId::from_bytes([0xC4; 32]).as_bytes());
+    push_u64(&mut blob, RunId::from_raw(0xC400).as_raw());
+    push_u64(&mut blob, ShardId::from_raw(0xC4).as_raw());
+    blob.push(ShardStatus::Split.as_u8());
+    blob.push(0); // park_reason absent
+    push_bytes(&mut blob, b"a"); // key_range_start
+    push_bytes(&mut blob, b"z"); // key_range_end
+    push_bytes(&mut blob, b"meta"); // metadata
+    blob.push(0); // cursor_last_key absent
+    blob.push(0); // cursor_token absent
+    blob.push(CursorSemantics::Completed.as_u8());
+    blob.push(0); // no lease
+    push_u64(&mut blob, FenceEpoch::INITIAL.as_raw());
+    blob.push(0); // parent absent
+    push_u32(&mut blob, over_max); // spawned len exceeds MAX_SPAWNED_PER_SHARD
+
+    let mut slab = ByteSlab::with_capacity(4096);
+    let error = decode_shard_record(&blob, &mut slab).expect_err("over-max spawned must fail");
+    assert!(
+        matches!(
+            error,
+            EtcdCodecError::InvariantViolation {
+                kind: "ShardRecord",
+                detail: "spawned exceeds MAX_SPAWNED_PER_SHARD",
+            }
+        ),
+        "expected InvariantViolation for over-max spawned, got: {error:?}"
+    );
+}
+
+#[test]
+fn run_record_at_op_log_cap_round_trips() {
+    let tenant = TenantId::from_bytes([0xC5; 32]);
+    let run = RunId::from_raw(0xC500);
+    let root_a = ShardId::from_raw(1);
+    let root_b = ShardId::from_raw(2);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+
+    let mut op_log = RingBuffer::<RunOpLogEntry, { RunRecord::OP_LOG_CAP }>::new();
+
+    // First entry must be RegisterShards for a non-Initializing record.
+    op_log.push_back_overwrite(RunOpLogEntry::new(
+        OpId::from_raw(1),
+        RunOpKind::RegisterShards,
+        0x1111,
+        LogicalTime::from_raw(1),
+        RunOpResult::RegisteredShards {
+            shard_ids: vec![root_a, root_b].into_boxed_slice(),
+        },
+    ));
+
+    // Fill the remaining slots with terminal ops (monotonically increasing timestamps).
+    let terminal_kinds = [
+        RunOpKind::CompleteRun,
+        RunOpKind::FailRun,
+        RunOpKind::CancelRun,
+    ];
+    for i in 1..RunRecord::OP_LOG_CAP {
+        let ts = (i as u64) + 1;
+        op_log.push_back_overwrite(RunOpLogEntry::new(
+            OpId::from_raw(ts),
+            terminal_kinds[i % terminal_kinds.len()],
+            0x2222 + ts,
+            LogicalTime::from_raw(ts),
+            RunOpResult::Ack,
+        ));
+    }
+    assert_eq!(op_log.len(), RunRecord::OP_LOG_CAP);
+
+    let record = RunRecord {
+        tenant,
+        run,
+        config,
+        status: RunStatus::Active,
+        created_at: LogicalTime::from_raw(1),
+        completed_at: None,
+        root_shards: vec![root_a, root_b],
+        op_log,
+    };
+    record.assert_invariants();
+
+    let encoded = encode_run_record(&record);
+    let decoded = decode_run_record(&encoded).expect("at-cap run record must decode");
+    assert_eq!(decoded, record);
 }
 
 // ---------------------------------------------------------------------------
@@ -1174,4 +1551,46 @@ fn decode_shard_record_rejects_non_monotonic_op_log_timestamps() {
         Err(other) => panic!("expected InvariantViolation, got: {other:?}"),
         Ok(_) => unreachable!(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Large root-shard count round-trip (structural bound, no hard cap)
+// ---------------------------------------------------------------------------
+
+/// Records with >1024 root shards round-trip correctly now that the decoder
+/// derives its allocation guard from remaining wire bytes rather than a
+/// hard-coded constant.
+#[test]
+fn run_record_large_root_shard_count_round_trips() {
+    let tenant = TenantId::from_bytes([0xFD; 32]);
+    let run = RunId::from_raw(0xFD00);
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let root_shards: Vec<ShardId> = (1..=2048).map(ShardId::from_raw).collect();
+
+    let mut op_log = RingBuffer::<RunOpLogEntry, { RunRecord::OP_LOG_CAP }>::new();
+    op_log.push_back_overwrite(RunOpLogEntry::new(
+        OpId::from_raw(1),
+        RunOpKind::RegisterShards,
+        0x1111,
+        LogicalTime::from_raw(1),
+        RunOpResult::RegisteredShards {
+            shard_ids: root_shards.clone().into_boxed_slice(),
+        },
+    ));
+
+    let record = RunRecord {
+        tenant,
+        run,
+        config,
+        status: RunStatus::Active,
+        created_at: LogicalTime::from_raw(1),
+        completed_at: None,
+        root_shards,
+        op_log,
+    };
+
+    let encoded = encode_run_record(&record);
+    let decoded = decode_run_record(&encoded)
+        .expect("record with 2048 root shards must decode with structural bound");
+    assert_eq!(&decoded, &record);
 }

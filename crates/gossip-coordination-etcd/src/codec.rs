@@ -73,13 +73,11 @@ use gossip_stdx::{ByteSlab, RingBuffer, SlabFull};
 
 const VERSION_PREFIX_V1: &[u8; 2] = b"v1";
 
-/// Decode-time upper bound on root shard count per run.
-///
-/// Prevents a crafted blob from triggering a multi-gigabyte allocation via
-/// an inflated length prefix. The value (1024) is deliberately generous —
-/// typical runs have far fewer root shards — but bounded enough to prevent
-/// DoS from untrusted input.
-const MAX_ROOT_SHARDS: usize = 1024;
+/// Minimum serialized size of a single `ShardId` entry (8 bytes for `u64`).
+/// Used to derive structural upper bounds on collection lengths from remaining
+/// wire bytes, preventing crafted length prefixes from triggering multi-GB
+/// allocations.
+const SHARD_ID_WIRE_SIZE: usize = 8;
 
 /// Blob discriminator embedded after the 2-byte version header.
 ///
@@ -145,6 +143,8 @@ pub enum EtcdCodecError {
         kind: &'static str,
         detail: &'static str,
     },
+    /// A variable-length field exceeded the maximum allowed size.
+    FieldTooLarge { actual: usize, max: usize },
 }
 
 impl fmt::Display for EtcdCodecError {
@@ -191,6 +191,12 @@ impl fmt::Display for EtcdCodecError {
             }
             Self::InvariantViolation { kind, detail } => {
                 write!(f, "decoded {kind} violates invariant: {detail}")
+            }
+            Self::FieldTooLarge { actual, max } => {
+                write!(
+                    f,
+                    "variable-length field too large: {actual} bytes exceeds {max}-byte limit"
+                )
             }
         }
     }
@@ -258,16 +264,20 @@ pub fn decode_run_record(blob: &[u8]) -> Result<RunRecord, EtcdCodecError> {
 /// from `slab` to extract their byte content into the output. The slab is borrowed
 /// immutably — no allocations or deallocations occur during encoding.
 ///
-/// Encoding is infallible given a valid record. The output begins with the
-/// standard 3-byte header followed by all record fields in deterministic order.
-#[must_use]
-pub fn encode_shard_record(record: &ShardRecord, slab: &ByteSlab) -> Vec<u8> {
+/// # Errors
+///
+/// Returns [`EtcdCodecError::InvariantViolation`] if the record has
+/// inconsistent lease state (owner present without deadline, or vice versa).
+pub fn encode_shard_record(
+    record: &ShardRecord,
+    slab: &ByteSlab,
+) -> Result<Vec<u8>, EtcdCodecError> {
     let owned = OwnedShardRecord::from_record(record, slab);
     let mut out = Vec::with_capacity(256);
     out.extend_from_slice(VERSION_PREFIX_V1);
     out.push(BlobKind::ShardRecord.as_u8());
-    owned.encode_into(&mut out);
-    out
+    owned.encode_into(&mut out)?;
+    Ok(out)
 }
 
 /// Decode a v1-encoded blob into a [`ShardRecord`], allocating pooled fields in `slab`.
@@ -385,10 +395,10 @@ impl OwnedRunRecord {
         let completed_at = decoder.read_opt_u64()?.map(LogicalTime::from_raw);
 
         let root_len = decoder.read_len()?;
-        if root_len > MAX_ROOT_SHARDS {
+        if root_len > decoder.remaining() / SHARD_ID_WIRE_SIZE {
             return Err(EtcdCodecError::InvariantViolation {
                 kind: "RunRecord",
-                detail: "root_shards exceeds decode cap",
+                detail: "root_shards length exceeds remaining wire bytes",
             });
         }
         let mut root_shards = Vec::with_capacity(root_len);
@@ -691,10 +701,10 @@ impl OwnedRunOpResult {
         match decoder.read_u8()? {
             1 => {
                 let len = decoder.read_len()?;
-                if len > MAX_ROOT_SHARDS {
+                if len > decoder.remaining() / SHARD_ID_WIRE_SIZE {
                     return Err(EtcdCodecError::InvariantViolation {
                         kind: "RunOpResult",
-                        detail: "RegisteredShards count exceeds decode cap",
+                        detail: "RegisteredShards length exceeds remaining wire bytes",
                     });
                 }
                 let mut shard_ids = Vec::with_capacity(len);
@@ -753,6 +763,45 @@ struct OwnedShardRecord {
     op_log: Vec<OwnedShardOpLogEntry>,
 }
 
+/// Accumulator for slab allocations during [`ShardRecord`] materialization.
+///
+/// Each allocation step deposits its result here. On failure, [`rollback`]
+/// releases all accumulated allocations in reverse order, restoring the slab
+/// to its pre-call state. On success, the fields are moved out individually
+/// into the final [`ShardRecord`].
+///
+/// [`rollback`]: StagedShardAllocations::rollback
+struct StagedShardAllocations {
+    spec: Option<PooledShardSpec>,
+    cursor: Option<PooledCursor>,
+    spawned: Option<PooledSpawned>,
+}
+
+impl StagedShardAllocations {
+    fn new() -> Self {
+        Self {
+            spec: None,
+            cursor: None,
+            spawned: None,
+        }
+    }
+
+    /// Release all accumulated allocations in reverse order (spawned, cursor,
+    /// spec). Safe to call when some fields are still `None` — only populated
+    /// slots are released.
+    fn rollback(mut self, slab: &mut ByteSlab) {
+        if let Some(mut s) = self.spawned.take() {
+            s.release_fields(slab);
+        }
+        if let Some(mut c) = self.cursor.take() {
+            c.release_fields(slab);
+        }
+        if let Some(mut s) = self.spec.take() {
+            s.release_fields(slab);
+        }
+    }
+}
+
 impl OwnedShardRecord {
     fn from_record(record: &ShardRecord, slab: &ByteSlab) -> Self {
         let spec = record.spec.as_spec_ref(slab);
@@ -781,7 +830,7 @@ impl OwnedShardRecord {
         }
     }
 
-    fn encode_into(&self, out: &mut Vec<u8>) {
+    fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), EtcdCodecError> {
         put_tenant(out, self.tenant);
         put_u64(out, self.run.as_raw());
         put_u64(out, self.shard.as_raw());
@@ -805,7 +854,10 @@ impl OwnedShardRecord {
             }
             (None, None) => put_bool(out, false),
             (Some(_), None) | (None, Some(_)) => {
-                panic!("OwnedShardRecord::encode_into called with partial lease state");
+                return Err(EtcdCodecError::InvariantViolation {
+                    kind: "ShardRecord",
+                    detail: "lease owner and deadline must be jointly present or absent",
+                });
             }
         }
 
@@ -821,6 +873,8 @@ impl OwnedShardRecord {
         for entry in &self.op_log {
             entry.encode_into(out);
         }
+
+        Ok(())
     }
 
     fn decode(decoder: &mut Decoder<'_>) -> Result<Self, EtcdCodecError> {
@@ -917,17 +971,38 @@ impl OwnedShardRecord {
 
     /// Materialize into a domain [`ShardRecord`], allocating pooled fields in `slab`.
     ///
-    /// Allocations proceed in dependency order: spec → cursor → spawned → op_log.
-    /// Each fallible step is wrapped in a rollback guard that deallocates all
-    /// previously successful allocations before returning the error. This
-    /// provides a strong exception guarantee: on `Err`, the slab's live count
-    /// is identical to its value before the call.
+    /// Allocations proceed in dependency order: spec, cursor, spawned, op_log.
+    /// A [`StagedShardAllocations`] guard accumulates successful allocations;
+    /// on any error, the caller rolls back all staged allocations in reverse
+    /// order, restoring the slab to its pre-call state (strong exception
+    /// guarantee).
     ///
     /// The lease is reconstructed from the split owner/deadline fields with a
     /// final joint-presence check, also guarded by rollback.
     fn into_record(self, slab: &mut ByteSlab) -> Result<ShardRecord, EtcdCodecError> {
         self.validate()?;
+        let mut staged = StagedShardAllocations::new();
+        match self.try_materialize(slab, &mut staged) {
+            Ok(record) => Ok(record),
+            Err(e) => {
+                staged.rollback(slab);
+                Err(e)
+            }
+        }
+    }
 
+    /// Perform all allocation and validation steps for [`into_record`].
+    ///
+    /// Each successful slab allocation is deposited into `staged` before the
+    /// next fallible step. If any step returns `Err`, the caller's rollback
+    /// of `staged` releases exactly the allocations that succeeded.
+    ///
+    /// [`into_record`]: OwnedShardRecord::into_record
+    fn try_materialize(
+        self,
+        slab: &mut ByteSlab,
+        staged: &mut StagedShardAllocations,
+    ) -> Result<ShardRecord, EtcdCodecError> {
         let spec_ref = ShardSpecRef::try_with_range_and_metadata(
             &self.key_range_start,
             &self.key_range_end,
@@ -937,29 +1012,20 @@ impl OwnedShardRecord {
             message: err.to_string(),
         })?;
         let pooled_spec = PooledShardSpec::from_spec_ref(spec_ref, slab)?;
+        staged.spec = Some(pooled_spec);
 
         let cursor_update = match (&self.cursor_last_key, &self.cursor_token) {
             (None, None) => CursorUpdate::initial(),
-            (Some(last_key), None) => match CursorUpdate::try_with_last_key(last_key) {
-                Ok(cu) => cu,
-                Err(err) => {
-                    pooled_spec.deallocate(slab);
-                    return Err(EtcdCodecError::InvalidCursor {
-                        message: err.to_string(),
-                    });
+            (Some(last_key), None) => CursorUpdate::try_with_last_key(last_key).map_err(|err| {
+                EtcdCodecError::InvalidCursor {
+                    message: err.to_string(),
                 }
-            },
-            (Some(last_key), Some(token)) => match CursorUpdate::try_with_token(last_key, token) {
-                Ok(cu) => cu,
-                Err(err) => {
-                    pooled_spec.deallocate(slab);
-                    return Err(EtcdCodecError::InvalidCursor {
-                        message: err.to_string(),
-                    });
-                }
-            },
+            })?,
+            (Some(last_key), Some(token)) => CursorUpdate::try_with_token(last_key, token)
+                .map_err(|err| EtcdCodecError::InvalidCursor {
+                    message: err.to_string(),
+                })?,
             (None, Some(_)) => {
-                pooled_spec.deallocate(slab);
                 return Err(EtcdCodecError::InvariantViolation {
                     kind: "ShardRecord",
                     detail: "cursor token without cursor last_key is invalid",
@@ -967,50 +1033,25 @@ impl OwnedShardRecord {
             }
         };
 
-        // Each allocation step rolls back all earlier allocations on failure.
-        // Order: spec → cursor → spawned → op_log → lease validation.
-        let mut pooled_cursor = match PooledCursor::from_update(&cursor_update, slab) {
-            Ok(cursor) => cursor,
-            Err(err) => {
-                pooled_spec.deallocate(slab);
-                return Err(err.into());
-            }
-        };
+        let pooled_cursor = PooledCursor::from_update(&cursor_update, slab)?;
+        staged.cursor = Some(pooled_cursor);
 
         let mut pooled_spawned = PooledSpawned::new();
         if !self.spawned.is_empty() {
-            match pooled_spawned.allocate_appended_slot(&self.spawned, slab) {
-                Ok((slot, len)) => pooled_spawned.install_slot(slot, len, slab),
-                Err(err) => {
-                    pooled_cursor.release_fields(slab);
-                    pooled_spec.deallocate(slab);
-                    return Err(err.into());
-                }
-            }
+            let (slot, len) = pooled_spawned.allocate_appended_slot(&self.spawned, slab)?;
+            pooled_spawned.install_slot(slot, len, slab);
         }
+        staged.spawned = Some(pooled_spawned);
 
         let mut op_log = RingBuffer::<OpLogEntry, { ShardRecord::OP_LOG_CAP }>::new();
         for entry in self.op_log {
-            match entry.into_entry() {
-                Ok(entry) => {
-                    op_log.push_back_overwrite(entry);
-                }
-                Err(err) => {
-                    pooled_spawned.release_fields(slab);
-                    pooled_cursor.release_fields(slab);
-                    pooled_spec.deallocate(slab);
-                    return Err(err);
-                }
-            }
+            op_log.push_back_overwrite(entry.into_entry()?);
         }
 
         let lease = match (self.lease_owner, self.lease_deadline) {
             (Some(owner), Some(deadline)) => Some(LeaseHolder::new(owner, deadline)),
             (None, None) => None,
             (Some(_), None) | (None, Some(_)) => {
-                pooled_spawned.release_fields(slab);
-                pooled_cursor.release_fields(slab);
-                pooled_spec.deallocate(slab);
                 return Err(EtcdCodecError::InvariantViolation {
                     kind: "ShardRecord",
                     detail: "lease owner and deadline must either both be present or both absent",
@@ -1018,19 +1059,25 @@ impl OwnedShardRecord {
             }
         };
 
+        // All allocations succeeded — move them out of the guard so rollback
+        // becomes a no-op (all fields are `None` after `.take()`).
+        let spec = staged.spec.take().expect("spec was set above");
+        let cursor = staged.cursor.take().expect("cursor was set above");
+        let spawned = staged.spawned.take().expect("spawned was set above");
+
         Ok(ShardRecord {
             tenant: self.tenant,
             run: self.run,
             shard: self.shard,
             status: self.status,
             park_reason: self.park_reason,
-            spec: pooled_spec,
-            cursor: pooled_cursor,
+            spec,
+            cursor,
             cursor_semantics: self.cursor_semantics,
             lease,
             fence_epoch: self.fence_epoch,
             parent: self.parent,
-            spawned: pooled_spawned,
+            spawned,
             op_log,
         })
     }
@@ -1108,6 +1155,16 @@ impl OwnedShardRecord {
                     kind: "ShardRecord",
                     detail: "all spawned shard ids must be derived",
                 });
+            }
+        }
+        for i in 0..self.spawned.len() {
+            for j in (i + 1)..self.spawned.len() {
+                if self.spawned[i] == self.spawned[j] {
+                    return Err(EtcdCodecError::InvariantViolation {
+                        kind: "ShardRecord",
+                        detail: "spawned must not contain duplicate ShardId values",
+                    });
+                }
             }
         }
         if self.op_log.len() > ShardRecord::OP_LOG_CAP {
@@ -1241,6 +1298,14 @@ impl OwnedShardOpLogEntry {
 ///
 /// [`finish`](Self::finish) asserts that the cursor has consumed the
 /// entire input, catching blobs that are longer than expected.
+/// Upper bound on any single variable-length field decoded from a blob.
+///
+/// Guards against untrusted input causing unbounded `Vec::with_capacity`
+/// allocations. 1 MiB is far larger than any legitimate coordination
+/// record field while remaining small enough to prevent OOM from a single
+/// crafted length prefix.
+const MAX_FIELD_SIZE: usize = 1 << 20;
+
 struct Decoder<'a> {
     bytes: &'a [u8],
     offset: usize,
@@ -1270,6 +1335,11 @@ impl<'a> Decoder<'a> {
         }
 
         Ok(())
+    }
+
+    /// Bytes not yet consumed.
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
     }
 
     /// Assert that all input bytes have been consumed.
@@ -1332,6 +1402,12 @@ impl<'a> Decoder<'a> {
 
     fn read_vec(&mut self) -> Result<Vec<u8>, EtcdCodecError> {
         let len = self.read_len()?;
+        if len > MAX_FIELD_SIZE {
+            return Err(EtcdCodecError::FieldTooLarge {
+                actual: len,
+                max: MAX_FIELD_SIZE,
+            });
+        }
         Ok(self.read_exact(len)?.to_vec())
     }
 
