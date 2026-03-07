@@ -234,12 +234,12 @@ impl InMemoryDoneLedger {
         }
 
         let mut released = 0usize;
-        for op_id in pending {
-            finish_done_ledger_op(&mut guard, op_id)?;
-            guard.order.retain(|id| *id != op_id);
+        for op_id in &pending {
+            finish_done_ledger_op(&mut guard, *op_id)?;
             released += 1;
         }
         if released > 0 {
+            guard.order.retain(|id| !pending.contains(id));
             self.inner.cv.notify_all();
         }
         Ok(released)
@@ -468,7 +468,11 @@ impl DoneLedger for InMemoryDoneLedger {
         }
 
         let op_id = PendingWriteId::from_raw(guard.next_op_id);
-        guard.next_op_id = guard.next_op_id.saturating_add(1);
+        guard.next_op_id = guard.next_op_id.checked_add(1).ok_or(
+            InMemoryPersistenceError::InjectedSubmissionFailure {
+                store: InMemoryStoreKind::DoneLedger,
+            },
+        )?;
 
         let mut op = PendingOp {
             payload: DoneLedgerPayload {
@@ -528,7 +532,7 @@ fn apply_done_ledger_payload(
         let key = record.key();
         match state.durable.get(&key) {
             Some(existing) => {
-                let merged = merge_done_ledger_records(existing, record);
+                let merged = merge_done_ledger_records(existing, record)?;
                 state.durable.insert(key, merged);
             }
             None => {
@@ -600,9 +604,9 @@ fn finish_done_ledger_op(
 ///    absorbs prior errors). Otherwise taken from the provenance winner,
 ///    falling back to the loser if the winner has none.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics (via `expect`) if the merged fields violate `DoneLedgerRecord`
+/// Returns an error if the merged fields violate `DoneLedgerRecord`
 /// construction invariants. This should be unreachable because the lattice
 /// join can only raise the status, never lower it, and `max()` on metrics
 /// preserves consistency.
@@ -611,7 +615,7 @@ fn finish_done_ledger_op(
 fn merge_done_ledger_records(
     existing: &DoneLedgerRecord,
     incoming: &DoneLedgerRecord,
-) -> DoneLedgerRecord {
+) -> Result<DoneLedgerRecord, InMemoryPersistenceError> {
     let merged_status = existing.status().merge(incoming.status());
     let bytes_scanned = existing.bytes_scanned().max(incoming.bytes_scanned());
     let findings_count = match merged_status {
@@ -644,13 +648,12 @@ fn merge_done_ledger_records(
             .or_else(|| fallback.error_code().cloned())
     };
 
-    DoneLedgerRecord::try_new(
+    Ok(DoneLedgerRecord::try_new(
         existing.key(),
         merged_status,
         bytes_scanned,
         findings_count,
         chosen.provenance(),
         error_code,
-    )
-    .expect("merged done-ledger record should preserve all record invariants")
+    )?)
 }

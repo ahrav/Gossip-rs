@@ -446,6 +446,34 @@ fn observe_realigns_byte_mark_after_wide_file_skips_multiple_cadences() {
 }
 
 #[test]
+fn observe_advances_rank_mark_only_when_rank_cadence_fires_alone() {
+    let mut estimator = StreamingSplitEstimator::new(SMALL_SAMPLE_CAP);
+    estimator.rank_stride = 4;
+    estimator.byte_stride = 10;
+    estimator.count = 4;
+    estimator.total_bytes = 13;
+    estimator.next_rank_sample = 4;
+    estimator.next_byte_mark = 20;
+
+    // end_bytes = 13 + 3 = 16, which does NOT straddle 20.
+    estimator.observe(&key_for_index(4), 3);
+
+    assert_eq!(
+        estimator.sample_len(),
+        1,
+        "rank cadence should emit a sample"
+    );
+    assert_eq!(
+        estimator.next_rank_sample, 8,
+        "rank mark must advance by exactly one rank_stride from the firing rank"
+    );
+    assert_eq!(
+        estimator.next_byte_mark, 20,
+        "byte mark must remain unchanged when only the rank cadence fires"
+    );
+}
+
+#[test]
 fn compaction_realigns_marks_to_the_doubled_stride_grid() {
     use super::{Sample, align_to_stride};
 

@@ -668,6 +668,15 @@ impl StreamingSplitEstimator {
         }
 
         if sample_rank {
+            // `rank` is always a multiple of `rank_stride` when the cadence fires
+            // (maintained by initialization at 0, incremental +rank_stride advances,
+            // and post-compaction realignment), so adding `rank_stride` keeps the
+            // mark on the stride grid without a modulo op.
+            debug_assert_eq!(
+                rank % self.rank_stride,
+                0,
+                "rank cadence fired at a non-grid-aligned rank; mark will drift"
+            );
             self.next_rank_sample = rank.saturating_add(self.rank_stride);
         }
         if sample_bytes {

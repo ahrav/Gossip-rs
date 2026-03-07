@@ -239,12 +239,12 @@ impl InMemoryFindingsSink {
         }
 
         let mut released = 0usize;
-        for op_id in pending {
-            finish_findings_op(&mut guard, op_id)?;
-            guard.order.retain(|id| *id != op_id);
+        for op_id in &pending {
+            finish_findings_op(&mut guard, *op_id)?;
             released += 1;
         }
         if released > 0 {
+            guard.order.retain(|id| !pending.contains(id));
             self.inner.cv.notify_all();
         }
         Ok(released)
@@ -518,7 +518,11 @@ impl FindingsSink for InMemoryFindingsSink {
         }
 
         let op_id = PendingWriteId::from_raw(guard.next_op_id);
-        guard.next_op_id = guard.next_op_id.saturating_add(1);
+        guard.next_op_id = guard.next_op_id.checked_add(1).ok_or(
+            InMemoryPersistenceError::InjectedSubmissionFailure {
+                store: InMemoryStoreKind::Findings,
+            },
+        )?;
 
         let mut op = PendingOp {
             payload: FindingsPayload {
@@ -668,7 +672,8 @@ fn apply_findings_payload(
     }
 
     // --- Layer 1: Findings (immutable insert-or-check) ---
-    let mut batch_findings: HashMap<FindingKey, FindingRecord> = HashMap::new();
+    let mut batch_findings: HashMap<FindingKey, FindingRecord> =
+        HashMap::with_capacity(payload.findings.len());
     for finding in &payload.findings {
         let key = (finding.tenant_id(), finding.finding_id());
         if let Some(existing) = batch_findings.get(&key) {
@@ -692,7 +697,8 @@ fn apply_findings_payload(
     }
 
     // --- Layer 2: Occurrences (immutable insert-or-check, with parent ref check) ---
-    let mut batch_occurrences: HashMap<OccurrenceKey, OccurrenceRecord> = HashMap::new();
+    let mut batch_occurrences: HashMap<OccurrenceKey, OccurrenceRecord> =
+        HashMap::with_capacity(payload.occurrences.len());
     for occurrence in &payload.occurrences {
         let key = (occurrence.tenant_id(), occurrence.occurrence_id());
         let finding_key = (occurrence.tenant_id(), occurrence.finding_id());
@@ -728,7 +734,8 @@ fn apply_findings_payload(
     // --- Layer 3: Observations (upsert with identity check + parent ref check) ---
     // Identity fields must agree, but last-seen provenance may legitimately
     // change across retries/reruns of the same occurrence under the same policy.
-    let mut batch_observations: HashMap<ObservationKey, ObservationRecord> = HashMap::new();
+    let mut batch_observations: HashMap<ObservationKey, ObservationRecord> =
+        HashMap::with_capacity(payload.observations.len());
     for observation in &payload.observations {
         observation.validate_identity()?;
         let key = (observation.tenant_id(), observation.observation_id());
@@ -758,21 +765,18 @@ fn apply_findings_payload(
     }
 
     // Validation passed — commit new rows into durable state.
-    for (key, record) in &batch_findings {
-        state
-            .durable_findings
-            .entry(*key)
-            .or_insert_with(|| record.clone());
+    let findings_count = batch_findings.len() as u64;
+    let occurrences_count = batch_occurrences.len() as u64;
+    let observations_count = batch_observations.len() as u64;
+    for (key, record) in batch_findings {
+        state.durable_findings.entry(key).or_insert(record);
     }
-    for (key, record) in &batch_occurrences {
-        state
-            .durable_occurrences
-            .entry(*key)
-            .or_insert_with(|| record.clone());
+    for (key, record) in batch_occurrences {
+        state.durable_occurrences.entry(key).or_insert(record);
     }
     // Observations use upsert semantics: always overwrite with the merged result.
-    for (key, record) in batch_observations.iter() {
-        state.durable_observations.insert(*key, record.clone());
+    for (key, record) in batch_observations {
+        state.durable_observations.insert(key, record);
     }
 
     // Use deduplicated batch map sizes rather than raw payload lengths.
@@ -780,9 +784,9 @@ fn apply_findings_payload(
     // by the `continue` branches above, so `batch_*.len()` reflects the
     // number of distinct rows actually acknowledged by this commit.
     Ok(FindingsCommitReceipt::new(
-        batch_findings.len() as u64,
-        batch_occurrences.len() as u64,
-        batch_observations.len() as u64,
+        findings_count,
+        occurrences_count,
+        observations_count,
     ))
 }
 
