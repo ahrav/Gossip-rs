@@ -1587,8 +1587,8 @@ impl CoordinationBackend for EtcdCoordinator {
                     .into_bytes(),
                 None,
             ));
-            ops.extend(child_puts);
-            ops.extend(child_index_ops);
+            ops.extend(child_puts.drain(..));
+            ops.extend(child_index_ops.drain(..));
 
             let txn = Txn::new().when(compares).and_then(ops);
             let response = match self.etcd_txn(txn) {
