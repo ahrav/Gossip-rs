@@ -258,6 +258,7 @@ impl SplitChildOrder {
                 )
         });
 
+        assert!(len >= 2, "split_replace requires >= 2 children");
         Self { len, indices }
     }
 
@@ -392,6 +393,12 @@ fn split_replace_apply_parent(
 /// derived from `(run, parent, op_id, Residual, idx)` can still be found
 /// even after many later operations have rotated the op-log.
 fn find_replayed_residual(parent: &ShardRecord, slab: &ByteSlab, op_id: OpId) -> Option<ShardId> {
+    assert!(
+        parent.spawned.len() <= MAX_SPAWNED_PER_SHARD,
+        "spawned count {} exceeds bound {}",
+        parent.spawned.len(),
+        MAX_SPAWNED_PER_SHARD,
+    );
     for (idx, spawned_id) in parent.spawned.iter(slab).enumerate() {
         let derived = derive_split_shard_id(
             parent.run,
