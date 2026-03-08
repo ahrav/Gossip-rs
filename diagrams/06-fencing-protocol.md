@@ -305,7 +305,7 @@ successful replays are never blocked by an expired lease or terminal status.
 ## Code Type Mapping
 
 The "fencing token" in the diagrams above maps to the `FenceEpoch` type in code
-(`crates/gossip-contracts/src/identity/coordination.rs:103`). `FenceEpoch` wraps a
+(`crates/gossip-contracts/src/identity/coordination.rs`). `FenceEpoch` wraps a
 `u64` and enforces the monotonicity invariant (INV-S11) at the type level -- it can
 only be incremented, never decremented or reset.
 

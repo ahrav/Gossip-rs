@@ -37,7 +37,7 @@ graph TD
         ShardSpec["<b>ShardSpec</b><br/>Owned shard: start, end,<br/>metadata bytes"]
         ShardSpecRef["<b>ShardSpecRef&lt;'a&gt;</b><br/>Borrowed view into<br/>arena or stack"]
         ShardArena["<b>ShardArena</b><br/>Slab allocator for<br/>shard key ranges + metadata"]
-        ShardSpecHandle["<b>ShardSpecHandle</b><br/>Arena slot index<br/>(u32 generation + offset)"]
+        ShardSpecHandle["<b>ShardSpecHandle</b><br/>Arena slot index<br/>(u32 slot + u32 generation + u32 arena_id)"]
         IntoShardSpecRef["<b>IntoShardSpecRef</b><br/>(trait) Generic shard<br/>access for validation"]
         SplitReplacePlan["<b>SplitReplacePlan</b><br/>Terminal split:<br/>parent → N children"]
         SplitResidualPlan["<b>SplitResidualPlan</b><br/>Non-terminal split:<br/>parent narrows + residual"]
@@ -161,7 +161,7 @@ callers that need canonical path semantics must normalize before constructing th
 Lexicographic byte ordering matches tuple ordering: compare by `manifest_id` first,
 then by `row`. The fixed width avoids delimiters and keeps decode cost constant.
 
-Source: `crates/gossip-frontier/src/key_encoding.rs:169-259`
+Source: `crates/gossip-frontier/src/key_encoding.rs`
 
 ---
 
@@ -239,7 +239,7 @@ lexicographic order. Returns `None` if the key is already at `MAX_KEY_SIZE`.
 the sum, and normalize. Falls back to `key_successor(a)` when the midpoint
 collapses to one of the inputs (adjacent keys).
 
-Source: `crates/gossip-frontier/src/key_encoding.rs:510-664`
+Source: `crates/gossip-frontier/src/key_encoding.rs`
 
 ---
 
@@ -313,7 +313,7 @@ Wire sizes per variant:
 | `Prefix`   | `0x01` | `prefix_len:u32 BE` + `prefix_bytes`                         | 5 + N bytes |
 | `Manifest` | `0x02` | `manifest_id:u64 BE` + `start_row:u64 BE` + `end_row:u64 BE` | 25 bytes    |
 
-Source: `crates/gossip-frontier/src/hint.rs:57-60,170-194,330-335`
+Source: `crates/gossip-frontier/src/hint.rs`
 
 ---
 
@@ -376,7 +376,7 @@ budget before the allocation loop. `split_range_by_boundaries` additionally vali
 all boundaries in a read-only pass before allocating, so boundary errors leave the
 builder state completely unchanged.
 
-Source: `crates/gossip-frontier/src/builder.rs:1-60,183-776`
+Source: `crates/gossip-frontier/src/builder.rs`
 
 ---
 
@@ -433,11 +433,11 @@ weight concentrates in the leading entry.
 capabilities struct: `seek_by_key`, `token_resume`, `range_read`, and `split_hints`.
 The worker uses these flags to choose the optimal enumeration and split strategy.
 
-Source: `crates/gossip-contracts/src/connector/api.rs:396-407`,
-`crates/gossip-connectors/src/filesystem.rs:411-932`,
-`crates/gossip-connectors/src/git.rs:214-548`,
-`crates/gossip-connectors/src/in_memory.rs:308-505`,
-`crates/gossip-connectors/src/split_estimator.rs:508-713`
+Source: `crates/gossip-contracts/src/connector/api.rs`,
+`crates/gossip-connectors/src/filesystem.rs`,
+`crates/gossip-connectors/src/git.rs`,
+`crates/gossip-connectors/src/in_memory.rs`,
+`crates/gossip-connectors/src/split_estimator.rs`
 
 ---
 
@@ -536,7 +536,7 @@ The Manifest path additionally rejects splits that would produce a child hint wi
 zero rows (`start_row >= end_row`) via `EmptyManifestRange { start_row, end_row }`.
 This prevents degenerate manifest shards that have no work to enumerate.
 
-Source: `crates/gossip-frontier/src/hint.rs:961-1025`
+Source: `crates/gossip-frontier/src/hint.rs`
 
 ---
 

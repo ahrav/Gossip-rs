@@ -471,7 +471,7 @@ the keyed hash construction.
 
 | Topic                                            | Diagram File                                                    |
 | ------------------------------------------------ | --------------------------------------------------------------- |
-| ID derivation DAG (full 15-type hierarchy)       | [03-id-derivation-dag.md](03-id-derivation-dag.md)              |
+| ID derivation DAG (full 19-type hierarchy)       | [03-id-derivation-dag.md](03-id-derivation-dag.md)              |
 | Secret identity chain (BLAKE3 keyed mode detail) | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 3 |
 | Finding identity chain (FindingId derivation)    | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 4 |
 | 5-check validation preamble (full flow)          | [06-fencing-protocol.md](06-fencing-protocol.md) -- Diagram 1   |
@@ -482,7 +482,6 @@ the keyed hash construction.
 
 | File                                              | Purpose                                                                               |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `08-cross-cutting/04-tenant-isolation.md`         | Deep-dive prose document on tenant isolation design                                   |
 | `crates/gossip-contracts/src/identity/finding.rs` | `SecretHash`, `FindingId` types; `key_secret_hash()`, `derive_finding_id()` functions |
 | `crates/gossip-contracts/src/identity/types.rs`   | `TenantId`, `TenantSecretKey` root types; restricted trait surface                    |
 | `crates/gossip-contracts/src/identity/domain.rs`  | Domain-separation constants (`SECRET_HASH_V1`, `FINDING_ID_V1`)                       |

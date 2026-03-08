@@ -376,23 +376,23 @@ the split or continuing to scan the shard as-is.
 
 | Symbol | Location | Role |
 |---|---|---|
-| `StreamingSplitEstimator` | `crates/gossip-connectors/src/split_estimator.rs:539` | Core estimator struct |
-| `Sample` | `crates/gossip-connectors/src/split_estimator.rs:123` | Retained checkpoint (rank + byte position + key) |
-| `SampleAxis` | `crates/gossip-connectors/src/split_estimator.rs:104` | Rank vs Bytes axis selector |
-| `observe()` | `crates/gossip-connectors/src/split_estimator.rs:648` | Per-item streaming observation |
-| `estimate_split_key()` | `crates/gossip-connectors/src/split_estimator.rs:741` | Byte-weighted midpoint estimation |
-| `compact_samples()` | `crates/gossip-connectors/src/split_estimator.rs:200` | In-place buffer compaction |
-| `selected_sample_indices()` | `crates/gossip-connectors/src/split_estimator.rs:245` | Nearest-neighbor index selection |
-| `redistribute_plateau_picks()` | `crates/gossip-connectors/src/split_estimator.rs:354` | Post-compaction plateau spreading |
-| `nearest_by_rank_in_range()` | `crates/gossip-connectors/src/split_estimator.rs:439` | Binary search for nearest rank in subslice |
-| `interpolated_position()` | `crates/gossip-connectors/src/split_estimator.rs:481` | u128 linear interpolation |
-| `from_sorted_entries()` | `crates/gossip-connectors/src/split_estimator.rs:620` | Bulk-load constructor |
-| `estimate_split_from_sorted()` | `crates/gossip-connectors/src/common.rs:241` | Shared batch-connector split path |
-| `is_valid_split_candidate()` | `crates/gossip-connectors/src/common.rs:218` | Post-selection cursor/bound guard |
-| `FilesystemConnector::choose_split_point()` | `crates/gossip-connectors/src/filesystem.rs:1074` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
-| `GitConnector::choose_split_point()` | `crates/gossip-connectors/src/git.rs:541` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
-| `InMemoryDeterministicConnector::choose_split_point()` | `crates/gossip-connectors/src/in_memory.rs:491` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
-| `FilesystemConnector::split_estimator` | `crates/gossip-connectors/src/filesystem.rs:300` | Persistent estimator field |
-| `FilesystemConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/filesystem.rs:897` | FS split selection entry point |
-| `GitConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/git.rs:464` | Git split selection entry point |
-| `InMemoryDeterministicConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/in_memory.rs:423` | In-memory split selection entry point |
+| `StreamingSplitEstimator` | `crates/gossip-connectors/src/split_estimator.rs` | Core estimator struct |
+| `Sample` | `crates/gossip-connectors/src/split_estimator.rs` | Retained checkpoint (rank + byte position + key) |
+| `SampleAxis` | `crates/gossip-connectors/src/split_estimator.rs` | Rank vs Bytes axis selector |
+| `observe()` | `crates/gossip-connectors/src/split_estimator.rs` | Per-item streaming observation |
+| `estimate_split_key()` | `crates/gossip-connectors/src/split_estimator.rs` | Byte-weighted midpoint estimation |
+| `compact_samples()` | `crates/gossip-connectors/src/split_estimator.rs` | In-place buffer compaction |
+| `selected_sample_indices()` | `crates/gossip-connectors/src/split_estimator.rs` | Nearest-neighbor index selection |
+| `redistribute_plateau_picks()` | `crates/gossip-connectors/src/split_estimator.rs` | Post-compaction plateau spreading |
+| `nearest_by_rank_in_range()` | `crates/gossip-connectors/src/split_estimator.rs` | Binary search for nearest rank in subslice |
+| `interpolated_position()` | `crates/gossip-connectors/src/split_estimator.rs` | u128 linear interpolation |
+| `from_sorted_entries()` | `crates/gossip-connectors/src/split_estimator.rs` | Bulk-load constructor |
+| `estimate_split_from_sorted()` | `crates/gossip-connectors/src/common.rs` | Shared batch-connector split path |
+| `is_valid_split_candidate()` | `crates/gossip-connectors/src/common.rs` | Post-selection cursor/bound guard |
+| `FilesystemConnector::choose_split_point()` | `crates/gossip-connectors/src/filesystem.rs` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
+| `GitConnector::choose_split_point()` | `crates/gossip-connectors/src/git.rs` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
+| `InMemoryDeterministicConnector::choose_split_point()` | `crates/gossip-connectors/src/in_memory.rs` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
+| `FilesystemConnector::split_estimator` | `crates/gossip-connectors/src/filesystem.rs` | Persistent estimator field |
+| `FilesystemConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/filesystem.rs` | FS split selection entry point |
+| `GitConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/git.rs` | Git split selection entry point |
+| `InMemoryDeterministicConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/in_memory.rs` | In-memory split selection entry point |

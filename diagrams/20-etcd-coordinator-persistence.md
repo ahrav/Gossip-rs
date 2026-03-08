@@ -1,16 +1,15 @@
 # etcd Coordinator Persistence
 
 The `gossip-coordination-etcd` crate implements the B2 Coordination backend
-against an etcd cluster. It provides the keyspace layout, binary codecs, and
-connection management needed to persist coordination records (runs, shards,
-leases, op-logs) to etcd, while currently delegating protocol semantics to the
-in-memory reference implementation.
+against an etcd cluster. It provides the keyspace layout, binary codecs,
+connection management, and optimistic CAS transaction logic needed to persist
+coordination records (runs, shards, leases, op-logs) to etcd.
 
 This diagram covers four systems that together form the etcd coordination
 persistence layer:
 
-1. **Backend architecture** — the delegation model, sync-async bridge, and
-   connection lifecycle.
+1. **Backend architecture** — the direct-persistence model, sync-async bridge,
+   and connection lifecycle.
 2. **Keyspace design** — the hierarchical etcd key layout with sibling
    separation, fixed-width hex encoding, and scan isolation.
 3. **Codec wire format** — the hand-written binary encoding for `RunRecord`
@@ -27,53 +26,50 @@ persistence layer:
 
 ## 1. Backend Architecture
 
-The `EtcdCoordinator` uses a **delegation architecture**: all protocol
-semantics (shard lifecycle, run lifecycle, idempotency, lease fencing) are
-delegated to an embedded `InMemoryCoordinator`. The etcd connection is
-established and health-checked at construction time, but shard and run state
-lives entirely in process memory. State is lost on restart.
+`EtcdCoordinator` directly persists all coordination state to etcd using
+optimistic CAS (compare-and-swap) transactions. Each mutating operation reads
+the current record, validates preconditions locally, builds a CAS transaction
+conditioned on the record's `mod_revision`, and retries with jittered
+exponential backoff on CAS failure. There is no in-process delegation layer —
+the etcd cluster is the single source of truth.
 
-This design provides a correct, test-covered trait surface while the etcd
-keyspace layout, record codecs, and transactional write protocol are developed
-in parallel. The three building blocks (keyspace, codec, config) are complete
-and ready for the transactional write protocol.
+Shard ownership uses a dual-key design: a persistent shard record (keyed under
+`/shards/{id}`) and an ephemeral `/owner` key with an etcd lease TTL. When the
+lease expires (worker crash, network partition), etcd automatically deletes the
+owner key, making the shard eligible for re-acquisition.
 
 ```mermaid
 %% Diagram: etcd-backend-architecture
 graph TB
     subgraph caller ["Caller (Scanner Runtime)"]
-        SR["DistributedScannerRuntime<br/>Calls sync coordination trait methods"]
+        SR["Coordination trait callers<br/>Sync &amp;mut self methods"]
     end
 
     subgraph etcd_coord ["EtcdCoordinator"]
         CONFIG["EtcdCoordinatorConfig<br/>endpoints: Vec&lt;String&gt;<br/>namespace_prefix: String"]
         KS["EtcdKeyspace<br/>Deterministic key builder<br/>rooted at namespace prefix"]
         RT["tokio::runtime::Runtime<br/>Current-thread, sync-async bridge"]
-        CLIENT["etcd_client::Client<br/>Live gRPC connection<br/>(health-check only)"]
-        DELEGATE["InMemoryCoordinator<br/>Holds all shard/run state<br/>All trait methods delegate here"]
+        CLIENT["etcd_client::Client<br/>Live gRPC connection"]
+        SCRATCH["claim_candidates_scratch<br/>Reusable Vec&lt;ShardId&gt; buffer"]
     end
 
-    subgraph traits_impl ["Trait Implementations (delegation)"]
-        CB["CoordinationBackend<br/>acquire_and_restore_into, renew, checkpoint,<br/>complete, park, split_replace,<br/>split_residual"]
-        RM["RunManagement<br/>create_run, register_shards,<br/>get_run, list_shards,<br/>complete/fail/cancel_run,<br/>unpark_shard"]
-        SC["ShardClaiming<br/>claim_next_available"]
+    subgraph bridge ["Sync-Async Bridge Helpers"]
+        direction TB
+        GET["etcd_get()"]
+        TXN["etcd_txn()"]
+        LG["etcd_lease_grant()"]
+        LKA["etcd_lease_keep_alive_once()"]
+        LR["etcd_lease_revoke()"]
     end
 
     subgraph etcd_cluster ["etcd Cluster"]
-        ETCD["etcd v3 gRPC API<br/>Status probe on connect"]
+        ETCD["etcd v3 gRPC API<br/>CAS transactions, lease TTL,<br/>prefix scans"]
     end
 
-    SR --> CB
-    SR --> RM
-    SR --> SC
-
-    CB -->|"delegates to"| DELEGATE
-    RM -->|"delegates to"| DELEGATE
-    SC -->|"delegates to"| DELEGATE
-
+    SR --> etcd_coord
     CONFIG --> KS
-    RT -->|"block_on()"| CLIENT
-    CLIENT -.->|"Status RPC"| ETCD
+    RT -->|"block_on()"| bridge
+    bridge -->|"client.get/txn/lease_*"| ETCD
 
     style SR fill:#F3F4F6,stroke:#374151,color:#374151
 
@@ -81,11 +77,13 @@ graph TB
     style KS fill:#DCFCE7,stroke:#166534,color:#166534
     style RT fill:#F3F4F6,stroke:#374151,color:#374151
     style CLIENT fill:#F3F4F6,stroke:#374151,color:#374151
-    style DELEGATE fill:#22C55E,stroke:#166534,color:#FFF
+    style SCRATCH fill:#F3F4F6,stroke:#374151,color:#374151
 
-    style CB fill:#22C55E,stroke:#166534,color:#FFF
-    style RM fill:#22C55E,stroke:#166534,color:#FFF
-    style SC fill:#22C55E,stroke:#166534,color:#FFF
+    style GET fill:#DCFCE7,stroke:#166534,color:#166534
+    style TXN fill:#DCFCE7,stroke:#166534,color:#166534
+    style LG fill:#DCFCE7,stroke:#166534,color:#166534
+    style LKA fill:#DCFCE7,stroke:#166534,color:#166534
+    style LR fill:#DCFCE7,stroke:#166534,color:#166534
 
     style ETCD fill:#F3F4F6,stroke:#374151,color:#374151
 ```
@@ -99,9 +97,9 @@ graph TB
 | 1. gRPC connect | Establishes a channel with a 5-second connect timeout | `EtcdCoordinatorError::Etcd { Connect }` |
 | 2. Status probe | Round-trips a maintenance `Status` RPC to confirm reachability | `EtcdCoordinatorError::Etcd { Status }` |
 
-On success the caller holds a validated config, a live etcd connection, and a
-fully initialized in-memory protocol delegate (bootstrapped with the default
-30-second lease duration).
+On success the caller holds a validated config, a live etcd connection, and
+a `EtcdKeyspace` for deterministic key generation. A `debug_assert!` prevents
+nested `block_on` calls by verifying no Tokio runtime is already active.
 
 ### Sync-async bridge
 
@@ -344,6 +342,7 @@ graph TB
 
     CFG["Config(EtcdCoordinatorConfigError)<br/>Validation before I/O"]
     RTB["RuntimeBuild(io::Error)<br/>Tokio runtime creation failure"]
+    CODEC_ERR["Codec { operation, source }<br/>Encode/decode failures"]
     ETCD["Etcd { operation, source }<br/>gRPC failures"]
     KSE["Keyspace(EtcdKeyspaceError)<br/>Namespace prefix validation"]
 
@@ -362,6 +361,7 @@ graph TB
 
     ECE --> CFG
     ECE --> RTB
+    ECE --> CODEC_ERR
     ECE --> ETCD
     ECE --> KSE
 
@@ -393,7 +393,7 @@ graph TB
     style CFGE_ES fill:#F3F4F6,stroke:#374151,color:#374151
     style CFGE_DS fill:#F3F4F6,stroke:#374151,color:#374151
 
-    style CODEC fill:#DCFCE7,stroke:#166534,color:#166534
+    style CODEC_ERR fill:#DCFCE7,stroke:#166534,color:#166534
 ```
 
 Config `Debug` output redacts credentials from endpoint URIs, showing
@@ -418,7 +418,7 @@ graph TB
 
     subgraph backends ["Coordination Backends"]
         INMEM_BACK["InMemoryCoordinator<br/>(reference implementation)"]
-        ETCD_BACK["EtcdCoordinator<br/>(etcd-backed, delegates to InMemory)"]
+        ETCD_BACK["EtcdCoordinator<br/>(etcd-backed, direct persistence)"]
     end
 
     subgraph etcd_modules ["EtcdCoordinator Modules"]
@@ -426,7 +426,7 @@ graph TB
         MOD_KS["keyspace.rs<br/>Deterministic key paths<br/>Buffer-reuse API"]
         MOD_CODEC["codec.rs<br/>Binary encode/decode<br/>Staged slab rollback"]
         MOD_ERR["error.rs<br/>Error hierarchy<br/>Operation labels"]
-        MOD_BACK["backend.rs<br/>Delegation + sync-async bridge"]
+        MOD_BACK["backend.rs<br/>Direct etcd persistence +<br/>sync-async bridge"]
     end
 
     subgraph testing ["Testing Coverage"]
@@ -479,10 +479,13 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` | Scaffolded | Delegation to `InMemoryCoordinator`; transactional etcd writes pending |
+| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions; `complete` and `park_shard` not yet implemented |
 
-The keyspace and codec are pre-built so the transactional write protocol can be
-developed incrementally without redesigning the persistence layer.
+The keyspace and codec are shared infrastructure used by the CAS transaction
+logic in `backend.rs`. Operations that are not yet implemented panic with
+`fail_unimplemented` — they have clear protocol semantics from the in-memory
+reference implementation and will be ported as the distributed runtime requires
+them.
 
 ---
 
@@ -505,7 +508,7 @@ developed incrementally without redesigning the persistence layer.
 | File | Purpose |
 |:---|:---|
 | `crates/gossip-coordination-etcd/src/lib.rs` | Crate root, public re-exports |
-| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` struct, trait delegation, sync-async bridge |
+| `crates/gossip-coordination-etcd/src/backend.rs` | `EtcdCoordinator` struct, CAS transaction logic, sync-async bridge |
 | `crates/gossip-coordination-etcd/src/keyspace.rs` | `EtcdKeyspace` deterministic key-path construction |
 | `crates/gossip-coordination-etcd/src/codec.rs` | Binary encode/decode for `RunRecord` and `ShardRecord` |
 | `crates/gossip-coordination-etcd/src/config.rs` | `EtcdCoordinatorConfig` validated connection parameters |

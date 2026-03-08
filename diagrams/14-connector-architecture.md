@@ -179,7 +179,7 @@ graph LR
 | `GitScanSourceFactory` | No | No |
 | `InMemoryScanSourceFactory` | Yes | Yes (polls `is_cancelled()` per item) |
 
-See also: [04-end-to-end-scan-flow.md](./04-end-to-end-scan-flow.md) for the full 13-step scan sequence, [05-shard-and-run-state-machines.md](./05-shard-and-run-state-machines.md) for shard assignment lifecycle.
+See also: [04-end-to-end-scan-flow.md](./04-end-to-end-scan-flow.md) for the ScanDriver architecture and distributed worker loop, [05-shard-and-run-state-machines.md](./05-shard-and-run-state-machines.md) for shard assignment lifecycle.
 
 ---
 

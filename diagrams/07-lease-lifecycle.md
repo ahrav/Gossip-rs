@@ -65,11 +65,11 @@ sequenceDiagram
 
     Note over CO: Fencing token generated atomically<br/>with state transition
 
-    CO-->>WS: AcquireResult { lease, snapshot, capacity }
-    WS-->>W: AcquireResult { lease, snapshot, capacity }
+    CO-->>WS: AcquireResultView { lease, snapshot, capacity }
+    WS-->>W: AcquireResultView { lease, snapshot, capacity }
 ```
 
-The `AcquireResult` returned to the worker contains everything it needs to begin
+The `AcquireResultView` returned to the worker contains everything it needs to begin
 scanning: the shard's key range (what to scan), the cursor position (where to
 resume if this is a re-acquisition after expiry), the fencing token (to
 authenticate all subsequent mutations), the expiry time (when to renew by), and
@@ -197,7 +197,7 @@ advancement, and shard completion.
 
 The scan loop is the inner core: for each page of results, the worker fetches
 data from the connector, processes it through the detection engine, and commits
-the results by calling `apply_event(AdvanceCursor)` with its fencing token. The
+the results by calling `checkpoint` with its fencing token. The
 backend validates the token on every call -- this is the 5-check preamble from
 [06-fencing-protocol.md](06-fencing-protocol.md) executing on every single
 cursor advancement.
@@ -223,8 +223,8 @@ sequenceDiagram
     Note over W,BE: Phase 2: Claim
     W->>WS: acquire_and_restore_into(run_id, worker_id)
     WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
-    CO-->>WS: AcquireResult { lease, snapshot, capacity }
-    WS-->>W: AcquireResult { lease(token=42), snapshot, capacity }
+    CO-->>WS: AcquireResultView { lease, snapshot, capacity }
+    WS-->>W: AcquireResultView { lease(token=42), snapshot, capacity }
 
     Note over W,BE: Phase 3: Scan Loop
 
@@ -234,18 +234,18 @@ sequenceDiagram
         loop For each page
             W->>W: fetch_page (connector)
             W->>W: process page (detection)
-            W->>WS: apply_event(AdvanceCursor, token=42)
-            WS->>BE: checkpoint(shard_id, token=42, new_cursor)
-            BE-->>WS: Ok
+            W->>WS: checkpoint(now, new_cursor, op_id)
+            WS->>BE: checkpoint(shard_id, token=42, new_cursor, op_id)
+            BE-->>WS: Ok(IdempotentOutcome)
             WS-->>W: Ok
         end
     end
 
     Note over W,BE: Phase 4: Complete
-    W->>WS: apply_event(CompleteShard, token=42)
-    WS->>BE: complete(shard_id, token=42)
+    W->>WS: complete(now, final_cursor, op_id)
+    WS->>BE: complete(shard_id, token=42, final_cursor, op_id)
     BE->>BE: Transition Active → Done
-    BE-->>WS: Ok
+    BE-->>WS: Ok(IdempotentOutcome)
     WS-->>W: Ok
 
     Note over W,BE: Phase 5: Claim next shard
@@ -263,7 +263,7 @@ The lifecycle has a clean five-phase structure:
    (worker ID and tenant ID) for all subsequent operations. No coordination
    state is allocated yet.
 2. **Claim.** The session calls `acquire_and_restore_into` to find and claim an idle shard.
-   If successful, the worker receives an `AcquireResult` containing the lease (with fencing
+   If successful, the worker receives an `AcquireResultView` containing the lease (with fencing
    token, key range, cursor position, and expiry time), a snapshot, and a `CapacityHint`.
 3. **Scan.** The worker iterates through pages, advancing the cursor after each
    one. Every cursor advancement is fenced -- a stale token halts the worker
@@ -415,9 +415,9 @@ sequenceDiagram
     W->>WS: acquire_and_restore_into(run_id, worker_id)
     WS->>CO: acquire_and_restore_into(tenant, run_id, worker_id)
     CO->>CO: grant lease + count_available_for_run()
-    CO-->>WS: AcquireResult { lease, snapshot, capacity }
+    CO-->>WS: AcquireResultView { lease, snapshot, capacity }
     WS->>WS: cache capacity hint
-    WS-->>W: AcquireResult
+    WS-->>W: AcquireResultView
 
     Note over W,CO: Renew — capacity refreshed
     W->>WS: renew(now)
