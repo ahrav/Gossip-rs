@@ -591,8 +591,10 @@ impl EtcdCoordinator {
     /// Calls `attempt` up to `optimistic_txn_retries` times. On
     /// [`CasOutcome::RetryNeeded`], sleeps with jittered backoff and
     /// retries. On [`CasOutcome::Committed`], returns immediately.
-    /// If retries exhaust, calls `on_exhaustion` to re-read state and
-    /// produce a domain error or panic.
+    /// If retries exhaust, calls `on_exhaustion` immediately (no
+    /// additional backoff) to re-read state and produce a domain error
+    /// or panic. Callers that perform network I/O in `on_exhaustion`
+    /// should be aware this executes at peak-contention time.
     fn cas_retry<T, E>(
         &mut self,
         mut attempt: impl FnMut(&mut Self, usize) -> Result<CasOutcome<T>, E>,
@@ -1645,8 +1647,11 @@ impl CoordinationBackend for EtcdCoordinator {
                 persisted.record.lease = Some(LeaseHolder::new(worker, new_deadline));
                 persisted.record.assert_invariants(&persisted.slab);
                 encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf)
-                    .map_err(|err| AcquireError::BackendError {
-                        message: format!("acquire.encode_shard: {err}"),
+                    .map_err(|err| {
+                        this.best_effort_revoke_lease(new_lease_id);
+                        AcquireError::BackendError {
+                            message: format!("acquire.encode_shard: {err}"),
+                        }
                     })?;
                 encode_owner_value_into(worker, new_fence, &mut owner_buf);
 
