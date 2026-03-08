@@ -542,6 +542,7 @@ Source: `crates/gossip-frontier/src/hint.rs`
 | `crates/gossip-frontier/src/key_encoding.rs`             | `KeyEncoding` trait, `PathKey`, `ManifestRowKey`, `KeyBuf`, `prefix_successor()`, `byte_midpoint()`, `key_successor()` |
 | `crates/gossip-frontier/src/hint.rs`                     | `ShardHint`, `ShardMetadata`, `MetadataBuf`, `ShardSpecScratch`, `propagate_hint_on_split()`, `HintPropagationError`   |
 | `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder`, `split_range_by_boundaries()`                                                                  |
-| `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`, `choose_split_point()` (inherent method on each connector)                                    |
-| `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` split point selection                                                                            |
-| `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` split point selection                                                                 |
+| `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`                                                                                                |
+| `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` split point selection (`choose_split_point`)                                                     |
+| `crates/gossip-connectors/src/git.rs`                    | `GitConnector` split point selection (`choose_split_point`)                                                            |
+| `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` split point selection (`choose_split_point`)                                          |

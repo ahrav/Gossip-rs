@@ -1,15 +1,11 @@
 use rstest::rstest;
 
 use super::*;
-use crate::common::IN_MEMORY_CONNECTOR_TAG;
 use crate::common::test_util::{default_budgets, make_key};
 
 // ---------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------
-
-const TAG: ConnectorTag = IN_MEMORY_CONNECTOR_TAG;
-const TEST_INSTANCE_ID: &[u8] = b"dataset-a";
 
 fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     MemItem::new(make_key(key), Vec::from(data))
@@ -27,7 +23,7 @@ fn make_item(key: &[u8], data: &[u8]) -> MemItem {
     Cursor::with_last_key(make_key(b"b")),
 )]
 fn split_point_returns_none(#[case] items: Vec<MemItem>, #[case] cursor: Cursor) {
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
     let split = c
         .choose_split_point_range(&make_key(b"a"), &make_key(b"z"), &cursor)
         .unwrap();
@@ -44,11 +40,7 @@ const BAD_INDEX_BYTES: [u8; 8] = 999u64.to_be_bytes();
 #[case::out_of_bounds(&BAD_INDEX_BYTES)]
 #[case::malformed(b"short")]
 fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
-    let mut c = InMemoryDeterministicConnector::new(
-        TAG,
-        TEST_INSTANCE_ID,
-        vec![make_item(b"key", b"data")],
-    );
+    let mut c = InMemoryDeterministicConnector::new(vec![make_item(b"key", b"data")]);
     let bad_ref = ItemRef::try_from_slice(ref_bytes).unwrap();
     assert!(c.open(&bad_ref, default_budgets()).is_err());
     let mut buf = [0u8; 16];
@@ -66,7 +58,7 @@ fn invalid_item_ref_returns_error(#[case] ref_bytes: &[u8]) {
 #[should_panic(expected = "unique item keys")]
 fn duplicate_keys_panic() {
     let items = vec![make_item(b"dup", b"first"), make_item(b"dup", b"second")];
-    InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    InMemoryDeterministicConnector::new(items);
 }
 
 #[test]
@@ -80,7 +72,7 @@ fn duplicate_keys_panic_redacts_item_key() {
     ];
 
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+        InMemoryDeterministicConnector::new(items);
     }))
     .expect_err("duplicate keys should panic");
 
@@ -119,7 +111,7 @@ fn duplicate_keys_panic_redacts_item_key() {
 #[test]
 fn inverted_range_split_returns_error() {
     let items = vec![make_item(b"a", b"1"), make_item(b"b", b"2")];
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
 
     let start = make_key(b"z");
     let end = make_key(b"a");
@@ -139,7 +131,7 @@ fn split_point_valid_returns_key_between_bounds() {
         make_item(b"c", b"3"),
         make_item(b"d", b"4"),
     ];
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
     let start = make_key(b"a");
     let end = make_key(b"z");
 
@@ -163,7 +155,7 @@ fn split_point_byte_weight_favors_heavy_items() {
         make_item(b"c", &vec![0u8; 1000]),
         make_item(b"d", b"z"),
     ];
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
     let start = make_key(b"a");
     let end = make_key(b"z");
 
@@ -181,11 +173,10 @@ fn split_point_byte_weight_favors_heavy_items() {
 
 #[test]
 fn caps_reflect_token_setting() {
-    let c_with = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, vec![]);
+    let c_with = InMemoryDeterministicConnector::new(vec![]);
     assert!(c_with.caps().token_resume);
 
-    let c_without =
-        InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, vec![]).with_tokens(false);
+    let c_without = InMemoryDeterministicConnector::new(vec![]).with_tokens(false);
     assert!(!c_without.caps().token_resume);
 }
 
@@ -196,12 +187,12 @@ fn caps_reflect_token_setting() {
 #[test]
 fn different_tags_produce_different_stable_ids() {
     use crate::common::derive_stable_item_id;
+    use gossip_contracts::identity::ConnectorTag;
 
     let tag_a = ConnectorTag::from_ascii(b"tagA");
     let tag_b = ConnectorTag::from_ascii(b"tagB");
-    let instance = gossip_contracts::identity::ConnectorInstanceIdHash::from_instance_id_bytes(
-        TEST_INSTANCE_ID,
-    );
+    let instance =
+        gossip_contracts::identity::ConnectorInstanceIdHash::from_instance_id_bytes(b"dataset-a");
     let key = make_key(b"same-key");
 
     let id_a = derive_stable_item_id(tag_a, instance, &key);
@@ -211,6 +202,7 @@ fn different_tags_produce_different_stable_ids() {
 
 #[test]
 fn different_instances_produce_different_stable_ids() {
+    use crate::common::IN_MEMORY_CONNECTOR_TAG;
     use crate::common::derive_stable_item_id;
 
     let key = make_key(b"same-key");
@@ -219,8 +211,8 @@ fn different_instances_produce_different_stable_ids() {
     let instance_b =
         gossip_contracts::identity::ConnectorInstanceIdHash::from_instance_id_bytes(b"dataset-b");
 
-    let id_a = derive_stable_item_id(TAG, instance_a, &key);
-    let id_b = derive_stable_item_id(TAG, instance_b, &key);
+    let id_a = derive_stable_item_id(IN_MEMORY_CONNECTOR_TAG, instance_a, &key);
+    let id_b = derive_stable_item_id(IN_MEMORY_CONNECTOR_TAG, instance_b, &key);
     assert_ne!(id_a, id_b);
 }
 
@@ -236,7 +228,7 @@ fn choose_split_point_via_shard_spec() {
         make_item(b"c", b"3"),
         make_item(b"d", b"4"),
     ];
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
 
     let shard = ShardSpec::try_with_range(b"a", b"z").unwrap();
     let split = c
@@ -254,7 +246,7 @@ fn choose_split_point_via_shard_spec_unbounded_and_one_sided() {
         make_item(b"d", b"4"),
         make_item(b"e", b"5"),
     ];
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
 
     let unbounded = ShardSpec::try_with_range(b"", b"").unwrap();
     let split_unbounded = c
@@ -290,7 +282,7 @@ fn split_point_degenerate_first_item_heavy() {
         make_item(b"b", b"x"),
         make_item(b"c", b"y"),
     ];
-    let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+    let mut c = InMemoryDeterministicConnector::new(items);
     let start = make_key(b"a");
     let end = make_key(b"z");
 
@@ -338,7 +330,7 @@ mod prop {
         ) {
             let start = make_key(b"\x01");
             let end = make_key(b"\x80");
-            let mut c = InMemoryDeterministicConnector::new(TAG, TEST_INSTANCE_ID, items);
+            let mut c = InMemoryDeterministicConnector::new(items);
 
             if let Ok(Some(split)) = c.choose_split_point_range(
                 &start, &end, &Cursor::initial(),

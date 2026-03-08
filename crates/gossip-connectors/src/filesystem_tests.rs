@@ -63,7 +63,10 @@ fn caps_reflect_defaults() {
     assert!(!c.caps().token_resume);
     assert!(c.caps().seek_by_key);
     assert!(c.caps().range_read);
-    assert!(c.caps().split_hints);
+    assert!(
+        !c.caps().split_hints,
+        "split_hints must be false when no observation feed populates the estimator"
+    );
 }
 
 // ---------------------------------------------------------------

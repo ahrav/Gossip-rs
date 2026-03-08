@@ -198,11 +198,12 @@ impl FilesystemConnector {
             return Err(EnumerateError::permanent("shard start key exceeds end key"));
         }
 
-        let config_start = self.walk_key_range_start.clone();
-        let config_end = self.walk_key_range_end.clone();
-        let Some((_effective_start, effective_end)) =
-            intersect_key_bounds(start, end, config_start.as_deref(), config_end.as_deref())
-        else {
+        let Some((_effective_start, effective_end)) = intersect_key_bounds(
+            start,
+            end,
+            self.walk_key_range_start.as_deref(),
+            self.walk_key_range_end.as_deref(),
+        ) else {
             return Ok(None);
         };
 
@@ -342,7 +343,7 @@ impl FilesystemConnector {
             seek_by_key: true,
             token_resume: false,
             range_read: true,
-            split_hints: true,
+            split_hints: false,
         }
     }
 

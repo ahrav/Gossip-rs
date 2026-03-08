@@ -57,7 +57,6 @@ use gossip_contracts::{
         Budgets, ConnectorCapabilities, Cursor, EnumerateError, ItemKey, ItemRef, ReadError,
     },
     coordination::ShardSpec,
-    identity::ConnectorTag,
 };
 
 use crate::common::{self, borrowed_shard_bound, parse_u64_be};
@@ -88,13 +87,9 @@ impl MemItem {
 
 /// Precomputed per-item metadata, built once at construction time.
 ///
-/// Every field except `key` and `bytes` is precomputed at construction time.
-/// `stable_item_id` and `version_id` are derived from key/bytes plus the
-/// connector tag; `item_ref` is the item's positional index in the sorted
-/// array; `size_hint` is `bytes.len()`. All are deterministic for a fixed
-/// input set. Computing them once eliminates redundant BLAKE3 hashing and
-/// index-to-[`ItemRef`] conversion on every page emission. This mirrors the
-/// `FileEntry` pattern used by `FilesystemConnector`.
+/// `size_hint` is precomputed as `bytes.len()` at construction time.
+/// Computing it once avoids repeated length queries during split-point
+/// estimation.
 struct PreparedItem {
     /// Sorted item key for ordering and cursor progression.
     key: ItemKey,
@@ -171,16 +166,12 @@ impl InMemoryDeterministicConnector {
     /// formatting so diagnostics stay redacted under the toxic-byte policy.
     ///
     /// [`with_tokens(false)`]: Self::with_tokens
-    pub fn new(
-        _connector_tag: ConnectorTag,
-        _connector_instance_id: impl AsRef<[u8]>,
-        mut items: Vec<MemItem>,
-    ) -> Self {
+    pub fn new(mut items: Vec<MemItem>) -> Self {
         items.sort_by(|left, right| left.key.cmp(&right.key));
 
         // Enforce unique keys. Duplicate keys break cursor resume
-        // (upper_bound skips remaining duplicates), identity derivation
-        // (collisions), and split-point selection (empty shards). Format the
+        // (upper_bound skips remaining duplicates) and split-point selection
+        // (empty shards). Format the
         // duplicate through ItemKey itself so panic diagnostics stay redacted.
         if let Some(pos) = items.windows(2).position(|w| w[0].key == w[1].key) {
             panic!(
