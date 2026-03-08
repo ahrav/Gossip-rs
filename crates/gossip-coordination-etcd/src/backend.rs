@@ -1181,8 +1181,8 @@ impl EtcdCoordinator {
         owner_key: String,
         owner_value: Vec<u8>,
         lease_id: i64,
-    ) -> Vec<Compare> {
-        vec![
+    ) -> [Compare; 3] {
+        [
             Compare::version(owner_key.clone(), CompareOp::Greater, 0),
             Compare::value(owner_key.clone(), CompareOp::Equal, owner_value),
             Compare::lease(owner_key, CompareOp::Equal, lease_id),
