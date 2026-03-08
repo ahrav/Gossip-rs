@@ -69,7 +69,6 @@ use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::limits::{MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN};
 use gossip_contracts::coordination::shard_spec::{
     ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
-    validate_split_coverage_bounds,
 };
 #[cfg(test)]
 use gossip_contracts::test_util::TestSlab;
