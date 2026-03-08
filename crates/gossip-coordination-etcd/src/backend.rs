@@ -1993,9 +1993,14 @@ impl CoordinationBackend for EtcdCoordinator {
             ops.extend(child_index_ops);
 
             let txn = Txn::new().when(compares).and_then(ops);
-            let response = self
-                .etcd_txn(txn)
-                .unwrap_or_else(|err| self.fatal_storage_error("split_replace.txn", err));
+            let response = match self.etcd_txn(txn) {
+                Ok(r) => r,
+                Err(err) => {
+                    return Err(SplitReplaceError::BackendError {
+                        message: format!("split_replace.txn: {err}"),
+                    });
+                }
+            };
             if response.succeeded() {
                 return Ok(IdempotentOutcome::Executed(SplitReplaceResult {
                     children: child_ids,
@@ -2048,7 +2053,11 @@ impl CoordinationBackend for EtcdCoordinator {
             let persisted = match self.load_shard_record(tenant, key) {
                 Ok(Some(shard)) => shard,
                 Ok(None) => return Err(SplitResidualError::ShardNotFound { shard: key }),
-                Err(err) => self.fatal_storage_error("split_residual.load_shard", err),
+                Err(err) => {
+                    return Err(SplitResidualError::BackendError {
+                        message: format!("split_residual.load_shard: {err}"),
+                    });
+                }
             };
 
             if persisted.record.tenant != tenant {
