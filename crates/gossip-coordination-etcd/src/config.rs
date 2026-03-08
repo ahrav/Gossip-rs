@@ -41,12 +41,17 @@ pub(crate) const DEFAULT_OPTIMISTIC_TXN_RETRIES: usize = 8;
 ///   owner keys.
 /// - **Optimistic txn retries** bounds compare-and-retry loops around fenced
 ///   mutations.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct EtcdCoordinatorConfig {
     endpoints: Vec<String>,
     namespace_prefix: String,
     owner_lease_ttl_secs: i64,
     optimistic_txn_retries: usize,
+    /// Optional username/password pair for etcd authentication.
+    auth: Option<(String, String)>,
+    /// Optional TLS configuration for encrypted etcd connections.
+    #[cfg(feature = "tls")]
+    tls: Option<etcd_client::TlsOptions>,
 }
 
 impl fmt::Debug for EtcdCoordinatorConfig {
@@ -64,12 +69,18 @@ impl fmt::Debug for EtcdCoordinatorConfig {
         }
 
         let redacted: Vec<String> = self.endpoints.iter().map(|e| redact_endpoint(e)).collect();
-        f.debug_struct("EtcdCoordinatorConfig")
-            .field("endpoints", &redacted)
+        let mut s = f.debug_struct("EtcdCoordinatorConfig");
+        s.field("endpoints", &redacted)
             .field("namespace_prefix", &self.namespace_prefix)
             .field("owner_lease_ttl_secs", &self.owner_lease_ttl_secs)
-            .field("optimistic_txn_retries", &self.optimistic_txn_retries)
-            .finish()
+            .field("optimistic_txn_retries", &self.optimistic_txn_retries);
+        if let Some((user, _)) = &self.auth {
+            s.field("auth_user", user);
+            s.field("auth_password", &"[REDACTED]");
+        }
+        #[cfg(feature = "tls")]
+        s.field("tls", &self.tls.as_ref().map(|_| "[configured]"));
+        s.finish()
     }
 }
 
@@ -119,6 +130,9 @@ impl EtcdCoordinatorConfig {
             namespace_prefix,
             owner_lease_ttl_secs,
             optimistic_txn_retries,
+            auth: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         };
         config.validate()?;
         Ok(config)
@@ -240,6 +254,36 @@ impl EtcdCoordinatorConfig {
     #[must_use]
     pub fn optimistic_txn_retries(&self) -> usize {
         self.optimistic_txn_retries
+    }
+
+    /// Optional authentication credentials (username, password).
+    #[must_use]
+    pub fn auth(&self) -> Option<(&str, &str)> {
+        self.auth
+            .as_ref()
+            .map(|(user, pass)| (user.as_str(), pass.as_str()))
+    }
+
+    /// Optional TLS configuration for encrypted connections.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn tls(&self) -> Option<&etcd_client::TlsOptions> {
+        self.tls.as_ref()
+    }
+
+    /// Set authentication credentials for the etcd connection.
+    #[must_use]
+    pub fn with_auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
+        self.auth = Some((user.into(), password.into()));
+        self
+    }
+
+    /// Set TLS configuration for encrypted etcd connections.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_tls(mut self, tls: etcd_client::TlsOptions) -> Self {
+        self.tls = Some(tls);
+        self
     }
 }
 

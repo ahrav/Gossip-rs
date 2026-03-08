@@ -213,8 +213,15 @@ impl EtcdCoordinator {
             .map_err(EtcdCoordinatorError::RuntimeBuild)?;
 
         let endpoints = config.endpoints().to_vec();
-        let connect_opts =
+        let mut connect_opts =
             etcd_client::ConnectOptions::new().with_connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+        if let Some((user, password)) = config.auth() {
+            connect_opts = connect_opts.with_user(user, password);
+        }
+        #[cfg(feature = "tls")]
+        if let Some(tls) = config.tls().cloned() {
+            connect_opts = connect_opts.with_tls(tls);
+        }
 
         debug_assert!(
             tokio::runtime::Handle::try_current().is_err(),
@@ -723,12 +730,22 @@ impl EtcdCoordinator {
         Compare::version(key, CompareOp::Equal, 0)
     }
 
-    /// CAS guard: owner key must exist (version > 0) with the given value.
-    /// Returns two `Compare` clauses — one for existence, one for value.
-    fn compare_owner_present(owner_key: String, owner_value: Vec<u8>) -> Vec<Compare> {
+    /// CAS guard: owner key must exist (version > 0) with the given value
+    /// and be attached to the expected etcd lease.
+    ///
+    /// Returns three `Compare` clauses: existence, value equality, and
+    /// lease identity. The lease check prevents a stale worker from
+    /// passing the value guard after another worker reuses the same
+    /// worker ID + fence epoch with a different etcd lease.
+    fn compare_owner_present(
+        owner_key: String,
+        owner_value: Vec<u8>,
+        lease_id: i64,
+    ) -> Vec<Compare> {
         vec![
             Compare::version(owner_key.clone(), CompareOp::Greater, 0),
-            Compare::value(owner_key, CompareOp::Equal, owner_value),
+            Compare::value(owner_key.clone(), CompareOp::Equal, owner_value),
+            Compare::lease(owner_key, CompareOp::Equal, lease_id),
         ]
     }
 
@@ -922,9 +939,12 @@ impl CoordinationBackend for EtcdCoordinator {
                 persisted.mod_revision,
             )];
             if let Some(expected_owner) = persisted.expected_owner_value() {
+                let prior_etcd_lease =
+                    prior_lease_id.expect("owner value present implies owner lease_id is known");
                 compares.extend(Self::compare_owner_present(
                     owner_key.clone(),
                     expected_owner,
+                    prior_etcd_lease,
                 ));
             } else {
                 compares.push(Self::compare_absent(owner_key.clone()));
@@ -1085,7 +1105,11 @@ impl CoordinationBackend for EtcdCoordinator {
                 shard_record_key.clone(),
                 persisted.mod_revision,
             )];
-            compares.extend(Self::compare_owner_present(owner_key, owner_blob));
+            compares.extend(Self::compare_owner_present(
+                owner_key,
+                owner_blob,
+                old_lease_id,
+            ));
 
             let txn = Txn::new().when(compares).and_then(vec![TxnOp::put(
                 shard_record_key.into_bytes(),
@@ -1198,6 +1222,11 @@ impl CoordinationBackend for EtcdCoordinator {
             let owner_blob = persisted
                 .expected_owner_value()
                 .expect("validated owner must produce owner value");
+            let owner_lease_id = persisted
+                .owner
+                .as_ref()
+                .expect("validated owner must have lease_id")
+                .lease_id;
 
             let shard_record_key = self
                 .keyspace
@@ -1209,7 +1238,11 @@ impl CoordinationBackend for EtcdCoordinator {
                 shard_record_key.clone(),
                 persisted.mod_revision,
             )];
-            compares.extend(Self::compare_owner_present(owner_key, owner_blob));
+            compares.extend(Self::compare_owner_present(
+                owner_key,
+                owner_blob,
+                owner_lease_id,
+            ));
 
             let txn = Txn::new().when(compares).and_then(vec![TxnOp::put(
                 shard_record_key.into_bytes(),
