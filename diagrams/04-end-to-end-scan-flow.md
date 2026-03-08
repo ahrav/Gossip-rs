@@ -72,7 +72,7 @@ sequenceDiagram
 
                 note over W,P: Step 4 — Derive OvidHash
 
-                W->>P: derive_ovid_hash(stable_item_id, version_id)
+                W->>P: derive_ovid_hash(&OvidHashInputs { stable_item_id, version })
                 activate P
                 P-->>W: OvidHash
                 deactivate P
@@ -252,7 +252,7 @@ every step.
 
 ---
 
-## 3. Atomic Commit Boundary
+## 3. Receipt-Chained Commit Boundary
 
 Step 9—seal and commit—is the correctness linchpin of the entire scan pipeline.
 This diagram zooms into the commit boundary to show exactly what must
@@ -312,20 +312,25 @@ paths:
    downstream, this may produce inflated counts or duplicate alerts. The
    typestate prevents the checkpoint from advancing in this case.
 
-2. **Done-ledger written, cursor fails.** The item is marked as scanned, but
-   the findings were not persisted. The secret is silently lost—a **false
-   negative**. For a security scanner, this is the worst possible outcome. The
-   typestate prevents this by requiring FindingsDurable before ItemDurable.
+2. **Done-ledger written, cursor fails.** Findings **are** already durable
+   (the `FindingsDurable` receipt was obtained before `ItemDurable` was
+   issued). On retry the done-ledger check correctly skips the
+   already-processed item, so the only cost is redundant enumeration — not a
+   false negative. The typestate eliminates the silent-loss failure mode
+   entirely: `FindingsDurable` must precede `ItemDurable`, making
+   "done-ledger written but findings lost" structurally impossible.
 
 3. **All sub-operations fail.** This is actually the safest failure mode. The
    cursor has not advanced, the done-ledger has not been updated, and no
    findings have been written. On retry, the worker re-processes the page from
    the same cursor position, producing identical results.
 
-The typestate-enforced ordering ensures that only scenario 3 (clean failure at
-any stage) or full success can occur. The receipt chain proves durability at
-each stage before the next stage proceeds, making out-of-order writes
-impossible by construction.
+The typestate-enforced ordering eliminates the dangerous failure mode: a
+done-ledger write that is not preceded by durable findings. Partial failures
+at any stage (scenarios 1 and 2) leave the cursor unadvanced, so the page is
+re-processed on retry — the worst outcome is duplicate findings, never a false
+negative. The receipt chain proves durability at each stage before the next
+stage proceeds, making out-of-order writes impossible by construction.
 
 **Cursor monotonicity.** The cursor only advances inside the receipt-chained
 commit (the checkpoint is the final stage). This guarantees forward-only
@@ -357,14 +362,14 @@ subsystems but tightly choreographed participants in a single pipeline:
 
 - **Identity (B1)** is called at the finding level. NormHash and SecretHash
   (step 7) identify secrets for deduplication. FindingId, OccurrenceId, and
-  ObservationId (step 7) identify findings for persistence and correlation. The
-  `OvidHash` derivation (step 4) bridges identity into persistence by collapsing
-  `(StableItemId, VersionId)` into the done-ledger join key.
+  ObservationId (step 7) identify findings for persistence and correlation.
 
-- **Persistence (B5)** owns the durability guarantees. The done-ledger check
-  (step 5), the receipt-chained commit (step 9), and the `OvidHash` derivation
-  (step 4) all live in the persistence boundary. Every correctness invariant
-  ultimately depends on persistence behaving correctly.
+- **Persistence (B5)** owns the durability guarantees. The `OvidHash`
+  derivation (step 4) collapses `(StableItemId, VersionId)` into the
+  done-ledger join key, the done-ledger check (step 5) determines whether an
+  item needs re-scanning, and the receipt-chained commit (step 9) enforces
+  typestate-ordered writes. Every correctness invariant ultimately depends on
+  persistence behaving correctly.
 
 - **The Worker** (cross-cutting) orchestrates the entire flow. It is the only
   participant that touches all five boundaries, driving the pipeline forward and
@@ -388,7 +393,7 @@ page's transaction.
 | Full 12-step sequence  | [ID Derivation DAG](./03-id-derivation-dag.md) — details step 7 finding identity derivation        |
 | Full 12-step sequence  | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) — details steps 2, 11, and 12 |
 | Simplified overview    | [PageCommit Typestate](./08-pagecommit-typestate.md) — details steps 8, 9                          |
-| Atomic commit boundary | [PageCommit Typestate](./08-pagecommit-typestate.md) — the AwaitingFindings-to-CheckpointDurable typestate chain |
+| Receipt-chained commit boundary | [PageCommit Typestate](./08-pagecommit-typestate.md) — the AwaitingFindings-to-CheckpointDurable typestate chain |
 
 ## Source Code References
 

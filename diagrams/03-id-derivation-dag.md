@@ -392,7 +392,7 @@ Because `PolicyHash` is included, a policy change (new rules, changed hash mode)
 | Policy-driven rescan                                                            | `PolicyHash` change forces new `RunId` and full rescan                    |
 | Triage group key                                                                | `TRIAGE_GROUP_KEY_V1` groups findings by `(tenant, item)` for persistence |
 | Boundary dependency graph (which boundaries consume which ID types)             | [02-boundary-dependency-graph.md](02-boundary-dependency-graph.md)        |
-| End-to-end scan flow (OvidHash in step 4, FindingId in step 7)              | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md)                  |
+| End-to-end scan flow (OvidHash usage in step 4, FindingId derivation in step 7) | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md)                  |
 | Tenant isolation (SecretHash keyed-mode derivation, cross-tenant unlinkability) | [11-tenant-isolation.md](11-tenant-isolation.md)                          |
 | Split operations (SPLIT_ID_V1 domain separator for child shard IDs)             | [12-split-operations.md](12-split-operations.md)                          |
 

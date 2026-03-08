@@ -85,7 +85,10 @@ module (`persistence/done_ledger.rs` and `persistence/ovid.rs` respectively).
 They consume B1 identity types (`TenantId`, `PolicyHash`, `StableItemId`) but
 are not re-exported from `identity/`. The domain-separation constants for their
 derivation (`DONE_LEDGER_KEY_V1`, `OVID_V1`) are registered in
-`identity/domain.rs`.
+`identity/domain.rs` so the identity boundary remains the single authoritative
+source for derivation roots — preventing duplicate or divergent domain IDs
+across boundaries. `TRIAGE_GROUP_KEY_V1` is similarly registered there for
+future `TriageGroupKey` derivation from `(tenant, item)` pairs.
 
 ---
 

@@ -101,8 +101,9 @@ sequenceDiagram
 ```
 
 The critical property is **cursor atomicity**: the cursor only advances inside
-the atomic commit boundary. If the commit did not happen, the cursor did not
-advance. This means the next worker always starts from a consistent position.
+the receipt-chained commit boundary. If the commit did not reach
+`CheckpointDurable`, the cursor did not advance. This means the next worker
+always starts from a consistent position.
 The fencing token (incrementing from 5 to 6 on the new acquisition) ensures that
 Worker 1 cannot interfere even if it comes back to life -- its stale token is
 rejected immediately by the 5-check validation preamble (INV-S12).
@@ -616,7 +617,7 @@ skipped.
 - [Shard and Run State Machines](./05-shard-and-run-state-machines.md) -- the
   state transitions (Active, Done, Split, Parked) referenced throughout
 - [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- the 12-step pipeline
-  and atomic commit boundary that define cursor semantics
+  and receipt-chained commit boundary that define cursor semantics
 - [System Overview](./01-system-overview.md) -- the five architectural
   boundaries (B1-B5) referenced by color coding
 - [Circuit Breaker](./09-circuit-breaker.md) -- the circuit breaker state machine
