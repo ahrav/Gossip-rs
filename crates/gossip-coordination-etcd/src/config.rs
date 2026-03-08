@@ -38,6 +38,11 @@ pub(crate) const DEFAULT_OWNER_LEASE_TTL_SECS: i64 = 60;
 /// a fenced etcd transaction before giving up and returning an error.
 pub(crate) const DEFAULT_OPTIMISTIC_TXN_RETRIES: usize = 8;
 
+/// Ceiling on `optimistic_txn_retries`. With 200 ms backoff cap,
+/// 64 retries is ~6.4 s worst-case — enough for transient contention
+/// without blocking for minutes.
+const MAX_OPTIMISTIC_TXN_RETRIES: usize = 64;
+
 /// Default cap on the number of children published in a single split
 /// transaction.
 pub(crate) const DEFAULT_MAX_CHILDREN_PER_OP: usize = 8;
@@ -250,7 +255,8 @@ impl EtcdCoordinatorConfig {
     /// - Namespace prefix must start with `/`, must not end with `/`
     ///   (unless it is exactly `"/"`), and must not contain `//`.
     /// - Owner lease TTL must be positive.
-    /// - Optimistic txn retries must be at least 1.
+    /// - Optimistic txn retries must be between 1 and
+    ///   `MAX_OPTIMISTIC_TXN_RETRIES` (inclusive).
     /// - Shard count limits must be positive.
     /// - Max children per split op must be between 1 and
     ///   `MAX_CHILDREN_PER_SPLIT_TXN` (etcd txn budget), and at most
@@ -286,6 +292,12 @@ impl EtcdCoordinatorConfig {
         }
         if self.optimistic_txn_retries == 0 {
             return Err(EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries);
+        }
+        if self.optimistic_txn_retries > MAX_OPTIMISTIC_TXN_RETRIES {
+            return Err(EtcdCoordinatorConfigError::ExcessiveOptimisticTxnRetries {
+                requested: self.optimistic_txn_retries,
+                max: MAX_OPTIMISTIC_TXN_RETRIES,
+            });
         }
         if self.max_shards_per_tenant == 0 {
             return Err(EtcdCoordinatorConfigError::ZeroMaxShardsPerTenant);
@@ -422,6 +434,7 @@ impl Default for EtcdCoordinatorConfig {
 /// indexes for multi-valued fields (endpoints). All checks run eagerly
 /// at construction time.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EtcdCoordinatorConfigError {
     /// No endpoints were provided (the list is empty after filtering).
     NoEndpoints,
@@ -442,6 +455,9 @@ pub enum EtcdCoordinatorConfigError {
     NonPositiveOwnerLeaseTtl,
     /// `optimistic_txn_retries` must be at least 1.
     ZeroOptimisticTxnRetries,
+    /// `optimistic_txn_retries` exceeds the safety ceiling. High retry
+    /// counts cause CAS operations to block for minutes under contention.
+    ExcessiveOptimisticTxnRetries { requested: usize, max: usize },
     /// `max_shards_per_tenant` must be at least 1.
     ZeroMaxShardsPerTenant,
     /// `max_total_shards` must be at least 1.
@@ -483,6 +499,10 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             }
             Self::NonPositiveOwnerLeaseTtl => f.write_str("owner_lease_ttl_secs must be > 0"),
             Self::ZeroOptimisticTxnRetries => f.write_str("optimistic_txn_retries must be > 0"),
+            Self::ExcessiveOptimisticTxnRetries { requested, max } => write!(
+                f,
+                "optimistic_txn_retries ({requested}) exceeds maximum ({max})",
+            ),
             Self::ZeroMaxShardsPerTenant => f.write_str("max_shards_per_tenant must be > 0"),
             Self::ZeroMaxTotalShards => f.write_str("max_total_shards must be > 0"),
             Self::ZeroMaxChildrenPerOp => f.write_str("max_children_per_op must be > 0"),

@@ -1277,7 +1277,10 @@ impl From<CoordError> for UnparkError {
                 actual_hash,
             }),
             // Explicitly reject all variants UnparkError does not cover.
-            // Adding a new CoordError variant triggers a compile error here.
+            // Adding a new CoordError variant triggers a compile error here,
+            // forcing a conscious mapping decision. The unreachable! is safe
+            // because check_op_idempotency (the only CoordError source in the
+            // unpark path) only produces OpIdConflict.
             CoordError::ShardNotFound { .. }
             | CoordError::TenantMismatch { .. }
             | CoordError::StaleFence { .. }

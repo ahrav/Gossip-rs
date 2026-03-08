@@ -52,8 +52,8 @@ use gossip_coordination::{
     AcquireError, AcquireScratch, ByteSlab, CheckpointError, CoordinationBackend,
     DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, DerivedShardKind, IdempotentOutcome,
     InitialShardInput, ParkReason, RegisterShardsError, RunConfig, RunManagement, RunStatus,
-    ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError, SplitResidualError,
-    derive_split_shard_id,
+    RunTransitionError, ShardLimitScope, ShardRecord, ShardStatus, SplitReplaceError,
+    SplitResidualError, UnparkError, derive_split_shard_id,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -224,6 +224,27 @@ fn config_rejects_zero_optimistic_txn_retries() {
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries
+    ));
+}
+
+/// Excessive retry budget would cause CAS operations to block for minutes
+/// under contention.
+#[test]
+fn config_rejects_excessive_optimistic_txn_retries() {
+    let error = EtcdCoordinatorConfig::new_with_tuning(
+        ["http://127.0.0.1:2379"],
+        "/gossip/v1",
+        60,
+        10_000,
+        8,
+    )
+    .expect_err("excessive retry budget must fail");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::ExcessiveOptimisticTxnRetries {
+            requested: 10_000,
+            max: 64,
+        }
     ));
 }
 
@@ -2873,5 +2894,193 @@ fn shard_limit_split_replace_off_by_one_global_limit() {
     assert!(
         fixed.is_none(),
         "N - 1 must allow the split when post-split global count equals the limit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Run lifecycle — terminal-state and wrong-status guards
+// ---------------------------------------------------------------------------
+
+/// `complete_run` requires `Active` status — must reject `Initializing` runs
+/// with `WrongStatus`.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn complete_run_rejects_initializing_run() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0xF010);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let err = backend
+        .complete_run(now(2), test_tenant(), run, OpId::from_raw(1))
+        .expect_err("complete_run on Initializing run must fail");
+    assert!(
+        matches!(
+            err,
+            RunTransitionError::WrongStatus {
+                status: RunStatus::Initializing,
+                target: RunStatus::Done,
+            }
+        ),
+        "expected WrongStatus(Initializing, Done), got {err:?}"
+    );
+}
+
+/// `fail_run` requires `Active` status — must reject `Initializing` runs
+/// with `WrongStatus`.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn fail_run_rejects_initializing_run() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0xF011);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let err = backend
+        .fail_run(now(2), test_tenant(), run, OpId::from_raw(1))
+        .expect_err("fail_run on Initializing run must fail");
+    assert!(
+        matches!(
+            err,
+            RunTransitionError::WrongStatus {
+                status: RunStatus::Initializing,
+                target: RunStatus::Failed,
+            }
+        ),
+        "expected WrongStatus(Initializing, Failed), got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unpark — wrong-status guard
+// ---------------------------------------------------------------------------
+
+/// `unpark_shard` requires `Parked` status — must reject `Active` shards
+/// with `NotParked`.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn unpark_shard_rejects_active_shard() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0xF012);
+    let shard = ShardId::from_raw(0x1234);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        shard,
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(99))
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(run, shard);
+    let err = backend
+        .unpark_shard(now(3), test_tenant(), key, OpId::from_raw(1))
+        .expect_err("unpark on Active shard must fail");
+    assert!(
+        matches!(
+            err,
+            UnparkError::NotParked {
+                status: ShardStatus::Active
+            }
+        ),
+        "expected NotParked(Active), got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Terminal re-transition — different op_id must yield RunTerminal
+// ---------------------------------------------------------------------------
+
+/// After a successful `complete_run`, calling `fail_run` with a different
+/// op_id must return `RunTerminal` (not `WrongStatus`).
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn complete_then_fail_with_different_op_id_returns_run_terminal() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0xF013);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x2001),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(99))
+        .expect("register_shards should succeed");
+
+    let complete = backend
+        .complete_run(now(3), test_tenant(), run, OpId::from_raw(1))
+        .expect("complete_run should succeed");
+    assert!(complete.is_executed());
+
+    let err = backend
+        .fail_run(now(4), test_tenant(), run, OpId::from_raw(2))
+        .expect_err("fail_run on Done run must fail");
+    assert!(
+        matches!(
+            err,
+            RunTransitionError::RunTerminal {
+                status: RunStatus::Done
+            }
+        ),
+        "expected RunTerminal(Done), got {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unpark — terminal-run guard
+// ---------------------------------------------------------------------------
+
+/// Unparking a shard whose run has been completed must return
+/// `RunTerminal`, regardless of the shard's own status.
+#[test]
+#[ignore = "requires Docker or ETCD_ENDPOINTS"]
+fn unpark_shard_rejects_terminal_run() {
+    let mut backend = test_coordinator();
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    let run = RunId::from_raw(0xF014);
+    let shard = ShardId::from_raw(0x3001);
+    backend
+        .create_run(now(1), test_tenant(), run, config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        shard,
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(now(2), test_tenant(), run, &manifest, OpId::from_raw(99))
+        .expect("register_shards should succeed");
+
+    let _ = backend
+        .complete_run(now(3), test_tenant(), run, OpId::from_raw(1))
+        .expect("complete_run should succeed");
+
+    let key = ShardKey::new(run, shard);
+    let err = backend
+        .unpark_shard(now(4), test_tenant(), key, OpId::from_raw(2))
+        .expect_err("unpark on terminal run must fail");
+    assert!(
+        matches!(
+            err,
+            UnparkError::RunTerminal {
+                status: RunStatus::Done
+            }
+        ),
+        "expected RunTerminal(Done), got {err:?}"
     );
 }
