@@ -68,7 +68,7 @@ graph TD
     S2 -->|"token lost or corrupt"| S1
     S2 -->|"next page continues"| S2
 
-    LK -.->|"always paired with"| TK
+    TK -.->|"always paired with"| LK
 
     style cursor_type fill:none,stroke:#991B1B,stroke-width:1px
     style constructors fill:none,stroke:#991B1B,stroke-width:1px

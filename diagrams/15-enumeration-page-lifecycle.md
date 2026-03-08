@@ -330,17 +330,15 @@ flowchart TD
     CHK_ITEMS -->|yes| CURSOR_SOME
     CHK_BYTES -->|yes| CURSOR_SOME
     CHK_DEADLINE -->|yes| CURSOR_SOME
-    CHK_END -->|yes| CURSOR_SOME_OR_NONE
+    CHK_END -->|yes| CURSOR_SOME
 
     CHK_SOURCE -->|yes| CURSOR_NONE
 
     CURSOR_SOME["build_next_cursor<br/>(last_key, next_idx, emit_tokens)<br/>→ Some(Cursor)"]
     CURSOR_NONE["Cursor::initial()<br/>→ shard complete"]
-    CURSOR_SOME_OR_NONE["Shard end bound reached<br/>→ Cursor::initial() if end<br/>bound is exact boundary;<br/>Some(Cursor) if items remain<br/>below end in other connectors"]
 
     CURSOR_SOME --> PAGE
     CURSOR_NONE --> PAGE
-    CURSOR_SOME_OR_NONE --> PAGE
 
     PAGE["EnumerationPage::new<br/>(items, next_cursor)"]
 
@@ -352,7 +350,6 @@ flowchart TD
     style CHK_END fill:#FEE2E2,stroke:#991B1B
     style CURSOR_SOME fill:#EF4444,stroke:#991B1B,color:#fff
     style CURSOR_NONE fill:#EF4444,stroke:#991B1B,color:#fff
-    style CURSOR_SOME_OR_NONE fill:#EF4444,stroke:#991B1B,color:#fff
     style PAGE fill:#EF4444,stroke:#991B1B,color:#fff
 ```
 
@@ -364,7 +361,7 @@ flowchart TD
 | Bytes budget exhausted | `Some(Cursor)` — more data exists | Cumulative `size_hint` bytes reached `max_bytes`; remaining items are unvisited. |
 | Deadline reached | `Some(Cursor)` — more data exists | `budgets.is_expired_at(Instant::now())` returned true. The page is valid but partial. `resolve_page_bounds` also checks the deadline before starting, returning `EnumerateError::retryable` if already expired. |
 | Data source exhausted | `Cursor::initial()` — shard complete | The walk (or sorted entry list) has no more items in the shard range. An initial cursor signals enumeration is done. |
-| Shard end bound reached | `Cursor::initial()` — shard complete | The next item's key is `≥ end`, so all items in `[start, end)` have been emitted. |
+| Shard end bound reached | `Some(Cursor)` — items emitted, shard end detected | The next item's key is `≥ end`, so the page stops collecting. Items already gathered are returned with a continuation cursor. The coordination layer detects shard completion on the next call when no items remain in range. |
 
 **Budget fields are `NonZero`.** `Budgets::try_new` rejects zero values for `max_items`
 (`NonZeroUsize`) and `max_bytes` (`NonZeroU64`), so a vacuous zero budget is

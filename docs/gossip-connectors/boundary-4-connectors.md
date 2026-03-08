@@ -48,7 +48,7 @@ The crate provides four core capabilities:
 
 | File             | Role                                                                                                          |
 | ---------------- | ------------------------------------------------------------------------------------------------------------- |
-| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG` |
+| `lib.rs`         | Crate root, exports `FilesystemConnector`, `InMemoryDeterministicConnector`, `GitConnector`, `MemItem`, `path_buf_from_bytes`, `FILESYSTEM_CONNECTOR_TAG`, `GIT_CONNECTOR_TAG`, `IN_MEMORY_CONNECTOR_TAG` |
 | `common.rs`      | Shared utilities: binary search, identity derivation, split-point selection, pooled page assembly, I/O error classification, path conversion |
 | `in_memory.rs`   | `InMemoryDeterministicConnector` -- deterministic in-memory fixture                                           |
 | `filesystem.rs`  | `FilesystemConnector` -- Unix-only filesystem connector                                                       |

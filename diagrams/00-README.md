@@ -112,36 +112,36 @@ graph TD
 1. `01-system-overview.md` — The five boundaries and how they connect
 2. `04-end-to-end-scan-flow.md` — How a scan works from start to finish
 
-**Deep dive into coordination**:
+**Deep dive into coordination** (continue from overview):
 3. `05-shard-and-run-state-machines.md` — State machines that drive work distribution
 4. `06-fencing-protocol.md` — How zombie workers are prevented
 5. `07-lease-lifecycle.md` — Worker sessions and cursor monotonicity
 
-**Deep dive into identity**:
+**Deep dive into identity** (alternative to coordination after overview):
 3. `02-boundary-dependency-graph.md` — How boundaries depend on each other
 4. `03-id-derivation-dag.md` — The 19-type identity hierarchy
 
-**Deep dive into persistence and connectors**:
-5. `08-pagecommit-typestate.md` — Compile-time safety for atomic commits
-6. `19-persistence-contracts.md` — Traits, data model, lattice, OVID, receipts
-7. `09-circuit-breaker.md` — Failure isolation for external APIs
-8. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
-9. `15-enumeration-page-lifecycle.md` — Page enumeration flow, validation, assembly
-10. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
-11. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
-12. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
+**Deep dive into persistence and connectors** (after coordination or identity):
+6. `08-pagecommit-typestate.md` — Compile-time safety for atomic commits
+7. `19-persistence-contracts.md` — Traits, data model, lattice, OVID, receipts
+8. `09-circuit-breaker.md` — Failure isolation for external APIs
+9. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
+10. `15-enumeration-page-lifecycle.md` — Page enumeration flow, validation, assembly
+11. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
+12. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
+13. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
 
-**Deep dive into etcd coordination persistence**:
-5. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
+**Deep dive into etcd coordination persistence** (after persistence):
+14. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
 
-**Cross-cutting concerns**:
-7. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
-8. `11-tenant-isolation.md` — Cryptographic multi-tenancy
-9. `12-split-operations.md` — Dynamic work distribution via shard splitting
+**Cross-cutting concerns** (after any deep dive):
+15. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
+16. `11-tenant-isolation.md` — Cryptographic multi-tenancy
+17. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
-**Deep dive into shard algebra**:
-10. `12-split-operations.md` — Split operations and coverage validation
-11. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+**Deep dive into shard algebra** (after split operations):
+18. `12-split-operations.md` — Split operations and coverage validation
+19. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
 
 ## File Index
 

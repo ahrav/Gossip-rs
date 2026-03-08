@@ -142,9 +142,9 @@ graph LR
     worker -->|"depends on"| coordination
     cli -->|"depends on"| runtime
 
-    coordination --> coordination_etcd
-    contracts --> persistence_inmem
-    scanner_engine --> integration_tests
+    coordination -->|"depends on"| coordination_etcd
+    contracts -->|"depends on"| persistence_inmem
+    scanner_engine -->|"depends on"| integration_tests
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
     style B3 fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
@@ -249,10 +249,11 @@ The crate graph compiles in four tiers. Tier 0 (`gossip-stdx`, `gossip-contracts
 and `gossip-frontier`) has no dependencies on higher-level crates and compiles
 first. `gossip-stdx` is a foundational utility crate depended on by contracts,
 frontier, and coordination. Tier 1 includes `gossip-coordination`,
-`gossip-coordination-etcd`, `gossip-connectors`, `gossip-persistence-inmemory`,
+`gossip-connectors`, `gossip-persistence-inmemory`,
 `scanner-engine`, `scanner-scheduler`, and `scanner-git` --
-these compile in parallel once Tier 0 finishes. Tier 2 includes `gossip-scan-driver`
-and `gossip-scanner-runtime`, which depend on Tier 1 crates. Tier 3
+these compile in parallel once Tier 0 finishes. Tier 2 includes
+`gossip-coordination-etcd`, `gossip-scan-driver`, and `gossip-scanner-runtime`,
+which depend on Tier 1 crates. Tier 3
 (`gossip-worker`, `scanner-rs-cli`, `scanner-engine-integration-tests`) are the
 final binaries and test crates.
 
@@ -267,7 +268,6 @@ graph TD
 
     subgraph "Tier 1"
         coordination["gossip-coordination"]
-        coordination_etcd["gossip-coordination-etcd"]
         connectors["gossip-connectors"]
         persistence_inmem["gossip-persistence-inmemory"]
         scanner_engine["scanner-engine"]
@@ -276,6 +276,7 @@ graph TD
     end
 
     subgraph "Tier 2"
+        coordination_etcd["gossip-coordination-etcd"]
         scan_driver["gossip-scan-driver"]
         runtime["gossip-scanner-runtime"]
     end

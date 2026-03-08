@@ -344,11 +344,17 @@ sequenceDiagram
     Note over W,SRC: Other connectors unaffected.<br/>Circuit breakers are per-source isolation.
 ```
 
-The circuit breaker pattern achieves two goals simultaneously. First, it
-**fails fast**: once the breaker opens, the worker does not waste time waiting
-for timeouts on a source that is known to be down. Second, it **minimizes blast
-radius**: the breaker is scoped to a single source. If GitHub is unreachable but
+The retry-budget pattern achieves two goals simultaneously. First, it
+**fails fast**: once the budget is exhausted, the worker stops retrying a source
+that is known to be unhealthy. Second, it **minimizes blast radius**: the budget
+is scoped to a single shard's connector interaction. If GitHub is unreachable but
 S3 is fine, workers can continue scanning S3 shards without interruption.
+
+> **Note:** The target design introduces a full circuit breaker state machine
+> (Closed → Open → HalfOpen) with cooldown and probe phases (shown in the
+> sequence diagram above). The current implementation achieves the same parking
+> outcome (`ParkReason::TooManyErrors`) via `RetryBudget` and `BackendError`
+> classification, without the intermediate Open/HalfOpen states.
 
 The parking mechanism ensures the shard is not lost. A parked shard retains its
 cursor position and can be unparked (an admin operation) or picked up by a

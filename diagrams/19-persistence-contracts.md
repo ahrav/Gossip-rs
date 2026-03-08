@@ -507,7 +507,7 @@ graph TB
 - [ID Derivation DAG](03-id-derivation-dag.md) — the full 19-type identity
   hierarchy that persistence record types depend on
 - [Boundary Dependency Graph](02-boundary-dependency-graph.md) — how B5
-  Persistence depends on B1 Identity and B4 Connector
+  Persistence depends on B1 Identity and B2 Coordination
 
 ## Source Code References
 

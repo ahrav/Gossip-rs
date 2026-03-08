@@ -149,7 +149,7 @@ graph TB
     R_HEX --> SHARDS
     R_HEX --> SHARDS_ACTIVE
     SHARDS --> S_HEX
-    SHARDS --> S_OWNER
+    S_HEX --> S_OWNER
     SHARDS_ACTIVE --> S_ACTIVE_HEX
 
     style PREFIX fill:#DCFCE7,stroke:#166534,color:#166534
