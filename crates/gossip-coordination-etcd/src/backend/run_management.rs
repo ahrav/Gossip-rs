@@ -184,7 +184,7 @@ impl RunManagement for EtcdCoordinator {
                     let shard_key = this.keyspace.shard_record_key(tenant, run, shard.shard());
                     compares.push(super::compare_absent(shard_key.clone()));
                     let shard_blob =
-                        this.build_root_shard_blob(tenant, run, cursor_semantics, shard)?;
+                        super::build_root_shard_blob(tenant, run, cursor_semantics, shard)?;
                     txn_ops.push(TxnOp::put(shard_key.into_bytes(), shard_blob, None));
 
                     let active_index =
@@ -850,7 +850,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                 let sk = self.keyspace.shard_record_key(tenant, run, shard.shard());
                 compares.push(super::compare_absent(sk.clone()));
                 let shard_blob =
-                    self.build_root_shard_blob(tenant, run, cursor_semantics, shard)?;
+                    super::build_root_shard_blob(tenant, run, cursor_semantics, shard)?;
                 txn_ops.push(TxnOp::put(sk.into_bytes(), shard_blob, None));
                 let ai = self
                     .keyspace

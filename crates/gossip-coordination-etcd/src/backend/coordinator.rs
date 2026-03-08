@@ -3,25 +3,21 @@ use std::fmt;
 
 use etcd_client::{DeleteOptions, GetOptions, Txn, TxnOp};
 use gossip_coordination::{
-    ByteSlab, CapacityHint, IdempotentOutcome, InfraError, InitialShardInput, LogicalTime, OpId,
-    RegisterShardsError, RunId, RunOpKind, RunStatus, RunTransitionError, ShardId, ShardKey,
-    ShardRecord, TenantId, hash_cancel_run_payload, hash_complete_run_payload,
-    hash_fail_run_payload,
+    CapacityHint, IdempotentOutcome, InfraError, LogicalTime, OpId, RunId, RunOpKind, RunStatus,
+    RunTransitionError, ShardId, ShardKey, TenantId, hash_cancel_run_payload,
+    hash_complete_run_payload, hash_fail_run_payload,
 };
 
-use crate::codec::{
-    EtcdCodecError, decode_run_record, decode_shard_record, encode_run_record, encode_shard_record,
-};
+use crate::codec::{EtcdCodecError, decode_run_record, decode_shard_record, encode_run_record};
 use crate::config::{DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::EtcdKeyspace;
 
 use super::{
     CasOutcome, PersistedOwner, PersistedRun, PersistedShard, ShardCountSnapshot,
-    apply_terminal_run_transition, build_slab_capacity_for_initial_shard, cas_retry_delay,
-    compare_absent, compare_present, compare_run_revision, decode_owner_kv, fatal_storage_error,
-    is_persisted_shard_record_key, make_decode_slab, parse_direct_run_id_from_key,
-    validate_owner_consistency,
+    apply_terminal_run_transition, cas_retry_delay, compare_absent, compare_present,
+    compare_run_revision, decode_owner_kv, fatal_storage_error, is_persisted_shard_record_key,
+    make_decode_slab, parse_direct_run_id_from_key, validate_owner_consistency,
 };
 
 #[cfg(any(test, feature = "test-support"))]
@@ -962,47 +958,6 @@ impl EtcdCoordinator {
             Err(err) => fatal_storage_error("load shard", err),
         }
     }
-
-    /// Construct a new `ShardRecord` from registration input and encode it
-    /// into a binary blob ready for etcd storage.
-    pub(super) fn encode_ephemeral_shard_blob(
-        &self,
-        context: &'static str,
-        mut record: ShardRecord,
-        mut slab: ByteSlab,
-    ) -> Vec<u8> {
-        let blob = encode_shard_record(&record, &slab)
-            .unwrap_or_else(|err| fatal_storage_error(context, err));
-        record.deallocate_fields(&mut slab);
-        slab.clear();
-        blob
-    }
-
-    /// Construct a new `ShardRecord` from registration input and encode it
-    /// into a binary blob ready for etcd storage.
-    pub(super) fn build_root_shard_blob(
-        &self,
-        tenant: TenantId,
-        run: RunId,
-        cursor_semantics: gossip_coordination::CursorSemantics,
-        input: &InitialShardInput<'_>,
-    ) -> Result<Vec<u8>, RegisterShardsError> {
-        let mut slab = ByteSlab::with_capacity(build_slab_capacity_for_initial_shard(input));
-        let record = ShardRecord::new_active_with_cursor(
-            tenant,
-            run,
-            input.shard(),
-            input.spec(),
-            input.cursor(),
-            cursor_semantics,
-            &mut slab,
-        )
-        .map_err(|_| RegisterShardsError::ResourceExhausted {
-            resource: "shard_slab",
-        })?;
-        record.assert_invariants(&slab);
-        Ok(self.encode_ephemeral_shard_blob("register_shards.encode_shard", record, slab))
-    }
 }
 
 impl fmt::Debug for EtcdCoordinator {
@@ -1504,43 +1459,6 @@ impl AsyncEtcdCoordinator {
             Ok(None) => fatal_storage_error("load shard", format!("shard {key:?} missing")),
             Err(err) => fatal_storage_error("load shard", err),
         }
-    }
-
-    pub(super) fn encode_ephemeral_shard_blob(
-        &self,
-        context: &'static str,
-        mut record: ShardRecord,
-        mut slab: ByteSlab,
-    ) -> Vec<u8> {
-        let blob = encode_shard_record(&record, &slab)
-            .unwrap_or_else(|err| fatal_storage_error(context, err));
-        record.deallocate_fields(&mut slab);
-        slab.clear();
-        blob
-    }
-
-    pub(super) fn build_root_shard_blob(
-        &self,
-        tenant: TenantId,
-        run: RunId,
-        cursor_semantics: gossip_coordination::CursorSemantics,
-        input: &InitialShardInput<'_>,
-    ) -> Result<Vec<u8>, RegisterShardsError> {
-        let mut slab = ByteSlab::with_capacity(build_slab_capacity_for_initial_shard(input));
-        let record = ShardRecord::new_active_with_cursor(
-            tenant,
-            run,
-            input.shard(),
-            input.spec(),
-            input.cursor(),
-            cursor_semantics,
-            &mut slab,
-        )
-        .map_err(|_| RegisterShardsError::ResourceExhausted {
-            resource: "shard_slab",
-        })?;
-        record.assert_invariants(&slab);
-        Ok(self.encode_ephemeral_shard_blob("register_shards.encode_shard", record, slab))
     }
 
     pub(super) fn fail_unimplemented<T>(&self, operation: &'static str) -> T {

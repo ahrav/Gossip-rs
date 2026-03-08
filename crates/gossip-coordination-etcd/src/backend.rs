@@ -70,11 +70,14 @@ use std::time::Duration;
 use etcd_client::{Compare, CompareOp};
 use gossip_contracts::coordination::shard_spec::{ShardLimitScope, ShardSpecRef};
 use gossip_coordination::{
-    ByteSlab, CursorUpdate, InitialShardInput, Lease, LogicalTime, OpId, RunId, RunOpKind,
-    RunOpLogEntry, RunOpResult, RunRecord, RunStatus, ShardId, ShardRecord, SplitChildIds,
+    ByteSlab, CursorSemantics, CursorUpdate, InitialShardInput, Lease, LogicalTime, OpId,
+    RegisterShardsError, RunId, RunOpKind, RunOpLogEntry, RunOpResult, RunRecord, RunStatus,
+    ShardId, ShardRecord, SplitChildIds, TenantId,
 };
 
-use crate::codec::{EtcdCodecError, OwnerLeaseValue, decode_owner_value, encode_owner_value};
+use crate::codec::{
+    EtcdCodecError, OwnerLeaseValue, decode_owner_value, encode_owner_value, encode_shard_record,
+};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 
 mod coordinator;
@@ -479,6 +482,54 @@ fn build_slab_capacity_for_spec_and_cursor(
 /// `DEFAULT_BUILD_SLAB_FLOOR`.
 fn build_slab_capacity_for_initial_shard(input: &InitialShardInput<'_>) -> usize {
     build_slab_capacity_for_spec_and_cursor(input.spec(), input.cursor())
+}
+
+/// Encode a shard record into a binary blob, then deallocate its pooled
+/// fields and clear the slab. Panics via [`fatal_storage_error`] on
+/// encode failure — encoding a just-constructed record should never fail
+/// under normal operation; failure indicates a codec or invariant bug.
+fn encode_ephemeral_shard_blob(
+    context: &'static str,
+    mut record: ShardRecord,
+    mut slab: ByteSlab,
+) -> Vec<u8> {
+    let blob =
+        encode_shard_record(&record, &slab).unwrap_or_else(|err| fatal_storage_error(context, err));
+    record.deallocate_fields(&mut slab);
+    slab.clear();
+    blob
+}
+
+/// Construct a root shard record from registration input, validate its
+/// invariants, and encode it into a binary blob ready for etcd storage.
+///
+/// Returns [`RegisterShardsError::ResourceExhausted`] if the slab cannot
+/// accommodate the shard's pooled fields.
+fn build_root_shard_blob(
+    tenant: TenantId,
+    run: RunId,
+    cursor_semantics: CursorSemantics,
+    input: &InitialShardInput<'_>,
+) -> Result<Vec<u8>, RegisterShardsError> {
+    let mut slab = ByteSlab::with_capacity(build_slab_capacity_for_initial_shard(input));
+    let record = ShardRecord::new_active_with_cursor(
+        tenant,
+        run,
+        input.shard(),
+        input.spec(),
+        input.cursor(),
+        cursor_semantics,
+        &mut slab,
+    )
+    .map_err(|_| RegisterShardsError::ResourceExhausted {
+        resource: "shard_slab",
+    })?;
+    record.assert_invariants(&slab);
+    Ok(encode_ephemeral_shard_blob(
+        "register_shards.encode_shard",
+        record,
+        slab,
+    ))
 }
 
 /// Verify that a persisted owner binding is consistent with the shard
