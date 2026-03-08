@@ -222,10 +222,10 @@ Connector page assembly converts raw byte slices from the data source into poole
 `ItemKey`/`ItemRef` wrappers backed by a shared `PooledByteSlab`. Two assembly paths
 exist, selected based on whether the connector's key bytes and ref bytes are identical.
 
-The filesystem connector uses the shared-slot path because `ItemRef` bytes are
-identical-by-construction to `ItemKey` bytes (both are the encoded relative path). The
-git and in-memory connectors use the two-slot path because their `ItemRef` bytes differ
-from key bytes (e.g., blob OID vs tree path).
+The filesystem and git connectors use the shared-slot path because their
+`ItemRef` bytes are identical-by-construction to `ItemKey` bytes (both use the
+same key encoding). The in-memory connector uses the two-slot path because its
+`ItemRef` bytes may differ from key bytes.
 
 ```mermaid
 %% Diagram: page-assembly-paths
@@ -381,7 +381,7 @@ truncate excess items, apply backpressure, or terminate a misbehaving connector.
 |-------|---------|
 | Circuit breaker failure isolation for connectors | `09-circuit-breaker.md` §1 |
 | Shard state machine (how shards reach enumeration) | `05-shard-and-run-state-machines.md` §1 |
-| End-to-end scan flow (page enumeration in context) | `04-end-to-end-scan-flow.md` §1 |
+| End-to-end scan flow (driver architecture) | `04-end-to-end-scan-flow.md` §2 |
 | Cursor monotonicity in lease lifecycle | `07-lease-lifecycle.md` §4 |
 | Shard algebra types (key encoding, shard specs) | `13-shard-algebra-types.md` |
 | Split operations (how split hints from enumeration feed shard splitting) | `12-split-operations.md` §1 |

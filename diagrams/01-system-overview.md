@@ -139,7 +139,6 @@ graph LR
     runtime -->|"depends on"| connectors
     runtime -->|"depends on"| contracts
     worker -->|"depends on"| runtime
-    worker -->|"depends on"| coordination
     cli -->|"depends on"| runtime
 
     coordination_etcd -->|"depends on"| coordination
@@ -306,7 +305,6 @@ graph TD
     connectors --> runtime
     contracts --> runtime
     runtime --> worker
-    coordination --> worker
     runtime --> cli
     scanner_engine --> integration_tests
 
@@ -360,4 +358,3 @@ For the full type-annotated dependency DAG and tiered compilation analysis, see 
 | B2: Coordination (etcd) | `crates/gossip-coordination-etcd/`                                                                                              |
 | B5: Persistence (in-mem) | `crates/gossip-persistence-inmemory/`                                                                                           |
 | Integration tests        | `crates/scanner-engine-integration-tests/`                                                                                      |
-| Architecture prose | `00-prologue/03-architecture-at-a-glance.md`                                                                                         |

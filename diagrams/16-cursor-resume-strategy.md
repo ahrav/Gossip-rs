@@ -374,36 +374,36 @@ graph TD
 | Connector boundary overview | [09-circuit-breaker.md](09-circuit-breaker.md) | B4 fault isolation context |
 | Shard key ranges and splits | [12-split-operations.md](12-split-operations.md) | Shard bounds that constrain cursor ranges |
 | Shard algebra types | [13-shard-algebra-types.md](13-shard-algebra-types.md) | `ShardSpec` key range encoding that cursors operate within |
-| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) | Where cursor resume fits in the 12-step scan sequence |
+| End-to-end scan flow | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md) | ScanDriver architecture and distributed worker loop |
 | Lease lifecycle | [07-lease-lifecycle.md](07-lease-lifecycle.md) | Cursor monotonicity enforcement by the coordination layer |
 
 ---
 
 ## Source Code References
 
-| Symbol / Concept | File | Line(s) | Notes |
-|-----------------|------|---------|-------|
-| `Cursor` struct | `crates/gossip-contracts/src/connector/types.rs` | 592–595 | Two-field struct: `last_key` + `token` |
-| `Cursor::initial()` | `crates/gossip-contracts/src/connector/types.rs` | 604–609 | No-progress neutral state |
-| `Cursor::with_last_key()` | `crates/gossip-contracts/src/connector/types.rs` | 617–621 | Key-only cursor constructor |
-| `Cursor::with_token()` | `crates/gossip-contracts/src/connector/types.rs` | 630–635 | Key + token cursor constructor |
-| `Cursor::try_from_update()` | `crates/gossip-contracts/src/connector/types.rs` | 688–702 | Validates `TokenWithoutLastKey` invariant |
-| `ItemKey` | `crates/gossip-contracts/src/connector/types.rs` | 512–530 | Ordered toxic-byte wrapper, max 4 KiB |
-| `TokenBytes` | `crates/gossip-contracts/src/connector/types.rs` | 555–576 | Unordered toxic-byte wrapper, max 16 KiB |
-| `key_resume_start()` | `crates/gossip-connectors/src/common.rs` | 202–210 | O(log N) key-authoritative resume position |
-| `cursor_token_index()` | `crates/gossip-connectors/src/common.rs` | 271–276 | Decode u64 token as array index |
-| `build_next_cursor()` | `crates/gossip-connectors/src/common.rs` | 289–303 | Encode next_idx as u64 BE token |
-| `build_next_cursor_from_staged()` | `crates/gossip-connectors/src/common.rs` | 317–333 | Reuse pre-staged pooled token |
-| `upper_bound()` | `crates/gossip-connectors/src/common.rs` | 126–128 | First index where key > target |
-| `WalkToken` struct | `crates/gossip-connectors/src/filesystem.rs` | 230–232 | Serialized DFS stack checkpoint |
-| `WalkTokenFrame` | `crates/gossip-connectors/src/filesystem.rs` | 234–244 | Per-frame component + child index |
-| `WALK_TOKEN_VERSION` | `crates/gossip-connectors/src/filesystem.rs` | 219 | Version byte `0x01` |
-| `WalkToken::decode_bytes()` | `crates/gossip-connectors/src/filesystem.rs` | 1270–1319 | Deserialize with validation |
-| `WalkToken::encode_from_state()` | `crates/gossip-connectors/src/filesystem.rs` | 1321–1377 | Serialize walk stack with size truncation |
-| `WalkState::from_token()` | `crates/gossip-connectors/src/filesystem.rs` | 1571–1702 | Restore DFS state from token |
-| `align_walk_to_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | 593–671 | Token-first, key-fallback resume |
-| `build_next_walk_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | 677–689 | Encode walk state into cursor token |
-| Git token resume | `crates/gossip-connectors/src/git.rs` | 398–418 | O(1) token + key cross-check |
-| `ResumeChecks` | `crates/gossip-contracts/src/connector/conformance.rs` | 151–156 | Drop-token and corrupt-token flags |
-| `ResumeMode` | `crates/gossip-contracts/src/connector/conformance.rs` | 388–397 | `DropToken` and `CorruptToken` variants |
-| `ConformanceConfig` | `crates/gossip-contracts/src/connector/conformance.rs` | 258–286 | Harness configuration with resume checks |
+| Symbol / Concept | File | Notes |
+|-----------------|------|-------|
+| `Cursor` struct | `crates/gossip-contracts/src/connector/types.rs` | Two-field struct: `last_key` + `token` |
+| `Cursor::initial()` | `crates/gossip-contracts/src/connector/types.rs` | No-progress neutral state |
+| `Cursor::with_last_key()` | `crates/gossip-contracts/src/connector/types.rs` | Key-only cursor constructor |
+| `Cursor::with_token()` | `crates/gossip-contracts/src/connector/types.rs` | Key + token cursor constructor |
+| `Cursor::try_from_update()` | `crates/gossip-contracts/src/connector/types.rs` | Validates `TokenWithoutLastKey` invariant |
+| `ItemKey` | `crates/gossip-contracts/src/connector/types.rs` | Ordered toxic-byte wrapper, max 4 KiB |
+| `TokenBytes` | `crates/gossip-contracts/src/connector/types.rs` | Unordered toxic-byte wrapper, max 16 KiB |
+| `key_resume_start()` | `crates/gossip-connectors/src/common.rs` | O(log N) key-authoritative resume position |
+| `cursor_token_index()` | `crates/gossip-connectors/src/common.rs` | Decode u64 token as array index |
+| `build_next_cursor()` | `crates/gossip-connectors/src/common.rs` | Encode next_idx as u64 BE token |
+| `build_next_cursor_from_staged()` | `crates/gossip-connectors/src/common.rs` | Reuse pre-staged pooled token |
+| `upper_bound()` | `crates/gossip-connectors/src/common.rs` | First index where key > target |
+| `WalkToken` struct | `crates/gossip-connectors/src/filesystem.rs` | Serialized DFS stack checkpoint |
+| `WalkTokenFrame` | `crates/gossip-connectors/src/filesystem.rs` | Per-frame component + child index |
+| `WALK_TOKEN_VERSION` | `crates/gossip-connectors/src/filesystem.rs` | Version byte `0x01` |
+| `WalkToken::decode_bytes()` | `crates/gossip-connectors/src/filesystem.rs` | Deserialize with validation |
+| `WalkToken::encode_from_state()` | `crates/gossip-connectors/src/filesystem.rs` | Serialize walk stack with size truncation |
+| `WalkState::from_token()` | `crates/gossip-connectors/src/filesystem.rs` | Restore DFS state from token |
+| `align_walk_to_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | Token-first, key-fallback resume |
+| `build_next_walk_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | Encode walk state into cursor token |
+| Git token resume | `crates/gossip-connectors/src/git.rs` | O(1) token + key cross-check |
+| `ResumeChecks` | `crates/gossip-contracts/src/connector/conformance.rs` | Drop-token and corrupt-token flags |
+| `ResumeMode` | `crates/gossip-contracts/src/connector/conformance.rs` | `DropToken` and `CorruptToken` variants |
+| `ConformanceConfig` | `crates/gossip-contracts/src/connector/conformance.rs` | Harness configuration with resume checks |

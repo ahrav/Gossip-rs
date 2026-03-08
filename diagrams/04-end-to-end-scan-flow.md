@@ -1,412 +1,297 @@
 # End-to-End Scan Flow
 
-This document traces a complete scan from run creation through final completion,
-showing how all five architectural boundaries compose into a single coherent
-pipeline. The scan flow is the central narrative of the system: every identity
-derivation, every coordination handshake, every persistence guarantee exists to
-serve this pipeline. Understanding these 12 steps—and the invariants that bind
-them—is the key to understanding why the system is correct.
+This document traces the production scan execution path from entry point
+through to completion. Two entry points — CLI and distributed worker — converge
+on a shared `execute_assignment_with_config` function that delegates to
+source-specific `ScanDriver` implementations. Each driver owns its entire
+scan lifecycle internally: enumeration, detection, and result collection are
+not orchestrated by an external loop.
 
 ---
 
-## 1. Full 12-Step Sequence
+## 1. Dual Entry Points — CLI and Distributed
 
-The following sequence diagram is the most detailed in the entire documentation
-suite. It shows every participant, every message, and every nested loop involved
-in processing a single shard of a scan run. The five boundaries appear as
-distinct participants, and numbered notes mark each of the 12 steps.
-
-The outer structure is straightforward: create a run, assign shards to workers,
-process pages, mark complete. The complexity lives in the inner loops—steps 3
-through 10—where enumeration, identity derivation, detection, and the
-receipt-chained commit interleave repeatedly for every page of every shard.
-
-Pay particular attention to how Identity (B1) is invoked at the finding level:
-once per secret (NormHash, SecretHash), and once per finding (FindingId,
-OccurrenceId, ObservationId). The connector derives StableItemId and VersionId
-during enumeration (Step 3), and the worker derives OvidHash from these (Step 4)
-for the done-ledger check. This layered identity derivation is what makes
-deduplication, idempotency, and incremental scanning possible.
+Both execution paths build an `Assignment` and feed it to the same shared
+core. The distributed path adds shard-level coordination: lease acquisition,
+done-ledger gating, and shard completion bookkeeping.
 
 ```mermaid
-%% Diagram: full-12-step-scan-sequence
+%% Diagram: dual-entry-point-sequence
 sequenceDiagram
     autonumber
 
-    participant W as Worker
-    participant C as Coordinator (B2)
-    participant CN as Connector (B4)
-    participant ID as Identity (B1)
-    participant P as Persistence (B5)
+    participant CLI as CLI Binary
+    participant DW as Distributed Worker
+    participant DC as DistributedCoordinator
+    participant RT as Runtime Core
+    participant SF as ScanSourceFactory
+    participant DR as ScanDriver
 
-    note over C: Step 1 — Create Run
+    note over CLI: CLI Path (scanner-rs-cli)
+    CLI->>RT: scan_fs_with_runtime / scan_git_with_runtime
+    RT->>RT: build_assignment(source, shard_spec, cursor)
+    RT->>RT: execute_assignment_with_config(assignment, ...)
+    RT->>SF: driver_for_assignment(&assignment)
+    SF-->>RT: Box&lt;dyn ScanDriver&gt;
+    RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+    RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
+    activate DR
+    DR-->>RT: ScanReport
+    deactivate DR
+    RT-->>CLI: ScanReport
 
-    W->>C: create_run(now, tenant, run_id, config)
-    activate C
-    C->>C: validate config<br/>store manifest<br/>register initial shards
-    C-->>W: RunRecord + shard manifest
-    deactivate C
-
-    note over W,C: Step 2 — Acquire Shard
-
-    W->>C: acquire_and_restore_into(now, tenant, key, worker, scratch)
-    activate C
-    C->>C: grant lease on Active shard<br/>increment FenceEpoch
-    C-->>W: AcquireResultView { lease, snapshot, capacity }
-    deactivate C
-
-    rect rgb(245, 245, 245)
-        note over W,P: Steps 3–10 — Page Processing Loop
-
-        loop For each page in shard
-
-            note over W,CN: Step 3 — Enumerate Items
-
-            W->>CN: enumerate_page(shard, cursor, budgets)
-            activate CN
-            CN-->>W: EnumerationPage(items: Vec&lt;ScanItem&gt;, next_cursor)
-            deactivate CN
-            Note over W: Each ScanItem carries StableItemId,<br/>VersionId, ItemKey, ItemRef from connector
-
-            loop For each item in page
-
-                note over W,P: Step 4 — Derive OvidHash
-
-                W->>P: derive_ovid_hash(&OvidHashInputs { stable_item_id, version })
-                activate P
-                P-->>W: OvidHash
-                deactivate P
-
-                note over W,P: Step 5 — Check Done-Ledger
-
-                W->>P: batch_get(tenant, policy, &amp;[ovid_hash])
-                activate P
-                P-->>W: None (not yet scanned)
-                deactivate P
-
-                note over W,CN: Step 6 — Read & Detect
-
-                W->>CN: open(item_ref, budgets)
-                activate CN
-                CN-->>W: Box&lt;dyn Read + Send&gt;
-                deactivate CN
-                W->>W: scan(content, policy) → findings[]
-
-                loop For each finding
-
-                    note over W,ID: Step 7 — Derive Identities
-
-                    W->>ID: NormHash(normalized_secret)
-                    ID-->>W: NormHash
-                    W->>ID: SecretHash(keyed, tenant_scope)
-                    ID-->>W: SecretHash
-                    W->>ID: derive_finding_id(FindingIdInputs)
-                    ID-->>W: FindingId
-                    W->>ID: derive_occurrence_id(OccurrenceIdInputs)
-                    ID-->>W: OccurrenceId
-                    W->>ID: derive_observation_id(ObservationIdInputs)
-                    ID-->>W: ObservationId
-
-                    note over W: Step 8 — Accumulate
-
-                    W->>W: batch.add(finding, done_record)
-
-                end
-            end
-
-            note over W,P: Step 9 — Receipt-Chained Commit
-
-            activate W
-
-            rect rgb(255, 240, 240)
-                note over W,P: Typestate-enforced durability ordering<br/>(PageCommit: AwaitingFindings → FindingsDurable → ItemDurable → CheckpointDurable)
-                W->>P: upsert_batch(findings) → wait FindingsCommitReceipt
-                P-->>W: FindingsCommitReceipt
-                W->>P: batch_upsert(done_ledger) → wait DoneLedgerCommitReceipt
-                P-->>W: DoneLedgerCommitReceipt
-                W->>C: checkpoint(now, cursor, op_id) → wait CheckpointCommitReceipt
-                Note over C: Op-log idempotency check + lease<br/>validation run inside checkpoint
-                C-->>W: CheckpointCommitReceipt
-                Note over W: Assemble PageCommitReceipt<br/>from the three stage receipts
-            end
-
-            deactivate W
-
-            note over W: Step 10 — Loop to next page
+    note over DW,DC: Distributed Path (run_worker loop)
+    loop For each shard
+        DW->>DC: acquire_shard()
+        DC-->>DW: Option&lt;ShardLease&gt;
+        DW->>DC: is_shard_done(&shard_id)
+        DC-->>DW: bool
+        alt Already done
+            DW->>DC: release_shard(&lease)
+        else Not done
+            DW->>RT: execute_assignment_with_config(lease.assignment, ...)
+            RT->>SF: driver_for_assignment(&assignment)
+            SF-->>RT: Box&lt;dyn ScanDriver&gt;
+            RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+            RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
+            activate DR
+            DR-->>RT: ScanReport
+            deactivate DR
+            RT-->>DW: AssignmentOutcome { report, checkpoint_hint, debug_output }
+            DW->>DC: complete_shard(&lease, checkpoint_hint, report)
+            DW->>DC: mark_shard_done(&shard_id)
         end
-    end
-
-    note over W,C: Step 11 — Mark Shard Complete
-
-    W->>C: session.complete(now, final_cursor, op_id)
-    activate C
-    C->>C: op-log idempotency + lease validation<br/>transition Active → Done
-    C-->>W: IdempotentOutcome&lt;()&gt;
-    deactivate C
-
-    note over C: Step 12 — Check Run Completion
-
-    C->>C: all_shards_complete?
-    alt All shards done
-        C->>C: mark_run_complete(run_id)
-        C->>P: finalize run record
-    else Shards remaining
-        C->>C: await remaining workers
     end
 ```
 
-**Reading the diagram.** The outermost flow is linear: create run, acquire
-shard, process pages, mark complete. Within the page processing loop (the gray
-rectangle), three nested loops execute: one per page, one per item within each
-page, and one per finding within each item. The red-tinted rectangle marks the
-receipt-chained durability boundary—the single most critical correctness
-invariant in the system. The PageCommit typestate enforces the ordering:
-findings must be durable before the done-ledger, and the done-ledger must be
-durable before the cursor checkpoint.
+**Convergence at `execute_assignment_with_config`.** The CLI path synthesises a
+single-shard `Assignment` with `Cursor::initial()` and a placeholder job ID.
+The distributed path receives a real `ShardLease` from the coordinator, whose
+`assignment` field carries the shard's key range and any prior cursor. Both
+paths pass the assignment to the same function, which selects a factory by
+`ConnectorKind`, builds a driver, and calls `driver.run()`.
 
-Note that idempotency checking via the op-log is internal to the checkpoint and
-complete calls. Each coordination mutation first checks `check_op_idempotency`
-for a duplicate `OpId` before validating the lease. On retry after a crash, the
-op-log detects the duplicate OpId and returns `Replayed`, preventing
-double-counting of findings.
+**Done-ledger gating.** The distributed worker checks `is_shard_done` before
+scanning. If a prior worker already completed this shard, the lease is
+released and the loop advances. This prevents redundant work after crash
+recovery.
+
+**Ordered completion.** `complete_shard` runs before `mark_shard_done`. If the
+process crashes between these two calls, the shard may be retried, but the
+system never observes a done-ledger entry without the corresponding report.
 
 ---
 
-## 2. Simplified Overview Flowchart
+## 2. Driver Architecture — Each Driver Owns Its Lifecycle
 
-The 12-step sequence above is precise but dense. The following flowchart
-presents the same flow as a high-level decision graph, making it easier to see
-the overall shape: which steps loop, which steps branch, and where each
-architectural boundary is responsible.
+The `ScanDriver` trait has a single `run()` method. Each implementation owns
+enumeration, detection, and result collection internally. There is no external
+page-processing loop.
 
-Each node is colored according to its owning boundary. Green nodes belong to
-Coordination (B2), red to the Connector (B4), blue to Identity (B1), purple to
-Persistence (B5), and gray to the Worker itself. This coloring reveals a key
-property: Persistence is touched at multiple levels of the pipeline (OvidHash
-derivation and the commit boundary), while Identity concentrates at finding
-derivation.
+```mermaid
+%% Diagram: driver-internal-architecture
+graph TB
+    subgraph shared ["Shared Runtime Core (gossip-scanner-runtime)"]
+        EX["execute_assignment_with_config"]
+        DFA["driver_for_assignment<br/>match ConnectorKind"]
+        ENG["runtime_engine<br/>→ Arc&lt;Engine&gt;"]
+    end
+
+    subgraph drivers ["ScanDriver Implementations (gossip-connectors)"]
+        direction TB
+        FS["<b>FsScanDriver::run</b><br/>━━━━━━━━━━━━━━━━━━━<br/>1. Spawn event + commit forwarder threads<br/>2. parallel_scan_dir(root, engine, cfg)<br/>3. Join forwarders<br/>4. Build ScanReport"]
+        GIT["<b>GitScanDriver::run</b><br/>━━━━━━━━━━━━━━━━━━━<br/>1. Spawn event forwarder thread<br/>2. run_git_scan(repo, engine, resolver,<br/>   seen, watermarks, cfg, sink)<br/>3. Join forwarder<br/>4. Build ScanReport"]
+        MEM["<b>InMemoryScanDriver::run</b><br/>━━━━━━━━━━━━━━━━━━━<br/>1. For each item in sorted dataset:<br/>   commit.begin_item → commit.finish_item<br/>2. Build ScanReport"]
+    end
+
+    subgraph engines ["Detection Backends"]
+        PSD["parallel_scan_dir<br/>(scanner-scheduler)<br/>━━━━━━━━━━━━━━━<br/>IterWalker DFS<br/>+ work-stealing pool<br/>+ Engine::scan per chunk"]
+        RGS["run_git_scan<br/>(scanner-git)<br/>━━━━━━━━━━━━━━━<br/>repo open → MIDX<br/>→ commit-graph plan<br/>→ ODB blob / diff pipeline<br/>→ Engine::scan per blob"]
+    end
+
+    EX --> DFA
+    EX --> ENG
+    DFA -->|Filesystem| FS
+    DFA -->|Git| GIT
+    DFA -->|InMemory| MEM
+
+    FS --> PSD
+    GIT --> RGS
+
+    style shared fill:none,stroke:#374151,stroke-width:1px
+    style drivers fill:none,stroke:#991B1B,stroke-width:1px
+    style engines fill:none,stroke:#991B1B,stroke-width:1px
+
+    style EX fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style DFA fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style ENG fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style FS fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style GIT fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style MEM fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
+    style PSD fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    style RGS fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+```
+
+**Why drivers own the loop.** Different sources have fundamentally different
+traversal strategies. Filesystem scanning uses a work-stealing parallel
+directory walker. Git scanning traverses the commit graph and pack index.
+Forcing these into a common page-oriented loop would add latency and
+eliminate source-specific parallelism opportunities. Each driver calls the
+shared `Engine::scan` for detection but controls its own I/O scheduling.
+
+**Thread scoping.** Both `FsScanDriver` and `GitScanDriver` use
+`std::thread::scope` to spawn forwarder threads that bridge channel-based
+internal sinks to the caller-provided `EventOutput` and `CommitSink` trait
+objects. This avoids `Send + 'static` bounds on the caller's sinks while
+keeping detection work off the calling thread.
+
+---
+
+## 3. Findings and Identity Flow
+
+Findings travel through two parallel channels: the `EventOutput` stream
+(human-readable output) and the `CommitSink` (identity derivation for
+persistence). In CLI mode the commit sink is a no-op. In distributed mode
+the `DurableCommitSink` derives the full identity chain per finding.
+
+```mermaid
+%% Diagram: findings-identity-flow
+sequenceDiagram
+    autonumber
+
+    participant DR as ScanDriver
+    participant EO as EventOutput
+    participant CS as CommitSink
+    participant ID as Identity (B1)
+    participant REC as CoordinationEventRecorder
+
+    note over DR,EO: Channel 1 — Event Stream (all modes)
+    DR->>EO: emit_core(Finding { rule, span, ... })
+    DR->>EO: emit_core(Progress { items, bytes, ... })
+    DR->>EO: emit_core(Summary { totals })
+
+    note over DR,REC: Channel 2 — Commit Lifecycle (distributed mode)
+    DR->>CS: begin_item(item_key, ItemMeta { stable_item_id, version })
+    CS->>REC: record_commit_progress(Begin { item_key, size_hint })
+
+    loop For each finding in item
+        DR->>CS: upsert_findings(item_key, FindingsBatch)
+
+        note over CS,ID: DurableCommitSink derives identity chain
+        CS->>ID: NormHash::from_digest(finding.norm_hash)
+        CS->>ID: key_secret_hash(tenant_secret_key, &norm_hash) → SecretHash
+        CS->>ID: derive_finding_id(FindingIdInputs) → FindingId
+        CS->>ID: derive_occurrence_id(OccurrenceIdInputs) → OccurrenceId
+
+        CS->>REC: record_identity_chain(IdentityChainRecord)
+    end
+
+    DR->>CS: finish_item(item_key)
+    CS->>REC: record_commit_progress(Finish { item_key })
+```
+
+**Split responsibility.** The `EventOutput` stream carries rich finding
+context (matched text, transform path, rule metadata) for human consumption
+and SARIF/JSONL output. The `CommitSink` carries only the minimal fields
+needed for identity derivation — `norm_hash`, `rule_id`, byte offsets — and
+derives the chain. This split keeps the detection engine decoupled from
+identity concerns.
+
+**Identity derivation chain.** For each finding the `DurableCommitSink`
+derives four identity types:
+
+1. `NormHash` — BLAKE3 digest of normalised secret bytes (from engine).
+2. `SecretHash` — tenant-scoped keyed hash: `key_secret_hash(tenant_secret_key, &norm_hash)`.
+3. `FindingId` — deterministic from `(tenant, stable_item_id, rule_fingerprint, secret_hash)`.
+4. `OccurrenceId` — deterministic from `(finding_id, object_version, byte_offset, byte_length)`.
+
+The `StableItemId` and `VersionId` are connector-provided via `ItemMeta` and
+trusted by the sink — the runtime does not re-derive them.
+
+> **Scope note.** The `DurableCommitSink` chain terminates at `OccurrenceId`.
+> `ObservationId` (which adds `PolicyHash` scoping) is derived downstream in
+> the B5 Persistence layer, not here — the commit sink has no access to the
+> active policy. See [ID Derivation DAG §7](./03-id-derivation-dag.md) for the
+> full `ObservationId` derivation.
+
+---
+
+## 4. Simplified Overview Flowchart
+
+The following flowchart shows the overall shape of both execution paths
+as a decision graph.
 
 ```mermaid
 %% Diagram: simplified-scan-overview-flowchart
 graph TD
-    A["Create Run"]
-    B["Assign Shard<br/>to Worker"]
-    C["Enumerate Page"]
-    D["Derive OvidHash"]
-    E{"Check<br/>Done-Ledger"}
-    F["Skip Item"]
-    G["Scan & Detect"]
-    H["Derive FindingId"]
-    I["Accumulate in<br/>FindingsUpsertBatch"]
-    J{"More Items<br/>in Page?"}
-    K["Seal & Commit Page"]
-    L{"More<br/>Pages?"}
-    M["Mark Shard<br/>Complete"]
-    N{"All Shards<br/>Done?"}
-    O["Run Complete"]
-    P["End"]
+    A["CLI: parse args"]
+    B["Distributed: acquire_shard"]
+    C{"Shard<br/>done?"}
+    D["build Assignment"]
+    E["driver_for_assignment<br/>(select factory by ConnectorKind)"]
+    F["runtime_engine<br/>(build/cache Engine)"]
+    G["driver.run<br/>(owns scan lifecycle)"]
+    H["ScanReport"]
+    I["complete_shard +<br/>mark_shard_done"]
+    J{"More<br/>shards?"}
+    K["Done"]
 
-    A --> B
+    A --> D
     B --> C
-    C --> D
+    C -- "Yes" --> J
+    C -- "No" --> D
     D --> E
-    E -- "Done" --> F
-    E -- "Not done" --> G
-    F --> J
+    E --> F
+    F --> G
     G --> H
-    H --> I
+    H -->|CLI| K
+    H -->|Distributed| I
     I --> J
-    J -- "Yes" --> D
+    J -- "Yes" --> B
     J -- "No" --> K
-    K --> L
-    L -- "Yes" --> C
-    L -- "No" --> M
-    M --> N
-    N -- "Yes" --> O
-    N -- "No" --> B
-    O --> P
 
-    style A fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style A fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
     style B fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style C fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style D fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
-    style E fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
+    style C fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style D fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style E fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
     style F fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style G fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style H fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF
-    style I fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style J fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style K fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
-    style L fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
-    style M fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style N fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style O fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style P fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style G fill:#EF4444,stroke:#991B1B,stroke-width:2px,color:#FFFFFF
+    style H fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
+    style I fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style J fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
+    style K fill:#F3F4F6,stroke:#374151,stroke-width:2px,color:#374151
 ```
 
-**Interpreting the colors.** The flow begins and ends in green (Coordination),
-passes through red (Connector) for enumeration, purple (Persistence) for
-OvidHash derivation and the done-ledger check, blue (Identity) for finding
-identity derivation, and purple again for the receipt-chained commit. Gray
-nodes represent Worker-local computation. The visual pattern makes clear that
-every page cycle touches all five boundaries—this is not a layered architecture
-with clean horizontal separation, but a pipeline where boundaries interleave at
-every step.
-
----
-
-## 3. Receipt-Chained Commit Boundary
-
-Step 9—seal and commit—is the correctness linchpin of the entire scan pipeline.
-This diagram zooms into the commit boundary to show exactly what must
-succeed in order and what happens when any sub-operation fails.
-
-The receipt-chained commit writes three things in strict typestate-enforced
-order: findings to the findings sink, entries to the done-ledger, and the
-advanced cursor to the coordinator. Each stage must produce a durability receipt
-before the next stage can proceed. The `PageCommit<S>` typestate machine
-(AwaitingFindings → FindingsDurable → ItemDurable → CheckpointDurable) enforces
-this ordering at compile time. If any stage fails, the cursor is not advanced,
-so the page will be re-processed on retry.
-
-```mermaid
-%% Diagram: receipt-chained-commit-boundary
-graph LR
-    INPUT["PageCommit&lt;AwaitingFindings&gt;<br/>━━━━━━━━━━━━━━<br/>findings[]<br/>done_records[]<br/>new_cursor"]
-
-    subgraph TX ["ORDERED — Receipt-Chained Durability"]
-        direction TB
-        S1["1. Write findings<br/>to FindingsSink"]
-        S2["2. Write done-ledger<br/>entries"]
-        S3["3. Advance cursor<br/>in Coordinator"]
-        S1 --> S2 --> S3
-    end
-
-    OUTPUT["PageCommit&lt;CheckpointDurable&gt;<br/>━━━━━━━━━━━━━━<br/>cursor advanced<br/>findings persisted<br/>items marked done"]
-
-    INPUT --> TX
-    TX --> OUTPUT
-
-    F1["RETRY — cursor unadvanced<br/>Findings written,<br/>done-ledger fails"]
-    F2["RETRY — cursor unadvanced<br/>Done-ledger written,<br/>cursor checkpoint fails"]
-    F3["RETRY — cursor unadvanced<br/>Write failures<br/>at any stage"]
-
-    S1 -.->|"failure"| F1
-    S2 -.->|"failure"| F2
-    S3 -.->|"failure"| F3
-
-    style INPUT fill:#FFF7ED,stroke:#9A3412,stroke-width:2px,color:#9A3412
-    style OUTPUT fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style TX fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style S1 fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
-    style S2 fill:#EDE9FE,stroke:#5B21B6,stroke-width:2px,color:#5B21B6
-    style S3 fill:#DCFCE7,stroke:#166534,stroke-width:2px,color:#166534
-    style F1 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style F2 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-    style F3 fill:#FEE2E2,stroke:#991B1B,stroke-width:2px,color:#991B1B
-```
-
-**Why ordering matters.** Consider the three failure scenarios shown as dashed
-paths:
-
-1. **Findings written, done-ledger fails.** On retry, the worker re-scans the
-   item because the done-ledger says it has not been processed. The findings
-   sink now contains duplicates. Depending on deduplication guarantees
-   downstream, this may produce inflated counts or duplicate alerts. The
-   typestate prevents the checkpoint from advancing in this case.
-
-2. **Done-ledger written, cursor fails.** Findings **are** already durable
-   (the `FindingsDurable` receipt was obtained before `ItemDurable` was
-   issued). On retry the done-ledger check correctly skips the
-   already-processed item, so the only cost is redundant enumeration — not a
-   false negative. The typestate eliminates the silent-loss failure mode
-   entirely: `FindingsDurable` must precede `ItemDurable`, making
-   "done-ledger written but findings lost" structurally impossible.
-
-3. **All sub-operations fail.** This is actually the safest failure mode. The
-   cursor has not advanced, the done-ledger has not been updated, and no
-   findings have been written. On retry, the worker re-processes the page from
-   the same cursor position, producing identical results.
-
-The typestate-enforced ordering eliminates the dangerous failure mode: a
-done-ledger write that is not preceded by durable findings. Partial failures
-at any stage (scenarios 1 and 2) leave the cursor unadvanced, so the page is
-re-processed on retry — the worst outcome is duplicate findings, never a false
-negative. The receipt chain proves durability at each stage before the next
-stage proceeds, making out-of-order writes impossible by construction.
-
-**Cursor monotonicity.** The cursor only advances inside the receipt-chained
-commit (the checkpoint is the final stage). This guarantees forward-only
-progress through the shard. A worker can never "skip ahead" past unprocessed
-items, and it can never "fall back" to re-process items that have already been
-committed. Combined with the done-ledger, this creates a two-layer idempotency
-guarantee: the cursor prevents re-enumeration, and the done-ledger prevents
-re-scanning of individual items that might appear in overlapping pages.
-
----
-
-## How the Boundaries Compose
-
-The 12-step flow reveals how the five architectural boundaries are not isolated
-subsystems but tightly choreographed participants in a single pipeline:
-
-- **Coordination (B2)** bookends the flow. It creates the run (step 1), assigns
-  shards (step 2), and determines completion (steps 11-12). It also owns the
-  cursor that tracks progress within each shard. Acquire and renew responses
-  carry a `CapacityHint` (available shard count and earliest lease deadline) so
-  workers can make backoff/retry decisions without additional RPCs.
-
-- **Connector (B4)** provides the raw material. Enumeration (step 3) and content
-  retrieval (step 6) are the only points where the system touches external data
-  sources. The connector abstraction means the scan pipeline is identical
-  regardless of whether the source is GitHub, S3, or a local filesystem.
-  Connectors also derive `StableItemId` and `VersionId` for each `ScanItem`
-  during enumeration, so the worker receives fully-identified items.
-
-- **Identity (B1)** is called at the finding level. NormHash and SecretHash
-  (step 7) identify secrets for deduplication. FindingId, OccurrenceId, and
-  ObservationId (step 7) identify findings for persistence and correlation.
-
-- **Persistence (B5)** owns the durability guarantees. The `OvidHash`
-  derivation (step 4) collapses `(StableItemId, VersionId)` into the
-  done-ledger join key, the done-ledger check (step 5) determines whether an
-  item needs re-scanning, and the receipt-chained commit (step 9) enforces
-  typestate-ordered writes. Every correctness invariant ultimately depends on
-  persistence behaving correctly.
-
-- **The Worker** (cross-cutting) orchestrates the entire flow. It is the only
-  participant that touches all five boundaries, driving the pipeline forward and
-  making local decisions (skip vs. scan, accumulate vs. commit).
-
-**Recovery semantics.** On failure at any point in the pipeline, recovery is
-straightforward: the worker resumes from the last committed cursor position.
-Items before the cursor have been durably committed through the receipt chain
-(findings persisted, done-ledger updated, cursor advanced). Items at or after
-the cursor will be re-processed from scratch. The done-ledger provides an
-additional safety net: even if an item appears in a re-enumerated page, the
-done-ledger check (step 5) will skip it if it was committed in a previous
-page's transaction.
+**Interpreting the colors.** Green nodes belong to the distributed
+coordination layer (`DistributedCoordinator`). Red nodes are scan-driver /
+connector operations. Gray nodes are runtime plumbing. The CLI path skips the
+green nodes entirely — it builds a single assignment and runs it directly.
 
 ---
 
 ## Cross-References
 
-| Diagram                | Related Document                                                                                   |
-| ---------------------- | -------------------------------------------------------------------------------------------------- |
-| Full 12-step sequence  | [ID Derivation DAG](./03-id-derivation-dag.md) — details step 7 finding identity derivation        |
-| Full 12-step sequence  | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) — details steps 2, 11, and 12 |
-| Simplified overview    | [PageCommit Typestate](./08-pagecommit-typestate.md) — details steps 8, 9                          |
-| Receipt-chained commit boundary | [PageCommit Typestate](./08-pagecommit-typestate.md) — the AwaitingFindings-to-CheckpointDurable typestate chain |
+| Diagram                          | Related Document                                                                                   |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Dual entry points                | [Shard and Run State Machines](./05-shard-and-run-state-machines.md) — shard lifecycle              |
+| Driver architecture              | [Connector Architecture](./14-connector-architecture.md) — connector type hierarchy                |
+| Findings identity flow           | [ID Derivation DAG](./03-id-derivation-dag.md) — finding identity derivation chain                 |
+| Simplified overview              | [Lease Lifecycle](./07-lease-lifecycle.md) — distributed lease acquisition and renewal              |
 
 ## Source Code References
 
-| Component                                                              | Path                                          |
-| ---------------------------------------------------------------------- | --------------------------------------------- |
-| Identity derivation (StableItemId, FindingId, NormHash)                | `crates/gossip-contracts/src/identity/`       |
-| OvidHash derivation (done-ledger join key)                             | `crates/gossip-contracts/src/persistence/ovid.rs` |
-| Coordination data types (shard_spec, cursor, pooled, manifest, limits) | `crates/gossip-contracts/src/coordination/`   |
-| Coordination protocol (run creation, shard assignment, completion)     | `crates/gossip-coordination/src/`             |
-| Persistence (done-ledger, findings sink, op-log)                       | `crates/gossip-contracts/src/persistence/`    |
-| Persistence (in-memory backends)                                       | `crates/gossip-persistence-inmemory/`         |
-| Coordination (etcd backend)                                            | `crates/gossip-coordination-etcd/`            |
-| Design specification                                                   | `08-cross-cutting/02-data-flow-end-to-end.md` |
+| Component                                                          | Path                                                |
+| ------------------------------------------------------------------ | --------------------------------------------------- |
+| CLI entry point and dispatch                                       | `crates/scanner-rs-cli/src/main.rs`                 |
+| Runtime core (`execute_assignment_with_config`, `driver_for_assignment`) | `crates/gossip-scanner-runtime/src/lib.rs`  |
+| Distributed worker loop (`run_worker`)                             | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| `DistributedCoordinator` trait                                     | `crates/gossip-scanner-runtime/src/distributed.rs` |
+| `ScanDriver` trait and `Assignment`                                | `crates/gossip-scan-driver/src/lib.rs`      |
+| `CommitSink` trait and `NoOpCommitSink`                            | `crates/gossip-scan-driver/src/lib.rs`      |
+| `DurableCommitSink` (identity derivation)                          | `crates/gossip-scanner-runtime/src/commit_sink.rs` |
+| `FsScanDriver` / `GitScanDriver` / `InMemoryScanDriver`           | `crates/gossip-connectors/src/scan_driver.rs`       |
+| `parallel_scan_dir` (filesystem detection backend)                 | `crates/scanner-scheduler/src/scheduler/parallel_scan.rs` |
+| `run_git_scan` (git detection backend)                             | `crates/scanner-git/src/runner.rs`             |
+| `CoordinationEventRecorder` trait                                  | `crates/gossip-scanner-runtime/src/coordination_sink.rs` |
+| `EventOutput` trait                                                | `crates/scanner-scheduler/src/events.rs`      |

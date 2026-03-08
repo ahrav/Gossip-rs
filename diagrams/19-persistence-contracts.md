@@ -157,7 +157,7 @@ graph TB
     end
 
     subgraph layer3 ["Layer 3: Policy-Scoped Observation"]
-        OBS["ObservationRecord<br/>tenant_id: TenantId<br/>policy_hash: PolicyHash<br/>observation_id: ObservationId<br/>occurrence_id: OccurrenceId<br/>run_id: RunId<br/>shard_id: ShardId<br/>fence_epoch: FenceEpoch<br/>observed_at: LogicalTime<br/>location: Option&lt;Location&gt;"]
+        OBS["ObservationRecord<br/>tenant_id: TenantId<br/>policy_hash: PolicyHash<br/>observation_id: ObservationId<br/>occurrence_id: OccurrenceId<br/>run_id: RunId<br/>shard_id: ShardId<br/>fence_epoch: FenceEpoch<br/>seen_at: LogicalTime<br/>location: Option&lt;Location&gt;"]
         OBSID["ObservationId = BLAKE3(<br/>  tenant_id,<br/>  policy_hash,<br/>  occurrence_id<br/>)"]
     end
 
@@ -313,7 +313,7 @@ graph LR
         KEY["key: DoneLedgerKey"]
         STATUS["status: DoneLedgerStatus"]
         BYTES["bytes_scanned: u64"]
-        FC["findings_count: u64"]
+        FC["findings_count: u32"]
         PROV["provenance: DoneLedgerProvenance"]
         EC["error_code: Option&lt;DoneLedgerErrorCode&gt;"]
     end
@@ -502,8 +502,8 @@ graph TB
 
 - [PageCommit Typestate Machine](08-pagecommit-typestate.md) — enforces the
   findings → done-ledger → checkpoint ordering at compile time
-- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) — shows where persistence
-  writes occur in the scan pipeline
+- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) — shows where identity
+  derivation and commit lifecycle occur in the scan pipeline
 - [ID Derivation DAG](03-id-derivation-dag.md) — the full 19-type identity
   hierarchy that persistence record types depend on
 - [Boundary Dependency Graph](02-boundary-dependency-graph.md) — how B5

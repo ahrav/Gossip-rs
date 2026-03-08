@@ -37,7 +37,7 @@ graph TD
     SO[01-system-overview.md<br/>5-boundary architecture<br/>4 diagrams]
     BD[02-boundary-dependency-graph.md<br/>Type-annotated DAG<br/>3 diagrams]
     ID[03-id-derivation-dag.md<br/>19-type identity hierarchy<br/>7 diagrams]
-    E2E[04-end-to-end-scan-flow.md<br/>12-step scan sequence<br/>3 diagrams]
+    E2E[04-end-to-end-scan-flow.md<br/>ScanDriver architecture<br/>4 diagrams]
 
     SM[05-shard-and-run-state-machines.md<br/>Shard + Run state machines<br/>4 diagrams]
     FP[06-fencing-protocol.md<br/>5-check validation<br/>4 diagrams]
@@ -151,7 +151,7 @@ graph TD
 | 01  | `01-system-overview.md`              | 4        | All              | 5-boundary model, crate mapping, scan flow, build DAG                     |
 | 02  | `02-boundary-dependency-graph.md`    | 3        | B1, All          | Type-annotated DAG, tiered compilation, anti-patterns                     |
 | 03  | `03-id-derivation-dag.md`            | 7        | B1               | 19-type hierarchy, item/secret/finding/occurrence/observation chains     |
-| 04  | `04-end-to-end-scan-flow.md`         | 3        | All              | 12-step sequence, receipt-chained commit boundary                         |
+| 04  | `04-end-to-end-scan-flow.md`         | 4        | All              | ScanDriver architecture, dual entry points, findings identity flow        |
 | 05  | `05-shard-and-run-state-machines.md` | 4        | B2               | Shard SM, run SM, splits lifecycle, illegal transitions                   |
 | 06  | `06-fencing-protocol.md`             | 4        | B2               | 5-check validation, zombie resolution, decision tree                      |
 | 07  | `07-lease-lifecycle.md`              | 7        | B2               | Acquisition, renewal timeline, cursor monotonicity, capacity piggybacking |
