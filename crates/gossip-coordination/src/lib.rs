@@ -112,9 +112,12 @@ pub use run_errors::{
 };
 pub use session::WorkerSession;
 pub use split_execution::{
-    DerivedShardKind, SplitReplaceResult, SplitResidualResult, derive_split_shard_id,
-    hash_checkpoint_payload, hash_complete_payload, hash_park_payload, hash_split_replace_payload,
-    hash_split_residual_payload,
+    DerivedShardKind, SplitChildIds, SplitChildOrder, SplitReplaceResult, SplitResidualResult,
+    derive_split_shard_id, find_replayed_residual, hash_checkpoint_payload, hash_complete_payload,
+    hash_park_payload, hash_split_replace_payload, hash_split_residual_payload,
+    split_replace_apply_parent, split_replace_validate_preconditions,
+    split_residual_apply_parent, split_residual_build_record, split_residual_check_replay,
+    split_residual_validate_cursor_bounds, split_residual_validate_preconditions,
 };
 pub use traits::CoordinationBackend;
 pub use validation::{check_op_idempotency, validate_lease};

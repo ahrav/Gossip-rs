@@ -50,20 +50,25 @@
 //! validate protocol preconditions.
 
 use blake3::Hasher;
-use gossip_stdx::InlineVec;
+use gossip_stdx::{ByteSlab, InlineVec};
 
-use crate::record::ParkReason;
-#[cfg(test)]
+use crate::error::{IdempotentOutcome, SplitReplaceError, SplitResidualError};
+use crate::lease::{OpKind, OpLogEntry, OpResult};
+use crate::record::{ParkReason, ShardRecord, ShardStatus};
+use crate::validation::{check_op_idempotency, validate_lease};
 use gossip_contracts::coordination::cursor::CursorUpdate;
-#[cfg(test)]
-use gossip_contracts::coordination::shard_spec::ShardSpec;
-#[cfg(test)]
-use gossip_contracts::coordination::split::{
-    SplitReplaceChild, plan_split_replace_at_points_initial_cursor,
+use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
+use gossip_contracts::coordination::shard_spec::{
+    ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
+    validate_split_coverage_bounds,
 };
-use gossip_contracts::coordination::split::{SplitReplacePlan, SplitResidualPlan};
+use gossip_contracts::coordination::split::{SplitReplaceChild, SplitReplacePlan, SplitResidualPlan};
+#[cfg(test)]
+use gossip_contracts::coordination::split::plan_split_replace_at_points_initial_cursor;
 use gossip_contracts::identity::hashing::{OP_PAYLOAD_HASHER, SPLIT_ID_HASHER};
-use gossip_contracts::identity::{CanonicalBytes, OpId, RunId, ShardId, finalize_64};
+use gossip_contracts::identity::{CanonicalBytes, LogicalTime, OpId, RunId, ShardId, TenantId, finalize_64};
+
+use crate::lease::Lease;
 
 // ============================================================================
 // Constants
@@ -314,6 +319,358 @@ pub fn hash_split_residual_payload(plan: &SplitResidualPlan<'_>) -> u64 {
     op_payload_hash(b"split_residual", |h| {
         plan.write_canonical(h);
     })
+}
+
+// ============================================================================
+// Shared split execution helpers
+// ============================================================================
+//
+// These functions are the canonical implementations of split precondition
+// validation, parent mutation, replay detection, and child-record
+// construction. Both the in-memory reference backend and the etcd
+// persistence backend delegate to these shared helpers, eliminating
+// duplication and preventing behavioral drift.
+//
+// Functions are free-standing (no `self`) because they operate on borrowed
+// `ShardRecord` / `ByteSlab` pairs and need no backend-specific state.
+
+/// Fixed-capacity child-id buffer used by split-replace helpers.
+pub type SplitChildIds = InlineVec<ShardId, { MAX_SPLIT_CHILDREN }>;
+
+const _: () = assert!(MAX_SPLIT_CHILDREN <= u16::MAX as usize);
+
+/// Fixed-capacity sorted index mapping for a split-replace plan's children.
+///
+/// Split plans preserve caller order for canonical payload hashing, but
+/// coverage validation and deterministic child-ID derivation require
+/// children sorted by `key_range_start`. This type maintains an index
+/// mapping from sorted position to original plan position, letting the
+/// backend validate and execute in sorted order without reordering the
+/// stored plan or allocating a separate sorted copy of the children.
+#[derive(Clone, Copy)]
+pub struct SplitChildOrder {
+    len: usize,
+    indices: [u16; MAX_SPLIT_CHILDREN],
+}
+
+impl SplitChildOrder {
+    /// Build a start-sorted index mapping for `plan`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the plan has fewer than 2 children. `SplitReplacePlan::try_new`
+    /// enforces this at construction time; this assertion catches accidental
+    /// bypass of constructor invariants.
+    pub fn from_plan(plan: &SplitReplacePlan<'_>) -> Self {
+        let len = plan.children().len();
+        let mut indices = [0u16; MAX_SPLIT_CHILDREN];
+        for (i, slot) in indices.iter_mut().take(len).enumerate() {
+            *slot = u16::try_from(i).expect("split child index exceeds u16");
+        }
+        indices[..len].sort_by(|a, b| {
+            plan.children()[usize::from(*a)]
+                .spec()
+                .key_range_start()
+                .cmp(plan.children()[usize::from(*b)].spec().key_range_start())
+        });
+        assert!(len >= 2, "split_replace requires >= 2 children");
+        Self { len, indices }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn child<'a>(
+        &self,
+        plan: &'a SplitReplacePlan<'a>,
+        sorted_idx: usize,
+    ) -> &'a SplitReplaceChild<'a> {
+        &plan.children()[usize::from(self.indices[sorted_idx])]
+    }
+}
+
+/// Validate split-replace preconditions: coverage continuity and spawn-cap.
+///
+/// Sorts children by `key_range_start`, validates that they form a
+/// contiguous partition of the parent's key range (including per-child
+/// spec size limits), and checks spawn-cap headroom. Returns the sorted
+/// child-order index on success for deterministic child-ID derivation.
+///
+/// Does **not** check backend-specific limits (e.g. etcd transaction-op
+/// caps). Backends with additional constraints should check those before
+/// calling this function.
+pub fn split_replace_validate_preconditions<'a>(
+    parent: &ShardRecord,
+    plan: &'a SplitReplacePlan<'a>,
+    slab: &ByteSlab,
+) -> Result<SplitChildOrder, SplitReplaceError> {
+    let sorted = SplitChildOrder::from_plan(plan);
+
+    let specs: Vec<ShardSpecRef<'_>> = plan.children().iter().map(|c| c.spec()).collect();
+    validate_split_coverage_bounds(
+        parent.spec.key_range_start(slab),
+        parent.spec.key_range_end(slab),
+        &specs,
+    )
+    .map_err(SplitReplaceError::SplitInvalid)?;
+
+    if !parent.can_spawn(sorted.len()) {
+        return Err(SplitReplaceError::SplitInvalid(
+            SplitValidationError::SpawnLimitExceeded {
+                current: parent.spawned.len(),
+                additional: sorted.len(),
+                max: MAX_SPAWNED_PER_SHARD,
+            },
+        ));
+    }
+
+    Ok(sorted)
+}
+
+/// Apply the parent-side mutation for `split_replace`.
+///
+/// The parent records the newly spawned children, transitions to terminal
+/// `Split` status, clears its lease, and logs the completed op.
+pub fn split_replace_apply_parent(
+    parent: &mut ShardRecord,
+    child_ids: &[ShardId],
+    op_id: OpId,
+    payload_hash: u64,
+    now: LogicalTime,
+    slab: &mut ByteSlab,
+) -> Result<(), SplitReplaceError> {
+    assert!(!child_ids.is_empty(), "split_replace requires children");
+    debug_assert!(parent.can_spawn(child_ids.len()));
+
+    let (spawned_slot, spawned_len) = parent.spawned.allocate_appended_slot(child_ids, slab)?;
+    parent.assert_transition_legal(ShardStatus::Split);
+    parent.spawned.install_slot(spawned_slot, spawned_len, slab);
+    parent.status = ShardStatus::Split;
+    parent.lease = None;
+    parent.op_log_push(OpLogEntry::new(
+        op_id,
+        OpKind::SplitReplace,
+        OpResult::Completed,
+        payload_hash,
+        now,
+    ));
+    parent.assert_invariants(slab);
+    Ok(())
+}
+
+/// Find a residual shard created by `split_residual(op_id)` in the parent's
+/// permanent spawned lineage list.
+///
+/// `spawned` is append-only: each derived split ID is pushed at the same
+/// index used in its derivation. This lets us probe replay candidates in a
+/// single pass without building a temporary set: for each current index `i`,
+/// derive `Residual(op_id, i)` and compare against `spawned[i]`.
+///
+/// Returns `None` if no match, meaning this is genuinely a new operation.
+pub fn find_replayed_residual(
+    parent: &ShardRecord,
+    op_id: OpId,
+    slab: &ByteSlab,
+) -> Option<ShardId> {
+    assert!(
+        parent.spawned.len() <= MAX_SPAWNED_PER_SHARD,
+        "spawned count {} exceeds bound {}",
+        parent.spawned.len(),
+        MAX_SPAWNED_PER_SHARD,
+    );
+    for (idx, spawned_id) in parent.spawned.iter(slab).enumerate() {
+        let derived = derive_split_shard_id(
+            parent.run,
+            parent.shard,
+            op_id,
+            DerivedShardKind::Residual,
+            idx as u32,
+        );
+        if spawned_id == derived {
+            return Some(derived);
+        }
+    }
+    None
+}
+
+/// Two-tier replay detection for `split_residual`.
+///
+/// Unlike `split_replace` (which makes the parent terminal, freezing its
+/// op-log), `split_residual` keeps the parent `Active`. Subsequent
+/// checkpoints can evict the split_residual op-log entry. To handle this:
+///
+/// 1. **Op-log check** (primary): if the entry is still present and the
+///    payload hash matches, return `Replayed`. If the hash differs, return
+///    `OpIdConflict`.
+/// 2. **Spawned probe** (fallback): if the op-log entry was evicted,
+///    scan `parent.spawned` for a residual derived from this `op_id`. The
+///    `spawned` list is permanent (never evicted, bounded by
+///    `MAX_SPAWNED_PER_SHARD`).
+///
+/// The spawned check comes *after* the op-log check so that `OpIdConflict`
+/// (same op_id, different payload) is not masked.
+pub fn split_residual_check_replay(
+    parent: &ShardRecord,
+    op_id: OpId,
+    payload_hash: u64,
+    slab: &ByteSlab,
+) -> Result<Option<IdempotentOutcome<SplitResidualResult>>, SplitResidualError> {
+    if check_op_idempotency(parent, op_id, payload_hash)?.is_some() {
+        let residual = find_replayed_residual(parent, op_id, slab).expect(
+            "split_residual replay hit in op-log without matching spawned residual; \
+             state corruption",
+        );
+        return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
+            residual,
+        })));
+    }
+
+    if let Some(residual) = find_replayed_residual(parent, op_id, slab) {
+        return Ok(Some(IdempotentOutcome::Replayed(SplitResidualResult {
+            residual,
+        })));
+    }
+
+    Ok(None)
+}
+
+/// Validate all preconditions for a fresh `split_residual` execution.
+///
+/// Checks, in order: lease validity (tenant, fence, expiry), per-spec
+/// size limits, split coverage (new parent + residual must partition old
+/// parent's range), cursor bounds (parent's cursor must remain within
+/// the shrunk range), and spawn-cap headroom.
+pub fn split_residual_validate_preconditions(
+    now: LogicalTime,
+    tenant: TenantId,
+    lease: &Lease,
+    parent: &ShardRecord,
+    plan: &SplitResidualPlan<'_>,
+    slab: &ByteSlab,
+) -> Result<(), SplitResidualError> {
+    validate_lease(now, tenant, lease, parent)?;
+
+    if ShardSpec::validate_ref(plan.parent_new_spec()).is_err() {
+        return Err(SplitResidualError::SplitInvalid(
+            SplitValidationError::InvalidChildSpec { child_index: 0 },
+        ));
+    }
+    if ShardSpec::validate_ref(plan.residual_spec()).is_err() {
+        return Err(SplitResidualError::SplitInvalid(
+            SplitValidationError::InvalidChildSpec { child_index: 1 },
+        ));
+    }
+
+    validate_residual_split_bounds(
+        parent.spec.key_range_start(slab),
+        parent.spec.key_range_end(slab),
+        plan.parent_new_spec(),
+        plan.residual_spec(),
+    )
+    .map_err(SplitResidualError::SplitInvalid)?;
+
+    split_residual_validate_cursor_bounds(parent, plan.parent_new_spec(), slab)?;
+
+    if !parent.can_spawn(1) {
+        return Err(SplitResidualError::SplitInvalid(
+            SplitValidationError::SpawnLimitExceeded {
+                current: parent.spawned.len(),
+                additional: 1,
+                max: MAX_SPAWNED_PER_SHARD,
+            },
+        ));
+    }
+
+    Ok(())
+}
+
+/// Ensure the parent's existing cursor stays inside its proposed new range.
+///
+/// After a residual split, the parent keeps a subset of the original
+/// keyspace. If the cursor's `last_key` falls outside the new range,
+/// the parent would violate cursor-bounds invariants.
+pub fn split_residual_validate_cursor_bounds(
+    parent: &ShardRecord,
+    new_parent_spec: ShardSpecRef<'_>,
+    slab: &ByteSlab,
+) -> Result<(), SplitResidualError> {
+    if let Some(last_key) = parent.cursor.last_key(slab)
+        && !new_parent_spec.contains_key(last_key)
+    {
+        return Err(SplitResidualError::SplitInvalid(
+            SplitValidationError::ParentCursorOutOfBounds {
+                cursor: last_key.len(),
+                new_parent_start: new_parent_spec.key_range_start().len(),
+                new_parent_end: new_parent_spec.key_range_end().len(),
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// Build the residual shard record for a fresh `split_residual`.
+///
+/// The residual starts with an initial cursor (no work done yet) and
+/// inherits `cursor_semantics` from the parent (a run-level property).
+pub fn split_residual_build_record(
+    parent: &ShardRecord,
+    tenant: TenantId,
+    residual_id: ShardId,
+    plan: &SplitResidualPlan<'_>,
+    slab: &mut ByteSlab,
+) -> Result<ShardRecord, SplitResidualError> {
+    ShardRecord::new_split_child(
+        tenant,
+        parent.run,
+        residual_id,
+        plan.residual_spec(),
+        CursorUpdate::initial(),
+        parent.cursor_semantics,
+        parent.shard,
+        slab,
+    )
+    .map_err(SplitResidualError::from)
+}
+
+/// Apply the parent-side mutation for `split_residual`.
+///
+/// The parent keeps its lease and active status, but records the new
+/// residual in `spawned`, shrinks its spec, and logs the completed op.
+/// If spec replacement fails after the spawned extension is staged, the
+/// staged slot is explicitly deallocated before returning.
+pub fn split_residual_apply_parent(
+    parent: &mut ShardRecord,
+    residual_id: ShardId,
+    new_parent_spec: ShardSpecRef<'_>,
+    op_id: OpId,
+    payload_hash: u64,
+    now: LogicalTime,
+    slab: &mut ByteSlab,
+) -> Result<(), SplitResidualError> {
+    debug_assert!(parent.can_spawn(1));
+
+    let (spawned_slot, spawned_len) = parent
+        .spawned
+        .allocate_appended_slot(core::slice::from_ref(&residual_id), slab)?;
+    if let Err(err) = parent.spec.update_from_ref(new_parent_spec, slab) {
+        slab.deallocate(spawned_slot);
+        return Err(SplitResidualError::from(err));
+    }
+
+    parent.spawned.install_slot(spawned_slot, spawned_len, slab);
+    parent.op_log_push(OpLogEntry::new(
+        op_id,
+        OpKind::SplitResidual,
+        OpResult::Completed,
+        payload_hash,
+        now,
+    ));
+    parent.assert_invariants(slab);
+    Ok(())
 }
 
 // ============================================================================
