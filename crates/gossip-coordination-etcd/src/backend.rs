@@ -578,6 +578,33 @@ fn visible_now(persisted: &PersistedShard, now: LogicalTime) -> LogicalTime {
     }
 }
 
+// -- Error mapping --
+
+/// Map an [`EtcdCoordinatorError`] to the appropriate [`InfraError`]
+/// variant, preserving the corruption vs. transient distinction.
+///
+/// - `Codec` (decode/encode/invariant failures) → `InfraError::corruption`
+/// - `Etcd` (gRPC transport failures) → `InfraError::transient`
+/// - `Config` / `Keyspace` / `RuntimeBuild` → `InfraError::corruption`
+///   (these are construction-time errors that should never appear at
+///   runtime, but if they do, they are not retryable)
+fn map_etcd_err(
+    operation: &'static str,
+    err: EtcdCoordinatorError,
+) -> gossip_coordination::InfraError {
+    match &err {
+        EtcdCoordinatorError::Codec { .. }
+        | EtcdCoordinatorError::Config(_)
+        | EtcdCoordinatorError::Keyspace(_)
+        | EtcdCoordinatorError::RuntimeBuild(_) => {
+            gossip_coordination::InfraError::corruption(operation, err)
+        }
+        EtcdCoordinatorError::Etcd { .. } => {
+            gossip_coordination::InfraError::transient(operation, err)
+        }
+    }
+}
+
 // -- CAS guard helpers --
 
 /// CAS guard: shard record key has not been modified since `mod_revision`.

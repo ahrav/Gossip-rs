@@ -54,7 +54,7 @@ impl RunManagement for EtcdCoordinator {
         let response = match self.etcd_txn(txn) {
             Ok(r) => r,
             Err(err) => {
-                return Err(CreateRunError::BackendError(InfraError::transient(
+                return Err(CreateRunError::BackendError(super::map_etcd_err(
                     "create_run.txn",
                     err,
                 )));
@@ -104,7 +104,7 @@ impl RunManagement for EtcdCoordinator {
                     Ok(Some(run_record)) => run_record,
                     Ok(None) => return Err(RegisterShardsError::RunNotFound),
                     Err(err) => {
-                        return Err(RegisterShardsError::BackendError(InfraError::transient(
+                        return Err(RegisterShardsError::BackendError(super::map_etcd_err(
                             "register_shards.load_run",
                             err,
                         )));
@@ -153,7 +153,7 @@ impl RunManagement for EtcdCoordinator {
                 let cursor_semantics = run_record.config.cursor_semantics();
                 let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
                 let counts = this.current_shard_counts(tenant).map_err(|err| {
-                    RegisterShardsError::BackendError(InfraError::transient(
+                    RegisterShardsError::BackendError(super::map_etcd_err(
                         "register_shards.count_shards",
                         err,
                     ))
@@ -224,7 +224,7 @@ impl RunManagement for EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(RegisterShardsError::BackendError(InfraError::transient(
+                        return Err(RegisterShardsError::BackendError(super::map_etcd_err(
                             "register_shards.txn",
                             err,
                         )));
@@ -281,7 +281,7 @@ impl RunManagement for EtcdCoordinator {
                 }
             }
             Ok(None) => Err(GetRunError::RunNotFound),
-            Err(err) => Err(GetRunError::BackendError(InfraError::transient(
+            Err(err) => Err(GetRunError::BackendError(super::map_etcd_err(
                 "get_run.load",
                 err,
             ))),
@@ -301,7 +301,7 @@ impl RunManagement for EtcdCoordinator {
     ) -> Result<RunProgress, GetRunError> {
         let _ = self.get_run(tenant, run)?;
         let shards = self.scan_run_shards(tenant, run).map_err(|err| {
-            GetRunError::BackendError(InfraError::transient("get_run_progress.scan", err))
+            GetRunError::BackendError(super::map_etcd_err("get_run_progress.scan", err))
         })?;
 
         let mut progress = RunProgress::default();
@@ -331,7 +331,7 @@ impl RunManagement for EtcdCoordinator {
     ) -> Result<(), GetRunError> {
         let _ = self.get_run(tenant, run)?;
         let shards = self.scan_run_shards(tenant, run).map_err(|err| {
-            GetRunError::BackendError(InfraError::transient("list_shards_into.scan", err))
+            GetRunError::BackendError(super::map_etcd_err("list_shards_into.scan", err))
         })?;
 
         out.clear();
@@ -393,7 +393,7 @@ impl RunManagement for EtcdCoordinator {
                 Some(GetOptions::new().with_prefix().with_keys_only()),
             )
             .map_err(|err| {
-                GetRunError::BackendError(InfraError::transient(
+                GetRunError::BackendError(super::map_etcd_err(
                     "collect_claim_candidates.active_scan",
                     err,
                 ))
@@ -419,7 +419,7 @@ impl RunManagement for EtcdCoordinator {
                 Some(GetOptions::new().with_prefix().with_keys_only()),
             )
             .map_err(|err| {
-                GetRunError::BackendError(InfraError::transient(
+                GetRunError::BackendError(super::map_etcd_err(
                     "collect_claim_candidates.keys_scan",
                     err,
                 ))
@@ -511,7 +511,7 @@ impl RunManagement for EtcdCoordinator {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(UnparkError::ShardNotFound),
                     Err(err) => {
-                        return Err(UnparkError::BackendError(InfraError::transient(
+                        return Err(UnparkError::BackendError(super::map_etcd_err(
                             "unpark.load_shard",
                             err,
                         )));
@@ -531,7 +531,7 @@ impl RunManagement for EtcdCoordinator {
                         )));
                     }
                     Err(err) => {
-                        return Err(UnparkError::BackendError(InfraError::transient(
+                        return Err(UnparkError::BackendError(super::map_etcd_err(
                             "unpark.load_run",
                             err,
                         )));
@@ -615,7 +615,7 @@ impl RunManagement for EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(UnparkError::BackendError(InfraError::transient(
+                        return Err(UnparkError::BackendError(super::map_etcd_err(
                             "unpark.txn",
                             err,
                         )));
@@ -631,7 +631,7 @@ impl RunManagement for EtcdCoordinator {
                     Ok(Some(s)) => s,
                     Ok(None) => return Err(UnparkError::ShardNotFound),
                     Err(err) => {
-                        return Err(UnparkError::BackendError(InfraError::transient(
+                        return Err(UnparkError::BackendError(super::map_etcd_err(
                             "unpark.exhaust.load_shard",
                             err,
                         )));
@@ -649,7 +649,7 @@ impl RunManagement for EtcdCoordinator {
                         )));
                     }
                     Err(err) => {
-                        return Err(UnparkError::BackendError(InfraError::transient(
+                        return Err(UnparkError::BackendError(super::map_etcd_err(
                             "unpark.exhaust.load_run",
                             err,
                         )));
@@ -749,7 +749,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
         let response = match self.etcd_txn(txn).await {
             Ok(r) => r,
             Err(e) => {
-                return Err(CreateRunError::BackendError(InfraError::transient(
+                return Err(CreateRunError::BackendError(super::map_etcd_err(
                     "create_run.txn",
                     e,
                 )));
@@ -780,7 +780,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                 Ok(Some(r)) => r,
                 Ok(None) => return Err(RegisterShardsError::RunNotFound),
                 Err(e) => {
-                    return Err(RegisterShardsError::BackendError(InfraError::transient(
+                    return Err(RegisterShardsError::BackendError(super::map_etcd_err(
                         "register_shards.load_run",
                         e,
                     )));
@@ -821,7 +821,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             let cursor_semantics = run_record.config.cursor_semantics();
             let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
             let counts = self.current_shard_counts(tenant).await.map_err(|e| {
-                RegisterShardsError::BackendError(InfraError::transient(
+                RegisterShardsError::BackendError(super::map_etcd_err(
                     "register_shards.count_shards",
                     e,
                 ))
@@ -878,7 +878,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             let response = match self.etcd_txn(txn).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(RegisterShardsError::BackendError(InfraError::transient(
+                    return Err(RegisterShardsError::BackendError(super::map_etcd_err(
                         "register_shards.txn",
                         e,
                     )));
@@ -925,7 +925,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                 }
             }
             Ok(None) => Err(GetRunError::RunNotFound),
-            Err(e) => Err(GetRunError::BackendError(InfraError::transient(
+            Err(e) => Err(GetRunError::BackendError(super::map_etcd_err(
                 "get_run.load",
                 e,
             ))),
@@ -940,7 +940,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
     ) -> Result<RunProgress, GetRunError> {
         let _ = self.get_run(tenant, run).await?;
         let shards = self.scan_run_shards(tenant, run).await.map_err(|e| {
-            GetRunError::BackendError(InfraError::transient("get_run_progress.scan", e))
+            GetRunError::BackendError(super::map_etcd_err("get_run_progress.scan", e))
         })?;
         let mut progress = RunProgress::default();
         for p in &shards {
@@ -963,7 +963,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
     ) -> Result<(), GetRunError> {
         let _ = self.get_run(tenant, run).await?;
         let shards = self.scan_run_shards(tenant, run).await.map_err(|e| {
-            GetRunError::BackendError(InfraError::transient("list_shards_into.scan", e))
+            GetRunError::BackendError(super::map_etcd_err("list_shards_into.scan", e))
         })?;
         out.clear();
         for p in &shards {
@@ -998,7 +998,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             )
             .await
             .map_err(|e| {
-                GetRunError::BackendError(InfraError::transient(
+                GetRunError::BackendError(super::map_etcd_err(
                     "collect_claim_candidates.active_scan",
                     e,
                 ))
@@ -1020,7 +1020,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
             )
             .await
             .map_err(|e| {
-                GetRunError::BackendError(InfraError::transient(
+                GetRunError::BackendError(super::map_etcd_err(
                     "collect_claim_candidates.keys_scan",
                     e,
                 ))
@@ -1089,7 +1089,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                         Ok(Some(s)) => s,
                         Ok(None) => return Err(UnparkError::ShardNotFound),
                         Err(e) => {
-                            return Err(UnparkError::BackendError(InfraError::transient(
+                            return Err(UnparkError::BackendError(super::map_etcd_err(
                                 "unpark.load_shard",
                                 e,
                             )));
@@ -1107,7 +1107,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                             )));
                         }
                         Err(e) => {
-                            return Err(UnparkError::BackendError(InfraError::transient(
+                            return Err(UnparkError::BackendError(super::map_etcd_err(
                                 "unpark.load_run",
                                 e,
                             )));
@@ -1183,7 +1183,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                     let response = match this.etcd_txn(txn).await {
                         Ok(r) => r,
                         Err(e) => {
-                            return Err(UnparkError::BackendError(InfraError::transient(
+                            return Err(UnparkError::BackendError(super::map_etcd_err(
                                 "unpark.txn",
                                 e,
                             )));
@@ -1201,7 +1201,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                         Ok(Some(s)) => s,
                         Ok(None) => return Err(UnparkError::ShardNotFound),
                         Err(e) => {
-                            return Err(UnparkError::BackendError(InfraError::transient(
+                            return Err(UnparkError::BackendError(super::map_etcd_err(
                                 "unpark.exhaust.load_shard",
                                 e,
                             )));
@@ -1219,7 +1219,7 @@ impl AsyncRunManagement for AsyncEtcdCoordinator {
                             )));
                         }
                         Err(e) => {
-                            return Err(UnparkError::BackendError(InfraError::transient(
+                            return Err(UnparkError::BackendError(super::map_etcd_err(
                                 "unpark.exhaust.load_run",
                                 e,
                             )));

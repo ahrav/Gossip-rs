@@ -106,7 +106,7 @@ The module provides seven core capabilities:
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
 | `backend.rs`      | Module root for the `backend/` directory; shared free functions (key comparison, CAS delay, shard capacity counting) |
-| `backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper with owned Tokio runtime) and `AsyncEtcdCoordinator` (async core): shared low-level etcd RPC wrappers, CAS retry logic, and data-access helpers (load/scan run and shard records) |
+| `backend/coordinator.rs` | `EtcdCoordinator` (sync wrapper with owned Tokio runtime) and `AsyncEtcdCoordinator` (async core): shared low-level etcd RPC wrappers, CAS retry logic, data-access helpers (load/scan run and shard records), and inherent methods (`list_active_runs_into`, `gc_stale_initializing_runs_into`) |
 | `backend/run_management.rs` | `RunManagement` and `AsyncRunManagement` impl: create/register/terminate runs, unpark shards, claim candidates |
 | `backend/shard_coordination.rs` | `CoordinationBackend` and `AsyncCoordinationBackend` impl: acquire/renew/checkpoint/split operations |
 | `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
@@ -115,7 +115,6 @@ The module provides seven core capabilities:
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |
-| `backend/test_support.rs` | Feature-gated seeding, inspection, snapshot, and deterministic split fault-injection helpers for etcd integration tests |
 | `tests.rs`        | Config validation, keyspace path invariants (proptest), and ignored etcd integration tests covering acquire/checkpoint/renew/split lifecycle, unpark, collision/limit paths, fault-injected split atomicity, lease expiry, and contention |
 
 ---

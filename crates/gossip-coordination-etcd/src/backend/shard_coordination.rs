@@ -61,7 +61,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(AcquireError::ShardNotFound { shard: key }),
                     Err(err) => {
-                        return Err(AcquireError::BackendError(InfraError::transient(
+                        return Err(AcquireError::BackendError(super::map_etcd_err(
                             "acquire.load_shard",
                             err,
                         )));
@@ -98,7 +98,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let grant = match this.etcd_lease_grant(this.config.owner_lease_ttl_secs()) {
                     Ok(g) => g,
                     Err(err) => {
-                        return Err(AcquireError::BackendError(InfraError::transient(
+                        return Err(AcquireError::BackendError(super::map_etcd_err(
                             "acquire.lease_grant",
                             err,
                         )));
@@ -155,7 +155,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     Ok(r) => r,
                     Err(err) => {
                         this.best_effort_revoke_lease(new_lease_id);
-                        return Err(AcquireError::BackendError(InfraError::transient(
+                        return Err(AcquireError::BackendError(super::map_etcd_err(
                             "acquire.txn",
                             err,
                         )));
@@ -273,7 +273,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(RenewError::ShardNotFound { shard: key }),
                     Err(err) => {
-                        return Err(RenewError::BackendError(InfraError::transient(
+                        return Err(RenewError::BackendError(super::map_etcd_err(
                             "renew.load_shard",
                             err,
                         )));
@@ -337,7 +337,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(RenewError::BackendError(InfraError::transient(
+                        return Err(RenewError::BackendError(super::map_etcd_err(
                             "renew.txn",
                             err,
                         )));
@@ -415,7 +415,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(CheckpointError::ShardNotFound { shard: key }),
                     Err(err) => {
-                        return Err(CheckpointError::BackendError(InfraError::transient(
+                        return Err(CheckpointError::BackendError(super::map_etcd_err(
                             "checkpoint.load_shard",
                             err,
                         )));
@@ -490,7 +490,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(CheckpointError::BackendError(InfraError::transient(
+                        return Err(CheckpointError::BackendError(super::map_etcd_err(
                             "checkpoint.txn",
                             err,
                         )));
@@ -595,7 +595,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(SplitReplaceError::ShardNotFound { shard: key }),
                     Err(err) => {
-                        return Err(SplitReplaceError::BackendError(InfraError::transient(
+                        return Err(SplitReplaceError::BackendError(super::map_etcd_err(
                             "split_replace.load_shard",
                             err,
                         )));
@@ -646,7 +646,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     &persisted.slab,
                 )?;
                 let counts = this.current_shard_counts(tenant).map_err(|err| {
-                    SplitReplaceError::BackendError(InfraError::transient(
+                    SplitReplaceError::BackendError(super::map_etcd_err(
                         "split_replace.count_shards",
                         err,
                     ))
@@ -784,7 +784,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(SplitReplaceError::BackendError(InfraError::transient(
+                        return Err(SplitReplaceError::BackendError(super::map_etcd_err(
                             "split_replace.txn",
                             err,
                         )));
@@ -852,7 +852,7 @@ impl CoordinationBackend for EtcdCoordinator {
                         }
                         Ok(None) => {}
                         Err(err) => {
-                            return Err(SplitReplaceError::BackendError(InfraError::transient(
+                            return Err(SplitReplaceError::BackendError(super::map_etcd_err(
                                 "split_replace.collision_probe",
                                 err,
                             )));
@@ -902,7 +902,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(SplitResidualError::ShardNotFound { shard: key }),
                     Err(err) => {
-                        return Err(SplitResidualError::BackendError(InfraError::transient(
+                        return Err(SplitResidualError::BackendError(super::map_etcd_err(
                             "split_residual.load_shard",
                             err,
                         )));
@@ -935,7 +935,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     &persisted.slab,
                 )?;
                 let counts = this.current_shard_counts(tenant).map_err(|err| {
-                    SplitResidualError::BackendError(InfraError::transient(
+                    SplitResidualError::BackendError(super::map_etcd_err(
                         "split_residual.count_shards",
                         err,
                     ))
@@ -1052,7 +1052,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(SplitResidualError::BackendError(InfraError::transient(
+                        return Err(SplitResidualError::BackendError(super::map_etcd_err(
                             "split_residual.txn",
                             err,
                         )));
@@ -1113,7 +1113,7 @@ impl CoordinationBackend for EtcdCoordinator {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        return Err(SplitResidualError::BackendError(InfraError::transient(
+                        return Err(SplitResidualError::BackendError(super::map_etcd_err(
                             "split_residual.collision_probe",
                             err,
                         )));
@@ -1152,7 +1152,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                             Ok(Some(s)) => s,
                             Ok(None) => return Err(AcquireError::ShardNotFound { shard: key }),
                             Err(e) => {
-                                return Err(AcquireError::BackendError(InfraError::transient(
+                                return Err(AcquireError::BackendError(super::map_etcd_err(
                                     "acquire.load_shard",
                                     e,
                                 )));
@@ -1187,7 +1187,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                         {
                             Ok(g) => g,
                             Err(e) => {
-                                return Err(AcquireError::BackendError(InfraError::transient(
+                                return Err(AcquireError::BackendError(super::map_etcd_err(
                                     "acquire.lease_grant",
                                     e,
                                 )));
@@ -1239,7 +1239,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                             Ok(r) => r,
                             Err(e) => {
                                 this.best_effort_revoke_lease(new_lease_id).await;
-                                return Err(AcquireError::BackendError(InfraError::transient(
+                                return Err(AcquireError::BackendError(super::map_etcd_err(
                                     "acquire.txn",
                                     e,
                                 )));
@@ -1336,7 +1336,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(RenewError::ShardNotFound { shard: key }),
                 Err(e) => {
-                    return Err(RenewError::BackendError(InfraError::transient(
+                    return Err(RenewError::BackendError(super::map_etcd_err(
                         "renew.load_shard",
                         e,
                     )));
@@ -1385,7 +1385,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let response = match self.etcd_txn(txn).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(RenewError::BackendError(InfraError::transient(
+                    return Err(RenewError::BackendError(super::map_etcd_err(
                         "renew.txn",
                         e,
                     )));
@@ -1441,7 +1441,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(CheckpointError::ShardNotFound { shard: key }),
                 Err(e) => {
-                    return Err(CheckpointError::BackendError(InfraError::transient(
+                    return Err(CheckpointError::BackendError(super::map_etcd_err(
                         "checkpoint.load_shard",
                         e,
                     )));
@@ -1506,7 +1506,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let response = match self.etcd_txn(txn).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(CheckpointError::BackendError(InfraError::transient(
+                    return Err(CheckpointError::BackendError(super::map_etcd_err(
                         "checkpoint.txn",
                         e,
                     )));
@@ -1580,7 +1580,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(SplitReplaceError::ShardNotFound { shard: key }),
                 Err(e) => {
-                    return Err(SplitReplaceError::BackendError(InfraError::transient(
+                    return Err(SplitReplaceError::BackendError(super::map_etcd_err(
                         "split_replace.load_shard",
                         e,
                     )));
@@ -1622,7 +1622,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let sorted =
                 split_replace_validate_preconditions(&persisted.record, &plan, &persisted.slab)?;
             let counts = self.current_shard_counts(tenant).await.map_err(|e| {
-                SplitReplaceError::BackendError(InfraError::transient(
+                SplitReplaceError::BackendError(super::map_etcd_err(
                     "split_replace.count_shards",
                     e,
                 ))
@@ -1738,7 +1738,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let response = match self.etcd_txn(txn).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(SplitReplaceError::BackendError(InfraError::transient(
+                    return Err(SplitReplaceError::BackendError(super::map_etcd_err(
                         "split_replace.txn",
                         e,
                     )));
@@ -1796,7 +1796,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    return Err(SplitReplaceError::BackendError(InfraError::transient(
+                    return Err(SplitReplaceError::BackendError(super::map_etcd_err(
                         "split_replace.collision_probe",
                         e,
                     )));
@@ -1824,7 +1824,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(SplitResidualError::ShardNotFound { shard: key }),
                 Err(e) => {
-                    return Err(SplitResidualError::BackendError(InfraError::transient(
+                    return Err(SplitResidualError::BackendError(super::map_etcd_err(
                         "split_residual.load_shard",
                         e,
                     )));
@@ -1856,7 +1856,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 &persisted.slab,
             )?;
             let counts = self.current_shard_counts(tenant).await.map_err(|e| {
-                SplitResidualError::BackendError(InfraError::transient(
+                SplitResidualError::BackendError(super::map_etcd_err(
                     "split_residual.count_shards",
                     e,
                 ))
@@ -1959,7 +1959,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             let response = match self.etcd_txn(txn).await {
                 Ok(r) => r,
                 Err(e) => {
-                    return Err(SplitResidualError::BackendError(InfraError::transient(
+                    return Err(SplitResidualError::BackendError(super::map_etcd_err(
                         "split_residual.txn",
                         e,
                     )));
@@ -2010,7 +2010,7 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
             }
             Ok(None) => {}
             Err(e) => {
-                return Err(SplitResidualError::BackendError(InfraError::transient(
+                return Err(SplitResidualError::BackendError(super::map_etcd_err(
                     "split_residual.collision_probe",
                     e,
                 )));

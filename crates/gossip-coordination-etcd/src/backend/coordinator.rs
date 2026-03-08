@@ -799,7 +799,7 @@ impl EtcdCoordinator {
                     Ok(Some(run_record)) => run_record,
                     Ok(None) => return Err(RunTransitionError::RunNotFound),
                     Err(err) => {
-                        return Err(RunTransitionError::BackendError(InfraError::transient(
+                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
                             "run_terminal.load_run",
                             err,
                         )));
@@ -869,7 +869,7 @@ impl EtcdCoordinator {
                 let response = match this.etcd_txn(txn) {
                     Ok(r) => r,
                     Err(err) => {
-                        return Err(RunTransitionError::BackendError(InfraError::transient(
+                        return Err(RunTransitionError::BackendError(super::map_etcd_err(
                             "run_terminal.txn",
                             err,
                         )));
@@ -1521,7 +1521,7 @@ impl AsyncEtcdCoordinator {
                         Ok(Some(r)) => r,
                         Ok(None) => return Err(RunTransitionError::RunNotFound),
                         Err(err) => {
-                            return Err(RunTransitionError::BackendError(InfraError::transient(
+                            return Err(RunTransitionError::BackendError(super::map_etcd_err(
                                 "run_terminal.load_run",
                                 err,
                             )));
@@ -1590,7 +1590,7 @@ impl AsyncEtcdCoordinator {
                     let response = match this.etcd_txn(txn).await {
                         Ok(r) => r,
                         Err(err) => {
-                            return Err(RunTransitionError::BackendError(InfraError::transient(
+                            return Err(RunTransitionError::BackendError(super::map_etcd_err(
                                 "run_terminal.txn",
                                 err,
                             )));
@@ -1649,6 +1649,10 @@ impl fmt::Debug for AsyncEtcdCoordinator {
         f.debug_struct("AsyncEtcdCoordinator")
             .field("endpoint_count", &self.config.endpoints().len())
             .field("namespace_prefix", &self.keyspace.prefix())
+            .field(
+                "coordination_storage_mode",
+                &"persisted acquire/renew/checkpoint/split/unpark + run lifecycle in etcd",
+            )
             .finish()
     }
 }
