@@ -615,7 +615,7 @@ skipped.
   preamble and zombie worker resolution that underpin Diagrams 1, 3, and 5
 - [Shard and Run State Machines](./05-shard-and-run-state-machines.md) -- the
   state transitions (Active, Done, Split, Parked) referenced throughout
-- [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- the 13-step pipeline
+- [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- the 12-step pipeline
   and atomic commit boundary that define cursor semantics
 - [System Overview](./01-system-overview.md) -- the five architectural
   boundaries (B1-B5) referenced by color coding
