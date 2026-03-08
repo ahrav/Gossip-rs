@@ -69,6 +69,7 @@ use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::limits::{MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN};
 use gossip_contracts::coordination::shard_spec::{
     ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
+    validate_split_coverage_bounds,
 };
 #[cfg(test)]
 use gossip_contracts::test_util::TestSlab;
@@ -273,78 +274,6 @@ impl SplitChildOrder {
     ) -> &'a SplitReplaceChild<'a> {
         &plan.children()[usize::from(self.indices[sorted_idx])]
     }
-}
-
-/// Verify that sorted split-replace children exactly partition the parent.
-///
-/// Checks the same contiguity invariants as
-/// [`validate_split_coverage_bounds`](gossip_contracts::coordination::shard_spec::validate_split_coverage_bounds)
-/// but operates on sorted `SplitChildOrder` indices into the plan rather
-/// than a standalone slice. This keeps validation allocation-free for
-/// pooled parent records and guarantees the same sibling order used for
-/// derived child IDs also satisfies the parent's `[start, end)` continuity
-/// contract.
-fn split_replace_validate_coverage_sorted(
-    parent_start: &[u8],
-    parent_end: &[u8],
-    plan: &SplitReplacePlan<'_>,
-    sorted: &SplitChildOrder,
-) -> Result<(), SplitValidationError> {
-    if sorted.len() == 0 {
-        return Err(SplitValidationError::NoChildren);
-    }
-    if sorted.len() == 1 {
-        return Err(SplitValidationError::SingleChild);
-    }
-
-    let first = sorted.child(plan, 0).spec();
-    if first.key_range_start() != parent_start {
-        return Err(SplitValidationError::StartMismatch {
-            parent_start: parent_start.len(),
-            first_child_start: first.key_range_start().len(),
-        });
-    }
-
-    let last = sorted.child(plan, sorted.len() - 1).spec();
-    if last.key_range_end() != parent_end {
-        return Err(SplitValidationError::EndMismatch {
-            parent_end: parent_end.len(),
-            last_child_end: last.key_range_end().len(),
-        });
-    }
-
-    for sorted_idx in 0..sorted.len() - 1 {
-        let child = sorted.child(plan, sorted_idx).spec();
-        let next = sorted.child(plan, sorted_idx + 1).spec();
-        if child.key_range_end() != next.key_range_start() {
-            return Err(SplitValidationError::BoundaryMismatch {
-                child_index: sorted_idx,
-                next_child_index: sorted_idx + 1,
-                child_end: child.key_range_end().len(),
-                next_child_start: next.key_range_start().len(),
-            });
-        }
-        if child.key_range_end().is_empty() {
-            return Err(SplitValidationError::OverlappingChild {
-                child_index: sorted_idx,
-                next_child_index: sorted_idx + 1,
-            });
-        }
-    }
-
-    for sorted_idx in 0..sorted.len() {
-        let child = sorted.child(plan, sorted_idx).spec();
-        if !child.key_range_start().is_empty()
-            && !child.key_range_end().is_empty()
-            && child.key_range_start() >= child.key_range_end()
-        {
-            return Err(SplitValidationError::InvertedChild {
-                child_index: sorted_idx,
-            });
-        }
-    }
-
-    Ok(())
 }
 
 /// Validate all split-replace preconditions before any etcd writes.
