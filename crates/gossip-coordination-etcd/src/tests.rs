@@ -263,18 +263,42 @@ fn config_rejects_zero_max_children_per_op() {
     ));
 }
 
-/// The per-backend child cap must not exceed the global `MAX_SPLIT_CHILDREN`
-/// constant to prevent generating transactions that exceed etcd op limits.
+/// The per-backend child cap must stay within the etcd `split_replace`
+/// transaction budget. Each child adds 3 transaction entries (1 compare +
+/// 2 ops) to a fixed overhead of 7, so `(128 - 7) / 3 = 40` is the max.
+#[test]
+fn config_rejects_max_children_per_op_above_etcd_txn_budget() {
+    // 40 children should be accepted (boundary value).
+    EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 40)
+        .expect("40 children must be accepted — exactly at the etcd txn budget ceiling");
+
+    // 41 children should be rejected: 7 + 3*41 = 130 > 128.
+    let error =
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 41)
+            .expect_err("41 children must fail — exceeds etcd txn budget");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
+            requested: 41,
+            max: 40,
+        }
+    ));
+}
+
+/// Values above `MAX_SPLIT_CHILDREN` (256) are also rejected, but the
+/// tighter etcd txn budget check (40) fires first. This test verifies
+/// that out-of-range values still produce a clear rejection.
 #[test]
 fn config_rejects_max_children_per_op_above_global_limit() {
     let error =
         EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 8, 257)
             .expect_err("max_children_per_op above MAX_SPLIT_CHILDREN must fail validation");
+    // The etcd txn budget check is stricter (40 < 256), so it fires first.
     assert!(matches!(
         error,
-        EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsGlobalLimit {
+        EtcdCoordinatorConfigError::MaxChildrenPerOpExceedsEtcdTxnBudget {
             requested: 257,
-            global_max: 256,
+            max: 40,
         }
     ));
 }
@@ -2398,5 +2422,93 @@ fn split_replace_rejects_over_cap_max_children_per_op() {
         owner.1,
         acquire.lease.fence(),
         "fence epoch must be unchanged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// shard_limit_violation unit tests (pure, no etcd required)
+// ---------------------------------------------------------------------------
+
+/// The etcd backend counts persisted shards via a prefix scan that includes
+/// the parent being split. After split_replace the parent becomes terminal
+/// (Split status) and N children are created, so the net live-shard delta
+/// is N - 1, not N. Passing `sorted.len()` (= N) as the `additional`
+/// argument to `shard_limit_violation` over-counts by one, causing a false
+/// ShardLimitExceeded rejection when the tenant is at exactly the limit
+/// that should still permit the split.
+#[test]
+fn shard_limit_split_replace_off_by_one_with_parent_in_count() {
+    use crate::backend::{ShardCountSnapshot, shard_limit_violation};
+
+    let num_children: usize = 2;
+
+    // max_per_tenant = 11, persisted count = 10 (including the parent
+    // being split). A 2-way split retires the parent (terminal Split) and
+    // creates 2 children, so the net delta in live shards is +1. Post-split
+    // live count = 10 - 1 + 2 = 11, exactly at the limit. This MUST be
+    // allowed.
+    let max_per_tenant: usize = 11;
+    let max_total: usize = 100;
+    let counts = ShardCountSnapshot {
+        tenant: 10, // includes the parent being split
+        total: 10,
+    };
+
+    // BUG: using num_children (= 2) as `additional` computes
+    // 10 + 2 = 12 > 11, falsely rejecting the split.
+    let buggy = shard_limit_violation(counts, num_children, max_per_tenant, max_total);
+    assert!(
+        buggy.is_some(),
+        "passing raw child count (N) must trigger a false violation, proving the bug"
+    );
+
+    // FIX: using num_children - 1 (= 1) as `additional` computes
+    // 10 + 1 = 11 <= 11, correctly allowing the split.
+    let fixed = shard_limit_violation(
+        counts,
+        num_children.saturating_sub(1),
+        max_per_tenant,
+        max_total,
+    );
+    assert!(
+        fixed.is_none(),
+        "passing N - 1 must allow the split when post-split count equals the limit"
+    );
+}
+
+/// Verify the same off-by-one manifests on the global shard limit path.
+#[test]
+fn shard_limit_split_replace_off_by_one_global_limit() {
+    use crate::backend::{ShardCountSnapshot, shard_limit_violation};
+
+    let num_children: usize = 3;
+    let max_per_tenant: usize = 1000; // high enough to never trigger
+
+    // 49 persisted shards (including the parent). A 3-way split retires
+    // the parent and creates 3 children, net delta = +2. Post-split
+    // live = 49 - 1 + 3 = 51, exactly at the limit. Must be allowed.
+    let max_total: usize = 51;
+    let counts = ShardCountSnapshot {
+        tenant: 49,
+        total: 49, // includes the parent
+    };
+
+    // BUG: 49 + 3 = 52 > 51, falsely rejects.
+    let buggy = shard_limit_violation(counts, num_children, max_per_tenant, max_total);
+    assert!(
+        buggy.is_some(),
+        "raw child count must trigger false global violation"
+    );
+
+    // FIX: 49 + 2 = 51 <= 51, correctly allows.
+    let fixed = shard_limit_violation(
+        counts,
+        num_children.saturating_sub(1),
+        max_per_tenant,
+        max_total,
+    );
+    assert!(
+        fixed.is_none(),
+        "N - 1 must allow the split when post-split global count equals the limit"
     );
 }

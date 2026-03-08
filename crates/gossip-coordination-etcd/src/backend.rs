@@ -131,6 +131,14 @@ const DEFAULT_BUILD_SLAB_FLOOR: usize = 1024;
 /// `(128 - 3) / 3 = 41` as the maximum shard count per transaction.
 const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 
+/// Maximum children per `split_replace` etcd transaction.
+///
+/// Each child generates 2 ops (put-record, put-active-index) and 1 compare
+/// (compare-absent). The parent side adds 4 compares (shard-revision,
+/// owner-version, owner-value, owner-lease) and 3 ops (put-parent,
+/// delete-owner, delete-active-index), giving `(128 - 7) / 3 = 40`.
+pub(crate) const MAX_CHILDREN_PER_SPLIT_TXN: usize = 40;
+
 /// Marker segment that appears exactly once in persisted shard record keys.
 const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
 
@@ -142,24 +150,25 @@ const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
 /// (unlike the in-memory backend, which temporarily removes the parent
 /// during split validation).
 #[derive(Clone, Copy, Debug, Default)]
-struct ShardCountSnapshot {
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) struct ShardCountSnapshot {
     /// Shards under the requesting tenant's prefix.
-    tenant: usize,
+    pub(crate) tenant: usize,
     /// Shards across all tenants.
-    total: usize,
+    pub(crate) total: usize,
 }
 
 /// Details for the first shard-limit violation detected in a growth check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ShardLimitViolation {
-    current: usize,
-    additional: usize,
-    max: usize,
-    scope: ShardLimitScope,
+pub(crate) struct ShardLimitViolation {
+    pub(crate) current: usize,
+    pub(crate) additional: usize,
+    pub(crate) max: usize,
+    pub(crate) scope: ShardLimitScope,
 }
 
 /// Returns the first shard-count ceiling that `additional` would exceed.
-fn shard_limit_violation(
+pub(crate) fn shard_limit_violation(
     counts: ShardCountSnapshot,
     additional: usize,
     max_shards_per_tenant: usize,
@@ -1086,6 +1095,10 @@ impl EtcdCoordinator {
     /// Deletion is total: the run record, any shard records, and any
     /// active-shard index entries are removed in a single transaction.
     /// Successfully deleted run IDs are appended to `out`.
+    ///
+    /// On error, `out` may contain a partial list of the runs that were
+    /// successfully deleted before the failure. Callers must not rely on
+    /// `out` contents when the return value is `Err`.
     pub fn gc_stale_initializing_runs_into(
         &mut self,
         tenant: TenantId,
@@ -2068,9 +2081,13 @@ impl CoordinationBackend for EtcdCoordinator {
                     message: format!("split_replace.count_shards: {err}"),
                 }
             })?;
+            // The persisted count already includes the parent shard (it is
+            // still stored in etcd). After split, the parent becomes terminal
+            // (Split status) while N children are created, so the net growth
+            // in live shards is N - 1, not N.
             if let Some(limit) = shard_limit_violation(
                 counts,
-                sorted.len(),
+                sorted.len().saturating_sub(1),
                 self.config.max_shards_per_tenant(),
                 self.config.max_total_shards(),
             ) {
