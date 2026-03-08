@@ -1889,24 +1889,6 @@ impl CoordinationBackend for EtcdCoordinator {
                     u32::try_from(persisted.record.spawned.len() + sorted_index)
                         .expect("child index exceeds u32"),
                 );
-                let child_key = ShardKey::new(persisted.record.run, child_id);
-
-                match self.load_shard_record(tenant, child_key) {
-                    Ok(Some(_)) => {
-                        return Err(SplitReplaceError::SplitInvalid(
-                            SplitValidationError::DerivedIdCollision {
-                                derived_id: child_id,
-                            },
-                        ));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        return Err(SplitReplaceError::BackendError {
-                            message: format!("split_replace.preflight_child_absence: {err}"),
-                        });
-                    }
-                }
-
                 let mut child_slab = ByteSlab::with_capacity(
                     Self::build_slab_capacity_for_spec_and_cursor(child.spec(), child.cursor()),
                 );
@@ -2099,23 +2081,6 @@ impl CoordinationBackend for EtcdCoordinator {
                 DerivedShardKind::Residual,
                 u32::try_from(persisted.record.spawned.len()).expect("spawned index exceeds u32"),
             );
-            let residual_key = ShardKey::new(persisted.record.run, residual_id);
-            match self.load_shard_record(tenant, residual_key) {
-                Ok(Some(_)) => {
-                    return Err(SplitResidualError::SplitInvalid(
-                        SplitValidationError::DerivedIdCollision {
-                            derived_id: residual_id,
-                        },
-                    ));
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    return Err(SplitResidualError::BackendError {
-                        message: format!("split_residual.preflight_child_absence: {err}"),
-                    });
-                }
-            }
-
             let mut residual_slab =
                 ByteSlab::with_capacity(Self::build_slab_capacity_for_spec_and_cursor(
                     plan.residual_spec(),
