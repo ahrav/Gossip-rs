@@ -89,11 +89,11 @@ use gossip_coordination::{
     ClaimError, CompleteError, CoordinationBackend, CreateRunError, CursorUpdate, DerivedShardKind,
     GetRunError, IdempotentOutcome, InitialShardInput, Lease, LeaseHolder, LogicalTime, OpId,
     OpKind, OpLogEntry, OpResult, ParkError, ParkReason, RegisterShardsError, RenewError,
-    RenewResult, RingBuffer, RunConfig, RunId, RunManagement, RunOpIdConflict, RunOpKind,
-    RunOpLogEntry, RunOpResult, RunProgress, RunRecord, RunStatus, RunTransitionError,
-    ShardClaiming, ShardFilter, ShardId, ShardKey, ShardRecord, ShardStatus, ShardSummary,
-    SplitChildIds, SplitReplaceError, SplitReplacePlan, SplitReplaceResult, SplitResidualError,
-    SplitResidualPlan, SplitResidualResult, TenantId, UnparkError, WorkerId, check_op_idempotency,
+    RenewResult, RingBuffer, RunConfig, RunId, RunManagement, RunOpKind, RunOpLogEntry,
+    RunOpResult, RunProgress, RunRecord, RunStatus, RunTransitionError, ShardClaiming, ShardFilter,
+    ShardId, ShardKey, ShardRecord, ShardStatus, ShardSummary, SplitChildIds, SplitReplaceError,
+    SplitReplacePlan, SplitReplaceResult, SplitResidualError, SplitResidualPlan,
+    SplitResidualResult, TenantId, UnparkError, WorkerId, check_op_idempotency,
     default_claim_next_available, derive_split_shard_id, hash_cancel_run_payload,
     hash_checkpoint_payload, hash_complete_run_payload, hash_fail_run_payload,
     hash_register_shards_payload, hash_split_replace_payload, hash_split_residual_payload,
@@ -1316,16 +1316,25 @@ impl EtcdCoordinator {
         ]
     }
 
-    /// Attempt to revoke an etcd lease, ignoring errors.
+    /// Attempt to revoke an etcd lease, logging on failure.
     ///
     /// Used for cleanup after a CAS failure when the lease is no longer
     /// needed. If the revocation fails (e.g., network error), the lease
-    /// will eventually expire via etcd's TTL mechanism.
+    /// will eventually expire via etcd's TTL mechanism. Failures are
+    /// logged at `warn` level so operators can detect accumulation of
+    /// orphaned leases during etcd instability.
     fn best_effort_revoke_lease(&self, lease_id: i64) {
         if lease_id <= 0 {
             return;
         }
-        let _ = self.etcd_lease_revoke(lease_id);
+        if let Err(err) = self.etcd_lease_revoke(lease_id) {
+            tracing::warn!(
+                lease_id,
+                %err,
+                ttl_secs = self.config.owner_lease_ttl_secs(),
+                "failed to revoke etcd lease; will expire via TTL",
+            );
+        }
     }
 
     /// Load a run record, panicking if the key is missing or unreadable.
@@ -2959,35 +2968,7 @@ impl RunManagement for EtcdCoordinator {
                 key
             );
 
-            let replay =
-                check_op_idempotency(&persisted.record, op_id, payload_hash).map_err(|err| {
-                    match err {
-                        gossip_coordination::CoordError::OpIdConflict {
-                            op_id,
-                            expected_hash,
-                            actual_hash,
-                        } => UnparkError::OpIdConflict(RunOpIdConflict {
-                            op_id,
-                            expected_hash,
-                            actual_hash,
-                        }),
-                        gossip_coordination::CoordError::ShardNotFound { .. }
-                        | gossip_coordination::CoordError::TenantMismatch { .. }
-                        | gossip_coordination::CoordError::StaleFence { .. }
-                        | gossip_coordination::CoordError::LeaseExpired { .. }
-                        | gossip_coordination::CoordError::ShardTerminal { .. }
-                        | gossip_coordination::CoordError::CursorRegression { .. }
-                        | gossip_coordination::CoordError::CursorOutOfBounds(_)
-                        | gossip_coordination::CoordError::CursorKeyTooLarge { .. }
-                        | gossip_coordination::CoordError::CursorTokenTooLarge { .. }
-                        | gossip_coordination::CoordError::SplitInvalid(_)
-                        | gossip_coordination::CoordError::CheckpointMissingKey => {
-                            unreachable!("check_op_idempotency only returns OpIdConflict")
-                        }
-                        _ => unreachable!("check_op_idempotency returned an unexpected error"),
-                    }
-                })?;
-            if replay.is_some() {
+            if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                 return Ok(IdempotentOutcome::Replayed(()));
             }
 
@@ -3030,11 +3011,10 @@ impl RunManagement for EtcdCoordinator {
                     Self::compare_shard_revision(shard_record_key.clone(), persisted.mod_revision),
                     Self::compare_run_revision(run_key, persisted_run.mod_revision),
                     Self::compare_present(run_active_key),
-                    Self::compare_absent(owner_key.clone()),
+                    Self::compare_absent(owner_key),
                 ])
                 .and_then(vec![
                     TxnOp::put(shard_record_key.into_bytes(), shard_blob, None),
-                    TxnOp::delete(owner_key.into_bytes(), None),
                     TxnOp::put(active_shard_key.into_bytes(), Vec::<u8>::new(), None),
                 ]);
             let response = self
@@ -3066,34 +3046,7 @@ impl RunManagement for EtcdCoordinator {
             key
         );
 
-        let replay = check_op_idempotency(&persisted.record, op_id, payload_hash).map_err(
-            |err| match err {
-                gossip_coordination::CoordError::OpIdConflict {
-                    op_id,
-                    expected_hash,
-                    actual_hash,
-                } => UnparkError::OpIdConflict(RunOpIdConflict {
-                    op_id,
-                    expected_hash,
-                    actual_hash,
-                }),
-                gossip_coordination::CoordError::ShardNotFound { .. }
-                | gossip_coordination::CoordError::TenantMismatch { .. }
-                | gossip_coordination::CoordError::StaleFence { .. }
-                | gossip_coordination::CoordError::LeaseExpired { .. }
-                | gossip_coordination::CoordError::ShardTerminal { .. }
-                | gossip_coordination::CoordError::CursorRegression { .. }
-                | gossip_coordination::CoordError::CursorOutOfBounds(_)
-                | gossip_coordination::CoordError::CursorKeyTooLarge { .. }
-                | gossip_coordination::CoordError::CursorTokenTooLarge { .. }
-                | gossip_coordination::CoordError::SplitInvalid(_)
-                | gossip_coordination::CoordError::CheckpointMissingKey => {
-                    unreachable!("check_op_idempotency only returns OpIdConflict")
-                }
-                _ => unreachable!("check_op_idempotency returned an unexpected error"),
-            },
-        )?;
-        if replay.is_some() {
+        if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
             return Ok(IdempotentOutcome::Replayed(()));
         }
         if persisted.record.status != ShardStatus::Parked {

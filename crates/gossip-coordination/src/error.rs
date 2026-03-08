@@ -78,6 +78,8 @@ use gossip_stdx::{InlineVec, SlabFull};
 
 use crate::lease::Lease;
 use crate::record::ShardStatus;
+use crate::run::RunOpIdConflict;
+use crate::run_errors::UnparkError;
 use gossip_contracts::coordination::cursor::{CursorUpdate, MAX_KEY_SIZE, MAX_TOKEN_SIZE};
 use gossip_contracts::coordination::limits::MAX_SPAWNED_PER_SHARD;
 use gossip_contracts::coordination::shard_spec::{
@@ -1257,6 +1259,37 @@ impl From<CoordError> for RenewError {
             | CoordError::SplitInvalid(_)
             | CoordError::CheckpointMissingKey => {
                 unreachable!("CoordError::{e} is not valid for RenewError")
+            }
+        }
+    }
+}
+
+impl From<CoordError> for UnparkError {
+    fn from(e: CoordError) -> Self {
+        match e {
+            CoordError::OpIdConflict {
+                op_id,
+                expected_hash,
+                actual_hash,
+            } => Self::OpIdConflict(RunOpIdConflict {
+                op_id,
+                expected_hash,
+                actual_hash,
+            }),
+            // Explicitly reject all variants UnparkError does not cover.
+            // Adding a new CoordError variant triggers a compile error here.
+            CoordError::ShardNotFound { .. }
+            | CoordError::TenantMismatch { .. }
+            | CoordError::StaleFence { .. }
+            | CoordError::LeaseExpired { .. }
+            | CoordError::ShardTerminal { .. }
+            | CoordError::CursorRegression { .. }
+            | CoordError::CursorOutOfBounds(_)
+            | CoordError::CursorKeyTooLarge { .. }
+            | CoordError::CursorTokenTooLarge { .. }
+            | CoordError::SplitInvalid(_)
+            | CoordError::CheckpointMissingKey => {
+                unreachable!("CoordError::{e} is not valid for UnparkError")
             }
         }
     }
