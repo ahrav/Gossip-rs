@@ -34,8 +34,11 @@ existing shard-record keys under the relevant etcd prefixes, then rejecting
 growth that would exceed the configured caps.
 The remaining mutating operations (`complete`, `park_shard`) fail closed
 until their persisted transaction semantics are defined. All `RunManagement`
-operations (run terminal transitions, `unpark_shard`, active-run listing,
-GC of stale initializing runs) are fully persisted.
+trait operations (run terminal transitions, `unpark_shard`) are fully
+persisted. The etcd backend also exposes backend-specific helpers for
+active-run listing and GC of stale initializing runs (see `backend.rs`
+file table below); these are inherent methods on `EtcdCoordinator`, not
+part of the `RunManagement` trait surface.
 
 The module provides seven core capabilities:
 
