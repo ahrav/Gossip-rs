@@ -79,10 +79,6 @@ use etcd_client::{Compare, CompareOp, DeleteOptions, GetOptions, PutOptions, Txn
 use gossip_contracts::coordination::shard_spec::{
     ShardLimitScope, ShardSpecRef, SplitValidationError,
 };
-#[cfg(test)]
-use gossip_contracts::test_util::TestSlab;
-#[cfg(test)]
-use gossip_coordination::FenceEpoch;
 use gossip_coordination::validation::validate_cursor_update_pooled;
 use gossip_coordination::{
     AcquireError, AcquireResultView, AcquireScratch, ByteSlab, CapacityHint, CheckpointError,
@@ -101,6 +97,13 @@ use gossip_coordination::{
     split_residual_apply_parent, split_residual_build_record, split_residual_check_replay,
     split_residual_validate_preconditions, validate_lease, validate_manifest,
 };
+
+mod test_support;
+
+#[cfg(any(test, feature = "test-support"))]
+use self::test_support::EtcdTestFaultState;
+#[cfg(any(test, feature = "test-support"))]
+pub use self::test_support::{EtcdTestFault, EtcdTestShardSnapshot};
 
 /// Minimum slab capacity allocated for decoding a shard record blob.
 ///
@@ -314,6 +317,12 @@ impl PersistedShard {
     }
 }
 
+impl Drop for PersistedShard {
+    fn drop(&mut self) {
+        self.record.deallocate_fields(&mut self.slab);
+    }
+}
+
 /// Recover split-replace child IDs from the parent's spawned lineage tail.
 ///
 /// `split_replace` makes the parent terminal (`Split` status), so once the
@@ -428,6 +437,8 @@ pub struct EtcdCoordinator {
     /// Reusable buffer for shard-claim candidate collection, avoiding
     /// per-claim allocation.
     claim_candidates_scratch: Vec<ShardId>,
+    #[cfg(any(test, feature = "test-support"))]
+    test_faults: EtcdTestFaultState,
 }
 
 impl EtcdCoordinator {
@@ -492,6 +503,8 @@ impl EtcdCoordinator {
             runtime,
             client,
             claim_candidates_scratch: Vec::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            test_faults: EtcdTestFaultState::default(),
         })
     }
 
@@ -1373,6 +1386,21 @@ impl EtcdCoordinator {
 
     /// Construct a new `ShardRecord` from registration input and encode it
     /// into a binary blob ready for etcd storage.
+    fn encode_ephemeral_shard_blob(
+        &self,
+        context: &'static str,
+        mut record: ShardRecord,
+        mut slab: ByteSlab,
+    ) -> Vec<u8> {
+        let blob = encode_shard_record(&record, &slab)
+            .unwrap_or_else(|err| self.fatal_storage_error(context, err));
+        record.deallocate_fields(&mut slab);
+        slab.clear();
+        blob
+    }
+
+    /// Construct a new `ShardRecord` from registration input and encode it
+    /// into a binary blob ready for etcd storage.
     fn build_root_shard_blob(
         &self,
         tenant: TenantId,
@@ -1393,80 +1421,8 @@ impl EtcdCoordinator {
         .map_err(|_| RegisterShardsError::ResourceExhausted {
             resource: "shard_slab",
         })?;
-
-        Ok(encode_shard_record(&record, &slab)
-            .unwrap_or_else(|err| self.fatal_storage_error("register_shards.encode_shard", err)))
-    }
-
-    /// Load the raw owner binding for a shard, returning the worker ID,
-    /// fence epoch, and etcd lease ID. Test-only: used to verify ownership
-    /// state in integration tests without going through the full
-    /// `load_shard_record` path.
-    #[cfg(test)]
-    pub(crate) fn test_load_owner_binding(
-        &self,
-        tenant: TenantId,
-        key: ShardKey,
-    ) -> Result<Option<(WorkerId, FenceEpoch, i64)>, EtcdCoordinatorError> {
-        let owner_key = self
-            .keyspace
-            .shard_owner_key(tenant, key.run(), key.shard())
-            .into_bytes();
-        let response = self.etcd_get(owner_key, None)?;
-        let Some(kv) = response.kvs().first() else {
-            return Ok(None);
-        };
-        let binding = self.decode_owner_binding(EtcdOperation::Get, kv.value())?;
-        Ok(Some((binding.worker, binding.fence, kv.lease())))
-    }
-
-    /// Load a shard record and its backing slab, returning a `TestSlab`
-    /// wrapper for assertion-friendly field access. Test-only.
-    #[cfg(test)]
-    pub(crate) fn test_load_shard_snapshot(
-        &self,
-        tenant: TenantId,
-        key: ShardKey,
-    ) -> Result<Option<(ShardRecord, TestSlab)>, EtcdCoordinatorError> {
-        match self.load_shard_record(tenant, key)? {
-            None => Ok(None),
-            Some(persisted) => Ok(Some((
-                persisted.record,
-                TestSlab::from_slab(persisted.slab),
-            ))),
-        }
-    }
-
-    /// Overwrite a shard record in etcd, bypassing all CAS guards. Test-only:
-    /// allows integration tests to seed states not yet reachable through the
-    /// public API (e.g., `Parked` status while `park_shard` is unimplemented).
-    #[cfg(test)]
-    pub(crate) fn test_seed_shard_record(
-        &self,
-        record: &ShardRecord,
-        slab: &ByteSlab,
-    ) -> Result<(), EtcdCoordinatorError> {
-        // Test helpers overwrite the shard record in place so integration
-        // tests can seed states that are not otherwise reachable yet (for
-        // example, a parked shard while `park_shard` remains fail-closed).
-        let key = self
-            .keyspace
-            .shard_record_key(record.tenant, record.run, record.shard)
-            .into_bytes();
-        let value =
-            encode_shard_record(record, slab).map_err(|source| EtcdCoordinatorError::Codec {
-                operation: EtcdOperation::Put,
-                source,
-            })?;
-
-        let mut client = self.client.clone();
-        self.runtime
-            .block_on(client.put(key, value, None))
-            .map_err(|source| EtcdCoordinatorError::Etcd {
-                operation: EtcdOperation::Put,
-                source,
-            })?;
-        Ok(())
+        record.assert_invariants(&slab);
+        Ok(self.encode_ephemeral_shard_blob("register_shards.encode_shard", record, slab))
     }
 }
 
@@ -2137,9 +2093,11 @@ impl CoordinationBackend for EtcdCoordinator {
                 child_absent_compares.push(Self::compare_absent(child_record_key.clone()));
                 child_puts.push(TxnOp::put(
                     child_record_key.into_bytes(),
-                    encode_shard_record(&child_record, &child_slab).unwrap_or_else(|err| {
-                        self.fatal_storage_error("split_replace.encode_child", err)
-                    }),
+                    self.encode_ephemeral_shard_blob(
+                        "split_replace.encode_child",
+                        child_record,
+                        child_slab,
+                    ),
                     None,
                 ));
                 child_index_ops.push(TxnOp::put(
@@ -2204,6 +2162,7 @@ impl CoordinationBackend for EtcdCoordinator {
             ops.append(&mut child_puts);
             ops.append(&mut child_index_ops);
 
+            self.inject_split_replace_fault_if_armed(tenant, key);
             let txn = Txn::new().when(compares).and_then(ops);
             let response = match self.etcd_txn(txn) {
                 Ok(r) => r,
@@ -2443,9 +2402,11 @@ impl CoordinationBackend for EtcdCoordinator {
                 TxnOp::put(shard_record_key.into_bytes(), parent_blob, None),
                 TxnOp::put(
                     residual_record_key.into_bytes(),
-                    encode_shard_record(&residual_record, &residual_slab).unwrap_or_else(|err| {
-                        self.fatal_storage_error("split_residual.encode_residual", err)
-                    }),
+                    self.encode_ephemeral_shard_blob(
+                        "split_residual.encode_residual",
+                        residual_record,
+                        residual_slab,
+                    ),
                     None,
                 ),
                 TxnOp::put(
@@ -2457,6 +2418,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 ),
             ];
 
+            self.inject_split_residual_fault_if_armed(tenant, key);
             let txn = Txn::new().when(compares).and_then(ops);
             let response = match self.etcd_txn(txn) {
                 Ok(r) => r,

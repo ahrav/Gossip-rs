@@ -61,16 +61,25 @@ static SHARED_ETCD: OnceLock<EtcdEndpoint> = OnceLock::new();
 
 /// Build the etcd container image definition.
 ///
-/// Uses `bitnami/etcd:3.5` with authentication disabled and
-/// single-node configuration. Waits for the "ready to serve client
-/// requests" log line on stderr before declaring readiness.
+/// Uses a pinned upstream etcd image with explicit single-node startup
+/// flags. Waits for the "ready to serve client requests" log line on
+/// stderr before declaring readiness.
 fn etcd_image() -> ContainerRequest<GenericImage> {
-    GenericImage::new("bitnami/etcd", "3.5")
+    GenericImage::new("quay.io/coreos/etcd", "v3.5.15")
         .with_wait_for(WaitFor::message_on_stderr("ready to serve client requests"))
         .with_exposed_port(2379.tcp())
-        .with_env_var("ALLOW_NONE_AUTHENTICATION", "yes")
-        .with_env_var("ETCD_ADVERTISE_CLIENT_URLS", "http://0.0.0.0:2379")
-        .with_env_var("ETCD_LISTEN_CLIENT_URLS", "http://0.0.0.0:2379")
+        .with_cmd([
+            "etcd",
+            "--name=node1",
+            "--data-dir=/etcd-data",
+            "--listen-client-urls=http://0.0.0.0:2379",
+            "--advertise-client-urls=http://0.0.0.0:2379",
+            "--listen-peer-urls=http://0.0.0.0:2380",
+            "--initial-advertise-peer-urls=http://0.0.0.0:2380",
+            "--initial-cluster=node1=http://0.0.0.0:2380",
+            "--initial-cluster-token=gossip-rs-test-cluster",
+            "--initial-cluster-state=new",
+        ])
 }
 
 /// Start (or reuse) the shared etcd endpoint.
@@ -91,7 +100,7 @@ fn shared_endpoint() -> &'static EtcdEndpoint {
         // No external endpoint — start a container.
         let container = etcd_image()
             .start()
-            .expect("failed to start etcd container — is Docker running?");
+            .expect("failed to start etcd container — is Docker running and able to pull quay.io/coreos/etcd:v3.5.15?");
 
         // Extract host and port as owned values before any
         // EtcdCoordinator is created. This ensures the SyncRunner's
