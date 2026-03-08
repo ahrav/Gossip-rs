@@ -314,10 +314,10 @@ Validation errors from boundary-crossing constructors:
 
 ### InMemoryDeterministicConnector (`in_memory.rs`)
 
-Deterministic in-memory connector for tests and simulation harnesses.
-Cheaply `Clone`-able via `Arc`. Takes `ConnectorTag` + `Vec<MemItem>`
-at construction; pre-sorts items and precomputes `StableItemId` and
-`PreparedItem` metadata.
+Deterministic in-memory connector for tests and simulation workloads.
+Cheaply `Clone`-able via `Arc`. Takes `Vec<MemItem>` at construction,
+pre-sorts items, and precomputes lightweight `PreparedItem` metadata
+(`key`, `bytes`, `size_hint`).
 
 Capabilities: `seek_by_key: true`, `token_resume: true` (default,
 configurable via `with_tokens()`), `split_hints: true`,
@@ -335,17 +335,14 @@ DFS walk (per-directory sorted frames, no full-tree materialization).
 `openat`-based reads with `O_NOFOLLOW` for read confinement.
 Symlinks are skipped during walk and rejected at open time.
 
-Capabilities: `seek_by_key: true`, `token_resume: false` (default,
-configurable via `with_tokens()`), `split_hints: true`,
-`range_read: true`.
+Capabilities: `seek_by_key: true`, `token_resume: false`,
+`split_hints: false`, `range_read: true`.
 
-Split hints are provided by a `StreamingSplitEstimator` integrated into
-the DFS walk. The estimator is fed `(key, file_size)` pairs as
-each file is discovered, and `choose_split_point`
-reads the byte-weighted median estimate without a separate walk pass.
-Memory is bounded by the configured sample cap. Walk issues (permission
-denied, non-regular files) are captured as `WalkWarning`s rather than
-fatal errors.
+The `StreamingSplitEstimator` field exists on the struct but has no
+observation feed after the enumeration-walk removal. `choose_split_point`
+returns `Ok(None)` until an external caller populates the estimator.
+`openat`-based reads with `O_NOFOLLOW` reject symlink-based
+traversal at each path component.
 
 ### GitConnector (`git.rs`)
 
