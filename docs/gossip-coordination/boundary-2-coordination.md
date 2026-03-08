@@ -103,7 +103,7 @@ The module provides seven core capabilities:
 | `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
 | `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |
-| `tests.rs`        | Config validation and etcd connectivity smoke tests                                           |
+| `tests.rs`        | Config validation, keyspace path invariants (proptest), and ignored etcd integration tests covering acquire/checkpoint/renew/split lifecycle, lease expiry, and contention |
 
 ---
 

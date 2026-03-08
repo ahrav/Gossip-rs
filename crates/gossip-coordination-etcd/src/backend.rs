@@ -41,10 +41,16 @@
 //!
 //! # Idempotency
 //!
-//! All mutating operations carry an `OpId` and a payload hash. If a retry
-//! finds the operation already recorded in the shard's or run's op-log,
-//! it returns [`IdempotentOutcome::Replayed`] with the previously computed
-//! result. This makes every mutation safe to retry across network partitions.
+//! Op-log-backed mutations (`checkpoint`, `complete`, `park_shard`,
+//! `split_replace`, `split_residual`, `register_shards`) carry an `OpId`
+//! and a payload hash. If a retry finds the operation already recorded in
+//! the shard's or run's op-log, it returns [`IdempotentOutcome::Replayed`]
+//! with the previously computed result, making these mutations safe to
+//! retry across network partitions.
+//!
+//! `acquire_and_restore_into` and `renew` do **not** use OpId-based
+//! idempotency. They rely on CAS fencing (lease + epoch checks) for
+//! correctness instead.
 //!
 //! # Unimplemented operations
 //!
@@ -63,8 +69,6 @@ use crate::codec::{
 use crate::config::{DEFAULT_CONNECT_TIMEOUT, EtcdCoordinatorConfig};
 use crate::error::{EtcdCoordinatorError, EtcdOperation};
 use crate::keyspace::EtcdKeyspace;
-#[cfg(test)]
-use etcd_client::DeleteOptions;
 use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::shard_spec::{
     ShardLimitScope, ShardSpecRef, SplitValidationError,
@@ -573,21 +577,6 @@ impl EtcdCoordinator {
             })
     }
 
-    #[cfg(test)]
-    fn etcd_delete(
-        &self,
-        key: Vec<u8>,
-        options: Option<DeleteOptions>,
-    ) -> Result<etcd_client::DeleteResponse, EtcdCoordinatorError> {
-        let mut client = self.client.clone();
-        self.runtime
-            .block_on(client.delete(key, options))
-            .map_err(|source| EtcdCoordinatorError::Etcd {
-                operation: EtcdOperation::Delete,
-                source,
-            })
-    }
-
     /// Load a single run record by exact key. Returns `None` if the key
     /// does not exist in etcd.
     fn load_run_record(
@@ -1022,15 +1011,6 @@ impl EtcdCoordinator {
 
         Ok(encode_shard_record(&record, &slab)
             .unwrap_or_else(|err| self.fatal_storage_error("register_shards.encode_shard", err)))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_clear_namespace(&self) -> Result<(), EtcdCoordinatorError> {
-        self.etcd_delete(
-            self.keyspace.prefix().as_bytes().to_vec(),
-            Some(DeleteOptions::new().with_prefix()),
-        )?;
-        Ok(())
     }
 
     #[cfg(test)]
@@ -1749,6 +1729,39 @@ impl CoordinationBackend for EtcdCoordinator {
             });
         }
 
+        // All standard preconditions still hold, yet the CAS failed
+        // every attempt. The most likely non-transient cause is a
+        // derived child key that already exists (hash collision). Probe
+        // each derived child key and surface DerivedIdCollision if found.
+        let sorted =
+            split_replace_validate_preconditions(&persisted.record, &plan, &persisted.slab)?;
+        for sorted_index in 0..sorted.len() {
+            let child_id = derive_split_shard_id(
+                persisted.record.run,
+                persisted.record.shard,
+                op_id,
+                DerivedShardKind::Child,
+                u32::try_from(persisted.record.spawned.len() + sorted_index)
+                    .expect("child index exceeds u32"),
+            );
+            let child_key = ShardKey::new(persisted.record.run, child_id);
+            match self.load_shard_record(tenant, child_key) {
+                Ok(Some(_)) => {
+                    return Err(SplitReplaceError::SplitInvalid(
+                        SplitValidationError::DerivedIdCollision {
+                            derived_id: child_id,
+                        },
+                    ));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    return Err(SplitReplaceError::BackendError {
+                        message: format!("split_replace.collision_probe: {err}"),
+                    });
+                }
+            }
+        }
+
         self.fatal_storage_error(
             "split_replace.compare_retry_budget",
             "compare contention did not converge",
@@ -1947,6 +1960,33 @@ impl CoordinationBackend for EtcdCoordinator {
                 presented: lease.fence(),
                 current: persisted.record.fence_epoch,
             });
+        }
+
+        // All standard preconditions still hold, yet the CAS failed
+        // every attempt. Check if the derived residual key already
+        // exists (hash collision) and surface DerivedIdCollision if so.
+        let residual_id = derive_split_shard_id(
+            persisted.record.run,
+            persisted.record.shard,
+            op_id,
+            DerivedShardKind::Residual,
+            u32::try_from(persisted.record.spawned.len()).expect("spawned index exceeds u32"),
+        );
+        let residual_key = ShardKey::new(persisted.record.run, residual_id);
+        match self.load_shard_record(tenant, residual_key) {
+            Ok(Some(_)) => {
+                return Err(SplitResidualError::SplitInvalid(
+                    SplitValidationError::DerivedIdCollision {
+                        derived_id: residual_id,
+                    },
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(SplitResidualError::BackendError {
+                    message: format!("split_residual.collision_probe: {err}"),
+                });
+            }
         }
 
         self.fatal_storage_error(

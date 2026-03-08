@@ -24,3 +24,4 @@ gossip-coordination = { workspace = true, features = ["test-support"] }
 gossip-contracts = { workspace = true, features = ["test-support"] }
 rstest.workspace = true
 proptest.workspace = true
+testcontainers.workspace = true
