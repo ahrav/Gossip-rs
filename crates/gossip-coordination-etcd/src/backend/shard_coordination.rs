@@ -1329,9 +1329,11 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
         lease: &Lease,
     ) -> Result<RenewResult, RenewError> {
         let key = lease.shard_key();
+        let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
         for attempt_num in 0..self.config.optimistic_txn_retries() {
-            let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
-            let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
+            shard_buf.clear();
+            owner_buf.clear();
             let persisted = match self.load_shard_record(tenant, key).await {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(RenewError::ShardNotFound { shard: key }),
@@ -1376,10 +1378,14 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 srk.clone(),
                 persisted.mod_revision,
             )];
-            compares.extend(super::compare_owner_present(ok, owner_buf, old_lease_id));
+            compares.extend(super::compare_owner_present(
+                ok,
+                owner_buf.clone(),
+                old_lease_id,
+            ));
             let txn = Txn::new().when(compares).and_then(vec![TxnOp::put(
                 srk.into_bytes(),
-                shard_buf,
+                shard_buf.clone(),
                 None,
             )]);
             let response = match self.etcd_txn(txn).await {
@@ -1434,9 +1440,11 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
     ) -> Result<IdempotentOutcome<()>, CheckpointError> {
         let key = lease.shard_key();
         let payload_hash = hash_checkpoint_payload(new_cursor);
+        let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
         for attempt_num in 0..self.config.optimistic_txn_retries() {
-            let mut shard_buf: Vec<u8> = Vec::with_capacity(2048);
-            let mut owner_buf: Vec<u8> = Vec::with_capacity(32);
+            shard_buf.clear();
+            owner_buf.clear();
             let persisted = match self.load_shard_record(tenant, key).await {
                 Ok(Some(s)) => s,
                 Ok(None) => return Err(CheckpointError::ShardNotFound { shard: key }),
@@ -1497,10 +1505,14 @@ impl AsyncCoordinationBackend for AsyncEtcdCoordinator {
                 srk.clone(),
                 persisted.mod_revision,
             )];
-            compares.extend(super::compare_owner_present(ok, owner_buf, owner_lease_id));
+            compares.extend(super::compare_owner_present(
+                ok,
+                owner_buf.clone(),
+                owner_lease_id,
+            ));
             let txn = Txn::new().when(compares).and_then(vec![TxnOp::put(
                 srk.into_bytes(),
-                shard_buf,
+                shard_buf.clone(),
                 None,
             )]);
             let response = match self.etcd_txn(txn).await {

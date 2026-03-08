@@ -42,8 +42,9 @@ use super::test_support::EtcdTestFaultState;
 /// ## Threading model
 ///
 /// Callers **must not** invoke methods from within an existing Tokio
-/// runtime — `block_on` within `block_on` deadlocks. Assertions
-/// guard against this in `connect()` and `status()`.
+/// runtime — `block_on` within `block_on` deadlocks. Runtime guards
+/// on all `block_on` call sites panic early if this invariant is
+/// violated.
 ///
 /// ## Scratch allocation
 ///
@@ -100,7 +101,8 @@ impl EtcdCoordinator {
 
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
-            "connect() must not be called from within an active Tokio runtime"
+            "EtcdCoordinator::connect() must not be called from within an \
+             active Tokio runtime — use AsyncEtcdCoordinator::connect() instead"
         );
 
         let mut client = runtime
@@ -142,12 +144,22 @@ impl EtcdCoordinator {
         &self.keyspace
     }
 
-    /// Round-trip a maintenance `status` request against etcd.
-    pub fn status(&self) -> Result<etcd_client::StatusResponse, EtcdCoordinatorError> {
+    /// Panics if an active Tokio runtime exists on the current thread.
+    ///
+    /// All sync methods funnel through `runtime.block_on(...)`, which
+    /// deadlocks when called from within an existing runtime. This
+    /// guard catches that programming error early.
+    pub(super) fn assert_not_in_async_context(&self) {
         assert!(
             tokio::runtime::Handle::try_current().is_err(),
-            "status() must not be called from within an active Tokio runtime"
+            "EtcdCoordinator sync methods must not be called from within an \
+             active Tokio runtime — use AsyncEtcdCoordinator instead"
         );
+    }
+
+    /// Round-trip a maintenance `status` request against etcd.
+    pub fn status(&self) -> Result<etcd_client::StatusResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
 
         let mut client = self.client.clone();
         self.runtime
@@ -202,6 +214,7 @@ impl EtcdCoordinator {
         key: Vec<u8>,
         options: Option<GetOptions>,
     ) -> Result<etcd_client::GetResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(client.get(key, options))
@@ -216,6 +229,7 @@ impl EtcdCoordinator {
         &self,
         txn: Txn,
     ) -> Result<etcd_client::TxnResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(client.txn(txn))
@@ -230,6 +244,7 @@ impl EtcdCoordinator {
         &self,
         ttl: i64,
     ) -> Result<etcd_client::LeaseGrantResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(client.lease_grant(ttl, None))
@@ -245,6 +260,7 @@ impl EtcdCoordinator {
         &self,
         lease_id: i64,
     ) -> Result<(), EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(async move {
@@ -272,6 +288,7 @@ impl EtcdCoordinator {
         &self,
         lease_id: i64,
     ) -> Result<etcd_client::LeaseRevokeResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(client.lease_revoke(lease_id))

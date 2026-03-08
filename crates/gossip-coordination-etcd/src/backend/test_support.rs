@@ -86,6 +86,7 @@ impl EtcdCoordinator {
         value: Vec<u8>,
         options: Option<etcd_client::PutOptions>,
     ) -> Result<etcd_client::PutResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(client.put(key, value, options))
@@ -102,6 +103,7 @@ impl EtcdCoordinator {
         key: Vec<u8>,
         options: Option<DeleteOptions>,
     ) -> Result<etcd_client::DeleteResponse, EtcdCoordinatorError> {
+        self.assert_not_in_async_context();
         let mut client = self.client.clone();
         self.runtime
             .block_on(client.delete(key, options))
