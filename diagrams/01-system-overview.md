@@ -192,18 +192,20 @@ make backoff/retry decisions without additional RPCs (see
 
 Once the worker has a shard assignment, it uses B4 (Connector) to enumerate
 items from the external data source -- a Git repository, an S3 bucket, a
-Confluence space, or any other supported source. For each item, the worker
-derives a `StableItemId` through B1 (Identity), which produces a deterministic
-content-addressed identifier. The worker then checks the done-ledger in B5
-(Persistence) to skip items that have already been scanned. For new items, the
-worker runs the detection engine, derives a `FindingId` for each discovered
-secret, and commits the entire page -- findings, done-ledger updates, and cursor
-position -- atomically through B5. Finally, the worker reports shard completion
-back to B2.
+Confluence space, or any other supported source. Each `ScanItem` carries a
+`StableItemId` and `VersionId` produced by the connector through B1 (Identity).
+The worker derives an `OvidHash` from these two fields and checks the
+done-ledger in B5 (Persistence) to skip items that have already been scanned.
+For new items, the worker runs the detection engine, derives a `FindingId` for
+each discovered secret, and commits the entire page -- findings, done-ledger
+updates, and cursor position -- through the receipt-chained typestate protocol
+in B5. Finally, the worker reports shard completion back to B2.
 
 The atomicity of the page commit is what guarantees exactly-once semantics: if
-the worker crashes mid-page, nothing is committed, and the next worker replays
-from the last saved cursor.
+the worker crashes mid-page, the cursor has not advanced, and the next worker
+replays from the last saved cursor. The `PageCommit<S>` typestate enforces the
+durability ordering -- findings before done-ledger before checkpoint -- at
+compile time.
 
 ```mermaid
 %% Diagram: simplified-scan-flow
@@ -221,10 +223,10 @@ sequenceDiagram
     Conn-->>W: stream of raw items
 
     loop For each item
-        W->>Id: derive StableItemId(item)
-        Id-->>W: StableItemId
+        W->>Id: derive OvidHash(StableItemId, VersionId)
+        Id-->>W: OvidHash
 
-        W->>P: check done-ledger(StableItemId)
+        W->>P: check done-ledger(OvidHash)
         P-->>W: seen / not-seen
 
         alt not seen

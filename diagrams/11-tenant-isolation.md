@@ -471,7 +471,7 @@ the keyed hash construction.
 
 | Topic                                            | Diagram File                                                    |
 | ------------------------------------------------ | --------------------------------------------------------------- |
-| ID derivation DAG (full 15-type hierarchy)       | [03-id-derivation-dag.md](03-id-derivation-dag.md)              |
+| ID derivation DAG (full 19-type hierarchy)       | [03-id-derivation-dag.md](03-id-derivation-dag.md)              |
 | Secret identity chain (BLAKE3 keyed mode detail) | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 3 |
 | Finding identity chain (FindingId derivation)    | [03-id-derivation-dag.md](03-id-derivation-dag.md) -- Section 4 |
 | 5-check validation preamble (full flow)          | [06-fencing-protocol.md](06-fencing-protocol.md) -- Diagram 1   |

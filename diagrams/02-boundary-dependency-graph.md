@@ -58,7 +58,7 @@ graph TB
     B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId,<br/>JobId, ShardKey"| B1
     B3 -->|"ShardId, MAX_KEY_SIZE<br/>(shard identity &amp;<br/>key-range ceiling)"| B1
     B4 -->|"ConnectorTag, ConnectorInstanceIdHash,<br/>ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
-    B5 -->|"FindingId, OccurrenceId,<br/>ObservationId, DoneLedgerKey,<br/>OvidHash, TriageGroupKey,<br/>TenantId, PolicyHash,<br/>SecretHash, FenceEpoch,<br/>RunId, ShardId"| B1
+    B5 -->|"FindingId, OccurrenceId,<br/>ObservationId,<br/>TenantId, PolicyHash,<br/>StableItemId, SecretHash,<br/>FenceEpoch, RunId, ShardId"| B1
 
     B2 -->|"ShardSpec, KeyEncoding<br/>(shard range types<br/>for split operations)"| B3
     B4 -->|"ShardSpec<br/>(shard range bounds<br/>for enumeration)"| B3
@@ -80,9 +80,15 @@ edge is the widest, reflecting the fact that persistence must reference nearly
 every content-addressed identity type for done-ledger keys, finding records, and
 occurrence records.
 
-Note: `DoneLedgerKey` and `OvidHash` are fully defined types exported from
-`identity/mod.rs`. `TriageGroupKey` has a domain separation constant registered
-in `identity/domain.rs`.
+Note: `DoneLedgerKey` and `OvidHash` are defined within the B5 persistence
+module (`persistence/done_ledger.rs` and `persistence/ovid.rs` respectively).
+They consume B1 identity types (`TenantId`, `PolicyHash`, `StableItemId`) but
+are not re-exported from `identity/`. The domain-separation constants for their
+derivation (`DONE_LEDGER_KEY_V1`, `OVID_V1`) are registered in
+`identity/domain.rs` so the identity boundary remains the single authoritative
+source for derivation roots — preventing duplicate or divergent domain IDs
+across boundaries. `TRIAGE_GROUP_KEY_V1` is similarly registered there for
+future `TriageGroupKey` derivation from `(tenant, item)` pairs.
 
 ---
 
@@ -129,7 +135,7 @@ graph TD
     B2 -->|"ShardSpec"| B3
     B4 -->|"ConnectorTag,<br/>ConnectorInstanceIdHash, ..."| B1
     B4 -->|"ShardSpec"| B3
-    B5 -->|"FindingId, ObservationId,<br/>DoneLedgerKey, ..."| B1
+    B5 -->|"FindingId, ObservationId,<br/>StableItemId, ..."| B1
     B5 -->|"Cursor, ShardStatus,<br/>ParkReason"| B2
 
     style B1 fill:#DBEAFE,stroke:#1E40AF,stroke-width:2px,color:#1E40AF

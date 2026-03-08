@@ -87,7 +87,7 @@ sequenceDiagram
 
     Note over W2: Worker 2 resumes from page_3<br/>(the last COMMITTED cursor)
     W2->>W2: Re-processes interrupted page from page_3
-    W2->>CO: commit(shard_1, token=6, cursor=page_4, findings)
+    W2->>CO: checkpoint(shard_1, token=6, cursor=page_4)
     CO-->>W2: Ok(cursor advanced to page_4)
 
     rect rgb(220, 252, 231)
@@ -101,8 +101,9 @@ sequenceDiagram
 ```
 
 The critical property is **cursor atomicity**: the cursor only advances inside
-the atomic commit boundary. If the commit did not happen, the cursor did not
-advance. This means the next worker always starts from a consistent position.
+the receipt-chained commit boundary. If the commit did not reach
+`CheckpointDurable`, the cursor did not advance. This means the next worker
+always starts from a consistent position.
 The fencing token (incrementing from 5 to 6 on the new acquisition) ensures that
 Worker 1 cannot interfere even if it comes back to life -- its stale token is
 rejected immediately by the 5-check validation preamble (INV-S12).
@@ -615,8 +616,8 @@ skipped.
   preamble and zombie worker resolution that underpin Diagrams 1, 3, and 5
 - [Shard and Run State Machines](./05-shard-and-run-state-machines.md) -- the
   state transitions (Active, Done, Split, Parked) referenced throughout
-- [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- the 13-step pipeline
-  and atomic commit boundary that define cursor semantics
+- [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- the 12-step pipeline
+  and receipt-chained commit boundary that define cursor semantics
 - [System Overview](./01-system-overview.md) -- the five architectural
   boundaries (B1-B5) referenced by color coding
 - [Circuit Breaker](./09-circuit-breaker.md) -- the circuit breaker state machine
