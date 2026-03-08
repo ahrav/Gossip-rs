@@ -742,6 +742,39 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(miri_proptest_config())]
+
+    /// `encode_shard_record_into` must produce the exact same bytes
+    /// as the allocating `encode_shard_record`.
+    #[test]
+    fn encode_shard_record_into_matches_allocating(input in arb_shard_input()) {
+        let (mut record, mut slab) = input.build();
+        let allocating = encode_shard_record(&record, &slab)
+            .expect("allocating encode must succeed");
+        let mut buf = Vec::new();
+        encode_shard_record_into(&record, &slab, &mut buf)
+            .expect("buffer-reuse encode must succeed");
+        prop_assert_eq!(&buf, &allocating, "encode_shard_record_into diverged from allocating");
+        release_shard_record(&mut record, &mut slab);
+    }
+}
+
+/// `encode_owner_value_into` must produce the exact same bytes as the
+/// allocating `encode_owner_value`.
+#[test]
+fn encode_owner_value_into_matches_allocating() {
+    let worker = WorkerId::from_raw(42);
+    let fence = FenceEpoch::from_raw(7);
+    let allocating = encode_owner_value(worker, fence);
+    let mut buf = Vec::new();
+    encode_owner_value_into(worker, fence, &mut buf);
+    assert_eq!(
+        buf, allocating,
+        "encode_owner_value_into diverged from allocating"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Decoder primitive unit tests
 // ---------------------------------------------------------------------------

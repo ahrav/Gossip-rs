@@ -320,6 +320,10 @@ pub enum RunTransitionError {
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
     /// to prevent external access to raw hash values (hash redaction).
     OpIdConflict(RunOpIdConflict),
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for RunTransitionError {
@@ -340,6 +344,10 @@ impl fmt::Debug for RunTransitionError {
                 .field("target", target)
                 .finish(),
             Self::OpIdConflict(c) => c.fmt(f),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -366,6 +374,9 @@ impl fmt::Display for RunTransitionError {
                 ),
             },
             Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }
@@ -396,6 +407,10 @@ pub enum UnparkError {
     /// OpId reuse with different payload hash. Wraps [`RunOpIdConflict`]
     /// to prevent external access to raw hash values (hash redaction).
     OpIdConflict(RunOpIdConflict),
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 impl fmt::Debug for UnparkError {
@@ -414,6 +429,10 @@ impl fmt::Debug for UnparkError {
                 f.debug_struct("NotParked").field("status", status).finish()
             }
             Self::OpIdConflict(c) => c.fmt(f),
+            Self::BackendError { message } => f
+                .debug_struct("BackendError")
+                .field("message", message)
+                .finish(),
         }
     }
 }
@@ -432,6 +451,9 @@ impl fmt::Display for UnparkError {
                 write!(f, "shard is not parked (status: {status})")
             }
             Self::OpIdConflict(c) => fmt::Display::fmt(c, f),
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }
@@ -609,12 +631,14 @@ mod tests {
     #[case::transition_wrong_status_done(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Done }.to_string())]
     #[case::transition_wrong_status_failed(RunTransitionError::WrongStatus { status: RunStatus::Initializing, target: RunStatus::Failed }.to_string())]
     #[case::transition_op_id_conflict(RunTransitionError::OpIdConflict(test_conflict()).to_string())]
+    #[case::transition_backend_error(RunTransitionError::BackendError { message: "test".into() }.to_string())]
     // UnparkError
     #[case::unpark_not_found(UnparkError::ShardNotFound.to_string())]
     #[case::unpark_tenant_mismatch(UnparkError::TenantMismatch { expected: test_tenant() }.to_string())]
     #[case::unpark_run_terminal(UnparkError::RunTerminal { status: RunStatus::Cancelled }.to_string())]
     #[case::unpark_not_parked(UnparkError::NotParked { status: ShardStatus::Active }.to_string())]
     #[case::unpark_op_id_conflict(UnparkError::OpIdConflict(test_conflict()).to_string())]
+    #[case::unpark_backend_error(UnparkError::BackendError { message: "test".into() }.to_string())]
     fn all_variants_display_non_empty(#[case] display: String) {
         assert!(!display.is_empty(), "variant has empty Display: {display}");
     }

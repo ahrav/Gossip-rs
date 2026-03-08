@@ -469,6 +469,9 @@ impl From<UnparkError> for RejectionKind {
             UnparkError::RunTerminal { .. } => Self::TerminalState,
             UnparkError::NotParked { .. } => Self::NotParked,
             UnparkError::OpIdConflict(_) => Self::OpIdConflict,
+            UnparkError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }
@@ -481,6 +484,9 @@ impl From<RunTransitionError> for RejectionKind {
             RunTransitionError::RunTerminal { .. } => Self::TerminalState,
             RunTransitionError::WrongStatus { .. } => Self::WrongRunStatus,
             RunTransitionError::OpIdConflict(_) => Self::OpIdConflict,
+            RunTransitionError::BackendError { message } => {
+                panic!("simulation backend produced unexpected infrastructure error: {message}")
+            }
         }
     }
 }

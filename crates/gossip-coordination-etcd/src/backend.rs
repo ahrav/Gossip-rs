@@ -500,7 +500,7 @@ impl EtcdCoordinator {
             connect_opts = connect_opts.with_tls(tls);
         }
 
-        debug_assert!(
+        assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "connect() must not be called from within an active Tokio runtime"
         );
@@ -544,7 +544,7 @@ impl EtcdCoordinator {
 
     /// Round-trip a maintenance `status` request against etcd.
     pub fn status(&self) -> Result<etcd_client::StatusResponse, EtcdCoordinatorError> {
-        debug_assert!(
+        assert!(
             tokio::runtime::Handle::try_current().is_err(),
             "status() must not be called from within an active Tokio runtime"
         );
@@ -1060,7 +1060,13 @@ impl EtcdCoordinator {
             active_prefix,
             Some(GetOptions::new().with_prefix().with_count_only()),
         )?;
-        let total_active = active_response.count() as u32;
+        let total_active = u32::try_from(active_response.count()).unwrap_or_else(|_| {
+            tracing::warn!(
+                count = active_response.count(),
+                "etcd active count exceeds u32 range; clamping to u32::MAX"
+            );
+            u32::MAX
+        });
 
         let shards_prefix = self
             .keyspace
@@ -1070,11 +1076,14 @@ impl EtcdCoordinator {
             shards_prefix,
             Some(GetOptions::new().with_prefix().with_keys_only()),
         )?;
-        let owned_count = keys_response
-            .kvs()
-            .iter()
-            .filter(|kv| kv.key().ends_with(b"/owner"))
-            .count() as u32;
+        let owned_count = u32::try_from(
+            keys_response
+                .kvs()
+                .iter()
+                .filter(|kv| kv.key().ends_with(b"/owner"))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
 
         Ok(CapacityHint {
             available_count: total_active.saturating_sub(owned_count),
@@ -1210,6 +1219,11 @@ impl EtcdCoordinator {
             let response = self.etcd_txn(txn)?;
             if response.succeeded() {
                 out.push(run);
+            } else {
+                tracing::debug!(
+                    ?run,
+                    "GC: skipped stale run (concurrent activation or revision change)"
+                );
             }
         }
 
@@ -1247,7 +1261,9 @@ impl EtcdCoordinator {
             RunOpKind::CompleteRun => (RunStatus::Done, hash_complete_run_payload(), true),
             RunOpKind::FailRun => (RunStatus::Failed, hash_fail_run_payload(), true),
             RunOpKind::CancelRun => (RunStatus::Cancelled, hash_cancel_run_payload(), false),
-            _ => unreachable!("transition_run_terminal only supports terminal run ops"),
+            RunOpKind::RegisterShards => {
+                unreachable!("transition_run_terminal does not handle RegisterShards")
+            }
         };
 
         self.cas_retry(
@@ -1255,7 +1271,11 @@ impl EtcdCoordinator {
                 let persisted = match this.load_run_record(tenant, run) {
                     Ok(Some(run_record)) => run_record,
                     Ok(None) => return Err(RunTransitionError::RunNotFound),
-                    Err(err) => this.fatal_storage_error("run_terminal.load_run", err),
+                    Err(err) => {
+                        return Err(RunTransitionError::BackendError {
+                            message: format!("run_terminal.load_run: {err}"),
+                        });
+                    }
                 };
                 let prior_status = persisted.record.status;
                 let mut record = persisted.record;
@@ -1264,7 +1284,14 @@ impl EtcdCoordinator {
                     return Err(RunTransitionError::TenantMismatch { expected: tenant });
                 }
                 if let Some(entry) = record.check_op_idempotency(op_id, payload_hash)? {
-                    assert_eq!(entry.kind(), op_kind);
+                    if entry.kind() != op_kind {
+                        return Err(RunTransitionError::BackendError {
+                            message: format!(
+                                "idempotent replay kind mismatch: expected {op_kind:?}, got {:?}",
+                                entry.kind()
+                            ),
+                        });
+                    }
                     return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
                 }
                 if record.status.is_terminal() {
@@ -1310,9 +1337,14 @@ impl EtcdCoordinator {
                     TxnOp::put(run_key.into_bytes(), run_blob, None),
                     TxnOp::delete(active_key.into_bytes(), None),
                 ]);
-                let response = this
-                    .etcd_txn(txn)
-                    .unwrap_or_else(|err| this.fatal_storage_error("run_terminal.txn", err));
+                let response = match this.etcd_txn(txn) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        return Err(RunTransitionError::BackendError {
+                            message: format!("run_terminal.txn: {err}"),
+                        });
+                    }
+                };
                 if response.succeeded() {
                     return Ok(CasOutcome::Committed(IdempotentOutcome::Executed(())));
                 }
@@ -1324,7 +1356,14 @@ impl EtcdCoordinator {
                     return Err(RunTransitionError::TenantMismatch { expected: tenant });
                 }
                 if let Some(entry) = persisted.record.check_op_idempotency(op_id, payload_hash)? {
-                    assert_eq!(entry.kind(), op_kind);
+                    if entry.kind() != op_kind {
+                        return Err(RunTransitionError::BackendError {
+                            message: format!(
+                                "idempotent replay kind mismatch: expected {op_kind:?}, got {:?}",
+                                entry.kind()
+                            ),
+                        });
+                    }
                     return Ok(IdempotentOutcome::Replayed(()));
                 }
                 if persisted.record.status.is_terminal() {
@@ -1339,10 +1378,9 @@ impl EtcdCoordinator {
                     });
                 }
 
-                this.fatal_storage_error(
-                    "run_terminal.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(RunTransitionError::BackendError {
+                    message: "run_terminal: CAS retry budget exhausted".into(),
+                })
             },
         )
     }
@@ -1699,7 +1737,10 @@ impl CoordinationBackend for EtcdCoordinator {
                 }
                 let capacity = this
                     .count_available_lightweight(tenant, key.run())
-                    .unwrap_or(CapacityHint::ZERO);
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(%err, "capacity hint unavailable; defaulting to zero");
+                        CapacityHint::ZERO
+                    });
                 let lease = Lease::new(
                     tenant,
                     key.run(),
@@ -1870,10 +1911,20 @@ impl CoordinationBackend for EtcdCoordinator {
                     // Best-effort: extend the etcd lease TTL after the CAS
                     // succeeds. If the keep-alive fails, the CAS already
                     // committed the new deadline to the shard record.
-                    let _ = this.etcd_lease_keep_alive_once(old_lease_id);
+                    if let Err(err) = this.etcd_lease_keep_alive_once(old_lease_id) {
+                        tracing::warn!(
+                            lease_id = old_lease_id,
+                            %err,
+                            "renew: failed to extend etcd lease TTL; \
+                             logical deadline was committed but etcd lease may expire early",
+                        );
+                    }
                     let capacity = this
                         .count_available_lightweight(tenant, key.run())
-                        .unwrap_or(CapacityHint::ZERO);
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(%err, "capacity hint unavailable; defaulting to zero");
+                            CapacityHint::ZERO
+                        });
                     return Ok(CasOutcome::Committed(RenewResult {
                         new_deadline,
                         capacity,
@@ -2719,12 +2770,14 @@ impl RunManagement for EtcdCoordinator {
                     return Err(RegisterShardsError::TenantMismatch { expected: tenant });
                 }
                 if let Some(entry) = run_record.check_op_idempotency(op_id, payload_hash)? {
-                    assert_eq!(
-                        entry.kind(),
-                        RunOpKind::RegisterShards,
-                        "idempotent replay kind mismatch: expected RegisterShards, got {:?}",
-                        entry.kind()
-                    );
+                    if entry.kind() != RunOpKind::RegisterShards {
+                        return Err(RegisterShardsError::BackendError {
+                            message: format!(
+                                "idempotent replay kind mismatch: expected RegisterShards, got {:?}",
+                                entry.kind()
+                            ),
+                        });
+                    }
                     match entry.result() {
                         RunOpResult::RegisteredShards { shard_ids } => {
                             return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(
@@ -2732,10 +2785,12 @@ impl RunManagement for EtcdCoordinator {
                             )));
                         }
                         RunOpResult::Ack => {
-                            panic!(
-                                "Run {run:?}: RegisterShards op-log entry has Ack result \
-                                 (expected RegisteredShards) — data corruption"
-                            );
+                            return Err(RegisterShardsError::BackendError {
+                                message: format!(
+                                    "run {run:?}: RegisterShards op-log entry has Ack result \
+                                     (expected RegisteredShards) — data corruption"
+                                ),
+                            });
                         }
                     }
                 }
@@ -3102,14 +3157,30 @@ impl RunManagement for EtcdCoordinator {
                 let persisted = match this.load_shard_record(tenant, key) {
                     Ok(Some(shard)) => shard,
                     Ok(None) => return Err(UnparkError::ShardNotFound),
-                    Err(err) => this.fatal_storage_error("unpark.load_shard", err),
+                    Err(err) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark.load_shard: {err}"),
+                        });
+                    }
                 };
 
                 if persisted.record.tenant != tenant {
                     return Err(UnparkError::TenantMismatch { expected: tenant });
                 }
 
-                let persisted_run = this.load_run_or_panic(tenant, key.run());
+                let persisted_run = match this.load_run_record(tenant, key.run()) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark: run {:?} missing", key.run()),
+                        });
+                    }
+                    Err(err) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark.load_run: {err}"),
+                        });
+                    }
+                };
                 if persisted_run.record.tenant != tenant {
                     return Err(UnparkError::TenantMismatch { expected: tenant });
                 }
@@ -3118,12 +3189,14 @@ impl RunManagement for EtcdCoordinator {
                         status: persisted_run.record.status,
                     });
                 }
-                assert_eq!(
-                    persisted_run.record.status,
-                    RunStatus::Active,
-                    "registered shard {:?} must belong to an active run",
-                    key
-                );
+                if persisted_run.record.status != RunStatus::Active {
+                    return Err(UnparkError::BackendError {
+                        message: format!(
+                            "shard {key:?} belongs to non-active run (status: {:?})",
+                            persisted_run.record.status
+                        ),
+                    });
+                }
 
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     return Ok(CasOutcome::Committed(IdempotentOutcome::Replayed(())));
@@ -3149,7 +3222,9 @@ impl RunManagement for EtcdCoordinator {
                 ));
                 persisted.record.assert_invariants(&persisted.slab);
                 encode_shard_record_into(&persisted.record, &persisted.slab, &mut shard_buf)
-                    .unwrap_or_else(|err| this.fatal_storage_error("unpark.encode_shard", err));
+                    .map_err(|err| UnparkError::BackendError {
+                        message: format!("unpark.encode_shard: {err}"),
+                    })?;
 
                 let shard_record_key =
                     this.keyspace
@@ -3177,20 +3252,45 @@ impl RunManagement for EtcdCoordinator {
                         TxnOp::put(shard_record_key.into_bytes(), shard_buf.clone(), None),
                         TxnOp::put(active_shard_key.into_bytes(), Vec::<u8>::new(), None),
                     ]);
-                let response = this
-                    .etcd_txn(txn)
-                    .unwrap_or_else(|err| this.fatal_storage_error("unpark.txn", err));
+                let response = match this.etcd_txn(txn) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark.txn: {err}"),
+                        });
+                    }
+                };
                 if response.succeeded() {
                     return Ok(CasOutcome::Committed(IdempotentOutcome::Executed(())));
                 }
                 Ok(CasOutcome::RetryNeeded)
             },
             |this| {
-                let persisted = this.load_shard_or_panic(tenant, key);
+                let persisted = match this.load_shard_record(tenant, key) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => return Err(UnparkError::ShardNotFound),
+                    Err(err) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark.exhaust.load_shard: {err}"),
+                        });
+                    }
+                };
                 if persisted.record.tenant != tenant {
                     return Err(UnparkError::TenantMismatch { expected: tenant });
                 }
-                let persisted_run = this.load_run_or_panic(tenant, key.run());
+                let persisted_run = match this.load_run_record(tenant, key.run()) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark.exhaust: run {:?} missing", key.run()),
+                        });
+                    }
+                    Err(err) => {
+                        return Err(UnparkError::BackendError {
+                            message: format!("unpark.exhaust.load_run: {err}"),
+                        });
+                    }
+                };
                 if persisted_run.record.tenant != tenant {
                     return Err(UnparkError::TenantMismatch { expected: tenant });
                 }
@@ -3199,12 +3299,14 @@ impl RunManagement for EtcdCoordinator {
                         status: persisted_run.record.status,
                     });
                 }
-                assert_eq!(
-                    persisted_run.record.status,
-                    RunStatus::Active,
-                    "registered shard {:?} must belong to an active run",
-                    key
-                );
+                if persisted_run.record.status != RunStatus::Active {
+                    return Err(UnparkError::BackendError {
+                        message: format!(
+                            "shard {key:?} belongs to non-active run (status: {:?})",
+                            persisted_run.record.status
+                        ),
+                    });
+                }
 
                 if check_op_idempotency(&persisted.record, op_id, payload_hash)?.is_some() {
                     return Ok(IdempotentOutcome::Replayed(()));
@@ -3215,10 +3317,9 @@ impl RunManagement for EtcdCoordinator {
                     });
                 }
 
-                this.fatal_storage_error(
-                    "unpark.compare_retry_budget",
-                    "compare contention did not converge",
-                )
+                Err(UnparkError::BackendError {
+                    message: "unpark: CAS retry budget exhausted".into(),
+                })
             },
         )
     }

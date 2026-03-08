@@ -433,6 +433,7 @@ impl Default for EtcdCoordinatorConfig {
 /// indexes for multi-valued fields (endpoints). All checks run eagerly
 /// at construction time.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EtcdCoordinatorConfigError {
     /// No endpoints were provided (the list is empty after filtering).
     NoEndpoints,
