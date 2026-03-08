@@ -35,7 +35,6 @@
 //! [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
 //! [`RunManagement`]: gossip_coordination::RunManagement
 //! [`ShardClaiming`]: gossip_coordination::ShardClaiming
-//! [`InMemoryCoordinator`]: gossip_coordination::InMemoryCoordinator
 
 #![forbid(unsafe_code)]
 

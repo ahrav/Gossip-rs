@@ -11,6 +11,8 @@
 //! - **Shard claiming** (via [`default_claim_next_available`])
 //! - **Cold-path maintenance** (`list_active_runs_into`,
 //!   `gc_stale_initializing_runs_into`)
+//! - **Not yet persisted** (`complete`, `park_shard`) — panic until their
+//!   etcd transaction semantics are defined
 //!
 //! # Concurrency model
 //!
@@ -190,7 +192,8 @@ fn shard_limit_violation(
 /// The shard-record key is the leaf under `…/shards/{hex}` with no further
 /// path segments. Owner keys (`…/shards/{hex}/owner`) and active-index
 /// keys (`…/shards_active/{hex}`) are excluded by checking that nothing
-/// follows the last `/shards/` segment except the 16-character hex shard ID.
+/// follows the last `/shards/` segment except a single path component
+/// (no further `/` separators).
 fn is_persisted_shard_record_key(key: &[u8]) -> bool {
     let Some(segment_pos) = key
         .windows(SHARD_RECORD_KEY_SEGMENT.len())
@@ -205,8 +208,8 @@ fn is_persisted_shard_record_key(key: &[u8]) -> bool {
 /// Compute a backoff delay for CAS retry loops.
 ///
 /// Uses exponential backoff (5 ms base, 2× per attempt, capped at 200 ms)
-/// with ±50% jitter to prevent thundering-herd contention when multiple
-/// workers race on the same shard.
+/// with jitter in `[0.5×, 1.5×)` of the exponential value to prevent
+/// thundering-herd contention when multiple workers race on the same shard.
 ///
 /// Jitter is derived from the current system time's sub-second nanoseconds
 /// rather than an RNG. This avoids adding a CSPRNG or thread-local RNG

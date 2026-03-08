@@ -16,24 +16,20 @@
 //!    containment, scan isolation, fixed-width hex encoding).
 //!
 //! 3. **etcd integration** — round-trip tests that connect to a local
-//!    etcd cluster. These are marked `#[ignore]` and require either a
-//!    running etcd at `http://127.0.0.1:2379` or the `ETCD_ENDPOINTS`
-//!    environment variable pointing to a reachable cluster. They cover
-//!    the full acquire/checkpoint/renew/split lifecycle including
-//!    idempotent replay, lease expiry, and concurrent acquire contention.
+//!    etcd cluster. These are marked `#[ignore]` and require either
+//!    Docker running (testcontainers auto-provisions a `bitnami/etcd:3.5`
+//!    instance) or the `ETCD_ENDPOINTS` environment variable pointing to
+//!    a reachable cluster. They cover the full
+//!    acquire/checkpoint/renew/split lifecycle including idempotent
+//!    replay, lease expiry, and concurrent acquire contention.
 //!
 //! ## Running integration tests
 //!
 //! ```bash
-//! # Start a local etcd (e.g., via Docker):
-//! docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.21 \
-//!   /usr/local/bin/etcd --advertise-client-urls http://0.0.0.0:2379 \
-//!   --listen-client-urls http://0.0.0.0:2379
-//!
-//! # Run all etcd integration tests:
+//! # With Docker installed, tests auto-provision etcd via testcontainers:
 //! cargo test -p gossip-coordination-etcd -- --ignored
 //!
-//! # Or point to a custom cluster:
+//! # Or point to an existing cluster:
 //! ETCD_ENDPOINTS="http://10.0.0.1:2379,http://10.0.0.2:2379" \
 //!   cargo test -p gossip-coordination-etcd -- --ignored
 //! ```
