@@ -1576,7 +1576,7 @@ impl CoordinationBackend for EtcdCoordinator {
                 owner_blob,
                 owner_lease_id,
             ));
-            compares.extend(child_absent_compares);
+            compares.extend(child_absent_compares.drain(..));
 
             let mut ops = Vec::with_capacity(3 + child_puts.len() + child_index_ops.len());
             ops.push(TxnOp::put(shard_record_key.into_bytes(), parent_blob, None));
