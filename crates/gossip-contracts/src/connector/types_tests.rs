@@ -368,24 +368,6 @@ fn scan_item_builder_methods_chain() {
     assert_eq!(scan_item.location(), Some(&location));
 }
 
-#[test]
-fn enumeration_page_new_stores_items_and_cursor() {
-    let scan_item = ScanItem::new(
-        ItemKey::try_from_slice(b"item-key-3").unwrap(),
-        ItemRef::try_from_slice(b"item-ref-3").unwrap(),
-        StableItemId::from_bytes([0x33; 32]),
-        VersionId::Strong(ObjectVersionId::from_version_bytes(b"v3")),
-    );
-    let next_cursor = Cursor::with_token(
-        ItemKey::try_from_slice(b"next-key").unwrap(),
-        TokenBytes::try_from_slice(b"next-token").unwrap(),
-    );
-
-    let page = EnumerationPage::new(vec![scan_item.clone()], next_cursor.clone());
-    assert_eq!(page.items(), &[scan_item]);
-    assert_eq!(page.next_cursor(), &next_cursor);
-}
-
 #[rstest]
 #[case::zero_items(0, 1024, "Budgets.max_items")]
 #[case::zero_bytes(10, 0, "Budgets.max_bytes")]
@@ -427,29 +409,6 @@ fn scan_item_into_parts_returns_owned_fields() {
     assert_eq!(sz, Some(42));
     assert_eq!(ch.as_ref(), Some(&content_hints));
     assert_eq!(loc.as_ref(), Some(&location));
-}
-
-#[test]
-fn enumeration_page_into_parts_returns_owned_fields() {
-    let item = ScanItem::new(
-        ItemKey::try_from_slice(b"k").unwrap(),
-        ItemRef::try_from_slice(b"r").unwrap(),
-        StableItemId::from_bytes([0xBB; 32]),
-        VersionId::Weak(ObjectVersionId::from_version_bytes(b"v2")),
-    );
-    let cursor = Cursor::with_last_key(ItemKey::try_from_slice(b"next").unwrap());
-    let page = EnumerationPage::new(vec![item.clone()], cursor.clone());
-
-    let (items, next) = page.into_parts();
-    assert_eq!(items, vec![item]);
-    assert_eq!(next, cursor);
-}
-
-#[test]
-fn enumeration_page_empty_is_valid() {
-    let page = EnumerationPage::new(vec![], Cursor::initial());
-    assert!(page.items().is_empty());
-    assert_eq!(page.next_cursor(), &Cursor::initial());
 }
 
 #[test]

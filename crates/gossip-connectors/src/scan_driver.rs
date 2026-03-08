@@ -36,11 +36,7 @@ use crate::{MemItem, connector_tag_for_kind};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FilesystemScanSourceFactory;
 
-/// Build a filesystem driver from an assignment and preserve its shard bounds.
-///
-/// The bounds are stored on the driver even though `parallel_scan_dir` cannot
-/// consume them yet, so assignment metadata is not lost as execution paths
-/// evolve toward connector-backed filesystem enumeration.
+/// Build a filesystem driver from an assignment.
 fn filesystem_driver_from_assignment(assignment: &Assignment) -> Result<FsScanDriver> {
     if assignment.connector_kind != ConnectorKind::Filesystem {
         bail!(
@@ -61,8 +57,6 @@ fn filesystem_driver_from_assignment(assignment: &Assignment) -> Result<FsScanDr
         root: root.clone(),
         connector_instance,
         checkpoint_hint: None,
-        shard_start: assignment.shard_spec.key_range_start().into(),
-        shard_end: assignment.shard_spec.key_range_end().into(),
     })
 }
 
@@ -184,25 +178,6 @@ struct FsScanDriver {
     root: PathBuf,
     connector_instance: ConnectorInstanceIdHash,
     checkpoint_hint: Option<CursorUpdate>,
-    /// Inclusive assignment lower bound (`[]` means unbounded).
-    shard_start: Box<[u8]>,
-    /// Exclusive assignment upper bound (`[]` means unbounded).
-    shard_end: Box<[u8]>,
-}
-
-impl FsScanDriver {
-    /// Return shard bounds as `Option` slices (empty vec → `None`).
-    ///
-    /// Not yet consumed by `parallel_scan_dir` — will be wired into
-    /// `FilesystemConnector::with_shard_bounds` once the scan path is
-    /// connector-backed.
-    #[allow(dead_code)]
-    fn shard_bounds(&self) -> (Option<&[u8]>, Option<&[u8]>) {
-        (
-            (!self.shard_start.is_empty()).then_some(&self.shard_start),
-            (!self.shard_end.is_empty()).then_some(&self.shard_end),
-        )
-    }
 }
 
 impl ScanDriver for FsScanDriver {
@@ -216,12 +191,6 @@ impl ScanDriver for FsScanDriver {
         cancel: &gossip_scan_driver::CancellationToken,
     ) -> Result<ScanReport> {
         std::thread::scope(|scope| -> Result<ScanReport> {
-            // TODO: pass shard_start/shard_end to FilesystemConnector via
-            // `with_shard_bounds` once parallel_scan_dir is replaced by a
-            // connector-backed enumeration path. Bounds are stored on the
-            // driver (populated from the assignment's ShardSpec) but cannot
-            // be applied yet because parallel_scan_dir has no key-range API.
-
             let (event_tx, event_rx) = unbounded();
             let event_forwarder = scope.spawn(move || forward_events(out, None, event_rx));
 
@@ -1222,37 +1191,11 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_driver_extracts_shard_bounds_from_assignment() {
+    fn filesystem_driver_extracts_root_from_assignment() {
         let assignment = filesystem_assignment(b"m", b"z");
 
         let driver = filesystem_driver_from_assignment(&assignment).expect("filesystem driver");
-        assert_eq!(&*driver.shard_start, b"m");
-        assert_eq!(&*driver.shard_end, b"z");
-    }
-
-    #[test]
-    fn filesystem_driver_preserves_unbounded_shard_bounds() {
-        let assignment = filesystem_assignment(b"", b"");
-
-        let driver = filesystem_driver_from_assignment(&assignment).expect("filesystem driver");
-        assert!(
-            driver.shard_start.is_empty(),
-            "empty shard start should stay unbounded"
-        );
-        assert!(
-            driver.shard_end.is_empty(),
-            "empty shard end should stay unbounded"
-        );
-    }
-
-    #[test]
-    #[ignore] // Enable when connector-backed filesystem enumeration lands
-    fn filesystem_driver_applies_shard_bounds_during_scan() {
-        // Verify that assignment shard bounds flow through FsScanDriver
-        // into the connector's key-range filter during actual scanning.
-        //
-        // Expected: create assignment with bounds [b"m", b"z"), run scan
-        // on a test directory, verify only files within range are scanned.
+        assert_eq!(driver.root, PathBuf::from("/tmp/scan-root"));
     }
 
     #[test]

@@ -50,7 +50,6 @@ graph TD
     SP[12-split-operations.md<br/>split_replace + split_residual<br/>5 diagrams]
     SA[13-shard-algebra-types.md<br/>B3 deep dive: types, keys,<br/>hints, builder<br/>7 diagrams]
     CA[14-connector-architecture.md<br/>B4 deep dive: traits, types,<br/>driver bridge, errors<br/>4 diagrams]
-    PL[15-enumeration-page-lifecycle.md<br/>Page flow, validation,<br/>assembly, budgets<br/>4 diagrams]
     CR[16-cursor-resume-strategy.md<br/>Two-layer cursor,<br/>token fallback<br/>5 diagrams]
     FW[17-filesystem-walk-state-machine.md<br/>DFS walk, WalkToken,<br/>pruning, safety<br/>5 diagrams]
     SE[18-streaming-split-estimation.md<br/>Dual-axis sampling,<br/>compaction, estimation<br/>5 diagrams]
@@ -74,10 +73,8 @@ graph TD
     BD --> SA
     SP --> SA
     E2E --> CA
-    CA --> PL
     CA --> CR
     CR --> FW
-    PL --> SE
     SE --> SP
     BD --> PCC
     PCC --> ECP
@@ -98,7 +95,6 @@ graph TD
     style SP fill:#FFF7ED,stroke:#9A3412
     style SA fill:#FFF7ED,stroke:#9A3412
     style CA fill:#FEE2E2,stroke:#991B1B
-    style PL fill:#FEE2E2,stroke:#991B1B
     style CR fill:#FEE2E2,stroke:#991B1B
     style FW fill:#FEE2E2,stroke:#991B1B
     style SE fill:#FEE2E2,stroke:#991B1B
@@ -126,22 +122,21 @@ graph TD
 7. `19-persistence-contracts.md` — Traits, data model, lattice, OVID, receipts
 8. `09-circuit-breaker.md` — Failure isolation for external APIs
 9. `14-connector-architecture.md` — Trait hierarchy, types, driver bridge, error classification
-10. `15-enumeration-page-lifecycle.md` — Page enumeration flow, validation, assembly
-11. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
-12. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
-13. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
+10. `16-cursor-resume-strategy.md` — Two-layer cursor, token-assisted resume, fallback
+11. `17-filesystem-walk-state-machine.md` — DFS walk, WalkToken, subtree pruning, safety
+12. `18-streaming-split-estimation.md` — Dual-axis sampling, compaction, split key estimation
 
 **Deep dive into etcd coordination persistence** (after persistence):
-14. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
+13. `20-etcd-coordinator-persistence.md` — Keyspace, codec, backend, delegation model
 
 **Cross-cutting concerns** (after any deep dive):
-15. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
-16. `11-tenant-isolation.md` — Cryptographic multi-tenancy
-17. `12-split-operations.md` — Dynamic work distribution via shard splitting
+14. `10-failure-modes-and-recovery.md` — What breaks and how it recovers
+15. `11-tenant-isolation.md` — Cryptographic multi-tenancy
+16. `12-split-operations.md` — Dynamic work distribution via shard splitting
 
 **Deep dive into shard algebra** (after split operations):
-18. `12-split-operations.md` — Split operations and coverage validation
-19. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
+17. `12-split-operations.md` — Split operations and coverage validation
+18. `13-shard-algebra-types.md` — Key encoding, hint framing, builder, connector enumeration
 
 ## File Index
 
@@ -162,13 +157,12 @@ graph TD
 | 12  | `12-split-operations.md`             | 5        | B2, B3           | split_replace, split_residual, coverage validation                        |
 | 13  | `13-shard-algebra-types.md`          | 7        | B3               | KeyEncoding, ShardHint, builder, key arithmetic, connector enumeration    |
 | 14  | `14-connector-architecture.md`       | 4        | B4               | Trait hierarchy, core types, scan-driver bridge, error classification     |
-| 15  | `15-enumeration-page-lifecycle.md`   | 4        | B4               | Page enumeration flow, 9-check validation, assembly paths, budgets        |
 | 16  | `16-cursor-resume-strategy.md`       | 5        | B4               | Two-layer cursor, token encoding, resilience model, resume decision       |
 | 17  | `17-filesystem-walk-state-machine.md`| 5        | B4               | DFS walk, WalkFrame stack, subtree pruning, WalkToken, safety mechanisms  |
 | 18  | `18-streaming-split-estimation.md`   | 5        | B4, B3           | Dual-axis sampling, stride compaction, split key estimation, integration  |
 | 19  | `19-persistence-contracts.md`        | 5        | B5               | Trait hierarchy, findings data model, done-ledger lattice, OVID, receipts |
 | 20  | `20-etcd-coordinator-persistence.md` | 5        | B2               | Keyspace design, codec wire format, backend delegation, sync-async bridge |
-|     | **Total**                            | **97**   |                  |                                                                           |
+|     | **Total**                            | **93**   |                  |                                                                           |
 
 ## Implementation Status Legend
 
@@ -214,9 +208,8 @@ These diagrams are derived from the [gossip-rs-learning-guide](https://github.co
 | `11-tenant-isolation.md`             | `08-cross-cutting/04-tenant-isolation.md`                                                                                                                                                   |
 | `12-split-operations.md`             | `04-boundary-2-coordination/06-split-operations.md`                                                                                                                                         |
 | `13-shard-algebra-types.md`          | `crates/gossip-frontier/src/key_encoding.rs`, `hint.rs`, `builder.rs`; `crates/gossip-contracts/src/coordination/shard_spec.rs`, `split.rs`; `crates/gossip-contracts/src/connector/api.rs` |
-| `14-connector-architecture.md`       | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`, `page_validator.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`, `in_memory.rs`, `scan_driver.rs`; `crates/gossip-scan-driver/src/lib.rs` |
-| `15-enumeration-page-lifecycle.md`   | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`, `page_validator.rs`; `crates/gossip-connectors/src/common.rs`                                                                                                      |
-| `16-cursor-resume-strategy.md`       | `crates/gossip-contracts/src/connector/types.rs`, `conformance.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`                                                                                        |
+| `14-connector-architecture.md`       | `crates/gossip-contracts/src/connector/api.rs`, `types.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`, `in_memory.rs`, `scan_driver.rs`; `crates/gossip-scan-driver/src/lib.rs` |
+| `16-cursor-resume-strategy.md`       | `crates/gossip-contracts/src/connector/types.rs`; `crates/gossip-connectors/src/common.rs`, `filesystem.rs`, `git.rs`                                                                                        |
 | `17-filesystem-walk-state-machine.md`| `crates/gossip-connectors/src/filesystem.rs` (WalkState, WalkFrame, WalkToken, should_skip_subtree)                                                                                                                             |
 | `18-streaming-split-estimation.md`   | `crates/gossip-connectors/src/split_estimator.rs`, `common.rs`; `crates/gossip-contracts/src/connector/api.rs` (choose_split_point)                                                                                             |
 | `19-persistence-contracts.md`        | `crates/gossip-contracts/src/persistence/commit.rs`, `findings.rs`, `done_ledger.rs`, `ovid.rs`, `page_commit.rs`, `error.rs`, `conformance.rs`; `crates/gossip-persistence-inmemory/src/`                                      |

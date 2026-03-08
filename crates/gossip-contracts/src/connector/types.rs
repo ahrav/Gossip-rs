@@ -20,8 +20,8 @@
 //!   weak while preserving the same [`ObjectVersionId`] representation.
 //! - [`ContentHints`] and [`Location`] are bounded metadata carriers for
 //!   presentation and downstream routing decisions.
-//! - [`ScanItem`] and [`EnumerationPage`] bundle validated boundary fields for
-//!   page-oriented connector enumeration handoff.
+//! - [`ScanItem`] bundles validated boundary fields for
+//!   connector scan handoff.
 //! - [`Budgets`] carries scan-level stop conditions (count, bytes, deadline).
 //!
 //! ## Core contract
@@ -42,6 +42,100 @@
 //!   that never enter the cursor path.
 //! - Cursor states with `token` but no `last_key` are invalid by contract and
 //!   rejected when crossing the coordination boundary.
+
+// ---------------------------------------------------------------------------
+// ToxicDigest — hash-only, fixed-size representation of untrusted bytes
+// ---------------------------------------------------------------------------
+
+/// A hash-only, fixed-size representation of toxic bytes.
+///
+/// Connector keys and cursors are untrusted external data ("toxic bytes")
+/// that must never appear raw in logs, error messages, or metrics. Instead
+/// of carrying the original payload, `ToxicDigest` stores just:
+///
+/// - `len`: the byte length of the original input, and
+/// - `hash`: a full 32-byte BLAKE3 digest.
+///
+/// ## Display format
+///
+/// Both `Display` and `Debug` emit the same compact, single-line form:
+///
+/// ```text
+/// len=42, hash=0a1b2c3d4e5f6a7b
+/// ```
+///
+/// Only the first 8 bytes of the hash are printed (16 hex characters),
+/// which is enough for log-line correlation without bloating output.
+///
+/// ## Equality semantics
+///
+/// `PartialEq` and `Eq` compare the **full** 32-byte hash (plus length),
+/// not just the truncated display prefix. Two digests that display
+/// identically are overwhelmingly likely to be equal, but equality is
+/// always decided on the complete hash.
+///
+/// ## Copy semantics
+///
+/// `ToxicDigest` is `Copy` (40 bytes on 64-bit targets). Error types
+/// embed digests by value, avoiding indirection for what are
+/// fundamentally small, immutable tokens.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ToxicDigest {
+    /// Byte length of the original input. Preserved so diagnostics can
+    /// distinguish zero-length sentinels from short keys without revealing
+    /// content.
+    len: usize,
+    /// Full 32-byte BLAKE3 digest of the original input. Only the first
+    /// 8 bytes are shown in display output; equality uses all 32.
+    hash: [u8; 32],
+}
+
+impl ToxicDigest {
+    /// Digest a raw byte slice into a redacted, fixed-size representation.
+    ///
+    /// This is the low-level entry point. Prefer [`of`](Self::of) when working
+    /// with typed wrappers like [`ItemKey`] that implement `AsRef<[u8]>`.
+    #[must_use]
+    pub fn of_bytes(bytes: &[u8]) -> Self {
+        let hash = blake3::hash(bytes);
+        Self {
+            len: bytes.len(),
+            hash: *hash.as_bytes(),
+        }
+    }
+
+    /// Digest any value that can be viewed as bytes.
+    ///
+    /// This is the ergonomic entry point for typed connector keys and cursors.
+    /// The `?Sized` bound allows passing both owned wrappers (`&ItemKey`) and
+    /// plain slices (`&[u8]`) without an extra `.as_ref()` at the call site.
+    #[must_use]
+    pub fn of<K: AsRef<[u8]> + ?Sized>(k: &K) -> Self {
+        Self::of_bytes(k.as_ref())
+    }
+}
+
+impl std::fmt::Display for ToxicDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "len={}, hash=", self.len)?;
+        // First 8 bytes => 16 hex characters. Enough for correlation, short
+        // enough that multi-field error lines stay readable.
+        for b in &self.hash[..8] {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Delegates to `Display` so that `{:?}` formatting in error chains and
+/// `Option<ToxicDigest>` debug output stays log-safe and compact.
+impl std::fmt::Debug for ToxicDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 use std::{
     fmt,
@@ -1041,66 +1135,6 @@ impl ScanItem {
             self.content_hints,
             self.location,
         )
-    }
-}
-
-/// A connector enumeration page and continuation cursor.
-///
-/// `items` are the scan results for the current page. `next_cursor` encodes
-/// where to resume, including connector token state when present.
-///
-/// ## Empty-page semantics
-///
-/// An empty `items` slice is valid and its meaning depends on the cursor:
-///
-/// - Empty items + [`Cursor::initial()`] → scan is complete (no more data).
-/// - Empty items + non-initial cursor → no results in the current range,
-///   but more data may exist beyond the cursor position.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EnumerationPage {
-    items: Vec<ScanItem>,
-    next_cursor: Cursor,
-}
-
-impl EnumerationPage {
-    /// Construct a page from scan items and the continuation cursor.
-    #[inline]
-    #[must_use]
-    pub fn new(items: Vec<ScanItem>, next_cursor: Cursor) -> Self {
-        Self { items, next_cursor }
-    }
-
-    /// Returns the current page items.
-    #[inline]
-    #[must_use]
-    pub fn items(&self) -> &[ScanItem] {
-        &self.items
-    }
-
-    /// Returns the cursor to use for the next page request.
-    #[inline]
-    #[must_use]
-    pub fn next_cursor(&self) -> &Cursor {
-        &self.next_cursor
-    }
-
-    /// Consume the page, returning owned items and the continuation cursor.
-    ///
-    /// Use this when you need to process the items and cursor separately
-    /// without borrowing from the page.
-    #[must_use]
-    pub fn into_parts(self) -> (Vec<ScanItem>, Cursor) {
-        (self.items, self.next_cursor)
-    }
-
-    /// Consume the page, returning only the continuation cursor.
-    ///
-    /// Use this when page items have already been inspected by reference and
-    /// only the cursor is needed by value (e.g., after validation in the scan
-    /// loop). Avoids cloning the cursor's heap-allocated key and token fields.
-    #[must_use]
-    pub fn into_next_cursor(self) -> Cursor {
-        self.next_cursor
     }
 }
 

@@ -2,9 +2,9 @@
 //!
 //! This crate provides concrete connector implementations that bridge
 //! specific data sources (local filesystem, git repository, or deterministic
-//! in-memory fixtures) into the unified shard-based enumeration and read model
+//! in-memory fixtures) into the unified shard-based read model
 //! defined in `gossip-contracts`. Shared value types
-//! (`ScanItem`, `ItemRef`, `EnumerationPage`, etc.) live in the
+//! (`ScanItem`, `ItemRef`, etc.) live in the
 //! `gossip_contracts::connector` module; this crate supplies the currently
 //! implemented per-source-type adapters.
 //!

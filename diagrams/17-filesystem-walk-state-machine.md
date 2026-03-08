@@ -7,8 +7,8 @@ globally sorted stream of `FileEntry` records without materializing a full-tree
 index. Memory stays proportional to `O(Σ entries_per_active_dir)` for buffered
 DFS frames plus `O(visited_dirs)` for cycle-detection identities.
 
-The walk integrates with the page-assembly layer described in
-[13-shard-algebra-types.md](13-shard-algebra-types.md) (connector enumeration
+The walk integrates with the shard-range types described in
+[13-shard-algebra-types.md](13-shard-algebra-types.md) (connector split-point
 lifecycle) and with the cursor resume protocol that keeps pagination consistent
 across calls. Walk state is either created fresh from a root directory or restored
 from a serialized `WalkToken` embedded in the cursor.
@@ -493,7 +493,7 @@ direction) rather than open→stat.
 
 | Topic                              | Diagram                                                                                                 |
 | ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| Connector enumeration lifecycle    | [13-shard-algebra-types.md](13-shard-algebra-types.md) §7 (Connector Enumeration Lifecycle)             |
+| Connector split-point lifecycle   | [13-shard-algebra-types.md](13-shard-algebra-types.md) §6 (Connector Split-Point Lifecycle)             |
 | Circuit breaker for connectors     | [09-circuit-breaker.md](09-circuit-breaker.md)                                                          |
 | Shard key ranges and split algebra | [12-split-operations.md](12-split-operations.md), [13-shard-algebra-types.md](13-shard-algebra-types.md)|
 | End-to-end scan flow               | [04-end-to-end-scan-flow.md](04-end-to-end-scan-flow.md)                                               |
@@ -533,7 +533,7 @@ direction) rather than open→stat.
 | `clear_nonblock`               | `crates/gossip-connectors/src/filesystem.rs`     | Remove `O_NONBLOCK` after regular-file validation               |
 | `verify_root_identity`         | `crates/gossip-connectors/src/filesystem.rs`     | fstat-based root `(dev, ino)` verification                      |
 | `intersect_key_bounds`         | `crates/gossip-connectors/src/filesystem.rs`     | Merge request + connector key-range bounds                      |
-| `enumerate_page_bounds`        | `crates/gossip-connectors/src/filesystem.rs`      | Core page loop: walk → filter → assemble → cursor               |
+| `choose_split_point_range`     | `crates/gossip-connectors/src/filesystem.rs`      | Shard-range split-point selection using walk data                        |
 | `align_walk_to_cursor`         | `crates/gossip-connectors/src/filesystem.rs`      | Token restore → key-only fallback cursor alignment              |
 | `StreamingSplitEstimator`      | `crates/gossip-connectors/src/split_estimator.rs`     | Reservoir-sampled split-point estimation fed during walk         |
 | `DEADLINE_CHECK_INTERVAL`      | `crates/gossip-connectors/src/filesystem.rs`     | Entries between deadline polls (512)                             |
