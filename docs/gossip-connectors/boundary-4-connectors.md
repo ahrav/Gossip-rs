@@ -16,11 +16,10 @@ The crate provides four core capabilities:
   `TypeName(len=N, hash=XXXXXXXX..)` via truncated BLAKE3, never raw
   bytes.
 
-- **Connector trait contracts** -- `EnumerationConnector` for page-oriented
-  listing and `ReadConnector` for item-level reads, with a
-  `ConnectorInstance` convenience supertrait. Traits include conservative
-  defaults (`choose_split_point` returns `Ok(None)`;
-  `read_range` returns `Err(ReadError::unsupported("range_read"))`).
+- **Connector method surface** -- each concrete connector exposes `caps`,
+  `enumerate_page`, `choose_split_point`, `open`, and `read_range` as
+  inherent methods with shared signatures. `ConnectorCapabilities`
+  advertises optional features at registration time.
 
 - **Page validation** -- a pure, allocation-free validator
   (`validate_page`, `validate_page_range`) that enforces 9 invariants on
@@ -99,7 +98,7 @@ The crate provides four core capabilities:
 | Concern                        | Owner                            | Examples                                                                           |
 | ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------- |
 | Toxic-byte validation + paging | `gossip-contracts::connector`    | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `Budgets`                            |
-| Connector traits + error types | `gossip-contracts::connector`    | `EnumerationConnector`, `ReadConnector`, `ErrorClass`                              |
+| Connector error types + caps   | `gossip-contracts::connector`    | `ConnectorCapabilities`, `ErrorClass`, `EnumerateError`, `ReadError`                |
 | Page validation                | `gossip-contracts::connector`    | `validate_page`, `validate_page_range`, `PageValidationError`                      |
 | Conformance testing            | `gossip-contracts::connector`    | `check_connector_conforms`, `ConformanceConfig`                                    |
 | Reference connectors           | `gossip-connectors`              | `FilesystemConnector`, `GitConnector`, `InMemoryDeterministicConnector` |
@@ -225,30 +224,30 @@ simulation determinism.
 
 ---
 
-## 4. Connector Traits
+## 4. Connector Method Surface
 
-### EnumerationConnector (`api.rs`)
+### Enumeration methods (inherent on each connector)
+
+Each concrete connector (`FilesystemConnector`, `GitConnector`,
+`InMemoryDeterministicConnector`) exposes the same set of inherent methods:
 
 ```rust
-pub trait EnumerationConnector: Send {
-    fn caps(&self) -> ConnectorCapabilities;
+impl FilesystemConnector {  // same signatures on all three connectors
+    pub fn caps(&self) -> ConnectorCapabilities;
 
-    fn enumerate_page(
+    pub fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
         budgets: Budgets,
     ) -> Result<EnumerationPage, EnumerateError>;
 
-    fn choose_split_point(
+    pub fn choose_split_point(
         &mut self,
-        _shard: &ShardSpec,
-        _cursor: &Cursor,
-        _budgets: Budgets,
-    ) -> Result<Option<ItemKey>, EnumerateError> {
-        // Default: no hint. debug_assert fires if caps().split_hints is true.
-        Ok(None)
-    }
+        shard: &ShardSpec,
+        cursor: &Cursor,
+        budgets: Budgets,
+    ) -> Result<Option<ItemKey>, EnumerateError>;
 }
 ```
 
@@ -257,43 +256,35 @@ Key design points:
 - A single `enumerate_page` method serves both initial and resume
   requests, distinguished by cursor state (`Cursor::initial()` vs
   non-initial).
-- `Budgets` values are advisory at the trait layer. Enforcement is the
+- `Budgets` values are advisory at the connector layer. Enforcement is the
   runtime's responsibility.
 - `choose_split_point` takes all three parameters (`shard`, `cursor`,
-  `budgets`) for interface consistency, even though the default ignores
-  them.
+  `budgets`) for interface consistency, even though some connectors ignore
+  the budget.
 
-### ReadConnector (`api.rs`)
+### Read methods (inherent on each connector)
 
 ```rust
-pub trait ReadConnector: Send {
-    fn open(
+impl FilesystemConnector {  // same signatures on all three connectors
+    pub fn open(
         &mut self,
         item_ref: &ItemRef,
         budgets: Budgets,
     ) -> Result<Box<dyn io::Read + Send>, ReadError>;
 
-    fn read_range(
+    pub fn read_range(
         &mut self,
-        _item_ref: &ItemRef,
-        _offset: u64,
-        _dst: &mut [u8],
-        _budgets: Budgets,
-    ) -> Result<usize, ReadError> {
-        Err(ReadError::unsupported("range_read"))
-    }
+        item_ref: &ItemRef,
+        offset: u64,
+        dst: &mut [u8],
+        budgets: Budgets,
+    ) -> Result<usize, ReadError>;
 }
 ```
 
 The boxed `dyn Read + Send` return from `open` is intentional: it sits
 on the WARM read path (once per item, not per byte), and the IO cost of
 subsequent reads dominates the heap allocation.
-
-### ConnectorInstance (`api.rs`)
-
-Pure bound alias: `EnumerationConnector + ReadConnector`. Blanket-
-implemented for all `T: EnumerationConnector + ReadConnector + ?Sized`.
-No additional methods -- it is not an extension point.
 
 ### ConnectorCapabilities (`api.rs`)
 
@@ -704,12 +695,12 @@ All connector-originated bytes (`ItemKey`, `ItemRef`, `TokenBytes`) are
 never shown as raw bytes in logs. Constructors validate, and formatters
 redact. Raw access requires explicit `.as_bytes()` or `.into_bytes()`.
 
-### Trait split rationale
+### Enumeration/read method split rationale
 
-Enumeration and reading are separate traits because they have independent
-scaling characteristics: enumeration is metadata-bound, reading is
-bandwidth-bound. Orchestration can compose them independently while
-`ConnectorInstance` provides a shorthand bound when both are needed.
+Enumeration and reading are separate method groups because they have
+independent scaling characteristics: enumeration is metadata-bound,
+reading is bandwidth-bound. Orchestration applies independent retry and
+circuit-breaker policies per operation.
 
 ### Two-layer cursor with key-only resume
 

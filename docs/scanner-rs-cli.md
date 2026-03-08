@@ -125,7 +125,6 @@ scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
 | `--x-repo-id` | Stable repository identifier |
 | `--x-mode` | Scan mode: `diff`, `diff-history`, `odb-blob`, `odb-blob-fast` |
 | `--x-merge` | Merge diff mode: `all`, `first-parent` |
-| `--x-pack-exec-workers` | Legacy worker count (superseded by `--workers`) |
 | `--x-tree-delta-cache-mb` | Tree delta cache size in MiB |
 | `--x-engine-chunk-mb` | Engine chunk size in MiB |
 

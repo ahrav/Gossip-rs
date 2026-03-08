@@ -66,8 +66,8 @@ use std::{
 
 use gossip_contracts::{
     connector::{
-        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationConnector,
-        EnumerationPage, ItemKey, ItemRef, ReadConnector, ReadError, ScanItem, VersionId,
+        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationPage, ItemKey, ItemRef,
+        ReadError, ScanItem, VersionId,
     },
     coordination::ShardSpec,
     identity::{ConnectorInstanceIdHash, ObjectVersionId, StableItemId},
@@ -125,7 +125,6 @@ enum IndexState {
 ///
 /// The connector lazily indexes tracked files on first use, then serves
 /// paginated enumeration and byte-range reads from that frozen snapshot.
-/// It implements both [`EnumerationConnector`] and [`ReadConnector`].
 ///
 /// # Invariants
 ///
@@ -515,8 +514,9 @@ impl GitConnector {
     }
 }
 
-impl EnumerationConnector for GitConnector {
-    fn caps(&self) -> ConnectorCapabilities {
+impl GitConnector {
+    /// Advertise connector capabilities used by orchestration planning.
+    pub fn caps(&self) -> ConnectorCapabilities {
         ConnectorCapabilities {
             seek_by_key: true,
             token_resume: self.emit_tokens,
@@ -525,7 +525,8 @@ impl EnumerationConnector for GitConnector {
         }
     }
 
-    fn enumerate_page(
+    /// Enumerate one page of items.
+    pub fn enumerate_page(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
@@ -536,7 +537,8 @@ impl EnumerationConnector for GitConnector {
         self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
-    fn choose_split_point(
+    /// Split-point hint for dynamic shard subdivision.
+    pub fn choose_split_point(
         &mut self,
         shard: &ShardSpec,
         cursor: &Cursor,
@@ -546,10 +548,9 @@ impl EnumerationConnector for GitConnector {
         let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
         self.choose_split_point_bounds(start, end, cursor, budgets.deadline())
     }
-}
 
-impl ReadConnector for GitConnector {
-    fn open(
+    /// Open an item for sequential read access.
+    pub fn open(
         &mut self,
         item_ref: &ItemRef,
         _budgets: Budgets,
@@ -560,7 +561,8 @@ impl ReadConnector for GitConnector {
         Ok(Box::new(file))
     }
 
-    fn read_range(
+    /// Range-read fast path.
+    pub fn read_range(
         &mut self,
         item_ref: &ItemRef,
         offset: u64,

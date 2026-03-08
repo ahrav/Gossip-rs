@@ -16,11 +16,9 @@
 //!
 //! - `types.rs` defines validated value wrappers and paging/value invariants
 //!   (including toxic-byte redaction and size bounds).
-//! - `api.rs` defines operation-outcome classification, optional capability
-//!   negotiation, and runtime connector trait contracts plus their conservative
-//!   defaults (`ErrorClass`, `EnumerateError`, `ReadError`,
-//!   `ConnectorCapabilities`, `EnumerationConnector`, `ReadConnector`,
-//!   `ConnectorInstance`).
+//! - `api.rs` defines operation-outcome classification and optional capability
+//!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
+//!   `ConnectorCapabilities`).
 //! - `page_validator.rs` defines log-safe page-validation diagnostics plus
 //!   validation helpers (`validate_page` and generic `validate_page_range`).
 //! - `conformance.rs` defines strict-by-default harness configuration,
@@ -28,11 +26,6 @@
 //!
 //! Re-exporting all four layers here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
-//!
-//! ## Trait composition
-//!
-//! See [`EnumerationConnector`] for the rationale behind the enumeration/read
-//! trait split and [`ConnectorInstance`] for the convenience supertrait.
 //!
 //! ## Invariants
 //!
@@ -67,9 +60,6 @@
 //!   surface)
 //! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
 //! - Connector feature flags: [`ConnectorCapabilities`]
-//! - Runtime connector traits: [`EnumerationConnector`], [`ReadConnector`],
-//!   [`ConnectorInstance`] (`choose_split_point` defaults to no hint;
-//!   `read_range` defaults to unsupported)
 //! - Conformance harness: [`conformance`] module (assertion entry point,
 //!   conformance config, and diagnostics)
 //!
@@ -89,10 +79,7 @@ pub mod page_validator;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
-pub use api::{
-    ConnectorCapabilities, ConnectorInstance, EnumerateError, EnumerationConnector, ErrorClass,
-    ReadConnector, ReadError,
-};
+pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
 pub use page_validator::{
     CursorWhich, PageValidationDetails, PageValidationError, PageValidationViolation, ToxicDigest,
     validate_page,

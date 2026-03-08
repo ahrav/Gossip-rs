@@ -298,10 +298,6 @@ selection, but they differ in how they feed observations into it.
 ```mermaid
 %% Diagram: connector-integration
 graph TD
-    subgraph Trait ["B4: EnumerationConnector trait"]
-        CSP_TRAIT["choose_split_point(&mut self, shard, cursor, budgets)<br/>→ Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
-    end
-
     subgraph FS ["FilesystemConnector — streaming"]
         FS_FIELD["split_estimator: StreamingSplitEstimator<br/>(field, created at construction)"]
         FS_ENUM["enumerate_page_core():<br/>self.split_estimator.observe(key, size)<br/>for each in-range file"]
@@ -323,10 +319,6 @@ graph TD
         EST_SORTED["estimate_split_from_sorted():<br/>1. StreamingSplitEstimator::from_sorted_entries(count, iter)<br/>2. estimator.estimate_split_key()<br/>3. is_valid_split_candidate(key, cursor, end)<br/>4. ItemKey::try_from_slice(split_key)"]
     end
 
-    CSP_TRAIT -.->|"impl"| FS_SPLIT
-    CSP_TRAIT -.->|"impl"| GIT_SPLIT
-    CSP_TRAIT -.->|"impl"| MEM_SPLIT
-
     FS_ENUM --> FS_FIELD
     FS_SPLIT --> FS_FIELD
     FS_RESET --> FS_FIELD
@@ -335,7 +327,6 @@ graph TD
     MEM_SPLIT --> EST_SORTED
     EST_SORTED -->|"from_sorted_entries<br/>sample_cap = entry_count<br/>(no compaction)"| FS_FIELD
 
-    style CSP_TRAIT fill:#FEE2E2,stroke:#991B1B
     style FS_FIELD fill:#EF4444,stroke:#991B1B,color:#fff
     style FS_ENUM fill:#FEE2E2,stroke:#991B1B
     style FS_SPLIT fill:#FEE2E2,stroke:#991B1B
@@ -398,7 +389,9 @@ the split or continuing to scan the shard as-is.
 | `from_sorted_entries()` | `crates/gossip-connectors/src/split_estimator.rs:620` | Bulk-load constructor |
 | `estimate_split_from_sorted()` | `crates/gossip-connectors/src/common.rs:241` | Shared batch-connector split path |
 | `is_valid_split_candidate()` | `crates/gossip-connectors/src/common.rs:218` | Post-selection cursor/bound guard |
-| `choose_split_point()` | `crates/gossip-contracts/src/connector/api.rs:400` | Trait method (default returns `None`) |
+| `FilesystemConnector::choose_split_point()` | `crates/gossip-connectors/src/filesystem.rs:1074` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
+| `GitConnector::choose_split_point()` | `crates/gossip-connectors/src/git.rs:541` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
+| `InMemoryDeterministicConnector::choose_split_point()` | `crates/gossip-connectors/src/in_memory.rs:491` | Shard-based split-point entry point (delegates to `choose_split_point_bounds`) |
 | `FilesystemConnector::split_estimator` | `crates/gossip-connectors/src/filesystem.rs:300` | Persistent estimator field |
 | `FilesystemConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/filesystem.rs:897` | FS split selection entry point |
 | `GitConnector::choose_split_point_bounds()` | `crates/gossip-connectors/src/git.rs:464` | Git split selection entry point |

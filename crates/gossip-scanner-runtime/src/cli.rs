@@ -166,7 +166,6 @@ where
     let mut git_repo_id: u64 = 1;
     let mut git_scan_mode = GitScanMode::OdbBlobFast;
     let mut git_merge_mode = MergeDiffMode::AllParents;
-    let mut x_pack_exec_workers: Option<usize> = None;
     let mut git_tree_delta_cache_mb: Option<u32> = None;
     let mut git_engine_chunk_mb: Option<u32> = None;
 
@@ -453,27 +452,6 @@ where
                 continue;
             }
 
-            if let Some(value) = arg.strip_prefix("--x-pack-exec-workers=") {
-                x_pack_exec_workers = Some(parse_workers(value, &source_kind)?);
-                i += 1;
-                continue;
-            }
-
-            if arg == "--x-pack-exec-workers" {
-                let value = args.get(i + 1).ok_or_else(|| {
-                    CliError::Usage(format!(
-                        "error: --x-pack-exec-workers requires a value\n\n{}",
-                        source_usage(&source_kind)
-                    ))
-                })?;
-                x_pack_exec_workers = Some(parse_workers(
-                    value.to_string_lossy().as_ref(),
-                    &source_kind,
-                )?);
-                i += 2;
-                continue;
-            }
-
             if let Some(value) = arg.strip_prefix("--x-tree-delta-cache-mb=") {
                 git_tree_delta_cache_mb = Some(parse_positive_u32(
                     value,
@@ -665,11 +643,6 @@ where
             )));
         }
     };
-
-    // `--workers` supersedes the legacy hidden worker knob regardless of order.
-    if source_kind == "git" && workers.is_none() {
-        workers = x_pack_exec_workers;
-    }
 
     Ok(CliConfig {
         source,

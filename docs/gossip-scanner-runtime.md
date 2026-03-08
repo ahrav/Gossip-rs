@@ -302,7 +302,7 @@ scanner-rs scan git --repo <path>     [GIT OPTIONS] [COMMON OPTIONS]
 **Git-specific flags:** `--debug[=perf|stats]`, `--enrich-identities`
 
 **Git hidden flags (parsed but excluded from help text):**
-`--x-repo-id`, `--x-mode`, `--x-merge`, `--x-pack-exec-workers`,
+`--x-repo-id`, `--x-mode`, `--x-merge`,
 `--x-tree-delta-cache-mb`, `--x-engine-chunk-mb`
 
 The `cli::run` function:
