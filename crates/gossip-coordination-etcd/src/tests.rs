@@ -46,12 +46,14 @@ use crate::{
 };
 use gossip_contracts::coordination::{
     CursorSemantics, CursorUpdate, ShardSpec, ShardSpecRef, SplitReplaceChild, SplitReplacePlan,
-    SplitResidualPlan,
+    SplitResidualPlan, SplitValidationError,
 };
 use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
 use gossip_coordination::{
-    AcquireError, AcquireScratch, CheckpointError, CoordinationBackend, IdempotentOutcome,
-    InitialShardInput, RegisterShardsError, RunConfig, RunManagement, ShardStatus,
+    AcquireError, AcquireScratch, CheckpointError, CoordinationBackend,
+    DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS, IdempotentOutcome, InitialShardInput,
+    RegisterShardsError, RunConfig, RunManagement, ShardLimitScope, ShardStatus, SplitReplaceError,
+    SplitResidualError,
 };
 use proptest::prelude::*;
 use rstest::rstest;
@@ -114,6 +116,11 @@ fn localhost_config_uses_expected_defaults() {
     assert_eq!(config.namespace_prefix(), "/gossip/v1");
     assert_eq!(config.owner_lease_ttl_secs(), 60);
     assert_eq!(config.optimistic_txn_retries(), 8);
+    assert_eq!(
+        config.max_shards_per_tenant(),
+        DEFAULT_MAX_SHARDS_PER_TENANT
+    );
+    assert_eq!(config.max_total_shards(), DEFAULT_MAX_TOTAL_SHARDS);
     assert_eq!(config.max_children_per_op(), 8);
 }
 
@@ -169,6 +176,16 @@ fn config_accepts_explicit_tuning_values() {
 }
 
 #[test]
+fn config_with_shard_limits_overrides_defaults() {
+    let config = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
+        .expect("valid config")
+        .with_shard_limits(12, 34)
+        .expect("valid shard limits");
+    assert_eq!(config.max_shards_per_tenant(), 12);
+    assert_eq!(config.max_total_shards(), 34);
+}
+
+#[test]
 fn config_rejects_non_positive_owner_lease_ttl() {
     let error =
         EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 0, 8, 8)
@@ -187,6 +204,30 @@ fn config_rejects_zero_optimistic_txn_retries() {
     assert!(matches!(
         error,
         EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries
+    ));
+}
+
+#[test]
+fn config_rejects_zero_max_shards_per_tenant() {
+    let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
+        .expect("base config should be valid")
+        .with_shard_limits(0, 8)
+        .expect_err("zero per-tenant shard cap must fail validation");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::ZeroMaxShardsPerTenant
+    ));
+}
+
+#[test]
+fn config_rejects_zero_max_total_shards() {
+    let error = EtcdCoordinatorConfig::new(["http://127.0.0.1:2379"], "/gossip/v1")
+        .expect("base config should be valid")
+        .with_shard_limits(8, 0)
+        .expect_err("zero global shard cap must fail validation");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::ZeroMaxTotalShards
     ));
 }
 
@@ -677,6 +718,74 @@ fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
 
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn register_shards_rejects_global_shard_limit_against_local_etcd() {
+    let mut backend = local_backend_with_limits("/gossip/tests/register-global-limit", 100, 2);
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), other_tenant(), other_run(), config)
+        .expect("create_run should succeed for other tenant");
+    let seed_manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x21),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let seed = backend
+        .register_shards(
+            now(2),
+            other_tenant(),
+            other_run(),
+            &seed_manifest,
+            OpId::from_raw(98),
+        )
+        .expect("seed registration should succeed");
+    assert!(seed.is_executed());
+
+    backend
+        .create_run(now(3), test_tenant(), test_run(), config)
+        .expect("create_run should succeed for target tenant");
+    let shard_a = ShardSpec::with_range(b"a", b"m");
+    let shard_b = ShardSpec::with_range(b"m", b"z");
+    let manifest = [
+        InitialShardInput::new(
+            ShardId::from_raw(0x31),
+            shard_a.as_ref(),
+            CursorUpdate::initial(),
+        ),
+        InitialShardInput::new(
+            ShardId::from_raw(0x32),
+            shard_b.as_ref(),
+            CursorUpdate::initial(),
+        ),
+    ];
+
+    let err = backend
+        .register_shards(
+            now(4),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect_err("registration should exceed the global shard limit");
+
+    assert!(
+        matches!(
+            err,
+            RegisterShardsError::ShardLimitExceeded {
+                scope: ShardLimitScope::Global,
+                ..
+            }
+        ),
+        "expected ShardLimitExceeded(Global), got {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn connects_to_local_etcd_and_fetches_status() {
     let backend = local_backend("/gossip/tests/status");
     let status = backend.status().expect("status call should succeed");
@@ -862,6 +971,98 @@ fn split_replace_round_trip_against_local_etcd() {
 
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn split_replace_rejects_per_tenant_shard_limit_against_local_etcd() {
+    let mut backend = local_backend_with_limits("/gossip/tests/split-replace-limit", 3, 100);
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+    let parent_manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &parent_manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+    assert!(register.is_executed());
+
+    backend
+        .create_run(now(3), test_tenant(), other_run(), config)
+        .expect("second run should be created");
+    let shard_a = ShardSpec::with_range(b"a", b"m");
+    let shard_b = ShardSpec::with_range(b"m", b"z");
+    let sibling_manifest = [
+        InitialShardInput::new(
+            ShardId::from_raw(0x41),
+            shard_a.as_ref(),
+            CursorUpdate::initial(),
+        ),
+        InitialShardInput::new(
+            ShardId::from_raw(0x42),
+            shard_b.as_ref(),
+            CursorUpdate::initial(),
+        ),
+    ];
+    let sibling_register = backend
+        .register_shards(
+            now(4),
+            test_tenant(),
+            other_run(),
+            &sibling_manifest,
+            OpId::from_raw(100),
+        )
+        .expect("sibling registration should fill the tenant limit");
+    assert!(sibling_register.is_executed());
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(5), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed");
+
+    let left = ShardSpec::with_range(b"a", b"m");
+    let right = ShardSpec::with_range(b"m", b"z");
+    let plan = SplitReplacePlan::try_new(vec![
+        SplitReplaceChild::new(left.as_ref(), CursorUpdate::initial()),
+        SplitReplaceChild::new(right.as_ref(), CursorUpdate::initial()),
+    ])
+    .expect("split plan should be valid");
+
+    let err = backend
+        .split_replace(
+            now(6),
+            test_tenant(),
+            &acquire.lease,
+            plan,
+            OpId::from_raw(200),
+        )
+        .expect_err("split_replace should exceed the per-tenant shard limit");
+
+    assert!(
+        matches!(
+            err,
+            SplitReplaceError::SplitInvalid(SplitValidationError::ShardLimitExceeded {
+                scope: ShardLimitScope::PerTenant,
+                ..
+            })
+        ),
+        "expected ShardLimitExceeded(PerTenant), got {err:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn split_residual_round_trip_against_local_etcd() {
     let mut backend = local_backend("/gossip/tests/split-residual");
     backend
@@ -955,6 +1156,97 @@ fn split_residual_round_trip_against_local_etcd() {
     assert_eq!(replay.as_ref().residual, first.as_ref().residual);
 }
 
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn split_residual_rejects_global_shard_limit_against_local_etcd() {
+    let mut backend = local_backend_with_limits("/gossip/tests/split-residual-limit", 100, 2);
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+    let parent_manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let register = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &parent_manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+    assert!(register.is_executed());
+
+    backend
+        .create_run(now(3), other_tenant(), other_run(), config)
+        .expect("other tenant run should be created");
+    let sibling_manifest = [InitialShardInput::new(
+        ShardId::from_raw(0x51),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let sibling_register = backend
+        .register_shards(
+            now(4),
+            other_tenant(),
+            other_run(),
+            &sibling_manifest,
+            OpId::from_raw(100),
+        )
+        .expect("sibling registration should fill the global limit");
+    assert!(sibling_register.is_executed());
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(5), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed");
+
+    let checkpoint = backend
+        .checkpoint(
+            now(6),
+            test_tenant(),
+            &acquire.lease,
+            &CursorUpdate::new(b"f"),
+            OpId::from_raw(101),
+        )
+        .expect("checkpoint should succeed");
+    assert!(checkpoint.is_executed());
+
+    let parent_new = ShardSpec::with_range(b"a", b"m");
+    let residual = ShardSpec::with_range(b"m", b"z");
+    let plan = SplitResidualPlan::try_new(parent_new.as_ref(), residual.as_ref())
+        .expect("residual split plan should be valid");
+
+    let err = backend
+        .split_residual(
+            now(7),
+            test_tenant(),
+            &acquire.lease,
+            plan,
+            OpId::from_raw(201),
+        )
+        .expect_err("split_residual should exceed the global shard limit");
+
+    assert!(
+        matches!(
+            err,
+            SplitResidualError::SplitInvalid(SplitValidationError::ShardLimitExceeded {
+                scope: ShardLimitScope::Global,
+                ..
+            })
+        ),
+        "expected ShardLimitExceeded(Global), got {err:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Test fixture helpers
 // ---------------------------------------------------------------------------
@@ -987,6 +1279,20 @@ fn local_backend(namespace: &str) -> EtcdCoordinator {
     EtcdCoordinator::connect(config).expect("local etcd should be reachable")
 }
 
+/// Connect to etcd with explicit shard count limits.
+fn local_backend_with_limits(
+    namespace: &str,
+    max_shards_per_tenant: usize,
+    max_total_shards: usize,
+) -> EtcdCoordinator {
+    let config = EtcdCoordinatorConfig::from_endpoints_csv(&test_endpoints(), namespace)
+        .expect("test endpoint configuration should be valid")
+        .with_shard_limits(max_shards_per_tenant, max_total_shards)
+        .expect("test shard limits should be valid");
+
+    EtcdCoordinator::connect(config).expect("local etcd should be reachable")
+}
+
 /// Connect to etcd with a custom owner-lease TTL (for lease-expiry tests).
 fn local_backend_with_ttl(namespace: &str, ttl_secs: i64) -> EtcdCoordinator {
     let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
@@ -1006,9 +1312,19 @@ fn test_tenant() -> TenantId {
     TenantId::from_bytes([0x11; 32])
 }
 
+/// Stable alternate tenant identity used for cross-tenant limit tests.
+fn other_tenant() -> TenantId {
+    TenantId::from_bytes([0x22; 32])
+}
+
 /// Stable run identity used across all tests.
 fn test_run() -> RunId {
     RunId::from_raw(0x0102_0304_0506_0708)
+}
+
+/// Stable alternate run identity for multi-run limit tests.
+fn other_run() -> RunId {
+    RunId::from_raw(0x1112_1314_1516_1718)
 }
 
 /// Stable shard identity used across all tests.

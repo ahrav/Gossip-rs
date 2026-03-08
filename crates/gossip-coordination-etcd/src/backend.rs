@@ -68,7 +68,7 @@ use etcd_client::DeleteOptions;
 use etcd_client::{Compare, CompareOp, GetOptions, PutOptions, Txn, TxnOp};
 use gossip_contracts::coordination::limits::{MAX_SPAWNED_PER_SHARD, MAX_SPLIT_CHILDREN};
 use gossip_contracts::coordination::shard_spec::{
-    ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
+    ShardLimitScope, ShardSpec, ShardSpecRef, SplitValidationError, validate_residual_split_bounds,
     validate_split_coverage_bounds,
 };
 #[cfg(test)]
@@ -121,9 +121,69 @@ const DEFAULT_BUILD_SLAB_FLOOR: usize = 1024;
 /// `(128 - 3) / 3 = 41` as the maximum shard count per transaction.
 const MAX_SHARDS_PER_ETCD_TXN: usize = 41;
 
+/// Marker segment that appears exactly once in persisted shard record keys.
+const SHARD_RECORD_KEY_SEGMENT: &[u8] = b"/shards/";
+
 type SplitChildIds = InlineVec<ShardId, { MAX_SPLIT_CHILDREN }>;
 
 const _: () = assert!(MAX_SPLIT_CHILDREN <= u16::MAX as usize);
+
+/// Snapshot of persisted shard counts used for shard-limit enforcement.
+#[derive(Clone, Copy, Debug, Default)]
+struct ShardCountSnapshot {
+    tenant: usize,
+    total: usize,
+}
+
+/// Details for the first shard-limit violation detected in a growth check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShardLimitViolation {
+    current: usize,
+    additional: usize,
+    max: usize,
+    scope: ShardLimitScope,
+}
+
+/// Returns the first shard-count ceiling that `additional` would exceed.
+fn shard_limit_violation(
+    counts: ShardCountSnapshot,
+    additional: usize,
+    max_shards_per_tenant: usize,
+    max_total_shards: usize,
+) -> Option<ShardLimitViolation> {
+    if counts.tenant.saturating_add(additional) > max_shards_per_tenant {
+        return Some(ShardLimitViolation {
+            current: counts.tenant,
+            additional,
+            max: max_shards_per_tenant,
+            scope: ShardLimitScope::PerTenant,
+        });
+    }
+
+    if counts.total.saturating_add(additional) > max_total_shards {
+        return Some(ShardLimitViolation {
+            current: counts.total,
+            additional,
+            max: max_total_shards,
+            scope: ShardLimitScope::Global,
+        });
+    }
+
+    None
+}
+
+/// Returns `true` when `key` is a shard record path rather than an owner or
+/// active-index key.
+fn is_persisted_shard_record_key(key: &[u8]) -> bool {
+    let Some(segment_pos) = key
+        .windows(SHARD_RECORD_KEY_SEGMENT.len())
+        .rposition(|window| window == SHARD_RECORD_KEY_SEGMENT)
+    else {
+        return false;
+    };
+
+    !key[segment_pos + SHARD_RECORD_KEY_SEGMENT.len()..].contains(&b'/')
+}
 
 /// Compute a backoff delay for CAS retry loops.
 ///
@@ -1144,6 +1204,42 @@ impl EtcdCoordinator {
         })
     }
 
+    /// Count persisted shard records under `prefix` using a keys-only scan.
+    ///
+    /// The subtree contains run records, owner keys, and active indexes in
+    /// addition to shard records, so the caller filters keys structurally.
+    fn count_persisted_shards_under_prefix(
+        &self,
+        prefix: String,
+    ) -> Result<usize, EtcdCoordinatorError> {
+        let response = self.etcd_get(
+            prefix.into_bytes(),
+            Some(GetOptions::new().with_prefix().with_keys_only()),
+        )?;
+        Ok(response
+            .kvs()
+            .iter()
+            .filter(|kv| is_persisted_shard_record_key(kv.key()))
+            .count())
+    }
+
+    /// Load current persisted shard counts for one tenant and for the whole
+    /// backend.
+    ///
+    /// Unlike the in-memory backend's remove-mutate-restore flow, etcd reads
+    /// the parent shard directly from storage, so the current counts already
+    /// include the parent being split.
+    fn current_shard_counts(
+        &self,
+        tenant: TenantId,
+    ) -> Result<ShardCountSnapshot, EtcdCoordinatorError> {
+        Ok(ShardCountSnapshot {
+            tenant: self
+                .count_persisted_shards_under_prefix(self.keyspace.tenant_prefix(tenant))?,
+            total: self.count_persisted_shards_under_prefix(self.keyspace.tenants_prefix())?,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // etcd CAS guard helpers
     // -----------------------------------------------------------------------
@@ -1800,6 +1896,26 @@ impl CoordinationBackend for EtcdCoordinator {
                 &persisted.slab,
                 self.config.max_children_per_op(),
             )?;
+            let counts = self.current_shard_counts(tenant).map_err(|err| {
+                SplitReplaceError::BackendError {
+                    message: format!("split_replace.count_shards: {err}"),
+                }
+            })?;
+            if let Some(limit) = shard_limit_violation(
+                counts,
+                sorted.len(),
+                self.config.max_shards_per_tenant(),
+                self.config.max_total_shards(),
+            ) {
+                return Err(SplitReplaceError::SplitInvalid(
+                    SplitValidationError::ShardLimitExceeded {
+                        current: limit.current,
+                        additional: limit.additional,
+                        max: limit.max,
+                        scope: limit.scope,
+                    },
+                ));
+            }
 
             let mut child_ids = SplitChildIds::new();
             let mut child_puts = Vec::with_capacity(sorted.len());
@@ -1994,6 +2110,26 @@ impl CoordinationBackend for EtcdCoordinator {
                 &plan,
                 &persisted.slab,
             )?;
+            let counts = self.current_shard_counts(tenant).map_err(|err| {
+                SplitResidualError::BackendError {
+                    message: format!("split_residual.count_shards: {err}"),
+                }
+            })?;
+            if let Some(limit) = shard_limit_violation(
+                counts,
+                1,
+                self.config.max_shards_per_tenant(),
+                self.config.max_total_shards(),
+            ) {
+                return Err(SplitResidualError::SplitInvalid(
+                    SplitValidationError::ShardLimitExceeded {
+                        current: limit.current,
+                        additional: limit.additional,
+                        max: limit.max,
+                        scope: limit.scope,
+                    },
+                ));
+            }
             if !persisted.owner_matches_lease(lease) {
                 return Err(SplitResidualError::StaleFence {
                     presented: lease.fence(),
@@ -2230,6 +2366,24 @@ impl RunManagement for EtcdCoordinator {
 
             let cursor_semantics = run_record.config.cursor_semantics();
             let shard_ids: Vec<ShardId> = shards.iter().map(InitialShardInput::shard).collect();
+            let counts = self.current_shard_counts(tenant).map_err(|err| {
+                RegisterShardsError::BackendError {
+                    message: format!("register_shards.count_shards: {err}"),
+                }
+            })?;
+            if let Some(limit) = shard_limit_violation(
+                counts,
+                shard_ids.len(),
+                self.config.max_shards_per_tenant(),
+                self.config.max_total_shards(),
+            ) {
+                return Err(RegisterShardsError::ShardLimitExceeded {
+                    current: limit.current,
+                    additional: limit.additional,
+                    max: limit.max,
+                    scope: limit.scope,
+                });
+            }
 
             let mut txn_ops = Vec::with_capacity(1 + (shards.len() * 2) + 1);
             let mut compares = Vec::with_capacity(1 + shards.len());

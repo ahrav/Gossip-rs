@@ -1,10 +1,11 @@
 //! Validated configuration for the etcd coordination backend.
 //!
 //! [`EtcdCoordinatorConfig`] carries connection parameters (endpoints,
-//! namespace prefix) and persistence-tuning knobs (owner lease TTL,
-//! optimistic CAS retry budget). All construction paths normalize
-//! whitespace and validate invariants eagerly, so invalid configs are
-//! rejected before any etcd connection attempt.
+//! namespace prefix) plus persistence controls (owner lease TTL,
+//! optimistic CAS retry budget, shard count ceilings, and split fanout
+//! bounds). All construction paths normalize whitespace and validate
+//! invariants eagerly, so invalid configs are rejected before any etcd
+//! connection attempt.
 //!
 //! # Defaults
 //!
@@ -14,11 +15,14 @@
 //! | Owner lease TTL | 60 s | Wall-clock etcd lease for shard owner keys |
 //! | Optimistic txn retries | 8 | Bounds CAS retry loops on fenced mutations |
 //! | Max children per split op | 8 | Keeps split transactions comfortably below common etcd txn-op caps |
+//! | Max shards per tenant | 100000 | Matches the in-memory backend's default split-flood guard |
+//! | Max total shards | 1000000 | Matches the in-memory backend's default global shard ceiling |
 
 use std::fmt;
 use std::time::Duration;
 
 use gossip_contracts::coordination::limits::MAX_SPLIT_CHILDREN;
+use gossip_coordination::{DEFAULT_MAX_SHARDS_PER_TENANT, DEFAULT_MAX_TOTAL_SHARDS};
 
 /// TCP connect timeout for the initial etcd client connection.
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -48,6 +52,8 @@ pub(crate) const DEFAULT_MAX_CHILDREN_PER_OP: usize = 8;
 ///   owner keys.
 /// - **Optimistic txn retries** bounds compare-and-retry loops around fenced
 ///   mutations.
+/// - **Shard count limits** cap persisted shard growth per tenant and across
+///   the whole backend.
 /// - **Max children per split op** bounds the fanout of one atomic
 ///   `split_replace` publication. Raising it also raises the transaction
 ///   write count (`3 + 2 * children`), so operators must keep it within
@@ -58,6 +64,8 @@ pub struct EtcdCoordinatorConfig {
     namespace_prefix: String,
     owner_lease_ttl_secs: i64,
     optimistic_txn_retries: usize,
+    max_shards_per_tenant: usize,
+    max_total_shards: usize,
     max_children_per_op: usize,
     /// Optional username/password pair for etcd authentication.
     auth: Option<(String, String)>,
@@ -94,6 +102,8 @@ impl fmt::Debug for EtcdCoordinatorConfig {
             .field("namespace_prefix", &self.namespace_prefix)
             .field("owner_lease_ttl_secs", &self.owner_lease_ttl_secs)
             .field("optimistic_txn_retries", &self.optimistic_txn_retries)
+            .field("max_shards_per_tenant", &self.max_shards_per_tenant)
+            .field("max_total_shards", &self.max_total_shards)
             .field("max_children_per_op", &self.max_children_per_op);
         if let Some((user, _)) = &self.auth {
             s.field("auth_user", user);
@@ -111,6 +121,8 @@ impl EtcdCoordinatorConfig {
     /// Defaults:
     /// - `owner_lease_ttl_secs = 60`
     /// - `optimistic_txn_retries = 8`
+    /// - `max_shards_per_tenant = 100_000`
+    /// - `max_total_shards = 1_000_000`
     /// - `max_children_per_op = 8`
     pub fn new<I, S>(
         endpoints: I,
@@ -134,7 +146,9 @@ impl EtcdCoordinatorConfig {
     ///
     /// Use this when the defaults are unsuitable — e.g., shorter TTLs for
     /// integration tests, higher retry budgets for high-contention
-    /// environments, or wider fanout for large split operations.
+    /// environments, or wider fanout for large split operations. Shard count
+    /// ceilings still default to the same values as the in-memory backend and
+    /// can be overridden with [`with_shard_limits`](Self::with_shard_limits).
     pub fn new_with_tuning<I, S>(
         endpoints: I,
         namespace_prefix: impl Into<String>,
@@ -158,6 +172,8 @@ impl EtcdCoordinatorConfig {
             namespace_prefix,
             owner_lease_ttl_secs,
             optimistic_txn_retries,
+            max_shards_per_tenant: DEFAULT_MAX_SHARDS_PER_TENANT,
+            max_total_shards: DEFAULT_MAX_TOTAL_SHARDS,
             max_children_per_op,
             auth: None,
             #[cfg(feature = "tls")]
@@ -231,6 +247,7 @@ impl EtcdCoordinatorConfig {
     ///   (unless it is exactly `"/"`), and must not contain `//`.
     /// - Owner lease TTL must be positive.
     /// - Optimistic txn retries must be at least 1.
+    /// - Shard count limits must be positive.
     /// - Max children per split op must be between 1 and `MAX_SPLIT_CHILDREN`.
     pub fn validate(&self) -> Result<(), EtcdCoordinatorConfigError> {
         if self.endpoints.is_empty() {
@@ -263,6 +280,12 @@ impl EtcdCoordinatorConfig {
         }
         if self.optimistic_txn_retries == 0 {
             return Err(EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries);
+        }
+        if self.max_shards_per_tenant == 0 {
+            return Err(EtcdCoordinatorConfigError::ZeroMaxShardsPerTenant);
+        }
+        if self.max_total_shards == 0 {
+            return Err(EtcdCoordinatorConfigError::ZeroMaxTotalShards);
         }
         if self.max_children_per_op == 0 {
             return Err(EtcdCoordinatorConfigError::ZeroMaxChildrenPerOp);
@@ -304,6 +327,18 @@ impl EtcdCoordinatorConfig {
         self.optimistic_txn_retries
     }
 
+    /// Maximum persisted shards a single tenant may own across all runs.
+    #[must_use]
+    pub fn max_shards_per_tenant(&self) -> usize {
+        self.max_shards_per_tenant
+    }
+
+    /// Maximum persisted shards across all tenants and runs.
+    #[must_use]
+    pub fn max_total_shards(&self) -> usize {
+        self.max_total_shards
+    }
+
     /// Maximum children the backend will publish in one atomic split
     /// operation.
     ///
@@ -321,6 +356,21 @@ impl EtcdCoordinatorConfig {
         self.auth
             .as_ref()
             .map(|(user, pass)| (user.as_str(), pass.as_str()))
+    }
+
+    /// Override the shard count ceilings used by shard-creation paths.
+    ///
+    /// These limits are enforced before `register_shards`, `split_replace`,
+    /// and `split_residual` publish new shard records into etcd.
+    pub fn with_shard_limits(
+        mut self,
+        max_shards_per_tenant: usize,
+        max_total_shards: usize,
+    ) -> Result<Self, EtcdCoordinatorConfigError> {
+        self.max_shards_per_tenant = max_shards_per_tenant;
+        self.max_total_shards = max_total_shards;
+        self.validate()?;
+        Ok(self)
     }
 
     /// Optional TLS configuration for encrypted connections.
@@ -378,6 +428,10 @@ pub enum EtcdCoordinatorConfigError {
     NonPositiveOwnerLeaseTtl,
     /// `optimistic_txn_retries` must be at least 1.
     ZeroOptimisticTxnRetries,
+    /// `max_shards_per_tenant` must be at least 1.
+    ZeroMaxShardsPerTenant,
+    /// `max_total_shards` must be at least 1.
+    ZeroMaxTotalShards,
     /// `max_children_per_op` must be at least 1.
     ZeroMaxChildrenPerOp,
     /// `max_children_per_op` cannot exceed the global split limit.
@@ -409,6 +463,8 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             }
             Self::NonPositiveOwnerLeaseTtl => f.write_str("owner_lease_ttl_secs must be > 0"),
             Self::ZeroOptimisticTxnRetries => f.write_str("optimistic_txn_retries must be > 0"),
+            Self::ZeroMaxShardsPerTenant => f.write_str("max_shards_per_tenant must be > 0"),
+            Self::ZeroMaxTotalShards => f.write_str("max_total_shards must be > 0"),
             Self::ZeroMaxChildrenPerOp => f.write_str("max_children_per_op must be > 0"),
             Self::MaxChildrenPerOpExceedsGlobalLimit {
                 requested,
