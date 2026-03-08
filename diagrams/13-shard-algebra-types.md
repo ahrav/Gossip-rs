@@ -3,7 +3,7 @@
 This document is the Boundary 3 (Shard Algebra) deep dive, paralleling
 [03-id-derivation-dag.md](03-id-derivation-dag.md) for B1 (Identity). It covers
 the type hierarchy, key encoding contract, key-range arithmetic, shard hint wire
-framing, the preallocated shard builder, connector enumeration lifecycle, and
+framing, the preallocated shard builder, connector split-point lifecycle, and
 split hint propagation.
 
 B3 spans two crates. `gossip-contracts` provides the shard data model: `ShardSpec`,
@@ -380,12 +380,12 @@ Source: `crates/gossip-frontier/src/builder.rs`
 
 ---
 
-## 6. Connector Enumeration Lifecycle
+## 6. Connector Split-Point Lifecycle
 
-Connectors (B4) use `ShardSpec` range bounds from B3 to enumerate items within a
-shard's key range. Each connector exposes `enumerate_page` and `choose_split_point`
-as inherent methods: a single `enumerate_page` call serves both initial and resume
-requests (distinguished by cursor state), with optional split point selection.
+Connectors (B4) use `ShardSpec` range bounds from B3 to operate within a
+shard's key range. Each connector exposes `choose_split_point`
+as an inherent method, with cursor state distinguishing initial and resume
+requests.
 
 ```mermaid
 %% Diagram: connector-enumeration-lifecycle
@@ -393,24 +393,6 @@ sequenceDiagram
     participant W as Worker
     participant C as Connector (B4)
     participant IDX as Sorted Index
-
-    Note over W,IDX: Initial page (Cursor::initial())
-
-    W->>C: enumerate_page(shard, Cursor::initial(), budgets)
-    C->>IDX: binary search on shard.start
-    IDX-->>C: start position
-    C->>IDX: yield items in [start, end)
-    IDX-->>C: page of items
-    C-->>W: EnumerationPage(items, cursor)
-
-    Note over W,IDX: Resume page (non-initial cursor)
-
-    W->>C: enumerate_page(shard, cursor, budgets)
-    C->>IDX: upper_bound(last_key)
-    IDX-->>C: resume position
-    C->>IDX: yield from resume position
-    IDX-->>C: page of items
-    C-->>W: EnumerationPage(items, cursor)
 
     Note over W,IDX: Split point selection
 
@@ -561,5 +543,5 @@ Source: `crates/gossip-frontier/src/hint.rs`
 | `crates/gossip-frontier/src/hint.rs`                     | `ShardHint`, `ShardMetadata`, `MetadataBuf`, `ShardSpecScratch`, `propagate_hint_on_split()`, `HintPropagationError`   |
 | `crates/gossip-frontier/src/builder.rs`                  | `PreallocShardBuilder`, `split_range_by_boundaries()`                                                                  |
 | `crates/gossip-contracts/src/connector/api.rs`           | `ConnectorCapabilities`, `choose_split_point()` (inherent method on each connector)                                    |
-| `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` enumeration and split point selection                                                            |
-| `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` enumeration and split point selection                                                 |
+| `crates/gossip-connectors/src/filesystem.rs`             | `FilesystemConnector` split point selection                                                                            |
+| `crates/gossip-connectors/src/in_memory.rs`              | `InMemoryDeterministicConnector` split point selection                                                                 |

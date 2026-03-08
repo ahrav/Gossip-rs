@@ -1,30 +1,22 @@
-//! Connector contract types and page-validation diagnostics shared between
-//! connector runtimes and coordinator-facing contracts.
+//! Connector contract types shared between connector runtimes and
+//! coordinator-facing contracts.
 //!
-//! This module intentionally stays narrow: it exports validated wrapper types for
-//! connector-originated bytes (`ItemKey`, `ItemRef`, `TokenBytes`), cursor and
-//! metadata types used by enumeration/read flows, and page-level validation
-//! diagnostics used to reject malformed connector pages.
-//!
-//! A sibling conformance harness module ([`conformance`]) builds on these
-//! contracts to validate connector behavior end-to-end in tests and
-//! bring-up workflows.
+//! This module exports validated wrapper types for connector-originated bytes
+//! (`ItemKey`, `ItemRef`, `TokenBytes`), cursor and metadata types used by
+//! enumeration/read flows, and a log-safe digest type ([`ToxicDigest`]) for
+//! redacting untrusted connector data in diagnostics.
 //!
 //! ## Surface split
 //!
-//! The connector contract surface is intentionally split into focused layers:
+//! The connector contract surface is split into focused layers:
 //!
-//! - `types.rs` defines validated value wrappers and paging/value invariants
-//!   (including toxic-byte redaction and size bounds).
+//! - `types.rs` defines validated value wrappers, paging/value invariants
+//!   (including toxic-byte redaction and size bounds), and [`ToxicDigest`].
 //! - `api.rs` defines operation-outcome classification and optional capability
 //!   negotiation (`ErrorClass`, `EnumerateError`, `ReadError`,
 //!   `ConnectorCapabilities`).
-//! - `page_validator.rs` defines log-safe page-validation diagnostics plus
-//!   validation helpers (`validate_page` and generic `validate_page_range`).
-//! - `conformance.rs` defines strict-by-default harness configuration,
-//!   observation records, and failure taxonomy for cross-run connector checks.
 //!
-//! Re-exporting all four layers here gives runtime crates a single import boundary
+//! Re-exporting both layers here gives runtime crates a single import boundary
 //! while keeping invariants and policy signaling concerns separated.
 //!
 //! ## Invariants
@@ -47,21 +39,12 @@
 //! - Paging bridge: [`Cursor`]
 //! - Version semantics: [`VersionId`]
 //! - Optional metadata: [`ContentHints`], [`Location`]
-//! - Enumeration composites: [`ScanItem`], [`EnumerationPage`]
+//! - Enumeration composites: [`ScanItem`]
 //! - Scan budgets: [`Budgets`]
 //! - Validation errors: [`ConnectorInputError`]
-//! - Page-validation diagnostics: [`PageValidationError`],
-//!   [`PageValidationViolation`], [`PageValidationDetails`],
-//!   [`CursorWhich`], [`ToxicDigest`]
-//! - Page-validation trait: [`page_validator::PageItem`] (stays module-qualified;
-//!   used by generic [`page_validator::validate_page_range`])
-//! - Page-validation helper: [`validate_page`] (generic
-//!   `validate_page_range` stays module-qualified to avoid widening the root
-//!   surface)
+//! - Log-safe digest: [`ToxicDigest`]
 //! - Connector API errors: [`ErrorClass`], [`EnumerateError`], [`ReadError`]
 //! - Connector feature flags: [`ConnectorCapabilities`]
-//! - Conformance harness: [`conformance`] module (assertion entry point,
-//!   conformance config, and diagnostics)
 //!
 //! These types are intentionally composable: a connector validates once at the
 //! boundary, then hands strongly-typed values across crate boundaries without
@@ -74,18 +57,12 @@
 //! scheduling, backoff policy) live in runtime crates.
 
 mod api;
-pub mod conformance;
-pub mod page_validator;
 mod types;
 // types_tests.rs is declared inside types.rs via #[path] attribute.
 
 pub use api::{ConnectorCapabilities, EnumerateError, ErrorClass, ReadError};
-pub use page_validator::{
-    CursorWhich, PageValidationDetails, PageValidationError, PageValidationViolation, ToxicDigest,
-    validate_page,
-};
 pub use types::{
-    Budgets, ConnectorInputError, ContentHints, Cursor, EnumerationPage, ItemKey, ItemRef,
-    Location, MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE,
-    MAX_LOCATION_URL_SIZE, MAX_TOKEN_SIZE, PooledByteSlab, ScanItem, TokenBytes, VersionId,
+    Budgets, ConnectorInputError, ContentHints, Cursor, ItemKey, ItemRef, Location,
+    MAX_ITEM_KEY_SIZE, MAX_ITEM_REF_SIZE, MAX_LOCATION_DISPLAY_SIZE, MAX_LOCATION_URL_SIZE,
+    MAX_TOKEN_SIZE, PooledByteSlab, ScanItem, TokenBytes, ToxicDigest, VersionId,
 };

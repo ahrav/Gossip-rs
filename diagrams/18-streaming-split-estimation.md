@@ -21,8 +21,8 @@ stream of N items, so the total cost of all compactions is O(N) amortised.
 
 ## 1. Split Estimation in the Scan Pipeline
 
-Where split estimation fits within the larger enumeration and split lifecycle.
-During pagination, each connector feeds observed `(key, file_size)` pairs into
+Where split estimation fits within the larger scan and split lifecycle.
+During connector operation, each connector feeds observed `(key, file_size)` pairs into
 the estimator. When the coordination layer decides a shard should split, it calls
 `choose_split_point()`, which delegates to `estimate_split_key()`. The resulting
 key becomes the split boundary for either a `SplitReplacePlan` (terminal) or
@@ -31,8 +31,8 @@ key becomes the split boundary for either a `SplitReplacePlan` (terminal) or
 ```mermaid
 %% Diagram: split-estimation-pipeline
 graph LR
-    subgraph B4 Connector ["B4: Connector — Enumeration Walk"]
-        EP["enumerate_page()"]
+    subgraph B4 Connector ["B4: Connector — Observation Feed"]
+        EP["connector walk / index scan"]
         OBS["estimator.observe(key, size)"]
     end
 
@@ -78,8 +78,7 @@ results.
 
 > **Cross-reference**: diagram 12 (Split Operations) details the `split_replace`
 > and `split_residual` coordination protocol that consumes the split key produced
-> here. Diagram 15 (Page Lifecycle) shows where `enumerate_page()` sits in the
-> broader scan loop.
+> here.
 
 ---
 
@@ -300,7 +299,7 @@ selection, but they differ in how they feed observations into it.
 graph TD
     subgraph FS ["FilesystemConnector — streaming"]
         FS_FIELD["split_estimator: StreamingSplitEstimator<br/>(field, created at construction)"]
-        FS_ENUM["enumerate_page_core():<br/>self.split_estimator.observe(key, size)<br/>for each in-range file"]
+        FS_ENUM["walk traversal:<br/>self.split_estimator.observe(key, size)<br/>for each in-range file"]
         FS_SPLIT["choose_split_point_bounds():<br/>self.split_estimator.estimate_split_key()"]
         FS_RESET["rebuild_walk_state():<br/>reset estimator to fresh state"]
     end
@@ -342,12 +341,12 @@ graph TD
 
 | Connector | Estimator Lifetime | Feed Mechanism | Compaction? |
 |---|---|---|---|
-| `FilesystemConnector` | Persistent field, reset on walk rebuild | `observe()` called per emitted file during `enumerate_page_core()` | Yes — `sample_cap = DEFAULT_SAMPLE_CAP` (1024) |
+| `FilesystemConnector` | Persistent field, reset on walk rebuild | `observe()` called per emitted file during walk traversal | Yes — `sample_cap = DEFAULT_SAMPLE_CAP` (1024) |
 | `GitConnector` | Ephemeral, built at split-selection time | `from_sorted_entries()` bulk-loads all in-range entries | No — `sample_cap = entry_count` |
 | `InMemoryDeterministicConnector` | Ephemeral, built at split-selection time | `from_sorted_entries()` bulk-loads all in-range items | No — `sample_cap = entry_count` |
 
 The filesystem connector benefits from streaming estimation because its DFS walk
-is incremental — the estimator accumulates observations across multiple pagination
+is incremental — the estimator accumulates observations across multiple connector
 calls on the same connector instance. The git and in-memory connectors already
 hold all entries in memory, so they set `sample_cap = entry_count` to avoid
 compaction and produce exact byte-weighted midpoints.

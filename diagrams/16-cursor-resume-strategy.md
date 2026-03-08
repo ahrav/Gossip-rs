@@ -1,9 +1,9 @@
 # Cursor Resume Strategy
 
 This document details the two-layer cursor architecture used by the **B4 Connector**
-boundary for paginated enumeration and fault-tolerant resume. Every connector must
+boundary for split-point selection and fault-tolerant resume. Every connector must
 produce globally sorted item keys and advance a `Cursor` that allows the coordination
-layer to resume enumeration from an arbitrary checkpoint. The cursor carries both a
+layer to resume work from an arbitrary checkpoint. The cursor carries both a
 key-authoritative progress marker and an optional connector-opaque token that enables
 O(1) position restoration when the token is valid.
 
@@ -21,17 +21,17 @@ All diagrams use the B4 Connector color palette (fill `#EF4444` / `#FEE2E2`, str
 
 ## 1. Two-Layer Cursor Architecture
 
-The `Cursor` struct encodes enumeration progress in two complementary layers. The
+The `Cursor` struct encodes progress in two complementary layers. The
 `last_key` field (an `ItemKey`) records the lexicographically greatest key that has
-been fully processed. This field is **always present** after the first page and is
+been fully processed. This field is **always present** after the first call and is
 the authoritative resume position — the coordination layer uses it for cursor
 monotonicity enforcement, and connectors use it as the fallback resume anchor.
 
 The `token` field (an `Option<TokenBytes>`) carries connector-specific opaque state
-that can restore enumeration position in O(1) time. Connectors that support tokens
+that can restore position in O(1) time. Connectors that support tokens
 encode internal state (DFS stack positions, sorted-index offsets) into this field.
 Token content is opaque to the coordination layer; it is round-tripped verbatim
-between `enumerate_page` calls.
+between connector calls.
 
 The `Cursor` type makes the invalid state `(None, Some(token))` — a token without
 a progress key — unrepresentable. All constructors enforce this invariant, and
@@ -89,7 +89,7 @@ graph TD
 
 ## 2. Resume Decision Tree
 
-When `enumerate_page()` receives a cursor, every connector follows the same logical
+When a connector receives a cursor, it follows the same logical
 decision tree to determine where to begin emitting items. The two resume paths —
 token-assisted (O(1)) and key-based (O(log N) or O(N)) — are **semantically
 equivalent**: both must resume from the first item strictly greater than
@@ -112,7 +112,7 @@ key-derived floor — this is enforced by `start_idx = start_idx.max(token_idx)`
 ```mermaid
 %% Diagram: resume-decision-tree
 flowchart TD
-    START(["enumerate_page(shard, cursor, budgets)"])
+    START(["connector_call(shard, cursor, budgets)"])
     Q1{"cursor.last_key()<br/>is None?"}
     Q2{"cursor.token()<br/>is Some?"}
     Q3{"Token decode +<br/>restore succeeds?"}
@@ -232,19 +232,19 @@ graph LR
 
 ## 4. Token Resilience Model
 
-The conformance harness validates that token loss or corruption never causes data
+The design ensures that token loss or corruption never causes data
 loss. Every connector must produce semantically identical results regardless of
-whether the cursor carries a valid token, no token, or a corrupted token. The
-`ResumeChecks` configuration controls two independent perturbation scenarios:
+whether the cursor carries a valid token, no token, or a corrupted token. Two
+independent perturbation scenarios validate this property:
 
-- **Drop token** (`ResumeMode::DropToken`): The harness removes the cursor's
-  `token` field entirely, leaving only `last_key`. The connector must resume
-  from the key position using binary search or DFS walk-and-seek.
+- **Drop token** (`ResumeMode::DropToken`): Remove the cursor's `token` field
+  entirely, leaving only `last_key`. The connector must resume from the key
+  position using binary search or DFS walk-and-seek.
 
-- **Corrupt token** (`ResumeMode::CorruptToken`): The harness replaces the
-  cursor's `token` with random bytes. The connector must detect the invalid
-  token (wrong version byte, malformed frames, index out of bounds, key
-  cross-check failure) and fall back to key-based resume.
+- **Corrupt token** (`ResumeMode::CorruptToken`): Replace the cursor's `token`
+  with random bytes. The connector must detect the invalid token (wrong version
+  byte, malformed frames, index out of bounds, key cross-check failure) and
+  fall back to key-based resume.
 
 Both perturbation paths must produce the same suffix of items as normal
 token-assisted resume. This is verified by comparing `ItemObservation` sequences
@@ -254,40 +254,40 @@ trace.
 ```mermaid
 %% Diagram: token-resilience-model
 sequenceDiagram
-    participant H as Conformance Harness
+    participant H as Test Harness
     participant C as Connector
 
-    Note over H,C: Phase 1 — Baseline enumeration
+    Note over H,C: Phase 1 — Baseline call
 
-    H->>C: enumerate_page(shard, initial_cursor, budgets)
-    C-->>H: page₁ {items, cursor₁ with token}
-    H->>C: enumerate_page(shard, cursor₁, budgets)
-    C-->>H: page₂ {items, cursor₂ with token}
+    H->>C: connector_call(shard, initial_cursor, budgets)
+    C-->>H: result₁ {items, cursor₁ with token}
+    H->>C: connector_call(shard, cursor₁, budgets)
+    C-->>H: result₂ {items, cursor₂ with token}
     Note over H: Record baseline trace:<br/>items + cursor checkpoints
 
     Note over H,C: Phase 2 — Resume from checkpoint with DROP TOKEN
 
     H->>H: cursor₁' = Cursor::with_last_key(cursor₁.last_key)<br/>← token removed
-    H->>C: enumerate_page(shard, cursor₁', budgets)
+    H->>C: connector_call(shard, cursor₁', budgets)
     Note over C: No token → key_resume_start()<br/>upper_bound(last_key) O(log N)
-    C-->>H: page₂' {items must match baseline suffix}
+    C-->>H: result₂' {items must match baseline suffix}
 
     Note over H,C: Phase 3 — Resume from checkpoint with CORRUPT TOKEN
 
     H->>H: cursor₁'' = Cursor::with_token(cursor₁.last_key, random_bytes)
-    H->>C: enumerate_page(shard, cursor₁'', budgets)
+    H->>C: connector_call(shard, cursor₁'', budgets)
     Note over C: Token decode fails →<br/>fall back to key_resume_start()
-    C-->>H: page₂'' {items must match baseline suffix}
+    C-->>H: result₂'' {items must match baseline suffix}
 
     Note over H,C: Phase 4 — Verification
-    H->>H: Assert page₂.items == page₂'.items == page₂''.items<br/>(element-by-element digest comparison)
+    H->>H: Assert result₂.items == result₂'.items == result₂''.items<br/>(element-by-element digest comparison)
 ```
 
 ---
 
 ## 5. Cursor Construction
 
-After emitting a page of items, each connector builds the continuation cursor
+After emitting items, each connector builds the continuation cursor
 using shared helpers in `common.rs`. The process varies slightly between the
 streaming filesystem connector (which encodes DFS stack state) and the
 index-based connectors (git, in-memory) that encode a simple array offset.
@@ -303,13 +303,13 @@ construction failure (for example, when the encoded size exceeds `MAX_TOKEN_SIZE
 gracefully degrades to a key-only cursor.
 
 When the data source is exhausted (no more items to emit), the connector returns
-`Cursor::initial()` — signalling that the shard is complete. An empty page with a
+`Cursor::initial()` — signalling that the shard is complete. An empty result with a
 non-initial cursor signals "no items in this range, but more data may exist beyond."
 
 ```mermaid
 %% Diagram: cursor-construction
 graph TD
-    subgraph page_emission["Page Emission"]
+    subgraph page_emission["Item Emission"]
         ITEMS["Emit items[start_idx .. start_idx + take]"]
         LAST["last_key = items.last().item_key()"]
     end
@@ -404,6 +404,3 @@ graph TD
 | `align_walk_to_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | Token-first, key-fallback resume |
 | `build_next_walk_cursor()` | `crates/gossip-connectors/src/filesystem.rs` | Encode walk state into cursor token |
 | Git token resume | `crates/gossip-connectors/src/git.rs` | O(1) token + key cross-check |
-| `ResumeChecks` | `crates/gossip-contracts/src/connector/conformance.rs` | Drop-token and corrupt-token flags |
-| `ResumeMode` | `crates/gossip-contracts/src/connector/conformance.rs` | `DropToken` and `CorruptToken` variants |
-| `ConformanceConfig` | `crates/gossip-contracts/src/connector/conformance.rs` | Harness configuration with resume checks |

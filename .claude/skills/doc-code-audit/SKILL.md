@@ -420,7 +420,7 @@ identity:
   source: crates/gossip-contracts/src/identity/
 
 connectors:
-  diagrams: 09-circuit-breaker.md, 14-connector-architecture.md, 15-enumeration-page-lifecycle.md, 16-cursor-resume-strategy.md, 17-filesystem-walk-state-machine.md, 18-streaming-split-estimation.md
+  diagrams: 09-circuit-breaker.md, 14-connector-architecture.md, 16-cursor-resume-strategy.md, 17-filesystem-walk-state-machine.md, 18-streaming-split-estimation.md
   docs: docs/gossip-connectors/boundary-4-connectors.md
   source: crates/gossip-contracts/src/connector/, crates/gossip-connectors/src/
 

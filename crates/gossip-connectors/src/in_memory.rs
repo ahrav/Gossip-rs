@@ -1,56 +1,27 @@
 //! Deterministic in-memory connector for test and harness use.
 //!
 //! This module provides [`InMemoryDeterministicConnector`], which implements
-//! enumeration and read operations keeping all data in memory. It guarantees
-//! bit-identical enumeration across runs for the same input set. Designed for
+//! read and split-point operations keeping all data in memory. It guarantees
+//! deterministic ordering across runs for the same input set. Designed for
 //! environments where reproducibility matters more than source realism: unit
-//! tests, conformance harnesses, and simulation workloads.
+//! tests and simulation workloads.
 //!
 //! # Algorithm
 //!
 //! 1. **Construction** -- Items are sorted by [`ItemKey`] once (O(n log n)),
-//!    uniqueness is verified, and all per-item metadata ([`StableItemId`],
-//!    [`ObjectVersionId`], [`ItemRef`], size hint) is precomputed into internal
-//!    `PreparedItem` records. Subsequent pages pay only clone/copy costs.
-//! 2. **Enumeration** -- Shard bounds are normalized via the internal
-//!    `borrowed_shard_bound` helper (`[]` means unbounded, oversize is rejected)
-//!    and resolved with binary search (O(log n)), then up to
-//!    [`Budgets::max_items`] are yielded by index iteration over precomputed
-//!    metadata.
-//! 3. **Split hints** -- `choose_split_point*` bulk-loads the remaining
+//!    uniqueness is verified, and per-item metadata is precomputed into
+//!    internal `PreparedItem` records.
+//! 2. **Split hints** -- `choose_split_point*` bulk-loads the remaining
 //!    sorted range into `StreamingSplitEstimator`,
 //!    keeping byte-weighted split selection aligned with the filesystem and
 //!    git connectors without storing mutable estimator state.
-//! 4. **Deterministic IDs** -- [`StableItemId`] derived via
-//!    [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id)
-//!    (connector-tag + connector-instance + key, domain-separated),
-//!    [`ObjectVersionId`] via [`ObjectVersionId::from_version_bytes`]
-//!    (domain-separated BLAKE3 of content bytes), [`ItemRef`] = big-endian
-//!    index. All items carry [`VersionId::Strong`] since content is immutable.
-//!
-//! # Pooled toxic-byte page assembly
-//!
-//! Enumeration stages item keys, item refs, and optional token bytes into a
-//! page-local [`gossip_stdx::ByteSlab`], then materializes wrappers with
-//! [`ItemKey::try_from_slot`], [`ItemRef::try_from_slot`], and token
-//! construction from slots. This incurs one copy per staged field but keeps
-//! wrapper cloning allocation-free in the HOT page-emission loop.
-//!
-//! The page's cursor and items share the same slab owner
-//! ([`gossip_contracts::connector::PooledByteSlab`]), so returning either one
-//! by value keeps pooled bytes valid until the last clone is dropped.
 //!
 //! # Unique key requirement
 //!
 //! The constructor **panics** if duplicate keys are present after sorting.
-//! Duplicate keys are unsupported because:
-//!
-//! - Cursor resume via `upper_bound(last_key)` skips remaining duplicates.
-//! - [`StableItemId`] is derived from `(connector_tag, connector_instance, key)`, so duplicates
-//!   collide on identity.
-//! - Split-point selection can return a duplicate key, producing empty shards.
-//!
-//! Callers must deduplicate before construction.
+//! Duplicate keys are unsupported because split-point selection can return a
+//! duplicate key, producing empty shards. Callers must deduplicate before
+//! construction.
 //!
 //! # Resume semantics
 //!
@@ -83,14 +54,13 @@ use std::{io, sync::Arc};
 
 use gossip_contracts::{
     connector::{
-        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationPage, ItemKey, ItemRef,
-        ReadError, ScanItem, VersionId,
+        Budgets, ConnectorCapabilities, Cursor, EnumerateError, ItemKey, ItemRef, ReadError,
     },
     coordination::ShardSpec,
-    identity::{ConnectorInstanceIdHash, ConnectorTag, ObjectVersionId, StableItemId},
+    identity::ConnectorTag,
 };
 
-use crate::common::{self, borrowed_shard_bound, derive_stable_item_id, parse_u64_be};
+use crate::common::{self, borrowed_shard_bound, parse_u64_be};
 
 /// One in-memory record served by [`InMemoryDeterministicConnector`].
 #[derive(Clone, Debug)]
@@ -130,12 +100,6 @@ struct PreparedItem {
     key: ItemKey,
     /// Immutable payload bytes for read operations.
     bytes: Arc<[u8]>,
-    /// Big-endian `u64` index into the sorted item array.
-    item_ref: ItemRef,
-    /// Domain-separated BLAKE3 hash of `(connector_tag, connector_instance, key)`.
-    stable_item_id: StableItemId,
-    /// Domain-separated BLAKE3 hash of the content bytes.
-    version_id: ObjectVersionId,
     /// Precomputed `bytes.len() as u64`.
     size_hint: u64,
 }
@@ -161,16 +125,9 @@ impl common::KeyedEntry for PreparedItem {
 /// - Duplicate keys are **rejected** (the constructor panics).
 /// - [`ItemRef`] values are big-endian `u64` indices into that sorted vector,
 ///   so the Nth item always gets `ItemRef(N)`.
-/// - [`StableItemId`] is derived via [`ItemIdentityKey::stable_id`](gossip_contracts::identity::ItemIdentityKey::stable_id)
-///   (domain-separated BLAKE3 of connector-tag + connector-instance + key)
-///   and [`ObjectVersionId`]
-///   via [`ObjectVersionId::from_version_bytes`] (domain-separated BLAKE3 of
-///   the item's content bytes), both deterministic and precomputed once at
-///   construction. All items are emitted with [`VersionId::Strong`] because
-///   the in-memory content is immutable.
 ///
-/// Together these choices make enumeration order, identity fields, and read
-/// handles reproducible across runs for identical inputs.
+/// Together these choices make ordering and read handles reproducible across
+/// runs for identical inputs.
 ///
 /// # Resume semantics
 ///
@@ -215,16 +172,14 @@ impl InMemoryDeterministicConnector {
     ///
     /// [`with_tokens(false)`]: Self::with_tokens
     pub fn new(
-        connector_tag: ConnectorTag,
-        connector_instance_id: impl AsRef<[u8]>,
+        _connector_tag: ConnectorTag,
+        _connector_instance_id: impl AsRef<[u8]>,
         mut items: Vec<MemItem>,
     ) -> Self {
         items.sort_by(|left, right| left.key.cmp(&right.key));
-        let connector_instance =
-            ConnectorInstanceIdHash::from_instance_id_bytes(connector_instance_id.as_ref());
 
         // Enforce unique keys. Duplicate keys break cursor resume
-        // (upper_bound skips remaining duplicates), StableItemId derivation
+        // (upper_bound skips remaining duplicates), identity derivation
         // (collisions), and split-point selection (empty shards). Format the
         // duplicate through ItemKey itself so panic diagnostics stay redacted.
         if let Some(pos) = items.windows(2).position(|w| w[0].key == w[1].key) {
@@ -237,21 +192,11 @@ impl InMemoryDeterministicConnector {
 
         let prepared: Arc<[PreparedItem]> = items
             .into_iter()
-            .enumerate()
-            .map(|(idx, item)| {
-                let idx_u64 = u64::try_from(idx).expect("item count must fit in u64");
-                let item_ref = ItemRef::try_from_slice(&idx_u64.to_be_bytes())
-                    .expect("8-byte big-endian index is always valid for ItemRef");
-                let stable_item_id =
-                    derive_stable_item_id(connector_tag, connector_instance, &item.key);
-                let version_id = ObjectVersionId::from_version_bytes(&item.bytes);
+            .map(|item| {
                 let size_hint = item.bytes.len() as u64;
                 PreparedItem {
                     key: item.key,
                     bytes: item.bytes,
-                    item_ref,
-                    stable_item_id,
-                    version_id,
                     size_hint,
                 }
             })
@@ -273,30 +218,6 @@ impl InMemoryDeterministicConnector {
         self
     }
 
-    /// Enumerate one page over the explicit half-open key range `[start, end)`.
-    ///
-    /// This entry point bypasses [`ShardSpec`] decoding, letting tests exercise
-    /// the core pagination logic with known-good bounds and without needing to
-    /// construct a full shard object.
-    ///
-    /// # Errors
-    ///
-    /// Returns `EnumerateError::permanent` if `start > end`.
-    pub fn enumerate_page_range(
-        &mut self,
-        start: &ItemKey,
-        end: &ItemKey,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<EnumerationPage, EnumerateError> {
-        self.enumerate_page_bounds(
-            Some(start.as_bytes()),
-            Some(end.as_bytes()),
-            cursor,
-            budgets,
-        )
-    }
-
     /// Return a split-point hint over the explicit half-open key range
     /// `[start, end)`.
     ///
@@ -313,105 +234,6 @@ impl InMemoryDeterministicConnector {
         cursor: &Cursor,
     ) -> Result<Option<ItemKey>, EnumerateError> {
         self.choose_split_point_bounds(Some(start.as_bytes()), Some(end.as_bytes()), cursor)
-    }
-
-    /// Core page enumeration for both shard-based and explicit-range callers.
-    ///
-    /// # Algorithm
-    ///
-    /// 1. **Budget gate** -- Return retryable error if deadline expired.
-    /// 2. **Range validation** -- Reject `start > end` as a permanent error.
-    /// 3. **Range resolution** -- Map keys to indices via binary search.
-    /// 4. **Cursor advancement** -- Resume from `last_key` position.
-    ///    The shared helper establishes this as the canonical floor; token
-    ///    handling below may advance further but never behind key-derived state.
-    ///    When tokens are enabled, the token is used as an O(1) fast path:
-    ///    validated by checking `items[token_idx - 1].key == last_key`. On
-    ///    mismatch, falls back to O(log n) `upper_bound` binary search.
-    /// 5. **Page extraction** -- Yield up to `max_items` consecutive items
-    ///    from precomputed metadata (clone/copy only, no hashing).
-    fn enumerate_page_bounds(
-        &self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<EnumerationPage, EnumerateError> {
-        let bounds = common::resolve_page_bounds(&self.items, start, end, budgets)?;
-        let key_resume = common::key_resume_start(&self.items, cursor, bounds.range_start);
-        let mut start_idx = key_resume;
-
-        // O(1) token fast path: when tokens are enabled and the cursor carries
-        // a well-formed token whose preceding item matches `last_key`, jump
-        // directly to the token index. On mismatch, fall back to the
-        // key-authoritative position computed above.
-        if let Some(last_key) = cursor.last_key() {
-            let token_idx = self
-                .emit_tokens
-                .then(|| common::cursor_token_index(cursor))
-                .flatten();
-
-            if let Some(token_idx) = token_idx
-                && token_idx > 0
-                && token_idx <= self.items.len()
-                && self.items[token_idx - 1].key == *last_key
-            {
-                start_idx = start_idx.max(token_idx);
-
-                #[cfg(debug_assertions)]
-                debug_assert_eq!(
-                    token_idx, key_resume,
-                    "token index {token_idx} disagrees with \
-                     key-derived resume position {key_resume}"
-                );
-            }
-        }
-
-        if start_idx >= bounds.range_end {
-            return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
-        }
-
-        let take = budgets.max_items().min(bounds.range_end - start_idx);
-        let page_items = &self.items[start_idx..start_idx + take];
-
-        let staged = common::assemble_pooled_page(
-            page_items
-                .iter()
-                .map(|item| (item.key.as_bytes(), item.item_ref.as_bytes())),
-            self.emit_tokens,
-            start_idx,
-        )?;
-
-        let common::StagedPage { wrappers, token } = staged;
-        let mut out = Vec::with_capacity(wrappers.len());
-        for ((item_key, item_ref), item) in wrappers.into_iter().zip(page_items) {
-            out.push(
-                ScanItem::new(
-                    item_key,
-                    item_ref,
-                    item.stable_item_id,
-                    VersionId::Strong(item.version_id),
-                )
-                .with_size_hint(item.size_hint),
-            );
-        }
-
-        // Build continuation cursor from the last emitted key.
-        // Defensive match: if `out` is unexpectedly empty (e.g., all staged
-        // items failed validation), return an empty page instead of panicking.
-        let last_key = match out.last() {
-            Some(item) => item.item_key().clone(),
-            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
-        };
-        let next_cursor = common::build_next_cursor_from_staged(
-            last_key,
-            start_idx,
-            out.len(),
-            self.emit_tokens,
-            token,
-        )?;
-
-        Ok(EnumerationPage::new(out, next_cursor))
     }
 
     /// Choose a midpoint key that can be used as a shard split hint.
@@ -470,20 +292,6 @@ impl InMemoryDeterministicConnector {
             range_read: true,
             split_hints: true,
         }
-    }
-
-    /// Shard bounds are validated allocation-free via the internal
-    /// `borrowed_shard_bound` helper:
-    /// empty means unbounded, oversize bounds are permanent input errors.
-    pub fn enumerate_page(
-        &mut self,
-        shard: &ShardSpec,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<EnumerationPage, EnumerateError> {
-        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
-        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
-        self.enumerate_page_bounds(start, end, cursor, budgets)
     }
 
     /// Budgets are accepted but not consumed: split-point selection is a

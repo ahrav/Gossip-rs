@@ -8,7 +8,7 @@ This document diagrams the B4 Connector boundary: trait contracts, core value ty
 
 ## 1. Connector Method Surface
 
-Each concrete connector exposes enumeration and read operations as inherent methods (not trait dispatch). All three connectors share the same method signatures and advertise capabilities via `ConnectorCapabilities`, a four-flag struct that orchestration reads at registration time. All three connectors support `seek_by_key`, `range_read`, and `split_hints`; `token_resume` is configurable per instance.
+Each concrete connector exposes read and split-point operations as inherent methods (not trait dispatch). All three connectors share the same method signatures and advertise capabilities via `ConnectorCapabilities`, a four-flag struct that orchestration reads at registration time. All three connectors support `seek_by_key`, `range_read`, and `split_hints`; `token_resume` is configurable per instance.
 
 ```mermaid
 %% Diagram: connector-method-surface
@@ -18,7 +18,7 @@ graph TD
     end
 
     subgraph Methods["Inherent Method Surface"]
-        EM["<b>Enumeration Methods</b><br/>caps() → ConnectorCapabilities<br/>enumerate_page(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;EnumerationPage, EnumerateError&gt;<br/>choose_split_point(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
+        EM["<b>Split &amp; Capability Methods</b><br/>caps() → ConnectorCapabilities<br/>choose_split_point(&mut, &ShardSpec, &Cursor, Budgets)<br/>  → Result&lt;Option&lt;ItemKey&gt;, EnumerateError&gt;"]
         RM["<b>Read Methods</b><br/>open(&mut, &ItemRef, Budgets)<br/>  → Result&lt;Box&lt;dyn Read + Send&gt;, ReadError&gt;<br/>read_range(&mut, &ItemRef, u64, &mut [u8], Budgets)<br/>  → Result&lt;usize, ReadError&gt;"]
     end
 
@@ -47,12 +47,12 @@ graph TD
 
 **Key design decisions:**
 
-- Enumeration (metadata traversal) and reading (payload I/O) are separate method groups because enumeration is metadata-bound while reading is bandwidth-bound. Orchestration applies independent retry and circuit-breaker policies per operation.
+- Reading (payload I/O) and split-point selection are separate method groups from capability advertisement. Orchestration applies independent retry and circuit-breaker policies per operation.
 - `choose_split_point` is provided by connectors that advertise `split_hints: true`. Only connectors with natural partition boundaries (tree objects, directory structure) implement it.
 - Connectors without native random-access support must explicitly return `Err(ReadError::unsupported("range_read"))` from `read_range`. All three current connectors implement full range-read support.
 - `token_resume` is instance-configurable via `with_tokens(bool)` on each connector rather than hardcoded, because some test scenarios disable tokens to exercise key-only resume.
 
-See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure isolation per connector, [13-shard-algebra-types.md](./13-shard-algebra-types.md) for shard key encoding consumed by `enumerate_page`.
+See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for failure isolation per connector, [13-shard-algebra-types.md](./13-shard-algebra-types.md) for shard key encoding.
 
 ---
 
@@ -76,15 +76,12 @@ graph TD
     IK -->|"last_key field"| CUR
     TB -->|"token field"| CUR
 
-    subgraph Enumeration["Enumeration Output"]
+    subgraph Enumeration["Connector Output"]
         SI["<b>ScanItem</b><br/>item_key: ItemKey<br/>item_ref: ItemRef<br/>stable_item_id: StableItemId<br/>version: VersionId<br/>size_hint: Option&lt;u64&gt;<br/>content_hints: Option&lt;ContentHints&gt;<br/>location: Option&lt;Location&gt;"]
-        EP["<b>EnumerationPage</b><br/>items: Vec&lt;ScanItem&gt;<br/>next_cursor: Cursor"]
     end
 
     IK -->|"item_key field"| SI
     IR -->|"item_ref field"| SI
-    SI -->|"items vec"| EP
-    CUR -->|"next_cursor field"| EP
 
     subgraph Budgets["Scan Budgets"]
         BU["<b>Budgets</b><br/>max_items: NonZeroUsize<br/>max_bytes: NonZeroU64<br/>deadline: Option&lt;Instant&gt;"]
@@ -105,7 +102,6 @@ graph TD
     style TB fill:#EF4444,stroke:#991B1B,color:#fff
     style CUR fill:#FEE2E2,stroke:#991B1B
     style SI fill:#FEE2E2,stroke:#991B1B
-    style EP fill:#FEE2E2,stroke:#991B1B
     style BU fill:#FEE2E2,stroke:#991B1B
     style EC2 fill:#EF4444,stroke:#991B1B,color:#fff
     style EE fill:#FEE2E2,stroke:#991B1B
@@ -268,9 +264,8 @@ See also: [09-circuit-breaker.md](./09-circuit-breaker.md) for how classified er
 | Crate | File | Key Types / Functions |
 |-------|------|----------------------|
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/api.rs` | `ErrorClass`, `EnumerateError`, `ReadError`, `ConnectorCapabilities` |
-| `gossip-contracts` | `crates/gossip-contracts/src/connector/types.rs` | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `ScanItem`, `EnumerationPage`, `Budgets`, `ConnectorInputError`, `ContentHints`, `Location`, `VersionId`, `PooledByteSlab` |
+| `gossip-contracts` | `crates/gossip-contracts/src/connector/types.rs` | `ItemKey`, `ItemRef`, `TokenBytes`, `Cursor`, `ScanItem`, `Budgets`, `ConnectorInputError`, `ContentHints`, `Location`, `VersionId`, `PooledByteSlab` |
 | `gossip-contracts` | `crates/gossip-contracts/src/connector/mod.rs` | Module structure and re-exports |
-| `gossip-contracts` | `crates/gossip-contracts/src/connector/page_validator.rs` | `PageValidationError`, `PageValidationViolation`, `ToxicDigest`, `validate_page` |
 | `gossip-connectors` | `crates/gossip-connectors/src/lib.rs` | `connector_tag_for_kind`, re-exports of connectors and factories |
 | `gossip-connectors` | `crates/gossip-connectors/src/common.rs` | `is_permanent_io_error`, `classify_io_enumerate_error`, `classify_io_read_error`, `path_digest`, `borrowed_shard_bound`, `resolve_bounds`, `key_resume_start`, `estimate_split_from_sorted` |
 | `gossip-connectors` | `crates/gossip-connectors/src/filesystem.rs` | `FilesystemConnector` |

@@ -61,38 +61,31 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     process::Command,
-    time::{Instant, UNIX_EPOCH},
+    time::Instant,
 };
 
 use gossip_contracts::{
     connector::{
-        Budgets, ConnectorCapabilities, Cursor, EnumerateError, EnumerationPage, ItemKey, ItemRef,
-        ReadError, ScanItem, VersionId,
+        Budgets, ConnectorCapabilities, Cursor, EnumerateError, ItemKey, ItemRef, ReadError,
     },
     coordination::ShardSpec,
-    identity::{ConnectorInstanceIdHash, ObjectVersionId, StableItemId},
 };
 
 use crate::common::{
-    self, GIT_CONNECTOR_TAG, borrowed_shard_bound, classify_io_enumerate_error,
-    classify_io_read_error, derive_stable_item_id, enumerate_error_to_read, path_buf_from_bytes,
+    self, borrowed_shard_bound, classify_io_enumerate_error, classify_io_read_error,
+    enumerate_error_to_read, path_buf_from_bytes,
 };
 
 /// A single indexed file from `git ls-files`.
 ///
-/// Each entry caches the pre-computed identity and weak version so that
-/// enumeration pages can be assembled without re-hashing on every page
-/// request. Entries are sorted by `key` (byte-lexicographic) after indexing
-/// and remain immutable thereafter.
+/// Each entry caches the pre-computed size hint so that enumeration pages
+/// can be assembled without re-stating files on every page request. Entries
+/// are sorted by `key` (byte-lexicographic) after indexing and remain
+/// immutable thereafter.
 #[derive(Debug)]
 struct GitEntry {
     /// Repository-relative path used as both the item key and the item ref.
     key: ItemKey,
-    /// Domain-separated BLAKE3 identity derived from
-    /// `(ConnectorTag, ConnectorInstanceIdHash, key)`.
-    stable_item_id: StableItemId,
-    /// Weak version fingerprint over `(path, size, mtime)`.
-    version: VersionId,
     /// File size in bytes at index time, used as a size hint for budgeting.
     size_hint: u64,
 }
@@ -139,8 +132,6 @@ enum IndexState {
 pub struct GitConnector {
     /// Absolute path to the repository root (working directory).
     repo: PathBuf,
-    /// Stable connector-instance scope used for `StableItemId` derivation.
-    connector_instance: ConnectorInstanceIdHash,
     /// Whether pagination cursors include positional tokens for O(1)
     /// resume. Defaults to `true`; set to `false` for key-only cursors.
     emit_tokens: bool,
@@ -161,11 +152,8 @@ impl GitConnector {
             !repo.as_os_str().is_empty(),
             "GitConnector repo path must not be empty"
         );
-        let connector_instance =
-            ConnectorInstanceIdHash::from_instance_id_bytes(repo.as_os_str().as_encoded_bytes());
         Self {
             repo,
-            connector_instance,
             emit_tokens: true,
             max_tracked_files: None,
             index_state: IndexState::NotIndexed,
@@ -186,26 +174,6 @@ impl GitConnector {
     pub fn with_max_tracked_files(mut self, limit: usize) -> Self {
         self.max_tracked_files = Some(limit);
         self
-    }
-
-    /// Enumerate one page over the explicit half-open key range `[start, end)`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `EnumerateError::permanent` if `start > end`.
-    pub fn enumerate_page_range(
-        &mut self,
-        start: &ItemKey,
-        end: &ItemKey,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<EnumerationPage, EnumerateError> {
-        self.enumerate_page_bounds(
-            Some(start.as_bytes()),
-            Some(end.as_bytes()),
-            cursor,
-            budgets,
-        )
     }
 
     /// Return a split-point hint over the explicit half-open key range
@@ -346,12 +314,7 @@ impl GitConnector {
             if !metadata.is_file() {
                 continue;
             }
-            let entry = build_git_entry(
-                self.connector_instance,
-                &key_bytes,
-                metadata.len(),
-                metadata.modified().ok(),
-            )?;
+            let entry = build_git_entry(&key_bytes, metadata.len())?;
             entries.push(entry);
         }
 
@@ -360,98 +323,6 @@ impl GitConnector {
         self.entries = entries;
         self.index_state = IndexState::Indexed;
         Ok(())
-    }
-
-    /// Core pagination over an optional half-open byte range `[start, end)`.
-    ///
-    /// 1. Ensures the index is built (lazy, respects `budgets.deadline()`).
-    /// 2. Resolves shard bounds to index positions via binary search.
-    /// 3. Determines the resume position from the cursor — first by
-    ///    key-authoritative O(log N) upper-bound, then accelerated to
-    ///    O(1) when a valid positional token is present and its key
-    ///    cross-check passes (see inline comments below).
-    /// 4. Slices at most `budgets.max_items()` entries, assembles pooled
-    ///    `ScanItem`s, and builds the continuation cursor.
-    ///
-    /// `None` bounds mean unbounded on that side.
-    fn enumerate_page_bounds(
-        &mut self,
-        start: Option<&[u8]>,
-        end: Option<&[u8]>,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<EnumerationPage, EnumerateError> {
-        self.ensure_indexed(budgets.deadline())?;
-        let bounds = common::resolve_page_bounds(&self.entries, start, end, budgets)?;
-        let key_resume = common::key_resume_start(&self.entries, cursor, bounds.range_start);
-        let mut start_idx = key_resume;
-
-        // Token fast-path: when the cursor carries a positional token and the
-        // entry at `token_idx - 1` still matches the last emitted key, we can
-        // skip the O(log N) binary search and resume at O(1). If the token is
-        // missing, malformed, out of range, or disagrees with the key, we
-        // silently fall back to `key_resume` (the binary-search result above).
-        //
-        // The `.max(token_idx)` ensures the token can only advance the resume
-        // position forward — never behind the key-derived floor.
-        if let Some(last_key) = cursor.last_key() {
-            let token_idx = self
-                .emit_tokens
-                .then(|| common::cursor_token_index(cursor))
-                .flatten();
-            if let Some(token_idx) = token_idx
-                && token_idx > 0
-                && token_idx <= self.entries.len()
-                && self.entries[token_idx - 1].key == *last_key
-            {
-                start_idx = start_idx.max(token_idx);
-
-                // In debug builds, verify the O(1) token path and O(log N)
-                // key path agree — a mismatch indicates an index corruption
-                // or a cursor that was constructed against a different snapshot.
-                #[cfg(debug_assertions)]
-                debug_assert_eq!(
-                    token_idx, key_resume,
-                    "token index {token_idx} disagrees with key-derived resume position {key_resume}"
-                );
-            }
-        }
-
-        if start_idx >= bounds.range_end {
-            return Ok(EnumerationPage::new(Vec::new(), cursor.clone()));
-        }
-
-        let take = budgets.max_items().min(bounds.range_end - start_idx);
-        let page_entries = &self.entries[start_idx..(start_idx + take)];
-
-        let staged = common::assemble_pooled_page_shared_key_ref(
-            page_entries.iter().map(|entry| entry.key.as_bytes()),
-            self.emit_tokens,
-            start_idx,
-        )?;
-
-        let common::StagedPage { wrappers, token } = staged;
-        let mut out = Vec::with_capacity(wrappers.len());
-        for ((item_key, item_ref), entry) in wrappers.into_iter().zip(page_entries) {
-            out.push(
-                ScanItem::new(item_key, item_ref, entry.stable_item_id, entry.version)
-                    .with_size_hint(entry.size_hint),
-            );
-        }
-
-        let last_key = match out.last() {
-            Some(item) => item.item_key().clone(),
-            None => return Ok(EnumerationPage::new(Vec::new(), cursor.clone())),
-        };
-        let next_cursor = common::build_next_cursor_from_staged(
-            last_key,
-            start_idx,
-            out.len(),
-            self.emit_tokens,
-            token,
-        )?;
-
-        Ok(EnumerationPage::new(out, next_cursor))
     }
 
     /// Choose a byte-weighted split point in the optional range `[start, end)`.
@@ -525,18 +396,6 @@ impl GitConnector {
         }
     }
 
-    /// Enumerate one page of items.
-    pub fn enumerate_page(
-        &mut self,
-        shard: &ShardSpec,
-        cursor: &Cursor,
-        budgets: Budgets,
-    ) -> Result<EnumerationPage, EnumerateError> {
-        let start = borrowed_shard_bound(shard.key_range_start(), "start")?;
-        let end = borrowed_shard_bound(shard.key_range_end(), "end")?;
-        self.enumerate_page_bounds(start, end, cursor, budgets)
-    }
-
     /// Split-point hint for dynamic shard subdivision.
     pub fn choose_split_point(
         &mut self,
@@ -595,12 +454,7 @@ impl GitConnector {
 /// share the same byte representation for this connector). The dual
 /// validation catches oversized or malformed paths at index time rather
 /// than during later enumeration or read calls.
-fn build_git_entry(
-    connector_instance: ConnectorInstanceIdHash,
-    key_bytes: &[u8],
-    size_hint: u64,
-    modified: Option<std::time::SystemTime>,
-) -> Result<GitEntry, EnumerateError> {
+fn build_git_entry(key_bytes: &[u8], size_hint: u64) -> Result<GitEntry, EnumerateError> {
     let key = ItemKey::try_from_slice(key_bytes)
         .map_err(|error| EnumerateError::permanent(format!("invalid git item key: {error}")))?;
     // Validate that the same bytes are also a valid ItemRef. This connector
@@ -608,62 +462,8 @@ fn build_git_entry(
     // size limits, so both must pass.
     let _ = ItemRef::try_from_slice(key_bytes)
         .map_err(|error| EnumerateError::permanent(format!("invalid git item_ref: {error}")))?;
-    let stable_item_id = derive_stable_item_id(GIT_CONNECTOR_TAG, connector_instance, &key);
-    let version = build_weak_version(key_bytes, size_hint, modified);
 
-    Ok(GitEntry {
-        key,
-        stable_item_id,
-        version,
-        size_hint,
-    })
-}
-
-/// Derive a weak version fingerprint from `(path, size, mtime)`.
-///
-/// "Weak" means the version is based on filesystem metadata rather than
-/// file content — two files with identical size and mtime but different
-/// contents will collide. This is acceptable because the coordination
-/// layer treats weak versions as change-detection hints, not as content
-/// identity proofs.
-///
-/// The encoded material includes `key_bytes`, so renaming a tracked file
-/// changes its weak version even if the file's bytes and metadata are
-/// otherwise unchanged. That matches the connector's path-keyed item model:
-/// path changes are visible as item-version changes to downstream resume and
-/// occurrence tracking.
-///
-/// When `modified` is `None` (e.g., on filesystems that lack mtime
-/// support), the mtime component defaults to zero. This still produces a
-/// unique version per `(path, size)` pair but loses change sensitivity.
-fn build_weak_version(
-    key_bytes: &[u8],
-    size_hint: u64,
-    modified: Option<std::time::SystemTime>,
-) -> VersionId {
-    // Fixed metadata: 8 (size_hint) + 16 (mtime u128) = 24 bytes.
-    // Paths up to 128 bytes fit entirely on the stack (128 + 24 = 152).
-    const INLINE_CAP: usize = 152;
-    let total_len = key_bytes.len() + 24;
-    let modified_nanos = modified
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-
-    if total_len <= INLINE_CAP {
-        let mut buf = [0u8; INLINE_CAP];
-        buf[..key_bytes.len()].copy_from_slice(key_bytes);
-        buf[key_bytes.len()..key_bytes.len() + 8].copy_from_slice(&size_hint.to_le_bytes());
-        buf[key_bytes.len() + 8..key_bytes.len() + 24]
-            .copy_from_slice(&modified_nanos.to_le_bytes());
-        VersionId::Weak(ObjectVersionId::from_version_bytes(&buf[..total_len]))
-    } else {
-        let mut version_material = Vec::with_capacity(total_len);
-        version_material.extend_from_slice(key_bytes);
-        version_material.extend_from_slice(&size_hint.to_le_bytes());
-        version_material.extend_from_slice(&modified_nanos.to_le_bytes());
-        VersionId::Weak(ObjectVersionId::from_version_bytes(&version_material))
-    }
+    Ok(GitEntry { key, size_hint })
 }
 
 /// Shell out to `git ls-files -z` and return NUL-split raw path entries.
