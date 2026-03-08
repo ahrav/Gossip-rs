@@ -106,6 +106,10 @@ pub enum ClaimError {
     /// from flooding the coordinator across multiple runs. Only
     /// successful claims trigger cooldown; failed claims do not.
     Throttled { retry_after: LogicalTime },
+    /// The coordination backend encountered a transient infrastructure
+    /// error (e.g., network timeout, storage unavailability). The caller
+    /// may retry after a backoff.
+    BackendError { message: String },
 }
 
 /// Human-readable formatting for logging and error display chains.
@@ -135,6 +139,9 @@ impl fmt::Display for ClaimError {
                     "claim throttled: worker in cooldown (retry after {retry_after:?})"
                 )
             }
+            Self::BackendError { message } => {
+                write!(f, "coordination backend error: {message}")
+            }
         }
     }
 }
@@ -152,13 +159,14 @@ impl From<GetRunError> for ClaimError {
         match e {
             GetRunError::RunNotFound => Self::RunNotFound,
             GetRunError::TenantMismatch { expected } => Self::TenantMismatch { expected },
+            GetRunError::BackendError { message } => Self::BackendError { message },
         }
     }
 }
 
 // Compile-time size guard: keeps `ClaimError` small so the error path of
 // `Result<_, ClaimError>` is lightweight.
-const _: () = assert!(std::mem::size_of::<ClaimError>() <= 48);
+const _: () = assert!(std::mem::size_of::<ClaimError>() <= 56);
 
 // ============================================================================
 // Free function: default claim logic
@@ -318,6 +326,11 @@ pub fn default_claim_next_available<'a, B: CoordinationBackend + RunManagement>(
                 // threaded into the call). Fail immediately; retrying
                 // other candidates would hit the same mismatch.
                 return Err(ClaimError::TenantMismatch { expected });
+            }
+            Err(AcquireError::BackendError { message }) => {
+                // Infrastructure error — fail immediately; retrying
+                // other candidates is unlikely to succeed.
+                return Err(ClaimError::BackendError { message });
             }
         }
     };

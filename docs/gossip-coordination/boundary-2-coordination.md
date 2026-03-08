@@ -15,8 +15,14 @@ lives in `crates/gossip-coordination/src/`. Both depend on Boundary 1
 The durable backend lives in `crates/gossip-coordination-etcd/`.
 It owns a real etcd client connection, a deterministic keyspace layout
 (`keyspace.rs`), and an explicit binary codec (`codec.rs`) for persisting
-coordination records. It still delegates protocol semantics to
-`InMemoryCoordinator` until transactional persistence lands.
+coordination records. It persists `create_run`, `register_shards`,
+`get_run*` queries, `claim_next_available`, and the fenced
+`acquire_and_restore_into` / `renew` / `checkpoint` hot path directly in etcd.
+Shard owner bindings live in separate etcd lease-backed keys so storage-layer
+liveness and logical lease deadlines are checked together before accepting
+progress updates. The remaining mutating operations (`complete`, `park_shard`,
+`split_*`, run terminal transitions, `unpark_shard`) fail closed until their
+persisted transaction shapes land.
 
 The module provides seven core capabilities:
 
@@ -79,12 +85,12 @@ The module provides seven core capabilities:
 | File              | Role                                                                                         |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | `lib.rs`          | Module root and public re-exports                                                            |
-| `backend.rs`      | `EtcdCoordinator` scaffold: owns the etcd client, exposes `status()`, delegates protocol ops |
-| `config.rs`       | Endpoint + namespace validation for etcd connectivity                                         |
+| `backend.rs`      | `EtcdCoordinator`: persisted etcd implementation for run creation, shard registration, read queries, claim, and fenced acquire/renew/checkpoint |
+| `config.rs`       | Endpoint + namespace validation plus owner-lease TTL and optimistic retry tuning             |
 | `keyspace.rs`     | Deterministic ASCII etcd path construction for runs, shards, ownership, and active indexes    |
-| `codec.rs`        | Explicit binary encoding/decoding for coordination records persisted to etcd                  |
-| `error.rs`        | etcd connection/runtime error surfaces                                                        |
+| `codec.rs`        | Explicit binary encoding/decoding for coordination records and shard-owner bindings persisted to etcd |
 | `codec_tests.rs`  | Round-trip, rejection, and proptest coverage for the binary codec                             |
+| `error.rs`        | etcd connection, codec, lease, and transaction error surfaces                                 |
 | `tests.rs`        | Config validation and etcd connectivity smoke tests                                           |
 
 ---

@@ -19,13 +19,16 @@ independently of scan execution internals, while runtime integration tests
 exercise that assignment-to-driver boundary.
 
 The etcd scaffold in `crates/gossip-coordination-etcd/` adds backend-specific
-bootstrap tests: configuration validation stays local and deterministic, while
-an ignored smoke test verifies `EtcdCoordinator::connect()` + `status()` against
-a real local etcd. The binary codec (`codec.rs`) has dedicated round-trip fuzz
+tests alongside the shared protocol suite: configuration/keyspace/codec tests
+stay local and deterministic, while ignored local-etcd integration coverage
+verifies `EtcdCoordinator::connect()` + `status()` and the persisted
+`create_run -> register_shards -> acquire -> checkpoint -> renew` path against
+a real etcd. The binary codec (`codec.rs`) has dedicated round-trip fuzz
 targets and proptest coverage for `ShardRecord` serialization in `codec_tests.rs`.
-Protocol conformance, scenario, and simulation coverage remain rooted in
-`InMemoryCoordinator` until real etcd transactions replace the current delegation
-path.
+Protocol conformance, scenario, and simulation coverage still use
+`InMemoryCoordinator` for the full mutation surface because the etcd backend
+currently fails closed for terminal, split, and unpark transitions that do not
+yet have persisted transaction shapes.
 
 ## Allocation Policy Scope (Tiered)
 

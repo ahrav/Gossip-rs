@@ -1,77 +1,65 @@
+//! Validated configuration for the etcd coordination backend.
+//!
+//! [`EtcdCoordinatorConfig`] carries connection parameters (endpoints,
+//! namespace prefix) and persistence-tuning knobs (owner lease TTL,
+//! optimistic CAS retry budget). All construction paths normalize
+//! whitespace and validate invariants eagerly, so invalid configs are
+//! rejected before any etcd connection attempt.
+//!
+//! # Defaults
+//!
+//! | Parameter | Default | Rationale |
+//! |-----------|---------|-----------|
+//! | Connect timeout | 5 s | Fast failure for unreachable endpoints |
+//! | Owner lease TTL | 60 s | Wall-clock etcd lease for shard owner keys |
+//! | Optimistic txn retries | 8 | Bounds CAS retry loops on fenced mutations |
+
 use std::fmt;
 use std::time::Duration;
 
-/// Logical lease duration (in seconds) passed to the
-/// [`InMemoryCoordinator`] delegate.
-///
-/// This constant is `pub(crate)` because it is only consumed by
-/// [`EtcdCoordinator::connect`] when constructing the delegate.
-///
-/// [`InMemoryCoordinator`]: gossip_coordination::InMemoryCoordinator
-/// [`EtcdCoordinator::connect`]: crate::backend::EtcdCoordinator::connect
-pub(crate) const DEFAULT_BOOTSTRAP_LEASE_DURATION: u64 = 30;
-
-/// Default timeout for establishing a gRPC connection to etcd.
-///
-/// Applied via [`ConnectOptions::with_connect_timeout`] to prevent
-/// `connect()` from blocking indefinitely when an endpoint is unreachable
-/// (firewall drop, wrong host, network partition). Five seconds is
-/// generous for LAN/localhost and fast enough to surface misconfigurations
-/// during startup.
-///
-/// [`ConnectOptions::with_connect_timeout`]: etcd_client::ConnectOptions::with_connect_timeout
+/// TCP connect timeout for the initial etcd client connection.
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Validated connection configuration for [`EtcdCoordinator`].
+/// Default wall-clock TTL (in seconds) for etcd leases attached to shard
+/// owner keys. If a worker dies without releasing its lease, the owner key
+/// is automatically deleted after this duration.
+pub(crate) const DEFAULT_OWNER_LEASE_TTL_SECS: i64 = 60;
+
+/// Default number of optimistic read-modify-write retry loops around
+/// a fenced etcd transaction before giving up and returning an error.
+pub(crate) const DEFAULT_OPTIMISTIC_TXN_RETRIES: usize = 8;
+
+/// Validated configuration for the etcd coordination backend.
 ///
-/// Captures two pieces of information needed to establish an etcd session:
+/// A complete config carries both connection settings and persistence-tuning
+/// knobs:
 ///
-/// - **Endpoints** — one or more `http(s)://host:port` addresses of etcd
-///   cluster members. At least one is required; each must be non-empty after
-///   whitespace trimming.
-/// - **Namespace prefix** — the etcd key prefix that scopes all coordination
-///   keys (e.g. `/gossip/v1`). Must start with `/` and must not end with `/`
-///   (unless it is exactly `/`). This prevents accidental key collisions
-///   between independent deployments sharing the same etcd cluster.
-///
-/// # Construction and normalization
-///
-/// [`new`] and [`from_endpoints_csv`] trim leading/trailing whitespace from
-/// each endpoint and the namespace prefix before validation. This means
-/// `"  http://host:2379  "` is accepted and stored as `"http://host:2379"`.
-/// [`localhost`] delegates to [`new`] and is therefore subject to the same
-/// validation rules.
-///
-/// # Invariants
-///
-/// A successfully constructed `EtcdCoordinatorConfig` satisfies:
-/// - `endpoints` is non-empty and every element is non-empty.
-/// - `namespace_prefix` starts with `'/'`.
-/// - `namespace_prefix` does not end with `'/'` (unless it is `"/"`).
-///
-/// [`EtcdCoordinator`]: crate::EtcdCoordinator
-/// [`new`]: Self::new
-/// [`from_endpoints_csv`]: Self::from_endpoints_csv
-/// [`localhost`]: Self::localhost
-#[derive(Clone, PartialEq, Eq)]
+/// - **Endpoints** identify the etcd members to contact.
+/// - **Namespace prefix** scopes all coordination keys under a single etcd
+///   subtree.
+/// - **Owner lease TTL** controls the wall-clock etcd lease attached to shard
+///   owner keys.
+/// - **Optimistic txn retries** bounds compare-and-retry loops around fenced
+///   mutations.
+#[derive(Clone)]
 pub struct EtcdCoordinatorConfig {
     endpoints: Vec<String>,
     namespace_prefix: String,
+    owner_lease_ttl_secs: i64,
+    optimistic_txn_retries: usize,
+    /// Optional username/password pair for etcd authentication.
+    auth: Option<(String, String)>,
+    /// Optional TLS configuration for encrypted etcd connections.
+    #[cfg(feature = "tls")]
+    tls: Option<etcd_client::TlsOptions>,
 }
 
-/// Redacts endpoint URIs to prevent credential leakage in logs and
-/// diagnostics. Endpoint strings may contain embedded credentials
-/// (e.g. `http://user:pass@host:2379`); the `Debug` output shows only
-/// the host:port portion of each endpoint.
 impl fmt::Debug for EtcdCoordinatorConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        /// Strip the userinfo portion from a URI, keeping only `scheme://host:port/path`.
         fn redact_endpoint(endpoint: &str) -> String {
-            // Find `://`, then check if there's a `@` before the next `/`.
             if let Some(scheme_end) = endpoint.find("://") {
                 let authority_start = scheme_end + 3;
                 let rest = &endpoint[authority_start..];
-                // If there's an `@`, the part before it is userinfo — strip it.
                 let path_start = rest.find('/').unwrap_or(rest.len());
                 if let Some(at_pos) = rest[..path_start].find('@') {
                     return format!("{}://***@{}", &endpoint[..scheme_end], &rest[at_pos + 1..]);
@@ -81,41 +69,50 @@ impl fmt::Debug for EtcdCoordinatorConfig {
         }
 
         let redacted: Vec<String> = self.endpoints.iter().map(|e| redact_endpoint(e)).collect();
-        f.debug_struct("EtcdCoordinatorConfig")
-            .field("endpoints", &redacted)
+        let mut s = f.debug_struct("EtcdCoordinatorConfig");
+        s.field("endpoints", &redacted)
             .field("namespace_prefix", &self.namespace_prefix)
-            .finish()
+            .field("owner_lease_ttl_secs", &self.owner_lease_ttl_secs)
+            .field("optimistic_txn_retries", &self.optimistic_txn_retries);
+        if let Some((user, _)) = &self.auth {
+            s.field("auth_user", user);
+            s.field("auth_password", &"[REDACTED]");
+        }
+        #[cfg(feature = "tls")]
+        s.field("tls", &self.tls.as_ref().map(|_| "[configured]"));
+        s.finish()
     }
 }
 
 impl EtcdCoordinatorConfig {
-    /// Create a validated configuration from an iterator of endpoints and a
-    /// namespace prefix.
+    /// Create a validated configuration with default persistence-tuning knobs.
     ///
-    /// Both endpoints and the prefix are trimmed of surrounding whitespace
-    /// before validation. Empty strings that result from trimming are
-    /// rejected (see [`EtcdCoordinatorConfigError`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EtcdCoordinatorConfigError`] if the endpoint list is empty,
-    /// any endpoint is blank, or the namespace prefix violates the leading/
-    /// trailing slash rules.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use gossip_coordination_etcd::EtcdCoordinatorConfig;
-    ///
-    /// let config = EtcdCoordinatorConfig::new(
-    ///     ["http://etcd-0:2379", "http://etcd-1:2379"],
-    ///     "/gossip/v1",
-    /// ).unwrap();
-    /// assert_eq!(config.endpoints().len(), 2);
-    /// ```
+    /// Defaults:
+    /// - `owner_lease_ttl_secs = 60`
+    /// - `optimistic_txn_retries = 8`
     pub fn new<I, S>(
         endpoints: I,
         namespace_prefix: impl Into<String>,
+    ) -> Result<Self, EtcdCoordinatorConfigError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new_with_tuning(
+            endpoints,
+            namespace_prefix,
+            DEFAULT_OWNER_LEASE_TTL_SECS,
+            DEFAULT_OPTIMISTIC_TXN_RETRIES,
+        )
+    }
+
+    /// Create a validated configuration with explicit persistence-tuning
+    /// values.
+    pub fn new_with_tuning<I, S>(
+        endpoints: I,
+        namespace_prefix: impl Into<String>,
+        owner_lease_ttl_secs: i64,
+        optimistic_txn_retries: usize,
     ) -> Result<Self, EtcdCoordinatorConfigError>
     where
         I: IntoIterator<Item = S>,
@@ -131,39 +128,48 @@ impl EtcdCoordinatorConfig {
         let config = Self {
             endpoints,
             namespace_prefix,
+            owner_lease_ttl_secs,
+            optimistic_txn_retries,
+            auth: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         };
         config.validate()?;
         Ok(config)
     }
 
-    /// Convenience configuration targeting a local single-node etcd at
-    /// `http://127.0.0.1:2379` with namespace prefix `/gossip/v1`.
-    ///
-    /// Useful for development and integration tests that run against a
-    /// local etcd instance. Routed through [`new`](Self::new) so the
-    /// hard-coded values stay in lockstep with the validation rules.
+    /// Convenience configuration for a local single-node etcd at
+    /// `http://127.0.0.1:2379` with namespace `/gossip/v1` and default
+    /// tuning knobs.
     #[must_use]
     pub fn localhost() -> Self {
         Self::new(["http://127.0.0.1:2379"], "/gossip/v1")
             .expect("hard-coded localhost config must remain valid")
     }
 
-    /// Parse a comma-separated endpoint string into a validated config.
+    /// Parse a comma-separated endpoint string with default tuning knobs.
     ///
-    /// Splits `endpoints_csv` on `,`, trims each segment, and silently
-    /// drops segments that are empty after trimming. The surviving
-    /// endpoints are forwarded to [`new`](Self::new) for full validation.
-    ///
-    /// This is primarily intended for environment-variable-driven
-    /// configuration (e.g. `ETCD_ENDPOINTS=http://host1:2379,http://host2:2379`).
-    ///
-    /// # Errors
-    ///
-    /// Same as [`new`](Self::new) — returns
-    /// [`EtcdCoordinatorConfigError`] on validation failure.
+    /// Empty segments (e.g., trailing commas) are silently filtered out.
+    /// Each remaining segment is trimmed of surrounding whitespace.
     pub fn from_endpoints_csv(
         endpoints_csv: &str,
         namespace_prefix: impl Into<String>,
+    ) -> Result<Self, EtcdCoordinatorConfigError> {
+        Self::from_endpoints_csv_with_tuning(
+            endpoints_csv,
+            namespace_prefix,
+            DEFAULT_OWNER_LEASE_TTL_SECS,
+            DEFAULT_OPTIMISTIC_TXN_RETRIES,
+        )
+    }
+
+    /// Parse a comma-separated endpoint string with explicit persistence-tuning
+    /// values.
+    pub fn from_endpoints_csv_with_tuning(
+        endpoints_csv: &str,
+        namespace_prefix: impl Into<String>,
+        owner_lease_ttl_secs: i64,
+        optimistic_txn_retries: usize,
     ) -> Result<Self, EtcdCoordinatorConfigError> {
         let endpoints = endpoints_csv
             .split(',')
@@ -171,26 +177,24 @@ impl EtcdCoordinatorConfig {
             .filter(|endpoint| !endpoint.is_empty())
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        Self::new(endpoints, namespace_prefix)
+        Self::new_with_tuning(
+            endpoints,
+            namespace_prefix,
+            owner_lease_ttl_secs,
+            optimistic_txn_retries,
+        )
     }
 
-    /// Check all configuration invariants and return an error describing
-    /// the first violation found.
+    /// Validate all configuration invariants.
     ///
-    /// Called automatically by [`new`](Self::new) and
-    /// [`from_endpoints_csv`](Self::from_endpoints_csv), but exposed
-    /// publicly so callers can re-validate after deserialization or
-    /// manual construction.
+    /// # Rules
     ///
-    /// # Validation rules (checked in order)
-    ///
-    /// 1. At least one endpoint must be present.
-    /// 2. No endpoint may be empty.
-    ///    2b. Every endpoint must start with `http://` or `https://`.
-    /// 3. Namespace prefix must be non-empty.
-    /// 4. Namespace prefix must start with `'/'`.
-    /// 5. Namespace prefix must not end with `'/'` (unless it is exactly
-    ///    `"/"`).
+    /// - At least one endpoint must be present.
+    /// - Every endpoint must be non-empty and use `http://` or `https://`.
+    /// - Namespace prefix must start with `/`, must not end with `/`
+    ///   (unless it is exactly `"/"`), and must not contain `//`.
+    /// - Owner lease TTL must be positive.
+    /// - Optimistic txn retries must be at least 1.
     pub fn validate(&self) -> Result<(), EtcdCoordinatorConfigError> {
         if self.endpoints.is_empty() {
             return Err(EtcdCoordinatorConfigError::NoEndpoints);
@@ -217,50 +221,104 @@ impl EtcdCoordinatorConfig {
         if self.namespace_prefix.contains("//") {
             return Err(EtcdCoordinatorConfigError::NamespacePrefixContainsDoubleSlash);
         }
+        if self.owner_lease_ttl_secs <= 0 {
+            return Err(EtcdCoordinatorConfigError::NonPositiveOwnerLeaseTtl);
+        }
+        if self.optimistic_txn_retries == 0 {
+            return Err(EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries);
+        }
 
         Ok(())
     }
 
-    /// Configured etcd cluster endpoints.
-    ///
-    /// Guaranteed non-empty; every element is a non-empty, trimmed string.
+    /// The etcd member endpoints to contact.
     #[must_use]
     pub fn endpoints(&self) -> &[String] {
         &self.endpoints
     }
 
-    /// Namespace prefix that roots all coordination keys in etcd.
-    ///
-    /// Guaranteed to start with `'/'` and not end with `'/'` (unless it
-    /// is exactly `"/"`).
+    /// The etcd keyspace prefix under which all coordination keys are scoped.
     #[must_use]
     pub fn namespace_prefix(&self) -> &str {
         &self.namespace_prefix
     }
+
+    /// Wall-clock etcd lease TTL used for ephemeral owner keys.
+    #[must_use]
+    pub fn owner_lease_ttl_secs(&self) -> i64 {
+        self.owner_lease_ttl_secs
+    }
+
+    /// Maximum number of optimistic re-read/retry loops around a fenced etcd
+    /// transaction.
+    #[must_use]
+    pub fn optimistic_txn_retries(&self) -> usize {
+        self.optimistic_txn_retries
+    }
+
+    /// Optional authentication credentials (username, password).
+    #[must_use]
+    pub fn auth(&self) -> Option<(&str, &str)> {
+        self.auth
+            .as_ref()
+            .map(|(user, pass)| (user.as_str(), pass.as_str()))
+    }
+
+    /// Optional TLS configuration for encrypted connections.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn tls(&self) -> Option<&etcd_client::TlsOptions> {
+        self.tls.as_ref()
+    }
+
+    /// Set authentication credentials for the etcd connection.
+    #[must_use]
+    pub fn with_auth(mut self, user: impl Into<String>, password: impl Into<String>) -> Self {
+        self.auth = Some((user.into(), password.into()));
+        self
+    }
+
+    /// Set TLS configuration for encrypted etcd connections.
+    #[cfg(feature = "tls")]
+    #[must_use]
+    pub fn with_tls(mut self, tls: etcd_client::TlsOptions) -> Self {
+        self.tls = Some(tls);
+        self
+    }
 }
 
-/// Validation errors returned when constructing an
-/// [`EtcdCoordinatorConfig`].
+impl Default for EtcdCoordinatorConfig {
+    fn default() -> Self {
+        Self::localhost()
+    }
+}
+
+/// Configuration validation errors for [`EtcdCoordinatorConfig`].
 ///
-/// Each variant maps to exactly one of the validation rules enforced by
-/// [`EtcdCoordinatorConfig::validate`].
+/// Each variant pinpoints a single invalid parameter, with positional
+/// indexes for multi-valued fields (endpoints). All checks run eagerly
+/// at construction time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EtcdCoordinatorConfigError {
-    /// The endpoint list is empty — at least one etcd member is required.
+    /// No endpoints were provided (the list is empty after filtering).
     NoEndpoints,
-    /// The endpoint at the given `index` is empty (after trimming).
+    /// The endpoint at `index` resolved to an empty string after trimming.
     EmptyEndpoint { index: usize },
-    /// The endpoint at the given `index` has an invalid scheme (expected
-    /// `http://` or `https://`).
+    /// The endpoint at `index` does not use `http://` or `https://`.
     InvalidEndpointScheme { index: usize },
-    /// The namespace prefix is empty (after trimming).
+    /// The namespace prefix is empty after trimming.
     EmptyNamespacePrefix,
-    /// The namespace prefix does not start with `'/'`.
+    /// The namespace prefix must start with `/` to form absolute etcd paths.
     NamespacePrefixMustStartWithSlash,
-    /// The namespace prefix ends with `'/'` and is longer than `"/"`.
+    /// The namespace prefix must not end with `/` (unless it is exactly `"/"`).
     NamespacePrefixMustNotEndWithSlash,
-    /// The namespace prefix contains consecutive slashes (`//`).
+    /// The namespace prefix contains consecutive slashes (`//`), which
+    /// would create invisible empty path segments.
     NamespacePrefixContainsDoubleSlash,
+    /// `owner_lease_ttl_secs` must be positive (> 0).
+    NonPositiveOwnerLeaseTtl,
+    /// `optimistic_txn_retries` must be at least 1.
+    ZeroOptimisticTxnRetries,
 }
 
 impl fmt::Display for EtcdCoordinatorConfigError {
@@ -286,6 +344,8 @@ impl fmt::Display for EtcdCoordinatorConfigError {
             Self::NamespacePrefixContainsDoubleSlash => {
                 f.write_str("namespace_prefix must not contain consecutive slashes '//'")
             }
+            Self::NonPositiveOwnerLeaseTtl => f.write_str("owner_lease_ttl_secs must be > 0"),
+            Self::ZeroOptimisticTxnRetries => f.write_str("optimistic_txn_retries must be > 0"),
         }
     }
 }

@@ -11,7 +11,12 @@ use crate::{
     EtcdCoordinator, EtcdCoordinatorConfig, EtcdCoordinatorConfigError, EtcdCoordinatorError,
     EtcdKeyspace, EtcdKeyspaceError, EtcdOperation,
 };
-use gossip_contracts::identity::{RunId, ShardId, TenantId};
+use gossip_contracts::coordination::{CursorSemantics, CursorUpdate, ShardSpecRef};
+use gossip_contracts::identity::{LogicalTime, OpId, RunId, ShardId, ShardKey, TenantId, WorkerId};
+use gossip_coordination::{
+    AcquireError, AcquireScratch, CheckpointError, CoordinationBackend, IdempotentOutcome,
+    InitialShardInput, RegisterShardsError, RunConfig, RunManagement,
+};
 use proptest::prelude::*;
 use rstest::rstest;
 
@@ -67,6 +72,8 @@ fn localhost_config_uses_expected_defaults() {
     let config = EtcdCoordinatorConfig::localhost();
     assert_eq!(config.endpoints(), ["http://127.0.0.1:2379"]);
     assert_eq!(config.namespace_prefix(), "/gossip/v1");
+    assert_eq!(config.owner_lease_ttl_secs(), 60);
+    assert_eq!(config.optimistic_txn_retries(), 8);
 }
 
 #[test]
@@ -110,6 +117,37 @@ fn config_accepts_root_namespace_slash() {
     assert_eq!(config.namespace_prefix(), "/");
 }
 
+#[test]
+fn config_accepts_explicit_tuning_values() {
+    let config =
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 90, 16)
+            .expect("explicit tuning should pass validation");
+    assert_eq!(config.owner_lease_ttl_secs(), 90);
+    assert_eq!(config.optimistic_txn_retries(), 16);
+}
+
+#[test]
+fn config_rejects_non_positive_owner_lease_ttl() {
+    let error =
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 0, 8)
+            .expect_err("non-positive owner lease ttl must fail validation");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::NonPositiveOwnerLeaseTtl
+    ));
+}
+
+#[test]
+fn config_rejects_zero_optimistic_txn_retries() {
+    let error =
+        EtcdCoordinatorConfig::new_with_tuning(["http://127.0.0.1:2379"], "/gossip/v1", 60, 0)
+            .expect_err("zero retry budget must fail validation");
+    assert!(matches!(
+        error,
+        EtcdCoordinatorConfigError::ZeroOptimisticTxnRetries
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Debug output tests
 // ---------------------------------------------------------------------------
@@ -142,6 +180,46 @@ fn config_debug_shows_endpoints_without_credentials_normally() {
         debug_output.contains("http://etcd-0:2379"),
         "Debug output should show plain endpoints unchanged, got: {debug_output}"
     );
+}
+
+#[test]
+fn config_debug_redacts_auth_password() {
+    let config = EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1")
+        .expect("valid config")
+        .with_auth("admin", "super_secret_pass");
+
+    let debug_output = format!("{config:?}");
+    assert!(
+        debug_output.contains("admin"),
+        "Debug output should show auth username, got: {debug_output}"
+    );
+    assert!(
+        !debug_output.contains("super_secret_pass"),
+        "Debug output must not contain auth password, got: {debug_output}"
+    );
+    assert!(
+        debug_output.contains("[REDACTED]"),
+        "Debug output should show [REDACTED] for password, got: {debug_output}"
+    );
+}
+
+#[test]
+fn config_with_auth_exposes_credentials_via_accessor() {
+    let config = EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1")
+        .expect("valid config")
+        .with_auth("admin", "password123");
+
+    let (user, pass) = config.auth().expect("auth should be set");
+    assert_eq!(user, "admin");
+    assert_eq!(pass, "password123");
+}
+
+#[test]
+fn config_without_auth_returns_none() {
+    let config =
+        EtcdCoordinatorConfig::new(["http://etcd-0:2379"], "/gossip/v1").expect("valid config");
+
+    assert!(config.auth().is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +271,11 @@ fn etcd_operation_display_connect() {
 #[test]
 fn etcd_operation_display_status() {
     assert_eq!(EtcdOperation::Status.to_string(), "status");
+}
+
+#[test]
+fn etcd_operation_display_lease_grant() {
+    assert_eq!(EtcdOperation::LeaseGrant.to_string(), "lease_grant");
 }
 
 #[test]
@@ -467,10 +550,156 @@ fn run_records_scan_prefix_is_scan_safe() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// register_shards txn size guard
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn register_shards_rejects_batch_exceeding_etcd_txn_limit() {
+    let mut backend = local_backend("/gossip/tests/register-batch-limit");
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    // 42 shards exceed the MAX_SHARDS_PER_ETCD_TXN limit of 41.
+    let ranges: Vec<(String, String)> = (0..42u64)
+        .map(|i| (format!("{i:04}"), format!("{:04}", i + 1)))
+        .collect();
+    let shards: Vec<InitialShardInput<'_>> = ranges
+        .iter()
+        .enumerate()
+        .map(|(i, (start, end))| {
+            InitialShardInput::new(
+                ShardId::from_raw(i as u64 + 1),
+                ShardSpecRef::new(start.as_bytes(), end.as_bytes(), b""),
+                CursorUpdate::initial(),
+            )
+        })
+        .collect();
+
+    let err = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &shards,
+            OpId::from_raw(99),
+        )
+        .expect_err("42 shards must exceed etcd txn op limit");
+
+    assert!(
+        matches!(
+            err,
+            RegisterShardsError::ResourceExhausted {
+                resource: "etcd_txn_ops"
+            }
+        ),
+        "expected ResourceExhausted(etcd_txn_ops), got {err:?}"
+    );
+}
+
 #[test]
 #[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
 fn connects_to_local_etcd_and_fetches_status() {
-    let endpoints = env::var("ETCD_ENDPOINTS")
+    let backend = local_backend("/gossip/tests/status");
+    let status = backend.status().expect("status call should succeed");
+
+    assert!(
+        !status.version().is_empty(),
+        "connected member should report a version"
+    );
+}
+
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn acquire_checkpoint_and_renew_round_trip_against_local_etcd() {
+    let mut backend = local_backend("/gossip/tests/acquire-checkpoint-renew");
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let reg = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+    assert!(matches!(reg, IdempotentOutcome::Executed(_)));
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed");
+    let owner = backend
+        .test_load_owner_binding(test_tenant(), key)
+        .expect("owner lookup should succeed")
+        .expect("owner key must exist after acquire");
+    assert_eq!(owner.0, test_worker(7));
+    assert_eq!(owner.1, acquire.lease.fence());
+    assert!(
+        owner.2 > 0,
+        "owner key must be attached to a real etcd lease"
+    );
+
+    let outcome = backend
+        .checkpoint(
+            now(4),
+            test_tenant(),
+            &acquire.lease,
+            &CursorUpdate::new(b"m"),
+            OpId::from_raw(100),
+        )
+        .expect("checkpoint should succeed");
+    assert!(matches!(outcome, IdempotentOutcome::Executed(())));
+
+    let (shard, slab) = backend
+        .test_load_shard_snapshot(test_tenant(), key)
+        .expect("shard lookup should succeed")
+        .expect("shard must exist");
+    assert_eq!(shard.cursor.last_key(&slab), Some(b"m".as_slice()));
+
+    let renew = backend
+        .renew(now(5), test_tenant(), &acquire.lease)
+        .expect("renew should succeed");
+    assert!(
+        renew.new_deadline > acquire.lease.deadline(),
+        "renew must extend the logical lease deadline"
+    );
+
+    let owner_after = backend
+        .test_load_owner_binding(test_tenant(), key)
+        .expect("owner lookup should succeed")
+        .expect("owner key must still exist after renew");
+    assert_eq!(owner_after.0, test_worker(7));
+    assert_eq!(
+        owner_after.1,
+        acquire.lease.fence(),
+        "renew must not change the fence epoch"
+    );
+}
+
+fn test_endpoints() -> String {
+    env::var("ETCD_ENDPOINTS")
         .ok()
         .and_then(|raw| {
             let trimmed = raw.trim().to_owned();
@@ -480,16 +709,175 @@ fn connects_to_local_etcd_and_fetches_status() {
                 Some(trimmed)
             }
         })
-        .unwrap_or_else(|| "http://127.0.0.1:2379".to_owned());
+        .unwrap_or_else(|| "http://127.0.0.1:2379".to_owned())
+}
 
-    let config = EtcdCoordinatorConfig::from_endpoints_csv(&endpoints, "/gossip/v1")
+fn local_backend(namespace: &str) -> EtcdCoordinator {
+    let config = EtcdCoordinatorConfig::from_endpoints_csv(&test_endpoints(), namespace)
         .expect("test endpoint configuration should be valid");
 
-    let backend = EtcdCoordinator::connect(config).expect("local etcd should be reachable");
-    let status = backend.status().expect("status call should succeed");
+    EtcdCoordinator::connect(config).expect("local etcd should be reachable")
+}
 
-    assert!(
-        !status.version().is_empty(),
-        "connected member should report a version"
+fn local_backend_with_ttl(namespace: &str, ttl_secs: i64) -> EtcdCoordinator {
+    let config = EtcdCoordinatorConfig::from_endpoints_csv_with_tuning(
+        &test_endpoints(),
+        namespace,
+        ttl_secs,
+        8,
+    )
+    .expect("test endpoint configuration should be valid");
+
+    EtcdCoordinator::connect(config).expect("local etcd should be reachable")
+}
+
+fn test_tenant() -> TenantId {
+    TenantId::from_bytes([0x11; 32])
+}
+
+fn test_run() -> RunId {
+    RunId::from_raw(0x0102_0304_0506_0708)
+}
+
+fn test_shard() -> ShardId {
+    ShardId::from_raw(0x0000_0000_0000_0011)
+}
+
+fn test_worker(id: u64) -> WorkerId {
+    WorkerId::from_raw(id)
+}
+
+fn now(t: u64) -> LogicalTime {
+    LogicalTime::from_raw(t)
+}
+
+// ---------------------------------------------------------------------------
+// Integration tests: error paths and contention
+// ---------------------------------------------------------------------------
+
+/// After the etcd lease expires (owner key auto-deleted), checkpoint must
+/// fail because the owner binding no longer matches the presented lease.
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn lease_expiry_rejects_stale_checkpoint() {
+    // Use a short owner-lease TTL so the etcd lease expires quickly.
+    // etcd enforces a minimum TTL of ~5s in most configurations.
+    let ttl_secs = 5;
+    let mut backend = local_backend_with_ttl("/gossip/tests/lease-expiry", ttl_secs);
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+    let mut scratch = AcquireScratch::new();
+    let acquire = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(7), &mut scratch)
+        .expect("acquire should succeed");
+
+    // Wait for the etcd lease to expire. The owner key is deleted by etcd's
+    // TTL mechanism, leaving the shard without a live owner binding.
+    std::thread::sleep(std::time::Duration::from_secs(ttl_secs as u64 + 3));
+
+    let checkpoint_result = backend.checkpoint(
+        now(4),
+        test_tenant(),
+        &acquire.lease,
+        &CursorUpdate::new(b"m"),
+        OpId::from_raw(100),
     );
+
+    match checkpoint_result {
+        Err(CheckpointError::StaleFence { .. }) => { /* expected */ }
+        Err(CheckpointError::BackendError { .. }) => { /* acceptable: CAS failed after owner key vanished */
+        }
+        other => panic!("expected StaleFence or BackendError after lease expiry, got {other:?}"),
+    }
+}
+
+/// When two workers race to acquire the same unowned shard, exactly one
+/// succeeds and the other receives `AlreadyLeased`.
+#[test]
+#[ignore = "requires a local etcd on ETCD_ENDPOINTS or localhost:2379"]
+fn concurrent_acquire_second_worker_gets_already_leased() {
+    let mut backend = local_backend("/gossip/tests/concurrent-acquire");
+    backend
+        .test_clear_namespace()
+        .expect("namespace cleanup should succeed");
+
+    let config = RunConfig::try_new(CursorSemantics::Completed, 30, Some(5)).unwrap();
+    backend
+        .create_run(now(1), test_tenant(), test_run(), config)
+        .expect("create_run should succeed");
+
+    let manifest = [InitialShardInput::new(
+        test_shard(),
+        ShardSpecRef::new(b"a", b"z", b""),
+        CursorUpdate::initial(),
+    )];
+    let _ = backend
+        .register_shards(
+            now(2),
+            test_tenant(),
+            test_run(),
+            &manifest,
+            OpId::from_raw(99),
+        )
+        .expect("register_shards should succeed");
+
+    let key = ShardKey::new(test_run(), test_shard());
+
+    // Worker A acquires the shard successfully.
+    let mut scratch_a = AcquireScratch::new();
+    let acquire_a = backend
+        .acquire_and_restore_into(now(3), test_tenant(), key, test_worker(1), &mut scratch_a)
+        .expect("worker A acquire should succeed");
+
+    // Worker B attempts to acquire the same shard — must fail.
+    let mut scratch_b = AcquireScratch::new();
+    let result_b = backend.acquire_and_restore_into(
+        now(4),
+        test_tenant(),
+        key,
+        test_worker(2),
+        &mut scratch_b,
+    );
+
+    match result_b {
+        Err(AcquireError::AlreadyLeased {
+            current_owner,
+            lease_deadline,
+        }) => {
+            assert_eq!(
+                current_owner,
+                test_worker(1),
+                "AlreadyLeased must report worker A as the current owner"
+            );
+            assert_eq!(
+                lease_deadline,
+                acquire_a.lease.deadline(),
+                "AlreadyLeased must report the lease deadline from worker A's acquire"
+            );
+        }
+        other => panic!("expected AlreadyLeased for worker B, got {other:?}"),
+    }
 }

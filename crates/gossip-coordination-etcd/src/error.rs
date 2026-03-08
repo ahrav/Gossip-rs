@@ -1,16 +1,56 @@
+//! Unified error types for the etcd coordination backend.
+//!
+//! All fallible operations in this crate ultimately surface one of two
+//! error types:
+//!
+//! - [`EtcdCoordinatorError`] — top-level error covering config validation,
+//!   keyspace construction, Tokio runtime creation, codec decode/encode
+//!   failures, and etcd RPC errors.
+//! - [`EtcdOperation`] — a discriminant that tags which RPC or codec step
+//!   failed, providing structured context for diagnostics without embedding
+//!   the full error chain in the variant name.
+//!
+//! Domain-level errors (e.g., [`AcquireError`], [`CheckpointError`]) are
+//! defined in `gossip-coordination` and returned directly from the
+//! [`CoordinationBackend`] trait methods; this module covers only
+//! infrastructure failures.
+//!
+//! [`AcquireError`]: gossip_coordination::AcquireError
+//! [`CheckpointError`]: gossip_coordination::CheckpointError
+//! [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
+
 use std::fmt;
 
+use crate::codec::EtcdCodecError;
 use crate::config::EtcdCoordinatorConfigError;
 use crate::keyspace::EtcdKeyspaceError;
 
-/// Labels the specific etcd RPC that failed, providing diagnostic context
-/// inside [`EtcdCoordinatorError::Etcd`].
+/// Labels the etcd RPC or codec stage that failed.
+///
+/// Paired with an error source in [`EtcdCoordinatorError::Etcd`] or
+/// [`EtcdCoordinatorError::Codec`] to provide structured failure context
+/// without losing the underlying cause.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EtcdOperation {
-    /// Initial gRPC connection to the etcd cluster.
+    /// Initial TCP/TLS connection to the etcd cluster.
     Connect,
-    /// Maintenance `status` RPC used to verify cluster health after connect.
+    /// Maintenance `status` health-check RPC.
     Status,
+    /// Key-value `get` (point lookup or prefix scan).
+    Get,
+    /// Key-value `put`.
+    Put,
+    /// Key-value `delete` (point or prefix).
+    Delete,
+    /// Compare-and-swap transaction (`txn`).
+    Txn,
+    /// Lease `grant` (create a new TTL-based lease).
+    LeaseGrant,
+    /// Lease `keep_alive` (extend an existing lease's TTL).
+    LeaseKeepAlive,
+    /// Lease `revoke` (immediately expire a lease and delete its keys).
+    LeaseRevoke,
 }
 
 impl fmt::Display for EtcdOperation {
@@ -18,56 +58,59 @@ impl fmt::Display for EtcdOperation {
         match self {
             Self::Connect => f.write_str("connect"),
             Self::Status => f.write_str("status"),
+            Self::Get => f.write_str("get"),
+            Self::Put => f.write_str("put"),
+            Self::Delete => f.write_str("delete"),
+            Self::Txn => f.write_str("txn"),
+            Self::LeaseGrant => f.write_str("lease_grant"),
+            Self::LeaseKeepAlive => f.write_str("lease_keep_alive"),
+            Self::LeaseRevoke => f.write_str("lease_revoke"),
         }
     }
 }
 
-/// Errors surfaced by the etcd coordination backend.
+/// Top-level errors surfaced by the etcd coordination backend.
 ///
-/// The variants form a progression that mirrors the `connect()` sequence:
+/// Covers all infrastructure failure modes: configuration validation,
+/// keyspace construction, Tokio runtime creation, wire-format codec
+/// failures, and raw etcd RPC errors. Domain-level coordination errors
+/// (wrong status, stale fence, etc.) are returned via their own types
+/// from the [`CoordinationBackend`] trait.
 ///
-/// 1. **Configuration validation** ([`Config`](Self::Config)) — checked
-///    before any I/O. Catches invalid endpoints or namespace prefixes.
-/// 2. **Tokio runtime construction** ([`RuntimeBuild`](Self::RuntimeBuild)) —
-///    a system-resource failure (e.g. `ulimit` exhaustion) that prevents the
-///    sync/async bridge from starting.
-/// 3. **etcd client errors** ([`Etcd`](Self::Etcd)) — network, TLS, or
-///    cluster-level failures encountered during gRPC calls.
+/// [`CoordinationBackend`]: gossip_coordination::CoordinationBackend
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum EtcdCoordinatorError {
-    /// The [`EtcdCoordinatorConfig`](crate::EtcdCoordinatorConfig) failed validation before any I/O.
-    ///
-    /// See [`EtcdCoordinatorConfigError`] for the specific constraint that
-    /// was violated (missing endpoints, bad namespace prefix, etc.).
+    /// Invalid [`EtcdCoordinatorConfig`](crate::EtcdCoordinatorConfig) parameters.
     Config(EtcdCoordinatorConfigError),
-
-    /// The Tokio current-thread runtime required by the sync/async bridge
-    /// could not be created — typically a system-resource exhaustion
-    /// (fd limits, thread limits).
+    /// Invalid [`EtcdKeyspace`](crate::EtcdKeyspace) prefix.
+    Keyspace(EtcdKeyspaceError),
+    /// Failed to build the internal single-threaded Tokio runtime.
     RuntimeBuild(std::io::Error),
-
-    /// An etcd gRPC call failed. `operation` identifies which RPC, and
-    /// `source` carries the upstream [`etcd_client::Error`] with transport
-    /// and cluster-level details.
+    /// A v1 blob failed to encode or decode during the given operation.
+    Codec {
+        operation: EtcdOperation,
+        source: EtcdCodecError,
+    },
+    /// An etcd gRPC call failed during the given operation.
     Etcd {
         operation: EtcdOperation,
         source: etcd_client::Error,
     },
-
-    /// The etcd namespace prefix could not be converted into a valid
-    /// deterministic keyspace builder.
-    Keyspace(EtcdKeyspaceError),
 }
 
 impl fmt::Display for EtcdCoordinatorError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Config(error) => write!(f, "invalid etcd coordinator config: {error}"),
-            Self::RuntimeBuild(error) => write!(f, "failed to build tokio runtime: {error}"),
+            Self::Config(err) => write!(f, "invalid etcd coordinator config: {err}"),
+            Self::Keyspace(err) => write!(f, "invalid etcd keyspace: {err}"),
+            Self::RuntimeBuild(err) => write!(f, "failed to build tokio runtime: {err}"),
+            Self::Codec { operation, source } => {
+                write!(f, "etcd {operation} codec operation failed: {source}")
+            }
             Self::Etcd { operation, source } => {
                 write!(f, "etcd {operation} operation failed: {source}")
             }
-            Self::Keyspace(error) => write!(f, "invalid etcd keyspace: {error}"),
         }
     }
 }
@@ -75,19 +118,15 @@ impl fmt::Display for EtcdCoordinatorError {
 impl std::error::Error for EtcdCoordinatorError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Config(error) => Some(error),
-            Self::RuntimeBuild(error) => Some(error),
+            Self::Config(err) => Some(err),
+            Self::Keyspace(err) => Some(err),
+            Self::RuntimeBuild(err) => Some(err),
+            Self::Codec { source, .. } => Some(source),
             Self::Etcd { source, .. } => Some(source),
-            Self::Keyspace(error) => Some(error),
         }
     }
 }
 
-/// Allows `?` propagation from [`EtcdCoordinatorConfig::validate()`] inside
-/// [`EtcdCoordinator::connect()`].
-///
-/// [`EtcdCoordinatorConfig::validate()`]: crate::config::EtcdCoordinatorConfig::validate
-/// [`EtcdCoordinator::connect()`]: crate::backend::EtcdCoordinator::connect
 impl From<EtcdCoordinatorConfigError> for EtcdCoordinatorError {
     fn from(value: EtcdCoordinatorConfigError) -> Self {
         Self::Config(value)
