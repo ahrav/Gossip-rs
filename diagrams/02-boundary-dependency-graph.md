@@ -55,7 +55,7 @@ graph TB
     B4["<b>B4: Connector</b><br/>Enumeration, reading, circuit breaker,<br/>page validation, scan stats"]
     B5["<b>B5: Persistence</b><br/>Done-ledger, findings sink,<br/>commit protocol, typestate machine"]
 
-    B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId,<br/>JobId, ShardKey"| B1
+    B2 -->|"TenantId, PolicyHash,<br/>ShardId, WorkerId,<br/>FenceEpoch, OpId,<br/>LogicalTime, RunId,<br/>ShardKey"| B1
     B3 -->|"ShardId, MAX_KEY_SIZE<br/>(shard identity &amp;<br/>key-range ceiling)"| B1
     B4 -->|"ConnectorTag, ConnectorInstanceIdHash,<br/>ItemIdentityKey,<br/>ObjectVersionId,<br/>StableItemId"| B1
     B5 -->|"FindingId, OccurrenceId,<br/>ObservationId,<br/>TenantId, PolicyHash,<br/>StableItemId, SecretHash,<br/>FenceEpoch, RunId, ShardId"| B1
@@ -75,7 +75,7 @@ graph TB
 **Reading the edges.** Each arrow points from consumer to provider. The label
 lists the types that cross the boundary. For example, `B2 --> B1` means
 Coordination imports `TenantId`, `PolicyHash`, `ShardId`, `WorkerId`,
-`FenceEpoch`, `OpId`, `LogicalTime`, `RunId`, `JobId`, and `ShardKey` from
+`FenceEpoch`, `OpId`, `LogicalTime`, `RunId`, and `ShardKey` from
 Identity. The B5 --> B1
 edge is the widest, reflecting the fact that persistence must reference nearly
 every content-addressed identity type for done-ledger keys, finding records, and
@@ -132,7 +132,7 @@ graph TD
     end
 
     B3 -->|"ShardId, MAX_KEY_SIZE"| B1
-    B2 -->|"TenantId, ShardId,<br/>FenceEpoch, JobId, ..."| B1
+    B2 -->|"TenantId, ShardId,<br/>FenceEpoch, ..."| B1
     B2 -->|"ShardSpec"| B3
     B4 -->|"ConnectorTag,<br/>ConnectorInstanceIdHash, ..."| B1
     B4 -->|"ShardSpec"| B3

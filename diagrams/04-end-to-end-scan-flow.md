@@ -30,6 +30,15 @@ sequenceDiagram
     note over CLI: CLI Path (scanner-rs-cli)
     CLI->>RT: scan_fs_with_runtime / scan_git_with_runtime
     RT->>RT: build_assignment(source, shard_spec, cursor)
+    RT->>RT: execute_assignment_with_config(assignment, ...)
+    RT->>SF: driver_for_assignment(&assignment)
+    SF-->>RT: Box&lt;dyn ScanDriver&gt;
+    RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+    RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
+    activate DR
+    DR-->>RT: ScanReport
+    deactivate DR
+    RT-->>CLI: ScanReport
 
     note over DW,DC: Distributed Path (run_worker loop)
     loop For each shard
@@ -40,25 +49,19 @@ sequenceDiagram
         alt Already done
             DW->>DC: release_shard(&lease)
         else Not done
-            note over RT: Both paths converge here
-
             DW->>RT: execute_assignment_with_config(lease.assignment, ...)
+            RT->>SF: driver_for_assignment(&assignment)
+            SF-->>RT: Box&lt;dyn ScanDriver&gt;
+            RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
+            RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
+            activate DR
+            DR-->>RT: ScanReport
+            deactivate DR
+            RT-->>DW: AssignmentOutcome { report, checkpoint_hint, debug_output }
+            DW->>DC: complete_shard(&lease, checkpoint_hint, report)
+            DW->>DC: mark_shard_done(&shard_id)
         end
     end
-
-    note over RT,DR: Shared Core
-    RT->>SF: driver_for_assignment(&assignment)
-    SF-->>RT: Box&lt;dyn ScanDriver&gt;
-    RT->>RT: runtime_engine(engine_config) → Arc&lt;Engine&gt;
-    RT->>DR: driver.run(engine, cfg, out, git_out, commit, cancel)
-    activate DR
-    DR-->>RT: ScanReport
-    deactivate DR
-    RT-->>DW: AssignmentOutcome { report, checkpoint_hint, debug_output }
-
-    note over DW,DC: Distributed completion
-    DW->>DC: complete_shard(&lease, checkpoint_hint, report)
-    DW->>DC: mark_shard_done(&shard_id)
 ```
 
 **Convergence at `execute_assignment_with_config`.** The CLI path synthesises a
@@ -204,6 +207,12 @@ derives four identity types:
 
 The `StableItemId` and `VersionId` are connector-provided via `ItemMeta` and
 trusted by the sink — the runtime does not re-derive them.
+
+> **Scope note.** The `DurableCommitSink` chain terminates at `OccurrenceId`.
+> `ObservationId` (which adds `PolicyHash` scoping) is derived downstream in
+> the B5 Persistence layer, not here — the commit sink has no access to the
+> active policy. See [ID Derivation DAG §7](./03-id-derivation-dag.md) for the
+> full `ObservationId` derivation.
 
 ---
 

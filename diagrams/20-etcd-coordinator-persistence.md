@@ -479,7 +479,7 @@ graph TB
 | `keyspace.rs` | Complete | Deterministic paths, buffer-reuse API, scan isolation |
 | `codec.rs` | Complete | Binary encode/decode, staged rollback, fuzz-tested |
 | `error.rs` | Complete | Full error hierarchy with operation labels |
-| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions; `complete`, `park_shard`, `complete_run`, `fail_run`, `cancel_run`, `unpark_shard` not yet implemented |
+| `backend.rs` | Mostly complete | Direct etcd persistence via CAS transactions; `complete` and `park_shard` not yet implemented |
 
 The keyspace and codec are shared infrastructure used by the CAS transaction
 logic in `backend.rs`. Operations that are not yet implemented panic with
