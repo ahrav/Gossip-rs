@@ -79,6 +79,14 @@ const VERSION_PREFIX_V1: &[u8; 2] = b"v1";
 /// allocations.
 const SHARD_ID_WIRE_SIZE: usize = 8;
 
+/// Absolute upper bound on the number of root shards in a [`RunRecord`].
+///
+/// Rejects obviously invalid `root_shards` length prefixes early —
+/// before the relative (remaining-bytes) check — so a crafted blob
+/// cannot trick the decoder into a multi-million-element allocation
+/// that happens to fit the remaining wire bytes.
+const MAX_ROOT_SHARDS: usize = 10_000;
+
 /// Blob discriminator embedded after the 2-byte version header.
 ///
 /// The decoder reads this byte to dispatch to the correct record parser.
@@ -243,6 +251,40 @@ pub fn encode_run_record(record: &RunRecord) -> Vec<u8> {
     out.push(BlobKind::RunRecord.as_u8());
     owned.encode_into(&mut out);
     out
+}
+
+/// Encode a [`ShardRecord`] into `buf`, reusing its allocation.
+///
+/// Equivalent to [`encode_shard_record`] but clears and writes into a
+/// caller-owned buffer instead of allocating a fresh `Vec`. Useful in CAS
+/// retry loops where the encode runs on every iteration — the buffer
+/// retains its capacity across retries, avoiding repeated allocation and
+/// potential regrowth.
+pub fn encode_shard_record_into(
+    record: &ShardRecord,
+    slab: &ByteSlab,
+    buf: &mut Vec<u8>,
+) -> Result<(), EtcdCodecError> {
+    let owned = OwnedShardRecord::from_record(record, slab);
+    buf.clear();
+    buf.extend_from_slice(VERSION_PREFIX_V1);
+    buf.push(BlobKind::ShardRecord.as_u8());
+    owned.encode_into(buf)?;
+    Ok(())
+}
+
+/// Encode a `(worker, fence)` owner-key binding into `buf`, reusing its
+/// allocation.
+///
+/// Equivalent to [`encode_owner_value`] but clears and writes into a
+/// caller-owned buffer. Same retry-loop motivation as
+/// [`encode_shard_record_into`].
+pub fn encode_owner_value_into(worker: WorkerId, fence: FenceEpoch, buf: &mut Vec<u8>) {
+    buf.clear();
+    buf.extend_from_slice(VERSION_PREFIX_V1);
+    buf.push(BlobKind::ShardOwner.as_u8());
+    put_u64(buf, worker.as_raw());
+    put_u64(buf, fence.as_raw());
 }
 
 /// Decode a v1-encoded blob into a [`RunRecord`].
@@ -432,6 +474,12 @@ impl OwnedRunRecord {
         let completed_at = decoder.read_opt_u64()?.map(LogicalTime::from_raw);
 
         let root_len = decoder.read_len()?;
+        if root_len > MAX_ROOT_SHARDS {
+            return Err(EtcdCodecError::FieldTooLarge {
+                actual: root_len,
+                max: MAX_ROOT_SHARDS,
+            });
+        }
         if root_len > decoder.remaining() / SHARD_ID_WIRE_SIZE {
             return Err(EtcdCodecError::InvariantViolation {
                 kind: "RunRecord",

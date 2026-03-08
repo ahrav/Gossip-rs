@@ -1521,12 +1521,12 @@ fn decode_run_record_rejects_oversized_root_shards() {
     assert!(
         matches!(
             error,
-            EtcdCodecError::InvariantViolation {
-                kind: "RunRecord",
-                ..
+            EtcdCodecError::FieldTooLarge {
+                actual: 1_000_000,
+                max: 10_000,
             }
         ),
-        "expected InvariantViolation for oversized root_shards, got: {error:?}"
+        "expected FieldTooLarge for oversized root_shards, got: {error:?}"
     );
 }
 
