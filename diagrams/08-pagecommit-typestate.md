@@ -464,8 +464,8 @@ a receipt is in hand.
   shard lifecycle that the cursor advancement feeds into
 - [Fencing Protocol](06-fencing-protocol.md) -- the checkpoint call in
   stage 3 passes through the 5-check fencing preamble
-- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) -- steps 8-9 of the scan pipeline
-  show PageCommit accumulation and durability chaining in context
+- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) -- DurableCommitSink
+  identity derivation flow and findings persistence architecture
 - [System Overview](01-system-overview.md) -- where PageCommit fits in the
   overall architecture
 

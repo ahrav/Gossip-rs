@@ -616,8 +616,8 @@ skipped.
   preamble and zombie worker resolution that underpin Diagrams 1, 3, and 5
 - [Shard and Run State Machines](./05-shard-and-run-state-machines.md) -- the
   state transitions (Active, Done, Split, Parked) referenced throughout
-- [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- the 12-step pipeline
-  and receipt-chained commit boundary that define cursor semantics
+- [End-to-End Scan Flow](./04-end-to-end-scan-flow.md) -- ScanDriver
+  architecture and distributed worker loop
 - [System Overview](./01-system-overview.md) -- the five architectural
   boundaries (B1-B5) referenced by color coding
 - [Circuit Breaker](./09-circuit-breaker.md) -- the circuit breaker state machine

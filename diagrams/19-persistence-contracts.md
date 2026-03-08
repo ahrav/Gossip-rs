@@ -502,8 +502,8 @@ graph TB
 
 - [PageCommit Typestate Machine](08-pagecommit-typestate.md) — enforces the
   findings → done-ledger → checkpoint ordering at compile time
-- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) — shows where persistence
-  writes occur in the scan pipeline
+- [End-to-End Scan Flow](04-end-to-end-scan-flow.md) — shows where identity
+  derivation and commit lifecycle occur in the scan pipeline
 - [ID Derivation DAG](03-id-derivation-dag.md) — the full 19-type identity
   hierarchy that persistence record types depend on
 - [Boundary Dependency Graph](02-boundary-dependency-graph.md) — how B5
